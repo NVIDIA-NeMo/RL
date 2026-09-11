@@ -34,16 +34,33 @@ pre-publication ``route_assembly:<reason>`` rejection.
 
 from __future__ import annotations
 
+import math
 import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 import torch
 
+from nemo_rl.data.multimodal_utils import (
+    PackedTensor,
+    encode_multimodal_for_wire,
+    multimodal_row_tags,
+)
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
+from nemo_rl.data_plane.schema import (
+    INVALID_TOOL_CALL_MASK,
+    MALFORMED_THINKING_MASK,
+    MASK_SAMPLE,
+    ROUTE_PLAN_TAG,
+    TRUNCATED,
+)
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
+from nemo_rl.experience.cc_media import (
+    SegmentMedia,
+    fetch_segment_media,
+    verify_image_alignment,
+)
 from nemo_rl.experience.payload import pack_payload
 from nemo_rl.experience.route_assembly import (
     ROUTE_MISSING_SENTINEL,
@@ -79,6 +96,43 @@ class FinalizedRollout:
     # the executed route plan; None when the rollout staged no routes.
     routed_experts: Optional[torch.Tensor] = None
     route_plan: Optional[RouteAssemblyPlan] = None
+    # Selected chain already proven by Gym; CC compares it to agent selection.
+    model_call_ids: tuple[str, ...] = ()
+    media: dict[str, PackedTensor] = field(default_factory=dict)
+    output_masks: dict[str, list[bool]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ActionOutputFlags:
+    """RL's existing detector result for one selected model action."""
+
+    invalid_tool_call: bool
+    malformed_thinking: bool
+
+
+@dataclass(frozen=True)
+class SegmentReceipt:
+    """Metadata-only selection for one ordinary captured physical segment."""
+
+    capture_rollout_id: str
+    receipt: Optional[dict[str, Any]]
+    selected_response_ids: tuple[str, ...]
+    # Optional for ordinary slice callers; CC dispatch supplies semantic stops.
+    truncated: bool = False
+    # Image columns occupy the selected terminal's existing staging key.
+    media: SegmentMedia | None = None
+    action_flags: tuple[ActionOutputFlags, ...] | None = None
+
+
+@dataclass
+class _LogicalRows:
+    rows: list[FinalizedRollout]
+    prompt_ids: list[list[int]]
+    mask_sample: list[bool]
+    tags: list[dict[str, Any]]
+    staging_keys: list[str]
+    truncated: list[bool]
+    valid_owner_count: int
 
 
 @dataclass
@@ -98,7 +152,8 @@ class FinalizedGroup:
     dropped: bool = False
     # Which policy dropped the group, for the caller's log line.
     drop_reason: Optional[str] = None
-    # Rows that verified vs. total rows in the group. 0/0 on a dropped group
+    # Real rows that verified vs. real rows in the group; execution padding
+    # does not enter failure-rate decisions. 0/0 on a dropped group
     # (the caller does not read these when dropped is True).
     valid_row_count: int = 0
     total_row_count: int = 0
@@ -141,7 +196,14 @@ class RolloutReassembler:
     # ── per rollout ─────────────────────────────────────────────────────────
 
     def finalize_rollout(
-        self, rollout_id: str, receipt: Optional[dict[str, Any]], *, reward: float
+        self,
+        rollout_id: str,
+        receipt: Optional[dict[str, Any]],
+        *,
+        reward: float,
+        context_compaction: bool = False,
+        media: SegmentMedia | None = None,
+        action_flags: tuple[ActionOutputFlags, ...] | None = None,
     ) -> FinalizedRollout:
         """Verify one receipt against its staged rows and linearize the main chain.
 
@@ -297,10 +359,56 @@ class RolloutReassembler:
             # the published row carries the assembled tensor instead).
             route_plan = plan
             if not self._defer_routed_experts_to_policy:
-                routed_experts, failure = self._execute_direct_plan(plan, fetched)
+                routed_experts, failure = self._execute_direct_plan(
+                    plan, fetched, backpatch_predecessor_tail=context_compaction
+                )
                 if failure is not None:
                     return rejected(f"route_assembly:{failure}", staging_keys)
 
+        processed_media = {}
+        if context_compaction or media is not None:
+            try:
+                if media is not None:
+                    processed_media = fetch_segment_media(
+                        self._dp_client,
+                        staging_partition=self._staging_partition,
+                        terminal_staging_key=records_by_call[
+                            row.model_call_ids[-1]
+                        ].staging_key,
+                        descriptor=media,
+                    )
+                verify_image_alignment(
+                    [fetched_by_call[call_id] for call_id in row.model_call_ids],
+                    descriptor=media,
+                    media=processed_media,
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                return rejected(f"image_alignment:{error}", staging_keys)
+        output_masks = {}
+        if action_flags is not None:
+            if len(action_flags) != len(row.link_spans) or any(
+                not isinstance(flags, ActionOutputFlags)
+                or type(flags.invalid_tool_call) is not bool
+                or type(flags.malformed_thinking) is not bool
+                for flags in action_flags
+            ):
+                return rejected("action_flags_mismatch", staging_keys)
+            output_masks = {
+                key: [False] * len(row.token_ids)
+                for key in (INVALID_TOOL_CALL_MASK, MALFORMED_THINKING_MASK)
+            }
+            position = 0
+            for flags, (_, carry_len, generation_len) in zip(
+                action_flags, row.link_spans, strict=True
+            ):
+                start, end = position + carry_len, position + carry_len + generation_len
+                output_masks[INVALID_TOOL_CALL_MASK][start:end] = [
+                    flags.invalid_tool_call
+                ] * generation_len
+                output_masks[MALFORMED_THINKING_MASK][start:end] = [
+                    flags.malformed_thinking
+                ] * generation_len
+                position = end
         return FinalizedRollout(
             rollout_id=rollout_id,
             valid=True,
@@ -315,12 +423,17 @@ class RolloutReassembler:
             max_wv=max_wv,
             routed_experts=routed_experts,
             route_plan=route_plan,
+            model_call_ids=tuple(row.model_call_ids),
+            media=processed_media,
+            output_masks=output_masks,
         )
 
     def _execute_direct_plan(
         self,
         plan: RouteAssemblyPlan,
         fetched: list[Any],
+        *,
+        backpatch_predecessor_tail: bool = False,
     ) -> tuple[Optional[torch.Tensor], Optional[str]]:
         """Run the shared executor eagerly with locally fetched fragments.
 
@@ -334,7 +447,7 @@ class RolloutReassembler:
             if item.fragment is not None
         }
         if not any(span.staged_route_len > 0 for span in plan.spans):
-            return None, None
+            return None, "missing_fragment" if backpatch_predecessor_tail else None
         if fragments:
             # Direct mode has no policy model in-process; the fragments'
             # own (num_moe_layers, topk) is the learned-dims heuristic, and
@@ -350,6 +463,7 @@ class RolloutReassembler:
             fragments,
             dims=self._routed_dims,
             canonical_len=plan.expected_token_length,
+            backpatch_predecessor_tail=backpatch_predecessor_tail,
         )
 
     # ── per group ───────────────────────────────────────────────────────────
@@ -366,8 +480,10 @@ class RolloutReassembler:
         prompt_idx: int,
         loss_multiplier: float = 1.0,
         canonical_sample_ids: Optional[list[str]] = None,
+        logical_segments: Optional[list[list[SegmentReceipt]]] = None,
+        execution_row_multiple: int = 1,
     ) -> FinalizedGroup:
-        """Publish exactly N canonical rows for one prompt group.
+        """Publish one prompt group, with optional physical rows per logical owner.
 
         Blocking (TQ round trips); run via ``asyncio.to_thread`` from the
         dispatch task. ``fallback_weight_version`` stamps a group none of
@@ -391,20 +507,51 @@ class RolloutReassembler:
         assert len(canonical_sample_ids) == len(rollout_ids), (
             "canonical_sample_ids must be one per rollout"
         )
+        if type(execution_row_multiple) is not int or execution_row_multiple < 1:
+            raise ValueError("execution_row_multiple must be a positive integer")
+        if logical_segments is None and execution_row_multiple != 1:
+            raise ValueError("execution row padding requires logical CC segments")
+        if logical_segments is not None and loss_multiplier != 1.0:
+            raise ValueError("CC currently requires unit dataset loss_multiplier")
         _group_t0 = time.perf_counter()
-        rows = [
-            self.finalize_rollout(rollout_id, receipt, reward=reward)
-            for rollout_id, receipt, reward in zip(rollout_ids, receipts, rewards)
-        ]
+        logical = None
+        if logical_segments is None:
+            rows = [
+                self.finalize_rollout(rollout_id, receipt, reward=reward)
+                for rollout_id, receipt, reward in zip(rollout_ids, receipts, rewards)
+            ]
+        else:
+            logical = self._finalize_logical_rows(
+                group_id,
+                rollout_ids,
+                logical_segments,
+                rewards,
+                mask_sample,
+                canonical_sample_ids=canonical_sample_ids,
+            )
+            rows = logical.rows
+            receipts = [
+                segment.receipt for owner in logical_segments for segment in owner
+            ]
+            mask_sample = logical.mask_sample
         _rollouts_ms = (time.perf_counter() - _group_t0) * 1000.0
         valid_rows = [row for row in rows if row.valid]
-        staging_keys = [key for row in rows for key in row.staging_keys]
+        staging_keys = (
+            logical.staging_keys
+            if logical is not None
+            else [key for row in rows for key in row.staging_keys]
+        )
         metrics = {
             "finalize/invalid_row_rate": 1.0 - len(valid_rows) / len(rows),
             "finalize/calls_per_rollout": (
                 sum(len(row.staging_keys) for row in rows) / len(rows)
             ),
         }
+        if logical is not None:
+            metrics["finalize/logical_owner_count"] = float(len(rollout_ids))
+            metrics["finalize/valid_logical_owner_count"] = float(
+                logical.valid_owner_count
+            )
         # Ledger-derived admission counters (per group): each manifest row
         # carries its admission mode. token_in_rate near 1.0 is the capture
         # health signal (a text root only opens each chain); this replaces the
@@ -486,6 +633,82 @@ class RolloutReassembler:
                 count
             )
 
+        return self._publish_rows(
+            group_id,
+            rows,
+            rollout_ids,
+            mask_sample=mask_sample,
+            fallback_weight_version=fallback_weight_version,
+            prompt_idx=prompt_idx,
+            staging_keys=staging_keys,
+            metrics=metrics,
+            rollouts_ms=_rollouts_ms,
+            logical=logical,
+            execution_row_multiple=execution_row_multiple,
+            canonical_sample_ids=canonical_sample_ids,
+            loss_multiplier=loss_multiplier,
+        )
+
+    def _publish_rows(
+        self,
+        group_id: str,
+        rows: list[FinalizedRollout],
+        rollout_ids: list[str],
+        *,
+        mask_sample: list[bool],
+        fallback_weight_version: int,
+        prompt_idx: int,
+        staging_keys: list[str],
+        metrics: dict[str, float],
+        rollouts_ms: float,
+        logical: Optional[_LogicalRows],
+        execution_row_multiple: int,
+        canonical_sample_ids: list[str],
+        loss_multiplier: float,
+    ) -> FinalizedGroup:
+        """Shared ordinary/CC tensorization, single publication, and cleanup."""
+        valid_rows = [row for row in rows if row.valid]
+        real_row_count = len(rows)
+        if logical is not None:
+            if not valid_rows:
+                raise ValueError("CC group has no verified input layout for dummy rows")
+            padding_count = (-real_row_count) % execution_row_multiple
+            dummy_layout = valid_rows[0]
+            for ordinal in range(padding_count):
+                rows.append(
+                    replace(
+                        dummy_layout,
+                        rollout_id=f"{group_id}_pad{ordinal}",
+                        valid=False,
+                        reward=0.0,
+                        staging_keys=[],
+                    )
+                )
+                logical.prompt_ids.append([self._pad_token_id])
+                logical.mask_sample.append(True)
+                logical.truncated.append(False)
+                logical.tags.append(
+                    {
+                        "dispatch_group_id": group_id,
+                        "logical_group_size": len(rollout_ids),
+                        "logical_rollout_id": None,
+                        "logical_slot": None,
+                        "segment_index": None,
+                        "segment_count": 0,
+                        "is_execution_padding": True,
+                        "num_invalid_tool_calls": 0,
+                        "num_malformed_thinking": 0,
+                        "num_assistant_messages": 0,
+                    }
+                )
+            metrics["finalize/execution_padding_rows"] = float(padding_count)
+            # Failed owners retain their own reward/grouping identity, but
+            # logprob forwards need a sound full input/media layout as well.
+            layouts = [row if row.valid else dummy_layout for row in rows]
+            for row, tag in zip(rows, logical.tags, strict=True):
+                tag["uses_borrowed_input"] = not row.valid
+        else:
+            layouts = rows
         group_min_wv = min(
             (r.min_wv for r in valid_rows if r.min_wv is not None),
             default=fallback_weight_version,
@@ -504,16 +727,30 @@ class RolloutReassembler:
         ) or [self._pad_token_id]
 
         n = len(rows)
-        seq_lens = [max(1, len(row.token_ids)) for row in rows]
+        seq_lens = [max(1, len(row.token_ids)) for row in layouts]
         max_len = max(seq_lens)
         input_ids = torch.full((n, max_len), self._pad_token_id, dtype=torch.int64)
         token_mask = torch.zeros((n, max_len), dtype=torch.float32)
         logprobs = torch.zeros((n, max_len), dtype=torch.float32)
-        prompt_ids_for_adv = torch.tensor([sibling_prompt] * n, dtype=torch.int64)
+        if logical is None:
+            prompt_ids_for_adv = torch.tensor([sibling_prompt] * n, dtype=torch.int64)
+        else:
+            # Original per-owner prompts, never a later compacted segment prompt.
+            prompt_ids_for_adv = torch.nested.as_nested_tensor(
+                [
+                    torch.tensor(prompt, dtype=torch.int64)
+                    for prompt in logical.prompt_ids
+                ],
+                layout=torch.jagged,
+            )
         sample_mask = torch.zeros(n, dtype=torch.float32)
         lengths = torch.tensor(seq_lens, dtype=torch.long)
         rewards_t = torch.tensor([row.reward for row in rows], dtype=torch.float32)
         for i, row in enumerate(rows):
+            if logical is not None:
+                input_ids[i, : seq_lens[i]] = torch.tensor(
+                    layouts[i].token_ids, dtype=torch.int64
+                )
             if not row.valid:
                 continue
             length = len(row.token_ids)
@@ -532,10 +769,21 @@ class RolloutReassembler:
             "total_reward": rewards_t,
             MASK_SAMPLE: torch.tensor(mask_sample, dtype=torch.bool),
             TRUNCATED: torch.tensor(
-                [seq_len == self._max_seq_len for seq_len in seq_lens],
+                logical.truncated
+                if logical is not None
+                else [seq_len == self._max_seq_len for seq_len in seq_lens],
                 dtype=torch.bool,
             ),
         }
+        if logical is not None:
+            for key in (INVALID_TOOL_CALL_MASK, MALFORMED_THINKING_MASK):
+                values = torch.zeros((n, max_len), dtype=torch.bool)
+                for index, row in enumerate(rows):
+                    if row.valid and key in row.output_masks:
+                        values[index, : len(row.token_ids)] = torch.tensor(
+                            row.output_masks[key], dtype=torch.bool
+                        )
+                train_batch[key] = values
         if self._router_replay_enabled and not self._defer_routed_experts_to_policy:
             has_routed_row = any(r.valid and r.routed_experts is not None for r in rows)
             if not has_routed_row and self._routed_dims is None and not valid_rows:
@@ -574,6 +822,24 @@ class RolloutReassembler:
             group_id=group_id,
             prompt_idx=prompt_idx,
         )
+        packed_media = {}
+        for key in {key for row in layouts if row.valid for key in row.media}:
+            prototype = next(
+                row.media[key] for row in layouts if row.valid and key in row.media
+            )
+            packed_media[key] = PackedTensor.concat(
+                [
+                    row.media[key]
+                    if row.valid and key in row.media
+                    else PackedTensor.empty_rows_like(prototype, 1)
+                    for row in layouts
+                ]
+            )
+            fields[key] = encode_multimodal_for_wire(key, packed_media[key])
+        media_tags = multimodal_row_tags(packed_media, n)
+        if media_tags is not None:
+            for tag, media_tag in zip(tags, media_tags, strict=True):
+                tag.update(media_tag)
         if self._defer_routed_experts_to_policy:
             encoded_sizes = 0
             span_count = 0
@@ -600,10 +866,15 @@ class RolloutReassembler:
                 metrics["finalize/routed_experts_row_coverage"] = (
                     valid_route_rows / len(valid_rows)
                 )
-        assert sample_ids == canonical_sample_ids, (
-            "canonical sample ids must equal the stable logical rollout ids: "
-            f"{sample_ids} != {canonical_sample_ids}"
-        )
+        if logical is None:
+            assert sample_ids == canonical_sample_ids, (
+                "canonical sample ids must equal the stable logical rollout ids: "
+                f"{sample_ids} != {canonical_sample_ids}"
+            )
+        else:
+            sample_ids = [row.rollout_id for row in rows]
+            for tag, owner_tag in zip(tags, logical.tags, strict=True):
+                tag.update(owner_tag)
         _tensorize_ms = (time.perf_counter() - _tensorize_t0) * 1000.0
         _put_t0 = time.perf_counter()
         self._call_dp(
@@ -621,7 +892,7 @@ class RolloutReassembler:
             _clear_ms = (time.perf_counter() - _clear_t0) * 1000.0
         # Per-step W&B breakdown of training-row assembly (capture arm) rides
         # FinalizedGroup.metrics into the controller's rollout metrics.
-        metrics["row_assembly/rollouts_ms"] = _rollouts_ms
+        metrics["row_assembly/rollouts_ms"] = rollouts_ms
         metrics["row_assembly/tensorize_ms"] = _tensorize_ms
         metrics["row_assembly/tq_put_ms"] = _put_ms
         if not self._defer_routed_experts_to_policy:
@@ -641,10 +912,214 @@ class RolloutReassembler:
             staging_keys=(staging_keys if self._defer_routed_experts_to_policy else []),
             metrics=metrics,
             valid_row_count=len(valid_rows),
-            total_row_count=len(rows),
+            total_row_count=real_row_count,
         )
 
     # ── internals ───────────────────────────────────────────────────────────
+
+    def _finalize_logical_rows(
+        self,
+        group_id: str,
+        rollout_ids: list[str],
+        logical_segments: list[list[SegmentReceipt]],
+        rewards: list[float],
+        mask_sample: list[bool],
+        *,
+        canonical_sample_ids: list[str],
+    ) -> _LogicalRows:
+        """Verify ordinary segments, then keep all or none of each owner's rows.
+
+        A missing initial prompt is a structural group failure: a sibling's
+        possibly different post-agent prompt is not evidence for a failed owner.
+        No publication or cleanup happens before this method completes.
+        """
+        # Optional Gym dependency; ordinary/non-Gym import paths remain unchanged.
+        from nemo_gym.token_id_capture.staging.records import RolloutReceipt
+
+        n = len(rollout_ids)
+        if not n or len(logical_segments) != n:
+            raise ValueError("logical segments must cover every logical slot")
+        if canonical_sample_ids != [f"{group_id}_g{i}" for i in range(n)]:
+            raise ValueError("logical rollout IDs must match their dispatch slots")
+        if not all(math.isfinite(reward) for reward in rewards):
+            raise ValueError("logical rewards must be finite")
+        if self._defer_routed_experts_to_policy:
+            raise ValueError("logical capture requires direct route assembly")
+
+        prepared = _LogicalRows([], [], [], [], [], [], 0)
+        seen_responses: set[str] = set()
+        for slot, (owner_id, segments, reward, owner_mask) in enumerate(
+            zip(
+                canonical_sample_ids,
+                logical_segments,
+                rewards,
+                mask_sample,
+                strict=True,
+            )
+        ):
+            if not segments:
+                raise ValueError(f"{owner_id}: missing initial prompt evidence")
+            rebuilt = []
+            parsed_receipts = []
+            owner_valid = True
+            for ordinal, segment in enumerate(segments):
+                expected_id = f"{rollout_ids[slot]}_s{ordinal}"
+                if segment.capture_rollout_id != expected_id:
+                    raise ValueError("capture ID must match owner and segment ordinal")
+                parsed = (
+                    RolloutReceipt.model_validate(segment.receipt)
+                    if segment.receipt is not None
+                    else None
+                )
+                if parsed is not None:
+                    if parsed.rollout_id != expected_id or any(
+                        record.staging_key != f"{expected_id}/{record.model_call_id}"
+                        for record in parsed.manifest
+                    ):
+                        raise ValueError("foreign receipt/staging ownership")
+                    prepared.staging_keys.extend(
+                        record.staging_key for record in parsed.manifest
+                    )
+                row = self.finalize_rollout(
+                    expected_id,
+                    segment.receipt,
+                    reward=reward,
+                    context_compaction=True,
+                    media=segment.media,
+                    action_flags=segment.action_flags,
+                )
+                selected = segment.selected_response_ids
+                record_by_call = (
+                    {record.model_call_id: record for record in parsed.manifest}
+                    if parsed
+                    else {}
+                )
+                actual = tuple(
+                    record_by_call[call_id].response_id
+                    for call_id in row.model_call_ids
+                )
+                selection_valid = (
+                    bool(selected)
+                    and all(isinstance(item, str) and item for item in selected)
+                    and len(set(selected)) == len(selected)
+                    and not seen_responses.intersection(selected)
+                    and actual == selected
+                )
+                if selection_valid:
+                    seen_responses.update(selected)
+                owner_valid = owner_valid and row.valid and selection_valid
+                rebuilt.append(row)
+                parsed_receipts.append(parsed)
+
+            first = rebuilt[0]
+            parsed = parsed_receipts[0]
+            selected = segments[0].selected_response_ids
+            roots = (
+                [
+                    record
+                    for record in parsed.manifest
+                    if selected
+                    and record.response_id == selected[0]
+                    and record.parent_call_id is None
+                ]
+                if parsed
+                else []
+            )
+            if len(roots) != 1:
+                raise ValueError(f"{owner_id}: missing initial prompt evidence")
+            if first.valid:
+                if first.model_call_ids[0] != roots[0].model_call_id:
+                    raise ValueError(
+                        f"{owner_id}: selected initial root disagrees with receipt"
+                    )
+                original_prompt = first.token_ids[: first.prompt_len]
+            else:
+                # Only recover grouping identity, never training validity, from
+                # a sound selected root when a later call poisoned segment zero.
+                root_receipt = RolloutReceipt(
+                    rollout_id=segments[0].capture_rollout_id,
+                    manifest=roots,
+                    terminal_model_call_id=roots[0].model_call_id,
+                    terminal_selection="declared",
+                )
+                root = self.finalize_rollout(
+                    segments[0].capture_rollout_id,
+                    root_receipt.model_dump(),
+                    reward=reward,
+                )
+                if not root.valid:
+                    raise ValueError(
+                        f"{owner_id}: unverifiable initial prompt evidence"
+                    )
+                original_prompt = root.token_ids[: root.prompt_len]
+            if not original_prompt:
+                raise ValueError(f"{owner_id}: empty initial grouping prompt")
+            if owner_valid:
+                prepared.valid_owner_count += 1
+            else:
+                rebuilt = [
+                    replace(
+                        first,
+                        rollout_id=f"{owner_id}_s0",
+                        valid=False,
+                        rejection_reason="logical_owner_invalid",
+                        token_ids=[],
+                        token_mask=[],
+                        logprobs=[],
+                        prompt_len=0,
+                        model_call_ids=(),
+                        routed_experts=None,
+                        route_plan=None,
+                        media={},
+                        output_masks={},
+                    )
+                ]
+            for ordinal, row in enumerate(rebuilt):
+                flag_segments = [segments[ordinal]] if owner_valid else segments
+                flags = [
+                    flag
+                    for segment in flag_segments
+                    for flag in segment.action_flags or ()
+                ]
+                prepared.rows.append(replace(row, rollout_id=f"{owner_id}_s{ordinal}"))
+                prepared.prompt_ids.append(original_prompt)
+                prepared.mask_sample.append(owner_mask)
+                prepared.truncated.append(
+                    any(segment.truncated for segment in segments)
+                )
+                prepared.tags.append(
+                    {
+                        "dispatch_group_id": group_id,
+                        "logical_rollout_id": owner_id,
+                        "logical_slot": slot,
+                        "logical_group_size": n,
+                        "segment_index": ordinal,
+                        "segment_count": len(rebuilt),
+                        "is_execution_padding": False,
+                        "num_invalid_tool_calls": sum(
+                            flag.invalid_tool_call for flag in flags
+                        ),
+                        "num_malformed_thinking": sum(
+                            flag.malformed_thinking for flag in flags
+                        ),
+                        "num_assistant_messages": sum(
+                            len(segment.selected_response_ids)
+                            for segment in flag_segments
+                        ),
+                    }
+                )
+        prepared.staging_keys = list(dict.fromkeys(prepared.staging_keys))
+        versions = {
+            value
+            for row in prepared.rows
+            if row.valid
+            for value in (row.min_wv, row.max_wv)
+        }
+        if len(versions) > 1:
+            raise ValueError(
+                "logical capture group must use one generation weight version"
+            )
+        return prepared
 
     def _build_routed_experts_tensor(
         self,

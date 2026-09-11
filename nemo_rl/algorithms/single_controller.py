@@ -65,6 +65,7 @@ import torch
 from ray.exceptions import RayActorError
 
 from nemo_rl.algorithms import opd as opd_module
+from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DATA_PLANE_CHECKPOINT_DIR,
     LEGACY_REPLAY_BUFFER_FILENAME,
@@ -95,6 +96,11 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
     is_ppo_run,
+    validate_cc_objective,
+)
+from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
+    build_logical_owner_batch,
+    has_logical_owners,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
@@ -1275,7 +1281,7 @@ class SingleControllerActor:
     def _request_staging_keys(request: "ReassemblyRequest") -> list[str]:
         """Return the full receipt-manifest staging ownership for a request."""
         keys: list[str] = []
-        for receipt in request.receipts:
+        for receipt in request.capture_receipts:
             if receipt is None:
                 continue
             manifest = receipt.get("manifest")
@@ -1299,7 +1305,7 @@ class SingleControllerActor:
         try:
             await self._call_dp(
                 "clear_samples",
-                sample_ids=list(request.canonical_sample_ids),
+                sample_ids=list(request.cleanup_sample_ids),
                 partition_id=self._partition_id,
             )
         except Exception as error:
@@ -1307,7 +1313,7 @@ class SingleControllerActor:
                 RuntimeError(
                     "pre-publication canonical cleanup failed for "
                     f"group={request.group_id!r}, "
-                    f"ids={request.canonical_sample_ids!r}"
+                    f"ids={request.cleanup_sample_ids!r}"
                 )
             )
             errors[-1].__cause__ = error
@@ -1522,6 +1528,8 @@ class SingleControllerActor:
     @staticmethod
     def _group_ids_from_meta(meta: KVBatchMeta) -> list[str]:
         """Return stable prompt-group IDs in canonical sample order."""
+        if has_logical_owners(meta):
+            return list(dict.fromkeys(tag["dispatch_group_id"] for tag in meta.tags))
         group_ids: list[str] = []
         seen_group_ids: set[str] = set()
         for sample_id in meta.sample_ids:
@@ -2260,6 +2268,7 @@ class SingleControllerActor:
         policy_training_start_step = (
             self._algo_cfg.policy_training_start_step if self._is_ppo else 0
         )
+        context_compaction = self._master_config.token_capture.context_compaction
 
         while self._train_steps < self._algo_cfg.max_num_steps:
             version_during_step = self._trainer_version
@@ -2280,6 +2289,7 @@ class SingleControllerActor:
             consumed_training_claim_ids: list[str] = []
             consumed_group_count = 0
             step_finalizer_metrics: dict[str, list[float]] = {}
+            logical_owners: set[str] = set()
 
             with self._timer.time("total_step_time"):
                 # Re-read on every iteration rather than once: a prompt stamped for this
@@ -2394,6 +2404,36 @@ class SingleControllerActor:
                         consumed_metas.append(train_meta)
                         consumed_training_claim_ids.extend(selected_training_claim_ids)
                         consumed_group_count += num_groups
+                        if context_compaction:
+                            if (
+                                not has_logical_owners(train_meta)
+                                or len(train_meta.tags or []) != train_meta.size
+                                or any(
+                                    type(tag.get("weight_version")) is not int
+                                    or tag["weight_version"] != version_during_step
+                                    or type(tag.get("is_execution_padding")) is not bool
+                                    or type(tag.get("uses_borrowed_input")) is not bool
+                                    for tag in train_meta.tags or []
+                                )
+                            ):
+                                raise ValueError(
+                                    "CC optimizer batch requires logical rows with padding flags, borrowed-input flags, and the current generation version"
+                                )
+                            if any(
+                                tag["is_execution_padding"]
+                                or tag["uses_borrowed_input"]
+                                for tag in train_meta.tags
+                            ):
+                                # Check before any policy/reference forward.
+                                # Borrowed failed-owner inputs can affect routing too,
+                                # even when no ownerless padding rows are needed.
+                                await asyncio.to_thread(
+                                    ray.get,
+                                    self._trainer.worker_group.run_all_workers_single_data(
+                                        "validate_cc_execution_padding"
+                                    ),
+                                )
+
                         for group_id in selected_group_ids:
                             for name, value in self._finalizer_metrics_by_group.pop(
                                 group_id, {}
@@ -2468,6 +2508,24 @@ class SingleControllerActor:
                             train_meta,
                             has_valid_training_tokens,
                         ) = await self._advantage_stage(train_meta)
+                    if context_compaction:
+                        # The advantage stage has verified every owner/segment.
+                        # Count those owners, not the physical rows or sampler tally.
+                        chunk_owners = {
+                            tag["logical_rollout_id"]
+                            for tag in train_meta.tags
+                            if not tag["is_execution_padding"]
+                        }
+                        if (
+                            len(selected_group_ids) != num_groups
+                            or len(chunk_owners)
+                            != num_groups * self._algo_cfg.num_generations_per_prompt
+                            or logical_owners.intersection(chunk_owners)
+                        ):
+                            raise ValueError(
+                                "CC sampler chunk must contain new, complete logical groups"
+                            )
+                        logical_owners.update(chunk_owners)
 
                     # A PPO step is this one chunk, so a chunk with nothing left
                     # after filtering is a step that trains neither model.
@@ -2610,6 +2668,14 @@ class SingleControllerActor:
                 # Only the streaming path has anything left open: a PPO step is one
                 # chunk, so each epoch already closed its own optimizer step above.
                 if not self._is_ppo:
+                    if context_compaction and (
+                        groups_dispatched != self._algo_cfg.num_prompts_per_step
+                        or len(logical_owners)
+                        != self._master_config.policy["train_global_batch_size"]
+                    ):
+                        raise ValueError(
+                            "CC optimizer step requires the full logical sample count"
+                        )
                     if not step_open:
                         raise RuntimeError(
                             "SingleController has no valid response tokens after "
@@ -4178,6 +4244,18 @@ class SingleControllerActor:
             for key in VIOLATION_TAG_KEYS:
                 self._step_log_dict.setdefault(key, []).append(int(tag.get(key, 0)))
 
+        logical = has_logical_owners(meta)
+        if logical:
+            if (
+                self._is_ppo
+                or not isinstance(self._algo_cfg, GRPOConfig)
+                or self._algo_cfg.adv_estimator.name != "grpo"
+                or not isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
+            ):
+                raise ValueError(
+                    "CC logical owners require the standard GRPO estimator"
+                )
+            validate_cc_objective(self._algo_cfg, self._master_config.loss_fn)
         if self._advantage_estimator is None:
             return meta, True
         adv_cfg = self._advantage_cfg
@@ -4191,6 +4269,12 @@ class SingleControllerActor:
         )
 
         prompt_ids = tensor_field(data, adv_cfg.prompt_ids_field)
+        if logical:
+            # Preserve true equality when zero-padding would alias [x] and [x, 0].
+            prompt_lengths = prompt_ids.new_tensor(
+                [row.numel() for row in data[adv_cfg.prompt_ids_field].unbind()]
+            )
+            prompt_ids = torch.cat((prompt_lengths.unsqueeze(-1), prompt_ids), dim=1)
         rewards = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.reward_field)
         ).float()
@@ -4253,7 +4337,23 @@ class SingleControllerActor:
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
             self._step_log_dict["seq_logprob_error_metrics"].append(seq_error_metrics)
 
+        owner_batch = None
+        if logical:
+            owner_batch = build_logical_owner_batch(
+                meta,
+                prompt_ids=prompt_ids,
+                rewards=rewards,
+                sample_mask=final_sample_mask,
+                expected_group_size=self._algo_cfg.num_generations_per_prompt,
+            )
+            final_sample_mask = owner_batch.fanout(owner_batch.valid_mask)
         mask = token_mask * final_sample_mask.unsqueeze(-1)
+        baseline_mask = final_sample_mask
+        if (
+            isinstance(self._algo_cfg, GRPOConfig)
+            and self._algo_cfg.baseline_population == "all_owners"
+        ):
+            baseline_mask = torch.ones_like(final_sample_mask)
 
         repeated_batch: dict[str, torch.Tensor] = {
             "total_reward": rewards,
@@ -4289,16 +4389,31 @@ class SingleControllerActor:
         # Value-model estimators (GAE) hand back the regression target alongside
         # the advantages; the group-relative ones return a bare tensor.
         returns: Optional[torch.Tensor] = None
-        if has_valid_training_tokens:
+        if has_valid_training_tokens and owner_batch is not None:
+            rows = owner_batch.representative_rows
+            owner_advantages = self._advantage_estimator.compute_advantage(
+                prompt_ids=prompt_ids[rows],
+                rewards=rewards[rows],
+                mask=owner_batch.valid_mask.unsqueeze(-1),
+                valid_mask=baseline_mask[rows],
+            )
+            if (
+                owner_advantages.shape != (len(rows), 1)
+                or not torch.isfinite(owner_advantages).all()
+            ):
+                raise ValueError("GRPO must return one finite advantage per CC owner")
+            advantages = (
+                owner_batch.fanout(owner_advantages[:, 0]).unsqueeze(-1).expand_as(mask)
+            )
+        elif has_valid_training_tokens:
             result = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
                 rewards=rewards,
                 mask=mask,
                 repeated_batch=repeated_batch,
-                # Real validity (token-capture placeholders carry sample_mask 0,
-                # and mask_sample/overlong/seq-logprob-error rows are folded in
-                # via final_sample_mask) instead of the hardwired all-ones.
-                valid_mask=final_sample_mask,
+                # One controller-wide policy for ordinary and CC populations.
+                # Loss validity remains authoritative under either policy.
+                valid_mask=baseline_mask,
                 **kwargs,
             )
             if self._is_ppo:
@@ -4332,8 +4447,13 @@ class SingleControllerActor:
             )
 
         response_advantages = torch.masked_select(advantages, mask.bool())
-        self._step_log_dict["rewards"].append(rewards.detach().cpu())
-        self._step_log_dict["sample_masks"].append(final_sample_mask.detach().cpu())
+        metric_rows = (
+            owner_batch.representative_rows if owner_batch is not None else slice(None)
+        )
+        self._step_log_dict["rewards"].append(rewards[metric_rows].detach().cpu())
+        self._step_log_dict["sample_masks"].append(
+            final_sample_mask[metric_rows].detach().cpu()
+        )
         if self._teacher_logprobs_required:
             valid = response_advantages.detach().double()
             self._opd_stat_sum += float(valid.sum())

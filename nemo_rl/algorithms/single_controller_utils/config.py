@@ -621,6 +621,12 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # Fixed CPU finalizer pool size; actors are never automatically replaced.
     num_reassembler_workers: PositiveInt = 2
 
+    # Expect the shared Gym context-management result for every logical owner.
+    # CC mutations are single-attempt; ordinary capture keeps its retry policy.
+    # Initially requires unit dataset loss weights and disables both trainer and
+    # rollout checkpointing; ordinary capture retains those capabilities.
+    context_compaction: bool = False
+
 
 @dataclass(frozen=True)
 class TaskSourceRecoveryGranularity:
@@ -806,6 +812,59 @@ class MasterConfig(BaseModel, extra="allow"):
                 "At least one algorithm block must be set, either `grpo` or `ppo`."
             )
         return self
+
+
+def validate_cc_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
+    """Keep the initial CC objective identical at startup and before fanout."""
+    if (
+        grpo.adv_estimator.name != "grpo"
+        or not loss.token_level_loss
+        or loss.sequence_level_importance_ratios
+        or loss.truncated_importance_sampling_type == "seq-mask-tis"
+        or loss.use_kl_in_reward
+        or loss.positive_example_nll_weight != 0
+        or grpo.advantage_clip_low is not None
+        or grpo.advantage_clip_high is not None
+        or grpo.seq_logprob_error_threshold is not None
+        or grpo.use_dynamic_sampling
+        or grpo.reward_shaping.enabled
+        or grpo.reward_scaling.enabled
+        or grpo.calculate_advantages_on_gpu
+        or grpo.invalid_tool_call_advantage is not None
+        or grpo.malformed_thinking_advantage is not None
+    ):
+        raise ValueError(
+            "CC requires standard token-level GRPO without advantage overrides"
+        )
+
+
+def cc_execution_row_multiple(
+    policy: PolicyConfig, *, dp_size: int, logprobs_required: bool
+) -> int:
+    """Common row divisibility for the initial fixed-batch Megatron consumers.
+
+    Policy and reference forwards share this trainer's mesh and logprob MBS.
+    Non-interleaved PP admits any positive microbatch count; interleaved PP
+    and token-budget planners require separate qualification.
+    """
+    if (
+        not policy["megatron_cfg"]["enabled"]
+        or policy["sequence_packing"]["enabled"]
+        or policy["dynamic_batching"]["enabled"]
+        or policy["megatron_cfg"].get("virtual_pipeline_model_parallel_size")
+        is not None
+    ):
+        raise ValueError(
+            "CC execution padding requires fixed-batch, non-interleaved Megatron"
+        )
+    sizes = [policy["train_micro_batch_size"]]
+    if logprobs_required:
+        sizes.append(policy["logprob_batch_size"])
+    if any(type(size) is not int or size < 1 for size in [dp_size, *sizes]):
+        raise ValueError(
+            "CC consumer DP and microbatch sizes must be positive integers"
+        )
+    return dp_size * math.lcm(*sizes)
 
 
 def is_ppo_run(master_config: MasterConfig) -> bool:
@@ -1325,6 +1384,50 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "non-default rollout_recovery policies require "
             "token_capture.enabled=true; without token capture, unfinished Gym "
             "siblings have no durable receipts to recover"
+        )
+    if token_capture_config.context_compaction:
+        if master_config.grpo is None or not master_config.env.get(
+            "should_use_nemo_gym"
+        ):
+            raise ValueError(
+                "context compaction requires GRPO and the NeMo-Gym rollout path"
+            )
+        if not token_capture_config.enabled:
+            raise ValueError(
+                "token_capture.context_compaction requires token_capture.enabled=true"
+            )
+        if (
+            master_config.grpo.invalid_tool_call_advantage is not None
+            or master_config.grpo.malformed_thinking_advantage is not None
+        ):
+            raise ValueError(
+                "context compaction does not support message-level advantage overrides"
+            )
+        if token_capture_config.defer_routed_experts_to_policy:
+            raise ValueError(
+                "context compaction requires direct routed-expert assembly"
+            )
+        if async_config.rollout_failure.min_step_batch_fraction != 1:
+            raise ValueError("context compaction requires min_step_batch_fraction=1")
+        validate_cc_objective(master_config.grpo, master_config.loss_fn)
+        if (
+            not isinstance(async_config.sampler, InOrderSamplerConfig)
+            or async_config.sampler.max_lookahead_versions != 0
+            or async_config.sampler.warmup_lookahead_versions is not None
+        ):
+            raise ValueError("CC requires the in_order sampler with zero lookahead")
+        if master_config.checkpointing["enabled"]:
+            raise ValueError("CC checkpoint/resume is not supported initially")
+        if master_config.rollout_checkpointing.snapshot_attempt_interval_s is not None:
+            raise ValueError("CC rollout checkpoint/resume is not supported initially")
+        if reward_penalties_enabled or opd_module.is_opd_enabled(master_config):
+            raise ValueError(
+                "CC does not support reward penalties or on-policy distillation"
+            )
+        # Validate the fixed-batch policy shape before workers/generation start.
+        # Setup recomputes Q from the actual trainer DP mesh.
+        cc_execution_row_multiple(
+            master_config.policy, dp_size=1, logprobs_required=True
         )
     if token_capture_config.defer_routed_experts_to_policy and not (
         token_capture_config.enabled

@@ -39,6 +39,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     AsyncRLConfig,
     MasterConfig,
+    TokenCaptureConfig,
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS
@@ -1352,6 +1353,7 @@ def _train_pump_controller(*, sampler) -> object:
         # The pump's step epilogue reads the save triggers even when saving
         # is disabled.
         checkpointing={"enabled": False, "save_period": 10},
+        token_capture=TokenCaptureConfig(),
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False

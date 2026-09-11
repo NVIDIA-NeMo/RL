@@ -22,7 +22,11 @@ import ray
 import torch
 
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
-from nemo_rl.experience.rollout_reassembler import FinalizedGroup, RolloutReassembler
+from nemo_rl.experience.rollout_reassembler import (
+    FinalizedGroup,
+    RolloutReassembler,
+    SegmentReceipt,
+)
 
 # Field names whose values are per-token and therefore large, but whose Python
 # type is indistinguishable from metadata -- a list[int] of token ids looks just
@@ -66,6 +70,61 @@ class ReassemblyRequest:
     mask_sample: tuple[bool, ...]
     # Dataset-level loss weight shared by every completion in this prompt group.
     loss_multiplier: float = 1.0
+    logical_segments: Optional[tuple[tuple[SegmentReceipt, ...], ...]] = None
+    execution_row_multiple: int = 1
+
+    @property
+    def capture_receipts(self) -> tuple[Optional[dict[str, Any]], ...]:
+        """Return cleanup receipts only after validating CC capture ownership."""
+        if self.logical_segments is None:
+            return self.receipts
+        # Gym remains optional for ordinary actor requests.
+        from nemo_gym.token_id_capture.staging.records import RolloutReceipt
+
+        if len(self.logical_segments) != len(
+            self.rollout_ids
+        ) or self.canonical_sample_ids != tuple(
+            f"{self.group_id}_g{i}" for i in range(len(self.rollout_ids))
+        ):
+            raise ValueError("logical segments must match dispatch owner slots")
+        receipts = []
+        for owner_id, segments in zip(
+            self.rollout_ids, self.logical_segments, strict=True
+        ):
+            for ordinal, segment in enumerate(segments):
+                capture_id = f"{owner_id}_s{ordinal}"
+                if segment.capture_rollout_id != capture_id:
+                    raise ValueError("foreign capture scope in finalizer request")
+                if segment.receipt is not None:
+                    parsed = RolloutReceipt.model_validate(segment.receipt)
+                    if parsed.rollout_id != capture_id or any(
+                        record.staging_key != f"{capture_id}/{record.model_call_id}"
+                        for record in parsed.manifest
+                    ):
+                        raise ValueError("foreign receipt/staging ownership")
+                receipts.append(segment.receipt)
+        return tuple(receipts)
+
+    @property
+    def cleanup_sample_ids(self) -> tuple[str, ...]:
+        """Enumerate every possible owned physical row, including placeholders."""
+        if self.logical_segments is None:
+            return self.canonical_sample_ids
+        _ = self.capture_receipts  # Validate scope before exposing cleanup IDs.
+        if (
+            type(self.execution_row_multiple) is not int
+            or self.execution_row_multiple < 1
+        ):
+            raise ValueError("execution_row_multiple must be a positive integer")
+        return tuple(
+            f"{owner_id}_s{ordinal}"
+            for owner_id, segments in zip(
+                self.canonical_sample_ids, self.logical_segments, strict=True
+            )
+            for ordinal in range(max(1, len(segments)))
+        ) + tuple(
+            f"{self.group_id}_pad{i}" for i in range(self.execution_row_multiple - 1)
+        )
 
 
 @dataclass(frozen=True)
@@ -158,6 +217,12 @@ class RolloutReassemblerActor:  # pragma: no cover
             prompt_idx=request.prompt_idx,
             loss_multiplier=request.loss_multiplier,
             canonical_sample_ids=list(request.canonical_sample_ids),
+            logical_segments=(
+                [list(segments) for segments in request.logical_segments]
+                if request.logical_segments is not None
+                else None
+            ),
+            execution_row_multiple=request.execution_row_multiple,
         )
         assert_metadata_only(result)
         return result

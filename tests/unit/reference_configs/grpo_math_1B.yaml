@@ -6,6 +6,7 @@ grpo:
   max_num_epochs: 1
   max_num_steps: 1000000
   normalize_rewards: true
+  baseline_population: valid_owners
   use_leave_one_out_baseline: true
   val_period: 10
   val_start_at: -1

@@ -21,12 +21,13 @@ import time
 import uuid
 import warnings
 from collections.abc import Awaitable, Callable
-from typing import Any, AsyncGenerator, Optional, cast
+from typing import Any, AsyncGenerator, Literal, Optional, cast
 
 import ray
 import torch
 import uvicorn
 from fastapi import FastAPI
+from pydantic import StrictInt, StrictStr
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -47,9 +48,11 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
+    capture_image_geometry,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
+    remap_multimodal_placeholders,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.openai_server_utils import (
@@ -197,7 +200,10 @@ class VllmAsyncGenerationWorkerImpl(
         self._rollout_weight_version = 0
         # In-flight captured calls keyed by id(request): (ActiveCall, the
         # exact engine prompt ids recorded at preprocess time).
-        self._capture_calls: dict[int, tuple[Any, list[int]]] = {}
+        self._capture_calls: dict[
+            int, tuple[Any, list[int], dict[str, Any] | None]
+        ] = {}
+        self._cc_capture_enabled = False
         self._staging_source: Any | None = None
         # Guarded by _prefix_cache_lock: _fetch_chain_prefix runs on executor
         # threads (asyncio.to_thread), so lookups/evictions can be concurrent.
@@ -441,7 +447,11 @@ class VllmAsyncGenerationWorkerImpl(
         self.token_capture = capture
 
     async def setup_token_capture(
-        self, dp_cfg: dict[str, Any], staging_partition: str
+        self,
+        dp_cfg: dict[str, Any],
+        staging_partition: str,
+        *,
+        context_compaction: bool = False,
     ) -> bool:
         """Host ledger-authoritative token capture in this worker.
 
@@ -466,6 +476,7 @@ class VllmAsyncGenerationWorkerImpl(
             dp_client, staging_partition=staging_partition
         )
         self._prefix_cache.clear()
+        self._cc_capture_enabled = context_compaction
         install_capture(
             self,
             sink=sink,
@@ -500,6 +511,7 @@ class VllmAsyncGenerationWorkerImpl(
         *,
         admission: Any | None = None,
         prefix_token_ids: list[int] | None = None,
+        engine_prompt: dict[str, Any] | None = None,
     ) -> None:
         """Admit one ledger-forwarded call into the capture layer.
 
@@ -520,12 +532,23 @@ class VllmAsyncGenerationWorkerImpl(
             admission = self._capture_admission(request)
             if admission is None:
                 return
+        image_geometry = None
+        if self._cc_capture_enabled:
+            if engine_prompt is None:
+                raise ValueError("CC capture requires the actual engine prompt")
+            image_geometry = capture_image_geometry(
+                engine_prompt, prev_len=admission.prev_len
+            )
         call = capture.begin_call(
             admission,
             prefix_token_ids=prefix_token_ids,
             stream=bool(getattr(request, "stream", False)),
         )
-        self._capture_calls[id(request)] = (call, list(prompt_token_ids))
+        self._capture_calls[id(request)] = (
+            call,
+            list(prompt_token_ids),
+            image_geometry,
+        )
 
     def _fetch_chain_prefix(self, staging_chain: list[str]) -> list[int]:
         """Assemble prefix token ids from staging_chain, with a worker-local LRU cache."""
@@ -568,6 +591,32 @@ class VllmAsyncGenerationWorkerImpl(
             return self._fetch_chain_prefix(list(admission.staging_chain))
         return list(admission.required_prefix_token_ids)
 
+    def _resolve_probe_prefix(self, request: Any) -> list[int] | None:
+        """Resolve tokenize-only prefix coordinates without admitting a model call."""
+        chain = getattr(request, "ng_prefix_staging_chain", None)
+        length = getattr(request, "ng_prefix_len", None)
+        if chain is None and length is None:
+            return None
+        if (
+            self.token_capture is None
+            or getattr(request, "ng_capture", None) is not None
+            or getattr(request, "required_prefix_token_ids", None) is not None
+            or not isinstance(chain, list)
+            or any(not isinstance(key, str) or not key for key in chain)
+            or type(length) is not int
+            or length < 0
+            or bool(chain) != bool(length)
+        ):
+            raise ValueError("invalid read-only context prefix coordinates")
+        prefix = self._fetch_chain_prefix(chain) if chain else []
+        if len(prefix) != length or any(
+            type(token) is not int or token < 0 for token in prefix
+        ):
+            raise ValueError(
+                "context prefix tokens are invalid or do not match the declared length"
+            )
+        return prefix
+
     def _enter_request_prefix(self, request: Any, prefix_token_ids: list[int]) -> None:
         """Attach the resolved prefix to the request through the capture adapter.
 
@@ -590,6 +639,7 @@ class VllmAsyncGenerationWorkerImpl(
             return
         choice = dict(choices[0])
         message = dict(choice.get("message") or {})
+        message.pop("predecessor_tail_route", None)
         routed = message.get("routed_experts")
         if routed is None:
             return
@@ -618,6 +668,10 @@ class VllmAsyncGenerationWorkerImpl(
                     f"length {expected_full_len}"
                 )
             message["routed_experts"] = encode_routed_experts(experts[prev_len:])
+            if prev_len:
+                # The previous generation's final token has no decode route
+                # until this continuation processes it as a prompt token.
+                message["predecessor_tail_route"] = experts[prev_len - 1].tolist()
         except (IndexError, TypeError, ValueError) as error:
             LOGGER.warning(
                 "dropping invalid routed_experts from staged capture: %s", error
@@ -639,8 +693,10 @@ class VllmAsyncGenerationWorkerImpl(
         state = self._capture_calls.pop(id(request), None)
         if state is None:
             return content
-        call, prompt_token_ids = state
+        call, prompt_token_ids, image_geometry = state
         payload = dict(content)
+        if image_geometry is not None:
+            payload["cc_image_geometry"] = image_geometry
         # vLLM's OpenAI response carries no prompt ids; the adapter reads the
         # preprocess-time engine prompt off the payload (see
         # nemo_gym.token_id_capture.adapters.vllm.extract_prompt_ids).
@@ -809,6 +865,13 @@ class VllmAsyncGenerationWorkerImpl(
 
                 messages_for_replace_prefix_tokens = deepcopy(messages)
 
+                # The pinned renderer's readonly processor cache returns actual
+                # per-image data, including on hits. Its sender cache may return
+                # None references, which cannot prove geometry. Ordinary serving
+                # keeps its cache policy; probes use the same CC processing path.
+                if worker_self._cc_capture_enabled:
+                    skip_mm_cache = True
+
                 # Temporarily set to 1 so vLLM's pre-tokenization length check passes;
                 # the actual value will be set through _clamp_max_tokens later.
                 actual_request_max_tokens = None
@@ -852,8 +915,19 @@ class VllmAsyncGenerationWorkerImpl(
                 # its event loop explicitly. The adapter then attaches the
                 # prefix to the request, so the inline-prefix branch below is
                 # the single splice path for staged and inline prefixes.
-                admission = worker_self._capture_admission(request)
+                is_tokenize = isinstance(request, NeMoRLTokenizeChatRequest)
+                if is_tokenize and getattr(request, "ng_capture", None) is not None:
+                    raise ValueError("tokenization cannot admit generation capture")
+                admission = (
+                    None if is_tokenize else worker_self._capture_admission(request)
+                )
                 capture_prefix_token_ids: list[int] | None = None
+                if is_tokenize:
+                    probe_prefix = await asyncio.to_thread(
+                        worker_self._resolve_probe_prefix, request
+                    )
+                    if probe_prefix:
+                        worker_self._enter_request_prefix(request, probe_prefix)
                 if admission is not None and admission.mode == "token_in":
                     capture_prefix_token_ids = await asyncio.to_thread(
                         worker_self._resolve_admission_prefix, admission
@@ -873,9 +947,13 @@ class VllmAsyncGenerationWorkerImpl(
                         )
                     # Token capture, text mode: the full render is the exact
                     # engine prompt.
-                    worker_self._begin_request_capture(
-                        request, res[1][0]["prompt_token_ids"], admission=admission
-                    )
+                    if not is_tokenize:
+                        worker_self._begin_request_capture(
+                            request,
+                            res[1][0]["prompt_token_ids"],
+                            admission=admission,
+                            engine_prompt=res[1][0],
+                        )
                     return res
 
                 model_prefix_token_ids = list(request.required_prefix_token_ids)
@@ -925,6 +1003,13 @@ class VllmAsyncGenerationWorkerImpl(
                     template_token_ids=engine_prompt["prompt_token_ids"],
                 )
 
+                # Read template coordinates before replacing the token sequence.
+                if engine_prompt.get("mm_placeholders"):
+                    engine_prompt["mm_placeholders"] = remap_multimodal_placeholders(
+                        template_token_ids=engine_prompt["prompt_token_ids"],
+                        final_token_ids=final_prompt_token_ids,
+                        mm_placeholders=engine_prompt["mm_placeholders"],
+                    )
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
 
                 # Clamp after prefix replacement since the prompt length may have changed.
@@ -938,12 +1023,14 @@ class VllmAsyncGenerationWorkerImpl(
                 # Token capture, token-in mode: the spliced prompt is the
                 # exact engine prompt; begin_call re-checks the prefix it
                 # was spliced from against the admission.
-                worker_self._begin_request_capture(
-                    request,
-                    final_prompt_token_ids,
-                    admission=admission,
-                    prefix_token_ids=capture_prefix_token_ids,
-                )
+                if not is_tokenize:
+                    worker_self._begin_request_capture(
+                        request,
+                        final_prompt_token_ids,
+                        admission=admission,
+                        prefix_token_ids=capture_prefix_token_ids,
+                        engine_prompt=engine_prompt,
+                    )
 
                 return res
 
@@ -1206,6 +1293,28 @@ class VllmAsyncGenerationWorkerImpl(
             NeMoRLOpenAIChatRequestMixin, TokenizeChatRequest
         ):
             required_prefix_token_ids: Optional[List[int]] = None
+            ng_prefix_staging_chain: Optional[list[StrictStr]] = None
+            ng_prefix_len: Optional[StrictInt] = None
+            documents: Optional[list[dict[str, str]]] = None
+            reasoning_effort: Optional[
+                Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+            ] = None
+            return_assistant_tokens_mask: bool = False
+
+            def build_chat_params(
+                self,
+                default_template: Optional[str],
+                default_template_content_format: str,
+            ) -> Any:
+                if self.ng_prefix_staging_chain is None:
+                    return super().build_chat_params(
+                        default_template, default_template_content_format
+                    )
+                # Share generation's documents/reasoning-effort/thinking merge;
+                # upstream TokenizeChatRequest omits those rendering inputs.
+                return ChatCompletionRequest.build_chat_params(
+                    self, default_template, default_template_content_format
+                )
 
         NeMoRLTokenizeRequest = Union[
             TokenizeCompletionRequest, NeMoRLTokenizeChatRequest
@@ -1244,6 +1353,18 @@ class VllmAsyncGenerationWorkerImpl(
                     content=generator.model_dump(), status_code=generator.error.code
                 )
             elif isinstance(generator, TokenizeResponse):
+                if (
+                    isinstance(request, NeMoRLTokenizeChatRequest)
+                    and request.ng_prefix_staging_chain is not None
+                ):
+                    # Feature acknowledgement and counts only: no token arrays
+                    # travel back through Gym for context-limit probes.
+                    return JSONResponse(
+                        content={
+                            "prompt_token_count": generator.count,
+                            "ng_prefix_len": request.ng_prefix_len,
+                        }
+                    )
                 return JSONResponse(content=generator.model_dump())
 
         ########################################
