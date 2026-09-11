@@ -547,9 +547,15 @@ def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
     """
     images: list[Image.Image] = []
     if item.get("type") == "function_call_output":
+        # Tool outputs are free text. Only an inline image data URL (what
+        # image_tools_agent / gym_v_agent emit) is an image here; a bash/curl
+        # output that merely starts with "http://", "https://" or "file://"
+        # (e.g. a printed URL list or a tool error) must not trigger a network
+        # fetch or file open — the training data has such rows (blend lines
+        # 417/422/4090/12153/12162) and the policy saw them as text.
         src = item.get("output")
-        if isinstance(src, str) and _looks_like_image_src(src):
-            images.append(resolve_to_image(src))
+        if isinstance(src, str) and src.startswith("data:image/"):
+            _append_resolved_image(images, src)
         return images
     content = item.get("content") or []
     if not isinstance(content, list):
@@ -566,8 +572,28 @@ def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
             src = src.get("url")
         if src is None:
             continue
-        images.append(resolve_to_image(src))
+        _append_resolved_image(images, src)
     return images
+
+
+def _append_resolved_image(images: list[Image.Image], src: Any) -> None:
+    """Resolve ``src`` and append it, skipping sources that are not loadable images.
+
+    Tool outputs are free text: a terminal tool error such as
+    ``"/project/assets/resource.txt: Unsupported scheme.\n"`` passes the prefix
+    heuristic in ``_looks_like_image_src`` yet is not a file. Letting PIL raise
+    here propagates through ``run_rollouts`` and drops the entire rollout batch
+    (job 7068977 lost 376/512 groups), so unresolvable sources are logged and
+    contribute zero images instead.
+    """
+    try:
+        images.append(resolve_to_image(src))
+    except (FileNotFoundError, OSError, ValueError) as e:
+        preview = src if isinstance(src, str) else type(src).__name__
+        print(
+            f"[nemo_gym] skipping non-image source in trajectory ({type(e).__name__}): {preview[:120]!r}",
+            flush=True,
+        )
 
 
 def _is_trainable_output_item(item: dict) -> bool:
