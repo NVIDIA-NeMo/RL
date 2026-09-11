@@ -13,6 +13,7 @@
 # limitations under the License.
 import json
 import os
+import random
 import re
 import socket
 import subprocess
@@ -435,6 +436,42 @@ class TestBindSocketInRange:
 
         assert port == 12022
         mock_sock.bind.assert_called_once_with(("", 12022))
+
+    def test_bounded_path_draws_from_the_supplied_rng(self):
+        """The supplied rng, not the process-wide `random` module, picks the port."""
+        mock_sock = MagicMock()
+
+        port = _bind_socket_in_range(mock_sock, 12100, 12200, rng=random.Random(1234))
+
+        assert port == random.Random(1234).randint(12100, 12199)
+        mock_sock.bind.assert_called_once_with(("", port))
+
+    def test_exhaustive_path_draws_from_the_supplied_rng(self):
+        """The max_retries=None shuffle must also honor the supplied rng."""
+        mock_sock = MagicMock()
+
+        port = _bind_socket_in_range(
+            mock_sock, 12200, 12300, max_retries=None, rng=random.Random(1234)
+        )
+
+        expected_candidates = list(range(12200, 12300))
+        random.Random(1234).shuffle(expected_candidates)
+        assert port == expected_candidates[0]
+        mock_sock.bind.assert_called_once_with(("", port))
+
+    def test_distinct_seeds_decorrelate_ports(self):
+        """The property rng exists for: ranks on one node must not collide.
+
+        Without it every rank replays the same process-wide sequence.
+        """
+        ports = set()
+        for rank in range(4):
+            mock_sock = MagicMock()
+            ports.add(
+                _bind_socket_in_range(mock_sock, 12300, 13300, rng=random.Random(rank))
+            )
+
+        assert len(ports) == 4
 
 
 class TestGetFreePortLocal:
