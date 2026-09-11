@@ -1691,6 +1691,18 @@ def setup_single_controller(
             saved_gym_checkpoint,
             restored_gym_checkpoint,
         )
+        restored_components = sorted(
+            {
+                result.participant.component
+                for result in restored_gym_checkpoint.participants
+            }
+        )
+        print(
+            "📦 Gym participant checkpoint restored and validated: "
+            f"participants={len(restored_gym_checkpoint.participants)}, "
+            f"components={','.join(restored_components)}",
+            flush=True,
+        )
 
     if use_nemo_gym:
         # the two fields are only meaningful when use_nemo_gym enabled
@@ -1742,7 +1754,11 @@ def setup_single_controller(
     # registers unseen field names lazily inside update_production_status
     # without a lock, so the first concurrent puts into an unregistered
     # partition can race kv_retrieve_meta and kill the controller thread
-    # (see TQDataPlaneClient.register_partition).
+    # (see TQDataPlaneClient.register_partition). A restored TQ checkpoint
+    # already contains the authoritative partition schemas. Replaying the
+    # placeholder registration against its live rows can conflict with their
+    # persisted dtypes, so only fresh data planes need schema warmup.
+    should_warm_partitions = data_plane_checkpoint_metadata is None
     token_capture_cfg = master_config.token_capture
     if not token_capture_cfg.enabled:
         # SingleController reuses one partition for the run. Warm every known
@@ -1758,16 +1774,17 @@ def setup_single_controller(
                 for field in sorted(WIRE_MULTIMODAL_FIELDS)
                 if field not in partition_fields
             )
-        dp_client.register_partition(
-            partition_id=partition_id,
-            fields=partition_fields,
-            num_samples=(
-                master_config.async_rl.max_buffered_rollouts
-                * algo_cfg.num_generations_per_prompt
-            ),
-            consumer_tasks=["prev_lp", "ref_lp", "train"],
-            grpo_group_size=algo_cfg.num_generations_per_prompt,
-        )
+        if should_warm_partitions:
+            dp_client.register_partition(
+                partition_id=partition_id,
+                fields=partition_fields,
+                num_samples=(
+                    master_config.async_rl.max_buffered_rollouts
+                    * algo_cfg.num_generations_per_prompt
+                ),
+                consumer_tasks=["prev_lp", "ref_lp", "train"],
+                grpo_group_size=algo_cfg.num_generations_per_prompt,
+            )
     else:
         from nemo_rl.data_plane.schema import (
             DP_TRAIN_FIELDS,
@@ -1795,20 +1812,21 @@ def setup_single_controller(
                 for field in sorted(WIRE_MULTIMODAL_FIELDS)
                 if field not in partition_fields
             )
-        dp_client.register_partition(
-            partition_id=partition_id,
-            fields=partition_fields,
-            num_samples=num_rollout_samples,
-            consumer_tasks=["prev_lp", "ref_lp", "train"],
-            grpo_group_size=group_size,
-        )
-        dp_client.register_partition(
-            partition_id=token_capture_cfg.staging_partition,
-            fields=list(STAGING_FIELDS)
-            + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else []),
-            num_samples=num_rollout_samples,
-            consumer_tasks=["finalize", "prev_lp", "train"],
-        )
+        if should_warm_partitions:
+            dp_client.register_partition(
+                partition_id=partition_id,
+                fields=partition_fields,
+                num_samples=num_rollout_samples,
+                consumer_tasks=["prev_lp", "ref_lp", "train"],
+                grpo_group_size=group_size,
+            )
+            dp_client.register_partition(
+                partition_id=token_capture_cfg.staging_partition,
+                fields=list(STAGING_FIELDS)
+                + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else []),
+                num_samples=num_rollout_samples,
+                consumer_tasks=["finalize", "prev_lp", "train"],
+            )
         # Host Gym's capture core in every vLLM DP leader (in-worker DP
         # client + TQTokenSink + the single install_capture call), and give
         # workers the initial weight version to stamp on captured calls.

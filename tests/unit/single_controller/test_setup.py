@@ -2241,6 +2241,7 @@ class TestNativeTQRecoverySetup:
 
         assert events == ["load", "build"]
         assert actor_args.data_plane_checkpoint_metadata == _native_tq_metadata()
+        actor_args.dp_client.register_partition.assert_not_called()
 
     def test_loads_authoritative_tq_checkpoint_when_metadata_file_exists(
         self, tmp_path
