@@ -4445,8 +4445,22 @@ def _zero_kl_config(megatron_cfg=None, mcore_generation_config=None, colocated=T
 
 @contextmanager
 def _stub_zero_kl_patches():
-    """Stub kernel enablement so only config resolution is exercised."""
-    with patch("nemo_rl.models.megatron.setup.enable_batch_invariant_mode"):
+    """Stub validation/kernels so only config resolution is exercised."""
+    from nemo_rl.models.megatron.zero_train_gen_mismatch import ZeroTrainGenValidation
+
+    noop = ZeroTrainGenValidation()
+    with (
+        patch(
+            "nemo_rl.models.megatron.zero_train_gen_mismatch.validate_zero_train_gen_mismatch",
+            return_value=noop,
+        ),
+        patch(
+            "nemo_rl.models.megatron.zero_train_gen_mismatch.validate_batch_invariant_mode",
+            return_value=noop,
+        ),
+        patch("nemo_rl.models.megatron.zero_train_gen_mismatch.enable_batch_invariant_kernels"),
+        patch("nemo_rl.models.megatron.setup._skip_megatron_moe_bi_fp8_assert"),
+    ):
         yield
 
 

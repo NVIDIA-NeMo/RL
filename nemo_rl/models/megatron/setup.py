@@ -248,6 +248,11 @@ from nemo_rl.models.megatron.draft.utils import (
     get_attached_draft_model,
 )
 from nemo_rl.models.megatron.memory_saver import inference_model_alloc_region
+from nemo_rl.models.megatron.zero_train_gen_mismatch import (
+    configure_zero_train_gen_mismatch,
+    enable_batch_invariant_kernels,
+    validate_batch_invariant_mode,
+)
 from nemo_rl.models.megatron.router_replay import (
     clear_global_router_replay_instances,
     router_replay_enabled,
@@ -282,100 +287,9 @@ def enable_batch_invariant_mode(config: PolicyConfig) -> None:
         AssertionError: If the installed Transformer Engine cannot pin the
             requested FlashAttention version.
     """
-    megatron_cfg = config["megatron_cfg"]
-    if not megatron_cfg.get("batch_invariant_mode"):
-        return
-
-    required_fields = (
-        "batch_invariant_backend",
-        "batch_invariant_collective",
-        "flash_attention_version",
-    )
-    missing_fields = [field for field in required_fields if field not in megatron_cfg]
-    if missing_fields:
-        raise ValueError(
-            "batch_invariant_mode=True requires policy.megatron_cfg fields: "
-            f"{', '.join(missing_fields)}."
-        )
-
-    if megatron_cfg["tensor_model_parallel_size"] != 1:
-        raise ValueError(
-            "batch_invariant_mode=True currently requires "
-            "policy.megatron_cfg.tensor_model_parallel_size=1."
-        )
-    if megatron_cfg["context_parallel_size"] != 1:
-        raise ValueError(
-            "batch_invariant_mode=True currently requires training context "
-            "parallel size 1."
-        )
-    if megatron_cfg.get("use_fused_linear_logprobs"):
-        raise ValueError(
-            "batch_invariant_mode=True is incompatible with "
-            "use_fused_linear_logprobs=True because generation parity requires "
-            "the shared float-log_softmax-gather path."
-        )
-    if megatron_cfg.get("attention_backend") != "flash":
-        raise ValueError(
-            "batch_invariant_mode=True requires "
-            "policy.megatron_cfg.attention_backend='flash'."
-        )
-    if megatron_cfg["flash_attention_version"] not in (3, 4):
-        raise ValueError(
-            "batch_invariant_mode=True requires "
-            "policy.megatron_cfg.flash_attention_version to be 3 or 4."
-        )
-
-    generation_cfg = config.get("generation")
-    if generation_cfg is None or generation_cfg["backend"] != "megatron":
-        raise ValueError(
-            "batch_invariant_mode=True requires policy.generation.backend='megatron'."
-        )
-    inference_cfg = merged_inference_megatron_cfg(config)
-    # inference_optimized generation currently expects BF16 params; TE training
-    # may still use policy.precision=bfloat16 with fp8_cfg (e.g. mxfp8).
-    if (
-        inference_cfg.get("transformer_impl") == "inference_optimized"
-        and config["precision"] != "bfloat16"
-    ):
-        raise ValueError(
-            "batch_invariant_mode=True with "
-            "transformer_impl='inference_optimized' requires "
-            "policy.precision='bfloat16'."
-        )
-    matching_fields = (
-        "tensor_model_parallel_size",
-        "context_parallel_size",
-        "batch_invariant_mode",
-        "batch_invariant_backend",
-        "batch_invariant_collective",
-        "attention_backend",
-        "flash_attention_version",
-    )
-    mismatched_fields = [
-        field
-        for field in matching_fields
-        if inference_cfg[field] != megatron_cfg[field]
-    ]
-    if mismatched_fields:
-        raise ValueError(
-            "Training and generation must use the same Megatron settings for "
-            f"batch invariance: {', '.join(mismatched_fields)}."
-        )
-
-    collective = megatron_cfg["batch_invariant_collective"]
-
-    # Keep optional Megatron GPU kernels out of imports when the mode is disabled.
-    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-        assert_te_supports_batch_invariant_attention,
-    )
-    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-        enable_batch_invariant_mode as enable_mcore_batch_invariant_mode,
-    )
-
-    assert_te_supports_batch_invariant_attention()
-    enable_mcore_batch_invariant_mode(
-        backend=megatron_cfg["batch_invariant_backend"], collective=collective
-    )
+    result = validate_batch_invariant_mode(config)
+    result.raise_if_invalid("batch_invariant_mode=True failed validation:")
+    enable_batch_invariant_kernels(config)
 
 
 def enable_zero_train_gen_kl(
@@ -393,58 +307,11 @@ def enable_zero_train_gen_kl(
         ValueError: If batch-invariant mode validation fails after defaults are
             applied.
     """
-    if not config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
-        return
-
-    mc = config["megatron_cfg"]
-    generation = config.get("generation")
-    defaults: list[tuple[dict[str, Any], str, dict[str, Any]]] = [
-        (
-            mc,
-            "policy.megatron_cfg",
-            {
-                "batch_invariant_mode": True,
-                "moe_permute_fusion": False,
-                "attention_backend": "flash",
-                "flash_attention_version": 4,
-                "batch_invariant_backend": "te_native",
-                "batch_invariant_collective": "ordered",
-            },
-        )
-    ]
-    if generation is not None:
-        defaults.append(
-            (
-                generation["mcore_generation_config"],
-                "policy.generation.mcore_generation_config",
-                {
-                    "logprobs_mode": "raw_logprobs",
-                    "enable_chunked_prefill": False,
-                },
-            )
-        )
-    for cfg, config_path, values in defaults:
-        for key, value in values.items():
-            if key in cfg and cfg[key] != value:
-                warnings.warn(
-                    f"zero_train_gen_mismatch=true overrides {config_path}.{key}"
-                    f"={cfg[key]!r} with {value!r}: the configured value would "
-                    "reintroduce train/generation mismatch.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-            cfg[key] = value
-
-    # Register before validate_and_set_config (apply_kernels=False) or worker
-    # __init__ (apply_kernels=True) call finalize(); training workers lack
-    # inference_optimized/TE grouped GEMM and must bypass Megatron's MoE+BI+FP8
-    # gate. Generation workers (merged mcore_generation_config) keep it.
-    _skip_megatron_moe_bi_fp8_assert()
-
-    if not apply_kernels:
-        return
-
-    enable_batch_invariant_mode(config)
+    configure_zero_train_gen_mismatch(
+        config,
+        apply_kernels=apply_kernels,
+        register_moe_bi_fp8_skip=_skip_megatron_moe_bi_fp8_assert,
+    )
 
 
 _MOE_BI_FP8_ASSERT_SKIPPED = False
@@ -1354,12 +1221,6 @@ def _validate_te_precision_config(
         _quant_recipe_name(fp8_cfg.get("fp8_recipe")) if fp8_cfg_enabled else None
     )
 
-    # A matched module's fp8_model_init comes from its own recipe block rather than
-    # from fp8_cfg.fp8_param, so a recipe that quantizes a module must repeat
-    # fp8_param to keep that module's primary weights in FP8. Only the value already
-    # configured in fp8_cfg is accepted: NeMo-RL derives sequence padding, refit
-    # export, and reshard validation from fp8_cfg, and a recipe that disagreed would
-    # send weights to the inference engine in a precision NeMo-RL does not expect.
     fp8_cfg_param = bool(fp8_cfg_enabled and fp8_cfg.get("fp8_param", False))
     for config_key in sorted({m.config_key for m in quant_recipe.matchers}):
         payload = quant_recipe.configs.get(config_key) or {}
