@@ -1,0 +1,23 @@
+defaults: ./qwen35-common.yaml
+
+policy:
+  megatron_cfg:
+    expert_model_parallel_size: 32
+    expert_tensor_parallel_size: 1
+    moe_token_dispatcher_type: alltoall
+  generation:
+    refit_transport: null
+    colocated:
+      enabled: true
+      resources:
+        num_nodes: null
+        gpus_per_node: null
+    vllm_cfg:
+      async_engine: false
+      tensor_parallel_size: 2
+      expert_parallel_size: 2
+      gpu_memory_utilization: 0.6
+
+cluster:
+  num_nodes: 8
+  segment_size: 8
