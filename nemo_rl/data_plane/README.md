@@ -722,6 +722,22 @@ per-row paths produce identical values, and the `_WriteScheme` bookkeeping
 that used to record which granularity a put had used, so a get could replay
 it, is gone with them.
 
+Measured cost, from a 15-step A/B on one recipe (Llama-3.2-1B, 1 node x 4
+GB300, TQ `simple`, 24 MB/step) differing only in `verify_tensor_hash`:
+
+| | guard on | guard off |
+|---|---|---|
+| `step/self/overhead_ms` | ~123 ms | ~4.4 ms |
+| `total_step_time` (mean, steps 8-15) | 16.8 s | 15.1 s |
+| `step/hash/rows_checked` | 2560 | — |
+
+The wrapper's own accounting is ~4 ms; the guard is essentially all of the
+~119 ms difference. The end-to-end step moved 1.7 s, far more than
+`self/overhead_ms` bills -- the `<field>_hash` columns are extra payload, and
+what TQ spends carrying them lands in the op's `wall_ms`, not in the wrapper's
+self time. The two runs were on different nodes, so treat 1.7 s as an upper
+bound until it is reproduced on one.
+
 **The accepted limit: a within-row permutation is not detected.** XOR cannot
 see its own operands reordered, and no seed fixes it — the seed covers dtype
 and shape, which a reordering leaves alone. This was taken deliberately, for
