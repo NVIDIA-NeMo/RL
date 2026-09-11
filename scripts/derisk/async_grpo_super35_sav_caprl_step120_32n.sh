@@ -32,7 +32,16 @@ esac
 
 run_stamp="${RUN_ID:-$(date -u +%Y%m%d-%H%M%S)}"
 cluster_name="${SLURM_CLUSTER_NAME:-aws-cmh-slurm-1-v1}"
-experiment="super35_0910_latest_pulkit_video_lnfix_legacy_loo_pb_async_${r3_tag}_frozen_src_text_r3_step120_32n_${run_stamp}"
+profile_band_enabled="${PROFILE_BAND_ENABLED:-true}"
+case "${profile_band_enabled}" in
+  true) profile_band_tag="pb" ;;
+  false) profile_band_tag="np" ;;
+  *)
+    echo "ERROR: PROFILE_BAND_ENABLED must be true or false, got: ${profile_band_enabled}" >&2
+    exit 2
+    ;;
+esac
+experiment="super35_0910_latest_pulkit_video_lnfix_legacy_loo_${profile_band_tag}_async_${r3_tag}_frozen_src_text_r3_step120_32n_${run_stamp}"
 
 export RUN_ID="${run_stamp}"
 export BASE_NAME="${BASE_NAME:-async_grpo_super35_derisk_sav_caprl_${experiment}}"
@@ -65,7 +74,7 @@ export VLLM_CHAT_TEMPLATE="${VLLM_CHAT_TEMPLATE:-null}"
 export IN_FLIGHT_WEIGHT_UPDATES="${IN_FLIGHT_WEIGHT_UPDATES:-true}"
 export RECOMPUTE_KV_CACHE_AFTER_WEIGHT_UPDATES="${RECOMPUTE_KV_CACHE_AFTER_WEIGHT_UPDATES:-false}"
 export LENGTH_PENALTY_ENABLED="${LENGTH_PENALTY_ENABLED:-true}"
-export PROFILE_BAND_ENABLED="${PROFILE_BAND_ENABLED:-true}"
+export PROFILE_BAND_ENABLED="${profile_band_enabled}"
 
 user_extra_overrides="${EXTRA_OVERRIDES:-}"
 export EXTRA_OVERRIDES="grpo.async_grpo.enabled=true grpo.async_grpo.max_trajectory_age_steps=1 ${router_replay_overrides} policy.megatron_cfg.freeze_moe_router=true policy.megatron_cfg.moe_router_load_balancing_type=none policy.megatron_cfg.moe_router_bias_update_rate=0.0 ${user_extra_overrides}"
