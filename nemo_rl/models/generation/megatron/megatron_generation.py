@@ -52,11 +52,15 @@ class MegatronGeneration(GenerationInterface):
     def effective_megatron_cfg(config: PolicyConfig) -> dict[str, Any]:
         """The megatron_cfg the generation workers actually run with.
 
-        Colocated generation shares the training model, so the training
-        values apply; non-colocated builds a dedicated policy with
+        Colocated generation uses a dedicated inference-layout model when its
+        resolved layout differs from training, and otherwise shares the training
+        model. Non-colocated generation always builds a dedicated policy from
         mcore_generation_config merged on top. Always returns a fresh dict.
         """
         if config["generation"]["colocated"]["enabled"]:
+            inference_mcfg = dedicated_inference_megatron_cfg(config)
+            if inference_mcfg is not None:
+                return inference_mcfg
             return dict(config["megatron_cfg"])
         return merged_inference_megatron_cfg(config)
 
@@ -66,11 +70,15 @@ class MegatronGeneration(GenerationInterface):
 
         Colocated reshard hosts a second, inference-layout model on the same ranks.
         """
-        layouts = [cls.effective_megatron_cfg(config)]
         if config["generation"]["colocated"]["enabled"]:
+            # Placement must satisfy both the resident training layout and any
+            # dedicated inference layout built on those same ranks.
+            layouts = [dict(config["megatron_cfg"])]
             inference_mcfg = dedicated_inference_megatron_cfg(config)
             if inference_mcfg is not None:
                 layouts.append(inference_mcfg)
+        else:
+            layouts = [cls.effective_megatron_cfg(config)]
         return max(
             max(
                 mcfg["tensor_model_parallel_size"] * mcfg["context_parallel_size"],
@@ -98,52 +106,103 @@ class MegatronGeneration(GenerationInterface):
             use_unified_pg=cls.nvlink_domain_span(config) > cluster.num_gpus_per_node,
         )
 
+    @staticmethod
+    def frontend_ranks(cluster: RayVirtualCluster, config: PolicyConfig) -> list[int]:
+        """Distributed ranks that will host an HTTP frontend.
+
+        Copy of the engine's ``is_mp_coordinator = tp_rank == 0 and pp_rank == 0``.
+        Megatron orders ranks TP-fastest, PP-slowest, so PP selects a leading
+        slice and TP a stride within it. CP and DP are not divided out because
+        the predicate ignores them.
+        """
+        mcore_cfg = MegatronGeneration.effective_megatron_cfg(config)
+        tensor_model_parallel_size = mcore_cfg["tensor_model_parallel_size"]
+        pipeline_model_parallel_size = mcore_cfg["pipeline_model_parallel_size"]
+        return list(
+            range(
+                0,
+                cluster.world_size() // pipeline_model_parallel_size,
+                tensor_model_parallel_size,
+            )
+        )
+
+    @staticmethod
+    def _rank_placement(cluster: RayVirtualCluster) -> list[tuple[int, int]]:
+        """The (placement group index, bundle index) each rank will occupy, in rank order.
+
+        Mirrors how `Policy` hands bundles to its worker group: a unified
+        placement group is walked in NVLink-sorted order, otherwise bundles are
+        taken group by group. Reserving a port for a rank means placing the
+        holder on the bundle that rank will land on, so the two must agree.
+        """
+        if cluster._sorted_bundle_indices is not None:
+            # Sorted indices imply a unified PG, and there is only ever one.
+            return [
+                (0, bundle_index) for bundle_index in cluster._sorted_bundle_indices
+            ]
+        return [
+            (pg_index, bundle_index)
+            for pg_index, placement_group in enumerate(cluster.get_placement_groups())
+            for bundle_index in range(placement_group.bundle_count)
+        ]
+
     @classmethod
-    def reserve_http_server_address(
+    def reserve_http_server_addresses(
         cls,
         cluster: RayVirtualCluster,
         config: PolicyConfig,
-    ) -> tuple[str, int, ray.actor.ActorHandle]:
-        """Reserve the OpenAI server address before any generation worker exists.
+    ) -> tuple[list[str], dict[int, int], list[ray.actor.ActorHandle]]:
+        """Reserve every OpenAI server address before any generation worker exists.
 
         This is megatron's substitute for vLLM's `defer_model_load` overlap.
         See https://github.com/NVIDIA-NeMo/RL/issues/3752
+
+        One address is reserved per frontend-hosting rank so NeMo Gym can be
+        handed the full set up front. Gym distributes sessions across the URLs it
+        is given, so reserving only one would pin every session to a single
+        frontend no matter how many the engine goes on to start.
+
+        Ports are only ever bound per node, so two frontends on different nodes
+        may be handed the same port number; no cross-node uniqueness is sought.
 
         Args:
             cluster: The cluster the generation workers will run on.
             config: The full `PolicyConfig`.
 
         Returns:
-            Tuple of (server base URL, reserved port, port-holder actor handle).
-            The caller must keep the handle referenced until rank 0 has adopted
-            the socket (worker init complete), then `ray.kill` it.
+            Tuple of (server base URLs, {distributed rank: reserved port},
+            port-holder actor handles). The caller must keep the handles
+            referenced until the workers have adopted the sockets (worker init
+            complete), then `ray.kill` them.
         """
         # Colocated generation shares the training policy's cluster and uses the
         # default placement-group init, triggered lazily by the read below.
         if not config["generation"]["colocated"]["enabled"]:
             cls.init_cluster_placement_groups(cluster, config)
 
-        # Distributed rank 0 lands on the first bundle handed to the worker
-        # group: sorted-first for a unified placement group, else bundle 0 of
-        # the first group (mirrors Policy's worker-group construction).
         placement_groups = cluster.get_placement_groups()
-        rank0_bundle_index = (
-            cluster._sorted_bundle_indices[0]
-            if cluster._sorted_bundle_indices is not None
-            else 0
-        )
-        # Zero-gap reservation: a holder actor on the rank-0 node binds and
+        placement = cls._rank_placement(cluster)
+        ranks = cls.frontend_ranks(cluster, config)
+
+        # Zero-gap reservation: a holder actor on each frontend's node binds and
         # HOLDS the socket (num_cpus=0, so it schedules even on a full bundle);
-        # rank 0 later adopts the live fd via receive_held_socket, so the port
+        # the rank later adopts the live fd via receive_held_socket, so the port
         # can never be stolen in between and any free port is safe.
-        holder = RemoteHeldPortReservation.options(
-            scheduling_strategy=PlacementGroupSchedulingStrategy(
-                placement_group=placement_groups[0],
-                placement_group_bundle_index=rank0_bundle_index,
-            ),
-        ).remote()
-        node_ip, port = ray.get(holder.address.remote())
-        return f"http://{node_ip}:{port}/v1", port, holder
+        holders = [
+            RemoteHeldPortReservation.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=placement_groups[placement[rank][0]],
+                    placement_group_bundle_index=placement[rank][1],
+                ),
+            ).remote()
+            for rank in ranks
+        ]
+        addresses = ray.get([holder.address.remote() for holder in holders])
+        urls = [f"http://{node_ip}:{port}/v1" for node_ip, port in addresses]
+        rank_to_port = {
+            rank: port for rank, (_, port) in zip(ranks, addresses, strict=True)
+        }
+        return urls, rank_to_port, holders
 
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:
@@ -185,14 +244,21 @@ class MegatronGeneration(GenerationInterface):
             )
 
     @classmethod
-    def verify_served_address(
-        cls, served_urls: list[Optional[str]], reserved_url: str
+    def verify_served_addresses(
+        cls, served_urls: list[Optional[str]], reserved_urls: list[str]
     ) -> None:
-        """Fail loud if the engine serves anywhere but the pre-published address."""
-        if served_urls != [reserved_url]:
+        """Fail loud if the engine serves anywhere but the pre-published addresses.
+
+        Order is not significant -- NeMo Gym spreads sessions over the set it was
+        given -- but the set must match exactly: a frontend serving an address
+        Gym never received takes no traffic, and an address Gym holds that
+        nothing serves fails its health check.
+        """
+        if sorted(filter(None, served_urls)) != sorted(reserved_urls):
             raise RuntimeError(
-                "Megatron server came up at a different address than the one "
-                f"pre-published to NeMo Gym: reserved {reserved_url}, serving {served_urls}."
+                "Megatron servers came up at different addresses than the ones "
+                f"pre-published to NeMo Gym: reserved {sorted(reserved_urls)}, "
+                f"serving {sorted(filter(None, served_urls))}."
             )
 
     def __init__(
@@ -204,7 +270,7 @@ class MegatronGeneration(GenerationInterface):
         name_prefix: str = "megatron_generation",
         processor: Optional[AutoProcessor] = None,
         skip_weight_load: bool = False,
-        reserved_http_server_port: Optional[int] = None,
+        reserved_http_server_ports: Optional[dict[int, int]] = None,
     ):
         """Initialize a MegatronGeneration instance.
 
@@ -221,7 +287,8 @@ class MegatronGeneration(GenerationInterface):
                 Inference-engine initialization is deferred until that first refit so CUDA
                 graphs capture the final persistent weight buffers rather than placeholder
                 checkpoint tensors.
-            reserved_http_server_port: Driver-reserved OpenAI server port for non-colocated.
+            reserved_http_server_ports: Driver-reserved OpenAI server ports, keyed by
+                the distributed rank that will adopt each one (non-colocated only).
         """
         # Import here to avoid circular imports
         from nemo_rl.models.policy.lm_policy import Policy
@@ -232,9 +299,9 @@ class MegatronGeneration(GenerationInterface):
         assert not (skip_weight_load and policy is not None), (
             "skip_weight_load only applies to the dedicated inference policy."
         )
-        assert not (reserved_http_server_port is not None and policy is not None), (
-            "reserved_http_server_port only applies to the dedicated inference "
-            "policy; when colocated, pass it to the training policy instead."
+        assert not (reserved_http_server_ports is not None and policy is not None), (
+            "reserved_http_server_ports only applies to the dedicated inference "
+            "policy; when colocated, pass them to the training policy instead."
         )
 
         # `self.cfg` exposes the `generation` that matches the `GenerationInterface` contract.
@@ -306,7 +373,7 @@ class MegatronGeneration(GenerationInterface):
             init_reference_model=False,
             skip_weight_load=skip_weight_load,
             is_refit_destination=True,
-            reserved_http_server_port=reserved_http_server_port,
+            reserved_http_server_ports=reserved_http_server_ports,
         )
 
         # Skip-load models do not have their final refit weight buffers yet.

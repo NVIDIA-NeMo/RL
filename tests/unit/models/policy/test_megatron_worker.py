@@ -858,6 +858,24 @@ def _disable_opd_full(worker) -> None:
     worker._opd_full_teacher_checkpoint_path = None
 
 
+@pytest.mark.parametrize(
+    ("reserved_ports", "rank", "expected"),
+    [
+        ({0: 5555, 2: 6666}, 0, 5555),
+        ({0: 5555, 2: 6666}, 1, None),
+        (None, 0, None),
+    ],
+)
+def test_reserved_http_server_port_is_selected_by_worker_rank(
+    reserved_ports, rank, expected
+):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _reserved_http_server_port_for_rank,
+    )
+
+    assert _reserved_http_server_port_for_rank(reserved_ports, rank) == expected
+
+
 def test_model_owned_packing_capability_is_detected():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         _model_self_packs_for_cp,
