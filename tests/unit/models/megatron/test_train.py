@@ -417,9 +417,13 @@ class TestForwardWithPostProcessingFn:
                 data_iterator=data_iterator,
                 model=MagicMock(),
                 post_processing_fn=post_processor,
+                model_slices_context_parallel_inputs=True,
             )
 
         mock_model_forward.assert_called_once()
+        forward_kwargs = mock_model_forward.call_args.kwargs
+        assert forward_kwargs["model_slices_context_parallel_inputs"] is True
+        assert forward_kwargs["position_ids"] is processed_mb.position_ids
 
     @patch("nemo_rl.models.megatron.train.model_forward")
     def test_forward_with_topk_post_processor(self, mock_model_forward):
@@ -971,10 +975,15 @@ class TestMegatronForwardBackward:
             mbs=1,
             post_processing_fn=post_processor,
             forward_only=True,
+            model_slices_context_parallel_inputs=True,
         )
 
         call_kwargs = mock_fb_func.call_args[1]
         assert call_kwargs["forward_only"] is True
+        forward_step_func = call_kwargs["forward_step_func"]
+        assert (
+            forward_step_func.keywords["model_slices_context_parallel_inputs"] is True
+        )
 
     @patch("nemo_rl.models.megatron.train.get_forward_backward_func")
     def test_forward_only_preserves_activation_offload_warmup(

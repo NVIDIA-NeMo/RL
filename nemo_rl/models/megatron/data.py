@@ -75,7 +75,10 @@ class ProcessedMicrobatch:
         input_ids_cp_sharded: Model-forward token IDs. Usually CP-sharded; models
             that insert media before CP selection receive the full packed THD row.
         attention_mask: Attention mask tensor (None for packed sequences)
-        position_ids: Position IDs tensor (None for packed sequences)
+        position_ids: Position IDs tensor. None for packed sequences unless the
+            model runs MTP, in which case per-sample arange positions are packed
+            like input_ids (full THD row for models that CP-slice their own
+            inputs, CP-local shard otherwise)
         packed_seq_params: PackedSeqParams for sequence packing (None if not packing)
         cu_seqlens_padded: Padded cumulative sequence lengths (None if not packing)
         mtp_loss_mask: Pre-computed MTP loss mask (token_mask × sample_mask).

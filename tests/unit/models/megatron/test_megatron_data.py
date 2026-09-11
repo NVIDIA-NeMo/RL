@@ -702,67 +702,114 @@ class TestProcessMicrobatch:
         assert torch.equal(result.position_ids, packed_idx1)
 
     @pytest.mark.parametrize(
-        ("mtp_enabled", "with_mtp_loss_mask"),
+        (
+            "mtp_enabled",
+            "with_mtp_loss_mask",
+            "cp_size",
+            "cp_rank",
+            "model_slices_context_parallel_inputs",
+            "expected_position_ids",
+        ),
         [
-            pytest.param(True, False, id="mtp-logprob-pass"),
-            pytest.param(True, True, id="mtp-train-pass"),
-            pytest.param(False, False, id="mtp-disabled"),
+            # Segments concatenate with no padding; positions restart at 0 at
+            # every packed boundary rather than running across the buffer.
+            pytest.param(
+                True,
+                False,
+                1,
+                0,
+                False,
+                [[0, 1, 2, 3, 4, 5, 0, 1, 2]],
+                id="cp1-logprob-pass",
+            ),
+            pytest.param(
+                True,
+                True,
+                1,
+                0,
+                False,
+                [[0, 1, 2, 3, 4, 5, 0, 1, 2]],
+                id="cp1-train-pass",
+            ),
+            pytest.param(
+                True, False, 2, 0, False, [[0, 1, 0, 0, 0, 0]], id="cp2-rank0-local"
+            ),
+            pytest.param(
+                True, False, 2, 1, False, [[2, 3, 4, 5, 1, 2]], id="cp2-rank1-local"
+            ),
+            # A model that slices CP itself gets the full THD row on every rank.
+            pytest.param(
+                True,
+                False,
+                2,
+                1,
+                True,
+                [[0, 1, 2, 3, 4, 5, 0, 0, 0, 1, 2, 0]],
+                id="cp2-full-row-for-model-cp-slicing",
+            ),
+            pytest.param(False, False, 2, 1, False, None, id="mtp-disabled"),
         ],
     )
-    @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
-    @patch(
-        "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=1
-    )
     def test_process_microbatch_with_packing_builds_mtp_position_ids(
-        self, mock_cp_world, mock_cp_rank, mtp_enabled, with_mtp_loss_mask
+        self,
+        mtp_enabled,
+        with_mtp_loss_mask,
+        cp_size,
+        cp_rank,
+        model_slices_context_parallel_inputs,
+        expected_position_ids,
     ):
-        """With packing, MTP models get position_ids that reset per packed segment.
+        """With packing, MTP models get position_ids in the token layout they consume.
 
         The trigger is the model running MTP, not the presence of mtp_loss_mask:
         logprob passes carry no mask yet still run the MTP block, and
         HybridModel asserts position_ids there. Runs the real
-        _pack_sequences_for_megatron to check the values.
+        _pack_sequences_for_megatron, so the CP=2 cases check the zigzag shard
+        and the full-row variant against literal layouts.
         """
-        from nemo_rl.models.megatron.data import (
-            _pack_sequences_for_megatron,
-            process_microbatch,
-        )
+        from nemo_rl.models.megatron.data import process_microbatch
 
-        input_ids = torch.tensor([[10, 11, 12, 0, 0], [20, 21, 0, 0, 0]])
-        seq_lengths = torch.tensor([3, 2])
+        # Token value == position + 1, so alignment with the model-forward
+        # tokens can be checked without re-deriving the packing.
+        input_ids = torch.tensor([[1, 2, 3, 4, 5, 6, 0, 0], [1, 2, 3, 0, 0, 0, 0, 0]])
+        seq_lengths = torch.tensor([6, 3])
         data_dict = {"input_ids": input_ids, "input_lengths": seq_lengths}
         if with_mtp_loss_mask:
-            data_dict["mtp_loss_mask"] = torch.tensor(
-                [[1, 1, 1, 0, 0], [1, 1, 0, 0, 0]]
-            )
+            data_dict["mtp_loss_mask"] = (input_ids != 0).long()
 
-        result = process_microbatch(
-            data_dict,
-            seq_length_key="input_lengths",
-            pack_sequences=True,
-            mtp_enabled=mtp_enabled,
-            straggler_timer=MagicMock(),
-        )
+        with (
+            patch(
+                "nemo_rl.models.megatron.data.get_context_parallel_rank",
+                return_value=cp_rank,
+            ),
+            patch(
+                "nemo_rl.models.megatron.data.get_context_parallel_world_size",
+                return_value=cp_size,
+            ),
+        ):
+            result = process_microbatch(
+                data_dict,
+                seq_length_key="input_lengths",
+                pad_individual_seqs_to_multiple_of=2 * cp_size if cp_size > 1 else 1,
+                pack_sequences=True,
+                model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
+                mtp_enabled=mtp_enabled,
+                straggler_timer=MagicMock(),
+            )
 
         if not mtp_enabled:
             assert result.position_ids is None
             return
 
-        # An independent packing of the same per-sample arange positions must
-        # agree with what process_microbatch produced.
-        position_ids_source = (
-            torch.arange(input_ids.shape[1], dtype=torch.long)
-            .unsqueeze(0)
-            .expand(input_ids.shape[0], -1)
-        )
-        _, expected_position_ids, _, _, _ = _pack_sequences_for_megatron(
-            position_ids_source, seq_lengths
-        )
         assert result.position_ids is not None
-        assert torch.equal(result.position_ids, expected_position_ids)
-        # Positions reset to 0 at each packed segment boundary rather than
-        # running continuously across the whole packed buffer.
-        assert result.position_ids.tolist() == [[0, 1, 2, 0, 1]]
+        assert result.position_ids.tolist() == expected_position_ids
+        # Same layout as the tokens the model will embed: full row or CP shard.
+        assert result.position_ids.shape == result.input_ids_cp_sharded.shape
+        real_tokens = result.input_ids_cp_sharded != 0
+        assert torch.equal(
+            result.position_ids[real_tokens],
+            result.input_ids_cp_sharded[real_tokens] - 1,
+        )
 
     @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
     @patch(
