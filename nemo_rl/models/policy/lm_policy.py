@@ -51,7 +51,6 @@ from nemo_rl.models.policy.utils import (
     aggregate_per_sample_handles,
     resolve_policy_worker_cls,
 )
-from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
     get_hf_config,
@@ -1331,15 +1330,22 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
-        checkpointing_cfg: Optional[CheckpointingConfig] = None,
+        *,
+        is_final_checkpoint: bool,
     ) -> None:
         """Save a checkpoint of the model.
 
         With Megatron async_save=True, this returns after D2H staging. The caller
         must call finalize_async_save() before renaming the checkpoint directory.
+
+        DTensor v2 checkpoint resources are configured when the Policy is
+        constructed. ``weights_path`` selects the destination for each save.
         """
-        # Only pass checkpointing_cfg for DTensor v2
-        use_v2 = self.cfg.get("dtensor_cfg", {}).get("_v2", False)
+        dtensor_cfg = self.cfg.get("dtensor_cfg", {})
+        checkpoint_cfg = dtensor_cfg.get("checkpoint", {})
+        use_v2 = bool(dtensor_cfg.get("enabled", False)) and bool(
+            dtensor_cfg.get("_v2", False)
+        )
 
         if use_v2:
             futures = self.worker_group.run_all_workers_single_data(
@@ -1347,15 +1353,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
                 tokenizer_path=tokenizer_path,
-                checkpointing_cfg=checkpointing_cfg,
+                is_final_checkpoint=is_final_checkpoint,
             )
         else:
             if (
-                checkpointing_cfg is not None
-                and checkpointing_cfg.get("model_save_format", None) is not None
+                self.cfg.get("dtensor_cfg", {}).get("enabled", False)
+                and checkpoint_cfg.get("model_save_format", None) is not None
             ):
                 raise ValueError(
-                    "model_save_format must be None or omitted if using DTensorPolicyWorker (_v2=False)."
+                    "policy.dtensor_cfg.checkpoint.model_save_format must be None or "
+                    "omitted "
+                    "when using DTensorPolicyWorker (_v2=False)."
                 )
             futures = self.worker_group.run_all_workers_single_data(
                 "save_checkpoint",

@@ -53,6 +53,79 @@ def test_policy_forwards_nccl_peer_to_workers():
     ]
 
 
+def test_policy_forwards_final_checkpoint_marker_to_dtensor_v2(monkeypatch):
+    calls = []
+
+    class WorkerGroup:
+        def run_all_workers_single_data(self, method_name, **kwargs):
+            calls.append((method_name, kwargs))
+            return ["future"]
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.lm_policy.ray.get", lambda futures: futures
+    )
+    policy = Policy.__new__(Policy)
+    policy.cfg = {"dtensor_cfg": {"enabled": True, "_v2": True}}
+    policy.worker_group = WorkerGroup()
+
+    policy.save_checkpoint(
+        weights_path="checkpoint/weights",
+        is_final_checkpoint=True,
+    )
+
+    assert calls == [
+        (
+            "save_checkpoint",
+            {
+                "weights_path": "checkpoint/weights",
+                "optimizer_path": None,
+                "tokenizer_path": None,
+                "is_final_checkpoint": True,
+            },
+        )
+    ]
+
+
+def test_policy_uses_megatron_save_path_when_dtensor_is_disabled(monkeypatch):
+    calls = []
+
+    class WorkerGroup:
+        def run_all_workers_single_data(self, method_name, **kwargs):
+            calls.append((method_name, kwargs))
+            return ["future"]
+
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.lm_policy.ray.get", lambda futures: futures
+    )
+    policy = Policy.__new__(Policy)
+    policy.cfg = {
+        # Disabled DTensor settings must not select the Automodel save path,
+        # even if their dormant _v2 value is true.
+        "dtensor_cfg": {"enabled": False, "_v2": True},
+        "megatron_cfg": {"enabled": True},
+    }
+    policy.worker_group = WorkerGroup()
+
+    policy.save_checkpoint(
+        weights_path="checkpoint/weights",
+        is_final_checkpoint=False,
+    )
+
+    assert calls == [
+        (
+            "save_checkpoint",
+            {
+                "weights_path": "checkpoint/weights",
+                "optimizer_path": None,
+                "tokenizer_path": None,
+            },
+        )
+    ]
+
+
 def test_policy_worker_initializes_requested_nccl_peer(monkeypatch):
     calls = []
 

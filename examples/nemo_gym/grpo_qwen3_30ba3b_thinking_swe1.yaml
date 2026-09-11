@@ -8,8 +8,6 @@ checkpointing:
   keep_top_k: 2
   save_period: 5
   checkpoint_must_save_by: 00:03:35:00
-  model_save_format: safetensors
-  save_consolidated: false
 grpo:
   num_prompts_per_step: 64
   num_generations_per_prompt: 8
