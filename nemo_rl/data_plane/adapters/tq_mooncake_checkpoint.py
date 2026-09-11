@@ -47,16 +47,13 @@ from typing import Any, Iterator
 
 import ray
 
-_PLUGIN_MARKER = "_nemo_rl_mooncake_checkpoint_v3"
+_PLUGIN_MARKER = "_nemo_rl_mooncake_checkpoint"
 _STORAGE_DIR = "mooncake_storage"
 _MANIFEST_FILE = "manifest.json"
-_MANIFEST_VERSION = 3
-_UNREGISTER_ATTEMPTS = 3
-_DEFAULT_TIMEOUT_S = 1800.0
-_DEFAULT_MAX_PARALLEL = 64
+_DEFAULT_TIMEOUT_S = 200.0  # Match TQ Simple's default storage-request timeout.
 
 # An mmap must outlive its Mooncake registration. On registration errors or a
-# persistent unregister failure, retain it until process teardown instead of
+# failed unregister, retain it until process teardown instead of
 # letting Python unmap memory that Mooncake or the NIC may still reference.
 _QUARANTINED_BUFFERS: list[mmap.mmap] = []
 
@@ -90,13 +87,6 @@ def _checkpoint_timeout_s(config: Any) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
         raise ValueError("MooncakeStore.checkpoint.timeout_s must be positive")
     return float(value)
-
-
-def _checkpoint_max_parallel(config: Any) -> int:
-    value = _checkpoint_settings(config).get("max_parallel", _DEFAULT_MAX_PARALLEL)
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError("MooncakeStore.checkpoint.max_parallel must be positive")
-    return value
 
 
 def _storage_layout(config: Any) -> dict[str, Any]:
@@ -280,24 +270,21 @@ class _CheckpointBuffer:
 def _unregister_or_quarantine(
     store: Any, buffer: _CheckpointBuffer, *, label: str
 ) -> None:
-    last_error: BaseException | None = None
-    for _ in range(_UNREGISTER_ATTEMPTS):
-        try:
-            result = store.unregister_buffer(buffer.pointer)
-        except BaseException as error:
-            last_error = error
-            continue
+    cleanup_error: BaseException
+    try:
+        result = store.unregister_buffer(buffer.pointer)
+    except BaseException as error:
+        cleanup_error = error
+    else:
         if result == 0:
             return
-        last_error = RuntimeError(f"status {result}")
+        cleanup_error = RuntimeError(f"status {result}")
 
     buffer.quarantined = True
     _QUARANTINED_BUFFERS.append(buffer.payload)
-    assert last_error is not None
     raise RuntimeError(
-        f"Mooncake buffer cleanup failed for {label} after "
-        f"{_UNREGISTER_ATTEMPTS} attempts; the mapped buffer was retained"
-    ) from last_error
+        f"Mooncake buffer cleanup failed for {label}; the mapped buffer was retained"
+    ) from cleanup_error
 
 
 @contextmanager
@@ -694,30 +681,28 @@ def _fanout_requests(
     workers: Mapping[str, Any],
     local: _CheckpointParticipant | None,
     timeout_s: float,
-    max_parallel: int = _DEFAULT_MAX_PARALLEL,
 ) -> dict[str, dict[str, Any]]:
     """Send metadata-only commands to existing actors; never RPC back to self."""
     responses: dict[str, dict[str, Any]] = {}
     try:
-        for start in range(0, len(requests), max_parallel):
-            pending: dict[str, Any] = {}
-            local_requests: list[_ParticipantRequest] = []
-            for request in requests[start : start + max_parallel]:
-                participant_id = request.participant.participant_id
-                if local is not None and participant_id == local.info.participant_id:
-                    local_requests.append(request)
-                else:
-                    pending[participant_id] = workers[
-                        participant_id
-                    ].mooncake_checkpoint.remote(body=request.body)
-            # Remote I/O runs concurrently with this process's own shard I/O.
-            for request in local_requests:
-                assert local is not None
-                responses[request.participant.participant_id] = local._dispatch(
-                    request.body
-                )
-            results = ray.get(list(pending.values()), timeout=timeout_s)
-            responses.update(zip(pending, results, strict=True))
+        pending: dict[str, Any] = {}
+        local_requests: list[_ParticipantRequest] = []
+        for request in requests:
+            participant_id = request.participant.participant_id
+            if local is not None and participant_id == local.info.participant_id:
+                local_requests.append(request)
+            else:
+                pending[participant_id] = workers[
+                    participant_id
+                ].mooncake_checkpoint.remote(body=request.body)
+        # Remote I/O runs concurrently with this process's own shard I/O.
+        for request in local_requests:
+            assert local is not None
+            responses[request.participant.participant_id] = local._dispatch(
+                request.body
+            )
+        results = ray.get(list(pending.values()), timeout=timeout_s)
+        responses.update(zip(pending, results, strict=True))
     except Exception as error:
         # An RPC may still be writing after a timeout. Do not let the periodic
         # checkpoint pump mistake that uncertainty for a retryable local timeout.
@@ -875,7 +860,6 @@ def _write_manifest(
     entries: list[_ManifestObject],
 ) -> None:
     manifest = {
-        "version": _MANIFEST_VERSION,
         "storage_layout": _storage_layout(config),
         "objects": [asdict(entry) for entry in sorted(entries, key=lambda x: x.key)],
     }
@@ -935,7 +919,6 @@ def _save_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
         workers=workers,
         local=manager._checkpoint_participant,
         timeout_s=_checkpoint_timeout_s(manager.config),
-        max_parallel=_checkpoint_max_parallel(manager.config),
     )
     _require_exact_responses(requests, responses, operation="checkpoint")
 
@@ -972,11 +955,8 @@ def _load_manifest(
 ) -> tuple[list[_ManifestObject], dict[str, Any]]:
     storage_dir = checkpoint_root / _STORAGE_DIR
     manifest = json.loads((storage_dir / _MANIFEST_FILE).read_text(encoding="utf-8"))
-    if (
-        not isinstance(manifest, Mapping)
-        or manifest.get("version") != _MANIFEST_VERSION
-    ):
-        raise ValueError("Unsupported Mooncake checkpoint manifest")
+    if not isinstance(manifest, Mapping):
+        raise ValueError("Mooncake checkpoint manifest must contain a mapping")
     raw_layout = manifest.get("storage_layout")
     if (
         not isinstance(raw_layout, Mapping)
@@ -1105,7 +1085,6 @@ def _load_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
         workers=workers,
         local=manager._checkpoint_participant,
         timeout_s=_checkpoint_timeout_s(manager.config),
-        max_parallel=_checkpoint_max_parallel(manager.config),
     )
     _require_exact_responses(requests, responses, operation="restore")
     restored: list[str] = []

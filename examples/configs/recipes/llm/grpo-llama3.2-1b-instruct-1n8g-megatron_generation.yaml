@@ -33,4 +33,3 @@ logger:
     name: grpo-llama3.2-1b-instruct-1n8g-megatron_generation
 cluster:
   gpus_per_node: 8
-

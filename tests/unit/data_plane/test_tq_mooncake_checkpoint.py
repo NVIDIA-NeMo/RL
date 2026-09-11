@@ -173,7 +173,6 @@ def _manager(store: _FakeStore, manager_id: str = "manager-a") -> Any:
         "checkpoint": {
             "enabled": True,
             "timeout_s": 10.0,
-            "max_parallel": 8,
         },
     }
     replica_config = SimpleNamespace(
@@ -461,6 +460,13 @@ def test_distributed_checkpoint_round_trip_over_command_only_rpc(
     }
 
 
+def test_checkpoint_timeout_matches_simple_default() -> None:
+    assert (
+        checkpoint_plugin._checkpoint_timeout_s({"checkpoint": {"enabled": True}})
+        == 200.0
+    )
+
+
 def test_participant_timeout_is_fatal_to_the_checkpoint_caller(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -484,9 +490,50 @@ def test_participant_timeout_is_fatal_to_the_checkpoint_caller(
             workers={participant.info.participant_id: worker},
             local=None,
             timeout_s=0.1,
-            max_parallel=1,
         )
     assert isinstance(error.value.__cause__, TimeoutError)
+
+
+def test_command_fanout_dispatches_all_workers_before_waiting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ray
+
+    managers = _managers(
+        _FakeCluster({}, {}),
+        [(f"owner-{index}", f"127.0.0.1:{12300 + index}") for index in range(65)],
+    )
+    requests = [
+        checkpoint_plugin._ParticipantRequest(
+            _participant(manager).info, {"participant_id": manager.storage_manager_id}
+        )
+        for manager in managers
+    ]
+    expected = [request.participant.participant_id for request in requests]
+    submitted: list[str] = []
+
+    def submit(body: dict[str, Any]) -> dict[str, Any]:
+        submitted.append(body["participant_id"])
+        return {"ok": True, "participant_id": body["participant_id"]}
+
+    def gather(values: list[Any], *, timeout: float) -> list[Any]:
+        assert submitted == expected
+        assert len(values) == len(requests)
+        assert timeout == 10.0
+        return values
+
+    workers = {
+        participant_id: SimpleNamespace(mooncake_checkpoint=_RemoteMethod(submit))
+        for participant_id in expected
+    }
+    monkeypatch.setattr(ray, "get", gather)
+    responses = checkpoint_plugin._fanout_requests(
+        requests, workers=workers, local=None, timeout_s=10.0
+    )
+    assert responses == {
+        participant_id: {"ok": True, "participant_id": participant_id}
+        for participant_id in expected
+    }
 
 
 def test_command_fanout_dispatches_local_owner_without_ray(
@@ -506,7 +553,7 @@ def test_command_fanout_dispatches_local_owner_without_ray(
 
     monkeypatch.setattr(ray, "get", empty_get)
     responses = checkpoint_plugin._fanout_requests(
-        [request], workers={}, local=participant, timeout_s=1.0, max_parallel=1
+        [request], workers={}, local=participant, timeout_s=1.0
     )
     assert responses[participant.info.participant_id]["participant"] == asdict(
         participant.info
@@ -693,7 +740,7 @@ def test_owner_distributed_checkpoint_round_trip_uses_current_participants(
     _save_storage_checkpoint(source_managers[0], str(checkpoint_dir))
 
     manifest = _manifest(checkpoint_dir)
-    assert manifest["version"] == 3
+    assert set(manifest) == {"storage_layout", "objects"}
     assert sorted(
         path.name for path in (checkpoint_dir / "mooncake_storage").iterdir()
     ) == [
@@ -920,17 +967,25 @@ def test_partial_registration_keeps_the_mapping_alive(
     assert store.registered == {buffer.pointer: 16}
 
 
+@pytest.mark.parametrize("raises", [False, True], ids=["error-code", "exception"])
 def test_save_quarantines_a_buffer_when_unregister_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     quarantined_buffers: list[Any],
+    raises: bool,
 ) -> None:
     cluster = _source_cluster()
-    managers = _managers(
-        cluster,
-        _SOURCE_IDENTITIES,
-        store_options={"manager-a": {"unregister_result": -1}},
-    )
+    managers = _managers(cluster, _SOURCE_IDENTITIES)
+    store = managers[0].storage_client._store
+    unregister_calls: list[int] = []
+
+    def unregister_buffer(pointer: int) -> int:
+        unregister_calls.append(pointer)
+        if raises:
+            raise RuntimeError("native unregister failed")
+        return -1
+
+    monkeypatch.setattr(store, "unregister_buffer", unregister_buffer)
     participants = [_participant(manager) for manager in managers]
     _wire_participants(monkeypatch, participants)
     checkpoint_dir = _checkpoint_dir(tmp_path)
@@ -940,10 +995,23 @@ def test_save_quarantines_a_buffer_when_unregister_fails(
 
     assert len(quarantined_buffers) == 1
     assert quarantined_buffers[0].closed is False
-    store = managers[0].storage_client._store
     pointer, size = next(iter(store.registered.items()))
+    assert unregister_calls == [pointer]
     assert ctypes.string_at(pointer, size) == _payloads()["0@router_indices"]
     assert not (checkpoint_dir / "mooncake_storage" / "manifest.json").exists()
+
+
+@pytest.mark.parametrize("manifest", [None, []])
+def test_load_manifest_rejects_a_non_mapping(
+    tmp_path: Path,
+    manifest: Any,
+) -> None:
+    storage_dir = tmp_path / "mooncake_storage"
+    storage_dir.mkdir()
+    (storage_dir / "manifest.json").write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="manifest must contain a mapping"):
+        checkpoint_plugin._load_manifest(tmp_path)
 
 
 def test_restore_rejects_a_corrupt_owner_shard(

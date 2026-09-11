@@ -69,3 +69,16 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
     'max(data["train/token_mult_prob_error"]) < 1.05'
+
+# This counter includes both overlapped and non-overlapped async orderings;
+# a positive value confirms that async_sched_mode reached and ran in the engine.
+ASYNC_SCHED_STEPS=$(grep -o 'mcore async scheduling steps (cumul): [0-9]*' $RUN_LOG | grep -o '[0-9]*$' | sort -n | tail -1 || true)
+if [[ -z "${ASYNC_SCHED_STEPS:-}" ]]; then
+    echo "FAIL: async scheduling counter not found"
+    exit 1
+fi
+if [[ "$ASYNC_SCHED_STEPS" -eq 0 ]]; then
+    echo "FAIL: async scheduler reported 0 scheduling steps"
+    exit 1
+fi
+echo "async scheduling steps: $ASYNC_SCHED_STEPS"

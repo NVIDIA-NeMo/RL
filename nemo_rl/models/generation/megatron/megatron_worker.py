@@ -25,10 +25,12 @@ import requests
 import torch
 from megatron.core.inference.config import (
     AsyncScheduleMode,
+    CudaGraphSizingDistribution,
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
     PrefixCachingCoordinatorPolicy,
+    PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.sampling_params import SamplingParams
@@ -77,6 +79,64 @@ from nemo_rl.models.megatron.memory_saver import (
     resume_inference_weights,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+
+
+def _resolve_coordinator_policy(
+    mcore_generation_config,
+) -> PrefixCachingCoordinatorPolicy:
+    """Effective DP-coordinator routing policy for this generation config.
+
+    Resolved in one place so the engine and the HTTP frontends cannot disagree:
+    if the engine routes on prefix affinity but the frontends skip hashing, the
+    coordinator silently sees no hashes and degrades to load balancing.
+    """
+    if not mcore_generation_config["enable_prefix_caching"]:
+        return PrefixCachingCoordinatorPolicy.LOAD_BALANCED
+    if "prefix_caching_coordinator_policy" not in mcore_generation_config:
+        return InferenceConfig.prefix_caching_coordinator_policy
+    return PrefixCachingCoordinatorPolicy(
+        mcore_generation_config["prefix_caching_coordinator_policy"]
+    )
+
+
+def _apply_optional_inference_config_kwargs(
+    inference_config_kwargs: dict[str, Any],
+    mcore_generation_config: dict[str, Any],
+) -> None:
+    """Forward configured optional MCore inference settings with validated types."""
+    enum_fields = {
+        "cuda_graph_sizing_distribution": CudaGraphSizingDistribution,
+        "async_sched_mode": AsyncScheduleMode,
+        "prefix_caching_eviction_policy": PrefixCachingEvictionPolicy,
+    }
+    cast_fields = {
+        "cuda_graph_max_tokens": int,
+        "vision_embedding_cache_max_bytes": int,
+        "allow_stale_multimodal_embeddings": bool,
+        "prefix_cache_ttl_seconds": float,
+        "prefix_caching_routing_alpha": float,
+        "logging_step_interval": int,
+    }
+    for key, enum_type in enum_fields.items():
+        if key in mcore_generation_config:
+            inference_config_kwargs[key] = enum_type(mcore_generation_config[key])
+    for key, cast_type in cast_fields.items():
+        if key in mcore_generation_config:
+            inference_config_kwargs[key] = cast_type(mcore_generation_config[key])
+    if "prefix_caching_mamba_gb" in mcore_generation_config:
+        inference_config_kwargs["prefix_caching_mamba_gb"] = mcore_generation_config[
+            "prefix_caching_mamba_gb"
+        ]
+
+
+def _apply_inference_cuda_graph_scope(
+    engine_model: MegatronModule, mcore_generation_config: dict[str, Any]
+) -> None:
+    """Apply the optional CUDA graph scope to the engine model."""
+    if "inference_cuda_graph_scope" in mcore_generation_config:
+        engine_model.config.inference_cuda_graph_scope = InferenceCudaGraphScope[
+            mcore_generation_config["inference_cuda_graph_scope"]
+        ]
 
 
 class MegatronGenerationMixin:
@@ -363,12 +423,6 @@ class MegatronGenerationMixin:
                     mcore_generation_config["mamba_inference_conv_states_dtype"]
                 )
 
-        # logging_step_interval is a power-user argument that should be NotRequired.
-        logging_step_interval = mcore_generation_config.get("logging_step_interval")
-        # This will be fixed in upstream MCore, allowing an argument of `None`.
-        if logging_step_interval is None:
-            logging_step_interval = 0
-
         # flashinfer's fused-RoPE kernel only dispatches fp16/bf16 q/k.
         use_flashinfer_fused_rope = model_config.params_dtype in (
             torch.float16,
@@ -384,59 +438,43 @@ class MegatronGenerationMixin:
             frame_manifest_magic=CACHED_VIDEO_FRAME_MANIFEST_MAGIC,
         )
 
-        # Only forward keys the config actually sets, so MCore's InferenceConfig
-        # defaults stay the single source of truth for the ones it omits.
-        inference_overrides: dict[str, Any] = {}
-        if "async_sched_mode" in mcore_generation_config:
-            inference_overrides["async_sched_mode"] = AsyncScheduleMode(
-                mcore_generation_config["async_sched_mode"]
-            )
-        if "vision_embedding_cache_max_bytes" in mcore_generation_config:
-            inference_overrides["vision_embedding_cache_max_bytes"] = int(
-                mcore_generation_config["vision_embedding_cache_max_bytes"]
-            )
-        if "allow_stale_multimodal_embeddings" in mcore_generation_config:
-            inference_overrides["allow_stale_multimodal_embeddings"] = bool(
-                mcore_generation_config["allow_stale_multimodal_embeddings"]
-            )
-
-        inference_config = InferenceConfig(
-            block_size_tokens=block_size_tokens,
-            buffer_size_gb=buffer_size_gb,
-            num_cuda_graphs=num_cuda_graphs,
-            max_tokens=max_tokens,
-            max_sequence_length=mcore_generation_config["max_model_len"],
-            kv_cache_management_mode=KVCacheManagementMode(kv_cache_management_mode),
-            static_kv_memory_pointers=needs_static_kv_pointers,
-            use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
-            use_flashinfer_fused_rope=use_flashinfer_fused_rope,
-            sampling_backend="flashinfer",
-            use_synchronous_zmq_collectives=True,
-            materialize_only_last_token_logits=materialize_only_last_token_logits,
-            enable_chunked_prefill=enable_chunked_prefill,
-            enable_prefix_caching=mcore_generation_config["enable_prefix_caching"],
-            **inference_overrides,
-            prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy(
-                "first_prefix_block"
+        inference_config_kwargs: dict[str, Any] = {
+            "block_size_tokens": block_size_tokens,
+            "buffer_size_gb": buffer_size_gb,
+            "num_cuda_graphs": num_cuda_graphs,
+            "max_tokens": max_tokens,
+            "max_sequence_length": mcore_generation_config["max_model_len"],
+            "kv_cache_management_mode": KVCacheManagementMode(kv_cache_management_mode),
+            "static_kv_memory_pointers": needs_static_kv_pointers,
+            "use_cuda_graphs_for_non_decode_steps": use_cuda_graphs_for_non_decode_steps,
+            "use_flashinfer_fused_rope": use_flashinfer_fused_rope,
+            "sampling_backend": "flashinfer",
+            "use_synchronous_zmq_collectives": True,
+            "materialize_only_last_token_logits": materialize_only_last_token_logits,
+            "enable_chunked_prefill": enable_chunked_prefill,
+            "enable_prefix_caching": mcore_generation_config["enable_prefix_caching"],
+            "prefix_caching_coordinator_policy": _resolve_coordinator_policy(
+                mcore_generation_config
             ),
-            pg_collection=pg_collection,
-            mamba_inference_state_config=mamba_inference_state_config,
+            "pg_collection": pg_collection,
+            "mamba_inference_state_config": mamba_inference_state_config,
             # Reserve more KV-cache space when speculative decoding is enabled.
-            mamba_memory_ratio=(
+            "mamba_memory_ratio": (
                 0.1 + 0.1 * num_speculative_tokens if is_hybrid_model else None
             ),
-            logging_step_interval=logging_step_interval,
-            num_speculative_tokens=num_speculative_tokens,
-            logprobs_mode=mcore_generation_config["logprobs_mode"],
-            max_requests=max_requests,
-            image_preprocessing_config=image_preprocessing_config,
-            video_preprocessing_config=video_preprocessing_config,
+            "num_speculative_tokens": num_speculative_tokens,
+            "logprobs_mode": mcore_generation_config["logprobs_mode"],
+            "max_requests": max_requests,
+            "image_preprocessing_config": image_preprocessing_config,
+            "video_preprocessing_config": video_preprocessing_config,
+        }
+        _apply_optional_inference_config_kwargs(
+            inference_config_kwargs, mcore_generation_config
         )
 
-        if "inference_cuda_graph_scope" in mcore_generation_config:
-            engine_model.config.inference_cuda_graph_scope = InferenceCudaGraphScope[
-                mcore_generation_config["inference_cuda_graph_scope"]
-            ]
+        inference_config = InferenceConfig(**inference_config_kwargs)
+
+        _apply_inference_cuda_graph_scope(engine_model, mcore_generation_config)
 
         self.inference_context = DynamicInferenceContext(
             engine_model.config, inference_config
@@ -545,6 +583,8 @@ class MegatronGenerationMixin:
 
     def _setup_openai_api_server(self) -> str:
         """Start the OpenAI-compatible HTTP server on this worker."""
+        import random
+
         from megatron.core.inference.text_generation_server.dynamic_text_gen_server.text_generation_server import (
             start_text_gen_server,
         )
@@ -554,7 +594,12 @@ class MegatronGenerationMixin:
             _get_node_ip_local,
         )
 
+        gen_cfg = self.cfg["generation"]["mcore_generation_config"]
+        coordinator_policy = _resolve_coordinator_policy(gen_cfg)
+
         ip = _get_node_ip_local()
+        # Setup Megatron inference front-end ports for service.
+        # If ports are reserved (such as for Gym), use those.
         reserved_port = self._reserved_http_server_port
         if reserved_port is not None:
             # Defer socket handoff until immediately before server startup.
@@ -564,18 +609,34 @@ class MegatronGenerationMixin:
             reserved_socket = receive_held_socket(reserved_port)
             server_port = reserved_socket.getsockname()[1]
         else:
+            # Seed port assignment by rank to ensure that inference servers
+            # do not listen to the same port and parallelize tokenization,
+            # preprocessing, and hashing on multiple CPUs.
             reserved_socket = None
-            server_port = _get_free_port_local()
+            server_port = _get_free_port_local(
+                rng=random.Random(torch.distributed.get_rank())
+            )
+
+        server_kwargs: dict[str, Any] = {}
+        if "http_server_num_replicas" in gen_cfg:
+            server_kwargs["num_replicas"] = int(gen_cfg["http_server_num_replicas"])
 
         start_text_gen_server(
             coordinator_addr=self.coordinator_addr,
             tokenizer=self.megatron_tokenizer,
             rank=torch.distributed.get_rank(),
             server_port=server_port,
-            parsers=self.cfg["generation"]["mcore_generation_config"]["parsers"],
+            parsers=gen_cfg["parsers"],
             verbose=False,
             sock=reserved_socket,
             multimodal_prompt_config=self.inference_wrapped_model.multimodal_prompt_config,
+            # The frontend hashes prompts so the coordinator does not have to.
+            # Whether it bothers follows from the routing policy, so pass that
+            # rather than encoding the decision here; the block size is only the
+            # granularity and must match the engine's.
+            block_size_tokens=gen_cfg["block_size_tokens"],
+            prefix_caching_coordinator_policy=coordinator_policy,
+            **server_kwargs,
         )
 
         base_url = f"http://{ip}:{server_port}/v1"
@@ -613,7 +674,7 @@ class MegatronGenerationMixin:
 
         if (
             self.cfg["generation"]["mcore_generation_config"]["expose_http_server"]
-            and torch.distributed.get_rank() == 0
+            and self.dynamic_inference_engine.is_mp_coordinator
         ):
             print(f"[Rank {torch.distributed.get_rank()}] Starting HTTP Server")
             self.base_url = self._setup_openai_api_server()
@@ -637,6 +698,21 @@ class MegatronGenerationMixin:
         if self.is_generation_colocated and not release_gpu:
             return
         print(f"[Rank {self.rank}] finishing generation", flush=True)
+
+        # Report how many steps the async scheduler processed. This includes
+        # steps that ran a non-overlapped async ordering because they could
+        # not overlap -- the legacy path never increments this counter.
+        if (
+            self.cfg["generation"]["mcore_generation_config"].get("async_sched_mode")
+            == "async"
+            and self._inference_engine_initialized
+        ):
+            print(
+                f"[Rank {self.rank}] mcore async scheduling steps (cumul): "
+                f"{self.inference_context.async_sched_step_count}",
+                flush=True,
+            )
+
         log_gpu_memory("finish_generation START")
 
         inference_model, media_model = self._inference_model_and_media_parts()

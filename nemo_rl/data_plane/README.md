@@ -471,9 +471,6 @@ GDR GET.
 
 ### Experimental Mooncake storage checkpoints
 
-The distributed format uses manifest version 3. Earlier centralized Mooncake
-checkpoint formats are not accepted by this loader; use fresh checkpoints.
-
 The existing `checkpointing.enabled=true` and
 `checkpointing.save_data_plane=true` settings enable Mooncake storage save/load
 support through TQ's existing explicit checkpoint API. Resuming a checkpoint
