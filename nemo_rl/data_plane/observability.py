@@ -910,10 +910,12 @@ def _step_metrics(
             # step's wall clock, so the numerator has to be wall time too:
             # processes run concurrently inside that window, so summing them
             # exceeds 1 whenever they overlapped (measured 1.054 across ten
-            # processes) and averaging them dilutes the busiest process with
-            # idle ones. The busiest process is the one the step waits on, so
-            # the max is what was exposed -- a lower bound on the step's own
-            # serial cost, where the sum was an upper bound on nothing.
+            # processes) and averaging them reports a cost no process paid.
+            # The DP ranks meet at the gradient all-reduce, so the fetch phase
+            # costs what the *slowest* rank paid -- hence the max. It is not a
+            # bound in either direction: it drops the driver's phase, which is
+            # serial with the fetches, and it counts time that overlapped
+            # compute on the async path. ``README.md`` records both.
             "step/frac_of_step": (
                 exposed_ms / (step_time_s * 1e3) if step_time_s > 0 else 0.0
             ),
@@ -921,6 +923,11 @@ def _step_metrics(
             # not on all of them added together. ``_step_deltas`` summed it.
             "step/wall_s": exposed_ms / 1e3,
             "step/self/overhead_ms": overhead_ms,
+            # Both terms are summed across processes, so this is the wrapper's
+            # share of data-plane *process-time*. Deliberately not the max:
+            # a sum over a max is not a ratio of anything. It therefore does
+            # not equal ``overhead_ms / (step/wall_s * 1e3)`` -- that series
+            # is wall time, this one is not.
             "step/self/frac": overhead_ms / wall_ms if wall_ms > 0 else 0.0,
         }
     )
