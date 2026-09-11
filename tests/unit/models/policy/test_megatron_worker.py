@@ -1258,11 +1258,13 @@ class _ModelWithNonSerializableExtraState(torch.nn.Module):
         raise AssertionError("moving a module must not serialize its extra state")
 
 
-@pytest.mark.parametrize("hooks_enabled", [False, True])
-def test_sync_params_before_refit_orders_copy_gather_and_device_sync(
-    monkeypatch, hooks_enabled
-):
-    """Refit must see updated optimizer shards before it reads model parameters."""
+def test_sync_params_before_refit_gathers_bf16_overlap_params(monkeypatch):
+    """Refit must see updated optimizer shards before it reads model parameters.
+
+    The BF16 branch only needs the all-gather: the optimizer step already wrote
+    the updated shards into the DDP param buffer, and the MXFP8-only staging
+    helper must not be involved.
+    """
     from nemo_rl.models.policy.workers import megatron_policy_worker
 
     events = []
@@ -1281,22 +1283,17 @@ def test_sync_params_before_refit_orders_copy_gather_and_device_sync(
     worker = object.__new__(megatron_policy_worker.MegatronPolicyWorkerImpl)
     worker.model = FakeDDP()
     worker._uses_mxfp8_overlap_shared_param_buffer = lambda: False
-    worker._forward_pre_hook_enabled = lambda: hooks_enabled
     worker.finalize_async_save = lambda: events.append(("finalize_async_save", None))
-    worker._copy_main_params_to_param_buffer = (
-        lambda *, zero_grad_buffer: events.append(
-            ("copy_main_params", zero_grad_buffer)
-        )
-    )
+    worker._copy_main_params_to_param_buffer = MagicMock()
 
     worker.sync_params_before_refit()
 
     assert events == [
         ("finalize_async_save", None),
-        ("copy_main_params", True),
         ("start_param_sync", True),
         ("cuda_synchronize", None),
     ]
+    worker._copy_main_params_to_param_buffer.assert_not_called()
 
 
 def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):

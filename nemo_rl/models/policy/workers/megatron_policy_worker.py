@@ -4109,45 +4109,56 @@ class MegatronPolicyWorkerImpl(
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/sync_params_before_refit")
     def sync_params_before_refit(self) -> None:
-        """Materialize optimizer updates before a refit reads model parameters."""
-        # With MXFP8 overlap, the optimizer updates FP32 master shards and the
-        # next parameter all-gather requantizes them into the model weights. A
-        # refit happens between optimizer steps, before that next training
-        # forward, so force the gather now. This both gives generation the
-        # latest weights and leaves hooks disabled while the shared param/grad
-        # buffer is held across refit. The normal train-step transition
-        # re-enables them.
-        # Deliberately conditional on the hooks being enabled. Every state in
-        # which they are already off is one where the weights are current
-        # anyway: before the first train step the buffer holds the checkpoint;
-        # eval entry already forced a sync via disable_forward_pre_hook(
-        # param_sync=True) and runs no optimizer step; a skipped step leaves the
-        # masters unchanged; and a successful step re-enables the hooks before
-        # returning. If a stale case is ever found, note that staging alone does
-        # NOT fix it - with reuse_grad_buf_for_mxfp8_param_ag param_data aliases
-        # grad_data, so zero_grad_buffer() wipes the parameters and
-        # _copy_main_params_to_param_buffer restores only this rank's shard,
-        # leaving every other DP rank at zero. Upstream pairs that staging with a
-        # following start_param_sync (DistributedOptimizer.
-        # prepare_model_params_for_param_sync); any fix needs the sync too.
+        """Materialize optimizer updates before a refit reads model parameters.
+
+        With ``overlap_param_gather`` the distributed optimizer defers the
+        parameter all-gather to the next training forward. A refit runs between
+        the optimizer step and that forward, so without an explicit gather each
+        DP rank would export its own updated shard next to stale copies of the
+        others.
+        """
         if self._uses_mxfp8_overlap_shared_param_buffer():
-            # An in-flight async checkpoint may still read these tensors, so settle it
-            # before the explicit gather mutates the shared parameter buffer.
+            # With MXFP8 overlap, the optimizer updates FP32 master shards and
+            # the next parameter all-gather requantizes them into the model
+            # weights. Forcing the gather now gives generation the latest weights
+            # and leaves hooks disabled while the shared param/grad buffer is held
+            # across refit. The normal train-step transition re-enables them.
+            # Deliberately conditional on the hooks being enabled. Every state in
+            # which they are already off is one where the weights are current
+            # anyway: before the first train step the buffer holds the
+            # checkpoint; eval entry already forced a sync via
+            # disable_forward_pre_hook(param_sync=True) and runs no optimizer
+            # step; a skipped step leaves the masters unchanged; and a successful
+            # step re-enables the hooks before returning. If a stale case is ever
+            # found, note that staging alone does NOT fix it - with
+            # reuse_grad_buf_for_mxfp8_param_ag param_data aliases grad_data, so
+            # zero_grad_buffer() wipes the parameters and
+            # _copy_main_params_to_param_buffer restores only this rank's shard,
+            # leaving every other DP rank at zero. Upstream pairs that staging
+            # with a following start_param_sync (DistributedOptimizer.
+            # prepare_model_params_for_param_sync); any fix needs the sync too.
             if self._forward_pre_hook_enabled():
+                # An in-flight async checkpoint may still read these tensors, so
+                # settle it before the explicit gather mutates the shared buffer.
                 self.finalize_async_save()
                 self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
             return
 
-        # BF16 overlap also defers gathering updated optimizer shards until the
-        # next forward. Refit reads the parameters directly, so materialize them
-        # even when inference forward hooks are disabled.
+        # Plain BF16 overlap: the optimizer step already wrote the updated master
+        # shards into the DDP param buffer (_copy_main_params_to_model_params),
+        # so only the all-gather is pending. Nothing aliases that buffer, so the
+        # gather is safe regardless of hook state and the hooks can stay
+        # installed; a forced sync marks every bucket as gathered.
         if (
             isinstance(self.model, DistributedDataParallel)
             and self.model.ddp_config.overlap_param_gather
         ):
+            # Settle any in-flight async checkpoint before the gather rewrites
+            # parameters it may still be reading.
             self.finalize_async_save()
-            self._copy_main_params_to_param_buffer(zero_grad_buffer=True)
             self.model.start_param_sync(force_sync=True)
+            # Refit exporters may read from side streams; make the gathered
+            # weights visible to them.
             torch.cuda.synchronize()
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")

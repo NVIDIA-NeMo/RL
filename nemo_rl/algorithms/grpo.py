@@ -2572,10 +2572,10 @@ def refit_policy_generation(
             "set. Attach one with create_weight_synchronizer(...) during setup."
         )
 
-    if not colocated_inference:
-        # Legacy callers without a WeightSynchronizer still need deferred
-        # Megatron parameter all-gathers completed before the collective reads.
-        policy.sync_params_before_refit()
+    # Legacy callers without a WeightSynchronizer still need deferred Megatron
+    # parameter all-gathers completed before either transport reads the weights.
+    # Same order as IPCWeightSynchronizer.sync_weights: sync, offload, prepare.
+    policy.sync_params_before_refit()
 
     if colocated_inference:
         policy.offload_before_refit()

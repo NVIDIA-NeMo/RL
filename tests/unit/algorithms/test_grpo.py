@@ -244,6 +244,32 @@ def test_legacy_noncolocated_refit_syncs_policy_params_first(
     assert events == ["sync", "broadcast"]
 
 
+@patch("nemo_rl.algorithms.grpo.ray")
+def test_legacy_colocated_refit_syncs_policy_params_before_offload(
+    mock_ray: MagicMock,
+) -> None:
+    mock_ray.get.return_value = [True]
+    events = []
+    policy = MagicMock()
+    policy.sync_params_before_refit.side_effect = lambda: events.append("sync")
+    policy.offload_before_refit.side_effect = lambda: events.append("offload")
+    policy.get_free_memory_bytes.return_value = 1 << 30
+    policy.stream_weights_via_ipc_zmq.side_effect = lambda **_: (
+        events.append("stream") or [MagicMock()]
+    )
+    policy_generation = MagicMock()
+    policy_generation.weight_synchronizer = None
+    policy_generation.update_weights_via_ipc_zmq.return_value = [MagicMock()]
+
+    refit_policy_generation(
+        policy,
+        policy_generation,
+        colocated_inference=True,
+    )
+
+    assert events == ["sync", "offload", "stream"]
+
+
 def test_megatron_m2n_refit_delegates_entirely_to_the_synchronizer() -> None:
     """MegatronWeightSynchronizer owns the engine lifecycle; the caller must not duplicate it.
 
