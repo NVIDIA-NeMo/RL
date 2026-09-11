@@ -190,44 +190,44 @@ def configure_fp8_llm_kwargs(
 def configure_fp8_moe_backend(
     llm_kwargs: dict[str, Any], moe_config_type: type[Any], *, is_mx: bool = False
 ) -> None:
-    """Force the MoE backend that implements the requested scale format.
+    """Force (or check) the MoE backend that implements the requested scale format.
 
     Block-FP8 routed experts need TRTLLMGen (it keeps the FP32 scale buffers
-    DeepGEMM would resmooth to E8M0). MXFP8 is the other way round: only
-    ``MXFP8CutlassFusedMoEMethod`` exists, wired in ``fused_moe_cutlass.py``,
-    so the CUTLASS backend is the only one that can serve it.
+    DeepGEMM would resmooth to E8M0). MXFP8 routed experts are served by
+    ``MXFP8CutlassFusedMoEMethod`` (CUTLASS) and, on Rubin, by the fused
+    FC1+FC2 CuTe DSL kernel (CUTEDSL, ``MXFP8CuteDslFusedMoEMethod``), which
+    inherits the CUTLASS weight storage and refit path. CUTLASS stays the
+    default when no backend is configured.
     """
-    required = "CUTLASS" if is_mx else "TRTLLM"
+    allowed = ("CUTLASS", "CUTEDSL") if is_mx else ("TRTLLM",)
+    default = allowed[0]
     reason = (
         "precision='fp8' with is_mx=true (MXFP8 routed-expert scales) requires "
         if is_mx
         else "precision='fp8' with FP32 routed-expert scales requires "
     )
+    expected = " or ".join(
+        f"trtllm_kwargs.moe_config.backend={backend!r}" for backend in allowed
+    )
 
     moe_config = llm_kwargs.get("moe_config")
     if moe_config is None:
-        llm_kwargs["moe_config"] = moe_config_type(backend=required)
+        llm_kwargs["moe_config"] = moe_config_type(backend=default)
         return
 
     if isinstance(moe_config, dict):
         moe_config_kwargs = dict(moe_config)
-        configured_backend = str(moe_config_kwargs.get("backend", required)).upper()
-        if configured_backend != required:
-            raise ValueError(
-                f"{reason}trtllm_kwargs.moe_config.backend={required!r}, got "
-                f"{configured_backend!r}"
-            )
-        moe_config_kwargs["backend"] = required
+        configured_backend = str(moe_config_kwargs.get("backend", default)).upper()
+        if configured_backend not in allowed:
+            raise ValueError(f"{reason}{expected}, got {configured_backend!r}")
+        moe_config_kwargs["backend"] = configured_backend
         llm_kwargs["moe_config"] = moe_config_type(**moe_config_kwargs)
         return
 
     if isinstance(moe_config, moe_config_type):
         configured_backend = str(moe_config.backend).upper()
-        if configured_backend != required:
-            raise ValueError(
-                f"{reason}trtllm_kwargs.moe_config.backend={required!r}, got "
-                f"{moe_config.backend!r}"
-            )
+        if configured_backend not in allowed:
+            raise ValueError(f"{reason}{expected}, got {moe_config.backend!r}")
         return
 
     raise TypeError(
