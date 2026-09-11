@@ -384,7 +384,7 @@ def test_init_fp8_keeps_mixed_recipe_boundary_targets_in_bf16(
     )
     monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
 
-    vllm_kwargs = fp8.init_fp8(
+    vllm_kwargs, _ = fp8.init_fp8(
         {
             "precision": "fp8",
             "kv_cache_dtype": "auto",
@@ -529,7 +529,7 @@ def test_init_fp8_reads_layer_count_from_text_config(fp8_module, monkeypatch):
     monkeypatch.setattr(fp8.AutoModel, "from_config", from_config)
     monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
 
-    vllm_kwargs = fp8.init_fp8(
+    vllm_kwargs, _ = fp8.init_fp8(
         {
             "precision": "fp8",
             "kv_cache_dtype": "auto",
