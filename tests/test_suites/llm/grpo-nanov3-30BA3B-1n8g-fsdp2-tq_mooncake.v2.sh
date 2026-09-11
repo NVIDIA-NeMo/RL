@@ -15,7 +15,9 @@ source "$SCRIPT_DIR/common-tq.env"
 # Run base script under this wrapper's identity (own log/ckpt dirs, wandb name).
 # The matching TQ YAML inherits from <base>.yaml and turns on data_plane.
 export EXP_NAME="$TQ_EXP_NAME"
-bash "$SCRIPT_DIR/$BASE_RECIPE.sh" "$@"
+bash "$SCRIPT_DIR/$BASE_RECIPE.sh" \
+    data_plane.observability.verify_tensor_hash=True \
+    "$@"
 
 # The wire guard only counts, so assert it looked and agreed. rows_checked
 # is the load-bearing one: mismatches==0 also holds when nothing was compared,
