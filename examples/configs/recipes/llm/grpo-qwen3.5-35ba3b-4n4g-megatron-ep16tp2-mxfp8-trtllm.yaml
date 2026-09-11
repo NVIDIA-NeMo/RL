@@ -1,0 +1,44 @@
+defaults: grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3.5-35ba3b-4n4g-megatron-ep16tp2-mxfp8-trtllm
+
+loss_fn:
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+
+policy:
+  make_sequence_length_divisible_by: 16
+  megatron_cfg:
+    context_parallel_size: 1
+    moe_router_dtype: fp32
+    freeze_config:
+      freeze_vision_model: true
+      freeze_vision_projection: true
+      freeze_language_model: false
+  generation:
+    refit_transport: null
+    vllm_cfg:
+      tensor_parallel_size: 2
+      expert_parallel_size: 2
+      gpu_memory_utilization: 0.5
+      precision: fp8
+      is_mx: true
+      enforce_eager: false
+      quantization_ignore_patterns:
+        - language_model.model.layers.*.linear_attn.*
+        - visual.*
+        - lm_head
+    vllm_kwargs:
+      moe_backend: flashinfer_trtllm
+      expert_placement_strategy: linear
+
+logger:
+  wandb:
+    name: grpo-qwen3.5-35ba3b-4n4g-megatron-ep16tp2-mxfp8-trtllm
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 4
+  segment_size: 4

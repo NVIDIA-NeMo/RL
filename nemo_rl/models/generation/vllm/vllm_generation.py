@@ -45,7 +45,6 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
-    assert_refit_unsupported_grouped_moe_params,
     assert_reload_refit_config_supported,
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
@@ -1220,8 +1219,6 @@ class VllmGeneration(GenerationInterface):
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare the info for refit."""
-        assert_refit_unsupported_grouped_moe_params(self.cfg, state_dict_info)
-
         # Choose the appropriate method based on async_engine setting
         method_name = (
             "prepare_refit_info_async"

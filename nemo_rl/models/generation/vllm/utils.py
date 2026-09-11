@@ -32,9 +32,6 @@ VLLM_LOGPROB_FLOOR = -9999.0
 # The expert-id range vs carry dtype is model-constant, so it is verified on the
 # first non-empty routed-experts tensor per process and skipped afterwards.
 G_ROUTED_EXPERTS_RANGE_CHECKED = False
-GROUPED_MOE_MXFP8_REFIT_ERROR = (
-    "MXFP8 refit does not support grouped MoE expert weights."
-)
 _GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES = (
     "mlp.experts.gate_up_proj",
     "mlp.experts.down_proj",
@@ -108,19 +105,6 @@ def assert_reload_refit_config_supported(config: VllmConfig) -> None:
 def is_grouped_moe_expert_weight_name(name: str) -> bool:
     """Return whether a checkpoint key is a grouped MoE expert slab."""
     return name.endswith(_GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES)
-
-
-def assert_refit_unsupported_grouped_moe_params(
-    config: VllmConfig, state_dict_info: dict[str, Any]
-) -> None:
-    """Reject grouped MoE MXFP8 state-dict params before refit starts."""
-    vllm_cfg = config["vllm_cfg"]
-    if (
-        vllm_cfg.get("precision") == "fp8"
-        and vllm_cfg.get("is_mx")
-        and any(is_grouped_moe_expert_weight_name(name) for name in state_dict_info)
-    ):
-        raise AssertionError(GROUPED_MOE_MXFP8_REFIT_ERROR)
 
 
 def _as_routed_experts_tensor(
