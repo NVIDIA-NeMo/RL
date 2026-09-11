@@ -183,11 +183,9 @@ policy:
       http_server_num_replicas: 8
     vllm_cfg:
       async_engine: true
-      # With Mooncake use_gdr=true and token capture, reuse native GPU outputs
-      # for the existing PUT. Router snapshots additionally require
-      # generation.vllm_kwargs.async_scheduling=true and prefix caching disabled.
-      # The budget counts shared backing storage plus peak payload assembly;
-      # defaults live in the config model.
+      # Reuse native GPU outputs for GDR token capture.
+      # This GPU adapter currently requires native async scheduling and no
+      # prefix caching for router capture; this is not a general R3 restriction.
       # gpu_output_capture:
       #   enabled: true
       #   max_retained_mb: 1024

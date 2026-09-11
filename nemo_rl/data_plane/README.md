@@ -494,11 +494,16 @@ The initial implementation supports vLLM **0.25.1**, one completion per
 request, no speculative decoding, PP=1, and no context parallelism. The TP
 output owner must be on the frontend host and its physical GPU must be
 mapped to frontend `cuda:0` (the current TQ executor's default device).
-Routed-expert retention additionally requires
-`policy.generation.vllm_kwargs.enable_prefix_caching: false` and native
+This GPU capture adapter's routed-expert retention currently requires
+`policy.generation.vllm_cfg.enable_prefix_caching: false` and native
 `policy.generation.vllm_kwargs.async_scheduling: true`. Setting
 `vllm_cfg.async_engine: true` alone does not ensure native async scheduling;
 the synchronous scheduler does not create a GPU router snapshot to reuse.
+R3 itself can use prefix caching: vLLM's scheduler stores router indices by
+KV-cache slot in CPU memory and retrieves the cached prompt routes on a hit.
+The GPU capture adapter retains newly computed step outputs but does not yet
+retain those cached prefix routes, so its prefix-caching restriction is a
+limitation of this adapter, not of R3 or GDR.
 Unsupported engine/device configurations fail during setup; an individual
 retention/validation failure produces `capture_failed` coordinates instead of
 silently using a CPU PUT or crashing generation.
