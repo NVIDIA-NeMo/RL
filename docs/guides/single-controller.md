@@ -72,7 +72,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
       use_importance_sampling_correction: true
     ```
 
-5. **Save the data plane for replay recovery.** When Single-Controller checkpointing is enabled, all built-in samplers require `checkpointing.save_data_plane: true` so completed, unconsumed rollout groups survive a restart. Native TQ checkpointing currently supports only the `simple` storage backend. For multi-node runs, `checkpoint_dir` must be on a durable filesystem visible at the same path from every node.
+5. **Save the data plane for replay recovery.** When Single-Controller checkpointing is enabled, all built-in samplers require `checkpointing.save_data_plane: true` so completed, unconsumed rollout groups survive a restart. Native TQ checkpointing supports both `simple` and `mooncake_cpu` through these same checkpoint settings; no backend-specific switch is needed. For multi-node runs, `checkpoint_dir` must be on a durable filesystem visible at the same path from every node.
 
     ```yaml
     checkpointing:
@@ -226,7 +226,7 @@ generation in the group has finished.
 
 When a sampler does not support replay recovery, a requested data-plane checkpoint is written in `shadow` mode. The TQ snapshot is retained, but no authoritative replay index is written and its rows are not restored into the training replay buffer.
 
-Native TQ save/load currently requires `data_plane.backend: "simple"`. Mooncake-backed storage is not recoverable through this mechanism. A failure while saving or validating the TQ snapshot prevents the incomplete checkpoint bundle from becoming the latest resumable checkpoint.
+Native TQ save/load works with both `data_plane.backend: "simple"` and `data_plane.backend: "mooncake_cpu"`, using the existing `checkpointing.enabled: true` and `checkpointing.save_data_plane: true` settings. A failure while saving or validating the TQ snapshot prevents the incomplete checkpoint bundle from becoming the latest resumable checkpoint.
 
 ## Async-RL Knobs and Sampler Modes
 

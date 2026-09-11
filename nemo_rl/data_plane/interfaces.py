@@ -138,13 +138,15 @@ class DataPlaneConfig(TypedDict):
     observability: NotRequired["ObservabilityConfig"]
 
 
-_CHECKPOINTABLE_BACKENDS: frozenset[str] = frozenset({"simple"})
+_CHECKPOINTABLE_BACKENDS: frozenset[str] = frozenset({"simple", "mooncake_cpu"})
 
 
 def data_plane_supports_checkpointing(cfg: DataPlaneConfig) -> bool:
     """Return whether the configured backend supports complete save/load.
 
-    This is a static allow-list so an unrecognized future backend defaults to
+    Simple and Mooncake support native TQ checkpoints. The existing
+    checkpointing settings decide whether a run saves data-plane state;
+    normal PUTs remain memory-only. An unrecognized future backend defaults to
     unsupported until its storage payload and controller metadata are both
     known to round-trip through a checkpoint.
     """

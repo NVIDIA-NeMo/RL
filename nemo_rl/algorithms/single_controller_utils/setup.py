@@ -142,8 +142,9 @@ from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 class SingleControllerActorArgs:
     """All inputs SingleControllerActor needs, built driver-side by setup_single_controller().
 
-    Passed as a single arg to SingleControllerActor.remote so the actor's __init__ does
-    no construction work — every heavy object is cloudpickled in.
+    Passed as a single arg to SingleControllerActor.remote. Heavy objects are
+    cloudpickled in; Mooncake restore stays actor-side so its process-local memory
+    segment is attached before checkpoint data is loaded.
     """
 
     gen_handle: Any
@@ -164,6 +165,7 @@ class SingleControllerActorArgs:
     finalizer_actors: list[Any]
     # Defaulted fields must follow the required ones above, so these stay last.
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None
+    partition_includes_multimodal_fields: bool = False
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None
     # None when async_rl.generation_fleet_health is disabled; the SingleController
     # drives the probe loop when it is present.
@@ -181,8 +183,8 @@ class SingleControllerActorArgs:
 
 
 def _maybe_restore_native_data_plane_checkpoint(
-    policy: TQPolicy,
     *,
+    load_checkpoint: Callable[[str | Path], dict[str, Any]],
     last_checkpoint_path: Optional[str],
     save_state: GRPOSaveState,
     partition_id: str,
@@ -227,7 +229,7 @@ def _maybe_restore_native_data_plane_checkpoint(
         )
 
     print(f"📦 Restoring native TQ checkpoint: {data_plane_path}", flush=True)
-    raw_metadata = policy.load_data_plane_checkpoint(data_plane_path)
+    raw_metadata = load_checkpoint(data_plane_path)
     if not isinstance(raw_metadata, dict):
         raise TypeError(
             "Native TQ checkpoint load must return a metadata dictionary, "
@@ -274,6 +276,62 @@ def _maybe_restore_native_data_plane_checkpoint(
         flush=True,
     )
     return metadata
+
+
+def _register_single_controller_partitions(
+    dp_client: DataPlaneClient,
+    *,
+    master_config: MasterConfig,
+    partition_id: str,
+    include_multimodal_fields: bool,
+) -> None:
+    """Warm all SingleController partitions before concurrent data-plane use."""
+    algo_cfg = algo_config(master_config)
+    policy_config = master_config.policy
+    token_capture_cfg = master_config.token_capture
+    r3_enabled = router_replay_enabled(policy_config)
+    group_size = algo_cfg.num_generations_per_prompt
+    num_rollout_samples = master_config.async_rl.max_buffered_rollouts * group_size
+
+    if not token_capture_cfg.enabled:
+        partition_fields = fields_with_optional_routed_experts(
+            SC_ROLLOUT_SCHEMA_FIELDS,
+            enabled=r3_enabled,
+        )
+    else:
+        from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
+
+        partition_fields = fields_with_optional_routed_experts(
+            DP_TRAIN_FIELDS,
+            enabled=r3_enabled and not token_capture_cfg.defer_routed_experts_to_policy,
+        )
+    if include_multimodal_fields:
+        partition_fields.extend(
+            field
+            for field in sorted(WIRE_MULTIMODAL_FIELDS)
+            if field not in partition_fields
+        )
+    dp_client.register_partition(
+        partition_id=partition_id,
+        fields=partition_fields,
+        num_samples=num_rollout_samples,
+        consumer_tasks=["prev_lp", "ref_lp", "train"],
+        grpo_group_size=group_size,
+    )
+
+    if token_capture_cfg.enabled:
+        from nemo_rl.data_plane.schema import (
+            ROUTED_EXPERTS_FIELD as STAGING_ROUTED_EXPERTS_FIELD,
+        )
+        from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS
+
+        dp_client.register_partition(
+            partition_id=token_capture_cfg.staging_partition,
+            fields=list(STAGING_FIELDS)
+            + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else []),
+            num_samples=num_rollout_samples,
+            consumer_tasks=["finalize", "prev_lp", "train"],
+        )
 
 
 def _non_colocated_teacher_node_count(master_config: MasterConfig) -> int:
@@ -592,6 +650,7 @@ def _build_trainer(
     *,
     weights_path: Optional[Path],
     optimizer_path: Optional[Path],
+    checkpointing: bool,
     reserved_http_server_ports: Optional[dict[int, int]] = None,
 ) -> tuple[Any, float]:
     """Build the TQ-mediated trainer (driver-side TQPolicy).
@@ -603,6 +662,7 @@ def _build_trainer(
         processor: Optional AutoProcessor for VLM paths.
         weights_path: Checkpointed policy weights to resume from, or None.
         optimizer_path: Checkpointed optimizer state to resume from, or None.
+        checkpointing: Whether data-plane checkpoint save or restore is needed.
         reserved_http_server_ports: Pre-published OpenAI server ports for NeMo Gym,
             keyed by the colocated Megatron trainer rank that adopts each one.
 
@@ -622,6 +682,7 @@ def _build_trainer(
         init_optimizer=True,
         init_reference_model=init_reference_model,
         dp_cfg=master_config.data_plane,
+        checkpointing=checkpointing,
         reserved_http_server_ports=reserved_http_server_ports,
     )
     return trainer, time.perf_counter() - t0
@@ -1375,6 +1436,13 @@ def setup_single_controller(
             processor,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
+            checkpointing=bool(
+                recovery_checkpoint_path is not None
+                or (
+                    master_config.checkpointing["enabled"]
+                    and master_config.checkpointing.get("save_data_plane")
+                )
+            ),
             reserved_http_server_ports=reserved_http_server_ports,
         )
         if not is_ppo_run(master_config):
@@ -1603,15 +1671,21 @@ def setup_single_controller(
     if "value_time" in time_metrics:
         setup_timing_metrics.value_init_time_s = time_metrics["value_time"]
 
-    # Native TQ restore must run through the trainer's bootstrap client before
-    # the normal SC data-plane client is created or any rollout/train data-plane
-    # operation starts.
-    data_plane_checkpoint_metadata = _maybe_restore_native_data_plane_checkpoint(
-        trainer,
-        last_checkpoint_path=recovery_checkpoint_path,
-        save_state=save_state,
-        partition_id=partition_id,
-        sampler_name=master_config.async_rl.sampler.name,
+    # SimpleStorage's dedicated storage actors already exist, so preserve its
+    # driver-side restore order. Mooncake capacity is contributed by each client
+    # process; defer its restore until actor deserialization has connected the
+    # final process-local client.
+    restore_data_plane_in_actor = dp_config["backend"] == "mooncake_cpu"
+    data_plane_checkpoint_metadata = (
+        None
+        if restore_data_plane_in_actor
+        else _maybe_restore_native_data_plane_checkpoint(
+            load_checkpoint=trainer.load_data_plane_checkpoint,
+            last_checkpoint_path=recovery_checkpoint_path,
+            save_state=save_state,
+            partition_id=partition_id,
+            sampler_name=master_config.async_rl.sampler.name,
+        )
     )
 
     if use_nemo_gym:
@@ -1673,71 +1747,23 @@ def setup_single_controller(
     # partition can race kv_retrieve_meta and kill the controller thread
     # (see TQDataPlaneClient.register_partition).
     token_capture_cfg = master_config.token_capture
-    if not token_capture_cfg.enabled:
-        # SingleController reuses one partition for the run. Warm every known
-        # tensor field before rollout, policy, and teacher writers become
-        # concurrent; TransferQueue otherwise registers field names lazily.
-        partition_fields = fields_with_optional_routed_experts(
-            SC_ROLLOUT_SCHEMA_FIELDS,
-            enabled=router_replay_enabled(policy_config),
+    if (
+        token_capture_cfg.enabled
+        and token_capture_cfg.defer_routed_experts_to_policy
+        and not router_replay_enabled(master_config.policy)
+    ):
+        raise ValueError(
+            "token_capture.defer_routed_experts_to_policy requires "
+            "policy.router_replay.enabled=true"
         )
-        if processor is not None:
-            partition_fields.extend(
-                field
-                for field in sorted(WIRE_MULTIMODAL_FIELDS)
-                if field not in partition_fields
-            )
-        dp_client.register_partition(
+    if not restore_data_plane_in_actor:
+        _register_single_controller_partitions(
+            dp_client,
+            master_config=master_config,
             partition_id=partition_id,
-            fields=partition_fields,
-            num_samples=(
-                master_config.async_rl.max_buffered_rollouts
-                * algo_cfg.num_generations_per_prompt
-            ),
-            consumer_tasks=["prev_lp", "ref_lp", "train"],
-            grpo_group_size=algo_cfg.num_generations_per_prompt,
+            include_multimodal_fields=processor is not None,
         )
-    else:
-        from nemo_rl.data_plane.schema import (
-            DP_TRAIN_FIELDS,
-        )
-        from nemo_rl.data_plane.schema import (
-            ROUTED_EXPERTS_FIELD as STAGING_ROUTED_EXPERTS_FIELD,
-        )
-        from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS
-
-        r3_enabled = router_replay_enabled(master_config.policy)
-        if token_capture_cfg.defer_routed_experts_to_policy and not r3_enabled:
-            raise ValueError(
-                "token_capture.defer_routed_experts_to_policy requires "
-                "policy.router_replay.enabled=true"
-            )
-        group_size = algo_cfg.num_generations_per_prompt
-        num_rollout_samples = master_config.async_rl.max_buffered_rollouts * group_size
-        partition_fields = fields_with_optional_routed_experts(
-            DP_TRAIN_FIELDS,
-            enabled=r3_enabled and not token_capture_cfg.defer_routed_experts_to_policy,
-        )
-        if processor is not None:
-            partition_fields.extend(
-                field
-                for field in sorted(WIRE_MULTIMODAL_FIELDS)
-                if field not in partition_fields
-            )
-        dp_client.register_partition(
-            partition_id=partition_id,
-            fields=partition_fields,
-            num_samples=num_rollout_samples,
-            consumer_tasks=["prev_lp", "ref_lp", "train"],
-            grpo_group_size=group_size,
-        )
-        dp_client.register_partition(
-            partition_id=token_capture_cfg.staging_partition,
-            fields=list(STAGING_FIELDS)
-            + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else []),
-            num_samples=num_rollout_samples,
-            consumer_tasks=["finalize", "prev_lp", "train"],
-        )
+    if token_capture_cfg.enabled:
         # Host Gym's capture core in every vLLM DP leader (in-worker DP
         # client + TQTokenSink + the single install_capture call), and give
         # workers the initial weight version to stamp on captured calls.
@@ -1807,6 +1833,11 @@ def setup_single_controller(
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )
+        if restore_data_plane_in_actor:
+            # Actor creation is asynchronous. A Mooncake restore must not start
+            # until every finalizer's process-local TQ client has attached and
+            # registered its checkpoint participant.
+            ray.get([actor.__ray_ready__.remote() for actor in finalizer_actors])
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         task_to_env=env_handles,
@@ -1857,6 +1888,7 @@ def setup_single_controller(
         save_state=save_state,
         last_checkpoint_path=recovery_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
+        partition_includes_multimodal_fields=processor is not None,
         bootstrap_identity=bootstrap_identity,
         finalizer_actors=finalizer_actors,
         fleet_monitor=fleet_monitor,

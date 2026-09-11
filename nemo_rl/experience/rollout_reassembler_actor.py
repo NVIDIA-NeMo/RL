@@ -22,6 +22,7 @@ import ray
 import torch
 
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
+from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup, RolloutReassembler
 
 # Field names whose values are per-token and therefore large, but whose Python
@@ -133,6 +134,10 @@ class RolloutReassemblerActor:  # pragma: no cover
             defer_routed_experts_to_policy=config.defer_routed_experts_to_policy,
             max_seq_len=config.max_seq_len,
         )
+
+    def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
+        """Run an owner-local checkpoint command; return metadata, never payloads."""
+        return run_checkpoint_command(body)
 
     def finalize(self, request: ReassemblyRequest) -> FinalizedGroup:
         """Finalize one request without allowing tensor payloads across Ray RPC."""

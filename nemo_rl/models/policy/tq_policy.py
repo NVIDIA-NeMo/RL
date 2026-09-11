@@ -116,6 +116,7 @@ class TQPolicy(TQDriverMixin, Policy):
         self,
         *args: Any,
         dp_cfg: DataPlaneRuntimeConfig,
+        checkpointing: bool = False,
         tq_partition_id: str = "train",
         **kwargs: Any,
     ) -> None:
@@ -132,7 +133,9 @@ class TQPolicy(TQDriverMixin, Policy):
                 f"TP/PP/CP/EP sizes."
             )
         self.dp_cfg = dp_cfg
-        self.dp_client = build_data_plane_client(dp_cfg, bootstrap=True)
+        self.dp_client = build_data_plane_client(
+            dp_cfg, bootstrap=True, checkpointing=checkpointing
+        )
         self.tq_partition_id = tq_partition_id
         self._router_replay_enabled = bool(
             (self.cfg.get("router_replay") or {}).get("enabled", False)

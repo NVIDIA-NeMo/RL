@@ -28,6 +28,7 @@ import torch
 import uvicorn
 from fastapi import FastAPI
 
+from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GENERATION_PORT_RANGE_HIGH,
@@ -473,6 +474,10 @@ class VllmAsyncGenerationWorkerImpl(
             adapter=VLLMCaptureAdapter(),
         )
         return True
+
+    async def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
+        """Run owner-local checkpoint I/O without blocking the actor event loop."""
+        return await asyncio.to_thread(run_checkpoint_command, body)
 
     async def set_rollout_weight_version(self, version: int) -> None:
         """Rotate the weight version stamped on subsequent captured calls."""

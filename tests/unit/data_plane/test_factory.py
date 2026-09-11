@@ -20,9 +20,43 @@ verified by the architecture invariants in test_architecture_invariants.
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from nemo_rl.data_plane import build_data_plane_client
+
+
+@pytest.mark.parametrize("backend", ["simple", "mooncake_cpu"])
+@pytest.mark.parametrize("checkpointing", [False, True])
+def test_factory_passes_checkpoint_runtime_mode_to_bootstrap(
+    monkeypatch, backend, checkpointing
+) -> None:
+    from nemo_rl.data_plane.adapters import tq_mooncake_checkpoint
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    bootstrap = MagicMock()
+    connect = MagicMock()
+    monkeypatch.setattr(adapter, "_init_tq", bootstrap)
+    monkeypatch.setattr(adapter, "_connect_existing", connect)
+    monkeypatch.setattr(adapter, "_get_local_node_ip", lambda: "")
+    monkeypatch.setattr(adapter, "_patch_mooncake_register_check", lambda: None)
+    monkeypatch.setattr(
+        tq_mooncake_checkpoint, "install_tq_mooncake_checkpoint_plugin", lambda: None
+    )
+    cfg = {
+        "enabled": True,
+        "impl": "transfer_queue",
+        "backend": backend,
+        "claim_meta_poll_interval_s": 0.5,
+        "mooncake_cpu": {"reuse_registered_buffers": False},
+    }
+
+    client = build_data_plane_client(cfg, checkpointing=checkpointing)
+
+    bootstrap.assert_called_once_with(cfg, checkpointing=checkpointing)
+    connect.assert_not_called()
+    assert client._supports_checkpointing is True
 
 
 def test_factory_none_cfg_rejected():
