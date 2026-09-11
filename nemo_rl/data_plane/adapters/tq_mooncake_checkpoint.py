@@ -51,6 +51,9 @@ _PLUGIN_MARKER = "_nemo_rl_mooncake_checkpoint"
 _STORAGE_DIR = "mooncake_storage"
 _MANIFEST_FILE = "manifest.json"
 _DEFAULT_TIMEOUT_S = 200.0  # Match TQ Simple's default storage-request timeout.
+_BATCH_KEYS = 400  # Match TQ's native Mooncake batch limit.
+_BATCH_BYTES = 64 * 1024 * 1024
+_BUFFER_ALIGNMENT = 256  # Match TQ's native transfer-buffer alignment.
 
 # An mmap must outlive its Mooncake registration. On registration errors or a
 # failed unregister, retain it until process teardown instead of
@@ -219,19 +222,6 @@ class _ManifestObject:
     saved_owner: str
 
 
-def _stored_objects(store: Any, keys: list[str]) -> list[_StoredObject]:
-    """Resolve the authoritative raw byte size for every checkpoint key."""
-    objects: list[_StoredObject] = []
-    for key in keys:
-        size = store.get_size(key)
-        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
-            raise RuntimeError(
-                f"Mooncake could not resolve a positive size for {key!r}: {size!r}"
-            )
-        objects.append(_StoredObject(key=key, size=size))
-    return objects
-
-
 def _controller_path(checkpoint_dir: Path) -> Path:
     # Optional dependency; importing it at module load would eagerly load TQ.
     from transfer_queue import interface as tq_interface
@@ -318,8 +308,10 @@ def _registered_buffer(
         _unregister_or_quarantine(store, buffer, label=label)
 
 
-def _write_buffer(output: Any, buffer: mmap.mmap, size: int, *, label: str) -> None:
-    view = memoryview(buffer)
+def _write_buffer(
+    output: Any, buffer: mmap.mmap, size: int, *, label: str, offset: int = 0
+) -> None:
+    view = memoryview(buffer)[offset : offset + size]
     try:
         offset = 0
         while offset < size:
@@ -331,8 +323,10 @@ def _write_buffer(output: Any, buffer: mmap.mmap, size: int, *, label: str) -> N
         view.release()
 
 
-def _read_buffer(source: Any, buffer: mmap.mmap, size: int, *, label: str) -> None:
-    view = memoryview(buffer)
+def _read_buffer(
+    source: Any, buffer: mmap.mmap, size: int, *, label: str, offset: int = 0
+) -> None:
+    view = memoryview(buffer)[offset : offset + size]
     try:
         offset = 0
         while offset < size:
@@ -344,53 +338,62 @@ def _read_buffer(source: Any, buffer: mmap.mmap, size: int, *, label: str) -> No
         view.release()
 
 
-def _save_object(store: Any, obj: _StoredObject, output: Any) -> str:
-    """GET one local Mooncake object and append it to an owner's shard."""
-    buffer = _CheckpointBuffer.allocate(obj.size)
-    try:
-        with _registered_buffer(
-            store, buffer, size=obj.size, label=f"Mooncake key {obj.key!r}"
-        ) as pointer:
-            result = store.get_into(obj.key, pointer, obj.size)
-            if result != obj.size:
-                raise RuntimeError(
-                    f"Mooncake checkpoint GET failed for {obj.key!r}: "
-                    f"expected {obj.size} bytes, got {result}"
-                )
+def _checkpoint_batches(sizes: list[int]) -> Iterator[tuple[int, int, list[int]]]:
+    """Bound native calls by keys and bytes; allow an oversized singleton."""
+    start = 0
+    offsets: list[int] = []
+    total = 0
+    for index, size in enumerate(sizes):
+        if offsets and (len(offsets) == _BATCH_KEYS or total + size > _BATCH_BYTES):
+            yield start, index, offsets
+            start, offsets, total = index, [], 0
+        offsets.append(total)
+        total += (size + _BUFFER_ALIGNMENT - 1) // _BUFFER_ALIGNMENT * _BUFFER_ALIGNMENT
+    if offsets:
+        yield start, len(sizes), offsets
 
-        digest = hashlib.sha256(buffer.payload).hexdigest()
-        _write_buffer(output, buffer.payload, obj.size, label=obj.key)
+
+@contextmanager
+def _checkpoint_buffer(
+    store: Any, sizes: list[int], *, label: str
+) -> Iterator[_CheckpointBuffer]:
+    # One registration for every batch in this owner operation. An object larger
+    # than the target gets enough space by itself, rather than being truncated.
+    capacity = max(
+        (
+            offsets[-1] + sizes[stop - 1]
+            for _, stop, offsets in _checkpoint_batches(sizes)
+        ),
+        default=1,
+    )
+    buffer = _CheckpointBuffer.allocate(capacity)
+    try:
+        with _registered_buffer(store, buffer, size=capacity, label=label):
+            yield buffer
     finally:
         buffer.close()
-    return digest
 
 
-def _restore_object(
-    store: Any,
-    entry: _ManifestObject,
-    replica_config: Any,
-    payload_file: Any,
-) -> None:
-    """Read one durable object and upsert it into the current client."""
-    buffer = _CheckpointBuffer.allocate(entry.size)
-    try:
-        payload_file.seek(entry.offset)
-        _read_buffer(payload_file, buffer.payload, entry.size, label=entry.key)
-        if hashlib.sha256(buffer.payload).hexdigest() != entry.sha256:
-            raise ValueError(f"Corrupt Mooncake checkpoint payload for {entry.key!r}")
+def _check_batch_results(results: Any, expected: list[int], *, operation: str) -> None:
+    """Native GET returns byte counts; UPSERT returns zero statuses, per key."""
+    if (
+        not isinstance(results, (list, tuple))
+        or len(results) != len(expected)
+        or any(
+            type(result) is not int or result != size
+            for result, size in zip(results, expected)
+        )
+    ):
+        raise RuntimeError(
+            f"Mooncake checkpoint {operation} returned incomplete or invalid results: {results!r}"
+        )
 
-        # Register anonymous memory rather than a Lustre-backed mmap. RDMA
-        # registration of network-filesystem mappings is not a Mooncake contract.
-        with _registered_buffer(
-            store, buffer, size=entry.size, label=f"Mooncake key {entry.key!r}"
-        ) as pointer:
-            result = store.upsert_from(entry.key, pointer, entry.size, replica_config)
-            if result != 0:
-                raise RuntimeError(
-                    f"Mooncake restore failed for {entry.key!r}: {result}"
-                )
-    finally:
-        buffer.close()
+
+def _batch_replicas(store: Any, keys: list[str]) -> Mapping[str, Any]:
+    descriptors = store.batch_get_replica_desc(keys)
+    if not isinstance(descriptors, Mapping) or set(descriptors) != set(keys):
+        raise RuntimeError("Mooncake replica query returned malformed data")
+    return descriptors
 
 
 def _status_is_complete(status: Any) -> bool:
@@ -588,14 +591,15 @@ class _CheckpointParticipant:
             raise ValueError("Mooncake checkpoint_root must be absolute")
         return root
 
-    def _verify_local_owner(self, obj: _StoredObject) -> None:
-        descriptors = self._store.get_replica_desc(obj.key)
-        replicas = _complete_memory_replicas(descriptors)
-        if (self.info.transport_endpoint, obj.size) not in replicas:
-            raise RuntimeError(
-                f"Mooncake key {obj.key!r} no longer has a complete memory "
-                f"replica owned by {self.info.transport_endpoint!r}"
-            )
+    def _verify_local_owners(self, objects: list[_StoredObject]) -> None:
+        descriptors = _batch_replicas(self._store, [obj.key for obj in objects])
+        for obj in objects:
+            replicas = _complete_memory_replicas(descriptors[obj.key])
+            if (self.info.transport_endpoint, obj.size) not in replicas:
+                raise RuntimeError(
+                    f"Mooncake key {obj.key!r} no longer has a complete memory "
+                    f"replica owned by {self.info.transport_endpoint!r}"
+                )
 
     def _save_shard(self, body: Mapping[str, Any]) -> dict[str, Any]:
         root = self._checkpoint_root(body)
@@ -613,21 +617,39 @@ class _CheckpointParticipant:
 
         entries: list[dict[str, Any]] = []
         offset = 0
-        with partial.open("xb") as output:
-            for obj in objects:
-                self._verify_local_owner(obj)
-                digest = _save_object(self._store, obj, output)
-                entries.append(
-                    {
-                        "key": obj.key,
-                        "shard": shard,
-                        "offset": offset,
-                        "size": obj.size,
-                        "sha256": digest,
-                        "saved_owner": self.info.transport_endpoint,
-                    }
+        sizes = [obj.size for obj in objects]
+        with (
+            partial.open("xb") as output,
+            _checkpoint_buffer(self._store, sizes, label=shard) as buffer,
+        ):
+            for start, stop, offsets in _checkpoint_batches(sizes):
+                batch = objects[start:stop]
+                self._verify_local_owners(batch)
+                results = self._store.batch_get_into(
+                    [obj.key for obj in batch],
+                    [buffer.pointer + position for position in offsets],
+                    sizes[start:stop],
                 )
-                offset += obj.size
+                _check_batch_results(results, sizes[start:stop], operation="GET")
+                for obj, position in zip(batch, offsets, strict=True):
+                    with memoryview(buffer.payload)[
+                        position : position + obj.size
+                    ] as payload:
+                        digest = hashlib.sha256(payload).hexdigest()
+                    _write_buffer(
+                        output, buffer.payload, obj.size, label=obj.key, offset=position
+                    )
+                    entries.append(
+                        {
+                            "key": obj.key,
+                            "shard": shard,
+                            "offset": offset,
+                            "size": obj.size,
+                            "sha256": digest,
+                            "saved_owner": self.info.transport_endpoint,
+                        }
+                    )
+                    offset += obj.size
             output.flush()
             os.fsync(output.fileno())
         partial.rename(target)
@@ -656,17 +678,44 @@ class _CheckpointParticipant:
         config = _local_replica_config(self._manager, self.info.segment_name)
         storage_dir = root / _STORAGE_DIR
         restored: list[str] = []
-        with ExitStack() as stack:
+        sizes = [entry.size for entry in entries]
+        with (
+            ExitStack() as stack,
+            _checkpoint_buffer(self._store, sizes, label="restore") as buffer,
+        ):
             payloads: dict[str, Any] = {}
-            for entry in entries:
-                payload = payloads.get(entry.shard)
-                if payload is None:
-                    payload = stack.enter_context(
-                        (storage_dir / entry.shard).open("rb")
+            for start, stop, offsets in _checkpoint_batches(sizes):
+                batch = entries[start:stop]
+                for entry, position in zip(batch, offsets, strict=True):
+                    payload = payloads.get(entry.shard)
+                    if payload is None:
+                        payload = stack.enter_context(
+                            (storage_dir / entry.shard).open("rb")
+                        )
+                        payloads[entry.shard] = payload
+                    payload.seek(entry.offset)
+                    _read_buffer(
+                        payload,
+                        buffer.payload,
+                        entry.size,
+                        label=entry.key,
+                        offset=position,
                     )
-                    payloads[entry.shard] = payload
-                _restore_object(self._store, entry, config, payload)
-                restored.append(entry.key)
+                    with memoryview(buffer.payload)[
+                        position : position + entry.size
+                    ] as value:
+                        if hashlib.sha256(value).hexdigest() != entry.sha256:
+                            raise ValueError(
+                                f"Corrupt Mooncake checkpoint payload for {entry.key!r}"
+                            )
+                results = self._store.batch_upsert_from(
+                    [entry.key for entry in batch],
+                    [buffer.pointer + position for position in offsets],
+                    sizes[start:stop],
+                    config,
+                )
+                _check_batch_results(results, [0] * len(batch), operation="restore")
+                restored.extend(entry.key for entry in batch)
 
         return {
             "ok": True,
@@ -771,7 +820,7 @@ def _live_participants(
 
 def _owner_assignments(
     store: Any,
-    objects: list[_StoredObject],
+    keys: list[str],
     participants: list[_ParticipantInfo],
 ) -> dict[str, list[_StoredObject]]:
     endpoint_to_participant = {
@@ -779,42 +828,43 @@ def _owner_assignments(
     }
     if len(endpoint_to_participant) != len(participants):
         raise RuntimeError("Mooncake checkpoint participants have duplicate endpoints")
-    descriptors = store.batch_get_replica_desc([obj.key for obj in objects])
-    if not isinstance(descriptors, Mapping):
-        raise RuntimeError("Mooncake replica query returned malformed data")
-
     assignments: dict[str, list[_StoredObject]] = {
         participant.participant_id: [] for participant in participants
     }
     assigned_bytes = {participant.participant_id: 0 for participant in participants}
-    for obj in objects:
-        candidates: list[_ParticipantInfo] = []
-        for endpoint, descriptor_size in _complete_memory_replicas(
-            descriptors.get(obj.key)
-        ):
-            if descriptor_size != obj.size:
+    for start in range(0, len(keys), _BATCH_KEYS):
+        batch_keys = keys[start : start + _BATCH_KEYS]
+        descriptors = _batch_replicas(store, batch_keys)
+        for key in batch_keys:
+            replicas = _complete_memory_replicas(descriptors[key])
+            candidates = [
+                endpoint_to_participant[endpoint]
+                for endpoint, _ in replicas
+                if endpoint in endpoint_to_participant
+            ]
+            if not candidates:
                 raise RuntimeError(
-                    f"Mooncake replica size mismatch for {obj.key!r}: "
-                    f"catalog={obj.size}, descriptor={descriptor_size}"
+                    f"Mooncake key {key!r} has no COMPLETE memory replica "
+                    "owned by a live checkpoint participant; disk-only/offloaded "
+                    "objects are not supported"
                 )
-            participant = endpoint_to_participant.get(endpoint)
-            if participant is not None:
-                candidates.append(participant)
-        if not candidates:
-            raise RuntimeError(
-                f"Mooncake key {obj.key!r} has no COMPLETE memory replica "
-                "owned by a live checkpoint participant; disk-only/offloaded "
-                "objects are not supported"
+            sizes = {size for _, size in replicas}
+            if len(sizes) != 1 or any(
+                type(size) is not int or size <= 0 for _, size in replicas
+            ):
+                raise RuntimeError(
+                    f"Mooncake replica sizes are invalid or inconsistent for {key!r}"
+                )
+            size = sizes.pop()
+            owner = min(
+                candidates,
+                key=lambda participant: (
+                    assigned_bytes[participant.participant_id],
+                    participant.participant_id,
+                ),
             )
-        owner = min(
-            candidates,
-            key=lambda participant: (
-                assigned_bytes[participant.participant_id],
-                participant.participant_id,
-            ),
-        )
-        assignments[owner.participant_id].append(obj)
-        assigned_bytes[owner.participant_id] += obj.size
+            assignments[owner.participant_id].append(_StoredObject(key=key, size=size))
+            assigned_bytes[owner.participant_id] += size
     return {
         participant_id: assigned
         for participant_id, assigned in assignments.items()
@@ -877,14 +927,12 @@ def _save_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
     """Coordinate owner-local saves without carrying payload through manager."""
     _validate_checkpoint_runtime(manager)
     checkpoint_root = Path(checkpoint_dir).resolve()
-    objects = _stored_objects(
-        manager.storage_client._store, _controller_keys(checkpoint_root)
-    )
+    keys = _controller_keys(checkpoint_root)
     storage_dir = checkpoint_root / _STORAGE_DIR
     storage_dir.mkdir(parents=True, exist_ok=False)
     _fsync_directory(checkpoint_root)
 
-    if not objects:
+    if not keys:
         _write_manifest(
             storage_dir,
             config=manager.config,
@@ -895,9 +943,7 @@ def _save_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
     participants, workers = _live_participants(manager)
     if not participants:
         raise RuntimeError("No live Mooncake checkpoint participants")
-    assignments = _owner_assignments(
-        manager.storage_client._store, objects, participants
-    )
+    assignments = _owner_assignments(manager.storage_client._store, keys, participants)
     by_id = {participant.participant_id: participant for participant in participants}
     requests: list[_ParticipantRequest] = []
     for index, participant_id in enumerate(sorted(assignments)):
@@ -931,7 +977,7 @@ def _save_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
                 f"{request.participant.participant_id}"
             )
         entries.extend(_validate_save_response(request, response))
-    if sorted(entry.key for entry in entries) != [obj.key for obj in objects]:
+    if sorted(entry.key for entry in entries) != keys:
         raise RuntimeError("Mooncake checkpoint ACKs do not cover the controller cut")
     packed_sizes: dict[str, int] = {}
     for entry in entries:
@@ -1055,12 +1101,17 @@ def _load_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
         )
 
     store = manager.storage_client._store
-    if entries:
-        existence = store.batch_is_exist([entry.key for entry in entries])
-        if len(existence) != len(entries) or any(result != 0 for result in existence):
-            raise RuntimeError("Mooncake storage restore requires a clean store")
-    else:
+    if not entries:
         return
+    for start in range(0, len(entries), _BATCH_KEYS):
+        keys = [entry.key for entry in entries[start : start + _BATCH_KEYS]]
+        existence = store.batch_is_exist(keys)
+        if (
+            not isinstance(existence, (list, tuple))
+            or len(existence) != len(keys)
+            or any(type(result) is not int or result != 0 for result in existence)
+        ):
+            raise RuntimeError("Mooncake storage restore requires a clean store")
 
     participants, workers = _live_participants(manager)
     if not participants:
@@ -1098,19 +1149,19 @@ def _load_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
     if sorted(restored) != expected_keys:
         raise RuntimeError("Mooncake restore ACKs do not cover the controller cut")
 
-    descriptors = store.batch_get_replica_desc(expected_keys)
-    if not isinstance(descriptors, Mapping):
-        raise RuntimeError("Mooncake restore replica query returned malformed data")
-    for entry in entries:
-        replicas = _complete_memory_replicas(descriptors.get(entry.key))
-        if not any(
-            endpoint in current_endpoints and size == entry.size
-            for endpoint, size in replicas
-        ):
-            raise RuntimeError(
-                f"Restored Mooncake key {entry.key!r} has no COMPLETE memory "
-                "replica on a current checkpoint participant"
-            )
+    for start in range(0, len(entries), _BATCH_KEYS):
+        batch = entries[start : start + _BATCH_KEYS]
+        descriptors = _batch_replicas(store, [entry.key for entry in batch])
+        for entry in batch:
+            replicas = _complete_memory_replicas(descriptors[entry.key])
+            if not any(
+                endpoint in current_endpoints and size == entry.size
+                for endpoint, size in replicas
+            ):
+                raise RuntimeError(
+                    f"Restored Mooncake key {entry.key!r} has no COMPLETE memory "
+                    "replica on a current checkpoint participant"
+                )
 
 
 def configure_checkpoint_workers(workers: list[Any]) -> None:

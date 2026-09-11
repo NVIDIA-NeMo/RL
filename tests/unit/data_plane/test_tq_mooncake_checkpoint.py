@@ -108,13 +108,16 @@ class _FakeStore:
         self.short_key = short_key
         self.owner_override = owner_override
         self.registered: dict[int, int] = {}
+        self.registrations: list[tuple[int, int]] = []
+        self.replica_batches: list[list[str]] = []
+        self.get_batches: list[list[str]] = []
+        self.upsert_batches: list[list[str]] = []
 
     def get_hostname(self) -> str:
         return self.endpoint
 
     def get_size(self, key: str) -> int:
-        value = self.cluster.objects.get(key)
-        return -1 if value is None else len(value)
+        pytest.fail("checkpoint made a per-object size query")
 
     def _replicas(self, key: str) -> list[_FakeMemoryReplica]:
         value = self.cluster.objects.get(key)
@@ -126,20 +129,29 @@ class _FakeStore:
         ]
 
     def get_replica_desc(self, key: str) -> list[_FakeMemoryReplica]:
-        return self._replicas(key)
+        pytest.fail("checkpoint made a per-object replica query")
 
     def batch_get_replica_desc(
         self, keys: list[str]
     ) -> dict[str, list[_FakeMemoryReplica]]:
+        self.replica_batches.append(list(keys))
         return {key: self._replicas(key) for key in keys}
 
     def register_buffer(self, pointer: int, size: int) -> int:
         assert pointer not in self.registered
         self.registered[pointer] = size
+        self.registrations.append((pointer, size))
         return 0
 
+    def _assert_registered(self, pointer: int, size: int) -> None:
+        assert pointer % 256 == 0
+        assert any(
+            base <= pointer and pointer + size <= base + capacity
+            for base, capacity in self.registered.items()
+        )
+
     def get_into(self, key: str, pointer: int, size: int) -> int:
-        assert self.registered[pointer] == size
+        self._assert_registered(pointer, size)
         assert self.endpoint in self.cluster.owners[key], (
             f"{self.endpoint} tried to checkpoint remotely owned {key}"
         )
@@ -148,6 +160,15 @@ class _FakeStore:
         ctypes.memmove(pointer, value, size)
         self.cluster.get_calls.append((self.endpoint, key))
         return size - 1 if key == self.short_key else size
+
+    def batch_get_into(
+        self, keys: list[str], pointers: list[int], sizes: list[int]
+    ) -> list[int]:
+        self.get_batches.append(list(keys))
+        return [
+            self.get_into(key, pointer, size)
+            for key, pointer, size in zip(keys, pointers, sizes, strict=True)
+        ]
 
     def unregister_buffer(self, pointer: int) -> int:
         if self.unregister_result == 0:
@@ -158,12 +179,21 @@ class _FakeStore:
         return [1 if key in self.cluster.objects else 0 for key in keys]
 
     def upsert_from(self, key: str, pointer: int, size: int, config: Any) -> int:
-        assert self.registered[pointer] == size
+        self._assert_registered(pointer, size)
         assert config.preferred_segment == self.endpoint
         self.cluster.objects[key] = ctypes.string_at(pointer, size)
         self.cluster.owners[key] = (self.owner_override or self.endpoint,)
         self.cluster.upsert_calls.append((self.endpoint, key, config.preferred_segment))
         return 0
+
+    def batch_upsert_from(
+        self, keys: list[str], pointers: list[int], sizes: list[int], config: Any
+    ) -> list[int]:
+        self.upsert_batches.append(list(keys))
+        return [
+            self.upsert_from(key, pointer, size, config)
+            for key, pointer, size in zip(keys, pointers, sizes, strict=True)
+        ]
 
 
 def _manager(store: _FakeStore, manager_id: str = "manager-a") -> Any:
@@ -420,10 +450,10 @@ def test_distributed_checkpoint_round_trip_over_command_only_rpc(
         pytest.fail("checkpoint coordinator performed payload I/O")
 
     monkeypatch.setattr(
-        coordinator.storage_client._store, "get_into", unexpected_payload_io
+        coordinator.storage_client._store, "batch_get_into", unexpected_payload_io
     )
     monkeypatch.setattr(
-        coordinator.storage_client._store, "upsert_from", unexpected_payload_io
+        coordinator.storage_client._store, "batch_upsert_from", unexpected_payload_io
     )
     monkeypatch.setattr(
         checkpoint_plugin,
@@ -997,7 +1027,8 @@ def test_save_quarantines_a_buffer_when_unregister_fails(
     assert quarantined_buffers[0].closed is False
     pointer, size = next(iter(store.registered.items()))
     assert unregister_calls == [pointer]
-    assert ctypes.string_at(pointer, size) == _payloads()["0@router_indices"]
+    first = _payloads()["0@router_indices"]
+    assert ctypes.string_at(pointer, len(first)) == first
     assert not (checkpoint_dir / "mooncake_storage" / "manifest.json").exists()
 
 
@@ -1090,7 +1121,8 @@ def test_restore_quarantines_a_buffer_when_unregister_fails(
     assert quarantined_buffers[0].closed is False
     store = managers[0].storage_client._store
     pointer, size = next(iter(store.registered.items()))
-    assert ctypes.string_at(pointer, size) == _payloads()["0@router_indices"]
+    first = _payloads()["0@router_indices"]
+    assert ctypes.string_at(pointer, len(first)) == first
 
 
 def test_plugin_install_does_not_change_the_normal_put_path(
@@ -1271,3 +1303,198 @@ def test_installed_manager_dispatches_explicit_storage_save_and_load(
         ("save", "/checkpoint-save"),
         ("load", "/checkpoint-load"),
     ]
+
+
+def test_batches_reuse_one_registration_and_pack_only_payload_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(checkpoint_plugin, "_BATCH_KEYS", 3)
+    monkeypatch.setattr(checkpoint_plugin, "_BATCH_BYTES", 512)
+    sizes = [4, 8, 4, 8, 513, 4, 8, 4, 8]
+    payloads = {
+        f"{index}@value": bytes([index + 1]) * size for index, size in enumerate(sizes)
+    }
+    endpoint = "127.0.0.1:12301"
+    cluster = _FakeCluster(payloads, {key: (endpoint,) for key in payloads})
+    store = _FakeStore(cluster, endpoint)
+    manager = _manager(store)
+    _wire_participants(monkeypatch, [_participant(manager)])
+    monkeypatch.setattr(
+        checkpoint_plugin, "_controller_keys", lambda _path: sorted(payloads)
+    )
+    checkpoint_dir = _checkpoint_dir(tmp_path)
+    _save_storage_checkpoint(manager, str(checkpoint_dir))
+    batches = list(checkpoint_plugin._checkpoint_batches(sizes))
+    assert len(store.get_batches) == len(batches) > 1
+    assert all(len(batch) <= 3 for batch in store.replica_batches)
+    assert len(store.replica_batches) == 3 + len(batches)
+    assert len(store.registrations) == 1
+    assert store.registrations[0][1] == 513
+    assert store.registered == {}
+    assert _saved_payloads(checkpoint_dir) == payloads
+    assert (
+        checkpoint_dir / "mooncake_storage" / "part-00000.bin"
+    ).stat().st_size == sum(sizes)
+    cluster.objects.clear()
+    cluster.owners.clear()
+    _load_storage_checkpoint(manager, str(checkpoint_dir))
+    assert cluster.objects == payloads
+    assert len(store.upsert_batches) == len(batches)
+    assert len(store.registrations) == 2
+    assert store.registered == {}
+
+
+def test_native_batch_key_limit_and_scalar_alignment() -> None:
+    batches = list(checkpoint_plugin._checkpoint_batches([4] * 401))
+    assert [(start, stop) for start, stop, _ in batches] == [(0, 400), (400, 401)]
+    assert batches[0][2] == list(range(0, 400 * 256, 256))
+    assert batches[1][2] == [0]
+
+
+@pytest.mark.parametrize("operation", ["GET", "restore"])
+@pytest.mark.parametrize(
+    "bad_result", [None, 0, [], [0], [0, 0, 0], [True, 0], [-1, 0], [4, 7], [4.0, 8]]
+)
+def test_native_batch_results_require_exact_cardinality_and_values(
+    operation: str, bad_result: Any
+) -> None:
+    expected = [4, 8] if operation == "GET" else [0, 0]
+    with pytest.raises(RuntimeError, match="incomplete or invalid"):
+        checkpoint_plugin._check_batch_results(
+            bad_result, expected, operation=operation
+        )
+
+
+@pytest.mark.parametrize("operation", ["save", "load"])
+def test_partial_native_batch_does_not_ack_and_unregisters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    checkpoint_dir, cluster, managers, _ = _save_distributed_checkpoint(
+        monkeypatch, tmp_path
+    )
+    if operation == "save":
+        checkpoint_dir = tmp_path / "incomplete"
+        checkpoint_dir.mkdir()
+        _write_controller(checkpoint_dir)
+        method = "batch_get_into"
+        run = _save_storage_checkpoint
+    else:
+        cluster.objects.clear()
+        cluster.owners.clear()
+        method = "batch_upsert_from"
+        run = _load_storage_checkpoint
+    store = managers[0].storage_client._store
+    original = getattr(store, method)
+    monkeypatch.setattr(store, method, lambda *args: original(*args)[:-1])
+    with pytest.raises(RuntimeError, match="incomplete or invalid"):
+        run(managers[0], str(checkpoint_dir))
+    assert all(manager.storage_client._store.registered == {} for manager in managers)
+    if operation == "save":
+        assert not (checkpoint_dir / "mooncake_storage" / "manifest.json").exists()
+
+
+@pytest.mark.parametrize("sizes", [[0], [-1], [True], [4, 8]])
+def test_save_rejects_invalid_or_disagreeing_replica_sizes(
+    monkeypatch: pytest.MonkeyPatch, sizes: list[Any]
+) -> None:
+    endpoint = "127.0.0.1:12301"
+    store = _FakeStore(_FakeCluster({}, {}), endpoint)
+    participant = _participant(_manager(store))
+    monkeypatch.setattr(
+        store,
+        "batch_get_replica_desc",
+        lambda _keys: {"key": [_FakeMemoryReplica(endpoint, size) for size in sizes]},
+    )
+    with pytest.raises(RuntimeError, match="invalid or inconsistent"):
+        checkpoint_plugin._owner_assignments(store, ["key"], [participant.info])
+
+
+@pytest.mark.parametrize("result", [None, {}, {"unexpected": []}])
+def test_replica_batch_requires_exact_key_coverage(
+    monkeypatch: pytest.MonkeyPatch, result: Any
+) -> None:
+    store = _FakeStore(_FakeCluster({}, {}), "127.0.0.1:12301")
+    monkeypatch.setattr(store, "batch_get_replica_desc", lambda _keys: result)
+    with pytest.raises(RuntimeError, match="malformed data"):
+        checkpoint_plugin._batch_replicas(store, ["key"])
+
+
+def test_owner_rechecks_batch_placement_before_reading(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cluster = _source_cluster()
+    managers = _managers(cluster, _SOURCE_IDENTITIES)
+    participants = [_participant(manager) for manager in managers]
+    _wire_participants(monkeypatch, participants)
+    store = managers[0].storage_client._store
+    original = store.batch_get_replica_desc
+    count = 0
+
+    def change_owner(keys: list[str]) -> Any:
+        nonlocal count
+        count += 1
+        if count == 2:
+            cluster.owners[keys[0]] = ("another-owner",)
+        return original(keys)
+
+    monkeypatch.setattr(store, "batch_get_replica_desc", change_owner)
+    with pytest.raises(RuntimeError, match="no longer has a complete memory"):
+        _save_storage_checkpoint(managers[0], str(_checkpoint_dir(tmp_path)))
+    assert cluster.get_calls == []
+    assert store.registered == {}
+
+
+def test_load_accepts_existing_unpadded_manifest_format(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint_dir = _checkpoint_dir(tmp_path)
+    storage_dir = checkpoint_dir / "mooncake_storage"
+    storage_dir.mkdir()
+    objects = []
+    offset = 0
+    with (storage_dir / "part-00000.bin").open("wb") as output:
+        for key, value in sorted(_payloads().items()):
+            output.write(value)
+            objects.append(
+                {
+                    "key": key,
+                    "shard": "part-00000.bin",
+                    "offset": offset,
+                    "size": len(value),
+                    "sha256": hashlib.sha256(value).hexdigest(),
+                    "saved_owner": "old-owner",
+                }
+            )
+            offset += len(value)
+    (storage_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "storage_layout": {"use_gdr": False, "gdr_staging_buffer_mb": 1024},
+                "objects": objects,
+            }
+        )
+    )
+    cluster = _FakeCluster({}, {})
+    manager = _manager(_FakeStore(cluster, "127.0.0.1:12301"))
+    _wire_participants(monkeypatch, [_participant(manager)])
+    _load_storage_checkpoint(manager, str(checkpoint_dir))
+    assert cluster.objects == _payloads()
+
+
+def test_batch_failure_preserves_primary_error_and_quarantines_cleanup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, quarantined_buffers: list[Any]
+) -> None:
+    cluster = _source_cluster()
+    managers = _managers(
+        cluster,
+        _SOURCE_IDENTITIES,
+        store_options={
+            "manager-a": {"short_key": "0@router_indices", "unregister_result": -1}
+        },
+    )
+    _wire_participants(monkeypatch, [_participant(manager) for manager in managers])
+    with pytest.raises(RuntimeError, match="GET returned incomplete") as error:
+        _save_storage_checkpoint(managers[0], str(_checkpoint_dir(tmp_path)))
+    assert any("buffer cleanup failed" in note for note in error.value.__notes__)
+    assert len(quarantined_buffers) == 1
+    assert not quarantined_buffers[0].closed
