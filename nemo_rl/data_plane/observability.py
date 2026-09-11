@@ -831,6 +831,12 @@ def merge_snapshots(snapshots: "list[dict[str, Any]]") -> dict[str, Any]:
     merged["by_op"] = by_op
     merged["hash_verify"] = hashes
     merged["n_processes"] = len(snapshots)
+    # The busiest single process, kept beside the sum: these ran concurrently
+    # inside one step, so the sum is process-time and only the max is wall
+    # time the step could have waited on. ``frac_of_step`` differences it.
+    merged["max_process_wall_ms"] = max(
+        (s.get("total_wall_ms", 0.0) for s in snapshots), default=0.0
+    )
     _derive_op_metrics(by_op, merged["total_wall_ms"])
     merged.update(_comm_volume(by_op))
     return merged
@@ -890,6 +896,9 @@ def _step_metrics(
     """
     wall_ms = snap["total_wall_ms"] - prev.get("total_wall_ms", 0.0)
     overhead_ms = snap["self_ms"] - prev.get("self_ms", 0.0) + collect_ms
+    exposed_ms = snap.get("max_process_wall_ms", wall_ms / n_procs) - prev.get(
+        "max_process_wall_ms", 0.0
+    )
     # step/ is a delta over this step; now/ is a level at this instant.
     # The unit alone does not distinguish them -- see README.md.
     metrics = _step_deltas(snap, prev)
@@ -897,15 +906,20 @@ def _step_metrics(
         {
             # The one metric that says whether optimising the data plane is
             # worth anything: per-op percentages say where its time went, never
-            # whether it mattered against compute. ``wall_ms`` sums
-            # processes that ran concurrently, so dividing it by one step's
-            # wall clock exceeds 1 whenever they overlapped (measured 1.054
-            # across ten processes) -- correct arithmetic that reads as
-            # "105% of the step". Per process it is bounded and answers the
-            # question people actually ask of it.
+            # whether it mattered against compute. The denominator is one
+            # step's wall clock, so the numerator has to be wall time too:
+            # processes run concurrently inside that window, so summing them
+            # exceeds 1 whenever they overlapped (measured 1.054 across ten
+            # processes) and averaging them dilutes the busiest process with
+            # idle ones. The busiest process is the one the step waits on, so
+            # the max is what was exposed -- a lower bound on the step's own
+            # serial cost, where the sum was an upper bound on nothing.
             "step/frac_of_step": (
-                (wall_ms / n_procs) / (step_time_s * 1e3) if step_time_s > 0 else 0.0
+                exposed_ms / (step_time_s * 1e3) if step_time_s > 0 else 0.0
             ),
+            # Same reduction, same reason: the step waited on one process,
+            # not on all of them added together. ``_step_deltas`` summed it.
+            "step/wall_s": exposed_ms / 1e3,
             "step/self/overhead_ms": overhead_ms,
             "step/self/frac": overhead_ms / wall_ms if wall_ms > 0 else 0.0,
         }
