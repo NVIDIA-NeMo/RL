@@ -4115,7 +4115,8 @@ class MegatronPolicyWorkerImpl(
         parameter all-gather to the next training forward. A refit runs between
         the optimizer step and that forward, so without an explicit gather each
         DP rank would export its own updated shard next to stale copies of the
-        others.
+        others. Megatron-FSDP wrappers gather inside their own module hooks and
+        are intentionally not handled here.
         """
         if self._uses_mxfp8_overlap_shared_param_buffer():
             # With MXFP8 overlap, the optimizer updates FP32 master shards and
@@ -4146,7 +4147,8 @@ class MegatronPolicyWorkerImpl(
 
         # Plain BF16 overlap: the optimizer step already wrote the updated master
         # shards into the DDP param buffer (_copy_main_params_to_model_params),
-        # so only the all-gather is pending. Nothing aliases that buffer, so the
+        # so only the all-gather is pending. That buffer is a separate
+        # allocation from the grad buffer (only MXFP8 shares storage), so the
         # gather is safe regardless of hook state and the hooks can stay
         # installed; a forced sync marks every bucket as gathered.
         if (
@@ -4157,8 +4159,9 @@ class MegatronPolicyWorkerImpl(
             # parameters it may still be reading.
             self.finalize_async_save()
             self.model.start_param_sync(force_sync=True)
-            # Refit exporters may read from side streams; make the gathered
-            # weights visible to them.
+            # Conservative: the synchronous gather is already stream-ordered,
+            # but a full device sync is cheap next to a refit and rules out any
+            # exporter observing a partially gathered buffer.
             torch.cuda.synchronize()
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
