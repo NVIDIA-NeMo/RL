@@ -499,12 +499,16 @@ step/percent_of_dataplane/by_op/put                 42.1   within it, put is the
 
 `by_op` sums to 100 by construction.
 
-**7% is not 7% of the step spent exclusively in the data plane.** The
-numerator is data-plane wall time and the denominator is the step's, but on
-the async and single-controller paths a transfer overlaps compute -- the same
-reason `wall_ms` is aggregate process-time rather than elapsed time (below).
-Read `frac_of_step` as "how much data-plane work a step carries", not as time
-the step would get back if the data plane were free.
+**`frac_of_step` and `wall_s` report the busiest process, not the sum.**
+The denominator is one step's wall clock, so the numerator has to be wall time
+too. These processes run concurrently inside that window: summing them
+exceeds the step itself (measured 1.054 across ten processes), and averaging
+them dilutes the busiest process with idle ones. The step waits on one
+process, so the max is what was exposed. It is a lower bound -- if the
+driver's ops are serial with the workers' fetches, the real figure is
+`driver + max(workers)` -- but it is a bound in the right direction, where the
+sum was neither. `by_op` percentages still sum, because "where did the time
+go" is a process-time question.
 
 `volume_mb` counts *transfers*, not data size, and two things follow from
 that. A byte written and later read is counted on both sides. And every
@@ -520,10 +524,11 @@ absent from `volume_mb/by_op/put` and from `comm_volume_mb`. That is why
 put reads small next to get. Read the write side as "what the driver and
 policy workers wrote", not as the step's write traffic.
 
-On the cluster path `wall_ms` is summed over processes that ran
-concurrently, so these are percentages of aggregate **process-time**, not of
-elapsed time. That is the right denominator for "what should I optimise"
-and the wrong one for "what blocked the step".
+On the cluster path the per-op `wall_ms` is summed over processes that ran
+concurrently, so the **`by_op` percentages** are shares of aggregate
+process-time, not of elapsed time. That is the right denominator for "what
+should I optimise" and the wrong one for "what blocked the step" -- which is
+what `frac_of_step` answers, and why it takes a max instead.
 
 **A per-op breakdown table** carries the detail, under
 `data_plane/{cluster,driver}/breakdown` — one row per op, ordered by
