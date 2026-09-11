@@ -18,10 +18,10 @@ import os
 import warnings
 from collections import defaultdict
 from typing import (
+    TYPE_CHECKING,
     Any,
     AsyncGenerator,
     Optional,
-    TYPE_CHECKING,
     Union,
     cast,
 )
