@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import os
+import threading
 import time
 from dataclasses import replace
 from typing import Any, Mapping, Optional
@@ -56,6 +58,11 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         self._sft_next_batch_index = 0
         self._sft_logical_rank: Optional[int] = None
         self._sft_logical_world_size: Optional[int] = None
+        self._ld_on = os.environ.get("NRL_LOADDIAG") == "1"
+        self._ld_phase: Optional[str] = None
+        self._ld_t0 = time.monotonic()
+        self._ld_durations: dict[str, float] = {}
+        self._ld_watchdog: Optional[threading.Thread] = None
         super().__init__(*args, **kwargs)
 
     def setup_sft_dataloader(
@@ -103,6 +110,65 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         self._sft_logical_world_size = logical_world_size
         return True
 
+    def _ld_mark(self, phase: str) -> None:
+        """Close the previous load phase and enter ``phase``."""
+        now = time.monotonic()
+        previous = self._ld_phase
+        elapsed = now - self._ld_t0
+        if previous is not None:
+            self._ld_durations[previous] = elapsed
+            if self._ld_on:
+                print(
+                    "[LOADDIAG] batch=%d %s done in %.3fs -> %s"
+                    % (self._sft_next_batch_index, previous, elapsed, phase),
+                    flush=True,
+                )
+        self._ld_phase = None if phase == "idle" else phase
+        self._ld_t0 = now
+        if self._ld_on and self._ld_watchdog is None:
+            self._ld_watchdog = threading.Thread(
+                target=self._ld_watch,
+                name="sft-loaddiag",
+                daemon=True,
+            )
+            self._ld_watchdog.start()
+
+    def _ld_watch(self) -> None:
+        """Print the in-flight phase every 15 seconds after a 30-second stall."""
+        while True:
+            time.sleep(15)
+            phase = self._ld_phase
+            if phase is None:
+                continue
+            elapsed = time.monotonic() - self._ld_t0
+            if elapsed < 30:
+                continue
+            try:
+                process_ids = os.listdir("/proc")
+            except OSError:
+                workers = -1
+            else:
+                workers = 0
+                for process_id in process_ids:
+                    if not process_id.isdigit():
+                        continue
+                    try:
+                        with open(
+                            f"/proc/{process_id}/comm",
+                            encoding="utf-8",
+                            errors="ignore",
+                        ) as stream:
+                            command = stream.read()
+                    except OSError:
+                        continue
+                    if "pt_data_worker" in command:
+                        workers += 1
+            print(
+                "[LOADDIAG] STUCK batch=%d phase=%s elapsed=%.0fs data_workers=%d"
+                % (self._sft_next_batch_index, phase, elapsed, workers),
+                flush=True,
+            )
+
     def load_next_sft_batch(
         self,
         *,
@@ -120,6 +186,10 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             raise RuntimeError("The SFT logical loader identity is missing.")
 
         started = time.monotonic()
+        self._ld_durations = {}
+        self._ld_phase = None
+        self._ld_t0 = started
+        self._ld_mark("iter")
 
         # restart when one epoch is exhausted
         try:
@@ -127,6 +197,7 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         except StopIteration:
             self._sft_loader_iterator = iter(self._sft_loader)
             batch = next(self._sft_loader_iterator)
+        self._ld_mark("prepare")
 
         prepared = prepare_sft_batch(
             batch,
@@ -134,7 +205,7 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             only_unmask_final=only_unmask_final,
             make_sequence_length_divisible_by=make_sequence_length_divisible_by,
         )
-        load_seconds = time.monotonic() - started
+        self._ld_mark("post-prepare")
         batch_size = prepared.size
         source_ids = self._source_ids(prepared, batch_size=batch_size)
         partition_id = (
@@ -149,23 +220,38 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             for key, value in prepared.items()
             if key not in {"source_ids", "sample_keys"}
         }
+        self._ld_mark("tensordict")
         fields = local_batch_to_tensordict(policy_batch, batch_size=batch_size)
+
+        self._ld_mark("publish")
+        publish_phase_started = time.monotonic()
         field_names = list(fields.keys())
         client = self._require_dp_client()
+        publish_setup = time.monotonic() - publish_phase_started
+
+        publish_phase_started = time.monotonic()
         client.register_partition(
             partition_id=partition_id,
             fields=field_names,
             num_samples=batch_size,
             consumer_tasks=["train"],
         )
+        publish_register_partition = time.monotonic() - publish_phase_started
+
+        publish_phase_started = time.monotonic()
         tags = self._source_tags(prepared, batch_size=batch_size)
+        publish_source_tags = time.monotonic() - publish_phase_started
+
+        publish_phase_started = time.monotonic()
         published_meta = client.put_samples(
             sample_ids=sample_ids,
             partition_id=partition_id,
             fields=fields,
             tags=tags,
         )
+        publish_put_samples = time.monotonic() - publish_phase_started
 
+        publish_phase_started = time.monotonic()
         lengths_tensor = prepared["input_lengths"]
         lengths = tuple(int(value) for value in lengths_tensor.tolist())
         sample_mask = prepared["sample_mask"]
@@ -180,6 +266,17 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             extra_info[MICRO_BATCH_LENGTHS] = [list(lengths)]
         if make_sequence_length_divisible_by > 1:
             extra_info["pad_to_multiple"] = int(make_sequence_length_divisible_by)
+        publish_batch_metadata = time.monotonic() - publish_phase_started
+        self._ld_mark("idle")
+        self._ld_durations.update(
+            {
+                "publish_setup": publish_setup,
+                "publish_register_partition": publish_register_partition,
+                "publish_source_tags": publish_source_tags,
+                "publish_put_samples": publish_put_samples,
+                "publish_batch_metadata": publish_batch_metadata,
+            }
+        )
         envelope = StepEnvelope(
             meta=replace(
                 published_meta,
@@ -191,8 +288,10 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             source_ids=source_ids,
             field_names=tuple(field_names),
             sequence_lengths=lengths,
-            load_seconds=load_seconds,
+            # The controller blocks on this whole call, so include publishing.
+            load_seconds=time.monotonic() - started,
             valid_tokens=valid_tokens,
+            load_phase_seconds=dict(self._ld_durations),
         )
         self._sft_active_envelope = envelope
         self._sft_next_batch_index += 1

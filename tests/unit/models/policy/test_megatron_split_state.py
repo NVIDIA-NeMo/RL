@@ -849,8 +849,11 @@ class TestFinish:
             "model_dtype",
             "all_mb_metrics",
             "grad_norm",
+            "step_phases",
         ):
             assert key in metrics, f"missing {key!r}"
+        assert {"finish_reduce", "finish_opt"} <= set(metrics["step_phases"])
+        assert all(value >= 0.0 for value in metrics["step_phases"].values())
 
     def test_moe_branch_skipped_when_num_experts_is_none(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
