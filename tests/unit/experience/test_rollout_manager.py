@@ -1873,6 +1873,7 @@ def _receipt_record(
                 "reward": 0.5,
                 "ng_receipt": receipt,
                 "ng_rollout_id": rid,
+                "_ng_resolved_agent_ref": {"name": "test-agent"},
                 **({"instance_config": cfg} if cfg is not None else {}),
             },
             truncated=False,
