@@ -41,6 +41,18 @@ class VllmVideoConfig(BaseModel):
     temporal_patch_size: PositiveInt
 
 
+class VllmGpuOutputCaptureConfig(BaseModel, extra="allow"):
+    """Retain generated CUDA payloads for completion-time GDR token capture.
+
+    Used only with Mooncake GDR and Gym token capture. CPU serving and digest
+    mirrors remain available. The budget includes pending requests and IPC
+    leases; exceeding it fails capture instead of silently copying through CPU.
+    """
+
+    enabled: bool = True
+    max_retained_mb: PositiveInt = 1024
+
+
 class VllmSpecificArgs(TypedDict):
     tensor_parallel_size: int
     pipeline_parallel_size: int
@@ -50,6 +62,8 @@ class VllmSpecificArgs(TypedDict):
     # Additional arguments for vLLM inserted by nemo rl based on the context of when vllm is used
     skip_tokenizer_init: bool
     async_engine: bool
+    # GDR token-capture retention; defaults live in VllmGpuOutputCaptureConfig.
+    gpu_output_capture: NotRequired[VllmGpuOutputCaptureConfig]
     # Optional video contract. When present, NeMo RL registers its TorchCodec
     # loader and uses these exact sampling values on both sides of GRPO.
     video: NotRequired[VllmVideoConfig]

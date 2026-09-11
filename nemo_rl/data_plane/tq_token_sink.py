@@ -36,12 +36,15 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import ray
 import torch
 from tensordict import TensorDict
+
+from nemo_rl.data_plane.gpu_token_payload import GpuTokenPayload
 
 if TYPE_CHECKING:
     # Deferred: nemo_gym is an optional extra absent in non-gym runs; runtime
@@ -157,7 +160,9 @@ class TQTokenSink:
         self._dp_client = dp_client
         self._staging_partition = staging_partition
 
-    def stage(self, record: StagedCallRecord) -> StageResult:
+    def stage(
+        self, record: StagedCallRecord, *, gpu_payload: GpuTokenPayload | None = None
+    ) -> StageResult:
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.records import StageResult
 
@@ -267,6 +272,8 @@ class TQTokenSink:
                 [routed_encoding], dtype=torch.int64
             )
             field_dict[ROUTED_LEN_FIELD] = torch.tensor([routed_len], dtype=torch.int64)
+            if gpu_payload is not None:
+                field_dict.update(gpu_payload.staging_fields(record, field_dict))
             fields = TensorDict(field_dict, batch_size=[1])
             tags = [
                 {
@@ -281,14 +288,26 @@ class TQTokenSink:
                     "schema_version": record.schema_version,
                 }
             ]
-            _call_dp(
-                self._dp_client,
-                "put_samples",
-                sample_ids=[key],
-                partition_id=self._staging_partition,
-                fields=fields,
-                tags=tags,
+            # Capture completes on a background thread. Bind its device for
+            # transport initialization and stream synchronization at PUT.
+            device_context = (
+                torch.cuda.device(gpu_payload.device())
+                if gpu_payload is not None
+                else nullcontext()
             )
+            with device_context:
+                if gpu_payload is not None:
+                    # Field casts and mask/prompt construction use the caller's
+                    # stream; a backend executor may read on a different one.
+                    torch.cuda.current_stream().synchronize()
+                _call_dp(
+                    self._dp_client,
+                    "put_samples",
+                    sample_ids=[key],
+                    partition_id=self._staging_partition,
+                    fields=fields,
+                    tags=tags,
+                )
         except Exception as error:  # noqa: BLE001 — any failure must poison, not crash serving
             # The reason string is dropped downstream (_failed_coords carries
             # only the disposition) — this log line is the only place the

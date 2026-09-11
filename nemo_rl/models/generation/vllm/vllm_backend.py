@@ -27,6 +27,12 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     preinit_nixl_from_vllm_config,
     resolve_rollout_rank,
 )
+from nemo_rl.models.generation.vllm.gpu_output_capture import (
+    GpuOutputCapture,
+    GpuOutputCaptureCapabilities,
+    GpuOutputLease,
+    configure_gpu_output_capture,
+)
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -335,6 +341,51 @@ def _read_mtp_layer_weights_from_checkpoint(
 
 
 class VllmInternalWorkerExtension:
+    _gpu_output_capture: GpuOutputCapture | None = None
+
+    def configure_gpu_output_capture(
+        self,
+        max_retained_bytes: int,
+        frontend_hostname: str,
+        require_routed_experts: bool,
+    ) -> GpuOutputCaptureCapabilities:
+        return configure_gpu_output_capture(
+            self,
+            max_retained_bytes=max_retained_bytes,
+            frontend_hostname=frontend_hostname,
+            require_routed_experts=require_routed_experts,
+        )
+
+    def export_gpu_output_capture(
+        self,
+        capture_key: str,
+        generated_token_count: int,
+        prompt_token_count: int,
+    ) -> GpuOutputLease | None:
+        if self._gpu_output_capture is None:
+            return None
+        return self._gpu_output_capture.export(
+            capture_key,
+            generated_token_count=generated_token_count,
+            prompt_token_count=prompt_token_count,
+        )
+
+    def release_gpu_output_capture(self, lease_id: str) -> None:
+        if self._gpu_output_capture is not None:
+            self._gpu_output_capture.release(lease_id)
+
+    def abandon_unimported_gpu_output_capture(self, lease_id: str) -> None:
+        if self._gpu_output_capture is not None:
+            self._gpu_output_capture.abandon_unimported(lease_id)
+
+    def discard_gpu_output_capture(self, capture_key: str) -> None:
+        if self._gpu_output_capture is not None:
+            self._gpu_output_capture.discard(capture_key)
+
+    def clear_gpu_output_capture(self) -> None:
+        if self._gpu_output_capture is not None:
+            self._gpu_output_capture.clear()
+
     # Per-PP-stage refit groups, None until init_nccl_reshard_comm_group builds them.
     # Declared rather than sprung into existence so a rebuild can release the previous
     # ones without probing, matching AbstractPolicyWorker.model_update_group. None and

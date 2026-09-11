@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -65,6 +66,8 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
         token_capture=None,
         _rollout_weight_version=0,
         _staging_source=None,
+        _token_sink=None,
+        _gpu_capture_host=None,
         _prefix_cache={},
         _prefix_cache_lock=threading.Lock(),
     )
@@ -109,6 +112,52 @@ def test_setup_token_capture_skips_non_model_owners(monkeypatch):
     )
     assert installed is False
     assert worker.token_capture is None
+
+
+@pytest.mark.parametrize("retain_gpu", [True, False])
+def test_gdr_setup_binds_producer_device_before_attaching_tq(monkeypatch, retain_gpu):
+    import torch
+
+    from nemo_rl.models.generation.vllm.gpu_capture_host import GpuCaptureHost
+
+    events = []
+    sink = _MemorySink()
+    worker = _fake_worker()
+    worker.cfg = {"vllm_cfg": {"gpu_output_capture": {"enabled": retain_gpu}}}
+    worker._http_engine_client = object()
+    worker._return_routed_experts_enabled = lambda: True
+
+    async def create(rpc, *, max_retained_bytes, require_routed_experts):
+        assert rpc is worker._http_engine_client
+        assert max_retained_bytes == 1024 * 1024 * 1024
+        assert require_routed_experts is True
+        events.append("configure")
+        return SimpleNamespace(device=torch.device("cuda", 0))
+
+    def build(dp_cfg, *, bootstrap):
+        assert bootstrap is False
+        events.append("attach")
+        return MagicMock()
+
+    monkeypatch.setattr(GpuCaptureHost, "create", create)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "init", lambda: events.append("cuda_init"))
+    monkeypatch.setattr("nemo_rl.data_plane.build_data_plane_client", build)
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
+        lambda dp_client, *, staging_partition: sink,
+    )
+    asyncio.run(
+        VllmAsyncGenerationWorkerImpl.setup_token_capture(
+            worker,
+            dp_cfg={"backend": "mooncake_cpu", "mooncake_cpu": {"use_gdr": True}},
+            staging_partition="staging",
+        )
+    )
+    assert events == (
+        ["configure", "cuda_init", "attach"] if retain_gpu else ["attach"]
+    )
+    assert (worker._gpu_capture_host is not None) is retain_gpu
 
 
 def test_weight_version_is_stamped_from_worker_state(monkeypatch):
@@ -208,6 +257,7 @@ def _worker_with_capture(sink: _MemorySink):
     worker._prefix_cache = {}
     worker._prefix_cache_lock = threading.Lock()
     worker._staging_source = None
+    worker._token_sink = sink
     worker._delta_align_routed_experts = (
         VllmAsyncGenerationWorkerImpl._delta_align_routed_experts
     )
@@ -226,6 +276,65 @@ def _worker_with_capture(sink: _MemorySink):
         adapter=VLLMCaptureAdapter(),
     )
     return worker
+
+
+def test_gpu_capture_key_is_scoped_to_one_admitted_request():
+    from nemo_rl.models.generation.vllm.gpu_output_capture import GPU_CAPTURE_KEY
+
+    worker = _worker_with_capture(_MemorySink())
+    worker._gpu_capture_host = object()
+    request = _FakeRequest(
+        ng_capture={"rollout_id": "r0", "model_call_id": "c1", "mode": "text"},
+        vllm_xargs={GPU_CAPTURE_KEY: "untrusted", "other_extension": 7},
+        stream=False,
+        n=1,
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [1, 2])
+    state = worker._capture_calls[id(request)]
+    assert state.capture is not worker.token_capture
+    assert state.gpu_sink is not None
+    assert state.capture_key != "untrusted"
+    assert request.vllm_xargs == {
+        GPU_CAPTURE_KEY: state.capture_key,
+        "other_extension": 7,
+    }
+    # Uncaptured requests cannot make the GPU worker retain arbitrary buffers.
+    uncaptured = _FakeRequest(
+        ng_capture=None, vllm_xargs={GPU_CAPTURE_KEY: "untrusted"}
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, uncaptured, [3])
+    assert uncaptured.vllm_xargs == {}
+    assert id(uncaptured) not in worker._capture_calls
+
+
+def test_gpu_capture_rejects_multiple_completions_before_admission():
+    worker = _worker_with_capture(_MemorySink())
+    worker._gpu_capture_host = object()
+    request = _FakeRequest(
+        ng_capture={"rollout_id": "r0", "model_call_id": "c1", "mode": "text"},
+        stream=False,
+        n=2,
+    )
+    with pytest.raises(ValueError, match="n=1"):
+        VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [1])
+    assert not worker._capture_calls
+
+
+def test_unbound_gpu_capture_fails_without_a_cpu_put():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    worker._gpu_capture_host = object()
+    request = _FakeRequest(
+        ng_capture={"rollout_id": "r0", "model_call_id": "c1", "mode": "text"},
+        stream=False,
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [1])
+    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker, request, _served_content([2], [-0.1])
+    )
+    assert content["ng_commit_coords"]["disposition"] == "capture_failed"
+    assert sink.records == []
+    assert not worker._capture_calls
 
 
 class _MemoryPrefixSource:
@@ -365,7 +474,8 @@ def test_staging_chain_prefix_flows_through_adapter_and_begin_call():
     assert admission.required_prefix_token_ids == []
     # enter_prefix is the production writer of the request field.
     assert request.required_prefix_token_ids == prefix
-    call, prompt = worker._capture_calls[id(request)]
+    state = worker._capture_calls[id(request)]
+    call, prompt = state.call, state.prompt_token_ids
     assert call.prefix_token_ids == prefix
     assert prompt == [10, 11, 12, 20]
 
@@ -472,8 +582,10 @@ def test_request_capture_abort_fails_the_call_and_drains_state():
         stream=False,
     )
     VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [1, 2])
-    VllmAsyncGenerationWorkerImpl._abort_request_capture(
-        worker, request, reason="engine_error"
+    asyncio.run(
+        VllmAsyncGenerationWorkerImpl._abort_request_capture(
+            worker, request, reason="engine_error"
+        )
     )
     assert worker._capture_calls == {}
     assert sink.records == []

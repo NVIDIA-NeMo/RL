@@ -183,6 +183,11 @@ policy:
       http_server_num_replicas: 8
     vllm_cfg:
       async_engine: true
+      # With Mooncake use_gdr=true and token capture, retain original generated
+      # CUDA tensors until the existing PUT. Defaults live in the config model.
+      # gpu_output_capture:
+      #   enabled: true
+      #   max_retained_mb: 1024
     colocated:
       enabled: false
       resources:

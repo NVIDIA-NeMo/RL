@@ -469,6 +469,48 @@ SingleController, however, each individual tensor must currently fit because
 the CPU PUT path does not create the chunk metadata required by an oversized
 GDR GET.
 
+With Gym token capture on the async vLLM HTTP server, `use_gdr: true` also
+retains original generated token IDs, selected logprobs, and optional routed
+experts on the producing GPU until the existing completion-time PUT. A CUDA
+IPC lease hands those allocations to the serving process. Only a request
+admitted by the capture ledger receives a retention key. PUT timing, staged
+keys, wire fields, and Gym digest versions remain unchanged.
+
+CPU copies remain for serving and the existing integrity digests. The sink
+checks device, shape, and alignment without copying the generated payload
+back to CPU again. Tests verify that the retained tensors match the existing
+CPU representation. This removes the generated payload's H2D staging input;
+it does **not** eliminate D2H used by serving/validation, CPU-origin
+prompt-carry and metadata transfers, the GPU staging D2D copy, or Mooncake's
+host-backed storage. Keeping a tensor on GPU does not make this an end-to-end
+zero-copy transport.
+
+The initial implementation supports vLLM **0.25.1**, one completion per
+request, no speculative decoding, PP=1, and no context parallelism. The TP
+output owner must be on the frontend host and its physical GPU must be
+mapped to frontend `cuda:0` (the current TQ executor's default device).
+Routed-expert retention additionally requires
+`enable_prefix_caching: false`. Unsupported engine/device configurations fail
+during setup; an individual retention/validation failure produces
+`capture_failed` coordinates instead of silently using a CPU PUT or crashing
+generation.
+
+Optional controls live under `policy.generation.vllm_cfg`:
+
+```yaml
+gpu_output_capture:
+  enabled: true          # only active with GDR + Gym token capture
+  max_retained_mb: 1024  # logical payload bytes per producing worker
+```
+
+The budget covers in-flight fragments and peak assembly of exported leases;
+CUDA allocator padding and Python metadata require additional memory. The
+producer keeps allocations alive until PUT completes, including cancellation
+while staging. Set `enabled: false` to use the previous CPU-produced GDR path
+on configurations outside the supported scope. CPU RDMA and Simple are
+unchanged. Like other PyTorch CUDA IPC users, an unrecoverable receiver or
+RPC failure can leave shared storage retained until the producer exits.
+
 Capacity rule of thumb (any backend):
 
 ```
