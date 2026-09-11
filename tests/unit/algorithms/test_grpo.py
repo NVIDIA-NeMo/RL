@@ -26,6 +26,7 @@ import torch
 from omegaconf import OmegaConf
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+from nemo_rl.algorithms import grpo as grpo_mod
 from nemo_rl.algorithms.advantage_estimator import (
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
@@ -226,7 +227,7 @@ def test_legacy_noncolocated_refit_syncs_policy_params_first(
     mock_ray.get.return_value = [True]
     events = []
     policy = MagicMock()
-    policy.sync_params_for_refit.side_effect = lambda: events.append("sync")
+    policy.sync_params_before_refit.side_effect = lambda: events.append("sync")
     policy.broadcast_weights_for_collective.side_effect = lambda **_: (
         events.append("broadcast") or [MagicMock()]
     )
@@ -241,6 +242,51 @@ def test_legacy_noncolocated_refit_syncs_policy_params_first(
     )
 
     assert events == ["sync", "broadcast"]
+
+
+def test_megatron_m2n_refit_delegates_entirely_to_the_synchronizer() -> None:
+    """MegatronWeightSynchronizer owns the engine lifecycle; the caller must not duplicate it.
+
+    ``refit_policy_generation`` returns as soon as a weight synchronizer is
+    present, so suspend/offload/prepare/resume must NOT be driven here — they
+    live inside ``MegatronWeightSynchronizer.sync_weights`` and are asserted in
+    ``tests/unit/weight_sync/test_weight_synchronizer.py``.
+    """
+    policy = MagicMock()
+    generation = object.__new__(MegatronGeneration)
+    generation.suspend_for_refit = MagicMock()
+    generation.prepare_for_generation = MagicMock()
+    generation.resume_after_refit = MagicMock()
+    generation.weight_synchronizer = MagicMock()
+    generation.weight_synchronizer.sync_weights.return_value = {"bytes": 16.0}
+
+    metrics = refit_policy_generation(
+        policy,
+        generation,
+        colocated_inference=False,
+        kv_scales={"layer.0": 0.5},
+    )
+
+    assert metrics == {"bytes": 16.0}
+    generation.weight_synchronizer.sync_weights.assert_called_once_with(
+        timer=None, kv_scales={"layer.0": 0.5}
+    )
+    generation.suspend_for_refit.assert_not_called()
+    generation.prepare_for_generation.assert_not_called()
+    generation.resume_after_refit.assert_not_called()
+    policy.offload_before_refit.assert_not_called()
+
+
+def test_refit_returns_empty_metrics_when_synchronizer_returns_none() -> None:
+    """``sync_weights`` returning None must not propagate as the metrics dict."""
+    generation = object.__new__(MegatronGeneration)
+    generation.weight_synchronizer = MagicMock()
+    generation.weight_synchronizer.sync_weights.return_value = None
+
+    assert (
+        refit_policy_generation(MagicMock(), generation, colocated_inference=False)
+        == {}
+    )
 
 
 class TestMaskSampleFilter:
@@ -3193,7 +3239,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
         def init_collective(self, *_args, **_kwargs):
             return []
 
-        def prepare_refit_info(self):
+        def prepare_refit_info(self, *, refit_payload_mode):
             return {}
 
     def legacy_policy_factory(
@@ -3230,6 +3276,9 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
 
         def prepare_refit_info(self, _state):
             pass
+
+        def get_refit_payload_mode(self):
+            return "hf_export"
 
         def init_collective(self, *_args, **_kwargs):
             return []
@@ -3332,7 +3381,7 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         def print_node_ip_and_gpu_id(self):
             pass
 
-        def prepare_refit_info(self):
+        def prepare_refit_info(self, *, refit_payload_mode):
             return {}
 
     class DummyTrtllmGeneration:
@@ -3344,6 +3393,9 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
 
         def prepare_refit_info(self, _state):
             pass
+
+        def get_refit_payload_mode(self):
+            return "hf_export"
 
     nemo_gym_actor = object()
     spinup_nemo_gym_actor = MagicMock(return_value=nemo_gym_actor)
@@ -3419,8 +3471,6 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
     monkeypatch, mock_grpo_components
 ):
     """The initial refit must start all skip-load endpoints before Gym can finish."""
-    from nemo_rl.algorithms import grpo as grpo_mod
-
     events = []
     gym_started = Event()
     engine_ready = Event()

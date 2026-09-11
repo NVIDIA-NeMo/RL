@@ -38,6 +38,7 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     _STR_TO_DTYPE,
     HFToLocalParamMap,
     LocalParamSpec,
+    RefitBuilderInterface,
     RefitCtx,
     _extract_layer_prefix,
 )
@@ -334,7 +335,7 @@ def _read_mtp_layer_weights_from_checkpoint(
     return weights
 
 
-class VllmInternalWorkerExtension:
+class VllmInternalWorkerExtension(RefitBuilderInterface):
     # Per-PP-stage refit groups, None until init_nccl_reshard_comm_group builds them.
     # Declared rather than sprung into existence so a rebuild can release the previous
     # ones without probing, matching AbstractPolicyWorker.model_update_group. None and
