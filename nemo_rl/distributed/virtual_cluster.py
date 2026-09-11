@@ -13,10 +13,11 @@
 # limitations under the License.
 import logging
 import os
+import random
 import socket
 import sys
 import time
-from typing import NamedTuple, NotRequired, Optional, TypedDict
+from typing import NamedTuple, NotRequired, Optional, Sequence, TypedDict
 
 import ray
 from ray.util.placement_group import (
@@ -26,6 +27,8 @@ from ray.util.placement_group import (
     remove_placement_group,
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+from nemo_rl.utils.venvs import add_hf_modules_cache_to_pythonpath
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -53,6 +56,12 @@ git_root = os.path.abspath(os.path.join(dir_path, "../.."))
 
 
 class PY_EXECUTABLES:
+    """Command each Ray actor launches under, one entry per uv extra combination.
+
+    Every uv command below is rewritten to SYSTEM when NEMO_RL_PY_EXECUTABLES_SYSTEM
+    is set to 1, so callers never apply that check themselves.
+    """
+
     SYSTEM = sys.executable
 
     # Use NeMo-RL direct dependencies.
@@ -73,11 +82,54 @@ class PY_EXECUTABLES:
     # Use NeMo-Gym dependencies
     NEMO_GYM = f"uv run --locked --extra nemo_gym --directory {git_root}"
 
+    # Default env for the vLLM generation workers (see
+    # ray_actor_environment_registry.py). It carries nemo_gym so the worker can
+    # host Gym's token capture (token_capture.enabled) without swapping the
+    # worker's env at runtime: worker venvs are cached by actor class name, so
+    # a venv prebuilt with plain `--extra vllm` would be reused as-is and the
+    # nemo_gym import would fail.
+    VLLM_GYM = f"uv run --locked --extra vllm --extra nemo_gym --directory {git_root}"
+
     # Use NeMo-RL direct dependencies and SGLang.
     SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and TRT-LLM.
     TRTLLM = f"uv run --locked --extra trtllm --directory {git_root}"
+
+    # Use NeMo-RL direct dependencies and ModelOpt.
+    MODELOPT_VLLM = (
+        f"uv run --locked --extra modelopt --extra vllm --directory {git_root}"
+    )
+    MODELOPT_AUTOMODEL = (
+        f"uv run --locked --extra modelopt --extra automodel --directory {git_root}"
+    )
+    MODELOPT_MCORE = (
+        f"uv run --locked --extra modelopt --extra mcore --directory {git_root}"
+    )
+
+    @classmethod
+    def _resolve_system_overrides(cls) -> None:
+        """Rewrite every uv command constant to the system executable when the flag is set."""
+        if os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") != "1":
+            return
+        for name in [n for n in vars(cls) if n.isupper()]:
+            setattr(cls, name, cls.SYSTEM)
+
+
+PY_EXECUTABLES._resolve_system_overrides()
+
+
+def uv_py_executable(extras: Sequence[str]) -> str:
+    """py_executable of a uv-managed venv with the given extras (same shape as PY_EXECUTABLES.*).
+
+    Honors NEMO_RL_PY_EXECUTABLES_SYSTEM the same way the PY_EXECUTABLES constants do.
+    The check has to live here as well: _resolve_system_overrides rewrites the class
+    attributes, but this builds a fresh string, so the rewrite cannot reach it.
+    """
+    if os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1":
+        return PY_EXECUTABLES.SYSTEM
+    extra_flags = "".join(f"--extra {extra} " for extra in extras)
+    return f"uv run --locked {extra_flags}--directory {git_root}"
 
 
 # Default port ranges — kept below the OS ephemeral range.  On some DGX/GB200
@@ -187,14 +239,22 @@ def _bind_socket_in_range(
     port_range_high: int,
     max_retries: int | None = 50,
     excluded_ports: set[int] | None = None,
+    rng: Optional[random.Random] = None,
 ) -> int:
     """Try to bind *sock* to a random port in [port_range_low, port_range_high).
 
     When *max_retries* is ``None``, try every non-excluded port once. Otherwise,
     preserve the existing bounded random-retry behavior.
-    """
-    import random
 
+    Args:
+        rng: Source of candidate ports. Defaults to the ``random`` module. That
+            module's state is process-wide and seeded per run, so every rank of a
+            job draws the same sequence; ranks sharing a node then contend for one
+            port, and whichever binds after the others have closed silently reuses
+            it. Pass a rank-seeded ``random.Random`` to decorrelate them.
+
+    Raises ``RuntimeError`` after *max_retries* failed attempts.
+    """
     excluded = excluded_ports or set()
     if max_retries is None:
         candidates = [
@@ -202,7 +262,10 @@ def _bind_socket_in_range(
             for port in range(port_range_low, port_range_high)
             if port not in excluded
         ]
-        random.shuffle(candidates)
+        if rng is None:
+            random.shuffle(candidates)
+        else:
+            rng.shuffle(candidates)
         for port in candidates:
             try:
                 sock.bind(("", port))
@@ -212,7 +275,10 @@ def _bind_socket_in_range(
         retry_description = f"all {len(candidates)} available ports"
     else:
         for _ in range(max_retries):
-            port = random.randint(port_range_low, port_range_high - 1)
+            if rng is None:
+                port = random.randint(port_range_low, port_range_high - 1)
+            else:
+                port = rng.randint(port_range_low, port_range_high - 1)
             if port in excluded:
                 continue
             try:
@@ -234,7 +300,15 @@ def _get_free_port_local(
     *,
     max_retries: int | None = 50,
     excluded_ports: set[int] | None = None,
+    rng: Optional[random.Random] = None,
 ) -> int:
+    """Find a free port, holding it only long enough to learn its number.
+
+    Args:
+        rng: Source of candidate ports; see :func:`_bind_socket_in_range`. Callers
+            that run on several ranks of one node should pass a rank-seeded
+            generator, or they will all be handed the same port.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         port = _bind_socket_in_range(
             s,
@@ -242,6 +316,7 @@ def _get_free_port_local(
             port_range_high,
             max_retries=max_retries,
             excluded_ports=excluded_ports,
+            rng=rng,
         )
         s.listen(1)
 
@@ -314,7 +389,11 @@ def init_ray(log_dir: Optional[str] = None) -> None:
         if _k.startswith(("PMIX_", "PMI_", "MPI_", "OMPI_", "SLURM_")):
             os.environ.pop(_k, None)
 
-    env_vars = dict(os.environ)
+    # Ray actors deserialize constructor arguments before importing NeMo-RL.
+    # Put Hugging Face's generated ``transformers_modules`` package on the
+    # cluster-wide PYTHONPATH so trust_remote_code objects can be unpickled at
+    # that boundary. This covers both V1 worker groups and direct V2/SC actors.
+    env_vars = add_hf_modules_cache_to_pythonpath(dict(os.environ))
     env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
 
     runtime_env = {

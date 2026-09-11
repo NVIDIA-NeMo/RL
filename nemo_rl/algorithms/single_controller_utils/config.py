@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import math
 import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Annotated, Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional, cast
 
 from pydantic import (
     BaseModel,
@@ -57,7 +58,8 @@ from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
 )
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.experience.rollout_recovery import RecoveryGranularity
+from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.value import ValueConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 
@@ -587,6 +589,184 @@ class AsyncRLConfig(BaseModel, extra="allow"):
         return self
 
 
+class TokenCaptureConfig(BaseModel, extra="allow"):
+    """Ledger-authoritative token capture (token-in/token-out via NeMo-Gym).
+
+    Dormant by default: with ``enabled=False`` every legacy codepath behaves
+    exactly as before — no staging partition is registered, no ledger is
+    installed, and rollouts ride the token-echo path.
+    """
+
+    enabled: bool = False
+    # TQ partition holding per-call staged token deltas (cleared by the
+    # finalizer; distinct from the canonical rollout partition).
+    staging_partition: str = "rollout_staging"
+    # Drop the whole group when fewer than this fraction of its rollouts
+    # produced valid rows (None keeps every group).
+    min_valid_fraction_per_group: Optional[float] = None
+    # Bearer token for Gym's token-capture control routes. None =
+    # minted per run at setup; set explicitly only for multi-controller
+    # setups that must share one ledger.
+    control_auth_token: Optional[str] = None
+    # Hard deadline per control-plane call (S5 finding: control-plane death must
+    # surface as a failed dispatch, not a silent retry stall).
+    control_timeout_s: float = 60.0
+    # Root for Gym's per-rollout capture ledgers and base capture layer. None =
+    # derived at setup
+    # under the run's log dir.
+    capture_dir: Optional[str] = None
+    # Keep routed_experts out of canonical rows and assemble them on policy
+    # workers from strict staged-fragment plans.
+    defer_routed_experts_to_policy: bool = False
+    # Fixed CPU finalizer pool size; actors are never automatically replaced.
+    num_reassembler_workers: PositiveInt = 2
+
+
+@dataclass(frozen=True)
+class TaskSourceRecoveryGranularity:
+    """Recovery granularity selected for a prompt-group reservation.
+
+    ``task_source`` is copied from the raw Gym row when present. ``granularity``
+    is selected from an explicit agent override, a task-source override, or the
+    global default.
+    """
+
+    task_source: Optional[str]
+    granularity: RecoveryGranularity
+
+
+class RolloutRecoveryConfig(BaseModel, extra="allow"):
+    """Retry and restore policy for unfinished token-capture prompt groups.
+
+    ``sibling`` (the default) preserves completed generations and retries only
+    the missing ones. Prefer it when reusing work and avoiding repeated long-tail
+    generations matters more than keeping a group on one policy version.
+
+    ``prompt_group`` discards and regenerates every sibling when any generation
+    is unfinished. It costs a full group per recovery, but keeps the regenerated
+    group on the policy weights live at redispatch instead of mixing those results
+    with older sealed siblings.
+
+    The resolved value is persisted on each ledger group, so restoring a saved
+    group does not reinterpret it using a newer configuration. The same
+    granularity governs failures handled in-process and after a process restart.
+    """
+
+    default_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING
+    # Keyed by ``extra_env_info.task_source``, which is available before Gym
+    # resolves the concrete agent used to execute the row.
+    task_source_granularity_overrides: dict[str, RecoveryGranularity] = Field(
+        default_factory=dict
+    )
+    # Keyed by ``extra_env_info.agent_ref.name`` when the input row already has
+    # a concrete Gym route. A matching agent override wins over task_source.
+    agent_granularity_overrides: dict[str, RecoveryGranularity] = Field(
+        default_factory=dict
+    )
+
+    @model_validator(mode="after")
+    def _reject_removed_override_keys(self) -> "RolloutRecoveryConfig":
+        """Reject the removed task-name map instead of silently ignoring it."""
+        removed = {"task_granularity_overrides"}.intersection(self.model_extra or {})
+        if removed:
+            raise ValueError(
+                f"rollout_recovery fields {sorted(removed)!r} were replaced by "
+                "task_source_granularity_overrides"
+            )
+        return self
+
+    def resolve_for_prompt(
+        self, prompt: Mapping[str, Any]
+    ) -> TaskSourceRecoveryGranularity:
+        """Resolve using matching agent, matching task source, then default."""
+        extra_env_info = prompt.get("extra_env_info")
+        task_source: Optional[str] = None
+        agent_name: Optional[str] = None
+        if isinstance(extra_env_info, Mapping):
+            raw_task_source = extra_env_info.get("task_source")
+            if raw_task_source is not None and not isinstance(raw_task_source, str):
+                raise TypeError("prompt task_source must be a string or None")
+            task_source = raw_task_source
+            agent_ref = extra_env_info.get("agent_ref")
+            if agent_ref is not None and not isinstance(agent_ref, Mapping):
+                raise TypeError("prompt agent_ref must be a mapping or None")
+            if isinstance(agent_ref, Mapping):
+                raw_agent_name = agent_ref.get("name")
+                if raw_agent_name is not None and not isinstance(raw_agent_name, str):
+                    raise TypeError("prompt agent_ref.name must be a string or None")
+                agent_name = raw_agent_name
+        if agent_name is not None:
+            if task_source is None:
+                warnings.warn(
+                    "rollout recovery is using legacy agent_ref because "
+                    "task_source is missing; re-collate the dataset with "
+                    "the current NeMo Gym",
+                    FutureWarning,
+                    stacklevel=2,
+                )
+            override = self.agent_granularity_overrides.get(agent_name)
+            if override is not None:
+                return TaskSourceRecoveryGranularity(task_source, override)
+        if task_source is not None:
+            override = self.task_source_granularity_overrides.get(task_source)
+            if override is not None:
+                return TaskSourceRecoveryGranularity(task_source, override)
+        return TaskSourceRecoveryGranularity(task_source, self.default_granularity)
+
+
+class RolloutCheckpointConfig(BaseModel, extra="forbid"):
+    """Frequent rollout-state snapshots anchored to durable trainer state.
+
+    ``snapshot_attempt_interval_s=None`` disables saving and restoring periodic
+    snapshots. A snapshot taken before the first trainer checkpoint is anchored
+    to the initial model and a rollout-semantic configuration fingerprint. Later
+    snapshots require the durable trainer checkpoint for the controller's
+    current completed step; attempts are skipped until that exact anchor exists.
+
+    ``restore_mode="latest"`` selects the newest compatible periodic snapshot.
+    ``trainer_checkpoint`` ignores newer periodic snapshots and restores the
+    rollout state bundled with the durable trainer checkpoint. Restore
+    selection never deletes checkpoint state. If no trainer checkpoint exists,
+    ``trainer_checkpoint`` rejects an occupied bootstrap namespace; use
+    ``latest`` or a new checkpoint directory instead.
+
+    Bootstrap compatibility is fail-closed: every configuration value affects
+    the fingerprint unless it is on the built-in operational denylist.
+    ``extra_fingerprint_excluded_paths`` lets integrations exclude additional
+    runtime-only dotpaths. ``*`` matches one mapping or list level and ``**``
+    matches any number of levels.
+
+    SingleController has no validation loop, so checkpoint selection must use
+    ``checkpointing.metric_name=None`` or a ``train:<name>`` metric. Inherited
+    ``val:<name>`` settings are rejected during setup. Unknown keys are
+    forbidden because a misspelled interval, retention, or restore option can
+    silently disable the durability behavior the operator intended.
+    """
+
+    snapshot_attempt_interval_s: Annotated[Optional[float], Field(gt=0)] = None
+    keep_latest_k: Annotated[int, Field(ge=1)] = 2
+    restore_mode: Literal["latest", "trainer_checkpoint"] = "latest"
+    extra_fingerprint_excluded_paths: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_extra_fingerprint_excluded_paths(self) -> "RolloutCheckpointConfig":
+        """Reject ambiguous paths that could silently fail to exclude a value."""
+        invalid = [
+            path
+            for path in self.extra_fingerprint_excluded_paths
+            if not path
+            or path != path.strip()
+            or any(not segment for segment in path.split("."))
+            or path in {"*", "**"}
+        ]
+        if invalid:
+            raise ValueError(
+                "extra_fingerprint_excluded_paths must contain non-empty dotpaths "
+                f"and cannot exclude the whole config, got {invalid!r}"
+            )
+        return self
+
+
 class MasterConfig(BaseModel, extra="allow"):
     # algo configs
     grpo: Optional[GRPOConfig] = None
@@ -604,7 +784,14 @@ class MasterConfig(BaseModel, extra="allow"):
     reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig
+    rollout_recovery: RolloutRecoveryConfig = Field(
+        default_factory=RolloutRecoveryConfig
+    )
+    rollout_checkpointing: RolloutCheckpointConfig = Field(
+        default_factory=RolloutCheckpointConfig
+    )
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
+    token_capture: TokenCaptureConfig = Field(default_factory=TokenCaptureConfig)
 
     @model_validator(mode="after")
     def validate_algorithm_block(self) -> "MasterConfig":
@@ -659,6 +846,110 @@ def validate_sampler_buffer_capacity(
             f"the {sampler_name} sampler's required capacity "
             f"({required_capacity}); the rollout pump would deadlock waiting for "
             f"buffer slots."
+        )
+
+
+def _validate_opd_full_config(
+    master_config: MasterConfig, opd_config: OnPolicyDistillationConfig
+) -> None:
+    """Validate the full-vocabulary MOPD block against the rest of the run.
+
+    Args:
+        master_config: Full SingleController config, already known to have OPD on.
+        opd_config: The resolved ``on_policy_distillation`` block.
+
+    Raises:
+        ValueError: If ``opd_full`` is enabled with an unsupported backend, an
+            incompatible logprob path, a fused packing path that never reaches
+            the opd_full branch, more than one teacher checkpoint, a student
+            pipeline-parallel size the teacher LM-head load cannot support, or a
+            sampling temperature the hidden-state payload cannot honor.
+    """
+    full_cfg = opd_module.get_opd_full_config(master_config)
+    if full_cfg is None:
+        return
+
+    policy_config = master_config.policy
+    if not policy_config.get("megatron_cfg", {}).get("enabled", False):
+        raise ValueError(
+            "on_policy_distillation.full requires the Megatron backend: the "
+            "teacher payload and the distributed reverse-KL kernels both run on "
+            "the vocabulary-parallel logit path."
+        )
+    # Narrowed by the check above: megatron_cfg.enabled true means this is a
+    # MegatronConfig, so its parallelism fields can be read directly.
+    megatron_cfg = cast(MegatronConfig, policy_config["megatron_cfg"])
+    if megatron_cfg.get("use_fused_linear_logprobs", False):
+        raise ValueError(
+            "on_policy_distillation.full is incompatible with "
+            "megatron_cfg.use_fused_linear_logprobs: the fused forward bypasses "
+            "output_layer, so the teacher hidden-state hook never fires and the "
+            "student never exposes full-vocabulary logits."
+        )
+
+    sequence_packing_config = policy_config.get("sequence_packing", {})
+    if sequence_packing_config.get("enabled", False) and sequence_packing_config.get(
+        "fuse_loss", False
+    ):
+        raise ValueError(
+            "on_policy_distillation.full is incompatible with "
+            "policy.sequence_packing.fuse_loss: the fused packing path routes "
+            "through prepare_packed_loss_input, which only supports "
+            "LossInputType.LOGPROB and never reaches the opd_full branch. "
+            "Without this check the run fails inside the first training forward, "
+            "after the whole cluster and every teacher have already come up. "
+            "Set sequence_packing.fuse_loss=false."
+        )
+
+    unique_teacher_checkpoints = sorted(
+        set(opd_config.teacher_model_by_agent_name.values())
+    )
+    if len(unique_teacher_checkpoints) != 1:
+        raise ValueError(
+            "on_policy_distillation.full currently supports exactly one unique "
+            f"teacher checkpoint, got {len(unique_teacher_checkpoints)}: "
+            f"{unique_teacher_checkpoints}. Multi-teacher full-vocabulary "
+            "distillation needs one LM head and one payload column per teacher."
+        )
+
+    if (
+        full_cfg.teacher_payload == "hidden_states"
+        and megatron_cfg["pipeline_model_parallel_size"] > 1
+    ):
+        raise ValueError(
+            "on_policy_distillation.full.teacher_payload='hidden_states' does not "
+            "support policy.megatron_cfg.pipeline_model_parallel_size > 1 yet. "
+            "Megatron builds output_layer only on the last pipeline stage, but resolving "
+            "the teacher checkpoint iteration goes through Megatron-Bridge's "
+            "read_train_state, whose broadcast_object_list spans the whole student "
+            "world, so earlier stages would fail while the last stage hangs in that "
+            "broadcast. Use pipeline_model_parallel_size=1, or "
+            "teacher_payload='logits', which needs no teacher LM head."
+        )
+
+    generation_config = policy_config.get("generation")
+    temperature = 1.0 if generation_config is None else generation_config["temperature"]
+    if full_cfg.teacher_payload == "hidden_states" and temperature != 1.0:
+        raise ValueError(
+            "on_policy_distillation.full.teacher_payload='hidden_states' does not "
+            f"support policy.generation.temperature != 1.0 (got {temperature}). "
+            "Temperature scaling divides the training logits in place, but the "
+            "capture hook reads output_layer's input, which is upstream of that "
+            "division -- so the student would be scaled while the teacher logits "
+            "reconstructed from its hidden states would not, silently optimizing a "
+            "mismatched objective. Use teacher_payload='logits', where both sides "
+            "come from the same scaled tensor."
+        )
+
+    if full_cfg.teacher_payload == "logits":
+        # The logits payload is vocab_size wide, so a production-scale run would
+        # move tens of GB per teacher batch. Advisory, not an error: a small
+        # vocabulary or a short-sequence cross-check is a legitimate use.
+        print(
+            "  ! on_policy_distillation.full.teacher_payload='logits' transports "
+            "the full vocabulary per token. This is a numerical-reference path; "
+            "prefer 'hidden_states' for production runs.",
+            flush=True,
         )
 
 
@@ -811,15 +1102,23 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "shaping. Disable them."
         )
 
-    if master_config.policy["generation"]["colocated"]["enabled"]:
-        raise ValueError(
-            "The SingleController path requires "
-            "policy.generation.colocated.enabled=false: SC drives rollout via "
-            "RolloutManager.generate_and_push, which is only supported on the "
-            "disaggregated async engine."
-        )
-
     async_config = master_config.async_rl
+    generation_config = master_config.policy["generation"]
+    if generation_config["colocated"]["enabled"]:
+        if generation_config["backend"] != "megatron":
+            raise ValueError(
+                "The SingleController path requires policy.generation.colocated.enabled=false "
+                f"for the {generation_config['backend']!r} backend: SC drives rollout via "
+                "RolloutManager.generate_and_push, which is only supported on the disaggregated "
+                "async engine. Colocated generation is supported only with backend='megatron'."
+            )
+        if async_config.min_groups_for_streaming_train != algo_cfg.num_prompts_per_step:
+            raise ValueError(
+                "colocated megatron generation requires async_rl.min_groups_for_streaming_train "
+                f"({async_config.min_groups_for_streaming_train}) == "
+                f"num_prompts_per_step ({algo_cfg.num_prompts_per_step})."
+            )
+
     # Capacity is sized from the peak window whatever the algorithm, so an inert
     # setting still costs buffer and fails setup naming the wrong cause.
     if (
@@ -979,6 +1278,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     required_capacity = required_buffer_capacity_for_config(
         async_config.sampler,
         algo_cfg.num_prompts_per_step,
+        min_groups_for_streaming_train=async_config.min_groups_for_streaming_train,
     )
     validate_sampler_buffer_capacity(
         async_config,
@@ -1012,6 +1312,57 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "SingleController path: it has no validation loop yet, so only "
             "'train:<name>' metrics are collected. Use 'train:<name>' (e.g. "
             "'train:loss') or set checkpointing.metric_name=null."
+        )
+
+    token_capture_config = master_config.token_capture
+    recovery_config = master_config.rollout_recovery
+    if not token_capture_config.enabled and (
+        recovery_config.default_granularity is not RecoveryGranularity.SIBLING
+        or recovery_config.task_source_granularity_overrides
+        or recovery_config.agent_granularity_overrides
+    ):
+        raise ValueError(
+            "non-default rollout_recovery policies require "
+            "token_capture.enabled=true; without token capture, unfinished Gym "
+            "siblings have no durable receipts to recover"
+        )
+    if token_capture_config.defer_routed_experts_to_policy and not (
+        token_capture_config.enabled
+    ):
+        raise ValueError(
+            "token_capture.defer_routed_experts_to_policy requires "
+            "token_capture.enabled=true"
+        )
+    if (
+        token_capture_config.enabled
+        and token_capture_config.num_reassembler_workers
+        > async_config.max_buffered_rollouts
+    ):
+        warnings.warn(
+            "token_capture.num_reassembler_workers exceeds "
+            "async_rl.max_buffered_rollouts; excess finalizer actors cannot be busy",
+            stacklevel=2,
+        )
+    if token_capture_config.enabled and reward_penalties_enabled:
+        warnings.warn(
+            "reward_penalties are enabled but token-capture receipt rollouts "
+            "carry no generated tokens/text at rollout time, so the penalty "
+            "checks are skipped and capture-path rewards stay unpenalized "
+            "(penalty-rate metrics will read 0). Disable the reward_penalties "
+            "flags to make this explicit, or run without token capture to "
+            "train with penalized rewards.",
+            stacklevel=2,
+        )
+    if (
+        token_capture_config.enabled
+        and async_config.rollout_failure.max_skipped_prompts
+    ):
+        warnings.warn(
+            "async_rl.rollout_failure.max_skipped_prompts does nothing with "
+            "token_capture.enabled=true: the capture dispatch path re-raises a "
+            "deterministic failure instead of skipping the prompt, so the run "
+            "ends on the first prompt that exhausts max_data_attempts.",
+            stacklevel=2,
         )
 
     # A non-zero reference-policy KL penalty makes the loss read
@@ -1066,6 +1417,21 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         algo_cfg.invalid_tool_call_advantage is not None
         or algo_cfg.malformed_thinking_advantage is not None
     )
+    if penalties_enabled and token_capture_config.enabled:
+        # TODO(token-capture): thread the per-message violation flags through
+        # capture receipts/staging so RolloutReassembler can emit
+        # invalid_tool_call_mask/malformed_thinking_mask; then drop this guard.
+        # Checked before the gym-path validation: the conflict exists
+        # regardless of how the rollout path is configured.
+        raise NotImplementedError(
+            "invalid_tool_call_advantage/malformed_thinking_advantage require "
+            "the invalid_tool_call_mask/malformed_thinking_mask train-batch "
+            "columns, which the token-capture finalizer does not emit — the "
+            "first streamed group would crash the train pump with a KeyError "
+            "at the advantage stage. Set grpo.invalid_tool_call_advantage=null "
+            "and grpo.malformed_thinking_advantage=null to run with token "
+            "capture; mask support on the capture path is a follow-up."
+        )
     if penalties_enabled and not should_use_nemo_gym(master_config):
         raise ValueError(
             "invalid_tool_call_advantage and malformed_thinking_advantage on the "
@@ -1108,6 +1474,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "at least one teacher mapping."
             )
         opd_module.assert_prev_logprobs_available(master_config)
+        _validate_opd_full_config(master_config, opd_config)
 
     if (
         reference_policy_kl_penalty == 0

@@ -83,6 +83,32 @@ def _patch_sglang_safe_unpickler() -> None:
     logger.info("Patched SafeUnpickler allowlist in %s.", file_to_patch)
 
 
+def _patch_sglang_transformers_compat_bootstrap() -> None:
+    """Load NeMo RL's temporary Transformers patch in every SGLang process."""
+    file_to_patch = _get_sglang_file("srt/utils/hf_transformers_patches.py")
+
+    with open(file_to_patch, "r") as f:
+        content = f.read()
+
+    sentinel = (
+        "    import nemo_rl  # noqa: F401  # Install temporary Transformers patch.\n"
+    )
+    if sentinel in content:
+        return
+
+    anchor = "\n    _applied = True\n"
+    if anchor not in content:
+        raise RuntimeError(
+            f"Transformers patch bootstrap anchor '{anchor.strip()}' not found in "
+            f"{file_to_patch}."
+        )
+
+    patched_content = content.replace(anchor, f"{anchor}\n{sentinel}", 1)
+    compile(patched_content, file_to_patch, "exec")
+    _write_and_verify(file_to_patch, patched_content, sentinel)
+    logger.info("Patched Transformers compatibility bootstrap in %s.", file_to_patch)
+
+
 def _override_sglang_imbalance_check_env() -> None:
     """Force-disable sglang's per-GPU memory imbalance check.
 
@@ -172,6 +198,8 @@ def _patch_megatron_training_hook_mode() -> None:
 
 
 def _apply_sglang_compat_patches() -> None:
+    # Remove with nemo_rl.transformers_compat once Transformers >= 5.13 is required.
+    _patch_sglang_transformers_compat_bootstrap()
     _patch_sglang_safe_unpickler()
     _override_sglang_imbalance_check_env()
     _patch_megatron_dynamic_context_hook_mode()
