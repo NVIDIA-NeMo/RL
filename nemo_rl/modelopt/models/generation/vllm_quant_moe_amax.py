@@ -66,6 +66,7 @@ def route_moe_input_quantizer_amax(
     weights: Iterable[tuple[str, torch.Tensor]],
     *,
     reduce_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = torch.max,
+    mapper: Any | None = None,
 ) -> list[tuple[str, torch.Tensor]]:
     """Fan per-expert ``input_quantizer._amax`` values into the fused quantizers.
 
@@ -73,6 +74,15 @@ def route_moe_input_quantizer_amax(
     the caller can hand them to vLLM's own loader unchanged. Names that end
     with the amax suffix but do not belong to an expert module (dense layers,
     attention quantizers) pass through untouched.
+
+    ``mapper`` is the model's ``hf_to_vllm_mapper`` (a vLLM ``WeightsMapper``),
+    when it has one. Refit sends checkpoint names and vLLM's ``layer_name`` /
+    expert mapping use vLLM names; ``load_weights`` applies the mapper before
+    its own matching, so the same rename has to happen here or e.g. Nemotron-H's
+    ``backbone.layers.N.mixer.experts.*`` never matches the module's
+    ``model.layers.N.mixer.experts`` prefix and falls through to the loader
+    that cannot resolve it. Names the mapper drops (returns ``None``) are
+    passed through untouched.
 
     Raises:
         KeyError: an expert amax name matched an expert module's mapping but
@@ -96,19 +106,27 @@ def route_moe_input_quantizer_amax(
         if not name.endswith(INPUT_QUANTIZER_AMAX_SUFFIX):
             remaining.append((name, tensor))
             continue
+        # Match on the vLLM-side name, exactly as AutoWeightsLoader will.
+        vllm_name = mapper._map_name(name) if mapper is not None else name
+        if vllm_name is None:
+            remaining.append((name, tensor))
+            continue
         handled = False
         for prefix, module, pairs in routes:
-            if not name.startswith(prefix):
+            if not vllm_name.startswith(prefix):
                 continue
             for param_name, weight_name in pairs:
-                if weight_name not in name:
+                if weight_name not in vllm_name:
                     continue
-                target_path = name.replace(weight_name, param_name).removeprefix(prefix)
+                target_path = vllm_name.replace(weight_name, param_name).removeprefix(
+                    prefix
+                )
                 buf = _resolve_dotted(module, target_path)
                 if not isinstance(buf, torch.Tensor):
                     raise KeyError(
                         f"Expert module {module.layer_name!r} has no quantizer "
-                        f"buffer {target_path!r} for incoming amax {name!r}"
+                        f"buffer {target_path!r} for incoming amax {name!r} "
+                        f"(vLLM name {vllm_name!r})"
                     )
                 with torch.no_grad():
                     buf.copy_(reduce_fn(buf, tensor.to(buf.device, buf.dtype)))
