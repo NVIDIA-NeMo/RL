@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from nemo_rl.models.policy import PolicyConfig
 
 # TE MXFP8 grouped MoE inference (Megatron-LM PR #6933) and batch-invariant follow-ups.
-MEGATRON_CORE_MIN_COMMIT_SHA = "4e603390dfd64a599d1c23989209892c2326c122"
+MEGATRON_CORE_MIN_COMMIT_SHA = "c5dedf8424c63123d8ef7966ad165f6c6e528255"
 
 TRANSFORMER_ENGINE_MIN_VERSION = Version("2.18")
 FLASH_ATTN_MIN_VERSION = Version("2.8.1")

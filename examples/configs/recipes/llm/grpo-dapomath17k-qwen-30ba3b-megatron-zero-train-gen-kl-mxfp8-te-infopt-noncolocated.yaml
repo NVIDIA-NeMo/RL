@@ -1,0 +1,57 @@
+# Qwen3-30B-A3B DAPO 8K — non-colocated inference_optimized + native TE MXFP8 MoE
+# (Megatron-LM PR #6933: inference_grouped_gemm_backend=te).
+#
+# Layout: 2 nodes × 4 GPUs (train node + dedicated inference node).
+# Requires: GB200 (SM10+), TE 2.18+, local Megatron-LM te-mxfp8 branch.
+#
+# te_precision_config_file: MXFP8 compute on MoE fc1/fc2 only; QKV/proj + rest BF16.
+# fp8_param=true: required for inference_optimized + mxfp8 on gen (MCore __post_init__).
+defaults: grpo-dapomath17k-qwen-30ba3b-megatron-zero-train-gen-kl-mxfp8.yaml
+
+policy:
+  megatron_cfg:
+    zero_train_gen_mismatch: true
+    moe_permute_fusion: false
+    expert_model_parallel_size: 4
+    # Train-only: TE 2.17+ GroupedLinear grouped-tensor path (group_quantize +
+    # general_grouped_gemm_for_grouped_tensor), matching what gen's mcore_fused_moe
+    # calls. Gen uses mcore_fused_moe directly and ignores this.
+    env_vars:
+      NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM: "1"
+    te_precision_config_file: /lustre/fsw/portfolios/coreai/users/yigongq/post-training/RL/examples/configs/te_precision/qwen30ba3b-moe-only-mxfp8.yaml
+    fp8_cfg:
+      enabled: true
+      fp8: hybrid
+      fp8_recipe: mxfp8
+      fp8_param: true
+
+  generation:
+    backend: megatron
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: ${cluster.gpus_per_node}
+        num_nodes: 1
+    mcore_generation_config:
+      # te_precision_config_file is inherited from megatron_cfg above; do not clear it.
+      transformer_impl: "inference_optimized"
+      moe_router_dtype: fp32
+      logprobs_mode: raw_logprobs
+      enable_chunked_prefill: false
+      cuda_graph_impl: "local"
+      inference_cuda_graph_scope: "block"
+      inference_moe_token_dispatcher_type: "nvls"
+      inference_grouped_gemm_backend: "te"
+      moe_pad_experts_for_cuda_graph_inference: false
+      buffer_size_gb: 20
+      num_cuda_graphs: 4
+      block_size_tokens: 256
+      use_cuda_graphs_for_non_decode_steps: false  # decode-only CGs (~4–6 graphs); prefill runs eager
+      kv_cache_management_mode: "persist"
+      materialize_only_last_token_logits: true
+      num_speculative_tokens: 0
+      refit_backend: "nccl"
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 2

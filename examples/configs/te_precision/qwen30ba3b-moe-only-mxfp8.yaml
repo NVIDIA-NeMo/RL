@@ -1,0 +1,57 @@
+# Per-module TE precision for Qwen3-30B-A3B: MXFP8 experts, BF16 everywhere else.
+#
+# MXFP8 only on routed-expert GroupedLinear (linear_fc1 / linear_fc2). Everything else
+# (QKV, proj, embeddings, output, layernorms' adjacent linears) stays BF16 even when
+# policy.megatron_cfg.fp8_cfg.enabled=true.
+#
+# Matcher order matters: first match wins. Put BF16 dense matchers before MoE MXFP8.
+#
+# Apply this on BOTH train and generation. Dense modules stay BF16 on both sides;
+# experts use mxfp8 compute with BF16 primary weights (fp8_cfg.fp8_param=false).
+# Set fp8_param in these recipe blocks only when fp8_cfg.fp8_param=true.
+
+configs:
+  bf16:
+    transformer_engine_config_type: TEQuantizationParams
+    training_recipe:
+      override_quantized_autocast: true
+    evaluation_recipe: {}
+  mxfp8_moe:
+    transformer_engine_config_type: TEQuantizationParams
+    training_recipe:
+      fp8_quantization_recipe: mxfp8
+      fp8_format: hybrid
+      override_quantized_autocast: true
+    # Model construction picks evaluation_recipe whenever grad is disabled, so it has
+    # to repeat the training precision; an empty block would mean BF16.
+    evaluation_recipe:
+      fp8_quantization_recipe: mxfp8
+      fp8_format: hybrid
+      override_quantized_autocast: true
+
+matchers:
+  qkv:
+    config: bf16
+    type: glob
+    pattern: "*linear_qkv*"
+    enabled: true
+  proj:
+    config: bf16
+    type: glob
+    pattern: "*linear_proj*"
+    enabled: true
+  moe_fc1:
+    config: mxfp8_moe
+    type: glob
+    pattern: "*experts*linear_fc1*"
+    enabled: true
+  moe_fc2:
+    config: mxfp8_moe
+    type: glob
+    pattern: "*experts*linear_fc2*"
+    enabled: true
+  default_bf16:
+    config: bf16
+    type: glob
+    pattern: "*"
+    enabled: true
