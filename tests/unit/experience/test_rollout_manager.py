@@ -1704,9 +1704,17 @@ class _FakeCaptureBuffer(_FakeBuffer):
 
 
 def _receipt_record(
-    rollout_ids, receipts, instance_configs=None, *, loss_multiplier=1.0
+    rollout_ids,
+    receipts,
+    instance_configs=None,
+    *,
+    logical_rollout_ids=None,
+    attempt_indices=None,
+    loss_multiplier=1.0,
 ):
     instance_configs = instance_configs or [None] * len(rollout_ids)
+    logical_rollout_ids = logical_rollout_ids or rollout_ids
+    attempt_indices = attempt_indices or [0] * len(rollout_ids)
     completions = [
         Completion(
             message_log=[],
@@ -1715,12 +1723,25 @@ def _receipt_record(
                 "ng_receipt": receipt,
                 "ng_rollout_id": rid,
                 "_ng_resolved_agent_ref": {"name": "test-agent"},
+                "_ng_completion_receipt": {
+                    "rollout_id": logical_rollout_id,
+                    "attempt_index": attempt_index,
+                    "execution_generation": attempt_index + 1,
+                    "result_identity": (f"result-{logical_rollout_id}-{attempt_index}"),
+                    "result_digest": f"{attempt_index + 1:064x}",
+                },
                 **({"instance_config": cfg} if cfg is not None else {}),
             },
             truncated=False,
             reward=0.5,
         )
-        for rid, receipt, cfg in zip(rollout_ids, receipts, instance_configs)
+        for rid, logical_rollout_id, attempt_index, receipt, cfg in zip(
+            rollout_ids,
+            logical_rollout_ids,
+            attempt_indices,
+            receipts,
+            instance_configs,
+        )
     ]
     return PromptGroupRecord(
         prompt_idx=0,
@@ -1811,6 +1832,8 @@ def _make_capture_manager(
                 selected_ids,
                 receipts,
                 instance_configs=selected_configs,
+                logical_rollout_ids=[rollout_ids[index] for index in indices],
+                attempt_indices=[attempt_indices[index] for index in indices],
                 loss_multiplier=float(_sample.get("loss_multiplier", 1.0)),
             )
             if on_completion is not None:
@@ -1840,7 +1863,9 @@ class TestGenerateForFinalizationFlow:
     def test_mints_ids_and_returns_metadata_request(self):
         buf = _FakeCaptureBuffer()
         mgr = _make_capture_manager(buf)
-        pending_acknowledgement_history: list[list[tuple[str, int, str]]] = []
+        pending_acknowledgement_history: list[
+            list[tuple[str, int, str, int, str, str]]
+        ] = []
 
         request = _run(
             mgr.generate_for_finalization(
@@ -1874,10 +1899,33 @@ class TestGenerateForFinalizationFlow:
         assert request.loss_multiplier == 0.25
         assert request.fallback_weight_version == 7
         assert pending_acknowledgement_history == [
-            [(canonical_ids[0], 0, "test-agent")],
             [
-                (canonical_ids[0], 0, "test-agent"),
-                (canonical_ids[1], 0, "test-agent"),
+                (
+                    canonical_ids[0],
+                    0,
+                    "test-agent",
+                    1,
+                    f"result-{canonical_ids[0]}-0",
+                    "1" * 64,
+                )
+            ],
+            [
+                (
+                    canonical_ids[0],
+                    0,
+                    "test-agent",
+                    1,
+                    f"result-{canonical_ids[0]}-0",
+                    "1" * 64,
+                ),
+                (
+                    canonical_ids[1],
+                    0,
+                    "test-agent",
+                    1,
+                    f"result-{canonical_ids[1]}-0",
+                    "1" * 64,
+                ),
             ],
         ]
         # Finalization and commit are exclusively owned by the controller's
@@ -1925,7 +1973,12 @@ class TestGenerateForFinalizationFlow:
                     "rollout_id": rollout_id,
                     "manifest": [{"staging_key": f"{rollout_id}/call"}],
                 }
-                completion = _receipt_record([rollout_id], [receipt]).completions[0]
+                completion = _receipt_record(
+                    [rollout_id],
+                    [receipt],
+                    logical_rollout_ids=[rollout_ids[generation_index]],
+                    attempt_indices=[attempt_index],
+                ).completions[0]
                 assert completion.env_extras is not None
                 completion.env_extras["_ng_resolved_agent_ref"] = {"name": "test-agent"}
                 await on_completion(generation_index, completion)
@@ -2049,7 +2102,12 @@ class TestGenerateForFinalizationFlow:
                         "rollout_id": rollout_id,
                         "manifest": [{"staging_key": f"{rollout_id}/call"}],
                     }
-                    completion = _receipt_record([rollout_id], [receipt]).completions[0]
+                    completion = _receipt_record(
+                        [rollout_id],
+                        [receipt],
+                        logical_rollout_ids=[rollout_ids[generation_index]],
+                        attempt_indices=[attempt_index],
+                    ).completions[0]
                     assert completion.env_extras is not None
                     completion.env_extras["_ng_resolved_agent_ref"] = {
                         "name": "test-agent"
@@ -2069,7 +2127,9 @@ class TestGenerateForFinalizationFlow:
 
         impl = _PartialCaptureImpl()
         mgr._impl = impl
-        pending_acknowledgement_history: list[list[tuple[str, int, str]]] = []
+        pending_acknowledgement_history: list[
+            list[tuple[str, int, str, int, str, str]]
+        ] = []
 
         request = _run(
             mgr.generate_for_finalization(
@@ -2096,8 +2156,22 @@ class TestGenerateForFinalizationFlow:
         assert request.rollout_ids == (second_ids[0], second_ids[1])
         assert pending_acknowledgement_history == [
             [
-                (f"{request.group_id}_g0", 1, "test-agent"),
-                (f"{request.group_id}_g1", 1, "test-agent"),
+                (
+                    f"{request.group_id}_g0",
+                    1,
+                    "test-agent",
+                    2,
+                    f"result-{request.group_id}_g0-1",
+                    "2" * 64,
+                ),
+                (
+                    f"{request.group_id}_g1",
+                    1,
+                    "test-agent",
+                    2,
+                    f"result-{request.group_id}_g1-1",
+                    "2" * 64,
+                ),
             ]
         ]
 

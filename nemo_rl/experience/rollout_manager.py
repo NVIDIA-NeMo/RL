@@ -41,6 +41,7 @@ from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.environments.gym_checkpoint import GymCompletionReceipt
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.failures import (
     FailureClass,
@@ -93,6 +94,7 @@ TokenizerType = PreTrainedTokenizerBase
 RolloutCompletionCallback = Callable[[int, Completion], Awaitable[None]]
 GymAcknowledgementsReadyCallback = Callable[[], None]
 _NG_RESOLVED_AGENT_REF_KEY = "_ng_resolved_agent_ref"
+_NG_COMPLETION_RECEIPT_KEY = "_ng_completion_receipt"
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
@@ -1337,6 +1339,10 @@ class AsyncNemoGymRolloutImpl:
                 env_extras = dict(result["full_result"])
                 env_extras["ng_receipt"] = result["receipt"]
                 env_extras["ng_rollout_id"] = result["rollout_id"]
+                if "gym_completion_receipt" in result:
+                    env_extras[_NG_COMPLETION_RECEIPT_KEY] = result[
+                        "gym_completion_receipt"
+                    ]
                 completions.append(
                     Completion(
                         message_log=result["message_log"],
@@ -2209,6 +2215,17 @@ class RolloutManager:
                     "token-capture completion resolved agent_ref.name must be a "
                     "non-empty string"
                 )
+            raw_completion_receipt = env_extras.get(_NG_COMPLETION_RECEIPT_KEY)
+            completion_receipt = (
+                GymCompletionReceipt.model_validate(raw_completion_receipt)
+                if raw_completion_receipt is not None
+                else None
+            )
+            if on_gym_acknowledgements_ready is not None and completion_receipt is None:
+                raise ValueError(
+                    "checkpointable Gym completion must contain its exact "
+                    "completion receipt"
+                )
 
             if recovery_group.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
                 result = SiblingSealResult(
@@ -2217,6 +2234,7 @@ class RolloutManager:
                     reward=completion.reward,
                     mask_sample=mask_sample,
                     resolved_agent_name=resolved_agent_name,
+                    completion_receipt=completion_receipt,
                 )
                 previous = pending_group_results.get(generation_index)
                 if previous is not None:
@@ -2253,6 +2271,7 @@ class RolloutManager:
                     generation_index=generation_index,
                     gate_rollout_id=gate_rollout_id,
                     receipt=receipt,
+                    completion_receipt=completion_receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
                     resolved_agent_name=resolved_agent_name,

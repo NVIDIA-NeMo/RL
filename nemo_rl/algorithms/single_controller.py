@@ -1636,13 +1636,23 @@ class SingleControllerActor:
                 return 0
             payload = [
                 GymCompletedExecution(
-                    execution={
+                    receipt={
                         "rollout_id": rollout_id,
                         "attempt_index": attempt_index,
+                        "execution_generation": execution_generation,
+                        "result_identity": result_identity,
+                        "result_digest": result_digest,
                     },
                     agent_name=agent_name,
                 ).model_dump(mode="json")
-                for rollout_id, attempt_index, agent_name in pending
+                for (
+                    rollout_id,
+                    attempt_index,
+                    agent_name,
+                    execution_generation,
+                    result_identity,
+                    result_digest,
+                ) in pending
             ]
             await self._nemo_gym_checkpoint_actor().acknowledge_completed_executions.remote(
                 payload

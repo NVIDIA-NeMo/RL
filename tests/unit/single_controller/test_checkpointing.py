@@ -1325,6 +1325,9 @@ class TestPeriodicRolloutCheckpoint:
                     "rollout_id": "group-7_g0",
                     "attempt_index": 0,
                     "agent_name": "test-agent",
+                    "execution_generation": 1,
+                    "result_identity": "result-group-7_g0-0",
+                    "result_digest": "1" * 64,
                 }
             ],
         }
@@ -1385,7 +1388,16 @@ class TestPeriodicRolloutCheckpoint:
                 acknowledge_completed_executions=_AsyncRemoteMethod(acknowledge)
             )
         }
-        pending = [("group-7_g0", 0, "test-agent")]
+        pending = [
+            (
+                "group-7_g0",
+                0,
+                "test-agent",
+                1,
+                "result-group-7_g0-0",
+                "1" * 64,
+            )
+        ]
         state = {
             "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
             "groups": [],
@@ -1394,6 +1406,9 @@ class TestPeriodicRolloutCheckpoint:
                     "rollout_id": pending[0][0],
                     "attempt_index": pending[0][1],
                     "agent_name": pending[0][2],
+                    "execution_generation": pending[0][3],
+                    "result_identity": pending[0][4],
+                    "result_digest": pending[0][5],
                 }
             ],
         }

@@ -32,13 +32,13 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Optional, Self, TypeAlias
 
-from nemo_rl.environments.gym_checkpoint import gym_capture_key
+from nemo_rl.environments.gym_checkpoint import GymCompletionReceipt, gym_capture_key
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 5
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 6
 _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {ROLLOUT_RECOVERY_SCHEMA_VERSION}
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
@@ -82,13 +82,21 @@ _ATTEMPT_STATE_FIELDS = frozenset(
         "attempt_uuid",
         "status",
         "receipt",
+        "completion_receipt",
         "reward",
         "mask_sample",
         "staging_keys",
     }
 )
 _COMPLETED_EXECUTION_ACKNOWLEDGEMENT_FIELDS = frozenset(
-    {"rollout_id", "attempt_index", "agent_name"}
+    {
+        "rollout_id",
+        "attempt_index",
+        "agent_name",
+        "execution_generation",
+        "result_identity",
+        "result_digest",
+    }
 )
 
 
@@ -191,6 +199,7 @@ class RolloutAttemptRecord:
     attempt_uuid: uuid.UUID
     status: RolloutAttemptStatus
     receipt: Optional[dict[str, Any]] = None
+    completion_receipt: Optional[dict[str, Any]] = None
     reward: Optional[float] = None
     mask_sample: Optional[bool] = None
     staging_keys: list[str] = field(default_factory=list)
@@ -307,6 +316,7 @@ class SiblingSealResult:
     reward: float
     mask_sample: bool
     resolved_agent_name: str
+    completion_receipt: Optional[GymCompletionReceipt] = None
 
 
 @dataclass(frozen=True)
@@ -316,6 +326,9 @@ class PendingCompletedExecutionAcknowledgement:
     rollout_id: str
     attempt_index: int
     agent_name: str
+    execution_generation: int
+    result_identity: str
+    result_digest: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.rollout_id, str) or not self.rollout_id:
@@ -328,15 +341,29 @@ class PendingCompletedExecutionAcknowledgement:
             raise ValueError("acknowledgement attempt_index must be non-negative")
         if not isinstance(self.agent_name, str) or not self.agent_name:
             raise ValueError("acknowledgement agent_name must not be empty")
+        GymCompletionReceipt(
+            rollout_id=self.rollout_id,
+            attempt_index=self.attempt_index,
+            execution_generation=self.execution_generation,
+            result_identity=self.result_identity,
+            result_digest=self.result_digest,
+        )
 
     @property
     def identity(self) -> tuple[str, int]:
         """Return the stable Gym execution identity used for deduplication."""
         return (self.rollout_id, self.attempt_index)
 
-    def as_tuple(self) -> tuple[str, int, str]:
+    def as_tuple(self) -> tuple[str, int, str, int, str, str]:
         """Return the transport-neutral representation used by the controller."""
-        return (self.rollout_id, self.attempt_index, self.agent_name)
+        return (
+            self.rollout_id,
+            self.attempt_index,
+            self.agent_name,
+            self.execution_generation,
+            self.result_identity,
+            self.result_digest,
+        )
 
 
 def _new_attempt(attempt_index: int) -> RolloutAttemptRecord:
@@ -641,6 +668,7 @@ class RolloutRecoveryLedger:
         generation_index: int,
         gate_rollout_id: str,
         receipt: Optional[dict[str, Any]],
+        completion_receipt: Optional[GymCompletionReceipt] = None,
         reward: float,
         mask_sample: bool,
         resolved_agent_name: str,
@@ -667,9 +695,25 @@ class RolloutRecoveryLedger:
                 "receipt rollout identity mismatch: "
                 f"receipt={receipt.get('rollout_id')!r}, expected={gate_rollout_id!r}"
             )
+        logical_rollout_id = record.logical_rollout_id(generation_index)
+        if completion_receipt is not None and (
+            completion_receipt.rollout_id != logical_rollout_id
+            or completion_receipt.attempt_index != attempt.attempt_index
+        ):
+            raise ValueError(
+                "Gym completion receipt identity mismatch: "
+                f"receipt={(completion_receipt.rollout_id, completion_receipt.attempt_index)!r}, "
+                f"expected={(logical_rollout_id, attempt.attempt_index)!r}"
+            )
         if attempt.status == RolloutAttemptStatus.SEALED:
             if (
                 attempt.receipt == receipt
+                and attempt.completion_receipt
+                == (
+                    completion_receipt.model_dump(mode="json")
+                    if completion_receipt is not None
+                    else None
+                )
                 and attempt.reward == float(reward)
                 and attempt.mask_sample is mask_sample
                 and attempt.staging_keys == staging_keys
@@ -687,6 +731,11 @@ class RolloutRecoveryLedger:
             )
 
         attempt.receipt = copy.deepcopy(receipt)
+        attempt.completion_receipt = (
+            completion_receipt.model_dump(mode="json")
+            if completion_receipt is not None
+            else None
+        )
         attempt.reward = float(reward)
         attempt.mask_sample = mask_sample
         attempt.staging_keys = staging_keys
@@ -759,6 +808,16 @@ class RolloutRecoveryLedger:
                     f"receipt={result.receipt.get('rollout_id')!r}, "
                     f"expected={expected_gate_rollout_id!r}"
                 )
+            logical_rollout_id = record.logical_rollout_id(generation_index)
+            if result.completion_receipt is not None and (
+                result.completion_receipt.rollout_id != logical_rollout_id
+                or result.completion_receipt.attempt_index != attempt.attempt_index
+            ):
+                raise ValueError(
+                    "Gym completion receipt identity mismatch: "
+                    f"receipt={(result.completion_receipt.rollout_id, result.completion_receipt.attempt_index)!r}, "
+                    f"expected={(logical_rollout_id, attempt.attempt_index)!r}"
+                )
             if not isinstance(result.mask_sample, bool):
                 raise TypeError("mask_sample must be a bool")
             validated.append((attempt, result, _receipt_staging_keys(result.receipt)))
@@ -767,6 +826,11 @@ class RolloutRecoveryLedger:
         # therefore observes either no committed siblings or the complete group.
         for attempt, result, staging_keys in validated:
             attempt.receipt = copy.deepcopy(result.receipt)
+            attempt.completion_receipt = (
+                result.completion_receipt.model_dump(mode="json")
+                if result.completion_receipt is not None
+                else None
+            )
             attempt.reward = float(result.reward)
             attempt.mask_sample = result.mask_sample
             attempt.staging_keys = staging_keys
@@ -866,7 +930,7 @@ class RolloutRecoveryLedger:
     def completed_execution_acknowledgements(
         self,
         group_id: str,
-    ) -> list[tuple[str, int, str]]:
+    ) -> list[tuple[str, int, str, int, str, str]]:
         """Return every sealed Gym execution identity for one finalizable group."""
         record = self._require_group(group_id)
         if record.status not in {
@@ -889,7 +953,7 @@ class RolloutRecoveryLedger:
         cut: DataPlaneMutationCut,
         group_id: str,
         generation_index: int,
-    ) -> tuple[str, int, str]:
+    ) -> tuple[str, int, str, int, str, str]:
         """Persist one sibling-scoped ACK obligation alongside its seal."""
         cut.require_live()
         record = self._require_group(group_id)
@@ -906,7 +970,7 @@ class RolloutRecoveryLedger:
         self,
         cut: DataPlaneMutationCut,
         group_id: str,
-    ) -> list[tuple[str, int, str]]:
+    ) -> list[tuple[str, int, str, int, str, str]]:
         """Persist every prompt-group-scoped ACK after its atomic seal."""
         cut.require_live()
         record = self._require_group(group_id)
@@ -916,21 +980,15 @@ class RolloutRecoveryLedger:
                 "granularity"
             )
         acknowledgements = [
-            PendingCompletedExecutionAcknowledgement(
-                rollout_id=rollout_id,
-                attempt_index=attempt_index,
-                agent_name=agent_name,
-            )
-            for rollout_id, attempt_index, agent_name in (
-                self.completed_execution_acknowledgements(group_id)
-            )
+            self._acknowledgement_for_sibling(record, sibling)
+            for sibling in record.siblings
         ]
         self._record_completed_execution_acknowledgements(acknowledgements)
         return [acknowledgement.as_tuple() for acknowledgement in acknowledgements]
 
     def pending_completed_execution_acknowledgements(
         self,
-    ) -> list[tuple[str, int, str]]:
+    ) -> list[tuple[str, int, str, int, str, str]]:
         """Return a stable copy of Gym ACK obligations not confirmed remotely."""
         return [
             acknowledgement.as_tuple()
@@ -947,16 +1005,26 @@ class RolloutRecoveryLedger:
     def mark_completed_executions_acknowledged(
         self,
         cut: DataPlaneMutationCut,
-        acknowledgements: list[tuple[str, int, str]],
+        acknowledgements: list[tuple[str, int, str, int, str, str]],
     ) -> None:
         """Remove only ACK obligations confirmed by Gym's idempotent endpoint."""
         cut.require_live()
         seen: set[tuple[str, int]] = set()
-        for rollout_id, attempt_index, agent_name in acknowledgements:
+        for (
+            rollout_id,
+            attempt_index,
+            agent_name,
+            execution_generation,
+            result_identity,
+            result_digest,
+        ) in acknowledgements:
             acknowledgement = PendingCompletedExecutionAcknowledgement(
                 rollout_id=rollout_id,
                 attempt_index=attempt_index,
                 agent_name=agent_name,
+                execution_generation=execution_generation,
+                result_identity=result_identity,
+                result_digest=result_digest,
             )
             if acknowledgement.identity in seen:
                 raise ValueError("completed execution acknowledgements must be unique")
@@ -992,10 +1060,22 @@ class RolloutRecoveryLedger:
                 "cannot acknowledge unsealed logical rollout "
                 f"{record.logical_rollout_id(sibling.generation_index)!r}"
             )
+        if attempt.completion_receipt is None:
+            raise RuntimeError(
+                "cannot acknowledge a sealed Gym execution without its exact "
+                f"completion receipt: rollout={record.logical_rollout_id(sibling.generation_index)!r}, "
+                f"attempt_index={attempt.attempt_index}"
+            )
+        completion_receipt = GymCompletionReceipt.model_validate(
+            attempt.completion_receipt
+        )
         return PendingCompletedExecutionAcknowledgement(
             rollout_id=record.logical_rollout_id(sibling.generation_index),
             attempt_index=attempt.attempt_index,
             agent_name=record.resolved_agent_name,
+            execution_generation=completion_receipt.execution_generation,
+            result_identity=completion_receipt.result_identity,
+            result_digest=completion_receipt.result_digest,
         )
 
     def _record_completed_execution_acknowledgements(
@@ -1127,6 +1207,9 @@ class RolloutRecoveryLedger:
                                     "attempt_uuid": attempt.attempt_uuid.bytes,
                                     "status": attempt.status.value,
                                     "receipt": copy.deepcopy(attempt.receipt),
+                                    "completion_receipt": copy.deepcopy(
+                                        attempt.completion_receipt
+                                    ),
                                     "reward": attempt.reward,
                                     "mask_sample": attempt.mask_sample,
                                     "staging_keys": list(attempt.staging_keys),
@@ -1146,6 +1229,9 @@ class RolloutRecoveryLedger:
                     "rollout_id": acknowledgement.rollout_id,
                     "attempt_index": acknowledgement.attempt_index,
                     "agent_name": acknowledgement.agent_name,
+                    "execution_generation": acknowledgement.execution_generation,
+                    "result_identity": acknowledgement.result_identity,
+                    "result_digest": acknowledgement.result_digest,
                 }
                 for acknowledgement in sorted(
                     self._pending_completed_execution_acknowledgements.values(),
@@ -1204,6 +1290,9 @@ class RolloutRecoveryLedger:
             rollout_id = raw_acknowledgement.get("rollout_id")
             attempt_index = raw_acknowledgement.get("attempt_index")
             agent_name = raw_acknowledgement.get("agent_name")
+            execution_generation = raw_acknowledgement.get("execution_generation")
+            result_identity = raw_acknowledgement.get("result_identity")
+            result_digest = raw_acknowledgement.get("result_digest")
             if not isinstance(rollout_id, str) or not rollout_id:
                 raise ValueError("acknowledgement rollout_id must not be empty")
             if (
@@ -1218,6 +1307,9 @@ class RolloutRecoveryLedger:
                 rollout_id=rollout_id,
                 attempt_index=attempt_index,
                 agent_name=agent_name,
+                execution_generation=execution_generation,
+                result_identity=result_identity,
+                result_digest=result_digest,
             )
             if (
                 acknowledgement.identity
@@ -1391,6 +1483,7 @@ class RolloutRecoveryLedger:
                         f"invalid rollout attempt status={raw_attempt_status!r}"
                     ) from error
                 receipt = attempt_state.get("receipt")
+                completion_receipt = attempt_state.get("completion_receipt")
                 reward = attempt_state.get("reward")
                 mask_sample = attempt_state.get("mask_sample")
                 staging_keys = attempt_state.get("staging_keys")
@@ -1419,8 +1512,20 @@ class RolloutRecoveryLedger:
                         raise ValueError(
                             "sealed attempt receipt must be a mapping or None"
                         )
+                    if completion_receipt is not None:
+                        validated_completion = GymCompletionReceipt.model_validate(
+                            completion_receipt
+                        )
+                        if (
+                            validated_completion.rollout_id != logical_id
+                            or validated_completion.attempt_index != attempt_index
+                        ):
+                            raise ValueError(
+                                "sealed Gym completion receipt identity mismatch"
+                            )
                 elif (
                     receipt is not None
+                    or completion_receipt is not None
                     or reward is not None
                     or mask_sample is not None
                     or staging_keys
@@ -1432,6 +1537,7 @@ class RolloutRecoveryLedger:
                         attempt_uuid=attempt_uuid,
                         status=attempt_status,
                         receipt=copy.deepcopy(receipt),
+                        completion_receipt=copy.deepcopy(completion_receipt),
                         reward=float(reward) if reward is not None else None,
                         mask_sample=mask_sample,
                         staging_keys=list(staging_keys),

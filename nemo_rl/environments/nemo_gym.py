@@ -52,10 +52,12 @@ from nemo_rl.environments.gym_checkpoint import (
     GYM_MODEL_CHECKPOINT_PREFIX,
     GYM_RESOURCES_CHECKPOINT_PREFIX,
     GymAgentCheckpointDirectoryRequest,
+    GymActorExecutionRegistry,
     GymAgentCommitResponse,
     GymAgentPrepareResponse,
     GymAgentRestoreResponse,
     GymAgentResumeResponse,
+    GymAgentStatusResponse,
     GymCheckpointArtifactReference,
     GymCheckpointCommitResult,
     GymCheckpointControlRequest,
@@ -64,6 +66,7 @@ from nemo_rl.environments.gym_checkpoint import (
     GymCheckpointResumeResult,
     GymCheckpointRestoreResult,
     GymCheckpointTopology,
+    GymCompletionReceipt,
     GymCompletedExecution,
     GymCompletedExecutionAcknowledgementRequest,
     GymCompletedExecutionAcknowledgementResponse,
@@ -448,6 +451,8 @@ class NemoGym(EnvironmentInterface):
         self._control_timeout_s = 60.0
         self._gym_checkpoint_participants: tuple[GymDiscoveredParticipant, ...] = ()
         self._gym_checkpoint_topology: Optional[GymCheckpointTopology] = None
+        self._active_gym_checkpoint_id: Optional[str] = None
+        self._gym_execution_registry = GymActorExecutionRegistry()
         self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
@@ -846,6 +851,39 @@ Depending on your data shape, you may want to change these values."""
             )
         return participant
 
+    async def _completion_receipt_for(
+        self,
+        execution: GymExecutionIdentity,
+        *,
+        agent_name: str,
+    ) -> GymCompletionReceipt:
+        """Fetch the exact Gym-issued receipt before publishing a completion."""
+        discovered = self._agent_checkpoint_participant(agent_name)
+        status = GymAgentStatusResponse.model_validate(
+            await self._control(
+                "GET",
+                f"{GYM_AGENT_CHECKPOINT_PREFIX}/status",
+                server_name=discovered.participant.server_name,
+                params={
+                    "checkpoint_id": self._active_gym_checkpoint_id or "actor-delivery"
+                },
+            )
+        )
+        matches = [
+            item.completion_receipt
+            for item in status.completed_unacknowledged_attempts
+            if item.rollout_id == execution.rollout_id
+            and item.attempt_index == execution.attempt_index
+            and item.completion_receipt is not None
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "expected exactly one Gym completion receipt for "
+                f"rollout={execution.rollout_id!r}, "
+                f"attempt_index={execution.attempt_index}; found={len(matches)}"
+            )
+        return matches[0]
+
     async def acknowledge_completed_executions(
         self,
         executions: list[dict[str, Any]],
@@ -859,22 +897,22 @@ Depending on your data shape, you may want to change these values."""
         keys = [
             (
                 item.agent_name,
-                item.execution.rollout_id,
-                item.execution.attempt_index,
+                item.receipt.rollout_id,
+                item.receipt.attempt_index,
             )
             for item in validated
         ]
         if len(keys) != len(set(keys)):
             raise ValueError("completed Gym execution acknowledgements must be unique")
 
-        by_agent: dict[str, list[GymExecutionIdentity]] = {}
+        by_agent: dict[str, list[GymCompletionReceipt]] = {}
         for item in validated:
-            by_agent.setdefault(item.agent_name, []).append(item.execution)
+            by_agent.setdefault(item.agent_name, []).append(item.receipt)
 
         acknowledged: list[GymCompletedExecution] = []
-        for agent_name, identities in sorted(by_agent.items()):
+        for agent_name, receipts in sorted(by_agent.items()):
             discovered = self._agent_checkpoint_participant(agent_name)
-            request = GymCompletedExecutionAcknowledgementRequest(executions=identities)
+            request = GymCompletedExecutionAcknowledgementRequest(executions=receipts)
             response = GymCompletedExecutionAcknowledgementResponse.model_validate(
                 await self._control(
                     "POST",
@@ -884,22 +922,26 @@ Depending on your data shape, you may want to change these values."""
                 )
             )
             requested_keys = {
-                (identity.rollout_id, identity.attempt_index) for identity in identities
+                (receipt.rollout_id, receipt.attempt_index) for receipt in receipts
             }
-            response_keys = {
-                (identity.rollout_id, identity.attempt_index)
-                for identity in response.acknowledged
+            requested_receipts = {
+                (receipt.rollout_id, receipt.attempt_index): receipt
+                for receipt in receipts
             }
-            if response_keys != requested_keys:
+            response_receipts = {
+                (receipt.rollout_id, receipt.attempt_index): receipt
+                for receipt in response.acknowledged
+            }
+            if response_receipts != requested_receipts:
                 raise RuntimeError(
                     "Gym completed-result acknowledgement did not cover the "
                     f"requested executions for agent {agent_name!r}: "
                     f"requested={sorted(requested_keys)!r}, "
-                    f"acknowledged={sorted(response_keys)!r}"
+                    f"acknowledged={sorted(response_receipts)!r}"
                 )
             acknowledged.extend(
-                GymCompletedExecution(execution=identity, agent_name=agent_name)
-                for identity in response.acknowledged
+                GymCompletedExecution(receipt=receipt, agent_name=agent_name)
+                for receipt in response.acknowledged
             )
         return {"acknowledged": [item.model_dump(mode="json") for item in acknowledged]}
 
@@ -955,6 +997,12 @@ Depending on your data shape, you may want to change these values."""
         policy server is observed through its status route until the common
         deadline. No incomplete cut is returned to a checkpoint coordinator.
         """
+        if self._active_gym_checkpoint_id not in (None, checkpoint_id):
+            raise RuntimeError(
+                f"Gym checkpoint {self._active_gym_checkpoint_id!r} is already active"
+            )
+        self._gym_execution_registry.freeze(checkpoint_id)
+        self._active_gym_checkpoint_id = checkpoint_id
         request = GymCheckpointControlRequest(
             checkpoint_id=checkpoint_id,
             deadline_ts=deadline_ts,
@@ -1064,13 +1112,16 @@ Depending on your data shape, you may want to change these values."""
                     "Gym checkpoint prepare failed and participant resume also failed",
                     [prepare_error, abort_error],
                 ) from prepare_error
+            self._gym_execution_registry.unfreeze(checkpoint_id)
             if time.time() >= deadline_ts and not isinstance(
                 prepare_error, asyncio.CancelledError
             ):
+                self._active_gym_checkpoint_id = None
                 raise TimeoutError(
                     f"Gym checkpoint {checkpoint_id!r} exceeded its prepare deadline; "
                     "participants were resumed and the previous checkpoint remains valid"
                 ) from prepare_error
+            self._active_gym_checkpoint_id = None
             raise
 
         return GymCheckpointPrepareResult(
@@ -1291,6 +1342,12 @@ Depending on your data shape, you may want to change these values."""
         source_checkpoint_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Restore every stateful participant but leave admission paused."""
+        if self._active_gym_checkpoint_id not in (None, checkpoint_id):
+            raise RuntimeError(
+                f"Gym checkpoint {self._active_gym_checkpoint_id!r} is already active"
+            )
+        self._gym_execution_registry.freeze(checkpoint_id)
+        self._active_gym_checkpoint_id = checkpoint_id
         common_request = GymCheckpointDirectoryRequest(
             checkpoint_id=checkpoint_id,
             deadline_ts=deadline_ts,
@@ -1397,6 +1454,8 @@ Depending on your data shape, you may want to change these values."""
             deadline_ts,
             self._checkpoint_participants(),
         )
+        self._gym_execution_registry.unfreeze(checkpoint_id)
+        self._active_gym_checkpoint_id = None
         return GymCheckpointResumeResult(
             checkpoint_id=checkpoint_id,
             participants=results,
@@ -1540,6 +1599,21 @@ Depending on your data shape, you may want to change these values."""
                     stable_execution_identity_enabled=False,
                 )
 
+        registered_executions: list[GymExecutionIdentity] = []
+        if self._gym_checkpoint_participants:
+            try:
+                for row in nemo_gym_examples:
+                    execution = GymExecutionIdentity(
+                        rollout_id=row[_NG_ROLLOUT_ID_BODY_KEY],
+                        attempt_index=row[_NG_ATTEMPT_INDEX_BODY_KEY],
+                    )
+                    self._gym_execution_registry.register(execution)
+                    registered_executions.append(execution)
+            except (KeyError, TypeError, ValueError, RuntimeError):
+                for execution in registered_executions:
+                    self._gym_execution_registry.release(execution)
+                raise
+
         # Normalize local media before shipping requests to vLLM. Helper is a no-op
         # for text-only rows and already-qualified URLs.
         # Megatron's HTTP backend consumes the same normalized Responses payload.
@@ -1560,6 +1634,8 @@ Depending on your data shape, you may want to change these values."""
                 try:
                     nemo_gym_row, nemo_gym_result = await task
                 except Exception as error:
+                    for execution in registered_executions:
+                        self._gym_execution_registry.release(execution)
                     if hasattr(error, "response_content"):
                         print(
                             "EXCEPTION RESULT",
@@ -1573,6 +1649,14 @@ Depending on your data shape, you may want to change these values."""
                         # the whole point. The status and message are already in `detail`.
                         raise typed from None
                     raise
+
+            execution: GymExecutionIdentity | None = None
+            if self._gym_checkpoint_participants:
+                execution = GymExecutionIdentity(
+                    rollout_id=nemo_gym_row[_NG_ROLLOUT_ID_BODY_KEY],
+                    attempt_index=nemo_gym_row[_NG_ATTEMPT_INDEX_BODY_KEY],
+                )
+                self._gym_execution_registry.mark_terminal(execution)
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
                 if self._token_capture_enabled:
@@ -1592,6 +1676,15 @@ Depending on your data shape, you may want to change these values."""
                     )
                     if _has_nan_generation_logprobs(nemo_rl_result):
                         raise RuntimeError("Generation logprobs contain NaN")
+                if self._gym_checkpoint_participants:
+                    assert execution is not None
+                    completion_receipt = await self._completion_receipt_for(
+                        execution,
+                        agent_name=nemo_gym_row["agent_ref"]["name"],
+                    )
+                    nemo_rl_result["gym_completion_receipt"] = (
+                        completion_receipt.model_dump(mode="json")
+                    )
             num_results += 1
             timing_metrics = None
             if num_results == len(nemo_gym_examples):
@@ -1623,12 +1716,16 @@ Depending on your data shape, you may want to change these values."""
             # task_source is resolved to agent_ref inside this Ray actor, after
             # the caller's row was serialized. Return the resolved ref explicitly
             # so the caller can hydrate its own row copy before postprocessing.
-            yield (
-                nemo_gym_row["_rowidx"],
-                nemo_gym_row["agent_ref"],
-                nemo_rl_result,
-                timing_metrics,
-            )
+            try:
+                yield (
+                    nemo_gym_row["_rowidx"],
+                    nemo_gym_row["agent_ref"],
+                    nemo_rl_result,
+                    timing_metrics,
+                )
+            finally:
+                if execution is not None:
+                    self._gym_execution_registry.release(execution)
 
     async def _postprocess_receipt_mode(
         self, nemo_gym_row: dict, nemo_gym_result: dict
