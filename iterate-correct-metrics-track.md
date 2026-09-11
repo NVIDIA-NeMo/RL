@@ -51,3 +51,37 @@ mirror-column payload. `comm_volume_mb` unchanged (24.42 vs 24.58 MB) and the
 arithmetic is 98 kB against 24 MB = 0.4%. Retracted in `b3fc916db`.
 
 **Verdict:** iterate — verification open, waiting on job 711125.
+
+## Round 2
+
+**Trial:** same-node interleaved A/B, `off/on/off/on`, 20 steps each, job 711125
+on `nvl72d054-T18`, at PR head `b3fc916db` (so `wall_s` is the max reduction).
+
+| run | step_s | sd | wall_s | ovh_ms | accounted | rows_checked |
+|---|---|---|---|---|---|---|
+| off | 14.27 | 4.00 | 0.182 | 3.3 | 186 ms | — |
+| off2 | 13.62 | 3.97 | 0.177 | 3.4 | 181 ms | — |
+| on | 14.26 | 2.84 | 0.249 | 117.2 | 366 ms | 2560 |
+| on2 | 13.34 | 2.83 | 0.245 | 114.3 | 359 ms | 2560 |
+
+- noise floor: off vs off2 = 0.645 s; on vs on2 = 0.926 s
+- guard effect on step time: **-0.147 s** (guard-on *faster*, inside the floor)
+- guard accounted cost: **+0.179 s** (wall +67 ms, self +112 ms)
+
+**Verification: passes.** Hypothesis (1) step-time variance is confirmed — the
+earlier 1.67 s was two different nodes against a 0.6-0.9 s floor and a 3-4 s
+sd. Hypothesis (2) counters under-reporting is **not supported**: the accounted
+180 ms is the whole measurable effect, and nothing appears in step time that
+the instrument fails to bill.
+
+**Defect review: passes.** The one finding from round 1 was my own misreading
+(wall and self are disjoint, so the guard's cost is their sum ~180 ms, not
+self alone); no code defect. Fixed in the docs, `db60af637`.
+
+**Decisions:** no new checks surfaced. Simplification stays out of scope
+(investigation). Superseded: every earlier cost figure in this doc and in the
+README — 10.2 ms, 119 ms, 416 ms, 1.7 s. The number is ~180 ms/step accounted,
+unmeasurable end to end.
+
+**Verdict:** done — both selected checks clean against the latest change, the
+set stabilised, and the conclusion rests on a run performed this round.
