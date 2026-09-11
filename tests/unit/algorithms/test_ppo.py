@@ -1570,6 +1570,8 @@ def _run_noncolocated_setup(monkeypatch, config):
     value_model = MagicMock()
     generation = MagicMock()
     generation.get_refit_payload_mode.return_value = "hf_export"
+
+    generation.prepare_refit_info.return_value = None
     generation.init_collective.return_value = ["generation-future"]
     policy_factory = MagicMock(return_value=policy)
     value_factory = MagicMock(return_value=value_model)

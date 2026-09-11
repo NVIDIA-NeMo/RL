@@ -77,6 +77,7 @@ basic_vllm_test_config: VllmConfig = {
     "stop_strings": None,
     "vllm_cfg": {
         "precision": "bfloat16",
+        "refit_cache_loader_routes": False,
         "tensor_parallel_size": 1,
         "pipeline_parallel_size": 1,
         "expert_parallel_size": 1,
@@ -258,6 +259,15 @@ def test_generation_config_allows_vllm_worker_extension() -> None:
     configured = configure_generation_config(config, MagicMock())
 
     assert configured["worker_extension_cls_fqn"] == extension_fqn
+
+
+@pytest.mark.vllm
+def test_prepare_refit_info_skips_missing_metadata():
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.worker_group = MagicMock()
+
+    assert generation.prepare_refit_info(None) is None
+    generation.worker_group.run_all_workers_single_data.assert_not_called()
 
 
 def test_context_capped_max_new_tokens():
