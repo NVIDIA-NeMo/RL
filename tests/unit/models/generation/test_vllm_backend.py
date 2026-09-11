@@ -2132,3 +2132,166 @@ def test_maybe_process_mtp_drafter_after_loading_noop_when_disk_loaded(monkeypat
     ext._maybe_process_mtp_drafter_after_loading()
 
     process_weights.assert_not_called()
+
+
+class _FakeHfToVllmMapper:
+    """Stands in for vLLM's WeightsMapper: only `_map_name` is consulted."""
+
+    def __init__(self, renames: dict[str, str | None]) -> None:
+        self._renames = renames
+
+    def _map_name(self, key: str) -> str | None:
+        return self._renames.get(key, key)
+
+
+def test_drop_tied_embedding_aliases_removes_only_aliases_without_mapper():
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        _drop_tied_embedding_aliases,
+    )
+
+    weights = [
+        ("model.embed_tokens.weight", "embed"),
+        ("lm_head.weight", "head"),
+        ("model.layers.0.mlp.up_proj.weight", "mlp"),
+    ]
+    kept = list(
+        _drop_tied_embedding_aliases(
+            weights, {"lm_head.weight": "model.embed_tokens.weight"}, mapper=None
+        )
+    )
+    assert kept == [weights[0], weights[2]]
+
+
+def test_drop_tied_embedding_aliases_matches_on_vllm_names_via_mapper():
+    """Gemma-style models alias `language_model.lm_head.weight` in vLLM names."""
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        _drop_tied_embedding_aliases,
+    )
+
+    mapper = _FakeHfToVllmMapper(
+        {
+            "lm_head.weight": "language_model.lm_head.weight",
+            "unused.weight": None,  # a mapper may drop a weight entirely
+        }
+    )
+    weights = [
+        ("lm_head.weight", "head"),
+        ("unused.weight", "x"),
+        ("model.embed_tokens.weight", "embed"),
+    ]
+    kept = list(
+        _drop_tied_embedding_aliases(
+            weights,
+            {
+                "language_model.lm_head.weight": "language_model.model.embed_tokens.weight"
+            },
+            mapper,
+        )
+    )
+    assert [name for name, _ in kept] == ["unused.weight", "model.embed_tokens.weight"]
+
+
+def test_drop_tied_embedding_aliases_is_passthrough_without_aliases():
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        _drop_tied_embedding_aliases,
+    )
+
+    weights = [("lm_head.weight", "head")]
+    assert list(_drop_tied_embedding_aliases(weights, {}, mapper=None)) == weights
+
+
+def test_load_weights_drops_tied_lm_head_before_vllm_load(monkeypatch):
+    """The alias never reaches load_weights; the MTP drafter still sees it."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    loaded = []
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=SimpleNamespace(load_weights=lambda *, weights: loaded.extend(weights)),
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(architectures=["Qwen2ForCausalLM"])
+        ),
+    )
+    ext._load_draft_weights = MagicMock()
+    ext._maybe_refit_mtp_drafter = MagicMock()
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
+    monkeypatch.setattr(
+        vllm_backend,
+        "_tied_embedding_aliases",
+        lambda model: {"lm_head.weight": "model.embed_tokens.weight"},
+    )
+    weights = [
+        ("model.layers.0.mlp.up_proj.weight", "mlp"),
+        ("lm_head.weight", "head"),
+    ]
+
+    ext._load_weights(weights)
+
+    assert [key for key, _ in loaded] == ["model.layers.0.mlp.up_proj.weight"]
+    ext._maybe_refit_mtp_drafter.assert_called_once_with(weights)
+
+
+def test_load_weights_keeps_everything_when_vllm_reports_no_aliases(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    loaded = []
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=SimpleNamespace(load_weights=lambda *, weights: loaded.extend(weights)),
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(architectures=["Qwen2ForCausalLM"])
+        ),
+    )
+    ext._load_draft_weights = MagicMock()
+    ext._maybe_refit_mtp_drafter = MagicMock()
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
+    monkeypatch.setattr(vllm_backend, "_tied_embedding_aliases", lambda model: {})
+    weights = [("lm_head.weight", "head"), ("model.embed_tokens.weight", "embed")]
+
+    ext._load_weights(weights)
+
+    assert loaded == weights
+
+
+def test_prepare_reload_weight_iterator_drops_tied_aliases(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=SimpleNamespace(),
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(architectures=["Qwen2ForCausalLM"])
+        ),
+    )
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
+    monkeypatch.setattr(
+        vllm_backend,
+        "_tied_embedding_aliases",
+        lambda model: {"lm_head.weight": "model.embed_tokens.weight"},
+    )
+    weights = iter([("lm_head.weight", "head"), ("model.norm.weight", "norm")])
+
+    kept = list(ext._prepare_reload_weight_iterator(weights))
+
+    assert kept == [("model.norm.weight", "norm")]
+
+
+@pytest.mark.vllm
+def test_vllm_exposes_the_tied_embedding_detector_the_refit_filter_relies_on():
+    """If upstream renames it, `_tied_embedding_aliases` silently returns {} and
+    tied-embedding refits regress to the 0.29 alias assertion."""
+    from vllm.model_executor.models.utils import (  # noqa: F401
+        AutoWeightsLoader,
+        _get_tied_embedding_params,
+    )
+
+    assert hasattr(AutoWeightsLoader, "_check_skipped_aliases")
