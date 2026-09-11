@@ -13,10 +13,18 @@
 # limitations under the License.
 
 
+import re
+from collections.abc import Callable, Iterable, Iterator
+
 import torch
 
 MXFP8_BLOCK_SIZE = 32
 MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
+
+_EXPERT_WEIGHT_PATTERN = re.compile(
+    r"^(?P<prefix>.+\.experts)\.(?P<expert_id>\d+)\."
+    r"(?P<projection>gate_proj|up_proj|down_proj)\.weight$"
+)
 
 
 def _mxfp8_e4m3_quantize_torch(
@@ -93,6 +101,220 @@ def mxfp8_e4m3_quantize_for_refit(
     # pyrefly: ignore  # no-matching-overload
     x_scales = x_scales.masked_fill(x_scales == 0, 1)
     return x_q, x_scales
+
+
+def iter_mxfp8_prequantized_params(
+    params: Iterable[tuple[str, torch.Tensor]],
+    selected_names: set[str],
+    *,
+    quantize_fn: Callable[
+        [torch.Tensor], tuple[torch.Tensor, torch.Tensor]
+    ] = mxfp8_e4m3_quantize_for_refit,
+    scratch_cache: dict[tuple[torch.device, torch.dtype, int | None], torch.Tensor]
+    | None = None,
+    max_experts_per_batch: int = 16,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Batch expert weights while preserving the existing refit wire entries.
+
+    Selected MoE experts with matching layer, projection, shape, dtype, and
+    device are quantized together in bounded chunks. Other selected weights use
+    the existing per-tensor path, and unselected weights pass through unchanged.
+
+    Args:
+        params: Exported Hugging Face parameter names and tensors.
+        selected_names: Parameter names selected for MXFP8 prequantization.
+        quantize_fn: MXFP8 quantization function.
+        scratch_cache: Reusable stacking buffers keyed by device, dtype, and
+            CUDA stream. When omitted, reuse is limited to this export pass so
+            the stacking storage is released before training resumes.
+        max_experts_per_batch: Maximum number of experts per quantization call.
+
+    Yields:
+        Weight and scale entries accepted by the vLLM refit receiver.
+    """
+    if max_experts_per_batch <= 0:
+        raise ValueError("max_experts_per_batch must be positive")
+    if scratch_cache is None:
+        scratch_cache = {}
+
+    pending: list[tuple[int, str, str, torch.Tensor, torch.cuda.Stream | None]] = []
+    pending_expert_ids: set[int] = set()
+    current_prefix: str | None = None
+
+    def yield_on_current_stream(
+        entries: Iterable[tuple[str, torch.Tensor]],
+        producer_stream: torch.cuda.Stream | None,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        for output_name, output_tensor in entries:
+            if producer_stream is not None:
+                consumer_stream = torch.cuda.current_stream(output_tensor.device)
+                if consumer_stream != producer_stream:
+                    consumer_stream.wait_stream(producer_stream)
+                output_tensor.record_stream(consumer_stream)
+            yield output_name, output_tensor
+
+    def quantize_one_result(
+        name: str,
+        tensor: torch.Tensor,
+        source_stream: torch.cuda.Stream | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.cuda.Stream | None]:
+        if tensor.dtype == torch.float8_e4m3fn:
+            raise ValueError(
+                "MXFP8 prequantization requires BF16 trainer-exported weights; "
+                f"{name} is already stored as E4M3."
+            )
+        producer_stream = (
+            torch.cuda.current_stream(tensor.device) if tensor.is_cuda else None
+        )
+        if (
+            producer_stream is not None
+            and source_stream is not None
+            and source_stream != producer_stream
+        ):
+            producer_stream.wait_stream(source_stream)
+            tensor.record_stream(producer_stream)
+        value, scale = quantize_fn(tensor)
+        return value, scale, producer_stream
+
+    def quantize_one(
+        name: str,
+        tensor: torch.Tensor,
+        source_stream: torch.cuda.Stream | None = None,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        value, scale, producer_stream = quantize_one_result(name, tensor, source_stream)
+        yield from yield_on_current_stream(
+            ((name, value), (name + "_scale_from_checkpoint", scale)),
+            producer_stream,
+        )
+
+    def flush_pending() -> Iterator[tuple[str, torch.Tensor]]:
+        if not pending:
+            return
+
+        results: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.cuda.Stream | None]
+        ] = {}
+        projection_groups: dict[str, list[int]] = {}
+        for index, (_expert_id, projection, _name, _tensor, _stream) in enumerate(
+            pending
+        ):
+            projection_groups.setdefault(projection, []).append(index)
+
+        for indices in projection_groups.values():
+            for chunk_start in range(0, len(indices), max_experts_per_batch):
+                chunk_indices = indices[
+                    chunk_start : chunk_start + max_experts_per_batch
+                ]
+                chunk = [pending[index] for index in chunk_indices]
+                tensors = [tensor for _id, _proj, _name, tensor, _stream in chunk]
+                batchable = len(chunk) > 1 and len({item[0] for item in chunk}) == len(
+                    chunk
+                )
+                if batchable:
+                    first = tensors[0]
+                    batchable = all(
+                        tensor.shape == first.shape
+                        and tensor.dtype == first.dtype
+                        and tensor.device == first.device
+                        and tensor.layout is torch.strided
+                        for tensor in tensors
+                    )
+                if not batchable:
+                    for index, (_id, _proj, name, tensor, source_stream) in zip(
+                        chunk_indices, chunk
+                    ):
+                        results[index] = quantize_one_result(
+                            name, tensor, source_stream
+                        )
+                    continue
+
+                first = tensors[0]
+                if first.dtype == torch.float8_e4m3fn:
+                    raise ValueError(
+                        "MXFP8 prequantization requires BF16 trainer-exported weights."
+                    )
+                required_numel = len(chunk) * first.numel()
+                stack_stream = (
+                    torch.cuda.current_stream(first.device) if first.is_cuda else None
+                )
+                if stack_stream is not None:
+                    for tensor, (_id, _proj, _name, _tensor, source_stream) in zip(
+                        tensors, chunk
+                    ):
+                        if source_stream is not None and source_stream != stack_stream:
+                            stack_stream.wait_stream(source_stream)
+                        tensor.record_stream(stack_stream)
+                # Stream objects must outlive this export pass; their raw CUDA
+                # handles form part of the scratch-storage identity.
+                stream_id = (
+                    int(stack_stream.cuda_stream) if stack_stream is not None else None
+                )
+                cache_key = (first.device, first.dtype, stream_id)
+                scratch = scratch_cache.get(cache_key)
+                if scratch is None or scratch.numel() < required_numel:
+                    scratch = torch.empty(
+                        required_numel,
+                        dtype=first.dtype,
+                        device=first.device,
+                    )
+                    scratch_cache[cache_key] = scratch
+                stacked = scratch[:required_numel].view(len(chunk), *first.shape)
+                with torch.no_grad():
+                    torch.stack(tensors, dim=0, out=stacked)
+
+                value, scale = quantize_fn(stacked.view(-1, stacked.shape[-1]))
+                value = value.view_as(stacked)
+                scale_columns = first.shape[-1] // MXFP8_BLOCK_SIZE
+                scale_shape = (*first.shape[:-1], scale_columns)
+                scale = scale.view(len(chunk), *scale_shape)
+                for offset, index in enumerate(chunk_indices):
+                    # These views avoid per-expert copies. Refit consumers must
+                    # copy them before advancing past the current export batch.
+                    results[index] = value[offset], scale[offset], stack_stream
+
+        for index, (_id, _proj, name, _tensor, _stream) in enumerate(pending):
+            value, scale, producer_stream = results[index]
+            yield from yield_on_current_stream(
+                ((name, value), (name + "_scale_from_checkpoint", scale)),
+                producer_stream,
+            )
+
+        pending.clear()
+        pending_expert_ids.clear()
+
+    for name, tensor in params:
+        match = _EXPERT_WEIGHT_PATTERN.match(name) if name in selected_names else None
+        if match is None:
+            if pending:
+                yield from flush_pending()
+                current_prefix = None
+            if name in selected_names:
+                yield from quantize_one(name, tensor)
+            else:
+                yield name, tensor
+            continue
+
+        prefix = match.group("prefix")
+        projection = match.group("projection")
+        if current_prefix is not None and prefix != current_prefix:
+            yield from flush_pending()
+        current_prefix = prefix
+        expert_id = int(match.group("expert_id"))
+        if (
+            expert_id not in pending_expert_ids
+            and len(pending_expert_ids) == max_experts_per_batch
+        ):
+            yield from flush_pending()
+        # Bridge export must hand off any private producer stream before yield;
+        # the ambient stream observed here defines tensor readiness.
+        source_stream = (
+            torch.cuda.current_stream(tensor.device) if tensor.is_cuda else None
+        )
+        pending.append((expert_id, projection, name, tensor, source_stream))
+        pending_expert_ids.add(expert_id)
+
+    if pending:
+        yield from flush_pending()
 
 
 def get_vllm_qkv_scale_names(layer_idx: int) -> dict[str, str]:

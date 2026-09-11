@@ -2899,10 +2899,14 @@ class MegatronPolicyWorkerImpl(
             Updated refit metadata: the listed params become float8_e4m3fn and
             each gains a *_scale_from_checkpoint uint8 entry.
         """
-        if self._is_fp8_export():
+        if (
+            self.fp8_cfg is not None
+            and self.fp8_cfg.get("enabled", False)
+            and self.fp8_cfg.get("fp8_param", False)
+        ):
             raise ValueError(
                 "vllm_cfg.refit_prequantize requires BF16 trainer-exported weights; "
-                "Megatron blockwise FP8 parameter storage uses a different scale layout."
+                "Megatron FP8 parameter storage uses a different scale layout."
             )
         if self._refit_param_info_hf is None:
             raise RuntimeError(
@@ -2942,6 +2946,7 @@ class MegatronPolicyWorkerImpl(
     def _maybe_prequantize_param(
         self, name: str, tensor: torch.Tensor
     ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Single-tensor fallback; normal trainer export uses the batched iterator."""
         if name not in self._refit_prequant_names:
             yield name, tensor
             return
@@ -3261,8 +3266,19 @@ class MegatronPolicyWorkerImpl(
 
         # Yield the original parameters first, MXFP8-quantizing on the trainer
         # when pre-quantized refit is enabled for the parameter.
-        for name, tensor in base_iter:
-            yield from self._maybe_prequantize_param(name, tensor)
+        if self._refit_prequant_names:
+            # Trainer workers only need this optional vLLM helper during MXFP8 refit.
+            from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+                iter_mxfp8_prequantized_params,
+            )
+
+            yield from iter_mxfp8_prequantized_params(
+                base_iter,
+                self._refit_prequant_names,
+            )
+        else:
+            for name, tensor in base_iter:
+                yield from self._maybe_prequantize_param(name, tensor)
 
         if include_draft and self.draft_model is not None:
             from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf

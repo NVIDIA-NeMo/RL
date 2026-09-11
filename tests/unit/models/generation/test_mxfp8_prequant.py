@@ -126,6 +126,194 @@ def test_refit_quantize_matches_receiver_path():
     assert torch.equal(got_scale.reshape(-1), ref_scale.reshape(-1))
 
 
+def test_batched_expert_prequantization_preserves_wire_entries_and_reuses_scratch():
+    from nemo_rl.models.generation.vllm.quantization import fp8_train_utils
+
+    calls = []
+
+    def quantize(tensor):
+        calls.append(tuple(tensor.shape))
+        scales = torch.ones(
+            (*tensor.shape[:-1], tensor.shape[-1] // MXFP8_BLOCK_SIZE),
+            dtype=torch.uint8,
+        )
+        return tensor.detach().clone(), scales
+
+    def expert_name(expert_id, projection):
+        return f"model.layers.0.mlp.experts.{expert_id}.{projection}_proj.weight"
+
+    params = [("model.layers.0.input_layernorm.weight", torch.ones(64))]
+    expected = {}
+    for expert_id in range(2):
+        for projection in ("gate", "up", "down"):
+            name = expert_name(expert_id, projection)
+            if projection == "down":
+                shape = (4, 32)
+                fill_value = expert_id + 5
+            else:
+                shape = (2, 64)
+                fill_value = expert_id + (1 if projection == "gate" else 3)
+            tensor = torch.full(
+                shape,
+                fill_value,
+                dtype=torch.bfloat16,
+                requires_grad=True,
+            )
+            params.append((name, tensor))
+            expected[name] = tensor
+
+    selected_names = set(expected)
+    scratch_cache = {}
+    output = dict(
+        fp8_train_utils.iter_mxfp8_prequantized_params(
+            iter(params),
+            selected_names,
+            quantize_fn=quantize,
+            scratch_cache=scratch_cache,
+        )
+    )
+
+    assert calls == [(4, 64), (4, 64), (8, 32)]
+    assert output[params[0][0]] is params[0][1]
+    for name, tensor in expected.items():
+        torch.testing.assert_close(output[name], tensor)
+        scale_name = name + "_scale_from_checkpoint"
+        scale_columns = tensor.shape[-1] // MXFP8_BLOCK_SIZE
+        expected_scale_shape = (*tensor.shape[:-1], scale_columns)
+        assert output[scale_name].shape == expected_scale_shape
+        assert torch.all(output[scale_name] == 1)
+
+    scratch = next(iter(scratch_cache.values()))
+    first_scratch_ptr = scratch.data_ptr()
+    calls.clear()
+    list(
+        fp8_train_utils.iter_mxfp8_prequantized_params(
+            iter(params),
+            selected_names,
+            quantize_fn=quantize,
+            scratch_cache=scratch_cache,
+        )
+    )
+    assert calls == [(4, 64), (4, 64), (8, 32)]
+    assert next(iter(scratch_cache.values())).data_ptr() == first_scratch_ptr
+
+
+def test_batched_expert_prequantization_bounds_batch_and_preserves_source_order():
+    from nemo_rl.models.generation.vllm.quantization import fp8_train_utils
+
+    calls = []
+
+    def quantize(tensor):
+        calls.append(tuple(tensor.shape))
+        scales = torch.ones(
+            (*tensor.shape[:-1], tensor.shape[-1] // MXFP8_BLOCK_SIZE),
+            dtype=torch.uint8,
+        )
+        return tensor.clone(), scales
+
+    def expert_name(expert_id, projection):
+        return f"model.layers.0.mlp.experts.{expert_id}.{projection}_proj.weight"
+
+    params = []
+    for expert_id in range(5):
+        for projection in ("gate", "up", "down"):
+            shape = (4, 32) if projection == "down" else (2, 64)
+            params.append((expert_name(expert_id, projection), torch.ones(*shape)))
+
+    output = list(
+        fp8_train_utils.iter_mxfp8_prequantized_params(
+            iter(params),
+            {name for name, _tensor in params},
+            quantize_fn=quantize,
+            max_experts_per_batch=2,
+        )
+    )
+
+    expected_names = [
+        output_name
+        for name, _tensor in params
+        for output_name in (name, name + "_scale_from_checkpoint")
+    ]
+
+    assert [name for name, _tensor in output] == expected_names
+    assert calls == [
+        (4, 64),
+        (4, 64),
+        (8, 32),
+        (4, 64),
+        (4, 64),
+        (8, 32),
+        (2, 64),
+        (2, 64),
+        (4, 32),
+    ]
+
+
+def test_batched_expert_prequantization_matches_per_tensor_quantization():
+    from nemo_rl.models.generation.vllm.quantization import fp8_train_utils
+
+    torch.manual_seed(0)
+
+    def expert_name(expert_id, projection):
+        return f"model.layers.0.mlp.experts.{expert_id}.{projection}_proj.weight"
+
+    params = []
+    for expert_id in range(3):
+        params.extend(
+            [
+                (expert_name(expert_id, "gate"), torch.randn(2, 64)),
+                (expert_name(expert_id, "up"), torch.randn(2, 64)),
+                (expert_name(expert_id, "down"), torch.randn(4, 32)),
+            ]
+        )
+
+    output = dict(
+        fp8_train_utils.iter_mxfp8_prequantized_params(
+            params,
+            {name for name, _tensor in params},
+        )
+    )
+
+    for name, tensor in params:
+        expected_value, expected_scale = fp8_train_utils.mxfp8_e4m3_quantize_for_refit(
+            tensor
+        )
+        assert torch.equal(
+            output[name].view(torch.uint8), expected_value.view(torch.uint8)
+        )
+        assert torch.equal(output[name + "_scale_from_checkpoint"], expected_scale)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_batched_expert_prequantization_uses_stream_local_scratch():
+    from nemo_rl.models.generation.vllm.quantization import fp8_train_utils
+
+    def expert_name(expert_id):
+        return f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"
+
+    params = [(expert_name(i), torch.ones(2, 64, device="cuda")) for i in range(4)]
+    scratch_cache = {}
+    output = fp8_train_utils.iter_mxfp8_prequantized_params(
+        params,
+        {name for name, _tensor in params},
+        quantize_fn=lambda tensor: (
+            tensor.clone(),
+            torch.ones((*tensor.shape[:-1], 2), dtype=torch.uint8, device="cuda"),
+        ),
+        scratch_cache=scratch_cache,
+        max_experts_per_batch=2,
+    )
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+
+    with torch.cuda.stream(streams[0]):
+        first_batch = [next(output) for _ in range(4)]
+    with torch.cuda.stream(streams[1]):
+        second_batch = [next(output) for _ in range(4)]
+
+    assert len(first_batch) == len(second_batch) == 4
+    assert len(scratch_cache) == 2
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_refit_quantize_matches_receiver_quantize_mxfp8_weight():
     """Sender prequantization and the receiver helper must agree bit-for-bit.
@@ -149,6 +337,133 @@ def test_refit_quantize_matches_receiver_quantize_mxfp8_weight():
     assert sent_scale.dtype == recv_scale.dtype
     assert sent_scale.shape == recv_scale.shape
     assert torch.equal(sent_scale, recv_scale)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_batched_expert_prequantization_waits_when_consumer_stream_changes():
+    from nemo_rl.models.generation.vllm.quantization import fp8_train_utils
+
+    def expert_name(expert_id):
+        return f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"
+
+    params = [
+        (expert_name(i), torch.full((2, 64), i + 1, device="cuda")) for i in range(2)
+    ]
+
+    def delayed_quantize(tensor):
+        value = torch.empty_like(tensor)
+        torch.cuda._sleep(5_000_000)
+        value.copy_(tensor)
+        scale = torch.ones((*tensor.shape[:-1], 2), dtype=torch.uint8, device="cuda")
+        return value, scale
+
+    output = fp8_train_utils.iter_mxfp8_prequantized_params(
+        params,
+        {name for name, _tensor in params},
+        quantize_fn=delayed_quantize,
+        max_experts_per_batch=2,
+    )
+    producer_stream = torch.cuda.Stream()
+    consumer_stream = torch.cuda.Stream()
+
+    with torch.cuda.stream(producer_stream):
+        next(output)
+        next(output)
+    with torch.cuda.stream(consumer_stream):
+        second_expert, _second_scale = next(output), next(output)
+        observed = second_expert[1].clone()
+    consumer_stream.synchronize()
+
+    torch.testing.assert_close(observed, params[1][1])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_prequantization_fallback_waits_when_consumer_stream_changes():
+    from nemo_rl.models.generation.vllm.quantization import fp8_train_utils
+
+    name = "model.layers.0.self_attn.q_proj.weight"
+    tensor = torch.full((2, 64), 7, device="cuda")
+
+    def delayed_quantize(input_tensor):
+        value = torch.empty_like(input_tensor)
+        torch.cuda._sleep(5_000_000)
+        value.copy_(input_tensor)
+        scale = torch.full(
+            (*input_tensor.shape[:-1], 2), 3, dtype=torch.uint8, device="cuda"
+        )
+        return value, scale
+
+    output = fp8_train_utils.iter_mxfp8_prequantized_params(
+        [(name, tensor)],
+        {name},
+        quantize_fn=delayed_quantize,
+    )
+    producer_stream = torch.cuda.Stream()
+    consumer_stream = torch.cuda.Stream()
+
+    with torch.cuda.stream(producer_stream):
+        next(output)
+    with torch.cuda.stream(consumer_stream):
+        scale_name, scale = next(output)
+        observed = scale.clone()
+    consumer_stream.synchronize()
+
+    assert scale_name == name + "_scale_from_checkpoint"
+    assert torch.all(observed == 3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("second_up_shape", [(2, 64), (3, 64)])
+def test_batched_expert_prequantization_waits_for_pending_input_stream(
+    second_up_shape,
+):
+    from nemo_rl.models.generation.vllm.quantization import fp8_train_utils
+
+    def expert_name(expert_id, projection):
+        return f"model.layers.0.mlp.experts.{expert_id}.{projection}_proj.weight"
+
+    def params():
+        yield expert_name(0, "gate"), torch.ones(2, 64, device="cuda")
+        delayed_up = torch.empty(2, 64, device="cuda")
+        torch.cuda._sleep(5_000_000)
+        delayed_up.fill_(7)
+        yield expert_name(0, "up"), delayed_up
+        yield expert_name(0, "down"), torch.ones(4, 32, device="cuda")
+        yield expert_name(1, "gate"), torch.full((2, 64), 2, device="cuda")
+        yield expert_name(1, "up"), torch.full(second_up_shape, 3, device="cuda")
+        yield expert_name(1, "down"), torch.full((4, 32), 4, device="cuda")
+
+    selected_names = {
+        expert_name(expert_id, projection)
+        for expert_id in range(2)
+        for projection in ("gate", "up", "down")
+    }
+    output = fp8_train_utils.iter_mxfp8_prequantized_params(
+        params(),
+        selected_names,
+        quantize_fn=lambda input_tensor: (
+            input_tensor.clone(),
+            torch.ones(
+                (*input_tensor.shape[:-1], input_tensor.shape[-1] // 32),
+                dtype=torch.uint8,
+                device="cuda",
+            ),
+        ),
+        max_experts_per_batch=2,
+    )
+    producer_stream = torch.cuda.Stream()
+    consumer_stream = torch.cuda.Stream()
+
+    with torch.cuda.stream(producer_stream):
+        gate_entries = [next(output) for _ in range(2)]
+    with torch.cuda.stream(consumer_stream):
+        up_name, up_tensor = next(output)
+        observed = up_tensor.clone()
+    consumer_stream.synchronize()
+
+    assert len(gate_entries) == 2
+    assert up_name == expert_name(0, "up")
+    torch.testing.assert_close(observed, torch.full_like(observed, 7))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
