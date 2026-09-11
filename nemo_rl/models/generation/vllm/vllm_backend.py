@@ -637,6 +637,12 @@ class VllmInternalWorkerExtension:
         """
         self._validate_native_layerwise_refit()
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        self._prepare_model_update_runtime(state_dict_info)
+
+    def _prepare_model_update_runtime(
+        self, state_dict_info: dict[str, tuple[Sequence[int], torch.dtype]]
+    ) -> None:
+        """Resolve the live draft model and describe the complete refit payload."""
         pp_group = get_pp_group()
         pp_rank = int(getattr(pp_group, "rank_in_group", 0))
         pp_size = int(getattr(pp_group, "world_size", 1))
@@ -1154,13 +1160,21 @@ class VllmInternalWorkerExtension:
             reload_targets = _unquantized_flashinfer_trtllm_modules(model)
             reloaded_module_ids = _reload_target_module_ids(reload_targets)
 
-            def finalize() -> None:
+            def finalize(finalize_draft: bool) -> None:
                 with torch.device(self.device):
                     finalize_layerwise_reload(model, self.model_config)
                     _process_mxfp8_modules_after_native_reload(
                         model, reloaded_module_ids
                     )
                     _refresh_hpc_modules_after_layerwise_reload(model)
+                    if finalize_draft:
+                        from vllm.model_executor.model_loader.utils import (
+                            process_weights_after_loading,
+                        )
+
+                        self._maybe_process_draft_after_loading(
+                            process_weights_after_loading
+                        )
                     self._maybe_process_mtp_drafter_after_loading()
                 torch.cuda.synchronize()
 
@@ -1494,6 +1508,30 @@ class VllmInternalWorkerExtension:
         self.nccl_reshard_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
             restore_refit_info_placements(refit_info)
         )
+        state_dict_info: dict[str, tuple[Sequence[int], torch.dtype]] = {}
+        for layer_name in self.nccl_reshard_refit_info["layer_names"]:
+            for param_info in self.nccl_reshard_refit_info["per_layer_params"][
+                layer_name
+            ]:
+                dtype = _STR_TO_DTYPE.get(str(param_info["dtype"]))
+                if dtype is None:
+                    raise ValueError(
+                        "prepare_nccl_reshard_refit_info: unsupported dtype "
+                        f"{param_info['dtype']!r} for {param_info['name']!r}"
+                    )
+                state_dict_info[param_info["name"]] = (
+                    tuple(param_info["global_shape"]),
+                    dtype,
+                )
+        for name, meta in self.nccl_reshard_refit_info.get("misc_meta", {}).items():
+            dtype = _STR_TO_DTYPE.get(str(meta["dtype"]))
+            if dtype is None:
+                raise ValueError(
+                    "prepare_nccl_reshard_refit_info: unsupported dtype "
+                    f"{meta['dtype']!r} for {name!r}"
+                )
+            state_dict_info[name] = (tuple(meta["shape"]), dtype)
+        self._prepare_model_update_runtime(state_dict_info)
         if self._uses_unquantized_flashinfer_trtllm() and not self.pp_comm_groups:
             # The TRTLLM expert map needs the per-PP-stage communicator ranks,
             # which init_nccl_reshard_comm_group establishes after prepare.
@@ -2062,7 +2100,8 @@ class VllmInternalWorkerExtension:
         # drafter's mirror of the same. The BF16 TRTLLM nccl_reshard path
         # rejects FP8 KV cache above because its static scales are outside this
         # targeted MoE lifecycle.
-        finalize(False)
+        manifest = self._model_update_manifest
+        finalize(manifest is not None and manifest.draft is not None)
 
         torch.cuda.empty_cache()
         return True

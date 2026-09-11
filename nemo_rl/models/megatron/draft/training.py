@@ -138,9 +138,11 @@ class DraftTrainingProvider(Protocol):
         policy_model_chunk: MegatronModule,
     ) -> MegatronModule | None:
         """Build the draft model for the policy chunk that owns it."""
+        ...
 
     def capture_layer_ids(self) -> tuple[int, ...] | None:
         """Return explicit target layers required by this training method."""
+        ...
 
     def prepare_batch(
         self,
@@ -150,6 +152,7 @@ class DraftTrainingProvider(Protocol):
         sequence_layout: DraftSequenceLayout | None = None,
     ) -> DFlashBatchPlan | None:
         """Build a method-specific immutable plan when one is required."""
+        ...
 
     def normalization_counts(
         self,
@@ -159,6 +162,7 @@ class DraftTrainingProvider(Protocol):
         sequence_layout: DraftSequenceLayout | None = None,
     ) -> Tensor | None:
         """Return local full-batch objective counts for synchronous training."""
+        ...
 
     def forward(
         self,
@@ -175,6 +179,7 @@ class DraftTrainingProvider(Protocol):
         tensor_parallel_group: torch.distributed.ProcessGroup | None,
     ) -> None:
         """Run method-specific draft forward and attach its transient output."""
+        ...
 
     def loss_stats(
         self,
@@ -187,9 +192,11 @@ class DraftTrainingProvider(Protocol):
         context_parallel_group: torch.distributed.ProcessGroup | None,
     ) -> DraftLossStats:
         """Return raw method-specific objective bins."""
+        ...
 
     def export_weights(self, model: MegatronModule) -> list[tuple[str, Tensor]]:
         """Return logical draft-body weights for later runtime adapters."""
+        ...
 
 
 DraftSpeculator = DraftTrainingProvider

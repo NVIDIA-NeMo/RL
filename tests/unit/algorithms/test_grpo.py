@@ -4215,6 +4215,143 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
     )
 
 
+@pytest.mark.mcore
+@pytest.mark.parametrize("speculator_type", ["dflash", "dspark"])
+def test_sync_nemo_gym_draft_ids_reach_training_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_grpo_components: dict[str, Any],
+    speculator_type: str,
+) -> None:
+    """Exercise the Gym rebuild through real draft batch-plan construction."""
+    from nemo_rl.algorithms import grpo as grpo_mod
+    from nemo_rl.experience.rollouts import NemoGymRolloutResult
+    from nemo_rl.models.megatron.draft.training import resolve_draft_speculator
+    from nemo_rl.models.policy.draft_config import (
+        DFlashDraftConfig,
+        DSparkDraftConfig,
+    )
+
+    if speculator_type == "dflash":
+        draft_config = DFlashDraftConfig(
+            enabled=True,
+            gamma=2,
+            anchors_per_sample=1,
+            mask_token_id=0,
+            target_hidden_state_layer_ids=[0],
+            max_cp_boundary_exclusion_fraction=1.0,
+        )
+    else:
+        draft_config = DSparkDraftConfig(
+            enabled=True,
+            block_size=3,
+            anchors_per_sample=1,
+            mask_token_id=0,
+            target_hidden_state_layer_ids=[0],
+            max_cp_boundary_exclusion_fraction=1.0,
+        )
+    provider = resolve_draft_speculator(draft_config)
+    assert provider is not None
+
+    fake_flat = BatchedDataDict(
+        {
+            "token_ids": torch.arange(8).reshape(1, 8),
+            "advantages": torch.zeros(1, 8),
+            "generation_logprobs": torch.zeros(1, 8),
+            "token_loss_mask": torch.ones(1, 8),
+            "content": ["ok"],
+        }
+    )
+    fake_lengths = torch.tensor([8])
+    expected_ids: torch.Tensor | None = None
+
+    def run_gym_rollout(**kwargs: Any) -> NemoGymRolloutResult:
+        nonlocal expected_ids
+        rollout_input = kwargs["input_batch"]
+        expected_ids = rollout_input["draft_sample_ids"].clone()
+        rebuilt_batch = _gym_style_rebuilt_batch(rollout_input.size)
+        assert "draft_sample_ids" not in rebuilt_batch
+        return NemoGymRolloutResult(
+            input_ids=fake_flat["token_ids"],
+            final_batch=rebuilt_batch,
+            rollout_metrics={"mean_gen_tokens_per_sample": 1.0},
+            task_index=None,
+        )
+
+    policy = mock_grpo_components["policy"]
+    train_result = policy.train.return_value
+    prepared_plan: object | None = None
+
+    def train_with_draft_provider(
+        train_data: BatchedDataDict[Any], *_args: Any, **_kwargs: Any
+    ) -> Any:
+        nonlocal prepared_plan
+        assert expected_ids is not None
+        prepared_plan = provider.prepare_batch(train_data, optimizer_step=9)
+        torch.testing.assert_close(train_data["draft_sample_ids"], expected_ids)
+        return train_result
+
+    policy.train.side_effect = train_with_draft_provider
+    policy.get_logprobs.return_value = {"logprobs": torch.zeros(1, 8)}
+    policy.get_reference_policy_logprobs.return_value = {
+        "reference_logprobs": torch.zeros(1, 8)
+    }
+    monkeypatch.setattr(
+        grpo_mod,
+        "batched_message_log_to_flat_message",
+        lambda *_args, **_kwargs: (fake_flat, fake_lengths),
+    )
+    monkeypatch.setattr(grpo_mod, "run_nemo_gym_rollout_sync", run_gym_rollout)
+    monkeypatch.setattr(
+        grpo_mod,
+        "calculate_baseline_and_std_per_prompt",
+        lambda *_args, **_kwargs: (torch.tensor([0.0]), torch.tensor([1.0])),
+    )
+    monkeypatch.setattr(
+        grpo_mod, "refit_policy_generation", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(
+        grpo_mod, "print_performance_metrics", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(
+        grpo_mod, "maybe_gpu_profile_step", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        grpo_mod,
+        "compute_and_apply_seq_logprob_error_masking",
+        lambda *_args, **_kwargs: _mock_seq_logprob_error_result(),
+    )
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.policy["draft"] = draft_config
+    master_config.policy["generation"]["vllm_cfg"]["expose_http_server"] = True
+    master_config.logger.update({"wandb_enabled": False, "wandb": {}})
+    master_config.env = {"should_use_nemo_gym": True}
+
+    grpo_mod.grpo_train(
+        policy,
+        _mock_policy_generation(),
+        mock_grpo_components["train_dataloader"],
+        mock_grpo_components["val_dataloader"],
+        mock_grpo_components["tokenizer"],
+        mock_grpo_components["loss_fn"],
+        mock_grpo_components["task_to_env"],
+        mock_grpo_components["val_task_to_env"],
+        mock_grpo_components["logger"],
+        mock_grpo_components["checkpointer"],
+        _initial_grpo_save_state(),
+        master_config,
+    )
+
+    assert prepared_plan is not None
+    policy.train.assert_called_once()
+
+
 def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path):
     """Regression test for epoch-bounded runs losing the final async checkpoint.
 
