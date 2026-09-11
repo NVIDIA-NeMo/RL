@@ -259,14 +259,13 @@ class Vllm0251RefitAdapter:
                 f"vLLM refit component {component!r} has no native destination binding"
             )
         try:
-            parameters = dict(self._model_runner.model.named_parameters())
             if role == "weight":
                 target_name = binding.value_name
             elif role == "weight_scale":
-                target_name = self._active_checkpoint_scale_name(binding, parameters)
+                target_name = self._active_checkpoint_scale_name(binding)
             else:
                 raise ValueError(f"unsupported refit component role {role!r}")
-            target = parameters.get(target_name)
+            target = _get_parameter_or_none(self._model_runner.model, target_name)
             if target is None:
                 raise ValueError(
                     f"vLLM checkpoint destination {target_name!r} for {component!r} "
@@ -461,22 +460,32 @@ class Vllm0251RefitAdapter:
     def _active_checkpoint_scale_name(
         self,
         binding: _NativeDestinationBinding,
-        parameters: Mapping[str, torch.Tensor],
     ) -> str:
         candidates = (
             binding.checkpoint_alias_name,
             binding.runtime_scale_name,
         )
-        present = [name for name in candidates if name in parameters]
-        for name in present:
-            loader = getattr(parameters[name], "weight_loader", None)
+        present = [
+            (name, parameter)
+            for name in candidates
+            if (
+                parameter := _get_parameter_or_none(
+                    self._model_runner.model,
+                    name,
+                )
+            )
+            is not None
+        ]
+        for name, parameter in present:
+            loader = getattr(parameter, "weight_loader", None)
             if callable(loader) and getattr(loader, "__name__", None) == (
                 "online_process_loader"
             ):
                 return name
         if present:
             raise ValueError(
-                f"vLLM checkpoint scale {present[0]!r} for {binding.logical_name!r} "
+                f"vLLM checkpoint scale {present[0][0]!r} for "
+                f"{binding.logical_name!r} "
                 "has no wrapped weight_loader"
             )
         raise ValueError(
@@ -514,7 +523,10 @@ class Vllm0251RefitAdapter:
                 f"vLLM checkpoint parameter {target_name!r} has no wrapped weight_loader"
             )
         owner_name, parameter_name = target_name.rsplit(".", 1)
-        owner = dict(self._model_runner.model.named_modules()).get(owner_name)
+        try:
+            owner = self._model_runner.model.get_submodule(owner_name)
+        except AttributeError:
+            owner = None
         if owner is None or getattr(owner, parameter_name, None) is not target:
             raise ValueError(
                 f"vLLM checkpoint parameter {target_name!r} has no owning module"
@@ -870,6 +882,16 @@ def _parameter_info_by_name(
         for layer_name in refit_info["layer_names"]
         for param_info in per_layer_params[layer_name]
     }
+
+
+def _get_parameter_or_none(
+    model: torch.nn.Module,
+    parameter_name: str,
+) -> torch.nn.Parameter | None:
+    try:
+        return model.get_parameter(parameter_name)
+    except AttributeError:
+        return None
 
 
 def _destination_region(
