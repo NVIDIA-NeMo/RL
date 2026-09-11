@@ -18,8 +18,6 @@ checkpointing:
 # TransferQueue is mandatory for the SingleController path.
 data_plane:
   enabled: true
-  observability:
-    verify_tensor_hash: false
 
 async_rl:
   sampler:
