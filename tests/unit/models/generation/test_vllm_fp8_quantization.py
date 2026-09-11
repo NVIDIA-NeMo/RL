@@ -971,8 +971,13 @@ def test_batched_moe_shuffle_matches_per_expert(
 def test_process_mxfp8_linear_separates_checkpoint_and_runtime_scales(
     fp8_module, monkeypatch
 ):
+    from vllm.model_executor import parameter as vllm_parameter
     from vllm.model_executor.layers.quantization.utils import mxfp8_utils
 
+    monkeypatch.setattr(vllm_parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        vllm_parameter, "get_tensor_model_parallel_world_size", lambda: 1
+    )
     layer = torch.nn.Module()
     layer.register_parameter(
         "weight",
@@ -1161,7 +1166,7 @@ def test_process_mxfp8_moe_refit_rejects_non_flashinfer_backend(fp8_module):
 
     with pytest.raises(
         NotImplementedError,
-        match="requires the monolithic FlashInfer TRTLLM backend",
+        match="only supports FLASHINFER_TRTLLM",
     ):
         fp8_module.process_weights_after_loading_mxfp8_moe(quant_method, object())
 
@@ -1197,10 +1202,10 @@ def test_process_mxfp8_moe_initializes_kernel_once(
     experts_cls = types.SimpleNamespace(is_monolithic=lambda: True)
     quant_config_calls = []
 
-    def make_quant_config(**kwargs):
-        quant_config_calls.append(kwargs["layer"])
-        quant_config.w1_scale = kwargs["w1_scale"]
-        quant_config.w2_scale = kwargs["w2_scale"]
+    def make_quant_config(realized_layer):
+        quant_config_calls.append(realized_layer)
+        quant_config.w1_scale = realized_layer.w13_weight_scale
+        quant_config.w2_scale = realized_layer.w2_weight_scale
         return quant_config
 
     quant_method = types.SimpleNamespace(
@@ -1209,6 +1214,7 @@ def test_process_mxfp8_moe_initializes_kernel_once(
         mxfp8_backend=Fp8MoeBackend.FLASHINFER_TRTLLM,
         experts_cls=experts_cls,
         weight_block_size=[32, 32],
+        get_fused_moe_quant_config=make_quant_config,
     )
     kernel = object()
     kernel_calls = []
@@ -1222,7 +1228,7 @@ def test_process_mxfp8_moe_initializes_kernel_once(
     monkeypatch.setattr(fp8, "_shuffle_mxfp8_moe_batched", shuffle)
 
     from vllm.model_executor import parameter as vllm_parameter
-    from vllm.model_executor.layers.fused_moe.oracle import fp8 as vllm_fp8
+    from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
 
     monkeypatch.setattr(vllm_parameter, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(
@@ -1233,7 +1239,6 @@ def test_process_mxfp8_moe_initializes_kernel_once(
         kernel_calls.append(kwargs)
         return kernel
 
-    monkeypatch.setattr(vllm_fp8, "make_fp8_moe_quant_config", make_quant_config)
     monkeypatch.setattr(vllm_fp8, "make_fp8_moe_kernel", make_kernel)
 
     fp8.process_weights_after_loading_mxfp8_moe(quant_method, layer)
@@ -2057,18 +2062,17 @@ def test_process_mxfp8_moe_pads_kernel_tensors_without_changing_checkpoint_layou
     fp8_module: types.ModuleType,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm.model_executor.layers.fused_moe.oracle import fp8 as fp8_oracle
+    from vllm.model_executor.layers.quantization import fp8 as fp8_oracle
     from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 
     fp8 = fp8_module
     captured: dict[str, Any] = {}
     kernel_builds = 0
 
-    def fake_make_quant_config(**kwargs: Any) -> Any:
-        captured["quant_config_kwargs"] = kwargs
+    def fake_make_quant_config(realized_layer: torch.nn.Module) -> Any:
         return types.SimpleNamespace(
-            w1_scale=kwargs["w1_scale"],
-            w2_scale=kwargs["w2_scale"],
+            w1_scale=realized_layer.w13_weight_scale,
+            w2_scale=realized_layer.w2_weight_scale,
         )
 
     def fake_make_kernel(**kwargs: Any) -> Any:
@@ -2102,21 +2106,20 @@ def test_process_mxfp8_moe_pads_kernel_tensors_without_changing_checkpoint_layou
         )
 
     monkeypatch.setattr(fp8, "_shuffle_mxfp8_moe_batched", fake_batched_shuffle)
-    monkeypatch.setattr(fp8_oracle, "make_fp8_moe_quant_config", fake_make_quant_config)
     monkeypatch.setattr(fp8_oracle, "make_fp8_moe_kernel", fake_make_kernel)
     fp8.global_fp8_config = fp8.FP8Config()
 
     layer = torch.nn.Module()
     layer.w13_weight = torch.nn.Parameter(
-        torch.arange(192, dtype=torch.float32).reshape(2, 3, 32),
+        torch.arange(2048, dtype=torch.float32).reshape(2, 32, 32),
         requires_grad=False,
     )
     layer.w2_weight = torch.nn.Parameter(
-        torch.arange(192, dtype=torch.float32).reshape(2, 32, 3),
+        torch.arange(2048, dtype=torch.float32).reshape(2, 32, 32),
         requires_grad=False,
     )
     layer.w13_weight_scale = torch.nn.Parameter(
-        torch.zeros(2, 3, 1, dtype=torch.uint8),
+        torch.zeros(2, 32, 1, dtype=torch.uint8),
         requires_grad=False,
     )
     layer.w2_weight_scale = torch.nn.Parameter(
@@ -2124,17 +2127,24 @@ def test_process_mxfp8_moe_pads_kernel_tensors_without_changing_checkpoint_layou
         requires_grad=False,
     )
     layer.w13_weight_scale_from_checkpoint = torch.nn.Parameter(
-        torch.zeros(2, 3, 1, dtype=torch.uint8),
+        torch.zeros(2, 32, 1, dtype=torch.uint8),
         requires_grad=False,
     )
     layer.w2_weight_scale_from_checkpoint = torch.nn.Parameter(
         torch.zeros(2, 32, 1, dtype=torch.uint8),
         requires_grad=False,
     )
-    moe_config = types.SimpleNamespace(
-        intermediate_size_per_partition=3,
-        is_act_and_mul=False,
-    )
+    @dataclass
+    class MoeConfig:
+        moe_parallel_config: Any
+        is_act_and_mul: bool = False
+        hidden_dim: int = 32
+        hidden_dim_unpadded: int = 32
+        intermediate_size: int = 32
+        intermediate_size_per_partition: int = 32
+        intermediate_size_per_partition_unpadded: int = 32
+
+    moe_config = MoeConfig(moe_parallel_config=types.SimpleNamespace(tp_size=1))
     layer.moe_config = moe_config
     layer._expert_routing_tables = lambda: None
     quant_method = types.SimpleNamespace(
@@ -2144,6 +2154,7 @@ def test_process_mxfp8_moe_pads_kernel_tensors_without_changing_checkpoint_layou
         moe=moe_config,
         moe_kernel=None,
         moe_quant_config=None,
+        get_fused_moe_quant_config=fake_make_quant_config,
     )
     original_w13 = layer.w13_weight.detach().clone()
     original_w2 = layer.w2_weight.detach().clone()
@@ -2157,35 +2168,37 @@ def test_process_mxfp8_moe_pads_kernel_tensors_without_changing_checkpoint_layou
     assert captured["w2_weight"].shape == (2, 512, 128)
     assert captured["w13_scale"].shape == (2, 128, 16)
     assert captured["w2_scale"].shape == (2, 512, 4)
-    assert torch.count_nonzero(captured["w13_scale"] == 0) == 0
-    assert torch.count_nonzero(captured["w2_scale"] == 0) == 0
+    for name in ("w13_scale", "w2_scale"):
+        assert torch.count_nonzero(captured[name][:, :32, :1]) == 0
+        assert torch.all(captured[name][:, 32:, :] == 127)
+        assert torch.all(captured[name][:, :, 1:] == 127)
 
     torch.testing.assert_close(layer.w13_weight, original_w13)
     torch.testing.assert_close(layer.w2_weight, original_w2)
-    assert layer.mxfp8_unpadded_hidden_size == 32
-    assert layer.mxfp8_padded_hidden_size == 512
-    assert layer.mxfp8_unpadded_intermediate_size_per_partition == 3
-    assert layer.mxfp8_padded_intermediate_size_per_partition == 128
-    assert layer.intermediate_size_per_partition == 128
-    assert layer.moe_config.intermediate_size_per_partition == 128
-    assert quant_method.moe.intermediate_size_per_partition == 128
+    kernel_config = quant_method._mxfp8_kernel_moe_config
+    assert kernel_config.hidden_dim_unpadded == 32
+    assert kernel_config.hidden_dim == 512
+    assert kernel_config.intermediate_size_per_partition_unpadded == 32
+    assert kernel_config.intermediate_size_per_partition == 128
+    assert layer.moe_config is moe_config
+    assert quant_method.moe is moe_config
+    assert moe_config.intermediate_size_per_partition == 32
     assert layer.w13_weight_for_apply.shape == (2, 128, 512)
     assert layer.w2_weight_for_apply.shape == (2, 512, 128)
-    assert layer.w13_scale_for_apply.shape == (2, 128, 16)
-    assert layer.w2_scale_for_apply.shape == (2, 512, 4)
-    assert layer.weight_block_size == [1, 32]
-    assert captured["quant_config_kwargs"]["w1_scale"] is layer.w13_scale_for_apply
-    assert captured["quant_config_kwargs"]["w2_scale"] is layer.w2_scale_for_apply
-    assert captured["kernel_kwargs"]["moe_config"] is moe_config
+    assert layer.w13_weight_scale.shape == (2, 128, 16)
+    assert layer.w2_weight_scale.shape == (2, 512, 4)
+    assert quant_method.moe_quant_config.w1_scale is layer.w13_weight_scale
+    assert quant_method.moe_quant_config.w2_scale is layer.w2_weight_scale
+    assert captured["kernel_kwargs"]["moe_config"] is kernel_config
     assert captured["kernel_kwargs"]["routing_tables"] is None
     assert kernel_builds == 1
 
-    w13_scale_for_apply = layer.w13_scale_for_apply
-    w2_scale_for_apply = layer.w2_scale_for_apply
+    w13_scale_for_apply = layer.w13_weight_scale
+    w2_scale_for_apply = layer.w2_weight_scale
     fp8.process_weights_after_loading_mxfp8_moe(quant_method, layer)
 
-    assert layer.w13_scale_for_apply is w13_scale_for_apply
-    assert layer.w2_scale_for_apply is w2_scale_for_apply
+    assert layer.w13_weight_scale is w13_scale_for_apply
+    assert layer.w2_weight_scale is w2_scale_for_apply
     assert quant_method.moe_quant_config.w1_scale is w13_scale_for_apply
     assert quant_method.moe_quant_config.w2_scale is w2_scale_for_apply
     assert kernel_builds == 1
@@ -2205,7 +2218,7 @@ def test_process_mxfp8_moe_rejects_non_trtllm_backend_before_mutation(
 
     with pytest.raises(
         NotImplementedError,
-        match="requires the monolithic FlashInfer TRTLLM backend",
+        match="only supports FLASHINFER_TRTLLM",
     ):
         fp8.process_weights_after_loading_mxfp8_moe(quant_method, layer)
 
@@ -2242,6 +2255,7 @@ def test_apply_monolithic_mxfp8_moe_uses_vllm_025_moe_config(
     quant_method = types.SimpleNamespace(
         is_monolithic=True,
         moe_kernel=kernel,
+        moe=types.SimpleNamespace(hidden_dim=512, hidden_dim_unpadded=64),
     )
     runtime_w13 = torch.empty(4, 128, 512, dtype=torch.float8_e4m3fn)
     runtime_w2 = torch.empty(4, 512, 128, dtype=torch.float8_e4m3fn)
