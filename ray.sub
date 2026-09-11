@@ -531,8 +531,15 @@ for _key in "${_topo_keys[@]}"; do
   printf '%s %s\n' "$_n" "$_rank" >> "$_topo_rank_map"
   _rank=$((_rank + 1))
 done
+# Ray rejects custom resource quantities above 1e14. Equality is allowed.
+# Do not wrap: a modulo would reintroduce collisions. Fail closed instead.
+_RAY_MAX_CUSTOM_RESOURCE=100000000000000
+if (( _rank - 1 > _RAY_MAX_CUSTOM_RESOURCE )); then
+  echo "[FATAL] topo_rank $((_rank - 1)) exceeds Ray's ${_RAY_MAX_CUSTOM_RESOURCE} custom-resource cap" >&2
+  exit 1
+fi
 echo "[INFO] Wrote dense topo_rank map (1..$((_rank - 1))) to $_topo_rank_map"
-unset _node_to_block _topo_txt _line _block _nodelist _expanded _n _topo_keys _key _rank
+unset _node_to_block _topo_txt _line _block _nodelist _expanded _n _topo_keys _key _rank _RAY_MAX_CUSTOM_RESOURCE
 
 # Write the topology probe script that runs inside each container.
 # Both head_cmd and worker_cmd source this to avoid duplication.
@@ -546,8 +553,9 @@ unset _node_to_block _topo_txt _line _block _nodelist _expanded _n _topo_keys _k
 # TOPO_RANK: Topology-aware infrastructure rank.
 #   Fallback chain:
 #   1. Dense 1..N lookup from topo_rank_map.txt (sorted block name, then hostname)
-#   2. SLURM_PROCID + 2 on workers, head pinned to 1 (SLURM without the map)
-#   3. Hostname digits (non-SLURM fallback)
+#   2. SLURM_PROCID + 2 on workers, head pinned to 1 (map miss under SLURM)
+#   Hostname digit-stripping is intentionally omitted: it is unbounded and
+#   can exceed Ray's 1e14 cap. Missing topo_rank becomes TOPO_RANK_UNKNOWN.
 TOPO_PROBE_SCRIPT="$LOG_DIR/topology_probe.sh"
 cat > "$TOPO_PROBE_SCRIPT" <<TOPO_PROBE_EOF
 CLUSTER_UUID=\$(nvidia-smi -q 2>/dev/null | grep 'ClusterUUID' | head -1 | awk -F: '{print \$2}' | tr -d ' ')
@@ -567,11 +575,6 @@ if [[ -z "\$TOPO_RANK" && -n "\${SLURM_PROCID:-}" ]]; then
     TOPO_RANK=1
   else
     TOPO_RANK=\$(( 10#\$SLURM_PROCID + 2 ))
-  fi
-elif [[ -z "\$TOPO_RANK" ]]; then
-  _hostname_digits=\$(hostname | tr -dc '0-9')
-  if [[ -n "\$_hostname_digits" ]]; then
-    TOPO_RANK=\$(( 10#\$_hostname_digits ))
   fi
 fi
 

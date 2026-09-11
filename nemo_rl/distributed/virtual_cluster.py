@@ -207,10 +207,11 @@ Nodes sharing the same key belong to the same NVLink switch fabric (e.g. one GB2
 TOPO_RANK_KEY = "topo_rank"
 """Ray resource key for the SLURM topological rank.
 Dense ``1..N`` index of allocated nodes sorted by Slurm block name then hostname
-(see ``ray.sub`` / ``topo_rank_map.txt``). Falls back to ``SLURM_PROCID + 2`` on
-worker nodes (head node is pinned to ``1``), then to hostname digits when SLURM
-is unavailable. Values are always ``>= 1`` so that Ray does not drop the custom
-resource (Ray drops value-0 custom resources).
+(see ``ray.sub`` / ``topo_rank_map.txt``). ``N`` is fail-closed against Ray's
+``1e14`` custom-resource cap. Falls back to ``SLURM_PROCID + 2`` on worker nodes
+(head node is pinned to ``1``) if the map lookup misses. Values are always
+``>= 1`` so that Ray does not drop the custom resource (Ray drops value-0
+custom resources).
 Used to sort nodes within and across NVLink domains so rank assignment follows physical topology."""
 
 NVLINK_DOMAIN_UNKNOWN = "unknown"
