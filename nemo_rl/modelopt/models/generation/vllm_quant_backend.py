@@ -152,10 +152,11 @@ def _batch_fused_modelopt_moe_weights(
     loader still requires an expert id, so only the tiny per-expert global
     scales are exposed as scalar views.
 
-    Gated ``w13`` payloads are the exception on vLLM >= 0.25: they are emitted
-    as per-expert 2-D shards instead, because ``RoutedExperts.load_weights``'
-    fused-3D branch mis-transposes packed NVFP4. See the comment at the
-    emission site below.
+    ``w13`` payloads are the exception on vLLM >= 0.25: they are emitted as
+    per-expert 2-D shards instead, because ``RoutedExperts.load_weights``'
+    fused-3D branch mis-transposes packed NVFP4 (gated models) and, for
+    non-gated models that have no fused mapping at all, keeps only the first
+    gate/up half of each expert. See the comments at the emission sites below.
     """
     batched: list[tuple[str, torch.Tensor]] = []
     for name, tensor in weights:
@@ -174,11 +175,22 @@ def _batch_fused_modelopt_moe_weights(
         if target in {"w13_weight", "w13_weight_scale"}:
             target_suffix = "weight" if target == "w13_weight" else "weight_scale"
             if w13_num_shards_by_prefix.get(prefix) == 1:
-                batched.append(
+                # Non-gated experts (Nemotron-H: `ckpt_gate_proj_name="up_proj"`,
+                # no up shard) get no fused gate/up mapping from vLLM >= 0.28
+                # ("Unexpected gate/up projection names ... will be skipped"),
+                # so a batched 3-D tensor under `experts.0.up_proj` falls into
+                # `RoutedExperts.load_weights`' fused branch, which assumes a
+                # gate/up concatenation and keeps `chunk(2, dim=1)[0]`: half of
+                # every expert's rows. Half of w13 plus all of w2 is the
+                # "134701312/179601664 elements" layerwise-reload failure seen
+                # on the nanov3 w4a16 recipe. Emit per-expert 2-D shards, the
+                # same path the initial disk load takes.
+                batched.extend(
                     (
-                        f"{prefix}.experts.0.up_proj.{target_suffix}",
-                        tensor,
+                        f"{prefix}.experts.{expert_id}.up_proj.{target_suffix}",
+                        expert_weight,
                     )
+                    for expert_id, expert_weight in enumerate(tensor.unbind(0))
                 )
                 continue
             if tensor.ndim < 2 or tensor.shape[1] % 2 != 0:
