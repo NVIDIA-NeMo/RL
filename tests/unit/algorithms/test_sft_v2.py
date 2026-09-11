@@ -99,7 +99,9 @@ def _valid_setup_config(
         "backend": "energon",
         "validation": None,
         "max_input_seq_length": 128,
-        "energon": SimpleNamespace(packing_buffer_size=None),
+        "energon": SimpleNamespace(
+            task_encoder=SimpleNamespace(packing=None),
+        ),
     }
     data.update(data_overrides or {})
     policy = {
@@ -322,7 +324,17 @@ def test_setup_rejects_unsupported_energon_packing_layouts(
     config = _valid_setup_config(
         data_overrides={
             "max_input_seq_length": 130,
-            "energon": SimpleNamespace(packing_buffer_size=64),
+            "energon": SimpleNamespace(
+                task_encoder=SimpleNamespace(
+                    packing=SimpleNamespace(
+                        name="greedy_knapsack",
+                        options=SimpleNamespace(
+                            max_sequence_length=130,
+                            sequence_length_pad_multiple=policy_multiple,
+                        ),
+                    )
+                )
+            ),
         },
         policy_overrides={
             "megatron_cfg": megatron_overrides,

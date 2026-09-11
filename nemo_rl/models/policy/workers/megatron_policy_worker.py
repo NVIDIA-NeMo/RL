@@ -67,6 +67,7 @@ from nemo_rl.models.generation.megatron.megatron_worker import (
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.megatron.common import (
+    count_moe_layers,
     get_aux_loss_track_names,
     get_moe_metrics,
 )
@@ -1274,6 +1275,7 @@ class MegatronPolicyWorkerImpl(
             moe_metrics = get_moe_metrics(
                 loss_scale=moe_loss_scale,
                 per_layer_logging=self.cfg["megatron_cfg"]["moe_per_layer_logging"],
+                num_moe_layers=count_moe_layers(self.model, model_config),
                 # Pre-initialize the aux-loss tracker on every PP rank so the
                 # cross-PP all_reduce inside get_moe_metrics does not hang when a
                 # rank recorded no aux loss this step (e.g. a stage with no MoE
@@ -2084,6 +2086,7 @@ class MegatronPolicyWorkerImpl(
             moe_metrics = get_moe_metrics(
                 loss_scale=moe_loss_scale,
                 per_layer_logging=self.cfg["megatron_cfg"]["moe_per_layer_logging"],
+                num_moe_layers=count_moe_layers(self.model, model_config),
                 # Pre-initialize the aux-loss tracker on every PP rank so the
                 # cross-PP all_reduce inside get_moe_metrics does not hang when a
                 # rank recorded no aux loss this step (e.g. a stage with no MoE

@@ -34,6 +34,17 @@ def test_factory_builds_knapsack_packers(algorithm, packer_type) -> None:
     assert isinstance(get_packer(algorithm.value, 10), packer_type)
 
 
+def test_factory_forwards_balanced_knapsack_delta() -> None:
+    packer = get_packer(
+        PackingAlgorithm.BALANCED_GREEDY_KNAPSACK,
+        10,
+        balanced_knapsack_delta=5,
+    )
+
+    assert isinstance(packer, BalancedGreedyKnapsackPacker)
+    assert packer.balanced_knapsack_delta == 5
+
+
 def test_greedy_knapsack_takes_largest_remaining_item_that_fits() -> None:
     assert GreedyKnapsackPacker(10).pack([6, 5, 4, 3, 2]) == [
         [0, 2],

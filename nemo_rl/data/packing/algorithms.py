@@ -19,7 +19,7 @@ import math
 import random
 from abc import ABC, abstractmethod
 from bisect import bisect, bisect_right
-from typing import Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 
 class PackingAlgorithm(enum.Enum):
@@ -759,6 +759,7 @@ def get_packer(
     min_bin_count: Optional[int] = None,
     bin_count_multiple: Optional[int] = None,
     max_sequences_per_bin: Optional[int] = None,
+    balanced_knapsack_delta: Optional[int] = None,
 ) -> SequencePacker:
     """Factory function to get a sequence packer based on the algorithm.
 
@@ -806,10 +807,16 @@ def get_packer(
             f"Available algorithms: {available_algorithms}"
         )
 
+    kwargs: dict[str, Any] = {
+        "collect_metrics": collect_metrics,
+        "min_bin_count": min_bin_count,
+        "bin_count_multiple": bin_count_multiple,
+        "max_sequences_per_bin": max_sequences_per_bin,
+    }
+    if algorithm == PackingAlgorithm.BALANCED_GREEDY_KNAPSACK:
+        kwargs["balanced_knapsack_delta"] = balanced_knapsack_delta or 0
+
     return packers[algorithm](
         bin_capacity,
-        collect_metrics=collect_metrics,
-        min_bin_count=min_bin_count,
-        bin_count_multiple=bin_count_multiple,
-        max_sequences_per_bin=max_sequences_per_bin,
+        **kwargs,
     )

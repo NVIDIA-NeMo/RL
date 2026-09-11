@@ -1,0 +1,87 @@
+defaults:
+  - sft_vlm_3B_megatron.yaml
+
+sft:
+  max_num_epochs: 1
+  max_num_steps: 1000
+  val_period: 0
+  val_batches: 0
+  val_global_batch_size: 32
+  val_micro_batch_size: 1
+  val_at_start: false
+  val_at_end: false
+  seed: 42
+  only_unmask_final: false
+
+policy:
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/sft_${policy.model_name}_clevr_energon_v2
+  metric_name: null
+  higher_is_better: false
+  keep_top_k: 1
+  save_period: 10
+  # Walltime budget as DD:HH:MM:SS. When reached, checkpoint after the current
+  # step and stop; null disables the timeout. Set below the scheduler's job
+  # limit so the save has room to finish.
+  checkpoint_must_save_by: null
+
+data:
+  _override_: true
+  backend: energon
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  add_bos: true
+  add_eos: true
+  add_generation_prompt: false
+  shuffle: true
+  num_workers: 0
+  energon:
+    model_family: qwen
+    num_workers: 8
+    shuffle_buffer_size: 1000
+    processor_adapter: hf_multimodal
+    topology_mapper: default
+    # Root of the DSS cache that `dss://` metadataset paths resolve against.
+    # null keeps whatever the environment already exports as
+    # NVDATASET_CACHE_DIR.
+    nvdataset_cache_dir: null
+    task_encoder:
+      name: generic_sft
+      packing: null
+      options: {}
+    cookers:
+      - name: generic_conversation
+        options: {}
+  train:
+    path: /data/nemorl-datasets/clevr
+    split: train
+    virtual_epoch_length: 4375
+  validation: null
+
+data_plane:
+  enabled: true
+  impl: local
+  max_partitions: 2
+
+logger:
+  log_dir: logs/sft-qwen2.5-vl-3b-clevr-energon-v2
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: sft-dev
+    name: sft-qwen2.5-vl-3b-clevr-energon-v2
+  tensorboard:
+    log_dir: tb_logs-sft-qwen2.5-vl-3b-clevr-energon-v2
+  swanlab:
+    name: sft-qwen2.5-vl-3b-clevr-energon-v2
+  mlflow:
+    run_name: sft-qwen2.5-vl-3b-clevr-energon-v2
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10

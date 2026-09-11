@@ -137,7 +137,7 @@ def test_v2_loader_applies_cache_pool_and_gc_controls() -> None:
         patch(
             "nemo_rl.data.energon.sft_dataloader.get_train_dataset",
             return_value=dataset,
-        ),
+        ) as get_train_dataset,
         patch(
             "nemo_rl.data.energon.sft_dataloader.FileStoreCachePool",
             return_value=cache_pool,
@@ -155,6 +155,17 @@ def test_v2_loader_applies_cache_pool_and_gc_controls() -> None:
                     "cache_pool_max_gbytes": 8,
                     "cache_pool_num_workers": 3,
                     "gc_collect_every_n_steps": 1234,
+                    "task_encoder": {
+                        "packing": {
+                            "name": "balanced_greedy_knapsack",
+                            "buffer_size": 5000,
+                            "options": {
+                                "max_sequence_length": 128,
+                                "sequence_length_pad_multiple": 8,
+                                "balanced_knapsack_delta": 5,
+                            },
+                        }
+                    },
                 },
             },
             source=EnergonSourceConfig(
@@ -167,15 +178,13 @@ def test_v2_loader_applies_cache_pool_and_gc_controls() -> None:
             logical_rank=0,
             logical_world_size=1,
             placement_fingerprint="placement",
-            packing_algorithm=None,
-            max_sequences_per_bin=None,
-            sequence_length_pad_multiple=1,
             only_unmask_final=False,
         )
 
     cache_pool_type.assert_called_once_with(
         method="raw", num_workers=3, max_cache_size_gbytes=8.0
     )
+    assert get_train_dataset.call_args.kwargs["packing_buffer_size"] == 5000
     assert get_savable_loader.call_args.kwargs["cache_pool"] is cache_pool
     assert get_savable_loader.call_args.kwargs["gc_collect_every_n_steps"] == 1234
 

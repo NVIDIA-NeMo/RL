@@ -28,6 +28,30 @@ class EnergonSourceConfig(BaseModel, extra="allow"):
     limit: Annotated[int, Field(ge=1)] | None = None
 
 
+class EnergonPackingOptions(BaseModel, extra="forbid"):
+    """Options for task-encoder-owned sequence packing."""
+
+    max_sequence_length: Annotated[int, Field(ge=1)]
+    sequence_length_pad_multiple: Annotated[int, Field(ge=1)]
+    balanced_knapsack_delta: Annotated[int, Field(ge=0)] | None = None
+
+    @model_validator(mode="after")
+    def _validate_alignment(self) -> "EnergonPackingOptions":
+        if self.max_sequence_length % self.sequence_length_pad_multiple:
+            raise ValueError(
+                "Energon pack capacity must be divisible by its padding multiple."
+            )
+        return self
+
+
+class EnergonPackingConfig(BaseModel, extra="allow"):
+    """One task-encoder-owned packing implementation."""
+
+    name: str
+    buffer_size: Annotated[int, Field(ge=1)]
+    options: EnergonPackingOptions
+
+
 class EnergonTaskEncoderOptions(BaseModel, extra="forbid"):
     """Typed settings used by the Nemotron multimodal task encoder."""
 
@@ -76,12 +100,13 @@ class EnergonTaskEncoderOptions(BaseModel, extra="forbid"):
 
 
 class EnergonTaskEncoderConfig(BaseModel, extra="allow"):
-    """One task encoder selected by registry key."""
+    """One task encoder and its optional packing implementation."""
 
     name: str = "generic_sft"
     options: EnergonTaskEncoderOptions = Field(
         default_factory=EnergonTaskEncoderOptions
     )
+    packing: EnergonPackingConfig | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -124,16 +149,9 @@ class EnergonLoaderConfig(BaseModel, extra="allow"):
         ]
         | None
     ) = None
-    packing_buffer_size: (
-        Annotated[
-            int,
-            Field(
-                ge=1,
-                description="Samples buffered by Energon for packing; None disables packing.",
-            ),
-        ]
-        | None
-    ) = None
+    # Packing is configured by task_encoder.packing. Keep the old field in the
+    # resolved config so older recipes that set it to null remain loadable.
+    packing_buffer_size: None = None
     batch_grouping: Literal["auto"] = "auto"
     processor_adapter: Literal["hf_multimodal"] = "hf_multimodal"
     topology_mapper: Literal["default"] = "default"
