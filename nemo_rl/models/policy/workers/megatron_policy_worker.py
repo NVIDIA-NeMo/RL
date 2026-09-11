@@ -2273,6 +2273,7 @@ class MegatronPolicyWorkerImpl(
             delegate_pack_to_model=self.delegate_pack_to_model,
             delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+            mtp_enabled=self.mtp_enabled,
         )
 
         list_of_outputs = megatron_forward_backward(
@@ -2291,6 +2292,7 @@ class MegatronPolicyWorkerImpl(
             defer_fp32_logits=self.defer_fp32_logits,
             sampling_params=self.sampling_params,
             straggler_timer=self.mcore_state.straggler_timer,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
             enable_opd_full_capture=(payload == "hidden_states"),
         )
 
