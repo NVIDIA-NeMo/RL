@@ -32,6 +32,7 @@ from typing import Any
 
 import pytest
 import torch
+from tensordict import TensorDict
 
 from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
 
@@ -301,3 +302,62 @@ def test_gdr_transfer_threads_keep_attach_device(
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         executor.submit(run_in_transfer_thread).result(timeout=10)
+
+
+@pytest.mark.parametrize("cuda_at_attach", [False, True])
+@pytest.mark.parametrize("payload_device", ["cpu", "cuda"])
+@pytest.mark.parametrize("gdr_active", [False, True])
+def test_put_gdr_requirement_uses_attach_state_and_actual_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    cuda_at_attach: bool,
+    payload_device: str,
+    gdr_active: bool,
+) -> None:
+    """Late CUDA init permits CPU writeback but cannot bypass a GPU PUT guard."""
+    if payload_device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA payload")
+    storage_client = SimpleNamespace(
+        use_gdr=True, _gdr_staging=object() if gdr_active else None
+    )
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: cuda_at_attach)
+    monkeypatch.setattr(tq_adapter, "_connect_existing", lambda: None)
+    monkeypatch.setattr(tq_adapter, "_get_local_node_ip", lambda: "")
+    monkeypatch.setattr(tq_adapter, "_patch_mooncake_register_check", lambda: None)
+    monkeypatch.setattr(tq_adapter, "_bind_mooncake_cuda_device", lambda: None)
+    monkeypatch.setattr(
+        tq_adapter.tq,
+        "get_client",
+        lambda: SimpleNamespace(
+            storage_manager=SimpleNamespace(storage_client=storage_client)
+        ),
+    )
+    client = tq_adapter.TQDataPlaneClient(
+        {
+            "enabled": True,
+            "impl": "transfer_queue",
+            "backend": "mooncake_cpu",
+            "claim_meta_poll_interval_s": 0.5,
+            "mooncake_cpu": {"use_gdr": True, "reuse_registered_buffers": False},
+        },
+        bootstrap=False,
+    )
+    # Unrelated later GPU work must not retroactively change attach eligibility.
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    fields = TensorDict(
+        {"sample_mask": torch.ones(1, device=payload_device)}, batch_size=[1]
+    )
+    puts: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        tq_adapter.tq, "kv_batch_put", lambda **kwargs: puts.append(kwargs)
+    )
+    required = cuda_at_attach or payload_device == "cuda"
+    if required and not gdr_active:
+        with pytest.raises(RuntimeError, match="selected CPU RDMA"):
+            client.put_samples(["sample"], "advantage", fields)
+        assert not puts
+        assert not client._gdr_put_confirmed
+    else:
+        client.put_samples(["sample"], "advantage", fields)
+        assert len(puts) == 1
+        assert puts[0]["fields"]["sample_mask"].device.type == payload_device
+        assert client._gdr_put_confirmed is required

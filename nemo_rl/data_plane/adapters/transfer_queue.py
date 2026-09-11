@@ -812,6 +812,7 @@ class TQDataPlaneClient(DataPlaneClient):
     # without ``__init__`` — ``object.__new__`` in tests, or a process that
     # unpickles a client without running the constructor.
     _gdr_requested: bool = False
+    _gdr_put_required: bool = False
     _gdr_put_confirmed: bool = False
 
     def __init__(self, cfg: DataPlaneConfig, *, bootstrap: bool = True) -> None:
@@ -865,13 +866,16 @@ class TQDataPlaneClient(DataPlaneClient):
         self._gdr_requested = self._backend == "mooncake_cpu" and bool(
             backend_config(cfg).use_gdr
         )
+        # TQ chooses GDR eligibility at attach. A CPU-only controller may
+        # initialize CUDA later without changing its existing storage client.
+        self._gdr_put_required = self._gdr_requested and torch.cuda.is_initialized()
         self._gdr_put_confirmed = False
 
         if bootstrap:
             _init_tq(cfg)
         else:
             _connect_existing()
-        if self._gdr_requested and torch.cuda.is_initialized():
+        if self._gdr_put_required:
             _bind_mooncake_cuda_device()
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]
         self._closed = False
@@ -1086,11 +1090,11 @@ class TQDataPlaneClient(DataPlaneClient):
         confirm_gdr_put = bool(
             self._gdr_requested
             and not self._gdr_put_confirmed
-            and torch.cuda.is_initialized()
             and wire_fields is not None
             and any(
-                isinstance(wire_fields.get(key), torch.Tensor)
-                for key in wire_fields.keys()
+                isinstance(value, torch.Tensor)
+                and (self._gdr_put_required or value.is_cuda)
+                for value in wire_fields.values()
             )
         )
         if confirm_gdr_put:
