@@ -1945,6 +1945,18 @@ def setup_single_controller(
             saved_gym_checkpoint,
             restored_gym_checkpoint,
         )
+        restored_components = sorted(
+            {
+                result.participant.component
+                for result in restored_gym_checkpoint.participants
+            }
+        )
+        print(
+            "📦 Gym participant checkpoint restored and validated: "
+            f"participants={len(restored_gym_checkpoint.participants)}, "
+            f"components={','.join(restored_components)}",
+            flush=True,
+        )
 
     if use_nemo_gym:
         # the two fields are only meaningful when use_nemo_gym enabled
@@ -2003,7 +2015,11 @@ def setup_single_controller(
     # registers unseen field names lazily inside update_production_status
     # without a lock, so the first concurrent puts into an unregistered
     # partition can race kv_retrieve_meta and kill the controller thread
-    # (see TQDataPlaneClient.register_partition).
+    # (see TQDataPlaneClient.register_partition). A restored TQ checkpoint
+    # already contains the authoritative partition schemas. Replaying the
+    # placeholder registration against its live rows can conflict with their
+    # persisted dtypes, so only fresh data planes need schema warmup.
+    should_warm_partitions = data_plane_checkpoint_metadata is None
     token_capture_cfg = master_config.token_capture
     if (
         token_capture_cfg.enabled
@@ -2014,7 +2030,7 @@ def setup_single_controller(
             "token_capture.defer_routed_experts_to_policy requires "
             "policy.router_replay.enabled=true"
         )
-    if not restore_data_plane_in_actor:
+    if should_warm_partitions and not restore_data_plane_in_actor:
         _register_single_controller_partitions(
             dp_client,
             master_config=master_config,

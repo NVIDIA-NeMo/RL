@@ -2498,6 +2498,7 @@ class TestNativeTQRecoverySetup:
 
         assert events == ["load", "build"]
         assert actor_args.data_plane_checkpoint_metadata == _native_tq_metadata()
+        actor_args.dp_client.register_partition.assert_not_called()
         assert actor_args.rollout_checkpoint_load_metrics["tq_load_seconds"] >= 0
 
     @pytest.mark.parametrize("save_enabled", [False, True])
