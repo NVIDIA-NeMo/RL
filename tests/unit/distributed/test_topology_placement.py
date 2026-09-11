@@ -129,7 +129,7 @@ class TestTopoRankValues:
         assert topo_rank == 7
 
     def test_block_node_combined_value(self):
-        # Dense allocation rank: sorted (block, hostname) -> 1..N.
+        # Allocation index: sorted (block, hostname) -> 1..N.
         # 1500-node job is still a small integer; must round-trip through Ray floats.
         topo_rank = int(1500.0)
         assert topo_rank == 1500
@@ -161,7 +161,7 @@ class TestTopoRankValues:
         assert max(b_indices) < min(a_indices)
 
     def test_sorting_with_block_node_ranks(self):
-        # Dense ranks: block 0 nodes 1..4, block 1 nodes 5..8
+        # 1..N ranks: block 0 nodes 1..4, block 1 nodes 5..8
         # block 0 has lower rank → should sort first
         block0_ranks = list(range(1, 5))
         block1_ranks = list(range(5, 9))

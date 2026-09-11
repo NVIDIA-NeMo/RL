@@ -190,7 +190,7 @@ DEFAULT_MASTER_PORT_RANGE_HIGH = 1999
 # into each worker node at cluster start-up. The probe pipeline is:
 #
 #   ray.sub  (topology_probe.sh)    -- parses nvidia-smi -q for ClusterUUID
-#                                   -- looks up a dense 1..N topo_rank from the
+#                                   -- looks up a 1..N topo_rank from the
 #                                      allocation's sorted (block, hostname) map
 #                                   -- prefixes ClusterUUID with NVLINK_DOMAIN_PREFIX
 #                                   -- registers both as Ray custom resources
@@ -206,7 +206,7 @@ Nodes sharing the same key belong to the same NVLink switch fabric (e.g. one GB2
 
 TOPO_RANK_KEY = "topo_rank"
 """Ray resource key for the SLURM topological rank.
-Dense ``1..N`` index of allocated nodes sorted by Slurm block name then hostname
+``1..N`` index of allocated nodes sorted by Slurm block name then hostname
 (see ``ray.sub`` / ``topo_rank_map.txt``). ``N`` is fail-closed against Ray's
 ``1e14`` custom-resource cap. Falls back to ``SLURM_PROCID + 2`` on worker nodes
 (head node is pinned to ``1``) if the map lookup misses. Values are always

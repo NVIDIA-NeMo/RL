@@ -485,7 +485,7 @@ head_node_ip=${ip_addresses_array[0]}
 
 ip_head=$head_node_ip:$PORT
 
-# Dense topo_rank map for this allocation. Digit-stripping SLURM_TOPOLOGY_ADDR
+# 1..N topo_rank map for this allocation. Digit-stripping SLURM_TOPOLOGY_ADDR
 # into block_digits * 10^10 + node_digits overflows Ray's 1e14 custom-resource
 # cap as soon as a block name contributes more than four digits (region / zone
 # / site codes), and collides when distinct names share a numeric substring
@@ -538,7 +538,7 @@ if (( _rank - 1 > _RAY_MAX_CUSTOM_RESOURCE )); then
   echo "[FATAL] topo_rank $((_rank - 1)) exceeds Ray's ${_RAY_MAX_CUSTOM_RESOURCE} custom-resource cap" >&2
   exit 1
 fi
-echo "[INFO] Wrote dense topo_rank map (1..$((_rank - 1))) to $_topo_rank_map"
+echo "[INFO] Wrote topo_rank map (1..$((_rank - 1))) to $_topo_rank_map"
 unset _node_to_block _topo_txt _line _block _nodelist _expanded _n _topo_keys _key _rank _RAY_MAX_CUSTOM_RESOURCE
 
 # Write the topology probe script that runs inside each container.
@@ -552,7 +552,7 @@ unset _node_to_block _topo_txt _line _block _nodelist _expanded _n _topo_keys _k
 #
 # TOPO_RANK: Topology-aware infrastructure rank.
 #   Fallback chain:
-#   1. Dense 1..N lookup from topo_rank_map.txt (sorted block name, then hostname)
+#   1. 1..N lookup from topo_rank_map.txt (sorted block name, then hostname)
 #   2. SLURM_PROCID + 2 on workers, head pinned to 1 (map miss under SLURM)
 #   Hostname digit-stripping is intentionally omitted: it is unbounded and
 #   can exceed Ray's 1e14 cap. Missing topo_rank becomes TOPO_RANK_UNKNOWN.
