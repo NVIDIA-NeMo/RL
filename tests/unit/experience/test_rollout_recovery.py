@@ -821,9 +821,15 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
 
     state = ledger.state_dict()
     restored = RolloutRecoveryLedger.from_state_dict(state)
-    physical_ids, _, restored_receipts, rewards, mask_sample, evidence = (
-        restored.finalization_inputs("g7")
-    )
+    (
+        physical_ids,
+        _,
+        restored_receipts,
+        rewards,
+        mask_sample,
+        evidence,
+        effort_contexts,
+    ) = restored.finalization_inputs("g7")
 
     assert physical_ids == gate_ids
     assert restored_receipts[0] is None
@@ -1186,3 +1192,81 @@ def test_checkpoint_preserves_pending_finalizer_metrics_independently_of_sealed_
     )
     del state["finalizer_metrics_by_group"]
     assert parse_rollout_recovery_state(state).finalizer_metrics_by_group == {}
+
+
+@pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+def test_effort_context_survives_sealing_restore_and_duplicate_validation(granularity):
+    from nemo_rl.experience.effort_shaping import (
+        EffortLevelsConfig,
+        compute_effort_context,
+    )
+
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=0,
+        start_weight_version=4,
+        group_id="g7",
+        recovery_granularity=granularity,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    rid = group.gate_rollout_ids[0]
+    context = compute_effort_context(
+        rid,
+        {"responses_create_params": {"input": [{"role": "user", "content": "budget"}]}},
+        EffortLevelsConfig(low_weight=1, low_string="budget"),
+    )
+    result = SiblingSealResult(
+        rid, {"rollout_id": rid, "manifest": []}, -2.0, False, effort_context=context
+    )
+    if granularity == RecoveryGranularity.SIBLING:
+
+        def seal(value):
+            _mutate(
+                lambda cut: ledger.mark_sibling_sealed(
+                    cut,
+                    "g7",
+                    generation_index=0,
+                    gate_rollout_id=rid,
+                    receipt=result.receipt,
+                    reward=result.reward,
+                    mask_sample=False,
+                    effort_context=value,
+                )
+            )
+
+        seal(context)
+        seal(context)
+        with pytest.raises(ValueError, match="conflicting duplicate"):
+            seal(dataclasses.replace(context, is_low_effort=False))
+    else:
+        with pytest.raises(ValueError, match="effort context rollout identity"):
+            _mutate(
+                lambda cut: ledger.mark_group_sealed(
+                    cut,
+                    "g7",
+                    {
+                        0: dataclasses.replace(
+                            result,
+                            effort_context=dataclasses.replace(
+                                context, rollout_id="wrong"
+                            ),
+                        )
+                    },
+                )
+            )
+        _mutate(lambda cut: ledger.mark_group_sealed(cut, "g7", {0: result}))
+    state = ledger.state_dict()
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+    _bind(restored, "g7", _prompt())
+    assert restored.state_dict() == state
+    assert restored.finalization_inputs("g7")[3] == [-2.0]
+    assert restored.finalization_inputs("g7")[6] == [context]
+    state["groups"][0]["siblings"][0]["attempts"][0]["effort_context"]["rollout_id"] = (
+        "wrong"
+    )
+    with pytest.raises(ValueError, match="effort context rollout identity"):
+        RolloutRecoveryLedger.from_state_dict(state)

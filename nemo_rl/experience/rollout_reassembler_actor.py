@@ -22,6 +22,7 @@ import ray
 import torch
 
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
+from nemo_rl.experience.effort_shaping import EffortLevelsConfig, RolloutEffortContext
 from nemo_rl.experience.reward_penalties import (
     CaptureRewardPenaltyConfig,
     RolloutTextPenaltyEvidence,
@@ -72,6 +73,7 @@ class ReassemblyRequest:
     # Dataset-level loss weight shared by every completion in this prompt group.
     loss_multiplier: float = 1.0
     text_penalty_evidence: tuple[RolloutTextPenaltyEvidence | None, ...] | None = None
+    effort_contexts: tuple[RolloutEffortContext | None, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +87,7 @@ class RolloutReassemblerActorConfig:
     defer_routed_experts_to_policy: bool
     max_seq_len: int
     reward_penalty_config: CaptureRewardPenaltyConfig | None = None
+    effort_config: EffortLevelsConfig | None = None
 
 
 def assert_metadata_only(value: Any, *, path: str = "rpc") -> None:
@@ -140,6 +143,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             defer_routed_experts_to_policy=config.defer_routed_experts_to_policy,
             max_seq_len=config.max_seq_len,
             reward_penalty_config=config.reward_penalty_config,
+            effort_config=config.effort_config,
         )
 
     def check_dependencies(self) -> None:
@@ -178,6 +182,9 @@ class RolloutReassemblerActor:  # pragma: no cover
             prompt_idx=request.prompt_idx,
             loss_multiplier=request.loss_multiplier,
             canonical_sample_ids=list(request.canonical_sample_ids),
+            effort_contexts=list(request.effort_contexts)
+            if request.effort_contexts is not None
+            else None,
             text_penalty_evidence=list(request.text_penalty_evidence)
             if request.text_penalty_evidence is not None
             else None,
