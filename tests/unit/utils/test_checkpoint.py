@@ -22,9 +22,10 @@ import numpy as np
 import pytest
 import torch
 import yaml
+from pydantic import TypeAdapter
 
 import nemo_rl.utils.checkpoint as checkpoint_module
-from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 
 
 @pytest.fixture
@@ -48,6 +49,14 @@ def checkpoint_config(checkpoint_dir):
 @pytest.fixture
 def checkpoint_manager(checkpoint_config):
     return CheckpointManager(checkpoint_config)
+
+
+def test_checkpoint_config_accepts_null_keep_top_k(checkpoint_config):
+    checkpoint_config["keep_top_k"] = None
+
+    validated = TypeAdapter(CheckpointingConfig).validate_python(checkpoint_config)
+
+    assert validated["keep_top_k"] is None
 
 
 def test_init_tmp_checkpoint(checkpoint_manager, checkpoint_dir):
