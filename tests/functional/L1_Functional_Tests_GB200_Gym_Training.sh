@@ -26,3 +26,8 @@ if [[ "${FAST:-0}" == "1" ]]; then
 else
     time uv run --no-sync bash ./tests/functional/grpo_nano4b_gym_training_e2e.sh
 fi
+
+cd "${PROJECT_ROOT}/tests"
+if compgen -G ".coverage*" > /dev/null; then
+    coverage combine .coverage*
+fi

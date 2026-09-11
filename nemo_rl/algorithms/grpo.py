@@ -2538,8 +2538,10 @@ def refit_policy_generation(
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
 
     Returns:
-        Scalar metrics reported by the selected weight synchronizer, or the
-        number of generation worker groups that acknowledged a direct refit.
+        Scalar metrics reported by the selected weight synchronizer, or
+        ``{"generation_workers_updated": n}`` where ``n`` is the number of
+        generation engine replicas (one TP/PP rank-0 worker per data-parallel
+        replica) that acknowledged a direct IPC/NCCL refit.
     """
     # Every SGLang deployment reaches its refit through this hook: `setup`
     # attaches an SGLang synchronizer that owns the whole lifecycle (phase
