@@ -39,6 +39,11 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.gym_traces import (
+    gym_masked_message_log,
+    gym_trace_message_log,
+    parse_gym_training_traces,
+)
 from nemo_rl.environments.nemo_gym_multimodal import (
     _index_per_turn_images,
     _is_trainable_output_item,
@@ -615,6 +620,30 @@ Depending on your data shape, you may want to change these values."""
         # Megatron's HTTP backend consumes the same normalized Responses payload.
         normalize_media_in_examples(nemo_gym_examples)
 
+        all_traces_delivery = (
+            (self.cfg.get("initial_global_config_dict") or {}).get("token_id_capture")
+            or {}
+        ).get("delivery") == "all_traces"
+        if all_traces_delivery:
+            from uuid import uuid4
+
+            from nemo_gym.global_config import ROLLOUT_ID_KEY_NAME
+            from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
+
+            # Synchronous rows need not carry Gym task indices. Assign capture
+            # identity before /run so writers and finalization use the same key.
+            # Fresh dispatches must not collide when task numbering restarts.
+            capture_ids = set()
+            for row in nemo_gym_examples:
+                if ROLLOUT_ID_KEY_NAME not in row:
+                    row[ROLLOUT_ID_KEY_NAME] = uuid4().hex
+                capture_id = maybe_rollout_id_from_run_body(row)
+                if not capture_id or capture_id in capture_ids:
+                    raise ValueError(
+                        "Gym all_traces dispatch requires unique valid capture rollout IDs"
+                    )
+                capture_ids.add(capture_id)
+
         timer = Timer()
         timer.start("_run_rollouts_total")
         nemo_gym_result_iterator = self.rch.run_examples(
@@ -652,6 +681,10 @@ Depending on your data shape, you may want to change these values."""
                     # NaN check) applies here.
                     nemo_rl_result = await self._postprocess_receipt_mode(
                         nemo_gym_row, nemo_gym_result
+                    )
+                elif all_traces_delivery:
+                    nemo_rl_result = await self._postprocess_all_gym_traces(
+                        nemo_gym_row, nemo_gym_result, tokenizer
                     )
                 else:
                     nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
@@ -699,6 +732,79 @@ Depending on your data shape, you may want to change these values."""
                 nemo_rl_result,
                 timing_metrics,
             )
+
+    async def _postprocess_all_gym_traces(
+        self,
+        nemo_gym_row: dict,
+        nemo_gym_result: dict,
+        tokenizer: PreTrainedTokenizerBase,
+    ) -> dict:
+        """Finalize the local Gym capture and preserve every owned training trace."""
+        # Gym is installed in the actor environment, not the trainer environment.
+        from nemo_gym.global_config import (
+            ATTEMPT_INDEX_KEY_NAME,
+            ROLLOUT_ID_KEY_NAME,
+            ROLLOUT_INDEX_KEY_NAME,
+            TASK_INDEX_KEY_NAME,
+        )
+        from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
+        from nemo_gym.token_id_capture.config import TokenIdCaptureConfig
+        from nemo_gym.token_id_capture.delivery import finalize_rollout_token_capture
+        from nemo_gym.token_id_capture.store import TokenCaptureStore
+
+        capture_config = TokenIdCaptureConfig.model_validate(
+            self.cfg["initial_global_config_dict"]
+        )
+        # Ordinary RL dispatch identifies requests with task/rollout indices;
+        # explicit IDs are optional. Use the same resolver as Gym's capture writer.
+        rollout_id = maybe_rollout_id_from_run_body(nemo_gym_row)
+        if not rollout_id:
+            raise ValueError("Gym all_traces result is missing its capture rollout ID")
+        # Preserve the original fields, not an already suffixed canonical ID:
+        # the finalizer applies the attempt suffix exactly once. The dispatched
+        # row is authoritative even if an agent echoes stale correlation fields.
+        for key in (
+            ROLLOUT_ID_KEY_NAME,
+            TASK_INDEX_KEY_NAME,
+            ROLLOUT_INDEX_KEY_NAME,
+            ATTEMPT_INDEX_KEY_NAME,
+        ):
+            if key in nemo_gym_row:
+                nemo_gym_result[key] = nemo_gym_row[key]
+            else:
+                nemo_gym_result.pop(key, None)
+        store = TokenCaptureStore(capture_config.resolved_dir())
+        await finalize_rollout_token_capture(
+            nemo_gym_result,
+            store,
+            builder=capture_config.token_id_capture.builder,
+            delivery=capture_config.token_id_capture.delivery,
+        )
+        envelope = nemo_gym_result.get("training_traces")
+        if envelope is None:
+            if not nemo_gym_result.get("mask_sample"):
+                raise ValueError(
+                    "Gym all_traces delivery returned no training envelope"
+                )
+            traces = []
+        else:
+            traces = parse_gym_training_traces(envelope)
+            if envelope["rollout_id"] != rollout_id:
+                raise ValueError("Gym trace envelope belongs to a different rollout")
+        logs = [gym_trace_message_log(trace) for trace in traces]
+        # The existing logical rollout protocol needs a representative prompt.
+        # Training expands gym_training_traces before flattening any sequence.
+        message_log = (
+            logs[0] if logs else gym_masked_message_log(tokenizer.pad_token_id)
+        )
+        return {
+            "message_log": message_log,
+            "input_message_log": message_log[:1],
+            "gym_training_traces": traces,
+            "gym_rollout_id": rollout_id,
+            "gym_metrics_message_log": [message for log in logs for message in log],
+            "full_result": nemo_gym_result,
+        }
 
     async def _postprocess_receipt_mode(
         self, nemo_gym_row: dict, nemo_gym_result: dict
