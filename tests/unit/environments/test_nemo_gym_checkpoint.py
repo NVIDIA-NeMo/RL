@@ -607,7 +607,7 @@ def test_completed_result_acknowledgement_rejects_a_different_receipt() -> None:
         )
 
 
-def test_completion_receipt_is_read_from_the_active_checkpoint_cut() -> None:
+def test_completion_receipt_uses_exact_participant_lookup() -> None:
     env = _checkpoint_env()
     capabilities = {
         "policy": _capability(
@@ -629,45 +629,19 @@ def test_completion_receipt_is_read_from_the_active_checkpoint_cut() -> None:
 
     env._control = AsyncMock(side_effect=discover_control)
     asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
-    env._active_gym_checkpoint_id = "snapshot-7"
     receipt = _completion_receipt()
 
-    async def status_control(method, path, *, server_name, params, **_kwargs):
+    async def receipt_control(method, path, *, server_name, params, **_kwargs):
         assert method == "GET"
-        assert path.endswith("/status")
+        assert path.endswith("/completion-receipt")
         assert server_name == "agent-route"
-        assert params == {"checkpoint_id": "snapshot-7"}
-        execution = {
-            "rollout_id": receipt["rollout_id"],
-            "attempt_index": receipt["attempt_index"],
-            "generation": receipt["execution_generation"],
-            "state": "completed",
-            "parked_boundary_state": None,
-            "boundary_index": None,
-            "turn_index": None,
-            "boundary_kind": None,
-            "resource_state_revisions": {},
-            "completion_receipt": receipt,
-            "age_seconds": 0.1,
+        assert params == {
+            "rollout_id": "group-7_g0",
+            "attempt_index": 2,
         }
-        return {
-            "checkpoint_id": "snapshot-7",
-            "state": "preparing",
-            "ready_to_commit": False,
-            "running": 0,
-            "parked": 0,
-            "parked_with_boundary": 0,
-            "parked_without_boundary": 0,
-            "completed_unacknowledged": 1,
-            "acknowledged_completed": 0,
-            "active": 1,
-            "blocking_attempts": [],
-            "completed_unacknowledged_attempts": [execution],
-            "selected_boundaries": [],
-            "executions": [execution],
-        }
+        return receipt
 
-    env._control = AsyncMock(side_effect=status_control)
+    env._control = AsyncMock(side_effect=receipt_control)
     resolved = asyncio.run(
         env._completion_receipt_for(
             GymExecutionIdentity(rollout_id="group-7_g0", attempt_index=2),
