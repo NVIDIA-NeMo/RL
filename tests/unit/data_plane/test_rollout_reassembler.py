@@ -824,3 +824,175 @@ def test_deferred_chain_hash_corruption_rejects_the_row(
     )
     assert not row.valid
     assert (row.rejection_reason or "").startswith("rebuild_failed:chain_hash_mismatch")
+
+
+@pytest.mark.parametrize("bad_second", [False, True])
+def test_group_batches_reads_and_preserves_rollout_failure_isolation(
+    tq_client, partitions, monkeypatch, bad_second
+):
+    group_id = "batched"
+    ids = [f"{group_id}_g{i}" for i in range(3)]
+    receipts = [
+        _stage_fixture(tq_client, "single_call", rollout_id=rollout_id)[0]
+        for rollout_id in ids[:2]
+    ]
+    if bad_second:
+        tq_client.clear_samples(
+            sample_ids=[receipts[1]["manifest"][0]["staging_key"]],
+            partition_id=STAGING_PARTITION,
+        )
+    calls = []
+    read = tq_client.get_samples
+
+    def recording_read(**kwargs):
+        calls.append(kwargs)
+        return read(**kwargs)
+
+    monkeypatch.setattr(tq_client, "get_samples", recording_read)
+    result = _finalizer(tq_client).finalize_group(
+        group_id,
+        ids,
+        receipts + [None],
+        [1.0, 2.0, 0.0],
+        mask_sample=[False] * 3,
+        fallback_weight_version=9,
+        prompt_idx=17,
+    )
+    assert result.valid_row_count == (1 if bad_second else 2)
+    assert result.total_row_count == 3
+    assert len(calls) == (3 if bad_second else 1)
+    assert calls[0]["sample_ids"] == [r["manifest"][0]["staging_key"] for r in receipts]
+    assert all(call["select_fields"] == STAGING_FIELDS for call in calls)
+    assert result.metrics["row_assembly/fetch_ms"] >= 0
+    assert result.metrics["row_assembly/verify_ms"] >= 0
+    assert result.metrics["row_assembly/rollouts_ms"] == pytest.approx(
+        result.metrics["row_assembly/fetch_ms"]
+        + result.metrics["row_assembly/verify_ms"]
+    )
+    if bad_second:
+        assert (
+            result.metrics["finalize/capture_failure_reason_missing_staging_row_count"]
+            == 1
+        )
+    published = read(
+        sample_ids=ids, partition_id=CANONICAL_PARTITION, select_fields=["sample_mask"]
+    )
+    assert published["sample_mask"].tolist() == [1.0, 0.0 if bad_second else 1.0, 0.0]
+
+
+@pytest.mark.parametrize("router_replay", [False, True])
+def test_placeholder_only_groups_have_zero_fetch_time(
+    tq_client, partitions, monkeypatch, router_replay
+):
+    def unexpected_read(**kwargs):
+        raise AssertionError("placeholder groups must not read staging")
+
+    monkeypatch.setattr(tq_client, "get_samples", unexpected_read)
+    result = _finalizer(tq_client, router_replay_enabled=router_replay).finalize_group(
+        "empty",
+        ["empty_g0"],
+        [None],
+        [0.0],
+        mask_sample=[False],
+        fallback_weight_version=9,
+        prompt_idx=17,
+    )
+    assert result.metrics["row_assembly/fetch_ms"] == 0
+    assert result.metrics["row_assembly/verify_ms"] >= 0
+    assert result.dropped == router_replay
+
+
+@pytest.mark.parametrize("damage", [None, "missing", "malformed", "reordered_partial"])
+def test_direct_group_fetch_targets_only_route_keys_and_isolates_payload_failures(
+    tq_client, r3_deferred_partitions, damage
+):
+    from nemo_rl.data_plane.tq_token_sink import ROUTED_EXPERTS_FIELD, FetchedStagedCall
+
+    records = [
+        build_fixture_artifacts("single_call", rollout_id=f"mixed_{i}")[0][0]
+        for i in range(3)
+    ]
+    records[0] = _record_with_routes(
+        records[0], _routes_for_delta(0, records[0].delta_len)
+    )
+    records[2] = _record_with_routes(
+        records[2], _routes_for_delta(2, records[2].delta_len)
+    )
+    sink = TQTokenSink(tq_client, staging_partition=_R3_DEFERRED_STAGING)
+    for record in records:
+        assert sink.stage(record).ok
+    keys = [r.staging_key for r in records]
+    calls = []
+
+    class RouteClient:
+        def get_samples(self, **kwargs):
+            calls.append((list(kwargs["sample_ids"]), list(kwargs["select_fields"])))
+            route_read = ROUTED_EXPERTS_FIELD in kwargs["select_fields"]
+            if route_read and keys[2] in kwargs["sample_ids"]:
+                if damage == "missing":
+                    raise ValueError("route field is not ready")
+                if damage == "reordered_partial":
+                    kwargs["sample_ids"] = list(reversed(kwargs["sample_ids"][:-1]))
+            rows = tq_client.get_samples(**kwargs)
+            if route_read and damage == "malformed" and keys[2] in kwargs["sample_ids"]:
+                rows[ROUTED_EXPERTS_FIELD] = "invalid non-tensor payload"
+            return rows
+
+    result = TQTokenSource(
+        RouteClient(), staging_partition=_R3_DEFERRED_STAGING
+    ).fetch_for_group(keys, include_route_fragments=True)
+    assert isinstance(result.calls[keys[0]], FetchedStagedCall)
+    assert result.calls[keys[0]].fragment is not None
+    assert isinstance(result.calls[keys[1]], FetchedStagedCall)
+    assert result.calls[keys[1]].fragment is None
+    if damage is None:
+        assert isinstance(result.calls[keys[2]], FetchedStagedCall)
+        assert result.calls[keys[2]].fragment is not None
+        assert len(calls) == 2
+    else:
+        assert isinstance(result.calls[keys[2]], (KeyError, TypeError, ValueError))
+    assert calls[0] == (keys, STAGING_FIELDS)
+    for selected_keys, fields in calls:
+        if ROUTED_EXPERTS_FIELD in fields:
+            assert keys[1] not in selected_keys
+            assert set(fields) == {
+                "rollout_id_utf8",
+                "model_call_id_utf8",
+                ROUTED_EXPERTS_FIELD,
+            }
+
+
+def test_group_timing_separates_reads_from_verification(
+    tq_client, partitions, monkeypatch
+):
+    import nemo_rl.experience.rollout_reassembler as module
+
+    receipt, _ = _stage_fixture(tq_client, "single_call", rollout_id="timed_g0")
+    finalizer = _finalizer(tq_client)
+    clock = [0.0]
+    read = tq_client.get_samples
+    verify = finalizer._verify_rollout
+
+    def timed_read(**kwargs):
+        clock[0] += 0.010
+        return read(**kwargs)
+
+    def timed_verify(*args, **kwargs):
+        clock[0] += 0.025
+        return verify(*args, **kwargs)
+
+    monkeypatch.setattr(module.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(tq_client, "get_samples", timed_read)
+    monkeypatch.setattr(finalizer, "_verify_rollout", timed_verify)
+    result = finalizer.finalize_group(
+        "timed",
+        ["timed_g0"],
+        [receipt],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=9,
+        prompt_idx=17,
+    )
+    assert result.metrics["row_assembly/fetch_ms"] == pytest.approx(10)
+    assert result.metrics["row_assembly/verify_ms"] == pytest.approx(25)
+    assert result.metrics["row_assembly/rollouts_ms"] == pytest.approx(35)

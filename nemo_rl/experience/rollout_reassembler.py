@@ -14,9 +14,9 @@
 """Blackbox finalization: token-free receipts + staged deltas -> canonical rows.
 
 Orchestration only:
-per rollout, apply the rollout-level receipt guards, fetch the staged base
-rows the receipt manifest names through the ``TokenSource`` (normally
-validated ``StagedCallBaseSnapshot`` values), and delegate all token, digest,
+apply per-rollout receipt guards, fetch the group's union of staged keys
+through the ``TokenSource`` (normally validated ``StagedCallBaseSnapshot``
+values), and delegate all token, digest,
 lineage, and terminal-chain semantics to Gym's ``verify_and_linearize``. Any
 rejection becomes a masked placeholder row — the group always publishes
 exactly N rows so GRPO group shape survives; validity folds into
@@ -28,22 +28,27 @@ Router replay runs one unified flow: both modes construct the same
 ``RouteAssemblyPlan`` from Gym's link spans and extras commitments. Deferred
 mode publishes the encoded plan beside the canonical row and leaves staged
 route fragments live until policy consumption; direct mode executes the plan
-eagerly with fragments fetched in the same batch — any executor failure is a
-pre-publication ``route_assembly:<reason>`` rejection.
+eagerly with fragments fetched in one targeted group read — any executor
+failure is a pre-publication ``route_assembly:<reason>`` rejection.
 """
 
 from __future__ import annotations
 
 import time
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
-from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
+from nemo_rl.data_plane.tq_token_sink import (
+    FetchedStagedCall,
+    TQTokenSink,
+    TQTokenSource,
+)
 from nemo_rl.experience.payload import pack_payload
 from nemo_rl.experience.route_assembly import (
     ROUTE_MISSING_SENTINEL,
@@ -58,6 +63,9 @@ from nemo_rl.experience.route_plan import (
     encoded_route_plan_size_bytes,
     validate_route_plan,
 )
+
+if TYPE_CHECKING:
+    from nemo_gym.token_id_capture.staging.records import RolloutReceipt
 
 
 @dataclass(frozen=True)
@@ -149,75 +157,139 @@ class RolloutReassembler:
         invalid row whose reason feeds the metrics; the group publisher
         substitutes a placeholder.
         """
+        parsed = self._prepare_rollout(rollout_id, receipt, reward=reward)
+        if isinstance(parsed, FinalizedRollout):
+            return parsed
+        staging_keys = [record.staging_key for record in parsed.manifest]
+        try:
+            fetched = self._source.fetch_for_finalization(
+                staging_keys,
+                include_route_fragments=(
+                    self._router_replay_enabled
+                    and not self._defer_routed_experts_to_policy
+                ),
+            )
+        except KeyError as error:
+            return self._rejected(
+                rollout_id, reward, f"missing_staging_row:{error}", staging_keys
+            )
+        except (TypeError, ValueError) as error:
+            return self._rejected(
+                rollout_id, reward, f"invalid_staging_row:{error}", staging_keys
+            )
+        return self._verify_rollout(rollout_id, parsed, fetched, reward=reward)
+
+    @staticmethod
+    def _rejected(
+        rollout_id: str, reward: float, reason: str, staging_keys: list[str]
+    ) -> FinalizedRollout:
+        return FinalizedRollout(
+            rollout_id=rollout_id,
+            valid=False,
+            rejection_reason=reason,
+            token_ids=[],
+            token_mask=[],
+            logprobs=[],
+            prompt_len=0,
+            reward=reward,
+            staging_keys=staging_keys,
+        )
+
+    def _prepare_rollout(
+        self, rollout_id: str, receipt: Optional[dict[str, Any]], *, reward: float
+    ) -> RolloutReceipt | FinalizedRollout:
+        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        from nemo_gym.token_id_capture.staging.records import RolloutReceipt
+
+        if receipt is None:
+            return self._rejected(rollout_id, reward, "missing_receipt", [])
+        try:
+            parsed = RolloutReceipt.model_validate(receipt)
+        except ValueError as error:
+            return self._rejected(rollout_id, reward, f"invalid_receipt:{error}", [])
+        staging_keys = [record.staging_key for record in parsed.manifest]
+        if parsed.rollout_id != rollout_id:
+            return self._rejected(
+                rollout_id,
+                reward,
+                f"identity_mismatch:{parsed.rollout_id}",
+                staging_keys,
+            )
+        if parsed.failure_reason is not None:
+            return self._rejected(
+                rollout_id,
+                reward,
+                f"rollout_failed:{parsed.failure_reason}",
+                staging_keys,
+            )
+        if parsed.capture_poisoned:
+            return self._rejected(rollout_id, reward, "capture_poisoned", staging_keys)
+        if not parsed.manifest:
+            return self._rejected(rollout_id, reward, "empty_manifest", staging_keys)
+        if len(set(staging_keys)) != len(staging_keys):
+            return self._rejected(
+                rollout_id,
+                reward,
+                "duplicate_staging_key",
+                list(dict.fromkeys(staging_keys)),
+            )
+        records_by_call = {record.model_call_id: record for record in parsed.manifest}
+        if len(records_by_call) != len(parsed.manifest):
+            return self._rejected(
+                rollout_id, reward, "duplicate_manifest_call_id", staging_keys
+            )
+
+        return parsed
+
+    def _verify_rollout(
+        self,
+        rollout_id: str,
+        parsed: RolloutReceipt,
+        fetch_results: Sequence[FetchedStagedCall | KeyError | TypeError | ValueError],
+        *,
+        reward: float,
+    ) -> FinalizedRollout:
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.rebuild import (
             RebuildError,
             ReceiptVerificationError,
             verify_and_linearize,
         )
-        from nemo_gym.token_id_capture.staging.records import RolloutReceipt
 
-        def rejected(reason: str, staging_keys: list[str]) -> FinalizedRollout:
-            return FinalizedRollout(
-                rollout_id=rollout_id,
-                valid=False,
-                rejection_reason=reason,
-                token_ids=[],
-                token_mask=[],
-                logprobs=[],
-                prompt_len=0,
-                reward=reward,
-                staging_keys=staging_keys,
-            )
-
-        if receipt is None:
-            return rejected("missing_receipt", [])
-        try:
-            parsed = RolloutReceipt.model_validate(receipt)
-        except ValueError as error:
-            return rejected(f"invalid_receipt:{error}", [])
         staging_keys = [record.staging_key for record in parsed.manifest]
-        if parsed.rollout_id != rollout_id:
-            return rejected(f"identity_mismatch:{parsed.rollout_id}", staging_keys)
-        if parsed.failure_reason is not None:
-            return rejected(f"rollout_failed:{parsed.failure_reason}", staging_keys)
-        if parsed.capture_poisoned:
-            return rejected("capture_poisoned", staging_keys)
-        if not parsed.manifest:
-            return rejected("empty_manifest", staging_keys)
-        if len(set(staging_keys)) != len(staging_keys):
-            return rejected(
-                "duplicate_staging_key",
-                list(dict.fromkeys(staging_keys)),
-            )
         records_by_call = {record.model_call_id: record for record in parsed.manifest}
-        if len(records_by_call) != len(parsed.manifest):
-            return rejected("duplicate_manifest_call_id", staging_keys)
-
-        fetch_fragments = (
-            self._router_replay_enabled and not self._defer_routed_experts_to_policy
-        )
-        try:
-            fetched = self._source.fetch_for_finalization(
-                staging_keys, include_route_fragments=fetch_fragments
-            )
-        except KeyError as error:
-            return rejected(f"missing_staging_row:{error}", staging_keys)
-        except (TypeError, ValueError) as error:
-            return rejected(f"invalid_staging_row:{error}", staging_keys)
+        fetched: list[FetchedStagedCall] = []
+        for item in fetch_results:
+            if isinstance(item, KeyError):
+                return self._rejected(
+                    rollout_id, reward, f"missing_staging_row:{item}", staging_keys
+                )
+            if isinstance(item, (TypeError, ValueError)):
+                return self._rejected(
+                    rollout_id, reward, f"invalid_staging_row:{item}", staging_keys
+                )
+            fetched.append(item)
         fetched_by_call = {}
         for record, item in zip(parsed.manifest, fetched):
             if item.staging_key != record.staging_key:
-                return rejected(
-                    f"staging_key_mismatch:{record.model_call_id}", staging_keys
+                return self._rejected(
+                    rollout_id,
+                    reward,
+                    f"staging_key_mismatch:{record.model_call_id}",
+                    staging_keys,
                 )
             if item.snapshot.model_call_id != record.model_call_id:
-                return rejected(
-                    f"call_id_mismatch:{record.model_call_id}", staging_keys
+                return self._rejected(
+                    rollout_id,
+                    reward,
+                    f"call_id_mismatch:{record.model_call_id}",
+                    staging_keys,
                 )
             fetched_by_call[record.model_call_id] = item
         if len(fetched_by_call) != len(fetched):
-            return rejected("duplicate_fetched_call_id", staging_keys)
+            return self._rejected(
+                rollout_id, reward, "duplicate_fetched_call_id", staging_keys
+            )
 
         # All base token/digest/lineage/terminal semantics belong to Gym; the
         # finalizer never re-verifies them.
@@ -231,7 +303,9 @@ class RolloutReassembler:
             RebuildError,
             NotImplementedError,
         ) as error:
-            return rejected(f"rebuild_failed:{error}", staging_keys)
+            return self._rejected(
+                rollout_id, reward, f"rebuild_failed:{error}", staging_keys
+            )
         weight_versions = [record.weight_version for record in parsed.manifest]
         min_wv, max_wv = min(weight_versions), max(weight_versions)
 
@@ -250,22 +324,43 @@ class RolloutReassembler:
             seen_span_call_ids: set[str] = set()
             for call_id, carry_len, generation_len in row.link_spans:
                 if call_id in seen_span_call_ids:
-                    return rejected(f"duplicate_route_span:{call_id}", staging_keys)
+                    return self._rejected(
+                        rollout_id,
+                        reward,
+                        f"duplicate_route_span:{call_id}",
+                        staging_keys,
+                    )
                 seen_span_call_ids.add(call_id)
                 record = records_by_call.get(call_id)
                 item = fetched_by_call.get(call_id)
                 commitment = commitments_by_call.get(call_id)
                 if record is None or item is None or commitment is None:
-                    return rejected(f"route_span_identity:{call_id}", staging_keys)
+                    return self._rejected(
+                        rollout_id,
+                        reward,
+                        f"route_span_identity:{call_id}",
+                        staging_keys,
+                    )
                 if item.routed_len not in (0, record.delta_len):
-                    return rejected(f"routed_len_mismatch:{call_id}", staging_keys)
+                    return self._rejected(
+                        rollout_id,
+                        reward,
+                        f"routed_len_mismatch:{call_id}",
+                        staging_keys,
+                    )
                 if generation_len < 0 or generation_len > record.delta_len:
-                    return rejected(
-                        f"route_generation_span_mismatch:{call_id}", staging_keys
+                    return self._rejected(
+                        rollout_id,
+                        reward,
+                        f"route_generation_span_mismatch:{call_id}",
+                        staging_keys,
                     )
                 if carry_len < 0:
-                    return rejected(
-                        f"route_carry_span_mismatch:{call_id}", staging_keys
+                    return self._rejected(
+                        rollout_id,
+                        reward,
+                        f"route_carry_span_mismatch:{call_id}",
+                        staging_keys,
                     )
                 route_spans.append(
                     RouteSpan(
@@ -280,7 +375,9 @@ class RolloutReassembler:
             if sum(span.carry_len + span.generation_len for span in route_spans) != len(
                 row.token_ids
             ):
-                return rejected("route_span_length_mismatch", staging_keys)
+                return self._rejected(
+                    rollout_id, reward, "route_span_length_mismatch", staging_keys
+                )
             plan = RouteAssemblyPlan(
                 schema_version=ROUTE_PLAN_SCHEMA_VERSION,
                 staging_partition=self._staging_partition,
@@ -291,7 +388,9 @@ class RolloutReassembler:
             try:
                 validate_route_plan(plan)
             except (TypeError, ValueError) as error:
-                return rejected(f"invalid_route_plan:{error}", staging_keys)
+                return self._rejected(
+                    rollout_id, reward, f"invalid_route_plan:{error}", staging_keys
+                )
             # Both modes carry the constructed plan on the rollout; only
             # deferred mode publishes it (direct mode executes it eagerly and
             # the published row carries the assembled tensor instead).
@@ -299,7 +398,9 @@ class RolloutReassembler:
             if not self._defer_routed_experts_to_policy:
                 routed_experts, failure = self._execute_direct_plan(plan, fetched)
                 if failure is not None:
-                    return rejected(f"route_assembly:{failure}", staging_keys)
+                    return self._rejected(
+                        rollout_id, reward, f"route_assembly:{failure}", staging_keys
+                    )
 
         return FinalizedRollout(
             rollout_id=rollout_id,
@@ -392,14 +493,49 @@ class RolloutReassembler:
             "canonical_sample_ids must be one per rollout"
         )
         _group_t0 = time.perf_counter()
-        rows = [
-            self.finalize_rollout(rollout_id, receipt, reward=reward)
+        prepared = [
+            self._prepare_rollout(rollout_id, receipt, reward=reward)
             for rollout_id, receipt, reward in zip(rollout_ids, receipts, rewards)
+        ]
+        staging_union = list(
+            dict.fromkeys(
+                record.staging_key
+                for parsed in prepared
+                if not isinstance(parsed, FinalizedRollout)
+                for record in parsed.manifest
+            )
+        )
+        # fetch_ms measures only data-plane reads, including failed attempts.
+        # verify_ms covers CPU work: receipt guards, wire decoding, Gym
+        # verification and direct route execution. Their sum is rollouts_ms.
+        fetched_by_key = self._source.fetch_for_group(
+            staging_union,
+            include_route_fragments=(
+                self._router_replay_enabled and not self._defer_routed_experts_to_policy
+            ),
+        )
+        _fetch_ms = fetched_by_key.fetch_ms
+        rows = [
+            parsed
+            if isinstance(parsed, FinalizedRollout)
+            else self._verify_rollout(
+                rollout_id,
+                parsed,
+                [
+                    fetched_by_key.calls[record.staging_key]
+                    for record in parsed.manifest
+                ],
+                reward=reward,
+            )
+            for rollout_id, parsed, reward in zip(rollout_ids, prepared, rewards)
         ]
         _rollouts_ms = (time.perf_counter() - _group_t0) * 1000.0
         valid_rows = [row for row in rows if row.valid]
         staging_keys = [key for row in rows for key in row.staging_keys]
         metrics = {
+            "row_assembly/fetch_ms": _fetch_ms,
+            "row_assembly/verify_ms": _rollouts_ms - _fetch_ms,
+            "row_assembly/rollouts_ms": _rollouts_ms,
             "finalize/invalid_row_rate": 1.0 - len(valid_rows) / len(rows),
             "finalize/calls_per_rollout": (
                 sum(len(row.staging_keys) for row in rows) / len(rows)
@@ -621,7 +757,6 @@ class RolloutReassembler:
             _clear_ms = (time.perf_counter() - _clear_t0) * 1000.0
         # Per-step W&B breakdown of training-row assembly (capture arm) rides
         # FinalizedGroup.metrics into the controller's rollout metrics.
-        metrics["row_assembly/rollouts_ms"] = _rollouts_ms
         metrics["row_assembly/tensorize_ms"] = _tensorize_ms
         metrics["row_assembly/tq_put_ms"] = _put_ms
         if not self._defer_routed_experts_to_policy:

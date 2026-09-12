@@ -20,6 +20,7 @@ from typing import Any, Optional
 
 import ray
 import torch
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup, RolloutReassembler
@@ -172,6 +173,14 @@ def create_rollout_reassembler_actors(
     """Construct the fixed validation pool after TQ partitions are registered."""
     if num_workers <= 0:
         raise ValueError(f"num_reassembler_workers must be positive, got {num_workers}")
-    return [
-        RolloutReassemblerActor.remote(dp_config, config) for _ in range(num_workers)
-    ]
+    # Prefer the controller node to avoid competing with policy workers, but
+    # permit spillover when its CPUs are busy. soft=True alone only spills
+    # when the node is dead or infeasible, not when its resources are occupied.
+    actor = RolloutReassemblerActor.options(
+        scheduling_strategy=NodeAffinitySchedulingStrategy(
+            node_id=ray.get_runtime_context().get_node_id(),
+            soft=True,
+            _spill_on_unavailable=True,
+        )
+    )
+    return [actor.remote(dp_config, config) for _ in range(num_workers)]
