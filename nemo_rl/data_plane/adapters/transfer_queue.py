@@ -27,6 +27,7 @@ import glob
 import importlib
 import ipaddress
 import json
+import logging
 import os
 import resource
 import socket
@@ -54,6 +55,8 @@ from nemo_rl.data_plane.interfaces import (
     backend_config,
     data_plane_supports_checkpointing,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────
 # Backend init — lifted from rl-arena/arena/backends.py.
@@ -684,6 +687,8 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
                     "metadata_server": f"{local_ip}:50050",
                     "master_server_address": f"{local_ip}:50051",
                     **_mooncake_transport_config(),
+                    "use_gdr": bool(mooncake_cfg.use_gdr),
+                    "gdr_staging_buffer_mb": int(mooncake_cfg.gdr_staging_buffer_mb),
                 },
             },
         }
@@ -771,6 +776,12 @@ def _from_wire(td: TensorDict) -> TensorDict:
 class TQDataPlaneClient(DataPlaneClient):
     """Adapter façade — maps NeMo-RL calls onto TransferQueue's public API."""
 
+    # Class-level so ``put_samples`` stays readable on an instance built
+    # without ``__init__`` — ``object.__new__`` in tests, or a process that
+    # unpickles a client without running the constructor.
+    _gdr_requested: bool = False
+    _gdr_put_confirmed: bool = False
+
     def __init__(self, cfg: DataPlaneConfig, *, bootstrap: bool = True) -> None:
         """Construct a TQ-backed client.
 
@@ -817,6 +828,13 @@ class TQDataPlaneClient(DataPlaneClient):
 
         self._backend = cfg["backend"]
         self._supports_checkpointing = data_plane_supports_checkpointing(cfg)
+        # GDR is a mooncake_cpu-only transport knob, so key it off the backend
+        # directly rather than off any incidental per-backend flag.
+        self._gdr_requested = self._backend == "mooncake_cpu" and bool(
+            backend_config(cfg).use_gdr
+        )
+        self._gdr_put_confirmed = False
+
         if bootstrap:
             _init_tq(cfg)
         else:
@@ -1031,6 +1049,31 @@ class TQDataPlaneClient(DataPlaneClient):
             wire_fields = detached_fields
             field_names = [str(key) for key in detached_fields.keys()]
 
+        confirm_gdr_put = bool(
+            self._gdr_requested
+            and not self._gdr_put_confirmed
+            and torch.cuda.is_initialized()
+            and wire_fields is not None
+            and any(
+                isinstance(wire_fields.get(key), torch.Tensor)
+                for key in wire_fields.keys()
+            )
+        )
+        if confirm_gdr_put:
+            # Checked before the put, not after: TQ fixes GDR eligibility when
+            # the client attaches, so this is decidable up front — and once
+            # `kv_batch_put` returns, the rows are already durable and the
+            # controller has been notified, so raising then would strand them.
+            tq_client = tq.get_client()
+            storage_manager = getattr(tq_client, "storage_manager", None)
+            storage_client = getattr(storage_manager, "storage_client", None)
+            gdr_staging = getattr(storage_client, "_gdr_staging", None)
+            if not getattr(storage_client, "use_gdr", False) or gdr_staging is None:
+                raise RuntimeError(
+                    "GDR was requested for a CUDA-initialized TransferQueue "
+                    "client, but TransferQueue selected CPU RDMA for tensor PUTs"
+                )
+
         self._mark_data_operation_started()
         # TQ's wire vocabulary is `keys=` — translation point.
         tq.kv_batch_put(
@@ -1039,6 +1082,11 @@ class TQDataPlaneClient(DataPlaneClient):
             fields=wire_fields,
             tags=user_tags,
         )
+        if confirm_gdr_put:
+            LOGGER.info(
+                "TransferQueue GDR tensor PUT active (partition=%s)", partition_id
+            )
+            self._gdr_put_confirmed = True
 
         return KVBatchMeta(
             partition_id=partition_id,

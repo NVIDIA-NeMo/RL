@@ -48,8 +48,9 @@ from nemo_rl.algorithms.grpo import (
     RewardPenaltyConfig,
     _initial_grpo_save_state,
 )
-from nemo_rl.algorithms.loss import ClippedPGLossConfig
-from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
+from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+from nemo_rl.algorithms.loss.interfaces import LossInputType
+from nemo_rl.algorithms.opd import OnPolicyDistillationConfig, get_opd_full_config
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
     MasterConfig,
@@ -59,6 +60,7 @@ from nemo_rl.algorithms.single_controller_utils import (
 from nemo_rl.algorithms.single_controller_utils.config import (
     RolloutCheckpointConfig,
     TokenCaptureConfig,
+    _validate_opd_full_config,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
@@ -1794,6 +1796,7 @@ class TestSetup:
         mc.policy["generation"]["top_k"] = None
         return mc
 
+    @pytest.mark.mcore
     @pytest.mark.parametrize("colocated", [True, False])
     @pytest.mark.parametrize(
         ("scenario", "error_match"),
@@ -1814,11 +1817,11 @@ class TestSetup:
     ):
         """Megatron generation setup: gym and native legs, colocated or not.
 
-        gym: reserve rank-0's URL, spin Gym up on it, build trainer and engine
-        in parallel (the engine through _build_generation with the reserved
-        port), run the initial refit while Gym is still waiting -- the
-        skip-load engine only starts serving then -- cross-check the served
-        address, reap the port holder.
+        gym: reserve every frontend URL, spin Gym up on them, build trainer and
+        engine in parallel (the engine through _build_generation with the
+        reserved ports), run the initial refit while Gym is still waiting --
+        the skip-load engine only starts serving then -- cross-check the served
+        addresses, reap every port holder.
         gym_served_mismatch: the served-vs-reserved cross-check fires after the
         builds when the engine comes up on a different address.
         gym_router_failure: the holder is created before the executor
@@ -1845,13 +1848,21 @@ class TestSetup:
         if scenario == "gym_router_failure":
             mc.async_rl.generation_router.enabled = True
         tokenizer = MagicMock(pad_token_id=0)
-        reserved_url = "http://10.0.0.1:5555/v1"
-        served_url = (
-            "http://10.0.0.9:7/v1"
+        reserved_urls = [
+            "http://10.0.0.1:5555/v1",
+            "http://10.0.0.2:6666/v1",
+        ]
+        reserved_http_server_ports = {0: 5555, 2: 6666}
+        served_urls = (
+            ["http://10.0.0.9:7/v1", reserved_urls[1]]
             if scenario == "gym_served_mismatch"
-            else reserved_url
+            # The worker-group completion order need not match reservation.
+            else list(reversed(reserved_urls))
         )
-        port_holder = MagicMock(name="port_holder")
+        port_holders = [
+            MagicMock(name="port_holder_rank_0"),
+            MagicMock(name="port_holder_rank_2"),
+        ]
         fake_gym_actor = MagicMock(name="nemo_gym_actor")
         weight_sync = patched_factories["create_weight_synchronizer"].return_value
         # Run the real _build_generation (MegatronGeneration is mocked below) so its
@@ -1889,17 +1900,17 @@ class TestSetup:
             patch.object(sc_setup_mod, "ray") as mock_ray,
             router_patch,
         ):
-            mock_megatron.reserve_http_server_address.return_value = (
-                reserved_url,
-                5555,
-                port_holder,
+            mock_megatron.reserve_http_server_addresses.return_value = (
+                reserved_urls,
+                reserved_http_server_ports,
+                port_holders,
             )
             # Wire the real check through the class mock so the
             # served-vs-reserved legs exercise the genuine logic.
-            mock_megatron.verify_served_address = (
-                MegatronGeneration.verify_served_address
+            mock_megatron.verify_served_addresses = (
+                MegatronGeneration.verify_served_addresses
             )
-            mock_megatron.return_value.dp_openai_server_base_urls = [served_url]
+            mock_megatron.return_value.dp_openai_server_base_urls = served_urls
             if error_match is None:
                 actor_args, metrics = setup_single_controller(mc, tokenizer)
             else:
@@ -1911,16 +1922,15 @@ class TestSetup:
         # Reservation + holder lifecycle exist on the gym legs only; every gym
         # leg — success or either failure — reaps the holder exactly once.
         if gym:
-            # Always the inference cluster: when colocated, _build_clusters
-            # returns the train cluster twice, so the two are the same object
-            # in production (the mocked distinction here is not).
-            mock_megatron.reserve_http_server_address.assert_called_once_with(
+            mock_megatron.reserve_http_server_addresses.assert_called_once_with(
                 inference_cluster,
                 mc.policy,
             )
-            mock_ray.kill.assert_called_once_with(port_holder)
+            assert [call.args for call in mock_ray.kill.call_args_list] == [
+                (port_holder,) for port_holder in port_holders
+            ]
         else:
-            mock_megatron.reserve_http_server_address.assert_not_called()
+            mock_megatron.reserve_http_server_addresses.assert_not_called()
             mock_ray.kill.assert_not_called()
 
         if scenario == "gym_router_failure":
@@ -1937,8 +1947,8 @@ class TestSetup:
         # port adopted by the engine (gym) or absent (native).
         patched_factories["_build_trainer"].assert_called_once()
         _, trainer_kwargs = patched_factories["_build_trainer"].call_args
-        assert trainer_kwargs["reserved_http_server_port"] == (
-            5555 if colocated and gym else None
+        assert trainer_kwargs["reserved_http_server_ports"] == (
+            reserved_http_server_ports if colocated and gym else None
         )
         if colocated:
             patched_factories["_build_generation"].assert_not_called()
@@ -1954,7 +1964,7 @@ class TestSetup:
                 config=mc.policy,
                 tokenizer=tokenizer,
                 cluster=inference_cluster,
-                reserved_http_server_port=5555 if gym else None,
+                reserved_http_server_ports=reserved_http_server_ports if gym else None,
                 processor=None,
                 skip_weight_load=True,
             )
@@ -1966,7 +1976,7 @@ class TestSetup:
             # cross-check — so the mismatch leg sees it too. The initial refit
             # must happen during that wait because it starts Megatron's server.
             _, spinup_kwargs = mock_spinup.call_args
-            assert spinup_kwargs["base_urls"] == [reserved_url]
+            assert spinup_kwargs["base_urls"] == reserved_urls
             # The initial refit ran in setup, against the collective brought up
             # there; the served-address check reads the URLs it populated.
             weight_sync.init_communicator.assert_called_once_with()
@@ -1990,6 +2000,10 @@ class TestSetup:
         assert factory_kwargs["generation_backend"] == "megatron"
         assert factory_kwargs["colocated"] is colocated
         assert factory_kwargs["inference_cluster"] is inference_cluster
+        assert (
+            factory_kwargs["refit_timeout_s"]
+            == mc.async_rl.generation_fleet_health.refit_timeout_s
+        )
         if gym:
             assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
             assert metrics.nemo_gym_init_time_s is not None
@@ -2187,3 +2201,216 @@ class TestNativeTQRecoverySetup:
                 partition_id="rollout_data",
                 sampler_name="in_order",
             )
+
+
+# ── Full-vocabulary MOPD (on_policy_distillation.full) ──────────────────────
+
+_FULLVOCAB_RECIPES = (
+    "mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller-fullvocab.yaml",
+    "mopd-qwen3-1.7b-3n4g-megatron-pack-single-controller-fullvocab.yaml",
+)
+
+
+def _load_fullvocab_master_config(
+    recipe_name: str = _FULLVOCAB_RECIPES[0],
+) -> MasterConfig:
+    register_omegaconf_resolvers()
+    repo_root = Path(__file__).resolve().parents[3]
+    recipe = repo_root / "examples/configs/recipes/llm" / recipe_name
+    resolved = OmegaConf.to_container(load_config(recipe), resolve=True)
+    assert isinstance(resolved, dict)
+    return MasterConfig.model_validate(resolved)
+
+
+@pytest.mark.parametrize("recipe_name", _FULLVOCAB_RECIPES)
+def test_fullvocab_mopd_recipes_resolve_to_runtime_contract(recipe_name: str):
+    """Both shipped recipes load and survive every opd_full validator.
+
+    The loss-side validator rejects each policy-gradient knob that opd_full
+    would otherwise ignore, and the base MOPD recipe two levels up turns
+    several of them on -- so a recipe that forgets to override one fails at
+    construction. Nothing else catches that at PR time: these recipes only run
+    in the nightly suites (``nightly.txt`` / ``nightly_gb200.txt``), not in CI.
+    """
+    config = _load_fullvocab_master_config(recipe_name)
+    validate_single_controller_config(config)
+
+    full_cfg = get_opd_full_config(config)
+    assert full_cfg is not None
+    assert full_cfg.teacher_payload == "hidden_states"
+    assert full_cfg.chunk_size == 1024
+    # Off: the residual is an algebraic identity (all three kernels read the same
+    # logits), so it costs a second full-vocabulary log-softmax without being
+    # able to catch a corrupted teacher.
+    assert full_cfg.validate_decomposition is False
+
+    # opd_full still runs the OPD advantage estimator: `advantages` is a
+    # required training column and its stage gates the training step.
+    assert config.grpo.adv_estimator.name == "opd"
+    # Self-distillation: student and teacher are the same checkpoint, which is
+    # what makes "the divergence must stay ~0" a meaningful assertion.
+    assert (
+        config.on_policy_distillation.teacher_model_by_agent_name["default_teacher"]
+        == config.policy["model_name"]
+    )
+
+
+def test_fullvocab_recipe_builds_an_opd_full_loss_function():
+    """The recipe's loss block is accepted by the opd_full loss constructor."""
+    config = _load_fullvocab_master_config()
+    loss_fn = ClippedPGLossFn(
+        config.loss_fn,
+        opd_full=get_opd_full_config(config),
+    )
+    assert loss_fn.input_type is LossInputType.OPD_FULL
+
+
+class TestOPDFullValidation:
+    """``_validate_opd_full_config`` rejects at startup, not mid-training.
+
+    Each combination below otherwise fails only once the whole cluster and
+    every teacher worker are already up -- or, for the fused packing path, not
+    until the first training forward.
+    """
+
+    def test_accepts_the_shipped_recipe(self):
+        config = _load_fullvocab_master_config()
+        _validate_opd_full_config(config, config.on_policy_distillation)
+
+    def test_is_a_no_op_when_full_is_absent(self):
+        config = _load_fullvocab_master_config()
+        config.on_policy_distillation.full = None
+        _validate_opd_full_config(config, config.on_policy_distillation)
+
+    def test_rejects_fused_linear_logprobs(self):
+        """The fused forward bypasses output_layer, so the capture hook never fires."""
+        config = _load_fullvocab_master_config()
+        config.policy["megatron_cfg"]["use_fused_linear_logprobs"] = True
+        with pytest.raises(ValueError, match="use_fused_linear_logprobs"):
+            _validate_opd_full_config(config, config.on_policy_distillation)
+
+    def test_rejects_fused_packing_loss(self):
+        """prepare_packed_loss_input only supports LossInputType.LOGPROB.
+
+        Without this check the run dies inside the first training forward, and
+        a real production MOPD config (nemo_gym/nemotron-3-ultra) already sets
+        ``fuse_loss: true``.
+        """
+        config = _load_fullvocab_master_config()
+        config.policy["sequence_packing"]["enabled"] = True
+        config.policy["sequence_packing"]["fuse_loss"] = True
+        with pytest.raises(ValueError, match="fuse_loss"):
+            _validate_opd_full_config(config, config.on_policy_distillation)
+
+    def test_rejects_more_than_one_teacher_checkpoint(self):
+        """One LM head and one payload column exist; a second teacher needs both."""
+        config = _load_fullvocab_master_config()
+        config.on_policy_distillation.teacher_model_by_agent_name = {
+            "a": "/ckpt/teacher-a",
+            "b": "/ckpt/teacher-b",
+        }
+        with pytest.raises(ValueError, match="exactly one unique"):
+            _validate_opd_full_config(config, config.on_policy_distillation)
+
+    def test_rejects_pipeline_parallel_on_the_hidden_state_path(self):
+        """Megatron builds output_layer only on the last pipeline stage.
+
+        Resolving the teacher checkpoint iteration goes through Megatron-Bridge's
+        read_train_state, whose broadcast spans the whole student world, so
+        earlier stages would raise while the last stage hangs inside it.
+        """
+        config = _load_fullvocab_master_config()
+        config.policy["megatron_cfg"]["pipeline_model_parallel_size"] = 2
+        with pytest.raises(ValueError, match="pipeline_model_parallel_size > 1"):
+            _validate_opd_full_config(config, config.on_policy_distillation)
+
+    def test_rejects_a_sampling_temperature_on_the_hidden_state_path(self):
+        """Temperature divides the training logits after the capture hook reads them.
+
+        The student would be scaled and the teacher -- reconstructed from
+        unscaled hidden states -- would not, silently optimizing a mismatched
+        objective that no self-distillation gate can detect.
+        """
+        config = _load_fullvocab_master_config()
+        config.policy["generation"]["temperature"] = 0.7
+        with pytest.raises(ValueError, match="temperature != 1.0"):
+            _validate_opd_full_config(config, config.on_policy_distillation)
+
+    def test_allows_a_sampling_temperature_on_the_logits_path(self):
+        """Both sides come from the same divided tensor there, so they agree."""
+        config = _load_fullvocab_master_config()
+        config.policy["generation"]["temperature"] = 0.7
+        assert config.on_policy_distillation.full is not None
+        config.on_policy_distillation.full.teacher_payload = "logits"
+        _validate_opd_full_config(config, config.on_policy_distillation)
+
+    def test_allows_pipeline_parallel_on_the_logits_path(self):
+        """The logits payload needs no teacher LM head, so no such collective."""
+        config = _load_fullvocab_master_config()
+        config.policy["megatron_cfg"]["pipeline_model_parallel_size"] = 2
+        assert config.on_policy_distillation.full is not None
+        config.on_policy_distillation.full.teacher_payload = "logits"
+        _validate_opd_full_config(config, config.on_policy_distillation)
+
+    def test_rejects_a_non_megatron_backend(self):
+        """DTensor has no vocabulary-parallel logit path for the kernels."""
+        config = _load_fullvocab_master_config()
+        config.policy["megatron_cfg"]["enabled"] = False
+        with pytest.raises(ValueError, match="requires the Megatron backend"):
+            _validate_opd_full_config(config, config.on_policy_distillation)
+
+
+class _FakeTeacherGroup:
+    def __init__(self, model_name: str, cfg: dict):
+        self.model_name = model_name
+        self.cfg = cfg
+
+
+def _fake_trainer(result: str = "/resolved/teacher") -> Any:
+    trainer = MagicMock()
+    trainer.worker_group.run_all_workers_single_data.return_value = [result, result]
+    return trainer
+
+
+def test_load_opd_full_teacher_lm_heads_sends_the_teacher_groups_own_config(
+    monkeypatch,
+):
+    """The LM head must be resolved from the teacher, never from the student.
+
+    ``TeacherWorkerGroup`` drops ``pretrained_checkpoint`` from the config it
+    copies, so what arrives here already describes the teacher alone; a config
+    still carrying that key would resolve the student's checkpoint and distill
+    the student into itself with a divergence of exactly zero.
+    """
+    monkeypatch.setattr(sc_setup_mod, "ray", MagicMock(get=lambda futures: futures))
+    teacher_cfg = {"model_name": "Qwen/Qwen3-8B", "megatron_cfg": {"enabled": True}}
+    trainer = _fake_trainer()
+
+    sc_setup_mod._load_opd_full_teacher_lm_heads(
+        trainer, {"default_teacher": _FakeTeacherGroup("Qwen/Qwen3-8B", teacher_cfg)}
+    )
+
+    call = trainer.worker_group.run_all_workers_single_data.call_args
+    assert call.args == ("load_opd_full_teacher_lm_head",)
+    sent = call.kwargs["teacher_path_config"]
+    assert sent["model_name"] == "Qwen/Qwen3-8B"
+    assert "pretrained_checkpoint" not in sent
+
+
+def test_load_opd_full_teacher_lm_heads_rejects_two_teacher_checkpoints(monkeypatch):
+    monkeypatch.setattr(sc_setup_mod, "ray", MagicMock(get=lambda futures: futures))
+    trainer = _fake_trainer()
+
+    with pytest.raises(ValueError, match="exactly one teacher"):
+        sc_setup_mod._load_opd_full_teacher_lm_heads(
+            trainer,
+            {
+                "a": _FakeTeacherGroup(
+                    "Qwen/teacher-a", {"model_name": "Qwen/teacher-a"}
+                ),
+                "b": _FakeTeacherGroup(
+                    "Qwen/teacher-b", {"model_name": "Qwen/teacher-b"}
+                ),
+            },
+        )
+    trainer.worker_group.run_all_workers_single_data.assert_not_called()

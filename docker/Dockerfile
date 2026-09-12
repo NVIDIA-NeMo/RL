@@ -519,10 +519,10 @@ EOF
 # themselves are built in hardlink mode: examples/nemo_gym/prefetch_venvs.py pins
 # UV_LINK_MODE=hardlink in the Gym actor's runtime_env, because Gym's setup scripts shell
 # out to `uv pip install --no-cache`, which uv refuses to combine with symlink installs.
-# Gym pins vllm==0.24.0; override it to vLLM's default prebuilt CUDA wheel so Gym's venvs share
+# Gym pins vllm==0.25.1; override it to vLLM's default prebuilt CUDA wheel so Gym's venvs share
 # RL's torch/nvidia stack. UV_TORCH_BACKEND keeps torch on the same CUDA backend.
 ARG NEMO_GYM_CUDA=cu130
-ARG NEMO_GYM_VLLM_VERSION=0.24.0
+ARG NEMO_GYM_VLLM_VERSION=0.25.1
 RUN <<"EOF" bash -exu
 if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     case "${TARGETARCH:-amd64}" in arm64) WHEEL_ARCH=aarch64 ;; *) WHEEL_ARCH=x86_64 ;; esac
