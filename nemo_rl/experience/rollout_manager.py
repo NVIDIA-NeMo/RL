@@ -786,9 +786,13 @@ class AsyncNemoGymRolloutImpl:
             rollout_inputs, timer, timer_prefix
         )
         source_message_log = input_sample["message_log"]
-        attach_static_multimodal_payload(prompt_message_log, source_message_log)
+        attach_static_multimodal_payload(
+            prompt_message_log, source_message_log, self._tokenizer
+        )
         for completion in completions:
-            attach_static_multimodal_payload(completion.message_log, source_message_log)
+            attach_static_multimodal_payload(
+                completion.message_log, source_message_log, self._tokenizer
+            )
 
         timer.stop(f"{timer_prefix}/total")
         rollout_metrics.update(timer.get_timing_metrics("sum"))
