@@ -201,6 +201,9 @@ class DTensorConfig(TypedDict):
     cpu_offload: bool
     custom_parallel_plan: NotRequired[str | None]
     defer_fsdp_grad_sync: NotRequired[bool]
+    # AutoModel FSDP2 output precision. Master weights/reductions remain FP32;
+    # BF16 outputs avoid retaining full FP32 residual/logit buffers.
+    fsdp_output_dtype: NotRequired[Literal["float32", "bfloat16", "float16"]]
     # MoE parallelizer config
     moe_parallelizer: NotRequired[MoEParallelizerOptions]
     # Model config

@@ -294,6 +294,9 @@ def validate_and_prepare_config(
     if precision not in STRING_TO_DTYPE:
         raise ValueError(f"Unknown precision: {precision}")
     dtype = STRING_TO_DTYPE[precision]
+    fsdp_output_dtype = config["dtensor_cfg"].get("fsdp_output_dtype", "float32")
+    if fsdp_output_dtype not in ("float32", "bfloat16", "float16"):
+        raise ValueError(f"Unknown FSDP output dtype: {fsdp_output_dtype}")
 
     # Get other configuration values
     cpu_offload = config["dtensor_cfg"]["cpu_offload"]
@@ -463,6 +466,7 @@ def setup_distributed(
     # Extract configuration values
     dtype = runtime_config.dtype
     cpu_offload = runtime_config.cpu_offload
+    fsdp_output_dtype = config["dtensor_cfg"].get("fsdp_output_dtype", "float32")
 
     # Extract parallelization config
     tp_size = config["dtensor_cfg"].get("tensor_parallel_size", 1)
@@ -491,7 +495,7 @@ def setup_distributed(
         mp_policy=MixedPrecisionPolicy(
             param_dtype=dtype,
             reduce_dtype=torch.float32,
-            output_dtype=torch.float32,
+            output_dtype=STRING_TO_DTYPE[fsdp_output_dtype],
         ),
         offload_policy=CPUOffloadPolicy(pin_memory=False) if cpu_offload else None,
         activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
