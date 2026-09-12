@@ -24,11 +24,12 @@ nemo_rl.models.megatron.setup, focusing on:
 - Model path validation
 """
 
+import contextlib
 import os
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
@@ -3106,11 +3107,128 @@ class TestFinalizeMegatronSetup:
         assert dp_size == 4
 
         # Verify function calls
-        mock_update_model_config.assert_called_once()
+        mock_update_model_config.assert_called_once_with(
+            [mock_model],
+            mock_model.config,
+            mock_megatron_cfg.ddp,
+            mock_optimizer,
+            align_grad_reduce=mock_megatron_cfg.dist.align_grad_reduce,
+            pg_collection=mock_pg_collection.use_mpu_process_groups.return_value,
+        )
+        assert mock_model.config is not mock_megatron_cfg.model
         mock_build_tokenizer.assert_called_once()
         mock_auto_bridge.from_hf_pretrained.assert_called_once_with(
             "test-model", trust_remote_code=True
         )
+
+    @pytest.mark.parametrize("copied_config", [False, True])
+    @pytest.mark.parametrize("overlap", [False, True])
+    @pytest.mark.parametrize("forward_only", [False, True])
+    def test_callbacks_reach_wrapped_runtime_config(
+        self, copied_config: bool, overlap: bool, forward_only: bool
+    ) -> None:
+        """Exercise NeMo-RL's real call site and Bridge's real installer."""
+        # Load the optional Megatron backend only for these backend tests.
+        from megatron.bridge.training import setup as bridge_setup
+        from megatron.core.enums import ModelType
+        from megatron.core.pipeline_parallel import schedules
+
+        from nemo_rl.models.megatron import setup as nrl_setup
+
+        def make_config() -> SimpleNamespace:
+            return SimpleNamespace(
+                make_vocab_size_divisible_by=128,
+                no_sync_func=None,
+                grad_sync_func=None,
+                param_sync_func=None,
+                finalize_model_grads_func=None,
+                grad_scale_func=None,
+                timers=None,
+                overlap_moe_expert_parallel_comm=False,
+                hybrid_context_parallel=False,
+                calculate_per_token_loss=False,
+            )
+
+        provider = make_config()
+        runtime = make_config() if copied_config else provider
+
+        class FakeDDP:
+            def __init__(self) -> None:
+                # A precision wrapper sits between DDP and the real model.
+                self.module = SimpleNamespace(
+                    module=SimpleNamespace(
+                        config=runtime, model_type=ModelType.encoder_or_decoder
+                    )
+                )
+                self.no_sync = Mock(side_effect=contextlib.nullcontext)
+                self.start_grad_sync = Mock()
+                self.start_param_sync = Mock()
+
+        model = FakeDDP()
+        optimizer = MagicMock()
+        ddp = SimpleNamespace(
+            overlap_grad_reduce=overlap,
+            overlap_param_gather=overlap,
+            align_param_gather=True,
+        )
+        megatron_cfg = SimpleNamespace(
+            model=provider, ddp=ddp, dist=SimpleNamespace(align_grad_reduce=True)
+        )
+        config = {
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 2,
+                "optimizer": {"use_distributed_optimizer": True},
+                "distributed_data_parallel_config": {"overlap_param_gather": overlap},
+            }
+        }
+        groups = SimpleNamespace(
+            tp=SimpleNamespace(size=lambda: 1), cp=SimpleNamespace(size=lambda: 1)
+        )
+        finalizer = Mock()
+        with (
+            patch.object(bridge_setup, "DistributedDataParallel", FakeDDP),
+            patch.object(bridge_setup, "finalize_model_grads", finalizer),
+            patch.object(nrl_setup, "build_tokenizer"),
+            patch.object(nrl_setup, "AutoBridge"),
+            patch.object(nrl_setup, "ProcessGroupCollection") as pg_collection,
+        ):
+            pg_collection.use_mpu_process_groups.return_value = groups
+            nrl_setup.finalize_megatron_setup(
+                config, megatron_cfg, "test-model", MagicMock(), model, optimizer
+            )
+
+        assert runtime.finalize_model_grads_func.func is finalizer
+        assert runtime.finalize_model_grads_func.keywords == {"pg_collection": groups}
+        assert runtime.grad_scale_func == optimizer.scale_loss
+        assert runtime.no_sync_func == (model.no_sync if overlap else None)
+        assert runtime.grad_sync_func == (model.start_grad_sync if overlap else None)
+        assert runtime.param_sync_func == (model.start_param_sync if overlap else None)
+        if copied_config:
+            assert provider.finalize_model_grads_func is None
+            assert provider.grad_scale_func is None
+
+        with (
+            patch.object(schedules.torch, "zeros", return_value=torch.tensor(0)),
+            patch.object(schedules, "forward_step", return_value=(None, 0)),
+            patch.object(schedules, "backward_step") as backward,
+        ):
+            schedules.forward_backward_no_pipelining(
+                forward_step_func=Mock(),
+                data_iterator=iter(()),
+                model=[model],
+                num_microbatches=3,
+                seq_length=1,
+                micro_batch_size=1,
+                forward_only=forward_only,
+                pg_collection=groups,
+            )
+        if forward_only:
+            finalizer.assert_not_called()
+        else:
+            finalizer.assert_called_once_with(
+                [model], None, pg_collection=groups, force_all_reduce=False
+            )
+        assert backward.call_count == (0 if forward_only else 3)
 
 
 @pytest.mark.mcore
