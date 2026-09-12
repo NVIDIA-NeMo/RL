@@ -24,7 +24,6 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-
 _TP_SIZE = 2
 _GLOBAL_SEQUENCE = 16
 _LOCAL_SEQUENCE = _GLOBAL_SEQUENCE // _TP_SIZE
