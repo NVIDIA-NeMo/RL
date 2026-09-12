@@ -58,8 +58,12 @@ def test_does_not_log_ignore_patterns_when_unconfigured(capsys) -> None:
 
 @pytest.mark.parametrize(
     "vllm_kwargs",
-    [{}, {"hf_overrides": {}}, {"hf_overrides": None},
-     {"hf_overrides": {"quantization_config": None}}],
+    [
+        {},
+        {"hf_overrides": {}},
+        {"hf_overrides": None},
+        {"hf_overrides": {"quantization_config": None}},
+    ],
 )
 def test_bf16_rollout_can_inherit_ignore_patterns(
     vllm_kwargs: dict[str, Any], capsys: pytest.CaptureFixture[str]
