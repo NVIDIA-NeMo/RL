@@ -43,6 +43,8 @@ def main() -> None:
                     assert cfg.loss_fn.reference_policy_kl_penalty > 0
                     assert not cfg.grpo.get("skip_reference_policy_logprobs_calculation", False)
                     assert cfg.loss_fn.use_importance_sampling_correction
+                    assert cfg.loss_fn.force_on_policy_ratio is False
+                    assert cfg.grpo.val_period == 0
                     if mode == "async":
                         assert cfg.policy.generation.refit_transport == "nccl_reshard"
                         assert cfg.grpo.async_grpo.max_trajectory_age_steps == 1
