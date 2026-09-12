@@ -6,6 +6,10 @@ attempt includes every generation turn and `finish_generation()`. Reward
 processing, policy scoring, validation rollouts, and policy training are outside
 this lifecycle.
 
+For a combined report covering refit, generation, logprobs, and training, use
+the opt-in [four-phase capture contract](four-phase-profiling.md). It replaces
+per-batch ownership with broad worker windows and explicit phase annotations.
+
 The integration supports `tensor_parallel_size>=1`,
 `pipeline_parallel_size=1`, and either `expert_parallel_size=1` or
 `expert_parallel_size=tensor_parallel_size` with synchronous or asynchronous

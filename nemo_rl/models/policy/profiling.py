@@ -15,12 +15,13 @@
 
 from typing import Protocol, cast
 
+from nemo_rl.models.four_phase_profiling import CaptureController
 from nemo_rl.models.profiling import load_profiler
 
 POLICY_PROFILER_CLASS_ENV = "NRL_POLICY_PROFILER_CLASS"
 
 
-class PolicyProfiler(Protocol):
+class PolicyProfiler(CaptureController, Protocol):
     """Lifecycle contract for profiling complete policy-training steps."""
 
     def begin_train_step(self) -> None: ...

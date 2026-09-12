@@ -431,6 +431,16 @@ class VllmAsyncGenerationWorkerImpl(
                 self._setup_vllm_server()
             )
 
+    async def full_step_profile_async(self, command: str, **kwargs: Any) -> None:
+        """Await control on every internal async vLLM GPU worker."""
+        if not self._use_internal_rollout_profiler or self.llm is None:
+            raise RuntimeError("Four-phase async rollout profiler is unavailable")
+        await self.llm.collective_rpc(
+            "full_step_profile",
+            args=tuple(),
+            kwargs={"command": command, **kwargs},
+        )
+
     async def begin_rollout_profile_async(self, *, step_id: int | str) -> None:
         """Open one rollout profile window on every async-engine GPU worker."""
         if not self._use_internal_rollout_profiler:

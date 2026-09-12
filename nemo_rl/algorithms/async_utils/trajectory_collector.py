@@ -155,6 +155,7 @@ class AsyncTrajectoryCollector:
         resume_covered_task_indices: Optional[list[int]] = None,
         trace_carrier: Optional[dict[str, str]] = None,
         enable_rollout_profile_windows: bool = False,
+        profile_full_run: bool = False,
     ) -> None:
         # Every rollout in an async run is generated from this process, so
         # without this the spans below are no-ops and an async trace has no
@@ -207,6 +208,14 @@ class AsyncTrajectoryCollector:
                 "Continuous rollout profiling is supported for async GRPO, "
                 "not async PPO"
             )
+        if profile_full_run and (not is_grpo or not rollout_profiler_enabled):
+            raise ValueError("Full-run profiling requires GRPO and a rollout profiler")
+        if profile_full_run and enable_rollout_profile_windows:
+            raise ValueError("Full-run and per-batch profiling cannot both own vLLM")
+        self._profile_full_run = profile_full_run
+        self._rollout_epoch_open = False
+        self._rollout_profiler_shutdown_ready = False
+        self._rollout_epoch_generation_open = False
         self._profile_async_grpo_rollouts = (
             enable_rollout_profile_windows and rollout_profiler_enabled
         )
@@ -469,10 +478,57 @@ class AsyncTrajectoryCollector:
         except Exception:
             return False
 
+    def begin_rollout_profile_epoch(self, weight_version: int) -> None:
+        """Own a process-wide epoch; requests may span several weight epochs."""
+        if not self._profile_full_run:
+            return
+        if self._rollout_epoch_open:
+            raise RuntimeError("A rollout profile epoch is already open")
+        self.policy_generation.full_step_profile(
+            "begin_step",
+            step_id=f"generation{weight_version}",
+            attempt=0,
+            weight_version=weight_version,
+        )
+        self._rollout_epoch_open = True
+
+    def _begin_rollout_epoch_generation(self) -> None:
+        if not self._profile_full_run:
+            return
+        self.policy_generation.full_step_profile(
+            "begin_phase",
+            name="generation_epoch",
+            phase_slot="generation",
+            labels={
+                "weight_version": self.current_weight_version,
+                "eligible_target_weight_versions": self._calculate_target_weights(
+                    self.current_weight_version
+                ),
+                "ownership": "process_epoch",
+                "request_assignment": "may_cross_weight_epochs",
+            },
+        )
+        self._rollout_epoch_generation_open = True
+
+    def _end_rollout_profile_generation(self) -> None:
+        if not self._profile_full_run or not self._rollout_epoch_open:
+            return
+        if self._rollout_epoch_generation_open:
+            self.policy_generation.full_step_profile("end_phase")
+            self._rollout_epoch_generation_open = False
+
+    def _finish_rollout_profile_epoch(self) -> None:
+        if not self._profile_full_run or not self._rollout_epoch_open:
+            return
+        self._end_rollout_profile_generation()
+        self.policy_generation.full_step_profile("finish_step")
+        self._rollout_epoch_open = False
+
     def start_collection(
         self, dataloader: StatefulDataLoader | CyclingDataLoader
     ) -> None:
         """Start collecting trajectories from dataloader."""
+        self._begin_rollout_epoch_generation()
         self.running = True
         self.dataloader = dataloader
 
@@ -1105,7 +1161,32 @@ class AsyncTrajectoryCollector:
         ``running`` after ownership settles releases those workers without
         delaying profiler closure. The bounded wait remains a fail-closed guard
         for profiler control calls or other work that cannot be cancelled.
+        Full-phase capture only pauses execution and ends the generation phase
+        here; a separate finalization RPC persists its epoch after this returns.
         """
+        if self._profile_full_run:
+            self._rollout_profiler_shutdown_ready = False
+            try:
+                # The engine's native pause quiesces GPU execution while
+                # preserving requests. No request-to-policy-step mapping is
+                # inferred from this final process capture boundary.
+                self.prepare_for_refit(
+                    begin_next_profile_epoch=False, finalize_profile_epoch=False
+                )
+                self._rollout_profiler_shutdown_ready = True
+            except BaseException as error:
+                try:
+                    self.policy_generation.full_step_profile(
+                        "abort_step",
+                        reason="async_epoch_shutdown_failed",
+                    )
+                except Exception as cleanup_error:
+                    error.add_note(f"Epoch abort also failed: {cleanup_error!r}")
+                raise
+            finally:
+                self.running = False
+                self._wake_waits()
+            return
         if not self._profile_async_grpo_rollouts:
             return
 
@@ -1156,7 +1237,32 @@ class AsyncTrajectoryCollector:
 
         self.check_health()
 
-    def prepare_for_refit(self) -> None:
+    def finalize_rollout_profiler_shutdown(self) -> None:
+        """Persist the quiesced epoch outside the bounded control RPC.
+
+        A large capture can take minutes to serialize. The driver must await
+        this transaction before reaping the collector or generation workers.
+        """
+        if not self._profile_full_run:
+            return
+        if not self._rollout_profiler_shutdown_ready:
+            raise RuntimeError("Rollout profiler shutdown has not quiesced")
+        try:
+            self._finish_rollout_profile_epoch()
+        except BaseException as error:
+            try:
+                self.policy_generation.full_step_profile(
+                    "abort_step", reason="async_epoch_save_failed"
+                )
+            except Exception as cleanup_error:
+                error.add_note(f"Epoch abort also failed: {cleanup_error!r}")
+            raise
+        finally:
+            self._rollout_profiler_shutdown_ready = False
+
+    def prepare_for_refit(
+        self, *, begin_next_profile_epoch: bool = True, finalize_profile_epoch: bool = True
+    ) -> None:
         """Pause new generation starts and optionally wait for pending generations.
 
         Every async backend configured for in-flight weight updates, except managed
@@ -1165,6 +1271,8 @@ class AsyncTrajectoryCollector:
         retain their existing behavior. Managed Dynamo drains active trajectories.
 
         For non-async engines, waits for all pending generations to complete before refit.
+        Shutdown defers epoch finalization so artifact serialization does not
+        consume the driver's bounded generation-quiescence RPC budget.
         """
         start_time = time.time()
         print("🔄 Preparing for refit: pausing new generations...")
@@ -1214,12 +1322,31 @@ class AsyncTrajectoryCollector:
             )
             self.wait_for_pending_generations()
 
+        if self._profile_full_run:
+            if (
+                is_async_engine
+                and in_flight_weight_updates
+                and not self._generation_paused_for_refit
+            ):
+                raise RuntimeError(
+                    "Four-phase epoch boundaries require a successful native generation pause"
+                )
+            if self._rollout_epoch_generation_open:
+                self._end_rollout_profile_generation()
+                if finalize_profile_epoch:
+                    self._finish_rollout_profile_epoch()
+                    if begin_next_profile_epoch:
+                        self.begin_rollout_profile_epoch(self.current_weight_version + 1)
+            elif not begin_next_profile_epoch:
+                if finalize_profile_epoch:
+                    self._finish_rollout_profile_epoch()
         elapsed = time.time() - start_time
         print(f"✅ Ready for refit (took {elapsed:.2f}s)")
 
     def resume_after_refit(self) -> None:
         """Resume new generation starts after refit is complete."""
         print("🔄 Resuming generation starts after refit")
+        self._begin_rollout_epoch_generation()
 
         if self._generation_pause_requested_for_refit:
             backend = self.master_config.policy["generation"]["backend"]

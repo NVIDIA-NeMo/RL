@@ -685,6 +685,10 @@ class VllmGeneration(GenerationInterface):
             )
         self._step_metrics_snapshot = self._get_raw_spec_counters()
 
+    def full_step_profile(self, command: str, **kwargs: Any) -> None:
+        """Forward full-step control through leaders to the GPU workers."""
+        self._run_rollout_profiler_rpc("full_step_profile", command=command, **kwargs)
+
     def begin_rollout_profile(self, *, step_id: int | str) -> None:
         """Open one complete rollout on profiled workers."""
         self._run_rollout_profiler_rpc("begin_rollout_profile", step_id=step_id)

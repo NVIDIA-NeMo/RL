@@ -483,6 +483,10 @@ class GenerationInterface(ABC):
         """Shut down generation resources; repeated calls must be safe."""
         pass
 
+    def full_step_profile(self, command: str, **kwargs: Any) -> None:
+        """Dispatch the optional complete-GRPO capture contract."""
+        raise NotImplementedError("Four-phase capture requires the vLLM backend")
+
     @property
     def rollout_profiler_enabled(self) -> bool:
         """Whether this backend has an active rollout-profiler lifecycle."""

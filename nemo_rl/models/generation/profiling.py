@@ -17,12 +17,13 @@ from __future__ import annotations
 
 from typing import Any, Protocol, cast
 
+from nemo_rl.models.four_phase_profiling import CaptureController
 from nemo_rl.models.profiling import load_profiler
 
 ROLLOUT_PROFILER_CLASS_ENV = "NRL_ROLLOUT_PROFILER_CLASS"
 
 
-class RolloutProfiler(Protocol):
+class RolloutProfiler(CaptureController, Protocol):
     """Lifecycle contract for profiling complete rollouts."""
 
     def begin_engine_initialization(self) -> Any: ...
