@@ -91,6 +91,7 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     bootstrap_compatibility_identity,
     commit_snapshot,
     prepare_snapshot_paths,
+    resolve_latest_snapshot,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.data.utils import load_dataloader_state
@@ -594,8 +595,15 @@ class _AsyncRemoteMethod:
 
 
 class _FakeGymCheckpointActor:
-    def __init__(self, events: list[str], *, fail_commit: bool = False):
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        fail_prepare: bool = False,
+        fail_commit: bool = False,
+    ):
         self.events = events
+        self.fail_prepare = fail_prepare
         self.fail_commit = fail_commit
         self.checkpoint_ids: list[str] = []
         self.acknowledge_completed_executions = _AsyncRemoteMethod(self._acknowledge)
@@ -612,6 +620,8 @@ class _FakeGymCheckpointActor:
         assert deadline_ts > time.time()
         self.checkpoint_ids.append(checkpoint_id)
         self.events.append("prepare")
+        if self.fail_prepare:
+            raise TimeoutError("Gym prompt group did not drain")
         return {"checkpoint_id": checkpoint_id, "ready": True, "participants": []}
 
     async def _commit(
@@ -1623,6 +1633,67 @@ class TestPeriodicRolloutCheckpoint:
         ]
         assert len(set(gym_actor.checkpoint_ids)) == 2
         assert actor._gym_checkpoint_rollout_permitted.is_set()
+
+    def test_gym_prepare_timeout_keeps_previous_snapshot_and_reopens_admission(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        events: list[str] = []
+        actor._gym_participant_checkpointing_enabled = True
+        actor._master_config.rollout_checkpointing.gym.participant_checkpointing_enabled = True
+        gym_actor = _FakeGymCheckpointActor(events)
+        actor._env_handles = {"nemo_gym": gym_actor}
+        actor._gym_checkpoint_topology = GymCheckpointTopology.model_validate(
+            {
+                "schema_version": 1,
+                "participants": [
+                    {
+                        "participant": {
+                            "server_name": "agent-route",
+                            "component": "responses_api_agents",
+                            "participant_name": "test-agent",
+                        },
+                        "schema_version": 1,
+                        "admission_states": ["accepting"],
+                        "checkpoint_mode": "export_restore",
+                        "concurrency_contract": "serialized_per_session",
+                        "multi_process": {
+                            "mode": "single_worker",
+                            "num_workers": 1,
+                        },
+                        "instance_role": None,
+                        "features": ["completed_result_acknowledgement"],
+                    }
+                ],
+            }
+        )
+
+        try:
+            first = asyncio.run(actor._save_rollout_checkpoint(force=True))
+            assert first.saved
+
+            gym_actor.fail_prepare = True
+            with pytest.raises(TimeoutError, match="prompt group did not drain"):
+                asyncio.run(actor._save_rollout_checkpoint(force=True))
+
+            resolved = resolve_latest_snapshot(
+                tmp_path / "checkpoints" / BOOTSTRAP_DIRNAME,
+                expected_train_step=0,
+                expected_trainer_version=0,
+                expected_bootstrap_fingerprint=actor._bootstrap_identity.fingerprint(),
+            )
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert events == ["prepare", "commit", "resume", "prepare"]
+        assert actor._gym_checkpoint_rollout_permitted.is_set()
+        assert resolved is not None
+        assert resolved.path.name == "snapshot_000001"
+        assert {
+            child.name
+            for child in resolved.path.parent.iterdir()
+            if child.is_dir()
+        } == {"snapshot_000001"}
 
     def test_gym_staging_index_failure_aborts_and_reopens_admission(
         self, tmp_path: Path
