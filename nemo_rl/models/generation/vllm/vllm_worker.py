@@ -39,6 +39,7 @@ from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype,
     verify_right_padding,
 )
+from nemo_rl.models.four_phase_profiling import WorkerCapture
 from nemo_rl.models.generation.profiling import (
     ROLLOUT_PROFILER_CLASS_ENV,
     RolloutProfiler,
@@ -797,6 +798,27 @@ class BaseVllmGenerationWorker:
         else:
             if profiler is not None:
                 profiler.end_engine_initialization(engine_token)
+
+    _four_phase_capture: WorkerCapture | None = None
+
+    def full_step_profile(self, command: str, **kwargs: Any) -> None:
+        """Use the rank-local owner or forward to internal vLLM GPU workers."""
+        if self._use_internal_rollout_profiler:
+            self._run_internal_rollout_profiler_rpc(
+                "full_step_profile", command=command, **kwargs
+            )
+            return
+        if command == "configure_capture":
+            if self._rollout_profiler is None:
+                raise RuntimeError("Four-phase capture requires a rollout profiler")
+            self._four_phase_capture = WorkerCapture(self._rollout_profiler)
+            # NVML is needed only for the selected four-phase capture mode.
+            from nemo_rl.utils.nvml import get_device_uuid
+
+            kwargs["device_uuid"] = get_device_uuid(torch.cuda.current_device())
+        if self._four_phase_capture is None:
+            raise RuntimeError("Four-phase rollout capture was not configured")
+        self._four_phase_capture.dispatch(command, **kwargs)
 
     def begin_rollout_profile(self, *, step_id: int | str) -> None:
         """Open one complete rollout profile window."""

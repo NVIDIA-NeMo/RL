@@ -66,6 +66,10 @@ class TeacherFullPayloadOutputSpec(TypedDict):
 class PolicyInterface(ABC):
     """Abstract base class defining the interface for RL policies."""
 
+    def full_step_profile(self, command: str, **kwargs: Any) -> None:
+        """Dispatch optional complete-GRPO profiling to policy GPU workers."""
+        raise NotImplementedError("Four-phase capture requires profiled policy workers")
+
     @abstractmethod
     def get_logprobs(
         self,
