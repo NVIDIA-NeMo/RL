@@ -44,6 +44,7 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.environments.gym_checkpoint import (
     GYM_AGENT_CONTINUATION_INDEX_FEATURE,
     GYM_AGENT_COMPLETION_ACK_PATH,
+    GYM_AGENT_COMPLETION_RECEIPT_PATH,
     GYM_AGENT_CHECKPOINT_PREFIX,
     GYM_CHECKPOINT_CAPABILITIES_PATH,
     GYM_CHECKPOINT_CONTROL_PREFIX,
@@ -57,7 +58,6 @@ from nemo_rl.environments.gym_checkpoint import (
     GymAgentPrepareResponse,
     GymAgentRestoreResponse,
     GymAgentResumeResponse,
-    GymAgentStatusResponse,
     GymCheckpointArtifactReference,
     GymCheckpointCommitResult,
     GymCheckpointControlRequest,
@@ -859,30 +859,17 @@ Depending on your data shape, you may want to change these values."""
     ) -> GymCompletionReceipt:
         """Fetch the exact Gym-issued receipt before publishing a completion."""
         discovered = self._agent_checkpoint_participant(agent_name)
-        status = GymAgentStatusResponse.model_validate(
+        return GymCompletionReceipt.model_validate(
             await self._control(
                 "GET",
-                f"{GYM_AGENT_CHECKPOINT_PREFIX}/status",
+                GYM_AGENT_COMPLETION_RECEIPT_PATH,
                 server_name=discovered.participant.server_name,
                 params={
-                    "checkpoint_id": self._active_gym_checkpoint_id or "actor-delivery"
+                    "rollout_id": execution.rollout_id,
+                    "attempt_index": execution.attempt_index,
                 },
             )
         )
-        matches = [
-            item.completion_receipt
-            for item in status.completed_unacknowledged_attempts
-            if item.rollout_id == execution.rollout_id
-            and item.attempt_index == execution.attempt_index
-            and item.completion_receipt is not None
-        ]
-        if len(matches) != 1:
-            raise RuntimeError(
-                "expected exactly one Gym completion receipt for "
-                f"rollout={execution.rollout_id!r}, "
-                f"attempt_index={execution.attempt_index}; found={len(matches)}"
-            )
-        return matches[0]
 
     async def acknowledge_completed_executions(
         self,
