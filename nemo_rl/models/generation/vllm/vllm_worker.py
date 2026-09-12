@@ -31,6 +31,7 @@ from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_VLLM_PORTS_PER_ENGINE,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.models.four_phase_profiling import WorkerCapture
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_FALLBACK_DTYPE,
     GenerationDatumSpec,
@@ -39,7 +40,6 @@ from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype,
     verify_right_padding,
 )
-from nemo_rl.models.four_phase_profiling import WorkerCapture
 from nemo_rl.models.generation.profiling import (
     ROLLOUT_PROFILER_CLASS_ENV,
     RolloutProfiler,
