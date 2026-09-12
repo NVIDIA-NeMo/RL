@@ -47,6 +47,7 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     _STR_TO_DTYPE,
     HFToLocalParamMap,
     LocalParamSpec,
+    RefitBuilderInterface,
     RefitCtx,
     _extract_layer_prefix,
 )
@@ -343,7 +344,7 @@ def _read_mtp_layer_weights_from_checkpoint(
     return weights
 
 
-class VllmInternalWorkerExtension:
+class VllmInternalWorkerExtension(RefitBuilderInterface):
     # Per-PP-stage refit groups, None until init_nccl_reshard_comm_group builds them.
     # Declared rather than sprung into existence so a rebuild can release the previous
     # ones without probing, matching AbstractPolicyWorker.model_update_group. None and
@@ -632,10 +633,8 @@ class VllmInternalWorkerExtension:
 
         Raises:
             RuntimeError: If the model realizes the unquantized FlashInfer TRTLLM
-                MoE backend while a co-trained MTP drafter is enabled (unsupported
-                by the native layerwise refit lifecycle).
+                MoE backend while a co-trained MTP drafter is enabled.
         """
-        self._validate_native_layerwise_refit()
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
         self._prepare_model_update_runtime(state_dict_info)
 
@@ -1499,8 +1498,6 @@ class VllmInternalWorkerExtension:
         Done once ahead of refit; the cached mapping is reused by every
         ``nccl_reshard_refit`` call.
         """
-        self._validate_native_layerwise_refit("nccl_reshard")
-
         from nemo_rl.weight_sync.nccl_reshard_utils import (
             restore_refit_info_placements,
         )
