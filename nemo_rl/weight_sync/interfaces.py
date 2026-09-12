@@ -53,7 +53,9 @@ def initialize_refit_metadata(
     policy: "ColocatablePolicyInterface", generation: "GenerationInterface"
 ) -> None:
     """Negotiate the wire-format metadata used by policy-to-generation refit."""
-    state_dict_info = policy.prepare_refit_info()
+    state_dict_info = policy.prepare_refit_info(
+        refit_payload_mode=generation.get_refit_payload_mode()
+    )
     prequant_names = generation.prepare_refit_info(state_dict_info)
     if not prequant_names:
         return

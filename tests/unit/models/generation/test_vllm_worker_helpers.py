@@ -21,6 +21,7 @@ import pytest
 from nemo_rl.models.generation.vllm.worker_utils import (
     configure_refit_runtime,
     refit_cache_loader_routes_enabled,
+    find_tokenizer_required_architectures,
     resolve_data_parallel_local_rank,
     resolve_distributed_executor_backend,
 )
@@ -47,6 +48,33 @@ def test_refit_loader_cache_defaults_to_disabled():
 
     vllm_config = SimpleNamespace(additional_config=vllm_kwargs["additional_config"])
     assert refit_cache_loader_routes_enabled(vllm_config) is False
+
+
+@pytest.mark.parametrize(
+    ("architectures", "expected"),
+    [
+        (None, []),
+        ([], []),
+        (["Gemma4ForCausalLM"], []),
+        (
+            ["Gemma4ForConditionalGeneration"],
+            ["Gemma4ForConditionalGeneration"],
+        ),
+        (
+            [
+                "Gemma4ForCausalLM",
+                "Gemma4UnifiedForConditionalGeneration",
+                "Mistral3ForConditionalGeneration",
+            ],
+            [
+                "Gemma4UnifiedForConditionalGeneration",
+                "Mistral3ForConditionalGeneration",
+            ],
+        ),
+    ],
+)
+def test_find_tokenizer_required_architectures(architectures, expected):
+    assert find_tokenizer_required_architectures(architectures) == expected
 
 
 @pytest.mark.parametrize(

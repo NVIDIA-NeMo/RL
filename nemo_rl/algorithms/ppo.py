@@ -982,7 +982,7 @@ def setup(
         if policy_generation is not None:
             initialize_refit_metadata(policy, policy_generation)
         else:
-            policy.prepare_refit_info()
+            policy.prepare_refit_info(refit_payload_mode="hf_export")
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time

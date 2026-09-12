@@ -73,6 +73,43 @@ attention, the router, and the language-model head in BF16:
                     - model.layers.*.mlp.gate
 ```
 
+`num_first_layers_in_bf16` and `num_last_layers_in_bf16` keep complete
+transformer layers in BF16. NeMo RL reads the model configuration and parameter
+names, so these options do not require a model-specific `model.layers` or
+`backbone.layers` prefix. The patterns above still apply to every middle layer.
+
+For example, this Nemotron 3.5 Lightning scope keeps the first two and last six
+layers in BF16. In the middle layers it quantizes only the non-shared routed
+experts. Attention, Mamba projections, routers, shared experts, latent
+projections, and MTP remain in BF16:
+
+```yaml
+policy:
+  generation:
+    vllm_cfg:
+      precision: fp8
+      is_mx: true
+      num_first_layers_in_bf16: 2
+      num_last_layers_in_bf16: 6
+      quantization_ignore_patterns:
+        - "*layers.*.mixer.qkv_proj"
+        - "*layers.*.mixer.o_proj"
+        - "*layers.*.mixer.in_proj"
+        - "*layers.*.mixer.out_proj"
+        - "*layers.*.mixer.up_proj"
+        - "*layers.*.mixer.down_proj"
+        - "*layers.*.mixer.gate"
+        - "*layers.*.mixer.shared_experts.*"
+        - "*layers.*.mixer.fc1_latent_proj"
+        - "*layers.*.mixer.fc2_latent_proj"
+        - "*mtp.*"
+```
+
+To quantize QKVO as well as the routed experts, remove the `qkv_proj` and
+`o_proj` entries. The first two and last six layers still remain entirely in
+BF16. Check the logged effective ignore list when adding a new model family;
+an ignore pattern that matches no module is usually a naming error.
+
 `lm_head` is always excluded from FP8 and MXFP8 quantization, even when it is
 not listed in `quantization_ignore_patterns` in the YAML configuration.
 Models with MTP layers must list their MTP module names explicitly, for example
@@ -106,13 +143,14 @@ packed-weight refit protocol.
 
 To train with FP8, you need to set the Megatron path and configure it using the following settings:
 
-```
+```yaml
     policy:
         megatron_cfg:
             fp8_cfg:
                 fp8: "hybrid"               # choices: [hybrid, e4m3]
-                fp8_recipe: "tensorwise"    # choices: [tensorwise, blockwise, mxfp8]
+                fp8_recipe: "tensorwise"    # choices: [tensorwise, blockwise, mxfp8, custom]
                 fp8_param: false            # boolean value
+                fp8_quantizer_factory: null # required for "custom" recipe; importable Python path e.g. package.module.quantizer_factory
 ```
 
 ### Per-module Transformer Engine precision recipes

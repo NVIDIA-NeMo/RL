@@ -19,7 +19,7 @@ import torch
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.models.generation.interfaces import GenerationDatumSpec, RefitPayloadMode
 from nemo_rl.utils.timer import Timer
 
 if TYPE_CHECKING:
@@ -49,6 +49,21 @@ class TopkLogitsOutputSpec(TypedDict):
 
     topk_logits: torch.Tensor
     topk_indices: torch.Tensor
+
+
+class TeacherFullPayloadOutputSpec(TypedDict):
+    """Sampled-token logprobs plus the full-vocabulary MOPD teacher payload.
+
+    ``teacher_full_payload`` is ``[B, S, hidden_size]`` or ``[B, S, vocab_size]``
+    depending on ``on_policy_distillation.full.teacher_payload``. It is ``None``
+    off the last pipeline stage: the payload is far too large to broadcast, so
+    only the stage that produced it writes it back. It comes back on CPU --
+    each microbatch is moved off the device inside the forward schedule, which
+    is what bounds the resident payload to one microbatch.
+    """
+
+    logprobs: torch.Tensor
+    teacher_full_payload: Optional[torch.Tensor]
 
 
 class PolicyInterface(ABC):
@@ -177,8 +192,14 @@ class ColocatablePolicyInterface(PolicyInterface):
         world_size: int,
         *,
         train_world_size: int,
+        rank_offset: int = 0,
         nccl_peer: str = "nemo",
     ) -> list[ray.ObjectRef]:
+        pass
+
+    @abstractmethod
+    def sync_params_before_refit(self) -> None:
+        """Materialize the latest policy parameters before weight transfer."""
         pass
 
     @abstractmethod
@@ -193,7 +214,11 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
-    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+    def prepare_refit_info(
+        self,
+        *,
+        refit_payload_mode: RefitPayloadMode,
+    ) -> Optional[dict[str, Any]]:
         pass
 
     def enable_refit_prequantize(
@@ -280,6 +305,8 @@ class ColocatablePolicyInterface(PolicyInterface):
         gen_parallelism: dict[str, int],
         train_world_size: int,
         gen_world_size: int,
+        *,
+        refit_payload_mode: RefitPayloadMode,
     ) -> Any:
         """Prepare per-layer param metadata for nccl_reshard-based refit."""
         raise NotImplementedError

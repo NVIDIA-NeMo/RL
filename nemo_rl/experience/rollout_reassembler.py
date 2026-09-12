@@ -364,6 +364,8 @@ class RolloutReassembler:
         mask_sample: list[bool],
         fallback_weight_version: int,
         prompt_idx: int,
+        loss_multiplier: float = 1.0,
+        canonical_sample_ids: Optional[list[str]] = None,
     ) -> FinalizedGroup:
         """Publish exactly N canonical rows for one prompt group.
 
@@ -374,13 +376,20 @@ class RolloutReassembler:
         advantage-stage flag the native ``pack_payload`` path emits from each
         ``Completion``; it rides along unchanged so the train pump's
         environment masking reads the same field on both paths (placeholder
-        rows already train nothing through ``sample_mask`` 0). ``truncated``
+        rows already train nothing through ``sample_mask`` 0).
+        ``loss_multiplier`` supplies the dataset-level weight for every valid
+        row, matching the ordinary ``record_to_train_batch`` path. ``truncated``
         is not carried from the dispatcher -- the receipt path has no real
         tokens to measure it from at dispatch time -- so it is computed here
         instead, from each row's rebuilt length against ``max_seq_len``.
         """
         assert len(rollout_ids) == len(receipts) == len(rewards) == len(mask_sample), (
             "rollout_ids, receipts, rewards, and mask_sample must be parallel"
+        )
+        if canonical_sample_ids is None:
+            canonical_sample_ids = rollout_ids
+        assert len(canonical_sample_ids) == len(rollout_ids), (
+            "canonical_sample_ids must be one per rollout"
         )
         _group_t0 = time.perf_counter()
         rows = [
@@ -511,7 +520,7 @@ class RolloutReassembler:
             input_ids[i, :length] = torch.tensor(row.token_ids, dtype=torch.int64)
             token_mask[i, :length] = torch.tensor(row.token_mask, dtype=torch.float32)
             logprobs[i, :length] = torch.tensor(row.logprobs, dtype=torch.float32)
-            sample_mask[i] = 1.0
+            sample_mask[i] = float(loss_multiplier)
 
         train_batch = {
             "input_ids": input_ids,
@@ -591,9 +600,9 @@ class RolloutReassembler:
                 metrics["finalize/routed_experts_row_coverage"] = (
                     valid_route_rows / len(valid_rows)
                 )
-        assert sample_ids == rollout_ids, (
-            "canonical sample ids must equal the ledger-registered rollout ids: "
-            f"{sample_ids} != {rollout_ids}"
+        assert sample_ids == canonical_sample_ids, (
+            "canonical sample ids must equal the stable logical rollout ids: "
+            f"{sample_ids} != {canonical_sample_ids}"
         )
         _tensorize_ms = (time.perf_counter() - _tensorize_t0) * 1000.0
         _put_t0 = time.perf_counter()

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 _REFIT_CACHE_LOADER_ROUTES_KEY = "nemo_rl_refit_cache_loader_routes"
@@ -38,6 +38,29 @@ def refit_cache_loader_routes_enabled(vllm_config: Any) -> bool:
     if not isinstance(value, bool):
         raise TypeError(f"{_REFIT_CACHE_LOADER_ROUTES_KEY} must be a boolean")
     return value
+
+
+TOKENIZER_REQUIRED_ARCHITECTURES = frozenset(
+    {
+        "Gemma3ForConditionalGeneration",
+        "Gemma4ForConditionalGeneration",
+        "Gemma4UnifiedForConditionalGeneration",
+        "Mistral3ForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    }
+)
+
+
+def find_tokenizer_required_architectures(
+    architectures: Iterable[str] | None,
+) -> list[str]:
+    """Return architectures for which vLLM must initialize a tokenizer."""
+    return [
+        architecture
+        for architecture in architectures or ()
+        if architecture in TOKENIZER_REQUIRED_ARCHITECTURES
+    ]
 
 
 def resolve_distributed_executor_backend(

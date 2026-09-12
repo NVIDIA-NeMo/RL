@@ -104,6 +104,7 @@ uv run --no-sync python examples/nemo_gym/run_grpo_nemo_gym.py \
     ++policy.megatron_cfg.optimizer.exp_avg_sq_dtype=bfloat16 \
     ++policy.megatron_cfg.optimizer.store_param_remainders=false \
     policy.generation.backend=megatron \
+    +policy.generation.refit_transport=mcore \
     ++policy.generation.bad_words=null \
     policy.generation.colocated.enabled=true \
     policy.generation.colocated.resources.num_nodes=1 \
@@ -133,9 +134,9 @@ uv run --no-sync python examples/nemo_gym/run_grpo_nemo_gym.py \
     ++policy.generation.mcore_generation_config.video_temporal_patch_size=2 \
     ++policy.generation.mcore_generation_config.video_target_num_patches=256 \
     policy.max_total_sequence_length=1024 \
-    +data.default.num_frames=8 \
-    +data.default.video_sampling_style=nemotron_vl \
-    +data.default.video_temporal_patch_size=2 \
+    data.default.num_frames=8 \
+    data.default.video_sampling_style=nemotron_vl \
+    data.default.video_temporal_patch_size=2 \
     +data.default.min_generation_tokens=128 \
     data.default.video_target_num_patches=256 \
     data.train.data_path="${TRAIN_PATH}" \
