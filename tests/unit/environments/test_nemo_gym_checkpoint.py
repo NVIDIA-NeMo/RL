@@ -29,6 +29,7 @@ from nemo_rl.environments.nemo_gym import (
 from nemo_rl.environments.gym_checkpoint import (
     GymActorExecutionRegistry,
     GymExecutionIdentity,
+    GymResourcesPrepareResponse,
 )
 
 
@@ -196,7 +197,18 @@ def test_checkpoint_prepare_fans_out_using_component_routes() -> None:
             "selected_boundaries": [],
             "executions": [],
         },
-        "tools": {"sessions": 1, "state": "prepared"},
+        "tools": {
+            "sessions": 1,
+            "state": "prepared",
+            "inventory": [
+                {
+                    "rollout_id": "rollout-1",
+                    "attempt_index": 0,
+                    "revision": 2,
+                    "mutation_receipts": 2,
+                }
+            ],
+        },
     }
 
     async def prepare_control(method, path, *, server_name, timeout_s, json):
@@ -220,6 +232,17 @@ def test_checkpoint_prepare_fans_out_using_component_routes() -> None:
         "agent",
         "tools",
     }
+
+
+def test_resources_prepare_inventory_count_must_match_sessions() -> None:
+    with pytest.raises(ValueError, match="session count does not match inventory"):
+        GymResourcesPrepareResponse.model_validate(
+            {
+                "sessions": 1,
+                "state": "prepared",
+                "inventory": [],
+            }
+        )
 
 
 def test_checkpoint_prepare_waits_for_draining_policy_model() -> None:
@@ -278,7 +301,7 @@ def test_checkpoint_prepare_waits_for_draining_policy_model() -> None:
                 "selected_boundaries": [],
                 "executions": [],
             }
-        return {"sessions": 0, "state": "prepared"}
+        return {"sessions": 0, "state": "prepared", "inventory": []}
 
     env._control = AsyncMock(side_effect=prepare_control)
 
@@ -351,7 +374,7 @@ def test_checkpoint_prepare_timeout_resumes_touched_participants() -> None:
                 "executions": [],
             }
         if path.endswith("/prepare"):
-            return {"sessions": 0, "state": "prepared"}
+            return {"sessions": 0, "state": "prepared", "inventory": []}
         resume_order.append(server_name)
         if server_name == "policy":
             return {
