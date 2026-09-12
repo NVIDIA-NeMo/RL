@@ -49,6 +49,7 @@ from nemo_rl.algorithms.loss import (
     prepare_packed_loss_input,
     wrap_loss_fn_with_input_preparation,
 )
+from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.utils import _pack_input_ids
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
@@ -546,6 +547,7 @@ class LossPostProcessor:
         sampling_params: Optional[TrainingSamplingParams] = None,
         draft_model: Optional[MegatronModule] = None,
         prepare_fn: Optional[Callable[..., Any]] = None,
+        defer_draft_normalization: bool = False,
         teacher_output_layer_weight: Optional[torch.Tensor] = None,
     ):
         """Build a per-microbatch loss post-processor for the Megatron train loop.
@@ -563,6 +565,8 @@ class LossPostProcessor:
                 vocab_parallel_group, context_parallel_group)`` and return
                 ``(loss_input, data)``; value models pass one that right-shifts
                 and CP-all-gathers the scalar value-head output.
+            defer_draft_normalization: Return raw draft loss statistics for split
+                optimizer-step finalization instead of normalizing per microbatch.
             teacher_output_layer_weight: This rank's teacher LM-head shard, used
                 by the full-vocabulary MOPD loss to project the teacher payload.
                 It rides this argument rather than the data dict because the
@@ -575,6 +579,7 @@ class LossPostProcessor:
         self.cp_normalize = cp_normalize
         self.sampling_params = sampling_params
         self.prepare_fn = prepare_fn
+        self.defer_draft_normalization = defer_draft_normalization
         self.teacher_output_layer_weight = teacher_output_layer_weight
         if draft_model is not None and draft_model.eagle_module is not None:
             self.d2t = getattr(draft_model.eagle_module, "d2t", None)
@@ -667,6 +672,12 @@ class LossPostProcessor:
                     cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
                     d2t=self.d2t,
                     student_logits=student_logits,
+                    token_chunk_size=int(
+                        self.cfg["draft"].get(
+                            "token_chunk_size", DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
+                        )
+                    ),
+                    defer_normalization=self.defer_draft_normalization,
                 )
         else:
             loss_fn_wrapped = partial(
@@ -686,6 +697,12 @@ class LossPostProcessor:
                     vocab_parallel_rank=get_tensor_model_parallel_rank(),
                     vocab_parallel_group=get_tensor_model_parallel_group(),
                     context_parallel_group=get_context_parallel_group(),
+                    token_chunk_size=int(
+                        self.cfg["draft"].get(
+                            "token_chunk_size", DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
+                        )
+                    ),
+                    defer_normalization=self.defer_draft_normalization,
                 )
 
         loss_fn_wrapped = partial(
