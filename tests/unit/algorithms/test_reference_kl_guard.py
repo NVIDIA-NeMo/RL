@@ -76,7 +76,7 @@ def _call_grpo(master_config):
         val_task_to_env=None,
         logger=MagicMock(),
         checkpointer=MagicMock(),
-        grpo_save_state=MagicMock(),
+        grpo_save_state=SimpleNamespace(total_steps=0),
         master_config=master_config,
     )
 
