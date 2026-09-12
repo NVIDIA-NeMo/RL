@@ -95,6 +95,41 @@ def test_explicit_run_id_is_preserved(monkeypatch):
     assert policy.full_step_profile.call_args.kwargs["run_id"] == "job-123"
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("data_plane", [None, {"enabled": False}, {"enabled": True}])
+def test_setup_rejects_four_phase_transfer_queue_before_allocating_workers(
+    monkeypatch, enabled, data_plane
+):
+    """Execute the real setup entry through its first timing/allocation boundary."""
+    monkeypatch.setenv("NRL_NTRACE_FOUR_PHASE", "1" if enabled else "0")
+    tree = ast.parse((ROOT / "nemo_rl/algorithms/grpo.py").read_text())
+    setup = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "setup"
+    )
+    # Setup must reject an unsupported trainer before starting setup work.
+    setup_start = next(
+        i
+        for i, node in enumerate(setup.body)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "setup_start_time"
+            for target in node.targets
+        )
+    )
+    body = ast.Module(body=setup.body[:setup_start], type_ignores=[])
+    namespace = {
+        "master_config": SimpleNamespace(data_plane=data_plane),
+        "four_phase_enabled": profiling.four_phase_enabled,
+    }
+    if enabled and data_plane and data_plane["enabled"]:
+        with pytest.raises(ValueError, match="data_plane.enabled=false"):
+            exec(compile(body, "grpo.setup", "exec"), namespace)
+    else:
+        exec(compile(body, "grpo.setup", "exec"), namespace)
+
+
 def test_async_bootstrap_is_in_first_policy_step_without_second_rollout_owner():
     policy, rollout = MagicMock(), MagicMock()
     capture = profiling.GrpoCapture(policy, rollout, schedule="async", colocated=False)
@@ -214,14 +249,27 @@ def test_sync_driver_validation_has_a_phase_and_closes_or_aborts(
     """Run the real in-step validation branch through the worker dispatcher."""
     monkeypatch.setenv("NRL_NTRACE_FOUR_PHASE", "1" if enabled else "0")
     tree = ast.parse((ROOT / "nemo_rl/algorithms/grpo.py").read_text())
-    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
-                    and node.name == "grpo_train")
-    step = next(node for node in ast.walk(function) if isinstance(node, ast.With)
-                and any(isinstance(item.context_expr, ast.Call)
-                        and ast.unparse(item.context_expr.func) == "capture.step"
-                        for item in node.items))
-    branch = next(node for node in ast.walk(step) if isinstance(node, ast.If)
-                  and ast.unparse(node.test) == "should_run_validation")
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_grpo_train_impl"
+    )
+    step = next(
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.With)
+        and any(
+            isinstance(item.context_expr, ast.Call)
+            and ast.unparse(item.context_expr.func) == "capture.step"
+            for item in node.items
+        )
+    )
+    branch = next(
+        node
+        for node in ast.walk(step)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "should_run_validation"
+    )
     work = []
 
     class Target:
@@ -260,23 +308,52 @@ def test_sync_driver_validation_has_a_phase_and_closes_or_aborts(
         return {"accuracy": 0.5}, {"total_validation_time": 1.0}
 
     namespace = dict(
-        should_run_validation=True, memory_tracker=MagicMock(),
-        POLICY_GENERATION_STALE=stale, refit_policy_generation=refit,
-        profile_phase=profiling.profile_phase, policy=policy, policy_generation=rollout,
-        colocated_inference=True, refit_buffer_size_gb=None, sync_kv_scales=False,
-        validate=validate, val_dataloader=None, tokenizer=None, val_task_to_env=None,
-        total_steps=10, master_config=SimpleNamespace(grpo=SimpleNamespace(debug_payload_metrics=False)),
-        logger=MagicMock(), processor=None, _validation_early_stop_message=lambda *a: None,
-        stop_at_validation_threshold=None, stop_at_validation_metric=None,
+        should_run_validation=True,
+        memory_tracker=MagicMock(),
+        POLICY_GENERATION_STALE=stale,
+        refit_policy_generation=refit,
+        profile_phase=profiling.profile_phase,
+        policy=policy,
+        policy_generation=rollout,
+        colocated_inference=True,
+        refit_buffer_size_gb=None,
+        sync_kv_scales=False,
+        validate=validate,
+        val_dataloader=None,
+        tokenizer=None,
+        val_task_to_env=None,
+        total_steps=10,
+        master_config=SimpleNamespace(
+            grpo=SimpleNamespace(debug_payload_metrics=False)
+        ),
+        logger=MagicMock(),
+        processor=None,
+        _validation_early_stop_message=lambda *a: None,
+        stop_at_validation_threshold=None,
+        stop_at_validation_metric=None,
     )
     capture = profiling.GrpoCapture(policy, rollout, schedule="sync", colocated=True)
-    expected = pytest.raises(RuntimeError, match=f"{failure} failed") if failure else nullcontext()
+    expected = (
+        pytest.raises(RuntimeError, match=f"{failure} failed")
+        if failure
+        else nullcontext()
+    )
     with expected:
         with capture.step(step_id=11, weight_version=10):
-            exec(compile(ast.Module(body=[branch], type_ignores=[]), "sync_validation", "exec"), namespace)
+            exec(
+                compile(
+                    ast.Module(body=[branch], type_ignores=[]),
+                    "sync_validation",
+                    "exec",
+                ),
+                namespace,
+            )
 
-    prep_names = [("policy", "send_weights"), ("rollout", "receive_weights")] if stale else [
-        ("policy", "offload"), ("rollout", "wake")]
+    prep_names = (
+        [("policy", "send_weights"), ("rollout", "receive_weights")]
+        if stale
+        else [("policy", "offload"), ("rollout", "wake")]
+    )
     expected_work = prep_names + [("rollout", "validation")]
     if failure != "validation":
         expected_work.append(("rollout", "finish_generation"))
@@ -449,20 +526,36 @@ def test_async_shutdown_quiesces_before_separate_save_without_creating_another()
 
 def load_driver_shutdown(ray):
     tree = ast.parse((ROOT / "nemo_rl/algorithms/grpo.py").read_text())
-    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
-                    and node.name == "_shutdown_async_trajectory_collector")
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_shutdown_async_trajectory_collector"
+    )
     namespace = {"ray": ray, "_ASYNC_ROLLOUT_PROFILER_DRAIN_RPC_TIMEOUT_S": 40.0}
-    module = ast.Module(body=[ast.ImportFrom(
-        module="__future__", names=[ast.alias(name="annotations")], level=0
-    ), function], type_ignores=[])
-    exec(compile(ast.fix_missing_locations(module), "driver_shutdown", "exec"), namespace)
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            function,
+        ],
+        type_ignores=[],
+    )
+    exec(
+        compile(ast.fix_missing_locations(module), "driver_shutdown", "exec"), namespace
+    )
     return namespace[function.name]
 
 
 def shutdown_actor(obj):
     actor = MagicMock()
-    actor.drain_for_rollout_profiler_shutdown.remote.return_value = obj.drain_for_rollout_profiler_shutdown
-    actor.finalize_rollout_profiler_shutdown.remote.return_value = obj.finalize_rollout_profiler_shutdown
+    actor.drain_for_rollout_profiler_shutdown.remote.return_value = (
+        obj.drain_for_rollout_profiler_shutdown
+    )
+    actor.finalize_rollout_profiler_shutdown.remote.return_value = (
+        obj.finalize_rollout_profiler_shutdown
+    )
     return actor
 
 
@@ -489,8 +582,12 @@ def test_save_exceeding_control_budget_runs_after_bounded_quiescence(has_generat
 
     actor = shutdown_actor(obj)
     ray = SimpleNamespace(get=MagicMock(side_effect=wait), kill=MagicMock())
-    load_driver_shutdown(ray)(actor, obj.policy_generation, flush_telemetry=MagicMock(),
-                              full_phase_capture=True)
+    load_driver_shutdown(ray)(
+        actor,
+        obj.policy_generation,
+        flush_telemetry=MagicMock(),
+        full_phase_capture=True,
+    )
     assert elapsed[0] == 1731.0
     assert ray.get.call_args_list == [
         call(obj.drain_for_rollout_profiler_shutdown, timeout=40.0),
@@ -504,11 +601,14 @@ def test_control_timeout_refuses_finalize_and_still_reaps_collector():
     obj = collector()
     obj.begin_rollout_profile_epoch(3)
     actor = shutdown_actor(obj)
-    ray = SimpleNamespace(get=MagicMock(side_effect=TimeoutError("pause timed out")), kill=MagicMock())
+    ray = SimpleNamespace(
+        get=MagicMock(side_effect=TimeoutError("pause timed out")), kill=MagicMock()
+    )
     flush = MagicMock()
     with pytest.raises(TimeoutError, match="pause timed out"):
-        load_driver_shutdown(ray)(actor, obj.policy_generation, flush_telemetry=flush,
-                                  full_phase_capture=True)
+        load_driver_shutdown(ray)(
+            actor, obj.policy_generation, flush_telemetry=flush, full_phase_capture=True
+        )
     actor.finalize_rollout_profiler_shutdown.remote.assert_not_called()
     flush.assert_called_once_with()
     ray.kill.assert_called_once_with(actor)
@@ -524,10 +624,15 @@ def test_failed_native_shutdown_pause_cannot_enable_save_finalization():
     with pytest.raises(RuntimeError, match="successful native generation pause"):
         obj.drain_for_rollout_profiler_shutdown()
     assert obj.running is False
-    obj.policy_generation.full_step_profile.assert_any_call("abort_step", reason="async_epoch_shutdown_failed")
+    obj.policy_generation.full_step_profile.assert_any_call(
+        "abort_step", reason="async_epoch_shutdown_failed"
+    )
     with pytest.raises(RuntimeError, match="has not quiesced"):
         obj.finalize_rollout_profiler_shutdown()
-    assert call("finish_step") not in obj.policy_generation.full_step_profile.call_args_list
+    assert (
+        call("finish_step")
+        not in obj.policy_generation.full_step_profile.call_args_list
+    )
 
 
 def test_save_failure_propagates_and_aborts_before_collector_cleanup():
@@ -541,12 +646,17 @@ def test_save_failure_propagates_and_aborts_before_collector_cleanup():
 
     obj.policy_generation.full_step_profile.side_effect = worker
     actor = shutdown_actor(obj)
-    ray = SimpleNamespace(get=MagicMock(side_effect=lambda future, **kwargs: future()), kill=MagicMock())
+    ray = SimpleNamespace(
+        get=MagicMock(side_effect=lambda future, **kwargs: future()), kill=MagicMock()
+    )
     flush = MagicMock()
     with pytest.raises(ValueError, match="disk save failed"):
-        load_driver_shutdown(ray)(actor, obj.policy_generation, flush_telemetry=flush,
-                                  full_phase_capture=True)
-    obj.policy_generation.full_step_profile.assert_any_call("abort_step", reason="async_epoch_save_failed")
+        load_driver_shutdown(ray)(
+            actor, obj.policy_generation, flush_telemetry=flush, full_phase_capture=True
+        )
+    obj.policy_generation.full_step_profile.assert_any_call(
+        "abort_step", reason="async_epoch_save_failed"
+    )
     assert obj._rollout_profiler_shutdown_ready is False
     flush.assert_called_once_with()
     ray.kill.assert_called_once_with(actor)
@@ -556,60 +666,123 @@ def test_legacy_driver_drain_keeps_only_bounded_rpc():
     actor, generation = MagicMock(), MagicMock()
     ray = SimpleNamespace(get=MagicMock(), kill=MagicMock())
     load_driver_shutdown(ray)(actor, generation, flush_telemetry=MagicMock())
-    ray.get.assert_called_once_with(actor.drain_for_rollout_profiler_shutdown.remote.return_value, timeout=40.0)
+    ray.get.assert_called_once_with(
+        actor.drain_for_rollout_profiler_shutdown.remote.return_value, timeout=40.0
+    )
     actor.finalize_rollout_profiler_shutdown.remote.assert_not_called()
 
 
 @pytest.mark.parametrize("capture_error", [None, RuntimeError("incomplete capture")])
-def test_explicit_capture_close_controls_failure_separately_from_engine_cleanup(capture_error):
+def test_explicit_capture_close_controls_failure_separately_from_engine_cleanup(
+    capture_error,
+):
     tree = ast.parse((ROOT / "nemo_rl/algorithms/grpo.py").read_text())
-    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
-                    and node.name == "async_grpo_train")
-    final = next(node.finalbody for node in function.body if isinstance(node, ast.Try)
-                 and any(isinstance(statement, ast.Assign) and
-                         any(isinstance(target, ast.Name) and target.id == "active_error"
-                             for target in statement.targets) for statement in node.finalbody))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "async_grpo_train"
+    )
+    final = next(
+        node.finalbody
+        for node in function.body
+        if isinstance(node, ast.Try)
+        and any(
+            isinstance(statement, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "active_error"
+                for target in statement.targets
+            )
+            for statement in node.finalbody
+        )
+    )
     policy, generation = MagicMock(), MagicMock()
     policy.shutdown.return_value = generation.shutdown.return_value = False
-    capture = profiling.GrpoCapture(policy, generation, schedule="async", colocated=False)
+    capture = profiling.GrpoCapture(
+        policy, generation, schedule="async", colocated=False
+    )
     if capture_error:
         policy.full_step_profile.side_effect = capture_error
-    namespace = dict(sys=sys, checkpointer=MagicMock(), trajectory_collector=MagicMock(),
-                     policy_generation=generation, policy=policy, capture=capture,
-                     _shutdown_async_trajectory_collector=MagicMock(), _flush_collector_telemetry=MagicMock(),
-                     ray=MagicMock(), replay_buffer=object(), shutdown_environments=MagicMock(),
-                     task_to_env=None, val_task_to_env=None)
+    namespace = dict(
+        sys=sys,
+        checkpointer=MagicMock(),
+        trajectory_collector=MagicMock(),
+        policy_generation=generation,
+        policy=policy,
+        capture=capture,
+        _shutdown_async_trajectory_collector=MagicMock(),
+        _flush_collector_telemetry=MagicMock(),
+        ray=MagicMock(),
+        replay_buffer=object(),
+        shutdown_environments=MagicMock(),
+        task_to_env=None,
+        val_task_to_env=None,
+    )
     module = ast.Module(body=final, type_ignores=[])
     if capture_error:
         with pytest.raises(RuntimeError, match="incomplete capture"):
-            exec(compile(ast.fix_missing_locations(module), "async_teardown", "exec"), namespace)
+            exec(
+                compile(ast.fix_missing_locations(module), "async_teardown", "exec"),
+                namespace,
+            )
     else:
-        exec(compile(ast.fix_missing_locations(module), "async_teardown", "exec"), namespace)
+        exec(
+            compile(ast.fix_missing_locations(module), "async_teardown", "exec"),
+            namespace,
+        )
     policy.full_step_profile.assert_any_call("close")
     generation.full_step_profile.assert_any_call("close")
     policy.shutdown.assert_called_once_with()
     generation.shutdown.assert_called_once_with()
-    assert namespace["_shutdown_async_trajectory_collector"].call_args.kwargs["full_phase_capture"] is True
+    assert (
+        namespace["_shutdown_async_trajectory_collector"].call_args.kwargs[
+            "full_phase_capture"
+        ]
+        is True
+    )
 
 
 @pytest.mark.parametrize("drain_error", [None, TimeoutError("drain failed")])
 def test_initial_validation_early_stop_finalizes_and_checks_capture(drain_error):
     tree = ast.parse((ROOT / "nemo_rl/algorithms/grpo.py").read_text())
-    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
-                    and node.name == "async_grpo_train")
-    early_stop = next(node for node in ast.walk(function) if isinstance(node, ast.If)
-                      and ast.unparse(node.test) == "stop_message is not None")
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "async_grpo_train"
+    )
+    early_stop = next(
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "stop_message is not None"
+    )
     capture = MagicMock(enabled=True)
     capture.close.side_effect = RuntimeError("too few captured policy steps")
     shutdown = MagicMock(side_effect=drain_error)
-    namespace = dict(sys=sys, stop_message="validation threshold met", checkpointer=MagicMock(),
-                     trajectory_collector=MagicMock(), policy_generation=MagicMock(), capture=capture,
-                     _shutdown_async_trajectory_collector=shutdown, _flush_collector_telemetry=MagicMock(),
-                     ray=MagicMock(), replay_buffer=object())
+    namespace = dict(
+        sys=sys,
+        stop_message="validation threshold met",
+        checkpointer=MagicMock(),
+        trajectory_collector=MagicMock(),
+        policy_generation=MagicMock(),
+        capture=capture,
+        _shutdown_async_trajectory_collector=shutdown,
+        _flush_collector_telemetry=MagicMock(),
+        ray=MagicMock(),
+        replay_buffer=object(),
+    )
     module = ast.Module(body=early_stop.body[:-1], type_ignores=[])
-    expected = (TimeoutError, "drain failed") if drain_error else (RuntimeError, "too few captured policy steps")
+    expected = (
+        (TimeoutError, "drain failed")
+        if drain_error
+        else (RuntimeError, "too few captured policy steps")
+    )
     with pytest.raises(expected[0], match=expected[1]) as caught:
-        exec(compile(ast.fix_missing_locations(module), "initial_validation_stop", "exec"), namespace)
+        exec(
+            compile(
+                ast.fix_missing_locations(module), "initial_validation_stop", "exec"
+            ),
+            namespace,
+        )
     assert shutdown.call_args.kwargs["full_phase_capture"] is True
     capture.close.assert_called_once_with()
     namespace["ray"].kill.assert_called_once_with(namespace["replay_buffer"])

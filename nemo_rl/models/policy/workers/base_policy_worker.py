@@ -324,7 +324,9 @@ class AbstractPolicyWorker:
         if command == "configure_capture":
             profiler = self._policy_profiler
             if profiler is None:
-                raise RuntimeError("Four-phase capture requires a profiled policy worker")
+                raise RuntimeError(
+                    "Four-phase capture requires a profiled policy worker"
+                )
             self._four_phase_capture = WorkerCapture(profiler)
             kwargs["device_uuid"] = self.report_device_id()
         if self._four_phase_capture is None:

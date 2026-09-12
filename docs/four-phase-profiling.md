@@ -23,12 +23,15 @@ The driver creates and distributes a UUID when `NTRACE_RUN_ID` is absent.
 Configure the plugin's rank selection, output directories, and iteration ranges
 separately for policy and rollout. Use fresh output directories; keep both roles'
 artifacts together with their effective configuration and worker completion logs.
-Benchmark-specific policy warmup must finish before enabling this lifecycle.
+Disable benchmark-specific policy warmup callbacks before entering GRPO; the
+capture identity must be configured before the first worker step.
 
 The supported combination is the legacy GRPO driver with Megatron policy
 workers and vLLM generation. Synchronous GRPO supports colocated or separate
 devices. Asynchronous GRPO uses separate policy and generation devices. The
-TransferQueue driver is not part of the four-phase contract. Existing standalone
+TransferQueue driver is not part of the four-phase contract: setup rejects
+`NRL_NTRACE_FOUR_PHASE=1` with `data_plane.enabled=true` before allocating workers.
+Existing standalone
 [policy](policy-profiler.md) and [rollout](rollout-profiler.md) profiling remain
 available without `NRL_NTRACE_FOUR_PHASE=1`.
 

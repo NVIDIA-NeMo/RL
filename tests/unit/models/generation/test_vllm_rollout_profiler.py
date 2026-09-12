@@ -20,10 +20,6 @@ import pytest
 from nemo_rl.models.generation.profiling import (
     validate_rollout_profiler_topology,
 )
-from nemo_rl.models.generation.vllm.vllm_backend import (
-    RolloutProfilingVllmWorker,
-    configure_rollout_profiler_worker,
-)
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker import (
     BaseVllmGenerationWorker,
@@ -84,7 +80,11 @@ def test_worker_drives_rollout_profiler_lifecycle():
     )
 
 
+@pytest.mark.vllm
 def test_internal_worker_owns_profiler_lifecycle_with_dense_rank():
+    # The internal worker imports vLLM; collect this module in the driver first.
+    from nemo_rl.models.generation.vllm.vllm_backend import RolloutProfilingVllmWorker
+
     events = []
     config = SimpleNamespace(
         additional_config={
@@ -143,7 +143,13 @@ def test_internal_worker_owns_profiler_lifecycle_with_dense_rank():
     profiler.close.assert_called_once_with()
 
 
+@pytest.mark.vllm
 def test_configure_internal_profiler_worker_preserves_additional_config():
+    # This helper lives alongside the vLLM worker and needs its test extra.
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        configure_rollout_profiler_worker,
+    )
+
     vllm_kwargs = {"additional_config": {"existing": "value"}}
 
     configure_rollout_profiler_worker(
@@ -160,7 +166,13 @@ def test_configure_internal_profiler_worker_preserves_additional_config():
     }
 
 
+@pytest.mark.vllm
 def test_configure_internal_profiler_worker_composes_with_nixl():
+    # This helper lives alongside the vLLM worker and needs its test extra.
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        configure_rollout_profiler_worker,
+    )
+
     vllm_kwargs = {
         "worker_cls": "nemo_rl.models.generation.vllm.vllm_backend.NixlVllmWorker"
     }
@@ -172,7 +184,13 @@ def test_configure_internal_profiler_worker_composes_with_nixl():
     assert vllm_kwargs["worker_cls"].endswith(".RolloutProfilingNixlVllmWorker")
 
 
+@pytest.mark.vllm
 def test_configure_internal_profiler_worker_rejects_other_worker_class():
+    # This helper lives alongside the vLLM worker and needs its test extra.
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        configure_rollout_profiler_worker,
+    )
+
     with pytest.raises(ValueError, match="cannot be composed"):
         configure_rollout_profiler_worker(
             {"worker_cls": "custom.Worker"},
