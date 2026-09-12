@@ -33,7 +33,7 @@ def test_opd_basic_positive_distill_advantage():
 
     adv = estimator.compute_advantage(
         prompt_ids, rewards, mask, teacher_logprobs=teacher_lp, prev_logprobs=student_lp
-    )
+    ).advantages
 
     assert adv.shape == (B, S)
     assert (adv > 0).all(), "teacher_lp > student_lp should yield positive advantages"
@@ -50,7 +50,7 @@ def test_opd_teacher_equals_student():
 
     adv = estimator.compute_advantage(
         prompt_ids, rewards, mask, teacher_logprobs=logprobs, prev_logprobs=logprobs
-    )
+    ).advantages
 
     torch.testing.assert_close(adv, torch.zeros(B, S))
 
@@ -67,7 +67,7 @@ def test_opd_mask_applied():
 
     adv = estimator.compute_advantage(
         prompt_ids, rewards, mask, teacher_logprobs=teacher_lp, prev_logprobs=student_lp
-    )
+    ).advantages
 
     # Masked positions must be zero
     assert (adv[:, 3:] == 0).all(), "Masked positions should be zero"
@@ -76,7 +76,7 @@ def test_opd_mask_applied():
 
 
 def test_opd_metrics_returned():
-    """self.last_metrics should be populated after compute_advantage."""
+    """Metrics travel on the returned AdvantageResult."""
     estimator = _make_estimator()
     B, S = 2, 4
     teacher_lp = torch.zeros(B, S)
@@ -85,25 +85,20 @@ def test_opd_metrics_returned():
     prompt_ids = torch.arange(B)
     rewards = torch.zeros(B)
 
-    estimator.compute_advantage(
+    result = estimator.compute_advantage(
         prompt_ids, rewards, mask, teacher_logprobs=teacher_lp, prev_logprobs=student_lp
     )
 
-    assert (
-        "on_policy_distillation/teacher_student_logprob_gap_mean"
-        in estimator.last_metrics
-    )
-    assert "on_policy_distillation/adv_mean" in estimator.last_metrics
-    assert "on_policy_distillation/adv_std" in estimator.last_metrics
+    assert "on_policy_distillation/teacher_student_logprob_gap_mean" in result.metrics
+    assert "on_policy_distillation/adv_mean" in result.metrics
+    assert "on_policy_distillation/adv_std" in result.metrics
     # teacher - student = 0 - (-1) = 1.0
     assert (
         abs(
-            estimator.last_metrics[
-                "on_policy_distillation/teacher_student_logprob_gap_mean"
-            ]
+            result.metrics["on_policy_distillation/teacher_student_logprob_gap_mean"]
             - 1.0
         )
         < 1e-5
     )
-    assert abs(estimator.last_metrics["on_policy_distillation/adv_mean"] - 1.0) < 1e-5
-    assert abs(estimator.last_metrics["on_policy_distillation/adv_std"]) < 1e-5
+    assert abs(result.metrics["on_policy_distillation/adv_mean"] - 1.0) < 1e-5
+    assert abs(result.metrics["on_policy_distillation/adv_std"]) < 1e-5

@@ -283,7 +283,7 @@ extras = policy.read_from_dataplane(
     select_fields=["generation_logprobs", "token_mask"],
     pad_value_dict=_pad_dict,
 )
-advantages = adv_estimator.compute_advantage(
+adv_result = adv_estimator.compute_advantage(
     prompt_ids=driver_carry["prompt_ids_for_adv"],
     rewards=rewards, mask=mask,
     repeated_batch=adv_inputs,
@@ -295,7 +295,7 @@ advantages = adv_estimator.compute_advantage(
 # under meta.keys so workers fetch the unified view in train.
 policy.write_to_dataplane(
     meta,
-    fields={"advantages": advantages, "sample_mask": sample_mask},
+    fields={"advantages": adv_result.advantages, "sample_mask": sample_mask},
 )
 ```
 

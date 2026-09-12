@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.advantage_estimator import (
+    AdvantageResult,
     GAEConfig,
     GeneralizedAdvantageEstimator,
     RawRewardAdvantageEstimator,
@@ -73,13 +74,14 @@ def test_gae_basic_computation():
     mask = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
     values = torch.tensor([[0.5, 0.5, 0.5, 0.5]])
 
-    advantages, returns = estimator.compute_advantage(
+    _res = estimator.compute_advantage(
         prompt_ids=torch.tensor([[0]]),
         rewards=rewards,
         mask=mask,
         lengths=lengths,
         values=values,
     )
+    advantages, returns = _res.advantages, _res.returns
 
     assert advantages.shape == (1, 4)
     assert returns.shape == (1, 4)
@@ -102,13 +104,14 @@ def test_gae_gamma_lambda_zero():
     mask = torch.tensor([[1.0, 1.0, 1.0]])
     values = torch.tensor([[1.0, 2.0, 3.0]])
 
-    advantages, returns = estimator.compute_advantage(
+    _res = estimator.compute_advantage(
         prompt_ids=torch.tensor([[0]]),
         rewards=rewards,
         mask=mask,
         lengths=lengths,
         values=values,
     )
+    advantages, returns = _res.advantages, _res.returns
 
     # Token-level rewards: [0, 0, 5.0] (terminal reward at last token)
     # delta_0 = 0 + 1.0 * 2.0 - 1.0 = 1.0
@@ -133,13 +136,14 @@ def test_gae_shape_and_masking():
     mask[2, 4:] = 0  # third sample has only 4 valid tokens
     values = torch.randn(batch_size, seq_len)
 
-    advantages, returns = estimator.compute_advantage(
+    _res = estimator.compute_advantage(
         prompt_ids=torch.tensor([[0], [1], [2]]),
         rewards=rewards,
         mask=mask,
         lengths=lengths,
         values=values,
     )
+    advantages, returns = _res.advantages, _res.returns
 
     assert advantages.shape == (batch_size, seq_len)
     assert returns.shape == (batch_size, seq_len)
@@ -162,13 +166,14 @@ def test_gae_normalize_advantages():
     mask = torch.ones(batch_size, seq_len)
     values = torch.randn(batch_size, seq_len)
 
-    advantages, _ = estimator.compute_advantage(
+    _res = estimator.compute_advantage(
         prompt_ids=torch.arange(batch_size).unsqueeze(-1),
         rewards=rewards,
         mask=mask,
         lengths=lengths,
         values=values,
     )
+    advantages, _ = _res.advantages, _res.returns
 
     # After whitening, mean should be ~0 and std ~1 across valid tokens
     valid_advs = advantages[mask.bool()]
@@ -191,7 +196,7 @@ def test_gae_kl_penalty_in_rewards():
 
     # Case 1: logprobs == reference_logprobs → KL=0, advantages should match
     # the no-reference (no-KL) call.
-    adv_kl_zero, _ = estimator.compute_advantage(
+    _res = estimator.compute_advantage(
         prompt_ids=torch.tensor([[0]]),
         rewards=rewards,
         mask=mask,
@@ -200,19 +205,21 @@ def test_gae_kl_penalty_in_rewards():
         logprobs_policy=logprobs,
         logprobs_reference=reference_logprobs_same,
     )
-    adv_no_kl, _ = estimator.compute_advantage(
+    adv_kl_zero, _ = _res.advantages, _res.returns
+    _res = estimator.compute_advantage(
         prompt_ids=torch.tensor([[0]]),
         rewards=rewards,
         mask=mask,
         lengths=lengths,
         values=values,
     )
+    adv_no_kl, _ = _res.advantages, _res.returns
     torch.testing.assert_close(adv_kl_zero, adv_no_kl)
 
     # Case 2: divergent reference_logprobs → KL>0, advantages should differ
     # from the no-KL baseline (the KL penalty subtracts from token rewards).
     reference_logprobs_divergent = torch.tensor([[-3.0, -4.0, -3.5]])
-    adv_kl_positive, _ = estimator.compute_advantage(
+    _res = estimator.compute_advantage(
         prompt_ids=torch.tensor([[0]]),
         rewards=rewards,
         mask=mask,
@@ -221,6 +228,7 @@ def test_gae_kl_penalty_in_rewards():
         logprobs_policy=logprobs,
         logprobs_reference=reference_logprobs_divergent,
     )
+    adv_kl_positive, _ = _res.advantages, _res.returns
     assert not torch.allclose(adv_kl_positive, adv_no_kl), (
         "Non-zero KL should change advantages relative to the no-KL baseline"
     )
@@ -233,7 +241,7 @@ def test_gae_kl_penalty_in_rewards():
     estimator_gated_off = GeneralizedAdvantageEstimator(
         estimator_config, loss_config_gated_off
     )
-    adv_gate_off, _ = estimator_gated_off.compute_advantage(
+    _res = estimator_gated_off.compute_advantage(
         prompt_ids=torch.tensor([[0]]),
         rewards=rewards,
         mask=mask,
@@ -242,6 +250,7 @@ def test_gae_kl_penalty_in_rewards():
         logprobs_policy=logprobs,
         logprobs_reference=reference_logprobs_divergent,
     )
+    adv_gate_off, _ = _res.advantages, _res.returns
     torch.testing.assert_close(adv_gate_off, adv_no_kl)
 
 
@@ -258,13 +267,14 @@ def test_gae_vapo_decoupled_lambda():
     mask = torch.ones(2, 4)
     values = torch.randn(2, 4)
 
-    advantages, returns = estimator.compute_advantage(
+    _res = estimator.compute_advantage(
         prompt_ids=torch.tensor([[0], [1]]),
         rewards=rewards,
         mask=mask,
         lengths=lengths,
         values=values,
     )
+    advantages, returns = _res.advantages, _res.returns
 
     # Verify shapes are correct
     assert advantages.shape == (2, 4)
@@ -317,22 +327,24 @@ def test_gae_carry_forward_interior_gap():
     mask_with_gap = torch.tensor([[1.0, 1.0, 0.0, 1.0, 1.0]])
     values_with_gap = torch.tensor([[0.1, 0.2, 999.0, 0.4, 0.5]])
 
-    adv_with_gap, _ = estimator.compute_advantage(
+    _res = estimator.compute_advantage(
         prompt_ids=torch.tensor([[0]]),
         rewards=rewards,
         mask=mask_with_gap,
         values=values_with_gap,
     )
+    adv_with_gap, _ = _res.advantages, _res.returns
 
     # Same sequence with the gap collapsed out (4 contiguous valid tokens).
     mask_no_gap = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
     values_no_gap = torch.tensor([[0.1, 0.2, 0.4, 0.5]])
-    adv_no_gap, _ = estimator.compute_advantage(
+    _res = estimator.compute_advantage(
         prompt_ids=torch.tensor([[0]]),
         rewards=rewards,
         mask=mask_no_gap,
         values=values_no_gap,
     )
+    adv_no_gap, _ = _res.advantages, _res.returns
 
     # Valid-token advantages must match: the carry-forward must skip over the
     # masked position rather than propagate the 999 placeholder.
@@ -368,11 +380,12 @@ def test_raw_reward_basic_broadcast_and_masking():
         ]
     )
 
-    advantages, returns = estimator.compute_advantage(
+    _res = estimator.compute_advantage(
         prompt_ids=torch.tensor([[0], [1]]),
         rewards=rewards,
         mask=mask,
     )
+    advantages, returns = _res.advantages, _res.returns
 
     expected = torch.tensor(
         [
@@ -800,7 +813,7 @@ def _run_mock_ppo_train(
         def compute_advantage(self, **kwargs):
             mask = kwargs["mask"].clone()
             self.masks.append(mask)
-            return mask.clone(), mask.clone()
+            return AdvantageResult(advantages=mask.clone(), returns=mask.clone())
 
     class DummyTimer:
         def __init__(self, *_args, **_kwargs):
