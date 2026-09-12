@@ -436,6 +436,8 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     # monitor there is nothing to reconcile.
     ctrl._gen_fleet = None
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
+    ctrl._trainer = SimpleNamespace(sync_params_before_refit=MagicMock())
+    ctrl._timer = Timer()
     ctrl._rollout_manager = SimpleNamespace(resume_request_deadlines=MagicMock())
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(),
@@ -452,6 +454,7 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     asyncio.run(ctrl._sync_weights())
 
     ctrl._weight_synchronizer.sync_weights.assert_called_once_with(kv_scales=None)
+    ctrl._trainer.sync_params_before_refit.assert_called_once_with()
     assert ctrl._gen.invalidate_kv_cache.call_count == expected_invalidation_calls
     assert ctrl._rollout_permitted.is_set()
 
@@ -472,8 +475,10 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
         requires_kv_scale_sync=True,
     )
     ctrl._trainer = SimpleNamespace(
-        calibrate_qkv_fp8_scales=MagicMock(return_value={"layers": {"layer.0": 0.5}})
+        calibrate_qkv_fp8_scales=MagicMock(return_value={"layers": {"layer.0": 0.5}}),
+        sync_params_before_refit=MagicMock(),
     )
+    ctrl._timer = Timer()
     ctrl._inflight_by_group_id = {}
     ctrl._rollout_recovery_enabled = False
     # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
@@ -497,6 +502,7 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     ctrl._weight_synchronizer.sync_weights.assert_called_once_with(
         kv_scales={"layer.0": 0.5}
     )
+    ctrl._trainer.sync_params_before_refit.assert_called_once_with()
 
 
 class _AdvantageDataPlane:

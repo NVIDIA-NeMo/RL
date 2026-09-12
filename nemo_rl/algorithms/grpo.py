@@ -2528,15 +2528,8 @@ def refit_policy_generation(
     Returns:
         Scalar metrics reported by the selected weight synchronizer.
     """
-    # Every SGLang deployment reaches its refit through this hook: `setup`
-    # attaches an SGLang synchronizer that owns the whole lifecycle (phase
-    # transitions, engine recovery, pause/flush, transport), so SGLang never
-    # touches the branches below.
     synchronizer = getattr(policy_generation, "weight_synchronizer", None)
-    if synchronizer is not None:
-        return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
-
-    if isinstance(policy_generation, SGLangGeneration):
+    if isinstance(policy_generation, SGLangGeneration) and synchronizer is None:
         # Fail loudly rather than falling through to the vLLM branches, which
         # would call methods the SGLang path does not implement.
         raise RuntimeError(
@@ -2544,10 +2537,18 @@ def refit_policy_generation(
             "set. Attach one with create_weight_synchronizer(...) during setup."
         )
 
-    # Legacy callers without a WeightSynchronizer still need deferred Megatron
-    # parameter all-gathers completed before either transport reads the weights.
-    # Same order as IPCWeightSynchronizer.sync_weights: sync, offload, prepare.
-    policy.sync_params_before_refit()
+    # Materialize deferred Megatron parameter all-gathers before any transport
+    # reads policy weights, including synchronizers that return early below.
+    sync_context = (
+        timer.time("prepare_for_generation/sync_policy_params")
+        if timer is not None
+        else nullcontext()
+    )
+    with sync_context:
+        policy.sync_params_before_refit()
+
+    if synchronizer is not None:
+        return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
 
     if colocated_inference:
         policy.offload_before_refit()

@@ -4008,8 +4008,9 @@ class SingleControllerActor:
         Flow:
           1. _rollout_permitted.clear()  — no new dispatches
           2. Optionally calibrate FP8 KV-cache scales.
-          3. weight_synchronizer.sync_weights(kv_scales=...)
-          4. _rollout_permitted.set()   — resume
+          3. Materialize deferred policy parameter all-gathers.
+          4. weight_synchronizer.sync_weights(kv_scales=...)
+          5. _rollout_permitted.set()   — resume
 
         Args:
             calibration_data: Optional data used to calibrate FP8 KV-cache
@@ -4062,6 +4063,11 @@ class SingleControllerActor:
         # set comparison in the common case -- it used to be a full rebuild on every call
         # once a shard was gone, because absent_shards() never empties again.
         await self._reconcile_refit_membership()
+
+        # Recovery may repeat the transport, but an optimizer update only needs
+        # one parameter all-gather, so keep this outside the retry block.
+        with self._timer.time("prepare_for_generation/sync_policy_params"):
+            await asyncio.to_thread(self._trainer.sync_params_before_refit)
 
         try:
             await self._sync_weights_within(kv_scales, "first")

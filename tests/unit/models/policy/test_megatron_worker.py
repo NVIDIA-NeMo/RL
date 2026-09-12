@@ -1258,7 +1258,10 @@ class _ModelWithNonSerializableExtraState(torch.nn.Module):
         raise AssertionError("moving a module must not serialize its extra state")
 
 
-def test_sync_params_before_refit_gathers_bf16_overlap_params(monkeypatch):
+@pytest.mark.parametrize("hooks_enabled", [True, False])
+def test_sync_params_before_refit_gathers_pending_bf16_params(
+    monkeypatch, hooks_enabled
+):
     """Refit must see updated optimizer shards before it reads model parameters.
 
     The BF16 branch only needs the all-gather: the optimizer step already wrote
@@ -1283,16 +1286,22 @@ def test_sync_params_before_refit_gathers_bf16_overlap_params(monkeypatch):
     worker = object.__new__(megatron_policy_worker.MegatronPolicyWorkerImpl)
     worker.model = FakeDDP()
     worker._uses_mxfp8_overlap_shared_param_buffer = lambda: False
+    worker._forward_pre_hook_enabled = lambda: hooks_enabled
     worker.finalize_async_save = lambda: events.append(("finalize_async_save", None))
     worker._copy_main_params_to_param_buffer = MagicMock()
 
     worker.sync_params_before_refit()
 
-    assert events == [
-        ("finalize_async_save", None),
-        ("start_param_sync", True),
-        ("cuda_synchronize", None),
-    ]
+    expected = (
+        [
+            ("finalize_async_save", None),
+            ("start_param_sync", True),
+            ("cuda_synchronize", None),
+        ]
+        if hooks_enabled
+        else []
+    )
+    assert events == expected
     worker._copy_main_params_to_param_buffer.assert_not_called()
 
 
@@ -1339,26 +1348,35 @@ def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):
     assert events.index("finalize_async_save") < events.index(("move_model", True))
 
 
-def test_megatron_sync_params_before_refit_materializes_latest_mxfp8_weights():
+@pytest.mark.parametrize("hooks_enabled", [True, False])
+def test_megatron_sync_params_before_refit_materializes_latest_mxfp8_weights(
+    monkeypatch, hooks_enabled
+):
     """Refit must see optimizer updates before the next overlapped train forward."""
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
 
     events = []
+
+    class FakeDDP:
+        ddp_config = SimpleNamespace(overlap_param_gather=True)
+
+    from nemo_rl.models.policy.workers import megatron_policy_worker
+
+    monkeypatch.setattr(megatron_policy_worker, "DistributedDataParallel", FakeDDP)
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = FakeDDP()
     worker.finalize_async_save = lambda: events.append("finalize_async_save")
     worker._uses_mxfp8_overlap_shared_param_buffer = lambda: True
-    worker._forward_pre_hook_enabled = lambda: True
+    worker._forward_pre_hook_enabled = lambda: hooks_enabled
     worker._disable_forward_pre_hook_until_next_train_step = (
         lambda *, param_sync=False: events.append(("disable_hook", param_sync))
     )
     MegatronPolicyWorkerImpl.sync_params_before_refit(worker)
 
-    assert events == [
-        "finalize_async_save",
-        ("disable_hook", True),
-    ]
+    expected = ["finalize_async_save", ("disable_hook", True)] if hooks_enabled else []
+    assert events == expected
 
 
 @pytest.mark.parametrize("ddp", [False, True])

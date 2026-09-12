@@ -20,10 +20,9 @@ broadcasts its weights, and generation workers receive them via the
 established NCCL process group.
 
 Lifecycle per sync:
-  1. policy.sync_params_before_refit()            -- materialize optimizer updates
-  2. policy.broadcast_weights_for_collective()    -- send via NCCL
+  1. policy.broadcast_weights_for_collective()    -- send via NCCL
      generation.update_weights_from_collective()  -- receive via NCCL
-  3. Verify transfer success
+  2. Verify transfer success
 
 No offload/restore steps are needed since policy and generation run on
 separate GPUs with dedicated memory.
@@ -92,9 +91,6 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             arms a watchdog and aborts its own communicator when it expires, which is
             what lets the controller rebuild over the survivors instead of blocking in
             NCCL forever. ``None`` disarms it entirely, so the hang protection is lost.
-        sync_policy_params: Whether this synchronizer owns the pre-transfer policy
-            parameter sync. A lifecycle wrapper may perform it earlier and disable it
-            here to avoid a duplicate worker round trip.
     """
 
     def __init__(
@@ -104,8 +100,6 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         train_cluster: Any,
         inference_cluster: Any,
         refit_timeout_s: Optional[float] = None,
-        *,
-        sync_policy_params: bool = True,
     ):
         # None disarms the abort watchdog in every worker, which is the default and
         # reproduces the pre-existing behaviour exactly.
@@ -114,7 +108,6 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         self._generation = generation
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
-        self._sync_policy_params = sync_policy_params
         self._stale = True
         # The absent set this synchronizer's current communicator was built with, so a
         # membership that has not changed can skip the rebuild. None means "never rebuilt",
@@ -135,8 +128,6 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
-        if self._sync_policy_params:
-            self._policy.sync_params_before_refit()
         timer_context = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
             if timer is not None

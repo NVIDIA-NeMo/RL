@@ -48,6 +48,7 @@ from nemo_rl.models.generation.fleet_health import (
     GenerationFleetHealth,
     ShardState,
 )
+from nemo_rl.utils.timer import Timer
 
 
 async def _completed(value=None):
@@ -163,6 +164,8 @@ def _make_controller(
     )
     ctrl._inflight_by_group_id = {}
     ctrl._rollout_recovery_enabled = False
+    ctrl._trainer = SimpleNamespace(sync_params_before_refit=MagicMock())
+    ctrl._timer = Timer()
     return ctrl, monitor, sync
 
 
@@ -198,6 +201,7 @@ class TestDeathInsideTheCollective:
         asyncio.run(ctrl._sync_weights())
         assert sync.sync_calls == 2
         assert sync.absent_at_retry == [0]
+        ctrl._trainer.sync_params_before_refit.assert_called_once_with()
 
     def test_survivors_are_pulled_from_service_then_given_back(self):
         """Partial weights must not serve -- and must not be stranded either.
