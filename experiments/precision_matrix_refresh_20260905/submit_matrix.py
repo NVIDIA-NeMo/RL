@@ -14,9 +14,11 @@ def main() -> None:
     parser.add_argument("--ledger", type=Path, required=True)
     parser.add_argument("--preflight-log", type=Path, required=True)
     parser.add_argument("--expected-sha", required=True)
+    parser.add_argument("--cases", nargs="+", help="Only submit these model/mode/arm cases")
     args = parser.parse_args()
     performance = os.environ.get("PERFORMANCE_RECIPE") == "1"
-    expected_count = 24 if performance else 48
+    hybridep = os.environ.get("PERFORMANCE_HYBRIDEP") == "1"
+    expected_count = 16 if hybridep else (24 if performance else 48)
     if f"{expected_count}/{expected_count} configurations composed." not in args.preflight_log.read_text():
         raise SystemExit("Configuration preflight has not passed")
     root = Path(os.environ["REPO"])
@@ -29,10 +31,17 @@ def main() -> None:
     if not performance:
         arms += ("mxfp8-false-bf16", "mxfp8-true-bf16")
     models = ("qwen30", "qwen235", "super") if performance else ("qwen30", "qwen35", "lightning", "qwen235")
+    if hybridep:
+        models = ("qwen30", "super")
+    valid_cases = {f"{model}/{mode}/{arm}" for model in models for mode in ("sync", "async") for arm in arms}
+    if args.cases and not set(args.cases) <= valid_cases:
+        raise SystemExit("Unknown matrix case requested")
     for arm in arms:
         for model in models:
             for mode in ("sync", "async"):
                 case = f"{model}/{mode}/{arm}"
+                if args.cases and case not in args.cases:
+                    continue
                 if any(row["case"] == case and row.get("job_id") for row in records):
                     continue
                 env = dict(os.environ, MODEL=model, MODE=mode, ARM=arm,

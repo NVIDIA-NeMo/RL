@@ -21,7 +21,10 @@ def main() -> None:
     launcher = root / "experiments/precision_matrix_refresh_20260905/submit.sh"
     failures: list[str] = []
     performance = os.environ.get("PERFORMANCE_RECIPE") == "1"
+    hybridep = os.environ.get("PERFORMANCE_HYBRIDEP") == "1"
     models = ("qwen30", "qwen235", "super") if performance else ("qwen30", "qwen235", "qwen35", "lightning")
+    if hybridep:
+        models = ("qwen30", "super")
     arms = ("bf16-bf16", "bf16-mxfp8", "mxfp8-false-mxfp8", "mxfp8-true-mxfp8") if performance else (
         "bf16-bf16", "bf16-mxfp8", "mxfp8-false-bf16",
         "mxfp8-false-mxfp8", "mxfp8-true-mxfp8", "mxfp8-true-bf16",
@@ -62,7 +65,15 @@ def main() -> None:
                             "policy.generation.colocated", "cluster",
                         )
                         for key in protected:
+                            if hybridep and key in ("policy.megatron_cfg.moe_token_dispatcher_type", "policy.megatron_cfg.moe_flex_dispatcher_backend"):
+                                continue
                             assert OmegaConf.select(cfg, key) == OmegaConf.select(original, key), key
+                        if hybridep:
+                            assert cfg.policy.megatron_cfg.moe_token_dispatcher_type == "flex"
+                            assert cfg.policy.megatron_cfg.moe_flex_dispatcher_backend == "hybridep"
+                            assert cfg.policy.megatron_cfg.moe_hybridep_prepad_packed_inputs
+                            assert cfg.policy.megatron_cfg.pipeline_model_parallel_size == 1
+                            assert cfg.policy.megatron_cfg.mtp_num_layers == 0
                         assert int(fields["nodes"]) == cfg.cluster.num_nodes
                         assert int(fields["segment"]) == cfg.cluster.segment_size
                         summary = {key: OmegaConf.select(cfg, key) for key in protected[:8]}
