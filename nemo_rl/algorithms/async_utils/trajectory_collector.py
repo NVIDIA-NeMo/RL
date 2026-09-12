@@ -1261,7 +1261,10 @@ class AsyncTrajectoryCollector:
             self._rollout_profiler_shutdown_ready = False
 
     def prepare_for_refit(
-        self, *, begin_next_profile_epoch: bool = True, finalize_profile_epoch: bool = True
+        self,
+        *,
+        begin_next_profile_epoch: bool = True,
+        finalize_profile_epoch: bool = True,
     ) -> None:
         """Pause new generation starts and optionally wait for pending generations.
 
@@ -1336,7 +1339,9 @@ class AsyncTrajectoryCollector:
                 if finalize_profile_epoch:
                     self._finish_rollout_profile_epoch()
                     if begin_next_profile_epoch:
-                        self.begin_rollout_profile_epoch(self.current_weight_version + 1)
+                        self.begin_rollout_profile_epoch(
+                            self.current_weight_version + 1
+                        )
             elif not begin_next_profile_epoch:
                 if finalize_profile_epoch:
                     self._finish_rollout_profile_epoch()

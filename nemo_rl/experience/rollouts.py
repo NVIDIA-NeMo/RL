@@ -2626,7 +2626,12 @@ async def run_async_nemo_gym_rollout(
                     raise
                 else:
                     try:
-                        rowidx, resolved_agent_ref, result, timing_metrics = await future
+                        (
+                            rowidx,
+                            resolved_agent_ref,
+                            result,
+                            timing_metrics,
+                        ) = await future
                     except (asyncio.CancelledError, GeneratorExit):
                         ray.cancel(rollout_gen)
                         raise

@@ -108,12 +108,13 @@ from nemo_rl.experience.rollouts import (
     run_nemo_gym_rollout_sync,
     should_mask_flagged_samples,
 )
-from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
 from nemo_rl.models.four_phase_profiling import (
     GrpoCapture,
+    four_phase_enabled,
     profile_phase,
     profile_refit,
 )
+from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationInterface,
@@ -534,6 +535,12 @@ def setup(
             logger, checkpointer, grpo_save_state, master_config,
             teacher_worker_groups, alias_to_group_alias.
     """
+    if four_phase_enabled() and (master_config.data_plane or {}).get("enabled", False):
+        raise ValueError(
+            "NRL_NTRACE_FOUR_PHASE=1 requires data_plane.enabled=false; "
+            "the TransferQueue trainer does not emit four-phase capture windows"
+        )
+
     # Start timing the entire setup process
     setup_start_time = time.perf_counter()
 
