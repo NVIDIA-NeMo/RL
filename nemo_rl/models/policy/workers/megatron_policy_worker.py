@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import functools
 import gc
 import logging
 import os
@@ -19,6 +20,7 @@ import re
 import time
 import warnings
 from collections import OrderedDict, defaultdict
+from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
@@ -110,6 +112,7 @@ from nemo_rl.models.policy.interfaces import (
     ReferenceLogprobOutputSpec,
     TeacherFullPayloadOutputSpec,
 )
+from nemo_rl.models.policy.profiling import PolicyProfiler, load_policy_profiler
 from nemo_rl.models.policy.utils import (
     broadcast_hf_buckets_via_distributed_impl,
     connect_rollout_engines_from_distributed,
@@ -144,6 +147,112 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 )
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+def _begin_policy_profiler_step(worker: Any, profiler: PolicyProfiler) -> None:
+    """Begin one profiler step and record that it needs a terminal callback."""
+    if getattr(worker, "_policy_profiler_step_open", False):
+        raise RuntimeError("a policy profiler step is already open")
+    profiler.begin_train_step()
+    worker._policy_profiler_step_open = True
+
+
+def _take_open_policy_profiler_step(worker: Any) -> PolicyProfiler | None:
+    """Close the worker-side step guard and return its profiler once."""
+    profiler = getattr(worker, "_policy_profiler", None)
+    if profiler is None or not getattr(worker, "_policy_profiler_step_open", False):
+        return None
+    worker._policy_profiler_step_open = False
+    return profiler
+
+
+def _finish_policy_profiler_step(worker: Any) -> None:
+    """Finish one open profiler step."""
+    profiler = _take_open_policy_profiler_step(worker)
+    if profiler is None:
+        raise RuntimeError("no policy profiler step is open")
+    profiler.finish_train_step()
+
+
+def _abort_policy_profiler_after_error(worker: Any, *, reason: str) -> None:
+    """Best-effort profiler cleanup without masking the policy failure."""
+    profiler = _take_open_policy_profiler_step(worker)
+    if profiler is None:
+        return
+    try:
+        profiler.abort_train_step(reason=reason)
+    except Exception:
+        log.exception("failed to abort the policy profiler after a policy error")
+
+
+def _profile_policy_step(
+    method: Callable[..., dict[str, Any]],
+) -> Callable[..., dict[str, Any]]:
+    """Profile one successful, non-evaluation monolithic policy update."""
+
+    @functools.wraps(method)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        eval_mode = kwargs.get("eval_mode", args[2] if len(args) > 2 else False)
+        profiler = getattr(self, "_policy_profiler", None)
+        if profiler is None or eval_mode:
+            return method(self, *args, **kwargs)
+
+        _begin_policy_profiler_step(self, profiler)
+        try:
+            result = method(self, *args, **kwargs)
+        except Exception:
+            _abort_policy_profiler_after_error(self, reason="policy_train_error")
+            raise
+        _finish_policy_profiler_step(self)
+        return result
+
+    return wrapped
+
+
+def _profile_split_train_step_begin(
+    method: Callable[..., None],
+) -> Callable[..., None]:
+    """Open the profiler around a split step after rejecting nested steps."""
+
+    @functools.wraps(method)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> None:
+        # Preserve the worker state machine's own nested-step error instead of
+        # replacing it with the profiler's open-step error.
+        if getattr(self, "_train_step_state", None) is not None:
+            return method(self, *args, **kwargs)
+
+        profiler = getattr(self, "_policy_profiler", None)
+        if profiler is None:
+            return method(self, *args, **kwargs)
+
+        _begin_policy_profiler_step(self, profiler)
+        try:
+            return method(self, *args, **kwargs)
+        except Exception:
+            _abort_policy_profiler_after_error(self, reason="policy_train_begin_error")
+            raise
+
+    return wrapped
+
+
+def _profile_split_train_step_finish(
+    method: Callable[..., dict[str, Any]],
+) -> Callable[..., dict[str, Any]]:
+    """Close the profiler after the split-step finish method fully returns."""
+
+    @functools.wraps(method)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        try:
+            result = method(self, *args, **kwargs)
+        except Exception:
+            _abort_policy_profiler_after_error(self, reason="policy_train_finish_error")
+            raise
+
+        if getattr(self, "_policy_profiler", None) is not None:
+            _finish_policy_profiler_step(self)
+        return result
+
+    return wrapped
 
 
 def _should_use_router_replay(
@@ -441,6 +550,8 @@ class MegatronPolicyWorkerImpl(
     # begin/abort; None when no step is open. Declared at class level so
     # ``self._train_step_state = None`` after finish/abort type-checks.
     _train_step_state: Optional[dict[str, Any]] = None
+    _policy_profiler: PolicyProfiler | None = None
+    _policy_profiler_step_open: bool = False
     _remote_sparse_refit: Any = None
     _async_checkpoint_cuda_cache_active: bool = False
 
@@ -621,6 +732,11 @@ class MegatronPolicyWorkerImpl(
             f"device drift after setup_distributed: current_device="
             f"{torch.cuda.current_device()}, LOCAL_RANK={local_rank}."
         )
+
+        # Construct the optional profiler after the distributed rank is
+        # available and before the worker begins handling policy calls.
+        self._policy_profiler_step_open = False
+        self._policy_profiler = load_policy_profiler(rank=torch.distributed.get_rank())
 
         # Step 2: Validate and setup model paths
         hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
@@ -947,6 +1063,7 @@ class MegatronPolicyWorkerImpl(
             return
         self.model.load_state_dict(extra_state, strict=False)
 
+    @_profile_policy_step
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
         self,
@@ -1517,6 +1634,7 @@ class MegatronPolicyWorkerImpl(
                 "saved_finalize_model_grads_func"
             )
 
+    @_profile_split_train_step_begin
     @wrap_with_nvtx_name("megatron_policy_worker/begin_train_step")
     def begin_train_step(
         self,
@@ -1619,6 +1737,9 @@ class MegatronPolicyWorkerImpl(
         try:
             self._train_microbatch_body(state, data)
         except Exception:
+            _abort_policy_profiler_after_error(
+                self, reason="policy_train_microbatch_error"
+            )
             # The body left all three mcore hooks nulled when begin_train_step
             # opened the step. If we propagate without restoring, future steps
             # run with the PP scheduler bypass disabled and with no end-of-step
@@ -1795,11 +1916,12 @@ class MegatronPolicyWorkerImpl(
             if "loss" in m:
                 state["mb_losses"].append(m["loss"])
 
+    @_profile_split_train_step_finish
     @wrap_with_nvtx_name("megatron_policy_worker/finish_train_step")
     def finish_train_step(self) -> dict[str, Any]:
         state = self._assert_step_open()
         try:
-            return self._finish_train_step_body(state)
+            result = self._finish_train_step_body(state)
         except Exception:
             # Mid-finish failure: state machine is in a partial state and the
             # mcore hooks may still be nulled (or restored, depending on how far
@@ -1819,6 +1941,7 @@ class MegatronPolicyWorkerImpl(
                     "failed to restore mcore hooks after finish_train_step error"
                 )
             raise
+        return result
 
     def _finish_train_step_body(self, state: dict[str, Any]) -> dict[str, Any]:
         from nemo_rl.algorithms.loss.interfaces import LossType
@@ -2090,18 +2213,31 @@ class MegatronPolicyWorkerImpl(
 
     @wrap_with_nvtx_name("megatron_policy_worker/abort_train_step")
     def abort_train_step(self) -> None:
-        state = getattr(self, "_train_step_state", None)
-        if state is None:
-            return
-        # Drop the step-local MTP scaler and restore the mcore hooks before
-        # zero_grad_buffer touches anything.
+        profiler = _take_open_policy_profiler_step(self)
         try:
-            self._set_mtp_grad_scale_func(None)
+            if profiler is not None:
+                profiler.abort_train_step(reason="policy_train_step_aborted")
         finally:
-            self._restore_saved_mcore_hooks(state)
-            self.model.zero_grad_buffer()
-            self.optimizer.zero_grad()
-            self._train_step_state = None
+            state = getattr(self, "_train_step_state", None)
+            if state is not None:
+                # Drop the step-local MTP scaler and restore the mcore hooks
+                # before zero_grad_buffer touches anything.
+                try:
+                    self._set_mtp_grad_scale_func(None)
+                finally:
+                    self._restore_saved_mcore_hooks(state)
+                    self.model.zero_grad_buffer()
+                    self.optimizer.zero_grad()
+                    self._train_step_state = None
+
+    def shutdown(self) -> bool:
+        """Close the optional policy profiler and release worker resources."""
+        try:
+            if self._policy_profiler is not None:
+                self._policy_profiler.close()
+        finally:
+            result = super().shutdown()
+        return result
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
     def get_logprobs(

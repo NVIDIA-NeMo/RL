@@ -2621,8 +2621,20 @@ async def run_async_nemo_gym_rollout(
                     future = await anext(rollout_iterator)
                 except StopAsyncIteration:
                     stream_finished = True
+                except (asyncio.CancelledError, GeneratorExit):
+                    ray.cancel(rollout_gen)
+                    raise
                 else:
-                    rowidx, resolved_agent_ref, result, timing_metrics = await future
+                    try:
+                        (
+                            rowidx,
+                            resolved_agent_ref,
+                            result,
+                            timing_metrics,
+                        ) = await future
+                    except (asyncio.CancelledError, GeneratorExit):
+                        ray.cancel(rollout_gen)
+                        raise
                     # Measure the received streaming Ray value in the caller. In
                     # async training this runs in the collector actor; validation
                     # runs in the driver, so the two phases cannot share a metric
@@ -2675,7 +2687,11 @@ async def run_async_nemo_gym_rollout(
         if stream_finished:
             break
         if group_to_yield is not None:
-            yield group_to_yield
+            try:
+                yield group_to_yield
+            except (asyncio.CancelledError, GeneratorExit):
+                ray.cancel(rollout_gen)
+                raise
 
     with timer.time(total_timer_label):
         accumulator.finish()
