@@ -46,6 +46,7 @@ GYM_RESOURCES_CHECKPOINT_PREFIX = (
 )
 GYM_AGENT_CONTINUATION_INDEX_FEATURE = "agent_continuation_index_v1"
 GYM_AGENT_DISCARD_RESTORED_CONTINUATION_FEATURE = "discard_restored_continuation_v1"
+GYM_AGENT_RESOURCE_DEPENDENCY_INDEX_FEATURE = "agent_resource_dependency_index_v1"
 GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE = "external_storage_reference_index_v1"
 
 _IDENTITY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
@@ -389,6 +390,7 @@ class GymCheckpointTopology(_StrictWireModel):
         missing_acknowledgement: list[str] = []
         missing_continuation_index: list[str] = []
         missing_fresh_restart: list[str] = []
+        missing_resource_dependencies: list[str] = []
         missing_storage_reference_index: list[str] = []
         requires_fresh_restart = bool(self.restart_only_resources())
         for contract in self.participants:
@@ -409,6 +411,14 @@ class GymCheckpointTopology(_StrictWireModel):
                     not in contract.features
                 ):
                     missing_fresh_restart.append(contract.participant.participant_name)
+                if (
+                    requires_fresh_restart
+                    and GYM_AGENT_RESOURCE_DEPENDENCY_INDEX_FEATURE
+                    not in contract.features
+                ):
+                    missing_resource_dependencies.append(
+                        contract.participant.participant_name
+                    )
             elif (
                 contract.participant.component == "responses_api_models"
                 and contract.instance_role == "policy"
@@ -436,6 +446,12 @@ class GymCheckpointTopology(_StrictWireModel):
                 "Gym restart-only resources require restored-continuation "
                 "discard support from every stateful agent participant; "
                 f"missing={missing_fresh_restart!r}"
+            )
+        if missing_resource_dependencies:
+            raise RuntimeError(
+                "Gym restart-only resources require per-continuation resource "
+                "dependency indexes from every stateful agent participant; "
+                f"missing={missing_resource_dependencies!r}"
             )
         if missing_storage_reference_index:
             raise RuntimeError(
@@ -808,6 +824,45 @@ class GymExternalStorageReference(_StrictWireModel):
     key: str = Field(min_length=1)
 
 
+class GymAgentContinuationRoot(_StrictWireModel):
+    """Public agent boundary coordinate used for selective recovery."""
+
+    schema_version: Literal[1] = GYM_CHECKPOINT_SCHEMA_VERSION
+    rollout_id: str = Field(min_length=1, pattern=_IDENTITY_PATTERN)
+    attempt_index: NonNegativeInt
+    capture_key: str = Field(min_length=1, pattern=_IDENTITY_PATTERN)
+    last_committed_model_call_id: str = Field(min_length=1)
+    # None identifies a legacy index that predates per-execution dependency
+    # metadata.  An empty mapping explicitly means no resources were used.
+    resource_state_revisions: dict[str, NonNegativeInt] | None = None
+
+    @model_validator(mode="after")
+    def validate_capture_key(self) -> "GymAgentContinuationRoot":
+        expected = gym_capture_key(self.rollout_id, self.attempt_index)
+        if self.capture_key != expected:
+            raise ValueError(
+                "Gym continuation capture key does not match its execution: "
+                f"expected={expected!r}, actual={self.capture_key!r}"
+            )
+        return self
+
+
+@dataclass(frozen=True)
+class GymCheckpointContinuation:
+    """One restored continuation and the external rows that keep it alive."""
+
+    rollout_id: str
+    source_attempt_index: int
+    capture_key: str
+    resource_state_revisions: tuple[tuple[str, int], ...] | None
+    staging_keys: tuple[str, ...]
+
+    @property
+    def replacement_attempt_index(self) -> int:
+        """Return the physical attempt into which Gym installs the boundary."""
+        return self.source_attempt_index + 1
+
+
 _ArtifactRecord = TypeVar("_ArtifactRecord", bound=_StrictWireModel)
 
 
@@ -870,16 +925,11 @@ def _read_jsonl_artifact(
     return records
 
 
-def gym_checkpoint_staging_keys(
+def _gym_checkpoint_external_storage_references(
     checkpoint_dir: Path,
     checkpoint: GymCheckpointCommitResult,
-) -> set[str]:
-    """Return the TQ staging rows required by committed Gym continuations.
-
-    Gym owns its private agent and model-lineage formats. RL consumes only the
-    required, digest-bound external-storage reference index.
-    """
-    validate_gym_checkpoint_manifests(checkpoint_dir, checkpoint)
+) -> dict[str, GymExternalStorageReference]:
+    """Load each unique external TQ reference from public model indexes."""
     model_results = [
         result
         for result in checkpoint.participants
@@ -905,7 +955,91 @@ def gym_checkpoint_staging_keys(
                     f"key={raw_record.key!r}"
                 )
             references_by_key[raw_record.key] = raw_record
-    return set(references_by_key)
+    return references_by_key
+
+
+def gym_checkpoint_staging_keys(
+    checkpoint_dir: Path,
+    checkpoint: GymCheckpointCommitResult,
+) -> set[str]:
+    """Return the TQ staging rows required by committed Gym continuations.
+
+    Gym owns its private agent and model-lineage formats. RL consumes only the
+    required, digest-bound external-storage reference index.
+    """
+    validate_gym_checkpoint_manifests(checkpoint_dir, checkpoint)
+    return set(_gym_checkpoint_external_storage_references(checkpoint_dir, checkpoint))
+
+
+def gym_checkpoint_continuations(
+    checkpoint_dir: Path,
+    checkpoint: GymCheckpointCommitResult,
+) -> tuple[GymCheckpointContinuation, ...]:
+    """Join public agent dependencies with model-owned TQ references."""
+    validate_gym_checkpoint_manifests(checkpoint_dir, checkpoint)
+    roots_by_capture_key: dict[str, GymAgentContinuationRoot] = {}
+    for result in checkpoint.participants:
+        if result.participant.component != "responses_api_agents":
+            continue
+        payload = result.payload
+        if not isinstance(payload, GymAgentCommitResponse):
+            raise TypeError(
+                "Gym agent participant returned a non-agent checkpoint payload"
+            )
+        roots = _read_jsonl_artifact(
+            checkpoint_dir,
+            payload.continuation_index,
+            GymAgentContinuationRoot,
+        )
+        for root in roots:
+            if root.capture_key in roots_by_capture_key:
+                raise ValueError(
+                    "Gym checkpoint repeats an agent continuation capture key: "
+                    f"capture_key={root.capture_key!r}"
+                )
+            roots_by_capture_key[root.capture_key] = root
+
+    references = _gym_checkpoint_external_storage_references(
+        checkpoint_dir,
+        checkpoint,
+    )
+    keys_by_capture_key: dict[str, list[str]] = {}
+    for key, reference in references.items():
+        root = roots_by_capture_key.get(reference.capture_key)
+        if (
+            root is not None
+            and reference.boundary_model_call_id != root.last_committed_model_call_id
+        ):
+            raise ValueError(
+                "Gym external storage reference does not match its agent "
+                "continuation boundary: "
+                f"capture_key={reference.capture_key!r}"
+            )
+        keys_by_capture_key.setdefault(reference.capture_key, []).append(key)
+    unknown_capture_keys = set(keys_by_capture_key) - set(roots_by_capture_key)
+    if unknown_capture_keys:
+        raise ValueError(
+            "Gym external storage references have no agent continuation: "
+            f"capture_keys={sorted(unknown_capture_keys)!r}"
+        )
+
+    return tuple(
+        GymCheckpointContinuation(
+            rollout_id=root.rollout_id,
+            source_attempt_index=root.attempt_index,
+            capture_key=root.capture_key,
+            resource_state_revisions=(
+                tuple(sorted(root.resource_state_revisions.items()))
+                if root.resource_state_revisions is not None
+                else None
+            ),
+            staging_keys=tuple(sorted(keys_by_capture_key.get(root.capture_key, []))),
+        )
+        for root in sorted(
+            roots_by_capture_key.values(),
+            key=lambda item: (item.rollout_id, item.attempt_index),
+        )
+    )
 
 
 class GymModelRestoreResponse(_StrictWireModel):
