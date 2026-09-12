@@ -78,6 +78,43 @@ for most models, but it is not guaranteed for every architecture or recipe. If
 you encounter errors with the standard Megatron layer specs, leave it unset or
 set it to `false` to exercise ModelOpt's Megatron layer-spec path.
 
+## Frozen-Weight Logprob Optimization
+
+QARL can avoid repeatedly fake-quantizing the same frozen weights during the
+no-gradient policy and reference logprob passes. Set
+`policy.quant_fold_frozen_weight_snap: true` to enable it; it defaults to `false`.
+
+> **Requires nvidia-modelopt 0.47 or newer**, which is where
+> `mtq.temporarily_fold_weights` was added. NeMo RL currently pins an older
+> commit, so enabling the option raises a `RuntimeError` naming this requirement
+> rather than silently doing nothing. The shipped QARL configs leave it `false`
+> until the pin moves.
+
+When enabled, NeMo RL wraps the pass in ModelOpt's
+`mtq.temporarily_fold_weights`, which folds each fake-quant weight quantizer once
+at the start of the pass: the fake-quantized value is written into the existing
+parameter storage and the weight quantizer is disabled. Forwards during the pass
+then read an already-quantized weight instead of re-quantizing it on every
+microbatch. ModelOpt snapshots the affected weights beforehand and restores them,
+along with the quantizer state, before training resumes -- including if the pass
+raises.
+
+`policy.quant_fold_snapshot_device` selects where those snapshots live. Leave it
+unset to keep each snapshot on its parameter's device, which is fastest; set it to
+`cpu` to trade a host round trip for accelerator memory on memory-tight runs.
+
+This applies to any quantization format. Only the *weight* quantizer is disabled,
+so recipes that also quantize activations (such as W4A4) keep their input and
+output quantizers running and produce unchanged logprobs.
+
+ModelOpt does not support weight quantizers built as a `SequentialQuantizer`
+(as used by double-quantized recipes) and raises `NotImplementedError` for them,
+so do not enable this option for such a recipe. None of the quantization configs
+shipped under `examples/modelopt/quant_configs/` build one.
+
+The option costs one temporary copy of each folded weight shard, held only for the
+duration of the pass.
+
 ## Quantization-Aware GRPO (QA-GRPO)
 
 ### Configuration
@@ -90,6 +127,7 @@ defaults: "../configs/grpo_math_8B_megatron.yaml"
 
 policy:
   quant_cfg: "examples/modelopt/quant_configs/nvfp4_a16.yaml"
+  quant_fold_frozen_weight_snap: true
   quant_calib_data: "cnn_dailymail"
   quant_calib_size: 512
   quant_batch_size: 1
@@ -328,6 +366,7 @@ defaults: "../configs/distillation_math_megatron.yaml"
 
 policy:
     quant_cfg: "NVFP4_DEFAULT_CFG"
+    quant_fold_frozen_weight_snap: true
     quant_calib_data: "cnn_dailymail"
     quant_calib_size: 512
     quant_batch_size: 1
@@ -357,6 +396,8 @@ These parameters are added under the `policy` section:
 | `quant_calib_size` | Number of samples for the calibration pass |
 | `quant_batch_size` | Batch size during calibration |
 | `quant_sequence_length` | Sequence length for calibration data |
+| `quant_fold_frozen_weight_snap` | Optional boolean, default `false`. During frozen-weight logprob passes, wrap the pass in `mtq.temporarily_fold_weights` so each fake-quantized weight is folded into its parameter once instead of re-quantizing every microbatch. ModelOpt restores the weights and quantizers afterwards. Safe for any format, including activation-quantized recipes such as W4A4, but not for double-quantized (`SequentialQuantizer`) recipes. |
+| `quant_fold_snapshot_device` | Optional string, default unset. Device for the weight snapshots taken while folding. Unset keeps each snapshot on its parameter's device; `cpu` trades a host round trip for accelerator memory. Only read when `quant_fold_frozen_weight_snap` is set. |
 
 The `policy.generation.quant_cfg` should match `policy.quant_cfg` to ensure consistent quantization between training and generation.
 

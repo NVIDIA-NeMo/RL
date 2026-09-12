@@ -87,6 +87,7 @@ policy:
 
   # NVFP4 weight-only (W4A16) custom recipe applied to the Megatron training worker.
   quant_cfg: "examples/modelopt/quant_configs/nvfp4_a16.yaml"
+  quant_fold_frozen_weight_snap: false
   quant_calib_data: "cnn_dailymail"
   quant_calib_size: 512
   quant_batch_size: 1
