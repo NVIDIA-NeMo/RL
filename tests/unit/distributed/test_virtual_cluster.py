@@ -11,10 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import os
+import random
 import re
 import socket
 import subprocess
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
@@ -328,6 +331,10 @@ def test_init_ray_alone_has_no_data_plane_awareness():
         assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in env_vars
 
 
+@pytest.mark.skipif(
+    os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1",
+    reason="No venv is built when every PY_EXECUTABLES entry is sys.executable",
+)
 def test_mcore_py_executable():
     # The temporary directory is created within the project.
     # For some reason, creating a virtual environment outside of the project
@@ -429,6 +436,42 @@ class TestBindSocketInRange:
 
         assert port == 12022
         mock_sock.bind.assert_called_once_with(("", 12022))
+
+    def test_bounded_path_draws_from_the_supplied_rng(self):
+        """The supplied rng, not the process-wide `random` module, picks the port."""
+        mock_sock = MagicMock()
+
+        port = _bind_socket_in_range(mock_sock, 12100, 12200, rng=random.Random(1234))
+
+        assert port == random.Random(1234).randint(12100, 12199)
+        mock_sock.bind.assert_called_once_with(("", port))
+
+    def test_exhaustive_path_draws_from_the_supplied_rng(self):
+        """The max_retries=None shuffle must also honor the supplied rng."""
+        mock_sock = MagicMock()
+
+        port = _bind_socket_in_range(
+            mock_sock, 12200, 12300, max_retries=None, rng=random.Random(1234)
+        )
+
+        expected_candidates = list(range(12200, 12300))
+        random.Random(1234).shuffle(expected_candidates)
+        assert port == expected_candidates[0]
+        mock_sock.bind.assert_called_once_with(("", port))
+
+    def test_distinct_seeds_decorrelate_ports(self):
+        """The property rng exists for: ranks on one node must not collide.
+
+        Without it every rank replays the same process-wide sequence.
+        """
+        ports = set()
+        for rank in range(4):
+            mock_sock = MagicMock()
+            ports.add(
+                _bind_socket_in_range(mock_sock, 12300, 13300, rng=random.Random(rank))
+            )
+
+        assert len(ports) == 4
 
 
 class TestGetFreePortLocal:
@@ -757,3 +800,54 @@ def test_default_port_ranges_ordered_and_below_ephemeral_floor():
     # Avoid privileged ports (<1024).
     assert DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW > 1024
     assert DEFAULT_MASTER_PORT_RANGE_LOW > 1024
+
+
+_REGISTRY_PROBE = """
+import json
+
+from nemo_rl.distributed.ray_actor_environment_registry import (
+    ACTOR_ENVIRONMENT_REGISTRY,
+    get_actor_python_env,
+)
+from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+
+envs = {fqn: get_actor_python_env(fqn) for fqn in ACTOR_ENVIRONMENT_REGISTRY}
+# Also assert on PY_EXECUTABLES directly: a constant with no registry entry
+# is invisible to envs, so the class-level promise needs its own check.
+constants = {n: getattr(PY_EXECUTABLES, n) for n in vars(PY_EXECUTABLES) if n.isupper()}
+print(
+    json.dumps(
+        {
+            "all_system": set(envs.values()) | set(constants.values())
+            == {PY_EXECUTABLES.SYSTEM},
+            "envs": envs,
+            "constants": constants,
+        }
+    )
+)
+"""
+
+
+@pytest.mark.parametrize("use_system_executable", [False, True])
+def test_actor_registry_honors_system_flag(use_system_executable):
+    # The registry freezes its executable strings at import, so the flag can
+    # only be exercised in a fresh interpreter.
+    env = dict(os.environ)
+    env["NEMO_RL_PY_EXECUTABLES_SYSTEM"] = "1" if use_system_executable else "0"
+    result = subprocess.run(
+        [sys.executable, "-c", _REGISTRY_PROBE],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+
+    if use_system_executable:
+        assert payload["all_system"], (payload["envs"], payload["constants"])
+    else:
+        envs = payload["envs"]
+        assert envs[
+            "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
+        ].startswith("uv run")
+        assert envs["nemo_rl.environments.nemo_gym.NemoGym"].startswith("uv run")

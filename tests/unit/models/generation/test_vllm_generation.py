@@ -21,7 +21,7 @@ import threading
 import types
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import ray
@@ -144,6 +144,120 @@ basic_dtensor_test_config: PolicyConfig = {
     "make_sequence_length_divisible_by": 1,
     "generation": deepcopy(basic_vllm_test_config),
 }
+
+
+@pytest.mark.parametrize("async_engine", [False, True])
+def test_vllm_generation_selects_worker_extension(
+    async_engine,
+) -> None:
+    config = deepcopy(basic_vllm_test_config)
+    config["vllm_cfg"]["async_engine"] = async_engine
+    extension_fqn = "tests.extensions.CustomGenerationWorker"
+    config["worker_extension_cls_fqn"] = extension_fqn
+
+    cluster = MagicMock()
+    cluster.world_size.return_value = 1
+    cluster.num_gpus_per_node = 1
+
+    with (
+        patch.dict(
+            "nemo_rl.distributed.ray_actor_environment_registry.ACTOR_ENVIRONMENT_REGISTRY",
+            {extension_fqn: "python"},
+        ),
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.RayWorkerBuilder"
+        ) as worker_builder,
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.RayWorkerGroup"
+        ) as worker_group,
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
+            return_value=[None],
+        ),
+    ):
+        worker_group.return_value.dp_size = 1
+        VllmGeneration(cluster, config, defer_model_load=True)
+
+    assert worker_builder.call_args.args[:2] == (extension_fqn, config)
+    assert worker_builder.call_args.kwargs == (
+        {"defer_model_load": True} if async_engine else {}
+    )
+
+
+def test_vllm_generation_rejects_worker_extension_with_quantization() -> None:
+    config = deepcopy(basic_vllm_test_config)
+    config["worker_extension_cls_fqn"] = "tests.extensions.CustomGenerationWorker"
+    config["quant_cfg"] = "NVFP4"
+    cluster = MagicMock()
+    cluster.world_size.return_value = 1
+    cluster.num_gpus_per_node = 1
+
+    with pytest.raises(
+        ValueError,
+        match="worker_extension_cls_fqn and quant_cfg are mutually exclusive",
+    ):
+        VllmGeneration(cluster, config, defer_model_load=True)
+
+    cluster._init_placement_groups.assert_not_called()
+
+
+@pytest.mark.parametrize("async_engine", [False, True])
+def test_vllm_generation_rejects_unregistered_worker_extension(
+    async_engine: bool,
+) -> None:
+    config = deepcopy(basic_vllm_test_config)
+    config["vllm_cfg"]["async_engine"] = async_engine
+    config["worker_extension_cls_fqn"] = "tests.extensions.UnregisteredGenerationWorker"
+    cluster = MagicMock()
+    cluster.world_size.return_value = 1
+    cluster.num_gpus_per_node = 1
+
+    with (
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.RayWorkerGroup"
+        ) as worker_group,
+        pytest.raises(ValueError, match="No actor environment registered"),
+    ):
+        VllmGeneration(cluster, config, defer_model_load=True)
+
+    worker_group.assert_not_called()
+    cluster._init_placement_groups.assert_not_called()
+
+
+@pytest.mark.parametrize("backend", ["sglang", "megatron", "trtllm", "dynamo"])
+def test_generation_config_rejects_worker_extension_for_other_backends(
+    backend: str,
+) -> None:
+    config = deepcopy(basic_vllm_test_config)
+    config["backend"] = backend
+    config["worker_extension_cls_fqn"] = "tests.extensions.CustomGenerationWorker"
+
+    with pytest.raises(ValueError, match="only supported by the vLLM backend"):
+        configure_generation_config(config, MagicMock())
+
+
+@pytest.mark.parametrize("backend", ["vllm", "sglang", "megatron", "trtllm", "dynamo"])
+@pytest.mark.parametrize("include_null", [False, True])
+def test_generation_config_allows_no_worker_extension(
+    backend: str,
+    include_null: bool,
+) -> None:
+    config = deepcopy(basic_vllm_test_config)
+    config["backend"] = backend
+    if include_null:
+        config["worker_extension_cls_fqn"] = None
+
+    configure_generation_config(config, MagicMock())
+
+
+def test_generation_config_allows_vllm_worker_extension() -> None:
+    config = deepcopy(basic_vllm_test_config)
+    extension_fqn = "tests.extensions.CustomGenerationWorker"
+    config["worker_extension_cls_fqn"] = extension_fqn
+
+    configured = configure_generation_config(config, MagicMock())
+
+    assert configured["worker_extension_cls_fqn"] == extension_fqn
 
 
 def test_context_capped_max_new_tokens():
@@ -1434,7 +1548,7 @@ async def test_vllm_policy_generation_async(
         lm_policy = Policy(cluster, dtensor_config, tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = lm_policy.prepare_refit_info()
+        state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
         async_policy.prepare_refit_info(state_dict_info)
 
         print("refitting vllm policy...")
@@ -1535,7 +1649,7 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
     dtensor_config = basic_dtensor_test_config
     lm_policy = Policy(cluster, dtensor_config, tokenizer)
 
-    state_dict_info = lm_policy.prepare_refit_info()
+    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
     policy.prepare_refit_info(state_dict_info)
 
     print("refitting vllm policy...")
@@ -1872,7 +1986,7 @@ async def test_vllm_generation_with_hf_training_colocated(
 
     # Prepare refit info
     print("Preparing refit info...")
-    state_dict_info = lm_policy.prepare_refit_info()
+    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
     vllm_policy.prepare_refit_info(state_dict_info)
 
     # Test
@@ -1972,7 +2086,7 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     ray.get(futures_train + futures_inference)
 
     # prepare refit info
-    state_dict_info = lm_policy.prepare_refit_info()
+    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
     vllm_policy.prepare_refit_info(state_dict_info)
 
     # Test
@@ -2628,7 +2742,7 @@ def test_vllm_weight_update_and_prefix_cache_reset(
         vllm_policy = VllmGeneration(cluster, vllm_config)
 
         print("preparing refit info...")
-        state_dict_info = lm_policy.prepare_refit_info()
+        state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
         vllm_policy.prepare_refit_info(state_dict_info)
 
         # Prepare input data (batch size 2)
@@ -2746,7 +2860,7 @@ def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
     lm_policy = Policy(cluster, train_config, tokenizer)
 
     print("preparing refit info...")
-    state_dict_info = lm_policy.prepare_refit_info()
+    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
     vllm_policy.prepare_refit_info(state_dict_info)
 
     print("refitting vllm policy...")
@@ -2820,7 +2934,7 @@ def test_vllm_generation_with_stop(cluster, test_input_data, tokenizer, is_eval)
         lm_policy = Policy(cluster, dtensor_config, tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = lm_policy.prepare_refit_info()
+        state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
         vllm_generation.prepare_refit_info(state_dict_info)
 
         print("refitting vllm policy...")
@@ -2959,7 +3073,7 @@ async def test_vllm_refit_non_colocated_update_weights(
     ray.get(futures_train + futures_inference)
 
     # prepare refit info
-    state_dict_info = lm_policy.prepare_refit_info()
+    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
     vllm_generation.prepare_refit_info(state_dict_info)
 
     print("refitting vllm policy...")
@@ -3082,7 +3196,9 @@ def test_vllm_generation_with_megatron_training(
         megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = megatron_policy.prepare_refit_info()
+        state_dict_info = megatron_policy.prepare_refit_info(
+            refit_payload_mode="hf_export"
+        )
         vllm_policy.prepare_refit_info(state_dict_info)
 
         print("Refitting vLLM policy with Megatron weights...")
@@ -3244,7 +3360,9 @@ def test_vllm_generation_with_megatron_training_moe_model(
         megatron_policy = Policy(moe_cluster, megatron_config, test_tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = megatron_policy.prepare_refit_info()
+        state_dict_info = megatron_policy.prepare_refit_info(
+            refit_payload_mode="hf_export"
+        )
         vllm_policy.prepare_refit_info(state_dict_info)
 
         print("Refitting vLLM policy with Megatron weights...")
@@ -3370,7 +3488,7 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
     megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
 
     print("preparing refit info...")
-    state_dict_info = megatron_policy.prepare_refit_info()
+    state_dict_info = megatron_policy.prepare_refit_info(refit_payload_mode="hf_export")
     vllm_policy.prepare_refit_info(state_dict_info)
 
     print("Refitting vLLM policy with Megatron...")
@@ -3486,7 +3604,9 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
         megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = megatron_policy.prepare_refit_info()
+        state_dict_info = megatron_policy.prepare_refit_info(
+            refit_payload_mode="hf_export"
+        )
         vllm_policy.prepare_refit_info(state_dict_info)
 
         print("Refitting vLLM with Megatron PP=2 weights...")
@@ -3552,7 +3672,9 @@ def test_vllm_megatron_weight_update_with_packing(cluster, test_input_data):
         vllm_generation = VllmGeneration(cluster, vllm_config)
 
         # prepare refit info
-        state_dict_info = megatron_policy.prepare_refit_info()
+        state_dict_info = megatron_policy.prepare_refit_info(
+            refit_payload_mode="hf_export"
+        )
         vllm_generation.prepare_refit_info(state_dict_info)
 
         print("refitting vllm policy...")

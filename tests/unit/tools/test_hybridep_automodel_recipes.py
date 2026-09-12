@@ -19,7 +19,6 @@ from omegaconf import OmegaConf
 
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
-
 RECIPE_DIR = Path(__file__).parents[3] / "examples/configs/recipes/llm"
 AUTOMODEL_RECIPES = tuple(sorted(RECIPE_DIR.glob("*automodel*.yaml")))
 
