@@ -1,0 +1,36 @@
+defaults: ../../../nemo_gym/grpo_qwen3_30ba3b_thinking_swe1.yaml
+checkpointing:
+  enabled: false
+policy:
+  offload_optimizer_for_logprob: false
+  megatron_cfg:
+    context_parallel_size: 1
+    expert_model_parallel_size: 2
+  generation:
+    vllm_kwargs:
+      speculative_config:
+        method: ${oc.env:NRL_SPEC_METHOD}
+        model: ${oc.env:NRL_DRAFT_MODEL}
+        num_speculative_tokens: ${oc.decode:${oc.env:NRL_NUM_SPECULATIVE_TOKENS}}
+        draft_tensor_parallel_size: 1
+    colocated:
+      resources:
+        gpus_per_node: 4
+        num_nodes: 1
+data:
+  train:
+    data_path: ${oc.env:NRL_SWE_TRAIN_DATA}
+  validation:
+    data_path: ${oc.env:NRL_SWE_VAL_DATA}
+env:
+  nemo_gym:
+    is_trajectory_collection: true
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-thinking-swe1-2n4g-megatron-tp2pp2-rollout-only-specdec
+  wandb:
+    project: nemo-rl
+    name: qwen3-30ba3b-thinking-swe1-rollout-only-specdec
+cluster:
+  gpus_per_node: 4
+  num_nodes: 2
+  segment_size: 1
