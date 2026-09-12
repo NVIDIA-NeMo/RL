@@ -609,9 +609,26 @@ class GymAgentStatusResponse(GymAgentPrepareResponse):
     checkpoint_id: str = Field(min_length=1, pattern=_IDENTITY_PATTERN)
 
 
+class GymResourcesPrepareInventoryEntry(GymExecutionIdentity):
+    """One resources session selected into the current checkpoint cut."""
+
+    revision: NonNegativeInt
+    mutation_receipts: NonNegativeInt
+
+
 class GymResourcesPrepareResponse(_StrictWireModel):
     sessions: NonNegativeInt
     state: Literal["prepared"]
+    inventory: list[GymResourcesPrepareInventoryEntry]
+
+    @model_validator(mode="after")
+    def validate_inventory_count(self) -> "GymResourcesPrepareResponse":
+        if self.sessions != len(self.inventory):
+            raise ValueError(
+                "resources checkpoint session count does not match inventory: "
+                f"sessions={self.sessions}, inventory={len(self.inventory)}"
+            )
+        return self
 
 
 GymPreparePayload: TypeAlias = Annotated[
