@@ -444,13 +444,17 @@ if [[ "${ACTION}" == submit && ! -f "${SOURCE_ARCHIVE}" ]]; then
   mkdir -p "${SOURCE_ARCHIVE_ROOT}"
   SOURCE_MANIFEST=$(mktemp "${TMPDIR:-/tmp}/nemo-rl-source-manifest.XXXXXX")
   SOURCE_ARCHIVE_TMP=$(mktemp "${TMPDIR:-/tmp}/nemo-rl-source.XXXXXX.tar")
-  trap 'rm -f "${SOURCE_MANIFEST:-}" "${SOURCE_ARCHIVE_TMP:-}"' EXIT
+  SOURCE_ARCHIVE_STAGE=$(mktemp "${SOURCE_ARCHIVE_ROOT}/.nemo-rl-${SOURCE_ID}.XXXXXX")
+  trap 'rm -f "${SOURCE_MANIFEST:-}" "${SOURCE_ARCHIVE_TMP:-}" "${SOURCE_ARCHIVE_STAGE:-}"' EXIT
   git -C "${REPO}" ls-files -z --recurse-submodules --cached --full-name > "${SOURCE_MANIFEST}"
   tar --null -cf "${SOURCE_ARCHIVE_TMP}" -C "${REPO}" -T "${SOURCE_MANIFEST}"
   if [[ ! -f "${SOURCE_ARCHIVE}" ]]; then
-    mv "${SOURCE_ARCHIVE_TMP}" "${SOURCE_ARCHIVE}"
+    # Cross-filesystem mv can expose a truncated final file on quota failure.
+    cp "${SOURCE_ARCHIVE_TMP}" "${SOURCE_ARCHIVE_STAGE}"
+    cmp -s "${SOURCE_ARCHIVE_TMP}" "${SOURCE_ARCHIVE_STAGE}"
+    mv "${SOURCE_ARCHIVE_STAGE}" "${SOURCE_ARCHIVE}"
   fi
-  rm -f "${SOURCE_MANIFEST}" "${SOURCE_ARCHIVE_TMP}"
+  rm -f "${SOURCE_MANIFEST}" "${SOURCE_ARCHIVE_TMP}" "${SOURCE_ARCHIVE_STAGE}"
   trap - EXIT
 fi
 
