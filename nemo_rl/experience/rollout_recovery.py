@@ -536,7 +536,9 @@ class RolloutRecoveryLedger:
             attempt = sibling.current_attempt
             attempt.status = RolloutAttemptStatus.ABANDONED
             attempt.receipt = None
+            attempt.completion_receipt = None
             attempt.reward = None
+            attempt.mask_sample = None
             attempt.staging_keys.clear()
         record.resolved_agent_name = None
         record.status = PromptGroupStatus.GENERATING
