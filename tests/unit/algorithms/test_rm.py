@@ -240,6 +240,12 @@ def test_exit_on_max_steps(mock_components):
 
     # Verify we only trained for 12 steps.
     assert mock_components["policy"].train.call_count == 12
+    final_timing_call = [
+        call
+        for call in mock_components["logger"].log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "timing/train"
+    ][-1]
+    assert final_timing_call.kwargs["step_finished"] is True
 
 
 def test_exit_on_max_epochs(mock_components):

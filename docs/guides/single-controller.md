@@ -119,6 +119,8 @@ checkpointing:
 
 rollout_checkpointing:
   snapshot_attempt_interval_s: 120
+  telemetry_interval_s: null
+  max_consecutive_failures: 3
   keep_latest_k: 2
   restore_mode: latest
   extra_fingerprint_excluded_paths: []
@@ -135,6 +137,17 @@ recommended for continuous post-step coverage; with a larger value, attempts
 are skipped until the matching trainer checkpoint exists. Before the first
 training step, snapshots are anchored to the initial model and a fingerprint of
 the rollout-semantic configuration.
+
+`telemetry_interval_s` controls an independent wall-clock sampler for rollout
+throughput and checkpoint pressure. It is `null` (disabled) by default; set it
+to a positive number such as `30` to emit one sample every 30 seconds. This does
+not change the checkpoint cadence. See the
+[Single-Controller rollout recovery metrics](../observability/metrics.md#single-controller-rollout-recovery-metrics)
+for the emitted fields.
+
+`max_consecutive_failures` is the number of consecutive retryable periodic-save
+failures tolerated before training aborts. A successful or skipped checkpoint
+attempt resets the count; checkpoint invariant failures still fail immediately.
 
 The bootstrap fingerprint is fail-closed: every configuration value affects
 compatibility unless NeMo-RL's built-in denylist identifies it as operational,
