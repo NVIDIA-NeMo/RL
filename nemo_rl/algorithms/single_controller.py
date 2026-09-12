@@ -87,6 +87,7 @@ from nemo_rl.algorithms.grpo import (
     _write_latest_checkpoint_status,
     aggregate_rollout_metrics,
     compute_and_apply_seq_logprob_error_masking,
+    scale_rewards,
 )
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.ppo import _compute_critic_metrics
@@ -4210,6 +4211,16 @@ class SingleControllerActor:
         final_sample_mask = sample_mask * (~mask_sample).to(sample_mask.dtype)
         if self._algo_cfg.overlong_filtering:
             final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
+
+        # Before anything reads the rewards, matching grpo.py's ordering. A
+        # no-op unless reward scaling exists and is enabled. Not every
+        # SingleController algorithm defines the GRPO-only config block.
+        reward_scaling_cfg = getattr(self._algo_cfg, "reward_scaling", None)
+        if reward_scaling_cfg is not None:
+            rewards = scale_rewards(
+                BatchedDataDict({"total_reward": rewards}),
+                reward_scaling_cfg,
+            )["total_reward"]
 
         seq_logprob_error_threshold = self._algo_cfg.seq_logprob_error_threshold
         # Match the legacy path: whenever real policy logprobs are available,

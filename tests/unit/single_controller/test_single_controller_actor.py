@@ -27,7 +27,11 @@ from tensordict import TensorDict
 import nemo_rl.algorithms.single_controller as single_controller
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler
-from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
+from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
+    RewardScalingConfig,
+    _initial_grpo_save_state,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.ppo import PPOConfig
@@ -518,10 +522,12 @@ class _AdvantageDataPlane:
 class _MaskRecordingAdvantageEstimator:
     def __init__(self) -> None:
         self.mask: torch.Tensor | None = None
+        self.rewards: torch.Tensor | None = None
 
     def compute_advantage(self, *, rewards, mask, **kwargs) -> torch.Tensor:
         del kwargs
         self.mask = mask.clone()
+        self.rewards = rewards.clone()
         return rewards.unsqueeze(-1).expand_as(mask).clone()
 
 
@@ -832,6 +838,66 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
     logged = torch.cat(ctrl._step_log_dict["masked_advantages"])
     assert logged.min().item() == pytest.approx(-1.0)
     assert logged.max().item() == pytest.approx(2.0)
+
+
+def test_advantage_stage_scales_rewards_before_estimation() -> None:
+    batch_size, sequence_length = 2, 4
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.zeros(
+                batch_size, sequence_length, dtype=torch.long
+            ),
+            "total_reward": torch.tensor([-4.0, 6.0]),
+            "token_mask": torch.ones(batch_size, sequence_length),
+            "sample_mask": torch.ones(batch_size),
+            "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+            "truncated": torch.zeros(batch_size, dtype=torch.bool),
+        },
+        batch_size=[batch_size],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    estimator = _MaskRecordingAdvantageEstimator()
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
+    ctrl._is_ppo = False
+    ctrl._message_level_advantage_penalties_enabled = False
+    ctrl._algo_cfg = GRPOConfig(
+        reward_scaling=RewardScalingConfig(
+            enabled=True,
+            source_min=-4.0,
+            source_max=6.0,
+            target_min=0.0,
+            target_max=1.0,
+        )
+    )
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "sample_masks": [],
+        "masked_advantages": [],
+        "num_mask_sample_filtered": [],
+        "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        fields=list(data.keys()),
+    )
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    assert estimator.rewards is not None
+    torch.testing.assert_close(estimator.rewards, torch.tensor([0.0, 1.0]))
+    torch.testing.assert_close(ctrl._step_log_dict["rewards"][0], estimator.rewards)
 
 
 def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
