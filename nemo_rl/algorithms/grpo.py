@@ -4353,7 +4353,30 @@ def aggregate_rollout_metrics(
     aggregated = {}
     for k, v in per_group_metrics.items():
         if is_histogram_metric(k):
-            aggregated[k] = [observation for group in v for observation in group]
+            observations = [observation for group in v for observation in group]
+            aggregated[k] = observations
+            if k.startswith("environment/") and k.endswith("/histogram"):
+                metric_name = k.removesuffix("/histogram")
+                if observations:
+                    aggregated[f"{metric_name}/mean"] = float(
+                        np.mean(observations)
+                    )
+                    aggregated[f"{metric_name}/min"] = min(observations)
+                    aggregated[f"{metric_name}/max"] = max(observations)
+                    aggregated[f"{metric_name}/median"] = float(
+                        np.median(observations)
+                    )
+                    aggregated[f"{metric_name}/p50"] = float(
+                        np.percentile(observations, 50)
+                    )
+                    aggregated[f"{metric_name}/p95"] = float(
+                        np.percentile(observations, 95)
+                    )
+                    aggregated[f"{metric_name}/stddev"] = (
+                        float(np.std(observations, ddof=1))
+                        if len(observations) > 1
+                        else float("nan")
+                    )
         elif not isinstance(v[0], (int, float)):
             aggregated[k] = v
         elif k.endswith("/min") or (k.startswith("min_") and not k.endswith("_rate")):
@@ -4361,6 +4384,8 @@ def aggregate_rollout_metrics(
         elif k.endswith("/max") or (k.startswith("max_") and not k.endswith("_rate")):
             aggregated[k] = max(v)
         elif k == "total_turns":
+            aggregated[k] = sum(v)
+        elif k.startswith("environment/") and k.endswith("/sample_count"):
             aggregated[k] = sum(v)
         elif k == "trajectory_duration_s":
             sorted_v = sorted(v)
