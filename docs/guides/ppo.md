@@ -262,7 +262,7 @@ where $V_{\text{clipped}} = \text{clamp}(V_\theta,\; V_{\text{old}} - \epsilon_v
 Key parameters:
 - **`value_loss_fn.scale`**: Scaling factor for the value loss (default: 1.0; reference recipe overrides to 0.4)
 - **`value_loss_fn.cliprange`**: Clip range $\epsilon_v$ for value predictions (default: `null` / disabled; reference recipe overrides to 0.2). Set to `null` to disable clipping.
-- **`loss_fn.positive_example_nll_weight`**: VAPO NLL auxiliary loss weight on correct samples (0 = disabled)
+- **`loss_fn.positive_example_nll_weight`**: VAPO NLL auxiliary loss weight on correct samples (0 = disabled). The NLL term is averaged over the same global valid-token count as the policy loss, so the weight is defined relative to all valid tokens and does not change when the microbatch size or the DP/CP world size changes.
 
 ## Configuration
 

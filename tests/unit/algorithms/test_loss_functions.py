@@ -2051,6 +2051,71 @@ def test_clipped_pg_loss_sequence_importance_ratio_averages_per_sample():
     assert metrics["sampling_importance_ratio"] == pytest.approx(3.0)
 
 
+@pytest.mark.parametrize("nll_weight", [0.0, 0.5])
+def test_clipped_pg_positive_nll_is_microbatch_invariant(nll_weight):
+    """Splitting the global batch into microbatches must not change the loss.
+
+    Trainers call the loss once per microbatch, sum the results and rescale by
+    the DP/CP world size, so every term has to be normalized by a global count.
+    Normalizing the VAPO positive-example NLL term by the microbatch's own
+    correct-token count made each microbatch contribute a full mean instead of
+    its share of one, so the term's effective weight scaled with the number of
+    microbatches and with the DP/CP world size.
+    """
+    torch.manual_seed(0)
+    batch_size, seq_len = 4, 6
+    data, _, _, _ = _setup_clipped_pg_test_data(
+        batch_size=batch_size, seq_len=seq_len, device="cpu"
+    )
+    data["advantages"] = torch.randn(batch_size, seq_len)
+    data["prev_logprobs"] = -torch.rand(batch_size, seq_len)
+    data["generation_logprobs"] = data["prev_logprobs"].clone()
+    # Two thirds of the samples are correct, so the NLL term is active but does
+    # not cover the whole batch.
+    data["rewards"] = torch.tensor([1.0, 0.0, 1.0, 1.0])
+
+    global_valid_seqs = data["sample_mask"].sum()
+    global_valid_toks = (
+        data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)
+    ).sum()
+
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            positive_example_nll_weight=nll_weight,
+            use_importance_sampling_correction=False,
+        )
+    )
+
+    def run(curr_logprobs, sample_slice):
+        return loss_fn(
+            next_token_logprobs=curr_logprobs[sample_slice],
+            data=BatchedDataDict(
+                {key: value[sample_slice] for key, value in data.items()}
+            ),
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+        )
+
+    single = data["prev_logprobs"][:, 1:].clone().requires_grad_(True)
+    single_loss, single_metrics = run(single, slice(None))
+    single_loss.backward()
+
+    split = data["prev_logprobs"][:, 1:].clone().requires_grad_(True)
+    first_loss, _ = run(split, slice(0, 2))
+    second_loss, _ = run(split, slice(2, 4))
+    (first_loss + second_loss).backward()
+
+    if nll_weight > 0:
+        # Guard against passing vacuously: the term has to actually be active.
+        assert single_metrics["positive_nll_loss"] != 0.0
+
+    assert (first_loss + second_loss).item() == pytest.approx(
+        single_loss.item(), abs=1e-6
+    )
+    torch.testing.assert_close(split.grad, single.grad, atol=1e-6, rtol=1e-5)
+
+
 def test_clipped_pg_loss_gspo_importance_sampling_correction():
     """Tests GSPO w/ importance sampling correction in ClippedPGLossFn."""
     if not torch.cuda.is_available():
@@ -2923,11 +2988,12 @@ class TestMetricNormalizationAdvertisement:
             "policy_kl_error",
             "js_divergence_error",
             "approx_entropy",
+            # normalized by global_valid_toks like the loss term it reports
+            "positive_nll_loss",
         ):
             assert norms[key] is MetricNormalizer.TOKENS
-        # raw counts / local means / extrema are never rescaled
+        # raw counts / extrema are never rescaled
         assert norms["num_valid_samples"] is MetricNormalizer.NONE
-        assert norms["positive_nll_loss"] is MetricNormalizer.NONE
         assert norms["probs_ratio_min"] is MetricNormalizer.NONE
         assert norms["probs_ratio_max"] is MetricNormalizer.NONE
         # no TIS configured → the metric is never emitted, so not advertised
