@@ -284,6 +284,8 @@ def _use_batched_bf16_trtllm_layout_conversion() -> Iterator[None]:
             unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout = (
                 original_converter
             )
+
+
 def _local_shard_slices(param_info: dict[str, Any], rank: int) -> tuple[slice, ...]:
     """Return this destination rank's slices in an HF-global tensor."""
     from nemo_rl.weight_sync.xferdtensor_python import _compute_shard_slices
