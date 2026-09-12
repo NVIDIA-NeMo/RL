@@ -65,13 +65,17 @@ from nemo_rl.distributed.model_utils import (
     distributed_vocab_topk,
     get_logprobs_from_vocab_parallel_logits,
 )
-from nemo_rl.models.automodel.data import filter_multimodal_kwargs_for_model
+from nemo_rl.models.automodel.data import (
+    check_sequence_dim,
+    filter_multimodal_kwargs_for_model,
+)
 from nemo_rl.models.dtensor.parallelize import (
     _parallelize_model,
     clip_grad_by_total_norm_,
     get_grad_norm,
     to_local_if_dtensor,
 )
+from nemo_rl.models.generation.interfaces import RefitPayloadMode
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
     pack_sequences,
@@ -340,7 +344,12 @@ class DTensorPolicyWorkerImpl(
                 raise ValueError(f"Unknown reward model type: {rm_type}")
         else:
             # DO NOT assume AutoModelForCausalLM, multimodal models can inherit from AutoModelForImageTextToText, AutoModelForTextToWaveform, etc.
-            model_class = resolve_model_class(model_config.model_type)
+            # This worker loads weights on rank 0 and applies FSDP itself. NeMo
+            # AutoModel wrappers may run collectives while the other ranks wait.
+            model_class = resolve_model_class(
+                model_config.model_type,
+                use_nemo_automodel=False,
+            )
 
         full_state_dict = None
         if self.rank == 0:
@@ -636,13 +645,9 @@ class DTensorPolicyWorkerImpl(
             "cross-tokenizer distillation requires dtensor_cfg._v2=True."
         )
         # dim 1 is always assumed to be the sequence dim, sanity check this here.
-        sequence_dim = 1
-        seq_dim_size = data.get("input_ids").shape[sequence_dim]
-        for k, v in data.items():
-            if torch.is_tensor(v) and len(v.shape) > 1:
-                assert v.shape[sequence_dim] == seq_dim_size, (
-                    f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
-                )
+        # Shared with the v2 worker so the multimodal skip (packed wire
+        # fields are not sequence-aligned) lives in exactly one place.
+        sequence_dim, seq_dim_size = check_sequence_dim(data)
 
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
@@ -1049,13 +1054,9 @@ class DTensorPolicyWorkerImpl(
         logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
 
         # dim 1 is always assumed to be the sequence dim, sanity check this here
-        sequence_dim = 1
-        seq_dim_size = data.get("input_ids").shape[sequence_dim]
-        for k, v in data.items():
-            if torch.is_tensor(v) and len(v.shape) > 1:
-                assert v.shape[sequence_dim] == seq_dim_size, (
-                    f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
-                )
+        # Shared with the v2 worker so the multimodal skip (packed wire
+        # fields are not sequence-aligned) lives in exactly one place.
+        sequence_dim, seq_dim_size = check_sequence_dim(data)
 
         all_log_probs = []
         self.model.eval()
@@ -1352,13 +1353,9 @@ class DTensorPolicyWorkerImpl(
     def score(self, data: BatchedDataDict) -> BatchedDataDict[ScoreOutputSpec]:
         global_batch_size = min(self.cfg["batch_size"], data.size)
 
-        sequence_dim = 1
-        seq_dim_size = data.get("input_ids").shape[sequence_dim]
-        for k, v in data.items():
-            if torch.is_tensor(v) and len(v.shape) > 1:
-                assert v.shape[sequence_dim] == seq_dim_size, (
-                    f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
-                )
+        # Shared with the v2 worker so the multimodal skip (packed wire
+        # fields are not sequence-aligned) lives in exactly one place.
+        sequence_dim, seq_dim_size = check_sequence_dim(data)
         self.model.eval()
 
         with unshard_fsdp2_model(self.model), torch.no_grad():
@@ -1846,8 +1843,11 @@ class DTensorPolicyWorkerImpl(
         return self.model.config
 
     @torch.no_grad()
-    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+    def prepare_refit_info(
+        self, *, refit_payload_mode: RefitPayloadMode = "hf_export"
+    ) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
+        del refit_payload_mode
         state_dict_info = {}
         for name, tensor in self.model.state_dict().items():
             # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
