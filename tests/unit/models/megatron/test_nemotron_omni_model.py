@@ -53,6 +53,7 @@ from nemo_rl.models.megatron.train import (  # noqa: E402
     LogprobsPostProcessor,
     megatron_forward_backward,
 )
+from nemo_rl.utils.sequence_lengths import to_cpu_int_tuple
 
 pytestmark = pytest.mark.mcore
 
@@ -203,7 +204,7 @@ def _forward(model):
     logprobs = from_parallel_logits_to_logprobs_packed_sequences(
         output,
         target=processed.input_ids,
-        cu_seqlens_padded=processed.cu_seqlens_padded,
+        cu_seqlens_padded=to_cpu_int_tuple(processed.cu_seqlens_padded),
         unpacked_seqlen=input_ids.shape[1],
         vocab_start_index=parallel_state.get_tensor_model_parallel_rank()
         * output.shape[-1],
@@ -290,7 +291,7 @@ def _forward_dedup_fixture(model, data: BatchedDataDict):
     logprobs = from_parallel_logits_to_logprobs_packed_sequences(
         output,
         target=processed.input_ids,
-        cu_seqlens_padded=processed.cu_seqlens_padded,
+        cu_seqlens_padded=to_cpu_int_tuple(processed.cu_seqlens_padded),
         unpacked_seqlen=input_ids.shape[1],
         vocab_start_index=0,
         vocab_end_index=output.shape[-1],
