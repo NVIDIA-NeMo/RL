@@ -27,6 +27,9 @@ import pytest
 import ray
 import torch
 
+
+
+
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossFn,
@@ -50,6 +53,38 @@ pytestmark = pytest.mark.mcore
 
 # Megatron Core/Bridge and worker-module imports stay test-local so pytest can
 # collect this module without the optional MCore/Transformer Engine stack.
+
+
+@pytest.mark.parametrize("pp_rank", [0, 1, 3])
+def test_refit_metadata_map_precedes_transport_init(
+    monkeypatch: pytest.MonkeyPatch, pp_rank: int
+) -> None:
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+    from nemo_rl.weight_sync.nccl_reshard_utils import LocalParamSpec
+
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    local_name = f"model.layers.{pp_rank}.mlp.down_proj.weight"
+    local_spec = LocalParamSpec(base=torch.ones(2, 2))
+    worker._iter_local_hf_param_shards = MagicMock(return_value=[(local_name, local_spec)])
+    monkeypatch.setattr(
+        worker_module.parallel_state, "get_pipeline_model_parallel_rank", lambda: pp_rank
+    )
+    info = {
+        "layer_names": [f"model.layers.{rank}" for rank in range(4)],
+        "per_layer_params": {
+            f"model.layers.{rank}": [
+                {"name": f"model.layers.{rank}.mlp.down_proj.weight", "pp_stage": rank}
+            ]
+            for rank in range(4)
+        },
+    }
+
+    assert not hasattr(worker, "my_pp_stage")
+    mapping = worker._build_source_hf_to_local_param_map(info)
+    assert mapping.get(local_name) is local_spec
+    for rank in range(4):
+        if rank != pp_rank:
+            assert mapping.get(f"model.layers.{rank}.mlp.down_proj.weight") is None
 
 
 def _make_refit_task(
