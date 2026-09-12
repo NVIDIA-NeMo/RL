@@ -50,6 +50,7 @@ from nemo_rl.experience.failures import (
     RolloutDataFailure,
     http_status_is_infra,
 )
+from nemo_rl.models.generation.dynamo.token_wrapper import DYNAMO_SESSION_ID_HEADER
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
     should_use_async_rollouts,
@@ -1261,6 +1262,15 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None
     generation_config["stop_token_ids"] = None
+
+    if generation_config["backend"] == "dynamo":
+        model_config = (
+            config.env.setdefault("nemo_gym", {})
+            .setdefault("policy_model", {})
+            .setdefault("responses_api_models", {})
+            .setdefault("vllm_model", {})
+        )
+        model_config["session_id_header"] = DYNAMO_SESSION_ID_HEADER
 
     # For VLM runs, plumb the tokenizer config into the gym env config so the
     # NemoGym actor can reconstruct the processor inside itself (needed for

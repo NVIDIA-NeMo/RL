@@ -35,6 +35,7 @@ _GYM_TOKEN_METADATA_FIELDS = (
     "generation_log_probs",
 )
 _TOOL_ARGUMENT_MAPPING_ERROR = "Can only get item pairs from a mapping."
+DYNAMO_SESSION_ID_HEADER = "X-Dynamo-Session-ID"
 
 
 def _coerce_token_id_list(value: Any, field_name: str) -> list[int]:
@@ -474,6 +475,7 @@ class DynamoTokenWrapperServer:
             status_code, response_body = await self._forward_chat_completion(
                 prepared_body,
                 authorization=request.headers.get("authorization"),
+                session_id=request.headers.get(DYNAMO_SESSION_ID_HEADER),
             )
             if 200 <= status_code < 300:
                 try:
@@ -512,6 +514,7 @@ class DynamoTokenWrapperServer:
         request_body: dict[str, Any],
         *,
         authorization: Optional[str],
+        session_id: Optional[str] = None,
     ) -> tuple[int, dict[str, Any]]:
         import aiohttp
 
@@ -519,6 +522,8 @@ class DynamoTokenWrapperServer:
         headers = {"Content-Type": "application/json"}
         if authorization:
             headers["Authorization"] = authorization
+        if session_id:
+            headers[DYNAMO_SESSION_ID_HEADER] = session_id
 
         session = self._client_session
         if session is None:

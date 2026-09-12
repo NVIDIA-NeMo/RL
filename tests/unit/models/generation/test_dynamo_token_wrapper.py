@@ -638,9 +638,15 @@ def test_forward_chat_completion_reuses_loop_bound_session() -> None:
 
     async def forward_twice():
         await server._forward_chat_completion({}, authorization=None)
-        await server._forward_chat_completion({}, authorization="Bearer token")
+        await server._forward_chat_completion(
+            {},
+            authorization="Bearer token",
+            session_id="trajectory-session",
+        )
 
     asyncio.run(forward_twice())
 
     assert len(session.calls) == 2
+    assert "X-Dynamo-Session-ID" not in session.calls[0][2]
     assert session.calls[1][2]["Authorization"] == "Bearer token"
+    assert session.calls[1][2]["X-Dynamo-Session-ID"] == "trajectory-session"

@@ -30,7 +30,10 @@ from nemo_rl.models.generation.dynamo.http_client import (
 from nemo_rl.models.generation.dynamo.managed_runtime import ManagedDynamoRuntime
 from nemo_rl.models.generation.dynamo.metrics import DynamoMetricsSampler
 from nemo_rl.models.generation.dynamo.refit import DynamoRefitChannel
-from nemo_rl.models.generation.dynamo.token_wrapper import DynamoTokenWrapperServer
+from nemo_rl.models.generation.dynamo.token_wrapper import (
+    DYNAMO_SESSION_ID_HEADER,
+    DynamoTokenWrapperServer,
+)
 from nemo_rl.models.generation.interfaces import (
     CollectiveSenderSpec,
     GenerationDatumSpec,
@@ -442,6 +445,7 @@ class DynamoGeneration(GenerationInterface):
         greedy: bool,
         stop_strings: Optional[list[str]],
         max_new_tokens: int,
+        session_id: Optional[str] = None,
     ) -> tuple[list[int], list[float], bool]:
         request_url = self._completion_url()
         payload = self._build_completion_request(
@@ -450,12 +454,16 @@ class DynamoGeneration(GenerationInterface):
             stop_strings=stop_strings,
             max_new_tokens=max_new_tokens,
         )
+        request_headers = (
+            {DYNAMO_SESSION_ID_HEADER: session_id} if session_id is not None else None
+        )
         response: dict[str, Any] = {}
         for attempt in range(1, _HTTP_MAX_ATTEMPTS + 1):
             response = await async_http_post_json(
                 request_url,
                 payload,
                 self._request_timeout_s(),
+                headers=request_headers,
             )
             if not _is_retryable_http_response(response):
                 break
@@ -570,6 +578,16 @@ class DynamoGeneration(GenerationInterface):
             "outside this method."
         )
         sample_idx = 0
+        session_ids = data.get("session_ids")
+        session_id = None
+        if session_ids is not None:
+            if len(session_ids) != batch_size:
+                raise ValueError(
+                    "Dynamo session_ids must contain one value for each input sample."
+                )
+            session_id = session_ids[sample_idx]
+            if not isinstance(session_id, str) or not session_id.strip():
+                raise ValueError("Dynamo session IDs must be non-empty strings.")
         input_length = int(input_lengths_batch[sample_idx].item())
         batch_stop_strings = data.get("stop_strings", [[] for _ in range(batch_size)])
         per_sample_stop_strings = None
@@ -590,6 +608,7 @@ class DynamoGeneration(GenerationInterface):
             greedy=greedy,
             stop_strings=final_stop_strings,
             max_new_tokens=allowed_new_tokens,
+            session_id=session_id,
         )
 
         yield (
