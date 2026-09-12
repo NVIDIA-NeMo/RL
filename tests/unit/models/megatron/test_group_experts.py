@@ -83,8 +83,11 @@ def test_group_experts_empty_group_raises():
 # shards (_iter_local_hf_param_shards) into LocalParamSpecs.  Fake the shard
 # iterator; _build_expert_groups / _group_experts run for real.
 # --------------------------------------------------------------------------
-def test_build_hf_to_local_param_map_train_side(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_build_hf_to_local_param_map_train_side(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from megatron.core import parallel_state
+
     from nemo_rl.weight_sync.nccl_reshard_utils import HFToLocalParamMap
 
     w = object.__new__(MegatronPolicyWorkerImpl)  # no __init__ / no megatron state

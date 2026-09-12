@@ -27,9 +27,6 @@ import pytest
 import ray
 import torch
 
-
-
-
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossFn,
@@ -65,9 +62,13 @@ def test_refit_metadata_map_precedes_transport_init(
     worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
     local_name = f"model.layers.{pp_rank}.mlp.down_proj.weight"
     local_spec = LocalParamSpec(base=torch.ones(2, 2))
-    worker._iter_local_hf_param_shards = MagicMock(return_value=[(local_name, local_spec)])
+    worker._iter_local_hf_param_shards = MagicMock(
+        return_value=[(local_name, local_spec)]
+    )
     monkeypatch.setattr(
-        worker_module.parallel_state, "get_pipeline_model_parallel_rank", lambda: pp_rank
+        worker_module.parallel_state,
+        "get_pipeline_model_parallel_rank",
+        lambda: pp_rank,
     )
     info = {
         "layer_names": [f"model.layers.{rank}" for rank in range(4)],
