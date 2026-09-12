@@ -127,6 +127,87 @@ def pack_rolled_draft_token_mask(
     return roll_packed_seq_dim(packed, cu_seqlens_padded, seq_dim=1)
 
 
+def _project_hidden_states_per_teacher(
+    payload: torch.Tensor,
+    weight_by_index: dict[int, torch.Tensor],
+    teacher_index: torch.Tensor,
+) -> torch.Tensor:
+    """Project each sample's hidden states through its own teacher's LM head.
+
+    ``payload`` is ``[B, S, H]``; ``teacher_index`` is ``[B]`` int, naming which
+    loaded teacher LM head produced each row (see ``OPD_FULL_TEACHER_INDEX_FIELD``).
+    Grouped by teacher so this costs one matmul per distinct teacher present in
+    the microbatch, not a per-sample loop -- when sequence packing is on, each
+    call already has ``B == 1`` (one sequence at a time), so it takes the
+    single-teacher path and never materializes the scatter buffer.
+
+    Raises:
+        ValueError: If ``teacher_index`` does not carry one entry per payload
+            row, if a row's teacher_index has no loaded LM head, or if an LM
+            head disagrees with the payload or with the other teachers'.
+    """
+    teacher_index = teacher_index.to(device=payload.device)
+    if int(teacher_index.shape[0]) != int(payload.shape[0]):
+        raise ValueError(
+            "opd_full teacher_index must carry one entry per payload row: got "
+            f"{tuple(teacher_index.shape)} against payload {tuple(payload.shape)}."
+        )
+
+    def _weight_for(idx: int) -> torch.Tensor:
+        weight = weight_by_index.get(idx)
+        if weight is None:
+            raise ValueError(
+                f"opd_full row tagged teacher_index={idx}, but no teacher LM "
+                f"head is loaded for that index (loaded: {sorted(weight_by_index)})."
+            )
+        if int(payload.shape[-1]) != int(weight.shape[1]):
+            raise ValueError(
+                "Teacher hidden states do not match the loaded teacher LM head "
+                f"for teacher_index={idx}: payload width {payload.shape[-1]} vs "
+                f"LM-head input width {weight.shape[1]}."
+            )
+        return weight
+
+    present = [int(idx) for idx in teacher_index.unique().tolist()]
+    if len(present) == 1:
+        # The sequence-packing path lands here on every call. Projecting
+        # straight into the result skips the scatter buffer below, which would
+        # otherwise double the peak ``[B, S, V_local]`` allocation for nothing.
+        weight = _weight_for(present[0])
+        return torch.matmul(payload.to(dtype=weight.dtype), weight.t())
+
+    # One buffer holds every group, so the groups have to agree on the
+    # vocabulary shard and dtype. They do by construction -- every shard is
+    # requested at the student's own width and dtype -- but say so here, since
+    # the alternative is an opaque RuntimeError out of the masked assignment.
+    reference_index, reference = next(iter(weight_by_index.items()))
+    teacher_logits = torch.empty(
+        payload.shape[0],
+        payload.shape[1],
+        int(reference.shape[0]),
+        dtype=reference.dtype,
+        device=payload.device,
+    )
+    for idx in present:
+        weight = _weight_for(idx)
+        if (int(weight.shape[0]), weight.dtype) != (
+            int(reference.shape[0]),
+            reference.dtype,
+        ):
+            raise ValueError(
+                "opd_full teacher LM heads must share one vocabulary shard and "
+                f"dtype to be projected together: teacher_index={idx} is "
+                f"[{weight.shape[0]}, ...] {weight.dtype}, but "
+                f"teacher_index={reference_index} is [{reference.shape[0]}, ...] "
+                f"{reference.dtype}."
+            )
+        mask = teacher_index == idx
+        teacher_logits[mask] = torch.matmul(
+            payload[mask].to(dtype=weight.dtype), weight.t()
+        )
+    return teacher_logits
+
+
 def reconstruct_opd_full_teacher_logits(
     payload: torch.Tensor,
     *,
@@ -134,7 +215,8 @@ def reconstruct_opd_full_teacher_logits(
     student_logits: torch.Tensor,
     vocab_parallel_rank: Optional[int],
     context_parallel_group: Optional[torch.distributed.ProcessGroup],
-    teacher_output_layer_weight: Optional[torch.Tensor],
+    teacher_output_layer_weight_by_index: Optional[dict[int, torch.Tensor]] = None,
+    teacher_index: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Turn the transported teacher payload into this rank's teacher logit shard.
 
@@ -149,32 +231,55 @@ def reconstruct_opd_full_teacher_logits(
             target device, dtype-independent shapes, and CP geometry.
         vocab_parallel_rank: This rank's vocabulary-parallel rank.
         context_parallel_group: Context-parallel process group, if any.
-        teacher_output_layer_weight: ``[V_local, H_teacher]`` teacher LM-head
-            shard; required for the hidden-state path.
+        teacher_output_layer_weight_by_index: ``[V_local, H_teacher]`` teacher
+            LM-head shards for the hidden-state path, keyed by the stable index
+            rows are tagged with. With more than one entry, ``teacher_index``
+            selects each row's teacher; with exactly one entry it is used
+            directly.
+        teacher_index: ``[B]`` int, this microbatch's per-row teacher index
+            (see ``OPD_FULL_TEACHER_INDEX_FIELD``). Required once
+            ``teacher_output_layer_weight_by_index`` holds more than one entry,
+            and ignored when it holds exactly one.
 
     Returns:
         Teacher logits ``[B, S_local, V_local]`` aligned with ``student_logits``.
 
     Raises:
-        ValueError: If the payload and student shard cannot be aligned, or if the
-            hidden-state path is used without a teacher LM-head shard.
+        ValueError: If the payload and student shard cannot be aligned, if the
+            hidden-state path is used without a teacher LM-head shard, or if
+            several shards are loaded without a ``teacher_index`` to route by.
     """
     vocab_shard_size = int(student_logits.shape[-1])
 
     # Every narrowing below happens before the device copy, and before the
     # hidden-state path widens the payload to the vocabulary.
     if teacher_payload == "hidden_states":
-        if teacher_output_layer_weight is None:
+        if not teacher_output_layer_weight_by_index:
             raise ValueError(
                 "opd_full hidden-state reconstruction requires a loaded teacher "
                 "output-layer weight shard on the training worker."
             )
-        if int(payload.shape[-1]) != int(teacher_output_layer_weight.shape[1]):
+        if len(teacher_output_layer_weight_by_index) > 1 and teacher_index is None:
+            # Refuse to guess rather than fall back to one arbitrary shard: that
+            # keeps every shape right and silently distills the whole microbatch
+            # toward whichever teacher the dict happens to yield first.
             raise ValueError(
-                "Teacher hidden states do not match the loaded teacher LM head: "
-                f"payload width {payload.shape[-1]} vs LM-head input width "
-                f"{teacher_output_layer_weight.shape[1]}."
+                f"opd_full has {len(teacher_output_layer_weight_by_index)} "
+                "teacher LM-head shards loaded, but this microbatch carries "
+                "no per-row teacher index (OPD_FULL_TEACHER_INDEX_FIELD); "
+                "there is no way to tell which teacher produced each row."
             )
+        # Every loaded shard, not just the ones this microbatch routes to: the
+        # widths are uniform by construction (the worker rejects a teacher whose
+        # hidden size disagrees at load time), so a mismatch here is a real
+        # inconsistency and should not depend on which rows happened to arrive.
+        for idx, weight in sorted(teacher_output_layer_weight_by_index.items()):
+            if int(payload.shape[-1]) != int(weight.shape[1]):
+                raise ValueError(
+                    "Teacher hidden states do not match the loaded teacher LM head "
+                    f"for teacher_index={idx}: payload width {payload.shape[-1]} vs "
+                    f"LM-head input width {weight.shape[1]}."
+                )
     else:
         assert vocab_parallel_rank is not None, (
             "vocab_parallel_rank is required to slice the opd_full logits payload"
@@ -220,10 +325,19 @@ def reconstruct_opd_full_teacher_logits(
     payload = payload.contiguous().to(device=student_logits.device)
 
     if teacher_payload == "hidden_states":
-        teacher_logits = torch.matmul(
-            payload.to(dtype=teacher_output_layer_weight.dtype),  # type: ignore[union-attr]
-            teacher_output_layer_weight.t(),  # type: ignore[union-attr]
-        )
+        # Validated above, before any narrowing ran.
+        assert teacher_output_layer_weight_by_index is not None
+        if len(teacher_output_layer_weight_by_index) > 1:
+            assert teacher_index is not None
+            teacher_logits = _project_hidden_states_per_teacher(
+                payload, teacher_output_layer_weight_by_index, teacher_index
+            )
+        else:
+            weight = next(iter(teacher_output_layer_weight_by_index.values()))
+            teacher_logits = torch.matmul(
+                payload.to(dtype=weight.dtype),
+                weight.t(),
+            )
     else:
         teacher_logits = payload
 
@@ -245,7 +359,7 @@ def prepare_opd_full_loss_input(
     context_parallel_group: Optional[torch.distributed.ProcessGroup],
     sampling_params: Optional[TrainingSamplingParams],
     chunk_size: Optional[int],
-    teacher_output_layer_weight: Optional[torch.Tensor],
+    teacher_output_layer_weight_by_index: Optional[dict[int, torch.Tensor]] = None,
 ) -> dict[str, Any]:
     """Build the full-vocabulary MOPD loss input from student logits + teacher payload.
 
@@ -261,7 +375,8 @@ def prepare_opd_full_loss_input(
         context_parallel_group: Context-parallel process group.
         sampling_params: Training sampling params for the sampled-token logprobs.
         chunk_size: Sequence-dim chunk size for the sampled-token logprobs.
-        teacher_output_layer_weight: Teacher LM-head shard for the hidden path.
+        teacher_output_layer_weight_by_index: Per-teacher LM-head shards keyed
+            by index, for the hidden-state path.
 
     Returns:
         Loss input dict with the per-token divergence and, when requested, the
@@ -273,7 +388,10 @@ def prepare_opd_full_loss_input(
     """
     # Deferred: nemo_rl.algorithms.opd imports the data plane (tensordict), which
     # should not be pulled into every loss-function consumer.
-    from nemo_rl.algorithms.opd import opd_full_payload_field
+    from nemo_rl.algorithms.opd import (
+        opd_full_payload_field,
+        opd_full_teacher_index_field,
+    )
 
     full_cfg = loss_fn.opd_full  # type: ignore[attr-defined]
     if vocab_parallel_group is None:
@@ -289,13 +407,21 @@ def prepare_opd_full_loss_input(
             "the training microbatch."
         )
 
+    teacher_index_field = opd_full_teacher_index_field(full_cfg)
+    teacher_index = (
+        data[teacher_index_field]
+        if teacher_index_field is not None and teacher_index_field in data
+        else None
+    )
+
     teacher_logits = reconstruct_opd_full_teacher_logits(
         data[payload_field],
         teacher_payload=full_cfg.teacher_payload,
         student_logits=logits,
         vocab_parallel_rank=vocab_parallel_rank,
         context_parallel_group=context_parallel_group,
-        teacher_output_layer_weight=teacher_output_layer_weight,
+        teacher_output_layer_weight_by_index=teacher_output_layer_weight_by_index,
+        teacher_index=teacher_index,
     ).detach()
 
     divergence_chunk_size = full_cfg.chunk_size or int(logits.shape[1])
@@ -381,7 +507,7 @@ def prepare_loss_input(
     d2t: Optional[torch.Tensor] = None,
     chunk_size: Optional[int] = None,
     cp_sharder: Optional["ContextParallelSharder"] = None,
-    teacher_output_layer_weight: Optional[torch.Tensor] = None,
+    teacher_output_layer_weight_by_index: Optional[dict[int, torch.Tensor]] = None,
 ) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input for a loss function.
 
@@ -400,15 +526,16 @@ def prepare_loss_input(
         cp_sharder: Automodel ``ContextParallelSharder`` owning this forward's
             sequence layout (V2 automodel worker with cp_size > 1); ``logits``
             are then this rank's CP-local shard while ``data`` stays canonical.
-        teacher_output_layer_weight: This TP rank's ``[V_local, H_teacher]``
-            teacher LM-head shard, used by the ``opd_full`` hidden-state path to
-            project the teacher payload into teacher logits.
+        teacher_output_layer_weight_by_index: This TP rank's
+            ``[V_local, H_teacher]`` teacher LM-head shards, keyed by the stable
+            index rows are tagged with. The ``opd_full`` hidden-state path
+            projects each row's teacher payload into teacher logits with them.
 
     Notes:
         vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
         sampling_params is only used for LossInputType.LOGPROB, and currently only supported for ClippedPGLossFn.
         d2t is only used for LossInputType.DRAFT.
-        teacher_output_layer_weight is only used for LossInputType.OPD_FULL.
+        teacher_output_layer_weight_by_index is only used for LossInputType.OPD_FULL.
 
     Returns:
         tuple(loss_input, maybe_updated_data)
@@ -476,7 +603,7 @@ def prepare_loss_input(
             context_parallel_group=context_parallel_group,
             sampling_params=sampling_params,
             chunk_size=chunk_size,
-            teacher_output_layer_weight=teacher_output_layer_weight,
+            teacher_output_layer_weight_by_index=teacher_output_layer_weight_by_index,
         )
 
     elif loss_fn.input_type == LossInputType.DISTILLATION:

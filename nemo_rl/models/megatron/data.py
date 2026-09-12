@@ -30,6 +30,7 @@ from megatron.core.utils import StragglerDetector
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
+from nemo_rl.data_plane.schema import OPD_FULL_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.common import _round_up_to_multiple
@@ -1554,11 +1555,16 @@ def _unpack_sequences_from_megatron(
 def get_and_validate_seqlen(data: BatchedDataDict[Any]):
     # dim 1 is always assumed to be the sequence dim, sanity check this here.
     # Skip multimodal fields: their dim 1 is num_images / num_patches, not
-    # seqlen.
+    # seqlen. Skip opd_full's teacher payload columns too: materialize()
+    # deliberately does not pad them to the forward pass's pad_to_seqlen
+    # target (they never feed the model forward, only the loss, which reads
+    # each sequence's own real length regardless of how far the column is
+    # padded) -- see codec.py's OPD_FULL_FIELDS exclusion. Their dim 1 can
+    # therefore legitimately be shorter than every other column's.
     sequence_dim = 1
     seq_dim_size = data["input_ids"].shape[sequence_dim]
     for k, v in data.items():
-        if k in PACKED_MULTIMODAL_FIELDS:
+        if k in PACKED_MULTIMODAL_FIELDS or k in OPD_FULL_FIELDS:
             continue
         if torch.is_tensor(v) and len(v.shape) > 1:
             assert v.shape[sequence_dim] == seq_dim_size, (

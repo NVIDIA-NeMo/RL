@@ -35,6 +35,7 @@ from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.data_plane.schema import (
     OPD_FULL_HIDDEN_STATES_FIELD,
     OPD_FULL_LOGITS_FIELD,
+    OPD_FULL_TEACHER_INDEX_FIELD,
     TEACHER_LP_FIELDS,
 )
 from nemo_rl.distributed.virtual_cluster import (
@@ -198,6 +199,21 @@ def opd_full_payload_field(full_cfg: OnPolicyDistillationFullConfig) -> str:
     return OPD_FULL_LOGITS_FIELD
 
 
+def opd_full_teacher_index_field(
+    full_cfg: OnPolicyDistillationFullConfig,
+) -> Optional[str]:
+    """Return the per-sample teacher-identity column, or ``None`` if unneeded.
+
+    Only the ``hidden_states`` payload needs it: the student loads a teacher
+    LM-head shard per unique checkpoint and must know which one projects each
+    row. The ``logits`` payload ships an already-projected distribution, so no
+    per-sample routing is needed at training time.
+    """
+    if full_cfg.teacher_payload == "hidden_states":
+        return OPD_FULL_TEACHER_INDEX_FIELD
+    return None
+
+
 def _skip_prev_logprobs(master_config: Any) -> bool:
     """Whether the training loop will zero ``prev_logprobs`` instead of computing it.
 
@@ -320,11 +336,14 @@ class TQTeacherLogprobCoordinator:
         # Set when full-vocabulary MOPD is on: the teacher then writes a second,
         # per-token payload column the training fetch must also see.
         full_cfg = self._opd_cfg.get("full")
-        self._opd_full_field: Optional[str] = (
-            opd_full_payload_field(OnPolicyDistillationFullConfig(**full_cfg))
-            if full_cfg and full_cfg.get("enabled")
-            else None
-        )
+        self._opd_full_field: Optional[str] = None
+        self._opd_full_teacher_index_field: Optional[str] = None
+        if full_cfg and full_cfg.get("enabled"):
+            resolved_full_cfg = OnPolicyDistillationFullConfig(**full_cfg)
+            self._opd_full_field = opd_full_payload_field(resolved_full_cfg)
+            self._opd_full_teacher_index_field = opd_full_teacher_index_field(
+                resolved_full_cfg
+            )
         self._teacher_full_payload_tokens = 0
         # Physical (deduplicated) groups own locks, not routing aliases. Two
         # aliases sharing one checkpoint therefore share one collective FIFO.
@@ -508,6 +527,8 @@ class TQTeacherLogprobCoordinator:
         enriched_fields = [self.teacher_logprobs_field]
         if self._opd_full_field is not None:
             enriched_fields.append(self._opd_full_field)
+        if self._opd_full_teacher_index_field is not None:
+            enriched_fields.append(self._opd_full_teacher_index_field)
         return meta.with_fields(enriched_fields)
 
     def drain_metrics(self) -> dict[str, float]:
@@ -737,6 +758,18 @@ def create_teacher_worker_groups(
             f"got {sorted(teacher_clusters)}."
         )
 
+    # Stable, config-derived index for each physical (deduplicated) teacher.
+    # This is the single source of truth for "which teacher wrote this row":
+    # the same index is what TeacherWorkerGroup tags every payload row with
+    # (see OPD_FULL_TEACHER_INDEX_FIELD) and what setup.py's opd_full teacher
+    # LM-head loading uses to key the student's per-teacher weight dict.
+    # Sorting fixes the numbering within a run; it is not stable across a
+    # config edit, since which alias represents a checkpoint shared by several
+    # agents is first-seen-wins over teacher_model_by_agent_name. Nothing
+    # persists the index across runs, so writer and reader always agree.
+    sorted_aliases = sorted(teacher_config.alias for teacher_config in teacher_configs)
+    alias_to_teacher_index = {alias: idx for idx, alias in enumerate(sorted_aliases)}
+
     teacher_worker_groups: dict[str, Any] = {}
     for teacher_config in teacher_configs:
         alias = teacher_config.alias
@@ -745,6 +778,7 @@ def create_teacher_worker_groups(
             cluster=teacher_clusters[alias],
             policy_config=policy_config,
             tokenizer=tokenizer,
+            teacher_index=alias_to_teacher_index[alias],
         )
         teacher_worker_groups[alias] = twg
         print(

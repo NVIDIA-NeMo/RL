@@ -546,7 +546,7 @@ class LossPostProcessor:
         sampling_params: Optional[TrainingSamplingParams] = None,
         draft_model: Optional[MegatronModule] = None,
         prepare_fn: Optional[Callable[..., Any]] = None,
-        teacher_output_layer_weight: Optional[torch.Tensor] = None,
+        teacher_output_layer_weight_by_index: Optional[dict[int, torch.Tensor]] = None,
     ):
         """Build a per-microbatch loss post-processor for the Megatron train loop.
 
@@ -563,11 +563,14 @@ class LossPostProcessor:
                 vocab_parallel_group, context_parallel_group)`` and return
                 ``(loss_input, data)``; value models pass one that right-shifts
                 and CP-all-gathers the scalar value-head output.
-            teacher_output_layer_weight: This rank's teacher LM-head shard, used
-                by the full-vocabulary MOPD loss to project the teacher payload.
-                It rides this argument rather than the data dict because the
-                sequence-packing wrapper batch-slices every data entry, and
-                rather than the loss object because that is pickled to workers.
+            teacher_output_layer_weight_by_index: This rank's teacher LM-head
+                shards for every configured teacher, keyed by the stable
+                per-checkpoint index rows are tagged with (see
+                ``OPD_FULL_TEACHER_INDEX_FIELD``). The full-vocabulary MOPD loss
+                projects each row's teacher payload with them. They ride this
+                argument rather than the data dict because the sequence-packing
+                wrapper batch-slices every data entry, and rather than the loss
+                object because that is pickled to workers.
         """
         self.loss_fn = loss_fn
         self.cfg = cfg
@@ -575,7 +578,7 @@ class LossPostProcessor:
         self.cp_normalize = cp_normalize
         self.sampling_params = sampling_params
         self.prepare_fn = prepare_fn
-        self.teacher_output_layer_weight = teacher_output_layer_weight
+        self.teacher_output_layer_weight_by_index = teacher_output_layer_weight_by_index
         if draft_model is not None and draft_model.eagle_module is not None:
             self.d2t = getattr(draft_model.eagle_module, "d2t", None)
         else:
@@ -613,7 +616,7 @@ class LossPostProcessor:
                 sampling_params=self.sampling_params,
                 d2t=self.d2t,
                 chunk_size=logprob_chunk_size,
-                teacher_output_layer_weight=self.teacher_output_layer_weight,
+                teacher_output_layer_weight_by_index=self.teacher_output_layer_weight_by_index,
             )
 
         # wrap loss function with loss input preparation

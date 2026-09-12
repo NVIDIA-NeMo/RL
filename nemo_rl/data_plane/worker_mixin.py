@@ -968,6 +968,8 @@ class TQWorkerMixin:
         opd_full_payload: Optional[str] = None,
         opd_full_payload_dtype: Optional[str] = None,
         opd_full_payload_field: Optional[str] = None,
+        opd_full_teacher_index: Optional[int] = None,
+        opd_full_teacher_index_field: Optional[str] = None,
     ) -> None:
         """Per-rank frozen-teacher logprob entrypoint for SingleController MOPD.
 
@@ -978,9 +980,16 @@ class TQWorkerMixin:
                 emit the full-vocabulary teacher payload from the same forward.
             opd_full_payload_dtype: Torch dtype name for that payload.
             opd_full_payload_field: Data-plane column the payload is written to.
+            opd_full_teacher_index: This teacher group's stable index (see
+                ``create_teacher_worker_groups``), tagged onto every row this
+                call writes so the student can select the matching LM head.
+            opd_full_teacher_index_field: Data-plane column the index is
+                written to; ``None`` when the run doesn't need per-sample
+                teacher routing (logits payload, or opd_full off).
 
         Raises:
-            ValueError: If a payload is requested without a target column.
+            ValueError: If a payload is requested without a target column, or
+                if a teacher-index column is requested without an index.
             RuntimeError: If batching metadata was not planned driver-side.
         """
         data = self._fetch(meta)
@@ -1016,6 +1025,16 @@ class TQWorkerMixin:
                     "resolved by the driver from OnPolicyDistillationFullConfig, "
                     "which owns the default."
                 )
+            if (
+                opd_full_teacher_index_field is not None
+                and opd_full_teacher_index is None
+            ):
+                raise ValueError(
+                    "opd_full_teacher_index_field requires opd_full_teacher_index "
+                    "naming which teacher this group is. Defaulting it would tag "
+                    "every row as teacher 0 -- a valid index, so the student "
+                    "would silently project these rows through the wrong LM head."
+                )
             result = self.get_logprobs_with_full_payload(  # type: ignore[attr-defined]
                 data=data,
                 payload=opd_full_payload,
@@ -1026,9 +1045,22 @@ class TQWorkerMixin:
             # single writer: the payload never leaves the stage that produced it.
             teacher_full_payload = result.get("teacher_full_payload")
             if teacher_full_payload is not None:
-                self._write_back_stage_local(
-                    meta, {opd_full_payload_field: teacher_full_payload.detach().cpu()}
-                )
+                stage_local_fields = {
+                    opd_full_payload_field: teacher_full_payload.detach().cpu()
+                }
+                if opd_full_teacher_index_field is not None:
+                    # Guarded above: a column without an index already raised,
+                    # on every rank, before the forward ran.
+                    assert opd_full_teacher_index is not None
+                    # Every row in this call comes from the same physical
+                    # teacher (one TeacherWorkerGroup per checkpoint), so the
+                    # index is a constant broadcast across the batch dim.
+                    stage_local_fields[opd_full_teacher_index_field] = torch.full(
+                        (teacher_full_payload.shape[0],),
+                        int(opd_full_teacher_index),
+                        dtype=torch.int64,
+                    )
+                self._write_back_stage_local(meta, stage_local_fields)
             del teacher_full_payload
         self._write_back_result_field(
             meta,

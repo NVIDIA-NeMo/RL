@@ -165,8 +165,9 @@ def _make_worker(loss_type):
     # opd_full off, mirroring __init__ when the config block is absent.
     w._opd_full_enabled = False
     w._opd_full_lm_head_lifecycle = None
-    w._opd_full_teacher_lm_head = None
-    w._opd_full_teacher_checkpoint_path = None
+    w._opd_full_teacher_lm_heads = {}
+    w._opd_full_teacher_checkpoint_paths = {}
+    w._opd_full_lm_head_evicted = False
     w.media_placeholder_token_id = None
     # Model-capability flags __init__ derives from self.model, which
     # object.__new__ skips. train_microbatch passes all three straight through

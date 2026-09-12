@@ -312,6 +312,7 @@ def _stub_tq_policy(monkeypatch, captured: dict[str, KVBatchMeta]):
     pol.cfg = {}
     pol._router_replay_enabled = False
     pol._opd_full_field = None  # opd_full off, as __init__ leaves it
+    pol._opd_full_teacher_index_field = None
     pol.flops_tracker = None
     pol.sharding_annotations = SimpleNamespace(get_axis_size=lambda _axis: 1)
     pol.worker_group = SimpleNamespace(

@@ -129,10 +129,15 @@ class TeacherWorkerGroup:
         cluster: RayVirtualCluster,
         policy_config: dict[str, Any],
         tokenizer: PreTrainedTokenizerBase,
+        teacher_index: int = 0,
     ):
         self.alias = teacher_cfg.alias
         self.model_name = teacher_cfg.model_name
         self.teacher_cfg = teacher_cfg
+        # Stable per-checkpoint index assigned by create_teacher_worker_groups
+        # (sorted by alias). Tags every payload row this group writes so the
+        # student can select the matching teacher LM head at training time.
+        self.teacher_index = teacher_index
 
         # Build a policy config for inference-only use.
         cfg = deepcopy(policy_config)
@@ -253,6 +258,9 @@ class TeacherWorkerGroup:
         self._opd_full_payload_field: Optional[str] = (
             opd_full_cfg["payload_field"] if opd_full_cfg else None
         )
+        self._opd_full_teacher_index_field: Optional[str] = (
+            opd_full_cfg["teacher_index_field"] if opd_full_cfg else None
+        )
 
         # Set up sequence packing / dynamic batching (mirrors lm_policy.py)
         self.use_sequence_packing = cfg["sequence_packing"]["enabled"]
@@ -355,6 +363,8 @@ class TeacherWorkerGroup:
                 "opd_full_payload": self._opd_full_payload,
                 "opd_full_payload_dtype": self._opd_full_payload_dtype,
                 "opd_full_payload_field": self._opd_full_payload_field,
+                "opd_full_teacher_index": self.teacher_index,
+                "opd_full_teacher_index_field": self._opd_full_teacher_index_field,
             },
         )
         self.worker_group.get_all_worker_results(futures)
