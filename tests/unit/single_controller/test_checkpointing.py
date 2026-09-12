@@ -1624,6 +1624,30 @@ class TestPeriodicRolloutCheckpoint:
         assert len(set(gym_actor.checkpoint_ids)) == 2
         assert actor._gym_checkpoint_rollout_permitted.is_set()
 
+    def test_gym_staging_index_failure_aborts_and_reopens_admission(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        events: list[str] = []
+        actor._gym_participant_checkpointing_enabled = True
+        actor._master_config.rollout_checkpointing.gym.participant_checkpointing_enabled = True
+        actor._env_handles = {"nemo_gym": _FakeGymCheckpointActor(events)}
+
+        try:
+            with (
+                patch(
+                    "nemo_rl.algorithms.single_controller.gym_checkpoint_staging_keys",
+                    side_effect=FileNotFoundError("missing Gym staging index"),
+                ),
+                pytest.raises(FileNotFoundError, match="missing Gym staging index"),
+            ):
+                asyncio.run(actor._save_rollout_checkpoint(force=True))
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert events == ["prepare", "commit", "abort"]
+        assert actor._gym_checkpoint_rollout_permitted.is_set()
+
     def test_logs_snapshot_phase_durations(self, tmp_path: Path) -> None:
         actor = self._actor(tmp_path)
         actor._logger = MagicMock()

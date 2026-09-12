@@ -4182,16 +4182,17 @@ class SingleControllerActor:
                         checkpoint_id,
                         tmp_path,
                     )
-                    gym_staging_keys = await asyncio.to_thread(
-                        gym_checkpoint_staging_keys,
-                        tmp_path,
-                        gym_checkpoint,
-                    )
                 except BaseException:
                     if tmp_path.exists():
                         await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
                     raise
             try:
+                if gym_checkpoint is not None:
+                    gym_staging_keys = await asyncio.to_thread(
+                        gym_checkpoint_staging_keys,
+                        tmp_path,
+                        gym_checkpoint,
+                    )
                 barrier_requested = time.monotonic()
                 async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
                     barrier_acquired = time.monotonic()

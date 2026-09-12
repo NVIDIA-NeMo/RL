@@ -1018,6 +1018,59 @@ def test_prompt_group_restart_retries_every_sibling_when_one_is_unfinished() -> 
     ]
 
 
+def test_prompt_group_restart_clears_sealed_only_attempt_state() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        task_source="genrm_compare",
+        recovery_granularity=RecoveryGranularity.SIBLING,
+        admitted=True,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    gate_id = group.gate_rollout_id(0)
+    _mutate(
+        lambda cut: ledger.mark_sibling_sealed(
+            cut,
+            "g7",
+            generation_index=0,
+            gate_rollout_id=gate_id,
+            receipt={
+                "rollout_id": gate_id,
+                "manifest": [{"staging_key": f"{gate_id}/call"}],
+            },
+            completion_receipt=_completion_receipt("g7_g0"),
+            reward=1.0,
+            mask_sample=True,
+            resolved_agent_name="test-agent",
+        )
+    )
+
+    # Checkpoints written before prompt-group sealing became atomic may contain
+    # a completed sibling next to an unfinished one.
+    state = ledger.state_dict()
+    state["groups"][0]["recovery_granularity"] = "prompt_group"
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+
+    _mutate(lambda cut: restored.prepare_for_restart(cut))
+
+    abandoned = restored.get_group("g7").siblings[0].current_attempt
+    assert abandoned.status is RolloutAttemptStatus.ABANDONED
+    assert abandoned.receipt is None
+    assert abandoned.completion_receipt is None
+    assert abandoned.reward is None
+    assert abandoned.mask_sample is None
+    assert abandoned.staging_keys == []
+    _bind(restored, "g7", _prompt())
+    RolloutRecoveryLedger.from_state_dict(restored.state_dict())
+
+
 def test_prompt_group_restart_keeps_a_fully_sealed_group() -> None:
     ledger = RolloutRecoveryLedger()
     group = _reserve(
