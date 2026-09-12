@@ -1029,6 +1029,7 @@ class TQReplayBuffer:
         include_message_violation_fields: bool,
         staging_partition_id: Optional[str] = None,
         require_routed_experts: bool = False,
+        require_reward_components: bool = False,
     ):
         self._dp_client = dp_client
         self._partition_id = partition_id
@@ -1039,6 +1040,7 @@ class TQReplayBuffer:
         # legacy path.
         self._staging_partition_id = staging_partition_id
         self._require_routed_experts = require_routed_experts
+        self._require_reward_components = require_reward_components
         self.meta_list: list[Optional[KVBatchMeta]] = []
         self.start_weight_list: list[int] = []
         self.end_weight_list: list[int] = []
@@ -1169,6 +1171,7 @@ class TQReplayBuffer:
             record,
             pad_value_dict=self._pad_value_dict,
             include_message_violation_fields=self._include_message_violation_fields,
+            require_reward_components=self._require_reward_components,
         )
         sample_ids, fields, tags = pack_payload(
             train_batch,

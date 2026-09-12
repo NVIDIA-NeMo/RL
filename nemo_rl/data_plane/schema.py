@@ -42,6 +42,11 @@ META_IDX = "meta_idx"
 INVALID_TOOL_CALL_MASK = "invalid_tool_call_mask"
 MALFORMED_THINKING_MASK = "malformed_thinking_mask"
 
+# Per-row GDPO reward mapping. The canonical JSON string rides in metadata
+# because component sets may differ between prompt groups; the controller
+# materializes dense named columns only after sampling a complete train chunk.
+REWARD_COMPONENTS_TAG = "reward_components"
+
 # Tensor fields in the train partition. Rollout writes the input
 # subset on first put; later stages add prev_logprobs /
 # reference_policy_logprobs (workers) and advantages (driver).
