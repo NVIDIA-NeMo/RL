@@ -98,8 +98,10 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.environments.gym_checkpoint import (
+    GymCheckpointContinuation,
     GymCheckpointRestoreResult,
     GymCheckpointTopology,
+    gym_checkpoint_continuations,
     gym_checkpoint_staging_keys,
     validate_gym_checkpoint_manifests,
     validate_gym_checkpoint_restore_artifacts,
@@ -179,6 +181,7 @@ class SingleControllerActorArgs:
     gym_checkpoint_topology: Optional[GymCheckpointTopology] = None
     gym_checkpoint_restore_operation_id: Optional[str] = None
     gym_checkpoint_staging_keys: tuple[str, ...] = ()
+    gym_checkpoint_continuations: tuple[GymCheckpointContinuation, ...] = ()
     # None when async_rl.generation_fleet_health is disabled; the SingleController
     # drives the probe loop when it is present.
     fleet_monitor: Optional[GenerationFleetHealth] = None
@@ -1636,6 +1639,7 @@ def setup_single_controller(
         setup_timing_metrics.value_init_time_s = time_metrics["value_time"]
 
     restored_gym_checkpoint_staging_keys: tuple[str, ...] = ()
+    restored_gym_checkpoint_continuations: tuple[GymCheckpointContinuation, ...] = ()
     if saved_gym_checkpoint is not None:
         assert resolved_snapshot is not None
         assert gym_checkpoint_topology is not None
@@ -1654,6 +1658,10 @@ def setup_single_controller(
                     saved_gym_checkpoint,
                 )
             )
+        )
+        restored_gym_checkpoint_continuations = gym_checkpoint_continuations(
+            resolved_snapshot.path,
+            saved_gym_checkpoint,
         )
 
     # Native TQ restore must run through the trainer's bootstrap client before
@@ -1948,6 +1956,7 @@ def setup_single_controller(
         gym_checkpoint_topology=gym_checkpoint_topology,
         gym_checkpoint_restore_operation_id=gym_checkpoint_restore_operation_id,
         gym_checkpoint_staging_keys=restored_gym_checkpoint_staging_keys,
+        gym_checkpoint_continuations=restored_gym_checkpoint_continuations,
         finalizer_actors=finalizer_actors,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,

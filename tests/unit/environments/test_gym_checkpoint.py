@@ -26,6 +26,7 @@ from nemo_rl.environments.gym_checkpoint import (
     GymAgentCommitResponse,
     GymAgentRestoreResponse,
     GymCheckpointCommitResult,
+    GymCheckpointContinuation,
     GymCheckpointRestoreResult,
     GymCheckpointTopology,
     GymControlCapabilities,
@@ -36,6 +37,7 @@ from nemo_rl.environments.gym_checkpoint import (
     GymModelCommitResponse,
     GymModelRestoreResponse,
     gym_capture_key,
+    gym_checkpoint_continuations,
     gym_checkpoint_staging_keys,
     validate_gym_checkpoint_manifests,
     validate_gym_checkpoint_restore_artifacts,
@@ -293,11 +295,22 @@ def test_restart_only_resource_requires_agent_fresh_restart_support() -> None:
     with pytest.raises(RuntimeError, match="restored-continuation discard"):
         topology_for(agent).validate_turn_recovery_capabilities()
 
-    supported = agent.model_copy(
+    discard_only = agent.model_copy(
         update={
             "features": [
                 *agent.features,
                 "discard_restored_continuation_v1",
+            ]
+        }
+    )
+    with pytest.raises(RuntimeError, match="resource dependency indexes"):
+        topology_for(discard_only).validate_turn_recovery_capabilities()
+
+    supported = discard_only.model_copy(
+        update={
+            "features": [
+                *discard_only.features,
+                "agent_resource_dependency_index_v1",
             ]
         }
     )
@@ -365,6 +378,7 @@ def test_private_lineage_is_not_scanned_for_tq_staging_ownership(tmp_path) -> No
                 "attempt_index": 0,
                 "capture_key": "group-7_g0",
                 "last_committed_model_call_id": "call-1",
+                "resource_state_revisions": {"durable-tools": 2},
             },
             separators=(",", ":"),
         ).encode()
@@ -529,6 +543,15 @@ def test_private_lineage_is_not_scanned_for_tq_staging_ownership(tmp_path) -> No
         "group-7_g0/source-call",
         "group-7_g0/call-1",
     }
+    assert gym_checkpoint_continuations(tmp_path, checkpoint) == (
+        GymCheckpointContinuation(
+            rollout_id="group-7_g0",
+            source_attempt_index=0,
+            capture_key="group-7_g0",
+            resource_state_revisions=(("durable-tools", 2),),
+            staging_keys=("group-7_g0/call-1", "group-7_g0/source-call"),
+        ),
+    )
 
     lineage_path.write_text("{}\n")
     assert gym_checkpoint_staging_keys(tmp_path, checkpoint) == {

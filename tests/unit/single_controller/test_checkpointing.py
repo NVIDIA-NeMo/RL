@@ -97,6 +97,7 @@ from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
 from nemo_rl.environments.gym_checkpoint import (
+    GymCheckpointContinuation,
     GymCheckpointTopology,
 )
 from nemo_rl.experience.rollout_recovery import (
@@ -676,7 +677,7 @@ class _FakeGymCheckpointActor:
         return {"participants": []}
 
 
-def test_restart_only_resources_discard_unsealed_replacement_continuations() -> None:
+def test_restart_only_resources_discard_only_dependent_continuations() -> None:
     async def exercise() -> None:
         calls: list[tuple[str, list[dict[str, Any]]]] = []
 
@@ -715,7 +716,22 @@ def test_restart_only_resources_discard_unsealed_replacement_continuations() -> 
                             "mode": "single_worker",
                             "num_workers": 1,
                         },
-                    }
+                    },
+                    {
+                        "participant": {
+                            "server_name": "durable-tools",
+                            "component": "resources_servers",
+                            "participant_name": "durable-tools",
+                        },
+                        "schema_version": 1,
+                        "admission_states": ["accepting"],
+                        "checkpoint_mode": "export_restore",
+                        "concurrency_contract": "serialized_per_session",
+                        "multi_process": {
+                            "mode": "single_worker",
+                            "num_workers": 1,
+                        },
+                    },
                 ]
             }
         )
@@ -733,6 +749,20 @@ def test_restart_only_resources_discard_unsealed_replacement_continuations() -> 
                         SimpleNamespace(
                             generation_index=1,
                             current_attempt=SimpleNamespace(
+                                attempt_index=4,
+                                status=RolloutAttemptStatus.ABANDONED,
+                            ),
+                        ),
+                        SimpleNamespace(
+                            generation_index=2,
+                            current_attempt=SimpleNamespace(
+                                attempt_index=1,
+                                status=RolloutAttemptStatus.ABANDONED,
+                            ),
+                        ),
+                        SimpleNamespace(
+                            generation_index=3,
+                            current_attempt=SimpleNamespace(
                                 attempt_index=0,
                                 status=RolloutAttemptStatus.SEALED,
                             ),
@@ -745,7 +775,36 @@ def test_restart_only_resources_discard_unsealed_replacement_continuations() -> 
             ]
         )
         controller._env_handles = {"nemo_gym": gym_actor}
-        controller._restored_gym_checkpoint_staging_keys = {"stage/old-call"}
+        controller._restored_gym_checkpoint_continuations = (
+            GymCheckpointContinuation(
+                rollout_id="group_g0",
+                source_attempt_index=2,
+                capture_key="group_g0-a2",
+                resource_state_revisions=(("tools", 0),),
+                staging_keys=("stage/restart-only",),
+            ),
+            GymCheckpointContinuation(
+                rollout_id="group_g1",
+                source_attempt_index=4,
+                capture_key="group_g1-a4",
+                resource_state_revisions=(("durable-tools", 3),),
+                staging_keys=("stage/export-restore",),
+            ),
+            # A legacy continuation has no dependency index, so it retains the
+            # conservative restart behavior.
+            GymCheckpointContinuation(
+                rollout_id="group_g2",
+                source_attempt_index=1,
+                capture_key="group_g2-a1",
+                resource_state_revisions=None,
+                staging_keys=("stage/legacy",),
+            ),
+        )
+        controller._restored_gym_checkpoint_staging_keys = {
+            "stage/restart-only",
+            "stage/export-restore",
+            "stage/legacy",
+        }
         controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         controller._call_dp = AsyncMock()
         controller._master_config = SimpleNamespace(
@@ -760,15 +819,20 @@ def test_restart_only_resources_discard_unsealed_replacement_continuations() -> 
         assert calls == [
             (
                 "restore-1",
-                [{"rollout_id": "group_g0", "attempt_index": 3}],
+                [
+                    {"rollout_id": "group_g0", "attempt_index": 3},
+                    {"rollout_id": "group_g2", "attempt_index": 2},
+                ],
             )
         ]
         controller._call_dp.assert_awaited_once_with(
             "clear_samples",
-            sample_ids=["stage/old-call"],
+            sample_ids=["stage/legacy", "stage/restart-only"],
             partition_id="staging",
         )
-        assert controller._restored_gym_checkpoint_staging_keys == set()
+        assert controller._restored_gym_checkpoint_staging_keys == {
+            "stage/export-restore"
+        }
 
     asyncio.run(exercise())
 

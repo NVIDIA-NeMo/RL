@@ -546,6 +546,9 @@ class SingleControllerActor:
         self._restored_gym_checkpoint_staging_keys = set(
             actor_args.gym_checkpoint_staging_keys
         )
+        self._restored_gym_checkpoint_continuations = tuple(
+            actor_args.gym_checkpoint_continuations
+        )
         self._rollout_checkpoint_stop_requested = asyncio.Event()
         # Narrow unsafe window after an optimizer mutates model state and before
         # SC publishes the matching TQ cleanup and trainer counters. Gradient
@@ -1625,22 +1628,49 @@ class SingleControllerActor:
         if not restart_only_resources:
             return
 
+        candidates = {
+            (
+                group.logical_rollout_id(sibling.generation_index),
+                sibling.current_attempt.attempt_index + 1,
+            )
+            for group in self._rollout_recovery_ledger.groups()
+            for sibling in group.siblings
+            if sibling.current_attempt.status is not RolloutAttemptStatus.SEALED
+        }
         executions = []
-        for group in self._rollout_recovery_ledger.groups():
-            for sibling in group.siblings:
-                attempt = sibling.current_attempt
-                if attempt.status is RolloutAttemptStatus.SEALED:
+        staging_keys: set[str] = set()
+        restart_only = set(restart_only_resources)
+        resource_modes = {
+            contract.participant.server_name: contract.checkpoint_mode
+            for contract in topology.participants
+            if contract.participant.component == "resources_servers"
+        }
+        for continuation in self._restored_gym_checkpoint_continuations:
+            execution = (
+                continuation.rollout_id,
+                continuation.replacement_attempt_index,
+            )
+            if execution not in candidates:
+                continue
+            resource_revisions = continuation.resource_state_revisions
+            if resource_revisions is not None:
+                dependencies = {name for name, _revision in resource_revisions}
+                unknown = dependencies - set(resource_modes)
+                if unknown:
+                    raise RuntimeError(
+                        "restored Gym continuation refers to undiscovered resources: "
+                        f"rollout_id={continuation.rollout_id!r}, "
+                        f"resources={sorted(unknown)!r}"
+                    )
+                if not dependencies.intersection(restart_only):
                     continue
-                executions.append(
-                    {
-                        "rollout_id": group.logical_rollout_id(
-                            sibling.generation_index
-                        ),
-                        # Gym restores a committed boundary into the replacement
-                        # physical attempt, not back into the interrupted one.
-                        "attempt_index": attempt.attempt_index + 1,
-                    }
-                )
+            executions.append(
+                {
+                    "rollout_id": continuation.rollout_id,
+                    "attempt_index": continuation.replacement_attempt_index,
+                }
+            )
+            staging_keys.update(continuation.staging_keys)
         if not executions:
             return
 
@@ -1650,17 +1680,16 @@ class SingleControllerActor:
             + self._master_config.rollout_checkpointing.gym.prepare_timeout_s,
             executions,
         )
-        staging_keys = sorted(self._restored_gym_checkpoint_staging_keys)
         if staging_keys:
             async with self._data_plane_checkpoint_barrier.mutation(
                 "gym_restart_cleanup"
             ):
                 await self._call_dp(
                     "clear_samples",
-                    sample_ids=staging_keys,
+                    sample_ids=sorted(staging_keys),
                     partition_id=self._master_config.token_capture.staging_partition,
                 )
-            self._restored_gym_checkpoint_staging_keys.clear()
+            self._restored_gym_checkpoint_staging_keys.difference_update(staging_keys)
         print(
             "📦 Restarting unfinished Gym executions from their initial task: "
             f"executions={result['executions']}, "
