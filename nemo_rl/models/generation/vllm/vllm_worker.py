@@ -205,10 +205,17 @@ def _log_effective_quantization_ignore_patterns(
         return
 
     hf_overrides = vllm_kwargs.get("hf_overrides")
-    if not isinstance(hf_overrides, dict):
-        return
-    quantization_config = hf_overrides.get("quantization_config")
+    quantization_config = (
+        hf_overrides.get("quantization_config")
+        if isinstance(hf_overrides, dict)
+        else None
+    )
     if not isinstance(quantization_config, dict):
+        if vllm_cfg.get("precision") in ("bf16", "bfloat16"):
+            logger.warning(
+                "Ignoring quantization_ignore_patterns because rollout precision is BF16 "
+                "and no quantization configuration is active. Continuing without quantization exclusions."
+            )
         return
     effective_ignore = quantization_config.get("ignore", [])
     print(f"NRL_MXFP8_EFFECTIVE_IGNORE={effective_ignore}")
