@@ -167,4 +167,5 @@ def assign_or_replace_parameter(
             parameter.copy_(value)
         return
 
-    setattr(layer, name, torch.nn.Parameter(value, requires_grad=False))
+    # New runtime storage must not alias reusable scratch or checkpoint storage.
+    setattr(layer, name, torch.nn.Parameter(value.clone(), requires_grad=False))
