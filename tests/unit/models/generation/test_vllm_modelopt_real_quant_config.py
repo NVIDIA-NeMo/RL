@@ -1177,14 +1177,20 @@ def test_real_quant_load_weights_batches_full_experts_and_expands_global_scales(
         )
         == "loaded"
     )
+    # Per-expert 2-D shards, never one batched 3-D tensor under expert 0: a
+    # non-gated model has no fused mapping, so vLLM's fused branch would keep
+    # only chunk(2, dim=1)[0] of every expert (the nanov3 w4a16 3/4 failure).
     assert [name for name, _ in batched_forwarded] == [
         f"{prefix}.experts.0.up_proj.weight",
+        f"{prefix}.experts.1.up_proj.weight",
         f"{prefix}.experts.0.up_proj.weight_scale_2",
         f"{prefix}.experts.1.up_proj.weight_scale_2",
     ]
-    assert batched_forwarded[0][1] is w13_weight
-    torch.testing.assert_close(batched_forwarded[1][1], w13_scale_2[0, 0])
-    torch.testing.assert_close(batched_forwarded[2][1], w13_scale_2[1, 0])
+    assert all(t.ndim == 2 for _, t in batched_forwarded[:2])
+    torch.testing.assert_close(batched_forwarded[0][1], w13_weight[0])
+    torch.testing.assert_close(batched_forwarded[1][1], w13_weight[1])
+    torch.testing.assert_close(batched_forwarded[2][1], w13_scale_2[0, 0])
+    torch.testing.assert_close(batched_forwarded[3][1], w13_scale_2[1, 0])
 
     extension = _make_real_quant_extension(
         backend,

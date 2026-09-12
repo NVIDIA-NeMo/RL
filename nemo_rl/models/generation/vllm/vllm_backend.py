@@ -15,7 +15,7 @@ import gc
 import logging
 import re
 import socket
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Any, Literal, Optional
 
@@ -288,6 +288,49 @@ def _filter_gemma4_unified_multimodal_weights(
     )
 
 
+def _tied_embedding_aliases(model: torch.nn.Module) -> dict[str, str]:
+    """Return vLLM's ``{alias qualname: canonical qualname}`` for tied embeddings.
+
+    Uses vLLM's own detector so this set is exactly what ``AutoWeightsLoader``
+    skips. Empty on a vLLM without the helper, which also has no alias check,
+    so the filter below becomes a no-op there.
+    """
+    try:
+        from vllm.model_executor.models.utils import _get_tied_embedding_params
+    except ImportError:
+        return {}
+    return _get_tied_embedding_params(model)
+
+
+def _drop_tied_embedding_aliases(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    aliases: Mapping[str, str],
+    mapper: Any | None,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Drop checkpoint weights that vLLM would skip as tied-embedding aliases.
+
+    vLLM 0.29's ``AutoWeightsLoader`` skips e.g. ``lm_head.weight`` when it is
+    tied to the input embedding and then asserts that the canonical embedding
+    weight was loaded in the *same* ``load_weights`` call
+    (vllm-project/vllm#51665). Refit streams weights in transport-sized
+    batches, so the two routinely arrive in different calls and every refit of
+    a tied-embedding model died with ``'lm_head.weight' was skipped because it
+    is tied to 'model.embed_tokens.weight' ... was not found in the
+    checkpoint``. The alias never loads anything, so dropping it up front is
+    lossless. ``mapper`` is the model's ``hf_to_vllm_mapper`` (if any): the
+    alias set is keyed by vLLM parameter names while refit sends checkpoint
+    names, and the loader applies the same mapper before its check.
+    """
+    if not aliases:
+        yield from weights
+        return
+    for name, weight in weights:
+        mapped = mapper._map_name(name) if mapper is not None else name
+        if mapped is not None and mapped in aliases:
+            continue
+        yield name, weight
+
+
 def _read_mtp_layer_weights_from_checkpoint(
     model_path: str, mtp_layer_indices: set[int]
 ) -> list[tuple[str, torch.Tensor]]:
@@ -417,6 +460,29 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             return
         self._load_full_hf_weights(policy_weights)
 
+    def _without_tied_embedding_aliases(
+        self, policy_weights: list[tuple[str, torch.Tensor]]
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Drop the tied-embedding aliases vLLM would skip (see module helper)."""
+        model = self.model_runner.model
+        aliases = _tied_embedding_aliases(model)
+        if not aliases:
+            return policy_weights
+        kept = list(
+            _drop_tied_embedding_aliases(
+                policy_weights, aliases, getattr(model, "hf_to_vllm_mapper", None)
+            )
+        )
+        dropped = len(policy_weights) - len(kept)
+        if dropped and not getattr(self, "_logged_tied_alias_drop", False):
+            self._logged_tied_alias_drop = True
+            logger.info(
+                "Refit dropped %d tied-embedding alias weight(s); vLLM ties %s",
+                dropped,
+                ", ".join(f"{a} -> {c}" for a, c in sorted(aliases.items())),
+            )
+        return kept
+
     def _prepare_reload_weight_iterator(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[tuple[str, torch.Tensor]]:
@@ -429,6 +495,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             )
         if _is_gemma4_unified_text_only(model_config):
             weights = _filter_gemma4_unified_multimodal_weights(weights)
+        model = self.model_runner.model
+        aliases = _tied_embedding_aliases(model)
+        if aliases:
+            weights = _drop_tied_embedding_aliases(
+                weights, aliases, getattr(model, "hf_to_vllm_mapper", None)
+            )
 
         from nemo_rl.models.generation.vllm.quantization import fp8
 
@@ -926,7 +998,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 )
 
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
-        self._load_hf_weights(policy_weights)
+        self._load_hf_weights(self._without_tied_embedding_aliases(policy_weights))
         # Eagle3 draft weights are exported with the `draft.` prefix.
         self._load_draft_weights(draft_weights)
         # MTP drafters co-trained with the policy receive their weights from the
@@ -1337,7 +1409,10 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         applier = self._get_sparse_delta_applier()
         return applier.update_weights_from_decoded_sparse_payload(*payloads)
 
-    def synchronize_device(self) -> None:
+    def synchronize_sparse_refit_device(self) -> None:
+        # Not named ``synchronize_device``: vLLM 0.29 added that method to
+        # ``WorkerBase`` (vllm-project/vllm#52914) and asserts at init that a
+        # worker extension never shadows a ``Worker`` attribute.
         self._get_sparse_delta_applier().synchronize_device()
 
     def finish_sparse_delta_refit(self) -> dict[str, Any]:

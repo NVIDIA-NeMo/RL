@@ -281,7 +281,17 @@ def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
     and falls through to ``get_open_port()`` — straight back to ``VLLM_PORT``.
     That is exactly the port the MessageQueue takes. See RL-1104.
 
-    Returns without raising when the snippet is missing, but logs at warning
+    vLLM 0.29 fixes the race upstream (vllm-project/vllm#53666, #50969): the
+    rank-0 actor now binds the TCPStore itself, on a kernel-assigned port, and
+    *holds* that socket (``self._dist_init_store = store``) until
+    ``init_process_group`` reuses it, so there is no probe/bind window for the
+    MessageQueue to land in. That is not the TOCTOU pattern the reserved band
+    guards against (the port is never released between selection and use), and
+    ``_select_tcpstore_port`` no longer exists to patch. When that upstream
+    marker is present this function logs at info level and leaves the file
+    alone.
+
+    Returns without raising when neither form is found, but logs at warning
     level so a silent no-op is visible in worker logs.
     """
     try:
@@ -293,6 +303,9 @@ def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
         )
         return
 
+    # vLLM >= 0.29: RayWorkerV2.create_dist_init_method binds and keeps the
+    # TCPStore before publishing its port (vllm-project/vllm#50969).
+    upstream_fix_marker = "self._dist_init_store = store"
     marker = "start_port=envs.VLLM_PORT + 32"
     old_snippet = (
         "        if local_dp_rank is None:\n            return get_open_port()\n"
@@ -325,6 +338,12 @@ def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
     with _locked_file_patch(file_to_patch) as (content, write_back):
         if marker in content:
             logger.info("vLLM RayExecutorV2 TCPStore port patch already applied.")
+            return
+        if upstream_fix_marker in content:
+            logger.info(
+                "vLLM binds the RayExecutorV2 TCPStore before publishing its port "
+                "(vllm-project/vllm#50969); NeMo-RL TCPStore port patch not needed."
+            )
             return
 
         if old_snippet not in content:
@@ -359,13 +378,12 @@ def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
 
 
 def _patch_vllm_shm_broadcast_bind_retry(logger) -> None:
-    """Make MessageQueue's remote socket survive losing a port race.
+    """Keep MessageQueue's remote socket in the reserved band with bind retries.
 
-    ``MessageQueue.__init__`` picks the port for its remote (TCP) socket with
-    ``remote_subscribe_port = get_open_port()``, which *probes a port and
-    releases it*, and only binds it with ZMQ several statements later
-    (``shm_broadcast.py``: ``self.remote_socket.bind(socket_addr)``). The
-    window between the probe and the bind is a TOCTOU race.
+    vLLM 0.28 binds port zero directly, avoiding the old probe/bind race but
+    ignoring ``VLLM_PORT``. Restore reserved-band selection with retries so
+    engine sockets do not consume the ephemeral ports used by other services.
+    A probe alone releases its socket before ZMQ binds, leaving a TOCTOU race.
 
     On vLLM 0.25 that race is lost reliably, not occasionally. Every
     ``RayWorkerProc`` on a **non-driver** node takes ``n_local_reader=0``
@@ -417,10 +435,14 @@ def _patch_vllm_shm_broadcast_bind_retry(logger) -> None:
 
     marker = "_nrl_bind_attempts"
     old_snippet = (
-        '            socket_addr = f"tcp://{connect_ip}:{remote_subscribe_port}"\n'
-        "            self.remote_socket.bind(socket_addr)\n"
+        '            self.remote_socket.bind(f"tcp://{connect_ip}:0")\n'
+        "            last_endpoint = self.remote_socket.getsockopt(zmq.LAST_ENDPOINT)\n"
+        '            remote_subscribe_port = last_endpoint.decode().rsplit(":", 1)[1]\n'
     )
     new_snippet = (
+        "            from vllm.utils.network_utils import get_open_port, _get_open_port\n"
+        "\n"
+        "            remote_subscribe_port = get_open_port()\n"
         "            # NeMo-RL: get_open_port() above probed this port and then\n"
         "            # released it; ZMQ only binds it for real here. Every worker\n"
         "            # on a non-driver node builds its response queue at the same\n"
@@ -441,8 +463,6 @@ def _patch_vllm_shm_broadcast_bind_retry(logger) -> None:
         "                except zmq.ZMQError:\n"
         "                    if _nrl_bind_attempt == _nrl_bind_attempts - 1:\n"
         "                        raise\n"
-        "                    from vllm.utils.network_utils import _get_open_port\n"
-        "\n"
         "                    logger.info(\n"
         '                        "Port %s was taken between probe and bind; '
         'retrying.",\n'

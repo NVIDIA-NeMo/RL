@@ -142,6 +142,18 @@ class _AsyncLLMHTTPClient:
     def dead_error(self) -> BaseException:
         return self._engine_client.dead_error
 
+    def check_admission(self, n: int = 1, request_id: str | None = None) -> None:
+        """Queue-limit admission check vLLM >= 0.29 runs before every response.
+
+        ``OpenAIServing._preflight`` calls this (vllm-project/vllm#49445,
+        ``max_num_queued_reqs`` / ``max_num_queued_tokens``); without it every
+        chat completion 500s with ``'_AsyncLLMHTTPClient' object has no
+        attribute 'check_admission'``. It only reads scheduler config and
+        unfinished-request counters, so it stays off the engine loop like the
+        other status reads above. Raises vLLM's HTTP-mapped overflow errors.
+        """
+        self._engine_client.check_admission(n, request_id=request_id)
+
     async def is_tracing_enabled(self) -> bool:
         return await self._engine_client.is_tracing_enabled()
 
@@ -692,7 +704,9 @@ class VllmAsyncGenerationWorkerImpl(
         from vllm.entrypoints.openai.chat_completion.serving import (
             OpenAIServingChat,
         )
-        from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+
+        # vLLM 0.29 moved this out of the openai package (vllm-project/vllm#54492).
+        from vllm.entrypoints.serve.engine.protocol import ErrorResponse
         from vllm.entrypoints.openai.models.protocol import BaseModelPath
         from vllm.entrypoints.openai.models.serving import OpenAIServingModels
         from vllm.entrypoints.serve.tokenize.protocol import (

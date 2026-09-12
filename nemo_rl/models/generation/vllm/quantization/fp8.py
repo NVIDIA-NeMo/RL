@@ -1153,13 +1153,14 @@ def process_weights_after_loading_moe(self, layer) -> None:
         from vllm.model_executor.layers.quantization.fp8 import make_fp8_moe_kernel
 
         assert self.experts_cls is not None
+        # vLLM 0.28 dropped the `layer` kwarg (0.25 forwarded it only to the
+        # FlashInfer TRTLLM experts); routing tables still come from the layer.
         self.moe_kernel = make_fp8_moe_kernel(
             moe_quant_config=self.moe_quant_config,
             moe_config=self.moe,
             fp8_backend=self.fp8_backend,
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
-            layer=layer,
         )
 
 
@@ -1407,7 +1408,6 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
             fp8_backend=self.mxfp8_backend,
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
-            layer=layer,
         )
 
 
@@ -1416,14 +1416,31 @@ def process_weights_after_loading_kv(self, layer) -> None:
 
     Doesn't delete k_scale, v_scale, q_scale, and prob_scale parameters to allow
     for dynamic updates during refit.
-    """
-    # If the kv-cache dtype is auto, we enforce the k/v_scale to be 1.0
-    # regardless whether the kv-scale is available in the checkpoint.
-    # No need to process kv scales after loading if we are going to
-    # calculate them on the fly.
-    from vllm.platforms import current_platform
 
-    if layer.kv_cache_dtype != "auto" and not layer.calculate_kv_scales:
+    Ported to vLLM 0.28: the attention layer no longer carries
+    ``calculate_kv_scales`` (dynamic per-token-head scales are a KV-cache dtype
+    now, see ``kv_cache_uses_per_token_head_scales``), and the fp8 branch keys off
+    ``is_quantized_kv_cache`` instead of ``!= "auto"``. Mirrors
+    ``BaseKVCacheMethod.process_weights_after_loading`` in
+    ``vllm/model_executor/layers/quantization/kv_cache.py`` minus the parameter
+    deletion.
+    """
+    from vllm.platforms import current_platform
+    from vllm.utils.torch_utils import is_quantized_kv_cache
+    from vllm.v1.kv_cache_interface import kv_cache_uses_per_token_head_scales
+
+    # Per-token-head quantized KV cache: scales are computed dynamically per
+    # (token, head) in the kernel at cache-write time. Nothing to refit here.
+    if kv_cache_uses_per_token_head_scales(layer.kv_cache_dtype):
+        layer._k_scale.copy_(1.0)
+        layer._v_scale.copy_(1.0)
+        layer._k_scale_float = 1.0
+        layer._v_scale_float = 1.0
+        return
+
+    # If the kv-cache is not quantized, we enforce the k/v_scale to be 1.0
+    # regardless whether the kv-scale is available in the checkpoint.
+    if is_quantized_kv_cache(layer.kv_cache_dtype):
         if layer.k_scale > 0.0 and layer.v_scale > 0.0:
             # We prefer to use separate k_scale and v_scale if present
             k_scale = layer.k_scale.to("cpu").tolist()
@@ -1460,12 +1477,16 @@ def process_weights_after_loading_kv(self, layer) -> None:
         layer._v_scale.copy_(v_scale)
         layer._k_scale_float = k_scale
         layer._v_scale_float = v_scale
+        # vLLM 0.28 also keeps host copies for the AITER fused kernels; the
+        # buffers exist on every platform, so keep them in sync on refit too.
+        if hasattr(layer, "_k_scale_cpu"):
+            layer._k_scale_cpu.fill_(k_scale)
+            layer._v_scale_cpu.fill_(v_scale)
 
     if layer.q_scale > 0.0:
         q_scale = layer.q_scale
         if current_platform.is_fp8_fnuz():
             q_scale *= 2
-        layer.calculate_kv_scales = False
     else:
         q_scale = 1.0
     if layer.prob_scale > 0.0:

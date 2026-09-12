@@ -14,14 +14,19 @@ if ! python -c "import torchcodec" 2>/dev/null; then
     apt-get update && apt-get install -y --no-install-recommends ffmpeg
 
     # torchaudio 2.11+ routes torchaudio.load through torchcodec, so both are needed.
+    # torchaudio 2.11.0 is the final torchaudio release and carries no torch pin.
+    # torchcodec must match the container's torch: 0.11 is built for torch 2.11
+    # only, 0.12+ use the stable ABI for torch >= 2.11 (pytorch/torchcodec README).
+    # The image ships torch 2.13; use the same 0.16.0 that Gym's
+    # docker/install_codec_deps.sh installs so the two venvs agree.
     # --no-config prevents the project's [tool.uv] overrides from interfering.
-    echo "[audio-deps] Installing torchaudio==2.11.0 and torchcodec..."
+    echo "[audio-deps] Installing torchaudio==2.11.0 and torchcodec==0.16.0..."
     uv pip install --no-config \
         --index-url https://download.pytorch.org/whl/cu130 \
         --extra-index-url https://pypi.org/simple \
         --reinstall-package torchaudio \
         "torchaudio==2.11.0" \
-        "torchcodec==0.11.1"
+        "torchcodec==0.16.0"
 fi
 
 # PyAV is intentionally absent from the base image (pyproject excludes it via

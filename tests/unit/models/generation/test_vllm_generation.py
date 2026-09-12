@@ -3699,3 +3699,28 @@ def test_vllm_megatron_weight_update_with_packing(cluster, test_input_data):
             megatron_policy.shutdown()
         if vllm_generation:
             vllm_generation.shutdown()
+
+
+def test_async_vllm_http_client_forwards_admission_checks() -> None:
+    """vLLM 0.29's serving layer calls check_admission before every response."""
+    calls = []
+
+    class Overflow(RuntimeError):
+        pass
+
+    class FakeEngine:
+        model_config = renderer = input_processor = vllm_config = None
+
+        def check_admission(self, n=1, request_id=None):
+            calls.append((n, request_id))
+            if n > 2:
+                raise Overflow("queue full")
+
+    client = _AsyncLLMHTTPClient(FakeEngine(), asyncio.new_event_loop())
+
+    client.check_admission(1)
+    client.check_admission(2, request_id="req-2")
+    with pytest.raises(Overflow):
+        client.check_admission(3, request_id="req-3")
+
+    assert calls == [(1, None), (2, "req-2"), (3, "req-3")]
