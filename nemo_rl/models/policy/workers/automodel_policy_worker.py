@@ -557,6 +557,7 @@ class AutomodelPolicyWorkerImpl(
             enable_seq_packing=self.enable_seq_packing,
             sampling_params=self.sampling_params,
             draft_runtime=draft_runtime,
+            tp_mesh=self.tp_mesh,
         )
 
         # Setup cache clearing callback if configured
