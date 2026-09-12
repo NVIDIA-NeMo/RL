@@ -62,6 +62,7 @@ from nemo_rl.models.automodel.data import (
     filter_multimodal_kwargs_for_model,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.utils.sequence_lengths import to_cpu_int_tuple
 
 # Union type for any post-processing function
 PostProcessingFunction = Union[
@@ -648,11 +649,14 @@ class LossPostProcessor:
         )
         # Wrap loss function for sequence packing if needed
         if self.enable_seq_packing:
+            cu_seqlens_q = to_cpu_int_tuple(
+                processed_inputs.flash_attn_kwargs.cu_seqlens_q
+            )
             loss_fn = SequencePackingLossWrapper(
                 loss_fn=self.loss_fn,
                 prepare_fn=prepare_loss_input_wrapped,
-                cu_seqlens_q=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
-                cu_seqlens_q_padded=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_q_padded=cu_seqlens_q,
             )
             loss, loss_metrics = loss_fn(
                 logits,
