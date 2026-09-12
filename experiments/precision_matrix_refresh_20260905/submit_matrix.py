@@ -15,7 +15,9 @@ def main() -> None:
     parser.add_argument("--preflight-log", type=Path, required=True)
     parser.add_argument("--expected-sha", required=True)
     args = parser.parse_args()
-    if "48/48 configurations composed." not in args.preflight_log.read_text():
+    performance = os.environ.get("PERFORMANCE_RECIPE") == "1"
+    expected_count = 24 if performance else 48
+    if f"{expected_count}/{expected_count} configurations composed." not in args.preflight_log.read_text():
         raise SystemExit("Configuration preflight has not passed")
     root = Path(os.environ["REPO"])
     head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
@@ -23,9 +25,12 @@ def main() -> None:
         raise SystemExit("Repository differs from expected SHA")
     records = json.loads(args.ledger.read_text()) if args.ledger.exists() else []
     launcher = root / "experiments/precision_matrix_refresh_20260905/submit.sh"
-    for arm in ("bf16-bf16", "bf16-mxfp8", "mxfp8-false-mxfp8",
-                "mxfp8-true-mxfp8", "mxfp8-false-bf16", "mxfp8-true-bf16"):
-        for model in ("qwen30", "qwen35", "lightning", "qwen235"):
+    arms = ("bf16-bf16", "bf16-mxfp8", "mxfp8-false-mxfp8", "mxfp8-true-mxfp8")
+    if not performance:
+        arms += ("mxfp8-false-bf16", "mxfp8-true-bf16")
+    models = ("qwen30", "qwen235", "super") if performance else ("qwen30", "qwen35", "lightning", "qwen235")
+    for arm in arms:
+        for model in models:
             for mode in ("sync", "async"):
                 case = f"{model}/{mode}/{arm}"
                 if any(row["case"] == case and row.get("job_id") for row in records):
