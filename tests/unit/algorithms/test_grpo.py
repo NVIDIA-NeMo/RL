@@ -2044,17 +2044,21 @@ def test_should_use_nemo_gym_requires_dynamo_token_wrapper() -> None:
         "generating_targets",
         "current_step_ready",
         "step",
+        "max_trajectory_age_steps",
         "max_num_steps",
         "expected",
         "expected_queries",
     ),
     [
-        pytest.param(True, [], True, 3, 10, True, 1, id="complete"),
-        pytest.param(False, [4], True, 3, 10, True, 1, id="reserved-only"),
-        pytest.param(False, [], True, 3, 10, False, 1, id="neither"),
-        pytest.param(False, [5, 6], True, 3, 10, False, 1, id="other-target-reserved"),
-        pytest.param(False, [], True, 9, 10, True, 0, id="last-step"),
-        pytest.param(False, [], False, 3, 10, False, 0, id="current-not-ready"),
+        pytest.param(True, [], True, 3, 1, 10, True, 1, id="complete"),
+        pytest.param(False, [4], True, 3, 1, 10, True, 1, id="reserved-only"),
+        pytest.param(False, [], True, 3, 1, 10, False, 1, id="neither"),
+        pytest.param(
+            False, [5, 6], True, 3, 1, 10, False, 1, id="other-target-reserved"
+        ),
+        pytest.param(False, [], True, 3, 0, 10, True, 0, id="no-lookahead-window"),
+        pytest.param(False, [], True, 9, 1, 10, True, 0, id="last-step"),
+        pytest.param(False, [], False, 3, 1, 10, False, 0, id="current-not-ready"),
     ],
 )
 def test_startup_pipeline_ready(
@@ -2062,11 +2066,12 @@ def test_startup_pipeline_ready(
     generating_targets,
     current_step_ready,
     step,
+    max_trajectory_age_steps,
     max_num_steps,
     expected,
     expected_queries,
 ):
-    """Startup needs a complete or claimed lookahead except at the last step."""
+    """Startup needs a complete or claimed lookahead only when one can exist."""
     replay_buffer = MagicMock()
     replay_buffer.has_complete_batch.remote.return_value = lookahead_complete
     collector_status = {"generating_targets": generating_targets}
@@ -2078,7 +2083,7 @@ def test_startup_pipeline_ready(
             current_step_ready=current_step_ready,
             step=step,
             num_prompts_per_step=8,
-            max_trajectory_age_steps=1,
+            max_trajectory_age_steps=max_trajectory_age_steps,
             max_num_steps=max_num_steps,
         )
 
