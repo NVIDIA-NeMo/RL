@@ -122,12 +122,12 @@ We are **incrementally migrating** the config schema from `typing.TypedDict` (v1
 
 **v2 — the new conventions (use these for all new code):**
 
-- **`pydantic.BaseModel` — v2, user-facing config (the new default).** Any class a user touches via YAML — currently the top-level `MasterConfig` of each algorithm and a few shared schemas like `ClippedPGLossConfig` — is declared as a `BaseModel` with `extra="allow"`. The `extra="allow"` flag preserves the original motivation behind picking `TypedDict`: users can keep using older configuration files with obsolete or user-defined keys without load-time errors. New user-facing configs should be `BaseModel`, and existing `TypedDict`s should be migrated as the codebase moves.
+- **`pydantic.BaseModel` — v2, user-facing config (the new default).** Any class a user touches via YAML — the top-level `MasterConfig` of every algorithm and most algorithm-level sub-configs (`GRPOConfig`, `AsyncGRPOConfig`, `ClippedPGLossConfig`, ...) — is declared as a `BaseModel`, normally with `extra="allow"`. The `extra="allow"` flag preserves the original motivation behind picking `TypedDict`: users can keep using older configuration files with obsolete or user-defined keys without load-time errors. New user-facing configs should be `BaseModel`, and existing `TypedDict`s should be migrated as the codebase moves.
 - **`@dataclass` — v2, internal classes, *not* loaded from YAML.** Process-local data containers (worker metadata, datum specs, internal state passed between Python components) use `@dataclass`. They are not config and should not pretend to be.
 
 **v1 — legacy, being migrated away:**
 
-- **`typing.TypedDict` — v1, legacy user-facing config still being migrated.** Most nested sub-configs (e.g. `GRPOConfig`, `RewardScalingConfig`) remain `TypedDict` for now and continue to follow the same default-handling rules below until they are migrated to `BaseModel`. Do not add new `TypedDict`-based config classes.
+- **`typing.TypedDict` — v1, legacy user-facing config still being migrated.** The remaining `TypedDict` configs live mostly outside the algorithm modules (e.g. `PolicyConfig` and its nested blocks, `ClusterConfig`, `CheckpointingConfig`, `LoggerConfig`) and continue to follow the same default-handling rules below until they are migrated to `BaseModel`. Do not add new `TypedDict`-based config classes.
 
 We follow a few design principles regarding configuration:
 
