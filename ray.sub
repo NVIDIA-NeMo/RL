@@ -485,6 +485,62 @@ head_node_ip=${ip_addresses_array[0]}
 
 ip_head=$head_node_ip:$PORT
 
+# 1..N topo_rank map for this allocation. Digit-stripping SLURM_TOPOLOGY_ADDR
+# into block_digits * 10^10 + node_digits overflows Ray's 1e14 custom-resource
+# cap as soon as a block name contributes more than four digits (region / zone
+# / site codes), and collides when distinct names share a numeric substring
+# ("rack-A1" vs "rack-B1"). Rank by sorted (block name, hostname) instead:
+# values are 1..N, unique, and independent of how many digits the names contain.
+#
+# Block names come from `scontrol show topology` BlockName= groups when present.
+# Nodes that are not in a reported block still get a unique hostname-order rank.
+# Head-node selection above stays on the hostname-sorted nodes_array; only the
+# rank map is reordered by topology.
+_topo_rank_map="$LOG_DIR/topo_rank_map.txt"
+declare -A _node_to_block=()
+_topo_txt=$(scontrol show topology 2>/dev/null || true)
+if [[ -n "$_topo_txt" ]]; then
+  while IFS= read -r _line; do
+    _block=""
+    _nodelist=""
+    if [[ "$_line" == *"BlockName="* ]]; then
+      _block="${_line#*BlockName=}"
+      _block="${_block%% *}"
+    fi
+    if [[ "$_line" == *"Nodes="* ]]; then
+      _nodelist="${_line#*Nodes=}"
+      _nodelist="${_nodelist%% *}"
+    fi
+    if [[ -n "$_block" && -n "$_nodelist" ]]; then
+      _expanded=$(scontrol show hostnames "$_nodelist" 2>/dev/null || true)
+      for _n in $_expanded; do
+        _node_to_block["$_n"]="$_block"
+      done
+    fi
+  done <<< "$_topo_txt"
+fi
+_topo_keys=()
+for _n in "${nodes_array[@]}"; do
+  _topo_keys+=("${_node_to_block[$_n]:-}|${_n}")
+done
+IFS=$'\n' _topo_keys=($(printf '%s\n' "${_topo_keys[@]}" | LC_ALL=C sort)); unset IFS
+: > "$_topo_rank_map"
+_rank=1
+for _key in "${_topo_keys[@]}"; do
+  _n="${_key#*|}"
+  printf '%s %s\n' "$_n" "$_rank" >> "$_topo_rank_map"
+  _rank=$((_rank + 1))
+done
+# Ray rejects custom resource quantities above 1e14. Equality is allowed.
+# Do not wrap: a modulo would reintroduce collisions. Fail closed instead.
+_RAY_MAX_CUSTOM_RESOURCE=100000000000000
+if (( _rank - 1 > _RAY_MAX_CUSTOM_RESOURCE )); then
+  echo "[FATAL] topo_rank $((_rank - 1)) exceeds Ray's ${_RAY_MAX_CUSTOM_RESOURCE} custom-resource cap" >&2
+  exit 1
+fi
+echo "[INFO] Wrote topo_rank map (1..$((_rank - 1))) to $_topo_rank_map"
+unset _node_to_block _topo_txt _line _block _nodelist _expanded _n _topo_keys _key _rank _RAY_MAX_CUSTOM_RESOURCE
+
 # Write the topology probe script that runs inside each container.
 # Both head_cmd and worker_cmd source this to avoid duplication.
 # The script sets two variables: CLUSTER_UUID and TOPO_RANK.
@@ -496,15 +552,10 @@ ip_head=$head_node_ip:$PORT
 #
 # TOPO_RANK: Topology-aware infrastructure rank.
 #   Fallback chain:
-#   1. SLURM_TOPOLOGY_ADDR (block.node format) -> block_num * 10^10 + node_num
-#   2. SLURM_PROCID + 2 on workers, head pinned to 1 (SLURM without topology plugin)
-#   3. Hostname digits (non-SLURM fallback)
-#
-# TODO(ansubramania): Harden the SLURM_TOPOLOGY_ADDR digit-extraction logic for open source.
-#   The current approach (tr -dc '0-9') assumes block/node names contain
-#   unique numeric substrings, which holds on internal clusters but
-#   may produce collisions on other providers with different naming conventions
-#   (e.g., "rack-A1" vs "rack-B1" both yield "1").
+#   1. 1..N lookup from topo_rank_map.txt (sorted block name, then hostname)
+#   2. SLURM_PROCID + 2 on workers, head pinned to 1 (map miss under SLURM)
+#   Hostname digit-stripping is intentionally omitted: it is unbounded and
+#   can exceed Ray's 1e14 cap. Missing topo_rank becomes TOPO_RANK_UNKNOWN.
 TOPO_PROBE_SCRIPT="$LOG_DIR/topology_probe.sh"
 cat > "$TOPO_PROBE_SCRIPT" <<TOPO_PROBE_EOF
 CLUSTER_UUID=\$(nvidia-smi -q 2>/dev/null | grep 'ClusterUUID' | head -1 | awk -F: '{print \$2}' | tr -d ' ')
@@ -513,17 +564,10 @@ if [[ -z "\$CLUSTER_UUID" ]]; then
 fi
 
 TOPO_RANK=""
-if [[ -n "\${SLURM_TOPOLOGY_ADDR:-}" && "\${SLURM_TOPOLOGY_ADDR_PATTERN:-}" == "block.node" ]]; then
-  _block_part="\${SLURM_TOPOLOGY_ADDR%%.*}"
-  _node_part="\${SLURM_TOPOLOGY_ADDR##*.}"
-  _block_digits=\$(echo "\$_block_part" | tr -dc '0-9')
-  _node_digits=\$(echo "\$_node_part" | tr -dc '0-9')
-  if [[ -n "\$_block_digits" && -n "\$_node_digits" ]]; then
-    # Force base-10 interpretation; leading-zero digits like "08" would otherwise
-    # be parsed as invalid octal by bash arithmetic, silently leaving TOPO_RANK empty.
-    TOPO_RANK=\$(( 10#\$_block_digits * 10000000000 + 10#\$_node_digits ))
-  fi
-elif [[ -n "\${SLURM_PROCID:-}" ]]; then
+if [[ -f "$LOG_DIR/topo_rank_map.txt" && -n "\${SLURMD_NODENAME:-}" ]]; then
+  TOPO_RANK=\$(awk -v n="\$SLURMD_NODENAME" '\$1==n {print \$2; exit}' "$LOG_DIR/topo_rank_map.txt")
+fi
+if [[ -z "\$TOPO_RANK" && -n "\${SLURM_PROCID:-}" ]]; then
   # Head srun and worker srun each start their own SLURM_PROCID counter at 0.
   # Head hardcoded to 1; workers get +2 so worker[0]=2, worker[62]=64 -- keeps
   # all nodes at unique values >=1 (Ray drops value-0 custom resources).
@@ -531,11 +575,6 @@ elif [[ -n "\${SLURM_PROCID:-}" ]]; then
     TOPO_RANK=1
   else
     TOPO_RANK=\$(( 10#\$SLURM_PROCID + 2 ))
-  fi
-else
-  _hostname_digits=\$(hostname | tr -dc '0-9')
-  if [[ -n "\$_hostname_digits" ]]; then
-    TOPO_RANK=\$(( 10#\$_hostname_digits ))
   fi
 fi
 
@@ -718,7 +757,7 @@ fi
 
 # Clear MPI/PMIx/SLURM env vars inherited from the srun launcher so TRT-LLM's
 # MPI_Init (in the ray daemon child process below) starts clean.
-# NOTE: keep this after topology_probe.sh, which reads SLURM_TOPOLOGY_ADDR/SLURM_PROCID.
+# NOTE: keep this after topology_probe.sh, which reads SLURMD_NODENAME/SLURM_PROCID.
 for v in \$(env | awk -F= '/^(PMI|PMIX|MPI|OMPI|SLURM)_/{print \$1}'); do
     unset "\$v"
 done
@@ -920,7 +959,7 @@ source $LOG_DIR/topology_probe.sh
 
 # Clear MPI/PMIx/SLURM env vars inherited from the srun launcher so TRT-LLM's
 # MPI_Init (in the ray daemon child process below) starts clean.
-# NOTE: keep this after topology_probe.sh, which reads SLURM_TOPOLOGY_ADDR/SLURM_PROCID.
+# NOTE: keep this after topology_probe.sh, which reads SLURMD_NODENAME/SLURM_PROCID.
 for v in \$(env | awk -F= '/^(PMI|PMIX|MPI|OMPI|SLURM)_/{print \$1}'); do
     unset "\$v"
 done
