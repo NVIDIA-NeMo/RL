@@ -136,6 +136,7 @@ def _make_master_config(
             "save_period": 10,
             "save_optimizer": False,
         },
+        logger={"wandb_enabled": False, "wandb": {}},
         loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
         env={},
         cluster={"num_nodes": 2, "gpus_per_node": 8, "segment_size": None},
@@ -163,6 +164,16 @@ def _ppo_master_config(**kwargs) -> MasterConfig:
     return _make_master_config(**kwargs)
 
 
+def _colocated_megatron_ppo_config(
+    *, policy_training_start_step: int = 0
+) -> MasterConfig:
+    mc = _ppo_master_config(megatron_enabled=True)
+    mc.ppo.policy_training_start_step = policy_training_start_step
+    mc.policy["generation"]["backend"] = "megatron"
+    mc.policy["generation"]["colocated"]["enabled"] = True
+    return mc
+
+
 class TestAlgorithmBlockValidator:
     """Exactly-one-block, enforced at construction so no reader sees a bad pair."""
 
@@ -186,7 +197,8 @@ class TestAlgorithmBlockValidator:
         ids=["grpo", "ppo"],
     )
     def test_the_exemplars_still_validate(self, name):
-        MasterConfig(**self._resolved(name))
+        config = MasterConfig(**self._resolved(name))
+        assert config.checkpointing["save_period"] == 1
 
     def test_rejects_a_config_with_no_algorithm_block(self):
         resolved = self._resolved("grpo_math_1B_megatron_single_controller.yaml")
@@ -235,8 +247,19 @@ class TestAlgoConfigSelection:
 
 
 class TestPPOValidation:
-    def test_accepts_a_well_formed_ppo_config(self):
-        validate_single_controller_config(_ppo_master_config())
+    @pytest.mark.parametrize(
+        "make_config",
+        [
+            _ppo_master_config,
+            _colocated_megatron_ppo_config,
+            # Warmup steps wake the stood-down engine through the
+            # (frozen-weight) sync, so the combination is legal.
+            lambda: _colocated_megatron_ppo_config(policy_training_start_step=2),
+        ],
+        ids=["base", "colocated_megatron", "colocated_megatron_warmup"],
+    )
+    def test_accepts_a_well_formed_ppo_config(self, make_config):
+        validate_single_controller_config(make_config())
 
     def test_rejects_message_penalties_without_nemo_gym(self):
         mc = _ppo_master_config()
@@ -328,13 +351,11 @@ class TestPPOValidation:
     @pytest.mark.parametrize(
         "enable",
         [
-            lambda cfg: setattr(cfg, "overlong_filtering", True),
             lambda cfg: setattr(cfg, "use_dynamic_sampling", True),
             lambda cfg: setattr(cfg.reward_scaling, "enabled", True),
             lambda cfg: setattr(cfg.reward_shaping, "enabled", True),
         ],
         ids=[
-            "overlong_filtering",
             "use_dynamic_sampling",
             "reward_scaling",
             "reward_shaping",
@@ -349,14 +370,12 @@ class TestPPOValidation:
         ):
             validate_single_controller_config(mc)
 
-    def test_rejects_shaping_on_a_grpo_run_too(self):
-        mc = _make_master_config()
-        mc.grpo.overlong_filtering = True
+    @pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
+    def test_accepts_overlong_filtering(self, algorithm: str):
+        mc = _make_master_config() if algorithm == "grpo" else _ppo_master_config()
+        getattr(mc, algorithm).overlong_filtering = True
 
-        with pytest.raises(
-            NotImplementedError, match="overlong_filtering not supported"
-        ):
-            validate_single_controller_config(mc)
+        validate_single_controller_config(mc)
 
     def test_rejects_a_dtensor_critic(self):
         """Only the Megatron value worker carries TQWorkerMixin."""
