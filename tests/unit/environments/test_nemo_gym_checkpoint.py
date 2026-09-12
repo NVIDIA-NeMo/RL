@@ -818,3 +818,56 @@ def test_agent_prepare_retries_completed_result_blocker() -> None:
 
     assert result["ready"] is True
     assert calls == [2]
+
+
+def test_agent_prepare_timeout_resumes_after_completed_result_blocker() -> None:
+    env = _checkpoint_env()
+    capabilities = {
+        "policy": _capability(
+            "responses_api_models",
+            "policy",
+            admission_states=["accepting", "draining", "paused"],
+            concurrency_contract="stateless",
+            instance_role="policy",
+        ),
+        "agent": _capability("responses_api_agents", "agent"),
+    }
+
+    async def discover_control(_method, _path, *, server_name, **_kwargs):
+        return capabilities[server_name]
+
+    env._control = AsyncMock(side_effect=discover_control)
+    asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
+    resume_order: list[str] = []
+
+    async def prepare_control(_method, path, *, server_name, **_kwargs):
+        if path.endswith("/pause"):
+            return {
+                "state": "paused",
+                "workers": {"acknowledged": 1, "expected": 1},
+                "inflight_total": 0,
+                "waiters_total": 0,
+            }
+        if path.endswith("/prepare"):
+            raise GymControlRequestError(
+                "completed prompt-group result still awaits acknowledgement",
+                status=409,
+                error_code="agent_prepare_incomplete",
+            )
+        resume_order.append(server_name)
+        if server_name == "policy":
+            return {
+                "state": "accepting",
+                "workers": {"acknowledged": 1, "expected": 1},
+                "released_waiters": 0,
+            }
+        return {"state": "accepting", "released": 0}
+
+    env._control = AsyncMock(side_effect=prepare_control)
+
+    with pytest.raises(TimeoutError, match="participants were resumed"):
+        asyncio.run(env.prepare_checkpoint("snapshot-prompt-group", time.time() + 0.01))
+
+    assert resume_order == ["agent", "policy"]
+    assert env._active_gym_checkpoint_id is None
+    assert env._gym_execution_registry.status()["frozen_checkpoint_id"] is None
