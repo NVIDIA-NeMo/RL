@@ -16,7 +16,7 @@ import math
 import random
 import warnings
 from functools import partial, wraps
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 import torch
@@ -30,6 +30,9 @@ from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.fastokens import maybe_patch_fastokens
 from nemo_rl.utils.logger import Logger
+
+if TYPE_CHECKING:
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
 def get_gdpo_reward_component_keys(batch) -> list[str]:
@@ -467,7 +470,9 @@ def get_tokenizer(
     return tokenizer if processor is None else processor
 
 
-def maybe_pad_last_batch(batch: dict, dp_size: int, mbs: int) -> dict:
+def maybe_pad_last_batch(
+    batch: "BatchedDataDict[Any]", dp_size: int, mbs: int
+) -> "BatchedDataDict[Any]":
     """Pads the given batch so that its size is divisible by (mbs * dp_size).
 
     Args:
@@ -481,48 +486,39 @@ def maybe_pad_last_batch(batch: dict, dp_size: int, mbs: int) -> dict:
     min_padding = (math.ceil(batch.size / (mbs * dp_size)) * mbs * dp_size) - batch.size
     if min_padding > 0:
         print(f"Padding last validation batch with {min_padding} padding samples")
-        # Pad input_ids
-        batch["input_ids"] = torch.cat(
-            [
-                batch["input_ids"],
-                batch["input_ids"][-1].unsqueeze(0).repeat(min_padding, 1),
-            ]
-        )
-        # Pad input_lengths
-        batch["input_lengths"] = torch.cat(
-            [
-                batch["input_lengths"],
-                batch["input_lengths"][-1].unsqueeze(0).repeat(min_padding),
-            ]
-        )
-        if "token_mask" in batch:
-            # Pad token_mask
-            batch["token_mask"] = torch.cat(
-                [
-                    batch["token_mask"],
-                    batch["token_mask"][-1].unsqueeze(0).repeat(min_padding, 1),
-                ]
-            )
-        # Pad sample_mask
-        batch["sample_mask"] = torch.cat(
-            [
-                batch["sample_mask"],
-                torch.zeros_like(batch["sample_mask"][-1])
-                .unsqueeze(0)
-                .repeat(min_padding),
-            ]
-        )
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
-        if "reference_policy_logprobs" in batch:
-            # Pad reference_policy_logprobs
-            batch["reference_policy_logprobs"] = torch.cat(
-                [
-                    batch["reference_policy_logprobs"],
-                    batch["reference_policy_logprobs"][-1]
-                    .unsqueeze(0)
-                    .repeat(min_padding, 1),
-                ]
-            )
+        if "pair_index" in batch and "is_chosen" in batch:
+            if min_padding % 2 != 0:
+                raise ValueError(
+                    "Preference validation batches must be padded by complete pairs."
+                )
+            # Padding runs before sequence packing, while preference rows are
+            # still interleaved. Duplicate complete media-bearing pairs so all
+            # batch-aligned fields remain consistent.
+            pair_repeats = min_padding // 2
+            padding_indices = [batch.size - 2, batch.size - 1] * pair_repeats
+        else:
+            padding_indices = [batch.size - 1] * min_padding
+
+        padding_batch = batch.select_indices(padding_indices)
+        padding_batch["sample_mask"] = torch.zeros_like(padding_batch["sample_mask"])
+
+        if "pair_index" in padding_batch and "is_chosen" in padding_batch:
+            first_padding_pair = int(batch["pair_index"].max().item()) + 1
+            padding_batch["pair_index"] = torch.arange(
+                first_padding_pair,
+                first_padding_pair + min_padding // 2,
+                dtype=batch["pair_index"].dtype,
+                device=batch["pair_index"].device,
+            ).repeat_interleave(2)
+            padding_batch["is_chosen"] = torch.tensor(
+                [True, False],
+                dtype=batch["is_chosen"].dtype,
+                device=batch["is_chosen"].device,
+            ).repeat(min_padding // 2)
+
+        batch = BatchedDataDict.from_batches([batch, padding_batch])
     return batch
 
 
@@ -967,28 +963,62 @@ EFFICIENCY_CATEGORIES = (
     WALL_CLOCK_EFFICIENCY_CATEGORIES + THREAD_ACCUMULATED_EFFICIENCY_CATEGORIES
 )
 
+# Wall-clock categories whose value covers the whole run rather than one step.
+# The driver's Timer is reset every step, so its idle categories are per-step
+# deltas -- but init/total is measured once before the loop and republished
+# unchanged afterwards, so it cannot be compared against a single step's wall
+# time. Mirrored by _RUN_WINDOW_WALL_CLOCK_CATEGORIES in
+# nemo_rl/telemetry/metrics.py, which cannot import this module (torch); a test
+# keeps the two in lockstep.
+RUN_WINDOW_WALL_CLOCK_CATEGORIES = frozenset({"init/total"})
+
+STEP_WINDOW_WALL_CLOCK_CATEGORIES = [
+    category
+    for category in WALL_CLOCK_EFFICIENCY_CATEGORIES
+    if category not in RUN_WINDOW_WALL_CLOCK_CATEGORIES
+]
+
 
 def print_efficiency_summary(
     efficiency_metrics: dict[str, float],
     total_wall_time_s: float,
     step: int,
+    step_wall_time_s: Optional[float] = None,
 ) -> dict[str, float]:
     """Print a summary table of efficiency metrics and return loggable dict.
 
-    Wall-clock categories (driver-side idle) are used for the efficiency
-    percentage.  Collector-side categories are summed across concurrent
-    threads and reported separately as thread-seconds so they are not
-    compared directly against a single wall-clock denominator.
+    Driver-side wall-clock categories drive the efficiency percentage.
+    Collector-side categories are summed across concurrent threads and reported
+    separately as thread-seconds so they are not compared directly against a
+    single wall-clock denominator.
+
+    The efficiency percentage is a *per-step* ratio, because the numerator is:
+    the driver resets its Timer every step, so its idle categories are per-step
+    deltas. Dividing them by the cumulative ``total_wall_time_s`` would make the
+    run look monotonically more efficient the longer it ran, whatever the idle
+    time actually did. ``init/total`` is excluded from that numerator for the
+    same reason in reverse -- it is a run-long constant (see
+    :data:`RUN_WINDOW_WALL_CLOCK_CATEGORIES`) and would otherwise add the whole
+    startup cost to every single step's waste.
 
     Args:
         efficiency_metrics: Dict mapping category labels to total seconds spent.
         total_wall_time_s: Total wall-clock time in seconds since training began.
+            Used for the per-category ``% of Wall`` column.
         step: Current training step number.
+        step_wall_time_s: Wall-clock seconds in the step being reported, the
+            denominator of the efficiency percentage. Defaults to
+            ``total_wall_time_s`` for callers with no per-step measurement.
 
     Returns:
         Dict of metrics suitable for logging to WandB/TensorBoard, including
         per-category seconds and percentages, total waste, and efficiency_pct.
     """
+    # Captured before the fallback below, because it decides which window the
+    # efficiency percentage actually covers.
+    pct_is_per_step = step_wall_time_s is not None
+    if step_wall_time_s is None:
+        step_wall_time_s = total_wall_time_s
     print(f"\n📊 Efficiency Summary (Step {step}):")
     print(f"  {'Category':<35} {'Time (s)':>10} {'% of Wall':>10}")
     print(f"  {'─' * 57}")
@@ -1010,17 +1040,17 @@ def print_efficiency_summary(
         loggable[f"efficiency/{category}_s"] = duration
 
     wall_waste = sum(
-        efficiency_metrics.get(cat, 0.0) for cat in WALL_CLOCK_EFFICIENCY_CATEGORIES
+        efficiency_metrics.get(cat, 0.0) for cat in STEP_WINDOW_WALL_CLOCK_CATEGORIES
     )
-    if total_wall_time_s > 0 and wall_waste > total_wall_time_s:
-        wall_waste = total_wall_time_s
+    if step_wall_time_s > 0 and wall_waste > step_wall_time_s:
+        wall_waste = step_wall_time_s
 
-    productive = max(0.0, total_wall_time_s - wall_waste)
+    productive = max(0.0, step_wall_time_s - wall_waste)
     efficiency_pct = (
-        (productive / total_wall_time_s * 100) if total_wall_time_s > 0 else 100.0
+        (productive / step_wall_time_s * 100) if step_wall_time_s > 0 else 100.0
     )
     efficiency_pct = min(100.0, max(0.0, efficiency_pct))
-    waste_pct = (wall_waste / total_wall_time_s * 100) if total_wall_time_s > 0 else 0.0
+    waste_pct = (wall_waste / step_wall_time_s * 100) if step_wall_time_s > 0 else 0.0
     waste_pct = min(100.0, max(0.0, waste_pct))
 
     print(f"  {'─' * 57}")
@@ -1028,14 +1058,26 @@ def print_efficiency_summary(
         f"  {'Collector thread-seconds (info)':<35} "
         f"{thread_seconds_total:>10.2f} {'n/a':>10}"
     )
-    print(f"  {'Wall-clock waste':<35} {wall_waste:>10.2f} {waste_pct:>9.2f}%")
-    print(f"  {'Productive time':<35} {productive:>10.2f} {efficiency_pct:>9.2f}%")
-    print(f"  {'Efficiency':<35} {'':>10} {efficiency_pct:>9.2f}%")
+    # Labelled "this step" because the denominator is the step's wall time, not
+    # the run's -- the column header above it is a share of the run.
+    print(
+        f"  {'Wall-clock waste (this step)':<35} {wall_waste:>10.2f} {waste_pct:>9.2f}%"
+    )
+    print(
+        f"  {'Productive time (this step)':<35} {productive:>10.2f} {efficiency_pct:>9.2f}%"
+    )
+    print(f"  {'Efficiency (this step)':<35} {'':>10} {efficiency_pct:>9.2f}%")
 
     loggable["efficiency/thread_seconds_total_s"] = thread_seconds_total
     loggable["efficiency/total_waste_s"] = wall_waste
     loggable["efficiency/productive_time_s"] = productive
     loggable["efficiency/efficiency_pct"] = efficiency_pct
     loggable["efficiency/total_wall_time_s"] = total_wall_time_s
+    # Carries the window of the ratio above to the OTel tee, which tags it. A
+    # caller that supplies no per-step denominator gets a run-cumulative ratio,
+    # and publishing that as per-step would state the opposite of what it is.
+    # A float, not the string it represents, because everything in this dict is
+    # also logged to WandB/TensorBoard as a scalar.
+    loggable["efficiency/efficiency_pct_is_per_step"] = float(pct_is_per_step)
 
     return loggable

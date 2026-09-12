@@ -72,6 +72,7 @@ from nemo_rl.models.megatron.setup import (
     setup_distributed,
     setup_model_and_optimizer,
     validate_and_set_config,
+    validate_megatron_config,
     validate_model_paths,
 )
 from nemo_rl.models.megatron.train import (
@@ -84,6 +85,7 @@ from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorke
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueOutputSpec
+from nemo_rl.telemetry.setup import init_telemetry_worker
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
@@ -353,6 +355,10 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         # (RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1).
         bind_to_gpu_numa(local_rank)
 
+        # OTel providers are process-global, so the driver's setup does not
+        # reach this actor. No-op unless telemetry is enabled.
+        init_telemetry_worker()
+
         self.cfg = config
         self.rank = get_rank_safe()
 
@@ -403,7 +409,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         ) and (runtime_config.model_cfg.fp16 or runtime_config.model_cfg.bf16)
 
         # Validate configuration
-        self.megatron_cfg.validate()
+        validate_megatron_config(self.megatron_cfg, self._policy_like_cfg)
 
         assert self.megatron_cfg.model.virtual_pipeline_model_parallel_size in (
             None,

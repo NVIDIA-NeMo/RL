@@ -35,6 +35,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    reject_unenforceable_refit_deadline,
 )
 from nemo_rl.models.generation.trtllm.config import TrtllmConfig
 
@@ -463,7 +464,10 @@ class TrtllmGeneration(GenerationInterface):
         )
         ray.get(futures)
 
-    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
+    def update_weights_from_collective(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
+        reject_unenforceable_refit_deadline("TensorRT-LLM", refit_timeout_s)
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group not initialised")
         trtllm_cfg = self.cfg["trtllm_cfg"]

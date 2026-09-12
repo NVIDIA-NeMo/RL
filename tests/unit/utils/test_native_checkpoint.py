@@ -390,6 +390,7 @@ def test_convert_dcp_to_hf(policy, num_gpus, request):
                 "model_save_format": "torch_save" if policy_version_is_v2 else None,
             },
         )
+        policy.finalize_async_save()
 
         # Dynamically create the expected set of distcp files based on num_gpus
         expected_distcp_files = {f"__{rank}_0.distcp" for rank in range(num_gpus)}

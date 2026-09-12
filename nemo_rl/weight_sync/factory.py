@@ -46,6 +46,7 @@ def create_weight_synchronizer(
     train_cluster: Optional[Any] = None,
     inference_cluster: Optional[Any] = None,
     refit_buffer_size_gb: Optional[float | int] = None,
+    refit_timeout_s: Optional[float] = None,
 ) -> WeightSynchronizer:
     """Create the appropriate WeightSynchronizer for the given deployment.
 
@@ -60,6 +61,9 @@ def create_weight_synchronizer(
         inference_cluster: RayVirtualCluster for inference workers. Same
             requirement as ``train_cluster``.
         refit_buffer_size_gb: Optional fixed buffer size for weight staging.
+        refit_timeout_s: Deadline for one refit collective, after which each participating
+            worker aborts its own communicator so the controller can rebuild over the
+            survivors. None disarms it.
 
     Returns:
         A WeightSynchronizer instance appropriate for the deployment topology.
@@ -80,7 +84,13 @@ def create_weight_synchronizer(
             f"Supported backends: {sorted(_SUPPORTED_BACKENDS)}"
         )
 
-    checkpoint_engine_config = checkpoint_engine_refit_config(generation.cfg)
+    # Megatron owns its refit selectors (including "mcore"); the vLLM-oriented
+    # checkpoint-engine normalization rejects that valid Megatron value.
+    checkpoint_engine_config = (
+        None
+        if generation_backend == MEGATRON_BACKEND
+        else checkpoint_engine_refit_config(generation.cfg)
+    )
     if checkpoint_engine_config is not None:
         if colocated:
             raise ValueError(
@@ -120,6 +130,7 @@ def create_weight_synchronizer(
             colocated=colocated,
             train_cluster=train_cluster,
             inference_cluster=inference_cluster,
+            refit_timeout_s=refit_timeout_s,
         )
 
     if generation_backend == SGLANG_BACKEND:
@@ -169,6 +180,7 @@ def create_weight_synchronizer(
                 generation=generation,
                 train_cluster=train_cluster,
                 inference_cluster=inference_cluster,
+                refit_timeout_s=refit_timeout_s,
             )
 
         from nemo_rl.weight_sync.collective_weight_synchronizer import (
@@ -180,6 +192,7 @@ def create_weight_synchronizer(
             generation=generation,
             train_cluster=train_cluster,
             inference_cluster=inference_cluster,
+            refit_timeout_s=refit_timeout_s,
         )
 
     from nemo_rl.weight_sync.ipc_weight_synchronizer import (

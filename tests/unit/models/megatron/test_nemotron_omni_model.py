@@ -23,27 +23,33 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-# This module is collected by catch-all unit-test lanes that intentionally do
-# not install the mcore extra. Skip before importing MBridge so those lanes can
-# deselect the mcore-marked tests without failing during collection.
+# This module is collected by every unit-test shard, including lanes that do
+# not install the Megatron-Bridge extra. Skip at collection time there instead
+# of turning an unrelated shard into an import error.
+pytest.importorskip("megatron.core")
 pytest.importorskip("megatron.bridge")
 
-from megatron.bridge.models.nemotron_omni.nemotron_omni_provider import (
+from megatron.bridge.models.nemotron_omni.nemotron_omni_provider import (  # noqa: E402
     NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT,
     NemotronOmniModelProvider,
 )
-from megatron.core import dist_checkpointing, parallel_state
-from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core import dist_checkpointing, parallel_state  # noqa: E402
+from megatron.core.distributed import DistributedDataParallelConfig  # noqa: E402
+from megatron.core.tensor_parallel.random import (  # noqa: E402
+    model_parallel_cuda_manual_seed,
+)
+from megatron.core.transformer.enums import AttnBackend  # noqa: E402
 
-from nemo_rl.data.multimodal_utils import PackedTensor
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import (
+from nemo_rl.data.multimodal_utils import PackedTensor  # noqa: E402
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict  # noqa: E402
+from nemo_rl.distributed.model_utils import (  # noqa: E402
     from_parallel_logits_to_logprobs_packed_sequences,
 )
-from nemo_rl.models.megatron.data import get_microbatch_iterator, process_microbatch
-from nemo_rl.models.megatron.train import (
+from nemo_rl.models.megatron.data import (  # noqa: E402
+    get_microbatch_iterator,
+    process_microbatch,
+)
+from nemo_rl.models.megatron.train import (  # noqa: E402
     LogprobsPostProcessor,
     megatron_forward_backward,
 )
@@ -79,7 +85,7 @@ class _TinyOmniProvider(NemotronOmniModelProvider):
     use_vision_backbone_fp8_arch: bool = False
     vision_proj_ffn_hidden_size: int = 256
     pipeline_model_parallel_size: int = 1
-    use_cpu_initialization: bool = True
+    use_cpu_initialization: bool = False
     gradient_accumulation_fusion: bool = False
     nemotron_omni_contract: str = NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT
 
@@ -151,6 +157,7 @@ def _build_distributed_model(
             use_distributed_optimizer=False,
             check_for_nan_in_grad=True,
         ),
+        use_cpu_initialization=False,
         wrap_with_ddp=True,
         mixed_precision_wrapper=None,
     )
