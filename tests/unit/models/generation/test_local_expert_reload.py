@@ -10,11 +10,16 @@
 # limitations under the License.
 
 import inspect
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from nemo_rl.models.generation.vllm.local_expert_reload import copy_local_bf16_expert
+from nemo_rl.models.generation.vllm.local_expert_reload import (
+    LocalBf16ExpertReload,
+    LocalExpertBinding,
+    copy_local_bf16_expert,
+)
 
 
 @pytest.mark.parametrize("gated", [False, True])
@@ -91,3 +96,117 @@ def test_vllm_counter_counts_only_payload() -> None:
     )
     count, _ = get_numel_loaded(copy_local_bf16_expert, bound)
     assert count == payload.numel()
+
+
+def _checkpoint_model(gated: bool, padded: bool) -> torch.nn.Module:
+    model = torch.nn.Module()
+    model.experts = torch.nn.Module()
+    model.experts.moe_config = SimpleNamespace(is_act_and_mul=gated)
+    width, hidden = (12, 20) if padded else (8, 16)
+    model.experts.w13 = torch.nn.Parameter(
+        torch.full((2, width * (2 if gated else 1), hidden), -1, dtype=torch.bfloat16),
+        requires_grad=False,
+    )
+    model.experts.w2 = torch.nn.Parameter(
+        torch.full((2, hidden, width), -1, dtype=torch.bfloat16), requires_grad=False
+    )
+    return model
+
+
+def _bindings(gated: bool) -> dict[str, LocalExpertBinding]:
+    result = {
+        "up": LocalExpertBinding("experts.w13", "up_proj", (2, 8, 16)),
+        "down": LocalExpertBinding("experts.w2", "down_proj", (2, 16, 8)),
+    }
+    if gated:
+        result["gate"] = LocalExpertBinding("experts.w13", "gate_proj", (2, 8, 16))
+    return result
+
+
+@pytest.mark.parametrize("gated", [False, True])
+@pytest.mark.parametrize("padded", [False, True])
+def test_installed_online_reload_preserves_values_and_storage(
+    gated: bool, padded: bool
+) -> None:
+    pytest.importorskip("vllm")
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        finalize_layerwise_reload,
+        initialize_layerwise_reload,
+        record_metadata_for_reloading,
+    )
+
+    model = _checkpoint_model(gated, padded)
+    record_metadata_for_reloading(model)
+    bindings = _bindings(gated)
+    originals = dict(model.named_parameters())
+    for update in (1, 2, 3):
+        reload = LocalBf16ExpertReload(model, bindings)
+        initialize_layerwise_reload(model)
+        expected13 = torch.zeros_like(originals["experts.w13"])
+        expected2 = torch.zeros_like(originals["experts.w2"])
+        for name, binding in bindings.items():
+            value = update * 10 + {"gate": 1, "up": 2, "down": 3}[name]
+            payload = torch.full(binding.local_shape, value, dtype=torch.bfloat16)
+            reload.load(name, payload)
+            payload.zero_()  # Deferred loading must not retain a borrowed receive buffer.
+            if name == "down":
+                expected2[:, :16, :8] = value
+            else:
+                start = expected13.shape[1] // 2 if name == "up" and gated else 0
+                expected13[:, start : start + 8, :16] = value
+        reload.require_complete()
+        finalize_layerwise_reload(model, None)
+        reload.verify_runtime_storage()
+        torch.testing.assert_close(model.experts.w13, expected13, rtol=0, atol=0)
+        torch.testing.assert_close(model.experts.w2, expected2, rtol=0, atol=0)
+
+
+def test_missing_component_poisoning() -> None:
+    reload = LocalBf16ExpertReload(_checkpoint_model(True, True), _bindings(True))
+    with pytest.raises(RuntimeError, match="Missing local expert"):
+        reload.require_complete()
+    with pytest.raises(RuntimeError, match="unusable"):
+        reload.require_complete()
+
+
+def test_load_before_initialization_rejected() -> None:
+    reload = LocalBf16ExpertReload(_checkpoint_model(True, True), _bindings(True))
+    with pytest.raises(RuntimeError, match="active checkpoint storage"):
+        reload.load("up", torch.ones((2, 8, 16), dtype=torch.bfloat16))
+
+
+def test_duplicate_destination_rejected() -> None:
+    bindings = _bindings(True)
+    bindings["alias"] = bindings["up"]
+    with pytest.raises(ValueError, match="Duplicate local expert destination"):
+        LocalBf16ExpertReload(_checkpoint_model(True, True), bindings)
+
+
+@pytest.mark.parametrize("bad_shape", [False, True])
+def test_incomplete_or_inconsistent_plan_rejected(bad_shape: bool) -> None:
+    bindings = _bindings(True)
+    if bad_shape:
+        bindings["down"] = LocalExpertBinding("experts.w2", "down_proj", (2, 16, 7))
+    else:
+        del bindings["gate"]
+    with pytest.raises(ValueError, match="plan"):
+        LocalBf16ExpertReload(_checkpoint_model(True, True), bindings)
+
+
+def test_duplicate_load_poisoning() -> None:
+    pytest.importorskip("vllm")
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        initialize_layerwise_reload,
+        record_metadata_for_reloading,
+    )
+
+    model = _checkpoint_model(True, True)
+    record_metadata_for_reloading(model)
+    reload = LocalBf16ExpertReload(model, _bindings(True))
+    initialize_layerwise_reload(model)
+    payload = torch.ones((2, 8, 16), dtype=torch.bfloat16)
+    reload.load("up", payload)
+    with pytest.raises(ValueError, match="Duplicate local expert component"):
+        reload.load("up", payload)
+    with pytest.raises(RuntimeError, match="unusable"):
+        reload.load("gate", payload)
