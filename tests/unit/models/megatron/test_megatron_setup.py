@@ -2697,6 +2697,64 @@ class TestCreateMegatronConfigOptimizerFp8Recipe:
 
 
 @pytest.mark.mcore
+class TestCreateMegatronConfigFP8Buffers:
+    """Tests for MXFP8 parameter-buffer plumbing into optimizer and DDP."""
+
+    @staticmethod
+    def _subconfig_kwargs():
+        from nemo_rl.models.megatron.setup import _create_megatron_config
+
+        config = {
+            "megatron_cfg": {
+                "optimizer": {"use_distributed_optimizer": True},
+                "scheduler": {},
+                "distributed_data_parallel_config": {
+                    "overlap_param_gather": True,
+                    "grad_reduce_in_fp32": False,
+                    "overlap_grad_reduce": True,
+                    "data_parallel_sharding_strategy": "optim_grads_params",
+                },
+                "fp8_cfg": {
+                    "enabled": True,
+                    "fp8_recipe": "mxfp8",
+                    "fp8_param": True,
+                },
+                "train_iters": 10,
+            },
+            "train_global_batch_size": 8,
+        }
+        with (
+            patch("nemo_rl.models.megatron.setup.ConfigContainer"),
+            patch("nemo_rl.models.megatron.setup.TrainingConfig"),
+            patch("nemo_rl.models.megatron.setup.OptimizerConfig") as mock_optimizer,
+            patch(
+                "nemo_rl.models.megatron.setup.DistributedDataParallelConfig"
+            ) as mock_ddp,
+            patch("nemo_rl.models.megatron.setup.SchedulerConfig"),
+            patch("nemo_rl.models.megatron.setup.TokenizerConfig"),
+            patch("nemo_rl.models.megatron.setup.LoggerConfig"),
+        ):
+            _create_megatron_config(
+                model_cfg=MagicMock(),
+                checkpoint_config=MagicMock(),
+                config=config,
+                hf_model_name="test-model",
+                dtype=torch.bfloat16,
+                fp8_param_enabled=True,
+            )
+
+        return mock_optimizer.call_args.kwargs, mock_ddp.call_args.kwargs
+
+    def test_mxfp8_recipe_and_param_gather_are_forwarded(self):
+        optimizer_kwargs, ddp_kwargs = self._subconfig_kwargs()
+
+        assert optimizer_kwargs["fp8_recipe"] == "mxfp8"
+        assert optimizer_kwargs["reuse_grad_buf_for_mxfp8_param_ag"] is True
+        assert ddp_kwargs["fp8_param_gather"] is True
+        assert ddp_kwargs["reuse_grad_buf_for_mxfp8_param_ag"] is True
+
+
+@pytest.mark.mcore
 class TestCreateMegatronConfigOptimizerOffload:
     """Tests for optimizer CPU-offload plumbing into Megatron Core."""
 
@@ -3793,6 +3851,61 @@ class TestDraftSetup:
         assert (
             mock_build_draft_model.call_args.kwargs["policy_model_chunk"] is chunks[1]
         )
+
+    @pytest.mark.parametrize(
+        "draft_cfg_kind", ["absent", "dict-disabled", "typed-disabled"]
+    )
+    @patch("nemo_rl.models.megatron.setup._load_checkpoint_from_path")
+    @patch("nemo_rl.models.megatron.setup.get_pg_collection")
+    @patch("nemo_rl.models.megatron.draft.training.build_draft_model")
+    def test_draft_pre_wrap_hook_is_identity_when_draft_disabled(
+        self,
+        mock_build_draft_model,
+        mock_get_pg_collection,
+        mock_load_checkpoint,
+        draft_cfg_kind,
+    ):
+        """A disabled draft config must leave the policy chunks untouched.
+
+        `_create_draft_pre_wrap_hook` resolves the speculator eagerly, so a
+        disabled or absent config has to short-circuit before the builder, the
+        process-group lookup and the pretrained preload run.
+        """
+        from nemo_rl.models.megatron.setup import _create_draft_pre_wrap_hook
+        from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
+
+        class DummyChunk(torch.nn.Module):
+            def __init__(self, *, post_process: bool = False):
+                super().__init__()
+                self.post_process = post_process
+
+        chunks = [
+            DummyChunk(post_process=False),
+            DummyChunk(post_process=True),
+        ]
+        if draft_cfg_kind == "absent":
+            policy_cfg = {}
+        elif draft_cfg_kind == "dict-disabled":
+            policy_cfg = {"draft": {"enabled": False}}
+        else:
+            policy_cfg = {"draft": Eagle3DraftConfig(enabled=False, model_name=None)}
+
+        hook = _create_draft_pre_wrap_hook(
+            policy_cfg=policy_cfg,
+            megatron_cfg=MagicMock(),
+            state=MagicMock(),
+            # True so the preload branch would fire if the disabled config were
+            # not short-circuited.
+            preload_policy_from_pretrained=True,
+        )
+
+        returned_model = hook(chunks)
+
+        assert returned_model is chunks
+        assert all(getattr(chunk, "draft_model", None) is None for chunk in chunks)
+        mock_build_draft_model.assert_not_called()
+        mock_get_pg_collection.assert_not_called()
+        mock_load_checkpoint.assert_not_called()
 
     @patch("nemo_rl.models.megatron.draft.utils.copy_policy_lm_head_to_draft")
     @patch("nemo_rl.models.megatron.draft.utils.load_hf_weights_to_eagle")
