@@ -1367,6 +1367,15 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 self.nccl_reshard_refit_info
             )
 
+    def _allows_receiver_dtype_conversion(
+        self,
+        param_info: dict[str, Any],
+        wire_dtype: torch.dtype,
+        target_dtype: torch.dtype,
+    ) -> bool:
+        """Return whether a subclass will replace a mismatched receive spec."""
+        return False
+
     def build_hf_to_local_param_map(self, refit_info: dict) -> HFToLocalParamMap:
         """Build the vLLM-backend ``hf_to_local_param_map`` (HFToLocalParamMap).
 
@@ -1621,7 +1630,13 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 specs[hf_name] = _bf16_to_mxfp8_receiver_quant_spec(
                     vllm_param, scale_param, merged_slice
                 )
-            elif wire_dtype != vllm_param.dtype:
+            elif wire_dtype != vllm_param.dtype and not (
+                self._allows_receiver_dtype_conversion(
+                    param_info,
+                    wire_dtype,
+                    vllm_param.dtype,
+                )
+            ):
                 raise ValueError(
                     f"build_hf_to_local_param_map: wire dtype {wire_dtype} does not "
                     f"match target dtype {vllm_param.dtype} for {hf_name!r}"
