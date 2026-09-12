@@ -1407,6 +1407,40 @@ def test_native_mxfp8_refit_skips_param_sync_without_shared_storage() -> None:
     worker._materialize_model_params_for_read.assert_not_called()
 
 
+@pytest.mark.parametrize("pp_rank", [0, 1, 3])
+def test_refit_metadata_map_precedes_transport_init(monkeypatch, pp_rank: int) -> None:
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+    from nemo_rl.weight_sync.nccl_reshard_utils import LocalParamSpec
+
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker._is_native_mxfp8_export = MagicMock(return_value=False)
+    local_name = f"model.layers.{pp_rank}.mlp.down_proj.weight"
+    local_spec = LocalParamSpec(base=torch.ones(2, 2))
+    worker._iter_local_hf_param_shards = MagicMock(
+        return_value=[(local_name, local_spec)]
+    )
+    monkeypatch.setattr(
+        worker_module.parallel_state, "get_pipeline_model_parallel_rank", lambda: pp_rank
+    )
+    info = {
+        "layer_names": [f"model.layers.{rank}" for rank in range(4)],
+        "per_layer_params": {
+            f"model.layers.{rank}": [{
+                "name": f"model.layers.{rank}.mlp.down_proj.weight", "pp_stage": rank
+            }]
+            for rank in range(4)
+        },
+    }
+
+    assert not hasattr(worker, "my_pp_stage")
+    mapping = worker._build_source_hf_to_local_param_map(info)
+
+    assert mapping.get(local_name) is local_spec
+    for rank in range(4):
+        if rank != pp_rank:
+            assert mapping.get(f"model.layers.{rank}.mlp.down_proj.weight") is None
+
+
 def test_native_mxfp8_transfer_uses_metadata_component_order(monkeypatch) -> None:
     import nemo_rl.weight_sync.xferdtensor as xfer_module
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
