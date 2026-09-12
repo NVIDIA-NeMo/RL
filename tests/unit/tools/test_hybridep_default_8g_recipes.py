@@ -49,10 +49,22 @@ X86_HYBRIDEP_ENVIRONMENT_KEYS = set(X86_HYBRIDEP_ENVIRONMENT)
 GB200_HYBRIDEP_RECIPES = {
     "grpo-deepseek-v3-32n4g.yaml": "16",
     "grpo-deepseek-v3-64n4g.yaml": "32",
+    "grpo-deepseek-v3-64n4g-mxfp8-rollout.yaml": "32",
     "grpo-deepseek-v3-64n4g-async-1off.yaml": "16",
+    "grpo-deepseek-v3-64n4g-async-1off-mxfp8-rollout.yaml": "16",
+    "grpo-nemotron3-super-120BA12B-32n4g.yaml": "16",
+    "grpo-nemotron3-super-120BA12B-32n4g-mxfp8-rollout.yaml": "16",
+    "grpo-nemotron3-super-120BA12B-32n4g-async-1off.yaml": "16",
+    "grpo-nemotron3-super-120BA12B-32n4g-async-1off-mxfp8-rollout.yaml": "16",
     "grpo-qwen3-235b-16n4g.yaml": "16",
+    "grpo-qwen3-235b-16n4g-mxfp8-rollout.yaml": "16",
     "grpo-qwen3-235b-32n4g.yaml": "16",
     "grpo-qwen3-235b-32n4g-async-1off.yaml": "16",
+    "grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout.yaml": "16",
+    "grpo-qwen3-30ba3b-4n4g.yaml": "16",
+    "grpo-qwen3-30ba3b-4n4g-mxfp8-rollout.yaml": "16",
+    "grpo-qwen3-30ba3b-4n4g-async-1off.yaml": "8",
+    "grpo-qwen3-30ba3b-4n4g-async-1off-mxfp8-rollout.yaml": "8",
 }
 GB200_HYBRIDEP_ENVIRONMENT_KEYS = {
     "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN",
@@ -69,11 +81,13 @@ DENSE_8G_RECIPES = (
     "grpo-qwen3-32b-8n8g-async-1off.yaml",
 )
 
-FOUR_GPU_NON_HYBRIDEP_RECIPES = (
-    "grpo-nemotron3-super-120BA12B-32n4g.yaml",
-    "grpo-nemotron3-super-120BA12B-32n4g-async-1off.yaml",
-    "grpo-qwen3-30ba3b-4n4g.yaml",
-    "grpo-qwen3-30ba3b-4n4g-async-1off.yaml",
+DENSE_4G_RECIPES = (
+    "grpo-llama3.1-8b-instruct-2n4g.yaml",
+    "grpo-llama3.1-8b-instruct-2n4g-async-1off.yaml",
+    "grpo-qwen3-32b-4n4g.yaml",
+    "grpo-qwen3-32b-4n4g-mxfp8-rollout.yaml",
+    "grpo-qwen3-32b-8n4g-async-1off.yaml",
+    "grpo-qwen3-32b-8n4g-async-1off-mxfp8-rollout.yaml",
 )
 
 
@@ -124,8 +138,8 @@ def test_moe_8g_canonical_recipes_default_to_x86_hybridep(
     assert X86_HYBRIDEP_ENVIRONMENT.items() <= _environment(megatron_cfg).items()
 
 
-@pytest.mark.parametrize("recipe_name", MOE_8G_RECIPES)
-def test_moe_8g_recipes_prepad_only_supported_pipeline_topologies(
+@pytest.mark.parametrize("recipe_name", (*MOE_8G_RECIPES, *GB200_HYBRIDEP_RECIPES))
+def test_moe_recipes_prepad_only_supported_pipeline_topologies(
     recipe_name: str,
 ) -> None:
     megatron_cfg = _megatron_config(_resolve_recipe(recipe_name))
@@ -196,11 +210,50 @@ def test_gb200_qwen3_235b_16n4g_preserves_parent_environment() -> None:
     assert "PYTORCH_CUDA_ALLOC_CONF" in _environment(megatron_cfg)
 
 
-@pytest.mark.parametrize("recipe_name", FOUR_GPU_NON_HYBRIDEP_RECIPES)
-def test_4g_non_hybridep_recipes_do_not_set_hybridep_topology(
+@pytest.mark.parametrize("recipe_name", DENSE_4G_RECIPES)
+def test_dense_4g_recipes_do_not_select_hybridep(
     recipe_name: str,
 ) -> None:
     megatron_cfg = _megatron_config(_resolve_recipe(recipe_name))
 
-    assert megatron_cfg.get("moe_flex_dispatcher_backend") != "hybridep"
+    assert megatron_cfg["moe_token_dispatcher_type"] == "alltoall"
+    assert "moe_flex_dispatcher_backend" not in megatron_cfg
+    assert "moe_hybridep_num_sms" not in megatron_cfg
     assert not GB200_HYBRIDEP_ENVIRONMENT_KEYS.intersection(_environment(megatron_cfg))
+
+
+@pytest.mark.parametrize(
+    "recipe_name",
+    [
+        name
+        for name in GB200_HYBRIDEP_RECIPES
+        if "nemotron3-super" in name or "qwen3-30ba3b" in name
+    ],
+)
+def test_gb200_new_hybridep_recipes_preserve_allocator_environment(
+    recipe_name: str,
+) -> None:
+    megatron_cfg = _megatron_config(_resolve_recipe(recipe_name))
+
+    assert (
+        _environment(megatron_cfg)["PYTORCH_CUDA_ALLOC_CONF"]
+        == "expandable_segments:False"
+    )
+
+
+@pytest.mark.parametrize(
+    "recipe_name",
+    [name for name in GB200_HYBRIDEP_RECIPES if "nemotron3-super" in name],
+)
+def test_gb200_super_recipes_preserve_refit_environment(recipe_name: str) -> None:
+    config = _resolve_recipe(recipe_name)
+    expected = {
+        "NRL_REFIT_BUFFER_MEMORY_RATIO": "0.005",
+        "NRL_REFIT_NUM_BUFFERS": "1",
+    }
+
+    assert expected.items() <= _environment(_megatron_config(config)).items()
+    assert (
+        expected.items()
+        <= config["policy"]["generation"]["vllm_cfg"]["env_vars"].items()
+    )
