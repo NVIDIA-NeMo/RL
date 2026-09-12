@@ -21,7 +21,7 @@ from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 def _patch_transformers_tokenizer_class_set():
     """Undo the transformers block on deepseek_v3 tokenizers.
 
-    Root cause: transformers 5.4-5.11 lists "deepseek_v3" in two internal
+    Root cause: transformers >=5.4 lists "deepseek_v3" in two internal
     registries -- MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS (a set) and
     TOKENIZER_MAPPING_NAMES (a dict pinning it to "TokenizersBackend"). Together
     they force the fast tokenizer backend and suppress trust_remote_code, so
@@ -42,16 +42,14 @@ def _patch_transformers_tokenizer_class_set():
     import transformers
     from packaging.version import Version as PkgVersion
 
-    # This whole patch exists only because Megatron-Bridge caps the transformers
-    # upper bound below 5.9 today, which forces us onto a transformers version
-    # that still has the deepseek_v3 tokenizer-blocklist bug. Once MBridge relaxes
-    # its transformers upper bound to >=5.12, we can drop this workaround.
-    # TODO: remove this patch (and the assert below) once MBridge relaxes its
-    # transformers upper bound past the deepseek_v3 fix (~transformers 5.12).
+    # Transformers 5.12.1 still ships both registry entries, so the patch remains
+    # load-bearing across the currently supported backend environments.
+    # TODO: remove this patch (and the assert below) once the deepseek_v3
+    # entries actually disappear upstream.
     # https://github.com/NVIDIA-NeMo/RL/issues/2764
-    assert PkgVersion(transformers.__version__) < PkgVersion("5.12.0"), (
+    assert PkgVersion(transformers.__version__) < PkgVersion("5.13.0"), (
         f"transformers {transformers.__version__} detected. "
-        "The deepseek_v3 tokenizer-blocklist patch was written for <5.12. "
+        "The deepseek_v3 tokenizer-blocklist patch was verified against <5.13. "
         "Check if the upstream fix now applies and remove this patch if so."
     )
 
@@ -103,6 +101,13 @@ class LoRAConfig(TypedDict):
     dropout_position: Literal["pre", "post"]
     lora_A_init: str
     use_triton: NotRequired[bool]
+    # Warm start: path to a PEFT adapter checkpoint (a directory containing
+    # adapter_model.safetensors + adapter_config.json, e.g. a previous run's
+    # step_*/policy/weights or step_*/policy/weights/model directory) whose
+    # adapter weights initialize this run's LoRA modules. Ignored when resuming
+    # from a NeMo RL training checkpoint (resumed weights take precedence for
+    # the policy; the reference policy still anchors to the restored adapters).
+    restore_from: NotRequired[str | None]
 
 
 class AutomodelBackendConfig(TypedDict):
@@ -218,6 +223,9 @@ class SequencePackingConfig(TypedDict):
     # Preserve the packer's order (or omit for backward compatibility), or
     # execute each DP rank's assigned bins largest-first for allocator reuse.
     microbatch_order: NotRequired[Literal["packer", "largest_first"]]
+    fuse_loss: NotRequired[bool]
+    pair_grouping_key: NotRequired[Literal["pair_index"]]
+    max_sequences_per_bin: NotRequired[int]
 
 
 class RewardModelConfig(TypedDict):
@@ -241,6 +249,14 @@ class MegatronPeftConfig(TypedDict):
     lora_B_init_method: str
     a2a_experimental: bool
     lora_dtype: str | None
+    # Warm start: path to a native Megatron-Bridge PEFT checkpoint (an
+    # iter_XXXXXXX directory, or a checkpoint root resolving to one) whose
+    # adapter weights initialize this run's LoRA modules. The donor checkpoint
+    # must have been saved with a matching peft configuration (dim and alpha
+    # are validated against its run_config.yaml). Ignored when resuming from a
+    # NeMo RL training checkpoint (resumed weights take precedence for the
+    # policy; the reference policy still anchors to the restored adapters).
+    restore_from: NotRequired[str | None]
 
 
 class MegatronOptimizerConfig(TypedDict):
@@ -263,9 +279,14 @@ class MegatronOptimizerConfig(TypedDict):
     clip_grad: float
     # knob to enable optimizer cpu offload
     optimizer_cpu_offload: bool
-    # knob to set the fraction of parameters to keep on CPU
-    # currently if optimizer_cpu_offload is true, this knob must be 1.0
+    # knob to set the fraction of optimizer state and work to keep on CPU
     optimizer_offload_fraction: float
+    # overlap optimizer state transfers with CPU optimizer updates
+    overlap_cpu_optimizer_d2h_h2d: NotRequired[bool]
+    # Precision-aware Adam moment / remainder dtypes (YAML strings resolved in setup).
+    exp_avg_dtype: NotRequired[str]
+    exp_avg_sq_dtype: NotRequired[str]
+    store_param_remainders: NotRequired[bool]
 
 
 class MegatronSchedulerConfig(TypedDict):
@@ -296,6 +317,8 @@ class Fp8Config(TypedDict):
     # When True, keep parameters in FP8. Can cause NaN token_mult_prob_error;
     # use with caution (see https://github.com/NVIDIA-NeMo/RL/issues/1164).
     fp8_param: NotRequired[bool]
+    # Python import path for a Transformer Engine custom recipe quantizer factory.
+    fp8_quantizer_factory: NotRequired[str]
     # When True, clear Transformer Engine's per-module _fp8_workspaces scratch
     # buffers in offload_before_refit (before weight transfer to the inference
     # engine). These FP8 workspace tensors anchor large CUDA segments and
@@ -363,6 +386,16 @@ class MegatronConfig(TypedDict):
     pipeline_dtype: str
     sequence_parallel: bool
     freeze_moe_router: bool
+    # Optional multimodal provider controls. These map legacy Omni recipe
+    # names onto the canonical NemotronOmniModel provider fields.
+    freeze_vision_encoder: NotRequired[bool]
+    freeze_vision_projector: NotRequired[bool]
+    freeze_audio_encoder: NotRequired[bool]
+    freeze_audio_projector: NotRequired[bool]
+    moe_router_dtype: str | None
+    moe_router_load_balancing_type: str | list[str]
+    moe_router_bias_update_rate: float
+    moe_permute_fusion: bool
     expert_tensor_parallel_size: int
     expert_model_parallel_size: int
     # If True, defer the casting of logits to float32 until the backward pass.
@@ -396,7 +429,9 @@ class MegatronConfig(TypedDict):
     # (used when transformer_impl='inference_optimized')
     moe_router_num_groups: NotRequired[int | None]
     moe_router_group_topk: NotRequired[int | None]
-    # Transformer implementation backing the model. Only valid on generation workers.
+    # Transformer implementation backing the model. 'inference_optimized'
+    # trains through the TE parent path and requires sequence_parallel with
+    # TP>1 (enforced at setup).
     # Options are 'transformer_engine' and 'inference_optimized'.
     transformer_impl: NotRequired[str]
     # CUDA-graph implementation.
@@ -439,6 +474,9 @@ class MegatronConfig(TypedDict):
     # See: https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep
     moe_flex_dispatcher_backend: NotRequired[str]
     moe_hybridep_num_sms: NotRequired[int]
+    # Align packed inputs once before the model forward instead of padding in every
+    # MoE layer. Currently requires NeMo-owned packing, PP=1, and MTP disabled.
+    moe_hybridep_prepad_packed_inputs: NotRequired[bool]
     # Number of HybridEP ranks per NVLink domain (default: min(expert_model_parallel_size, 64))
     hybridep_num_ranks_per_nvlink_domain: NotRequired[int]
     # Enable multi-node NVLink support (default: expert_model_parallel_size > 4)
@@ -466,6 +504,8 @@ class MegatronConfig(TypedDict):
     mtp_num_layers: NotRequired[int]
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
     mtp_loss_scaling_factor: NotRequired[float]
+    # Populated by the algorithm before Megatron setup to size the LR scheduler.
+    train_iters: NotRequired[int]
     # When True, repeat a single MTP layer mtp_num_layers times instead of using distinct layers.
     mtp_use_repeated_layer: NotRequired[bool]
     # When True, detach MTP heads from the main model so MTP loss does not affect main-model gradients.
@@ -478,6 +518,13 @@ class MegatronConfig(TypedDict):
     clear_memory_caches_before_refit: NotRequired[bool]
     # FP8 quantization settings for the Megatron training backend.
     fp8_cfg: NotRequired[Fp8Config]
+    # Path to a per-module Transformer Engine precision recipe loaded into
+    # Megatron quant_recipe.
+    te_precision_config_file: NotRequired[str]
+    # Passed through to the Megatron model's freeze() method.
+    # Supported keys are model-specific, such as freeze_vision_model,
+    # freeze_vision_projection, and freeze_language_model.
+    freeze_config: NotRequired[dict[str, Any]]
 
 
 class DraftConfigDisabled(TypedDict):
@@ -498,15 +545,18 @@ class DraftConfig(TypedDict):
 
 class TokenizerConfig(TypedDict):
     name: str
-    chat_template: NotRequired[str]
+    # None selects NeMo-RL's passthrough prompt/response template.
+    chat_template: NotRequired[str | None]
     # Arguments to pass to tokenizer.apply_chat_template(...). This can be used to pass kwargs like enable_thinking=true
     chat_template_kwargs: NotRequired[dict[str, Any] | None]
+    # Arguments forwarded to tokenizer loading via get_tokenizer.
+    tokenizer_kwargs: NotRequired[dict[str, Any] | None]
     # Multimodal configs
     audio: NotRequired[dict[str, Any]]
     video: NotRequired[dict[str, Any]]
     use_processor: NotRequired[bool]
-    # Opt-in fastokens Rust-backed BPE tokenizer (~10x faster encode). Defaults to
-    # off when absent; NRL_USE_FASTOKENS overrides at runtime when set.
+    # Opt-in fastokens Rust-backed BPE tokenizer for NeMo-RL tokenization.
+    # Defaults to off when absent; NRL_USE_FASTOKENS overrides this and also sets VLLM_USE_FASTOKENS.
     use_fastokens: NotRequired[bool]
 
 
@@ -551,11 +601,31 @@ class RouterReplayConfig(TypedDict):
     enabled: Literal[True]
 
 
+class OnPolicyDistillationFullTransport(TypedDict):
+    """Resolved full-vocabulary MOPD settings carried to the policy workers.
+
+    A ``model_dump`` of ``OnPolicyDistillationFullConfig`` plus the resolved
+    ``payload_field``. That BaseModel remains the authoritative schema and the
+    only place defaults are declared, so readers must take these keys as
+    required rather than supplying their own fallbacks.
+    """
+
+    enabled: bool
+    teacher_payload: Literal["hidden_states", "logits"]
+    divergence: Literal["reverse_kl"]
+    payload_dtype: Literal["bfloat16", "float16", "float32"]
+    chunk_size: int | None
+    teacher_lm_head_lifecycle: Literal["none", "offload", "evict"]
+    validate_decomposition: bool
+    payload_field: str
+
+
 class PolicyConfig(TypedDict):
     model_name: str
     tokenizer: TokenizerConfig
     train_global_batch_size: int
     train_micro_batch_size: int
+    offload_optimizer_for_logprob: bool
     logprob_batch_size: NotRequired[int]
     # If set, log probability computation is chunked along the sequence dimension to avoid GPU OOM (especially during backward pass).
     # Within each chunk loop, logits casting (from float16/bfloat16 to float32) is done to prevent holding the entire float32 logits tensor in memory.
@@ -571,6 +641,9 @@ class PolicyConfig(TypedDict):
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
     draft: NotRequired[DraftConfig | DraftConfigDisabled]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
+    # Resolved once by the driver and carried to the student workers and (via
+    # deepcopy) to the teacher group. Absent means full-vocabulary MOPD is off.
+    on_policy_distillation_full: NotRequired[OnPolicyDistillationFullTransport]
     router_replay: NotRequired[RouterReplayConfig | RouterReplayConfigDisabled]
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
@@ -598,3 +671,9 @@ class PolicyConfig(TypedDict):
     disable_modelopt_layer_spec: NotRequired[bool]
 
     is_vlm: NotRequired[bool]
+
+    # FQN of a worker extension class to use instead of the resolved default
+    # policy worker. Must be a subclass of the resolved worker and cannot be
+    # combined with quant_cfg. Its runtime environment must already be in
+    # ACTOR_ENVIRONMENT_REGISTRY.
+    worker_extension_cls_fqn: NotRequired[str | None]

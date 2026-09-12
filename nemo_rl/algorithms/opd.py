@@ -21,15 +21,27 @@ IS truncation lives in loss_functions.ClippedPGLoss (ICE-POP mode).
 
 from __future__ import annotations
 
-from typing import Any, Optional
+import asyncio
+import time
+import uuid
+from typing import Any, Literal, Optional
 
 import ray
-from pydantic import BaseModel, Field
+import torch
+from pydantic import BaseModel, Field, model_validator
 
+from nemo_rl.data_plane.column_io import read_columns, write_columns
+from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
+from nemo_rl.data_plane.schema import (
+    OPD_FULL_HIDDEN_STATES_FIELD,
+    OPD_FULL_LOGITS_FIELD,
+    TEACHER_LP_FIELDS,
+)
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
     prepare_segment_topology,
 )
+from nemo_rl.experience.interfaces import PromptGroupRecord
 
 # ---------------------------------------------------------------------------
 # Config schemas
@@ -64,6 +76,51 @@ class NonColocatedTeachersConfig(BaseModel, extra="allow"):
     teacher_overrides: dict[str, TeacherResourceConfig] = Field(default_factory=dict)
 
 
+class OnPolicyDistillationFullConfig(BaseModel, extra="allow"):
+    """Full-vocabulary MOPD (``opd_full``).
+
+    The student matches the teacher's entire next-token distribution through an
+    exact reverse KL instead of the sampled-token log-probability gap -- the
+    K=V limit of the top-k estimator, with no score-function tail term.
+
+    The policy-gradient knobs on ``ClippedPGLossConfig`` (ratio clipping, CISPO,
+    importance-sampling correction, truncated IS) have no code path here and are
+    rejected at construction. The OPD advantage estimator still runs: its output
+    is unused, but ``advantages`` is a required training column.
+    """
+
+    enabled: bool = False
+    # "hidden_states": teacher ships pre-LM-head hidden states, student projects
+    #   them with an LM-head shard from the teacher checkpoint. `hidden_size`
+    #   wide, so teacher/student parallelism stay decoupled. Production path.
+    # "logits": teacher ships full-vocabulary logits, no student-side LM head.
+    #   `vocab_size` wide (~74x larger at 2k hidden / 152k vocab), so this is a
+    #   numerical reference and fallback, not a production configuration.
+    teacher_payload: Literal["hidden_states", "logits"] = "hidden_states"
+    divergence: Literal["reverse_kl"] = "reverse_kl"
+    payload_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
+    # Sequence-dimension chunk for the distributed divergence kernels, bounding
+    # the live fp32 vocabulary working set. None processes the sequence at once.
+    chunk_size: Optional[int] = None
+    # Student-side cache policy for the teacher LM-head shard (hidden path only).
+    #   none    -- keep resident on GPU for the whole run
+    #   offload -- park on CPU between train steps, stage back in per step
+    #   evict   -- free after every train step and reload from the checkpoint
+    teacher_lm_head_lifecycle: Literal["none", "offload", "evict"] = "offload"
+    # Report the entropy/cross-entropy residual against the reverse KL. Roughly
+    # doubles the divergence cost; diagnostics only.
+    validate_decomposition: bool = False
+
+    @model_validator(mode="after")
+    def validate_positive_sizes(self) -> "OnPolicyDistillationFullConfig":
+        """Reject a chunk size that would make the divergence kernels useless."""
+        if self.chunk_size is not None and self.chunk_size < 1:
+            raise ValueError(
+                f"on_policy_distillation.full.chunk_size must be >= 1, got {self.chunk_size}."
+            )
+        return self
+
+
 class OnPolicyDistillationConfig(BaseModel, extra="allow"):
     """User-facing config for the top-level ``on_policy_distillation`` block."""
 
@@ -73,6 +130,7 @@ class OnPolicyDistillationConfig(BaseModel, extra="allow"):
     strict_agent_name_match: bool = False
     deduplicate_shared_teacher_checkpoints: bool = True
     non_colocated_teachers: Optional[NonColocatedTeachersConfig] = None
+    full: Optional[OnPolicyDistillationFullConfig] = None
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +168,34 @@ def is_non_colocated_teachers_enabled(master_config: Any) -> bool:
     return bool(
         _opd_cfg(master_config).get("non_colocated_teachers", {}).get("enabled", False)
     )
+
+
+def get_opd_full_config(master_config: Any) -> Optional[OnPolicyDistillationFullConfig]:
+    """Return the validated ``opd_full`` sub-config when the feature is enabled.
+
+    Args:
+        master_config: Full training configuration, a plain dict, or any object
+            without the field (non-OPD recipes).
+
+    Returns:
+        The full-vocabulary config when both OPD and ``full.enabled`` are on,
+        otherwise ``None``.
+    """
+    if not is_opd_enabled(master_config):
+        return None
+    full_cfg = _opd_cfg(master_config).get("full")
+    if full_cfg is None:
+        return None
+    if not isinstance(full_cfg, OnPolicyDistillationFullConfig):
+        full_cfg = OnPolicyDistillationFullConfig(**full_cfg)
+    return full_cfg if full_cfg.enabled else None
+
+
+def opd_full_payload_field(full_cfg: OnPolicyDistillationFullConfig) -> str:
+    """Return the data-plane column name carrying this run's teacher payload."""
+    if full_cfg.teacher_payload == "hidden_states":
+        return OPD_FULL_HIDDEN_STATES_FIELD
+    return OPD_FULL_LOGITS_FIELD
 
 
 def _skip_prev_logprobs(master_config: Any) -> bool:
@@ -198,6 +284,264 @@ def get_teacher_routing_metrics(
             model_unique / max(alias_unique, 1)
         ),
     }
+
+
+class TQTeacherLogprobCoordinator:
+    """Enrich SingleController rollout rows with teacher logprobs through TQ.
+
+    A prompt group is already present in the data plane when :meth:`enrich` is
+    called. The coordinator sends its metadata to the inference-only teacher;
+    teacher workers fetch their own DP shards and write the token column back
+    under the same sample IDs. The controller materializes only the final row
+    when unique temporary rows are needed for DP divisibility. Calls targeting
+    the same deduplicated teacher group are serialized to keep NCCL collective
+    ordering identical across that group's workers; distinct teachers remain
+    independent and can run concurrently.
+    """
+
+    teacher_logprobs_field = "teacher_reference_logprobs"
+
+    def __init__(
+        self,
+        *,
+        dp_client: DataPlaneClient,
+        teacher_worker_groups: dict[str, Any],
+        alias_to_group_alias: dict[str, str],
+        on_policy_distillation_cfg: dict[str, Any],
+    ) -> None:
+        if not teacher_worker_groups:
+            raise ValueError(
+                "TQTeacherLogprobCoordinator requires at least one teacher worker group"
+            )
+        self._dp_client = dp_client
+        self._teacher_worker_groups = dict(teacher_worker_groups)
+        self._alias_to_group_alias = dict(alias_to_group_alias)
+        self._opd_cfg = dict(on_policy_distillation_cfg)
+        # Set when full-vocabulary MOPD is on: the teacher then writes a second,
+        # per-token payload column the training fetch must also see.
+        full_cfg = self._opd_cfg.get("full")
+        self._opd_full_field: Optional[str] = (
+            opd_full_payload_field(OnPolicyDistillationFullConfig(**full_cfg))
+            if full_cfg and full_cfg.get("enabled")
+            else None
+        )
+        self._teacher_full_payload_tokens = 0
+        # Physical (deduplicated) groups own locks, not routing aliases. Two
+        # aliases sharing one checkpoint therefore share one collective FIFO.
+        self._teacher_locks = {
+            group_alias: asyncio.Lock() for group_alias in self._teacher_worker_groups
+        }
+        self._teacher_batches = 0
+        self._teacher_samples = 0
+        self._teacher_logprob_time_s = 0.0
+        self._teacher_inference_time_s = 0.0
+        self._teacher_lock_wait_time_s = 0.0
+        self._aliases_seen: set[str] = set()
+
+    def _resolve_teacher(self, record: PromptGroupRecord) -> tuple[str, str]:
+        extra_env_info = record.extra_env_info
+        agent_ref = (
+            extra_env_info.get("agent_ref")
+            if isinstance(extra_env_info, dict)
+            else None
+        )
+        if not isinstance(agent_ref, dict):
+            raise ValueError(
+                "on_policy_distillation is enabled but this prompt group has no "
+                "extra_env_info['agent_ref'] mapping to route it to a teacher. "
+                "SingleController MOPD requires the NeMo-Gym rollout path, and "
+                "regenerating this prompt cannot repair missing routing metadata."
+            )
+
+        teacher_model_by_agent_name = dict(
+            self._opd_cfg.get("teacher_model_by_agent_name", {})
+        )
+        alias = resolve_reference_aliases(
+            [agent_ref],
+            teacher_model_by_agent_name,
+            default_teacher_alias=self._opd_cfg.get("default_teacher_alias"),
+            strict_agent_name_match=bool(
+                self._opd_cfg.get("strict_agent_name_match", False)
+            ),
+        )[0]
+        group_alias = self._alias_to_group_alias.get(alias, alias)
+        if group_alias not in self._teacher_worker_groups:
+            raise ValueError(
+                f"Teacher alias {alias!r} resolved to unavailable worker group "
+                f"{group_alias!r}; available groups: "
+                f"{sorted(self._teacher_worker_groups)}"
+            )
+        return alias, group_alias
+
+    def _enrich_sync(
+        self,
+        meta: KVBatchMeta,
+        group_alias: str,
+    ) -> float:
+        """Run the blocking TQ-read, teacher inference, and TQ-write sequence."""
+        if not meta.sequence_lengths:
+            raise ValueError("MOPD teacher enrichment requires sequence_lengths")
+
+        teacher = self._teacher_worker_groups[group_alias]
+        dp_size = teacher.sharding_annotations.get_axis_size("data_parallel")
+        if dp_size <= 0:
+            raise ValueError(
+                f"Teacher {group_alias!r} has invalid data-parallel size {dp_size}"
+            )
+        actual_batch_size = meta.size
+        remainder = actual_batch_size % dp_size
+        padded_meta = meta
+        temporary_sample_ids: list[str] = []
+        try:
+            if remainder:
+                pad_count = dp_size - remainder
+                source_meta = meta.slice(actual_batch_size - 1, actual_batch_size)
+                source_data = read_columns(
+                    self._dp_client,
+                    source_meta,
+                    select_fields=TEACHER_LP_FIELDS,
+                    pad_value_dict={"input_ids": 0},
+                )
+                input_ids = source_data["input_ids"]
+                input_lengths = source_data["input_lengths"]
+                if not isinstance(input_ids, torch.Tensor) or not isinstance(
+                    input_lengths, torch.Tensor
+                ):
+                    raise TypeError("MOPD teacher padding inputs must be tensors")
+                temporary_prefix = uuid.uuid4().hex
+                temporary_sample_ids = [
+                    f"{meta.sample_ids[-1]}__teacher_pad_{temporary_prefix}_{index}"
+                    for index in range(pad_count)
+                ]
+                pad_meta = KVBatchMeta(
+                    partition_id=meta.partition_id,
+                    task_name=meta.task_name,
+                    sample_ids=temporary_sample_ids,
+                    fields=list(TEACHER_LP_FIELDS),
+                    sequence_lengths=[meta.sequence_lengths[-1]] * pad_count,
+                )
+                # Keep this write inside the cleanup lifetime. A backend may
+                # write only some rows before reporting failure.
+                write_columns(
+                    self._dp_client,
+                    pad_meta,
+                    fields={
+                        "input_ids": input_ids.expand(pad_count, *input_ids.shape[1:]),
+                        "input_lengths": input_lengths.expand(
+                            pad_count, *input_lengths.shape[1:]
+                        ),
+                    },
+                )
+                padded_meta = meta.concat(pad_meta)
+
+            inference_started_at = time.perf_counter()
+            teacher.get_logprobs_from_meta(padded_meta)
+            inference_finished_at = time.perf_counter()
+        except BaseException as enrichment_error:
+            if temporary_sample_ids:
+                try:
+                    self._dp_client.clear_samples(
+                        sample_ids=temporary_sample_ids,
+                        partition_id=meta.partition_id,
+                    )
+                except BaseException as cleanup_error:
+                    raise BaseExceptionGroup(
+                        f"teacher enrichment and temporary-row cleanup both failed "
+                        f"for group {group_alias!r}",
+                        [enrichment_error, cleanup_error],
+                    )
+            raise
+        if temporary_sample_ids:
+            self._dp_client.clear_samples(
+                sample_ids=temporary_sample_ids,
+                partition_id=meta.partition_id,
+            )
+        return inference_finished_at - inference_started_at
+
+    async def enrich(
+        self,
+        meta: KVBatchMeta,
+        record: PromptGroupRecord,
+    ) -> KVBatchMeta:
+        """Write teacher logprobs before the replay-buffer slot becomes ready."""
+        alias, group_alias = self._resolve_teacher(record)
+        started_at = time.perf_counter()
+        lock_started_at = time.perf_counter()
+        # Wait for a physical teacher without occupying a default-executor
+        # thread. Only the active inference consumes a thread-pool slot.
+        async with self._teacher_locks[group_alias]:
+            lock_wait_s = time.perf_counter() - lock_started_at
+            # asyncio cannot cancel a running thread. Shield and explicitly
+            # drain it so replay-buffer rollback never clears rows while teacher
+            # workers are still fetching from or writing to those rows.
+            enrichment_task = asyncio.create_task(
+                asyncio.to_thread(self._enrich_sync, meta, group_alias)
+            )
+            try:
+                inference_time_s = await asyncio.shield(enrichment_task)
+            except asyncio.CancelledError:
+                try:
+                    await enrichment_task
+                except BaseException as drain_error:
+                    raise asyncio.CancelledError(
+                        f"cancelled while draining teacher enrichment for {group_alias!r}"
+                    ) from drain_error
+                raise
+        total_time_s = time.perf_counter() - started_at
+
+        self._teacher_batches += 1
+        self._teacher_samples += meta.size
+        self._teacher_logprob_time_s += total_time_s
+        self._teacher_inference_time_s += inference_time_s
+        self._teacher_lock_wait_time_s += lock_wait_s
+        if self._opd_full_field is not None:
+            self._teacher_full_payload_tokens += meta.size * max(
+                meta.sequence_lengths or [0]
+            )
+        self._aliases_seen.add(alias)
+        print(
+            f"[teacher_logprob] group={group_alias} samples={meta.size} "
+            f"lock_wait={lock_wait_s:.2f}s inference={inference_time_s:.2f}s "
+            f"total={total_time_s:.2f}s",
+            flush=True,
+        )
+        enriched_fields = [self.teacher_logprobs_field]
+        if self._opd_full_field is not None:
+            enriched_fields.append(self._opd_full_field)
+        return meta.with_fields(enriched_fields)
+
+    def drain_metrics(self) -> dict[str, float]:
+        """Return and reset teacher activity accumulated since the last drain."""
+        metrics = {
+            "on_policy_distillation/teacher_batches": float(self._teacher_batches),
+            "on_policy_distillation/teacher_samples": float(self._teacher_samples),
+            "on_policy_distillation/teacher_logprob_time_s": self._teacher_logprob_time_s,
+            "on_policy_distillation/teacher_inference_time_s": self._teacher_inference_time_s,
+            "on_policy_distillation/teacher_lock_wait_time_s": self._teacher_lock_wait_time_s,
+        }
+        if self._opd_full_field is not None:
+            # Tokens, not bytes: the coordinator does not know the payload width.
+            # For bytes, multiply by hidden_size (or vocab_size) x dtype itemsize.
+            metrics["on_policy_distillation/teacher_full_payload_tokens"] = float(
+                self._teacher_full_payload_tokens
+            )
+        if self._teacher_batches:
+            # Cardinality describes what ran. On an idle step, zero reads as
+            # "zero teacher models" rather than "no teacher activity."
+            metrics.update(
+                get_teacher_routing_metrics(
+                    sorted(self._aliases_seen),
+                    self._opd_cfg["teacher_model_by_agent_name"],
+                )
+            )
+        self._teacher_batches = 0
+        self._teacher_samples = 0
+        self._teacher_logprob_time_s = 0.0
+        self._teacher_inference_time_s = 0.0
+        self._teacher_lock_wait_time_s = 0.0
+        self._teacher_full_payload_tokens = 0
+        self._aliases_seen.clear()
+        return metrics
 
 
 # ---------------------------------------------------------------------------

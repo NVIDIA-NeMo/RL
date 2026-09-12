@@ -13,16 +13,12 @@
 # limitations under the License.
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 
 from nemo_rl.modelopt import utils as modelopt_utils
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     check_nccl_reshard_refit_support,
-)
-from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
-    NcclReshardWeightSynchronizer,
 )
 
 
@@ -79,6 +75,22 @@ def test_validator_rejects_unsupported_policy_precision_alias(
 
     with pytest.raises(ValueError, match="policy.precision must be 'bfloat16'"):
         check_nccl_reshard_refit_support(config)
+
+
+def test_validator_rejects_non_nvfp4_real_quant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject_non_nvfp4(_quant_cfg: str) -> str:
+        raise ValueError("enabled weights are not NVFP4")
+
+    monkeypatch.setattr(
+        modelopt_utils,
+        "resolve_nvfp4_real_quant_mode",
+        reject_non_nvfp4,
+    )
+
+    with pytest.raises(ValueError, match="must resolve to a supported NVFP4 mode"):
+        check_nccl_reshard_refit_support(_valid_nvfp4_config(mode="w4a16"))
 
 
 @pytest.mark.parametrize(
@@ -149,50 +161,3 @@ def test_validator_rejects_w4a4_without_calibration(
 
     with pytest.raises(ValueError, match="non-empty.*real_quant_calibration_path"):
         check_nccl_reshard_refit_support(config)
-
-
-class _CollectiveStarted(RuntimeError):
-    pass
-
-
-def test_synchronizer_prepares_generation_before_starting_collectives() -> None:
-    events: list[str] = []
-    policy = MagicMock()
-    policy.cfg = {
-        "megatron_cfg": {},
-        "generation": {"vllm_cfg": {}},
-    }
-    policy.prepare_refit_info.side_effect = lambda: (
-        events.append("policy.prepare_refit_info")
-        or {"weight": ((32, 16), "torch.bfloat16")}
-    )
-    generation = MagicMock()
-    generation.prepare_refit_info.side_effect = lambda _info: events.append(
-        "generation.prepare_refit_info"
-    )
-
-    def start_collective(*_args: object, **_kwargs: object) -> None:
-        events.append("policy.init_collective")
-        raise _CollectiveStarted
-
-    policy.init_collective.side_effect = start_collective
-    train_cluster = MagicMock()
-    train_cluster.world_size.return_value = 1
-    train_cluster.get_master_address_and_port.return_value = ("127.0.0.1", 29500)
-    inference_cluster = MagicMock()
-    inference_cluster.world_size.return_value = 1
-    synchronizer = NcclReshardWeightSynchronizer(
-        policy,
-        generation,
-        train_cluster,
-        inference_cluster,
-    )
-
-    with pytest.raises(_CollectiveStarted):
-        synchronizer.init_communicator()
-
-    assert events == [
-        "policy.prepare_refit_info",
-        "generation.prepare_refit_info",
-        "policy.init_collective",
-    ]

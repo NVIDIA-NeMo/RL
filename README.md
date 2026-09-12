@@ -10,6 +10,10 @@
 </div>
 
 ## 📣 News
+
+* [08/12/2026] MuseGlimmer RL is supported [on this branch](https://github.com/NVIDIA-NeMo/RL/tree/muse-glimmer-support) with the following [doc](https://github.com/NVIDIA-NeMo/RL/blob/muse-glimmer-support/docs/guides/models/muse-glimmer.md).
+* [08/11/2026] Nemotron-3.5-lightning is released. Trained natively using NeMo RL. Check out [reproducible recipes](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/nemo_gym/nemotron-3.5-lightning).
+* [07/25/2026] [Release v0.7.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.7.0): PPO, MOPD, Cross-tokenizer, Router-replay, CISPO, model support for Qwen3-Omni, Nemotron Nano v3 Omni, Gemma 4, GLM 5.1 and many more!
 * [06/12/2026] [Minimax-M3](https://github.com/NVIDIA-NeMo/RL/tree/minimax-m3) Day 0 support by NeMo RL! More details on the [accuracy verifications](https://github.com/NVIDIA-NeMo/RL/blob/minimax-m3/docs/guides/minimax-m3.md). Thank you [vLLM for the shoutout](https://x.com/vllm_project/status/2065445062423826534
 ).
 * [06/04/2026] [Nemotron-3-Ultra](https://research.nvidia.com/labs/nemotron/Nemotron-3-Ultra/) was trained with NeMo-RL! Follow [this guide](https://github.com/NVIDIA-NeMo/RL/blob/ultra-v3/docs/guides/nemotron-3-ultra.md) to explore the post-training recipe.
@@ -27,6 +31,10 @@
     * Support Async RL training 
     * WIP: Nemo-gym compatibility
 * [03/11/2026] [Nemotron-3-Super](https://research.nvidia.com/labs/nemotron/Nemotron-3-Super/) was post-trained with NeMo-RL! Follow [this guide](https://github.com/NVIDIA-NeMo/RL/blob/super-v3/docs/guides/nemotron-3-super.md) to reproduce the full RL training recipe.
+
+<details>
+<summary>Previous News</summary>
+
 * [02/04/2026] LoRA Support
     * LoRA SFT is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1556) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/1629) backends.
     * LoRA GRPO is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1797) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/1889) backends.
@@ -35,9 +43,6 @@
         * [sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml)
         * [grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml)
         * [grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml](examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml)
-
-<details>
-<summary>Previous News</summary>
    
 * [01/30/2026] [Release v0.5.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.5.0)
     * Both linux/amd64 and linux/arm64 Docker containers are available on NGC [nvcr.io/nvidia/nemo-rl:v0.5.0](https://registry.ngc.nvidia.com/orgs/nvidia/containers/nemo-rl/tags).

@@ -64,6 +64,8 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.megatron_cfg.context_parallel_size=1 \
     policy.megatron_cfg.sequence_parallel=false \
     policy.generation.backend=megatron \
+    +policy.generation.refit_transport=mcore \
+    policy.generation.mcore_generation_config.refit_backend=nccl \
     policy.generation.mcore_generation_config.expose_http_server=true \
     policy.max_total_sequence_length=512 \
     policy.generation.max_new_tokens=128 \
@@ -89,7 +91,8 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-# Smoke-level thresholds, mirroring grpo_megatron_generation_async_gym.sh.
+# Lag-0 run: strict engine/trainer token parity on top of the standard gym gates.
 uv run tests/check_metrics.py $JSON_METRICS \
+    'max(data["train/token_mult_prob_error"]) < 1.05' \
     'median(data["train/gen_kl_error"]) < 1.3' \
     'data["validation/accuracy"]["10"] > 0.1'

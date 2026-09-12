@@ -223,6 +223,7 @@ policy:
 
       optimizer_cpu_offload: false
       optimizer_offload_fraction: 0.0
+      overlap_cpu_optimizer_d2h_h2d: false
 
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
@@ -307,6 +308,7 @@ policy:
     vllm_cfg:
       async_engine: true
       precision: ${policy.precision}
+      refit_with_reload_api: false
       kv_cache_dtype: "auto"
       tensor_parallel_size: 4
       pipeline_parallel_size: 1

@@ -15,7 +15,20 @@
 from typing import Any, Literal, NotRequired, Optional, TypedDict, cast
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import Fp8Config, PolicyConfig
+from nemo_rl.utils.packed_tensor import get_target_packed_tensor_size
+
+
+def resolve_refit_execution_batch_bytes(configured_bytes: int | None) -> int:
+    """Resolve native MCore staging bytes using NeMo-RL's collective default."""
+    if configured_bytes is None:
+        return get_target_packed_tensor_size()
+    if configured_bytes <= 0:
+        raise ValueError(
+            "policy.generation.mcore_generation_config."
+            "refit_execution_batch_bytes must be positive or null."
+        )
+    return configured_bytes
 
 
 class MCoreGenerationSpecificArgs(TypedDict):
@@ -27,59 +40,177 @@ class MCoreGenerationSpecificArgs(TypedDict):
     """
 
     expose_http_server: bool
+    http_server_num_replicas: NotRequired[int]
     parsers: list[str]
-
     buffer_size_gb: int
     block_size_tokens: int
     max_tokens: int
     max_model_len: int
 
-    num_cuda_graphs: int
+    # None disables CUDA-graph bucket construction; -1 selects automatic
+    # sizing; positive values request a fixed maximum bucket count.
+    num_cuda_graphs: int | None
     use_cuda_graphs_for_non_decode_steps: bool
     cuda_graph_impl: str
+    # How the captured CUDA-graph token-count sizes are spaced. Options:
+    # - 'exponential': log-spaced graphs for all request types.
+    # - 'linear': densely spaced graphs for all request types.
+    # - 'hybrid': exponential prefill/mixed graphs and linear decode graphs (MCore default).
+    cuda_graph_sizing_distribution: NotRequired[
+        Literal["exponential", "linear", "hybrid"]
+    ]
+    # Token ceiling for captured prefill/mixed CUDA graphs. MCore default: 512.
+    cuda_graph_max_tokens: NotRequired[int]
     # Inference CUDA-graph scope. Options:
     # - 'none': inference runs in eager mode (no CUDA graphs).
     # - 'layer': graphs are owned at the per-layer boundary (TransformerLayer / MambaLayer).
     # - 'block': graphs are owned at the enclosing block (TransformerBlock / HybridBlock).
     # Only meaningful when cuda_graph_impl='local'.
     inference_cuda_graph_scope: NotRequired[str]
+    # Required for EP>1 + inference CUDA graphs, except when using the
+    # `inference_optimized` transformer implementation.
+    moe_pad_experts_for_cuda_graph_inference: NotRequired[bool]
 
     materialize_only_last_token_logits: bool
     enable_chunked_prefill: bool
     enable_prefix_caching: bool
 
-    refit_backend: Literal["gloo", "nccl", "nvshmem"]
+    # Dynamic-batching scheduler mode. Options:
+    # - 'legacy': resolve the previous forward pass before preparing the next one.
+    # - 'async': overlap the scheduling phases by preparing the next forward pass
+    #   before resolving the previous one, hiding scheduler CPU time behind GPU
+    #   compute. For any step it cannot overlap (prefill, paused requests,
+    #   KV-cache pressure) mcore drops to a non-overlapped async ordering --
+    #   not to legacy.
+    async_sched_mode: NotRequired[Literal["legacy", "async"]]
+
+    vision_embedding_cache_max_bytes: NotRequired[int]
+    allow_stale_multimodal_embeddings: NotRequired[bool]
+
+    # Copy-service backend used only when refit_transport="mcore".
+    refit_backend: NotRequired[Literal["gloo", "nccl", "nccl_m2n", "nvshmem"] | None]
+    # Soft per-rank staging limit for native MCore refit. None uses the same
+    # dynamic packed-buffer target as NeMo-RL's existing collective refit.
+    refit_execution_batch_bytes: int | None
+    # Move training gradients and optimizer state to CPU around a non-colocated
+    # refit when extra GPU headroom is needed for transfer staging. The
+    # recommended default is False.
+    offload_policy_before_refit: bool
     num_speculative_tokens: int
 
     mamba_inference_ssm_states_dtype: NotRequired[str]
     mamba_inference_conv_states_dtype: NotRequired[str]
+    # GPU budget for cached Mamba states; null disables it (MCore default).
+    prefix_caching_mamba_gb: NotRequired[float | None]
+
+    # Prefix-cache block eviction policy. MCore default: 'lru'.
+    prefix_caching_eviction_policy: NotRequired[Literal["ref_zero", "lru"]]
+    # DP coordinator routing policy. MCore default: 'longest_prefix'.
+    prefix_caching_coordinator_policy: NotRequired[
+        Literal["load_balanced", "longest_prefix", "first_prefix_block"]
+    ]
+    # Coordinator cache-entry lifetime in seconds. MCore default: 300.0.
+    prefix_cache_ttl_seconds: NotRequired[float]
+    # Prefix-affinity versus load routing penalty. MCore default: 1.0.
+    prefix_caching_routing_alpha: NotRequired[float]
+
+    # Raw media preprocessing corresponding with Megatron's
+    # ImageProcessingConfig / VideoProcessingConfig.
+    # `video_num_frames` is required for video.
+    vision_model_type: NotRequired[str]
+    image_dynamic_resolution: NotRequired[bool]
+    video_num_frames: NotRequired[int]  # Frames sampled per video.
+    video_temporal_patch_size: NotRequired[int]  # Frames per temporal patch.
+    video_target_num_patches: NotRequired[int]  # Overrides the image max-patch budget.
+    video_maintain_aspect_ratio: NotRequired[bool]
+
+    # Fully-qualified class path of the MCore inference wrapper, e.g.
+    # "megatron.core.inference.model_inference_wrappers.multimodal.
+    # nemotron_omni_inference_wrapper.NemotronOmniInferenceWrapper".
+    # Resolved by `_get_megatron_inference_wrapper_cls`; its `supports_*`
+    # attributes gate which modalities are preprocessed. Not media preprocessing
+    # itself, and used on the direct generate path as well as the HTTP endpoint.
+    megatron_inference_wrapper: NotRequired[str]
 
     # KV cache lifecycle across suspend/resume:
     # - "persist": cache stays allocated; CUDA graphs remain valid (default)
     # - "offload": cache is moved off-GPU between iterations
-    #
-    # The third mcore value, "recompute" (drop + rebuild on resume), must be set via
-    # `grpo.async_grpo.recompute_kv_cache_after_weight_updates=true`.
-    # TODO: Unify `kv_cache_management_mode` and `recompute_kv_cache_after_weight_updates`.
-    kv_cache_management_mode: Literal["persist", "offload"]
+    # - "recompute": cache is dropped and rebuilt on resume
+    kv_cache_management_mode: Literal["persist", "offload", "recompute"]
 
     logging_step_interval: NotRequired[int]
+    # Whether MCore returns selected-token log-probs before or after sampling
+    # processors. Policy recomputation uses raw model logits, so numerical
+    # parity checks should select raw_logprobs explicitly.
+    logprobs_mode: Literal["processed_logprobs", "raw_logprobs"]
+
+    # FP8/MXFP8 for the dedicated (non-colocated) inference model;
+    # merged into its `megatron_cfg` by `merged_inference_megatron_cfg`.
+    fp8_cfg: NotRequired[Fp8Config]
 
 
 class MCoreGenerationConfig(GenerationConfig):
     """Generation config for Megatron Inference."""
 
+    # None uses NeMo-RL's packed collective, mcore uses Megatron Core's native
+    # refit, and nccl_reshard selects the non-colocated NCCL M-to-N transport.
+    refit_transport: NotRequired[Literal["mcore", "nccl_reshard"] | None]
     mcore_generation_config: MCoreGenerationSpecificArgs
 
 
 def merged_inference_megatron_cfg(policy_config: PolicyConfig) -> dict[str, Any]:
     """The `megatron_cfg` a dedicated inference model runs with."""
     generation_config = cast(MCoreGenerationConfig, policy_config["generation"])
-    return {
+    overrides = dict(generation_config.get("mcore_generation_config") or {})
+    explicit_cp = overrides.pop("context_parallel_size", None)
+    if explicit_cp is not None and explicit_cp != 1:
+        raise ValueError(
+            "Megatron generation does not support context parallelism: remove "
+            "policy.generation.mcore_generation_config.context_parallel_size or set it to 1."
+        )
+    merged: dict[str, Any] = {
         **cast(dict[str, Any], policy_config["megatron_cfg"]),
-        **(generation_config.get("mcore_generation_config") or {}),
+        **overrides,
         "activation_checkpointing": False,
+        "context_parallel_size": 1,
     }
+    # inference_optimized layers hard-require SP with TP>1. Raise with the
+    # config key: the colocated build bypasses validate_and_set_config, so this
+    # merge is the only spot the inference cfg gets a named error instead of a
+    # raw MCore assert at model build.
+    if (
+        merged.get("transformer_impl") == "inference_optimized"
+        and merged["tensor_model_parallel_size"] > 1
+        and not merged["sequence_parallel"]
+    ):
+        raise ValueError(
+            "transformer_impl=inference_optimized requires sequence parallelism "
+            "with TP>1 on the generation model: set "
+            "policy.generation.mcore_generation_config.sequence_parallel=true."
+        )
+
+    # inference_optimized MoE layers do not implement expert tensor parallelism:
+    # MCore raises whenever the *resolved* ETP exceeds 1, and an omitted ETP
+    # resolves to TP. Pin the generation-side ETP to 1 so that TP>1 generation
+    # keeps working without the caller having to know that rule (ETP is inert
+    # for dense models). An explicitly requested gen-side ETP>1 is unsatisfiable,
+    # so name the config key rather than letting MCore assert at model build.
+    if merged.get("transformer_impl") == "inference_optimized":
+        gen_overrides = cast(
+            dict[str, Any], generation_config.get("mcore_generation_config") or {}
+        )
+        explicit_etp = cast(
+            Optional[int], gen_overrides.get("expert_tensor_parallel_size")
+        )
+        if explicit_etp is not None and explicit_etp > 1:
+            raise ValueError(
+                "transformer_impl=inference_optimized does not support expert "
+                "tensor parallelism on the generation model: set "
+                "policy.generation.mcore_generation_config."
+                f"expert_tensor_parallel_size=1 (got {explicit_etp})."
+            )
+        merged["expert_tensor_parallel_size"] = 1
+    return merged
 
 
 def dedicated_inference_megatron_cfg(
@@ -90,13 +221,12 @@ def dedicated_inference_megatron_cfg(
     Colocated Megatron generation shares the training model unless the resolved
     inference layout or `transformer_impl` differs from training; then the worker
     builds a second model and reshards into it on every wake. Inference never
-    uses CP, so CP is pinned to 1 (CP>1 training therefore always differs).
+    uses CP, and CP is already pinned to 1 (CP>1 training therefore always differs).
 
-    Returns None when the resolved config matches training (dual-mode: generate
-    directly on the shared training model).
+    Returns None when the resolved config matches training (reshardless:
+    generate directly on the shared training model).
     """
     inference_mcfg = merged_inference_megatron_cfg(policy_config)
-    inference_mcfg["context_parallel_size"] = 1
 
     train_mcfg = cast(dict[str, Any], policy_config["megatron_cfg"])
     layout_keys = (

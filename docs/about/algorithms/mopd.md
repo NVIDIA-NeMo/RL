@@ -26,9 +26,10 @@ teacher-minus-student log-probability gap:
 `log π_student` is the policy's `prev_logprobs` and `log π_teacher` is computed
 by the teacher worker group at collection time. Maximizing this advantage is
 reverse-KL minimization — it pushes the student toward the teacher's token
-distribution — but, unlike forward-KL logit distillation, it needs only the
-teacher's log-probability for the *sampled* token rather than the full
-vocabulary distribution.
+distribution — but, in this default (top-k) form, it needs only the teacher's
+log-probability for the *sampled* token rather than the full vocabulary
+distribution. See [Full-vocabulary MOPD](#full-vocabulary-mopd) for the exact
+K=V variant, which trades that property for an unbiased objective.
 
 The advantage is applied only to trained (assistant) tokens via the loss mask;
 tool / environment tokens contribute zero. Because the advantage subtracts a
@@ -123,11 +124,110 @@ trainable) + 1 node vLLM generation (frozen) + 1 node teacher (frozen). Ten
 distinct teachers at 1 node each would instead add 10 nodes on top of the
 policy and generation nodes.
 
+## Full-vocabulary MOPD
+
+`on_policy_distillation.full` replaces the sampled-token log-probability gap
+with the exact reverse KL over the whole vocabulary:
+
+```
+L_t = Σ_v p_student(v) · [ log p_student(v) − log p_teacher(v) ]
+```
+
+This is the K=V limit of the top-k estimator: with the support spanning the
+whole vocabulary the score-function tail term vanishes, so the objective is
+exact, deterministic, and free of that estimator's off-policy bias. It replaces
+the policy-gradient objective entirely — the OPD advantage estimator still runs
+(`advantages` is a required training column and its stage supplies the
+teacher/student gap diagnostic), but this loss ignores its output.
+
+```yaml
+on_policy_distillation:
+  full:
+    enabled: true
+    teacher_payload: hidden_states  # or: logits
+    divergence: reverse_kl
+    payload_dtype: bfloat16
+    teacher_lm_head_lifecycle: offload  # none | offload | evict
+    chunk_size: 1024
+    validate_decomposition: false
+```
+
+`teacher_payload` selects what crosses the teacher/student boundary:
+
+| | width | notes |
+|---|---|---|
+| `hidden_states` (default) | `hidden_size` | Teacher ships pre-LM-head hidden states; the student projects them with an output-layer shard loaded from the teacher checkpoint. Teacher and student parallelism stay decoupled. |
+| `logits` | `vocab_size` | Teacher ships full-vocabulary logits; no student-side teacher LM head. Roughly 74× larger for a 2k-hidden / 152k-vocab model — a numerical reference and fallback, not a production configuration. |
+
+`chunk_size` bounds the live fp32 vocabulary working set in the divergence
+kernels; unchunked, one 8K-token row materializes several GB of fp32
+log-softmax. `teacher_lm_head_lifecycle` controls whether the teacher LM-head
+shard stays resident on GPU, is parked on CPU between steps, or is freed and
+reloaded each step.
+
+`validate_decomposition` additionally reports the reverse KL against its
+entropy / cross-entropy decomposition. Note that this residual is an algebraic
+identity — all three kernels read the same logits, so a corrupted teacher
+cancels out of it. It pins the kernels' own arithmetic and nothing upstream of
+them, at the cost of a second full-vocabulary log-softmax, so it is off by
+default. The assertion that actually catches a broken payload, gather, LM-head
+shard, or token shift is the divergence itself staying near zero under
+self-distillation.
+
+### Current restrictions
+
+Rejected at construction rather than silently ignored:
+
+- Megatron backend and the Single-Controller runtime only.
+- Exactly one teacher checkpoint.
+- `teacher_payload: hidden_states` additionally requires student
+  `policy.megatron_cfg.pipeline_model_parallel_size: 1` and
+  `policy.generation.temperature: 1.0`. The `logits` path has neither
+  restriction.
+- `teacher_payload: hidden_states` also requires a teacher whose logits are
+  exactly `output_layer(h)`. Models that transform the logits after that linear
+  — Gemma2 and Gemma4 (`final_logit_softcapping`), MuseGlimmer
+  (`output_multiplier`), and any MuP model (`use_mup`) — are rejected on the
+  teacher worker, because the student's reconstruction cannot reproduce the
+  post-transform and would silently distill toward a distribution the teacher
+  never emits. Use `teacher_payload: logits`, which is exact for these models.
+- `policy.megatron_cfg.use_fused_linear_logprobs: false` and
+  `policy.sequence_packing.fuse_loss: false`.
+- The policy-gradient and reward-side KL knobs have no code path under this
+  objective and are rejected: `disable_ppo_ratio: false`, `ratio_clip_c`,
+  `use_cispo`, `force_on_policy_ratio`, `sequence_level_importance_ratios`,
+  `use_importance_sampling_correction`, `truncated_importance_sampling_type`,
+  `positive_example_nll_weight`, `use_kl_in_reward`, and
+  `use_on_policy_kl_approximation` (the base MOPD recipe sets this one to
+  `true`, so a derived full-vocabulary recipe must override it to `false`).
+
 ## Running MOPD
 
-MOPD collects rollouts through NeMo Gym, so use the NeMo Gym GRPO entrypoint
-with an MOPD recipe. The checked-in recipe uses placeholder dataset paths;
-override them for your local data:
+MOPD collects rollouts through NeMo Gym and supports both the legacy async GRPO
+runtime and the Single-Controller runtime. The checked-in recipes use
+placeholder dataset paths; override them for your local data.
+
+### Single-Controller text path
+
+The Single-Controller path moves rollout and teacher-logprob tensors through
+TransferQueue. It currently supports text-only MOPD rollouts:
+
+```sh
+uv run examples/run_grpo_single_controller.py \
+  --config examples/configs/recipes/llm/mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller.yaml \
+  data.train.data_path=/path/to/train.jsonl \
+  data.validation.data_path=/path/to/val.jsonl
+```
+
+See [Train with Single-Controller](../../guides/single-controller.md) for the
+runtime's configuration and architecture.
+
+The full-vocabulary variants of that recipe are
+`mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller-fullvocab.yaml` (H100) and
+`mopd-qwen3-1.7b-3n4g-megatron-pack-single-controller-fullvocab.yaml` (GB200),
+run the same way.
+
+### Legacy async GRPO path
 
 ```sh
 uv run examples/nemo_gym/run_grpo_nemo_gym.py \
@@ -136,10 +236,10 @@ uv run examples/nemo_gym/run_grpo_nemo_gym.py \
   data.validation.data_path=/path/to/val.jsonl
 ```
 
-The reference recipe self-distills `Qwen/Qwen3-1.7B` (student == teacher) across
-3 nodes (1 policy + 1 vLLM + 1 teacher) with sequence packing enabled. Because
-student and teacher are identical, the OPD loss stays near zero — it is a
-correctness smoke test, not a demonstration of distillation gains.
+Both reference recipes self-distill `Qwen/Qwen3-1.7B` (student == teacher)
+across 3 nodes (1 policy + 1 vLLM + 1 teacher) with sequence packing enabled.
+Because student and teacher are identical, the OPD loss stays near zero — it is
+a correctness smoke test, not a demonstration of distillation gains.
 
 ## References
 

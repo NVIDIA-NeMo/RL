@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import sys
 import tempfile
@@ -43,6 +44,7 @@ from nemo_rl.data.processors import (
     kd_data_processor,
     math_data_processor,
     math_hf_data_processor,
+    nemo_gym_data_processor,
 )
 from nemo_rl.models.policy import TokenizerConfig
 
@@ -69,6 +71,26 @@ class DummyTokenizer:
         if return_tensors == "pt":
             return {"input_ids": torch.tensor([encoded], dtype=torch.long)}
         return {"input_ids": encoded}
+
+
+def test_nemo_gym_data_processor_without_task_data_spec():
+    extra_env_info = {"agent_ref": {"name": "test_agent"}}
+
+    result = nemo_gym_data_processor(
+        datum_dict={
+            "extra_env_info": json.dumps(extra_env_info),
+            "task_name": "nemo_gym",
+        },
+        task_data_spec=None,
+        tokenizer=None,
+        max_seq_length=None,
+        idx=3,
+    )
+
+    assert result["extra_env_info"] == extra_env_info
+    assert result["idx"] == 3
+    assert result["task_name"] == "nemo_gym"
+    assert result["length"] == 0
 
 
 def test_math_data_processor():

@@ -601,6 +601,9 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
     _nrl_bf16_nvfp4_group_families: dict[str, str]
     _nrl_bf16_nvfp4_staging: dict[str, dict[str, torch.Tensor]]
 
+    def _supports_unquantized_flashinfer_trtllm_refit(self) -> bool:
+        return False
+
     def maybe_init_zmq(self) -> None:
         """Use a longer timeout only for ModelOpt real-quant refits."""
         super().maybe_init_zmq()
