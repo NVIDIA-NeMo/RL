@@ -94,8 +94,8 @@ def test_shutdown_environments_continues_after_a_failure():
     wedged, healthy = _fake_env("wedged"), _fake_env("healthy")
 
     with patch("nemo_rl.environments.utils.ray") as mock_ray:
-        mock_ray.get.side_effect = (
-            lambda ref, timeout: None
+        mock_ray.get.side_effect = lambda ref, timeout: (
+            None
             if ref == "healthy-ref"
             else (_ for _ in ()).throw(TimeoutError("no response"))
         )
@@ -109,8 +109,8 @@ def test_shutdown_environments_continues_after_a_failed_kill():
     wedged, healthy = _fake_env("wedged"), _fake_env("healthy")
 
     with patch("nemo_rl.environments.utils.ray") as mock_ray:
-        mock_ray.get.side_effect = (
-            lambda ref, timeout: None
+        mock_ray.get.side_effect = lambda ref, timeout: (
+            None
             if ref == "healthy-ref"
             else (_ for _ in ()).throw(TimeoutError("no response"))
         )

@@ -13,11 +13,13 @@
 # limitations under the License.
 
 import math
+from copy import copy
 from typing import Any, Callable, Optional, TypeVar
 
 import torch
 import torch.distributed
 
+from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -277,6 +279,10 @@ class DraftLossWrapper:
         cu_seqlens_q_padded: Optional[torch.Tensor] = None,
         d2t: Optional[torch.Tensor] = None,
         student_logits: Optional[torch.Tensor] = None,
+        defer_normalization: bool = False,
+        draft_provider: Any | None = None,
+        draft_normalization_counts: torch.Tensor | None = None,
+        token_chunk_size: int = DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
     ):
         self.loss_fn = loss_fn
         self.prepare_fn = prepare_fn
@@ -291,12 +297,16 @@ class DraftLossWrapper:
         )
         self.d2t = d2t
         self.student_logits = student_logits
+        self.defer_normalization = defer_normalization
+        self.draft_provider = draft_provider
+        self.draft_normalization_counts = draft_normalization_counts
         if cu_seqlens_q is not None and student_logits is None:
             raise ValueError("student_logits must be passed explicitly in packed mode.")
-        if cu_seqlens_q is None and prepare_fn is None:
+        if cu_seqlens_q is None and prepare_fn is None and draft_provider is None:
             raise ValueError("prepare_fn is required in unpacked mode.")
         self.draft_loss_fn = DraftCrossEntropyLossFn(
             vocab_parallel_group=vocab_parallel_group,
+            token_chunk_size=token_chunk_size,
         )
 
     def _packed_draft_loss(
@@ -350,19 +360,43 @@ class DraftLossWrapper:
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         if global_valid_toks is None:
             raise ValueError("global_valid_toks is required for DraftLossWrapper.")
+        policy_data = data
+        if self.draft_provider is not None:
+            transient_output_keys = {"dflash_output", "dspark_output"} & data.keys()
+            if transient_output_keys:
+                policy_data = copy(data)
+                policy_data.data = {
+                    key: value
+                    for key, value in data.items()
+                    if key not in transient_output_keys
+                }
         policy_loss, metrics = self.loss_fn(
             next_token_logits,
-            data,
+            policy_data,
             global_valid_seqs,
             global_valid_toks,
             **kwargs,
         )
 
+        # Function-local import: step_state lives under models.megatron.draft,
+        # whose package import pulls the modelopt chain non-megatron users avoid.
+        from nemo_rl.models.megatron.draft.step_state import (
+            DRAFT_LOSS_METRIC_KEY,
+            DRAFT_STEP_PAYLOAD_KEY,
+            DraftStepState,
+        )
+
+        # The packed EAGLE-3 path predates the provider protocol and normalizes
+        # inside _packed_draft_loss, so it never defers normalization.
         if self.cu_seqlens_q is not None:
             draft_loss = self._packed_draft_loss(
                 next_token_logits, data, global_valid_seqs, global_valid_toks
             )
-        else:
+            combined_loss = policy_loss + self.loss_weight * draft_loss
+            metrics[DRAFT_LOSS_METRIC_KEY] = float(draft_loss.detach().item())
+            return combined_loss, metrics
+
+        if self.draft_provider is None:
             loss_input, data = self.prepare_fn(
                 logits=next_token_logits,
                 data=data,
@@ -371,14 +405,48 @@ class DraftLossWrapper:
                 vocab_parallel_group=self.vocab_parallel_group,
                 context_parallel_group=self.context_parallel_group,
             )
-            draft_loss = self.draft_loss_fn(
-                data=data,
-                global_valid_seqs=global_valid_seqs,
-                global_valid_toks=global_valid_toks,
-                **loss_input,
+            stats = (
+                self.draft_loss_fn.loss_stats(data=data, **loss_input)
+                if self.defer_normalization
+                else None
             )
+        else:
+            stats = self.draft_provider.loss_stats(
+                target_logits=next_token_logits,
+                data=data,
+                prepare_fn=self.prepare_fn,
+                vocab_parallel_rank=self.vocab_parallel_rank,
+                vocab_parallel_group=self.vocab_parallel_group,
+                context_parallel_group=self.context_parallel_group,
+            )
+        if self.defer_normalization:
+            assert stats is not None
+            draft_loss = (stats.numerators * stats.weights).sum()
+            # Deferred payloads are only consumed by the Megatron split API.
+            metrics[DRAFT_STEP_PAYLOAD_KEY] = DraftStepState.metric_payload(stats)
+        else:
+            if self.draft_provider is None:
+                draft_loss = self.draft_loss_fn(
+                    data=data,
+                    global_valid_seqs=global_valid_seqs,
+                    global_valid_toks=global_valid_toks,
+                    **loss_input,
+                )
+            else:
+                assert stats is not None
+                if self.draft_provider.config.speculator_type in ("dflash", "dspark"):
+                    if self.draft_normalization_counts is None:
+                        raise RuntimeError(
+                            "block-draft synchronous loss requires full-batch global counts"
+                        )
+                    normalization_counts = self.draft_normalization_counts
+                else:
+                    normalization_counts = global_valid_toks.reshape(1)
+                draft_loss = stats.normalized(
+                    normalization_counts=normalization_counts,
+                )
         combined_loss = policy_loss + self.loss_weight * draft_loss
-        metrics["draft_loss"] = float(draft_loss.detach().item())
+        metrics[DRAFT_LOSS_METRIC_KEY] = float(draft_loss.detach().item())
         return combined_loss, metrics
 
 

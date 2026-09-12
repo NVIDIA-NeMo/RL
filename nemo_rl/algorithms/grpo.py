@@ -128,6 +128,7 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.draft_sample_ids import stable_draft_sample_ids
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
@@ -2316,6 +2317,53 @@ def _preserve_router_replay_routed_experts(
         target["routed_experts"] = flat_messages["routed_experts"]
 
 
+def _attach_grpo_draft_sample_ids(
+    repeated_batch: BatchedDataDict,
+    *,
+    num_generations_per_prompt: int,
+) -> None:
+    """Stamp rollout rows with IDs stable under downstream batch reordering."""
+    if num_generations_per_prompt < 1:
+        raise ValueError("num_generations_per_prompt must be positive")
+    if repeated_batch.size % num_generations_per_prompt != 0:
+        raise ValueError("repeated GRPO batch does not contain complete prompt groups")
+
+    task_names = repeated_batch.get("task_name", [None] * repeated_batch.size)
+    row_keys = [
+        json.dumps(
+            [
+                task_names[row],
+                repeated_batch["idx"][row],
+                row % num_generations_per_prompt,
+            ],
+            separators=(",", ":"),
+        )
+        for row in range(repeated_batch.size)
+    ]
+    repeated_batch["draft_sample_ids"] = torch.tensor(
+        stable_draft_sample_ids(row_keys), dtype=torch.int64
+    )
+
+
+def _preserve_draft_sample_ids(
+    target: BatchedDataDict,
+    repeated_batch: BatchedDataDict,
+) -> None:
+    """Carry stable rollout identity into the policy training payload."""
+    if "draft_sample_ids" not in repeated_batch:
+        return
+    sample_ids = repeated_batch["draft_sample_ids"]
+    # A row-count mismatch means the source batch no longer lines up with the
+    # target, so the IDs would silently label the wrong rows.
+    if target.size != len(sample_ids):
+        raise ValueError(
+            f"draft_sample_ids carries {len(sample_ids)} rows but the target "
+            f"batch has {target.size}; rollout postprocessing must preserve "
+            "input row order and row count."
+        )
+    target["draft_sample_ids"] = sample_ids
+
+
 def _policy_dtype(policy_config: PolicyConfig) -> torch.dtype:
     """Resolve the configured policy precision to its matching torch dtype."""
     return getattr(torch, policy_config["precision"])
@@ -2338,6 +2386,7 @@ def _build_async_grpo_train_data(
         }
     )
     _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
+    _preserve_draft_sample_ids(train_data, repeated_batch)
     # update multimodal data unconditionally
     extra_multimodal_data = flat_messages.get_multimodal_dict(
         as_tensors=False, pixel_dtype=_policy_dtype(policy_config)
@@ -3059,6 +3108,16 @@ def _grpo_train_impl(
                             ),
                         )
                     )
+                    draft_config = master_config.policy.get("draft")
+                    if (
+                        draft_config is not None
+                        and draft_config.enabled
+                        and draft_config.speculator_type in ("dflash", "dspark")
+                    ):
+                        _attach_grpo_draft_sample_ids(
+                            repeated_batch,
+                            num_generations_per_prompt=master_config.grpo.num_generations_per_prompt,
+                        )
                     print_multimodal_payload_metrics(
                         collect_multimodal_payload_metrics(
                             repeated_batch,
@@ -3188,9 +3247,17 @@ def _grpo_train_impl(
                             ),
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
-                        repeated_batch = nemo_gym_rollout_result.final_batch
+                        gym_final_batch = nemo_gym_rollout_result.final_batch
+                        # Gym rebuilds the batch from its own result rows and
+                        # keeps only the columns it models, so draft_sample_ids
+                        # would be dropped here. The rebuilt batch is in input
+                        # row order (run_nemo_gym_rollout_sync restores it), so
+                        # the IDs carry over positionally.
+                        _preserve_draft_sample_ids(gym_final_batch, repeated_batch)
+                        repeated_batch = gym_final_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result
+                        del gym_final_batch
 
                     # Use async rollouts when enabled by config/backend defaults.
                     elif should_use_async_rollouts(master_config.policy["generation"]):
@@ -3401,6 +3468,7 @@ def _grpo_train_impl(
                             "sample_mask": repeated_batch["loss_multiplier"],
                         }
                     )
+                    _preserve_draft_sample_ids(train_data, repeated_batch)
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
                     # This is also used to populate part of the downstream logprob calculation data
                     extra_multimodal_data = flat_messages.get_multimodal_dict(

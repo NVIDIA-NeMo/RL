@@ -15,7 +15,7 @@
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from functools import partial
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union, cast
 
 import torch
 from megatron.core import tensor_parallel
@@ -43,12 +43,14 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 )
 from nemo_rl.algorithms.loss import (
     DraftLossWrapper,
+    NLLLossFn,
     SequencePackingFusionLossWrapper,
     SequencePackingLossWrapper,
     prepare_loss_input,
     prepare_packed_loss_input,
     wrap_loss_fn_with_input_preparation,
 )
+from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.utils import _pack_input_ids
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
@@ -64,6 +66,7 @@ from nemo_rl.models.megatron.data import ProcessedMicrobatch
 from nemo_rl.models.megatron.draft.hidden_capture import (
     get_capture_context,
 )
+from nemo_rl.models.megatron.draft.training import DraftSpeculator
 from nemo_rl.models.megatron.opd_full_capture import get_opd_full_capture_context
 from nemo_rl.models.megatron.router_replay import (
     clear_router_replay,
@@ -150,14 +153,16 @@ def model_forward(
     model: GPTModel,
     data_dict: BatchedDataDict[Any],
     input_ids_cp_sharded: torch.Tensor,
-    position_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
     packed_seq_params: Optional[PackedSeqParams] = None,
     defer_fp32_logits: Optional[bool] = False,
     mtp_loss_mask: Optional[torch.Tensor] = None,
     padding_mask: Optional[torch.Tensor] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     use_fused_linear_logprobs: bool = False,
+    labels_cp_sharded: Optional[torch.Tensor] = None,
+    loss_mask_cp_sharded: Optional[torch.Tensor] = None,
     media_token_validity_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
@@ -176,6 +181,8 @@ def model_forward(
         straggler_timer: Straggler detector for profiling the forward pass
         use_fused_linear_logprobs: Whether to compute logprobs with the fused
             chunked linear cross-entropy kernel (directly from hidden states)
+        labels_cp_sharded: Target-aligned labels for direct MCore loss computation
+        loss_mask_cp_sharded: Target-aligned mask for direct MCore loss computation
         media_token_validity_mask: Which media-token positions actually anchor a
             projected feature, already in this model's token layout. Only passed
             when the model accepts it; otherwise the model derives its own.
@@ -183,6 +190,15 @@ def model_forward(
     Returns:
         torch.Tensor: Output tensor from the model (logits)
     """
+    if (labels_cp_sharded is None) != (loss_mask_cp_sharded is None):
+        raise ValueError(
+            "labels_cp_sharded and loss_mask_cp_sharded must be provided together"
+        )
+    if labels_cp_sharded is not None and use_fused_linear_logprobs:
+        raise ValueError(
+            "Direct packed SFT labels do not support fused linear logprobs"
+        )
+
     multimodal_data = data_dict.get_multimodal_dict(
         as_tensors=True, device=input_ids_cp_sharded.device
     )
@@ -194,8 +210,10 @@ def model_forward(
     if packed_seq_params is not None:
         additional_kwargs["packed_seq_params"] = packed_seq_params
 
-    # Pass MTP loss mask to exclude prompt tokens from MTP loss
-    if mtp_loss_mask is not None:
+    if labels_cp_sharded is not None:
+        additional_kwargs["labels"] = labels_cp_sharded
+        additional_kwargs["loss_mask"] = loss_mask_cp_sharded
+    elif mtp_loss_mask is not None:
         additional_kwargs["loss_mask"] = mtp_loss_mask
     padding_mask = _prepare_padding_mask_for_model(model, padding_mask)
     if padding_mask is not None:
@@ -208,7 +226,7 @@ def model_forward(
 
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
-    if use_fused_linear_logprobs:
+    if use_fused_linear_logprobs and labels_cp_sharded is None:
         additional_kwargs["labels"] = input_ids_cp_sharded
         # Only pass this kwarg when linear CE fusion is enabled. Older Megatron-LM
         # GPTModel.forward signatures do not accept it.
@@ -262,6 +280,8 @@ def forward_with_post_processing_fn(
     sampling_params: Optional[TrainingSamplingParams] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     draft_model: Optional[MegatronModule] = None,
+    draft_provider: DraftSpeculator | None = None,
+    draft_optimizer_step: int = 0,
     enable_hidden_capture: Optional[bool] = False,
     enable_opd_full_capture: bool = False,
     use_fused_linear_logprobs: bool = False,
@@ -306,6 +326,8 @@ def forward_with_post_processing_fn(
     cu_seqlens_padded = processed_mb.cu_seqlens_padded
     mtp_loss_mask = processed_mb.mtp_loss_mask
     padding_mask = processed_mb.padding_mask
+    labels_cp_sharded = processed_mb.labels_cp_sharded
+    loss_mask_cp_sharded = processed_mb.loss_mask_cp_sharded
     routed_experts_cp_sharded = processed_mb.routed_experts_cp_sharded
     original_seq_length = processed_mb.original_seq_length
     media_token_validity_mask = processed_mb.media_token_validity_mask
@@ -323,7 +345,13 @@ def forward_with_post_processing_fn(
     # opd_full capture below the unqualified name reads as the generic one. Not
     # done here: it would pull draft/*.py and three @patch paths in
     # test_train.py into an unrelated feature's review.
-    capture_context, capture = get_capture_context(model, enable_hidden_capture)
+    capture_context, capture = get_capture_context(
+        model,
+        enable_hidden_capture,
+        aux_layer_indices=(
+            draft_provider.capture_layer_ids() if draft_provider is not None else None
+        ),
+    )
     # Independent of the draft capture above: grabs the pre-LM-head hidden states
     # a frozen MOPD teacher ships for full-vocabulary distillation.
     opd_full_capture_context, opd_full_capture = get_opd_full_capture_context(
@@ -343,6 +371,8 @@ def forward_with_post_processing_fn(
                 padding_mask=padding_mask,
                 straggler_timer=straggler_timer,
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
+                labels_cp_sharded=labels_cp_sharded,
+                loss_mask_cp_sharded=loss_mask_cp_sharded,
                 media_token_validity_mask=media_token_validity_mask,
             )
     except Exception:
@@ -360,43 +390,60 @@ def forward_with_post_processing_fn(
             clear_router_replay(model)
 
     if capture is not None:
-        from megatron.core.transformer.multi_token_prediction import roll_tensor
-
-        captured_states = capture.get_captured_states()
-        if packed_seq_params is not None:
-            # Packed layout: rolling the captured embeddings would leak the
-            # next segment's first token across every packing boundary, so
-            # shift the token ids per sequence before packing and re-embed
-            # them instead (one extra embedding lookup; also yields the
-            # correct sequence-parallel layout for free). no_grad matches the
-            # capture hooks, which hand the draft detached embeddings.
-            with torch.no_grad():
-                shifted_input_ids = _pack_input_ids(
-                    data_dict["input_ids"],
-                    packed_seq_params.cu_seqlens_q,
-                    packed_seq_params.cu_seqlens_q_padded,
-                    roll_shift=-1,
-                )
-                shifted_input_embeds = capture.model.embedding(
-                    input_ids=shifted_input_ids, position_ids=position_ids
-                )
-        else:
-            shifted_input_embeds = roll_tensor(
-                captured_states.inputs_embeds,
-                shifts=-1,
-                dims=0,
-                cp_group=get_context_parallel_group(),
-            )[0]
-        data_dict["student_logits"] = draft_model(
-            hidden_states=captured_states.hidden_states,
-            input_embeds=shifted_input_embeds,
-            attention_mask=attention_mask,
-            packed_seq_params=packed_seq_params,
+        captured_states = capture.get_captured_states(
+            sequence_layout=processed_mb.draft_sequence_layout
         )
+        if draft_provider is None:
+            from megatron.core.transformer.multi_token_prediction import roll_tensor
+
+            if packed_seq_params is not None:
+                # Packed layout: rolling the captured embeddings would leak the
+                # next segment's first token across every packing boundary, so
+                # shift the token ids per sequence before packing and re-embed
+                # them instead (one extra embedding lookup; also yields the
+                # correct sequence-parallel layout for free). no_grad matches the
+                # capture hooks, which hand the draft detached embeddings.
+                with torch.no_grad():
+                    shifted_input_ids = _pack_input_ids(
+                        data_dict["input_ids"],
+                        packed_seq_params.cu_seqlens_q,
+                        packed_seq_params.cu_seqlens_q_padded,
+                        roll_shift=-1,
+                    )
+                    shifted_input_embeds = capture.model.embedding(
+                        input_ids=shifted_input_ids, position_ids=position_ids
+                    )
+            else:
+                shifted_input_embeds = roll_tensor(
+                    captured_states.inputs_embeds,
+                    shifts=-1,
+                    dims=0,
+                    cp_group=get_context_parallel_group(),
+                )[0]
+            data_dict["student_logits"] = draft_model(
+                hidden_states=captured_states.hidden_states,
+                input_embeds=shifted_input_embeds,
+                attention_mask=attention_mask,
+                packed_seq_params=packed_seq_params,
+            )
+        else:
+            assert draft_model is not None
+            draft_provider.forward(
+                policy_model=model,
+                draft_model=draft_model,
+                captured_states=captured_states,
+                input_ids_cp_local=input_ids_cp_sharded,
+                attention_mask=attention_mask,
+                data=data_dict,
+                optimizer_step=draft_optimizer_step,
+                sequence_layout=processed_mb.draft_sequence_layout,
+                context_parallel_group=get_context_parallel_group(),
+                tensor_parallel_group=get_tensor_model_parallel_group(),
+            )
 
     # Apply temperature scaling only for sampling-oriented post-processors.
     # Loss computation should use unscaled logits.
-    if isinstance(
+    if labels_cp_sharded is None and isinstance(
         post_processing_fn,
         (
             LossPostProcessor,
@@ -417,6 +464,7 @@ def forward_with_post_processing_fn(
             packed_seq_params=packed_seq_params,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
+            prepacked_loss_mask=loss_mask_cp_sharded,
         )
     elif isinstance(post_processing_fn, LogprobsPostProcessor):
         assert original_seq_length is not None
@@ -468,6 +516,8 @@ def megatron_forward_backward(
     sampling_params: Optional[TrainingSamplingParams] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     draft_model: Optional[MegatronModule] = None,
+    draft_provider: DraftSpeculator | None = None,
+    draft_optimizer_step: int = 0,
     enable_hidden_capture: Optional[bool] = False,
     enable_opd_full_capture: bool = False,
     use_fused_linear_logprobs: bool = False,
@@ -510,6 +560,8 @@ def megatron_forward_backward(
         sampling_params=sampling_params,
         straggler_timer=straggler_timer,
         draft_model=draft_model,
+        draft_provider=draft_provider,
+        draft_optimizer_step=draft_optimizer_step,
         enable_hidden_capture=enable_hidden_capture,
         enable_opd_full_capture=enable_opd_full_capture,
         use_fused_linear_logprobs=use_fused_linear_logprobs,
@@ -545,7 +597,10 @@ class LossPostProcessor:
         cp_normalize: bool = True,
         sampling_params: Optional[TrainingSamplingParams] = None,
         draft_model: Optional[MegatronModule] = None,
+        draft_provider: DraftSpeculator | None = None,
+        draft_normalization_counts: torch.Tensor | None = None,
         prepare_fn: Optional[Callable[..., Any]] = None,
+        defer_draft_normalization: bool = False,
         teacher_output_layer_weight: Optional[torch.Tensor] = None,
     ):
         """Build a per-microbatch loss post-processor for the Megatron train loop.
@@ -563,6 +618,8 @@ class LossPostProcessor:
                 vocab_parallel_group, context_parallel_group)`` and return
                 ``(loss_input, data)``; value models pass one that right-shifts
                 and CP-all-gathers the scalar value-head output.
+            defer_draft_normalization: Return raw draft loss statistics for split
+                optimizer-step finalization instead of normalizing per microbatch.
             teacher_output_layer_weight: This rank's teacher LM-head shard, used
                 by the full-vocabulary MOPD loss to project the teacher payload.
                 It rides this argument rather than the data dict because the
@@ -575,9 +632,17 @@ class LossPostProcessor:
         self.cp_normalize = cp_normalize
         self.sampling_params = sampling_params
         self.prepare_fn = prepare_fn
+        self.defer_draft_normalization = defer_draft_normalization
+        self.draft_provider = draft_provider
+        self.draft_normalization_counts = draft_normalization_counts
         self.teacher_output_layer_weight = teacher_output_layer_weight
-        if draft_model is not None and draft_model.eagle_module is not None:
-            self.d2t = getattr(draft_model.eagle_module, "d2t", None)
+        eagle_module = (
+            getattr(draft_model, "eagle_module", None)
+            if draft_model is not None
+            else None
+        )
+        if eagle_module is not None:
+            self.d2t = getattr(eagle_module, "d2t", None)
         else:
             self.d2t = None
 
@@ -587,6 +652,7 @@ class LossPostProcessor:
         packed_seq_params: Optional[PackedSeqParams] = None,
         global_valid_seqs: Optional[torch.Tensor] = None,
         global_valid_toks: Optional[torch.Tensor] = None,
+        prepacked_loss_mask: Optional[torch.Tensor] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
         """Create a loss post-processing function for training.
 
@@ -599,10 +665,64 @@ class LossPostProcessor:
             packed_seq_params: Parameters for packed sequences (optional)
             global_valid_seqs: Global valid sequence count for loss normalization
             global_valid_toks: Global valid token count for loss normalization
+            prepacked_loss_mask: CP-local target-aligned mask when MCore returned
+                per-token losses for a direct packed row
 
         Returns:
             Callable: Function that takes output tensor and returns (loss, metrics) tuple
         """
+        if prepacked_loss_mask is not None:
+            if (
+                type(self.loss_fn) is not NLLLossFn
+                or self.loss_fn.use_fused_linear_logprobs
+            ):
+                raise TypeError(
+                    "direct Megatron-LM prepacked SFT requires the standard "
+                    "NLLLossFn with use_fused_linear_logprobs=false because "
+                    "custom LossFunction implementations are not invoked"
+                )
+            if global_valid_toks is None:
+                raise ValueError(
+                    "global_valid_toks is required for direct packed model loss"
+                )
+
+            def _direct_packed_model_loss(
+                model_losses: torch.Tensor,
+            ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+                if model_losses.shape != prepacked_loss_mask.shape:
+                    raise ValueError(
+                        "loss and loss mask shapes must match for direct packed "
+                        f"SFT: loss={tuple(model_losses.shape)}, "
+                        f"mask={tuple(prepacked_loss_mask.shape)}"
+                    )
+                mask = prepacked_loss_mask.to(
+                    device=model_losses.device, dtype=torch.float32
+                )
+                normalizer = global_valid_toks.to(
+                    device=model_losses.device, dtype=torch.float32
+                ).clamp(min=1)
+                loss = (model_losses.float() * mask).sum() / normalizer
+                metrics: Dict[str, Any] = {"loss": loss.detach()}
+                if "sample_mask" in data_dict:
+                    metrics["num_valid_samples"] = (
+                        data_dict["sample_mask"].sum().detach()
+                    )
+                return loss, metrics
+
+            cp_size = get_context_parallel_world_size()
+            num_microbatches = self.num_microbatches
+            # Mirror the shared cp_normalize division below; this branch returns
+            # early and would otherwise skip it, inflating loss by cp_size.
+            cp_normalizer = cp_size * cp_size if self.cp_normalize else cp_size
+
+            def _counteract_direct_mcore_loss_averaging(
+                model_losses: torch.Tensor,
+            ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+                loss, metrics = _direct_packed_model_loss(model_losses)
+                return loss * num_microbatches / cp_normalizer, metrics
+
+            return _counteract_direct_mcore_loss_averaging
+
         # A custom prepare_fn (e.g. value models) overrides the default logit prep.
         logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
         if self.prepare_fn is not None:
@@ -615,6 +735,7 @@ class LossPostProcessor:
                 chunk_size=logprob_chunk_size,
                 teacher_output_layer_weight=self.teacher_output_layer_weight,
             )
+        draft_prepare_fn = prepare_loss_input_wrapped
 
         # wrap loss function with loss input preparation
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
@@ -638,6 +759,7 @@ class LossPostProcessor:
             else:
                 wrapper_cls = SequencePackingLossWrapper
                 prepare_fn = prepare_loss_input_wrapped
+            draft_prepare_fn = prepare_fn
 
             loss_fn_wrapped = wrapper_cls(
                 loss_fn=self.loss_fn,
@@ -648,7 +770,7 @@ class LossPostProcessor:
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
             )
-            if "student_logits" in data_dict:
+            if "student_logits" in data_dict and self.draft_provider is None:
                 # draft + use_fused_linear_logprobs is rejected at setup in
                 # lm_policy.py (the fused path never materializes the full
                 # next-token logits the teacher needs), so no check here.
@@ -659,7 +781,7 @@ class LossPostProcessor:
                     loss_fn=loss_fn_wrapped,
                     prepare_fn=None,
                     data_dict=data_dict,
-                    loss_weight=float(self.cfg["draft"]["loss_weight"]),
+                    loss_weight=float(self.cfg["draft"].loss_weight),
                     vocab_parallel_rank=get_tensor_model_parallel_rank(),
                     vocab_parallel_group=get_tensor_model_parallel_group(),
                     context_parallel_group=get_context_parallel_group(),
@@ -667,6 +789,11 @@ class LossPostProcessor:
                     cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
                     d2t=self.d2t,
                     student_logits=student_logits,
+                    token_chunk_size=getattr(
+                        self.cfg["draft"],
+                        "token_chunk_size",
+                        DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
+                    ),
                 )
         else:
             loss_fn_wrapped = partial(
@@ -677,16 +804,25 @@ class LossPostProcessor:
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
             )
-            if "student_logits" in data_dict:
-                loss_fn_wrapped = DraftLossWrapper(
-                    loss_fn=loss_fn_wrapped,
-                    prepare_fn=prepare_loss_input_wrapped,
-                    data_dict=data_dict,
-                    loss_weight=float(self.cfg["draft"]["loss_weight"]),
-                    vocab_parallel_rank=get_tensor_model_parallel_rank(),
-                    vocab_parallel_group=get_tensor_model_parallel_group(),
-                    context_parallel_group=get_context_parallel_group(),
-                )
+
+        if "student_logits" in data_dict or self.draft_provider is not None:
+            loss_fn_wrapped = DraftLossWrapper(
+                loss_fn=loss_fn_wrapped,
+                prepare_fn=draft_prepare_fn,
+                data_dict=data_dict,
+                loss_weight=float(self.cfg["draft"].loss_weight),
+                vocab_parallel_rank=get_tensor_model_parallel_rank(),
+                vocab_parallel_group=get_tensor_model_parallel_group(),
+                context_parallel_group=get_context_parallel_group(),
+                defer_normalization=self.defer_draft_normalization,
+                draft_provider=self.draft_provider,
+                draft_normalization_counts=self.draft_normalization_counts,
+                token_chunk_size=getattr(
+                    self.cfg["draft"],
+                    "token_chunk_size",
+                    DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
+                ),
+            )
 
         loss_fn_wrapped = partial(
             loss_fn_wrapped,
@@ -718,6 +854,22 @@ class LossPostProcessor:
         loss_fn_wrapped = _counteract_mcore_loss_averaging
 
         return loss_fn_wrapped
+
+
+def should_reduce_loss_across_context_parallel(
+    data: BatchedDataDict[Any] | dict[str, Any],
+) -> bool:
+    """Return whether scalar loss reporting must include context-parallel ranks."""
+    return "packed_cu_seqlens" in data and "target_ids" in data
+
+
+def strip_context_parallel_local_loss_metric(
+    metrics: Dict[str, List[Any]], enabled: bool
+) -> Dict[str, List[Any]]:
+    """Remove CP-local loss after it contributes to the global reduction."""
+    if enabled:
+        metrics.pop("loss", None)
+    return metrics
 
 
 class LogprobsPostProcessor:
@@ -1128,7 +1280,7 @@ class TopkLogitsPostProcessor:
 
 def aggregate_training_statistics(
     all_mb_metrics: List[Dict[str, Any]],
-    losses: List[float],
+    losses: List[Union[float, torch.Tensor]],
     data_parallel_group: torch.distributed.ProcessGroup,
 ) -> Tuple[Dict[str, List[Any]], torch.Tensor]:
     """Aggregate training statistics across microbatches and data-parallel ranks.
@@ -1139,7 +1291,8 @@ def aggregate_training_statistics(
 
     Args:
         all_mb_metrics: List of metric dicts from each microbatch.
-        losses: List of per-gradient-buffer scalar losses on this rank.
+        losses: List of per-gradient-buffer scalar losses on this rank. Tensor
+            values remain on device until the final reduction.
         data_parallel_group: The data-parallel process group for all-reduce.
 
     Returns:
@@ -1149,7 +1302,15 @@ def aggregate_training_statistics(
     """
     # Compute global loss across all data-parallel ranks
     with torch.no_grad():
-        global_loss = torch.tensor(losses, device="cuda")
+        tensor_losses = [
+            cast(torch.Tensor, loss).detach()
+            for loss in losses
+            if isinstance(loss, torch.Tensor)
+        ]
+        if losses and len(tensor_losses) == len(losses):
+            global_loss = torch.stack(tensor_losses)
+        else:
+            global_loss = torch.tensor(losses, device="cuda")
         torch.distributed.all_reduce(
             global_loss,
             op=torch.distributed.ReduceOp.SUM,
@@ -1161,5 +1322,15 @@ def aggregate_training_statistics(
     for m in all_mb_metrics:
         for k, v in m.items():
             mb_metrics[k].append(v)
+
+    for key, values in mb_metrics.items():
+        if values and all(
+            isinstance(value, torch.Tensor) and value.numel() == 1 for value in values
+        ):
+            mb_metrics[key] = (
+                torch.stack([value.detach().reshape(()) for value in values])
+                .cpu()
+                .tolist()
+            )
 
     return dict(mb_metrics), global_loss

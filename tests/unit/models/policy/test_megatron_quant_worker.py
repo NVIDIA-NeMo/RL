@@ -283,6 +283,23 @@ def test_iter_real_quant_refit_params_uses_megatron_bridge_export():
 
 
 @requires_weight_folding
+def test_real_quant_refit_forwards_draft_metadata_mode():
+    worker = _make_real_quant_worker()
+    metadata_modes = []
+
+    def iter_draft_weights(*, metadata_only):
+        metadata_modes.append(metadata_only)
+        yield "draft.layers.0.weight", torch.empty(2, device="meta")
+
+    worker._iter_draft_weights_for_refit = iter_draft_weights
+
+    output = list(worker._iter_params_with_optional_kv_scales(draft_metadata_only=True))
+
+    assert metadata_modes == [True]
+    assert output[-1][0] == "draft.layers.0.weight"
+
+
+@requires_weight_folding
 def test_iter_real_quant_refit_params_can_keep_export_on_gpu() -> None:
     worker = _make_real_quant_worker()
     worker.cfg["generation"]["real_quant_export_cpu_offload"] = False
@@ -372,7 +389,7 @@ def test_iter_params_with_optional_kv_scales_uses_real_quant_export(monkeypatch)
     monkeypatch.setattr(
         worker,
         "_iter_real_quant_refit_params",
-        lambda kv_scales=None: iter([("real.weight", torch.ones(1))]),
+        lambda kv_scales=None, **_kwargs: iter([("real.weight", torch.ones(1))]),
     )
 
     output = list(worker._iter_params_with_optional_kv_scales({"scale": 1.0}))
@@ -421,7 +438,7 @@ def test_iter_params_with_optional_kv_scales_exports_input_amax(monkeypatch):
     monkeypatch.setattr(
         MegatronPolicyWorkerImpl,
         "_iter_params_with_optional_kv_scales",
-        lambda self, kv_scales=None: iter(
+        lambda self, kv_scales=None, **_kwargs: iter(
             [("model.layers.0.mlp.down_proj.weight", torch.ones(2, 2))]
         ),
     )
@@ -433,6 +450,49 @@ def test_iter_params_with_optional_kv_scales_exports_input_amax(monkeypatch):
         "model.layers.0.mlp.down_proj.input_quantizer._amax",
     ]
     torch.testing.assert_close(output[1][1], torch.tensor([3.0]))
+
+
+@requires_weight_folding
+def test_iter_params_with_optional_kv_scales_forwards_draft_metadata_only(
+    monkeypatch,
+):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.cfg = {
+        "generation": {
+            "backend": "vllm",
+            "quant_cfg": "FP8_DEFAULT_CFG",
+            "real_quant": False,
+        }
+    }
+    worker.rank = 0
+    worker.refit_conversion_tasks = []
+
+    def metadata_export(
+        self,
+        kv_scales=None,
+        *,
+        draft_metadata_only=False,
+        draft_weights=None,
+    ):
+        if not draft_metadata_only:
+            raise AssertionError("quant override dropped draft metadata mode")
+        yield "draft.model.weight", torch.empty(2, dtype=torch.float32, device="meta")
+
+    monkeypatch.setattr(
+        MegatronPolicyWorkerImpl,
+        "_iter_params_with_optional_kv_scales",
+        metadata_export,
+    )
+
+    output = list(worker._iter_params_with_optional_kv_scales(draft_metadata_only=True))
+
+    assert [name for name, _ in output] == ["draft.model.weight"]
+    assert output[0][1].device.type == "meta"
 
 
 @requires_weight_folding
@@ -470,7 +530,13 @@ def test_folded_quantizer_error_includes_parameter_name(monkeypatch):
         lambda *_args: FailingQuantizer(),
     )
 
-    def access_refit_task_weights(self, kv_scales=None):
+    def access_refit_task_weights(
+        self,
+        kv_scales=None,
+        *,
+        draft_metadata_only=False,
+        draft_weights=None,
+    ):
         for refit_task in self.refit_conversion_tasks:
             yield refit_task.param_name, refit_task.param_weight
 
@@ -547,7 +613,7 @@ def test_stream_weights_via_ipc_zmq_does_not_move_without_real_quant(monkeypatch
     monkeypatch.setattr(
         worker,
         "_iter_params_with_optional_kv_scales",
-        lambda kv_scales=None: iter([("model.weight", torch.ones(1))]),
+        lambda kv_scales=None, **_kwargs: iter([("model.weight", torch.ones(1))]),
     )
 
     def fake_stream_weights_via_ipc_zmq_impl(**kwargs):

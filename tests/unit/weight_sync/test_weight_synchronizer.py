@@ -649,6 +649,101 @@ class TestCollectiveWeightSynchronizer:
 
 
 class TestNcclReshardWeightSynchronizer:
+    def test_parallelism_includes_context_parallelism(self):
+        policy = _mock_policy(
+            cfg={
+                "megatron_cfg": {
+                    "tensor_model_parallel_size": 2,
+                    "expert_model_parallel_size": 1,
+                    "context_parallel_size": 2,
+                    "pipeline_model_parallel_size": 1,
+                },
+                "generation": {
+                    "backend": "vllm",
+                    "vllm_cfg": {
+                        "tensor_parallel_size": 4,
+                        "expert_parallel_size": 1,
+                        "pipeline_parallel_size": 1,
+                    },
+                },
+            },
+        )
+        sync = NcclReshardWeightSynchronizer(
+            policy, _mock_generation(), _mock_cluster(), _mock_cluster()
+        )
+
+        assert sync._train_parallelism() == {
+            "tp_size": 2,
+            "ep_size": 1,
+            "cp_size": 2,
+            "etp_size": 2,
+            "pp_size": 1,
+        }
+        assert sync._gen_parallelism() == {
+            "tp_size": 4,
+            "ep_size": 1,
+            "cp_size": 1,
+            "etp_size": 4,
+            "pp_size": 1,
+        }
+
+    @patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray")
+    def test_init_communicator_rejects_generation_context_parallelism_before_collectives(
+        self, mock_ray
+    ):
+        policy = _mock_policy(
+            cfg={
+                "megatron_cfg": {},
+                "generation": {
+                    "backend": "vllm",
+                    "vllm_cfg": {"context_parallel_size": 2},
+                },
+            },
+        )
+        generation = _mock_generation()
+        sync = NcclReshardWeightSynchronizer(
+            policy, generation, _mock_cluster(), _mock_cluster()
+        )
+
+        with pytest.raises(ValueError, match="context_parallel_size must be 1"):
+            sync.init_communicator()
+
+        policy.init_collective.assert_not_called()
+        generation.init_collective.assert_not_called()
+
+    def test_init_communicator_rejects_train_world_not_divisible_by_pp_before_collectives(
+        self,
+    ):
+        policy = _mock_policy(
+            cfg={
+                "megatron_cfg": {
+                    "tensor_model_parallel_size": 1,
+                    "expert_model_parallel_size": 1,
+                    "context_parallel_size": 2,
+                    "pipeline_model_parallel_size": 3,
+                },
+                "generation": {"backend": "vllm", "vllm_cfg": {}},
+            },
+        )
+        generation = _mock_generation()
+        sync = NcclReshardWeightSynchronizer(
+            policy,
+            generation,
+            _mock_cluster(world_size=14),
+            _mock_cluster(world_size=1),
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="train_world_size=14.*TP=1.*EP=1.*CP=2.*PP=3",
+        ):
+            sync.init_communicator()
+
+        policy.init_collective.assert_not_called()
+        generation.init_collective.assert_not_called()
+        policy.init_nccl_reshard_comm_group.assert_not_called()
+        generation.init_nccl_reshard_comm_group.assert_not_called()
+
     @patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray")
     def test_sync_weights_materializes_policy_params_before_transfer(self, mock_ray):
         mock_ray.get.return_value = [True]
@@ -721,8 +816,20 @@ class TestNcclReshardWeightSynchronizer:
         sync.init_communicator()
 
         policy.prepare_nccl_reshard_refit_info.assert_called_once_with(
-            {"tp_size": 2, "ep_size": 1, "etp_size": 2, "pp_size": 1},
-            {"tp_size": 4, "ep_size": 1, "etp_size": 4, "pp_size": 1},
+            {
+                "tp_size": 2,
+                "ep_size": 1,
+                "etp_size": 2,
+                "cp_size": 1,
+                "pp_size": 1,
+            },
+            {
+                "tp_size": 4,
+                "ep_size": 1,
+                "etp_size": 4,
+                "cp_size": 1,
+                "pp_size": 1,
+            },
             2,
             4,
             refit_payload_mode="hf_export",
@@ -1091,6 +1198,7 @@ class TestFactory:
             "tp_size": 8,
             "ep_size": 2,
             "etp_size": 8,
+            "cp_size": 1,
             "pp_size": 1,
         }
 

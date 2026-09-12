@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 import ray
 import torch
@@ -42,11 +43,13 @@ from nemo_rl.algorithms.grpo import (
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
+    _attach_grpo_draft_sample_ids,
     _get_grpo_save_state,
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
     _maybe_restore_async_replay_buffer_checkpoint,
     _needs_hf_refit_handshake,
+    _preserve_draft_sample_ids,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
@@ -63,13 +66,22 @@ from nemo_rl.algorithms.grpo import (
     setup,
     validate,
 )
-from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
+from nemo_rl.algorithms.grpo_sync import (
+    _log_completed_draft_refit,
+    _should_use_split_draft_training,
+    _train_fields_for_step,
+    _train_policy_from_meta,
+    grpo_train_sync,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
 )
-from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
+from nemo_rl.algorithms.utils import (
+    calculate_baseline_and_std_per_prompt,
+    sum_metric_values,
+)
 from nemo_rl.data.dataloader import CyclingDataLoader
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.multimodal_utils import PackedTensor
@@ -127,6 +139,77 @@ def test_save_async_replay_buffer_checkpoint(tmp_path):
     replay_buffer.save_to_path.remote.assert_called_once_with(
         str(tmp_path / "replay_buffer.pt")
     )
+
+
+def test_grpo_dflash_sample_ids_are_stable_across_prompt_group_order() -> None:
+    forward = BatchedDataDict(
+        {
+            "idx": [17, 17, 23, 23],
+            "task_name": ["math"] * 4,
+        }
+    )
+    reverse = BatchedDataDict(
+        {
+            "idx": [23, 23, 17, 17],
+            "task_name": ["math"] * 4,
+        }
+    )
+
+    _attach_grpo_draft_sample_ids(forward, num_generations_per_prompt=2)
+    _attach_grpo_draft_sample_ids(reverse, num_generations_per_prompt=2)
+
+    forward_ids = forward["draft_sample_ids"]
+    reverse_ids = reverse["draft_sample_ids"]
+    assert forward_ids.dtype == torch.int64
+    assert torch.equal(forward_ids, reverse_ids.roll(2))
+    assert torch.unique(forward_ids).numel() == 4
+
+
+def _gym_style_rebuilt_batch(num_rows: int) -> BatchedDataDict:
+    """A Gym final_batch: rebuilt from result rows, draft columns dropped."""
+    return BatchedDataDict(
+        {
+            "message_log": [[] for _ in range(num_rows)],
+            "length": torch.arange(num_rows, dtype=torch.int64),
+            "loss_multiplier": torch.ones(num_rows),
+            "total_reward": torch.zeros(num_rows),
+            "truncated": torch.zeros(num_rows, dtype=torch.bool),
+        }
+    )
+
+
+def test_preserve_draft_sample_ids_survives_nemo_gym_batch_rebuild() -> None:
+    """Sync Gym replaces repeated_batch with a rebuild that has no draft IDs."""
+    repeated_batch = BatchedDataDict(
+        {
+            "idx": [17, 17, 23, 23],
+            "task_name": ["math"] * 4,
+        }
+    )
+    _attach_grpo_draft_sample_ids(repeated_batch, num_generations_per_prompt=2)
+    gym_final_batch = _gym_style_rebuilt_batch(4)
+    assert "draft_sample_ids" not in gym_final_batch
+
+    _preserve_draft_sample_ids(gym_final_batch, repeated_batch)
+
+    # Gym restores input row order, so the IDs carry over positionally.
+    assert torch.equal(
+        gym_final_batch["draft_sample_ids"], repeated_batch["draft_sample_ids"]
+    )
+
+
+def test_preserve_draft_sample_ids_rejects_row_count_mismatch() -> None:
+    """Silently relabelled rows would poison the draft plan; fail instead."""
+    repeated_batch = BatchedDataDict(
+        {
+            "idx": [17, 17, 23, 23],
+            "task_name": ["math"] * 4,
+        }
+    )
+    _attach_grpo_draft_sample_ids(repeated_batch, num_generations_per_prompt=2)
+
+    with pytest.raises(ValueError, match="draft_sample_ids carries 4 rows"):
+        _preserve_draft_sample_ids(_gym_style_rebuilt_batch(3), repeated_batch)
 
 
 @pytest.mark.parametrize("load_replay_buffer", [True, None])
@@ -876,6 +959,332 @@ def test_raise_if_message_level_advantage_penalties_enabled_raises_when_set(
         _raise_if_message_level_advantage_penalties_enabled(master_config)
 
 
+def test_log_completed_draft_refit_marks_only_post_update_refits(capsys) -> None:
+    master_config = MagicMock()
+    master_config.policy = {"draft": MagicMock(enabled=True)}
+
+    _log_completed_draft_refit(master_config, pending_step=None)
+    assert capsys.readouterr().out == ""
+
+    _log_completed_draft_refit(master_config, pending_step=1)
+    assert capsys.readouterr().out == "draft_post_update_refit=complete step=1\n"
+
+
+def test_log_completed_draft_refit_skips_non_draft_training(capsys) -> None:
+    master_config = MagicMock()
+    master_config.policy = {}
+
+    _log_completed_draft_refit(master_config, pending_step=1)
+
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize(
+    ("speculator_type", "context_parallel_size", "sequence_parallel"),
+    [
+        ("dflash", 2, True),
+        ("dspark", 4, True),
+        ("dflash", 2, False),
+        ("custom", 2, False),
+    ],
+)
+def test_split_draft_training_requires_supported_packed_cp_layout(
+    speculator_type: str, context_parallel_size: int, sequence_parallel: bool
+) -> None:
+    master_config = MagicMock()
+    master_config.policy = {
+        "draft": MagicMock(
+            enabled=True,
+            speculator_type=speculator_type,
+            supports_context_parallel=True,
+            supports_sequence_packing=True,
+            supports_target_sequence_parallel=True,
+        ),
+        "megatron_cfg": {
+            "enabled": True,
+            "context_parallel_size": context_parallel_size,
+            "sequence_parallel": sequence_parallel,
+        },
+        "sequence_packing": {"enabled": True},
+    }
+
+    assert _should_use_split_draft_training(master_config)
+
+
+@pytest.mark.parametrize(
+    ("draft", "megatron_cfg", "sequence_packing"),
+    [
+        (None, {"enabled": True, "context_parallel_size": 2}, {"enabled": True}),
+        (
+            MagicMock(
+                enabled=True,
+                speculator_type="eagle3",
+                supports_context_parallel=False,
+                supports_sequence_packing=False,
+                supports_target_sequence_parallel=False,
+            ),
+            {"enabled": True, "context_parallel_size": 2, "sequence_parallel": True},
+            {"enabled": True},
+        ),
+        (
+            MagicMock(
+                enabled=True,
+                speculator_type="dflash",
+                supports_context_parallel=True,
+                supports_sequence_packing=True,
+                supports_target_sequence_parallel=True,
+            ),
+            {"enabled": False, "context_parallel_size": 2, "sequence_parallel": True},
+            {"enabled": True},
+        ),
+        (
+            MagicMock(
+                enabled=True,
+                speculator_type="dflash",
+                supports_context_parallel=True,
+                supports_sequence_packing=True,
+                supports_target_sequence_parallel=True,
+            ),
+            {"enabled": True, "context_parallel_size": 1, "sequence_parallel": True},
+            {"enabled": True},
+        ),
+        (
+            MagicMock(
+                enabled=True,
+                speculator_type="dflash",
+                supports_context_parallel=True,
+                supports_sequence_packing=True,
+                supports_target_sequence_parallel=True,
+            ),
+            {"enabled": True, "context_parallel_size": 2, "sequence_parallel": True},
+            {"enabled": False},
+        ),
+        (
+            MagicMock(
+                enabled=True,
+                speculator_type="custom",
+                supports_context_parallel=True,
+                supports_sequence_packing=True,
+                supports_target_sequence_parallel=False,
+            ),
+            {"enabled": True, "context_parallel_size": 2, "sequence_parallel": True},
+            {"enabled": True},
+        ),
+    ],
+)
+def test_split_draft_training_rejects_unproven_layouts(
+    draft, megatron_cfg, sequence_packing
+) -> None:
+    master_config = MagicMock()
+    master_config.policy = {
+        "draft": draft,
+        "megatron_cfg": megatron_cfg,
+        "sequence_packing": sequence_packing,
+    }
+
+    assert not _should_use_split_draft_training(master_config)
+
+
+def test_train_policy_from_meta_uses_split_lifecycle_and_fields() -> None:
+    policy = MagicMock()
+    policy.finish_train_step.return_value = {"loss": 1.0}
+    master_config = MagicMock()
+    master_config.policy = {
+        "draft": MagicMock(enabled=True, speculator_type="dflash"),
+        "megatron_cfg": {
+            "enabled": True,
+            "context_parallel_size": 2,
+            "sequence_parallel": True,
+        },
+        "sequence_packing": {"enabled": True},
+    }
+    meta = MagicMock()
+    loss_fn = MagicMock()
+    timer = MagicMock()
+    train_fields = ("input_ids", "advantages")
+
+    result = _train_policy_from_meta(
+        policy,
+        meta,
+        loss_fn=loss_fn,
+        timer=timer,
+        train_fields=train_fields,
+        master_config=master_config,
+    )
+
+    assert result == {"loss": 1.0}
+    policy.begin_train_step.assert_called_once_with(loss_fn)
+    policy.train_microbatches_from_meta.assert_called_once_with(
+        meta,
+        timer=timer,
+        train_fields=train_fields,
+    )
+    policy.finish_train_step.assert_called_once_with()
+    policy.abort_train_step.assert_not_called()
+    policy.train_from_meta.assert_not_called()
+
+
+def test_train_policy_from_meta_aborts_split_step_on_failure() -> None:
+    policy = MagicMock()
+    policy.train_microbatches_from_meta.side_effect = RuntimeError("backward failed")
+    master_config = MagicMock()
+    master_config.policy = {
+        "draft": MagicMock(enabled=True, speculator_type="dspark"),
+        "megatron_cfg": {
+            "enabled": True,
+            "context_parallel_size": 4,
+            "sequence_parallel": True,
+        },
+        "sequence_packing": {"enabled": True},
+    }
+
+    with pytest.raises(RuntimeError, match="backward failed"):
+        _train_policy_from_meta(
+            policy,
+            MagicMock(),
+            loss_fn=MagicMock(),
+            timer=None,
+            train_fields=("input_ids",),
+            master_config=master_config,
+        )
+
+    policy.abort_train_step.assert_called_once_with()
+    policy.finish_train_step.assert_not_called()
+
+
+def test_train_policy_from_meta_aborts_when_split_begin_fails() -> None:
+    policy = MagicMock()
+    policy.begin_train_step.side_effect = RuntimeError("begin failed")
+    master_config = MagicMock()
+    master_config.policy = {
+        "draft": MagicMock(enabled=True, speculator_type="dflash"),
+        "megatron_cfg": {
+            "enabled": True,
+            "context_parallel_size": 2,
+            "sequence_parallel": True,
+        },
+        "sequence_packing": {"enabled": True},
+    }
+
+    with pytest.raises(RuntimeError, match="begin failed"):
+        _train_policy_from_meta(
+            policy,
+            MagicMock(),
+            loss_fn=MagicMock(),
+            timer=None,
+            train_fields=("input_ids",),
+            master_config=master_config,
+        )
+
+    policy.abort_train_step.assert_called_once_with()
+    policy.train_microbatches_from_meta.assert_not_called()
+
+
+def test_train_policy_from_meta_aborts_when_split_finish_fails() -> None:
+    policy = MagicMock()
+    policy.finish_train_step.side_effect = RuntimeError("finish failed")
+    master_config = MagicMock()
+    master_config.policy = {
+        "draft": MagicMock(
+            enabled=True,
+            speculator_type="dflash",
+            supports_context_parallel=True,
+            supports_sequence_packing=True,
+            supports_target_sequence_parallel=True,
+        ),
+        "megatron_cfg": {
+            "enabled": True,
+            "context_parallel_size": 2,
+            "sequence_parallel": True,
+        },
+        "sequence_packing": {"enabled": True},
+    }
+
+    with pytest.raises(RuntimeError, match="finish failed"):
+        _train_policy_from_meta(
+            policy,
+            MagicMock(),
+            loss_fn=MagicMock(),
+            timer=None,
+            train_fields=("input_ids",),
+            master_config=master_config,
+        )
+
+    policy.abort_train_step.assert_called_once_with()
+
+
+def test_train_policy_from_meta_preserves_training_error_when_abort_fails() -> None:
+    policy = MagicMock()
+    policy.train_microbatches_from_meta.side_effect = RuntimeError("backward failed")
+    policy.abort_train_step.side_effect = RuntimeError("abort failed")
+    master_config = MagicMock()
+    master_config.policy = {
+        "draft": MagicMock(
+            enabled=True,
+            speculator_type="dspark",
+            supports_context_parallel=True,
+            supports_sequence_packing=True,
+            supports_target_sequence_parallel=True,
+        ),
+        "megatron_cfg": {
+            "enabled": True,
+            "context_parallel_size": 2,
+            "sequence_parallel": True,
+        },
+        "sequence_packing": {"enabled": True},
+    }
+
+    with pytest.raises(RuntimeError, match="backward failed") as error:
+        _train_policy_from_meta(
+            policy,
+            MagicMock(),
+            loss_fn=MagicMock(),
+            timer=None,
+            train_fields=("input_ids",),
+            master_config=master_config,
+        )
+
+    assert error.value.__notes__ == [
+        "split training abort also failed: RuntimeError('abort failed')"
+    ]
+
+
+def test_train_policy_from_meta_keeps_cp1_on_monolithic_path() -> None:
+    policy = MagicMock()
+    policy.train_from_meta.return_value = {"loss": 2.0}
+    master_config = MagicMock()
+    master_config.policy = {
+        "draft": MagicMock(enabled=True, speculator_type="dflash"),
+        "megatron_cfg": {
+            "enabled": True,
+            "context_parallel_size": 1,
+            "sequence_parallel": True,
+        },
+        "sequence_packing": {"enabled": True},
+    }
+    meta = MagicMock()
+    loss_fn = MagicMock()
+    train_fields = ("input_ids",)
+
+    result = _train_policy_from_meta(
+        policy,
+        meta,
+        loss_fn=loss_fn,
+        timer=None,
+        train_fields=train_fields,
+        master_config=master_config,
+    )
+
+    assert result == {"loss": 2.0}
+    policy.train_from_meta.assert_called_once_with(
+        meta,
+        loss_fn=loss_fn,
+        timer=None,
+        train_fields=train_fields,
+    )
+    policy.begin_train_step.assert_not_called()
+
+
 def test_multimodal_dedup_rejects_unqualified_transfer_paths(
     mock_grpo_components,
 ):
@@ -1476,6 +1885,171 @@ def mock_sync_grpo_infrastructure(policy):
     policy.tq_partition_id = 0
 
     return stack
+
+
+def _run_sync_draft_refit_marker_case(
+    mock_grpo_components,
+    capsys,
+    *,
+    total_steps: int = 0,
+    current_step: int = 0,
+    max_steps: int = 2,
+    val_period: int = 0,
+    refit_side_effect=None,
+):
+    components = mock_grpo_components
+    master_config = components["master_config"]
+    master_config.data_plane = {"enabled": True}
+    master_config.grpo.max_num_steps = max_steps
+    master_config.grpo.max_num_epochs = 2
+    master_config.grpo.val_period = val_period
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.checkpointing["enabled"] = False
+    master_config.policy["draft"] = MagicMock(enabled=True)
+
+    save_state = _initial_grpo_save_state()
+    save_state.total_steps = total_steps
+    save_state.current_step = current_step
+    events: list[str] = []
+    train_result = components["policy"].train.return_value
+    components["policy"].train_from_meta.side_effect = lambda *args, **kwargs: (
+        events.append("update"),
+        train_result,
+    )[1]
+
+    def refit(*args, **kwargs):
+        events.append("refit")
+        if refit_side_effect is not None:
+            return refit_side_effect()
+
+    def validate(**kwargs):
+        events.append(f"validate:{kwargs['step']}")
+        return {}, {}
+
+    error = None
+    with (
+        mock_sync_grpo_infrastructure(components["policy"]),
+        patch(
+            "nemo_rl.algorithms.grpo_sync.MemoryTracker",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo_sync.refit_policy_generation",
+            side_effect=refit,
+        ),
+        patch("nemo_rl.algorithms.grpo_sync.validate_sync", side_effect=validate),
+    ):
+        try:
+            grpo_train_sync(
+                components["policy"],
+                _mock_policy_generation(),
+                components["train_dataloader"],
+                components["val_dataloader"],
+                components["tokenizer"],
+                components["loss_fn"],
+                components["task_to_env"],
+                components["val_task_to_env"],
+                components["logger"],
+                components["checkpointer"],
+                save_state,
+                master_config,
+            )
+        except RuntimeError as caught:
+            error = caught
+
+    markers = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("draft_post_update_refit=")
+    ]
+    return events, markers, error
+
+
+def test_sync_draft_refit_marker_follows_fresh_update(
+    mock_grpo_components, capsys
+) -> None:
+    events, markers, error = _run_sync_draft_refit_marker_case(
+        mock_grpo_components,
+        capsys,
+    )
+
+    assert error is None
+    assert events == ["refit", "update", "refit", "update"]
+    assert markers == ["draft_post_update_refit=complete step=1"]
+
+
+def test_sync_draft_refit_marker_ignores_resumed_startup_refit(
+    mock_grpo_components, capsys
+) -> None:
+    events, markers, error = _run_sync_draft_refit_marker_case(
+        mock_grpo_components,
+        capsys,
+        total_steps=1,
+        current_step=1,
+    )
+
+    assert error is None
+    assert events == ["refit", "update"]
+    assert markers == []
+
+
+def test_sync_draft_refit_marker_consumes_validation_refits(
+    mock_grpo_components, capsys
+) -> None:
+    events, markers, error = _run_sync_draft_refit_marker_case(
+        mock_grpo_components,
+        capsys,
+        val_period=1,
+    )
+
+    assert error is None
+    assert events == [
+        "refit",
+        "update",
+        "refit",
+        "validate:1",
+        "update",
+        "refit",
+        "validate:2",
+    ]
+    assert markers == [
+        "draft_post_update_refit=complete step=1",
+        "draft_post_update_refit=complete step=2",
+    ]
+
+
+def test_sync_draft_refit_marker_is_silent_on_failure_and_resume(
+    mock_grpo_components, capsys
+) -> None:
+    refit_count = 0
+
+    def fail_second_refit() -> None:
+        nonlocal refit_count
+        refit_count += 1
+        if refit_count == 2:
+            raise RuntimeError("refit failed")
+
+    first_events, first_markers, first_error = _run_sync_draft_refit_marker_case(
+        mock_grpo_components,
+        capsys,
+        refit_side_effect=fail_second_refit,
+    )
+    retry_events, retry_markers, retry_error = _run_sync_draft_refit_marker_case(
+        mock_grpo_components,
+        capsys,
+        total_steps=1,
+        current_step=1,
+    )
+
+    assert isinstance(first_error, RuntimeError)
+    assert str(first_error) == "refit failed"
+    assert first_events == ["refit", "update", "refit"]
+    assert first_markers == []
+    assert retry_error is None
+    assert retry_events == ["refit", "update"]
+    assert retry_markers == []
 
 
 def test_async_grpo_propagates_main_loop_collector_failure(mock_grpo_components):
@@ -3672,6 +4246,143 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
         and call.kwargs.get("prefix") == "refit"
         for call in mock_grpo_components["logger"].log_metrics.call_args_list
     )
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("speculator_type", ["dflash", "dspark"])
+def test_sync_nemo_gym_draft_ids_reach_training_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_grpo_components: dict[str, Any],
+    speculator_type: str,
+) -> None:
+    """Exercise the Gym rebuild through real draft batch-plan construction."""
+    from nemo_rl.algorithms import grpo as grpo_mod
+    from nemo_rl.experience.rollouts import NemoGymRolloutResult
+    from nemo_rl.models.megatron.draft.training import resolve_draft_speculator
+    from nemo_rl.models.policy.draft_config import (
+        DFlashDraftConfig,
+        DSparkDraftConfig,
+    )
+
+    if speculator_type == "dflash":
+        draft_config = DFlashDraftConfig(
+            enabled=True,
+            gamma=2,
+            anchors_per_sample=1,
+            mask_token_id=0,
+            target_hidden_state_layer_ids=[0],
+            max_cp_boundary_exclusion_fraction=1.0,
+        )
+    else:
+        draft_config = DSparkDraftConfig(
+            enabled=True,
+            block_size=3,
+            anchors_per_sample=1,
+            mask_token_id=0,
+            target_hidden_state_layer_ids=[0],
+            max_cp_boundary_exclusion_fraction=1.0,
+        )
+    provider = resolve_draft_speculator(draft_config)
+    assert provider is not None
+
+    fake_flat = BatchedDataDict(
+        {
+            "token_ids": torch.arange(8).reshape(1, 8),
+            "advantages": torch.zeros(1, 8),
+            "generation_logprobs": torch.zeros(1, 8),
+            "token_loss_mask": torch.ones(1, 8),
+            "content": ["ok"],
+        }
+    )
+    fake_lengths = torch.tensor([8])
+    expected_ids: torch.Tensor | None = None
+
+    def run_gym_rollout(**kwargs: Any) -> NemoGymRolloutResult:
+        nonlocal expected_ids
+        rollout_input = kwargs["input_batch"]
+        expected_ids = rollout_input["draft_sample_ids"].clone()
+        rebuilt_batch = _gym_style_rebuilt_batch(rollout_input.size)
+        assert "draft_sample_ids" not in rebuilt_batch
+        return NemoGymRolloutResult(
+            input_ids=fake_flat["token_ids"],
+            final_batch=rebuilt_batch,
+            rollout_metrics={"mean_gen_tokens_per_sample": 1.0},
+            task_index=None,
+        )
+
+    policy = mock_grpo_components["policy"]
+    train_result = policy.train.return_value
+    prepared_plan: object | None = None
+
+    def train_with_draft_provider(
+        train_data: BatchedDataDict[Any], *_args: Any, **_kwargs: Any
+    ) -> Any:
+        nonlocal prepared_plan
+        assert expected_ids is not None
+        prepared_plan = provider.prepare_batch(train_data, optimizer_step=9)
+        torch.testing.assert_close(train_data["draft_sample_ids"], expected_ids)
+        return train_result
+
+    policy.train.side_effect = train_with_draft_provider
+    policy.get_logprobs.return_value = {"logprobs": torch.zeros(1, 8)}
+    policy.get_reference_policy_logprobs.return_value = {
+        "reference_logprobs": torch.zeros(1, 8)
+    }
+    monkeypatch.setattr(
+        grpo_mod,
+        "batched_message_log_to_flat_message",
+        lambda *_args, **_kwargs: (fake_flat, fake_lengths),
+    )
+    monkeypatch.setattr(grpo_mod, "run_nemo_gym_rollout_sync", run_gym_rollout)
+    monkeypatch.setattr(
+        grpo_mod,
+        "calculate_baseline_and_std_per_prompt",
+        lambda *_args, **_kwargs: (torch.tensor([0.0]), torch.tensor([1.0])),
+    )
+    monkeypatch.setattr(
+        grpo_mod, "refit_policy_generation", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(
+        grpo_mod, "print_performance_metrics", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(
+        grpo_mod, "maybe_gpu_profile_step", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        grpo_mod,
+        "compute_and_apply_seq_logprob_error_masking",
+        lambda *_args, **_kwargs: _mock_seq_logprob_error_result(),
+    )
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.policy["draft"] = draft_config
+    master_config.policy["generation"]["vllm_cfg"]["expose_http_server"] = True
+    master_config.logger.update({"wandb_enabled": False, "wandb": {}})
+    master_config.env = {"should_use_nemo_gym": True}
+
+    grpo_mod.grpo_train(
+        policy,
+        _mock_policy_generation(),
+        mock_grpo_components["train_dataloader"],
+        mock_grpo_components["val_dataloader"],
+        mock_grpo_components["tokenizer"],
+        mock_grpo_components["loss_fn"],
+        mock_grpo_components["task_to_env"],
+        mock_grpo_components["val_task_to_env"],
+        mock_grpo_components["logger"],
+        mock_grpo_components["checkpointer"],
+        _initial_grpo_save_state(),
+        master_config,
+    )
+
+    assert prepared_plan is not None
+    policy.train.assert_called_once()
 
 
 def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path):
@@ -6102,13 +6813,43 @@ def test_validate_use_kl_in_reward_allows_zero_kl_penalty():
 
 
 @pytest.mark.parametrize(
-    "skip_prev_logprobs, expect_prev",
-    [(False, True), (True, False)],
-    ids=["keep_prev_logprobs", "skip_prev_logprobs"],
+    "skip_prev_logprobs, skip_reference_logprobs, expect_prev, expect_reference",
+    [
+        (False, False, True, True),
+        (True, False, False, True),
+        (False, True, True, False),
+        (True, True, False, False),
+    ],
+    ids=["keep_both", "skip_prev", "skip_reference", "skip_both"],
 )
-def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
-    fields = _train_fields_for_step(skip_prev_logprobs)
+def test_train_fields_for_step(
+    skip_prev_logprobs, skip_reference_logprobs, expect_prev, expect_reference
+):
+    fields = _train_fields_for_step(
+        skip_prev_logprobs,
+        skip_reference_logprobs,
+    )
     assert ("prev_logprobs" in fields) is expect_prev
+    assert ("reference_policy_logprobs" in fields) is expect_reference
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_sum_step_metric_values_handles_torch_tensors(device: str) -> None:
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the device-boundary regression")
+
+    values = [
+        torch.tensor(1.25, device=device),
+        torch.tensor([2.0, 3.75], device=device),
+    ]
+
+    assert sum_metric_values(values) == pytest.approx(7.0)
+
+
+def test_sum_step_metric_values_preserves_numpy_behavior() -> None:
+    values = np.array([1.25, 2.0, 3.75])
+
+    assert sum_metric_values(values) == pytest.approx(7.0)
 
 
 @pytest.mark.parametrize(
