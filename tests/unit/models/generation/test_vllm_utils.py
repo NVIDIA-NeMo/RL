@@ -75,7 +75,10 @@ def test_vllm_utils_vlm_with_images_and_text():
             "input_ids": input_ids,
             "input_lengths": input_lengths,
             "vllm_content": ["<s>user: hi</s>", "<s>user: hello</s>"],
-            "vllm_images": [["img1"], ["img2a", "img2b"]],
+            "vllm_multi_modal_data": [
+                {"image": "img1"},
+                {"image": ["img2a", "img2b"]},
+            ],
         }
     )
 
@@ -87,14 +90,31 @@ def test_vllm_utils_vlm_with_images_and_text():
     assert prompts[1]["multi_modal_data"]["image"] == ["img2a", "img2b"]
 
 
+def test_vllm_utils_vlm_with_custom_modality():
+    embedding = torch.ones(1, 2, 3)
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2]]),
+            "input_lengths": torch.tensor([2]),
+            "vllm_multi_modal_data": [{"image": "img", "conditioning": embedding}],
+        }
+    )
+
+    prompts = format_prompt_for_vllm_generation(data)
+
+    multi_modal_data = prompts[0]["multi_modal_data"]
+    assert prompts[0]["prompt_token_ids"] == [1, 2]
+    assert multi_modal_data["image"] == "img"
+    assert multi_modal_data["conditioning"] is embedding
+
+
 def test_vllm_utils_vlm_with_audio_and_video_intent_path():
     """IntentTrain/IntentBench rollouts must surface both modalities to vLLM.
 
-    Asserts ``multi_modal_data`` contains a ``video`` key built from
-    ``vllm_videos`` AND an ``audio`` key built from ``vllm_audios`` for the
-    same prompt. This is the regression bar for AC-3 of the audio+video
-    intent recipe; if either key is dropped at this site, vLLM rolls out a
-    text-only / single-modality prompt and the smoke run silently degrades.
+    Asserts ``multi_modal_data`` contains both ``video`` and ``audio`` for the
+    same prompt. This is the regression bar for AC-3 of the audio+video intent
+    recipe; if either key is dropped at this site, vLLM rolls out a text-only /
+    single-modality prompt and the smoke run silently degrades.
     """
     input_ids, input_lengths = _mk_inputs()
     data = BatchedDataDict(
@@ -102,8 +122,10 @@ def test_vllm_utils_vlm_with_audio_and_video_intent_path():
             "input_ids": input_ids,
             "input_lengths": input_lengths,
             "vllm_content": ["<s>user: q1</s>", "<s>user: q2</s>"],
-            "vllm_videos": [["frames-1"], ["frames-2"]],
-            "vllm_audios": [[("audio-1", 16000)], [("audio-2", 16000)]],
+            "vllm_multi_modal_data": [
+                {"video": "frames-1", "audio": ("audio-1", 16000)},
+                {"video": "frames-2", "audio": ("audio-2", 16000)},
+            ],
             "task_name": ["intent-train", "intent-bench"],
         }
     )
@@ -115,14 +137,8 @@ def test_vllm_utils_vlm_with_audio_and_video_intent_path():
             f"prompt {i} missing multi_modal_data: keys={list(prompt)}"
         )
         mm = prompt["multi_modal_data"]
-        assert "video" in mm, (
-            f"prompt {i} dropped vllm_videos -> multi_modal_data['video']: "
-            f"keys={list(mm)}"
-        )
-        assert "audio" in mm, (
-            f"prompt {i} dropped vllm_audios -> multi_modal_data['audio']: "
-            f"keys={list(mm)}"
-        )
+        assert "video" in mm, f"prompt {i} dropped video: keys={list(mm)}"
+        assert "audio" in mm, f"prompt {i} dropped audio: keys={list(mm)}"
     # The independent-streams path explicitly does not set
     # mm_processor_kwargs={"use_audio_in_video": True} (Round 1 BitLesson
     # BL-20260428-omni-use-audio-in-video). If a future change re-introduces
@@ -140,7 +156,10 @@ def test_vllm_utils_vlm_with_video_only():
             "input_ids": input_ids,
             "input_lengths": input_lengths,
             "vllm_content": ["<s>user: q1</s>", "<s>user: q2</s>"],
-            "vllm_videos": [["frames-1"], ["frames-2"]],
+            "vllm_multi_modal_data": [
+                {"video": "frames-1"},
+                {"video": "frames-2"},
+            ],
         }
     )
 
@@ -154,15 +173,15 @@ def test_vllm_utils_vlm_with_video_only():
         assert "image" not in mm, f"prompt {i} should not have image key"
 
 
-def test_vllm_utils_vlm_with_empty_videos_fallback_to_tokens():
-    """Empty vllm_videos (per-sample) should fall back to prompt_token_ids."""
+def test_vllm_utils_vlm_with_empty_media_fallback_to_tokens():
+    """Empty per-sample media should fall back to prompt_token_ids."""
     input_ids, input_lengths = _mk_inputs()
     data = BatchedDataDict(
         {
             "input_ids": input_ids,
             "input_lengths": input_lengths,
             "vllm_content": ["a", "b"],
-            "vllm_videos": [[], []],
+            "vllm_multi_modal_data": [{}, {}],
         }
     )
     prompts = format_prompt_for_vllm_generation(data)
@@ -177,7 +196,7 @@ def test_vllm_utils_vlm_with_missing_images_fallback_to_tokens():
             "input_ids": input_ids,
             "input_lengths": input_lengths,
             "vllm_content": ["a", "b"],
-            "vllm_images": None,
+            "vllm_multi_modal_data": None,
         }
     )
     prompts = format_prompt_for_vllm_generation(data_none)
@@ -189,7 +208,7 @@ def test_vllm_utils_vlm_with_missing_images_fallback_to_tokens():
             "input_ids": input_ids,
             "input_lengths": input_lengths,
             "vllm_content": ["a", "b"],
-            "vllm_images": [[], []],
+            "vllm_multi_modal_data": [{}, {}],
         }
     )
     prompts = format_prompt_for_vllm_generation(data_empty)
@@ -203,7 +222,7 @@ def test_vllm_utils_vlm_with_none_content_uses_updated_tokens_and_media():
             "input_ids": input_ids,
             "input_lengths": input_lengths,
             "vllm_content": [None, None],
-            "vllm_images": [["img"], ["img"]],
+            "vllm_multi_modal_data": [{"image": "img"}, {"image": "img"}],
         }
     )
     prompts_all = format_prompt_for_vllm_generation(data)

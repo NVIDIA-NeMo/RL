@@ -45,20 +45,18 @@ def rl_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
     # Extract stop_strings if present
     stop_strings = [datum.get("stop_strings", None) for datum in data_batch]
 
-    # Presence of the key selects vLLM's native-media path. Placeholder-style
-    # processors intentionally set the content to None so vLLM uses input_ids.
+    # Preserve vLLM-ready prompt data without interpreting its modality keys.
     extra_args = {}
-    if any("vllm_content" in datum_spec for datum_spec in data_batch):
-        vllm_content = [
+    if any(
+        "vllm_content" in datum_spec or "vllm_multi_modal_data" in datum_spec
+        for datum_spec in data_batch
+    ):
+        extra_args["vllm_content"] = [
             datum_spec.get("vllm_content", None) for datum_spec in data_batch
         ]
-        vllm_images = [datum_spec.get("vllm_images", []) for datum_spec in data_batch]
-        vllm_videos = [datum_spec.get("vllm_videos", []) for datum_spec in data_batch]
-        vllm_audios = [datum_spec.get("vllm_audios", []) for datum_spec in data_batch]
-        extra_args["vllm_content"] = vllm_content
-        extra_args["vllm_images"] = vllm_images
-        extra_args["vllm_videos"] = vllm_videos
-        extra_args["vllm_audios"] = vllm_audios
+        extra_args["vllm_multi_modal_data"] = [
+            datum_spec.get("vllm_multi_modal_data", {}) for datum_spec in data_batch
+        ]
 
     output: BatchedDataDict[Any] = BatchedDataDict(
         message_log=message_log,
@@ -118,21 +116,17 @@ def eval_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
     idx = [datum_spec["idx"] for datum_spec in data_batch]
     task_names = [datum_spec.get("task_name", None) for datum_spec in data_batch]
 
-    # Preserve native media when placeholder-style processors intentionally
-    # set vllm_content to None in favor of their expanded input_ids.
+    # Preserve vLLM-ready prompt data without interpreting its modality keys.
     extra_args = {}
-    if any("vllm_content" in datum_spec for datum_spec in data_batch):
+    if any(
+        "vllm_content" in datum_spec or "vllm_multi_modal_data" in datum_spec
+        for datum_spec in data_batch
+    ):
         extra_args["vllm_content"] = [
             datum_spec.get("vllm_content", None) for datum_spec in data_batch
         ]
-        extra_args["vllm_images"] = [
-            datum_spec.get("vllm_images", []) for datum_spec in data_batch
-        ]
-        extra_args["vllm_audios"] = [
-            datum_spec.get("vllm_audios", []) for datum_spec in data_batch
-        ]
-        extra_args["vllm_videos"] = [
-            datum_spec.get("vllm_videos", []) for datum_spec in data_batch
+        extra_args["vllm_multi_modal_data"] = [
+            datum_spec.get("vllm_multi_modal_data", {}) for datum_spec in data_batch
         ]
 
     output: BatchedDataDict[Any] = BatchedDataDict(
