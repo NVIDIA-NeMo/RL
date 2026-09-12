@@ -24,7 +24,6 @@ from megatron.core.parallel_state import (
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.common import _round_up_to_multiple
 
-
 _HYBRIDEP_DISPATCH_PADDING_FIELDS = (
     "moe_hybridep_pad_uneven_dispatch_inputs",
     "moe_hybridep_pad_variable_tokens",
