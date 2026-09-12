@@ -107,56 +107,44 @@ def test_raw_interpolation_truncates_where_quoting_does_not(root):
 
 _SPACEY_SUFFIX = " with space"
 
-# The three modelopt constants are built the same way but live in their own
-# module, and nothing in this file reached them before.
-_MODELOPT_EXECUTABLES = [
-    "MODELOPT_VLLM_EXECUTABLE",
-    "MODELOPT_AUTOMODEL_EXECUTABLE",
-    "MODELOPT_MCORE_EXECUTABLE",
-]
-
 
 @contextlib.contextmanager
 def _repo_root_with_a_space():
-    """Re-import the executable modules as if the checkout path had a space.
+    """Re-import the executable module as if the checkout path had a space.
 
     ``git_root`` is computed at module scope from ``os.path.abspath``, and the
     executable strings are f-strings evaluated at the same time, so the only
-    way to see the un-quoted behaviour is to re-execute both with a different
-    root. Both modules are reloaded again on the way out.
+    way to see the unquoted behaviour is to re-execute it with a different
+    root. The module is reloaded again on the way out.
     """
     import nemo_rl.distributed.virtual_cluster as vc
-    import nemo_rl.modelopt.registry as registry
 
     real_abspath = os.path.abspath
     try:
         with patch("os.path.abspath", lambda p: real_abspath(p) + _SPACEY_SUFFIX):
             importlib.reload(vc)
-            importlib.reload(registry)
-            yield vc, registry
+            yield vc
     finally:
         importlib.reload(vc)
-        importlib.reload(registry)
 
 
 @pytest.mark.parametrize("attr", _UV_EXECUTABLES)
 def test_a_repo_root_with_a_space_survives_uv_argument_parsing(attr):
-    with _repo_root_with_a_space() as (vc, _):
+    with _repo_root_with_a_space() as vc:
         assert _SPACEY_SUFFIX in vc.git_root, "the fixture did not take effect"
         assert _directory_arg(getattr(vc.PY_EXECUTABLES, attr)) == vc.git_root
 
 
-@pytest.mark.parametrize("name", _MODELOPT_EXECUTABLES)
-def test_the_modelopt_executables_quote_the_repo_root_too(name):
-    """Three of the eleven interpolation sites live in ``nemo_rl/modelopt``.
-    Reverting that file alone left the rest of this suite green."""
-    with _repo_root_with_a_space() as (_, registry):
-        assert _directory_arg(getattr(registry, name)) == registry.git_root
+def test_dynamic_environment_survives_a_repo_root_with_a_space():
+    with _repo_root_with_a_space() as vc:
+        command = vc.uv_py_executable(("vllm", "nemo_gym"))
+
+        assert _directory_arg(command) == vc.git_root
 
 
 def test_the_fixture_itself_would_catch_an_unquoted_root():
     """Guards the guard: if reloading ever stopped changing the root, every
     assertion above would go quiet again rather than fail."""
-    with _repo_root_with_a_space() as (vc, _):
+    with _repo_root_with_a_space() as vc:
         unquoted = f"uv run --locked --directory {vc.git_root}"
         assert _directory_arg(unquoted) != vc.git_root
