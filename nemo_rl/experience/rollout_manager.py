@@ -22,7 +22,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 import ray.exceptions
 import torch
@@ -51,11 +51,15 @@ from nemo_rl.experience.failures import (
     classify_rollout_failure,
 )
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ATTEMPT_INDEX_KEY,
+    NEMO_GYM_CAPTURE_ID_KEY,
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_ROLLOUT_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     Completion,
     PromptGroupRecord,
+    nemo_gym_capture_key,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollout_recovery import (
@@ -89,10 +93,37 @@ from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
 RolloutCompletionCallback = Callable[[int, Completion], Awaitable[None]]
+RolloutAttemptAllocator = Callable[[list[int]], Awaitable[dict[int, int]]]
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
     from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
+
+
+@dataclass
+class _LocalSiblingAttemptState:
+    """Run-local attempt ownership for ordinary NeMo-Gym rollouts."""
+
+    logical_rollout_ids: tuple[str, ...]
+    next_attempt_indices: list[int]
+
+    @classmethod
+    def create(cls, group_id: str, sibling_count: int) -> "_LocalSiblingAttemptState":
+        return cls(
+            logical_rollout_ids=tuple(
+                f"{group_id}_g{generation_index}"
+                for generation_index in range(sibling_count)
+            ),
+            next_attempt_indices=[0] * sibling_count,
+        )
+
+    async def allocate(self, generation_indices: list[int]) -> dict[int, int]:
+        allocated: dict[int, int] = {}
+        for generation_index in generation_indices:
+            attempt_index = self.next_attempt_indices[generation_index]
+            allocated[generation_index] = attempt_index
+            self.next_attempt_indices[generation_index] = attempt_index + 1
+        return allocated
 
 
 def _contains_post_write_enrichment_error(error: BaseException) -> bool:
@@ -944,19 +975,17 @@ class AsyncNemoGymRolloutImpl:
         self,
         input_sample: DatumSpec,
         *,
-        rollout_ids: Optional[list[str]] = None,
+        logical_rollout_ids: Optional[list[str]] = None,
         generation_indices: Optional[list[int]] = None,
         on_completion: Optional[RolloutCompletionCallback] = None,
+        attempt_allocator: Optional[RolloutAttemptAllocator] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
     ) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
 
         Args:
             input_sample: A single prompt (one DatumSpec entry).
-            rollout_ids: Token-capture mode: gate-registered rollout ids, one
-                per generation, riding each row's run body as the opaque
-                ``_ng_rollout_id`` key (agents stamp /ng-rollout/<id> from it;
-                zero agent changes).
+            logical_rollout_ids: Stable sibling identities, one per generation.
 
         Returns:
             PromptGroupRecord with num_generations_per_prompt completions.
@@ -967,14 +996,23 @@ class AsyncNemoGymRolloutImpl:
 
         rollout_inputs = self._build_inputs(
             input_sample,
-            rollout_ids=rollout_ids,
+            logical_rollout_ids=logical_rollout_ids,
             generation_indices=generation_indices,
         )
+        if attempt_allocator is None:
+            local_state = _LocalSiblingAttemptState(
+                logical_rollout_ids=tuple(
+                    row[NEMO_GYM_ROLLOUT_ID_KEY] for row in rollout_inputs
+                ),
+                next_attempt_indices=[0] * self._num_generations_per_prompt,
+            )
+            attempt_allocator = local_state.allocate
         completions, prompt_message_log, rollout_metrics = await self._run_rollouts(
             rollout_inputs,
             timer,
             timer_prefix,
             on_completion=on_completion,
+            attempt_allocator=attempt_allocator,
             recovery_granularity=recovery_granularity,
         )
         # Token-capture receipt rows carry empty message logs by design — the
@@ -1035,7 +1073,7 @@ class AsyncNemoGymRolloutImpl:
         self,
         input_sample: DatumSpec,
         *,
-        rollout_ids: Optional[list[str]] = None,
+        logical_rollout_ids: Optional[list[str]] = None,
         generation_indices: Optional[list[int]] = None,
     ) -> list[dict]:
         """Build N row dicts from input_sample, applying generation config params."""
@@ -1058,9 +1096,9 @@ class AsyncNemoGymRolloutImpl:
         )
 
         # Build N rows with distinct rowidxs so run_rollouts can sort them correctly.
-        if rollout_ids is not None:
-            assert len(rollout_ids) == self._num_generations_per_prompt, (
-                "token-capture rollout ids must be one per generation"
+        if logical_rollout_ids is not None:
+            assert len(logical_rollout_ids) == self._num_generations_per_prompt, (
+                "logical rollout ids must be one per generation"
             )
         group_id = template_row.get(NEMO_GYM_GROUP_ID_KEY) or uuid.uuid4().hex
         group_attempt = template_row.get(NEMO_GYM_GROUP_ATTEMPT_KEY, 0)
@@ -1090,11 +1128,12 @@ class AsyncNemoGymRolloutImpl:
             row[NEMO_GYM_GROUP_ID_KEY] = group_id
             row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempt
             row[NEMO_GYM_ROLLOUT_INDEX_KEY] = i
-            if rollout_ids is not None:
-                # Opaque run-body carrier (Gym's _ng_rollout_id key): the agent
-                # derives the id from the run body and stamps /ng-rollout/<id>
-                # on every model call, so the TQ sample id IS the capture key.
-                row["_ng_rollout_id"] = rollout_ids[i]
+            row[NEMO_GYM_ROLLOUT_ID_KEY] = (
+                logical_rollout_ids[i]
+                if logical_rollout_ids is not None
+                else f"{group_id}_g{i}"
+            )
+            row[NEMO_GYM_ATTEMPT_INDEX_KEY] = 0
             rows.append(row)
         return rows
 
@@ -1177,6 +1216,7 @@ class AsyncNemoGymRolloutImpl:
         timer_prefix: str,
         *,
         on_completion: Optional[RolloutCompletionCallback] = None,
+        attempt_allocator: Optional[RolloutAttemptAllocator] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
     ) -> tuple[list[Completion], LLMMessageLogType, dict[str, Any]]:
         """Dispatch rows to NeMo-Gym; return completions, prompt, and metrics.
@@ -1189,6 +1229,22 @@ class AsyncNemoGymRolloutImpl:
         if not inputs:
             raise ValueError("NeMo-Gym rollout dispatch requires at least one row")
         total_rows = self._num_generations_per_prompt
+        if attempt_allocator is None:
+            fallback_group_id = uuid.uuid4().hex
+            for row in inputs:
+                rowidx = row.get("_rowidx")
+                if isinstance(rowidx, int):
+                    row.setdefault(
+                        NEMO_GYM_ROLLOUT_ID_KEY,
+                        f"{fallback_group_id}_g{rowidx}",
+                    )
+            local_state = _LocalSiblingAttemptState(
+                logical_rollout_ids=tuple(
+                    f"{fallback_group_id}_g{index}" for index in range(total_rows)
+                ),
+                next_attempt_indices=[0] * total_rows,
+            )
+            attempt_allocator = local_state.allocate
         # Re-dispatch maps NeMo-Gym's echoed _rowidx back onto the original group, so
         # the rows must carry the index _build_inputs stamped on them. Checked here
         # because the alternative is a KeyError several frames deeper.
@@ -1238,6 +1294,28 @@ class AsyncNemoGymRolloutImpl:
                     pending = [row for row in inputs if results[row["_rowidx"]] is None]
                     if not pending:
                         break
+                    pending_indices = [row["_rowidx"] for row in pending]
+                    attempt_indices = await attempt_allocator(pending_indices)
+                    if set(attempt_indices) != set(pending_indices):
+                        raise ValueError(
+                            "attempt allocator must return every dispatched sibling"
+                        )
+                    for row in pending:
+                        rowidx = row["_rowidx"]
+                        attempt_index = attempt_indices[rowidx]
+                        if (
+                            isinstance(attempt_index, bool)
+                            or not isinstance(attempt_index, int)
+                            or attempt_index < 0
+                        ):
+                            raise ValueError(
+                                "attempt allocator returned an invalid attempt index"
+                            )
+                        logical_rollout_id = row[NEMO_GYM_ROLLOUT_ID_KEY]
+                        row[NEMO_GYM_ATTEMPT_INDEX_KEY] = attempt_index
+                        row[NEMO_GYM_CAPTURE_ID_KEY] = nemo_gym_capture_key(
+                            logical_rollout_id, attempt_index
+                        )
                     if attempt > 1:
                         print(
                             f"NeMo-Gym: re-dispatching {len(pending)}/{total_rows} "
@@ -1598,6 +1676,7 @@ class RolloutManager:
             effort_config=effort_config,
         )
         self._tokenizer = tokenizer
+        self._use_nemo_gym = use_nemo_gym
         self._num_generations_per_prompt = num_generations_per_prompt
         self._rollout_recovery_config = rollout_recovery_config
         self._tq_buffer = tq_buffer
@@ -1735,22 +1814,25 @@ class RolloutManager:
         self,
         input_sample: DatumSpec,
         *,
-        rollout_ids: Optional[list[str]] = None,
+        logical_rollout_ids: Optional[list[str]] = None,
         generation_indices: Optional[list[int]] = None,
         on_completion: Optional[RolloutCompletionCallback] = None,
+        attempt_allocator: Optional[RolloutAttemptAllocator] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
     ) -> PromptGroupRecord:
-        if rollout_ids is None:
+        if logical_rollout_ids is None:
             assert generation_indices is None
             assert on_completion is None
+            assert attempt_allocator is None
             assert recovery_granularity is RecoveryGranularity.SIBLING
-            # Legacy path: keep the impl call signature byte-identical.
             return await self._impl.run_rollout(input_sample)
-        return await self._impl.run_rollout(
+        nemo_gym_impl = cast(AsyncNemoGymRolloutImpl, self._impl)
+        return await nemo_gym_impl.run_rollout(
             input_sample,
-            rollout_ids=rollout_ids,
+            logical_rollout_ids=logical_rollout_ids,
             generation_indices=generation_indices,
             on_completion=on_completion,
+            attempt_allocator=attempt_allocator,
             recovery_granularity=recovery_granularity,
         )
 
@@ -1821,6 +1903,7 @@ class RolloutManager:
         data_attempts = 0
         last_infra_error: Optional[Exception] = None
         logical_group_id: Optional[str] = None
+        local_attempt_state: Optional[_LocalSiblingAttemptState] = None
         group_attempt = 0
         extra_env_info = input_sample.get("extra_env_info")
         if isinstance(extra_env_info, dict):
@@ -1830,6 +1913,11 @@ class RolloutManager:
             ):
                 raise ValueError(f"{NEMO_GYM_GROUP_ID_KEY} must be a non-empty string")
             logical_group_id = configured_group_id or uuid.uuid4().hex
+            if self._use_nemo_gym:
+                local_attempt_state = _LocalSiblingAttemptState.create(
+                    logical_group_id,
+                    self._num_generations_per_prompt,
+                )
             configured_group_attempt = extra_env_info.get(NEMO_GYM_GROUP_ATTEMPT_KEY, 0)
             if (
                 not isinstance(configured_group_attempt, int)
@@ -1873,7 +1961,16 @@ class RolloutManager:
                         attempt_extra_env_info[NEMO_GYM_GROUP_ATTEMPT_KEY] = (
                             group_attempt
                         )
-                    record = await self.run_rollout(attempt_input_sample)
+                    if local_attempt_state is None:
+                        record = await self.run_rollout(attempt_input_sample)
+                    else:
+                        record = await self.run_rollout(
+                            attempt_input_sample,
+                            logical_rollout_ids=list(
+                                local_attempt_state.logical_rollout_ids
+                            ),
+                            attempt_allocator=local_attempt_state.allocate,
+                        )
                 finally:
                     if inflight_registry is not None:
                         inflight_registry.pop(tq_group_id, None)
@@ -2129,12 +2226,12 @@ class RolloutManager:
         from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 
         assert self._tq_buffer is not None
-        async with self._recovery_mutation() as cut:
-            recovery_group = self._recovery_ledger.get_group(recovery_group_id)
-            if recovery_group.status == PromptGroupStatus.GENERATING:
-                recovery_group = self._recovery_ledger.prepare_incomplete_retry(
-                    cut, recovery_group_id
-                )
+        recovery_group = self._recovery_ledger.get_group(recovery_group_id)
+        if recovery_group.status is not PromptGroupStatus.GENERATING:
+            raise ValueError(
+                f"cannot generate recovery group {recovery_group_id!r} from "
+                f"{recovery_group.status.value!r}"
+            )
         pending_indices = [
             sibling.generation_index
             for sibling in recovery_group.siblings
@@ -2142,7 +2239,22 @@ class RolloutManager:
         ]
         group_id = recovery_group.group_id
         start_version = recovery_group.start_weight_version
-        rollout_ids = tuple(recovery_group.gate_rollout_ids)
+        logical_rollout_ids = tuple(recovery_group.logical_rollout_ids)
+        planned_rollout_ids = [
+            nemo_gym_capture_key(
+                logical_rollout_ids[sibling.generation_index],
+                (
+                    sibling.current_attempt.attempt_index
+                    if sibling.current_attempt.status
+                    in {
+                        RolloutAttemptStatus.RESERVED,
+                        RolloutAttemptStatus.SEALED,
+                    }
+                    else len(sibling.attempts)
+                ),
+            )
+            for sibling in recovery_group.siblings
+        ]
         attempt_input_sample = copy.deepcopy(input_sample)
         attempt_extra_env_info = attempt_input_sample.get("extra_env_info")
         if isinstance(attempt_extra_env_info, dict):
@@ -2154,9 +2266,19 @@ class RolloutManager:
             weight_version=start_version,
             target_step=recovery_group.target_step,
             group_id=group_id,
-            rollout_ids=list(rollout_ids),
+            rollout_ids=planned_rollout_ids,
         )
         pending_group_results: dict[int, SiblingSealResult] = {}
+
+        async def _allocate_recovery_attempts(
+            generation_indices: list[int],
+        ) -> dict[int, int]:
+            async with self._recovery_mutation() as cut:
+                return self._recovery_ledger.allocate_dispatch_attempts(
+                    cut,
+                    group_id,
+                    generation_indices=generation_indices,
+                )
 
         async def _record_streamed_completion(
             generation_index: int, completion: Completion
@@ -2178,12 +2300,14 @@ class RolloutManager:
                 raise ValueError(
                     "token-capture completion must contain its Gate rollout ID"
                 )
-            if not 0 <= generation_index < len(rollout_ids):
+            if not 0 <= generation_index < len(logical_rollout_ids):
                 raise ValueError(
                     f"streamed generation index {generation_index} is outside "
                     f"prompt group {group_id!r}"
                 )
-            expected_gate_rollout_id = rollout_ids[generation_index]
+            expected_gate_rollout_id = self._recovery_ledger.get_group(
+                group_id
+            ).gate_rollout_id(generation_index)
             if gate_rollout_id != expected_gate_rollout_id:
                 raise ValueError(
                     "streamed rollout identity mismatch: "
@@ -2248,17 +2372,12 @@ class RolloutManager:
                 inflight_registry[group_id] = (current_task, start_version)
             try:
                 if pending_indices:
-                    async with self._recovery_mutation() as cut:
-                        self._recovery_ledger.mark_group_dispatched(
-                            cut,
-                            group_id,
-                            generation_indices=pending_indices,
-                        )
                     await self.run_rollout(
                         attempt_input_sample,
-                        rollout_ids=list(rollout_ids),
+                        logical_rollout_ids=list(logical_rollout_ids),
                         generation_indices=pending_indices,
                         on_completion=_record_streamed_completion,
+                        attempt_allocator=_allocate_recovery_attempts,
                         recovery_granularity=recovery_group.recovery_granularity,
                     )
             finally:

@@ -50,6 +50,12 @@ from nemo_rl.experience.failures import (
     RolloutDataFailure,
     http_status_is_infra,
 )
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ATTEMPT_INDEX_KEY,
+    NEMO_GYM_CAPTURE_ID_KEY,
+    NEMO_GYM_ROLLOUT_ID_KEY,
+    nemo_gym_capture_key,
+)
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
     should_use_async_rollouts,
@@ -231,12 +237,10 @@ class NemoGymConfig(TypedDict):
     token_capture: NotRequired[Dict[str, Any] | None]
 
 
-# Gym control-plane server name (the model server hosting the ledger) and the
-# opaque run-body key rollout ids ride on (Gym's ROLLOUT_ID_KEY_NAME): the
-# agent derives the id from the run body and stamps /ng-rollout/<id> on every
-# model call, so the TQ sample id IS the capture key end to end.
+# Gym control-plane server name for the model server hosting the capture ledger.
+# Gym derives its physical capture key from the logical run-body rollout ID and
+# numeric attempt index.
 _POLICY_SERVER_NAME = "policy_model"
-_NG_ROLLOUT_ID_BODY_KEY = "_ng_rollout_id"
 _TOKEN_CAPTURE_CONTROL_PREFIX = "/training-token-capture/control"
 _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
 
@@ -606,6 +610,29 @@ Depending on your data shape, you may want to change these values."""
             )
         tokenizer = self._tokenizer
 
+        for row in nemo_gym_examples:
+            logical_rollout_id = row.get(NEMO_GYM_ROLLOUT_ID_KEY)
+            attempt_index = row.get(NEMO_GYM_ATTEMPT_INDEX_KEY)
+            if not isinstance(logical_rollout_id, str) or not logical_rollout_id:
+                raise ValueError(
+                    f"{NEMO_GYM_ROLLOUT_ID_KEY} must be a non-empty string"
+                )
+            if (
+                isinstance(attempt_index, bool)
+                or not isinstance(attempt_index, int)
+                or attempt_index < 0
+            ):
+                raise ValueError(
+                    f"{NEMO_GYM_ATTEMPT_INDEX_KEY} must be a non-negative integer"
+                )
+            expected_capture_id = nemo_gym_capture_key(
+                logical_rollout_id, attempt_index
+            )
+            if row.get(NEMO_GYM_CAPTURE_ID_KEY) != expected_capture_id:
+                raise ValueError(
+                    f"{NEMO_GYM_CAPTURE_ID_KEY} must equal {expected_capture_id!r}"
+                )
+
         from nemo_rl.utils.fastokens import maybe_patch_fastokens
 
         maybe_patch_fastokens(bool(self.cfg.get("use_fastokens")))
@@ -714,7 +741,7 @@ Depending on your data shape, you may want to change these values."""
         assert isinstance(nemo_gym_result, dict), (
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
-        rollout_id = nemo_gym_row[_NG_ROLLOUT_ID_BODY_KEY]
+        rollout_id = nemo_gym_row[NEMO_GYM_CAPTURE_ID_KEY]
         # Gym's TERMINAL_RESPONSE_ID_KEY: the served response envelope id the
         # harness kept (``response.id``), not the logical-request header.
         terminal_response_id = nemo_gym_result.get("terminal_response_id")
