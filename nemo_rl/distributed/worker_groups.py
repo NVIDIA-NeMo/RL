@@ -30,7 +30,10 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.distributed.worker_group_utils import recursive_merge_options
+from nemo_rl.distributed.worker_group_utils import (
+    merge_env_vars_with_process_env,
+    recursive_merge_options,
+)
 from nemo_rl.utils.venvs import (
     add_hf_modules_cache_to_pythonpath,
     create_local_venv_on_each_node,
@@ -461,10 +464,7 @@ class RayWorkerGroup:
             self.cluster.get_master_address_and_port()
         )
 
-        # Update env_vars with the current environment variables
-        for k, v in os.environ.items():
-            if k not in env_vars:
-                env_vars[k] = v
+        env_vars = merge_env_vars_with_process_env(env_vars)
 
         # Get the python environment for the actor
         actor_python_env = get_actor_python_env(
