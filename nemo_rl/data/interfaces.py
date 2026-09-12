@@ -52,6 +52,35 @@ class PreferenceDatumSpec(TypedDict):
     idx: int
 
 
+class TrajectoryValueDatumSpec(TypedDict):
+    """A tokenized trajectory with one or more scalar supervision positions."""
+
+    message_log: LLMMessageLogType
+    length: int
+    untruncated_length: int
+    loss_multiplier: float
+    target_positions: torch.Tensor
+    target_values: torch.Tensor
+    target_is_point: list[bool]
+    target_definition_indices: list[int]
+    target_definitions: list[dict[str, Any]]
+    evaluation_positions: NotRequired[torch.Tensor]
+    evaluation_values: NotRequired[torch.Tensor]
+    evaluation_definition_indices: NotRequired[list[int]]
+    evaluation_definitions: NotRequired[list[dict[str, Any]]]
+    trajectory_id: str
+    experiment_id: str
+    value_target: NotRequired[float]
+    pass_count: NotRequired[int]
+    rollout_count: NotRequired[int]
+    pivot_id: NotRequired[str]
+    instance_id: str
+    label_source: NotRequired[str]
+    group_metadata: dict[str, Any]
+    idx: int
+    task_name: NotRequired[str]
+
+
 @dataclass
 class TaskDataSpec:
     task_name: Optional[str] = None

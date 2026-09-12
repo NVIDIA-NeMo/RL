@@ -52,6 +52,9 @@ from nemo_rl.data.datasets.response_datasets.refcoco import RefCOCODataset
 from nemo_rl.data.datasets.response_datasets.response_dataset import ResponseDataset
 from nemo_rl.data.datasets.response_datasets.squad import SquadDataset
 from nemo_rl.data.datasets.response_datasets.tulu3 import Tulu3SftMixtureDataset
+from nemo_rl.data.datasets.response_datasets.trajectory_value_dataset import (
+    TrajectoryValueDataset,
+)
 from nemo_rl.data.datasets.utils import resolve_external_dataset_class
 
 DATASET_REGISTRY = {
@@ -85,6 +88,7 @@ DATASET_REGISTRY = {
     "openai_format": OpenAIFormatDataset,
     "NemoGymDataset": NemoGymDataset,
     "ResponseDataset": ResponseDataset,
+    "TrajectoryValueDataset": TrajectoryValueDataset,
 }
 
 
@@ -155,5 +159,6 @@ __all__ = [
     "ResponseDataset",
     "SquadDataset",
     "Tulu3SftMixtureDataset",
+    "TrajectoryValueDataset",
     "load_response_dataset",
 ]
