@@ -355,6 +355,7 @@ debugging.md
 nsys-profiling.md
 policy-profiler.md
 rollout-profiler.md
+four-phase-profiling.md
 fp8.md
 guides/use-custom-vllm.md
 ```

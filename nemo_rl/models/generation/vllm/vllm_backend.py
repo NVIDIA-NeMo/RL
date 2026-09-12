@@ -23,6 +23,7 @@ from typing import Any, Literal, Optional
 import torch
 import zmq
 
+from nemo_rl.models.four_phase_profiling import WorkerCapture
 from nemo_rl.models.generation.profiling import (
     ROLLOUT_PROFILER_CLASS_ENV,
     RolloutProfiler,
@@ -343,6 +344,22 @@ class _RolloutProfilingVllmWorkerBase(VllmWorker):
         finally:
             self._nrl_rollout_engine_initialization_open = False
             self._nrl_rollout_engine_initialization_token = None
+
+    _four_phase_capture: WorkerCapture | None = None
+
+    def full_step_profile(self, command: str, **kwargs: Any) -> None:
+        """Execute full-step capture control on this internal GPU process."""
+        if command == "configure_capture":
+            if self._nrl_rollout_engine_initialization_open:
+                raise RuntimeError("vLLM engine initialization is still open")
+            self._four_phase_capture = WorkerCapture(self._require_rollout_profiler())
+            # NVML is needed only for the selected four-phase capture mode.
+            from nemo_rl.utils.nvml import get_device_uuid
+
+            kwargs["device_uuid"] = get_device_uuid(torch.cuda.current_device())
+        if self._four_phase_capture is None:
+            raise RuntimeError("Four-phase internal rollout capture was not configured")
+        self._four_phase_capture.dispatch(command, **kwargs)
 
     def begin_rollout_profile(self, *, step_id: int | str) -> None:
         """Open one complete rollout capture window on this GPU worker."""

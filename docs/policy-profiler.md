@@ -5,6 +5,9 @@ training updates. A profiled step includes forward and backward execution,
 gradient reduction, and the optimizer step. Evaluation calls, rollout
 generation, reward processing, and policy scoring are outside this lifecycle.
 
+To include logprobs and weight refit alongside training and rollout generation,
+use the opt-in [four-phase capture contract](four-phase-profiling.md).
+
 ## Plugin contract
 
 The profiler package must expose a class with the following interface:

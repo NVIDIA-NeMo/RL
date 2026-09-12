@@ -770,6 +770,10 @@ For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubern
   [rollout profiler guide](docs/rollout-profiler.md) for the supported scope and
   plugin contract.
 
+- Four-phase capture combines policy and rollout artifacts for weight refit,
+  generation, logprobs, and training. See the
+  [four-phase capture guide](docs/four-phase-profiling.md).
+
 - If you forget to initialize the NeMo and Megatron submodules when cloning the NeMo-RL repository, you may run into an error like this:
 
   ```sh
