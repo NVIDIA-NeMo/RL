@@ -169,6 +169,7 @@ project-includes = [
   "nemo_rl/environments/interfaces.py",
   "nemo_rl/environments/math_environment.py",
   "nemo_rl/environments/metrics.py",
+  "nemo_rl/environments/nemo_gym_checkpoint.py",
   "nemo_rl/environments/nemo_gym_multimodal.py",
   "nemo_rl/environments/nemo_gym_request.py",
   "nemo_rl/environments/nemotron_utils.py",
