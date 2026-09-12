@@ -329,11 +329,20 @@ def test_checkpoint_prepare_waits_for_draining_policy_model() -> None:
             return {
                 "checkpoint_id": "snapshot-8",
                 "state": "paused",
-                "per_worker": {"0": {"state": "paused", "inflight": 0}},
+                "per_worker": {
+                    "0": {
+                        "state": "paused",
+                        "inflight": 0,
+                        "future_worker_metric": 7,
+                    }
+                },
                 "inflight_total": 0,
+                "response_inflight_total": 0,
+                "generation_pending_total": 0,
                 "waiters_total": 0,
                 "inflight": [],
                 "tombstones": [],
+                "future_status_metric": 9,
             }
         if server_name == "agent":
             return {
