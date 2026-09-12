@@ -14,9 +14,9 @@
 """Packing must not change what a metric means.
 
 ``SequencePackingLossWrapper`` folds per-sequence metric dicts into one. Sums
-are right for globally normalized metrics and wrong for extrema, and the
-workers that consume this dict downstream already tell the two apart by the
-``_min``/``_max`` suffix (megatron_value_worker.py:611 and four sibling sites).
+are right for globally normalized metrics and wrong for extrema. Most extrema
+use the ``_min``/``_max`` suffix; explicitly registered exceptions must keep
+their reduction as new metrics are added.
 """
 
 import pytest
@@ -96,6 +96,7 @@ class _AdditiveControlLossFn:
         return value.new_zeros(()), {
             "latency_minibatch": value,
             "latency_maximum": value,
+            "opd_full_decomposition_error": value,
         }
 
 
@@ -119,6 +120,7 @@ def test_embedded_extrema_substrings_do_not_make_metrics_extrema() -> None:
 
     assert metrics["latency_minibatch"] == pytest.approx(10.0)
     assert metrics["latency_maximum"] == pytest.approx(10.0)
+    assert metrics["opd_full_decomposition_error"] == pytest.approx(7.0)
 
 
 def test_packing_reports_the_true_value_range():
