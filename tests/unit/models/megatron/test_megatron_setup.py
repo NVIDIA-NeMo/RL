@@ -61,6 +61,13 @@ class _SerializableModelConfig:
         self.finalized = True
 
 
+def _install_mock_megatron_fp8_utils(monkeypatch, fp8_utils):
+    monkeypatch.setitem(sys.modules, fp8_utils.__name__, fp8_utils)
+    megatron_core = sys.modules.get("megatron.core")
+    if megatron_core is not None:
+        monkeypatch.setattr(megatron_core, "fp8_utils", fp8_utils, raising=False)
+
+
 @pytest.mark.mcore
 def test_resolve_optimizer_fp8_moment_dtypes():
     from nemo_rl.models.megatron.setup import _resolve_optimizer_dtype_kwargs
@@ -3931,7 +3938,7 @@ def test_patch_megatron_fp8_context_layer_quantization_logging(monkeypatch, capl
 
     fp8_utils.get_fp8_context = get_fp8_context
     fp8_utils.is_first_last_bf16_layer = is_first_last_bf16_layer
-    monkeypatch.setitem(sys.modules, fp8_utils.__name__, fp8_utils)
+    _install_mock_megatron_fp8_utils(monkeypatch, fp8_utils)
     monkeypatch.setenv("NRL_LOG_LAYER_QUANTIZATION", "1")
 
     setup._patch_megatron_fp8_context_layer_quantization_logging()
@@ -3967,7 +3974,7 @@ def test_patch_megatron_fp8_context_layer_quantization_logging_is_idempotent(
         return ("context", layer_no, is_init)
 
     fp8_utils.get_fp8_context = get_fp8_context
-    monkeypatch.setitem(sys.modules, fp8_utils.__name__, fp8_utils)
+    _install_mock_megatron_fp8_utils(monkeypatch, fp8_utils)
     monkeypatch.setenv("NRL_LOG_LAYER_QUANTIZATION", "true")
 
     setup._patch_megatron_fp8_context_layer_quantization_logging()
@@ -3991,7 +3998,7 @@ def test_patch_megatron_fp8_context_layer_quantization_logging_skips_init(
         return ("context", layer_no, is_init)
 
     fp8_utils.get_fp8_context = get_fp8_context
-    monkeypatch.setitem(sys.modules, fp8_utils.__name__, fp8_utils)
+    _install_mock_megatron_fp8_utils(monkeypatch, fp8_utils)
     monkeypatch.setenv("NRL_LOG_LAYER_QUANTIZATION", "yes")
 
     setup._patch_megatron_fp8_context_layer_quantization_logging()
@@ -4020,7 +4027,7 @@ def test_patch_megatron_fp8_context_layer_quantization_logging_rank_fallback(
         return ("context", layer_no, is_init)
 
     fp8_utils.get_fp8_context = get_fp8_context
-    monkeypatch.setitem(sys.modules, fp8_utils.__name__, fp8_utils)
+    _install_mock_megatron_fp8_utils(monkeypatch, fp8_utils)
     monkeypatch.setenv("NRL_LOG_LAYER_QUANTIZATION", "1")
     monkeypatch.setattr(setup.torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(setup.torch.distributed, "is_initialized", lambda: True)
