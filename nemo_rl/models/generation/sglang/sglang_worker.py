@@ -304,6 +304,70 @@ class SGLangGenerationWorker:
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})
 
+    def init_weights_update_group(
+        self, master_address, master_port, rank_offset, world_size, group_name, backend
+    ):
+        return self._make_request(
+            "init_weights_update_group",
+            {
+                "master_address": master_address,
+                "master_port": master_port,
+                "rank_offset": rank_offset,
+                "world_size": world_size,
+                "group_name": group_name,
+                "backend": backend,
+            },
+        )
+
+    def destroy_weights_update_group(self, group_name):
+        try:
+            return self._make_request(
+                "destroy_weights_update_group",
+                {
+                    "group_name": group_name,
+                },
+            )
+        except requests.exceptions.RequestException:
+            # catch the case where the engine is just created and does not have the group.
+            pass
+
+    def update_weights_from_distributed(
+        self,
+        names,
+        dtypes,
+        shapes,
+        group_name,
+        flush_cache=False,
+        weight_version: str | None = None,
+    ):
+        payload = {
+            "names": names,
+            "dtypes": [str(dtype).replace("torch.", "") for dtype in dtypes],
+            "shapes": shapes,
+            "group_name": group_name,
+            "flush_cache": flush_cache,
+        }
+        if weight_version is not None:
+            payload["weight_version"] = weight_version
+        return self._make_request(
+            "update_weights_from_distributed",
+            payload,
+        )
+
+    def pause_generation(self, mode: str):
+        return self._make_request("pause_generation", {"mode": mode})
+
+    def continue_generation(self):
+        return self._make_request("continue_generation", {})
+
+    def begin_weight_update(self):
+        """Open one engine-side session before the first refit bucket."""
+        return self._make_request("begin_weight_update", {})
+
+    def end_weight_update(self):
+        """Finalize quantized layouts after the last refit bucket."""
+        return self._make_request("end_weight_update", {})
+
     def start_profile(
         self,
         # The output directory
@@ -427,11 +491,14 @@ class SGLangGenerationWorker:
             "log_level",
             "mem_fraction_static",
             "allow_auto_truncate",
-            "disable_piecewise_cuda_graph",
             "disable_cuda_graph",
             "disable_cuda_graph_padding",
-            "cuda_graph_max_bs",
-            "cuda_graph_bs",
+            "cuda_graph_backend_decode",
+            "cuda_graph_backend_prefill",
+            "cuda_graph_max_bs_decode",
+            "cuda_graph_max_bs_prefill",
+            "cuda_graph_bs_decode",
+            "cuda_graph_bs_prefill",
         ]:
             if key in sglang_cfg_inner:
                 kwargs[key] = sglang_cfg_inner[key]

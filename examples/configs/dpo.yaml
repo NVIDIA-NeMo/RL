@@ -2,6 +2,9 @@
 dpo:
   max_num_epochs: 1
   max_num_steps: 150
+  # Optional checkpoint boundary for time-sliced jobs. The final scheduler
+  # horizon remains max_num_steps across resumed segments.
+  stop_after_step: null
   val_period: 25
   val_batches: 8
   val_global_batch_size: 8
@@ -85,6 +88,7 @@ policy:
       dropout_position: "post"  # Where to apply dropout: "pre" (before LoRA) or "post" (after LoRA)
       lora_A_init: "xavier"  # Initialization method for LoRA A matrix: "xavier" or "uniform"
       use_triton: true  # Use Triton-optimized kernels for LoRA (faster but requires flash-attn). Disable when tensor_parallel_size > 1
+      restore_from: null  # Warm start: path to a PEFT adapter checkpoint (adapter_model.safetensors + adapter_config.json) to initialize this run's LoRA weights from, e.g. a previous SFT run's step_*/policy/weights
 
   dynamic_batching:
     enabled: false
@@ -198,6 +202,7 @@ policy:
       lora_B_init_method: "zero"
       a2a_experimental: false
       lora_dtype: null
+      restore_from: null  # Warm start: path to a native Megatron PEFT checkpoint (iter_XXXXXXX dir or its root) to initialize this run's LoRA weights from, e.g. a previous SFT run
 
     optimizer:
       optimizer: "adam"
@@ -225,6 +230,7 @@ policy:
       # optimizer cpu offload
       optimizer_cpu_offload: false
       optimizer_offload_fraction: 0.0
+      overlap_cpu_optimizer_d2h_h2d: false
 
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}

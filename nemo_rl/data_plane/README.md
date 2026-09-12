@@ -409,34 +409,65 @@ global_forward_pad_seqlen = round_up(1320, 64) = 1344
 ## Configuration
 
 The data plane is configured via a `data_plane:` block in the master
-YAML (`examples/configs/...`). **YAML is the single source of truth
-for defaults** — the adapter has no hidden `cfg.get(key, default)`
-fallbacks. The canonical exemplar is
+YAML (`examples/configs/...`). The canonical exemplar is
 `examples/configs/grpo_math_1B.yaml`.
 
-All eight keys below are **required** when `enabled=true`. Recipes
-under `examples/configs/recipes/**/*.yaml` inherit them via
-`defaults:` from the exemplar.
+`enabled`, `impl`, `backend` and `claim_meta_poll_interval_s` are
+**required** when `enabled=true`. Backend sizing lives in a block named
+for the backend that reads it; only the block named by `backend` is
+consulted. An absent `mooncake_cpu:` block means that backend's
+defaults, declared on `MooncakeCpuConfig` in
+`nemo_rl/data_plane/interfaces.py`. `simple:` is **not** optional —
+`num_storage_units` has no static default, since no single value is
+right across cluster sizes, so a `simple` run without the block fails
+validation. Recipes under `examples/configs/recipes/**/*.yaml` inherit
+all of it via `defaults:`.
 
 ```yaml
 data_plane:
   enabled: false                       # flip to true to engage grpo_train_sync
   impl: transfer_queue                 # only one impl today
   backend: "simple"                    # "simple" or "mooncake_cpu"
-  storage_capacity: 1000000            # max samples retained per partition
-  num_storage_units: 2                 # storage shards
   claim_meta_poll_interval_s: 0.5      # blocking-claim poll cadence
-  global_segment_size: 549755813888    # 512 GiB — used when backend == "mooncake_cpu"
-  local_buffer_size:   68719476736     # 64 GiB  — used when backend == "mooncake_cpu"
+  simple:
+    storage_capacity: 1000000          # max samples retained per partition
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
+  mooncake_cpu:
+    global_segment_size: 68719476736   # 64 GiB/process
+    local_buffer_size:    4294967296   # 4 GiB/process
+    reuse_registered_buffers: true     # reuse RDMA-registered buffers
+    staging_buffer_size:   268435456   # 256 MiB/pool slot; bigger transfers bypass the pool
+    use_gdr: false                      # GPU-memory RDMA staging in CUDA clients
+    gdr_staging_buffer_mb: 1024         # persistent MiB per active GDR client
   # observability:                     # NotRequired
   #   enabled: false
 ```
 
+These keys used to sit directly under `data_plane:`. That spelling is not
+rejected — it is simply never read. A config still using it silently gets
+this backend's defaults instead of its own values: an inherited config
+supplies the nested block, so a surviving flat key always loses the merge,
+with no warning either way.
+
 Backend choice:
 - **`simple`** — ZMQ-backed; lowest setup overhead. Default for tests
   and small runs.
-- **`mooncake_cpu`** — Mooncake transfer engine; higher throughput at
-  scale. Required for multi-node clusters with large bulk volume.
+- **`mooncake_cpu`** — Mooncake's RDMA-only transfer engine. By default,
+  tensors transfer through registered CPU staging. Set
+  `mooncake_cpu.use_gdr: true` to let CUDA-initialized clients use
+  TransferQueue's GDR staging path. CPU-only clients, such as a
+  SingleController producer, continue to use CPU RDMA. GDR changes the
+  client-side tensor transfer and staging path; queued objects still reside in
+  Mooncake-managed host-memory segments.
+
+The CPU host staging pool's `staging_buffer_size` is independent of the GDR
+buffer. `gdr_staging_buffer_mb` is the persistent GPU staging capacity per
+active CUDA client and defaults to 1024 MiB. Transfers through that per-client
+buffer are serialized. Aggregate fetches may exceed the buffer and are split
+into groups. In the mixed CPU-producer/GDR-receiver flow used by
+SingleController, however, each individual tensor must currently fit because
+the CPU PUT path does not create the chunk metadata required by an oversized
+GDR GET.
 
 Capacity rule of thumb (any backend):
 

@@ -26,6 +26,8 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - "3rdparty/**"
+      - "docker/dynamo/pyproject.toml"
+      - "docker/dynamo/uv.lock"
       - ".github/workflows/lockfile-check.yml"
 
 jobs:
@@ -48,3 +50,6 @@ jobs:
       # uv.lock is slow (~5 min); cached runs are fast.
       - name: Check lockfile is up to date
         run: uv lock --check
+
+      - name: Check Dynamo lockfile is up to date
+        run: uv lock --check --directory docker/dynamo
