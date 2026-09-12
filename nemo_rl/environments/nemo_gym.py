@@ -1321,6 +1321,12 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     elif backend == "megatron":
         # Enable the http server for Gym dispatch over the Megatron generation backend.
         generation_config["mcore_generation_config"]["expose_http_server"] = True
+    elif backend == "trtllm":
+        # Same contract as vLLM, on trtllm_cfg. should_use_nemo_gym above already
+        # reads expose_http_server from this section, so leaving the backend out
+        # of this dispatch made every TRT-LLM Gym run die here.
+        generation_config["trtllm_cfg"]["async_engine"] = True
+        generation_config["trtllm_cfg"]["expose_http_server"] = True
     else:
         raise ValueError(f"NeMo Gym does not support generation backend {backend!r}.")
 
