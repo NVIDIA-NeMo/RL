@@ -243,6 +243,13 @@ COMMON_OVERRIDES=(
   "logger.wandb.name=${RUN_NAME}"
   "logger.monitor_gpus=true"
 )
+if [[ -n "${VLLM_LOGGING_LEVEL:-}" ]]; then
+  case "${VLLM_LOGGING_LEVEL}" in
+    DEBUG|INFO|WARNING|ERROR|CRITICAL) ;;
+    *) echo "Invalid VLLM_LOGGING_LEVEL" >&2; exit 2 ;;
+  esac
+  COMMON_OVERRIDES+=("++policy.generation.vllm_cfg.env_vars.VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL}")
+fi
 if [[ "${MODEL}" == qwen235 && "${PERFORMANCE_RECIPE}" != 1 ]]; then
   COMMON_OVERRIDES+=("policy.generation.vllm_cfg.tensor_parallel_size=4")
 fi
