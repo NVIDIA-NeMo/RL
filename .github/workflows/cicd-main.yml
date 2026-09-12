@@ -477,6 +477,10 @@ jobs:
           enable-cache: true
 
       - name: Generate lockfile
+        env:
+          # The overridden MCore dev extra builds torch-memory-saver while
+          # resolving the lock and requires the selected CUDA wheel family.
+          TMS_CUDA_MAJOR: "13"
         run: uv lock
 
       - name: Package lockfile
