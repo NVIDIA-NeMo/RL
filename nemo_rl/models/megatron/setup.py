@@ -308,6 +308,7 @@ from nemo_rl.models.megatron.draft.utils import (
 )
 from nemo_rl.models.megatron.hybridep import (
     configure_hybridep_packed_input_padding,
+    set_hybridep_dispatch_padding,
 )
 from nemo_rl.models.megatron.memory_saver import inference_model_alloc_region
 from nemo_rl.models.megatron.router_replay import (
@@ -878,10 +879,9 @@ def validate_megatron_config(megatron_cfg: Any, config: Mapping[str, Any]) -> No
     megatron_cfg.validate()
 
     if config["megatron_cfg"].get("moe_hybridep_prepad_packed_inputs"):
-        # Bridge 5ed9799 does not auto-enable per-layer padding because NeMo-RL
-        # supplies no Bridge dataset. Keep the opt-in authoritative if that gate
-        # changes or another config provider enables the field.
-        megatron_cfg.model.moe_hybridep_pad_uneven_dispatch_inputs = False
+        # Bridge cannot infer the packed layout because NeMo-RL supplies no
+        # Bridge dataset. Keep the explicit one-time prepadding authoritative.
+        set_hybridep_dispatch_padding(megatron_cfg.model, enabled=False)
 
 
 def setup_model_config(
