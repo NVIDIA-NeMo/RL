@@ -154,6 +154,56 @@ def test_checkpoint_capability_discovery_requires_policy_model() -> None:
         asyncio.run(env.discover_checkpoint_capabilities(["tools"]))
 
 
+def test_discard_restored_agent_continuations_fans_out_before_resume() -> None:
+    env = _checkpoint_env()
+    capabilities = {
+        "policy": _capability(
+            "responses_api_models",
+            "policy",
+            admission_states=["accepting", "draining", "paused"],
+            concurrency_contract="stateless",
+            instance_role="policy",
+        ),
+        "agent-route": _capability("responses_api_agents", "agent"),
+        "tools": _capability(
+            "resources_servers",
+            "tools",
+            checkpoint_mode="restart_only",
+            concurrency_contract="stateless",
+        ),
+    }
+
+    async def discover_control(_method, _path, *, server_name, **_kwargs):
+        return capabilities[server_name]
+
+    env._control = AsyncMock(side_effect=discover_control)
+    asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
+    env._active_gym_checkpoint_id = "restore-1"
+    env._control = AsyncMock(return_value={"discarded": True})
+
+    result = asyncio.run(
+        env.discard_restored_agent_continuations(
+            "restore-1",
+            time.time() + 60,
+            [{"rollout_id": "group_g0", "attempt_index": 1}],
+        )
+    )
+
+    assert result == {
+        "executions": 1,
+        "agent_participants": 1,
+        "discarded": 1,
+    }
+    call = env._control.await_args
+    assert call.args[:2] == (
+        "POST",
+        "/ng-control/v1/agent-checkpoint/discard-restored-continuation",
+    )
+    assert call.kwargs["server_name"] == "agent-route"
+    assert call.kwargs["json"]["rollout_id"] == "group_g0"
+    assert call.kwargs["json"]["attempt_index"] == 1
+
+
 def test_checkpoint_prepare_fans_out_using_component_routes() -> None:
     env = _checkpoint_env()
     deadline_ts = time.time() + 60.0

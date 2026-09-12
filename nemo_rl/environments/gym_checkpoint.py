@@ -38,10 +38,14 @@ GYM_MODEL_CHECKPOINT_PREFIX = f"{GYM_CHECKPOINT_CONTROL_PREFIX}/model-checkpoint
 GYM_AGENT_CHECKPOINT_PREFIX = f"{GYM_CHECKPOINT_CONTROL_PREFIX}/agent-checkpoint"
 GYM_AGENT_COMPLETION_RECEIPT_PATH = f"{GYM_AGENT_CHECKPOINT_PREFIX}/completion-receipt"
 GYM_AGENT_COMPLETION_ACK_PATH = f"{GYM_AGENT_CHECKPOINT_PREFIX}/acknowledge-completed"
+GYM_AGENT_DISCARD_RESTORED_CONTINUATION_PATH = (
+    f"{GYM_AGENT_CHECKPOINT_PREFIX}/discard-restored-continuation"
+)
 GYM_RESOURCES_CHECKPOINT_PREFIX = (
     f"{GYM_CHECKPOINT_CONTROL_PREFIX}/resources-checkpoint"
 )
 GYM_AGENT_CONTINUATION_INDEX_FEATURE = "agent_continuation_index_v1"
+GYM_AGENT_DISCARD_RESTORED_CONTINUATION_FEATURE = "discard_restored_continuation_v1"
 GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE = "external_storage_reference_index_v1"
 
 _IDENTITY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
@@ -223,7 +227,7 @@ class GymControlCapabilities(_StrictWireModel):
     name: str = Field(min_length=1)
     schema_version: Literal[1]
     admission_states: list[Literal["accepting", "draining", "paused"]]
-    checkpoint_mode: Literal["stateless", "export_restore"]
+    checkpoint_mode: Literal["stateless", "restart_only", "export_restore"]
     concurrency_contract: Literal[
         "stateless",
         "serialized_per_session",
@@ -269,7 +273,7 @@ class GymCheckpointParticipantContract(_StrictWireModel):
     participant: GymParticipantIdentity
     schema_version: Literal[1]
     admission_states: list[Literal["accepting", "draining", "paused"]]
-    checkpoint_mode: Literal["stateless", "export_restore"]
+    checkpoint_mode: Literal["stateless", "restart_only", "export_restore"]
     concurrency_contract: Literal[
         "stateless",
         "serialized_per_session",
@@ -342,6 +346,15 @@ class GymCheckpointTopology(_StrictWireModel):
         ).encode()
         return hashlib.sha256(payload).hexdigest()
 
+    def restart_only_resources(self) -> list[str]:
+        """Return resources whose unfinished rollouts cannot resume in place."""
+        return sorted(
+            contract.participant.server_name
+            for contract in self.participants
+            if contract.participant.component == "resources_servers"
+            and contract.checkpoint_mode == "restart_only"
+        )
+
     def validate_checkpoint_participants(
         self,
         checkpoint: "GymCheckpointCommitResult",
@@ -375,7 +388,9 @@ class GymCheckpointTopology(_StrictWireModel):
         """Require the Gym features used by coordinated turn recovery."""
         missing_acknowledgement: list[str] = []
         missing_continuation_index: list[str] = []
+        missing_fresh_restart: list[str] = []
         missing_storage_reference_index: list[str] = []
+        requires_fresh_restart = bool(self.restart_only_resources())
         for contract in self.participants:
             if contract.checkpoint_mode != "export_restore":
                 continue
@@ -388,6 +403,12 @@ class GymCheckpointTopology(_StrictWireModel):
                     missing_continuation_index.append(
                         contract.participant.participant_name
                     )
+                if (
+                    requires_fresh_restart
+                    and GYM_AGENT_DISCARD_RESTORED_CONTINUATION_FEATURE
+                    not in contract.features
+                ):
+                    missing_fresh_restart.append(contract.participant.participant_name)
             elif (
                 contract.participant.component == "responses_api_models"
                 and contract.instance_role == "policy"
@@ -409,6 +430,12 @@ class GymCheckpointTopology(_StrictWireModel):
                 "Gym participant checkpointing requires continuation-index "
                 "support from every stateful agent participant; "
                 f"missing={missing_continuation_index!r}"
+            )
+        if missing_fresh_restart:
+            raise RuntimeError(
+                "Gym restart-only resources require restored-continuation "
+                "discard support from every stateful agent participant; "
+                f"missing={missing_fresh_restart!r}"
             )
         if missing_storage_reference_index:
             raise RuntimeError(
@@ -487,6 +514,19 @@ class GymCheckpointArtifactReference(_StrictWireModel):
 
 class GymAgentCheckpointDirectoryRequest(GymCheckpointDirectoryRequest):
     """Agent commit/restore request returning continuation coordinates."""
+
+
+class GymAgentDiscardRestoredContinuationRequest(
+    GymCheckpointControlRequest,
+    GymExecutionIdentity,
+):
+    """Discard one restored continuation before replacement admission opens."""
+
+
+class GymAgentDiscardRestoredContinuationResponse(_StrictWireModel):
+    """Result of removing saved turn state for one replacement attempt."""
+
+    discarded: bool
 
 
 class GymModelCheckpointCommitRequest(GymCheckpointDirectoryRequest):
