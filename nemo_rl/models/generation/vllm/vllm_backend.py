@@ -31,6 +31,10 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     preinit_nixl_from_vllm_config,
     resolve_rollout_rank,
 )
+from nemo_rl.models.generation.vllm.local_expert_reload import (
+    LocalBf16ExpertReload,
+    LocalExpertBinding,
+)
 from nemo_rl.models.generation.vllm.worker_utils import (
     refit_cache_loader_routes_enabled,
 )
@@ -675,6 +679,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     # previous group without probing for the attribute's existence.
     model_update_group: Any = None
     _nccl_reshard_refit_adapter: Any | None = None
+    _local_bf16_expert_bindings: dict[str, LocalExpertBinding] | None = None
+    _local_bf16_expert_reload: LocalBf16ExpertReload | None = None
     nccl_reshard_refit_info: dict[str, Any]
     hf_to_local_param_map: HFToLocalParamMap
 
@@ -1854,16 +1860,18 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         ) -> LocalParamSpec:
             from torch.distributed._tensor import Shard
 
-            unsupported_shards = [
+            tensor_shards = [
                 placement.dim
                 for placement in param_info["dst_placements"]
                 if isinstance(placement, Shard) and placement.dim != 0
             ]
-            if unsupported_shards:
+            grouped_proj = param_info["grouped_expert_proj"]
+            intermediate_dim = 2 if grouped_proj == "down_proj" else 1
+            if any(dim != intermediate_dim for dim in tensor_shards):
                 raise ValueError(
-                    "BF16 FlashInfer TRTLLM nccl_reshard refit requires "
-                    "expert-parallel destination shards; unsupported tensor shard "
-                    f"dimensions {unsupported_shards} for {param_info['name']!r}"
+                    "BF16 FlashInfer TRTLLM refit has unsupported tensor shard "
+                    f"dimensions {tensor_shards} for {param_info['name']!r}; "
+                    f"expected intermediate dimension {intermediate_dim}"
                 )
 
             dst_mesh = param_info["dst_mesh_info"]
@@ -1941,6 +1949,32 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     buf=torch.empty(local_shape, dtype=dtype, device=self.device)
                 )
 
+            if tensor_shards:
+                if grouped_proj not in ("gate_proj", "up_proj", "down_proj"):
+                    raise ValueError(
+                        f"Unsupported local expert projection {grouped_proj!r}"
+                    )
+                if len(local_shape) != 3 or dtype != torch.bfloat16:
+                    raise ValueError(
+                        "TP-local BF16 experts require a 3D BF16 wire tensor"
+                    )
+                assert self._local_bf16_expert_bindings is not None
+                self._local_bf16_expert_bindings[param_info["name"]] = (
+                    LocalExpertBinding(
+                        registered_vllm_name,
+                        grouped_proj,
+                        (local_shape[0], local_shape[1], local_shape[2]),
+                    )
+                )
+
+                def post_local(ctx: RefitCtx) -> None:
+                    reload = self._local_bf16_expert_reload
+                    if reload is None:
+                        raise RuntimeError("TP-local BF16 expert reload is not active")
+                    reload.load(param_info["name"], ctx.buf)
+
+                return LocalParamSpec(base=None, pre=pre, post=post_local)
+
             def post(ctx: RefitCtx) -> None:
                 weights = [
                     (
@@ -1997,6 +2031,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
             return LocalParamSpec(base=value_param.data, pre=pre, post=post)
 
+        self._local_bf16_expert_bindings = {}
         param_info_by_name = {
             param_info["name"]: param_info
             for layer_name in refit_info["layer_names"]
@@ -2247,6 +2282,16 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
         return mapping
 
+    def _begin_local_bf16_expert_reload(self) -> LocalBf16ExpertReload | None:
+        bindings = self._local_bf16_expert_bindings
+        reload = (
+            LocalBf16ExpertReload(self.model_runner.model, bindings)
+            if bindings
+            else None
+        )
+        self._local_bf16_expert_reload = reload
+        return reload
+
     def nccl_reshard_refit(self, refit_timeout_s: float | None = None) -> bool:
         """Receive weights from training workers via xferdtensor, under a deadline.
 
@@ -2283,8 +2328,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             if native_names:
                 result = self._nccl_reshard_refit_impl()
             else:
-                with self._weight_update_lifecycle("nccl_reshard") as finalize:
-                    result = self._nccl_reshard_refit_impl(finalize)
+                self._begin_local_bf16_expert_reload()
+                try:
+                    with self._weight_update_lifecycle("nccl_reshard") as finalize:
+                        result = self._nccl_reshard_refit_impl(finalize)
+                finally:
+                    self._local_bf16_expert_reload = None
         if guard.fired:
             raise RefitAborted(
                 f"refit nccl_reshard receive exceeded {refit_timeout_s}s and was "
@@ -2426,8 +2475,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 self.nccl_reshard_refit_info,
                 include_native=False,
             )
-            adapter.begin_update()
+            local_reload = self._begin_local_bf16_expert_reload()
             try:
+                adapter.begin_update()
                 # Resolving every destination up front ensures a missing role,
                 # alias, shape, dtype, or wrapped loader fails before NCCL starts.
                 native_specs = self._build_native_destination_specs(
@@ -2452,7 +2502,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 self.hf_to_local_param_map = destination_map
                 _receive_bulk_components()
                 _receive_misc()
+                if local_reload is not None:
+                    local_reload.require_complete()
                 adapter.finish_update()
+                if local_reload is not None:
+                    local_reload.verify_runtime_storage()
                 _rebuild_kernel_layouts_after_bulk_writes(
                     self.model_runner.model, bulk_param_ids, native_param_ids
                 )
@@ -2464,6 +2518,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             except BaseException as error:
                 adapter.abort_update(error)
                 raise
+            finally:
+                self._local_bf16_expert_reload = None
             torch.cuda.empty_cache()
             return True
 
@@ -2473,7 +2529,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             )
         _receive_bulk_components()
         _receive_misc()
+        local_reload = self._local_bf16_expert_reload
+        if local_reload is not None:
+            local_reload.require_complete()
         finalize()
+        if local_reload is not None:
+            local_reload.verify_runtime_storage()
         torch.cuda.empty_cache()
         return True
 

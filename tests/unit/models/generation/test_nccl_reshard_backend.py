@@ -941,8 +941,8 @@ def test_build_hf_to_local_param_map_rejects_missing_trtllm_destination():
         spec.post(spec.pre(spec.base))
 
 
-def test_build_hf_to_local_param_map_rejects_trtllm_tensor_sharding():
-    """TRTLLM expert staging supports expert-parallel destination shards only."""
+def test_build_hf_to_local_param_map_rejects_trtllm_hidden_sharding():
+    """Intermediate TP shards are supported, hidden-axis shards are not."""
     expert_name = "model.layers.0.mlp.experts.gate_proj.weight"
     refit_info = {
         "gen_tp_size": 2,
@@ -955,7 +955,7 @@ def test_build_hf_to_local_param_map_rejects_trtllm_tensor_sharding():
                     "dtype": "torch.bfloat16",
                     "grouped_expert_proj": "gate_proj",
                     "dst_mesh_info": MeshInfo(torch.tensor([8, 9])),
-                    "dst_placements": [Shard(1)],
+                    "dst_placements": [Shard(2)],
                 }
             ]
         },
@@ -971,6 +971,42 @@ def test_build_hf_to_local_param_map_rejects_trtllm_tensor_sharding():
 
     with pytest.raises(ValueError, match="unsupported tensor shard dimensions"):
         ext.build_hf_to_local_param_map(refit_info)
+
+
+@pytest.mark.parametrize("rank", [8, 9, 10, 11])
+def test_trtllm_tp_local_staging_uses_local_loader(rank: int):
+    expert_name = "model.layers.0.mlp.experts.gate_proj.weight"
+    runtime_name = "model.layers.0.mlp.experts.routed_experts.w13_weight"
+    refit_info = {
+        "gen_tp_size": 4,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": expert_name,
+                    "global_shape": [4, 32, 16],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "gate_proj",
+                    "dst_mesh_info": MeshInfo(torch.tensor([8, 9, 10, 11])),
+                    "dst_placements": [Shard(1)],
+                }
+            ],
+        },
+    }
+    ext = _make_ext({runtime_name: torch.empty(4, 16, 24, 64)})
+    ext.device = torch.device("cpu")
+    ext.pp_comm_groups = {0: SimpleNamespace(rank=rank)}
+    _enable_trtllm_staging(ext)
+    ext._local_bf16_expert_reload = SimpleNamespace(load=MagicMock())
+    ext._load_full_hf_weights = MagicMock()
+    spec = ext.build_hf_to_local_param_map(refit_info).get(expert_name)
+    assert spec is not None and spec.pre is not None and spec.post is not None
+    ctx = spec.pre(spec.base)
+    assert tuple(ctx.buf.shape) == (4, 8, 16)
+    spec.post(ctx)
+    ext._local_bf16_expert_reload.load.assert_called_once_with(expert_name, ctx.buf)
+    ext._load_full_hf_weights.assert_not_called()
+    assert ext._local_bf16_expert_bindings[expert_name].target_name == runtime_name
 
 
 def test_prepare_nccl_reshard_refit_info_validates_before_building_map(monkeypatch):
