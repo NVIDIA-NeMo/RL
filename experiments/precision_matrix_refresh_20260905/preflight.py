@@ -23,13 +23,14 @@ def main() -> None:
         for mode in ("sync", "async"):
             for arm in (
                 "bf16-bf16", "bf16-mxfp8", "mxfp8-false-bf16",
-                "mxfp8-false-mxfp8", "mxfp8-true-mxfp8",
+                "mxfp8-false-mxfp8", "mxfp8-true-mxfp8", "mxfp8-true-bf16",
             ):
                 case = f"{model}/{mode}/{arm}"
                 try:
                     env = dict(os.environ, ACTION="render", REPO=str(root),
                                MODEL=model, MODE=mode, ARM=arm,
-                               SLURM_ACCOUNT="coreai_dlalgo_nemorl", MAX_STEPS="20")
+                               SLURM_ACCOUNT="coreai_dlalgo_nemorl", MAX_STEPS="20", TOPOLOGY="default")
+                    env.pop("CONFIG_OVERRIDE", None)
                     output = subprocess.check_output(["bash", str(launcher)], env=env, text=True)
                     fields = dict(line.split("=", 1) for line in output.splitlines()
                                   if "=" in line and not line.startswith("overrides:"))
@@ -45,6 +46,10 @@ def main() -> None:
                     assert cfg.loss_fn.use_importance_sampling_correction
                     assert cfg.loss_fn.force_on_policy_ratio is False
                     assert cfg.grpo.val_period == 0
+                    if arm == "mxfp8-true-bf16":
+                        assert cfg.policy.megatron_cfg.fp8_cfg.fp8_param is True
+                        assert cfg.policy.generation.vllm_cfg.precision == "bfloat16"
+                        assert cfg.policy.generation.vllm_cfg.is_mx is False
                     if mode == "async":
                         assert cfg.policy.generation.refit_transport == "nccl_reshard"
                         assert cfg.grpo.async_grpo.max_trajectory_age_steps == 1
@@ -54,7 +59,7 @@ def main() -> None:
                     print(f"FAIL {case}: {type(exc).__name__}: {exc}", flush=True)
     if failures:
         raise SystemExit(f"{len(failures)} configuration failures: {failures}")
-    print("40/40 configurations composed. No model execution was performed.")
+    print("48/48 configurations composed. No model execution was performed.")
 
 
 if __name__ == "__main__":

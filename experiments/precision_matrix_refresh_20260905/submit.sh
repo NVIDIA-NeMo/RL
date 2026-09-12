@@ -32,13 +32,9 @@ if [[ "${MODEL}:${MODE}" == super:sync ]]; then
   exit 2
 fi
 case "${ARM}" in
-  bf16-bf16|bf16-mxfp8|mxfp8-false-bf16|mxfp8-false-mxfp8|mxfp8-true-mxfp8|mxfp8-mxfp8) ;;
-  mxfp8-true-bf16)
-    echo "ARM=mxfp8-true-bf16 is unsupported: native MXFP8 parameter storage cannot refit a BF16 rollout consumer." >&2
-    exit 3
-    ;;
+  bf16-bf16|bf16-mxfp8|mxfp8-false-bf16|mxfp8-false-mxfp8|mxfp8-true-bf16|mxfp8-true-mxfp8|mxfp8-mxfp8) ;;
   *)
-    echo "ARM must be bf16-bf16, bf16-mxfp8, mxfp8-false-bf16, mxfp8-false-mxfp8, mxfp8-true-mxfp8, or mxfp8-mxfp8" >&2
+    echo "ARM must be bf16-bf16, bf16-mxfp8, mxfp8-false-bf16, mxfp8-false-mxfp8, mxfp8-true-bf16, mxfp8-true-mxfp8, or mxfp8-mxfp8" >&2
     exit 2
     ;;
 esac
@@ -282,7 +278,7 @@ case "${ARM}" in
       )
     fi
     ;;
-  mxfp8-true-mxfp8|mxfp8-mxfp8)
+  mxfp8-true-mxfp8|mxfp8-mxfp8|mxfp8-true-bf16)
     PRECISION_OVERRIDES=(
       "policy.megatron_cfg.fp8_cfg.enabled=true"
       "policy.megatron_cfg.fp8_cfg.fp8=e4m3"
@@ -301,6 +297,14 @@ case "${ARM}" in
       "policy.generation.vllm_cfg.num_first_layers_in_bf16=${FIRST_BF16}"
       "policy.generation.vllm_cfg.num_last_layers_in_bf16=${LAST_BF16}"
     )
+    if [[ "${ARM}" == mxfp8-true-bf16 ]]; then
+      PRECISION_OVERRIDES+=(
+        "policy.generation.vllm_cfg.precision=bfloat16"
+        "++policy.generation.vllm_cfg.is_mx=false"
+        "policy.generation.vllm_cfg.num_first_layers_in_bf16=0"
+        "policy.generation.vllm_cfg.num_last_layers_in_bf16=0"
+      )
+    fi
     ;;
 esac
 

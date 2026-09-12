@@ -15,7 +15,7 @@ def main() -> None:
     parser.add_argument("--preflight-log", type=Path, required=True)
     parser.add_argument("--expected-sha", required=True)
     args = parser.parse_args()
-    if "40/40 configurations composed." not in args.preflight_log.read_text():
+    if "48/48 configurations composed." not in args.preflight_log.read_text():
         raise SystemExit("Configuration preflight has not passed")
     root = Path(os.environ["REPO"])
     head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
@@ -24,14 +24,15 @@ def main() -> None:
     records = json.loads(args.ledger.read_text()) if args.ledger.exists() else []
     launcher = root / "experiments/precision_matrix_refresh_20260905/submit.sh"
     for arm in ("bf16-bf16", "bf16-mxfp8", "mxfp8-false-mxfp8",
-                "mxfp8-true-mxfp8", "mxfp8-false-bf16"):
+                "mxfp8-true-mxfp8", "mxfp8-false-bf16", "mxfp8-true-bf16"):
         for model in ("qwen30", "qwen35", "lightning", "qwen235"):
             for mode in ("sync", "async"):
                 case = f"{model}/{mode}/{arm}"
                 if any(row["case"] == case and row.get("job_id") for row in records):
                     continue
                 env = dict(os.environ, MODEL=model, MODE=mode, ARM=arm,
-                           MAX_STEPS="20", EXPECTED_SOURCE_SHA=head)
+                           MAX_STEPS="20", EXPECTED_SOURCE_SHA=head, TOPOLOGY="default")
+                env.pop("CONFIG_OVERRIDE", None)
                 row = {"case": case, "sha": head, "run_group": env["RUN_GROUP"]}
                 for action in ("test-only", "submit"):
                     env["ACTION"] = action
