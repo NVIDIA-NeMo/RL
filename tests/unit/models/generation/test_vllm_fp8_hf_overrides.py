@@ -65,14 +65,30 @@ def test_does_not_log_ignore_patterns_when_unconfigured(capsys) -> None:
         {"hf_overrides": {"quantization_config": None}},
     ],
 )
+@pytest.mark.parametrize("precision", ["bf16", "bfloat16"])
 def test_bf16_rollout_can_inherit_ignore_patterns(
-    vllm_kwargs: dict[str, Any], capsys: pytest.CaptureFixture[str]
+    vllm_kwargs: dict[str, Any], precision: str,
+    capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture,
 ) -> None:
     _log_effective_quantization_ignore_patterns(
-        {"precision": "bfloat16", "quantization_ignore_patterns": ["*self_attn.*"]},
+        {"precision": precision, "quantization_ignore_patterns": ["*self_attn.*"]},
         vllm_kwargs,
     )
     assert capsys.readouterr().out == ""
+    assert "Ignoring quantization_ignore_patterns because rollout precision is BF16" in caplog.text
+
+
+def test_mixed_mxfp8_rollout_keeps_exclusions_without_bf16_warning(
+    capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture,
+) -> None:
+    _log_effective_quantization_ignore_patterns(
+        {"precision": "fp8", "is_mx": True,
+         "num_first_layers_in_bf16": 2, "num_last_layers_in_bf16": 6,
+         "quantization_ignore_patterns": ["*self_attn.*"]},
+        {"hf_overrides": {"quantization_config": {"ignore": ["model.layers.0.*"]}}},
+    )
+    assert "model.layers.0.*" in capsys.readouterr().out
+    assert not caplog.records
 
 
 def test_fp8_and_user_hf_overrides_coexist():
