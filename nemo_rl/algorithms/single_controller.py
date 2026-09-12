@@ -154,6 +154,7 @@ from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
     PromptGroupPhase,
+    RolloutAttemptStatus,
     RolloutRecoveryState,
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
@@ -671,6 +672,7 @@ class SingleControllerActor:
             restored_replay_groups=restored_replay_groups,
         )
         if self._gym_checkpoint_restore_operation_id is not None:
+            await self._discard_restart_only_gym_continuations()
             await self._nemo_gym_checkpoint_actor().resume_checkpoint.remote(
                 self._gym_checkpoint_restore_operation_id,
                 time.time()
@@ -1612,6 +1614,59 @@ class SingleControllerActor:
             raise RuntimeError(
                 "Gym participant checkpointing is enabled without a nemo_gym actor"
             ) from error
+
+    async def _discard_restart_only_gym_continuations(self) -> None:
+        """Make interrupted attempts start fresh when resource state cannot restore."""
+        checkpoint_id = self._gym_checkpoint_restore_operation_id
+        topology = self._gym_checkpoint_topology
+        if checkpoint_id is None or topology is None:
+            return
+        restart_only_resources = topology.restart_only_resources()
+        if not restart_only_resources:
+            return
+
+        executions = []
+        for group in self._rollout_recovery_ledger.groups():
+            for sibling in group.siblings:
+                attempt = sibling.current_attempt
+                if attempt.status is RolloutAttemptStatus.SEALED:
+                    continue
+                executions.append(
+                    {
+                        "rollout_id": group.logical_rollout_id(
+                            sibling.generation_index
+                        ),
+                        # Gym restores a committed boundary into the replacement
+                        # physical attempt, not back into the interrupted one.
+                        "attempt_index": attempt.attempt_index + 1,
+                    }
+                )
+        if not executions:
+            return
+
+        result = await self._nemo_gym_checkpoint_actor().discard_restored_agent_continuations.remote(
+            checkpoint_id,
+            time.time()
+            + self._master_config.rollout_checkpointing.gym.prepare_timeout_s,
+            executions,
+        )
+        staging_keys = sorted(self._restored_gym_checkpoint_staging_keys)
+        if staging_keys:
+            async with self._data_plane_checkpoint_barrier.mutation(
+                "gym_restart_cleanup"
+            ):
+                await self._call_dp(
+                    "clear_samples",
+                    sample_ids=staging_keys,
+                    partition_id=self._master_config.token_capture.staging_partition,
+                )
+            self._restored_gym_checkpoint_staging_keys.clear()
+        print(
+            "📦 Restarting unfinished Gym executions from their initial task: "
+            f"executions={result['executions']}, "
+            f"resources={','.join(restart_only_resources)}",
+            flush=True,
+        )
 
     def _schedule_completed_gym_acknowledgement_drain(self) -> None:
         """Schedule delivery for ledger-backed Gym acknowledgement obligations."""

@@ -244,6 +244,66 @@ def test_turn_recovery_capability_guardrails(
         topology.validate_turn_recovery_capabilities()
 
 
+def test_restart_only_resource_requires_agent_fresh_restart_support() -> None:
+    model = GymControlCapabilities.model_validate(
+        _capabilities(features=["external_storage_reference_index_v1"])
+    )
+    agent = GymControlCapabilities.model_validate(
+        _capabilities(
+            component="responses_api_agents",
+            name="agent",
+            admission_states=["accepting"],
+            concurrency_contract="serialized_per_session",
+            instance_role=None,
+            features=[
+                "agent_continuation_index_v1",
+                "completed_result_acknowledgement",
+            ],
+        )
+    )
+    resources = GymControlCapabilities.model_validate(
+        _capabilities(
+            component="resources_servers",
+            name="tools",
+            admission_states=["accepting"],
+            checkpoint_mode="restart_only",
+            concurrency_contract="stateless",
+            instance_role=None,
+        )
+    )
+
+    def topology_for(agent_capabilities: GymControlCapabilities):
+        return GymCheckpointTopology.from_discovered(
+            [
+                GymDiscoveredParticipant(
+                    participant=model.participant("policy-route"),
+                    capabilities=model,
+                ),
+                GymDiscoveredParticipant(
+                    participant=agent_capabilities.participant("agent-route"),
+                    capabilities=agent_capabilities,
+                ),
+                GymDiscoveredParticipant(
+                    participant=resources.participant("tools-route"),
+                    capabilities=resources,
+                ),
+            ]
+        )
+
+    with pytest.raises(RuntimeError, match="restored-continuation discard"):
+        topology_for(agent).validate_turn_recovery_capabilities()
+
+    supported = agent.model_copy(
+        update={
+            "features": [
+                *agent.features,
+                "discard_restored_continuation_v1",
+            ]
+        }
+    )
+    topology_for(supported).validate_turn_recovery_capabilities()
+
+
 def test_participant_manifest_digest_is_verified_before_publication(tmp_path) -> None:
     manifest_path = tmp_path / "resources" / "manifest.json"
     manifest_path.parent.mkdir()
@@ -751,3 +811,38 @@ def test_topology_requires_every_stateful_checkpoint_participant() -> None:
 
     with pytest.raises(ValueError, match="missing=.*policy-route"):
         topology.validate_checkpoint_participants(checkpoint)
+
+
+def test_topology_reports_restart_only_resources() -> None:
+    topology = GymCheckpointTopology.model_validate(
+        {
+            "participants": [
+                {
+                    "participant": {
+                        "server_name": "stateful-tools",
+                        "component": "resources_servers",
+                        "participant_name": "stateful-tools",
+                    },
+                    "schema_version": 1,
+                    "admission_states": ["accepting"],
+                    "checkpoint_mode": "restart_only",
+                    "concurrency_contract": "stateless",
+                    "multi_process": {"mode": "single_worker", "num_workers": 1},
+                },
+                {
+                    "participant": {
+                        "server_name": "stateless-tools",
+                        "component": "resources_servers",
+                        "participant_name": "stateless-tools",
+                    },
+                    "schema_version": 1,
+                    "admission_states": ["accepting"],
+                    "checkpoint_mode": "stateless",
+                    "concurrency_contract": "stateless",
+                    "multi_process": {"mode": "single_worker", "num_workers": 1},
+                },
+            ]
+        }
+    )
+
+    assert topology.restart_only_resources() == ["stateful-tools"]

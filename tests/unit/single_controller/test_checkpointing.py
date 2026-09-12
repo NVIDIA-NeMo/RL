@@ -103,6 +103,7 @@ from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
     RolloutRecoveryLedger,
+    RolloutAttemptStatus,
 )
 from nemo_rl.experience.route_plan import (
     ROUTE_PLAN_SCHEMA_VERSION,
@@ -673,6 +674,103 @@ class _FakeGymCheckpointActor:
     async def _abort(self, _checkpoint_id: str, _deadline_ts: float) -> dict[str, Any]:
         self.events.append("abort")
         return {"participants": []}
+
+
+def test_restart_only_resources_discard_unsealed_replacement_continuations() -> None:
+    async def exercise() -> None:
+        calls: list[tuple[str, list[dict[str, Any]]]] = []
+
+        async def discard(
+            checkpoint_id: str,
+            _deadline_ts: float,
+            executions: list[dict[str, Any]],
+        ) -> dict[str, Any]:
+            calls.append((checkpoint_id, executions))
+            return {
+                "executions": len(executions),
+                "agent_participants": 1,
+                "discarded": len(executions),
+            }
+
+        gym_actor = SimpleNamespace(
+            discard_restored_agent_continuations=_AsyncRemoteMethod(discard)
+        )
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        controller = object.__new__(controller_cls)
+        controller._gym_checkpoint_restore_operation_id = "restore-1"
+        controller._gym_checkpoint_topology = GymCheckpointTopology.model_validate(
+            {
+                "participants": [
+                    {
+                        "participant": {
+                            "server_name": "tools",
+                            "component": "resources_servers",
+                            "participant_name": "tools",
+                        },
+                        "schema_version": 1,
+                        "admission_states": ["accepting"],
+                        "checkpoint_mode": "restart_only",
+                        "concurrency_contract": "stateless",
+                        "multi_process": {
+                            "mode": "single_worker",
+                            "num_workers": 1,
+                        },
+                    }
+                ]
+            }
+        )
+        controller._rollout_recovery_ledger = SimpleNamespace(
+            groups=lambda: [
+                SimpleNamespace(
+                    siblings=[
+                        SimpleNamespace(
+                            generation_index=0,
+                            current_attempt=SimpleNamespace(
+                                attempt_index=2,
+                                status=RolloutAttemptStatus.ABANDONED,
+                            ),
+                        ),
+                        SimpleNamespace(
+                            generation_index=1,
+                            current_attempt=SimpleNamespace(
+                                attempt_index=0,
+                                status=RolloutAttemptStatus.SEALED,
+                            ),
+                        ),
+                    ],
+                    logical_rollout_id=lambda generation_index: (
+                        f"group_g{generation_index}"
+                    ),
+                )
+            ]
+        )
+        controller._env_handles = {"nemo_gym": gym_actor}
+        controller._restored_gym_checkpoint_staging_keys = {"stage/old-call"}
+        controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        controller._call_dp = AsyncMock()
+        controller._master_config = SimpleNamespace(
+            rollout_checkpointing=SimpleNamespace(
+                gym=SimpleNamespace(prepare_timeout_s=30.0)
+            ),
+            token_capture=SimpleNamespace(staging_partition="staging"),
+        )
+
+        await controller._discard_restart_only_gym_continuations()
+
+        assert calls == [
+            (
+                "restore-1",
+                [{"rollout_id": "group_g0", "attempt_index": 3}],
+            )
+        ]
+        controller._call_dp.assert_awaited_once_with(
+            "clear_samples",
+            sample_ids=["stage/old-call"],
+            partition_id="staging",
+        )
+        assert controller._restored_gym_checkpoint_staging_keys == set()
+
+    asyncio.run(exercise())
 
 
 # ── builders ─────────────────────────────────────────────────────────────────

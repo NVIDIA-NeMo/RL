@@ -46,6 +46,7 @@ from nemo_rl.environments.gym_checkpoint import (
     GYM_AGENT_COMPLETION_ACK_PATH,
     GYM_AGENT_COMPLETION_RECEIPT_PATH,
     GYM_AGENT_CHECKPOINT_PREFIX,
+    GYM_AGENT_DISCARD_RESTORED_CONTINUATION_PATH,
     GYM_CHECKPOINT_CAPABILITIES_PATH,
     GYM_CHECKPOINT_CONTROL_PREFIX,
     GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE,
@@ -53,6 +54,8 @@ from nemo_rl.environments.gym_checkpoint import (
     GYM_MODEL_CHECKPOINT_PREFIX,
     GYM_RESOURCES_CHECKPOINT_PREFIX,
     GymAgentCheckpointDirectoryRequest,
+    GymAgentDiscardRestoredContinuationRequest,
+    GymAgentDiscardRestoredContinuationResponse,
     GymActorExecutionRegistry,
     GymAgentCommitResponse,
     GymAgentPrepareResponse,
@@ -1429,6 +1432,53 @@ Depending on your data shape, you may want to change these values."""
             checkpoint_id=checkpoint_id,
             participants=results,
         ).model_dump(mode="json")
+
+    async def discard_restored_agent_continuations(
+        self,
+        checkpoint_id: str,
+        deadline_ts: float,
+        executions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Prevent selected replacement attempts from consuming saved turns."""
+        if self._active_gym_checkpoint_id != checkpoint_id:
+            raise RuntimeError(
+                f"Gym checkpoint {checkpoint_id!r} is not the active restore"
+            )
+        identities = [GymExecutionIdentity.model_validate(item) for item in executions]
+        keys = [(item.rollout_id, item.attempt_index) for item in identities]
+        if len(keys) != len(set(keys)):
+            raise ValueError("restored Gym continuations to retire must be unique")
+
+        agent_participants = [
+            discovered
+            for discovered in self._checkpoint_participants()
+            if discovered.participant.component == "responses_api_agents"
+            and discovered.capabilities.checkpoint_mode == "export_restore"
+        ]
+        discarded = 0
+        for discovered in agent_participants:
+            for identity in identities:
+                request = GymAgentDiscardRestoredContinuationRequest(
+                    checkpoint_id=checkpoint_id,
+                    deadline_ts=deadline_ts,
+                    rollout_id=identity.rollout_id,
+                    attempt_index=identity.attempt_index,
+                ).model_dump(mode="json")
+                response = GymAgentDiscardRestoredContinuationResponse.model_validate(
+                    await self._control(
+                        "POST",
+                        GYM_AGENT_DISCARD_RESTORED_CONTINUATION_PATH,
+                        server_name=discovered.participant.server_name,
+                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                        json=request,
+                    )
+                )
+                discarded += int(response.discarded)
+        return {
+            "executions": len(identities),
+            "agent_participants": len(agent_participants),
+            "discarded": discarded,
+        }
 
     async def resume_checkpoint(
         self,
