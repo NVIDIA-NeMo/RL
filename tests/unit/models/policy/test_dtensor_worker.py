@@ -27,7 +27,7 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.utils.flops_tracker import FLOPTracker, get_default_hf_config
+from nemo_rl.utils.flops_tracker import FLOPTracker, get_hf_config
 from tests.unit.test_utils import SimpleLossFn
 
 
@@ -1197,7 +1197,11 @@ class TestTwoGPUCluster:
                 assert total_flops > 0, "total_flops should be positive"
 
                 expected_tracker = FLOPTracker.from_config(
-                    config["model_name"], get_default_hf_config(config["model_name"])
+                    config["model_name"],
+                    get_hf_config(
+                        config["model_name"],
+                        **(config.get("hf_config_overrides") or {}),
+                    ),
                 )
                 expected_tracker.track_batch(input_lengths.tolist())
                 expected_total_flops = expected_tracker.total_flops

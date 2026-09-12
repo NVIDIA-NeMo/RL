@@ -39,6 +39,7 @@ at the synchronizer level.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from typing import Optional
 
 from nemo_rl.utils.timer import Timer
@@ -122,6 +123,47 @@ class WeightSynchronizer(ABC):
         process group.
         """
         pass
+
+    def reconcile_communicator(
+        self, absent_shards: Sequence[int], force: bool = False
+    ) -> Optional[bool]:
+        """Bring the transport's communicator in line with the live generation fleet.
+
+        Called immediately before every refit, rather than in response to a death event.
+        Reconciling on a schedule is idempotent and converges after a missed or reordered
+        notification, and it is the only point where the refit group is provably idle and
+        every rank is synchronized -- which matters because the collectives that change
+        membership are themselves collectives.
+
+        Args:
+            absent_shards: shard indices whose process cannot take part in a collective
+                (see ``GenerationFleetHealth.absent_shards``). Note this is not the
+                complement of the serving set: a shard withheld from traffic may still be
+                alive and able to refit.
+            force: rebuild even when the membership is unchanged. Implementations
+                skip a rebuild whose absent set matches what they last built with,
+                which is what stops a lost shard costing a rebuild on every
+                subsequent step. The recovery path sets this because after an abort
+                the membership is identical and the communicator is *gone*.
+
+        Returns:
+            True if the communicator was rebuilt, False if nothing needed rebuilding,
+            and None if this transport owns no membership to reconcile at all. The
+            caller reports a failed refit differently for the last case: "no shard was
+            absent" and "there was nothing to reconcile" point at different causes.
+
+        Raises:
+            NoSurvivingShards: if every generation shard is gone, so there is nothing
+                left to rebuild onto.
+
+        The default is a no-op: transports that own no NCCL world of their own -- IPC,
+        HTTP, checkpoint-engine -- have no membership to reconcile. It returns None
+        rather than False so the controller does not report a refit failure on one of
+        them as "no shard could be identified as absent", which would send the reader
+        hunting for a silent rank that does not exist.
+        """
+        del absent_shards
+        return None
 
     @abstractmethod
     def shutdown(self) -> None:

@@ -15,6 +15,8 @@
 import os
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from threading import Event
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -24,6 +26,7 @@ import torch
 from omegaconf import OmegaConf
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+from nemo_rl.algorithms import grpo as grpo_mod
 from nemo_rl.algorithms.advantage_estimator import (
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
@@ -48,6 +51,7 @@ from nemo_rl.algorithms.grpo import (
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
     _save_async_replay_buffer_checkpoint,
+    _startup_pipeline_ready,
     _validate_multimodal_dedup_capability,
     _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
@@ -57,7 +61,6 @@ from nemo_rl.algorithms.grpo import (
     grpo_train,
     refit_policy_generation,
     setup,
-    shutdown_environments,
     validate,
 )
 from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
@@ -67,6 +70,7 @@ from nemo_rl.algorithms.reward_functions import (
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
+from nemo_rl.data.dataloader import CyclingDataLoader
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -212,6 +216,51 @@ def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
     policy.stream_weights_via_ipc_zmq.assert_called_once_with(
         buffer_size_bytes=1024**3,
         kv_scales=kv_scales,
+    )
+
+
+def test_megatron_m2n_refit_delegates_entirely_to_the_synchronizer() -> None:
+    """MegatronWeightSynchronizer owns the engine lifecycle; the caller must not duplicate it.
+
+    ``refit_policy_generation`` returns as soon as a weight synchronizer is
+    present, so suspend/offload/prepare/resume must NOT be driven here — they
+    live inside ``MegatronWeightSynchronizer.sync_weights`` and are asserted in
+    ``tests/unit/weight_sync/test_weight_synchronizer.py``.
+    """
+    policy = MagicMock()
+    generation = object.__new__(MegatronGeneration)
+    generation.suspend_for_refit = MagicMock()
+    generation.prepare_for_generation = MagicMock()
+    generation.resume_after_refit = MagicMock()
+    generation.weight_synchronizer = MagicMock()
+    generation.weight_synchronizer.sync_weights.return_value = {"bytes": 16.0}
+
+    metrics = refit_policy_generation(
+        policy,
+        generation,
+        colocated_inference=False,
+        kv_scales={"layer.0": 0.5},
+    )
+
+    assert metrics == {"bytes": 16.0}
+    generation.weight_synchronizer.sync_weights.assert_called_once_with(
+        timer=None, kv_scales={"layer.0": 0.5}
+    )
+    generation.suspend_for_refit.assert_not_called()
+    generation.prepare_for_generation.assert_not_called()
+    generation.resume_after_refit.assert_not_called()
+    policy.offload_before_refit.assert_not_called()
+
+
+def test_refit_returns_empty_metrics_when_synchronizer_returns_none() -> None:
+    """``sync_weights`` returning None must not propagate as the metrics dict."""
+    generation = object.__new__(MegatronGeneration)
+    generation.weight_synchronizer = MagicMock()
+    generation.weight_synchronizer.sync_weights.return_value = None
+
+    assert (
+        refit_policy_generation(MagicMock(), generation, colocated_inference=False)
+        == {}
     )
 
 
@@ -478,8 +527,10 @@ def test_get_grpo_save_state_handles_legacy_checkpoint_and_filters_metrics():
         "total_steps": 13,
         "total_valid_tokens": 0,
         "val_reward": -99999999.0,
-        # SingleController-only field; None for every other algorithm.
+        # SingleController-only fields; None for every other algorithm.
         "sampler_name": None,
+        "trainer_version": None,
+        "sampler_dispatch_index": None,
     }
     assert "total_valid_tokens" not in loaded_state
     assert not hasattr(save_state, "val:accuracy")
@@ -836,12 +887,34 @@ def test_multimodal_dedup_rejects_unqualified_transfer_paths(
         _validate_multimodal_dedup_capability(master_config)
 
     master_config.policy["generation"]["backend"] = "vllm"
+
+    # Data plane + NeMo-Gym stays rejected: ``grpo_train_sync`` never calls
+    # ``attach_initial_nemo_gym_image_payloads``, so the run would silently
+    # train on the media a Gym dataset omits from ``extra_env_info``.
     master_config.data_plane = {"enabled": True}
-    with pytest.raises(NotImplementedError, match="data_plane.enabled=false"):
+    with patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=True):
+        with pytest.raises(NotImplementedError, match="NeMo-Gym"):
+            _validate_multimodal_dedup_capability(master_config)
+
+    # Data plane without Gym is supported: the wire format carries dedup
+    # (``PackedTensor.to_wire`` emits one row per *logical* row), and the Gym
+    # attach helper is itself gated on ``should_use_nemo_gym``. Rejecting this
+    # blocked every Nemotron-Omni recipe, since all of them set
+    # ``deduplicate_multimodal_data: true``.
+    with patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=False):
         _validate_multimodal_dedup_capability(master_config)
 
     master_config.data_plane = {"enabled": False}
     _validate_multimodal_dedup_capability(master_config)
+
+    # And with dedup off, nothing is gated — the guard returns before it looks
+    # at the backend or at NeMo-Gym, so a text-only sync GRPO + Gym run is not
+    # blocked by a multimodal validator.
+    master_config.grpo.deduplicate_multimodal_data = False
+    master_config.policy["generation"]["backend"] = "sglang"
+    master_config.data_plane = {"enabled": True}
+    with patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=True):
+        _validate_multimodal_dedup_capability(master_config)
 
 
 def test_grpo_sync_seq_logprob_error_helper_accepts_dict_result(monkeypatch):
@@ -1116,6 +1189,21 @@ class StubAsyncTrajectoryCollector:
         return self._remote_method("resume_after_refit")
 
     @property
+    def get_status(self):
+        """Return a healthy collector status with no reserved targets."""
+        mock = MagicMock()
+        mock.remote = MagicMock(
+            return_value={
+                "running": True,
+                "data_exhausted": False,
+                "errored": False,
+                "inflight_workers": 0,
+                "generating_targets": [],
+            }
+        )
+        return mock
+
+    @property
     def stop(self):
         """Stop collection - returns a remote-callable mock"""
         mock = MagicMock()
@@ -1216,16 +1304,11 @@ def mock_async_grpo_infrastructure(
         checkpoint_cut_ordinal=checkpoint_cut_ordinal,
     )
 
-    # Patch venv creation
+    # Patch actor runtime environment creation
     stack.enter_context(
         patch(
-            "nemo_rl.algorithms.grpo.create_local_venv_on_each_node",
-            return_value="/fake/venv",
-        )
-    )
-    stack.enter_context(
-        patch(
-            "nemo_rl.algorithms.grpo.get_actor_python_env", return_value="/fake/python"
+            "nemo_rl.algorithms.grpo.make_actor_runtime_env",
+            return_value={"py_executable": "/fake/python", "env_vars": {}},
         )
     )
 
@@ -1436,6 +1519,168 @@ def test_async_grpo_propagates_main_loop_collector_failure(mock_grpo_components)
 
     mock_grpo_components["checkpointer"].shutdown.assert_called_once()
     mock_grpo_components["policy"].shutdown.assert_called_once()
+
+
+def test_async_grpo_startup_aborts_when_lookahead_never_claimed(
+    mock_grpo_components, tmp_path
+):
+    """Startup raises instead of spinning when the lookahead can never be claimed.
+
+    The pre-fix startup loop skipped the exhausted/errored check whenever the
+    lookahead was missing, leaving the driver waiting on a target no producer
+    would ever claim.
+    """
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 2
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    checkpointer = mock_grpo_components["checkpointer"]
+    checkpointer.get_latest_checkpoint_path.return_value = None
+    checkpointer.checkpoint_dir = tmp_path
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+
+    # Restored buffer: step 0 is complete, step 1 is absent.
+    complete_batch = MagicMock()
+    complete_batch.remote = MagicMock(
+        side_effect=lambda target_step, *_args, **_kwargs: target_step == 0
+    )
+
+    # First poll: collector alive but has not claimed step 1 -> keep waiting.
+    # Second poll: collector stopped with the dataset exhausted -> must raise.
+    statuses = [
+        {
+            "running": True,
+            "data_exhausted": False,
+            "errored": False,
+            "error": None,
+            "inflight_workers": 1,
+            "generating_targets": [],
+        },
+        {
+            "running": False,
+            "data_exhausted": True,
+            "errored": False,
+            "error": None,
+            "inflight_workers": 0,
+            "generating_targets": [],
+        },
+    ]
+    status = MagicMock()
+    status.remote = MagicMock(side_effect=statuses)
+
+    with (
+        patch.object(
+            StubReplayBuffer,
+            "has_complete_batch",
+            property(lambda self: complete_batch),
+        ),
+        patch.object(
+            StubAsyncTrajectoryCollector,
+            "get_status",
+            property(lambda self: status),
+        ),
+        patch("nemo_rl.algorithms.grpo.time.sleep", return_value=None),
+        mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+        pytest.raises(
+            RuntimeError,
+            match=r"dataloader exhausted.*lookahead claim at target=1",
+        ),
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    # Two polls prove the barrier waited once before detecting terminal state.
+    assert status.remote.call_count == 2
+
+
+def test_async_grpo_starvation_reports_collector_error(mock_grpo_components):
+    """Main-loop starvation reports a collector failure, not data exhaustion."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    checkpointer = mock_grpo_components["checkpointer"]
+    checkpointer.get_latest_checkpoint_path.return_value = None
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+
+    empty_sample = MagicMock()
+    empty_sample.remote = MagicMock(return_value=None)
+    statuses = [
+        {
+            "running": True,
+            "data_exhausted": False,
+            "errored": False,
+            "error": None,
+            "inflight_workers": 0,
+            "generating_targets": [],
+        },
+        {
+            "running": False,
+            "data_exhausted": False,
+            "errored": True,
+            "error": "tokenizer failed",
+            "inflight_workers": 0,
+            "generating_targets": [],
+        },
+    ]
+    status = MagicMock()
+    status.remote = MagicMock(side_effect=statuses)
+
+    with (
+        patch.object(
+            StubReplayBuffer,
+            "sample",
+            property(lambda self: empty_sample),
+        ),
+        patch.object(
+            StubAsyncTrajectoryCollector,
+            "get_status",
+            property(lambda self: status),
+        ),
+        mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+        pytest.raises(
+            RuntimeError,
+            match=r"collector errored.*Inspect the preceding trajectory collector error",
+        ),
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    assert status.remote.call_count == 2
 
 
 @pytest.mark.parametrize("frontier_aligned", [True, False])
@@ -1776,35 +2021,6 @@ def test_async_grpo_awaits_resume_after_refit_failure(mock_grpo_components) -> N
         )
 
 
-def test_shutdown_environments_drains_unique_actors_before_kill() -> None:
-    shared_environment = MagicMock()
-    failing_environment = MagicMock()
-    shared_shutdown_ref = object()
-    failing_shutdown_ref = object()
-    shared_environment.shutdown.remote.return_value = shared_shutdown_ref
-    failing_environment.shutdown.remote.return_value = failing_shutdown_ref
-
-    def get_or_fail(ref, timeout=None):
-        assert timeout == 10
-        if ref is failing_shutdown_ref:
-            raise RuntimeError("environment shutdown failed")
-        assert ref is shared_shutdown_ref
-        return True
-
-    with (
-        patch("nemo_rl.algorithms.grpo.ray.get", side_effect=get_or_fail),
-        patch("nemo_rl.algorithms.grpo.ray.kill") as ray_kill,
-    ):
-        shutdown_environments(
-            {"train": shared_environment, "failing": failing_environment},
-            {"validation": shared_environment},
-        )
-
-    shared_environment.shutdown.remote.assert_called_once_with()
-    failing_environment.shutdown.remote.assert_called_once_with()
-    ray_kill.assert_called_once_with(failing_environment)
-
-
 def test_should_use_nemo_gym_requires_dynamo_token_wrapper() -> None:
     master_config = MagicMock()
     master_config.env = {"should_use_nemo_gym": True}
@@ -1820,6 +2036,54 @@ def test_should_use_nemo_gym_requires_dynamo_token_wrapper() -> None:
 
     master_config.policy["generation"]["vllm_cfg"]["expose_http_server"] = True
     assert should_use_nemo_gym(master_config) is True
+
+
+@pytest.mark.parametrize(
+    (
+        "lookahead_complete",
+        "generating_targets",
+        "current_step_ready",
+        "step",
+        "max_num_steps",
+        "expected",
+        "expected_queries",
+    ),
+    [
+        pytest.param(True, [], True, 3, 10, True, 1, id="complete"),
+        pytest.param(False, [4], True, 3, 10, True, 1, id="reserved-only"),
+        pytest.param(False, [], True, 3, 10, False, 1, id="neither"),
+        pytest.param(False, [5, 6], True, 3, 10, False, 1, id="other-target-reserved"),
+        pytest.param(False, [], True, 9, 10, True, 0, id="last-step"),
+        pytest.param(False, [], False, 3, 10, False, 0, id="current-not-ready"),
+    ],
+)
+def test_startup_pipeline_ready(
+    lookahead_complete,
+    generating_targets,
+    current_step_ready,
+    step,
+    max_num_steps,
+    expected,
+    expected_queries,
+):
+    """Startup needs a complete or claimed lookahead except at the last step."""
+    replay_buffer = MagicMock()
+    replay_buffer.has_complete_batch.remote.return_value = lookahead_complete
+    collector_status = {"generating_targets": generating_targets}
+
+    with patch("nemo_rl.algorithms.grpo.ray.get", side_effect=lambda value: value):
+        result = _startup_pipeline_ready(
+            replay_buffer,
+            collector_status,
+            current_step_ready=current_step_ready,
+            step=step,
+            num_prompts_per_step=8,
+            max_trajectory_age_steps=1,
+            max_num_steps=max_num_steps,
+        )
+
+    assert result is expected
+    assert replay_buffer.has_complete_batch.remote.call_count == expected_queries
 
 
 @contextmanager
@@ -2760,12 +3024,11 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
     assert DynamoConfig.model_validate(dynamo_config).engine_world_size == 4
     synchronizer.init_communicator.assert_called_once_with()
     spinup_nemo_gym_actor.assert_called_once_with(
-        env_configs=master_config.env,
+        master_config.env,
         base_urls=["http://dynamo-wrapper.example/v1"],
         model_name=master_config.policy["model_name"],
         tokenizer=tokenizer,
         enable_router_replay=False,
-        routed_experts_dtype="int16",
         use_fastokens=False,
     )
 
@@ -2922,7 +3185,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
         def init_collective(self, *_args, **_kwargs):
             return []
 
-        def prepare_refit_info(self):
+        def prepare_refit_info(self, *, refit_payload_mode):
             return {}
 
     def legacy_policy_factory(
@@ -2959,6 +3222,9 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
 
         def prepare_refit_info(self, _state):
             pass
+
+        def get_refit_payload_mode(self):
+            return "hf_export"
 
         def init_collective(self, *_args, **_kwargs):
             return []
@@ -3061,7 +3327,7 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         def print_node_ip_and_gpu_id(self):
             pass
 
-        def prepare_refit_info(self):
+        def prepare_refit_info(self, *, refit_payload_mode):
             return {}
 
     class DummyTrtllmGeneration:
@@ -3073,6 +3339,9 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
 
         def prepare_refit_info(self, _state):
             pass
+
+        def get_refit_payload_mode(self):
+            return "hf_export"
 
     nemo_gym_actor = object()
     spinup_nemo_gym_actor = MagicMock(return_value=nemo_gym_actor)
@@ -3134,14 +3403,150 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
 
     assert result[2] is nemo_gym_actor
     spinup_nemo_gym_actor.assert_called_once_with(
-        env_configs=master_config.env,
+        master_config.env,
         base_urls=["http://trtllm.example/v1"],
         model_name="test-model",
         tokenizer=tokenizer,
         enable_router_replay=False,
-        routed_experts_dtype="int16",
         use_fastokens=False,
     )
+
+
+@pytest.mark.mcore
+def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
+    monkeypatch, mock_grpo_components
+):
+    """The initial refit must start all skip-load endpoints before Gym can finish."""
+    events = []
+    gym_started = Event()
+    engine_ready = Event()
+    checkpointer = MagicMock()
+    checkpointer.get_latest_checkpoint_path.return_value = None
+    checkpointer.load_training_info.return_value = None
+    checkpointer.get_resume_paths.return_value = (None, None)
+
+    reserved_urls = [
+        "http://megatron-a.example/v1",
+        "http://megatron-b.example/v1",
+    ]
+    reserved_http_server_ports = {0: 1234, 2: 5678}
+    port_holders = [object(), object()]
+    generation = SimpleNamespace(
+        weight_synchronizer=None,
+        dp_openai_server_base_urls=[],
+    )
+    generation_cls = MagicMock(return_value=generation)
+    generation_cls.reserve_http_server_addresses.return_value = (
+        reserved_urls,
+        reserved_http_server_ports,
+        port_holders,
+    )
+    generation_cls.verify_served_addresses = MegatronGeneration.verify_served_addresses
+
+    synchronizer = MagicMock()
+    synchronizer.init_communicator.side_effect = lambda: events.append("init")
+
+    def sync_weights():
+        assert gym_started.wait(timeout=5), "NeMo Gym did not start concurrently"
+        events.append("sync")
+        # The served order is determined by worker completion, not the order
+        # addresses were reserved for Gym.
+        generation.dp_openai_server_base_urls = list(reversed(reserved_urls))
+        engine_ready.set()
+
+    synchronizer.sync_weights.side_effect = sync_weights
+    nemo_gym_actor = object()
+
+    def spinup_nemo_gym_actor(_env_configs, **kwargs):
+        assert kwargs["base_urls"] == reserved_urls
+        events.append("gym_started")
+        gym_started.set()
+        assert engine_ready.wait(timeout=5), (
+            "NeMo Gym waited for an endpoint that the initial refit never started"
+        )
+        events.append("gym_ready")
+        return nemo_gym_actor
+
+    logger = MagicMock()
+    policy_cls = MagicMock(return_value=MagicMock())
+    ray_kill = MagicMock()
+    monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: logger)
+    monkeypatch.setattr(
+        grpo_mod, "CheckpointManager", lambda *_args, **_kwargs: checkpointer
+    )
+    monkeypatch.setattr(
+        grpo_mod, "ClippedPGLossFn", lambda *_args, **_kwargs: MagicMock()
+    )
+    monkeypatch.setattr(
+        grpo_mod, "StatefulDataLoader", lambda *_args, **_kwargs: [None]
+    )
+    monkeypatch.setattr(grpo_mod, "RayVirtualCluster", MagicMock)
+    monkeypatch.setattr(grpo_mod, "Policy", policy_cls)
+    monkeypatch.setattr(grpo_mod, "MegatronGeneration", generation_cls)
+    monkeypatch.setattr(
+        grpo_mod, "create_weight_synchronizer", lambda **_kwargs: synchronizer
+    )
+    monkeypatch.setattr(grpo_mod, "spinup_nemo_gym_actor", spinup_nemo_gym_actor)
+    monkeypatch.setattr(grpo_mod.ray, "kill", ray_kill)
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["model_name"] = "test-model"
+    master_config.policy["tokenizer"] = {"use_fastokens": False}
+    master_config.policy["dtensor_cfg"] = {"enabled": False}
+    master_config.policy["megatron_cfg"] = {
+        "enabled": False,
+        "pipeline_model_parallel_size": 1,
+    }
+    master_config.policy["generation"] = {
+        "backend": "megatron",
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": None,
+        "val_temperature": 1.0,
+        "val_top_p": 1.0,
+        "val_top_k": None,
+        "colocated": {
+            "enabled": False,
+            "resources": {"gpus_per_node": 1, "num_nodes": 1},
+        },
+        "mcore_generation_config": {
+            "expose_http_server": True,
+            "kv_cache_management_mode": "persist",
+        },
+    }
+    master_config.env = {"should_use_nemo_gym": True}
+    master_config.loss_fn = ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
+    master_config.grpo.val_period = 0
+    master_config.grpo.batch_multiplier = 1
+    master_config.cluster["gpus_per_node"] = 2
+    master_config.data["shuffle"] = False
+    master_config.data["num_workers"] = 0
+
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=1)
+    result = grpo_mod.setup(master_config, MagicMock(), dataset, None)
+
+    assert generation_cls.call_args.kwargs["skip_weight_load"] is True
+    assert (
+        generation_cls.call_args.kwargs["reserved_http_server_ports"]
+        == reserved_http_server_ports
+    )
+    assert "reserved_http_server_ports" not in policy_cls.call_args.kwargs
+    assert events.index("init") < events.index("sync")
+    assert events.index("gym_started") < events.index("sync")
+    assert events.index("sync") < events.index("gym_ready")
+    synchronizer.init_communicator.assert_called_once_with()
+    synchronizer.sync_weights.assert_called_once_with()
+    assert [call.args for call in ray_kill.call_args_list] == [
+        (port_holder,) for port_holder in port_holders
+    ]
+    setup_metrics = next(
+        call.args[0]
+        for call in logger.log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "timing/setup"
+    )
+    assert setup_metrics["weight_sync_time_s"] > 0
+    assert result[2] is nemo_gym_actor
 
 
 def test_grpo_train_collects_generation_logger_and_seq_metrics(
@@ -3471,8 +3876,8 @@ def test_async_grpo_colocated_save_defers_wake_until_after_checkpoint(
     policy_generation.finish_generation.side_effect = lambda *a, **k: events.append(
         ("finish_generation", k.get("release_gpu", True))
     )
-    policy_generation.prepare_for_generation.side_effect = (
-        lambda *a, **k: events.append("wake_engine")
+    policy_generation.prepare_for_generation.side_effect = lambda *a, **k: (
+        events.append("wake_engine")
     )
     policy.offload_before_refit.side_effect = lambda *a, **k: events.append(
         "offload_before_refit"
@@ -4234,6 +4639,7 @@ def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
     # Set max steps to 12
     master_config = mock_grpo_components["master_config"]
     master_config.grpo.max_num_steps = 12
+    master_config.grpo.max_num_epochs = 100
 
     grpo_save_state = _initial_grpo_save_state()
 
@@ -4301,7 +4707,7 @@ def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
 
 @pytest.mark.parametrize(
     "train_func", [grpo_train]
-)  # Only test sync version for epochs (async uses steps)
+)  # Sync coverage retained alongside the async regression below.
 def test_grpo_exit_on_max_epochs(mock_grpo_components, train_func):
     """Test that GRPO training loop exits when max_num_epochs is reached"""
     # Set max epochs to 2 and max steps to a large number
@@ -4351,6 +4757,63 @@ def test_grpo_exit_on_max_epochs(mock_grpo_components, train_func):
 
     # Verify we trained for exactly two epochs (20 batches)
     assert mock_grpo_components["policy"].train.call_count == 20
+
+
+def test_async_grpo_exit_on_max_epochs(mock_grpo_components, tmp_path):
+    """Async GRPO stops and saves at the epoch bound when it comes first."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_epochs = 2
+    master_config.grpo.max_num_steps = 100
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    master_config.checkpointing["enabled"] = True
+    master_config.checkpointing["save_period"] = 100
+    master_config.checkpointing["metric_name"] = None
+
+    checkpointer = mock_grpo_components["checkpointer"]
+    checkpointer.init_tmp_checkpoint.return_value = "/tmp/checkpoint"
+    checkpointer.checkpoint_dir = tmp_path
+
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+
+    grpo_save_state = _initial_grpo_save_state()
+    with (
+        mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+        patch(
+            "nemo_rl.algorithms.grpo.CyclingDataLoader",
+            wraps=CyclingDataLoader,
+        ) as cycling_dataloader_cls,
+        patch("nemo_rl.algorithms.grpo.torch.save"),
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            grpo_save_state,
+            master_config,
+        )
+
+    assert mock_grpo_components["policy"].train.call_count == 20
+    assert [
+        call.args[0] for call in checkpointer.init_tmp_checkpoint.call_args_list
+    ] == [20]
+    assert grpo_save_state.current_step == 20
+    assert grpo_save_state.total_steps == 20
+    assert master_config.grpo.max_num_steps == 20
+    cycling_dataloader_cls.assert_called_once_with(
+        mock_grpo_components["train_dataloader"]
+    )
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
@@ -5668,3 +6131,58 @@ def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
 )
 def test_needs_hf_refit_handshake(backend, nccl_reshard, colocated, expected):
     assert _needs_hf_refit_handshake(backend, nccl_reshard, colocated) is expected
+
+
+def test_grpo_train_shuts_down_environments_after_failure():
+    task_to_env = {"nemo_gym": MagicMock()}
+    val_task_to_env = task_to_env
+
+    with (
+        patch(
+            "nemo_rl.algorithms.grpo._grpo_train_impl",
+            side_effect=RuntimeError("rollout failed"),
+        ),
+        patch("nemo_rl.algorithms.grpo.shutdown_environments") as shutdown,
+        pytest.raises(RuntimeError, match="rollout failed"),
+    ):
+        grpo_train(
+            policy=MagicMock(),
+            policy_generation=MagicMock(),
+            wrapped_dataloader=MagicMock(),
+            val_dataloader=None,
+            tokenizer=MagicMock(),
+            loss_fn=MagicMock(),
+            task_to_env=task_to_env,
+            val_task_to_env=val_task_to_env,
+            logger=MagicMock(),
+            checkpointer=MagicMock(),
+            grpo_save_state=MagicMock(),
+            master_config=MagicMock(),
+        )
+
+    shutdown.assert_called_once_with(task_to_env, val_task_to_env)
+
+
+def test_grpo_train_shuts_down_environments_after_success():
+    task_to_env = {"nemo_gym": MagicMock()}
+
+    with (
+        patch("nemo_rl.algorithms.grpo._grpo_train_impl"),
+        patch("nemo_rl.algorithms.grpo.shutdown_environments") as shutdown,
+    ):
+        grpo_train(
+            policy=MagicMock(),
+            policy_generation=MagicMock(),
+            wrapped_dataloader=MagicMock(),
+            val_dataloader=None,
+            tokenizer=MagicMock(),
+            loss_fn=MagicMock(),
+            task_to_env=task_to_env,
+            val_task_to_env=task_to_env,
+            logger=MagicMock(),
+            checkpointer=MagicMock(),
+            grpo_save_state=MagicMock(),
+            master_config=MagicMock(),
+        )
+
+    shutdown.assert_called_once_with(task_to_env, task_to_env)

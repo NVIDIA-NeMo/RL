@@ -25,10 +25,12 @@ from nemo_rl.algorithms.sft import (
     SFTConfig,
     _get_sft_save_state,
     _initial_sft_save_state,
+    prepare_sft_batch,
     setup,
     sft_train,
     validate,
 )
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -53,6 +55,37 @@ def test_get_sft_save_state_handles_legacy_checkpoint_and_filters_metrics():
         "total_valid_tokens": 0,
     }
     assert "total_valid_tokens" not in loaded_state
+
+
+def test_prepare_sft_batch_accepts_prepared_batch_and_checks_media_rows():
+    tokenizer = MagicMock(pad_token_id=0)
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 0]]),
+        "input_lengths": torch.tensor([2]),
+        "token_mask": torch.tensor([[0, 1, 0]]),
+        "sample_mask": torch.tensor([1.0]),
+        "pixel_values": PackedTensor([torch.ones(2, 3)], dim_to_pack=0),
+    }
+
+    prepared = prepare_sft_batch(
+        batch,
+        tokenizer=tokenizer,
+        only_unmask_final=False,
+        make_sequence_length_divisible_by=1,
+    )
+
+    assert prepared["input_ids"].tolist() == [[1, 2, 0]]
+    bad_batch = dict(batch)
+    bad_batch["pixel_values"] = PackedTensor(
+        [torch.ones(2, 3), torch.ones(2, 3)], dim_to_pack=0
+    )
+    with pytest.raises(ValueError, match="2 rows"):
+        prepare_sft_batch(
+            bad_batch,
+            tokenizer=tokenizer,
+            only_unmask_final=False,
+            make_sequence_length_divisible_by=1,
+        )
 
 
 @pytest.fixture

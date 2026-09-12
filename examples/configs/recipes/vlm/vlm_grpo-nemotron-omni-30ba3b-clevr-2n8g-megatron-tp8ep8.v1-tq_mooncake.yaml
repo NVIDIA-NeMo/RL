@@ -1,0 +1,4 @@
+defaults: vlm_grpo-nemotron-omni-30ba3b-clevr-2n8g-megatron-tp8ep8.v1.yaml
+data_plane:
+  enabled: true
+  backend: mooncake_cpu

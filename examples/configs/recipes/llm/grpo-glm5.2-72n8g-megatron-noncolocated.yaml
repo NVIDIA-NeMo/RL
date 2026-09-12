@@ -1,0 +1,124 @@
+# GLM-5.2 non-colocated recipe on 72 H100 nodes: 64 nodes for
+# TP2/PP8/CP32/EP64 training and 8 nodes for vLLM generation.
+# The training configuration has 131K context-length capacity. GRPO has been
+# validated at 8K and with 32K-input/4K-output synthetic data; end-to-end 131K
+# GRPO validation is pending because of vLLM timeouts and resource constraints.
+# Megatron Core SFT has been tested at 131K, confirming backend capability.
+defaults: ../../grpo_math_1B.yaml
+
+grpo:
+  # GBS32 is the largest batch validated on this topology without OOM.
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
+  max_num_steps: 100
+  val_at_start: true
+  max_val_samples: 128
+  val_batch_size: 128
+  skip_reference_policy_logprobs_calculation: true
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_max: 0.28
+  force_on_policy_ratio: true
+checkpointing:
+  checkpoint_dir: results/grpo-glm5.2-72n8g-megatron-noncolocated
+policy:
+  model_name: zai-org/GLM-5.2
+  # TODO: Remove this workaround after upgrading Transformers to a version that
+  # preserves GLM-5.2's qk_rope_head_dim when loading its config.
+  hf_config_overrides:
+    qk_rope_head_dim: 64
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  max_total_sequence_length: 131072
+  logprob_chunk_size: 2048
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 64
+    pipeline_model_parallel_size: 8
+    num_layers_in_first_pipeline_stage: 14
+    num_layers_in_last_pipeline_stage: 16
+    context_parallel_size: 32
+    sequence_parallel: true
+    moe_router_dtype: fp32
+    apply_rope_fusion: false
+    defer_fp32_logits: true
+    moe_token_dispatcher_type: allgather
+    optimizer:
+      lr: 5.0e-07
+      min_lr: 5.0e-08
+      weight_decay: 0.0
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+    scheduler:
+      lr_warmup_iters: 2
+      lr_warmup_init: 5.0e-08
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    env_vars:
+      CUDA_DEVICE_MAX_CONNECTIONS: '1'
+    model_overrides:
+      dsa_kernel_backend: cudnn
+      dsa_indexer_loss_coeff: 0.0
+      dsa_indexer_use_sparse_loss: false
+      persist_layer_norm: true
+      bias_dropout_fusion: true
+    clear_memory_caches_before_refit: true
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.tensor_model_parallel_size},
+    ${mul:2, ${policy.megatron_cfg.context_parallel_size}}}
+  optimizer: null
+  scheduler: null
+  generation:
+    max_new_tokens: 4096
+    vllm_cfg:
+      tensor_parallel_size: 8
+      expert_parallel_size: 64
+      gpu_memory_utilization: 0.7
+      # Rollouts are capped at the 2K input plus 4K generated tokens; the 131K
+      # policy limit is reserved for training-side sequence packing.
+      max_model_len: 6144
+      enforce_eager: true
+    vllm_kwargs:
+      max_num_batched_tokens: 4096
+      max_num_seqs: 1
+      enable_chunked_prefill: true
+
+      # On SM100, vLLM 0.25.1 auto-selects FlashInfer TRTLLM MoE. Its
+      # block-major expert layout requires native layerwise reload, which this
+      # branch's refit paths do not yet use. CUTLASS is refit-compatible on both.
+      kernel_config:
+        moe_backend: flashinfer_cutlass
+      async_scheduling: false
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 8
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  log_dir: logs/grpo-glm5.2-72n8g-megatron-noncolocated
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl-glm-perf
+    name: grpo-glm5.2-72n8g-megatron-noncolocated
+cluster:
+  gpus_per_node: 8
+  num_nodes: 72
