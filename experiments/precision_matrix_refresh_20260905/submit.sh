@@ -336,6 +336,8 @@ if [[ "${PERFORMANCE_RECIPE}" == 1 ]]; then
     NORMALIZED_OVERRIDES+=("++${override}")
   done
   COMMON_OVERRIDES=("${NORMALIZED_OVERRIDES[@]}")
+  # FP8 rollout requires this in GRPO; keep the BF16 control matched as well.
+  COMMON_OVERRIDES+=("++loss_fn.use_importance_sampling_correction=true")
   PRECISION_OVERRIDES=()
   if [[ "${MODE}" == async ]]; then
     COMMON_OVERRIDES+=("++policy.generation.refit_transport=nccl_reshard")
