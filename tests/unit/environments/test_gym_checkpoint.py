@@ -35,7 +35,9 @@ from nemo_rl.environments.gym_checkpoint import (
     GymModelCheckpointCommitRequest,
     GymModelCheckpointRestoreRequest,
     GymModelCommitResponse,
+    GymCoordinatorModelStatusResponse,
     GymModelRestoreResponse,
+    GymSingleWorkerModelStatusResponse,
     gym_capture_key,
     gym_checkpoint_continuations,
     gym_checkpoint_staging_keys,
@@ -99,6 +101,75 @@ def test_checkpoint_requests_use_required_new_only_artifact_contract() -> None:
             **common,
             include_storage_reference_index=True,
         )
+
+
+def test_single_worker_model_status_accepts_current_and_additive_fields() -> None:
+    status = GymSingleWorkerModelStatusResponse.model_validate(
+        {
+            "checkpoint_id": "checkpoint-1",
+            "state": "paused",
+            "per_worker": {
+                "0": {
+                    "state": "paused",
+                    "inflight": 0,
+                    "future_worker_metric": 7,
+                }
+            },
+            "inflight_total": 0,
+            "response_inflight_total": 0,
+            "generation_pending_total": 0,
+            "waiters_total": 0,
+            "inflight": [
+                {
+                    "rollout_id": "rollout-1",
+                    "attempt_index": 0,
+                    "plane": "policy",
+                    "age_seconds": 1.0,
+                    "future_request_metric": 5,
+                }
+            ],
+            "tombstones": [],
+            "future_status_metric": 9,
+        }
+    )
+
+    assert status.response_inflight_total == 0
+    assert status.generation_pending_total == 0
+
+
+def test_coordinator_model_status_accepts_current_and_additive_fields() -> None:
+    status = GymCoordinatorModelStatusResponse.model_validate(
+        {
+            "state": "paused",
+            "workers": {
+                "acknowledged": 1,
+                "expected": 1,
+                "live": 1,
+                "future_worker_summary": 3,
+            },
+            "missing_workers": 0,
+            "inflight_total": 0,
+            "response_inflight_total": 0,
+            "generation_pending_total": 0,
+            "waiters_total": 0,
+            "per_worker": {
+                "worker-0": {
+                    "acked_seq": 1,
+                    "inflight": 0,
+                    "generation_pending": 0,
+                    "generation_cut_proof": None,
+                    "proof_error": None,
+                    "connected": True,
+                    "future_worker_metric": 7,
+                }
+            },
+            "future_status_metric": 9,
+        }
+    )
+
+    assert status.response_inflight_total == 0
+    assert status.generation_pending_total == 0
+    assert status.per_worker["worker-0"].generation_pending == 0
 
 
 @pytest.mark.parametrize(

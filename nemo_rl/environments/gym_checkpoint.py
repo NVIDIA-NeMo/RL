@@ -68,6 +68,12 @@ class _StrictWireModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class _LiveResponseWireModel(BaseModel):
+    """Validate required live fields while tolerating additive telemetry."""
+
+    model_config = ConfigDict(extra="ignore")
+
+
 class GymExecutionIdentity(_StrictWireModel):
     """Stable logical rollout identity plus one physical execution number."""
 
@@ -567,45 +573,53 @@ class GymModelPrepareResponse(_StrictWireModel):
     waiters_total: NonNegativeInt
 
 
-class GymModelInflightRequest(_StrictWireModel):
+class GymModelInflightRequest(_LiveResponseWireModel):
     rollout_id: str | None = Field(default=None, pattern=_IDENTITY_PATTERN)
     attempt_index: NonNegativeInt | None = None
     plane: str | None
     age_seconds: NonNegativeFloat
 
 
-class GymSingleWorkerModelStatus(_StrictWireModel):
+class GymSingleWorkerModelStatus(_LiveResponseWireModel):
     state: Literal["accepting", "draining", "paused"]
     inflight: NonNegativeInt
 
 
-class GymSingleWorkerModelStatusResponse(_StrictWireModel):
+class GymSingleWorkerModelStatusResponse(_LiveResponseWireModel):
     checkpoint_id: str = Field(min_length=1, pattern=_IDENTITY_PATTERN)
     state: Literal["accepting", "draining", "paused"]
     per_worker: dict[str, GymSingleWorkerModelStatus]
     inflight_total: NonNegativeInt
+    response_inflight_total: NonNegativeInt | None = None
+    generation_pending_total: NonNegativeInt | None = None
     waiters_total: NonNegativeInt
     inflight: list[GymModelInflightRequest]
     tombstones: list[GymExecutionIdentity]
 
 
-class GymCoordinatorWorkers(_StrictWireModel):
+class GymCoordinatorWorkers(_LiveResponseWireModel):
     acknowledged: NonNegativeInt
     expected: PositiveInt
     live: NonNegativeInt
 
 
-class GymCoordinatorWorkerStatus(_StrictWireModel):
+class GymCoordinatorWorkerStatus(_LiveResponseWireModel):
     acked_seq: NonNegativeInt
     inflight: NonNegativeInt
+    generation_pending: NonNegativeInt | None = None
+    # RL only observes proof presence here; Gym owns the nested proof schema.
+    generation_cut_proof: dict[str, object] | None = None
+    proof_error: str | None = None
     connected: bool
 
 
-class GymCoordinatorModelStatusResponse(_StrictWireModel):
+class GymCoordinatorModelStatusResponse(_LiveResponseWireModel):
     state: Literal["accepting", "draining", "paused"]
     workers: GymCoordinatorWorkers
     missing_workers: NonNegativeInt
     inflight_total: NonNegativeInt
+    response_inflight_total: NonNegativeInt | None = None
+    generation_pending_total: NonNegativeInt | None = None
     waiters_total: NonNegativeInt
     per_worker: dict[str, GymCoordinatorWorkerStatus]
 
