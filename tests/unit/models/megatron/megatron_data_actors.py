@@ -72,6 +72,11 @@ class PackSequencesTestActor:
             )
             if not results["context_parallel"]["success"]:
                 return results["context_parallel"]
+            results["direct_packed_context_parallel"] = (
+                self._test_direct_packed_context_parallel(rank)
+            )
+            if not results["direct_packed_context_parallel"]["success"]:
+                return results["direct_packed_context_parallel"]
         else:
             results["context_parallel"] = {
                 "success": True,
@@ -80,6 +85,90 @@ class PackSequencesTestActor:
             }
 
         return {"success": True, "error": None, "detailed_results": results}
+
+    def _test_direct_packed_context_parallel(self, rank):
+        from megatron.core.parallel_state import (
+            destroy_model_parallel,
+            initialize_model_parallel,
+        )
+
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        initialize_model_parallel(context_parallel_size=self.cp_size)
+        try:
+            data = {
+                "input_ids": torch.tensor(
+                    [[10, 11, 12, 13, 20, 21, 22, 23]], device="cuda"
+                ),
+                "target_ids": torch.tensor(
+                    [[11, 12, 13, 14, 21, 22, 23, 24]], device="cuda"
+                ),
+                "token_mask": torch.tensor(
+                    [[1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]], device="cuda"
+                ),
+                "position_ids": torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]], device="cuda"),
+                "sample_mask": torch.tensor([0.5], device="cuda"),
+                "packed_cu_seqlens": torch.tensor(
+                    [[0, 4, 8]], dtype=torch.int32, device="cuda"
+                ),
+                "packed_cu_seqlens_lengths": torch.tensor([3], device="cuda"),
+                "packed_max_seqlen": torch.tensor([4], device="cuda"),
+            }
+            data["mtp_loss_mask"] = data["token_mask"] * data["sample_mask"].unsqueeze(
+                -1
+            )
+
+            processed = process_microbatch(data, pack_sequences=True)
+
+            expected = {
+                0: {
+                    "tokens": [10, 13, 20, 23],
+                    "labels": [11, 14, 21, 24],
+                    "loss_mask": [0.5, 0.5, 0.5, 0.5],
+                    "position_ids": [0, 3, 0, 3],
+                },
+                1: {
+                    "tokens": [11, 12, 21, 22],
+                    "labels": [12, 13, 22, 23],
+                    "loss_mask": [0.5, 0.0, 0.0, 0.5],
+                    "position_ids": [1, 2, 1, 2],
+                },
+            }[rank]
+            actual = {
+                "tokens": processed.input_ids_cp_sharded[0].tolist(),
+                "labels": processed.labels_cp_sharded[0].tolist(),
+                "loss_mask": processed.loss_mask_cp_sharded[0].tolist(),
+                "position_ids": processed.position_ids[0].tolist(),
+            }
+            if actual != expected:
+                return {
+                    "success": False,
+                    "error": (
+                        "Direct packed CP partition mismatch: "
+                        f"expected {expected}, got {actual}"
+                    ),
+                }
+            if not torch.equal(processed.mtp_loss_mask, processed.loss_mask_cp_sharded):
+                return {
+                    "success": False,
+                    "error": "Direct packed MTP mask does not follow CP partition",
+                }
+            if processed.packed_seq_params.total_tokens != 4:
+                return {
+                    "success": False,
+                    "error": (
+                        "Direct packed total_tokens mismatch: "
+                        f"expected 4, got {processed.packed_seq_params.total_tokens}"
+                    ),
+                }
+            return {"success": True, "error": None}
+        except Exception as error:
+            return {
+                "success": False,
+                "error": f"Direct packed CP test failed: {error}",
+            }
+        finally:
+            destroy_model_parallel()
 
     def _test_basic_packing(self, _pack_sequences_for_megatron):
         """Test basic sequence packing without context parallelism."""
