@@ -441,7 +441,11 @@ def grpo_train_sync(
     assert policy_generation is not None
 
     if master_config.grpo.skip_reference_policy_logprobs_calculation:
-        assert master_config.loss_fn.reference_policy_kl_penalty == 0
+        if master_config.loss_fn.reference_policy_kl_penalty != 0:
+            raise ValueError(
+                "Skipping reference logprobs requires "
+                "loss_fn.reference_policy_kl_penalty=0"
+            )
         print(
             "Reference policy logprob calculation will be skipped since `grpo.skip_reference_policy_logprobs_calculation` is set to True and `loss_fn.reference_policy_kl_penalty` is 0."
         )
