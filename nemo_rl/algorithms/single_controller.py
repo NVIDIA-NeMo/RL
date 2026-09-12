@@ -74,6 +74,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneCheckpointBarrier,
     DataPlaneCheckpointMetadata,
     DataPlaneMutationCut,
+    TQReplayGroupMetadata,
     TQReplayMetadataState,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
@@ -295,6 +296,9 @@ class SingleControllerActor:
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
         self._rollout_recovery_ledger = self._rollout_manager.recovery_ledger
+        self._restored_replay_groups_to_regenerate: list[
+            TQReplayGroupMetadata
+        ] = []
 
         # Direct access, deliberately. A getattr default here reads as defensive but
         # buys a silent failure mode: rename or drop the field and
@@ -718,6 +722,28 @@ class SingleControllerActor:
         )
         await self._validate_replay_inventory(buffer_state)
 
+        if self._master_config.checkpointing.get("load_replay_buffer", True) is False:
+            # Validate and load the native snapshot before discarding it. This keeps
+            # replay-free resume fail-closed: a mismatched/corrupt checkpoint must
+            # not silently turn into a different training stream.
+            self._restored_replay_groups_to_regenerate = list(groups)
+            removed = await self._buffer.remove(
+                list(range(restored)), remove_in_dp=True
+            )
+            if removed != restored:
+                raise RuntimeError(
+                    "replay-free resume did not discard every restored replay group: "
+                    f"restored={restored}, removed={removed}"
+                )
+            print(
+                "📦 Discarded "
+                f"{restored} restored replay group(s); "
+                "checkpointing.load_replay_buffer=false will regenerate their "
+                "prompts on the current policy",
+                flush=True,
+            )
+            return 0
+
         # Each buffered group holds one _buffer_capacity permit. Restore fails
         # above if the saved group count exceeds current capacity.
         assert restored <= self._async_cfg.max_buffered_rollouts
@@ -745,6 +771,9 @@ class SingleControllerActor:
                     f"{ROLLOUT_RECOVERY_STATE_FILENAME} exists, but the matching "
                     "native TQ checkpoint does not advertise rollout recovery"
                 )
+            if self._restored_replay_groups_to_regenerate:
+                async with self._data_plane_checkpoint_barrier.mutation() as cut:
+                    await self._queue_restored_replay_groups_for_regeneration(cut)
             return
         if not isinstance(expected_payload_sha256, str):
             raise TypeError(
@@ -816,6 +845,7 @@ class SingleControllerActor:
                     clear_unreferenced=True,
                 )
             await self._rehydrate_rollout_recovery_prompts(cut)
+            await self._queue_restored_replay_groups_for_regeneration(cut)
         self._sampler_stamps_target_steps = (
             parsed_state.sampler_stamps_target_steps
             if parsed_state.sampler_stamps_target_steps is not None
@@ -837,6 +867,109 @@ class SingleControllerActor:
                 flush=True,
             )
 
+    async def _queue_restored_replay_groups_for_regeneration(
+        self,
+        cut: DataPlaneMutationCut,
+    ) -> None:
+        """Convert discarded canonical replay groups into fresh prompt work."""
+        groups = self._restored_replay_groups_to_regenerate
+        if not groups:
+            return
+
+        for group in groups:
+            tags = group["meta"].tags or []
+            prompt_indices = {tag.get("prompt_idx") for tag in tags}
+            if len(prompt_indices) != 1:
+                raise ValueError(
+                    "replay-free resume requires one stable prompt_idx per group: "
+                    f"group={group['group_id']!r}, values={prompt_indices!r}"
+                )
+            prompt_index = next(iter(prompt_indices))
+            if isinstance(prompt_index, bool) or not isinstance(prompt_index, int):
+                raise TypeError(
+                    "replay-free resume requires integer prompt_idx tags: "
+                    f"group={group['group_id']!r}, value={prompt_index!r}"
+                )
+            prompt = await self._load_recovery_prompt(
+                group_id=group["group_id"], sample_id=str(prompt_index)
+            )
+            self._rollout_manager.reserve_prompt_group(
+                cut,
+                prompt,
+                target_step=group["target_step"],
+                admitted=True,
+            )
+
+        print(
+            "📦 Queued "
+            f"{len(groups)} restored replay prompt group(s) for fresh generation",
+            flush=True,
+        )
+        self._restored_replay_groups_to_regenerate = []
+
+    async def _load_recovery_prompt(
+        self,
+        *,
+        group_id: str,
+        sample_id: str,
+    ) -> DatumSpec:
+        """Resolve and collate one stable dataset prompt reference."""
+        try:
+            sample_index = int(sample_id)
+        except ValueError as error:
+            raise ValueError(
+                f"recovery group {group_id!r} has a non-integer "
+                f"dataset sample_id={sample_id!r}"
+            ) from error
+        if sample_index < 0 or str(sample_index) != sample_id:
+            raise ValueError(
+                f"recovery group {group_id!r} has a non-canonical "
+                f"dataset sample_id={sample_id!r}"
+            )
+
+        dataset = getattr(self._dataloader, "dataset", None)
+        if dataset is None:
+            raise RuntimeError(
+                "cannot restore unfinished rollouts because the dataloader does "
+                "not expose its source dataset"
+            )
+        try:
+            dataset_prompt = await asyncio.to_thread(
+                dataset.__getitem__, sample_index
+            )
+        except (IndexError, KeyError) as error:
+            raise RuntimeError(
+                f"cannot rehydrate recovery group {group_id!r}: "
+                f"dataset sample_id={sample_id!r} is unavailable"
+            ) from error
+        if not isinstance(dataset_prompt, dict):
+            raise TypeError(
+                f"dataset sample_id={sample_id!r} resolved to "
+                f"{type(dataset_prompt).__name__}, expected a DatumSpec dictionary"
+            )
+
+        collate_fn = getattr(self._dataloader, "collate_fn", None)
+        if collate_fn is None:
+            return cast(DatumSpec, dataset_prompt)
+        prompt_batch = await asyncio.to_thread(collate_fn, [dataset_prompt])
+        if isinstance(prompt_batch, BatchedDataDict):
+            if prompt_batch.size != 1:
+                raise ValueError(
+                    "recovery collation must return exactly one prompt; "
+                    f"sample_id={sample_id!r}, size={prompt_batch.size}"
+                )
+            return cast(
+                DatumSpec,
+                {key: value[0] for key, value in prompt_batch.items()},
+            )
+        if isinstance(prompt_batch, dict):
+            return cast(DatumSpec, prompt_batch)
+        raise TypeError(
+            "recovery collation for "
+            f"sample_id={sample_id!r} returned "
+            f"{type(prompt_batch).__name__}, expected a mapping"
+        )
+
     async def _rehydrate_rollout_recovery_prompts(
         self,
         cut: DataPlaneMutationCut,
@@ -851,75 +984,15 @@ class SingleControllerActor:
         if not groups:
             return
 
-        dataset = getattr(self._dataloader, "dataset", None)
-        if dataset is None:
-            raise RuntimeError(
-                "cannot restore unfinished rollouts because the dataloader does "
-                "not expose its source dataset"
-            )
-
         resolved_prompts: dict[str, DatumSpec] = {}
         for group in groups:
             sample_id = group.prompt_ref.sample_id
-            try:
-                sample_index = int(sample_id)
-            except ValueError as error:
-                raise ValueError(
-                    f"recovery group {group.group_id!r} has a non-integer "
-                    f"dataset sample_id={sample_id!r}"
-                ) from error
-            if sample_index < 0 or str(sample_index) != sample_id:
-                raise ValueError(
-                    f"recovery group {group.group_id!r} has a non-canonical "
-                    f"dataset sample_id={sample_id!r}"
-                )
-
             prompt = resolved_prompts.get(sample_id)
             if prompt is None:
-                try:
-                    dataset_prompt = await asyncio.to_thread(
-                        dataset.__getitem__, sample_index
-                    )
-                except (IndexError, KeyError) as error:
-                    raise RuntimeError(
-                        f"cannot rehydrate recovery group {group.group_id!r}: "
-                        f"dataset sample_id={sample_id!r} is unavailable"
-                    ) from error
-                if not isinstance(dataset_prompt, dict):
-                    raise TypeError(
-                        f"dataset sample_id={sample_id!r} resolved to "
-                        f"{type(dataset_prompt).__name__}, expected a DatumSpec "
-                        "dictionary"
-                    )
-
-                # Re-run one-row collation to reconstruct the tensor scalars,
-                # optional fields, and multimodal wrappers expected by RolloutManager.
-                collate_fn = getattr(self._dataloader, "collate_fn", None)
-                if collate_fn is None:
-                    prompt = dataset_prompt
-                else:
-                    prompt_batch = await asyncio.to_thread(
-                        collate_fn,
-                        [dataset_prompt],
-                    )
-                    if isinstance(prompt_batch, BatchedDataDict):
-                        if prompt_batch.size != 1:
-                            raise ValueError(
-                                "recovery collation must return exactly one prompt; "
-                                f"sample_id={sample_id!r}, size={prompt_batch.size}"
-                            )
-                        prompt = {key: value[0] for key, value in prompt_batch.items()}
-                    elif isinstance(prompt_batch, dict):
-                        # Identity-style collators used by lightweight/custom
-                        # dataloaders may return the DatumSpec directly.
-                        prompt = prompt_batch
-                    else:
-                        raise TypeError(
-                            "recovery collation for "
-                            f"sample_id={sample_id!r} returned "
-                            f"{type(prompt_batch).__name__}, expected a mapping"
-                        )
-                resolved_prompts[sample_id] = cast(DatumSpec, prompt)
+                prompt = await self._load_recovery_prompt(
+                    group_id=group.group_id, sample_id=sample_id
+                )
+                resolved_prompts[sample_id] = prompt
             recovery_ledger.bind_runtime_prompt(
                 cut,
                 group.group_id,
