@@ -1416,18 +1416,19 @@ def test_refit_metadata_map_precedes_transport_init(monkeypatch, pp_rank: int) -
     worker._is_native_mxfp8_export = MagicMock(return_value=False)
     local_name = f"model.layers.{pp_rank}.mlp.down_proj.weight"
     local_spec = LocalParamSpec(base=torch.ones(2, 2))
-    worker._iter_local_hf_param_shards = MagicMock(
-        return_value=[(local_name, local_spec)]
-    )
+    worker._iter_local_hf_param_shards = MagicMock(return_value=[(local_name, local_spec)])
     monkeypatch.setattr(
         worker_module.parallel_state, "get_pipeline_model_parallel_rank", lambda: pp_rank
     )
     info = {
         "layer_names": [f"model.layers.{rank}" for rank in range(4)],
         "per_layer_params": {
-            f"model.layers.{rank}": [{
-                "name": f"model.layers.{rank}.mlp.down_proj.weight", "pp_stage": rank
-            }]
+            f"model.layers.{rank}": [
+                {
+                    "name": f"model.layers.{rank}.mlp.down_proj.weight",
+                    "pp_stage": rank,
+                }
+            ]
             for rank in range(4)
         },
     }

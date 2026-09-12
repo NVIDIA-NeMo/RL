@@ -4665,10 +4665,11 @@ class MegatronPolicyWorkerImpl(
                 base=self._group_experts(proj, grouped_name, expert_groups)
             )
 
+        my_pp_stage = parallel_state.get_pipeline_model_parallel_rank()
         mapping: dict[str | tuple[str, str], LocalParamSpec] = {}
         for layer_name in refit_info["layer_names"]:
             for p in refit_info["per_layer_params"][layer_name]:
-                if p.get("pp_stage", 0) != self.my_pp_stage:
+                if p.get("pp_stage", 0) != my_pp_stage:
                     continue
                 name = p["name"]
                 if p.get("grouped_expert_proj"):
