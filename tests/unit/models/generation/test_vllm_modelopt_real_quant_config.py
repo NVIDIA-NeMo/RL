@@ -1130,6 +1130,21 @@ def test_modelopt_moe_manifest_requires_complete_w4a4_family(monkeypatch):
         )
 
 
+def test_real_quant_prepare_refit_info_rejects_draft_manifest(monkeypatch):
+    """A draft manifest must fail at preparation, before any weight is loaded."""
+    backend = _import_vllm_quant_backend(monkeypatch)
+    extension = _make_real_quant_extension(backend, torch.nn.Module(), [])
+    _patch_real_quant_load(monkeypatch, backend)
+
+    with pytest.raises(RuntimeError, match="does not support draft finalization"):
+        extension.prepare_refit_info(
+            {
+                "model.layers.0.mlp.up_proj.weight": ((4, 4), torch.uint8),
+                "draft.layers.0.self_attn.qkv_proj.weight": ((4, 4), torch.bfloat16),
+            }
+        )
+
+
 def test_real_quant_load_weights_batches_full_experts_and_expands_global_scales(
     monkeypatch,
 ):

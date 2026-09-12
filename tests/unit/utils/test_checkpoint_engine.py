@@ -576,6 +576,7 @@ def test_maybe_preinit_nixl_checkpoint_engine_defaults_backend(monkeypatch):
         maybe_preinit_nixl_checkpoint_engine(
             {
                 "generation": {
+                    "backend": "vllm",
                     "refit_transport": "nixl",
                     "refit_cfg": {"nixl": {}},
                 }
@@ -584,6 +585,18 @@ def test_maybe_preinit_nixl_checkpoint_engine_defaults_backend(monkeypatch):
         == "agent"
     )
     assert calls == [{"backend_name": "UCX", "backend_init_params": None}]
+
+    assert (
+        maybe_preinit_nixl_checkpoint_engine(
+            {
+                "generation": {
+                    "backend": "megatron",
+                    "refit_transport": "mcore",
+                }
+            }
+        )
+        is None
+    )
 
 
 def test_merge_weight_chunk_batches_uses_aligned_zero_copy_view():

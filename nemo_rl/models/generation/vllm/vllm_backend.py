@@ -47,6 +47,7 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     _STR_TO_DTYPE,
     HFToLocalParamMap,
     LocalParamSpec,
+    RefitBuilderInterface,
     RefitCtx,
     _extract_layer_prefix,
 )
@@ -343,7 +344,7 @@ def _read_mtp_layer_weights_from_checkpoint(
     return weights
 
 
-class VllmInternalWorkerExtension:
+class VllmInternalWorkerExtension(RefitBuilderInterface):
     # Per-PP-stage refit groups, None until init_nccl_reshard_comm_group builds them.
     # Declared rather than sprung into existence so a rebuild can release the previous
     # ones without probing, matching AbstractPolicyWorker.model_update_group. None and
@@ -632,11 +633,15 @@ class VllmInternalWorkerExtension:
 
         Raises:
             RuntimeError: If the model realizes the unquantized FlashInfer TRTLLM
-                MoE backend while a co-trained MTP drafter is enabled (unsupported
-                by the native layerwise refit lifecycle).
+                MoE backend while a co-trained drafter is enabled (unsupported by
+                the native layerwise refit lifecycle).
         """
-        self._validate_native_layerwise_refit()
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        self._prepare_model_update_manifest(state_dict_info)
+        self._validate_native_layerwise_refit()
+
+    def _prepare_model_update_manifest(self, state_dict_info: dict[str, Any]) -> None:
+        """Bind target/draft metadata to the live speculative runtime."""
         pp_group = get_pp_group()
         pp_rank = int(getattr(pp_group, "rank_in_group", 0))
         pp_size = int(getattr(pp_group, "world_size", 1))
@@ -1109,6 +1114,13 @@ class VllmInternalWorkerExtension:
                 "a co-trained MTP drafter"
             )
 
+        manifest = self._model_update_manifest
+        if manifest is not None and manifest.draft is not None:
+            raise RuntimeError(
+                "Unquantized FlashInfer TRTLLM refit does not yet support "
+                "a co-trained draft model"
+            )
+
     def _reject_unsupported_native_refit(
         self, transport: UnsupportedNativeRefitTransport
     ) -> None:
@@ -1155,20 +1167,17 @@ class VllmInternalWorkerExtension:
             reloaded_module_ids = _reload_target_module_ids(reload_targets)
 
             def finalize(finalize_draft: bool) -> None:
+                # _validate_native_layerwise_refit already rejected a co-trained
+                # drafter, so reaching here with draft weights is a wiring error.
+                assert not finalize_draft, (
+                    "native layerwise reload cannot finalize draft weights"
+                )
                 with torch.device(self.device):
                     finalize_layerwise_reload(model, self.model_config)
                     _process_mxfp8_modules_after_native_reload(
                         model, reloaded_module_ids
                     )
                     _refresh_hpc_modules_after_layerwise_reload(model)
-                    if finalize_draft:
-                        from vllm.model_executor.model_loader.utils import (
-                            process_weights_after_loading,
-                        )
-
-                        self._maybe_process_draft_after_loading(
-                            process_weights_after_loading
-                        )
                     self._maybe_process_mtp_drafter_after_loading()
                 torch.cuda.synchronize()
 
@@ -1493,8 +1502,6 @@ class VllmInternalWorkerExtension:
         Done once ahead of refit; the cached mapping is reused by every
         ``nccl_reshard_refit`` call.
         """
-        self._validate_native_layerwise_refit("nccl_reshard")
-
         from nemo_rl.weight_sync.nccl_reshard_utils import (
             restore_refit_info_placements,
         )
@@ -1502,6 +1509,25 @@ class VllmInternalWorkerExtension:
         self.nccl_reshard_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
             restore_refit_info_placements(refit_info)
         )
+        state_dict_info = {
+            param["name"]: (
+                tuple(param["global_shape"]),
+                _STR_TO_DTYPE[param["dtype"]],
+            )
+            for layer_name in self.nccl_reshard_refit_info["layer_names"]
+            for param in self.nccl_reshard_refit_info["per_layer_params"][layer_name]
+        }
+        state_dict_info.update(
+            {
+                name: (tuple(meta["shape"]), _STR_TO_DTYPE[meta["dtype"]])
+                for name, meta in self.nccl_reshard_refit_info.get(
+                    "misc_meta", {}
+                ).items()
+            }
+        )
+        self._prepare_model_update_manifest(state_dict_info)
+        self._validate_native_layerwise_refit("nccl_reshard")
+
         if self._uses_unquantized_flashinfer_trtllm() and not self.pp_comm_groups:
             # The TRTLLM expert map needs the per-PP-stage communicator ranks,
             # which init_nccl_reshard_comm_group establishes after prepare.
@@ -2070,7 +2096,8 @@ class VllmInternalWorkerExtension:
         # drafter's mirror of the same. The BF16 TRTLLM nccl_reshard path
         # rejects FP8 KV cache above because its static scales are outside this
         # targeted MoE lifecycle.
-        finalize(False)
+        manifest = self._model_update_manifest
+        finalize(manifest is not None and manifest.draft is not None)
 
         torch.cuda.empty_cache()
         return True

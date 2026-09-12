@@ -87,6 +87,55 @@ def test_prepare_refit_info_builds_common_speculator_manifest(
 
 
 @pytest.mark.vllm
+def test_prepare_nccl_reshard_refit_info_builds_draft_manifest(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    draft_model = object()
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        get_draft_model=lambda: draft_model,
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(method="dflash")
+        ),
+    )
+    ext.pp_comm_groups = {}
+    ext._uses_unquantized_flashinfer_trtllm = lambda: False
+    ext._validate_native_layerwise_refit = MagicMock()
+    ext.build_hf_to_local_param_map = MagicMock(return_value={})
+    monkeypatch.setattr(
+        vllm_backend,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=1),
+    )
+
+    ext.prepare_nccl_reshard_refit_info(
+        {
+            "layer_names": [],
+            "per_layer_params": {},
+            "misc_meta": {
+                "model.norm.weight": {
+                    "shape": [2],
+                    "dtype": "torch.float32",
+                },
+                "draft.model.weight": {
+                    "shape": [2],
+                    "dtype": "torch.float32",
+                },
+            },
+        }
+    )
+
+    assert ext._draft_runtime_adapter is not None
+    assert ext._draft_runtime_adapter.model is draft_model
+    assert ext._model_update_manifest is not None
+    assert ext._model_update_manifest.draft is not None
+    assert ext._model_update_manifest.draft.ordered_names == ("draft.model.weight",)
+    ext._validate_native_layerwise_refit.assert_called_once_with("nccl_reshard")
+
+
+@pytest.mark.vllm
 @pytest.mark.parametrize("speculator_type", ["dflash", "dspark"])
 def test_common_speculator_refit_loads_then_finalizes_target_and_draft(
     monkeypatch, speculator_type
@@ -101,7 +150,10 @@ def test_common_speculator_refit_loads_then_finalizes_target_and_draft(
 
     call_order = []
     target_model = SimpleNamespace(
-        load_weights=MagicMock(side_effect=lambda **_: call_order.append("load_target"))
+        load_weights=MagicMock(
+            side_effect=lambda **_: call_order.append("load_target")
+        ),
+        modules=lambda: (),
     )
     draft_model = SimpleNamespace(
         load_weights=MagicMock(side_effect=lambda **_: call_order.append("load_draft")),
@@ -179,7 +231,8 @@ def test_partial_refit_failure_makes_worker_fail_closed(monkeypatch):
         vllm_backend.VllmInternalWorkerExtension
     )
     ext.model_runner = SimpleNamespace(
-        model=object(), vllm_config=SimpleNamespace(speculative_config=None)
+        model=torch.nn.Module(),
+        vllm_config=SimpleNamespace(speculative_config=None),
     )
     ext.model_config = object()
     ext.device = object()
@@ -208,7 +261,8 @@ def test_nccl_reshard_refit_failure_is_fail_closed_and_nonfatal(monkeypatch):
         vllm_backend.VllmInternalWorkerExtension
     )
     ext.model_runner = SimpleNamespace(
-        model=object(), vllm_config=SimpleNamespace(speculative_config=None)
+        model=torch.nn.Module(),
+        vllm_config=SimpleNamespace(speculative_config=None),
     )
     ext.model_config = object()
     ext.device = object()
@@ -277,6 +331,39 @@ def test_nccl_reshard_preflight_failure_is_fail_closed_and_nonfatal(monkeypatch)
 
 
 @pytest.mark.vllm
+@pytest.mark.parametrize("has_draft", [False, True])
+def test_nccl_reshard_refit_finalizes_transported_draft_selectively(
+    monkeypatch, has_draft
+):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_update_group = object()
+    ext.pp_comm_groups = {}
+    ext.nccl_reshard_refit_info = {"layer_names": []}
+    ext.hf_to_local_param_map = {}
+    ext._model_update_manifest = SimpleNamespace(draft=object() if has_draft else None)
+    ext._receive_and_load_misc_params = MagicMock()
+    finalize = MagicMock()
+    monkeypatch.setattr(
+        vllm_backend,
+        "packed_broadcast_preflight_consumer",
+        lambda _group, _src: None,
+    )
+    monkeypatch.setattr(vllm_backend.torch.cuda, "Stream", lambda: object())
+    monkeypatch.setattr(vllm_backend.torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(vllm_backend.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(vllm_backend.torch.distributed, "get_rank", lambda: 1)
+
+    assert ext._nccl_reshard_refit_impl(finalize) is True
+
+    ext._receive_and_load_misc_params.assert_called_once_with()
+    finalize.assert_called_once_with(has_draft)
+
+
+@pytest.mark.vllm
 def test_fp8_kv_postprocess_failure_makes_worker_fail_closed(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
@@ -284,7 +371,8 @@ def test_fp8_kv_postprocess_failure_makes_worker_fail_closed(monkeypatch):
         vllm_backend.VllmInternalWorkerExtension
     )
     ext.model_runner = SimpleNamespace(
-        model=object(), vllm_config=SimpleNamespace(speculative_config=None)
+        model=torch.nn.Module(),
+        vllm_config=SimpleNamespace(speculative_config=None),
     )
     ext.model_config = object()
     ext.device = object()
@@ -550,9 +638,6 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
     ext.model_runner = SimpleNamespace(model=model, vllm_config=vllm_config)
     ext.model_config = model_config
     ext.device = torch.device("cpu")
-    ext._maybe_process_draft_after_loading = lambda process: call_order.append(
-        ("draft", process)
-    )
     ext._maybe_process_mtp_drafter_after_loading = lambda: call_order.append("mtp")
     ext._maybe_process_fp8_kv_cache = MagicMock()
 
@@ -583,16 +668,17 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
         "_refresh_hpc_modules_after_layerwise_reload",
         lambda reload_model: call_order.append(("hpc", reload_model)),
     )
-    process_weights_after_loading = MagicMock()
     monkeypatch.setattr(
         "vllm.model_executor.model_loader.utils.process_weights_after_loading",
-        process_weights_after_loading,
+        lambda *_args: pytest.fail(
+            "unquantized refit must use vLLM's native layerwise reload lifecycle"
+        ),
     )
 
     for _ in range(2):
         with ext._weight_update_lifecycle("collective") as finalize:
             call_order.append("load")
-            finalize(True)
+            finalize(False)
         assert ext._nrl_layerwise_reload_active is False
 
     expected_cycle = [
@@ -601,12 +687,10 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
         "load",
         ("finalize", model, model_config),
         ("hpc", model),
-        ("draft", process_weights_after_loading),
         "mtp",
         "config_exit",
     ]
     assert call_order == expected_cycle * 2
-    process_weights_after_loading.assert_not_called()
     ext._maybe_process_fp8_kv_cache.assert_not_called()
 
 
