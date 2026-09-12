@@ -31,12 +31,14 @@ from nemo_rl.distributed.batched_data_dict import (
     SlicedDataDict,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    RefitPayloadMode,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -102,9 +104,39 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         processor: Optional[AutoProcessor] = None,
         worker_extension_cls_fqn: Optional[str] = None,
         skip_weight_load: bool = False,
-        reserved_http_server_port: Optional[int] = None,
+        is_refit_destination: bool = False,
+        reserved_http_server_ports: Optional[dict[int, int]] = None,
     ):
         self.debug_payload_metrics = False
+        configured_extension_fqn = config.get("worker_extension_cls_fqn")
+        if (
+            configured_extension_fqn is not None
+            and worker_extension_cls_fqn is not None
+            and configured_extension_fqn != worker_extension_cls_fqn
+        ):
+            raise ValueError(
+                "worker_extension_cls_fqn was set to different values in the "
+                "policy config and Policy constructor"
+            )
+        extension_fqn = (
+            configured_extension_fqn
+            if configured_extension_fqn is not None
+            else worker_extension_cls_fqn
+        )
+        # Only the config-supplied FQN is mutually exclusive with quant_cfg: a config
+        # author cannot know which worker quant_cfg resolves to, so silently replacing
+        # it would be a footgun. The constructor argument is exempt because callers
+        # passing it already see the resolved class name and are expected to subclass
+        # it, which has always been supported alongside quantization.
+        if configured_extension_fqn is not None and config.get("quant_cfg") is not None:
+            raise ValueError(
+                "worker_extension_cls_fqn and quant_cfg are mutually exclusive: "
+                "a custom policy worker cannot be combined with ModelOpt quantization"
+            )
+        if extension_fqn is not None:
+            # Validate registration before allocating workers or placement groups.
+            get_actor_python_env(extension_fqn)
+
         if weights_path:
             weights_path = os.path.abspath(weights_path)
         if optimizer_path:
@@ -124,9 +156,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
             )
-        if reserved_http_server_port is not None and not megatron_enable:
+        if reserved_http_server_ports is not None and not megatron_enable:
             raise ValueError(
-                "reserved_http_server_port is only supported by the Megatron "
+                "reserved_http_server_ports is only supported by the Megatron "
                 "worker (policy.megatron_cfg.enabled=true)."
             )
         if draft_enabled and not megatron_enable:
@@ -237,11 +269,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             env_vars = config["dtensor_cfg"].get("env_vars", {})
 
         # If a worker extension class is provided, use it instead of the default worker builder class
-        if worker_extension_cls_fqn is not None:
+        if extension_fqn is not None:
             print(
-                f"Using worker extension class: {worker_extension_cls_fqn}, please make sure it is a subclass of {worker_builder_cls_fqn}."
+                f"Using worker extension class: {extension_fqn}, please make sure it is a subclass of {worker_builder_cls_fqn}."
             )
-            worker_builder_cls_fqn = worker_extension_cls_fqn
+            worker_builder_cls_fqn = extension_fqn
 
         # Validate world_size compatibility with parallelism configuration
         model_parallel_size = pp_size * cp_size * tp_size
@@ -308,10 +340,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             worker_sharding_annotations=self.sharding_annotations,
             pre_init_communication_queue=pre_init_queue,
         )
+        if megatron_enable:
+            worker_kwargs["is_refit_destination"] = is_refit_destination
+        elif is_refit_destination:
+            raise ValueError("is_refit_destination=True requires the Megatron backend.")
         if skip_weight_load:
             worker_kwargs["skip_weight_load"] = True
-        if reserved_http_server_port is not None:
-            worker_kwargs["reserved_http_server_port"] = reserved_http_server_port
+        if reserved_http_server_ports is not None:
+            worker_kwargs["reserved_http_server_ports"] = reserved_http_server_ports
 
         if use_v2:
             # DTensor v2 workers reconstruct tokenizer/processor locally to avoid
@@ -399,6 +435,16 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             microbatch_order = config["sequence_packing"].get("microbatch_order")
             if microbatch_order is not None:
                 self.sequence_packing_args["microbatch_order"] = microbatch_order
+            if pair_grouping_key := config["sequence_packing"].get("pair_grouping_key"):
+                self.sequence_packing_args["pair_grouping_key"] = pair_grouping_key
+            if (
+                max_sequences_per_bin := config["sequence_packing"].get(
+                    "max_sequences_per_bin"
+                )
+            ) is not None:
+                self.sequence_packing_args["max_sequences_per_bin"] = (
+                    max_sequences_per_bin
+                )
             assert not config["dynamic_batching"]["enabled"], (
                 "Sequence Packing is exclusive of Dynamic Batching. Please disable Dynamic Batching"
             )
@@ -457,6 +503,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         world_size: int,
         *,
         train_world_size: int,
+        rank_offset: int = 0,
         nccl_peer: str = "nemo",
     ) -> list[ray.ObjectRef]:
         """Initialize the collective communication."""
@@ -466,6 +513,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             port=port,
             world_size=world_size,
             train_world_size=train_world_size,
+            rank_offset=rank_offset,
             nccl_peer=nccl_peer,
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
@@ -478,7 +526,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         world_size: int,
         *,
         rank_offset: int,
-        refit_backend: str = "gloo",
+        refit_execution_batch_bytes: int | None,
+        refit_backend: str,
     ) -> list[ray.ObjectRef]:
         """Initialize the megatron refit collective on this policy's workers."""
         return self.worker_group.run_all_workers_single_data(
@@ -487,6 +536,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             port=port,
             world_size=world_size,
             rank_offset=rank_offset,
+            refit_execution_batch_bytes=refit_execution_batch_bytes,
             refit_backend=refit_backend,
         )
 
@@ -1026,13 +1076,19 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # We don't need to do anything here
         return True
 
-    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+    def prepare_refit_info(
+        self,
+        *,
+        refit_payload_mode: RefitPayloadMode,
+    ) -> Optional[dict[str, Any]]:
         """Prepare the info for refit.
 
         Returns:
             dict: A dictionary containing the info for refit.
         """
-        futures = self.worker_group.run_all_workers_single_data("prepare_refit_info")
+        futures = self.worker_group.run_all_workers_single_data(
+            "prepare_refit_info", refit_payload_mode=refit_payload_mode
+        )
         results = ray.get(futures)
         # Only get the first worker's info since all workers will have the same result
         return results[0]
@@ -1245,11 +1301,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
     def prepare_nccl_reshard_refit_info(
         self,
-        train_parallelism,
-        gen_parallelism,
-        train_world_size,
-        gen_world_size,
-    ):
+        train_parallelism: dict[str, Any],
+        gen_parallelism: dict[str, Any],
+        train_world_size: int,
+        gen_world_size: int,
+        *,
+        refit_payload_mode: RefitPayloadMode,
+    ) -> dict[str, Any]:
         """Prepare per-layer param metadata for nccl_reshard refit."""
         futures = self.worker_group.run_all_workers_single_data(
             "prepare_nccl_reshard_refit_info",
@@ -1257,6 +1315,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             gen_parallelism=gen_parallelism,
             train_world_size=train_world_size,
             gen_world_size=gen_world_size,
+            refit_payload_mode=refit_payload_mode,
         )
         results = ray.get(futures)
         return results[0]
@@ -1271,6 +1330,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             refit_timeout_s=refit_timeout_s,
         )
         return futures
+
+    def sync_params_before_refit(self) -> None:
+        """Materialize the latest parameters on every policy worker before refit."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "sync_params_before_refit"
+        )
+        ray.get(futures)
 
     def offload_before_refit(self) -> None:
         """Offload the optimizer and buffers to the CPU."""

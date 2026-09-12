@@ -36,10 +36,9 @@ from typing import TYPE_CHECKING, Any, Literal, Optional
 import numpy as np
 import torch
 
-FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
-
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, backend_config
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
     GLOBAL_FORWARD_PAD_SEQLEN,
@@ -63,6 +62,8 @@ if TYPE_CHECKING:
         DataPlaneClient,
         DataPlaneRuntimeConfig,
     )
+
+FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
 
 
 def _broadcast_batched_data_dict(
@@ -326,6 +327,18 @@ class TQWorkerMixin:
             return
         self._route_fallback_counts = Counter()
         from nemo_rl.data_plane import build_data_plane_client
+
+        # ``LocalDataPlaneConfig`` is the process-local plane: no TQ, no
+        # mooncake, so no GDR to order against a CUDA context.
+        if (
+            not isinstance(cfg, LocalDataPlaneConfig)
+            and cfg["backend"] == "mooncake_cpu"
+            and backend_config(cfg).use_gdr
+            and not torch.cuda.is_initialized()
+        ):
+            raise RuntimeError(
+                "CUDA must be initialized before attaching TransferQueue with GDR"
+            )
 
         # bootstrap=False — the driver already created the named
         # controller actor; this process attaches as a client.
@@ -767,6 +780,48 @@ class TQWorkerMixin:
 
         return NamedSharding.is_axis_zero(self._local_coords(), REPLICATED_AXES)
 
+    def _is_stage_local_writer(self) -> bool:
+        """True iff this rank is the TP/CP-zero rank of its own pipeline stage.
+
+        Unlike :meth:`_is_replica_leader` this does not pin the pipeline stage,
+        so it selects one rank per stage rather than one per DP rank. Callers
+        must therefore only write outputs that exist on a single stage; see
+        :meth:`_write_back_stage_local`.
+        """
+        from nemo_rl.distributed.named_sharding import NamedSharding
+
+        return NamedSharding.is_axis_zero(
+            self._local_coords(), ("tensor_parallel", "context_parallel")
+        )
+
+    def _write_back_stage_local(
+        self,
+        meta: "KVBatchMeta",
+        fields: dict[str, torch.Tensor],
+    ) -> None:
+        """Write fields produced on exactly one pipeline stage.
+
+        The ordinary :meth:`_write_back` writes from the replica leader, which
+        sits on stage 0. Outputs that only the last stage holds -- notably the
+        full-vocabulary MOPD teacher payload -- would then have to be broadcast
+        backwards just to be written, which for a per-token payload means moving
+        gigabytes across the pipeline group for nothing. This writes from the
+        stage that already owns the data instead.
+
+        Single-writer safety comes from the caller: it must pass fields that are
+        absent (``None``) on every other stage, so exactly one stage reaches this
+        and :meth:`_is_stage_local_writer` picks one rank within it.
+
+        Args:
+            meta: Per-rank ``KVBatchMeta`` for this slice.
+            fields: Map of field name to tensor to write back.
+        """
+        if not self._is_stage_local_writer() or not fields:
+            return
+        from nemo_rl.data_plane.column_io import write_columns
+
+        write_columns(self._require_dp_client(), meta, fields)
+
     def _write_back(
         self,
         meta: "KVBatchMeta",
@@ -910,8 +965,24 @@ class TQWorkerMixin:
         self,
         meta: "KVBatchMeta",
         micro_batch_size: Optional[int] = None,
+        opd_full_payload: Optional[str] = None,
+        opd_full_payload_dtype: Optional[str] = None,
+        opd_full_payload_field: Optional[str] = None,
     ) -> None:
-        """Per-rank frozen-teacher logprob entrypoint for SingleController MOPD."""
+        """Per-rank frozen-teacher logprob entrypoint for SingleController MOPD.
+
+        Args:
+            meta: Per-rank ``KVBatchMeta`` for this DP shard.
+            micro_batch_size: Overrides the configured logprob batch size.
+            opd_full_payload: When set (``"hidden_states"`` or ``"logits"``), also
+                emit the full-vocabulary teacher payload from the same forward.
+            opd_full_payload_dtype: Torch dtype name for that payload.
+            opd_full_payload_field: Data-plane column the payload is written to.
+
+        Raises:
+            ValueError: If a payload is requested without a target column.
+            RuntimeError: If batching metadata was not planned driver-side.
+        """
         data = self._fetch(meta)
         cfg = getattr(self, "cfg", {})
         batching_enabled = bool(
@@ -928,10 +999,37 @@ class TQWorkerMixin:
                 "can desynchronize data-parallel collectives."
             )
         data = self._attach_or_repack_pack_metadata(data, meta)
-        result: BatchedDataDict[Any] = self.get_logprobs(  # type: ignore[attr-defined]
-            data=data,
-            micro_batch_size=micro_batch_size,
-        )
+        if opd_full_payload is None:
+            result: BatchedDataDict[Any] = self.get_logprobs(  # type: ignore[attr-defined]
+                data=data,
+                micro_batch_size=micro_batch_size,
+            )
+        else:
+            if opd_full_payload_field is None:
+                raise ValueError(
+                    "opd_full_payload requires opd_full_payload_field naming the "
+                    "data-plane column to write the teacher payload to."
+                )
+            if opd_full_payload_dtype is None:
+                raise ValueError(
+                    "opd_full_payload requires opd_full_payload_dtype; it is "
+                    "resolved by the driver from OnPolicyDistillationFullConfig, "
+                    "which owns the default."
+                )
+            result = self.get_logprobs_with_full_payload(  # type: ignore[attr-defined]
+                data=data,
+                payload=opd_full_payload,
+                payload_dtype=opd_full_payload_dtype,
+                micro_batch_size=micro_batch_size,
+            )
+            # None off the last pipeline stage, which is what keeps this to a
+            # single writer: the payload never leaves the stage that produced it.
+            teacher_full_payload = result.get("teacher_full_payload")
+            if teacher_full_payload is not None:
+                self._write_back_stage_local(
+                    meta, {opd_full_payload_field: teacher_full_payload.detach().cpu()}
+                )
+            del teacher_full_payload
         self._write_back_result_field(
             meta,
             result,

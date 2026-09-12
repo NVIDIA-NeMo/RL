@@ -20,10 +20,11 @@ broadcasts its weights, and generation workers receive them via the
 established NCCL process group.
 
 Lifecycle per sync:
-  1. policy.offload_before_refit()                 -- optional trainer memory release
-  2. policy.broadcast_weights_for_collective()    -- send via NCCL
+  1. policy.sync_params_before_refit()            -- materialize optimizer updates
+  2. policy.offload_before_refit()                 -- optional trainer memory release
+  3. policy.broadcast_weights_for_collective()    -- send via NCCL
      generation.update_weights_from_collective()  -- receive via NCCL
-  3. Verify transfer success
+  4. Verify transfer success
 
 Policy and generation run on separate GPUs. Trainer offload is disabled by
 default, but large quantized exports can opt in when their temporary tensors
@@ -95,6 +96,9 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             NCCL forever. ``None`` disarms it entirely, so the hang protection is lost.
         release_grads_before_refit: Whether to run the policy's existing refit
             offload lifecycle before exporting weights.
+        sync_policy_params: Whether this synchronizer owns the pre-transfer policy
+            parameter sync. A lifecycle wrapper may perform it earlier and disable it
+            here to avoid a duplicate worker round trip.
     """
 
     def __init__(
@@ -106,6 +110,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         refit_timeout_s: Optional[float] = None,
         *,
         release_grads_before_refit: bool = False,
+        sync_policy_params: bool = True,
     ) -> None:
         # None disarms the abort watchdog in every worker, which is the default and
         # reproduces the pre-existing behaviour exactly.
@@ -115,6 +120,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
         self._release_grads_before_refit = release_grads_before_refit
+        self._sync_policy_params = sync_policy_params
         self._stale = True
         # The absent set this synchronizer's current communicator was built with, so a
         # membership that has not changed can skip the rebuild. None means "never rebuilt",
@@ -135,9 +141,10 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
+        if self._sync_policy_params:
+            self._policy.sync_params_before_refit()
         if self._release_grads_before_refit:
             self._policy.offload_before_refit()
-
         timer_context = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
             if timer is not None
@@ -191,7 +198,9 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         # prepare_refit_info is called before init_collective. This matches
         # distillation.py ordering. Neither call depends on the other today,
         # but we document this as the canonical ordering for future reference.
-        state_dict_info = self._policy.prepare_refit_info()
+        state_dict_info = self._policy.prepare_refit_info(
+            refit_payload_mode=self._generation.get_refit_payload_mode()
+        )
         self._generation.prepare_refit_info(state_dict_info)
 
         ip, port = self._train_cluster.get_master_address_and_port()
