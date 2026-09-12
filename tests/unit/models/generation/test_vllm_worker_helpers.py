@@ -20,8 +20,8 @@ import pytest
 
 from nemo_rl.models.generation.vllm.worker_utils import (
     configure_refit_runtime,
-    refit_cache_loader_routes_enabled,
     find_tokenizer_required_architectures,
+    refit_cache_loader_routes_enabled,
     resolve_data_parallel_local_rank,
     resolve_distributed_executor_backend,
 )
