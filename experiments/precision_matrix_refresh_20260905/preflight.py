@@ -60,6 +60,7 @@ def main() -> None:
                             "policy.generation.vllm_cfg.expert_parallel_size",
                             "policy.generation.vllm_cfg.gpu_memory_utilization",
                             "policy.generation.colocated", "cluster",
+                            "loss_fn.use_importance_sampling_correction",
                         )
                         for key in protected:
                             assert OmegaConf.select(cfg, key) == OmegaConf.select(original, key), key
@@ -75,7 +76,8 @@ def main() -> None:
                     assert cfg.policy.generation.vllm_cfg.enforce_eager is False
                     assert cfg.loss_fn.reference_policy_kl_penalty > 0
                     assert not cfg.grpo.get("skip_reference_policy_logprobs_calculation", False)
-                    assert cfg.loss_fn.use_importance_sampling_correction
+                    if not performance:
+                        assert cfg.loss_fn.use_importance_sampling_correction
                     assert cfg.loss_fn.force_on_policy_ratio is False
                     assert cfg.grpo.val_period == 0
                     if arm == "mxfp8-true-bf16":
