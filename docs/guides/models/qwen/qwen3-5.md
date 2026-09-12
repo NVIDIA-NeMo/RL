@@ -64,6 +64,7 @@ authoritative settings.
 | Qwen3.5-9B-Base | LLM | GRPO | Megatron | 1n8g | [`grpo-qwen3.5-9b-1n8g-megatron-fp8.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-9b-1n8g-megatron-fp8.yaml) |
 | Qwen3.5-35B-A3B-Base | LLM | GRPO | Megatron | 2n8g | [`grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml) |
 | Qwen3.5-35B-A3B-Base | LLM | GRPO | Megatron | 2n8g | [`grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2-fp8.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2-fp8.yaml) |
+| Qwen3.5-35B-A3B-Base | LLM | GRPO | Megatron | 4n4g | [`grpo-qwen3.5-35ba3b-4n4g-megatron-ep16tp2-mxfp8-trtllm.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-4n4g-megatron-ep16tp2-mxfp8-trtllm.yaml) |
 | Qwen3.5-35B-A3B-Base | LLM | GRPO | Megatron | 6n4g | [`grpo-qwen3.5-35ba3b-6n4g-async-1off-bf16-trtllm.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-6n4g-async-1off-bf16-trtllm.yaml) |
 | Qwen3.5-35B-A3B-Base | LLM | GRPO | AutoModel | 2n8g | [`grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.yaml) |
 | Qwen3.5-35B-A3B-Base | LLM | GRPO | AutoModel | 4n8g | [`grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml) |
@@ -247,8 +248,12 @@ FP8 noise.
 
 ### Limitations
 
-- MXFP8 is not yet supported; tracked in
-  [#3694](https://github.com/NVIDIA-NeMo/RL/issues/3694).
+- Dense Qwen3.5 MXFP8 rollout has not been validated end to end.
+- Grouped-MoE MXFP8 refit is supported through both weight-transfer paths:
+  NCCL Reshard uses the receiver-side conversion added in
+  [#3477](https://github.com/NVIDIA-NeMo/RL/pull/3477), while colocated CUDA IPC
+  and legacy reloads expand fused expert slabs before calling vLLM's native
+  per-expert loader.
 
 ## `flash-linear-attention` Performance
 
