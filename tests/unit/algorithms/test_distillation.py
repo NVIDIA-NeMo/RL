@@ -975,8 +975,13 @@ def test_distillation_train_shuts_down_environments_after_success():
     shutdown.assert_called_once_with(task_to_env, task_to_env)
 
 
-@pytest.mark.parametrize("refit_transport", [None, "nixl"])
-def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
+@pytest.mark.parametrize(
+    ("refit_transport", "release_grads_before_refit"),
+    [(None, False), (None, True), ("nixl", False)],
+)
+def test_distillation_setup_non_colocated_smoke(
+    monkeypatch, refit_transport, release_grads_before_refit
+):
     """Smoke test: calling setup with a non-colocated config should succeed."""
     from unittest.mock import MagicMock, patch
 
@@ -1007,6 +1012,10 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
                 "dtensor_cfg": {
                     "enabled": False,
                 },
+                "megatron_cfg": {
+                    "enabled": release_grads_before_refit,
+                },
+                "release_grads_before_refit": release_grads_before_refit,
                 "model_name": "test-policy",
             },
             "teacher": {
@@ -1116,7 +1125,7 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
         assert isinstance(result, tuple)
         assert result[3] is None
         mock_spinup_nemo_gym.assert_not_called()
-        if refit_transport == "nixl":
+        if refit_transport == "nixl" or release_grads_before_refit:
             mock_create_synchronizer.assert_called_once()
             mock_create_synchronizer.return_value.init_communicator.assert_called_once()
             assert not DummyPolicy.collective_calls
