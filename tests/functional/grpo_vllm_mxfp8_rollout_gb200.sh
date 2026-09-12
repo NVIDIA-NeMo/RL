@@ -13,6 +13,7 @@ LOG_DIR=$EXP_DIR/logs
 JSON_METRICS=$EXP_DIR/metrics.json
 RUN_LOG=$EXP_DIR/run.log
 export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
+export NRL_MXFP8_SHUFFLE_VERIFY=1
 
 rm -rf "$EXP_DIR" "$LOG_DIR"
 mkdir -p "$EXP_DIR" "$LOG_DIR"
@@ -37,9 +38,12 @@ uv run coverage run -a --data-file="$PROJECT_ROOT/tests/.coverage" --source="$PR
     policy.train_micro_batch_size=1 \
     policy.logprob_batch_size=1 \
     policy.max_total_sequence_length=256 \
+    policy.dtensor_cfg.enabled=false \
+    policy.megatron_cfg.enabled=true \
     policy.generation.max_new_tokens=128 \
     policy.generation.vllm_cfg.precision=fp8 \
     ++policy.generation.vllm_cfg.is_mx=true \
+    policy.generation.vllm_cfg.refit_prequantize=true \
     policy.generation.vllm_cfg.kv_cache_dtype=auto \
     policy.generation.vllm_cfg.max_model_len=256 \
     policy.generation.vllm_cfg.gpu_memory_utilization=0.5 \

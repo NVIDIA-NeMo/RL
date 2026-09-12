@@ -118,6 +118,7 @@ def assert_refit_unsupported_grouped_moe_params(
     if (
         vllm_cfg.get("precision") == "fp8"
         and vllm_cfg.get("is_mx")
+        and not vllm_cfg.get("refit_prequantize")
         and any(is_grouped_moe_expert_weight_name(name) for name in state_dict_info)
     ):
         raise AssertionError(GROUPED_MOE_MXFP8_REFIT_ERROR)

@@ -45,6 +45,7 @@ large_model_vllm_config: VllmConfig = {
     "stop_strings": None,
     "vllm_cfg": {
         "precision": "bfloat16",
+        "refit_cache_loader_routes": False,
         "tensor_parallel_size": 8,
         "pipeline_parallel_size": 2,
         "expert_parallel_size": 1,
