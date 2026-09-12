@@ -18,7 +18,7 @@ def main() -> None:
     args = parser.parse_args()
     performance = os.environ.get("PERFORMANCE_RECIPE") == "1"
     hybridep = os.environ.get("PERFORMANCE_HYBRIDEP") == "1"
-    expected_count = 16 if hybridep else (24 if performance else 48)
+    expected_count = 16 if hybridep else (32 if performance else 48)
     if f"{expected_count}/{expected_count} configurations composed." not in args.preflight_log.read_text():
         raise SystemExit("Configuration preflight has not passed")
     root = Path(os.environ["REPO"])
@@ -30,7 +30,7 @@ def main() -> None:
     arms = ("bf16-bf16", "bf16-mxfp8", "mxfp8-false-mxfp8", "mxfp8-true-mxfp8")
     if not performance:
         arms += ("mxfp8-false-bf16", "mxfp8-true-bf16")
-    models = ("qwen30", "qwen235", "super") if performance else ("qwen30", "qwen35", "lightning", "qwen235")
+    models = ("qwen30", "qwen235", "qwen35", "super") if performance else ("qwen30", "qwen35", "lightning", "qwen235")
     if hybridep:
         models = ("qwen30", "super")
     valid_cases = {f"{model}/{mode}/{arm}" for model in models for mode in ("sync", "async") for arm in arms}

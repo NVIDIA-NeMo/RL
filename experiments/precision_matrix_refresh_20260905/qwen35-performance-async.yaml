@@ -1,0 +1,9 @@
+# Keep workload identical to the Sync comparison; only execution topology differs.
+defaults: ./qwen35-async.yaml
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+
+policy:
+  train_global_batch_size: 512

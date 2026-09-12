@@ -22,7 +22,7 @@ def main() -> None:
     failures: list[str] = []
     performance = os.environ.get("PERFORMANCE_RECIPE") == "1"
     hybridep = os.environ.get("PERFORMANCE_HYBRIDEP") == "1"
-    models = ("qwen30", "qwen235", "super") if performance else ("qwen30", "qwen235", "qwen35", "lightning")
+    models = ("qwen30", "qwen235", "qwen35", "super") if performance else ("qwen30", "qwen235", "qwen35", "lightning")
     if hybridep:
         models = ("qwen30", "super")
     arms = ("bf16-bf16", "bf16-mxfp8", "mxfp8-false-mxfp8", "mxfp8-true-mxfp8") if performance else (
@@ -47,6 +47,15 @@ def main() -> None:
                     OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
                     if performance:
                         original = load_config(root / fields["config"])
+                        if model == "qwen35":
+                            base = load_config(root / "examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml")
+                            for key in (
+                                "grpo.num_prompts_per_step",
+                                "grpo.num_generations_per_prompt",
+                                "policy.train_global_batch_size",
+                                "policy.max_total_sequence_length",
+                            ):
+                                assert OmegaConf.select(cfg, key) == OmegaConf.select(base, key), key
                         protected = (
                             "grpo.num_prompts_per_step", "grpo.num_generations_per_prompt",
                             "policy.train_global_batch_size", "policy.train_micro_batch_size",

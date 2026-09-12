@@ -1,0 +1,9 @@
+# Matched performance workload; restore the base recipe's batch dimensions.
+defaults: ./qwen35-sync.yaml
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+
+policy:
+  train_global_batch_size: 512

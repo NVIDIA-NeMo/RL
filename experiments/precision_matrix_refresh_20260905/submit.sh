@@ -196,6 +196,8 @@ if [[ "${PERFORMANCE_RECIPE}" == 1 ]]; then
     qwen30:async) CONFIG=${PERF_DIR}/grpo-qwen3-30ba3b-4n4g-async-1off.yaml ;;
     qwen235:sync) CONFIG=${PERF_DIR}/grpo-qwen3-235b-16n4g.yaml ;;
     qwen235:async) CONFIG=${PERF_DIR}/grpo-qwen3-235b-32n4g-async-1off.yaml ;;
+    qwen35:sync) CONFIG=${EXPERIMENT}/qwen35-performance-sync.yaml ;;
+    qwen35:async) CONFIG=${EXPERIMENT}/qwen35-performance-async.yaml ;;
     super:sync) CONFIG=${PERF_DIR}/grpo-nemotron3-super-120BA12B-32n4g.yaml ;;
     super:async) CONFIG=${PERF_DIR}/grpo-nemotron3-super-120BA12B-32n4g-async-1off.yaml ;;
     *) echo "No audited performance recipe for ${MODEL}:${MODE}" >&2; exit 2 ;;
