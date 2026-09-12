@@ -23,6 +23,7 @@ import torch
 
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup, RolloutReassembler
+from nemo_rl.utils.venvs import make_actor_runtime_env
 
 # Field names whose values are per-token and therefore large, but whose Python
 # type is indistinguishable from metadata -- a list[int] of token ids looks just
@@ -134,6 +135,18 @@ class RolloutReassemblerActor:  # pragma: no cover
             max_seq_len=config.max_seq_len,
         )
 
+    def check_dependencies(self) -> None:
+        """Import the finalization API before the controller starts rollouts."""
+        # Deferred: only the actor's environment needs the optional Gym extra.
+        from nemo_gym.token_id_capture.staging.rebuild import (  # noqa: F401
+            RebuildError,
+            ReceiptVerificationError,
+            verify_and_linearize,
+        )
+        from nemo_gym.token_id_capture.staging.records import (
+            RolloutReceipt,  # noqa: F401
+        )
+
     def finalize(self, request: ReassemblyRequest) -> FinalizedGroup:
         """Finalize one request without allowing tensor payloads across Ray RPC."""
         assert_metadata_only(request)
@@ -169,9 +182,22 @@ def create_rollout_reassembler_actors(
     *,
     num_workers: int,
 ) -> list[Any]:
-    """Construct the fixed validation pool after TQ partitions are registered."""
+    """Construct and validate the pool after TQ partitions are registered."""
     if num_workers <= 0:
         raise ValueError(f"num_reassembler_workers must be positive, got {num_workers}")
-    return [
-        RolloutReassemblerActor.remote(dp_config, config) for _ in range(num_workers)
+    runtime_env = make_actor_runtime_env(
+        "nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor"
+    )
+    actors = [
+        RolloutReassemblerActor.options(runtime_env=runtime_env).remote(
+            dp_config, config
+        )
+        for _ in range(num_workers)
     ]
+    try:
+        ray.get([actor.check_dependencies.remote() for actor in actors])
+    except ray.exceptions.RayError:
+        for actor in actors:
+            ray.kill(actor)
+        raise
+    return actors

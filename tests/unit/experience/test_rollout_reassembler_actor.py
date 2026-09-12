@@ -15,19 +15,26 @@
 
 from __future__ import annotations
 
+import builtins
 from dataclasses import fields, replace
-from unittest.mock import MagicMock
+from typing import Any
+from unittest.mock import MagicMock, call, patch
 
 import pytest
+import ray
 import torch
 
+import nemo_rl.experience.rollout_reassembler_actor as actor_module
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_reassembler_actor import (
     _FORBIDDEN_RPC_KEYS,
     ReassemblyRequest,
     RolloutReassemblerActor,
+    RolloutReassemblerActorConfig,
     assert_metadata_only,
+    create_rollout_reassembler_actors,
 )
 
 
@@ -153,3 +160,72 @@ def test_every_forbidden_key_is_rejected(key) -> None:
     """Removing an entry from the denylist should fail loudly."""
     with pytest.raises(TypeError, match="forbidden heavy field"):
         assert_metadata_only({key: [1, 2, 3]})
+
+
+@pytest.mark.parametrize("startup_fails", [False, True])
+def test_factory_selects_gym_environment_and_waits_for_dependencies(
+    startup_fails: bool,
+) -> None:
+    actor_fqn = "nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor"
+    assert ACTOR_ENVIRONMENTS[actor_fqn] == ["nemo_gym"]
+    config = RolloutReassemblerActorConfig(
+        partition_id="canonical",
+        staging_partition="staging",
+        pad_token_id=0,
+        router_replay_enabled=False,
+        defer_routed_experts_to_policy=False,
+        max_seq_len=4096,
+    )
+    dp_config = {"enabled": True, "impl": "transfer_queue", "backend": "simple"}
+    actors = [MagicMock(), MagicMock()]
+    runtime_env = {"py_executable": "/gym-venv/bin/python"}
+    with (
+        patch.object(
+            actor_module, "make_actor_runtime_env", return_value=runtime_env
+        ) as make_env,
+        patch.object(RolloutReassemblerActor, "options") as options,
+        patch.object(ray, "get") as get,
+        patch.object(ray, "kill") as kill,
+    ):
+        options.return_value.remote.side_effect = actors
+        if startup_fails:
+            get.side_effect = ray.exceptions.RayError("missing orjson")
+            with pytest.raises(ray.exceptions.RayError, match="missing orjson"):
+                create_rollout_reassembler_actors(dp_config, config, num_workers=2)
+            assert kill.call_args_list == [call(actor) for actor in actors]
+        else:
+            assert (
+                create_rollout_reassembler_actors(dp_config, config, num_workers=2)
+                == actors
+            )
+            kill.assert_not_called()
+
+        make_env.assert_called_once_with(actor_fqn)
+        assert options.call_args_list == [call(runtime_env=runtime_env)] * 2
+        assert (
+            options.return_value.remote.call_args_list == [call(dp_config, config)] * 2
+        )
+        for actor in actors:
+            actor.check_dependencies.remote.assert_called_once_with()
+        get.assert_called_once_with(
+            [actor.check_dependencies.remote.return_value for actor in actors]
+        )
+
+
+@pytest.mark.parametrize("missing_module", ["nemo_gym", "orjson"])
+def test_dependency_check_propagates_missing_direct_and_transitive_imports(
+    monkeypatch: pytest.MonkeyPatch, missing_module: str
+) -> None:
+    original_import = builtins.__import__
+
+    def fail_rebuild_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "nemo_gym.token_id_capture.staging.rebuild":
+            raise ModuleNotFoundError(
+                f"No module named '{missing_module}'", name=missing_module
+            )
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_rebuild_import)
+    actor = object.__new__(RolloutReassemblerActor.__ray_metadata__.modified_class)
+    with pytest.raises(ModuleNotFoundError, match=missing_module):
+        actor.check_dependencies()
