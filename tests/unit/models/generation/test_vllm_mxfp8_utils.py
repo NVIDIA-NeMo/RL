@@ -145,6 +145,35 @@ def test_assign_or_replace_parameter_can_force_new_runtime_storage() -> None:
     assert torch.all(layer.weight == 1)
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("mode", ["new", "resize", "force"])
+def test_runtime_parameter_owns_shared_scratch_storage(device: str, mode: str) -> None:
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    assign = _load_mxfp8_utils().assign_or_replace_parameter
+    layers = [torch.nn.Module(), torch.nn.Module()]
+    scratch = torch.ones(2, 4, 8, dtype=torch.uint8, device=device)
+    for index, layer in enumerate(layers):
+        if mode != "new":
+            shape = scratch.shape if mode == "force" else (1,)
+            layer.weight = torch.nn.Parameter(
+                torch.zeros(shape, dtype=scratch.dtype, device=device), requires_grad=False
+            )
+        scratch.fill_(index + 1)
+        assign(layer, "weight", scratch, force_replace=mode == "force")
+    pointers = [layer.weight.data_ptr() for layer in layers]
+    assert len(set(pointers + [scratch.data_ptr()])) == 3
+    assert torch.all(layers[0].weight == 1)
+    assert torch.all(layers[1].weight == 2)
+    for index, layer in enumerate(layers):
+        scratch.fill_(index + 3)
+        assign(layer, "weight", scratch)
+        assert layer.weight.data_ptr() == pointers[index]
+    scratch.zero_()
+    assert torch.all(layers[0].weight == 3)
+    assert torch.all(layers[1].weight == 4)
+
+
 @pytest.mark.parametrize("is_gated", [False, True])
 def test_pad_w13_intermediate_preserves_gate_halves(is_gated: bool) -> None:
     pad_w13_intermediate = _load_mxfp8_utils().pad_w13_intermediate
