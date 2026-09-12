@@ -1846,19 +1846,124 @@ def test_maybe_prequantize_param_rejects_fp8_trainer_storage():
         list(worker._maybe_prequantize_param(name, tensor))
 
 
-def test_enable_refit_prequantize_rejects_blockwise_fp8_storage():
+def test_iter_params_batches_expert_prequantization(monkeypatch):
+    from nemo_rl.models.generation.vllm.quantization import fp8_train_utils
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    name = "model.layers.0.mlp.experts.0.gate_proj.weight"
+    weight = torch.ones(2, 32, dtype=torch.bfloat16)
+    calls = []
+
+    def iter_batched(params, selected_names):
+        calls.append((list(params), selected_names))
+        yield "batched.weight", weight
+
+    monkeypatch.setattr(fp8_train_utils, "iter_mxfp8_prequantized_params", iter_batched)
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker._refit_prequant_names = {name}
+    worker.model = object()
+    worker.draft_model = None
+    worker.refit_conversion_tasks = []
+    worker.cfg = {"megatron_cfg": {"enabled": True}}
+    worker.megatron_bridge = SimpleNamespace(
+        export_hf_weights=lambda *_args, **_kwargs: iter([(name, weight)])
+    )
+
+    first = list(worker._iter_params_with_optional_kv_scales())
+    second = list(worker._iter_params_with_optional_kv_scales())
+
+    assert first == [("batched.weight", weight)]
+    assert second == first
+    assert len(calls) == 2
+    assert calls[0][0] == [(name, weight)]
+    assert calls[0][1] == {name}
+
+
+def test_iter_params_preserves_bridge_expert_wire_order(monkeypatch):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    names = [
+        f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"
+        for expert_id in range(2)
+    ]
+    weights = [
+        torch.full((2, 32), expert_id + 1, dtype=torch.bfloat16)
+        for expert_id in range(2)
+    ]
+    stack_calls = []
+    original_stack = torch.stack
+
+    def record_stack(tensors, *args, **kwargs):
+        stack_calls.append([tensor.clone() for tensor in tensors])
+        return original_stack(tensors, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "stack", record_stack)
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker._refit_prequant_names = set(names)
+    worker.model = object()
+    worker.draft_model = None
+    worker.refit_conversion_tasks = []
+    worker.cfg = {"megatron_cfg": {"enabled": True}}
+    worker.megatron_bridge = SimpleNamespace(
+        export_hf_weights=lambda *_args, **_kwargs: iter(zip(names, weights))
+    )
+
+    output = list(worker._iter_params_with_optional_kv_scales())
+
+    assert [name for name, _tensor in output] == [
+        entry_name
+        for name in names
+        for entry_name in (name, name + "_scale_from_checkpoint")
+    ]
+    assert len(stack_calls) == 1
+    assert len(stack_calls[0]) == 2
+
+
+@pytest.mark.parametrize("fp8_recipe", ["blockwise", "mxfp8"])
+def test_enable_refit_prequantize_rejects_fp8_param_storage(
+    fp8_recipe: str,
+) -> None:
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.fp8_cfg = {
+        "enabled": True,
         "fp8_param": True,
-        "fp8_recipe": "blockwise",
+        "fp8_recipe": fp8_recipe,
     }
 
     with pytest.raises(ValueError, match="BF16 trainer-exported weights"):
         worker.enable_refit_prequantize(["model.weight"])
+
+
+def test_enable_refit_prequantize_allows_disabled_fp8_param_storage() -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = {
+        "enabled": False,
+        "fp8_param": True,
+        "fp8_recipe": "mxfp8",
+    }
+    worker._refit_param_info_hf = {
+        "model.weight": (torch.Size([4, 64]), torch.bfloat16),
+    }
+
+    info = worker.enable_refit_prequantize(["model.weight"])
+
+    assert info["model.weight"] == (torch.Size([4, 64]), torch.float8_e4m3fn)
+    assert info["model.weight_scale_from_checkpoint"] == (
+        torch.Size([4, 2]),
+        torch.uint8,
+    )
 
 
 def test_enable_refit_prequantize_requires_prepare_refit_info():
