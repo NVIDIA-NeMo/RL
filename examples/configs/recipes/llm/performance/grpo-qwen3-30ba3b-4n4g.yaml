@@ -28,6 +28,10 @@ policy:
     expert_model_parallel_size: 16
     sequence_parallel: false
     moe_grouped_gemm: true
+    moe_token_dispatcher_type: flex
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32
+    moe_hybridep_prepad_packed_inputs: true
     optimizer:
       lr: 3.0e-07
       min_lr: 3.0e-08
@@ -36,6 +40,10 @@ policy:
       lr_warmup_init: 3.0e-08
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+      NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "16"
+      NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: "128"
+      NVLINK_DOMAIN_SIZE: "72"
+      USE_MNNVL: "1"
   generation:
     vllm_cfg:
       tensor_parallel_size: 1
