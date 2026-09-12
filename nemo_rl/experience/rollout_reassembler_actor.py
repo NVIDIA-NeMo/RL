@@ -16,13 +16,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, is_dataclass
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import ray
 import torch
 
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
+from nemo_rl.experience.reward_penalties import RewardChecks
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup, RolloutReassembler
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
+    from nemo_rl.experience.rollouts import EffortLevelsConfig
 
 # Field names whose values are per-token and therefore large, but whose Python
 # type is indistinguishable from metadata -- a list[int] of token ids looks just
@@ -66,6 +71,7 @@ class ReassemblyRequest:
     mask_sample: tuple[bool, ...]
     # Dataset-level loss weight shared by every completion in this prompt group.
     loss_multiplier: float = 1.0
+    reward_checks: tuple[RewardChecks | None, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +84,8 @@ class RolloutReassemblerActorConfig:
     router_replay_enabled: bool
     defer_routed_experts_to_policy: bool
     max_seq_len: int
+    reward_penalty_config: RewardPenaltyConfig | None = None
+    effort_config: EffortLevelsConfig | None = None
 
 
 def assert_metadata_only(value: Any, *, path: str = "rpc") -> None:
@@ -132,6 +140,8 @@ class RolloutReassemblerActor:  # pragma: no cover
             router_replay_enabled=config.router_replay_enabled,
             defer_routed_experts_to_policy=config.defer_routed_experts_to_policy,
             max_seq_len=config.max_seq_len,
+            reward_penalty_config=config.reward_penalty_config,
+            effort_config=config.effort_config,
         )
 
     def finalize(self, request: ReassemblyRequest) -> FinalizedGroup:
@@ -158,6 +168,9 @@ class RolloutReassemblerActor:  # pragma: no cover
             prompt_idx=request.prompt_idx,
             loss_multiplier=request.loss_multiplier,
             canonical_sample_ids=list(request.canonical_sample_ids),
+            reward_checks=list(request.reward_checks)
+            if request.reward_checks is not None
+            else None,
         )
         assert_metadata_only(result)
         return result

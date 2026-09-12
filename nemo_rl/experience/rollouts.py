@@ -28,7 +28,7 @@ from typing import Any, Optional
 
 import ray
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
@@ -68,6 +68,14 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.reward_penalties import (
+    effort_shaping_enabled,
+    has_duplicated_reasoning,
+    has_empty_final_answer,
+    has_unwanted_tokens,
+    is_low_effort,
+    shape_effort_reward,
+)
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
     GenerationConfig,
@@ -425,6 +433,12 @@ class EffortLevelsConfig(BaseModel, extra="allow"):
     low_string: str = ""
     """Substring that must appear in the user prompt to trigger shaping."""
 
+    @model_validator(mode="after")
+    def validate_length_bound(self) -> "EffortLevelsConfig":
+        if self.low_weight > 0 and self.low_string and self.low_ub <= 0:
+            raise ValueError("active effort shaping requires low_ub > 0")
+        return self
+
 
 @dataclass
 class _EffortShapingMetrics:
@@ -435,44 +449,11 @@ class _EffortShapingMetrics:
 
 
 def _terminal_completion_length(result: dict) -> Optional[int]:
-    """Terminal assistant completion length for effort shaping, or None.
-
-    Legacy rollouts carry tokens inline: the last ``message_log`` entry is the
-    terminal turn, and its ``token_ids`` length is the completion length (0 if
-    that turn is not an assistant turn, matching the pre-receipt behavior).
-
-    Token-capture receipt rollouts carry ``message_log: []`` by design — the
-    tokens live in the capture ledger. The manifest's ``delta_len`` is NOT the
-    same quantity (a root call's delta stages prompt + generation, per the
-    ledger invariant ``parentless rows have prev_len == 0``), so the length
-    comes from the scored response's usage block instead: ``output_tokens``
-    is the terminal call's generation length, matching the legacy semantics.
-    A receipt row with no usable usage returns None so the caller skips
-    shaping rather than inventing a length.
-    """
+    """Return inline terminal assistant length; capture is shaped after verification."""
     message_log = result.get("message_log") or []
     if message_log:
         last = message_log[-1]
         return len(last["token_ids"]) if last["role"] == "assistant" else 0
-    # TODO(token-capture): the agent ACCUMULATES usage across model calls onto
-    # the scored response (simple_agent accumulate_response_usage), so
-    # output_tokens equals the terminal generation only for single-call
-    # rollouts; on multi-call rollouts this shapes on the accumulated total
-    # while the legacy path uses the final assistant turn only. All observed
-    # capture runs are single-call (finalize/calls_per_rollout == 1.0). The
-    # durable fix is upstream: per-call generation counts on the receipt
-    # (Gym preserving per-call usage, or CallRecord recording generation
-    # length distinct from staged delta_len).
-    full_result = result.get("full_result")
-    if isinstance(full_result, dict):
-        response = full_result.get("response")
-        if isinstance(response, dict):
-            usage = response.get("usage")
-            if isinstance(usage, dict):
-                for key in ("output_tokens", "completion_tokens"):
-                    tokens = usage.get(key)
-                    if isinstance(tokens, (int, float)):
-                        return int(tokens)
     return None
 
 
@@ -495,15 +476,12 @@ def _apply_effort_shaping(
     low_lengths: list[int] = []
     high_lengths: list[int] = []
 
-    if (
-        effort_config is None
-        or effort_config.low_weight <= 0
-        or not effort_config.low_string
-    ):
+    if not effort_shaping_enabled(effort_config):
         return _EffortShapingMetrics(
             length_rewards_low, rewards_low, low_lengths, high_lengths
         )
 
+    assert effort_config is not None
     lengths = [_terminal_completion_length(r) for r in results]
     orig_rewards = [r["full_result"]["reward"] for r in results]
     for i, result in enumerate(results):
@@ -513,25 +491,9 @@ def _apply_effort_shaping(
         length = lengths[i]
         if length is None:
             continue
-        prompt = next(
-            (
-                msg["content"]
-                for msg in reversed(
-                    nemo_gym_rows[i]["responses_create_params"]["input"]
-                )
-                if msg.get("role") == "user" and "content" in msg
-            ),
-            "",
-        )
-        if effort_config.low_string in prompt:
-            length_reward = min(
-                1.0,
-                effort_config.low_weight * (1.0 - length / effort_config.low_ub),
-            )
-            new_reward = (
-                orig_rewards[i]
-                + orig_rewards[i] * max(length_reward, 0.0)
-                + effort_config.low_penalty * min(length_reward, 0.0)
+        if is_low_effort(nemo_gym_rows[i], effort_config):
+            new_reward, length_reward = shape_effort_reward(
+                orig_rewards[i], length=length, config=effort_config
             )
             result["full_result"]["reward"] = new_reward
             length_rewards_low.append(length_reward)
@@ -2191,25 +2153,7 @@ def apply_reward_penalties(
     ):
         for result in results:
             output_items = result["full_result"].get("response", {}).get("output", [])
-            is_duplicated = False
-            for item1, item2 in zip(output_items, output_items[1:]):
-                if item1.get("type") != "reasoning":
-                    continue
-                summary = item1.get("summary", [])
-                if not summary or "text" not in summary[0]:
-                    continue
-                reasoning_text = summary[0]["text"].strip()
-                content = item2.get("content", "")
-                if isinstance(content, list) and content and "text" in content[0]:
-                    chat_text = content[0]["text"].strip()
-                elif isinstance(content, str):
-                    chat_text = content.strip()
-                else:
-                    continue
-                if reasoning_text and chat_text and reasoning_text == chat_text:
-                    is_duplicated = True
-                    break
-            if is_duplicated:
+            if has_duplicated_reasoning(output_items):
                 result["full_result"]["reward"] = 0.0
 
                 counts["duplicated_reasoning"] += 1
@@ -2220,23 +2164,7 @@ def apply_reward_penalties(
     ):
         for result in results:
             output_items = result["full_result"].get("response", {}).get("output", [])
-            # Skip if the last output item is a function_call — it is legit for model to
-            # produce reasoning and then a function_call as the last output item in PivotRL
-            if output_items and output_items[-1].get("type") == "function_call":
-                continue
-            final_answer_text = None
-            for item in reversed(output_items):
-                # Skip items without content (function_call, function_call_output, etc.)
-                if "content" not in item:
-                    continue
-                content = item["content"]
-                if isinstance(content, list) and content and "text" in content[0]:
-                    final_answer_text = content[0]["text"].strip()
-                    break
-                elif isinstance(content, str):
-                    final_answer_text = content.strip()
-                    break
-            if final_answer_text is None or final_answer_text == "":
+            if has_empty_final_answer(output_items):
                 result["full_result"]["reward"] = 0.0
 
                 counts["empty_final_answer"] += 1
@@ -2249,15 +2177,14 @@ def apply_reward_penalties(
             reward_penalty_config, "unwanted"
         )
         for result in results:
-            has_unwanted_token = False
-            for msg in result["message_log"]:
-                if msg["role"] != "assistant":
-                    continue
-                # Penalize any configured unwanted token in the assistant generation,
-                # including the terminal position.
-                if any(token_id in msg["token_ids"] for token_id in unwanted_token_ids):
-                    has_unwanted_token = True
-                    break
+            has_unwanted_token = has_unwanted_tokens(
+                (
+                    msg["token_ids"]
+                    for msg in result["message_log"]
+                    if msg["role"] == "assistant"
+                ),
+                unwanted_token_ids,
+            )
             if has_unwanted_token:
                 result["full_result"]["reward"] = 0.0
 

@@ -1343,15 +1343,12 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "async_rl.max_buffered_rollouts; excess finalizer actors cannot be busy",
             stacklevel=2,
         )
-    if token_capture_config.enabled and reward_penalties_enabled:
-        warnings.warn(
-            "reward_penalties are enabled but token-capture receipt rollouts "
-            "carry no generated tokens/text at rollout time, so the penalty "
-            "checks are skipped and capture-path rewards stay unpenalized "
-            "(penalty-rate metrics will read 0). Disable the reward_penalties "
-            "flags to make this explicit, or run without token capture to "
-            "train with penalized rewards.",
-            stacklevel=2,
+    if (
+        token_capture_config.enabled
+        and master_config.reward_penalties.penalize_malformed_think_tag
+    ):
+        raise ValueError(
+            "token_capture.enabled does not support reward_penalties.penalize_malformed_think_tag"
         )
     if (
         token_capture_config.enabled

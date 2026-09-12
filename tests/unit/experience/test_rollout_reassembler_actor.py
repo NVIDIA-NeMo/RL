@@ -100,6 +100,7 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         prompt_idx=17,
         loss_multiplier=0.25,
         canonical_sample_ids=["group_g0"],
+        reward_checks=None,
     )
 
 
@@ -134,6 +135,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "prompt_idx",
         "mask_sample",
         "loss_multiplier",
+        "reward_checks",
     }
     assert {f.name for f in fields(FinalizedGroup)} == {
         "meta",
@@ -153,3 +155,18 @@ def test_every_forbidden_key_is_rejected(key) -> None:
     """Removing an entry from the denylist should fail loudly."""
     with pytest.raises(TypeError, match="forbidden heavy field"):
         assert_metadata_only({key: [1, 2, 3]})
+
+
+def test_reward_checks_remain_metadata_only_and_reach_finalizer():
+    from nemo_rl.experience.reward_penalties import RewardChecks
+
+    checks = RewardChecks(True, True, True)
+    request = replace(_request(), reward_checks=(checks,))
+    assert_metadata_only(request)
+    actor = object.__new__(RolloutReassemblerActor.__ray_metadata__.modified_class)
+    actor._finalizer = MagicMock()
+    actor._finalizer.finalize_group.return_value = FinalizedGroup(
+        None, 4, 4, [], dropped=True
+    )
+    actor.finalize(request)
+    assert actor._finalizer.finalize_group.call_args.kwargs["reward_checks"] == [checks]

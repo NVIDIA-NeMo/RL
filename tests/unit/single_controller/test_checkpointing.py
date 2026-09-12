@@ -1296,7 +1296,10 @@ class TestPeriodicRolloutCheckpoint:
             SetupTimingMetrics(),
         )
 
-    def test_pre_step_snapshot_contains_only_rollout_state(self, tmp_path: Path):
+    @pytest.mark.parametrize("changed_setting", [None, "penalty", "effort"])
+    def test_pre_step_snapshot_contains_only_rollout_state(
+        self, tmp_path: Path, changed_setting
+    ):
         actor = self._actor(tmp_path)
         try:
             actor._sampler.restore_dispatch_index(5)
@@ -1321,6 +1324,27 @@ class TestPeriodicRolloutCheckpoint:
         assert (snapshot / REPLAY_BUFFER_METADATA_FILENAME).is_file()
         assert (snapshot / ROLLOUT_RECOVERY_STATE_FILENAME).is_file()
         assert not (snapshot / "policy").exists()
+        state = torch.load(
+            snapshot / ROLLOUT_RECOVERY_STATE_FILENAME, weights_only=True
+        )
+        assert state["reward_settings"] == actor._capture_reward_settings()
+        actor._last_checkpoint_path = str(snapshot)
+        actor._data_plane_checkpoint_metadata = actor._dp_client.save_calls[-1][
+            "metadata"
+        ]
+        if changed_setting == "penalty":
+            actor._master_config.reward_penalties.penalize_empty_final_answer = True
+        elif changed_setting == "effort":
+            actor._master_config.env["nemo_gym"] = {
+                "effort_levels": {"low_weight": 1, "low_string": "budget"}
+            }
+        if changed_setting:
+            with pytest.raises(ValueError, match="reward settings differ"):
+                asyncio.run(
+                    actor._maybe_restore_rollout_recovery(restored_replay_groups=0)
+                )
+        else:
+            asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=0))
 
     def test_snapshot_reindexes_rows_owned_by_active_streamed_step(
         self, tmp_path: Path
@@ -1941,6 +1965,7 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._consumed_samples = 0
     actor._total_valid_tokens = 0
     actor._replacement_reserve = []
+    actor._finalizer_metrics_by_group = {}
     actor._async_cfg = SimpleNamespace(
         sampler=SimpleNamespace(name="in_order"),
         max_buffered_rollouts=4,

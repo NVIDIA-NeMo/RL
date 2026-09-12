@@ -51,6 +51,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 )
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
+    RewardPenaltyConfig,
     _get_effort_config,
     _get_grpo_save_state,
 )
@@ -1804,6 +1805,10 @@ def setup_single_controller(
                 router_replay_enabled=router_replay_enabled(policy_config),
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
+                effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
+                reward_penalty_config=RewardPenaltyConfig.model_validate(
+                    resolved_reward_penalty_config
+                ),
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )

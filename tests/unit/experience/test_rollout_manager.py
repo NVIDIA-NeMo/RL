@@ -2057,3 +2057,57 @@ class TestGenerateForFinalizationFlow:
         assert (
             restored._impl.seen_recovery_granularity is RecoveryGranularity.PROMPT_GROUP
         )
+
+
+def test_capture_completion_preserves_checks_and_raw_reward_until_finalization():
+    from nemo_rl.experience.reward_penalties import RewardChecks
+
+    impl = _nemo_gym_impl(
+        True, {"penalize_empty_final_answer": True}, log_full_result_tables=True
+    )
+    checks = RewardChecks(False, True, True)
+    result = {
+        "rollout_id": "r",
+        "receipt": {"rollout_id": "r", "manifest": []},
+        "reward_checks": checks,
+        "message_log": [],
+        "input_message_log": [],
+        "full_result": {"reward": -2.0, "response": {"output": []}},
+    }
+    completions, counts = impl._results_to_completions([result])
+    assert completions[0].reward == -2.0
+    assert completions[0].env_extras["ng_reward_checks"] == checks
+    assert sum(counts.values()) == 0
+    assert impl._compute_reward_penalty_metrics(counts, 0) == {}
+    metrics = impl._compute_rollout_metrics(completions, "agent")
+    assert not any(k.startswith(("total_reward/", "agent/reward/")) for k in metrics)
+
+
+@pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+def test_capture_manager_seals_checks_and_forwards_them_to_reassembly(
+    monkeypatch, granularity
+):
+    from nemo_rl.experience.reward_penalties import RewardChecks
+
+    checks = RewardChecks(True, True, True)
+    original = _receipt_record
+
+    def with_checks(*args, **kwargs):
+        record = original(*args, **kwargs)
+        for completion in record.completions:
+            completion.env_extras["ng_reward_checks"] = checks
+        return record
+
+    monkeypatch.setattr(f"{__name__}._receipt_record", with_checks)
+    mgr = _make_capture_manager(
+        _FakeCaptureBuffer(),
+        recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
+    )
+    request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+    assert request.rewards == (0.5, 0.5)
+    assert request.reward_checks == (checks, checks)
+    restored = RolloutRecoveryLedger.from_state_dict(mgr.recovery_ledger.state_dict())
+    assert (
+        tuple(restored.finalization_inputs(request.group_id)[5])
+        == request.reward_checks
+    )

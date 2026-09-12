@@ -130,15 +130,18 @@ from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lo
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
+from nemo_rl.experience.reward_penalties import aggregate_capture_reward_metrics
 from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
+    SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS,
     PromptGroupPhase,
     RolloutRecoveryState,
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
 )
+from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.experience.route_plan import decode_route_plan
 from nemo_rl.models.generation.fleet_health import ShardState
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
@@ -754,12 +757,13 @@ class SingleControllerActor:
         expected_schema_version = metadata.get("rollout_recovery_schema_version")
         if (
             isinstance(expected_schema_version, bool)
-            or expected_schema_version != ROLLOUT_RECOVERY_SCHEMA_VERSION
+            or not isinstance(expected_schema_version, int)
+            or expected_schema_version not in SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
         ):
             raise ValueError(
                 "native TQ checkpoint rollout recovery schema mismatch: "
                 f"checkpoint={expected_schema_version!r}, "
-                f"expected={ROLLOUT_RECOVERY_SCHEMA_VERSION}"
+                f"supported={sorted(SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS)}"
             )
         expected_group_count = metadata.get("rollout_recovery_group_count")
         if (
@@ -791,6 +795,15 @@ class SingleControllerActor:
             weights_only=True,
         )
         parsed_state = parse_rollout_recovery_state(state)
+        if (
+            self._master_config.token_capture.enabled
+            and state.get("reward_settings") != self._capture_reward_settings()
+        ):
+            raise ValueError("capture reward settings differ from the checkpoint")
+        if parsed_state.ledger_state["schema_version"] != expected_schema_version:
+            raise ValueError(
+                "rollout recovery sidecar schema does not match native TQ metadata"
+            )
         if len(parsed_state.ledger_state["groups"]) != expected_group_count:
             raise ValueError(
                 "rollout recovery sidecar group count does not match native "
@@ -809,6 +822,11 @@ class SingleControllerActor:
                 group["group_id"] for group in canonical_state["groups"]
             }
             recovery_ledger.discard_canonical_groups(cut, canonical_group_ids)
+            self._finalizer_metrics_by_group = {
+                group_id: metrics
+                for group_id, metrics in parsed_state.finalizer_metrics_by_group.items()
+                if group_id in canonical_group_ids
+            }
             if self._master_config.token_capture.enabled:
                 await self._validate_rollout_recovery_inventory(
                     cut,
@@ -1457,6 +1475,9 @@ class SingleControllerActor:
                     # Canonical TQ rows plus replay metadata now own the completed
                     # group; keep only unfinished work in the lineage sidecar.
                     ledger.discard_group(cut, request.group_id)
+                    self._finalizer_metrics_by_group[request.group_id] = dict(
+                        finalized.metrics
+                    )
                     committed = True
         finally:
             self._active_finalizers -= 1
@@ -2280,6 +2301,7 @@ class SingleControllerActor:
             consumed_training_claim_ids: list[str] = []
             consumed_group_count = 0
             step_finalizer_metrics: dict[str, list[float]] = {}
+            step_finalizer_group_ids: set[str] = set()
 
             with self._timer.time("total_step_time"):
                 # Re-read on every iteration rather than once: a prompt stamped for this
@@ -2395,7 +2417,10 @@ class SingleControllerActor:
                         consumed_training_claim_ids.extend(selected_training_claim_ids)
                         consumed_group_count += num_groups
                         for group_id in selected_group_ids:
-                            for name, value in self._finalizer_metrics_by_group.pop(
+                            if group_id in step_finalizer_group_ids:
+                                continue
+                            step_finalizer_group_ids.add(group_id)
+                            for name, value in self._finalizer_metrics_by_group.get(
                                 group_id, {}
                             ).items():
                                 step_finalizer_metrics.setdefault(name, []).append(
@@ -2633,6 +2658,8 @@ class SingleControllerActor:
                 async with self._data_plane_checkpoint_barrier.mutation() as cut:
                     await self._cleanup_consumed_metas_unlocked(cut, consumed_metas)
                     self._buffer.release_training_claims(consumed_training_claim_ids)
+                    for group_id in step_finalizer_group_ids:
+                        self._finalizer_metrics_by_group.pop(group_id, None)
                 for _ in range(consumed_group_count):
                     self._buffer_capacity.release()
                 step_metrics.update(
@@ -2640,6 +2667,13 @@ class SingleControllerActor:
                         name: statistics.fmean(values)
                         for name, values in step_finalizer_metrics.items()
                         if values
+                        and not name.startswith(
+                            (
+                                "finalize/reward_",
+                                "finalize/penalty_count/",
+                                "finalize/effort/",
+                            )
+                        )
                     }
                 )
                 step_metrics.update(
@@ -2653,6 +2687,9 @@ class SingleControllerActor:
                         )
                 step_metrics.update(
                     aggregate_rollout_metrics(per_group_rollout_metrics)
+                )
+                step_metrics.update(
+                    aggregate_capture_reward_metrics(step_finalizer_metrics)
                 )
                 try:
                     step_metrics.update(
@@ -3427,6 +3464,19 @@ class SingleControllerActor:
         )
         return len(stale_tasks)
 
+    def _capture_reward_settings(self) -> dict[str, Any] | None:
+        """Save run-scoped settings once, alongside raw captured rewards."""
+        if not self._master_config.token_capture.enabled:
+            return None
+        gym = self._master_config.env.get("nemo_gym")
+        effort = gym.get("effort_levels") if gym is not None else None
+        return {
+            "penalties": self._master_config.reward_penalties.model_dump(),
+            "effort": EffortLevelsConfig.model_validate(effort).model_dump()
+            if effort is not None
+            else None,
+        }
+
     async def _capture_rollout_checkpoint_cut(
         self,
         cut: DataPlaneMutationCut,
@@ -3449,11 +3499,17 @@ class SingleControllerActor:
         await self._validate_replay_inventory(replay_metadata)
 
         recovery_state = self._rollout_manager.recovery_ledger.state_dict()
+        recovery_state["reward_settings"] = self._capture_reward_settings()
         recovery_state["batch_shortfall"] = self._batch_shortfall.copy()
         recovery_state["sampler_stamps_target_steps"] = (
             self._sampler_stamps_target_steps
         )
         canonical_group_ids = {group["group_id"] for group in replay_metadata["groups"]}
+        recovery_state["finalizer_metrics_by_group"] = {
+            group_id: dict(metrics)
+            for group_id, metrics in self._finalizer_metrics_by_group.items()
+            if group_id in canonical_group_ids
+        }
         recovery_state["groups"] = [
             group
             for group in recovery_state["groups"]
@@ -3796,6 +3852,10 @@ class SingleControllerActor:
                         self._rollout_manager.recovery_ledger,
                         batch_shortfall=self._batch_shortfall,
                         sampler_stamps_target_steps=(self._sampler_stamps_target_steps),
+                        finalizer_metrics_by_group=self._finalizer_metrics_by_group,
+                    )
+                    rollout_recovery_state["reward_settings"] = (
+                        self._capture_reward_settings()
                     )
                     if replay_metadata is not None:
                         canonical_group_ids = {

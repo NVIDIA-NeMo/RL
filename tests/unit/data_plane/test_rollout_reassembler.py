@@ -824,3 +824,308 @@ def test_deferred_chain_hash_corruption_rejects_the_row(
     )
     assert not row.valid
     assert (row.rejection_reason or "").startswith("rebuild_failed:chain_hash_mismatch")
+
+
+@pytest.mark.parametrize(
+    "unwanted,expected_reward",
+    [(10, -2.0), (20, -2.0), (12, 0.0), (13, 0.0), (21, 0.0), (22, 0.0), (99, -2.0)],
+)
+def test_penalties_use_only_verified_selected_generations(
+    tq_client, partitions, unwanted, expected_reward
+):
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
+    from tests.unit.data_plane.token_capture_test_fixtures import _manifest, _record
+
+    records, receipt, expected = build_fixture_artifacts(
+        "worked_example", rollout_id="r"
+    )
+    # A committed but abandoned root is verified and cleaned; it is not scored.
+    dead = _record(
+        rollout_id="r",
+        model_call_id="dead",
+        parent_call_id=None,
+        prev_len=0,
+        token_ids=[30, 99],
+        token_mask=[0.0, 1.0],
+        logprobs=[0.0, -0.5],
+        weight_version=4,
+    )
+    records.append(dead)
+    receipt = receipt.model_copy(
+        update={"manifest": [*receipt.manifest, _manifest(dead)]}
+    )
+    sink = TQTokenSink(tq_client, staging_partition=STAGING_PARTITION)
+    for record in records:
+        assert sink.stage(record).ok
+    finalizer = _finalizer(
+        tq_client,
+        reward_penalty_config=RewardPenaltyConfig(
+            penalize_unwanted_tokens=True, token_ids={"unwanted": [unwanted]}
+        ),
+    )
+    for _ in range(2):
+        row = finalizer.finalize_rollout("r", receipt.model_dump(), reward=-2.0)
+        assert row.valid, row.rejection_reason
+        assert row.reward == expected_reward
+        assert row.token_ids == expected.token_ids
+        assert row.logprobs == expected.logprobs
+        assert row.token_mask == expected.token_mask
+        assert row.penalty_counts["unwanted_token"] == int(expected_reward == 0.0)
+
+
+def test_penalized_rewards_reach_grpo_advantages_without_token_changes(
+    tq_client, partitions
+):
+    from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
+    from nemo_rl.experience.reward_penalties import (
+        aggregate_capture_reward_metrics,
+        compute_reward_checks,
+    )
+    from nemo_rl.experience.rollouts import EffortLevelsConfig
+
+    effort = EffortLevelsConfig(
+        low_weight=1, low_penalty=1, low_ub=4, low_string="budget"
+    )
+    config = RewardPenaltyConfig(
+        penalize_duplicated_reasoning=True, penalize_empty_final_answer=True
+    )
+    ids = ["penalty_g0", "penalty_g1", "penalty_g2"]
+    receipts, expected = [], []
+    for rid in ids[:2]:
+        receipt, row = _stage_fixture(tq_client, "worked_example", rollout_id=rid)
+        receipts.append(receipt)
+        expected.append(row)
+    prompt = {
+        "responses_create_params": {"input": [{"role": "user", "content": "budget"}]}
+    }
+    checks = [
+        compute_reward_checks({"response": {"output": output}}, prompt, effort)
+        for output in ([], [{"content": "ok"}], [])
+    ]
+    finalizer = _finalizer(
+        tq_client, reward_penalty_config=config, effort_config=effort
+    )
+    finalized = finalizer.finalize_group(
+        "penalty",
+        ids,
+        [*receipts, None],
+        [-2.0, 2.0, 9.0],
+        mask_sample=[False] * 3,
+        fallback_weight_version=4,
+        prompt_idx=7,
+        reward_checks=checks,
+    )
+    assert finalized.valid_row_count == 2
+    rows = _fetch_rows(tq_client, ids)
+    rewards = torch.as_tensor(rows["total_reward"]).flatten()
+    assert rewards[:2].tolist() == [0.0, 3.0]
+    for i in range(2):
+        assert torch.as_tensor(rows["input_ids"][i]).tolist() == expected[i].token_ids
+        assert (
+            torch.as_tensor(rows["generation_logprobs"][i]).tolist()
+            == expected[i].logprobs
+        )
+        assert torch.as_tensor(rows["token_mask"][i]).tolist() == expected[i].token_mask
+    estimator = object.__new__(GRPOAdvantageEstimator)
+    estimator.use_leave_one_out_baseline = False
+    estimator.normalize_rewards = False
+    advantages = estimator.compute_advantage(
+        torch.stack(
+            [torch.as_tensor(prompt).flatten() for prompt in rows["prompt_ids_for_adv"]]
+        ),
+        rewards,
+        torch.ones(3, 7),
+        valid_mask=torch.tensor([1, 1, 0]),
+    )
+    assert advantages[:2, 0].tolist() == [-1.5, 1.5]
+    metrics = aggregate_capture_reward_metrics(
+        {k: [v] for k, v in finalized.metrics.items()}
+    )
+    assert metrics["empty_final_answer_rate"] == 0.5
+    assert metrics["total_reward/mean"] == 1.5
+    assert metrics["mean_reward_low"] == 0.0  # -3 and +3, before zeroing.
+    assert metrics["mean_length_low"] == 2
+    assert metrics["median_length_low"] == 2
+
+
+@pytest.mark.parametrize("shaping", [False, True])
+def test_missing_reward_checks_reject_before_publication(
+    tq_client, partitions, shaping
+):
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
+    from nemo_rl.experience.rollouts import EffortLevelsConfig
+
+    receipt, _ = _stage_fixture(tq_client, "single_call", rollout_id="r")
+    row = _finalizer(
+        tq_client,
+        reward_penalty_config=None
+        if shaping
+        else RewardPenaltyConfig(penalize_empty_final_answer=True),
+        effort_config=EffortLevelsConfig(low_weight=1, low_string="budget")
+        if shaping
+        else None,
+    ).finalize_rollout("r", receipt, reward=1.0)
+    assert not row.valid
+    assert row.rejection_reason == "reward_processing:missing_reward_checks"
+
+
+@pytest.mark.parametrize("flags", range(8))
+@pytest.mark.parametrize("incoming_reward", [-2.0, 0.0, 2.0])
+@pytest.mark.parametrize("effort_mode", ["disabled", "low", "high"])
+def test_staged_penalties_match_non_capture_all_flags(
+    tq_client, partitions, flags, incoming_reward, effort_mode
+):
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
+    from nemo_rl.experience.reward_penalties import (
+        compute_reward_checks,
+    )
+    from nemo_rl.experience.rollouts import (
+        EffortLevelsConfig,
+        _apply_effort_shaping,
+        apply_reward_penalties,
+        resolve_reward_penalty_config,
+    )
+
+    effort = (
+        None
+        if effort_mode == "disabled"
+        else EffortLevelsConfig(
+            low_weight=1, low_penalty=1, low_ub=1, low_string="budget"
+        )
+    )
+    prompt = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": "budget" if effort_mode == "low" else "explain",
+                }
+            ]
+        }
+    }
+    output = [
+        {"type": "reasoning", "summary": [{"text": " same "}]},
+        {"content": "same"},
+        {"content": "  "},
+    ]
+    resolved = resolve_reward_penalty_config(
+        {
+            "penalize_duplicated_reasoning": bool(flags & 1),
+            "penalize_empty_final_answer": bool(flags & 2),
+            "penalize_unwanted_tokens": bool(flags & 4),
+            "token_ids": {"unwanted": [22]},
+        },
+        None,
+    )
+    config = RewardPenaltyConfig.model_validate(resolved)
+    receipt, expected = _stage_fixture(tq_client, "worked_example", rollout_id="parity")
+    inline = {
+        "full_result": {"reward": incoming_reward, "response": {"output": output}},
+        "message_log": [
+            {"role": "user", "token_ids": [10, 11]},
+            {"role": "assistant", "token_ids": [12, 13]},
+            {"role": "user", "token_ids": [20]},
+            {"role": "assistant", "token_ids": [21, 22]},
+        ],
+    }
+    _apply_effort_shaping([inline], [prompt], effort)
+    counts = apply_reward_penalties([inline], resolved)
+    checks = compute_reward_checks(inline["full_result"], prompt, effort)
+    actual = _finalizer(
+        tq_client, reward_penalty_config=config, effort_config=effort
+    ).finalize_rollout(
+        "parity",
+        receipt,
+        reward=incoming_reward,
+        reward_checks=checks,
+    )
+    assert actual.valid, actual.rejection_reason
+    assert actual.reward == inline["full_result"]["reward"]
+    assert actual.penalty_counts == {key: counts[key] for key in actual.penalty_counts}
+    assert actual.token_ids == expected.token_ids
+    assert actual.logprobs == expected.logprobs
+
+
+@pytest.mark.parametrize("generations", [(100,), (900, 100), (100, 900), (900, 1200)])
+@pytest.mark.parametrize("raw_reward", [-1.0, 0.0, 1.0])
+def test_effort_uses_terminal_call_with_carries_and_abandoned_branch(
+    tq_client, partitions, generations, raw_reward
+):
+    from nemo_gym.token_id_capture.staging.records import RolloutReceipt
+
+    from nemo_rl.experience.reward_penalties import compute_reward_checks
+    from nemo_rl.experience.rollouts import EffortLevelsConfig, _apply_effort_shaping
+    from tests.unit.data_plane.token_capture_test_fixtures import _manifest, _record
+
+    records, full_tokens, messages, masks, logprobs = [], [], [], [], []
+    for index, length in enumerate(generations):
+        carry = [20] * (4 if index == 0 else 7)
+        generated = [30] * (length - 1) + [31]  # Include the terminal token.
+        parent = records[-1] if records else None
+        record = _record(
+            rollout_id="effort",
+            model_call_id=f"c{index}",
+            parent_call_id=parent.model_call_id if parent else None,
+            prev_len=len(full_tokens),
+            token_ids=carry + generated,
+            token_mask=[0.0] * len(carry) + [1.0] * length,
+            logprobs=[0.0] * len(carry) + [-0.1] * length,
+            weight_version=4,
+            parent_chain_hash=parent.chain_hash if parent else None,
+            cumulative_prefix=full_tokens,
+        )
+        records.append(record)
+        full_tokens += carry + generated
+        masks += record.token_mask_delta
+        logprobs += record.generation_log_probs_delta
+        messages += [
+            {"role": "user", "token_ids": carry},
+            {"role": "assistant", "token_ids": generated},
+        ]
+    records.append(
+        _record(
+            rollout_id="effort",
+            model_call_id="dead",
+            parent_call_id=None,
+            prev_len=0,
+            token_ids=[40] + [50] * 5000,
+            token_mask=[0.0] + [1.0] * 5000,
+            logprobs=[0.0] + [-0.1] * 5000,
+            weight_version=4,
+        )
+    )
+    receipt = RolloutReceipt(
+        rollout_id="effort",
+        reward=raw_reward,
+        terminal_model_call_id=f"c{len(generations) - 1}",
+        manifest=[_manifest(record) for record in records],
+        terminal_selection="declared",
+    )
+    sink = TQTokenSink(tq_client, staging_partition=STAGING_PARTITION)
+    for record in records:
+        assert sink.stage(record).ok
+    config = EffortLevelsConfig(
+        low_weight=1, low_penalty=1, low_ub=1000, low_string="budget"
+    )
+    prompt = {
+        "responses_create_params": {"input": [{"role": "user", "content": "budget"}]}
+    }
+    inline = {"message_log": messages, "full_result": {"reward": raw_reward}}
+    shaping = _apply_effort_shaping([inline], [prompt], config)
+    finalizer = _finalizer(tq_client, effort_config=config)
+    checks = compute_reward_checks(inline["full_result"], prompt, config)
+    for _ in range(2):
+        actual = finalizer.finalize_rollout(
+            "effort", receipt.model_dump(), reward=raw_reward, reward_checks=checks
+        )
+        assert actual.valid, actual.rejection_reason
+        assert actual.reward == inline["full_result"]["reward"]
+        assert actual.reward_metrics == {
+            f"finalize/effort/low/{generations[-1]}": 1.0,
+            "finalize/effort/length_reward_sum": shaping.length_rewards_low[0],
+            "finalize/effort/reward_sum": shaping.rewards_low[0],
+        }
+        assert actual.token_ids == full_tokens
+        assert actual.token_mask == masks
+        assert actual.logprobs == logprobs

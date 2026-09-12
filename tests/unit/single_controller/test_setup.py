@@ -634,6 +634,16 @@ class TestSetup:
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
 
+    def test_capture_rejects_malformed_thinking_reward_penalty(self, patched_factories):
+        mc = _make_master_config()
+        mc.env["should_use_nemo_gym"] = True
+        mc.token_capture.enabled = True
+        mc.reward_penalties = RewardPenaltyConfig(penalize_malformed_think_tag=True)
+        with pytest.raises(
+            ValueError, match="does not support.*penalize_malformed_think_tag"
+        ):
+            validate_single_controller_config(mc)
+
     def test_resolves_and_passes_reward_penalties(self, patched_factories):
         mc = _make_master_config()
         tokenizer = MagicMock(pad_token_id=0)
@@ -1583,7 +1593,10 @@ class TestSetup:
         ]
         assert WIRE_MULTIMODAL_FIELDS <= set(warmup_fields)
 
-    def test_token_capture_always_creates_finalizer_actor_pool(self, patched_factories):
+    @pytest.mark.parametrize("shaping_enabled", [False, True])
+    def test_token_capture_always_creates_finalizer_actor_pool(
+        self, patched_factories, shaping_enabled
+    ):
         mc = _make_master_config(backend="vllm")
         mc.policy["generation"].update(
             {
@@ -1597,7 +1610,26 @@ class TestSetup:
         # Extend, don't replace: setup_single_controller also indexes the
         # wandb keys that _make_master_config populates.
         mc.logger = {**mc.logger, "log_dir": "/tmp/test-token-capture"}
+        mc.reward_penalties = RewardPenaltyConfig(
+            penalize_duplicated_reasoning=True,
+            penalize_empty_final_answer=True,
+            penalize_unwanted_tokens=True,
+            token_ids={"unwanted": [99]},
+        )
         mc.token_capture.enabled = True
+        effort = (
+            EffortLevelsConfig(
+                low_weight=1, low_penalty=2, low_ub=500, low_string="budget"
+            )
+            if shaping_enabled
+            else None
+        )
+        mc.env = {
+            "should_use_nemo_gym": True,
+            "nemo_gym": {
+                "effort_levels": effort.model_dump() if effort is not None else None
+            },
+        }
         mc.token_capture.num_reassembler_workers = 3
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
@@ -1627,6 +1659,8 @@ class TestSetup:
         assert actor_config.partition_id == "rollout_data"
         assert actor_config.staging_partition == mc.token_capture.staging_partition
         assert actor_config.pad_token_id == 9
+        assert actor_config.reward_penalty_config == mc.reward_penalties
+        assert actor_config.effort_config == effort
         assert actor_kwargs == {"num_workers": 3}
         assert actor_args.finalizer_actors == fake_actors
         assert not hasattr(actor_args.rollout_manager, "_finalizer")

@@ -87,6 +87,59 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 
 6. **(PPO) Set `ppo:` instead of `grpo:`** — the two algorithm blocks are mutually exclusive, and SC reads every step setting from whichever one is present. A PPO run also needs `value:`, `value_loss_fn:` and `ppo.adv_estimator.name: gae` (same schemas as legacy PPO), a Megatron critic, and `policy.offload_optimizer_for_logprob: true`, which is what keeps the policy optimizer off the GPU while the critic runs. `ppo.policy_training_start_step: N` gives the usual critic warmup: for the first N steps the policy is neither trained nor refit, while the critic trains every step. `ppo.warm_start_value_checkpoint` seeds that critic from another run's checkpoint instead, so a fresh run can skip the online warmup entirely — see [Warm-Starting the Critic](./ppo.md#warm-starting-the-critic).
 
+## Reward penalties and effort shaping with token capture
+
+With NeMo-Gym and `token_capture.enabled: true`, the following existing settings
+work the same way as in non-capture rollouts:
+
+```yaml
+reward_penalties:
+  penalize_duplicated_reasoning: true
+  penalize_empty_final_answer: true
+  penalize_unwanted_tokens: true
+  token_ids:
+    unwanted: [12345]  # Replace with IDs from your model's tokenizer.
+env:
+  nemo_gym:
+    effort_levels:
+      low_weight: 1.0
+      low_penalty: 1.0
+      low_ub: 1000
+      low_string: "<budget>"
+```
+
+The manager checks the scored `response.output` and classifies the original
+prompt using the last user message. The finalizer shapes the raw reward using
+**the terminal call's generated length**, then sets it to `0.0` if any enabled
+penalty matches, including when the shaped reward is negative. Unwanted IDs are
+checked across all selected generated spans, including terminal tokens; prompt,
+tool, and abandoned-branch tokens do not count. The final-function-call exception
+for empty answers is preserved. Token IDs, logprobs, and training masks keep their
+existing behavior.
+
+Both paths share the classification, text checks, token membership check, and
+shaping formula. For low-effort prompts:
+
+```text
+term = min(1, low_weight * (1 - terminal_generation_length / low_ub))
+reward = raw_reward + raw_reward * max(term, 0) + low_penalty * min(term, 0)
+```
+
+Setting `low_weight <= 0` or an empty `low_string` disables shaping. Active
+shaping requires `low_ub > 0`. High-effort rewards remain unchanged. A 900-token
+call followed by a 100-token call uses 100 tokens for shaping in both paths.
+
+Recovery saves raw rewards and three Boolean checks per unfinished rollout, and
+reward settings once per checkpoint. Restoring with different reward settings
+fails before replay. Finalized rows retain their saved rewards. Migration of
+older capture checkpoints is outside scope.
+
+Penalty rates and final reward statistics use valid finalized rows. Existing
+low/high effort means and exact length medians are preserved; `mean_reward_low`
+measures the shaped reward before penalties. Pending statistics survive recovery
+and are consumed once. Malformed-thinking penalties and message-level advantage
+overrides remain unsupported with capture and fail at setup.
+
 ## Checkpointing and Replay Recovery
 
 With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint contains:
