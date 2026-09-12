@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
+import sys
 from pathlib import Path
 from types import ModuleType
 
@@ -48,20 +50,51 @@ def _load_heads() -> tuple[type[nn.Module], type[nn.Module]]:
 
 DSparkMarkovHead, DSparkConfidenceHead = _load_heads()
 
+_PUBLIC_DSPARK_MANIFEST = json.loads(
+    (
+        Path(__file__).with_name("fixtures") / "dspark_qwen3_8b_block7_03326e50.json"
+    ).read_text()
+)
 _PUBLIC_DSPARK_ARTIFACT = (
-    "mgoin/Qwen3-8B-speculator.dspark@737765aa0ff9f5dbda65839a6e010f03b66bc506"
+    f"{_PUBLIC_DSPARK_MANIFEST['repository']}@{_PUBLIC_DSPARK_MANIFEST['revision']}"
 )
 _PUBLIC_DSPARK_CONFIG = {
-    "vocab_size": 151936,
-    "draft_vocab_size": 32000,
-    "markov_rank": 256,
+    "vocab_size": _PUBLIC_DSPARK_MANIFEST["config"]["vocab_size"],
+    "draft_vocab_size": _PUBLIC_DSPARK_MANIFEST["config"]["vocab_size"],
+    "markov_rank": _PUBLIC_DSPARK_MANIFEST["config"]["markov_rank"],
 }
 _PUBLIC_DSPARK_HEAD_SHAPES = {
-    "markov_head.markov_w1.weight": (151936, 256),
-    "markov_head.markov_w2.weight": (32000, 256),
-    "confidence_head.proj.weight": (1, 4352),
-    "confidence_head.proj.bias": (1,),
+    name: tuple(shape)
+    for name, shape in _PUBLIC_DSPARK_MANIFEST["head_tensor_shapes"].items()
 }
+_PUBLIC_DSPARK_BORROWED_SHAPES = {
+    name: tuple(shape)
+    for name, shape in _PUBLIC_DSPARK_MANIFEST["borrowed_tensor_shapes"].items()
+}
+
+
+def _install_tensor_parallel_layers_stub() -> None:
+    layers_module = ModuleType("megatron.core.tensor_parallel.layers")
+
+    def set_tensor_model_parallel_attributes(
+        tensor: Tensor,
+        is_parallel: bool,
+        dimension: int,
+        stride: int,
+    ) -> None:
+        tensor.tensor_model_parallel = is_parallel
+        tensor.partition_dim = dimension
+        tensor.partition_stride = stride
+
+    layers_module.set_tensor_model_parallel_attributes = (
+        set_tensor_model_parallel_attributes
+    )
+    sys.modules["megatron"] = ModuleType("megatron")
+    sys.modules["megatron.core"] = ModuleType("megatron.core")
+    sys.modules["megatron.core.tensor_parallel"] = ModuleType(
+        "megatron.core.tensor_parallel"
+    )
+    sys.modules["megatron.core.tensor_parallel.layers"] = layers_module
 
 
 def _run_tp_markov_gradient(
@@ -82,6 +115,7 @@ def _run_tp_markov_gradient(
     tp_group = dist.new_group(ranks=list(range(world_size)))
     assert isinstance(tp_group, dist.ProcessGroup)
     try:
+        _install_tensor_parallel_layers_stub()
         target_vocab_size = 12
         draft_vocab_size = 8
         markov_rank = 3
@@ -175,6 +209,94 @@ def _run_tp_markov_gradient(
         torch.testing.assert_close(
             head.markov_w1.weight.grad,
             reference_w1.grad,
+            rtol=0,
+            atol=0,
+        )
+    finally:
+        dist.destroy_process_group(tp_group)
+        dist.destroy_process_group()
+
+
+def _run_tp_confidence_markov_gradient(
+    rank: int,
+    world_size: int,
+    init_file: str,
+) -> None:
+    use_cuda = torch.cuda.is_available()
+    if use_cuda:
+        torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank) if use_cuda else torch.device("cpu")
+    dist.init_process_group(
+        backend="nccl" if use_cuda else "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    tp_group = dist.new_group(ranks=list(range(world_size)))
+    assert isinstance(tp_group, dist.ProcessGroup)
+    try:
+        _install_tensor_parallel_layers_stub()
+        target_vocab_size = 12
+        draft_vocab_size = 8
+        markov_rank = 3
+        local_draft_vocab_size = draft_vocab_size // world_size
+        head = DSparkMarkovHead(
+            target_vocab_size=target_vocab_size,
+            draft_vocab_size=draft_vocab_size,
+            markov_rank=markov_rank,
+            draft_vocab_start_index=rank * local_draft_vocab_size,
+            draft_vocab_end_index=(rank + 1) * local_draft_vocab_size,
+            tensor_parallel_group=tp_group,
+            device=device,
+        ).double()
+        confidence_head = DSparkConfidenceHead(
+            hidden_size=2,
+            markov_rank=markov_rank,
+            with_markov=True,
+            device=device,
+        ).double()
+        with torch.no_grad():
+            head.markov_w1.weight.copy_(
+                torch.arange(
+                    target_vocab_size * markov_rank,
+                    dtype=torch.float64,
+                    device=device,
+                ).reshape(target_vocab_size, markov_rank)
+                / 17
+            )
+            # Real TP replication: proj is identical on every rank; the
+            # confidence-path gradient is therefore already complete per rank
+            # and must NOT be summed across the TP group.
+            confidence_head.proj.weight.fill_(1.0)
+            confidence_head.proj.bias.zero_()
+
+        previous_token_ids = torch.tensor([[1, -1, 4]], device=device)
+        slot_valid = torch.tensor([[True, False, True]], device=device)
+        hidden_states = torch.zeros(
+            (*previous_token_ids.shape, 2),
+            dtype=torch.float64,
+            device=device,
+        )
+        markov_embeddings = head.embed_previous_tokens(
+            previous_token_ids=previous_token_ids,
+            slot_valid=slot_valid,
+            reduce_across_tensor_parallel=False,
+        )
+        confidence_logits = confidence_head(
+            hidden_states,
+            markov_embeddings=markov_embeddings,
+            slot_valid=slot_valid,
+        )
+        confidence_logits.sum().backward()
+
+        assert confidence_logits[0, 1].item() == 0.0
+        assert head.markov_w1.weight.grad is not None
+        expected_gradient = torch.zeros_like(head.markov_w1.weight.grad)
+        expected_gradient[1] = 1.0
+        expected_gradient[4] = 1.0
+        torch.testing.assert_close(
+            head.markov_w1.weight.grad,
+            expected_gradient,
             rtol=0,
             atol=0,
         )
@@ -378,6 +500,18 @@ def test_tp2_markov_head_sums_replicated_w1_gradients(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is required")
+def test_tp2_confidence_path_sanitizes_ids_without_tp_gradient_summing(
+    tmp_path: Path,
+) -> None:
+    mp.spawn(
+        _run_tp_confidence_markov_gradient,
+        args=(2, str(tmp_path / "tp_confidence_init")),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is required")
 def test_tp2_markov_head_megatron_checkpoint_round_trip(tmp_path: Path) -> None:
     pytest.importorskip("megatron.core.dist_checkpointing")
     mp.spawn(
@@ -437,8 +571,14 @@ def test_markov_head_has_explicit_tp_local_vocab_contract() -> None:
         )
 
 
-def test_markov_head_loads_pinned_public_dspark_checkpoint_schema() -> None:
-    assert _PUBLIC_DSPARK_ARTIFACT.startswith("mgoin/Qwen3-8B-speculator.dspark@")
+def test_heads_load_pinned_official_deepseek_dspark_checkpoint_schema() -> None:
+    assert _PUBLIC_DSPARK_ARTIFACT == (
+        "deepseek-ai/dspark_qwen3_8b_block7@03326e5043815da1f81b109078b2889737c26017"
+    )
+    assert _PUBLIC_DSPARK_MANIFEST["config"]["architectures"] == ["Qwen3DSparkModel"]
+    assert "draft_vocab_size" not in _PUBLIC_DSPARK_MANIFEST["config"]
+    assert len(_PUBLIC_DSPARK_MANIFEST["config_sha256"]) == 64
+    assert len(_PUBLIC_DSPARK_MANIFEST["safetensors_header_sha256"]) == 64
     heads = nn.ModuleDict(
         {
             "markov_head": DSparkMarkovHead(
@@ -461,6 +601,10 @@ def test_markov_head_loads_pinned_public_dspark_checkpoint_schema() -> None:
     assert {
         name: tuple(tensor.shape) for name, tensor in state.items()
     } == _PUBLIC_DSPARK_HEAD_SHAPES
+    assert _PUBLIC_DSPARK_BORROWED_SHAPES == {
+        "embed_tokens.weight": (151936, 4096),
+        "lm_head.weight": (151936, 4096),
+    }
     pinned_checkpoint = {
         name: torch.empty(shape, dtype=torch.bfloat16, device="meta")
         for name, shape in _PUBLIC_DSPARK_HEAD_SHAPES.items()
@@ -696,7 +840,11 @@ def test_heads_support_cuda_bfloat16_forward_and_backward() -> None:
         [[True, True, False, True], [True, False, True, True]],
         device=device,
     )
-    markov_embeddings = markov_head.markov_w1(previous_token_ids)
+    markov_embeddings = markov_head.embed_previous_tokens(
+        previous_token_ids=previous_token_ids,
+        slot_valid=slot_valid,
+        reduce_across_tensor_parallel=False,
+    )
 
     corrected_logits = markov_head(
         base_logits,

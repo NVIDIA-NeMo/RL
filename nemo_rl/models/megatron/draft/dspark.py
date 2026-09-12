@@ -12,7 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Small checkpoint-compatible heads used by DSpark block drafting."""
+"""Small checkpoint-compatible heads used by DSpark block drafting.
+
+The parameter names ``markov_w1`` / ``markov_w2`` / ``proj``, and the
+``nn.Linear(markov_rank, draft_vocab)`` orientation that makes ``markov_w2.weight``
+come out ``[draft_vocab, markov_rank]``, are an interop contract with the official
+``deepseek-ai/dspark_qwen3_8b_block7`` checkpoint (revision ``03326e50``). Callers
+must additionally attach these modules under the ``markov_head`` / ``confidence_head``
+attribute names, since those become the checkpoint key prefixes. Renaming any of the
+above silently breaks loading of the official artifact; the pinned schema lives in
+``tests/unit/models/megatron/fixtures/dspark_qwen3_8b_block7_03326e50.json``.
+"""
 
 from __future__ import annotations
 
@@ -127,6 +137,65 @@ class DSparkMarkovHead(nn.Module):
             device=device,
             dtype=dtype,
         )
+        if self.local_draft_vocab_size != draft_vocab_size:
+            # The optimizer identifies TP-sharded params by these attributes, not by
+            # the checkpoint axis map. Without them param_is_not_tensor_parallel_duplicate
+            # treats every tp_rank>0 shard as a duplicate and drops it from the global
+            # grad norm, so clipping silently under-clips this head.
+            from megatron.core.tensor_parallel.layers import (
+                set_tensor_model_parallel_attributes,
+            )
+
+            set_tensor_model_parallel_attributes(self.markov_w2.weight, True, 0, 1)
+
+    def embed_previous_tokens(
+        self,
+        *,
+        previous_token_ids: Tensor,
+        slot_valid: Tensor,
+        reduce_across_tensor_parallel: bool,
+    ) -> Tensor:
+        """Embed previous-token IDs without invalid lookups or replicated TP drift.
+
+        Invalid slots use token ID zero for the lookup; consumers must still apply
+        ``slot_valid`` to their outputs.
+
+        ``reduce_across_tensor_parallel`` must reflect the CONSUMER, not this
+        head: pass True when the embeddings feed a vocabulary-sharded weight
+        (each rank then holds a partial gradient that must be summed into the
+        replicated ``markov_w1``, as ``forward`` does for ``markov_w2``); pass
+        False when the consumer is TP-replicated (e.g. the confidence head's
+        ``proj``) -- every rank already computes the identical, complete
+        gradient there, and summing would over-count it by the TP world size.
+        """
+        if previous_token_ids.shape != slot_valid.shape:
+            raise ValueError("slot_valid must match previous_token_ids")
+        if previous_token_ids.dtype != torch.int64:
+            raise TypeError("previous_token_ids must use torch.int64")
+        if slot_valid.dtype != torch.bool:
+            raise TypeError("slot_valid must be a boolean tensor")
+        if (
+            previous_token_ids.device != slot_valid.device
+            or self.markov_w1.weight.device != previous_token_ids.device
+        ):
+            raise ValueError("DSpark Markov inputs and weights must share a device")
+
+        safe_previous_token_ids = torch.where(
+            slot_valid,
+            previous_token_ids,
+            torch.zeros_like(previous_token_ids),
+        )
+        previous_embeddings = self.markov_w1(safe_previous_token_ids)
+        if (
+            reduce_across_tensor_parallel
+            and self.local_draft_vocab_size != self.draft_vocab_size
+        ):
+            assert self.tensor_parallel_group is not None
+            previous_embeddings = _CopyToTensorParallelRegion.apply(
+                previous_embeddings,
+                self.tensor_parallel_group,
+            )
+        return previous_embeddings
 
     def forward(
         self,
@@ -152,30 +221,17 @@ class DSparkMarkovHead(nn.Module):
             )
         if not base_logits.dtype.is_floating_point:
             raise TypeError("base_logits must use a floating dtype")
-        if previous_token_ids.dtype != torch.int64:
-            raise TypeError("previous_token_ids must use torch.int64")
-        if slot_valid.dtype != torch.bool:
-            raise TypeError("slot_valid must be a boolean tensor")
         if (
-            previous_token_ids.device != base_logits.device
-            or slot_valid.device != base_logits.device
+            self.markov_w2.weight.device != base_logits.device
             or self.markov_w1.weight.device != base_logits.device
-            or self.markov_w2.weight.device != base_logits.device
         ):
             raise ValueError("DSpark Markov inputs and weights must share a device")
 
-        safe_previous_token_ids = torch.where(
-            slot_valid,
-            previous_token_ids,
-            torch.zeros_like(previous_token_ids),
+        previous_embeddings = self.embed_previous_tokens(
+            previous_token_ids=previous_token_ids,
+            slot_valid=slot_valid,
+            reduce_across_tensor_parallel=True,
         )
-        previous_embeddings = self.markov_w1(safe_previous_token_ids)
-        if self.local_draft_vocab_size != self.draft_vocab_size:
-            assert self.tensor_parallel_group is not None
-            previous_embeddings = _CopyToTensorParallelRegion.apply(
-                previous_embeddings,
-                self.tensor_parallel_group,
-            )
         corrected_logits = base_logits + self.markov_w2(previous_embeddings)
         return torch.where(
             slot_valid.unsqueeze(-1),
@@ -193,19 +249,30 @@ class DSparkMarkovHead(nn.Module):
         from megatron.core.transformer.utils import (
             make_sharded_tensors_for_checkpoint,
         )
+        from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
         tensor_parallel_layers_axis_map = (
             {"markov_w2.weight": 0}
             if self.local_draft_vocab_size != self.draft_vocab_size
             else {}
         )
+        # make_sharded_tensors_for_checkpoint only falls back to parallel_state when
+        # *both* groups are None, and get_pg_rank(None) returns 0 rather than the real
+        # rank. Forwarding exactly one of them collapses that axis of replica_id, so
+        # several ranks claim is_main_replica and the save raises CheckpointingException.
+        # See the same failure documented in eagle.py.
+        tp_group = get_tensor_model_parallel_group_if_none(self.tensor_parallel_group)
         dp_cp_group = None if metadata is None else metadata.get("dp_cp_group")
+        if tp_group is not None and dp_cp_group is None:
+            from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
+
+            dp_cp_group = ensure_metadata_has_dp_cp_group(metadata)["dp_cp_group"]
         return make_sharded_tensors_for_checkpoint(
             self.state_dict(prefix="", keep_vars=True),
             prefix,
             tensor_parallel_layers_axis_map,
             sharded_offsets,
-            tp_group=self.tensor_parallel_group,
+            tp_group=tp_group,
             dp_cp_group=dp_cp_group,
         )
 
