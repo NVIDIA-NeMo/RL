@@ -29,7 +29,7 @@ if [[ -z "${WANDB_API_KEY:-}" ]]; then
 fi
 
 container="${CONTAINER:-/scratch/fsw/portfolios/nemotron/projects/nemotron_omni_vision/users/pulkitk/tracking/images/nemo-rl:super35_20260901_prefetched_venvs_arm64.squashfs}"
-config_in_container="examples/configs/recipes/vlm/vlm_grpo_videoqa_super_sav_caprl_derisk.v1.yaml"
+config_in_container="${CONFIG_PATH:-examples/configs/recipes/vlm/vlm_grpo_videoqa_super_sav_caprl_derisk.v1.yaml}"
 model_path="${MODEL_PATH:-/scratch/fsw/portfolios/nemotron/projects/nemotron_omni_vision/users/pulkitk/tracking/weights/full_generalist_prod/iter_9500}"
 data_path="${DATA_PATH:-/lustre/fsw/portfolios/nemotron/users/arushig/nemo_gym_rl_video_0803/nemo_rl/results/combined_sav_caprl_20260822/train_sav_all_tracks_plus_caprl_exclude6215_cluster_paths.jsonl}"
 tokenizer_chat_template="${TOKENIZER_CHAT_TEMPLATE:-default}"

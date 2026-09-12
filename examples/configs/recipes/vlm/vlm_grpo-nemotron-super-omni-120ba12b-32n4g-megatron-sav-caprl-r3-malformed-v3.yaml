@@ -1,0 +1,37 @@
+# Malformed-v3 continuation of the validated combined SA-V + CapRL recipe.
+#
+# This intentionally keeps the existing legacy/text-team leave-one-out
+# estimator, data handling, Gym verifier, reward functions, and optimizer
+# topology. It changes only the controlled v3 experiment settings documented
+# in .codex/malformed_v3_video_rl_handoff_20260912.md.
+defaults: ./vlm_grpo_videoqa_super_sav_caprl_derisk.v1.yaml
+
+grpo:
+  max_num_steps: 60
+  malformed_thinking_advantage: -5.0
+  length_penalty:
+    default:
+      enabled: false
+    profile_band:
+      enabled: false
+
+reward_penalties:
+  penalize_malformed_think_tag: true
+
+checkpointing:
+  save_period: 5
+  keep_top_k: null
+  save_optimizer: true
+
+policy:
+  megatron_cfg:
+    optimizer:
+      lr: 3.0e-6
+      min_lr: 5.0e-7
+    scheduler:
+      lr_decay_style: cosine
+      lr_decay_iters: 60
+      lr_warmup_iters: 10
+      lr_warmup_init: 3.0e-8
+  generation:
+    max_new_tokens: 16384
