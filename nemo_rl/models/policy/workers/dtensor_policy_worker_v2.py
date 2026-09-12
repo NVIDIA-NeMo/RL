@@ -435,6 +435,7 @@ class DTensorPolicyWorkerV2Impl(
             dp_size=self.dp_size,
             enable_seq_packing=self.enable_seq_packing,
             sampling_params=self.sampling_params,
+            tp_mesh=self.tp_mesh,
         )
 
         # Setup cache clearing callback if configured

@@ -553,6 +553,7 @@ class LossPostProcessor:
         dp_size: int,
         enable_seq_packing: bool = False,
         sampling_params: Optional[TrainingSamplingParams] = None,
+        tp_mesh: Any = None,
     ):
         """Initialize LossPostProcessor.
 
@@ -566,6 +567,8 @@ class LossPostProcessor:
             dp_size: Data parallel size
             enable_seq_packing: Whether sequence packing is enabled
             sampling_params: Sampling parameters
+            tp_mesh: Tensor-parallel mesh; its singleton group permits the
+                existing chunked vocabulary loss to handle unsharded logits.
         """
         self.loss_fn: LossFunction = loss_fn
         self.cfg: PolicyConfig = cfg
@@ -574,6 +577,7 @@ class LossPostProcessor:
         self.dp_size = dp_size
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
+        self.tp_mesh = tp_mesh
         self._cp_gradient_fanout = (
             cp_size
             if cp_size > 1
@@ -637,10 +641,30 @@ class LossPostProcessor:
                     "context_parallel_size > 1 on the automodel policy worker."
                 )
 
+        # The local-vocabulary path otherwise materializes full FP32 logits and
+        # log_softmax outputs. Reuse the existing chunked autograd implementation
+        # with a singleton TP group rather than inventing a second loss kernel.
+        chunk_size = self.cfg.get("logprob_chunk_size")
+        local_vocab_group = None
+        if (
+            chunk_size is not None
+            and token_layout is None
+            and self.loss_fn.input_type == LossInputType.LOGPROB
+            and not isinstance(logits, torch.distributed.tensor.DTensor)
+        ):
+            if chunk_size <= 0:
+                raise ValueError("logprob_chunk_size must be positive")
+            if self.tp_mesh is None or self.tp_mesh.size() != 1:
+                raise ValueError("chunked local logits require a singleton TP mesh")
+            local_vocab_group = self.tp_mesh.get_group()
+
         # Wrap prepare_loss_input with sampling_params
         prepare_loss_input_wrapped = partial(
             prepare_loss_input,
             sampling_params=self.sampling_params,
+            chunk_size=chunk_size,
+            vocab_parallel_group=local_vocab_group,
+            vocab_parallel_rank=0 if local_vocab_group is not None else None,
             context_parallel_group=(
                 self.cp_mesh.get_group() if self.cp_size > 1 else None
             ),
