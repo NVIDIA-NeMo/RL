@@ -15,6 +15,7 @@
 import asyncio
 import importlib.util
 import json
+import math
 import os
 import sys
 import threading
@@ -47,6 +48,7 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
     _AsyncLLMHTTPClient,
+    _replace_non_finite,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
@@ -2477,6 +2479,30 @@ def test_vllm_deferred_model_load(cluster, tokenizer):
 
     # Clean up
     vllm_generation.shutdown()
+
+
+def test_replace_non_finite(caplog):
+    result = _replace_non_finite(
+        {
+            "nan": math.nan,
+            "pos_inf": math.inf,
+            "nested": [-math.inf, 1.5, "unchanged", None],
+        }
+    )
+
+    assert result == {
+        "nan": 0.0,
+        "pos_inf": 0.0,
+        "nested": [0.0, 1.5, "unchanged", None],
+    }
+    assert caplog.messages == [
+        "Replaced 3 non-finite float values in the vLLM chat completion response "
+        "with 0.0; this may indicate numerical instability."
+    ]
+
+    caplog.clear()
+    assert _replace_non_finite({"finite": 1.5}) == {"finite": 1.5}
+    assert not caplog.records
 
 
 def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
