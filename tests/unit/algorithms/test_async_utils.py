@@ -38,6 +38,7 @@ from nemo_rl.algorithms.async_utils import (
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferImpl
 from nemo_rl.algorithms.async_utils.trajectory_collector import (
+    _warn_stale_prefix_cache_once,
     _stamped_task_indices,
     _unanimous_task_index,
 )
@@ -2763,17 +2764,67 @@ class TestAsyncTrajectoryCollector:
 
         collector.policy_generation.invalidate_kv_cache.assert_called_once_with()
 
-    def test_resume_after_refit_skips_cache_invalidation_when_recompute_disabled(self):
-        """Test resume after refit skips cache invalidation when recompute is disabled."""
+    def test_drained_refit_invalidates_cache_even_when_recompute_disabled(self):
+        """A drained refit (no in-flight pause requested) always invalidates the
+        prefix/KV cache: nothing is using it, and a cache that survives a weight
+        update serves later requests KV computed by old weights."""
         collector = self.create_local_collector()
+        async_cfg = collector.master_config.grpo.async_grpo
+        async_cfg.in_flight_weight_updates = False
+        async_cfg.recompute_kv_cache_after_weight_updates = False
+        collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)
+        collector.wait_for_pending_generations = mock.Mock()
+
+        collector.prepare_for_refit()
+        collector.resume_after_refit()
+
+        collector.policy_generation.invalidate_kv_cache.assert_called_once_with()
+        assert collector._refit_pause_cleared.is_set()
+
+    def test_in_flight_refit_without_recompute_keeps_cache_and_warns_once(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """With in-flight updates and recompute disabled the cache is kept
+        (Magistral-style) and the collector warns once that the prefix cache
+        will go stale across weight updates."""
+        _warn_stale_prefix_cache_once.cache_clear()
+        collector = self.create_local_collector()
+        collector.master_config.policy["generation"] = {
+            "backend": "vllm",
+            "vllm_cfg": {"async_engine": True},  # enable_prefix_caching unset -> on
+        }
         async_cfg = collector.master_config.grpo.async_grpo
         async_cfg.in_flight_weight_updates = True
         async_cfg.recompute_kv_cache_after_weight_updates = False
         collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)
 
-        collector.resume_after_refit()
+        for _ in range(2):
+            collector.prepare_for_refit()
+            collector.resume_after_refit()
 
         collector.policy_generation.invalidate_kv_cache.assert_not_called()
+        assert collector.policy_generation.pause_generation_for_refit_calls == [False, False]
+        output = capsys.readouterr().out
+        assert output.count("prefix cache is NOT invalidated across weight updates") == 1
+        _warn_stale_prefix_cache_once.cache_clear()
+
+    def test_in_flight_refit_without_recompute_does_not_warn_when_prefix_caching_off(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _warn_stale_prefix_cache_once.cache_clear()
+        collector = self.create_local_collector()
+        collector.master_config.policy["generation"] = {
+            "backend": "vllm",
+            "vllm_cfg": {"async_engine": True, "enable_prefix_caching": False},
+        }
+        async_cfg = collector.master_config.grpo.async_grpo
+        async_cfg.in_flight_weight_updates = True
+        async_cfg.recompute_kv_cache_after_weight_updates = False
+
+        collector.prepare_for_refit()
+        collector.resume_after_refit()
+
+        assert "prefix cache is NOT invalidated" not in capsys.readouterr().out
 
     def test_dynamo_cache_invalidation_failure_is_fatal_and_unblocks_waiters(self):
         collector = self.create_local_collector()

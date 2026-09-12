@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import functools
 import threading as _threading
 import time
 from collections import defaultdict, deque
@@ -78,6 +79,33 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     print_multimodal_payload_metrics,
 )
 from nemo_rl.utils.timer import ThreadSafeTimer
+
+
+def _prefix_caching_may_be_enabled(generation_cfg: dict[str, Any]) -> bool:
+    """Whether the vLLM prefix cache is (or defaults to) enabled.
+
+    ``vllm_cfg.enable_prefix_caching`` unset resolves to True on Ampere+ GPUs in
+    ``vllm_worker._resolve_enable_prefix_caching``; mirror that without touching CUDA.
+    """
+    vllm_cfg = generation_cfg.get("vllm_cfg") or {}
+    value = vllm_cfg.get("enable_prefix_caching")
+    return True if value is None else bool(value)
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_stale_prefix_cache_once(backend: str) -> None:
+    print(
+        f"⚠️ {backend} in-flight weight update with "
+        "recompute_kv_cache_after_weight_updates=false and prefix caching enabled: "
+        "the prefix cache is NOT invalidated across weight updates, so any later "
+        "request that shares a prefix with an earlier one is served KV/state "
+        "computed by older weights. This staleness is unbounded within the job "
+        "(it is not limited to in-flight requests) and grows the train-vs-rollout "
+        "logprob mismatch step over step. Set "
+        "grpo.async_grpo.recompute_kv_cache_after_weight_updates=true (default) or "
+        "policy.generation.vllm_cfg.enable_prefix_caching=false.",
+        flush=True,
+    )
 
 TokenizerType = PreTrainedTokenizerBase
 _MAX_NEMO_GYM_STREAM_RETRIES = 3
@@ -1073,6 +1101,8 @@ class AsyncTrajectoryCollector:
 
         if is_async_engine and in_flight_weight_updates:
             clear_cache = self.async_config.recompute_kv_cache_after_weight_updates
+            if not clear_cache and _prefix_caching_may_be_enabled(generation_cfg):
+                _warn_stale_prefix_cache_once(backend)
             self._generation_pause_requested_for_refit = True
             print(f"⏸️ Requesting {backend} generation pause before refit")
             self._generation_paused_for_refit = (
@@ -1117,10 +1147,17 @@ class AsyncTrajectoryCollector:
             self._refit_pause_cleared.set()
             return
 
-        # Invalidate&recompute vLLM caches after the weight updates (in-flight or not) if
-        # recompute_kv_cache_after_weight_updates is True (AREAL-style implementation).
-        # Otherwise, keep using the stale KV caches (Magistral-style implementation).
-        if self.async_config.recompute_kv_cache_after_weight_updates:
+        # No in-flight pause was requested for this refit, so generation was drained
+        # first and nothing is using the KV cache: invalidating it is free. Always do
+        # it. (A backend that lacks the pause hook still goes through the pause
+        # request above and keeps the legacy behaviour below.) A prefix cache that
+        # survives a weight update serves later requests KV/state computed by old
+        # weights, without bound, which silently grows the train-vs-rollout
+        # logprob mismatch. `recompute_kv_cache_after_weight_updates` only decides
+        # what happens to requests that were *in flight* during an in-flight refit
+        # (preempt and recompute vs. keep their pre-update KV, Magistral-style).
+        drained = not self._generation_pause_requested_for_refit
+        if drained or self.async_config.recompute_kv_cache_after_weight_updates:
             try:
                 print(
                     "🔄 Invalidating generation backend KV caches after weight update"

@@ -43,7 +43,7 @@ grpo:
     max_trajectory_age_steps: 1  # Maximum age, in training steps, for trajectories
     max_generation_failures: 0  # Consecutive worker failures to tolerate
     in_flight_weight_updates: false  # Enable for faster weight synchronization
-    recompute_kv_cache_after_weight_updates: false # Invalidates kv cache after weight-updates
+    recompute_kv_cache_after_weight_updates: true  # Preempt+recompute in-flight requests and clear the prefix cache on refit (see below)
 ```
 
 ### Complete Example Config
@@ -72,7 +72,7 @@ grpo:
     max_trajectory_age_steps: 1
     max_generation_failures: 0  # Consecutive worker failures to tolerate
     in_flight_weight_updates: false  # Enable for faster weight synchronization
-    recompute_kv_cache_after_weight_updates: false # Invalidates kv cache after weight-updates
+    recompute_kv_cache_after_weight_updates: true  # Preempt+recompute in-flight requests and clear the prefix cache on refit (see below)
 
 cluster:
   num_nodes: 2
@@ -223,7 +223,7 @@ If no `replay_buffer.pt` file is found in the latest checkpoint directory, train
 
 4. **In-Flight Weight Updates**: Enable `in_flight_weight_updates: true` to refit without waiting for the longest in-flight generation to finish. Except for managed Dynamo, the collector requests a generation pause and resume from every async backend around the weight transfer. Async vLLM implements this contract while preserving request state. A backend that does not implement the hook emits a warning once per backend type per process and refits without a collector-side pause or drain; SGLang is in this group today and instead relies on the pause its own weight synchronizer performs around the transfer. Managed Dynamo always drains active trajectories before refit. vLLM requires `async_engine: true`; the Megatron backend is always async-engine.
 
-5. **Recompute KV Cache After Weight Updates**: Set `recompute_kv_cache_after_weight_updates: true` to invalidate reusable KV/prefix caches when weights change. On the native async vLLM in-flight path, caches are cleared while generation is paused, so preserved requests recompute their KV after resuming. Other refit paths keep their existing post-update invalidation behavior. When false, in-flight requests retain their pre-update KV cache. On the Megatron generation backend, this must agree with `policy.generation.mcore_generation_config.kv_cache_management_mode`; setup errors on a mismatch.
+5. **Recompute KV Cache After Weight Updates**: `recompute_kv_cache_after_weight_updates` (default `true`) decides what happens to requests that are *in flight* during an in-flight refit. With `true`, vLLM is paused with `clear_cache=True`: in-flight requests are preempted, the prefix cache is reset, and the preserved requests re-prefill with the new weights after resuming. With `false` (Magistral-style), in-flight requests keep their pre-update KV, **and the prefix cache is not invalidated either**: every later request that shares a prefix with an earlier one (same prompt, shared system prompt, multi-sample groups spanning a refit) is served KV/state computed by whichever weights first filled that block. That staleness is unbounded within the job and grows the train-vs-rollout logprob mismatch step over step; the collector prints a warning once when this combination is active with prefix caching enabled. Only choose `false` with `policy.generation.vllm_cfg.enable_prefix_caching: false`, or when prompts never share prefixes across steps. Refits that drain generation first (`in_flight_weight_updates: false`, or backends without a pause hook) always invalidate the caches after the update regardless of this flag, since nothing is using them at that point. On the Megatron generation backend, this must agree with `policy.generation.mcore_generation_config.kv_cache_management_mode`; setup errors on a mismatch.
 
 ## Why Importance Sampling Correction Is Required for Async
 
