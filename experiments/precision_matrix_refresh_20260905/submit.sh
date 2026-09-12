@@ -8,6 +8,7 @@ MODEL=${MODEL:-qwen30}
 MODE=${MODE:-async}
 ARM=${ARM:-bf16-bf16}
 TOPOLOGY=${TOPOLOGY:-default}
+PERFORMANCE_RECIPE=${PERFORMANCE_RECIPE:-0}
 MAX_STEPS=${MAX_STEPS:-20}
 RUN_GROUP=${RUN_GROUP:-$(date +%Y%m%d-%H%M%S)}
 WALLTIME=${WALLTIME:-04:00:00}
@@ -27,7 +28,7 @@ case "${MODE}" in
   sync|async) ;;
   *) echo "MODE must be sync or async" >&2; exit 2 ;;
 esac
-if [[ "${MODEL}:${MODE}" == super:sync ]]; then
+if [[ "${MODEL}:${MODE}" == super:sync && "${PERFORMANCE_RECIPE}" != 1 ]]; then
   echo "Super is currently configured only for async measurements" >&2
   exit 2
 fi
@@ -87,7 +88,7 @@ esac
 : "${ACTOR_VENV_ROOT:=/opt/ray_venvs}"
 
 case "${MODEL}:${MODE}" in
-  super:async)
+  super:async|super:sync)
     CONFIG=experiments/mxfp8_training_perf_20260911/super-async.yaml
     NUM_NODES=32
     SEGMENT_SIZE=8
@@ -179,6 +180,22 @@ case "${MODEL}:${MODE}" in
 esac
 
 CONFIG=${CONFIG_OVERRIDE:-${CONFIG}}
+if [[ "${PERFORMANCE_RECIPE}" == 1 ]]; then
+  if [[ -n "${CONFIG_OVERRIDE:-}" || "${TOPOLOGY}" != default ]]; then
+    echo "Performance recipes do not allow config or topology overrides" >&2
+    exit 2
+  fi
+  PERF_DIR=examples/configs/recipes/llm/performance
+  case "${MODEL}:${MODE}" in
+    qwen30:sync) CONFIG=${PERF_DIR}/grpo-qwen3-30ba3b-4n4g.yaml; NUM_NODES=4; SEGMENT_SIZE=4 ;;
+    qwen30:async) CONFIG=${PERF_DIR}/grpo-qwen3-30ba3b-4n4g-async-1off.yaml ;;
+    qwen235:sync) CONFIG=${PERF_DIR}/grpo-qwen3-235b-16n4g.yaml ;;
+    qwen235:async) CONFIG=${PERF_DIR}/grpo-qwen3-235b-32n4g-async-1off.yaml ;;
+    super:sync) CONFIG=${PERF_DIR}/grpo-nemotron3-super-120BA12B-32n4g.yaml ;;
+    super:async) CONFIG=${PERF_DIR}/grpo-nemotron3-super-120BA12B-32n4g-async-1off.yaml ;;
+    *) echo "No audited performance recipe for ${MODEL}:${MODE}" >&2; exit 2 ;;
+  esac
+fi
 SOURCE_SHA=$(git -C "${REPO}" rev-parse HEAD 2>/dev/null || printf unknown)
 RUN_NAME="pmx-${CLUSTER}-${MODEL}-${MODE}-${ARM}-${TOPOLOGY}-${RUN_GROUP}"
 JOB_NAME="${SLURM_ACCOUNT}-pmx.${CLUSTER}-${MODEL}-${MODE}-${ARM}-${TOPOLOGY}-${RUN_GROUP}"
@@ -219,7 +236,7 @@ COMMON_OVERRIDES=(
   "logger.wandb.name=${RUN_NAME}"
   "logger.monitor_gpus=true"
 )
-if [[ "${MODEL}" == qwen235 ]]; then
+if [[ "${MODEL}" == qwen235 && "${PERFORMANCE_RECIPE}" != 1 ]]; then
   COMMON_OVERRIDES+=("policy.generation.vllm_cfg.tensor_parallel_size=4")
 fi
 
@@ -307,6 +324,31 @@ case "${ARM}" in
     fi
     ;;
 esac
+
+if [[ "${PERFORMANCE_RECIPE}" == 1 ]]; then
+  # Preserve the original workload and topology; only add precision/refit controls.
+  NORMALIZED_OVERRIDES=()
+  for override in "${COMMON_OVERRIDES[@]}" "${PRECISION_OVERRIDES[@]}"; do
+    case "${override}" in
+      *overlap_param_gather=*|*overlap_grad_reduce=*) continue ;;
+    esac
+    override=${override#++}
+    NORMALIZED_OVERRIDES+=("++${override}")
+  done
+  COMMON_OVERRIDES=("${NORMALIZED_OVERRIDES[@]}")
+  PRECISION_OVERRIDES=()
+  if [[ "${MODE}" == async ]]; then
+    COMMON_OVERRIDES+=("++policy.generation.refit_transport=nccl_reshard")
+  fi
+  if [[ "${ARM}" == *-mxfp8 ]]; then
+    if [[ "${MODEL}" == super ]]; then
+      IGNORE_PATTERNS='["*layers.*.mixer.qkv_proj","*layers.*.mixer.o_proj","*layers.*.mixer.in_proj","*layers.*.mixer.out_proj","*layers.*.mixer.up_proj","*layers.*.mixer.down_proj","*layers.*.mixer.gate","*layers.*.mixer.shared_experts.*","*layers.*.mixer.fc1_latent_proj","*layers.*.mixer.fc2_latent_proj","*mtp.*","lm_head"]'
+    else
+      IGNORE_PATTERNS='["*layers.*.self_attn.*","*layers.*.mlp.gate","*layers.*.mlp.shared_experts.*","*mtp.*","lm_head"]'
+    fi
+    COMMON_OVERRIDES+=("++policy.generation.vllm_cfg.quantization_ignore_patterns=${IGNORE_PATTERNS}")
+  fi
+fi
 
 printf 'cluster=%s\nmodel=%s\nmode=%s\narm=%s\ntopology=%s\nconfig=%s\nnodes=%s\nsegment=%s\nsteps=%s\nshared_model=%s\nmoe_backend=%s\ndatasets_cache=%s\nnuma_membind_disabled=%s\nforce_rebuild_venvs=%s\nsystem_python=%s\nactor_venv_root=%s\nsha=%s\nrun=%s\n' \
   "${CLUSTER}" "${MODEL}" "${MODE}" "${ARM}" "${TOPOLOGY}" "${CONFIG}" "${NUM_NODES}" \
