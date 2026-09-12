@@ -41,9 +41,19 @@ policy:
 
   generation:
     backend: "megatron"
+    refit_transport: "mcore"
     mcore_generation_config:
+      refit_backend: nccl
       # NeMo-Gym drives rollouts through the engine's OpenAI server.
       expose_http_server: true
+      cuda_graph_sizing_distribution: hybrid
+      cuda_graph_max_tokens: 512
+      prefix_caching_mamba_gb: null
+      prefix_caching_eviction_policy: lru
+      prefix_caching_coordinator_policy: longest_prefix
+      prefix_cache_ttl_seconds: 300.0
+      prefix_caching_routing_alpha: 1.0
+      http_server_num_replicas: 8
     colocated:
       enabled: false
       resources:
@@ -62,6 +72,9 @@ data_plane:
     num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
 
 async_rl:
+  generation_fleet_health:
+    # Native MCore refit has no worker-side abort hook for a deadline.
+    refit_timeout_s: null
   sampler:
     name: in_order
     # 0 = fully synchronous, so the importance sampling correction above is an
