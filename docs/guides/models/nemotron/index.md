@@ -25,3 +25,14 @@ For the full list of supported models, see
 - **[Nemotron 3.5 Lightning](nemotron-3.5-lightning.md)** — RLVR with NeMo Gym
   on GB200, plus a compact 4-node DAPO math recipe on the DTensor (AutoModel)
   backend.
+
+```{toctree}
+:hidden:
+
+nemotron-3-nano.md
+nemotron-3-nano-omni.md
+nemotron-3.5-lightning.md
+nemotron-3-super.md
+nemotron-3-super-omni-mopd.md
+nemotron-3-ultra.md
+```

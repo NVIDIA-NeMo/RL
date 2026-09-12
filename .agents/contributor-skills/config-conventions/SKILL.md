@@ -33,7 +33,7 @@ Use the right tool for the job. **v2 (the new convention):**
 
 **v1 (legacy, being migrated away):**
 
-- **`typing.TypedDict` — v1, legacy / not-yet-migrated user-facing config.** Most nested sub-configs (e.g. `GRPOConfig`, `RewardScalingConfig`, `AsyncGRPOConfig`) are still `TypedDict`. Continue to maintain them with the same defaults rules below until they are migrated to `BaseModel`. Use `typing.NotRequired` to mark optional attributes. **Do not add new `TypedDict`-based config classes.**
+- **`typing.TypedDict` — v1, legacy / not-yet-migrated user-facing config.** Some nested sub-configs are still `TypedDict`. Continue to maintain them with the same defaults rules below until they are migrated to `BaseModel`. Use `typing.NotRequired` to mark optional attributes. **Do not add new `TypedDict`-based config classes.**
 
 When in doubt: *is this class populated from a user-edited YAML?* If yes → `BaseModel` (or legacy `TypedDict`). If no → `@dataclass`.
 

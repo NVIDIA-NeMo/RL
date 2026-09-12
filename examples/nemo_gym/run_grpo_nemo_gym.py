@@ -33,18 +33,22 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     StatefulDataLoader,
     TokenizerType,
-    _should_use_nemo_gym,
     grpo_train,
     refit_policy_generation,
     setup,
-    shutdown_environments,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
+from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
 from nemo_rl.distributed.virtual_cluster import init_ray
-from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
+from nemo_rl.environments.nemo_gym import (
+    setup_nemo_gym_config,
+    should_use_nemo_gym,
+)
+from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.rollouts import run_nemo_gym_rollout_sync
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation.vllm.config import materialize_vllm_video_config
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -142,6 +146,7 @@ def main() -> None:
 
         config = OmegaConf.to_container(config, resolve=True)
         config = MasterConfig(**config)
+        materialize_vllm_video_config(config.policy, config.data)
         print("Applied CLI overrides")
 
     # Get the next experiment directory with incremented ID
@@ -188,7 +193,7 @@ def main() -> None:
         setup_nemo_gym_config(config, tokenizer)
 
     # We assert here since this is right after the final config has been materialized.
-    assert _should_use_nemo_gym(config)
+    assert should_use_nemo_gym(config)
 
     # NeMo-Gym environment needs to get dp_openai_server_base_urls from policy_generation, so we don't setup env here.
     with rl_init_timer.time("data"):
@@ -220,6 +225,8 @@ The validation set you pass in will directly be used for validation with no addi
     pprint.pprint(config)
 
     with rl_init_timer.time("ray_connect"):
+        # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
+        maybe_configure_data_plane_env(config.data_plane)
         init_ray()
 
     # `is_trajectory_collection` is a NeMo-RL-side control-flow knob; pop it
@@ -267,6 +274,7 @@ The validation set you pass in will directly be used for validation with no addi
     task_to_env = {"nemo_gym": nemo_gym}
     val_task_to_env = task_to_env
 
+    trainer_owns_environment_shutdown = False
     try:
         if is_trajectory_collection:
             collect_trajectories(
@@ -327,6 +335,7 @@ The validation set you pass in will directly be used for validation with no addi
             print("🚀 Running synchronous GRPO training")
 
             # Run standard GRPO training
+            trainer_owns_environment_shutdown = True
             grpo_train(
                 policy,
                 policy_generation,
@@ -343,7 +352,8 @@ The validation set you pass in will directly be used for validation with no addi
                 processor=processor,
             )
     finally:
-        shutdown_environments(task_to_env, val_task_to_env)
+        if not trainer_owns_environment_shutdown:
+            shutdown_environments(task_to_env, val_task_to_env)
         try:
             policy_generation.shutdown()
         except Exception as error:

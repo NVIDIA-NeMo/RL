@@ -14,22 +14,639 @@
 
 import gc
 from copy import deepcopy
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+import ray
 import torch
 
+import nemo_rl.models.policy.lm_policy as lm_policy
 from nemo_rl.algorithms.grpo import refit_policy_generation
 from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.models.generation.megatron import MegatronGeneration
+from nemo_rl.models.generation.megatron import MegatronGeneration, megatron_generation
+from nemo_rl.models.generation.megatron.config import (
+    dedicated_inference_megatron_cfg,
+    merged_inference_megatron_cfg,
+    resolve_refit_execution_batch_bytes,
+)
+from nemo_rl.models.generation.megatron.megatron_worker import MegatronGenerationMixin
+from nemo_rl.models.generation.megatron.utils import (
+    build_prompt_and_multimodal_data,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.weight_sync.megatron_weight_synchronizer import (
     MegatronWeightSynchronizer,
 )
+from nemo_rl.weight_sync.membership import RefitMembership
+from tests.unit.test_utils import SimpleLossFn
 
 model_name = "Qwen/Qwen3-0.6B"
+
+
+@pytest.mark.mcore
+def test_mxfp8_skip_weight_load_defers_http_server_until_refit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HTTP URLs must not force engine init before MXFP8 refit buffers exist."""
+    config = deepcopy(basic_megatron_test_config)
+    config["generation"]["colocated"]["enabled"] = False
+    config["generation"]["mcore_generation_config"]["expose_http_server"] = True
+    config["generation"]["mcore_generation_config"]["fp8_cfg"] = {"enabled": True}
+
+    prepare_for_generation = MagicMock()
+    monkeypatch.setattr(lm_policy, "Policy", MagicMock())
+    monkeypatch.setattr(
+        MegatronGeneration, "init_cluster_placement_groups", MagicMock()
+    )
+    monkeypatch.setattr(
+        MegatronGeneration, "prepare_for_generation", prepare_for_generation
+    )
+
+    generation = MegatronGeneration(
+        config=config,
+        tokenizer=MagicMock(),
+        cluster=MagicMock(),
+        skip_weight_load=True,
+    )
+
+    prepare_for_generation.assert_not_called()
+    assert generation.dp_openai_server_base_urls == []
+    assert lm_policy.Policy.call_args.kwargs["is_refit_destination"] is True
+
+
+@pytest.mark.mcore
+def test_nccl_m2n_refit_backend_requires_non_colocated_generation() -> None:
+    config = deepcopy(basic_megatron_test_config)
+    config["generation"]["colocated"]["enabled"] = True
+    config["generation"]["refit_transport"] = "mcore"
+    config["generation"]["mcore_generation_config"]["refit_backend"] = "nccl_m2n"
+
+    with pytest.raises(ValueError, match="only supported with non-colocated"):
+        MegatronGeneration(
+            config=config,
+            tokenizer=MagicMock(),
+            policy=MagicMock(),
+        )
+
+
+@pytest.mark.mcore
+def test_null_refit_transport_selects_packed_collective() -> None:
+    config = deepcopy(basic_megatron_test_config)
+    config["generation"]["refit_transport"] = None
+    config["generation"]["mcore_generation_config"]["refit_backend"] = None
+
+    generation = MegatronGeneration(
+        config=config,
+        tokenizer=MagicMock(),
+        policy=MagicMock(),
+    )
+
+    assert not generation.uses_native_refit
+
+
+@pytest.mark.mcore
+def test_native_refit_requires_explicit_backend() -> None:
+    config = deepcopy(basic_megatron_test_config)
+    config["generation"]["mcore_generation_config"]["refit_backend"] = None
+
+    with pytest.raises(ValueError, match="got None"):
+        MegatronGeneration(
+            config=config,
+            tokenizer=MagicMock(),
+            policy=MagicMock(),
+        )
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("refit_transport", [None, "nccl_reshard"])
+def test_non_native_refit_rejects_mcore_backend(refit_transport) -> None:
+    config = deepcopy(basic_megatron_test_config)
+    config["generation"]["refit_transport"] = refit_transport
+    config["generation"]["mcore_generation_config"]["refit_backend"] = "nccl"
+
+    with pytest.raises(ValueError, match="only read by the native MCore refit"):
+        MegatronGeneration(
+            config=config,
+            tokenizer=MagicMock(),
+            policy=MagicMock(),
+        )
+
+
+@pytest.mark.mcore
+def test_inference_optimized_pins_generation_etp_to_one() -> None:
+    """Generation-side TP>1 must stay usable for MoE.
+
+    MCore's inference_optimized MoE layers reject a *resolved* ETP > 1, and an
+    omitted ETP resolves to TP rather than 1. Pinning it here is what keeps
+    TP>1 generation working.
+    """
+    config = deepcopy(basic_megatron_test_config)
+    config["megatron_cfg"]["tensor_model_parallel_size"] = 2
+    config["megatron_cfg"]["expert_tensor_parallel_size"] = 2
+    config["generation"]["mcore_generation_config"]["transformer_impl"] = (
+        "inference_optimized"
+    )
+    config["generation"]["mcore_generation_config"]["tensor_model_parallel_size"] = 2
+    config["generation"]["mcore_generation_config"]["sequence_parallel"] = True
+    config["generation"]["mcore_generation_config"].pop(
+        "expert_tensor_parallel_size", None
+    )
+
+    merged = merged_inference_megatron_cfg(config)
+
+    assert merged["expert_tensor_parallel_size"] == 1
+    # TP>1 is preserved -- the pin narrows ETP only.
+    assert merged["tensor_model_parallel_size"] == 2
+
+
+@pytest.mark.mcore
+def test_inference_optimized_rejects_explicit_generation_etp_above_one() -> None:
+    config = deepcopy(basic_megatron_test_config)
+    config["generation"]["mcore_generation_config"]["transformer_impl"] = (
+        "inference_optimized"
+    )
+    config["generation"]["mcore_generation_config"]["sequence_parallel"] = True
+    config["generation"]["mcore_generation_config"]["expert_tensor_parallel_size"] = 2
+
+    with pytest.raises(ValueError, match="expert_tensor_parallel_size=1"):
+        merged_inference_megatron_cfg(config)
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("refit_transport", [None, "mcore"])
+def test_megatron_generation_dispatches_refit_transport(refit_transport):
+    generation = object.__new__(MegatronGeneration)
+    generation.cfg = {
+        "refit_transport": refit_transport,
+        "mcore_generation_config": {
+            "refit_backend": "gloo",
+            "refit_execution_batch_bytes": 123,
+        },
+    }
+    generation._policy = MagicMock()
+    generation._owns_policy = False
+
+    generation.init_collective("127.0.0.1", 1234, 4, train_world_size=2)
+    generation.update_weights_from_collective()
+
+    if refit_transport == "mcore":
+        generation._policy.init_collective_mcore_generation.assert_called_once_with(
+            "127.0.0.1",
+            1234,
+            4,
+            rank_offset=2,
+            refit_execution_batch_bytes=123,
+            refit_backend="gloo",
+        )
+        generation._policy.swap_weights_via_reshard.assert_called_once_with(
+            is_source=False
+        )
+        generation._policy.init_collective.assert_not_called()
+    else:
+        generation._policy.init_collective.assert_called_once_with(
+            "127.0.0.1",
+            1234,
+            4,
+            train_world_size=2,
+            rank_offset=2,
+        )
+        generation._policy.worker_group.run_all_workers_single_data.assert_called_once_with(
+            "update_weights_from_collective", refit_timeout_s=None
+        )
+        generation._policy.init_collective_mcore_generation.assert_not_called()
+
+
+@pytest.mark.mcore
+def test_megatron_generation_m2n_transport_uses_packed_collective_api() -> None:
+    generation = object.__new__(MegatronGeneration)
+    generation.cfg = {
+        "refit_transport": "nccl_reshard",
+        "mcore_generation_config": {
+            "refit_backend": "nccl",
+            "refit_execution_batch_bytes": 123,
+        },
+    }
+    generation._policy = MagicMock()
+    generation._owns_policy = False
+
+    generation.init_collective("127.0.0.1", 1234, 4, train_world_size=2)
+
+    assert not generation.uses_native_refit
+    generation._policy.init_collective.assert_called_once_with(
+        "127.0.0.1",
+        1234,
+        4,
+        train_world_size=2,
+        rank_offset=2,
+    )
+    generation._policy.init_collective_mcore_generation.assert_not_called()
+
+
+@pytest.mark.mcore
+def test_megatron_generation_uses_common_refit_worker_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workers = [MagicMock(), MagicMock()]
+    generation = object.__new__(MegatronGeneration)
+    generation._policy = SimpleNamespace(worker_group=SimpleNamespace(workers=workers))
+    generation._owns_policy = False
+    generation._refit_membership = None
+    monkeypatch.setattr(megatron_generation.ray, "get", lambda refs: refs)
+    refit_info = {"layer_names": [], "per_layer_params": {}}
+
+    generation.prepare_nccl_reshard_refit_info(refit_info)
+    assert generation.nccl_reshard_refit() == [
+        worker.nccl_reshard_refit.remote.return_value for worker in workers
+    ]
+
+    for worker in workers:
+        worker.prepare_nccl_reshard_refit_info.remote.assert_called_once_with(
+            refit_info=refit_info
+        )
+        worker.nccl_reshard_refit.remote.assert_called_once_with(refit_timeout_s=None)
+
+
+@pytest.mark.mcore
+def test_megatron_generation_rebuild_dispatches_only_selected_ranks() -> None:
+    workers = [MagicMock() for _ in range(3)]
+    for idx, worker in enumerate(workers):
+        worker.init_collective.remote.return_value = f"misc-{idx}"
+        worker.init_nccl_reshard_comm_groups_generation.remote.return_value = (
+            f"bulk-{idx}"
+        )
+        worker.nccl_reshard_refit.remote.return_value = f"refit-{idx}"
+
+    generation = object.__new__(MegatronGeneration)
+    generation._policy = SimpleNamespace(worker_group=SimpleNamespace(workers=workers))
+    generation._owns_policy = False
+    generation._refit_membership = None
+    membership = RefitMembership(
+        world_size=10,
+        train_world_size=8,
+        shard_prefixes={0: 0, 2: 1},
+        workers_per_shard=1,
+    )
+    generation.set_refit_membership(membership)
+
+    assert generation.rebuild_collective(membership, "10.0.0.1", 1234) == [
+        "misc-0",
+        "misc-2",
+    ]
+    workers[0].init_collective.remote.assert_called_once_with(
+        ip="10.0.0.1",
+        port=1234,
+        world_size=10,
+        train_world_size=8,
+        rank_offset=8,
+        nccl_peer="nemo",
+    )
+    workers[1].init_collective.remote.assert_not_called()
+    workers[2].init_collective.remote.assert_called_once_with(
+        ip="10.0.0.1",
+        port=1234,
+        world_size=10,
+        train_world_size=8,
+        rank_offset=7,
+        nccl_peer="nemo",
+    )
+
+    assert generation.rebuild_nccl_reshard_comm_group(
+        membership,
+        pp_ips=["10.0.0.1"],
+        pp_ports=[1235],
+        pp_size=1,
+        train_ranks_per_stage=8,
+        sub_world_size=10,
+    ) == ["bulk-0", "bulk-2"]
+    workers[0].init_nccl_reshard_comm_groups_generation.remote.assert_called_once_with(
+        pp_ips=["10.0.0.1"],
+        pp_ports=[1235],
+        pp_size=1,
+        train_ranks_per_stage=8,
+        sub_world_size=10,
+        rank_prefix=0,
+    )
+    workers[1].init_nccl_reshard_comm_groups_generation.remote.assert_not_called()
+    workers[2].init_nccl_reshard_comm_groups_generation.remote.assert_called_once_with(
+        pp_ips=["10.0.0.1"],
+        pp_ports=[1235],
+        pp_size=1,
+        train_ranks_per_stage=8,
+        sub_world_size=10,
+        rank_prefix=1,
+    )
+
+    assert generation.nccl_reshard_refit(refit_timeout_s=30.0) == [
+        "refit-0",
+        "refit-2",
+    ]
+    workers[0].nccl_reshard_refit.remote.assert_called_once_with(refit_timeout_s=30.0)
+    workers[1].nccl_reshard_refit.remote.assert_not_called()
+    workers[2].nccl_reshard_refit.remote.assert_called_once_with(refit_timeout_s=30.0)
+
+
+@pytest.mark.mcore
+def test_native_refit_batch_bytes_use_collective_default(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.megatron.config.get_target_packed_tensor_size",
+        lambda: 456,
+    )
+
+    assert resolve_refit_execution_batch_bytes(None) == 456
+    assert resolve_refit_execution_batch_bytes(123) == 123
+    with pytest.raises(ValueError, match="must be positive or null"):
+        resolve_refit_execution_batch_bytes(0)
+
+
+@pytest.mark.mcore
+def test_bridge_refit_finalizes_import_before_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Keep the optional MCore/Transformer Engine worker import test-local.
+    import nemo_rl.models.generation.megatron.megatron_worker as worker_module
+
+    events = []
+    worker = object.__new__(worker_module.MegatronGenerationRefitMixin)
+    worker.model_update_group = object()
+    worker._generation_refit_state_dict_info = {}
+    worker._generation_refit_tasks = []
+    worker._generation_refit_dependency_counts = {}
+    worker._generation_refit_model_chunks = [torch.nn.Module()]
+    worker.megatron_bridge = MagicMock()
+    worker.megatron_bridge.finalize_hf_import.side_effect = (
+        lambda _model_chunks: events.append("finalize")
+    )
+    worker._refresh_flashinfer_mxfp8_weights = MagicMock(
+        side_effect=lambda: events.append("refresh")
+    )
+
+    monkeypatch.setattr(
+        worker_module,
+        "packed_broadcast_consumer",
+        lambda **_kwargs: events.append("receive"),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.distributed.refit_watchdog.sync_stream_within",
+        lambda *_args: events.append("sync"),
+    )
+
+    assert worker._update_destination_weights_from_collective()
+    assert events == ["receive", "finalize", "refresh", "sync"]
+    worker.megatron_bridge.finalize_hf_import.assert_called_once_with(
+        worker._generation_refit_model_chunks
+    )
+
+
+@pytest.mark.mcore
+def test_bridge_refit_converts_external_state_through_streaming_api() -> None:
+    # Keep the optional MCore/Transformer Engine worker import test-local.
+    import nemo_rl.models.generation.megatron.megatron_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronGenerationRefitMixin)
+    conversion_task = SimpleNamespace(
+        param_name="megatron.weight", hf_param_names=("hf.weight",)
+    )
+    task = worker_module._MegatronRefitTask(
+        conversion_task=conversion_task,
+        destination=torch.empty(2),
+        target_id=1,
+    )
+    converted_weight = torch.ones(2)
+    worker._generation_refit_pending_weights = {}
+    worker._generation_refit_pending_streams = {}
+    worker._generation_refit_remaining_dependencies = {"hf.weight": 1}
+    worker._generation_refit_tasks = [task]
+    worker._generation_refit_task_index = 0
+    worker._generation_refit_model_chunks = [torch.nn.Module()]
+    worker.megatron_bridge = MagicMock()
+    streamed_states = []
+
+    def stream_weights(*_args, hf_state_dict, **_kwargs):
+        streamed_states.append(dict(hf_state_dict))
+        return iter([SimpleNamespace(weight=converted_weight)])
+
+    worker.megatron_bridge.stream_weights_hf_to_megatron.side_effect = stream_weights
+    worker._write_generation_refit_weight = MagicMock()
+    source_weight = torch.zeros(2)
+
+    worker._load_generation_refit_batch([("hf.weight", source_weight)])
+
+    stream_call = worker.megatron_bridge.stream_weights_hf_to_megatron.call_args
+    assert stream_call.args == (worker._generation_refit_model_chunks,)
+    assert stream_call.kwargs["conversion_tasks"] == [conversion_task]
+    assert streamed_states[0]["hf.weight"] is source_weight
+    worker._write_generation_refit_weight.assert_called_once_with(
+        task, converted_weight
+    )
+    assert worker._generation_refit_pending_weights == {}
+
+
+@pytest.mark.mcore
+def test_multimodal_preprocessing_requires_policy_processor():
+    class _ImageWrapper:
+        supports_image = True
+
+    worker = object.__new__(MegatronGenerationMixin)
+    worker._get_megatron_inference_wrapper_cls = lambda: _ImageWrapper
+
+    with pytest.raises(ValueError, match="requires the policy processor"):
+        worker._build_image_preprocessing_config({})
+
+
+@pytest.mark.mcore
+def test_multimodal_preprocessing_forwards_vision_model_type():
+    class _ImageWrapper:
+        supports_image = True
+
+    worker = object.__new__(MegatronGenerationMixin)
+    worker._get_megatron_inference_wrapper_cls = lambda: _ImageWrapper
+    worker.processor = SimpleNamespace(
+        image_processor=SimpleNamespace(
+            patch_size=14,
+            min_num_patches=1,
+            max_num_patches=32,
+            norm_mean=[0.1, 0.2, 0.3],
+            norm_std=[0.4, 0.5, 0.6],
+        )
+    )
+
+    config = worker._build_image_preprocessing_config({"vision_model_type": "qwen-vl"})
+
+    assert config.vision_model_type == "qwen-vl"
+
+
+@pytest.mark.mcore
+def test_direct_megatron_media_request_preserves_preexpanded_prompt():
+    def fake_sample_vision_tensors(data, index):
+        return torch.ones(1, 2, 4), torch.tensor([[2, 2]]), None
+
+    data = {
+        "input_ids": torch.tensor([[10, 99, 99, 20, 0]]),
+        "input_lengths": torch.tensor([4]),
+    }
+
+    prompt, multi_modal_data = build_prompt_and_multimodal_data(
+        data,
+        0,
+        sample_tensors=fake_sample_vision_tensors,
+        supports_modality=lambda modality: modality == "image",
+    )
+
+    assert prompt == [10, 99, 99, 20]
+    assert multi_modal_data["media_tokens_preexpanded"] is True
+    assert "image" in multi_modal_data
+
+
+@pytest.mark.mcore
+def test_text_only_request_does_not_resolve_multimodal_capabilities():
+    data = {
+        "input_ids": torch.tensor([[10, 20, 0]]),
+        "input_lengths": torch.tensor([2]),
+    }
+
+    prompt, multi_modal_data = build_prompt_and_multimodal_data(
+        data,
+        0,
+        supports_modality=lambda modality: pytest.fail(
+            f"unexpected capability lookup for {modality}"
+        ),
+    )
+
+    assert prompt == [10, 20]
+    assert multi_modal_data is None
+
+
+@pytest.mark.mcore
+def test_direct_megatron_video_request_marks_preexpanded_prompt():
+    def fake_sample_vision_tensors(data, index):
+        return (
+            torch.ones(1, 4, 4),
+            torch.tensor([[2, 2], [2, 2], [2, 2], [2, 2]]),
+            torch.tensor([4]),
+        )
+
+    data = {
+        "input_ids": torch.tensor([[10, 99, 99, 20]]),
+        "input_lengths": torch.tensor([4]),
+    }
+
+    prompt, multi_modal_data = build_prompt_and_multimodal_data(
+        data,
+        0,
+        sample_tensors=fake_sample_vision_tensors,
+        supports_modality=lambda modality: modality == "video",
+    )
+
+    assert prompt == [10, 99, 99, 20]
+    assert multi_modal_data["media_tokens_preexpanded"] is True
+    assert "video" in multi_modal_data
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("modality", "num_frames"),
+    [("image", torch.tensor([1])), ("video", torch.tensor([4]))],
+)
+def test_direct_megatron_multimodal_generate_round_trip(
+    monkeypatch, modality, num_frames
+):
+    """Exercise RL request construction and response packing around a mocked MCore LLM."""
+
+    class _MultimodalWrapper:
+        supports_text = True
+        supports_image = True
+        supports_video = True
+        supports_audio = False
+
+    worker = object.__new__(MegatronGenerationMixin)
+    worker.cfg = {
+        "generation": {
+            "temperature": 1.0,
+            "top_k": None,
+            "top_p": 1.0,
+            "max_new_tokens": 2,
+            "stop_strings": None,
+            "mcore_generation_config": {},
+        }
+    }
+    worker.tokenizer = SimpleNamespace(pad_token_id=0)
+    worker.megatron_tokenizer = SimpleNamespace(eod=2)
+    worker._inference_loop = object()
+    worker._get_megatron_inference_wrapper_cls = lambda: _MultimodalWrapper
+
+    frame_count = int(num_frames.sum())
+    pixels = torch.arange(frame_count * 12, dtype=torch.float32).reshape(
+        frame_count, 3, 2, 2
+    )
+    sizes = torch.tensor([[2, 2]] * frame_count)
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[10, 99, 99, 20]]),
+            "input_lengths": torch.tensor([4]),
+            "pixel_values": PackedTensor([pixels], dim_to_pack=0),
+            "imgs_sizes": PackedTensor([sizes], dim_to_pack=0),
+            "num_frames": PackedTensor([num_frames], dim_to_pack=0),
+        }
+    )
+
+    captured = {}
+    mocked_call = object()
+
+    def mock_generate(prompts, multi_modal_data, sampling_params):
+        captured.update(
+            prompts=prompts,
+            multi_modal_data=multi_modal_data,
+            sampling_params=sampling_params,
+        )
+        return mocked_call
+
+    replies = [
+        SimpleNamespace(
+            prompt_tokens=torch.tensor([10, 99, 99, 20]),
+            generated_tokens=[71, 72],
+            generated_log_probs=[-0.25, -0.5],
+        )
+    ]
+    worker._generate_with_persistent_engine = mock_generate
+
+    class _CompletedFuture:
+        def result(self):
+            return replies
+
+    def mock_run_coroutine_threadsafe(call, loop):
+        assert call is mocked_call
+        assert loop is worker._inference_loop
+        return _CompletedFuture()
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.megatron.megatron_worker.asyncio.run_coroutine_threadsafe",
+        mock_run_coroutine_threadsafe,
+    )
+
+    output = worker.generate(data=data)
+
+    assert captured["prompts"] == [[10, 99, 99, 20]]
+    media = captured["multi_modal_data"][0]
+    assert media["media_tokens_preexpanded"] is True
+    assert set(media) == {modality, "media_tokens_preexpanded"}
+    assert torch.equal(media[modality]["imgs"], pixels)
+    assert torch.equal(media[modality]["imgs_sizes"], sizes)
+    if modality == "video":
+        assert torch.equal(media["video"]["num_frames"], num_frames.to(torch.int32))
+    else:
+        assert "num_frames" not in media["image"]
+    assert captured["sampling_params"][0].return_prompt_tokens is True
+
+    assert output["output_ids"][0].tolist() == [10, 99, 99, 20, 71, 72]
+    assert output["logprobs"][0].tolist() == [0.0, 0.0, 0.0, 0.0, -0.25, -0.5]
+    assert output["generation_lengths"].tolist() == [2]
+    assert output["unpadded_sequence_lengths"].tolist() == [6]
+
 
 basic_megatron_test_config: PolicyConfig = {
     "model_name": model_name,
@@ -45,6 +662,7 @@ basic_megatron_test_config: PolicyConfig = {
     "dtensor_cfg": {"enabled": False},
     "dynamic_batching": {"enabled": False},
     "sequence_packing": {"enabled": False},
+    "make_sequence_length_divisible_by": 1,
     "megatron_cfg": {
         "enabled": True,
         "empty_unused_memory_level": 0,
@@ -113,6 +731,7 @@ basic_megatron_test_config: PolicyConfig = {
     "max_grad_norm": 1.0,
     "generation": {
         "backend": "megatron",
+        "refit_transport": "mcore",
         "model_name": model_name,
         "max_new_tokens": 16,  # Small number of tokens for testing
         "temperature": 1.0,
@@ -138,7 +757,10 @@ basic_megatron_test_config: PolicyConfig = {
             "kv_cache_management_mode": "persist",
             "materialize_only_last_token_logits": True,
             "num_speculative_tokens": 0,
+            "logprobs_mode": "processed_logprobs",
             "refit_backend": "gloo",  # not nvshmem: its NVLS multicast init is unavailable in CI
+            "refit_execution_batch_bytes": None,
+            "offload_policy_before_refit": False,
             "parsers": [],
             "expose_http_server": False,
         },
@@ -270,13 +892,14 @@ async def _generate_async(mg, tokenizer, test_input_data, greedy=False):
 @pytest.mark.mcore
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize(
-    "tensor_parallel_size,pipeline_parallel_size,top_p,top_k",
+    "tensor_parallel_size,pipeline_parallel_size,top_p,top_k,logprobs_mode",
     [
-        (1, 1, 1.0, None),
-        (2, 1, 1.0, None),
-        (1, 2, 1.0, None),
-        (1, 1, 0.9, 8000),
-        (1, 1, 1.0, 1),
+        (1, 1, 1.0, None, "processed_logprobs"),
+        (2, 1, 1.0, None, "processed_logprobs"),
+        (1, 2, 1.0, None, "processed_logprobs"),
+        (1, 1, 0.9, 8000, "processed_logprobs"),
+        (1, 1, 1.0, 1, "processed_logprobs"),
+        (1, 1, 1.0, 1, "raw_logprobs"),
     ],
 )
 def test_megatron_policy_generation(
@@ -287,6 +910,7 @@ def test_megatron_policy_generation(
     pipeline_parallel_size,
     top_p,
     top_k,
+    logprobs_mode,
 ):
     """Standalone Megatron generation across tp/pp and sampling params."""
     if cluster.num_gpus_per_node < tensor_parallel_size * pipeline_parallel_size:
@@ -295,11 +919,18 @@ def test_megatron_policy_generation(
             f"tp={tensor_parallel_size} pp={pipeline_parallel_size}"
         )
 
+    if pipeline_parallel_size > 1:
+        pytest.xfail(
+            "FIXME(@cspades/@tdene): MCore async-scheduled generation segfaults with PP>1 "
+            "in dynamic_context.calculate_log_probs_tensors when slicing log_probs."
+        )
+
     config = deepcopy(basic_megatron_test_config)
     config["megatron_cfg"]["tensor_model_parallel_size"] = tensor_parallel_size
     config["megatron_cfg"]["pipeline_model_parallel_size"] = pipeline_parallel_size
     config["generation"]["top_p"] = top_p
     config["generation"]["top_k"] = top_k
+    config["generation"]["mcore_generation_config"]["logprobs_mode"] = logprobs_mode
     # config-level stop string, unioned with the per-sample stop strings below.
     config["generation"]["stop_strings"] = ["</s>"]
 
@@ -323,14 +954,21 @@ def test_megatron_policy_generation(
                 start = test_input_data["input_lengths"][i].item()
                 end = start + sampled["generation_lengths"][i].item()
                 gen_logprobs = sampled["logprobs"][i, start:end]
-                # Processed logprobs are exactly 0.0 where the argmax is unique;
-                # bf16 max-ties renormalize to log(1/n). Raw logprobs are never
-                # exactly 0, so a mostly-exact-0 row pins the processed mode.
-                assert (gen_logprobs <= 0).all() and (
-                    (gen_logprobs == 0.0).float().mean() >= 0.5
-                ), (
-                    f"expected mostly-exact-0 processed logprobs under top_k=1, got {gen_logprobs}"
-                )
+                assert (gen_logprobs <= 0).all()
+                if logprobs_mode == "processed_logprobs":
+                    # Processed logprobs are exactly 0.0 where the argmax is
+                    # unique; bf16 max-ties renormalize to log(1/n).
+                    assert (gen_logprobs == 0.0).float().mean() >= 0.5, (
+                        "expected mostly-exact-0 processed logprobs under "
+                        f"top_k=1, got {gen_logprobs}"
+                    )
+                else:
+                    # Raw model probabilities are computed before top-k=1 and
+                    # therefore retain nonzero uncertainty.
+                    assert (gen_logprobs < 0.0).float().mean() >= 0.5, (
+                        "expected mostly-negative raw logprobs under top_k=1, "
+                        f"got {gen_logprobs}"
+                    )
 
         # per-sample stop strings are merged with the config stop string (may stop early,
         # so don't require a generated token)
@@ -382,11 +1020,42 @@ async def test_megatron_policy_generation_async(cluster, test_input_data, tokeni
 
 @pytest.mark.mcore
 @pytest.mark.timeout(900)
-def test_megatron_generation_colocated(cluster, test_input_data, tokenizer):
+@pytest.mark.parametrize(
+    "train_impl, gen_impl",
+    [
+        ("transformer_engine", "transformer_engine"),
+        ("transformer_engine", "inference_optimized"),
+        ("inference_optimized", "inference_optimized"),
+    ],
+)
+def test_megatron_generation_colocated(
+    cluster, test_input_data, tokenizer, train_impl, gen_impl
+):
     """Colocated Megatron generation: wrap an existing training policy without owning it."""
     config = deepcopy(basic_megatron_test_config)
     config["generation"]["colocated"]["enabled"] = True
-    config["generation"]["mcore_generation_config"]["expose_http_server"] = True
+    # Eager engine startup (expose_http_server) flips MLM's process-wide
+    # InferenceMode on at construction; the legs that train before any
+    # generate/suspend cycle must construct engine-less.
+    expose_http_server = (
+        train_impl == "transformer_engine" and gen_impl == "transformer_engine"
+    )
+    config["generation"]["mcore_generation_config"]["expose_http_server"] = (
+        expose_http_server
+    )
+    # Matched impls => reshardless colocated (shared model; the
+    # inference_optimized pair trains through the TE parent path); differing
+    # impls => the worker builds a dedicated resharded inference model on
+    # the shared GPUs.
+    config["megatron_cfg"]["transformer_impl"] = train_impl
+    config["generation"]["mcore_generation_config"]["transformer_impl"] = gen_impl
+    if train_impl == "inference_optimized":
+        # The parity block's sleep/wake cycle would tear down and recapture
+        # CUDA graphs mid-test; keep them off here.
+        config["generation"]["mcore_generation_config"]["cuda_graph_impl"] = "none"
+        # The parity block's 2-sample batch shards to 1 sample per DP rank
+        # (DP=2 on the 2-GPU cluster); the logprob microbatch must divide it.
+        config["logprob_batch_size"] = 1
 
     # construction guard: exactly one of `cluster` / `policy` is required
     with pytest.raises(AssertionError):
@@ -408,20 +1077,111 @@ def test_megatron_generation_colocated(cluster, test_input_data, tokenizer):
         assert "max_tokens" not in config["megatron_cfg"]
         assert config["megatron_cfg"] == megatron_cfg_before
 
-        # setup() hands dp_openai_server_base_urls to NeMo Gym right after
-        # construction, so the colocated constructor must have collected them.
-        assert mg.dp_openai_server_base_urls, "no OpenAI server URLs collected"
-        assert all(url.startswith("http") for url in mg.dp_openai_server_base_urls)
+        # The selector: matched impls => reshardless (no dedicated model).
+        assert (dedicated_inference_megatron_cfg(config) is None) == (
+            train_impl == gen_impl
+        )
+
+        if expose_http_server:
+            # setup() hands dp_openai_server_base_urls to NeMo Gym right after
+            # construction, so the colocated constructor must have collected them.
+            assert mg.dp_openai_server_base_urls, "no OpenAI server URLs collected"
+            assert all(url.startswith("http") for url in mg.dp_openai_server_base_urls)
+
+        if gen_impl == "inference_optimized":
+            # Both inference_optimized legs take a train step (finite loss)
+            # before the engine ever starts; the reshard leg then generates
+            # on the dedicated model built at first wake, the matched-impl
+            # leg directly on the shared training model.
+            torch.manual_seed(42)
+            train_data = BatchedDataDict(
+                {
+                    "input_ids": torch.randint(0, 32000, (4, 64)),
+                    "input_lengths": torch.full((4,), 64, dtype=torch.int32),
+                    "attention_mask": torch.ones(4, 64),
+                    "labels": torch.randint(0, 32000, (4, 64)),
+                    "sample_mask": torch.ones(4),
+                }
+            )
+            policy.prepare_for_training()
+            loss = policy.train(train_data, SimpleLossFn())["loss"]
+            assert not torch.isnan(loss).any() and not torch.isinf(loss).any(), (
+                f"pre-generation train step produced bad loss: {loss}"
+            )
+            policy.finish_training()
 
         # re-entering generation mode must be a no-op on the running engine
         mg.prepare_for_generation()
         outputs = mg.generate(test_input_data, greedy=True)
         _assert_valid_generation_output(outputs, test_input_data)
 
+        # CUDA-graph capture proof: count the number of actually-created graphs.
+        # The inference_optimized train leg pins cuda_graph_impl="none" above,
+        # so it must stay at zero captures; the other legs must really capture.
+        graphs_enabled = (
+            config["generation"]["mcore_generation_config"]["cuda_graph_impl"] != "none"
+        )
+        capture_counts = ray.get(
+            mg._policy.worker_group.run_all_workers_single_data(
+                "get_inference_cuda_graph_capture_count"
+            )
+        )
+        if graphs_enabled:
+            assert all(count > 0 for count in capture_counts), capture_counts
+        else:
+            assert all(count == 0 for count in capture_counts), capture_counts
+
+        if train_impl == "inference_optimized":
+            # 3490-review follow-up: bound token mult-prob error on the
+            # matched-impl leg — generation and recomputed policy logprobs
+            # run the same inference kernels on the same shared weights.
+            # Greedy must be off: processed logprobs are ~0 under top_k=1.
+            sampled = mg.generate(test_input_data, greedy=False)
+            fprop_data = BatchedDataDict(
+                {
+                    "input_ids": sampled["output_ids"],
+                    "input_lengths": sampled["unpadded_sequence_lengths"],
+                }
+            )
+            # Production ordering: the engine stands down before any training-path forward.
+            mg.finish_generation(release_gpu=True)
+            policy.prepare_for_lp_inference()
+            lp_logprobs = policy.get_logprobs(fprop_data)["logprobs"]
+            gen_mask = torch.zeros_like(sampled["logprobs"], dtype=torch.bool)
+            for i, (start, end) in enumerate(
+                zip(
+                    test_input_data["input_lengths"],
+                    sampled["unpadded_sequence_lengths"],
+                )
+            ):
+                gen_mask[i, start:end] = True
+            abs_diff = (sampled["logprobs"] - lp_logprobs).abs().masked_select(gen_mask)
+            avg_prob_mult_error = torch.exp(abs_diff).mean()
+            assert avg_prob_mult_error <= 1.05, (
+                f"matched-impl inference_optimized: generation logprobs "
+                f"diverge from policy logprobs (avg prob mult error "
+                f"{avg_prob_mult_error:.4f})"
+            )
+            # Wake the engine again for the post-shutdown generation check.
+            mg.prepare_for_generation()
+
         # ownership guard: shutdown is a no-op, so the wrapped policy keeps generating
         assert mg.shutdown() is True
         after_shutdown = mg.generate(test_input_data, greedy=True)
         _assert_valid_generation_output(after_shutdown, test_input_data)
+
+        # Capture-once: a full sleep/wake cycle re-attaches the same managers and replays
+        # the same graphs; a growing count means managers were rebuilt and the old graphs leaked.
+        mg.finish_generation()
+        mg.prepare_for_generation()
+        after_cycle = mg.generate(test_input_data, greedy=True)
+        _assert_valid_generation_output(after_cycle, test_input_data)
+        recapture_counts = ray.get(
+            mg._policy.worker_group.run_all_workers_single_data(
+                "get_inference_cuda_graph_capture_count"
+            )
+        )
+        assert recapture_counts == capture_counts, (capture_counts, recapture_counts)
     finally:
         if policy is not None:
             policy.shutdown()
@@ -433,12 +1193,16 @@ def test_megatron_generation_colocated(cluster, test_input_data, tokenizer):
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize("skip_weight_load", [False, True])
 def test_megatron_generation_non_colocated_refit(
-    policy_cluster_separate, test_input_data, tokenizer, skip_weight_load
+    policy_cluster_separate,
+    test_input_data,
+    tokenizer,
+    skip_weight_load,
 ):
     """Non-colocated Megatron generation.
 
-    With skip_weight_load the inference engine builds without loading the
-    checkpoint and must still generate correctly once refit delivers weights.
+    With skip_weight_load, inference-engine initialization is deferred until
+    refit delivers the final weight objects. This is required for CUDA graphs
+    to capture persistent refit-buffer addresses.
     """
     generation_cluster = RayVirtualCluster(
         bundle_ct_per_node_list=[1],
@@ -477,6 +1241,12 @@ def test_megatron_generation_non_colocated_refit(
             tokenizer=tokenizer,
             cluster=generation_cluster,
             skip_weight_load=skip_weight_load,
+        )
+        assert mg._policy_config is not config
+        assert mg._policy_config["generation"] is not config["generation"]
+        assert (
+            mg._policy_config["generation"]["mcore_generation_config"]
+            is not config["generation"]["mcore_generation_config"]
         )
 
         # Wire the refit collective the way grpo.setup does: through the
@@ -533,3 +1303,244 @@ def test_megatron_generation_non_colocated_refit(
             print(f"Error during generation_cluster shutdown: {e}")
         gc.collect()
         torch.cuda.empty_cache()
+
+
+class _CapturingPortHolder:
+    """Stand-in for the RemoteHeldPortReservation actor.
+
+    Records the scheduling strategies it is pinned to, in creation order, and
+    returns one (ip, port) per holder instead of binding real sockets on real
+    placement groups. Ports repeat across nodes on purpose: only the (node, port)
+    pair has to be unique, which is what the real holders bind.
+    """
+
+    scheduling_strategies: list = []
+    _next_index = 0
+
+    @classmethod
+    def reset(cls):
+        cls.scheduling_strategies = []
+        cls._next_index = 0
+
+    @classmethod
+    def options(cls, *, scheduling_strategy):
+        cls.scheduling_strategies.append(scheduling_strategy)
+        return cls
+
+    @classmethod
+    def remote(cls):
+        index = cls._next_index
+        cls._next_index += 1
+        address = (f"10.0.0.{index}", 4321)
+        return SimpleNamespace(address=SimpleNamespace(remote=lambda: address))
+
+
+def _bundles_via_worker_group(sorted_bundle_indices, group_size, placement_groups):
+    """The (pg index, bundle) each RANK actually lands on, reconstructed from the live code.
+
+    Mirrors lm_policy.py's tied_groups for a unified PG and RayWorkerGroup's
+    default per-node tuples otherwise, then RayWorkerGroup's single-placement-
+    group collapse -- the two branches reserve_http_server_addresses must agree
+    with.
+
+    Deliberately a hand-copy rather than a call into the code under test (or a
+    shared helper): sharing the implementation would make the assertion a
+    tautology. The cost is that this copy is frozen -- if the worker-group
+    placement rule ever changes, update it by hand; grpo.py's runtime
+    served-vs-reserved URL check is the net for that direction.
+    """
+    if sorted_bundle_indices is not None:
+        # lm_policy.py: tied_groups = [(i // group_size, [b]) for i, b in ...]
+        tied_groups = [
+            (i // group_size, [bundle_idx])
+            for i, bundle_idx in enumerate(sorted_bundle_indices)
+        ]
+    else:
+        # RayWorkerGroup.__init__: bundle_indices_list.append((i, [bundle_idx]))
+        tied_groups = [
+            (pg_idx, [bundle_idx])
+            for pg_idx, pg in enumerate(placement_groups)
+            for bundle_idx in range(pg.bundle_count)
+        ]
+    # RayWorkerGroup collapses the group index when there is only one PG.
+    if len(placement_groups) == 1:
+        return [(0, bundles[0]) for _, bundles in tied_groups]
+    return [(pg_idx, bundles[0]) for pg_idx, bundles in tied_groups]
+
+
+@pytest.fixture
+def patched_holder(monkeypatch):
+    monkeypatch.setattr(
+        megatron_generation, "RemoteHeldPortReservation", _CapturingPortHolder
+    )
+    # ray.get here only unwraps the holder's (ip, port); no real Ray involved.
+    monkeypatch.setattr(megatron_generation.ray, "get", lambda ref: ref)
+    _CapturingPortHolder.reset()
+    return _CapturingPortHolder
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    "sorted_bundle_indices, model_parallel_size",
+    [
+        # Unified cross-node PG: topology sort can make rank 0 a bundle other
+        # than 0, so a naive "bundle 0" prediction would bind the wrong node.
+        ([3, 1, 0, 2], 1),
+        ([3, 1, 0, 2], 2),
+        # Per-node PGs: no sorted indices, ranks walk each PG's bundles in turn.
+        (None, 1),
+        (None, 2),
+    ],
+)
+def test_reserve_http_server_addresses_pins_every_frontend_bundle(
+    patched_holder, sorted_bundle_indices, model_parallel_size
+):
+    """Each reserved address must sit on the bundle its frontend rank will occupy.
+
+    reserve_http_server_addresses publishes the OpenAI server URLs to NeMo Gym
+    *before* any worker exists, pinning one port holder to the (placement_group,
+    bundle) it predicts each frontend rank will occupy. That prediction is a
+    second, hand-written copy of the placement lm_policy.py / RayWorkerGroup
+    actually perform: if the two ever disagree a holder binds the wrong node,
+    the pre-published URL is unreachable, and the served-vs-reserved check fails
+    loud at runtime. Pins the prediction to a hand-reconstruction of that
+    placement so the two copies cannot silently drift. This stays in the MCore
+    lane because the placement prediction mirrors MCore's inference frontend
+    topology.
+
+    Reserving one address per frontend is the point: Gym spreads sessions over
+    the URLs it is handed, so a single reservation would pin every session to
+    one frontend however many the engine goes on to start.
+    """
+    if sorted_bundle_indices is not None:
+        placement_groups = [SimpleNamespace(bundle_count=4)]
+    else:
+        placement_groups = [
+            SimpleNamespace(bundle_count=2),
+            SimpleNamespace(bundle_count=2),
+        ]
+    cluster = SimpleNamespace(
+        num_gpus_per_node=2,
+        _sorted_bundle_indices=sorted_bundle_indices,
+        get_placement_groups=lambda: placement_groups,
+        world_size=lambda: 4,
+    )
+    config = {
+        "megatron_cfg": {
+            "tensor_model_parallel_size": model_parallel_size,
+            "pipeline_model_parallel_size": 1,
+            "expert_model_parallel_size": 1,
+            "expert_tensor_parallel_size": 1,
+            "context_parallel_size": 1,
+        },
+        "generation": {
+            "colocated": {"enabled": True},
+            "mcore_generation_config": {
+                # This is an override block, not a complete Megatron config.
+                "expose_http_server": True,
+            },
+        },
+    }
+
+    urls, rank_to_port, holders = MegatronGeneration.reserve_http_server_addresses(
+        cluster, config
+    )
+
+    expected_ranks = list(range(0, 4, model_parallel_size))
+    expected_placement = _bundles_via_worker_group(
+        sorted_bundle_indices, cluster.num_gpus_per_node, placement_groups
+    )
+    assert list(rank_to_port) == expected_ranks
+    assert len(urls) == len(holders) == len(expected_ranks)
+
+    # Each holder -- and thus each pre-published URL's node -- must sit on the
+    # exact (placement_group, bundle) its frontend rank will occupy.
+    for strategy, rank in zip(patched_holder.scheduling_strategies, expected_ranks):
+        pg_index, bundle_index = expected_placement[rank]
+        assert strategy.placement_group is placement_groups[pg_index]
+        assert strategy.placement_group_bundle_index == bundle_index
+
+    assert urls == [f"http://10.0.0.{i}:4321/v1" for i in range(len(expected_ranks))]
+    assert all(port == 4321 for port in rank_to_port.values())
+
+
+@pytest.mark.mcore
+def test_frontend_ranks_uses_dedicated_colocated_inference_layout():
+    """A colocated reshard reserves frontends for its serving layout, not training TP."""
+    cluster = SimpleNamespace(world_size=lambda: 2)
+    config = {
+        "megatron_cfg": {
+            "tensor_model_parallel_size": 2,
+            "pipeline_model_parallel_size": 1,
+            "expert_model_parallel_size": 1,
+            "expert_tensor_parallel_size": 1,
+            "context_parallel_size": 1,
+            "transformer_impl": "transformer_engine",
+            "sequence_parallel": False,
+        },
+        "generation": {
+            "colocated": {"enabled": True},
+            "mcore_generation_config": {
+                "tensor_model_parallel_size": 1,
+                "transformer_impl": "inference_optimized",
+                "sequence_parallel": True,
+            },
+        },
+    }
+
+    assert MegatronGeneration.frontend_ranks(cluster, config) == [0, 1]
+
+
+def _mp_coordinator_ranks(tp: int, pp: int, world_size: int) -> list[int]:
+    """Ranks satisfying MCore's `is_mp_coordinator`, by explicit decomposition.
+
+    Per-rank rather than a stride: sharing frontend_ranks' formula would make
+    the assertion a tautology. CP and DP cancel, so they take no parameter.
+    """
+    ranks_per_pp_stage = world_size // pp
+    return [
+        rank
+        for rank in range(world_size)
+        if rank % tp == 0 and rank // ranks_per_pp_stage == 0
+    ]
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    "tp, cp, pp, world_size",
+    [
+        (1, 1, 1, 8),
+        (2, 1, 1, 8),
+        (4, 1, 1, 16),
+        (2, 2, 1, 8),
+        # PP > 1: a TP*PP stride picks 0 and 4 here instead of 0 and 2.
+        (2, 1, 2, 8),
+        (2, 2, 2, 16),
+        (4, 1, 2, 16),
+    ],
+)
+def test_frontend_ranks_matches_is_mp_coordinator(tp, cp, pp, world_size):
+    """frontend_ranks is a driver-side copy of the engine's own predicate.
+
+    Reservation runs before any worker exists, so the set must be predicted.
+    `is_mp_coordinator` needs a real engine, so without this the copy only
+    drifts loudly on a multi-node nightly.
+    """
+    cluster = SimpleNamespace(world_size=lambda: world_size)
+    config = {
+        "megatron_cfg": {
+            "tensor_model_parallel_size": tp,
+            "pipeline_model_parallel_size": pp,
+            "expert_model_parallel_size": 1,
+            "expert_tensor_parallel_size": 1,
+            "context_parallel_size": cp,
+        },
+        "generation": {
+            "colocated": {"enabled": True},
+            "mcore_generation_config": {"expose_http_server": True},
+        },
+    }
+
+    assert MegatronGeneration.frontend_ranks(cluster, config) == _mp_coordinator_ranks(
+        tp, pp, world_size
+    )

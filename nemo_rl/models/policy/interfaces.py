@@ -19,7 +19,7 @@ import torch
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.models.generation.interfaces import GenerationDatumSpec, RefitPayloadMode
 from nemo_rl.utils.timer import Timer
 
 
@@ -46,6 +46,21 @@ class TopkLogitsOutputSpec(TypedDict):
 
     topk_logits: torch.Tensor
     topk_indices: torch.Tensor
+
+
+class TeacherFullPayloadOutputSpec(TypedDict):
+    """Sampled-token logprobs plus the full-vocabulary MOPD teacher payload.
+
+    ``teacher_full_payload`` is ``[B, S, hidden_size]`` or ``[B, S, vocab_size]``
+    depending on ``on_policy_distillation.full.teacher_payload``. It is ``None``
+    off the last pipeline stage: the payload is far too large to broadcast, so
+    only the stage that produced it writes it back. It comes back on CPU --
+    each microbatch is moved off the device inside the forward schedule, which
+    is what bounds the resident payload to one microbatch.
+    """
+
+    logprobs: torch.Tensor
+    teacher_full_payload: Optional[torch.Tensor]
 
 
 class PolicyInterface(ABC):
@@ -172,8 +187,14 @@ class ColocatablePolicyInterface(PolicyInterface):
         world_size: int,
         *,
         train_world_size: int,
+        rank_offset: int = 0,
         nccl_peer: str = "nemo",
     ) -> list[ray.ObjectRef]:
+        pass
+
+    @abstractmethod
+    def sync_params_before_refit(self) -> None:
+        """Materialize the latest policy parameters before weight transfer."""
         pass
 
     @abstractmethod
@@ -188,7 +209,11 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
-    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+    def prepare_refit_info(
+        self,
+        *,
+        refit_payload_mode: RefitPayloadMode,
+    ) -> Optional[dict[str, Any]]:
         pass
 
     @abstractmethod
@@ -199,35 +224,58 @@ class ColocatablePolicyInterface(PolicyInterface):
     ) -> list[ray.ObjectRef]:
         pass
 
-    def stream_weights_via_http(
+    def connect_sglang_rollout_engines(
         self,
-        rollout_engine_urls: list[str],
-        buffer_size_bytes: int,
-    ) -> list[ray.ObjectRef]:
-        """Stream model weights to colocated SGLang engines via CUDA IPC over HTTP.
-
-        Args:
-            rollout_engine_urls: ``http://host:port`` base URLs of each
-                engine's ``node_rank=0`` SGLang HTTP server.
-            buffer_size_bytes: Max bucket size in bytes before flushing.
-
-        The rollout TP size (``num_gpus_per_engine``) is captured once via
-        ``set_rollout_num_gpus_per_engine`` and reused on every refit.
-        """
+        *,
+        engine_gpu_counts: list[int],
+        engine_gpu_offsets: Optional[list[int]] = None,
+    ) -> None:
         raise NotImplementedError(
-            "stream_weights_via_http is not implemented for this policy worker"
+            "connect_sglang_rollout_engines is not implemented for this policy"
         )
 
-    def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
-        """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
+    def update_weights_to_sglang_colocated(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict[str, Any]] = None,
+    ) -> list[ray.ObjectRef]:
         raise NotImplementedError(
-            "set_rollout_num_gpus_per_engine is not implemented for this policy worker"
+            "update_weights_to_sglang_colocated is not implemented for this policy"
+        )
+
+    def connect_sglang_rollout_engines_distributed(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        engine_gpu_counts: list[int],
+        group_name: Optional[str] = None,
+    ) -> None:
+        raise NotImplementedError(
+            "connect_sglang_rollout_engines_distributed is not implemented "
+            "for this policy"
+        )
+
+    def update_weights_to_sglang_distributed(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        rollout_engine_lock: ray.actor.ActorHandle,
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict[str, Any]] = None,
+    ) -> list[ray.ObjectRef]:
+        raise NotImplementedError(
+            "update_weights_to_sglang_distributed is not implemented for this policy"
         )
 
     @abstractmethod
     def broadcast_weights_for_collective(
         self,
         kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
@@ -240,12 +288,16 @@ class ColocatablePolicyInterface(PolicyInterface):
         gen_parallelism: dict[str, int],
         train_world_size: int,
         gen_world_size: int,
+        *,
+        refit_payload_mode: RefitPayloadMode,
     ) -> Any:
         """Prepare per-layer param metadata for nccl_reshard-based refit."""
         raise NotImplementedError
 
     def nccl_reshard_refit(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
     ) -> list[ray.ObjectRef]:
         """Sync weights to generation workers via the NCCL-reshard path."""
         raise NotImplementedError

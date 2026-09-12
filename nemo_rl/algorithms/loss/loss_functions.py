@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar
+import warnings
+from typing import TYPE_CHECKING, Any, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from nemo_rl.algorithms.loss.draft import (
+    DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
     DraftLossStats,
     streaming_vocab_parallel_soft_ce,
 )
@@ -37,6 +39,7 @@ from nemo_rl.algorithms.x_token.loss_utils import (
     next_token_accuracy,
     project_student_to_teacher_vocab,
     select_teacher_topk_indices,
+    slice_sparse_projection_cols,
     student_next_token_ce,
     valid_chunk_mask,
 )
@@ -44,17 +47,26 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     cp_shift_next,
     group_all_reduce_sum,
+    group_all_reduce_sum_with_grad,
     vocab_parallel_full_log_softmax,
     vocab_parallel_gather_columns,
     vocab_parallel_log_softmax,
 )
 from nemo_rl.models.dtensor.parallelize import to_local_if_dtensor
 
+if TYPE_CHECKING:
+    # Import-time only: nemo_rl.algorithms.opd imports the data plane, which
+    # would pull a heavy dependency chain into every loss-function consumer.
+    from nemo_rl.algorithms.opd import OnPolicyDistillationFullConfig
+
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
 
 class DraftCrossEntropyLossConfig(TypedDict):
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup]
+    # Tokens per FP32 vocab tile in the streaming soft-CE reduction. Defaults to
+    # DEFAULT_DRAFT_TOKEN_CHUNK_SIZE; see policy.draft.token_chunk_size.
+    token_chunk_size: NotRequired[int]
 
 
 class DraftCrossEntropyLossDataDict(TypedDict):
@@ -74,7 +86,7 @@ class DraftCrossEntropyLossFn(LossFunction):
     def __init__(
         self,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-        token_chunk_size: int = 4096,
+        token_chunk_size: int = DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
     ):
         self.vocab_parallel_group = vocab_parallel_group
         self.token_chunk_size = token_chunk_size
@@ -134,7 +146,7 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     ratio_clip_c: Optional[float] = None
 
     # --- KL regularization ---
-    reference_policy_kl_penalty: float = 0.01
+    reference_policy_kl_penalty: float = Field(default=0.01, ge=0, allow_inf_nan=False)
     # Can be set to k1, k2, k3
     # For more details, see http://joschu.net/blog/kl-approx.html
     reference_policy_kl_type: str = "k3"
@@ -235,13 +247,24 @@ class ClippedPGLossFn(LossFunction):
     input_type = LossInputType.LOGPROB
 
     def __init__(
-        self, cfg: ClippedPGLossConfig, use_fused_linear_logprobs: bool = False
+        self,
+        cfg: ClippedPGLossConfig,
+        use_fused_linear_logprobs: bool = False,
+        opd_full: Optional["OnPolicyDistillationFullConfig"] = None,
     ):
         # When True, the model forward is patched to return precomputed next-token
         # logprobs (via chunked linear CE fusion) instead of full logits. This is
         # consumed by prepare_loss_input, which short-circuits the logits->logprobs
         # conversion. See nemo_rl/distributed/model_utils.py for the fused forward.
         self.use_fused_linear_logprobs = use_fused_linear_logprobs
+        self.opd_full = opd_full if opd_full is not None and opd_full.enabled else None
+        self.input_type = (
+            LossInputType.OPD_FULL
+            if self.opd_full is not None
+            else LossInputType.LOGPROB
+        )
+        if self.opd_full is not None:
+            _validate_opd_full_loss_config(cfg, use_fused_linear_logprobs)
         self.disable_ppo_ratio = cfg.disable_ppo_ratio
         self.ratio_clip_min = cfg.ratio_clip_min
         self.ratio_clip_max = cfg.ratio_clip_max
@@ -379,15 +402,75 @@ class ClippedPGLossFn(LossFunction):
                 if self.truncated_importance_sampling_type == "seq-mask-tis"
                 else MetricNormalizer.TOKENS
             )
+        if self.opd_full is not None:
+            # opd_full returns its own metric set from _opd_full_call; the
+            # policy-gradient diagnostics above are never produced there.
+            self.metric_normalizations = {
+                "loss": grad_normalizer,
+                "kl_penalty": grad_normalizer,
+                "num_valid_samples": MetricNormalizer.NONE,
+                "opd_full_reverse_kl": MetricNormalizer.TOKENS,
+                "opd_full_reverse_kl_min": MetricNormalizer.NONE,
+                "opd_full_reverse_kl_max": MetricNormalizer.NONE,
+            }
+            if self.opd_full.validate_decomposition:
+                self.metric_normalizations.update(
+                    {
+                        "opd_full_entropy": MetricNormalizer.TOKENS,
+                        "opd_full_cross_entropy": MetricNormalizer.TOKENS,
+                        "opd_full_decomposition_error": MetricNormalizer.NONE,
+                    }
+                )
 
     def __call__(
         self,
-        next_token_logprobs: Tensor,
-        data: BatchedDataDict[ClippedPGLossDataDict],
-        global_valid_seqs: torch.Tensor,
-        global_valid_toks: torch.Tensor,
+        next_token_logprobs: Optional[Tensor] = None,
+        data: Optional[BatchedDataDict[ClippedPGLossDataDict]] = None,
+        global_valid_seqs: Optional[torch.Tensor] = None,
+        global_valid_toks: Optional[torch.Tensor] = None,
+        opd_full_divergence: Optional[Tensor] = None,
+        opd_full_entropy: Optional[Tensor] = None,
+        opd_full_cross_entropy: Optional[Tensor] = None,
     ) -> tuple[torch.Tensor, dict]:
-        """Clipped Policy Gradient RL loss function."""
+        """Clipped Policy Gradient RL loss, or the full-vocabulary MOPD reverse KL.
+
+        Which objective runs is fixed at construction by ``opd_full``.
+
+        Args:
+            next_token_logprobs: Sampled-token log-probabilities ``[B, S - 1]``.
+                Required on the policy-gradient branch; on the ``opd_full``
+                branch only when ``reference_policy_kl_penalty`` is non-zero.
+            data: Microbatch with masks, advantages, and prior log-probabilities.
+            global_valid_seqs: Global valid-sequence count for normalization.
+            global_valid_toks: Global valid-token count for normalization.
+            opd_full_divergence: Per-token reverse KL ``[B, S - 1]``, required on
+                the ``opd_full`` branch.
+            opd_full_entropy: Optional ``sum_v p_s log p_s`` diagnostic.
+            opd_full_cross_entropy: Optional ``-sum_v p_s log p_t`` diagnostic.
+
+        Returns:
+            Tuple of the scalar loss and its metric dict.
+        """
+        assert data is not None, "ClippedPGLossFn requires data"
+        assert global_valid_seqs is not None, (
+            "ClippedPGLossFn requires global_valid_seqs"
+        )
+        assert global_valid_toks is not None, (
+            "ClippedPGLossFn requires global_valid_toks"
+        )
+        if self.opd_full is not None:
+            return self._opd_full_call(
+                data=data,
+                global_valid_seqs=global_valid_seqs,
+                global_valid_toks=global_valid_toks,
+                next_token_logprobs=next_token_logprobs,
+                opd_full_divergence=opd_full_divergence,
+                opd_full_entropy=opd_full_entropy,
+                opd_full_cross_entropy=opd_full_cross_entropy,
+            )
+        assert next_token_logprobs is not None, (
+            "ClippedPGLossFn requires next_token_logprobs"
+        )
         curr_logprobs = next_token_logprobs
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]
@@ -705,7 +788,7 @@ class ClippedPGLossFn(LossFunction):
         # See: docs/guides/grpo.md#sampling-importance-ratio
         if self.sequence_level_importance_ratios:
             sample_importance_ratio = masked_mean(
-                actor_importance_weights,
+                actor_importance_weights.squeeze(-1),
                 sample_mask,
                 global_normalization_factor=global_valid_seqs,
             )
@@ -796,6 +879,245 @@ class ClippedPGLossFn(LossFunction):
             },
         )
 
+    def _opd_full_call(
+        self,
+        *,
+        data: BatchedDataDict[ClippedPGLossDataDict],
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        next_token_logprobs: Optional[Tensor],
+        opd_full_divergence: Optional[Tensor],
+        opd_full_entropy: Optional[Tensor],
+        opd_full_cross_entropy: Optional[Tensor],
+    ) -> tuple[torch.Tensor, dict]:
+        """Full-vocabulary MOPD objective: the exact reverse KL is the whole loss.
+
+        ``prepare_loss_input`` reconstructs the teacher distribution and runs the
+        distributed divergence kernel, so this only masks and normalizes. No
+        policy-gradient ratio, advantage, or importance-sampling term applies:
+        the reverse KL is an exact expectation over the student distribution and
+        does not depend on which token was sampled.
+
+        Args:
+            data: Microbatch with ``token_mask`` and ``sample_mask``.
+            global_valid_seqs: Global valid-sequence count for normalization.
+            global_valid_toks: Global valid-token count for normalization.
+            next_token_logprobs: Current-policy sampled-token log-probabilities,
+                only needed when ``reference_policy_kl_penalty`` is non-zero.
+            opd_full_divergence: Per-token reverse KL ``[B, S - 1]``.
+            opd_full_entropy: Optional ``sum_v p_s log p_s`` diagnostic.
+            opd_full_cross_entropy: Optional ``-sum_v p_s log p_t`` diagnostic.
+
+        Returns:
+            Tuple of the scalar loss and its metric dict.
+
+        Raises:
+            ValueError: If the divergence tensor is missing.
+        """
+        if opd_full_divergence is None:
+            raise ValueError(
+                "opd_full requires opd_full_divergence from prepare_loss_input."
+            )
+        token_mask = data["token_mask"][:, 1:]
+        sample_mask = data["sample_mask"]
+        mask = token_mask * sample_mask.unsqueeze(-1)
+
+        def reduce_like_loss(per_token_values: Tensor) -> torch.Tensor:
+            """Reduce a per-token tensor the way the gradient is normalized.
+
+            SEQUENCE_LEVEL averages within each sequence first, so every sequence
+            contributes equally regardless of length; a flat masked_mean against
+            ``global_valid_seqs`` would instead divide a token sum by a sequence
+            count and scale the loss by the mean sequence length.
+            """
+            if self.loss_type == LossType.TOKEN_LEVEL:
+                return masked_mean(
+                    per_token_values,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                )
+            return masked_mean(
+                masked_mean(per_token_values, token_mask, dim=-1),
+                sample_mask,
+                global_normalization_factor=global_valid_seqs,
+            )
+
+        actor_loss = reduce_like_loss(opd_full_divergence)
+
+        kl = torch.tensor(0.0, device=actor_loss.device)
+        if self.reference_policy_kl_penalty != 0:
+            if next_token_logprobs is None:
+                raise ValueError(
+                    "opd_full with reference_policy_kl_penalty != 0 requires "
+                    "next_token_logprobs from prepare_loss_input: the penalty must "
+                    "be differentiable through the current policy."
+                )
+            # Unlike the exact divergence above, this penalty is sampled, so its
+            # gradient needs the score-function term through the sampling
+            # probability, as in the policy-gradient branch.
+            # exp(x - x.detach()) is 1 in the forward pass and supplies it.
+            kl_importance_weights = torch.nan_to_num(
+                torch.exp(next_token_logprobs - next_token_logprobs.detach()),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            kl = self.reference_policy_kl_penalty * calculate_kl(
+                logprobs=next_token_logprobs,
+                logprobs_reference=data["reference_policy_logprobs"][:, 1:],
+                kl_type=self.reference_policy_kl_type,
+                input_clamp_value=self.kl_input_clamp_value,
+                output_clamp_value=self.kl_output_clamp_value,
+                importance_sampling_weights=kl_importance_weights,
+            )
+            kl = reduce_like_loss(kl)
+
+        loss = actor_loss + kl
+
+        with torch.no_grad():
+            masked_divergence = opd_full_divergence.detach()[mask.bool()]
+            # Token-normalized diagnostics use global_valid_toks regardless of
+            # loss_type, matching their declared MetricNormalizer.TOKENS.
+            reverse_kl_metric = masked_mean(
+                opd_full_divergence.detach(),
+                mask,
+                global_normalization_factor=global_valid_toks,
+            )
+            metrics: dict[str, Any] = {
+                "loss": loss.item(),
+                # Report the raw KL, undoing the coefficient. Guard on the
+                # coefficient: `kl` is 0-dim, so its `numel()` is always 1 and
+                # cannot stand in for "the penalty is active".
+                "kl_penalty": (
+                    kl.item() / self.reference_policy_kl_penalty
+                    if self.reference_policy_kl_penalty
+                    else 0
+                ),
+                "num_valid_samples": sample_mask.sum().item(),
+                "opd_full_reverse_kl": reverse_kl_metric.item(),
+                "opd_full_reverse_kl_min": (
+                    masked_divergence.min().item()
+                    if masked_divergence.numel() > 0
+                    else float("inf")
+                ),
+                "opd_full_reverse_kl_max": (
+                    masked_divergence.max().item()
+                    if masked_divergence.numel() > 0
+                    else float("-inf")
+                ),
+            }
+            if (
+                opd_full_entropy is not None
+                and opd_full_cross_entropy is not None
+                and self.opd_full is not None
+                and self.opd_full.validate_decomposition
+            ):
+                # reverse_kl == sum_v p_s log p_s + (-sum_v p_s log p_t)
+                decomposition = (
+                    opd_full_entropy.detach() + opd_full_cross_entropy.detach()
+                )
+                metrics["opd_full_entropy"] = masked_mean(
+                    -opd_full_entropy.detach(),
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                ).item()
+                metrics["opd_full_cross_entropy"] = masked_mean(
+                    opd_full_cross_entropy.detach(),
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                ).item()
+                metrics["opd_full_decomposition_error"] = (
+                    (decomposition - opd_full_divergence.detach())
+                    .abs()
+                    .mul(mask)
+                    .max()
+                    .item()
+                )
+
+        return loss, metrics
+
+
+def _validate_opd_full_loss_config(
+    cfg: ClippedPGLossConfig, use_fused_linear_logprobs: bool
+) -> None:
+    """Reject loss knobs that have no code path under the full-vocabulary objective.
+
+    ``opd_full`` replaces the whole policy-gradient objective with an exact
+    reverse KL, so the ratio, CISPO, and importance-sampling machinery is dead
+    code on that branch. Erroring out beats silently ignoring user config.
+
+    Args:
+        cfg: The clipped-PG loss config supplied by the user.
+        use_fused_linear_logprobs: Whether the fused linear-CE forward is on.
+
+    Raises:
+        ValueError: If any incompatible option is set.
+    """
+    if use_fused_linear_logprobs:
+        raise ValueError(
+            "opd_full is incompatible with use_fused_linear_logprobs: the fused "
+            "forward returns precomputed logprobs, but the full-vocabulary "
+            "reverse KL needs the raw vocabulary-parallel logits."
+        )
+
+    # Policy-gradient ratio machinery: no ratio exists under opd_full.
+    if not cfg.disable_ppo_ratio:
+        raise ValueError("opd_full requires loss_fn.disable_ppo_ratio=true.")
+    if cfg.ratio_clip_c is not None:
+        raise ValueError("opd_full is incompatible with dual PPO clipping.")
+    if cfg.use_cispo:
+        raise ValueError("opd_full is incompatible with CISPO.")
+    if cfg.force_on_policy_ratio:
+        raise ValueError("opd_full is incompatible with force_on_policy_ratio.")
+    if cfg.use_on_policy_kl_approximation:
+        raise ValueError(
+            "opd_full is incompatible with use_on_policy_kl_approximation: it "
+            "reweights the reference-KL term by a generation-to-current ratio "
+            "that only the policy-gradient branch computes. The opd_full branch "
+            "never reads it, so leaving it on would be silently ignored."
+        )
+    if cfg.sequence_level_importance_ratios:
+        raise ValueError(
+            "opd_full is incompatible with sequence_level_importance_ratios."
+        )
+
+    # Importance-sampling machinery: the reverse KL is an exact expectation over
+    # the student distribution, so no sampling-distribution correction applies.
+    if cfg.use_importance_sampling_correction:
+        raise ValueError(
+            "opd_full is incompatible with use_importance_sampling_correction: the "
+            "full-vocabulary reverse KL is an exact expectation and carries no "
+            "sampled-token score-function term to correct."
+        )
+    if cfg.truncated_importance_sampling_type is not None:
+        raise ValueError(
+            "opd_full is incompatible with truncated_importance_sampling_type."
+        )
+
+    # Advantage/reward-shaped terms: opd_full never reads advantages or rewards.
+    if cfg.positive_example_nll_weight != 0:
+        raise ValueError(
+            "opd_full is incompatible with a non-zero positive_example_nll_weight."
+        )
+
+    if cfg.use_kl_in_reward:
+        raise ValueError(
+            "opd_full is incompatible with use_kl_in_reward: it routes the "
+            "reference KL through the reward, which reaches the objective only "
+            "via advantages, and opd_full ignores advantages entirely. It also "
+            "zeroes the loss-side reference_policy_kl_penalty, so the penalty "
+            "would be dropped on both paths. Set use_kl_in_reward=false; the "
+            "loss-side penalty is applied directly."
+        )
+
+    if cfg.reference_policy_kl_penalty != 0:
+        warnings.warn(
+            "opd_full is already a KL objective against the teacher; "
+            "reference_policy_kl_penalty adds a second KL against the frozen "
+            "reference policy on top of it.",
+            stacklevel=3,
+        )
+
 
 class NLLLossFn(LossFunction):
     """Negative Log Likelihood Loss function."""
@@ -852,11 +1174,18 @@ class NLLLossFn(LossFunction):
 
 
 class PreferenceLossDataDict(TypedDict):
-    """Required keys for the preference loss function."""
+    """Keys for a preference loss.
+
+    ``pair_index`` and ``is_chosen`` make pair reconstruction robust to row
+    reordering by sequence packing. They remain optional for compatibility
+    with existing interleaved DPO batches.
+    """
 
     input_ids: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
+    pair_index: NotRequired[torch.Tensor]
+    is_chosen: NotRequired[torch.Tensor]
 
 
 class PreferenceLossFn(LossFunction):
@@ -883,9 +1212,48 @@ class PreferenceLossFn(LossFunction):
     loss_type = LossType.SEQUENCE_LEVEL
     input_type = LossInputType.LOGIT
 
-    def split_output_tensor(self, tensor: Tensor) -> tuple[Tensor, Tensor]:
-        # tensor is of shape (2*micro_batch_size,)
-        return tensor[::2], tensor[1::2]
+    def split_output_tensor(
+        self,
+        tensor: Tensor,
+        data: Optional[PreferenceLossDataDict] = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Return pair-aligned chosen and rejected rows.
+
+        Sequence packing may reorder rows, so positional slicing is only safe
+        for legacy batches that do not carry pair metadata.
+        """
+        if data is None or "pair_index" not in data or "is_chosen" not in data:
+            return tensor[::2], tensor[1::2]
+
+        is_chosen = data["is_chosen"].to(device=tensor.device, dtype=torch.bool)
+        pair_index = data["pair_index"].to(device=tensor.device)
+        if (
+            is_chosen.numel() != tensor.shape[0]
+            or pair_index.numel() != tensor.shape[0]
+        ):
+            raise ValueError(
+                "pair_index and is_chosen must contain one entry per preference row."
+            )
+        chosen_rows = torch.nonzero(is_chosen, as_tuple=True)[0]
+        rejected_rows = torch.nonzero(~is_chosen, as_tuple=True)[0]
+        chosen_pairs = pair_index.index_select(0, chosen_rows)
+        rejected_pairs = pair_index.index_select(0, rejected_rows)
+        chosen_order = chosen_pairs.argsort(stable=True)
+        rejected_order = rejected_pairs.argsort(stable=True)
+        chosen_pairs = chosen_pairs.index_select(0, chosen_order)
+        rejected_pairs = rejected_pairs.index_select(0, rejected_order)
+        if (
+            not torch.equal(chosen_pairs, rejected_pairs)
+            or torch.unique(chosen_pairs).numel() != chosen_pairs.numel()
+        ):
+            raise ValueError(
+                "Preference batch must contain exactly one chosen and one rejected "
+                "row for every pair_index."
+            )
+        return (
+            tensor.index_select(0, chosen_rows.index_select(0, chosen_order)),
+            tensor.index_select(0, rejected_rows.index_select(0, rejected_order)),
+        )
 
     def _preference_loss(
         self,
@@ -893,34 +1261,36 @@ class PreferenceLossFn(LossFunction):
         sample_mask: Tensor,
         global_valid_seqs: Tensor,
         beta: float = 1.0,
+        data: Optional[PreferenceLossDataDict] = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        rewards_chosen, rewards_rejected = self.split_output_tensor(rewards)
+        rewards_chosen, rewards_rejected = self.split_output_tensor(rewards, data)
+        mask_chosen, mask_rejected = self.split_output_tensor(sample_mask, data)
         rewards_delta = rewards_chosen - rewards_rejected
 
         per_sample_loss = (
-            -torch.nn.functional.logsigmoid(beta * rewards_delta) * sample_mask[::2]
+            -torch.nn.functional.logsigmoid(beta * rewards_delta) * mask_chosen
         )  ## zero out invalid samples
 
         ## divide by 2 because each preference example corresponds to 2 samples (chosen, rejected)
         return (
             masked_mean(
                 per_sample_loss,
-                sample_mask[::2],
+                mask_chosen,
                 global_normalization_factor=global_valid_seqs / 2,
             ),
             masked_mean(
                 rewards_chosen > rewards_rejected,
-                sample_mask[::2],
+                mask_chosen,
                 global_normalization_factor=global_valid_seqs / 2,
             ),
             masked_mean(
                 rewards_chosen,
-                sample_mask[::2],
+                mask_chosen,
                 global_normalization_factor=global_valid_seqs / 2,
             ),
             masked_mean(
                 rewards_rejected,
-                sample_mask[1::2],
+                mask_rejected,
                 global_normalization_factor=global_valid_seqs / 2,
             ),
         )
@@ -941,7 +1311,7 @@ class PreferenceLossFn(LossFunction):
             accuracy,
             rewards_chosen_mean,
             rewards_rejected_mean,
-        ) = self._preference_loss(rewards, sample_mask, global_valid_seqs)
+        ) = self._preference_loss(rewards, sample_mask, global_valid_seqs, data=data)
 
         ## divide by 2 because we're summing over (chosen, rejected) pairs
         num_valid_samples = sample_mask.sum() / 2
@@ -970,6 +1340,8 @@ class DPOLossDataDict(TypedDict):
     reference_policy_logprobs: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
+    pair_index: NotRequired[torch.Tensor]
+    is_chosen: NotRequired[torch.Tensor]
 
 
 class DPOLossFn(PreferenceLossFn):
@@ -1039,6 +1411,15 @@ class DPOLossFn(PreferenceLossFn):
         self.sft_average_log_probs = cfg.sft_average_log_probs
         self.use_fused_linear_logprobs = use_fused_linear_logprobs
         self.sft_loss = NLLLossFn(use_fused_linear_logprobs=use_fused_linear_logprobs)
+        self.metric_normalizations = {
+            "loss": MetricNormalizer.SEQUENCES,
+            "sft_loss": MetricNormalizer.SEQUENCES,
+            "preference_loss": MetricNormalizer.SEQUENCES,
+            "accuracy": MetricNormalizer.SEQUENCES,
+            "rewards_chosen_mean": MetricNormalizer.SEQUENCES,
+            "rewards_rejected_mean": MetricNormalizer.SEQUENCES,
+            "num_valid_samples": MetricNormalizer.NONE,
+        }
 
     def _dpo_loss(
         self,
@@ -1058,7 +1439,11 @@ class DPOLossFn(PreferenceLossFn):
             rewards = rewards / token_mask.sum(-1).clamp(min=1)
 
         return self._preference_loss(
-            rewards, sample_mask, global_valid_seqs, self.reference_policy_kl_penalty
+            rewards,
+            sample_mask,
+            global_valid_seqs,
+            self.reference_policy_kl_penalty,
+            data=data,
         )
 
     # TODO a cleaner typing fix would be required (probably that DPOLossFn should not inherit from PreferenceLossFn)
@@ -1082,10 +1467,11 @@ class DPOLossFn(PreferenceLossFn):
                 dpo_loss=True,
                 dpo_average_log_probs=self.sft_average_log_probs,
             )
-            sft_loss_chosen, sft_loss_rejected = self.split_output_tensor(sft_loss)
+            sft_loss_chosen, _ = self.split_output_tensor(sft_loss, data)
+            sample_mask_chosen, _ = self.split_output_tensor(data["sample_mask"], data)
             sft_loss_chosen = masked_mean(
                 sft_loss_chosen,
-                data["sample_mask"][::2],
+                sample_mask_chosen,
                 global_normalization_factor=global_valid_seqs / 2,
             )
 
@@ -1112,6 +1498,221 @@ class DPOLossFn(PreferenceLossFn):
             "rewards_chosen_mean": rewards_chosen_mean.item(),
             "rewards_rejected_mean": rewards_rejected_mean.item(),
             "num_valid_samples": num_valid_samples.item(),
+        }
+
+
+class MPOLossConfig(BaseModel, extra="allow"):
+    """Mixed Preference Optimization loss configuration."""
+
+    reference_policy_kl_penalty: float = 0.05
+    preference_loss_weight: float = 1.0
+    sft_loss_weight: float = 0.0
+    bco_loss_weight: float = 1.0
+    preference_average_log_probs: bool = False
+    sft_average_log_probs: bool = False
+    quality_average_log_probs: bool = False
+    reward_shift_momentum: float = 0.99
+    reward_shift: float = 0.0
+
+
+class MPOLossFn(PreferenceLossFn):
+    """MPO loss with driver-owned BCO reward-shift state.
+
+    The loss combines a DPO preference term, a chosen-response SFT term, and
+    a BCO quality term. The BCO shift is intentionally not mutated here:
+    loss objects are serialized to distributed workers, so worker-local
+    mutation would be lost between optimizer steps and would diverge across
+    data-parallel ranks. Instead, the loss returns a raw reward sum/count;
+    the algorithm aggregates those values and updates ``reward_shift`` once
+    on the driver after each successful training step.
+    """
+
+    loss_type = LossType.SEQUENCE_LEVEL
+    input_type = LossInputType.LOGPROB
+
+    def __init__(
+        self, cfg: MPOLossConfig, use_fused_linear_logprobs: bool = False
+    ) -> None:
+        self.reference_policy_kl_penalty = cfg.reference_policy_kl_penalty
+        self.preference_loss_weight = cfg.preference_loss_weight
+        self.sft_loss_weight = cfg.sft_loss_weight
+        self.bco_loss_weight = cfg.bco_loss_weight
+        self.preference_average_log_probs = cfg.preference_average_log_probs
+        self.sft_average_log_probs = cfg.sft_average_log_probs
+        self.quality_average_log_probs = cfg.quality_average_log_probs
+        self.reward_shift_momentum = cfg.reward_shift_momentum
+        self.reward_shift = float(cfg.reward_shift)
+        self.use_fused_linear_logprobs = use_fused_linear_logprobs
+
+        if not 0.0 <= self.reward_shift_momentum < 1.0:
+            raise ValueError("reward_shift_momentum must be in [0, 1)")
+
+        self.metric_normalizations = {
+            "loss": MetricNormalizer.SEQUENCES,
+            "sft_loss": MetricNormalizer.SEQUENCES,
+            "preference_loss": MetricNormalizer.SEQUENCES,
+            "bco_loss": MetricNormalizer.SEQUENCES,
+            "accuracy": MetricNormalizer.SEQUENCES,
+            "rewards_chosen_mean": MetricNormalizer.SEQUENCES,
+            "rewards_rejected_mean": MetricNormalizer.SEQUENCES,
+            "bco_rewards_chosen_mean": MetricNormalizer.SEQUENCES,
+            "bco_rewards_rejected_mean": MetricNormalizer.SEQUENCES,
+            "num_valid_samples": MetricNormalizer.NONE,
+            # These are sufficient statistics, aggregated by summation before
+            # the single driver-side EMA update.
+            "bco_reward_sum": MetricNormalizer.NONE,
+            "bco_reward_count": MetricNormalizer.NONE,
+        }
+
+    def update_reward_shift(self, reward_sum: float, reward_count: float) -> float:
+        """Apply one EMA update from globally aggregated BCO rewards."""
+        if reward_count <= 0:
+            return self.reward_shift
+        batch_mean = reward_sum / reward_count
+        self.reward_shift = (
+            self.reward_shift_momentum * self.reward_shift
+            + (1.0 - self.reward_shift_momentum) * batch_mean
+        )
+        return self.reward_shift
+
+    @staticmethod
+    def _sequence_logratios(
+        next_token_logprobs: Tensor,
+        data: BatchedDataDict[DPOLossDataDict],
+        *,
+        average: bool,
+    ) -> Tensor:
+        token_mask = data["token_mask"][:, 1:]
+        reference_logprobs = data["reference_policy_logprobs"][:, :-1]
+        logratios = ((next_token_logprobs - reference_logprobs) * token_mask).sum(
+            dim=-1
+        )
+        if average:
+            logratios = logratios / token_mask.sum(dim=-1).clamp(min=1)
+        return logratios
+
+    def _sft_loss(
+        self,
+        next_token_logprobs: Tensor,
+        data: BatchedDataDict[DPOLossDataDict],
+        global_valid_seqs: Tensor,
+    ) -> Tensor:
+        token_mask = data["token_mask"][:, 1:]
+        sample_mask = data["sample_mask"]
+        per_sequence_loss = -(next_token_logprobs * token_mask).sum(dim=-1)
+        if self.sft_average_log_probs:
+            per_sequence_loss = per_sequence_loss / token_mask.sum(dim=-1).clamp(min=1)
+        chosen_loss, _ = self.split_output_tensor(per_sequence_loss, data)
+        chosen_mask, _ = self.split_output_tensor(sample_mask, data)
+        return masked_mean(
+            chosen_loss,
+            chosen_mask,
+            global_normalization_factor=global_valid_seqs / 2,
+        )
+
+    def _bco_loss(
+        self,
+        rewards: Tensor,
+        data: BatchedDataDict[DPOLossDataDict],
+        global_valid_seqs: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        sample_mask = data["sample_mask"]
+        chosen_rewards, rejected_rewards = self.split_output_tensor(rewards, data)
+        chosen_mask, rejected_mask = self.split_output_tensor(sample_mask, data)
+        shift = torch.as_tensor(
+            self.reward_shift, dtype=rewards.dtype, device=rewards.device
+        )
+        chosen_loss = (
+            -torch.nn.functional.logsigmoid(chosen_rewards - shift) * chosen_mask
+        )
+        rejected_loss = (
+            -torch.nn.functional.logsigmoid(-(rejected_rewards - shift)) * rejected_mask
+        )
+        pair_count = global_valid_seqs / 2
+        loss = masked_mean(
+            chosen_loss,
+            chosen_mask,
+            global_normalization_factor=pair_count,
+        ) + masked_mean(
+            rejected_loss,
+            rejected_mask,
+            global_normalization_factor=pair_count,
+        )
+        chosen_mean = masked_mean(
+            chosen_rewards,
+            chosen_mask,
+            global_normalization_factor=pair_count,
+        )
+        rejected_mean = masked_mean(
+            rejected_rewards,
+            rejected_mask,
+            global_normalization_factor=pair_count,
+        )
+        return loss, chosen_mean, rejected_mean
+
+    def __call__(
+        self,
+        next_token_logprobs: Tensor,
+        data: BatchedDataDict[DPOLossDataDict],
+        global_valid_seqs: Tensor,
+        global_valid_toks: Tensor | None,
+    ) -> tuple[Tensor, dict[str, Any]]:
+        preference_logratios = self._sequence_logratios(
+            next_token_logprobs,
+            data,
+            average=self.preference_average_log_probs,
+        )
+        (
+            preference_loss,
+            accuracy,
+            rewards_chosen_mean,
+            rewards_rejected_mean,
+        ) = self._preference_loss(
+            preference_logratios,
+            data["sample_mask"],
+            global_valid_seqs,
+            beta=self.reference_policy_kl_penalty,
+            data=data,
+        )
+
+        quality_logratios = self._sequence_logratios(
+            next_token_logprobs,
+            data,
+            average=self.quality_average_log_probs,
+        )
+        quality_rewards = self.reference_policy_kl_penalty * quality_logratios
+        bco_loss, bco_chosen_mean, bco_rejected_mean = self._bco_loss(
+            quality_rewards, data, global_valid_seqs
+        )
+
+        sft_loss = torch.zeros(
+            (), dtype=next_token_logprobs.dtype, device=next_token_logprobs.device
+        )
+        if self.sft_loss_weight > 0:
+            sft_loss = self._sft_loss(next_token_logprobs, data, global_valid_seqs)
+
+        total_loss = (
+            self.preference_loss_weight * preference_loss
+            + self.sft_loss_weight * sft_loss
+            + self.bco_loss_weight * bco_loss
+        )
+        sample_mask = data["sample_mask"].to(dtype=quality_rewards.dtype)
+        bco_reward_sum = (quality_rewards.detach() * sample_mask).sum()
+        bco_reward_count = sample_mask.sum()
+
+        return total_loss, {
+            "loss": total_loss.item(),
+            "sft_loss": sft_loss.item(),
+            "preference_loss": preference_loss.item(),
+            "bco_loss": bco_loss.item(),
+            "accuracy": accuracy.item(),
+            "rewards_chosen_mean": rewards_chosen_mean.item(),
+            "rewards_rejected_mean": rewards_rejected_mean.item(),
+            "bco_rewards_chosen_mean": bco_chosen_mean.item(),
+            "bco_rewards_rejected_mean": bco_rejected_mean.item(),
+            "num_valid_samples": (data["sample_mask"].sum() / 2).item(),
+            "bco_reward_sum": bco_reward_sum.item(),
+            "bco_reward_count": bco_reward_count.item(),
         }
 
 
@@ -1629,6 +2230,8 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
         aligns_by_idx: dict[int, LocalizedAlignment],
         *,
+        student_next_token_logprobs: Optional[torch.Tensor] = None,
+        student_next_token_mask: Optional[torch.Tensor] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -1642,9 +2245,16 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
         ``student_logits_contig`` (CP-relaid) and the per-teacher ``aligns_by_idx``
         / ``teacher_full_logits_by_idx`` are precomputed in ``prepare_loss_input``;
-        the raw ``logits`` is kept for the CE term.
+        the Automodel CP path also supplies its sequence-local CE inputs.
         """
-        ce_loss = self._compute_ce(logits, data, global_valid_toks)
+        ce_loss = self._compute_ce(
+            logits,
+            data,
+            global_valid_toks,
+            student_next_token_logprobs=student_next_token_logprobs,
+            student_next_token_mask=student_next_token_mask,
+            cp_group=cp_group,
+        )
 
         if self.kd_loss_mode == "sum":
             total_kd, per_teacher_metrics = self._sum_kd(
@@ -2285,14 +2895,17 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
         Steps:
 
-        1. Project full-vocab student probs through ``M`` to teacher vocab.
-        2. Use the full teacher logits materialized by ``prepare_loss_input``.
-        3. Compute one ``global_top_indices [k]`` per microbatch from the
+        1. Use the full teacher logits materialized by ``prepare_loss_input``.
+        2. Compute one ``global_top_indices [k]`` per microbatch from the
            teacher's importance: ``max`` over flat ``(B*T_t)``, ``topk``
            over ``V_t``. Same vocab subset across every sample/position —
            keeps chunk-averaged KL well-defined.
-        4. Slice both the projected student probs and the teacher logits
-           to those ``k`` columns.
+        3. Restrict ``M`` to those ``k`` teacher columns and project the
+           student probs through it, so only the ``k`` columns are ever
+           produced. Each teacher column of ``M.t() @ p`` is an independent
+           contraction over the student axis, so slicing before the matmul
+           is value-preserving.
+        4. Slice the teacher logits to the same ``k`` columns.
         5. Build per-token chunk masks from ``alignment_*_chunk_id`` and
            chunk-average via ``bmm`` (shared helper).
         6. Renormalize student chunk distributions inside the top-k subset
@@ -2316,10 +2929,9 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             student_vocab_size=self.student_vocab_size,
             teacher_vocab_size=teacher_vocab_size,
         )  # [V_s, V_t] sparse COO, fp32
-        projected_full = project_student_to_teacher_vocab(
-            student_probs, sparse_projection, tp_group=tp_group
-        )  # [B, T_s_local, V_t]
-        full_teacher_vocab_size = projected_full.shape[-1]
+        # The projection itself is deferred until the top-k columns are known
+        # (see below); its teacher-vocab width is available from the matrix.
+        full_teacher_vocab_size = sparse_projection.size(1)
 
         # `teacher_full_logits` [B, T_t, V_t_model] is materialized by
         # `prepare_loss_input` (rebuilt from the IPC handles). Same transport
@@ -2350,8 +2962,21 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             teacher_full_logits, vocab_topk, cp_group=cp_group
         )  # [k]
 
-        # Slice both sides to the shared [k] columns.
-        projected_topk = projected_full[..., global_top_indices]  # [B, T_s, k]
+        # Slice both sides to the shared [k] columns. On the student side the
+        # slice is folded into the projection matrix rather than applied to its
+        # output: every teacher column of ``M.t() @ p`` is an independent
+        # contraction over the student axis, so restricting M's columns first is
+        # value-preserving, and the only renormalization here is within the [k]
+        # subset (below), never over V_t. Projecting all V_t columns and then
+        # discarding all but k built -- and all-reduced, under TP -- a
+        # [B, T_s, V_t] fp32 tensor to read k of its columns.
+        if vocab_topk < full_teacher_vocab_size:
+            sparse_projection = slice_sparse_projection_cols(
+                sparse_projection, global_top_indices
+            )
+        projected_topk = project_student_to_teacher_vocab(
+            student_probs, sparse_projection, tp_group=tp_group
+        )  # [B, T_s_local, k]
         teacher_topk_logits = teacher_full_logits[
             ..., global_top_indices
         ]  # [B, T_t, k]
@@ -2643,8 +3268,29 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         logits: torch.Tensor,
         data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
         global_valid_toks: torch.Tensor,
+        *,
+        student_next_token_logprobs: Optional[torch.Tensor] = None,
+        student_next_token_mask: Optional[torch.Tensor] = None,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> torch.Tensor:
         """Next-token CE on the student side (TP/CP handled by the helpers)."""
+        if student_next_token_logprobs is not None:
+            assert student_next_token_mask is not None
+            label_mask = student_next_token_mask.to(
+                student_next_token_logprobs.dtype
+            ) * to_local_if_dtensor(data["sample_mask"]).to(
+                student_next_token_logprobs.device
+            ).unsqueeze(-1)
+            local_ce = masked_mean(
+                -student_next_token_logprobs,
+                label_mask,
+                global_normalization_factor=global_valid_toks,
+            )
+            # Forward SUM gives every CP rank the same full-sequence CE (and
+            # therefore the same dynamic KD scale). Identity backward keeps the
+            # disjoint rank-local windows at a single gradient fanout.
+            return group_all_reduce_sum_with_grad(local_ce, cp_group)
+
         per_token_ce = student_next_token_ce(
             logits, input_ids=data["input_ids"], seq_index=data.get("seq_index")
         )

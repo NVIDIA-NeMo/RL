@@ -267,3 +267,31 @@ def test_raw_stats_are_additive_across_microbatches_with_an_empty_bin() -> None:
         combined.counts,
     )
     assert combined.counts[1] == 0
+
+
+def test_streaming_soft_ce_rejects_out_of_range_bin_ids() -> None:
+    student = torch.randn(2, 3, 5, dtype=torch.float64)
+    teacher = torch.randn(2, 3, 5, dtype=torch.float64)
+    mask = torch.ones(2, 3)
+    weights = torch.tensor([1.0, 0.5])
+
+    with pytest.raises(ValueError, match=r"bin_ids must lie in \[0, 2\)"):
+        streaming_vocab_parallel_soft_ce(
+            student_logits=student,
+            teacher_logits=teacher,
+            mask=mask,
+            token_chunk_size=4,
+            tp_group=None,
+            bin_ids=torch.full((2, 3), 2, dtype=torch.long),
+            weights=weights,
+        )
+    with pytest.raises(ValueError, match=r"bin_ids must lie in \[0, 2\)"):
+        streaming_vocab_parallel_soft_ce(
+            student_logits=student,
+            teacher_logits=teacher,
+            mask=mask,
+            token_chunk_size=4,
+            tp_group=None,
+            bin_ids=torch.full((2, 3), -1, dtype=torch.long),
+            weights=weights,
+        )

@@ -19,6 +19,14 @@ from typing import Any
 
 import torch
 
+# Tokens per FP32 vocab tile. The streaming kernel materializes
+# ``token_chunk_size x vocab`` FP32 probabilities at a time, so this trades peak
+# activation memory against launch count: 4096 keeps the tile near 0.5 GiB at a
+# 32k vocabulary while still saturating a modern GPU. Exposed as
+# ``policy.draft.token_chunk_size`` for models whose vocabulary makes that tile
+# too large (lower it) or too small to keep the GPU busy (raise it).
+DEFAULT_DRAFT_TOKEN_CHUNK_SIZE = 4096
+
 
 @dataclass(frozen=True, slots=True)
 class DraftLossStats:
@@ -276,7 +284,9 @@ class _StreamingVocabParallelSoftCE(torch.autograd.Function):
         )
         # pyrefly: ignore[implicitly-defined-attribute]
         ctx.token_chunk_size = token_chunk_size
-        ctx.tp_group = tp_group  # pyrefly: ignore[implicitly-defined-attribute]
+        # tp_group is deliberately not saved: backward rebuilds both
+        # distributions from the already TP-reduced log-normalizers, so the
+        # gradient is purely local and needs no collective.
         return numerators
 
     @staticmethod
@@ -364,16 +374,30 @@ def streaming_vocab_parallel_soft_ce(
         if num_bins != 1:
             raise ValueError("bin_ids is required when weights contains multiple bins.")
         bin_ids = torch.zeros_like(mask, dtype=torch.long)
-    elif bin_ids.shape != mask.shape:
-        raise ValueError(
-            f"bin_ids must match mask, got {bin_ids.shape} and {mask.shape}."
-        )
-    elif bin_ids.dtype != torch.long:
-        raise TypeError(f"bin_ids must use torch.long, got {bin_ids.dtype}.")
-    elif bin_ids.device != mask.device:
-        raise ValueError(
-            f"bin_ids and mask must share a device, got {bin_ids.device} and {mask.device}."
-        )
+    else:
+        if bin_ids.shape != mask.shape:
+            raise ValueError(
+                f"bin_ids must match mask, got {bin_ids.shape} and {mask.shape}."
+            )
+        if bin_ids.dtype != torch.long:
+            raise TypeError(f"bin_ids must use torch.long, got {bin_ids.dtype}.")
+        if bin_ids.device != mask.device:
+            raise ValueError(
+                f"bin_ids and mask must share a device, got {bin_ids.device} and "
+                f"{mask.device}."
+            )
+        if bin_ids.numel() > 0:
+            # Out-of-range bins would otherwise surface as a device-side assert
+            # (CUDA) or RuntimeError (CPU) deep inside scatter_add_; validate
+            # caller-supplied ids here for a clear message. The internal
+            # zeros default above needs no check and pays no device sync.
+            min_bin = int(bin_ids.min())
+            max_bin = int(bin_ids.max())
+            if min_bin < 0 or max_bin >= num_bins:
+                raise ValueError(
+                    f"bin_ids must lie in [0, {num_bins}), got range "
+                    f"[{min_bin}, {max_bin}]."
+                )
 
     num_tokens = student_logits.numel() // student_logits.shape[-1]
     if num_tokens <= token_chunk_size:

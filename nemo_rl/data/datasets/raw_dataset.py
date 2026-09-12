@@ -65,8 +65,17 @@ class RawDataset:
         self.data_config = data_config
         system_prompt_file = self.data_config.get("system_prompt_file", None)
         prompt_file = self.data_config.get("prompt_file", None)
+        # TODO(rohitrango): Source model-specific media keys from ProcessorInterface.
         self.task_spec = TaskDataSpec(
             task_name=self.task_name,
             prompt_file=prompt_file,
             system_prompt_file=system_prompt_file,
+            num_frames=self.data_config.get("num_frames"),
+            video_sampling_style=self.data_config.get("video_sampling_style"),
+            video_target_num_patches=self.data_config.get("video_target_num_patches"),
+            video_temporal_patch_size=self.data_config.get("video_temporal_patch_size"),
+            video_maintain_aspect_ratio=self.data_config.get(
+                "video_maintain_aspect_ratio"
+            ),
+            min_generation_tokens=self.data_config.get("min_generation_tokens"),
         )

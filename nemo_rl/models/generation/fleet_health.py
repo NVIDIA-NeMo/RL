@@ -62,6 +62,13 @@ class ShardState(str, enum.Enum):
 # transient blip cost a shard's worth of throughput.
 _SERVING_STATES = frozenset({ShardState.HEALTHY, ShardState.SUSPECT})
 
+# States whose process cannot take part in a collective, because it is gone or coming
+# back. This is deliberately NOT the complement of _SERVING_STATES: SUSPECT and STALE are
+# not handed traffic but their processes are alive and join a refit normally. Refitting a
+# STALE shard is precisely how it stops being stale, so counting it absent would break
+# the recovery this distinction exists to enable.
+_ABSENT_STATES = frozenset({ShardState.DEAD, ShardState.RESTARTING, ShardState.RETIRED})
+
 
 @dataclass
 class ShardHealth:
@@ -78,6 +85,10 @@ class ShardHealth:
     # reaches unhealthy_threshold. Only report_success (or a refit) clears this.
     consecutive_reported_failures: int = 0
     restart_attempts: int = 0
+    # What this shard was before an aborted refit pulled it out of service, so the
+    # promotion afterwards can put it back where it was instead of laundering it to
+    # HEALTHY. None whenever the shard is not mid-recovery.
+    state_before_partial: Optional["ShardState"] = None
     # Trainer weight version this shard was last refit to.
     weight_version: int = 0
     last_ok_at: float = 0.0
@@ -154,9 +165,15 @@ class GenerationFleetHealth:
             )
             for idx in range(shard_count)
         }
-        # Bumped whenever the serving set changes. The weight-sync path compares this
-        # against the epoch its communicator was built with, so reconciliation is an
-        # integer comparison in the common case.
+        # Bumped whenever the serving set changes. Published as a metric, and nothing
+        # else reads it.
+        #
+        # This used to claim the weight-sync path compared it against the epoch its
+        # communicator was built with. It never did -- the comparison described here did
+        # not exist anywhere, and reconcile_communicator rebuilt on every call once a shard
+        # was gone. That skip is now real, but it compares absent SETS on the synchronizer
+        # rather than an epoch from here, because the synchronizer is what knows which
+        # membership its current communicator was built with.
         self._membership_epoch: int = 0
         self._last_serving: frozenset[int] = frozenset(self._shards)
 
@@ -177,6 +194,42 @@ class GenerationFleetHealth:
     def serving_shards(self) -> list[int]:
         """Shard indices currently eligible to be handed traffic."""
         return [idx for idx in sorted(self._shards) if self._shards[idx].is_serving]
+
+    def absent_shards(self) -> list[int]:
+        """Shard indices whose process cannot take part in a collective.
+
+        The set the weight-refit path cares about, and deliberately not the complement of
+        :meth:`serving_shards`: a SUSPECT or STALE shard is withheld from traffic but its
+        process is alive and joins the refit normally.
+        """
+        return [
+            idx
+            for idx in sorted(self._shards)
+            if self._shards[idx].state in _ABSENT_STATES
+        ]
+
+    def suspected_shards(self) -> list[int]:
+        """Shards the ledger already doubted when the refit went wrong.
+
+        SUSPECT, or STALE having been SUSPECT immediately before an aborted refit marked
+        it partial. The second case is the common one at recovery time and would otherwise
+        be invisible: ``mark_weights_partial`` runs over every *serving* shard, and SUSPECT
+        is a serving state, so the suspicion is overwritten by STALE microseconds before
+        anyone asks. ``state_before_partial`` is what preserves it.
+
+        Not for routing -- ``serving_shards`` decides that. This exists for the one caller
+        that has independent evidence something in the collective stopped participating and
+        needs to know which shard the ledger was already unhappy with.
+        """
+        return [
+            idx
+            for idx in sorted(self._shards)
+            if self._shards[idx].state is ShardState.SUSPECT
+            or (
+                self._shards[idx].state is ShardState.STALE
+                and self._shards[idx].state_before_partial is ShardState.SUSPECT
+            )
+        ]
 
     def state_of(self, shard_idx: int) -> ShardState:
         return self._shards[shard_idx].state
@@ -249,6 +302,52 @@ class GenerationFleetHealth:
         elif shard.state is ShardState.HEALTHY:
             self._transition(shard, ShardState.SUSPECT)
 
+    def record_actor_death(self, shard_idx: int, error: str = "") -> None:
+        """Record proof that a shard's process is gone. DEAD at once, no counting.
+
+        The counters in :meth:`record_probe` exist to tell a slow shard from a dead one,
+        because a probe timeout cannot distinguish them. Some evidence carries no such
+        ambiguity: Ray reporting its actor dead means the process is gone, full stop, and
+        making that wait for ``unhealthy_threshold`` more rounds of the same answer only
+        delays the conclusion.
+
+        The delay was not academic. Detection took ``probe_interval_s *
+        unhealthy_threshold``, which the refit deadline could expire inside -- so a refit
+        hung on a dead rank aborted while the monitor still had that rank SUSPECT, and
+        the rebuild the abort exists to trigger had an empty absent set to work from.
+        Job 5925668.
+
+        Ignores shards that are already absent, so a repeat report is idempotent, and
+        RETIRED is never disturbed.
+        """
+        shard = self._shards[shard_idx]
+        if shard.state in _ABSENT_STATES:
+            return
+        if error:
+            shard.last_error = error
+        shard.consecutive_probe_successes = 0
+        shard.consecutive_probe_failures = self._policy.unhealthy_threshold
+        self._transition(shard, ShardState.DEAD)
+
+    def condemn_silent_participant(self, shard_idx: int, *, reason: str) -> None:
+        """Quarantine a shard that is alive but did not take part in a collective.
+
+        Distinct from :meth:`record_actor_death`, which means "Ray says the process is
+        gone". This one means "the process answers and still broke the refit", which is the
+        failure mode ``is_alive`` cannot see: it is answered by the Ray actor and never
+        touches the engine, so a wedged engine reads as healthy forever.
+
+        DEAD rather than STALE, because the point is to make it *absent*: STALE keeps it in
+        the refit, which is precisely what just hung. The caller owes an independent reason
+        to believe this shard is the culprit -- see the single-suspect rule in
+        ``_recover_from_failed_refit`` -- because this is a judgement, not an observation.
+        """
+        shard = self._shards[shard_idx]
+        if shard.state in _ABSENT_STATES:
+            return
+        shard.last_error = reason
+        self._transition(shard, ShardState.DEAD)
+
     def report_failure(self, shard_idx: int, error: BaseException) -> None:
         """Record a failure observed by a routing adapter rather than by a probe.
 
@@ -313,14 +412,50 @@ class GenerationFleetHealth:
             return
         self._transition(shard, ShardState.STALE)
 
+    def mark_weights_partial(self, shard_idx: int) -> None:
+        """An aborted refit left this shard holding a mix of old and new weights.
+
+        STALE rather than DEAD: the process is alive and refits normally, it just must not
+        serve until a refit completes. That is exactly what STALE already means, and
+        because DEAD -> HEALTHY is unreachable and STALE ignores successful probes, the
+        only route back into the serving set is report_refit -- which is the property that
+        makes partial weights safe to hold.
+
+        Absent shards are left alone; they are not serving and their problem is not weights.
+        """
+        shard = self._shards[shard_idx]
+        if shard.state in _ABSENT_STATES:
+            return
+        if shard.state is not ShardState.STALE:
+            # Remembered so report_refit can put a SUSPECT shard back where it was.
+            # Without this the recovery launders it: SUSPECT -> STALE here, STALE ->
+            # HEALTHY there, and consecutive_reported_failures is zeroed by a refit that
+            # had nothing to do with why the shard was suspect. That counter is the only
+            # one that can condemn a wedged engine -- it is kept separate from the probe
+            # streak precisely because such an engine still answers is_alive.
+            shard.state_before_partial = shard.state
+        self._transition(shard, ShardState.STALE)
+
     def report_refit(self, shard_idx: int, *, weight_version: int) -> None:
         """A completed refit is the only way back into the serving set."""
         shard = self._shards[shard_idx]
         if shard.state is ShardState.RETIRED:
             return
+        was_before_partial, shard.state_before_partial = (
+            shard.state_before_partial,
+            None,
+        )
         shard.weight_version = weight_version
         shard.consecutive_probe_failures = 0
         shard.consecutive_probe_successes = 0
+        if was_before_partial is ShardState.SUSPECT:
+            # Already failing generations before the refit pulled it out of service, for
+            # reasons the refit did not address. It goes back to SUSPECT with its
+            # reported streak intact, still on its way to DEAD. Promoting it to HEALTHY
+            # here would reset that streak and leave a wedged engine unable to reach
+            # unhealthy_threshold for as long as refits keep happening.
+            self._transition(shard, ShardState.SUSPECT)
+            return
         # A refit means a fresh engine holding current weights; whatever it failed at
         # before is not evidence against what it is now.
         shard.consecutive_reported_failures = 0
