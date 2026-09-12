@@ -94,16 +94,22 @@ Within the driver script, NeMo RL starts multiple [`RayWorkerGroup`](https://git
 - **Generation workers** (e.g., vLLM): Require `vllm` dependencies  
 - **Environment workers** (e.g., math evaluation): Use system/base dependencies
 
-Each worker type is mapped to a specific Python executable configuration in the [`ACTOR_ENVIRONMENT_REGISTRY`](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/distributed/ray_actor_environment_registry.py#L27-L46). This registry defines which virtual environment should be used for each actor type:
+Each worker type is mapped to the uv extras its virtual environment needs in `ACTOR_ENVIRONMENTS` in [`nemo_rl/distributed/actor_environments.py`](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/distributed/actor_environments.py). [`ACTOR_ENVIRONMENT_REGISTRY`](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/distributed/ray_actor_environment_registry.py) is built from it at import time, and `docker/Dockerfile` runs the same module as a script to prefetch one virtual environment per worker type into the image:
 
 ```python
-ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
-    "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": VLLM_EXECUTABLE,
-    "nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker": MCORE_EXECUTABLE,
-    "nemo_rl.environments.math_environment.MathEnvironment": PY_EXECUTABLES.SYSTEM,
+# nemo_rl/distributed/actor_environments.py -- None means the driver's interpreter
+ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
+    # An actor can need more than one extra: the vLLM workers also get nemo_gym
+    # because token capture imports it inside the worker.
+    "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": ["vllm", "nemo_gym"],
+    "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": ["mcore"],
+    "nemo_rl.environments.math_environment.MathEnvironment": None,
     # ... more mappings
 }
 ```
+
+This module is deliberately dependency-free: `docker/Dockerfile` runs it as a script
+from the dependency layer, where the rest of the source tree does not exist yet.
 
 > [!NOTE]
 > For more details on how workers define and use their Python executables, see the [UV Documentation](uv.md#worker-configuration).
@@ -280,6 +286,10 @@ NeMo RL containers enforce environment reproducibility by automatically checking
 
 - The **md5sum of `pyproject.toml`**
 - The **md5sum of `uv.lock`**
+- The **md5sum of `nemo_rl/distributed/actor_environments.py`** (the actor → uv extras
+  table). Worker virtual environments are reused rather than rebuilt, and nothing prunes
+  them, so changing an actor's extras has to invalidate the fingerprint the same way a
+  dependency change does.
 - The **commit hashes of relevant submodules**
 
 If any of these values differ between your code and the container image, NeMo RL will alert you and show exactly what has changed:
@@ -298,6 +308,9 @@ Differences found:
   - uv.lock:
       Container: 0987f6543210
       Current:   1234abcd5678
+  - nemo_rl/distributed/actor_environments.py:
+      Container: 2b3c4d5e6f70
+      Current:   9a8b7c6d5e4f
   - submodules/3rdparty/ExampleSubmodule:
       Container: a1b2c3d4e5f6
       Current:   f6e5d4c3b2a1

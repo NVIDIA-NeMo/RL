@@ -8,8 +8,11 @@ ppo:
   max_rollout_turns: 1
   max_num_epochs: 100000
   max_num_steps: 100000
-  ppo_epochs: 4
+  ppo_epochs: 4  # actor passes over each rollout batch
+  # Critic passes over each rollout batch; follows ppo_epochs unless overridden.
+  critic_ppo_epochs: ${ppo.ppo_epochs}
   policy_training_start_step: 0  # number of PPO steps of critic-only warmup before policy training begins
+  warm_start_value_checkpoint: null  # step_<n> dir of a critic-pretrain run whose value/ seeds the critic
   val_period: 20
   val_at_start: true
   val_at_end: false
@@ -55,6 +58,10 @@ ppo:
     source_max: 1.0
     target_min: -1.0  # DAPO: scale rewards to [-1, 1]
     target_max: 1.0
+  # Advantage value assigned to invalid tool call tokens (e.g. -5.0 to penalize). null disables.
+  invalid_tool_call_advantage: null
+  # Advantage value assigned to tokens with malformed <think>/</think> tags (e.g. -5.0). null disables.
+  malformed_thinking_advantage: null
   seq_logprob_error_threshold: null
 
 loss_fn:
@@ -130,6 +137,7 @@ policy:
       dropout_position: "post"
       lora_A_init: "xavier"
       use_triton: true
+      restore_from: null  # Warm start: path to a PEFT adapter checkpoint (adapter_model.safetensors + adapter_config.json) to initialize this run's LoRA weights from, e.g. a previous SFT run's step_*/policy/weights
 
   megatron_cfg:
     enabled: true
@@ -242,17 +250,31 @@ policy:
     mcore_generation_config:
       buffer_size_gb: 20
       buffer_guaranteed_fraction: 0.1
+      cuda_graph_sizing_distribution: hybrid
+      cuda_graph_max_tokens: 512
       num_cuda_graphs: 16
       block_size_tokens: 256
       use_cuda_graphs_for_non_decode_steps: true
       enable_chunked_prefill: true
+      prefix_caching_mamba_gb: null
+      prefix_caching_eviction_policy: lru
+      prefix_caching_coordinator_policy: longest_prefix
+      prefix_cache_ttl_seconds: 300.0
+      prefix_caching_routing_alpha: 1.0
       unified_memory_level: 0
       max_tokens: 16384
+      refit_backend: null  # Native MCore copy-service backend, used only when refit_transport="mcore". Options: "gloo", "nccl", or "nccl_m2n" ("nvshmem" is currently broken, see https://github.com/NVIDIA-NeMo/RL/issues/3646).
+      refit_execution_batch_bytes: null  # Native MCore refit staging limit. null matches NeMo-RL's collective default (2% of total GPU memory, capped at 5 GiB); set a positive byte count to override.
+      logprobs_mode: processed_logprobs
+      offload_policy_before_refit: false
+      http_server_num_replicas: 8
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
+      # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
+      refit_with_reload_api: false
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1
@@ -309,6 +331,7 @@ value:
       dropout_position: "post"
       lora_A_init: "xavier"
       use_triton: true
+      restore_from: null  # Warm start: path to a PEFT adapter checkpoint (adapter_model.safetensors + adapter_config.json) to initialize this run's LoRA weights from, e.g. a previous SFT run's step_*/policy/weights
 
   megatron_cfg:
     enabled: true
@@ -452,3 +475,7 @@ cluster:
   master_port_range_low: 1400
   master_port_range_high: 1999
   segment_size: null
+
+# OpenTelemetry instrumentation; null = disabled (default). Mirrors the optional
+# field on the MasterConfig, which stays None unless a run opts in.
+telemetry: null

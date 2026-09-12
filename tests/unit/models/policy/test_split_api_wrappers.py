@@ -32,7 +32,12 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, ROUTED_EXPERTS_FIELD
+from nemo_rl.data_plane.schema import (
+    DP_TRAIN_FIELDS,
+    OPD_FULL_HIDDEN_STATES_FIELD,
+    OPD_FULL_LOGITS_FIELD,
+    ROUTED_EXPERTS_FIELD,
+)
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.models.policy.tq_policy import TQPolicy
 
@@ -117,6 +122,8 @@ def _make_tq_policy() -> tuple[TQPolicy, MagicMock]:
     p = object.__new__(TQPolicy)
     p.cfg = {"train_global_batch_size": 8, "train_micro_batch_size": 2}
     p._router_replay_enabled = False
+    # opd_full off, as __init__ leaves it when the config block is absent.
+    p._opd_full_field = None
     p.flops_tracker = None
     wg = MagicMock()
     wg.run_all_workers_single_data.return_value = ["f0", "f1"]
@@ -164,6 +171,27 @@ class TestTQPolicySplitFanout:
         # get_all_worker_results (unlike the single-data fan-outs)
         wg.get_all_worker_results.assert_called_once()
 
+    def test_train_microbatches_fetches_only_requested_fields(self):
+        p, _ = _make_tq_policy()
+        meta = _meta()
+        train_fields = tuple(
+            field
+            for field in DP_TRAIN_FIELDS
+            if field not in {"prev_logprobs", "reference_policy_logprobs"}
+        )
+        with (
+            patch.object(TQPolicy, "_stamp_pad_seqlen"),
+            patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
+                return_value=([meta, meta], None),
+            ) as mock_shard,
+        ):
+            p.train_microbatches_from_meta(meta, train_fields=train_fields)
+
+        train_meta = mock_shard.call_args.args[0]
+        assert train_meta.fields == list(train_fields)
+
     def test_train_microbatches_requests_routed_experts_for_router_replay(self):
         p, _ = _make_tq_policy()
         p._router_replay_enabled = True
@@ -207,6 +235,31 @@ class TestTQPolicySplitFanout:
         # _aggregate_train_results surfaces global_loss under "loss"
         assert out["loss"] == 1.0
 
+    def test_finish_propagates_mtp_metrics(self):
+        """Worker-reduced MTP metrics survive the TQPolicy aggregation layer."""
+        p, _ = _make_tq_policy()
+        with patch("nemo_rl.models.policy.tq_policy.ray") as mock_ray:
+            mock_ray.get.return_value = [
+                {
+                    "global_loss": 1.0,
+                    "grad_norm": 0.5,
+                    "all_mb_metrics": {"loss": [0.1]},
+                    "mtp_metrics": {
+                        "mtp_1_loss": 0.25,
+                        "mtp_1_acceptance_rate": 75.0,
+                        "grad_norm": 1.25,
+                    },
+                    "is_replica_leader": True,
+                }
+            ]
+            out = p.finish_train_step()
+
+        assert out["mtp_metrics"] == {
+            "mtp_1_loss": 0.25,
+            "mtp_1_acceptance_rate": 75.0,
+            "grad_norm": 1.25,
+        }
+
     def test_abort_consumes_single_data_futures_with_ray_get(self):
         p, wg = _make_tq_policy()
         with patch("nemo_rl.models.policy.tq_policy.ray") as mock_ray:
@@ -215,3 +268,48 @@ class TestTQPolicySplitFanout:
             "abort_train_step_presharded"
         )
         mock_ray.get.assert_called_once_with(["f0", "f1"])
+
+
+class TestTQPolicyOPDFullColumn:
+    def test_train_microbatches_request_the_teacher_payload_column(self):
+        p, _ = _make_tq_policy()
+        p._opd_full_field = OPD_FULL_HIDDEN_STATES_FIELD
+        meta = _meta()
+        with (
+            patch.object(TQPolicy, "_stamp_pad_seqlen"),
+            patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
+                return_value=([meta, meta], None),
+            ) as mock_shard,
+        ):
+            p.train_microbatches_from_meta(meta)
+
+        train_meta = mock_shard.call_args.args[0]
+        assert train_meta.fields == [*DP_TRAIN_FIELDS, OPD_FULL_HIDDEN_STATES_FIELD]
+
+    def test_prepare_step_registers_the_teacher_payload_column(self):
+        """The TQ schema is fixed at registration.
+
+        A column missing there is rejected on the teacher's write rather than
+        silently created.
+        """
+        p, _ = _make_tq_policy()
+        p._opd_full_field = OPD_FULL_LOGITS_FIELD
+        p.tq_partition_id = "train"
+        p.dp_client = MagicMock()
+
+        p.prepare_step(num_samples=4, group_size=2)
+
+        fields = p.dp_client.register_partition.call_args.kwargs["fields"]
+        assert fields == [*DP_TRAIN_FIELDS, OPD_FULL_LOGITS_FIELD]
+
+    def test_prepare_step_leaves_the_schema_alone_when_opd_full_is_off(self):
+        p, _ = _make_tq_policy()
+        p.tq_partition_id = "train"
+        p.dp_client = MagicMock()
+
+        p.prepare_step(num_samples=4)
+
+        fields = p.dp_client.register_partition.call_args.kwargs["fields"]
+        assert fields == list(DP_TRAIN_FIELDS)

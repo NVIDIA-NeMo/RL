@@ -13,11 +13,8 @@
 # limitations under the License.
 
 import os
-import runpy
 import subprocess
-import sys
 from pathlib import Path
-from types import ModuleType
 
 import pytest
 from omegaconf import OmegaConf
@@ -30,7 +27,6 @@ RECIPE = (
     / "examples/configs/recipes/llm/grpo-qwen3-30ba3b-thinking-swe1-2n4g-megatron-tp2pp2-rollout-only-specdec.yaml"
 )
 LAUNCHER = REPO_ROOT / "examples/nemo_gym/run_qwen3_swe_rollout_only.sh"
-ACTOR_REGISTRY = REPO_ROOT / "nemo_rl/distributed/ray_actor_environment_registry.py"
 
 
 def _launcher_env(
@@ -212,35 +208,3 @@ def test_launcher_rejects_missing_required_path(tmp_path: Path) -> None:
 
     assert result.returncode == 2
     assert "required path does not exist" in result.stderr
-
-
-def test_system_executable_override_covers_every_registered_actor(
-    monkeypatch,
-) -> None:
-    class FakeExecutables:
-        SYSTEM = "/shared/runtime/bin/python"
-        VLLM = "uv vllm"
-        SGLANG = "uv sglang"
-        MCORE = "uv mcore"
-        TRTLLM = "uv trtllm"
-        FSDP = "uv fsdp"
-        AUTOMODEL = "uv automodel"
-        NEMO_GYM = "uv nemo-gym"
-
-    virtual_cluster = ModuleType("nemo_rl.distributed.virtual_cluster")
-    virtual_cluster.PY_EXECUTABLES = FakeExecutables
-    modelopt_registry = ModuleType("nemo_rl.modelopt.registry")
-    modelopt_registry.MODELOPT_ACTOR_REGISTRY = {
-        "modelopt.Actor": FakeExecutables.SYSTEM
-    }
-    monkeypatch.setitem(
-        sys.modules, "nemo_rl.distributed.virtual_cluster", virtual_cluster
-    )
-    monkeypatch.setitem(sys.modules, "nemo_rl.modelopt.registry", modelopt_registry)
-    monkeypatch.setenv("NEMO_RL_PY_EXECUTABLES_SYSTEM", "1")
-
-    namespace = runpy.run_path(str(ACTOR_REGISTRY))
-
-    assert set(namespace["ACTOR_ENVIRONMENT_REGISTRY"].values()) == {
-        FakeExecutables.SYSTEM
-    }

@@ -45,7 +45,7 @@ uv run coverage run -a --data-file="$PROJECT_ROOT/tests/.coverage" --source="$PR
     policy.generation.vllm_cfg.gpu_memory_utilization=0.5 \
     policy.generation.vllm_cfg.enforce_eager=true \
     policy.generation.vllm_cfg.use_tqdm=false \
-    '++policy.generation.vllm_cfg.quantization_ignored_layer_kws=[q_proj,k_proj,v_proj,o_proj]' \
+    '++policy.generation.vllm_cfg.quantization_ignore_patterns=[model.layers.*.self_attn.*]' \
     loss_fn.use_importance_sampling_correction=true \
     cluster.gpus_per_node=2 \
     logger.tensorboard_enabled=true \
@@ -64,6 +64,6 @@ uv run tests/check_metrics.py "$JSON_METRICS" \
     'max(data["train/token_mult_prob_error"]) < 2.0'
 
 assert_grep 'quantization=modelopt_mxfp8|quant_algo.*MXFP8' "$RUN_LOG"
-assert_grep 'ignored_layers' "$RUN_LOG"
+assert_grep 'NRL_MXFP8_EFFECTIVE_IGNORE=.*self_attn' "$RUN_LOG"
 
 echo "[PASS] GB200 dense Qwen GRPO vLLM MXFP8 rollout functional test"
