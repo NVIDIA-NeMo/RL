@@ -16,4 +16,10 @@ test -x "$PYTHON"
 if [[ "${PROBE_LOCAL_SHARD:-0}" == 1 ]]; then
   "$PYTHON" /source/experiments/precision_matrix_refresh_20260905/probe_vllm_tp_loader.py > /results/tp-loader-probe.json
 fi
+if [[ "${TEST_LOCAL_EXPERT_RELOAD:-0}" == 1 ]]; then
+  PYTHONPATH=/source PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 "$PYTHON" -m pytest \
+    -o addopts= --confcutdir=/source/tests/unit/models/generation \
+    /source/tests/unit/models/generation/test_local_expert_reload.py \
+    --junitxml=/results/local-expert-reload.xml -v > /results/local-expert-reload.log 2>&1
+fi
 '
