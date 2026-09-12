@@ -23,7 +23,6 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 RECIPE_NAME = "grpo-qwen3.5-35ba3b-4n4g-megatron-ep16tp2-mxfp8-trtllm.yaml"
 SCRIPT_NAME = "grpo-qwen3.5-35ba3b-4n4g-megatron-ep16tp2-mxfp8-trtllm.sh"
