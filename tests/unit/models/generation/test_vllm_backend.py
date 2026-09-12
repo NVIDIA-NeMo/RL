@@ -101,7 +101,10 @@ def test_common_speculator_refit_loads_then_finalizes_target_and_draft(
 
     call_order = []
     target_model = SimpleNamespace(
-        load_weights=MagicMock(side_effect=lambda **_: call_order.append("load_target"))
+        load_weights=MagicMock(
+            side_effect=lambda **_: call_order.append("load_target")
+        ),
+        modules=lambda: (),
     )
     draft_model = SimpleNamespace(
         load_weights=MagicMock(side_effect=lambda **_: call_order.append("load_draft")),
@@ -179,7 +182,8 @@ def test_partial_refit_failure_makes_worker_fail_closed(monkeypatch):
         vllm_backend.VllmInternalWorkerExtension
     )
     ext.model_runner = SimpleNamespace(
-        model=object(), vllm_config=SimpleNamespace(speculative_config=None)
+        model=torch.nn.Module(),
+        vllm_config=SimpleNamespace(speculative_config=None),
     )
     ext.model_config = object()
     ext.device = object()
@@ -208,7 +212,8 @@ def test_nccl_reshard_refit_failure_is_fail_closed_and_nonfatal(monkeypatch):
         vllm_backend.VllmInternalWorkerExtension
     )
     ext.model_runner = SimpleNamespace(
-        model=object(), vllm_config=SimpleNamespace(speculative_config=None)
+        model=torch.nn.Module(),
+        vllm_config=SimpleNamespace(speculative_config=None),
     )
     ext.model_config = object()
     ext.device = object()
@@ -244,7 +249,8 @@ def test_fp8_kv_postprocess_failure_makes_worker_fail_closed(monkeypatch):
         vllm_backend.VllmInternalWorkerExtension
     )
     ext.model_runner = SimpleNamespace(
-        model=object(), vllm_config=SimpleNamespace(speculative_config=None)
+        model=torch.nn.Module(),
+        vllm_config=SimpleNamespace(speculative_config=None),
     )
     ext.model_config = object()
     ext.device = object()
@@ -550,7 +556,7 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
     for _ in range(2):
         with ext._weight_update_lifecycle("collective") as finalize:
             call_order.append("load")
-            finalize()
+            finalize(False)
         assert ext._nrl_layerwise_reload_active is False
 
     expected_cycle = [
@@ -664,7 +670,7 @@ def test_mixed_mxfp8_native_refit_processes_each_module_once(monkeypatch, transp
 
     with ext._weight_update_lifecycle(transport) as finalize:
         call_order.append("transfer")
-        finalize()
+        finalize(False)
 
     assert call_order == [
         "config_enter",
@@ -832,7 +838,7 @@ def test_layerwise_reload_preserves_deferred_weight_across_buffer_reuse(monkeypa
 
         transport_buffer.copy_(torch.tensor([7.0, 8.0]))
         ext._load_full_hf_weights([("layer.second", transport_buffer)])
-        finalize()
+        finalize(False)
 
     torch.testing.assert_close(model.layer.first, torch.tensor([1.0, 2.0]))
     torch.testing.assert_close(model.layer.second, torch.tensor([7.0, 8.0]))
@@ -946,7 +952,7 @@ def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
     )
 
     with ext._weight_update_lifecycle("collective") as finalize:
-        finalize()
+        finalize(False)
 
     process.assert_called_once_with(model, model_config, ext.device)
     ext._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
