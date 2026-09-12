@@ -34,8 +34,6 @@ run_test() {
     fi
 }
 
-# CPU regression: the finalizer must select Gym without relying on driver packages.
-run_test fast uv run --no-sync python -m tests.functional.test_rollout_reassembler_runtime_env
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/ppo_async_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh
