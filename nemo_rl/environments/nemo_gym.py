@@ -17,7 +17,7 @@ import os
 import subprocess
 import sys
 from collections import Counter
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Mapping, MutableMapping
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, Optional, Protocol, TypedDict
 
@@ -1245,10 +1245,14 @@ def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> Non
 
 
 def setup_nemo_gym_config(config, tokenizer) -> None:
+    """Configure NeMo-Gym for the selected generation backend.
+
+    Dynamo idempotently requests engine data so Gym can derive exact prefixes.
+    """
     generation_config = config.policy["generation"]
 
     backend = generation_config.get("backend")
-    if backend == "vllm":
+    if backend in ("vllm", "dynamo"):
         # Enable the http server. Requires both async engine and the expose_http_server flag
         generation_config["vllm_cfg"]["async_engine"] = True
         generation_config["vllm_cfg"]["expose_http_server"] = True
@@ -1261,6 +1265,39 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None
     generation_config["stop_token_ids"] = None
+
+    if generation_config["backend"] == "dynamo":
+        env_cfg = config.env.setdefault("nemo_gym", {})
+        model_cfg = (
+            env_cfg.setdefault("policy_model", {})
+            .setdefault("responses_api_models", {})
+            .setdefault("vllm_model", {})
+        )
+        extra_body = model_cfg.get("extra_body")
+        if extra_body is None:
+            model_cfg["extra_body"] = {}
+            extra_body = model_cfg["extra_body"]
+        if not isinstance(extra_body, MutableMapping):
+            raise ValueError(
+                "env.nemo_gym policy model extra_body must be a mapping or null."
+            )
+
+        nvext = extra_body.get("nvext")
+        if nvext is None:
+            extra_body["nvext"] = {}
+            nvext = extra_body["nvext"]
+        if not isinstance(nvext, MutableMapping):
+            raise ValueError(
+                "env.nemo_gym policy model extra_body.nvext must be a mapping or null."
+            )
+
+        extra_fields = nvext.setdefault("extra_fields", [])
+        if not isinstance(extra_fields, list):
+            raise ValueError(
+                "env.nemo_gym policy model nvext.extra_fields must be a list."
+            )
+        if "engine_data" not in extra_fields:
+            extra_fields.append("engine_data")
 
     # For VLM runs, plumb the tokenizer config into the gym env config so the
     # NemoGym actor can reconstruct the processor inside itself (needed for
