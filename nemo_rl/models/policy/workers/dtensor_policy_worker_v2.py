@@ -274,6 +274,7 @@ class DTensorPolicyWorkerV2Impl(
             config=config,
             processor=self.processor,
             rank=0,  # Temporary, will be updated after distributed init
+            init_optimizer=init_optimizer,
         )
 
         # Set up distributed environment (returns DistributedContext)
@@ -362,6 +363,7 @@ class DTensorPolicyWorkerV2Impl(
             self.model_class,  # Already set above, but includes in tuple for completeness
             self.model_config,  # Already set above, but includes in tuple for completeness
             self.hf_config_overrides,
+            self.model_load_dtype,
             self.allow_flash_attn_args,
             self.attn_impl,
             self.dtype,
