@@ -4389,6 +4389,7 @@ def _rollout_actor_driver_carry(
             "generation": {},
             "make_sequence_length_divisible_by": 1,
             "max_total_sequence_length": 8,
+            "precision": "bfloat16",
         },
         logger={"wandb_enabled": False, "wandb": {}},
         env={},
