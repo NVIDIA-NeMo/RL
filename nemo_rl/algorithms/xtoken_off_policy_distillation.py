@@ -371,10 +371,10 @@ def setup(
     print("\n▶ Setting up compute cluster...", flush=True)
     cluster = RayVirtualCluster(
         name="xtoken_off_policy_distillation_cluster",
-        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
-        * cluster_config["num_nodes"],
+        bundle_ct_per_node_list=[cluster_config.gpus_per_node]
+        * cluster_config.num_nodes,
         use_gpus=True,
-        num_gpus_per_node=cluster_config["gpus_per_node"],
+        num_gpus_per_node=cluster_config.gpus_per_node,
         # N teacher worker groups + 1 student, colocated and run serially.
         max_colocated_worker_groups=len(teachers) + 1,
     )
@@ -444,8 +444,8 @@ def setup(
         # share DP and a node-aligned model-parallel group, else a student rank
         # would read teacher shards from another node.
         assert_xtoken_ipc_node_local(
-            num_nodes=cluster_config["num_nodes"],
-            gpus_per_node=cluster_config["gpus_per_node"],
+            num_nodes=cluster_config.num_nodes,
+            gpus_per_node=cluster_config.gpus_per_node,
             student_tp=student_tp,
             student_cp=student_cp,
             teacher_tp=tc["dtensor_cfg"]["tensor_parallel_size"],
