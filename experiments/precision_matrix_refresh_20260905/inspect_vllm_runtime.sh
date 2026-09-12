@@ -13,4 +13,7 @@ export PYTHONDONTWRITEBYTECODE=1
 PYTHON=/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python
 test -x "$PYTHON"
 "$PYTHON" /source/experiments/precision_matrix_refresh_20260905/inspect_vllm_runtime.py /results/runtime
+if [[ "${PROBE_LOCAL_SHARD:-0}" == 1 ]]; then
+  "$PYTHON" /source/experiments/precision_matrix_refresh_20260905/probe_vllm_tp_loader.py > /results/tp-loader-probe.json
+fi
 '
