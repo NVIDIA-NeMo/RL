@@ -15,6 +15,7 @@
 import copy
 import gc
 import inspect
+import json
 import logging
 import os
 import sys
@@ -72,6 +73,14 @@ from nemo_rl.telemetry.setup import (
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
+from nemo_rl.utils.quantization_logging import (
+    FP8_QUANTIZATION_IGNORE_DUMP_DEFAULT_PATH,
+    FP8_QUANTIZATION_IGNORE_DUMP_ENV,
+    FP8_QUANTIZATION_IGNORE_DUMP_PATH_ENV,
+    LAYER_QUANTIZATION_LOG_ENV,
+    VLLM_LAYER_QUANTIZATION_LEADER_ENV,
+    is_truthy_env_var,
+)
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
@@ -208,6 +217,35 @@ def _log_effective_quantization_ignore_patterns(
         "ignore", []
     )
     print(f"NRL_MXFP8_EFFECTIVE_IGNORE={effective_ignore}")
+
+
+def _log_fp8_quantization_ignore_report(
+    ignore_report: dict[str, Any], vllm_kwargs: dict[str, Any]
+) -> None:
+    quantization_config = vllm_kwargs["hf_overrides"].get("quantization_config") or {}
+    payload = {
+        **ignore_report,
+        "passed_to_vllm": {
+            "ignored_layers": list(quantization_config.get("ignored_layers", [])),
+            "ignore": list(quantization_config.get("ignore", [])),
+        },
+    }
+    dump_path = (
+        os.environ.get(FP8_QUANTIZATION_IGNORE_DUMP_PATH_ENV)
+        or FP8_QUANTIZATION_IGNORE_DUMP_DEFAULT_PATH
+    )
+    os.makedirs(os.path.dirname(os.path.abspath(dump_path)), exist_ok=True)
+    with open(dump_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print(f"NRL_FP8_QUANTIZATION_IGNORE_DUMP_FILE={dump_path}")
+
+
+def _should_log_fp8_quantization_ignore() -> bool:
+    return (
+        is_truthy_env_var(FP8_QUANTIZATION_IGNORE_DUMP_ENV)
+        and os.environ.get("RANK") == "0"
+    )
 
 
 # Use a base class to share some functions to avoid code duplication.
@@ -438,9 +476,21 @@ class BaseVllmGenerationWorker:
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
 
+        if (
+            is_truthy_env_var(LAYER_QUANTIZATION_LOG_ENV)
+            and os.environ.get("RANK") == "0"
+        ):
+            os.environ[VLLM_LAYER_QUANTIZATION_LEADER_ENV] = "1"
+        else:
+            os.environ.pop(VLLM_LAYER_QUANTIZATION_LEADER_ENV, None)
+        vllm_extra_env_vars = [
+            *(extra_env_vars or []),
+            LAYER_QUANTIZATION_LOG_ENV,
+            VLLM_LAYER_QUANTIZATION_LEADER_ENV,
+        ]
         _apply_vllm_patches(
             self.py_executable,
-            extra_env_vars=extra_env_vars,
+            extra_env_vars=vllm_extra_env_vars,
         )
 
         # Skip model loading if we're not the model owner
@@ -589,12 +639,15 @@ class BaseVllmGenerationWorker:
             vllm_kwargs["ray_workers_use_nsight"] = True
             self._patch_vllm_nsight_config()
 
+        should_log_fp8_ignore = _should_log_fp8_quantization_ignore()
+        fp8_ignore_report: dict[str, Any] | None = None
+
         # Call init_fp8 when precision is fp8
         # (kv_cache_dtype can be fp8/fp8_e4m3 or auto, validated in init_fp8)
         if self.cfg["vllm_cfg"]["precision"] == "fp8":
             from nemo_rl.models.generation.vllm.quantization.fp8 import init_fp8
 
-            fp8_kwargs = init_fp8(
+            fp8_kwargs, fp8_ignore_report = init_fp8(
                 self.cfg["vllm_cfg"], self.model_name, model_parallel_size
             )
 
@@ -663,6 +716,9 @@ class BaseVllmGenerationWorker:
 
             # Text-only runs additionally set generation.vllm_kwargs.language_model_only
             # in the recipe YAML to skip vLLM's multimodal preflight.
+
+        if should_log_fp8_ignore and fp8_ignore_report is not None:
+            _log_fp8_quantization_ignore_report(fp8_ignore_report, vllm_kwargs)
 
         _log_effective_quantization_ignore_patterns(self.cfg["vllm_cfg"], vllm_kwargs)
 

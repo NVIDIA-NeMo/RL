@@ -39,6 +39,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm import vllm_worker as vllm_worker_module
 from nemo_rl.models.generation.vllm.vllm_worker import (
     VllmGenerationWorkerImpl,
     _context_capped_max_new_tokens,
@@ -50,6 +51,10 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.utils.quantization_logging import (
+    LAYER_QUANTIZATION_LOG_ENV,
+    VLLM_LAYER_QUANTIZATION_LEADER_ENV,
+)
 
 model_name = "Qwen/Qwen3-0.6B"
 # Define basic vLLM test config
@@ -283,6 +288,41 @@ def test_context_capped_max_new_tokens():
             input_length=8192,
             max_model_len=8192,
         )
+
+
+@pytest.mark.parametrize(
+    "rank,expected_marker", [("0", "1"), ("2", None)], ids=["leader", "non_leader"]
+)
+def test_vllm_layer_quantization_leader_marker_is_forwarded(
+    monkeypatch, rank, expected_marker
+):
+    calls = []
+
+    def fake_apply_vllm_patches(_py_executable, *, extra_env_vars=None):
+        calls.append(list(extra_env_vars or []))
+
+    monkeypatch.setattr(
+        vllm_worker_module, "_apply_vllm_patches", fake_apply_vllm_patches
+    )
+    monkeypatch.setenv(LAYER_QUANTIZATION_LOG_ENV, "true")
+    monkeypatch.setenv("RANK", rank)
+    monkeypatch.setenv(VLLM_LAYER_QUANTIZATION_LEADER_ENV, "stale")
+
+    worker = object.__new__(VllmGenerationWorkerImpl)
+    worker._init_config(
+        deepcopy(basic_vllm_test_config),
+        bundle_indices=[0, 1],
+        fraction_of_gpus=1.0,
+        seed=0,
+        extra_env_vars=["USER_ENV"],
+    )
+
+    assert os.environ.get(VLLM_LAYER_QUANTIZATION_LEADER_ENV) == expected_marker
+    assert calls
+    copied_env_vars = calls[0]
+    assert "USER_ENV" in copied_env_vars
+    assert LAYER_QUANTIZATION_LOG_ENV in copied_env_vars
+    assert VLLM_LAYER_QUANTIZATION_LEADER_ENV in copied_env_vars
 
 
 @pytest.mark.asyncio
