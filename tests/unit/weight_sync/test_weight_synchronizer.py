@@ -670,7 +670,6 @@ class TestNcclReshardWeightSynchronizer:
             )
         )
 
-
     @patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray")
     def test_init_validates_refit_plan_before_collectives(self, mock_ray):
         """Both synchronous metadata phases must finish before NCCL setup starts."""

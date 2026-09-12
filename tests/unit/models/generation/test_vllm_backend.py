@@ -861,11 +861,11 @@ def test_the_non_native_finalizer_clears_the_exactly_once_guard(monkeypatch):
     The guard is read at call time rather than after the fact, because clearing
     it *after* the pass would look identical at the end and fix nothing.
     """
-    from nemo_rl.models.generation.vllm import vllm_backend
-
     from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
         UnquantizedFusedMoEMethod,
     )
+
+    from nemo_rl.models.generation.vllm import vllm_backend
 
     model = _make_mixed_precision_moe_model("FlashInfer TRTLLM")
     quantized = [
