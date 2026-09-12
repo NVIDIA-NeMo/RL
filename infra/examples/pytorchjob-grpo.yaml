@@ -1,0 +1,91 @@
+# Kubeflow PyTorchJob example for NeMo RL using k8s_entry.sh.
+#
+# The PyTorchJob is used purely as a gang-scheduled pod group + rendezvous: the
+# training-operator injects RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT into
+# every pod, and k8s_entry.sh turns that into a Ray cluster (rank 0 == head). No
+# torchrun is involved -- every pod runs the same command and the script uses
+# RANK to decide head vs. worker.
+#
+# Prerequisites:
+#   - Kubeflow training-operator installed (provides the PyTorchJob CRD).
+#   - A NeMo RL image and a shared PVC (here: rl-workspace) mounted at /workspace.
+#   - For multi-node NCCL you typically also want hostNetwork / RDMA tuning;
+#     omitted here for clarity.
+#
+# Usage:
+#   kubectl apply -f pytorchjob-grpo.yaml
+#   kubectl get pytorchjob grpo-job -w
+#   kubectl logs -f grpo-job-master-0
+apiVersion: "kubeflow.org/v1"
+kind: PyTorchJob
+metadata:
+  name: grpo-job
+spec:
+  # PyTorchJob sets RANK=0 on Master and RANK=1.. on Workers, plus a shared
+  # WORLD_SIZE / MASTER_ADDR / MASTER_PORT. k8s_entry.sh reads these directly.
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        spec:
+          imagePullSecrets:
+          - name: nvcr-secret
+          containers:
+          - name: pytorch
+            image: nvcr.io/nvidian/nemo-rl:nightly
+            command: ["/bin/bash", "-c"]
+            args:
+            - |
+              cd /opt/nemo-rl
+              export GPUS_PER_NODE=8
+              # The training command is passed as positional args; k8s_entry.sh
+              # runs it on rank 0 and treats other ranks as Ray workers.
+              bash k8s_entry.sh uv run --locked examples/run_grpo.py \
+                --config examples/configs/grpo_math_1B.yaml \
+                cluster.num_nodes=${WORLD_SIZE} \
+                cluster.gpus_per_node=${GPUS_PER_NODE}
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+            volumeMounts:
+            - { name: rl-workspace, mountPath: /workspace }
+            - { name: dshm, mountPath: /dev/shm }
+          volumes:
+          - name: rl-workspace
+            persistentVolumeClaim: { claimName: rl-workspace }
+          - name: dshm
+            emptyDir: { medium: Memory }
+    Worker:
+      replicas: 1   # total nodes = 1 (master) + replicas
+      restartPolicy: Never
+      template:
+        spec:
+          imagePullSecrets:
+          - name: nvcr-secret
+          containers:
+          - name: pytorch
+            image: nvcr.io/nvidian/nemo-rl:nightly
+            command: ["/bin/bash", "-c"]
+            args:
+            - |
+              cd /opt/nemo-rl
+              export GPUS_PER_NODE=8
+              # Workers run the same command; k8s_entry.sh sees RANK > 0 and
+              # joins the cluster as a Ray worker (training args are ignored off
+              # rank 0).
+              bash k8s_entry.sh uv run --locked examples/run_grpo.py \
+                --config examples/configs/grpo_math_1B.yaml \
+                cluster.num_nodes=${WORLD_SIZE} \
+                cluster.gpus_per_node=${GPUS_PER_NODE}
+            resources:
+              limits:
+                nvidia.com/gpu: 8
+            volumeMounts:
+            - { name: rl-workspace, mountPath: /workspace }
+            - { name: dshm, mountPath: /dev/shm }
+          volumes:
+          - name: rl-workspace
+            persistentVolumeClaim: { claimName: rl-workspace }
+          - name: dshm
+            emptyDir: { medium: Memory }
