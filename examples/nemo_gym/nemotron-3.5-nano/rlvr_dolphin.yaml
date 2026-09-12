@@ -1,0 +1,336 @@
+# =============================================================================
+# Nemotron 3.5 Nano — RLVR, legacy async-1, honest-dolphin warm start
+# =============================================================================
+# Reproduces the internal reference run
+#   geshen-ultra-rl-nano-honest-dolphin-v10-iter6000-mopd-rlvr
+#   (launch_nano_honest_dolphin.sh + examples/configs/grpo_ultra_512n4g_bf16.yaml
+#    on nemo-rl-internal @ 97c55ee2, branch geshen/nano_training)
+# on public NeMo-RL main.
+#
+# Inherits examples/nemo_gym/nemotron-3-ultra/student_rlvr1.yaml. "ultra" there
+# names the RLVR *recipe lineage* — the 34-env Gym blend, GenRM comparison
+# judging, judge topology, reward penalties, async-1 — not the model. The
+# reference does the same thing: it runs the nano checkpoint against the ultra
+# config and overrides parallelism. Everything ultra-shaped is overridden below.
+#
+# Model: NemotronH hybrid-Mamba MoE, 52 layers, hidden 2688, 128 routed experts
+# top-6 + 1 shared, 32 heads / 2 KV, mamba n_groups=8, MTP 1 layer, vocab 131072.
+#
+# Node budget (GB200, 4 GPU/node), sbatch --nodes=64:
+#   8 train + 40 generation   -> cluster.num_nodes = 48
+#   16 gym                    -> env.nemo_gym.num_gpu_nodes = 16
+#
+# A 5:1 generation-to-training split. GenRM is served from a SEPARATE
+# allocation (2 replicas x 2 nodes = 4 nodes), so the campaign footprint is 68
+# nodes even though this job asks for 64.
+# =============================================================================
+defaults: ../nemotron-3-ultra/student_rlvr1.yaml
+
+# -----------------------------------------------------------------------------
+# Cluster — ultra was 256 nodes / segment 16; nano uses 48 actor nodes / segment 2
+# -----------------------------------------------------------------------------
+cluster:
+  gpus_per_node: 4
+  num_nodes: 48
+  segment_size: 2
+
+checkpointing:
+  # 4 h wall on partition `batch` (batch_long's 7 d is not what we're using),
+  # minus the reference's 25 min teardown margin.
+  checkpoint_must_save_by: "00:03:35:00"
+  # Reference used 10 against a 24 h wall. At 4 h a slow step can mean a job
+  # restarts having saved nothing and re-does the same work forever. Raise back
+  # toward 10 once step time is measured.
+  save_period: 5
+  save_optimizer: true
+
+grpo:
+  # Stability setting: cut the prompt groups while retaining 16 generations per
+  # prompt. This yields 2048 samples/step and an async replay-buffer capacity
+  # of 256 groups.
+  num_prompts_per_step: 128
+  # Validation is effectively off in the reference; genrm cohort envs are
+  # train-only and would hang under eval.
+  val_period: 10000000
+  # REQUIRED by GRPOConfig, and absent from the inherited student_rlvr1.yaml —
+  # upstream inconsistency: 83753ed56 (Jul 29-30) added val_start_at as a required
+  # field while 64cb9f985 added the ultra recipes without it, so student_rlvr1.yaml
+  # on main cannot be validated by MasterConfig. Killed job 5733424 with
+  # "ValidationError: grpo.val_start_at Field required".
+  # -1 disables the delay, matching grpo_nanov3.yaml and grpo_math_1B.yaml.
+  val_start_at: -1
+
+# -----------------------------------------------------------------------------
+# Policy — nano parallelism (reference: TP=4 CP=4 EP=16 PP=1 ETP=1)
+# -----------------------------------------------------------------------------
+policy:
+  model_name: /lustre/fsw/portfolios/llmservice/users/venkats/training_actual_0603/nano_n3_post/checkpoints/nano-3.5-sft-v10-closethink-unmask-orig6k-from-midtrain-100B-lc-lr2e-5/eval/iter_0006000/hf
+
+  # Must equal num_prompts_per_step * num_generations_per_prompt: 128 * 16.
+  # Over DP=2 (32 training GPUs / TP4 x CP4 x PP1) this is 1024 sequences per
+  # data-parallel rank — the same per-rank load as the 16-node / GBS 4096 shape
+  # this replaces, so per-GPU memory pressure is unchanged.
+  train_global_batch_size: 2048
+
+  # Ultra base is 49152. Reference nano runs 73728.
+  max_total_sequence_length: 73728
+
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+    # 128 routed experts / EP8 = 16 experts per rank. Matches the control run
+    # (job 5931924) so the judge relocation is the only variable between them.
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 4
+    moe_token_dispatcher_type: "alltoall"
+    moe_flex_dispatcher_backend: "alltoall"
+    # MTP head training is inherited unchanged from the base and matches the
+    # reference exactly: mtp_num_layers 5, loss_scaling 0.3, use_repeated_layer
+    # true, detach_heads true. detach_heads keeps the MTP loss off the backbone,
+    # so it cannot perturb GRPO. use_repeated_layer reconciles 5 with the
+    # checkpoint's num_nextn_predict_layers=1 (one layer's weights reused 5x).
+
+  generation:
+    # Base hardcodes 49152; re-tie to the policy value.
+    max_new_tokens: ${policy.max_total_sequence_length}
+
+    vllm_cfg:
+      tensor_parallel_size: 4
+      # Reference runs EP=1 for nano. vLLM's EP = DP * TP, and EP > TP is
+      # blocked upstream (NVIDIA-NeMo/RL#1101).
+      expert_parallel_size: 1
+      max_model_len: ${policy.max_total_sequence_length}
+      # 0.85 -> 0.80. Job 5744748 died in weight refit:
+      #   update_weights_from_collective: CUDA out of memory.
+      #   Tried to allocate 3.69 GiB. GPU has 184.31 GiB total, 1.61 GiB free;
+      #   this process holds 163.22 GiB.
+      # The OOM killed that vLLM rank, which was a participant in the NCCL
+      # collective, so MegatronPolicyWorker rank=0/22 aborted with it.
+      # 0.80 frees ~9 GiB per GPU against a 3.69 GiB staging buffer.
+      # The 40-node smoke run refit fine at 0.85 because it had 32 generation
+      # ranks; the buffer grows with that count. This shape has 160, more than
+      # the 128 that OOM'd, so 0.80 is a floor to watch rather than a settled
+      # value. Costs some KV cache, so slightly lower generation throughput.
+      gpu_memory_utilization: 0.80
+      # nano_v3 reasoning parser + qwen3_coder tool parser are inherited and are
+      # correct for this checkpoint: its chat template emits <think> and the
+      # <tool_call><function=...><parameter=...> XML form.
+
+    vllm_kwargs:
+      # Hybrid Mamba allocates one state slot per running sequence. Base uses
+      # 256 (sized for ultra); the reference nano run uses 64 at 73728 tokens.
+      max_num_seqs: 64
+      # Required on vLLM 0.25 and NOT accepted by 0.20 -- this branch only runs
+      # against a 0.25 container. Left at the default "auto", 0.25 picks the
+      # FlashInfer TRT-LLM BF16 MoE, whose expert weights are 3D grouped
+      # tensors under the new routed_experts submodule. Refit then hands them to
+      # a loader that rejects the expert dimension: job 5944595 died in
+      # update_weights_from_collective with "shard_dim=0 is not a valid data
+      # dimension for a 3D tensor (expected 1 or 2)". flashinfer_cutlass keeps
+      # the layout refit can address and is the backend the 64-node Ultra smoke
+      # run (job 5939591) refit through step 4 with on this same container.
+      moe_backend: flashinfer_cutlass
+
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        # Overridden by the launch script via NUM_GEN_NODES.
+        num_nodes: 40
+
+# -----------------------------------------------------------------------------
+# Data — the launcher overrides these; defaults point at the reference blend.
+# trusty_viper carries agent_ref per row, so NeMo-Gym routes each row to its
+# family directly (no BlendDispatchAgent — that is a nemogym2mrl construct).
+# -----------------------------------------------------------------------------
+data:
+  train:
+    data_path: /lustre/fs1/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/geshen/rl-data-tools/blends/curriculum_honest_dolphin_v41_trusty_viper.train.jsonl
+  validation:
+    data_path: /lustre/fs1/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/geshen/rl-data-tools/blends/curriculum_honest_dolphin_v41_trusty_viper.train.jsonl
+
+env:
+  nemo_gym:
+    num_gpu_nodes: 16
+
+    # -------------------------------------------------------------------------
+    # Env blend. Identical to the base except rdkit_chemistry, which the base
+    # lists but the pinned Gym submodule (473f446) does not ship — it would fail
+    # at Gym startup. Unused by this blend, so dropped.
+    # -------------------------------------------------------------------------
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/math_with_judge/configs/math_with_judge.yaml
+      - resources_servers/code_gen/configs/code_gen.yaml
+      - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+      - resources_servers/mcqa/configs/mcqa.yaml
+      - resources_servers/instruction_following/configs/instruction_following.yaml
+      - resources_servers/equivalence_llm_judge/configs/lc_judge.yaml
+      - resources_servers/calendar/configs/calendar.yaml
+      - resources_servers/genrm_compare/configs/genrm_compare.yaml
+      - resources_servers/equivalence_llm_judge/configs/nl2bash-equivalency.yaml
+      - resources_servers/equivalence_llm_judge/configs/equivalence_llm_judge.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/single_step_tool_use_with_argument_comparison.yaml
+      - resources_servers/reasoning_gym/configs/reasoning_gym.yaml
+      - resources_servers/terminus_judge/configs/terminus_judge_string_only.yaml
+      - resources_servers/ns_tools/configs/ns_tools.yaml
+      - resources_servers/math_formal_lean/configs/math_formal_lean_multi_turn.yaml
+      - resources_servers/multichallenge/configs/multichallenge.yaml
+      - resources_servers/inverse_if/configs/inverse_if.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/search_pivot_single_step_tool_use_with_argument_comparison.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/toolcall_schema_single_step_tool_use_with_argument_comparison.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/swe_pivot_single_step_tool_use_with_argument_comparison.yaml
+      - resources_servers/abstention/configs/abstention.yaml
+      - resources_servers/nvarc/configs/inductive.yaml
+      - resources_servers/nvarc/configs/transductive.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/droid_pivot_single_step_tool_use_with_argument_comparison.yaml
+      - resources_servers/equivalence_rule/configs/lc.yaml
+      - resources_servers/ether0/configs/ether0.yaml
+      - resources_servers/structured_outputs/configs/structured_outputs_json_yaml_xml_v1.yaml
+      - resources_servers/structured_outputs/configs/structured_outputs_v3.yaml
+      - resources_servers/format_verification/configs/freeform_formatting.yaml
+      - resources_servers/format_verification/configs/citation_format.yaml
+      - resources_servers/jailbreak_detection/configs/jailbreak_detection_nemotron_combined_reward_tp8.yaml
+      - resources_servers/indirect_prompt_injection/configs/indirect_prompt_injection.yaml
+
+    # -------------------------------------------------------------------------
+    # GenRM — EXTERNAL. The launcher sets base_url to the compute-side load
+    # balancer. `model` must match the external vLLM --served-model-name.
+    # Local vLLM settings below are inert whenever base_url is set.
+    # -------------------------------------------------------------------------
+    genrm_model:
+      _override_: true
+      responses_api_models:
+        genrm_model:
+          entrypoint: app.py
+          api_key: dummy_key
+          base_url: null         # set by the launcher via GENRM_BASE_URL
+          model: "model"
+          uses_reasoning_parser: true
+          return_token_id_information: false
+          debug: true
+          ray_worker_py_executable: /opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python
+          # Aligned to nl2bash_judge_model where their roles overlap, except for
+          # GenRM-specific data parallelism, parsing, batching, and load format.
+          # Job 5746440's external GenRM predecessor died with a Triton illegal
+          # memory access; that incident is separate from job 5755734's internal
+          # nl2bash collective stall.
+          vllm_serve_env_vars:
+            VLLM_RAY_DP_PACK_STRATEGY: strict
+            NCCL_MNNVL_ENABLE: "1"
+            # Disable the blocked-GEMM MoE kernels. Job 5743685 died here:
+            #   AssertionError: K must be divisible by blockK
+            #   Error executing method 'load_model'
+            # genrm_model was the only vLLM service with none of these set, and
+            # it inherits VLLM_USE_FLASHINFER_MOE_FP8=1 from the driver's
+            # TRAIN_CMD. nl2bash is the control: same Qwen3-235B-A22B family,
+            # same TP4, loads fine with all four disabled. safety disables
+            # DeepGEMM too. This makes GenRM match them.
+            VLLM_USE_DEEP_GEMM: "0"
+            VLLM_MOE_USE_DEEP_GEMM: "0"
+            VLLM_USE_FLASHINFER_MOE_FP8: "0"
+            VLLM_USE_FLASHINFER_MOE_FP16: "0"
+          vllm_serve_kwargs:
+            attention_backend: FLASH_ATTN      # was TRITON_ATTN; matches nl2bash
+            tensor_parallel_size: 4
+            data_parallel_size: 4
+            data_parallel_size_local: 1
+            pipeline_parallel_size: 1
+            enable_expert_parallel: true       # matches nl2bash on the same MoE family
+            reasoning_parser: deepseek_r1      # GenRM-specific, nl2bash has none
+            gpu_memory_utilization: 0.85
+            max_model_len: 131072
+            max_num_seqs: 256
+            max_num_batched_tokens: 8192
+            enable_prefix_caching: true
+            enable_chunked_prefill: true
+            # Back to 112 (upstream default). The os error 108 in job 5744482
+            # was traced to a single bad node, nvl72138-T01 (10.109.24.155),
+            # which also caused the ModuleNotFoundError in 5742619 and 5745204 —
+            # not loader-thread pressure. That node is now excluded at submit.
+            model_loader_extra_config:
+              enable_multithread_load: true
+              num_threads: 112
+            load_format: auto
+            compilation_config:                # matches nl2bash
+              cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32]
+
+    genrm_compare_resources_server:
+      resources_servers:
+        genrm_compare:
+          # Base ships 0.1 / 0.25 (retuned for ultra). Reference dolphin used
+          # 0.12 / 0.12 — restored, since we are reproducing that run.
+          group_reasoning_length_penalty_coeff: 0.12
+          group_answer_length_penalty_coeff: 0.12
+
+    # Qwen3-235B-A22B-Instruct-2507-FP8. TP4 x DP8 = 32 GPUs = 8 of the 16 gym
+    # nodes. Base ships DP4 (sized for 256n ultra); reference uses DP8.
+    # Backs equivalence_llm_judge, lc_judge, math_with_judge, multichallenge,
+    # inverse_if and abstention — so this sizing gates six families.
+    nl2bash_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          model: /lustre/fsw/portfolios/llmservice/users/ansubramania/models/Qwen3-235B-A22B-Instruct-2507-FP8
+          # Launch this judge from the Gym venv, not the RL one. On a 0.25
+          # container the RL venv pairs vLLM 0.25 with the openai version
+          # uv.lock pins, and `vllm serve` then fails to import NamespaceTool
+          # from openai.types.responses (job 5943331). The Gym venv is
+          # self-consistent. Judges need no weight sync, so they gain nothing
+          # from sharing the RL venv.
+          ray_worker_py_executable: /opt/gym_venvs/responses_api_models/local_vllm_model/.venv/bin/python
+          vllm_serve_env_vars:
+            # Matches the known-working internal dolphin/bear judge recipe.
+            NCCL_MNNVL_ENABLE: "0"
+            # Keep Ray's compiled-DAG wait aligned with vLLM's distributed wait.
+            RAY_CGRAPH_get_timeout: "2400"
+            # Off for every judge that runs from the Gym venv; see the note on
+            # safety_judge_model below.
+            VLLM_USE_FASTOKENS: "0"
+          vllm_serve_kwargs:
+            tensor_parallel_size: 4
+            data_parallel_size: 8
+            distributed_timeout_seconds: 2400
+            # Back to 112 (upstream default); see genrm note above.
+            model_loader_extra_config:
+              enable_multithread_load: true
+              num_threads: 112
+
+    # Nemotron-Content-Safety-Reasoning-4B — 1 GPU, per the reference.
+    safety_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          model: /lustre/fsw/portfolios/llmservice/users/ansubramania/super_v3/model_checkpoints/Nemotron-Content-Safety-Reasoning-4B
+          vllm_serve_env_vars:
+            # Some images bake VLLM_USE_FASTOKENS=1 into /etc/environment, so
+            # every process inherits it, but only the RL venv carries the wheel
+            # (fastokens 0.3.1). This judge has no ray_worker_py_executable, so
+            # it runs from the Gym venv, whose vLLM ships the integration module
+            # (vllm/tokenizers/fastokens.py) without the package behind it, and
+            # exits at import with "The 'fastokens' package (>= 0.2.0) is
+            # required when VLLM_USE_FASTOKENS=1" -- taking Gym spinup down with
+            # it (job 6232802, on the 08-15 build). The Jul-30 image's Gym vLLM
+            # had no fastokens support at all and ignored the flag, which is why
+            # this appeared only once the pin moved forward. Pinned off rather
+            # than left to the image so a future pin cannot reintroduce it.
+            # Merged onto the base's env vars rather than replacing them.
+            VLLM_USE_FASTOKENS: "0"
+          vllm_serve_kwargs:
+            tensor_parallel_size: 1
+            data_parallel_size: 1
+
+# -----------------------------------------------------------------------------
+# Logger — log_dir / wandb.name are set by the launcher.
+# -----------------------------------------------------------------------------
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: "ultra-streaming"
+
+# reward_penalties inherited unchanged and already match the reference:
+#   penalize_duplicated_reasoning / empty_final_answer / unwanted_tokens /
+#   malformed_think_tag all true, token_ids {unwanted: [2], think_open: 12,
+#   think_close: 13}. This is the upstreamed form of the internal config's
+#   top-level penalize_* + token_ids block.
