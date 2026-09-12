@@ -771,6 +771,8 @@ def setup(
     loss_fn = ClippedPGLossFn(
         loss_config, use_fused_linear_logprobs=use_fused_linear_logprobs
     )
+    if loss_config.loss_mode == "dppo_binary_tv":
+        print("  DPPO Binary-TV loss enabled", flush=True)
 
     # Validate force_on_policy_ratio
     if loss_config.force_on_policy_ratio:

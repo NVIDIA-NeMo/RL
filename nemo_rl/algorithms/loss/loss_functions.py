@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import warnings
 from typing import TYPE_CHECKING, Any, NotRequired, Optional, TypedDict, TypeVar
 
@@ -117,6 +118,9 @@ class DraftCrossEntropyLossFn(LossFunction):
 
 class ClippedPGLossConfig(BaseModel, extra="allow"):
     # --- Loss type ---
+    # Selects the policy-gradient loss family. "grpo", "clipped_pg", and
+    # "ppo" use the clipped-PG formula; "dppo_binary_tv" uses Binary-TV DPPO.
+    loss_mode: str = "grpo"
     disable_ppo_ratio: bool = False
     token_level_loss: bool = True
     # If True, apply the off-policy importance-sampling correction at the
@@ -169,6 +173,8 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # L = L_PPO + μ·L_NLL(correct)   (arXiv:2504.05118, Eq. 10)
     # Set to 0 to disable.
     positive_example_nll_weight: float = 0.0
+    # DPPO-only upper bound for the detached importance-sampling ratio.
+    dppo_clip_ratio_c: float = Field(default=20.0, gt=0, allow_inf_nan=False)
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -184,6 +190,9 @@ class ClippedPGLossDataDict(TypedDict):
     __extra__: Any
 
 
+_CLIPPED_PG_LOSS_MODES = ("grpo", "clipped_pg", "ppo", "dppo_binary_tv")
+
+
 class ClippedPGLossFn(LossFunction):
     """Generalized Clipped Policy Gradient loss function w/ KL regularization.
 
@@ -195,6 +204,7 @@ class ClippedPGLossFn(LossFunction):
     - GSPO (set sequence_level_importance_ratios = True and token_level_loss = False) - https://arxiv.org/abs/2507.18071
     - CISPO (set use_cispo = True) - https://arxiv.org/abs/2506.13585
     - Truly on-policy (set force_on_policy_ratio = True to force ratio = 1.0, requires one update per rollout)
+    - Binary-TV DPPO (set loss_mode = "dppo_binary_tv")
 
     Formula:
     L(θ) = E_t [ min(r_t(θ) * A_t, clip(r_t(θ), 1-ε, 1+ε) * A_t) ] - β * KL(π_θ || π_ref)
@@ -243,6 +253,13 @@ class ClippedPGLossFn(LossFunction):
         # consumed by prepare_loss_input, which short-circuits the logits->logprobs
         # conversion. See nemo_rl/distributed/model_utils.py for the fused forward.
         self.use_fused_linear_logprobs = use_fused_linear_logprobs
+        self.loss_mode = cfg.loss_mode or "grpo"
+        if self.loss_mode not in _CLIPPED_PG_LOSS_MODES:
+            raise ValueError(
+                f"Unsupported loss_fn.loss_mode={self.loss_mode!r}. Supported values "
+                f"are: {', '.join(_CLIPPED_PG_LOSS_MODES)}."
+            )
+        self.is_dppo_binary_tv = self.loss_mode == "dppo_binary_tv"
         self.opd_full = opd_full if opd_full is not None and opd_full.enabled else None
         self.input_type = (
             LossInputType.OPD_FULL
@@ -250,11 +267,16 @@ class ClippedPGLossFn(LossFunction):
             else LossInputType.LOGPROB
         )
         if self.opd_full is not None:
+            if self.is_dppo_binary_tv:
+                raise ValueError(
+                    "loss_fn.loss_mode='dppo_binary_tv' is incompatible with opd_full."
+                )
             _validate_opd_full_loss_config(cfg, use_fused_linear_logprobs)
         self.disable_ppo_ratio = cfg.disable_ppo_ratio
         self.ratio_clip_min = cfg.ratio_clip_min
         self.ratio_clip_max = cfg.ratio_clip_max
         self.ratio_clip_c = cfg.ratio_clip_c  # set to None to disable dual-clipping
+        self.dppo_clip_ratio_c = cfg.dppo_clip_ratio_c
         self.reference_policy_kl_penalty = (
             cfg.reference_policy_kl_penalty if not cfg.use_kl_in_reward else 0
         )
@@ -280,66 +302,97 @@ class ClippedPGLossFn(LossFunction):
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg.token_level_loss else LossType.SEQUENCE_LEVEL
         )
-        if self.sequence_level_importance_ratios:
-            assert self.loss_type == LossType.SEQUENCE_LEVEL, (
-                "sequence-level importance sampling (e.g. GSPO) is mutually exclusive with token-level loss"
-            )
-
         self.use_cispo = cfg.use_cispo
-        if self.use_cispo:
-            assert not self.disable_ppo_ratio, (
-                "use_cispo is incompatible with disable_ppo_ratio; "
-                "CISPO needs the pi_theta/pi_theta_old ratio but disable_ppo_ratio removes it"
-            )
-            assert not self.force_on_policy_ratio, (
-                "use_cispo is incompatible with force_on_policy_ratio; "
-                "forcing ratio=1 removes the clipped IS-weight that CISPO optimizes"
-            )
-            assert not self.sequence_level_importance_ratios, (
-                "use_cispo is incompatible with sequence_level_importance_ratios; "
-                "CISPO uses token-level importance weights"
-            )
-            assert self.ratio_clip_c is None, (
-                "use_cispo is incompatible with dual clipping (ratio_clip_c); "
-                "the dual-clip block runs after the CISPO loss assembly and would "
-                "silently overwrite it. Set ratio_clip_c=null when use_cispo=True."
-            )
-            assert self.loss_type == LossType.TOKEN_LEVEL, (
-                "use_cispo requires token_level_loss=True (LossType.TOKEN_LEVEL)."
-            )
-        if self.truncated_importance_sampling_type is not None:
-            assert self.use_importance_sampling_correction, (
-                "truncated importance sampling is only supported when use_importance_sampling_correction is True"
-            )
-            assert self.truncated_importance_sampling_type in (
-                "tis",
-                "icepop",
-                "seq-mask-tis",
-            ), (
-                f"truncated_importance_sampling_type must be 'tis', 'icepop', or 'seq-mask-tis', "
-                f"got {self.truncated_importance_sampling_type}"
-            )
-            assert (
-                self.truncated_importance_sampling_ratio is not None
-                and self.truncated_importance_sampling_ratio > 0
-            ), "truncated_importance_sampling_ratio should be positive"
+        if self.is_dppo_binary_tv:
+            unsupported: list[str] = []
+            if self.disable_ppo_ratio:
+                unsupported.append("disable_ppo_ratio")
+            if self.sequence_level_importance_ratios:
+                unsupported.append("sequence_level_importance_ratios")
+            if self.use_importance_sampling_correction:
+                unsupported.append("use_importance_sampling_correction")
+            if self.truncated_importance_sampling_type is not None:
+                unsupported.append("truncated_importance_sampling_type")
+            if self.truncated_importance_sampling_ratio is not None:
+                unsupported.append("truncated_importance_sampling_ratio")
             if self.truncated_importance_sampling_ratio_min is not None:
-                assert (
-                    self.truncated_importance_sampling_ratio_min
-                    <= self.truncated_importance_sampling_ratio
-                ), (
-                    "truncated_importance_sampling_ratio_min must be <= "
-                    "truncated_importance_sampling_ratio"
+                unsupported.append("truncated_importance_sampling_ratio_min")
+            if self.force_on_policy_ratio:
+                unsupported.append("force_on_policy_ratio")
+            if self.use_cispo:
+                unsupported.append("use_cispo")
+            if self.ratio_clip_c is not None:
+                unsupported.append("ratio_clip_c")
+            if self.positive_example_nll_weight != 0:
+                unsupported.append("positive_example_nll_weight")
+            if unsupported:
+                raise ValueError(
+                    "loss_fn.loss_mode='dppo_binary_tv' does not support: "
+                    + ", ".join(unsupported)
                 )
-            if self.truncated_importance_sampling_type in ("icepop", "seq-mask-tis"):
-                assert self.truncated_importance_sampling_ratio_min is not None, (
-                    "truncated_importance_sampling_ratio_min should be set when truncated_importance_sampling_type is 'icepop' or 'seq-mask-tis'"
+        else:
+            if self.sequence_level_importance_ratios:
+                assert self.loss_type == LossType.SEQUENCE_LEVEL, (
+                    "sequence-level importance sampling (e.g. GSPO) is mutually exclusive with token-level loss"
                 )
-            if self.truncated_importance_sampling_type == "seq-mask-tis":
+
+            if self.use_cispo:
+                assert not self.disable_ppo_ratio, (
+                    "use_cispo is incompatible with disable_ppo_ratio; "
+                    "CISPO needs the pi_theta/pi_theta_old ratio but disable_ppo_ratio removes it"
+                )
+                assert not self.force_on_policy_ratio, (
+                    "use_cispo is incompatible with force_on_policy_ratio; "
+                    "forcing ratio=1 removes the clipped IS-weight that CISPO optimizes"
+                )
                 assert not self.sequence_level_importance_ratios, (
-                    "seq-mask-tis uses token-level IS correction with sequence-level masking, "
-                    "and is incompatible with sequence_level_importance_ratios=True"
+                    "use_cispo is incompatible with sequence_level_importance_ratios; "
+                    "CISPO uses token-level importance weights"
                 )
+                assert self.ratio_clip_c is None, (
+                    "use_cispo is incompatible with dual clipping (ratio_clip_c); "
+                    "the dual-clip block runs after the CISPO loss assembly and would "
+                    "silently overwrite it. Set ratio_clip_c=null when use_cispo=True."
+                )
+                assert self.loss_type == LossType.TOKEN_LEVEL, (
+                    "use_cispo requires token_level_loss=True (LossType.TOKEN_LEVEL)."
+                )
+            if self.truncated_importance_sampling_type is not None:
+                assert self.use_importance_sampling_correction, (
+                    "truncated importance sampling is only supported when use_importance_sampling_correction is True"
+                )
+                assert self.truncated_importance_sampling_type in (
+                    "tis",
+                    "icepop",
+                    "seq-mask-tis",
+                ), (
+                    f"truncated_importance_sampling_type must be 'tis', 'icepop', or 'seq-mask-tis', "
+                    f"got {self.truncated_importance_sampling_type}"
+                )
+                assert (
+                    self.truncated_importance_sampling_ratio is not None
+                    and self.truncated_importance_sampling_ratio > 0
+                ), "truncated_importance_sampling_ratio should be positive"
+                if self.truncated_importance_sampling_ratio_min is not None:
+                    assert (
+                        self.truncated_importance_sampling_ratio_min
+                        <= self.truncated_importance_sampling_ratio
+                    ), (
+                        "truncated_importance_sampling_ratio_min must be <= "
+                        "truncated_importance_sampling_ratio"
+                    )
+                if self.truncated_importance_sampling_type in (
+                    "icepop",
+                    "seq-mask-tis",
+                ):
+                    assert self.truncated_importance_sampling_ratio_min is not None, (
+                        "truncated_importance_sampling_ratio_min should be set when truncated_importance_sampling_type is 'icepop' or 'seq-mask-tis'"
+                    )
+                if self.truncated_importance_sampling_type == "seq-mask-tis":
+                    assert not self.sequence_level_importance_ratios, (
+                        "seq-mask-tis uses token-level IS correction with sequence-level masking, "
+                        "and is incompatible with sequence_level_importance_ratios=True"
+                    )
 
         # Advertise, per returned metric, the global denominator it was
         # normalized by (see MetricNormalizer). Built here — next to the flags
@@ -388,6 +441,17 @@ class ClippedPGLossFn(LossFunction):
                 if self.truncated_importance_sampling_type == "seq-mask-tis"
                 else MetricNormalizer.TOKENS
             )
+        if self.is_dppo_binary_tv:
+            self.metric_normalizations.update(
+                {
+                    "dppo/mask_ratio": MetricNormalizer.TOKENS,
+                    "dppo/mask_ratio_positive_adv": MetricNormalizer.TOKENS,
+                    "dppo/mask_ratio_negative_adv": MetricNormalizer.TOKENS,
+                    "dppo/prob_diff_mean": MetricNormalizer.TOKENS,
+                    "dppo/prob_diff_min": MetricNormalizer.NONE,
+                    "dppo/prob_diff_max": MetricNormalizer.NONE,
+                }
+            )
         if self.opd_full is not None:
             # opd_full returns its own metric set from _opd_full_call; the
             # policy-gradient diagnostics above are never produced there.
@@ -407,6 +471,255 @@ class ClippedPGLossFn(LossFunction):
                         "opd_full_decomposition_error": MetricNormalizer.NONE,
                     }
                 )
+
+    @torch.no_grad()
+    def _compute_binary_tv_mask(
+        self,
+        curr_logprobs: torch.Tensor,
+        generation_logprobs: torch.Tensor,
+        advantages: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        curr_probs = torch.exp(curr_logprobs)
+        generation_probs = torch.exp(generation_logprobs)
+        prob_diff = curr_probs - generation_probs
+
+        invalid_positive_adv = prob_diff > self.ratio_clip_max
+        invalid_negative_adv = prob_diff < -self.ratio_clip_min
+        keep_mask = torch.where(
+            advantages > 0,
+            ~invalid_positive_adv,
+            ~invalid_negative_adv,
+        )
+        return keep_mask.float() * mask
+
+    def _call_dppo_binary_tv(
+        self,
+        next_token_logprobs: Tensor,
+        data: BatchedDataDict[ClippedPGLossDataDict],
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        curr_logprobs = next_token_logprobs
+        token_mask = data["token_mask"][:, 1:]
+        sample_mask = data["sample_mask"]
+        advantages = data["advantages"][:, 1:]
+        generation_logprobs = data["generation_logprobs"][:, 1:]
+        if self.reference_policy_kl_penalty != 0:
+            reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
+            curr_logprobs_unfiltered = data.get(
+                "curr_logprobs_unfiltered", curr_logprobs
+            )
+
+        mask = token_mask * sample_mask.unsqueeze(-1)
+
+        log_ratios = curr_logprobs - generation_logprobs
+        ratios_unclamped = torch.exp(
+            torch.clamp(log_ratios, min=-20.0, max=20.0)
+        ).detach()
+        ratios = torch.exp(
+            torch.clamp(log_ratios, max=math.log(self.dppo_clip_ratio_c))
+        ).detach()
+        ratios = torch.nan_to_num(
+            ratios, nan=0.0, posinf=self.dppo_clip_ratio_c, neginf=0.0
+        )
+
+        divergence_mask = self._compute_binary_tv_mask(
+            curr_logprobs=curr_logprobs,
+            generation_logprobs=generation_logprobs,
+            advantages=advantages,
+            mask=mask,
+        )
+        actor_loss_per_token = -advantages * ratios * divergence_mask * curr_logprobs
+
+        if self.reference_policy_kl_penalty != 0:
+            if self.use_on_policy_kl_approximation:
+                kl_importance_weights = torch.exp(
+                    curr_logprobs_unfiltered - generation_logprobs
+                ).detach()
+                kl_importance_weights = torch.nan_to_num(
+                    kl_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
+                )
+            else:
+                kl_importance_weights = torch.ones_like(curr_logprobs_unfiltered)
+            kl = (
+                kl_importance_weights
+                * self.reference_policy_kl_penalty
+                * calculate_kl(
+                    logprobs=curr_logprobs_unfiltered,
+                    logprobs_reference=reference_policy_logprobs,
+                    kl_type=self.reference_policy_kl_type,
+                    input_clamp_value=self.kl_input_clamp_value,
+                    output_clamp_value=self.kl_output_clamp_value,
+                )
+            )
+            if self.loss_type == LossType.TOKEN_LEVEL:
+                kl = masked_mean(
+                    kl, mask, global_normalization_factor=global_valid_toks
+                )
+            else:
+                kl = masked_mean(
+                    masked_mean(kl, token_mask, dim=-1),
+                    sample_mask,
+                    global_normalization_factor=global_valid_seqs,
+                )
+        else:
+            kl = torch.tensor(0.0, device=curr_logprobs.device)
+
+        if self.loss_type == LossType.TOKEN_LEVEL:
+            actor_loss = masked_mean(
+                actor_loss_per_token,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            )
+        else:
+            actor_loss = masked_mean(
+                masked_mean(actor_loss_per_token, token_mask, dim=-1),
+                sample_mask,
+                global_normalization_factor=global_valid_seqs,
+            )
+
+        loss = actor_loss + kl
+
+        with torch.no_grad():
+            lp_error = torch.abs(generation_logprobs - curr_logprobs)
+            mult_prob_error = masked_mean(
+                torch.exp(torch.clamp(lp_error * mask, max=20.0)),
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+
+            gen_kl_error = calculate_kl(
+                logprobs=generation_logprobs,
+                logprobs_reference=curr_logprobs,
+                kl_type=self.reference_policy_kl_type,
+                input_clamp_value=None,
+                output_clamp_value=None,
+            )
+            gen_kl_error = masked_mean(
+                gen_kl_error,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+
+            policy_kl_error = calculate_kl(
+                logprobs=curr_logprobs,
+                logprobs_reference=generation_logprobs,
+                kl_type=self.reference_policy_kl_type,
+                input_clamp_value=None,
+                output_clamp_value=None,
+            )
+            policy_kl_error = masked_mean(
+                policy_kl_error,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+
+            curr_probs = torch.exp(curr_logprobs)
+            generation_probs = torch.exp(generation_logprobs)
+            log_mixture = torch.log(0.5 * curr_probs + 0.5 * generation_probs)
+            kl_curr_to_mixture = (
+                torch.exp(curr_logprobs - log_mixture)
+                - (curr_logprobs - log_mixture)
+                - 1
+            )
+            kl_generation_to_mixture = (
+                torch.exp(generation_logprobs - log_mixture)
+                - (generation_logprobs - log_mixture)
+                - 1
+            )
+            js_divergence_error = masked_mean(
+                0.5 * kl_curr_to_mixture + 0.5 * kl_generation_to_mixture,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+            prob_diff = torch.abs(curr_probs - generation_probs)
+            prob_diff_mean = masked_mean(
+                prob_diff,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+
+            valid_ratios = ratios_unclamped[mask.bool()]
+            if valid_ratios.numel() > 0:
+                probs_ratio_min = valid_ratios.min().item()
+                probs_ratio_max = valid_ratios.max().item()
+                probs_ratio_clamped_min = ratios[mask.bool()].min().item()
+                probs_ratio_clamped_max = ratios[mask.bool()].max().item()
+                prob_diff_min = prob_diff[mask.bool()].min().item()
+                prob_diff_max = prob_diff[mask.bool()].max().item()
+            else:
+                probs_ratio_min = float("inf")
+                probs_ratio_max = float("-inf")
+                probs_ratio_clamped_min = float("inf")
+                probs_ratio_clamped_max = float("-inf")
+                prob_diff_min = float("inf")
+                prob_diff_max = float("-inf")
+
+            is_masked = (divergence_mask == 0) & (mask > 0)
+            mask_ratio = masked_mean(
+                is_masked.float(),
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+            mask_ratio_positive_adv = masked_mean(
+                (is_masked & (advantages > 0)).float(),
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+            mask_ratio_negative_adv = masked_mean(
+                (is_masked & (advantages < 0)).float(),
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+
+            seq_entropy_approx = -masked_mean(
+                ratios_unclamped * curr_logprobs,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            )
+
+        return (
+            loss,
+            {
+                "loss": loss.item(),
+                "probs_ratio": masked_mean(
+                    ratios_unclamped,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                ).item(),
+                "probs_ratio_clamped": masked_mean(
+                    ratios,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                ).item(),
+                "probs_ratio_min": probs_ratio_min,
+                "probs_ratio_max": probs_ratio_max,
+                "probs_ratio_clamped_min": probs_ratio_clamped_min,
+                "probs_ratio_clamped_max": probs_ratio_clamped_max,
+                "kl_penalty": kl.item() / self.reference_policy_kl_penalty
+                if self.reference_policy_kl_penalty != 0
+                else 0,
+                "token_mult_prob_error": mult_prob_error,
+                "gen_kl_error": gen_kl_error,
+                "policy_kl_error": policy_kl_error,
+                "js_divergence_error": js_divergence_error,
+                "sampling_importance_ratio": masked_mean(
+                    ratios,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                ).item(),
+                "num_valid_samples": sample_mask.sum().item(),
+                "approx_entropy": seq_entropy_approx.item(),
+                "positive_nll_loss": 0.0,
+                "dppo/mask_ratio": mask_ratio,
+                "dppo/mask_ratio_positive_adv": mask_ratio_positive_adv,
+                "dppo/mask_ratio_negative_adv": mask_ratio_negative_adv,
+                "dppo/prob_diff_mean": prob_diff_mean,
+                "dppo/prob_diff_min": prob_diff_min,
+                "dppo/prob_diff_max": prob_diff_max,
+            },
+        )
 
     def __call__(
         self,
@@ -457,6 +770,14 @@ class ClippedPGLossFn(LossFunction):
         assert next_token_logprobs is not None, (
             "ClippedPGLossFn requires next_token_logprobs"
         )
+        if self.is_dppo_binary_tv:
+            return self._call_dppo_binary_tv(
+                next_token_logprobs=next_token_logprobs,
+                data=data,
+                global_valid_seqs=global_valid_seqs,
+                global_valid_toks=global_valid_toks,
+            )
+
         curr_logprobs = next_token_logprobs
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]

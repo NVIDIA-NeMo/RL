@@ -54,6 +54,54 @@ def test_clipped_pg_loss_config_rejects_invalid_reference_kl_penalty(
         ClippedPGLossConfig(reference_policy_kl_penalty=invalid_penalty)
 
 
+def test_dppo_binary_tv_loss_masks_diverged_tokens():
+    """Binary-TV DPPO masks only tokens that diverge in the advantage direction."""
+    cfg = ClippedPGLossConfig(
+        loss_mode="dppo_binary_tv",
+        reference_policy_kl_penalty=0.0,
+        ratio_clip_min=0.1,
+        ratio_clip_max=0.1,
+        dppo_clip_ratio_c=20.0,
+    )
+    loss_fn = ClippedPGLossFn(cfg)
+
+    generation_logprobs = torch.full((1, 4), torch.log(torch.tensor(0.5)))
+    generation_logprobs[:, 0] = 0.0
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[0, 1, 2, 3]], dtype=torch.long),
+            "token_mask": torch.tensor([[0.0, 1.0, 1.0, 1.0]]),
+            "sample_mask": torch.tensor([1.0]),
+            "advantages": torch.tensor([[0.0, 1.0, -1.0, 2.0]]),
+            "generation_logprobs": generation_logprobs,
+            "prev_logprobs": torch.zeros((1, 4)),
+            "reference_policy_logprobs": torch.zeros((1, 4)),
+        }
+    )
+    curr_logprobs = torch.tensor([[-0.20, -2.00, -0.80]])
+
+    loss, metrics = loss_fn(
+        next_token_logprobs=curr_logprobs,
+        data=data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+
+    generation_logprobs = data["generation_logprobs"][:, 1:]
+    ratios = torch.exp(curr_logprobs - generation_logprobs)
+    expected_per_token = torch.tensor(
+        [[0.0, 0.0, -2.0 * ratios[0, 2] * curr_logprobs[0, 2]]]
+    )
+    expected_loss = expected_per_token.sum() / 3.0
+
+    torch.testing.assert_close(loss, expected_loss)
+    assert metrics["dppo/mask_ratio"] == pytest.approx(2.0 / 3.0)
+    assert metrics["dppo/mask_ratio_positive_adv"] == pytest.approx(1.0 / 3.0)
+    assert metrics["dppo/mask_ratio_negative_adv"] == pytest.approx(1.0 / 3.0)
+
+
 def setup_dpo_loss_test_data(vocab_size=16, batch_size=1):
     seq_len = 4
     data = {
@@ -2932,6 +2980,23 @@ class TestMetricNormalizationAdvertisement:
         assert norms["probs_ratio_max"] is MetricNormalizer.NONE
         # no TIS configured → the metric is never emitted, so not advertised
         assert "is_oob_ratio" not in norms
+
+    def test_dppo_binary_tv_config_advertises_dppo_metrics(self):
+        norms = ClippedPGLossFn(
+            ClippedPGLossConfig(loss_mode="dppo_binary_tv")
+        ).metric_normalizations
+        assert norms["loss"] is MetricNormalizer.TOKENS
+        assert norms["kl_penalty"] is MetricNormalizer.TOKENS
+        assert norms["positive_nll_loss"] is MetricNormalizer.NONE
+        for key in (
+            "dppo/mask_ratio",
+            "dppo/mask_ratio_positive_adv",
+            "dppo/mask_ratio_negative_adv",
+            "dppo/prob_diff_mean",
+        ):
+            assert norms[key] is MetricNormalizer.TOKENS
+        assert norms["dppo/prob_diff_min"] is MetricNormalizer.NONE
+        assert norms["dppo/prob_diff_max"] is MetricNormalizer.NONE
 
     def test_gspo_config_keys_on_sequence_flags(self):
         norms = ClippedPGLossFn(
