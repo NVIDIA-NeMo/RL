@@ -828,7 +828,9 @@ def main_vllm():
     generation_data = prepare_input_data(args.prompt, tokenizer)
 
     # prepare refit info
-    state_dict_info = policy.prepare_refit_info()
+    state_dict_info = policy.prepare_refit_info(
+        refit_payload_mode=vllm_inference_policy.get_refit_payload_mode()
+    )
     vllm_inference_policy.prepare_refit_info(state_dict_info)
 
     # Perform model refitting

@@ -64,6 +64,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.megatron_cfg.context_parallel_size=1 \
     policy.megatron_cfg.sequence_parallel=false \
     policy.generation.backend=megatron \
+    +policy.generation.refit_transport=mcore \
     policy.generation.mcore_generation_config.expose_http_server=true \
     policy.generation.mcore_generation_config.enable_prefix_caching=true \
     policy.max_total_sequence_length=512 \
@@ -71,6 +72,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.generation.colocated.enabled=true \
     ++policy.generation.mcore_generation_config.transformer_impl=inference_optimized \
     ++policy.generation.mcore_generation_config.tensor_model_parallel_size=1 \
+    policy.generation.mcore_generation_config.refit_backend=nccl \
     grpo.num_prompts_per_step=4 \
     grpo.num_generations_per_prompt=2 \
     grpo.max_num_steps=10 \

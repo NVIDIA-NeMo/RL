@@ -48,6 +48,7 @@ The bugs these catch:
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -149,6 +150,10 @@ def _make_worker(loss_type):
             },
         },
     }
+    w.megatron_cfg = SimpleNamespace(
+        optimizer=SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=False),
+        ddp=SimpleNamespace(overlap_param_gather=False),
+    )
     w.dp_size = 2
     w.cp_size = 1
     w.sampling_params = None
@@ -157,6 +162,11 @@ def _make_worker(loss_type):
     w.dtype = torch.float32
     w._is_reward_model = False
     w._router_replay_enabled = False
+    # opd_full off, mirroring __init__ when the config block is absent.
+    w._opd_full_enabled = False
+    w._opd_full_lm_head_lifecycle = None
+    w._opd_full_teacher_lm_head = None
+    w._opd_full_teacher_checkpoint_path = None
     w.media_placeholder_token_id = None
     # Model-capability flags __init__ derives from self.model, which
     # object.__new__ skips. train_microbatch passes all three straight through
@@ -410,6 +420,27 @@ class TestAssertStepOpen:
 
 
 class TestTrainMicrobatch:
+    def test_forwards_multimodal_iterator_capabilities(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.media_placeholder_token_id = 42
+        w.delegate_pack_to_model = True
+        w.delegate_mtp_loss_mask_to_model = True
+        batch = _fake_batch()
+
+        with patch(
+            f"{WORKER_MOD}.attach_media_token_validity_mask"
+        ) as attach_validity_mask:
+            w.begin_train_step(loss_fn=w._test_loss_fn)
+            w.train_microbatch(batch)
+
+        attach_validity_mask.assert_called_once_with(batch, 42)
+        iterator_kwargs = mock_module_symbols["gmi"].call_args.kwargs
+        assert iterator_kwargs["delegate_pack_to_model"] is True
+        assert iterator_kwargs["delegate_mtp_loss_mask_to_model"] is True
+        assert iterator_kwargs["model_slices_context_parallel_inputs"] is False
+
     def test_wraps_forward_backward_in_no_sync(self, mock_module_symbols):
         """The single most important assertion in this file. Without the
         no_sync wrap, mcore DDP dispatches a per-call cross-DP reduce on
