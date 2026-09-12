@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import os
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass, fields
+from functools import partial
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 import numpy as np
@@ -29,6 +31,7 @@ from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
@@ -112,6 +115,127 @@ class MasterConfig(BaseModel, extra="allow"):
     telemetry: Optional[TelemetryConfig] = None
 
 
+def _uses_direct_megatron_sft_packing(
+    dataset: Optional[AllTaskProcessedDataset],
+) -> bool:
+    if dataset is None:
+        return False
+    task_data_processors = dataset.task_data_processors
+    return (
+        isinstance(task_data_processors, dict)
+        and "megatron_sft_packed" in task_data_processors
+    )
+
+
+def _direct_megatron_sft_context_parallel_sizes(
+    dataset: Optional[AllTaskProcessedDataset],
+) -> set[int]:
+    if dataset is None or not isinstance(dataset.task_data_processors, dict):
+        return set()
+    processor_entry = dataset.task_data_processors.get("megatron_sft_packed")
+    if not isinstance(processor_entry, tuple) or len(processor_entry) != 2:
+        return set()
+    processor = processor_entry[1]
+    if not isinstance(processor, partial) or processor.keywords is None:
+        return set()
+    context_parallel_size = processor.keywords.get("context_parallel_size")
+    return set() if context_parallel_size is None else {int(context_parallel_size)}
+
+
+def _validate_direct_megatron_sft_setup(
+    master_config: MasterConfig,
+    train_dataset: Optional[AllTaskProcessedDataset],
+    val_dataset: Optional[AllTaskProcessedDataset],
+    loss_fn: NLLLossFn,
+) -> None:
+    direct_train = _uses_direct_megatron_sft_packing(train_dataset)
+    direct_validation = _uses_direct_megatron_sft_packing(val_dataset)
+    uses_direct_packing = direct_train or direct_validation
+    if not uses_direct_packing:
+        return
+
+    for dataset in (train_dataset, val_dataset):
+        if dataset is None or not isinstance(dataset.task_data_processors, dict):
+            continue
+        if (
+            "megatron_sft_packed" in dataset.task_data_processors
+            and len(dataset.task_data_processors) != 1
+        ):
+            raise ValueError(
+                "SFT cannot mix direct Megatron-LM prepacked and regular datasets"
+            )
+
+    policy_config = master_config.policy
+    megatron_cfg = policy_config.get("megatron_cfg")
+    if megatron_cfg is None or not megatron_cfg["enabled"]:
+        raise ValueError(
+            "Direct Megatron-LM prepacked SFT requires the Megatron backend"
+        )
+    policy_context_parallel_size = int(megatron_cfg["context_parallel_size"])
+    data_context_parallel_sizes = _direct_megatron_sft_context_parallel_sizes(
+        train_dataset
+    ) | _direct_megatron_sft_context_parallel_sizes(val_dataset)
+    mismatched_context_parallel_sizes = sorted(
+        size
+        for size in data_context_parallel_sizes
+        if size != policy_context_parallel_size
+    )
+    if mismatched_context_parallel_sizes:
+        raise ValueError(
+            "Megatron-LM prepacked SFT data was prepared for "
+            f"context_parallel_size={mismatched_context_parallel_sizes[0]}, but "
+            "policy context_parallel_size="
+            f"{policy_context_parallel_size}"
+        )
+    if "draft" in policy_config and policy_config["draft"]["enabled"]:
+        raise NotImplementedError(
+            "Direct Megatron-LM prepacked SFT does not support draft training"
+        )
+    if policy_config["dynamic_batching"]["enabled"]:
+        raise ValueError(
+            "Direct Megatron-LM prepacked SFT requires dynamic batching to be disabled"
+        )
+    if direct_train and policy_config["train_micro_batch_size"] != 1:
+        raise ValueError(
+            "Direct Megatron-LM prepacked SFT requires policy.train_micro_batch_size=1"
+        )
+    if direct_validation and master_config.sft.val_micro_batch_size != 1:
+        raise ValueError(
+            "Direct Megatron-LM prepacked SFT requires sft.val_micro_batch_size=1"
+        )
+    if "router_replay" in policy_config and policy_config["router_replay"]["enabled"]:
+        raise NotImplementedError(
+            "Direct Megatron-LM prepacked SFT does not support router replay"
+        )
+    if master_config.sft.only_unmask_final:
+        raise ValueError(
+            "sft.only_unmask_final=true is not supported with direct "
+            "Megatron-LM prepacked SFT because its assistant-token loss masks "
+            "were materialized during offline packing. Set "
+            "sft.only_unmask_final=false or use the online SFT data path."
+        )
+
+    if type(loss_fn) is not NLLLossFn or loss_fn.use_fused_linear_logprobs:
+        raise TypeError(
+            "Direct Megatron-LM prepacked SFT requires the standard NLLLossFn "
+            "with use_fused_linear_logprobs=false."
+        )
+
+
+def _build_sft_collate_fn(
+    policy_config: PolicyConfig,
+) -> Callable[[list[DatumSpec]], BatchedDataDict[Any]]:
+    megatron_cfg = policy_config.get("megatron_cfg")
+    context_parallel_size = None
+    if megatron_cfg is not None and megatron_cfg["enabled"]:
+        context_parallel_size = int(megatron_cfg["context_parallel_size"])
+
+    return partial(
+        rl_collate_fn,
+        megatron_sft_context_parallel_size=context_parallel_size,
+    )
+
+
 # =======================================================
 # Setup & Initialization
 # =======================================================
@@ -152,6 +276,20 @@ def setup(
         processor = tokenizer
         tokenizer = processor.tokenizer
 
+    megatron_cfg = policy_config.get("megatron_cfg")
+    use_fused_linear_logprobs = bool(
+        megatron_cfg is not None
+        and megatron_cfg["enabled"]
+        and megatron_cfg.get("use_fused_linear_logprobs")
+    )
+    loss_fn = NLLLossFn(use_fused_linear_logprobs=use_fused_linear_logprobs)
+    _validate_direct_megatron_sft_setup(
+        master_config,
+        train_dataset,
+        val_dataset,
+        loss_fn,
+    )
+
     checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
@@ -178,11 +316,12 @@ def setup(
     else:
         if train_dataset is None:
             raise ValueError("The Hugging Face SFT backend requires a train dataset.")
+        sft_collate_fn = _build_sft_collate_fn(policy_config)
         train_dataloader = StatefulDataLoader(
             train_dataset,
             batch_size=policy_config["train_global_batch_size"],
             shuffle=data_config["shuffle"],
-            collate_fn=rl_collate_fn,
+            collate_fn=sft_collate_fn,
             drop_last=True,
             num_workers=data_config["num_workers"],
         )
@@ -192,7 +331,7 @@ def setup(
                 val_dataset,
                 batch_size=sft_config.val_global_batch_size,
                 shuffle=False,
-                collate_fn=rl_collate_fn,
+                collate_fn=sft_collate_fn,
                 drop_last=False,
                 num_workers=data_config["num_workers"],
             )
@@ -247,10 +386,6 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    loss_fn = NLLLossFn(
-        use_fused_linear_logprobs=policy_config["megatron_cfg"]["enabled"]
-        and policy_config["megatron_cfg"]["use_fused_linear_logprobs"]
-    )
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)
@@ -600,7 +735,6 @@ def sft_train(
                             "make_sequence_length_divisible_by"
                         ],
                     )
-
                 print("▶ Taking a training step...")
                 with (
                     timer.time("policy_training"),
