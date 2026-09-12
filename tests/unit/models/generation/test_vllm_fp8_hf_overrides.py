@@ -21,6 +21,8 @@ silently reverted (#2188), and re-fixed (#2904). These tests pin the merge
 behavior so it cannot regress a third time.
 """
 
+from typing import Any
+
 import pytest
 
 from nemo_rl.models.generation.vllm.vllm_worker import (
@@ -51,6 +53,21 @@ def test_logs_effective_quantization_ignore_patterns(capsys) -> None:
 def test_does_not_log_ignore_patterns_when_unconfigured(capsys) -> None:
     _log_effective_quantization_ignore_patterns({}, {})
 
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize(
+    "vllm_kwargs",
+    [{}, {"hf_overrides": {}}, {"hf_overrides": None},
+     {"hf_overrides": {"quantization_config": None}}],
+)
+def test_bf16_rollout_can_inherit_ignore_patterns(
+    vllm_kwargs: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    _log_effective_quantization_ignore_patterns(
+        {"precision": "bfloat16", "quantization_ignore_patterns": ["*self_attn.*"]},
+        vllm_kwargs,
+    )
     assert capsys.readouterr().out == ""
 
 
