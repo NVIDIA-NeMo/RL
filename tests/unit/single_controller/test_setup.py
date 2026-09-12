@@ -830,7 +830,7 @@ class TestSetup:
                 MagicMock(pad_token_id=0),
             )
 
-        assert actor_args.finalizer_actors == fake_finalizers
+        assert actor_args.reassembler_actors == fake_finalizers
 
     def test_disabled_periodic_checkpointing_ignores_existing_snapshots(
         self,
@@ -1293,7 +1293,7 @@ class TestSetup:
         assert actor_args.partition_id == "rollout_data"
         assert actor_args.tq_buffer._partition_id == "rollout_data"
         assert actor_args.tq_buffer._require_routed_experts is False
-        assert actor_args.finalizer_actors == []
+        assert actor_args.reassembler_actors == []
         actor_args.dp_client.register_partition.assert_called_once()
         warmup = actor_args.dp_client.register_partition.call_args.kwargs
         assert warmup["partition_id"] == "rollout_data"
@@ -1616,19 +1616,19 @@ class TestSetup:
             patch(
                 "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
                 return_value=fake_actors,
-            ) as mock_create_finalizer_actors,
+            ) as mock_create_reassembler_actors,
         ):
             actor_args, _ = setup_single_controller(mc, tokenizer, processor=processor)
 
         (actor_dp_config, actor_config), actor_kwargs = (
-            mock_create_finalizer_actors.call_args
+            mock_create_reassembler_actors.call_args
         )
         assert actor_dp_config == mc.data_plane
         assert actor_config.partition_id == "rollout_data"
         assert actor_config.staging_partition == mc.token_capture.staging_partition
         assert actor_config.pad_token_id == 9
         assert actor_kwargs == {"num_workers": 3}
-        assert actor_args.finalizer_actors == fake_actors
+        assert actor_args.reassembler_actors == fake_actors
         assert not hasattr(actor_args.rollout_manager, "_finalizer")
         partition_calls = actor_args.dp_client.register_partition.call_args_list
         assert WIRE_MULTIMODAL_FIELDS <= set(partition_calls[0].kwargs["fields"])

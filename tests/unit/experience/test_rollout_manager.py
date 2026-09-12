@@ -45,7 +45,7 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.failures import GenerationUnavailable
+from nemo_rl.experience.failures import GenerationUnavailable, RolloutDataFailure
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -1776,6 +1776,110 @@ def _make_capture_manager(
 
 
 class TestGenerateForFinalizationFlow:
+    @pytest.mark.parametrize("lineage_owned", [False, True])
+    def test_data_skip_releases_only_internally_owned_lineage(self, lineage_owned):
+        buf = _FakeCaptureBuffer()
+        calls = 0
+
+        async def fail(_sample):
+            nonlocal calls
+            calls += 1
+            raise ValueError("bad prompt")
+
+        mgr = _make_capture_manager(
+            buf,
+            on_run=fail,
+            retry_policy=RolloutRetryPolicy.single_attempt(
+                max_data_attempts=2,
+                max_skipped_prompts=1,
+            ),
+        )
+
+        async def scenario():
+            sample = {"prompt": "p", "idx": 0}
+            group_id = None
+            if lineage_owned:
+                async with mgr._recovery_mutation() as cut:
+                    group_id = mgr.reserve_prompt_group(
+                        cut,
+                        sample,
+                        target_step=3,
+                        admitted=True,
+                    )
+            assert (
+                await mgr.generate_for_finalization(
+                    sample,
+                    lineage_group_id=group_id,
+                )
+                is None
+            )
+            assert calls == 2
+            assert not buf._slots
+            assert len(mgr.recovery_ledger) == int(lineage_owned)
+            assert mgr.stats.skipped == 1
+            assert mgr.stats.data_retries_by_reason == {"ValueError": 1}
+            assert mgr.stats.data_failures_by_reason == {"ValueError": 1}
+            with pytest.raises(RolloutDataFailure, match="max_skipped_prompts=1"):
+                await mgr.generate_for_finalization(sample)
+            assert calls == 4
+            assert mgr.stats.skipped == 1
+            assert len(mgr.recovery_ledger) == int(lineage_owned)
+
+        _run(scenario())
+
+    def test_mixed_retry_classes_have_independent_capture_budgets(self):
+        errors = iter([ValueError("bad data"), GenerationUnavailable("lost"), None])
+
+        async def attempt(_sample):
+            error = next(errors)
+            if error is not None:
+                raise error
+
+        mgr = _make_capture_manager(
+            _FakeCaptureBuffer(),
+            on_run=attempt,
+            retry_policy=RolloutRetryPolicy.single_attempt(
+                max_data_attempts=2,
+                max_infra_attempts=2,
+                backoff_base_s=0,
+            ),
+        )
+        assert (
+            _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0})) is not None
+        )
+        assert mgr.stats.data_retries_by_reason == {"ValueError": 1}
+        assert mgr.stats.redispatches_by_reason == {"GenerationUnavailable": 1}
+        assert mgr.stats.data_failures_by_reason == {}
+        assert mgr.stats.skipped == 0
+
+    def test_capture_cleanup_failure_is_never_retried(self):
+        class BrokenBuffer(_FakeCaptureBuffer):
+            def abort(self, group_id):
+                raise RuntimeError("abort failed")
+
+        calls = 0
+
+        async def fail(_sample):
+            nonlocal calls
+            calls += 1
+            raise GenerationUnavailable("lost")
+
+        mgr = _make_capture_manager(
+            BrokenBuffer(),
+            on_run=fail,
+            retry_policy=RolloutRetryPolicy.single_attempt(
+                max_data_attempts=3,
+                max_infra_attempts=3,
+                backoff_base_s=0,
+                max_skipped_prompts=5,
+            ),
+        )
+        with pytest.raises(RuntimeError, match="capture cleanup failed"):
+            _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+        assert calls == 1
+        assert mgr.stats.redispatches_by_reason == {}
+        assert mgr.stats.data_retries_by_reason == {}
+
     def test_request_carries_env_mask_flags(self):
         buf = _FakeCaptureBuffer()
         mgr = _make_capture_manager(
@@ -1874,7 +1978,7 @@ class TestGenerateForFinalizationFlow:
         assert first_rollout_ids is not None
         assert buf.cleared_staging_key_batches == [[f"{first_rollout_ids[0]}/call"]]
         assert (
-            "dropping capture prompt idx=0 after 1 infrastructure failure(s) "
+            "dropping prompt idx=0 after 1 infrastructure failure(s) "
             "(GenerationUnavailable: worker disappeared) [consecutive drop 1/1]"
             in capsys.readouterr().out
         )

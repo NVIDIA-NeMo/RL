@@ -161,7 +161,7 @@ class SingleControllerActorArgs:
     partition_id: str
     save_state: GRPOSaveState
     last_checkpoint_path: Optional[str]
-    finalizer_actors: list[Any]
+    reassembler_actors: list[Any]
     # Defaulted fields must follow the required ones above, so these stay last.
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None
@@ -1788,14 +1788,14 @@ def setup_single_controller(
             token_capture_cfg.staging_partition if token_capture_cfg.enabled else None
         ),
     )
-    finalizer_actors: list[Any] = []
+    reassembler_actors: list[Any] = []
     if token_capture_cfg.enabled:
         from nemo_rl.experience.rollout_reassembler_actor import (
             RolloutReassemblerActorConfig,
             create_rollout_reassembler_actors,
         )
 
-        finalizer_actors = create_rollout_reassembler_actors(
+        reassembler_actors = create_rollout_reassembler_actors(
             dp_config,
             RolloutReassemblerActorConfig(
                 partition_id=partition_id,
@@ -1858,7 +1858,7 @@ def setup_single_controller(
         last_checkpoint_path=recovery_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         bootstrap_identity=bootstrap_identity,
-        finalizer_actors=finalizer_actors,
+        reassembler_actors=reassembler_actors,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,
         teacher_worker_groups=teacher_worker_groups,
