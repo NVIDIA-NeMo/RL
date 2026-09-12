@@ -1,0 +1,53 @@
+# GRPO recipe for Mistral-Medium-3.5-128B — the only model in Mistral's
+# released catalog that actually carries the "3.5" version tag
+# (https://huggingface.co/mistralai/Mistral-Medium-3.5-128B). Addresses the
+# 128B side of https://github.com/NVIDIA-NeMo/RL/issues/2542.
+#
+# Uses FSDP2 (not Megatron) because the Megatron converter_type for this
+# model is not yet validated in NeMo-RL — FSDP2 + HF AutoModel loading is the
+# more portable path until the converter is added. Sharding mirrors the
+# Gemma3-27B recipe, scaled up to 16 nodes × 8 GPUs to accommodate the ~5x
+# parameter count and KV cache.
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 16
+  max_num_steps: 20
+checkpointing:
+  checkpoint_dir: results/grpo-mistral-medium-3.5-128b-16n8g-fsdp2tp8-actckpt-long
+  model_save_format: null
+policy:
+  model_name: mistralai/Mistral-Medium-3.5-128B
+  tokenizer:
+    name: mistralai/Mistral-Medium-3.5-128B
+  train_micro_batch_size: 1
+  max_total_sequence_length: 8192
+  dtensor_cfg:
+    activation_checkpointing: true
+    tensor_parallel_size: 8
+    sequence_parallel: true
+    _v2: false
+  sequence_packing:
+    enabled: true
+  make_sequence_length_divisible_by: 8
+  optimizer:
+    kwargs:
+      lr: 1.0e-07
+  generation:
+    max_new_tokens: 8192
+    vllm_cfg:
+      tensor_parallel_size: 8
+      max_model_len: 8192
+      gpu_memory_utilization: 0.55
+data:
+  max_input_seq_length: 8192
+logger:
+  log_dir: logs/grpo-mistral-medium-3.5-128b-16n8g-fsdp2tp8-actckpt-long
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-mistral-medium-3.5-128b-16n8g-fsdp2tp8-actckpt-long
+cluster:
+  gpus_per_node: 8
+  num_nodes: 16
