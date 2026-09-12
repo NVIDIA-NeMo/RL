@@ -364,6 +364,10 @@ if [[ "${ACTION}" == submit ]]; then
 fi
 
 SOURCE_SHA=$(git -C "${REPO}" rev-parse HEAD)
+if [[ -n "${EXPECTED_SOURCE_SHA:-}" && "${SOURCE_SHA}" != "${EXPECTED_SOURCE_SHA}" ]]; then
+  echo "Source changed after preflight: expected ${EXPECTED_SOURCE_SHA}, got ${SOURCE_SHA}" >&2
+  exit 2
+fi
 SOURCE_STATE=$(git -C "${REPO}" submodule status --recursive)
 SOURCE_ID=$(printf '%s\n%s\n' "${SOURCE_SHA}" "${SOURCE_STATE}" | sha256sum | cut -c1-16)
 SOURCE_ARCHIVE_ROOT=${SOURCE_ARCHIVE_ROOT:-/home/${USER}/.cache/nemo-rl-source-archives}
