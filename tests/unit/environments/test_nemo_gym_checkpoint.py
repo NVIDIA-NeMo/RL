@@ -28,6 +28,7 @@ from nemo_rl.environments.nemo_gym import (
 )
 from nemo_rl.environments.gym_checkpoint import (
     GymActorExecutionRegistry,
+    GymAgentExecutionStatus,
     GymCheckpointPrepareResult,
     GymExecutionIdentity,
     GymResourcesPrepareResponse,
@@ -35,6 +36,27 @@ from nemo_rl.environments.gym_checkpoint import (
     gym_generation_cut_receipts,
     gym_generation_cut_staging_keys,
 )
+
+
+def test_agent_execution_status_accepts_frozen_model_wait() -> None:
+    status = GymAgentExecutionStatus.model_validate(
+        {
+            "rollout_id": "rollout-1",
+            "attempt_index": 0,
+            "generation": 1,
+            "state": "model_wait_frozen",
+            "parked_boundary_state": "model_wait_frozen",
+            "boundary_index": 2,
+            "turn_index": 1,
+            "boundary_kind": "pending_model",
+            "resource_state_revisions": {"tools": 3},
+            "completion_receipt": None,
+            "age_seconds": 0.5,
+        }
+    )
+
+    assert status.state == "model_wait_frozen"
+    assert status.parked_boundary_state == "model_wait_frozen"
 
 
 def _capability(component: str, name: str, **overrides):
