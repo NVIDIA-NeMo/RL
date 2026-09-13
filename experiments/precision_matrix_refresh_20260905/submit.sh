@@ -379,6 +379,19 @@ if [[ "${PERFORMANCE_RECIPE}" == 1 ]]; then
   fi
 fi
 
+if [[ "${REFIT_CACHE_DIAGNOSTICS:-0}" == 1 ]]; then
+  if [[ "${MODE}" != sync || "${ARM}" != mxfp8-false-mxfp8 ]]; then
+    printf 'Cache attribution requires Sync MXFP8 false/MXFP8.\n' >&2
+    exit 1
+  fi
+  COMMON_OVERRIDES+=(
+    "++policy.megatron_cfg.env_vars.NRL_LOG_LEVEL=DEBUG"
+    "++policy.megatron_cfg.fp8_cfg.force_clear_fp8_caches=true"
+    "++policy.megatron_cfg.clear_memory_caches_before_refit=true"
+  )
+  printf 'Diagnostic cache release enabled; exclude timings from performance comparisons.\n'
+fi
+
 printf 'cluster=%s\nmodel=%s\nmode=%s\narm=%s\ntopology=%s\nconfig=%s\nnodes=%s\nsegment=%s\nsteps=%s\nshared_model=%s\nmoe_backend=%s\ndatasets_cache=%s\nnuma_membind_disabled=%s\nforce_rebuild_venvs=%s\nsystem_python=%s\nactor_venv_root=%s\nsha=%s\nrun=%s\n' \
   "${CLUSTER}" "${MODEL}" "${MODE}" "${ARM}" "${TOPOLOGY}" "${CONFIG}" "${NUM_NODES}" \
   "${SEGMENT_SIZE}" "${MAX_STEPS}" "${USE_SHARED_MODEL}" "${MOE_BACKEND}" "${DATASETS_CACHE}" \

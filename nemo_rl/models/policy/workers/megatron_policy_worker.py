@@ -5043,6 +5043,7 @@ class MegatronPolicyWorkerImpl(
         - "max_split_size_mb:512" — fast, prevents large-block splitting
         - "expandable_segments:True" — most effective but ~5x slower weight transfer
         """
+        self._log_gpu_mem("before_te_workspace_clear")
         # 1. Clear Transformer Engine workspaces
         workspace_count = 0
         for module in self.model.modules():
@@ -5053,6 +5054,10 @@ class MegatronPolicyWorkerImpl(
         print(
             f"[_clear_fp8_caches] Cleared {workspace_count} workspace modules on rank {self.rank}"
         )
+        if log.isEnabledFor(logging.DEBUG):
+            gc.collect()
+            torch.cuda.synchronize()
+            self._log_gpu_mem("after_te_workspace_clear")
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/sync_params_before_refit")
@@ -5147,6 +5152,7 @@ class MegatronPolicyWorkerImpl(
 
     def _clear_rope_and_moe_dispatcher_caches(self) -> None:
         """Clear rotary-embedding and MoE dispatcher caches repopulated by forwards."""
+        self._log_gpu_mem("before_rope_dispatcher_clear")
         # Clear RotaryEmbedding's @lru_cache(maxsize=32). The cache accumulates one
         # entry per unique (max_seq_len, offset, packed_seq) seen, and each entry is
         # a GPU tensor (the concatenated sin/cos embedding). With training + logprob
@@ -5197,6 +5203,11 @@ class MegatronPolicyWorkerImpl(
                         setattr(dispatcher, attr, None)
         except Exception:
             pass
+
+        if log.isEnabledFor(logging.DEBUG):
+            gc.collect()
+            torch.cuda.synchronize()
+            self._log_gpu_mem("after_rope_dispatcher_clear")
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_after_refit")
     def offload_after_refit(self):

@@ -2062,6 +2062,39 @@ def test_reference_model_pinned_swap_restores_state_and_reuses_buffer(monkeypatc
     assert synchronize.call_count == 6
 
 
+@pytest.mark.parametrize("debug", [False, True])
+@pytest.mark.parametrize(
+    "method,tag",
+    [
+        ("_clear_fp8_caches", "te_workspace_clear"),
+        ("_clear_rope_and_moe_dispatcher_caches", "rope_dispatcher_clear"),
+    ],
+)
+def test_cache_release_memory_diagnostics(
+    monkeypatch: pytest.MonkeyPatch, debug: bool, method: str, tag: str
+) -> None:
+    from nemo_rl.models.policy.workers import megatron_policy_worker as module
+
+    worker = object.__new__(module.MegatronPolicyWorkerImpl)
+    worker.rank = 0
+    worker.model = SimpleNamespace(modules=lambda: [])
+    worker._log_gpu_mem = MagicMock()
+    synchronize = MagicMock()
+    collect = MagicMock()
+    monkeypatch.setattr(module.log, "isEnabledFor", lambda level: debug)
+    monkeypatch.setattr(module.torch.cuda, "synchronize", synchronize)
+    monkeypatch.setattr(module.gc, "collect", collect)
+
+    getattr(worker, method)()
+
+    assert worker._log_gpu_mem.call_args_list[0].args == (f"before_{tag}",)
+    assert worker._log_gpu_mem.call_count == (2 if debug else 1)
+    assert synchronize.call_count == int(debug)
+    assert collect.call_count == int(debug)
+    if debug:
+        assert worker._log_gpu_mem.call_args_list[1].args == (f"after_{tag}",)
+
+
 def test_clear_rope_and_moe_dispatcher_caches_clears_tensor_state(monkeypatch):
     from megatron.core.models.common.embeddings import rotary_pos_embedding
 
