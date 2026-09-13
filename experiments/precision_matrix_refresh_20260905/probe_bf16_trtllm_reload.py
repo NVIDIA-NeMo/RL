@@ -52,8 +52,10 @@ def main() -> None:
         inputs = torch.randn(16, hidden, dtype=torch.bfloat16) / 8
         router = torch.randn(16, experts, dtype=torch.float32)
 
-        # Native vLLM pads non-gated experts; gated experts require aligned I.
-        for gated, intermediate in ((True, 4096), (False, 2688), (False, 3712)):
+        cases = [(True, 4096), (False, 2688), (False, 3712)]
+        if os.environ.get("PROBE_GATED_PADDING") == "1":
+            cases.extend([(True, 768), (True, 3712)])
+        for gated, intermediate in cases:
             local_width = intermediate // world
 
             def weights(update: int) -> dict[str, torch.Tensor]:

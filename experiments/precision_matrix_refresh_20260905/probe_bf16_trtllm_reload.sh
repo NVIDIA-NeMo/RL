@@ -3,9 +3,18 @@ set -euo pipefail
 : "${REPO:?}"
 : "${CONTAINER:?}"
 : "${RESULT_DIR:?}"
+MOUNTS="${REPO}:/source:ro,${RESULT_DIR}:/results,/raid/scratch:/raid/scratch"
+if [[ -n "${VLLM_PADDING_SOURCE:-}" ]]; then
+  PACKAGE=/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/lib/python3.13/site-packages/vllm
+  for file in model_executor/layers/quantization/utils/flashinfer_utils.py \
+    model_executor/layers/fused_moe/oracle/unquantized.py; do
+    test -f "${VLLM_PADDING_SOURCE}/vllm/${file}"
+    MOUNTS+=",${VLLM_PADDING_SOURCE}/vllm/${file}:${PACKAGE}/${file}:ro"
+  done
+fi
 srun --ntasks=1 --kill-on-bad-exit=1 --wait=30 \
   --no-container-mount-home --container-image="${CONTAINER}" \
-  --container-mounts="${REPO}:/source:ro,${RESULT_DIR}:/results,/raid/scratch:/raid/scratch" \
+  --container-mounts="${MOUNTS}" \
   --output="${RESULT_DIR}/probe-%N.log" \
   timeout --signal=TERM --kill-after=30s 25m bash -c '
 set -euo pipefail
