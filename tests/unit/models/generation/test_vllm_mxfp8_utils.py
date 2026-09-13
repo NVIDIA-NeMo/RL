@@ -157,7 +157,8 @@ def test_runtime_parameter_owns_shared_scratch_storage(device: str, mode: str) -
         if mode != "new":
             shape = scratch.shape if mode == "force" else (1,)
             layer.weight = torch.nn.Parameter(
-                torch.zeros(shape, dtype=scratch.dtype, device=device), requires_grad=False
+                torch.zeros(shape, dtype=scratch.dtype, device=device),
+                requires_grad=False,
             )
         scratch.fill_(index + 1)
         assign(layer, "weight", scratch, force_replace=mode == "force")
