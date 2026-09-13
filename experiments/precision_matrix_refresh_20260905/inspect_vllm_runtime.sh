@@ -27,6 +27,7 @@ if [[ "${TEST_LOCAL_EXPERT_RELOAD:-0}" == 1 ]]; then
     -p no:cacheprovider -o addopts= --confcutdir=/source/tests/unit/models/generation \
     /source/tests/unit/models/generation/test_local_expert_reload.py \
     /source/tests/unit/models/generation/test_nccl_reshard_backend.py \
+    /source/tests/unit/models/generation/test_vllm_wakeup_errors.py \
     --junitxml=/results/local-expert-reload.xml -v > /results/local-expert-reload.log 2>&1
 fi
 '

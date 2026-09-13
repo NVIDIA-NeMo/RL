@@ -1163,23 +1163,19 @@ class VllmGeneration(GenerationInterface):
         if not self.cfg["colocated"]["enabled"]:
             return True
 
-        try:
-            # Choose the appropriate method based on async_engine setting
-            method_name = (
-                "wake_up_async" if self.cfg["vllm_cfg"]["async_engine"] else "wake_up"
-            )
-            # Use run_all_workers_single_data for methods that don't need data
-            futures = self.worker_group.run_all_workers_single_data(
-                method_name,
-                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-                **kwargs,
-            )
-            # Wait for all futures to complete
-            results = ray.get(futures)
-            return all(result for result in results if result is not None)
-        except Exception as e:
-            print(f"Error during policy preparation: {e}")
-            return False
+        method_name = (
+            "wake_up_async" if self.cfg["vllm_cfg"]["async_engine"] else "wake_up"
+        )
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            **kwargs,
+        )
+        # Callers cannot safely continue generation after a failed wake-up.
+        results = ray.get(futures)
+        if not all(result for result in results if result is not None):
+            raise RuntimeError("vLLM worker wake-up reported failure")
+        return True
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Sleep workers and reset prefix cache."""
