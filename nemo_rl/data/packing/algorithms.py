@@ -18,7 +18,7 @@ import enum
 import math
 import random
 from abc import ABC, abstractmethod
-from bisect import bisect
+from bisect import bisect, bisect_right
 from typing import Dict, List, Optional, Tuple, Type, Union
 
 
@@ -29,6 +29,8 @@ class PackingAlgorithm(enum.Enum):
     FIRST_FIT_DECREASING = "first_fit_decreasing"
     FIRST_FIT_SHUFFLE = "first_fit_shuffle"
     MODIFIED_FIRST_FIT_DECREASING = "modified_first_fit_decreasing"
+    GREEDY_KNAPSACK = "greedy_knapsack"
+    BALANCED_GREEDY_KNAPSACK = "balanced_greedy_knapsack"
 
 
 class SequencePacker(ABC):
@@ -291,6 +293,88 @@ class SequencePacker(ABC):
         """
         total_length = sum(sequence_lengths)
         return max(1, math.ceil(total_length / self.bin_capacity))
+
+
+class GreedyKnapsackPacker(SequencePacker):
+    """Repeatedly take the largest remaining sequence that fits."""
+
+    def _pack_implementation(self, sequence_lengths: List[int]) -> List[List[int]]:
+        self._validate_sequence_lengths(sequence_lengths)
+        remaining = sorted(
+            (length, -index, index) for index, length in enumerate(sequence_lengths)
+        )
+        bins: List[List[int]] = []
+        while remaining:
+            current: List[int] = []
+            capacity = self.bin_capacity
+            while (
+                self.max_sequences_per_bin is None
+                or len(current) < self.max_sequences_per_bin
+            ):
+                fit = bisect_right(remaining, (capacity, 1, len(sequence_lengths)))
+                if fit == 0:
+                    break
+                length, _, index = remaining.pop(fit - 1)
+                capacity -= length
+                current.append(index)
+            bins.append(current)
+        return bins
+
+
+class BalancedGreedyKnapsackPacker(SequencePacker):
+    """Place descending sequences into the least-full available bin."""
+
+    def __init__(
+        self,
+        bin_capacity: int,
+        collect_metrics: bool = False,
+        min_bin_count: Optional[int] = None,
+        bin_count_multiple: Optional[int] = None,
+        max_sequences_per_bin: Optional[int] = None,
+        balanced_knapsack_delta: int = 0,
+    ) -> None:
+        super().__init__(
+            bin_capacity,
+            collect_metrics,
+            min_bin_count,
+            bin_count_multiple,
+            max_sequences_per_bin,
+        )
+        if balanced_knapsack_delta < 0:
+            raise ValueError("balanced_knapsack_delta must be nonnegative")
+        self.balanced_knapsack_delta = balanced_knapsack_delta
+
+    def _pack_implementation(self, sequence_lengths: List[int]) -> List[List[int]]:
+        self._validate_sequence_lengths(sequence_lengths)
+        if not sequence_lengths:
+            return []
+        count = math.ceil(sum(sequence_lengths) / self.bin_capacity)
+        bins: List[List[int]] = [
+            [] for _ in range(count + self.balanced_knapsack_delta)
+        ]
+        loads = [0] * len(bins)
+        for index in sorted(
+            range(len(sequence_lengths)),
+            key=sequence_lengths.__getitem__,
+            reverse=True,
+        ):
+            candidates = [
+                i
+                for i, load in enumerate(loads)
+                if load + sequence_lengths[index] <= self.bin_capacity
+                and (
+                    self.max_sequences_per_bin is None
+                    or len(bins[i]) < self.max_sequences_per_bin
+                )
+            ]
+            if not candidates:
+                bins.append([])
+                loads.append(0)
+                candidates = [len(bins) - 1]
+            target = min(candidates, key=loads.__getitem__)
+            bins[target].append(index)
+            loads[target] += sequence_lengths[index]
+        return [bin_indexes for bin_indexes in bins if bin_indexes]
 
 
 class ConcatenativePacker(SequencePacker):
@@ -700,6 +784,8 @@ def get_packer(
         PackingAlgorithm.FIRST_FIT_DECREASING: FirstFitDecreasingPacker,
         PackingAlgorithm.FIRST_FIT_SHUFFLE: FirstFitShufflePacker,
         PackingAlgorithm.MODIFIED_FIRST_FIT_DECREASING: ModifiedFirstFitDecreasingPacker,
+        PackingAlgorithm.GREEDY_KNAPSACK: GreedyKnapsackPacker,
+        PackingAlgorithm.BALANCED_GREEDY_KNAPSACK: BalancedGreedyKnapsackPacker,
     }
 
     # Convert string to enum if needed

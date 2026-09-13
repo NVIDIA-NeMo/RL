@@ -121,6 +121,7 @@ project-includes = [
   "nemo_rl/data/energon/multimodal/cookers/__init__.py",
   "nemo_rl/data/energon/multimodal/cookers/generic.py",
   "nemo_rl/data/energon/multimodal/model_families.py",
+  "nemo_rl/data/energon/multimodal/packing.py",
   "nemo_rl/data/energon/multimodal/registry.py",
   "nemo_rl/data/energon/multimodal/task_encoders/__init__.py",
   "nemo_rl/data/energon/multimodal/task_encoders/base.py",

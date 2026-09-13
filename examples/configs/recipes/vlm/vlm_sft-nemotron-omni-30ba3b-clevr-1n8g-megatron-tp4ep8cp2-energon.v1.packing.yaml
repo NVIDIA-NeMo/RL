@@ -1,0 +1,14 @@
+defaults: ./vlm_sft-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8-energon.v1.packing.yaml
+sft:
+  max_num_steps: 50
+policy:
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.context_parallel_size},
+    ${mul:2, ${policy.megatron_cfg.tensor_model_parallel_size}}}
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    context_parallel_size: 2
+logger:
+  wandb_enabled: true
+  log_dir: logs/sft-nemotron-omni-30b-clevr-energon-packing-tp4ep8cp2
+  wandb:
+    name: sft-nemotron-omni-30b-clevr-energon-packing-tp4ep8cp2

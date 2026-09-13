@@ -19,7 +19,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN
+from nemo_rl.data_plane.schema import (
+    GLOBAL_FORWARD_PAD_SEQLEN,
+    MICRO_BATCH_INDICES,
+    MICRO_BATCH_LENGTHS,
+)
 from nemo_rl.models.policy.tq_policy import TQPolicy
 
 
@@ -92,15 +96,44 @@ def test_train_placed_microbatches_requires_one_batch_per_dp_rank() -> None:
     worker_group.run_all_workers_sharded_data.assert_not_called()
 
 
-def test_train_placed_microbatches_rejects_sequence_packing() -> None:
+def test_train_placed_microbatches_rejects_dynamic_batching() -> None:
     policy, worker_group = _policy()
-    policy.use_sequence_packing = True
-    policy.sequence_packing_args = {"algorithm": "modified_first_fit_decreasing"}
-    policy.cfg["sequence_packing"] = {"train_mb_tokens": 4096}
+    policy.use_dynamic_batches = True
+    policy.dynamic_batching_args = {}
+    policy.cfg["dynamic_batching"] = {"train_mb_tokens": 4096}
 
-    with pytest.raises(ValueError, match="fixed batches only"):
+    with pytest.raises(ValueError, match="dynamic batching"):
         policy.train_placed_microbatches(
             [_meta(0, ["input_ids"]), _meta(1, ["input_ids"])]
         )
 
     worker_group.run_all_workers_sharded_data.assert_not_called()
+
+
+def test_train_placed_microbatches_requires_producer_packing_shapes() -> None:
+    policy, worker_group = _policy()
+    policy.use_sequence_packing = True
+    policy.sequence_packing_args = {"algorithm": "modified_first_fit_decreasing"}
+    policy.cfg["sequence_packing"] = {"train_mb_tokens": 4096}
+
+    with pytest.raises(ValueError, match="producer microbatch shapes"):
+        policy.train_placed_microbatches(
+            [_meta(0, ["input_ids"]), _meta(1, ["input_ids"])]
+        )
+
+    worker_group.run_all_workers_sharded_data.assert_not_called()
+
+
+def test_train_placed_microbatches_accepts_producer_packing_shapes() -> None:
+    policy, worker_group = _policy()
+    policy.use_sequence_packing = True
+    policy.sequence_packing_args = {"algorithm": "modified_first_fit_decreasing"}
+    policy.cfg["sequence_packing"] = {"train_mb_tokens": 4096}
+    dp_metas = [_meta(0, ["input_ids"]), _meta(1, ["input_ids"])]
+    for meta in dp_metas:
+        meta.extra_info[MICRO_BATCH_INDICES] = [[[0, 1], [1, 2]]]
+        meta.extra_info[MICRO_BATCH_LENGTHS] = [[8, 16]]
+
+    policy.train_placed_microbatches(dp_metas)
+
+    worker_group.run_all_workers_sharded_data.assert_called_once()

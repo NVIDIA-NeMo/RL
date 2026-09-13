@@ -1,0 +1,20 @@
+defaults: ./vlm_sft-qwen2.5-vl-3b-instruct-clevr-1n2g-megatrontp1-energon.v1.yaml
+
+policy:
+  sequence_packing:
+    enabled: true
+    fuse_loss: true
+    algorithm: balanced_greedy_knapsack
+
+data:
+  energon:
+    packing_buffer_size: 64
+    max_samples_per_sequence: 16
+
+checkpointing:
+  checkpoint_dir: results/sft_${policy.model_name}_clevr_energon_packing
+
+logger:
+  log_dir: logs/sft-qwen2.5-vl-3b-clevr-energon-packing
+  wandb:
+    name: sft-qwen2.5-vl-3b-clevr-energon-packing

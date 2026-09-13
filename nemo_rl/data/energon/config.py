@@ -65,8 +65,26 @@ class EnergonLoaderConfig(BaseModel, extra="allow"):
     )
     num_workers: Annotated[int, Field(ge=0)] = 8
     shuffle_buffer_size: Annotated[int, Field(ge=0)] = 1000
-    max_samples_per_sequence: None = None
-    packing_buffer_size: None = None
+    max_samples_per_sequence: (
+        Annotated[
+            int,
+            Field(
+                ge=1,
+                description="Maximum sequential sample run used when sharding a dataset.",
+            ),
+        ]
+        | None
+    ) = None
+    packing_buffer_size: (
+        Annotated[
+            int,
+            Field(
+                ge=1,
+                description="Samples buffered by Energon for packing; None disables packing.",
+            ),
+        ]
+        | None
+    ) = None
     batch_grouping: Literal["auto"] = "auto"
     processor_adapter: Literal["hf_multimodal"] = "hf_multimodal"
     topology_mapper: Literal["default"] = "default"
