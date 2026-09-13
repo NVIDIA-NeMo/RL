@@ -403,6 +403,24 @@ _GYM_COMPONENT_KEYS = frozenset(
 )
 
 
+def _model_checkpoint_ready(
+    *,
+    state: str,
+    inflight_total: int,
+    generation_pending_total: int | None,
+    generation_cut_proof: dict[str, object] | None,
+) -> bool:
+    """Accept drained models or a complete durable cut of their live calls."""
+    if state != "paused":
+        return False
+    if generation_pending_total is None:
+        # Compatibility with Gym versions that only implement full draining.
+        return inflight_total == 0
+    if generation_pending_total != 0:
+        return False
+    return inflight_total == 0 or generation_cut_proof is not None
+
+
 class GymControlRequestError(RuntimeError):
     """Typed non-success response from one Gym checkpoint control route."""
 
@@ -726,6 +744,9 @@ Depending on your data shape, you may want to change these values."""
                 "lineage_store": ("nemo_gym.token_id_capture.lineage:FileLineageStore"),
                 "lineage_store_kwargs": {"root": os.path.join(capture_dir, "lineage")},
                 "external_staging": True,
+                "generation_prefix_cuts_enabled": bool(
+                    token_capture.get("generation_prefix_cuts_enabled", False)
+                ),
                 "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
             }
             # Gym resolves the credential inside each serving process. Keep
@@ -1117,8 +1138,12 @@ Depending on your data shape, you may want to change these values."""
                         )
                     )
                     ready = (
-                        payload.state == "paused"
-                        and payload.inflight_total == 0
+                        _model_checkpoint_ready(
+                            state=payload.state,
+                            inflight_total=payload.inflight_total,
+                            generation_pending_total=payload.generation_pending_total,
+                            generation_cut_proof=payload.generation_cut_proof,
+                        )
                         and payload.workers.acknowledged == payload.workers.expected
                     )
                 elif participant.component == "responses_api_agents":
@@ -1171,7 +1196,12 @@ Depending on your data shape, you may want to change these values."""
                 )
                 results[index] = GymParticipantPrepareResult(
                     participant=result.participant,
-                    ready=(payload.state == "paused" and payload.inflight_total == 0),
+                    ready=_model_checkpoint_ready(
+                        state=payload.state,
+                        inflight_total=payload.inflight_total,
+                        generation_pending_total=payload.generation_pending_total,
+                        generation_cut_proof=payload.generation_cut_proof,
+                    ),
                     payload=payload,
                 )
 
@@ -1285,8 +1315,12 @@ Depending on your data shape, you may want to change these values."""
                 "expected": status.workers.expected,
             }
             ready = (
-                status.state == "paused"
-                and status.inflight_total == 0
+                _model_checkpoint_ready(
+                    state=status.state,
+                    inflight_total=status.inflight_total,
+                    generation_pending_total=status.generation_pending_total,
+                    generation_cut_proof=status.generation_cut_proof,
+                )
                 and status.missing_workers == 0
                 and status.workers.acknowledged == status.workers.expected
             )
@@ -1296,11 +1330,19 @@ Depending on your data shape, you may want to change these values."""
                 "acknowledged": len(status.per_worker),
                 "expected": discovered.capabilities.multi_process.num_workers,
             }
-            ready = status.state == "paused" and status.inflight_total == 0
+            ready = _model_checkpoint_ready(
+                state=status.state,
+                inflight_total=status.inflight_total,
+                generation_pending_total=status.generation_pending_total,
+                generation_cut_proof=status.generation_cut_proof,
+            )
         payload = GymModelPrepareResponse(
             state=status.state,
             workers=workers,
             inflight_total=status.inflight_total,
+            response_inflight_total=status.response_inflight_total,
+            generation_pending_total=status.generation_pending_total,
+            generation_cut_proof=status.generation_cut_proof,
             waiters_total=status.waiters_total,
         )
         if not ready:

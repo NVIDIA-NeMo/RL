@@ -623,7 +623,12 @@ class VllmGeneration(GenerationInterface):
         return results
 
     def setup_token_capture(
-        self, dp_cfg: dict[str, Any], staging_partition: str
+        self,
+        dp_cfg: dict[str, Any],
+        staging_partition: str,
+        *,
+        generation_prefix_cuts_enabled: bool = False,
+        generation_cut_control_token: str | None = None,
     ) -> None:
         """Install ledger-authoritative token capture in every DP-leader worker.
 
@@ -639,6 +644,8 @@ class VllmGeneration(GenerationInterface):
             "setup_token_capture",
             dp_cfg=dp_cfg,
             staging_partition=staging_partition,
+            generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
+            generation_cut_control_token=generation_cut_control_token,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         ray.get(futures)
@@ -1654,6 +1661,42 @@ class VllmGeneration(GenerationInterface):
         )
         if not all(ray.get(futures)):
             raise RuntimeError("Failed to resume every async vLLM engine")
+        return True
+
+    def pause_generation_for_checkpoint(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Freeze every engine and its terminal capture writes for a TQ cut."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "pause_generation_for_checkpoint requires async_engine=True"
+            )
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        futures = self.worker_group.run_all_workers_single_data(
+            "pause_generation_for_checkpoint_async",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        if not all(ray.get(futures, timeout=timeout_s)):
+            raise RuntimeError("Failed to checkpoint-pause every async vLLM engine")
+        return True
+
+    def resume_generation_after_checkpoint(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Resume every engine and release terminal capture writes."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "resume_generation_after_checkpoint requires async_engine=True"
+            )
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        futures = self.worker_group.run_all_workers_single_data(
+            "resume_generation_after_checkpoint_async",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        if not all(ray.get(futures, timeout=timeout_s)):
+            raise RuntimeError("Failed to checkpoint-resume every async vLLM engine")
         return True
 
     @property

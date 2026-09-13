@@ -39,6 +39,7 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     STAGING_FIELDS,
     TQTokenSink,
     TQTokenSource,
+    generation_cut_staging_key,
 )
 from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
     build_fixture_artifacts,
@@ -177,6 +178,24 @@ def test_sink_clear_drops_rows(tq_client, staging_partition):
     sink.clear(keys)
     with pytest.raises(KeyError):
         source.fetch(keys)
+
+
+def test_generation_prefix_uses_checkpoint_scoped_key(tq_client, staging_partition):
+    sink = TQTokenSink(tq_client, staging_partition=staging_partition)
+    source = TQTokenSource(tq_client, staging_partition=staging_partition)
+    records, _, _ = build_fixture_artifacts("single_call")
+    record = records[0]
+
+    result = sink.stage_generation_prefix(record, checkpoint_id="checkpoint-1")
+
+    expected_key = generation_cut_staging_key(
+        "checkpoint-1", record.rollout_id, record.model_call_id
+    )
+    assert result.ok
+    assert result.staging_key == expected_key
+    assert source.fetch([expected_key])[0].model_dump() == record.model_dump(
+        exclude={"extras"}
+    )
 
 
 def test_fetch_prefix_token_ids_empty(tq_client, staging_partition):

@@ -29,8 +29,11 @@ from nemo_rl.environments.nemo_gym import (
 from nemo_rl.environments.gym_checkpoint import (
     GymActorExecutionRegistry,
     GymAgentExecutionStatus,
+    GymCheckpointPrepareResult,
     GymExecutionIdentity,
     GymResourcesPrepareResponse,
+    gym_generation_cut_proofs,
+    gym_generation_cut_staging_keys,
 )
 
 
@@ -93,6 +96,51 @@ def _completion_receipt(
         "execution_generation": attempt_index + 1,
         "result_identity": f"result-{rollout_id}-{attempt_index}",
         "result_digest": f"{attempt_index + 1:064x}",
+    }
+
+
+def test_generation_cut_proof_exposes_durable_tq_prefix_keys() -> None:
+    proof = {
+        "checkpoint_id": "checkpoint-1",
+        "generation_cut_receipt": {
+            "prefixes": [
+                {
+                    "disposition": "durable_prefix",
+                    "staging_key": "__generation_cut__/checkpoint-1/r0/c1",
+                },
+                {"disposition": "durable_failure"},
+            ]
+        },
+    }
+    prepare = GymCheckpointPrepareResult.model_validate(
+        {
+            "checkpoint_id": "checkpoint-1",
+            "ready": True,
+            "participants": [
+                {
+                    "participant": {
+                        "server_name": "policy",
+                        "component": "responses_api_models",
+                        "participant_name": "policy",
+                    },
+                    "ready": True,
+                    "payload": {
+                        "state": "paused",
+                        "workers": {"acknowledged": 1, "expected": 1},
+                        "inflight_total": 1,
+                        "response_inflight_total": 1,
+                        "generation_pending_total": 0,
+                        "generation_cut_proof": proof,
+                        "waiters_total": 0,
+                    },
+                }
+            ],
+        }
+    )
+
+    assert gym_generation_cut_proofs(prepare) == (proof,)
+    assert gym_generation_cut_staging_keys(prepare) == {
+        "__generation_cut__/checkpoint-1/r0/c1"
     }
 
 
