@@ -198,6 +198,10 @@ run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controll
 # The same recovery contract against Workplace Assistant's real DataFrame-backed
 # state adapter, including an exactly-once calendar mutation across restart.
 run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_workplace_turn_recovery.sh
+# Full-process restart while a policy-model call is still generating. This is
+# the end-to-end guard that proves a durable TQ prefix is restored and only the
+# missing suffix is generated after restart.
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
