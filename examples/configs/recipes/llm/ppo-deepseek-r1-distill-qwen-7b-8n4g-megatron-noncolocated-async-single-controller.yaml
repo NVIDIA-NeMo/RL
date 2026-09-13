@@ -168,6 +168,7 @@ async_rl:
   max_buffered_rollouts: ${mul:${ppo.num_prompts_per_step}, 3}
 
 checkpointing:
-  enabled: false
+  enabled: true
   checkpoint_dir: results/ppo-deepseek-r1-distill-qwen-7b-8n4g-megatron-noncolocated-async-single-controller
   metric_name: null
+  save_period: 10
