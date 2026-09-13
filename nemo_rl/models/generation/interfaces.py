@@ -607,6 +607,29 @@ class GenerationInterface(ABC):
         _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False
 
+    def pause_generation_for_checkpoint(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Freeze decoding and terminal token staging for a coordinated cut.
+
+        Backends that support token-prefix checkpointing must override this
+        method. Unsupported backends fail loudly because continuing would let
+        token writes race the data-plane snapshot.
+        """
+        raise NotImplementedError(
+            "generation-prefix checkpointing is not supported for "
+            f"{type(self).__name__}"
+        )
+
+    def resume_generation_after_checkpoint(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Release a generation freeze after snapshot publication or abort."""
+        raise NotImplementedError(
+            "generation-prefix checkpointing is not supported for "
+            f"{type(self).__name__}"
+        )
+
     def blocks_training(self) -> bool:
         """Whether this engine must stand down before a training step.
 
