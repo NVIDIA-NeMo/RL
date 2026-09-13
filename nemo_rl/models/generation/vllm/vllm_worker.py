@@ -49,6 +49,10 @@ from nemo_rl.models.generation.vllm.config import (
 )
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
+    FINISHED_REASON_LABEL,
+    HISTOGRAM_COUNT_PART,
+    HISTOGRAM_SUM_PART,
+    encode_counter_key,
     format_prompt_for_vllm_generation,
     pad_and_align_routed_expert_indices,
 )
@@ -62,7 +66,7 @@ from nemo_rl.models.generation.vllm.worker_utils import (
 )
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
-from nemo_rl.telemetry.instrumentation import trace_fn
+from nemo_rl.telemetry.instrumentation import umbrella_trace_fn
 from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     shutdown_telemetry,
@@ -96,10 +100,19 @@ def _maybe_enable_vllm_native_tracing(llm_kwargs: dict[str, Any]) -> None:
     """Optionally enable vLLM's native OpenTelemetry tracing on the engine.
 
     Requires both ``telemetry.enabled`` and ``telemetry.vllm_native_tracing``
-    (plus an OTLP endpoint). vLLM's OTLP span exporter is gRPC-only, so the
-    endpoint must speak OTLP/gRPC (e.g. a collector on ``:4317`` or a
-    gRPC-capable backend) — it will not reach an ``http/protobuf`` OTLP
-    endpoint. Degrades to a no-op if the installed vLLM lacks these engine args.
+    (plus an OTLP endpoint). vLLM builds its own span exporter and picks the
+    protocol from ``OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`` alone, defaulting to
+    gRPC; it does not consult the generic ``OTEL_EXPORTER_OTLP_PROTOCOL``. So an
+    ``http/protobuf`` endpoint inherited from lens needs that traces-specific
+    var set as well, or vLLM will speak gRPC at an HTTP port.
+
+    Note this only enables tracing in the engine: vLLM's *worker* processes
+    gate on ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` being present in their
+    environment and never read the engine args, so they trace whenever that var
+    reaches them -- which the Ray runtime_env does for the whole cluster. This
+    switch therefore governs engine spans, not every vLLM span.
+
+    Degrades to a no-op if the installed vLLM lacks these engine args.
     """
     # The master switch is re-checked here because _config_to_env() exports
     # every field before init_telemetry_driver's `enabled` check, so
@@ -140,9 +153,15 @@ def _maybe_enable_vllm_native_tracing(llm_kwargs: dict[str, Any]) -> None:
         )
         return
     llm_kwargs.setdefault("otlp_traces_endpoint", endpoint)
-    if "collect_detailed_traces" in supported:
-        llm_kwargs.setdefault("collect_detailed_traces", ["all"])
-    logger.info("nemo-lens: enabled vLLM native OTLP tracing -> %s", endpoint)
+    # collect_detailed_traces is deliberately left unset: vLLM documents it as
+    # "possibly costly and or blocking", and it adds per-request timing inside
+    # the engine, so it taxes generation itself and not just the exporter. A run
+    # that wants it can still pass it through vllm_kwargs.
+    logger.info(
+        "nemo-lens: enabled vLLM native OTLP tracing -> %s. This emits one span "
+        "per generation request; expect high span volume at rollout scale.",
+        endpoint,
+    )
 
 
 def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
@@ -459,7 +478,7 @@ class BaseVllmGenerationWorker:
     def _refit_with_reload_api_enabled(self) -> bool:
         return bool(self.cfg["vllm_cfg"].get("refit_with_reload_api"))
 
-    @trace_fn(RLSpanGroup.MODEL_INIT, "rl.vllm.load_model")
+    @umbrella_trace_fn(RLSpanGroup.U_MODEL_INIT, "rl.vllm.load_model")
     def _load_model(self, bundle_indices, seed):
         """Perform the heavy model loading and engine creation.
 
@@ -862,32 +881,49 @@ class BaseVllmGenerationWorker:
         RayDistributedExecutor._configure_ray_workers_use_nsight = _patched_configure
 
     def _get_raw_spec_counters(self) -> dict[str, float | list[float]]:
-        """Get speculative decoding metrics from the vLLM engine.
+        """Get the vLLM engine's Prometheus counters.
 
-        Collects spec decode counters including number of drafts,
-        draft tokens, and accepted tokens for monitoring acceptance rates.
+        Returns the engine's whole snapshot -- the spec-decode counters plus the
+        token, sequence-length and request-outcome series -- so one RPC per
+        snapshot serves every metric family the driver reports on.
+
+        Two shapes in the snapshot do not survive a plain ``{name: value}`` read
+        and so are encoded into the key instead (see
+        ``utils.encode_counter_key``): a labelled series arrives as several
+        objects sharing one ``name``, so reading by name alone would keep only
+        whichever came last, and a histogram carries ``count``/``sum``/``buckets``
+        with no scalar at all, so reading by name alone would drop it entirely.
 
         Returns:
             Dictionary mapping metric names to their values.
             Values may be floats or lists of floats (for per-position metrics).
-
-        Raises:
-            AssertionError: If called before vLLM engine is initialized.
+            Empty before the engine is initialized.
         """
         metrics: dict[str, float | list[float]] = {}
-        if self.llm is not None:
-            if hasattr(self.llm, "get_metrics"):
-                vllm_prom_metrics = self.llm.get_metrics()
-            else:
-                # The AsyncLLM API does not implement get_metrics so we need to call the prometheus API ourselves
-                from vllm.v1.metrics.reader import get_metrics_snapshot
+        if self.llm is None:
+            return metrics
 
-                vllm_prom_metrics = get_metrics_snapshot()
-            for metric in vllm_prom_metrics:
-                if hasattr(metric, "values"):
-                    metrics[metric.name] = metric.values
-                elif hasattr(metric, "value"):
-                    metrics[metric.name] = metric.value
+        if hasattr(self.llm, "get_metrics"):
+            vllm_prom_metrics = self.llm.get_metrics()
+        else:
+            # The AsyncLLM API does not implement get_metrics so we need to call the prometheus API ourselves
+            from vllm.v1.metrics.reader import get_metrics_snapshot
+
+            vllm_prom_metrics = get_metrics_snapshot()
+
+        for metric in vllm_prom_metrics:
+            name = metric.name
+            reason = (getattr(metric, "labels", None) or {}).get(FINISHED_REASON_LABEL)
+            if reason is not None:
+                name = encode_counter_key(name, f"{FINISHED_REASON_LABEL}={reason}")
+
+            if hasattr(metric, "values"):
+                metrics[name] = metric.values
+            elif hasattr(metric, "value"):
+                metrics[name] = metric.value
+            elif hasattr(metric, "count") and hasattr(metric, "sum"):
+                metrics[encode_counter_key(name, HISTOGRAM_COUNT_PART)] = metric.count
+                metrics[encode_counter_key(name, HISTOGRAM_SUM_PART)] = metric.sum
         return metrics
 
     def report_refit_server_base_url(self) -> str | None:

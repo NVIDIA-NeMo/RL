@@ -14,11 +14,7 @@ def test_defaults():
     assert cfg.enabled is False
     assert cfg.service_name == "nemo-rl"
     assert cfg.span_groups == "default"
-    assert cfg.export_strategy == "single_rank"
-    assert cfg.export_rank == -1
     # Must match the nemo-lens defaults, since propagating them is unconditional.
-    assert cfg.export_sample_rate == 1.0
-    assert cfg.sampler_enabled is False
     assert cfg.traces_enabled is True
     assert cfg.metrics_enabled is True
     assert cfg.logs_enabled is False
@@ -35,10 +31,7 @@ def test_config_to_env_translation():
     tel = TelemetryConfig(
         enabled=True,
         span_groups="per_step",
-        export_rank=3,
-        export_strategy="sampled",
-        export_sample_rate=0.25,
-        sampler_enabled=True,
+        logs_enabled=True,
         vllm_native_tracing=True,
         exporter="console",
         service_name="my-rl",
@@ -46,13 +39,22 @@ def test_config_to_env_translation():
     _config_to_env(tel)
     assert os.environ["NEMO_RL_OTEL_ENABLED"] == "1"
     assert os.environ["NEMO_RL_OTEL_SPAN_GROUPS"] == "per_step"
-    assert os.environ["NEMO_RL_OTEL_EXPORT_RANK"] == "3"
-    assert os.environ["NEMO_RL_OTEL_EXPORT_STRATEGY"] == "sampled"
-    assert os.environ["NEMO_RL_OTEL_EXPORT_SAMPLE_RATE"] == "0.25"
-    assert os.environ["NEMO_RL_OTEL_SAMPLER_ENABLED"] == "1"
+    assert os.environ["NEMO_RL_OTEL_LOGS_ENABLED"] == "1"
     assert os.environ["NEMO_RL_OTEL_VLLM_NATIVE_TRACING"] == "1"
     assert os.environ["NEMO_RL_OTEL_EXPORTER"] == "console"
     assert os.environ["OTEL_SERVICE_NAME"] == "my-rl"
+
+
+def test_a_stale_rank_filtering_key_is_not_propagated():
+    """``extra="allow"`` accepts an obsolete key; it must not reach a worker.
+
+    ``export_strategy`` was a real field until lens removed the machinery, so
+    old YAMLs still carry it. Projecting it would put a ``NEMO_RL_OTEL_*`` var
+    in the environment that nothing reads -- and that the next reader would
+    reasonably assume still works.
+    """
+    _config_to_env(TelemetryConfig(enabled=True, export_strategy="sampled"))
+    assert "NEMO_RL_OTEL_EXPORT_STRATEGY" not in os.environ
 
 
 def test_disabled_translates_to_zero():

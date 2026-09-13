@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import inspect
 import json
 import time
 from copy import deepcopy
@@ -66,6 +67,7 @@ from nemo_rl.experience.rollouts import (
     attach_static_multimodal_payload,
 )
 from nemo_rl.models.generation.vllm import VllmGeneration
+from nemo_rl.telemetry.instrumentation import TRACE_CARRIER_KWARG
 
 # cluster and tokenizer are fixture imports
 from tests.unit.models.generation.test_vllm_generation import (
@@ -107,6 +109,10 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
             head_server_config = object()
             _token_capture_enabled = False
             _tokenizer = object()
+            # run_rollouts is a thin span-opening wrapper that delegates the
+            # streaming to _stream_rollouts, so the mock has to supply the real
+            # one for the generator below to produce anything.
+            _stream_rollouts = NemoGym.__ray_metadata__.modified_class._stream_rollouts
 
             def _require_spinup(self):
                 pass
@@ -1241,6 +1247,36 @@ def test_run_rollouts_requires_an_installed_tokenizer():
         asyncio.run(stream.__anext__())
 
 
+def test_run_rollouts_takes_a_trace_carrier_without_disturbing_the_body():
+    """The span wrapper must be invisible to everything except the trace.
+
+    Ray records an actor method's signature from the *unwrapped* function and
+    validates ``.remote()`` arguments against it on the caller, so the reserved
+    kwarg has to be declared there or every dispatch raises ``TypeError``
+    before the task is submitted. Checked here as well as in
+    ``tests/unit/telemetry`` because this is the signature Ray actually reads.
+    """
+    gym_cls = NemoGym.__ray_metadata__.modified_class
+    gym = gym_cls({})
+    gym.rh = object()
+
+    # Still a generator, or Ray would schedule it on the wrong path.
+    assert inspect.isasyncgenfunction(gym_cls.run_rollouts)
+    ray_visible = inspect.signature(inspect.unwrap(gym_cls.run_rollouts))
+    assert TRACE_CARRIER_KWARG in ray_visible.parameters
+    ray_visible.bind(gym, [{"_rowidx": 0}], "", **{TRACE_CARRIER_KWARG: {}})
+    # And still callable the way an uninstrumented run calls it.
+    ray_visible.bind(gym, [{"_rowidx": 0}], "")
+
+    # Constructing the generator runs nothing, so the body's own errors still
+    # surface on first advance rather than at the call.
+    stream = gym.run_rollouts(
+        [{"_rowidx": 0}], "", **{TRACE_CARRIER_KWARG: {"traceparent": "00-a-b-01"}}
+    )
+    with pytest.raises(RuntimeError, match="set_tokenizer must be called"):
+        asyncio.run(stream.__anext__())
+
+
 def test_nemo_gym_postprocess_uses_batch_decode():
     class _Tokenizer:
         def __init__(self):
@@ -1628,6 +1664,10 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
             rch = _RolloutCollectionHelper()
             head_server_config = object()
             _token_capture_enabled = False
+            # run_rollouts is a thin span-opening wrapper that delegates the
+            # streaming to _stream_rollouts, so the mock has to supply the real
+            # one for the generator below to produce anything.
+            _stream_rollouts = NemoGym.__ray_metadata__.modified_class._stream_rollouts
 
             def _require_spinup(self):
                 pass
@@ -1750,6 +1790,10 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
             # Bind the real postprocess: the assertions below are about its
             # message_log output, not about run_rollouts' dispatch alone.
             _postprocess_nemo_gym_to_nemo_rl_result = NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result
+            # run_rollouts is a thin span-opening wrapper that delegates the
+            # streaming to _stream_rollouts, so the mock has to supply the real
+            # one for the generator below to produce anything.
+            _stream_rollouts = NemoGym.__ray_metadata__.modified_class._stream_rollouts
 
             def _require_spinup(self):
                 pass

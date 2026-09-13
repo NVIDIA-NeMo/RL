@@ -66,8 +66,8 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.telemetry.instrumentation import (
     efficiency_span,
-    managed_span,
     remote_trace_context,
+    umbrella_span,
 )
 from nemo_rl.telemetry.setup import init_telemetry_worker, shutdown_telemetry
 from nemo_rl.telemetry.span_groups import RLSpanGroup
@@ -150,13 +150,11 @@ class AsyncTrajectoryCollector:
         # rollout phase at all. rank/world_size are passed explicitly: this
         # actor is a singleton rather than a member of a ranked group, and its
         # runtime_env is a copy of the driver's environment, so a stray RANK
-        # there must not decide whether it exports. always_export goes with
-        # that synthetic rank -- an export_strategy picking among a group's
-        # ranks would otherwise mute this actor entirely (export_rank: 3 never
-        # matches rank 0), taking every rollout span with it.
-        _telemetry = init_telemetry_worker(rank=0, world_size=1, always_export=True)
+        # there would otherwise label every rollout span with another group's
+        # rank.
+        _telemetry = init_telemetry_worker(rank=0, world_size=1)
         self._tracer = _telemetry.tracer if _telemetry is not None else None
-        # The driver's rl.grpo.job span, so this actor's spans land in the run's
+        # The driver's rl.<algo>.job span, so this actor's spans land in the run's
         # trace rather than as loose roots. Reattached per thread below.
         self._trace_carrier = trace_carrier or {}
 
@@ -174,12 +172,17 @@ class AsyncTrajectoryCollector:
             )
             self._debug_payload_metrics = algorithm_config.debug_payload_metrics
             self._max_generation_failures = async_config.max_generation_failures
+            # Matches the driver-side span the sync path opens, so a rollout
+            # reads the same on either path. Spelled per branch rather than
+            # interpolated so both names stay greppable from the emit site.
+            self._rollout_span_name = "rl.grpo.generation"
         elif isinstance(master_config, PPOMasterConfig):
             algorithm_config = master_config.ppo
             async_config = algorithm_config.async_ppo  # type: ignore
             self._deduplicate_multimodal_data = False
             self._debug_payload_metrics = False
             self._max_generation_failures = 0
+            self._rollout_span_name = "rl.ppo.generation"
         else:
             raise TypeError(
                 "master_config must be a GRPO or PPO MasterConfig, got "
@@ -929,7 +932,7 @@ class AsyncTrajectoryCollector:
                     _collect()
 
             def _collect() -> None:
-                # The async counterpart of the driver's rl.grpo.generation.
+                # The async counterpart of the driver's rl.<algo>.generation.
                 # ROLLOUT is an umbrella group, so this carries no rl.bucket --
                 # several batch workers run concurrently, so their durations sum
                 # past wall time and cannot go into a bucket rollup. It is here
@@ -937,9 +940,9 @@ class AsyncTrajectoryCollector:
                 # version. Deliberately one span per batch, not per sample:
                 # generate_async is dispatched one coroutine per sample, which
                 # would be thousands of overlapping spans per step.
-                with managed_span(
-                    RLSpanGroup.ROLLOUT,
-                    "rl.grpo.generation",
+                with umbrella_span(
+                    RLSpanGroup.U_ROLLOUT,
+                    self._rollout_span_name,
                     tracer=self._tracer,
                     **{
                         "rl.weight_version": generation_weight_version,
@@ -1204,7 +1207,7 @@ class AsyncTrajectoryCollector:
         Joins ``_live_threads`` rather than ``_inflight_threads``, and joins
         rather than polling ``is_alive``: a batch worker leaves the latter from
         inside its own ``finally``, which still sits inside the
-        ``rl.grpo.generation`` span, so neither an empty set nor a set snapshot
+        ``rl.<algo>.generation`` span, so neither an empty set nor a set snapshot
         means the spans are closed. Thread death does.
 
         The loop is woken before it is joined, since the refit and

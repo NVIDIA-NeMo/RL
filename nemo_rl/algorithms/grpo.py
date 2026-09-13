@@ -137,7 +137,8 @@ from nemo_rl.telemetry.instrumentation import (
     current_trace_carrier,
     efficiency_span,
     managed_span,
-    trace_fn,
+    umbrella_span,
+    umbrella_trace_fn,
 )
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
@@ -3024,8 +3025,8 @@ def _grpo_train_impl(
 
             with (
                 timer.time("total_step_time"),
-                managed_span(
-                    RLSpanGroup.STEP,
+                umbrella_span(
+                    RLSpanGroup.U_STEP,
                     "rl.grpo.step",
                     tracer=_tracer,
                     **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
@@ -3136,8 +3137,8 @@ def _grpo_train_impl(
                     policy_generation.snapshot_step_metrics()
                 with (
                     timer.time("generation"),
-                    managed_span(
-                        RLSpanGroup.ROLLOUT,
+                    umbrella_span(
+                        RLSpanGroup.U_ROLLOUT,
                         "rl.grpo.generation",
                         tracer=_tracer,
                         **{
@@ -4064,7 +4065,7 @@ def _grpo_train_impl(
     checkpointer.shutdown()
 
 
-@trace_fn(RLSpanGroup.JOB, "rl.grpo.job")
+@umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.grpo.job")
 def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -4124,8 +4125,8 @@ def validate(
     _tracer = _telemetry.tracer if _telemetry is not None else None
     with (
         timer.time("total_validation_time"),
-        managed_span(
-            RLSpanGroup.EVALUATE,
+        umbrella_span(
+            RLSpanGroup.U_EVALUATE,
             "rl.grpo.evaluate",
             tracer=_tracer,
             **{"rl.step": step},
@@ -4459,7 +4460,7 @@ def _raise_if_collector_stopped(
     )
 
 
-@trace_fn(RLSpanGroup.JOB, "rl.grpo.job")
+@umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.grpo.job")
 def async_grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -4724,7 +4725,9 @@ def async_grpo_train(
 
     # Captured inside rl.grpo.job, so the collector's spans join this run's
     # trace instead of starting their own roots. Empty unless the job group is
-    # enabled (per_step omits it) — see docs/observability/span-groups.md.
+    # enabled — both shipped presets enable it, but a hand-written group list
+    # need not, and that degrades to roots rather than failing. See
+    # docs/observability/span-groups.md.
     _tc_trace_carrier = current_trace_carrier()
 
     # Initialize trajectory collector with synchronized collection
@@ -4752,9 +4755,11 @@ def async_grpo_train(
         not sent yet goes with the actor -- including the last rollout batches
         of the run. Every path that reaps the collector needs this, not only the
         normal one, and collection is already running by the time this is
-        defined. The timeout covers the callee's quiesce budget *plus* its 5s
-        export; too short and it gives up mid-export, dropping the very spans
-        it exists to save.
+        defined. The timeout covers the callee's quiesce budget *plus* its
+        export budget; too short and it gives up mid-export, dropping the very
+        spans it exists to save. ``shutdown_telemetry`` enforces the latter
+        itself -- the SDK ignores the timeout it is handed -- so this stays
+        ahead of it only as long as that remains true.
         """
         try:
             ray.get(
@@ -4889,67 +4894,75 @@ def async_grpo_train(
     print(
         f"⏳ Waiting for replay buffer to have sufficient trajectories for step {step}..."
     )
-    timer.start("init/total")
-    wait_iterations = 0
-    while True:
-        buffer_size_current = ray.get(replay_buffer.size.remote())
-        ray.get(trajectory_collector.check_health.remote())
-        current_step_ready = ray.get(
-            replay_buffer.has_complete_batch.remote(
-                step, num_prompts_per_step, max_trajectory_age_steps
+    # Spanned as well as timed so the wait shows up in the startup waterfall
+    # rather than only as a scalar. Unbucketed by construction (see
+    # UNBUCKETED_SPAN_CATEGORIES): the generation fleet is busy for this whole
+    # window, and its spans join this trace.
+    with efficiency_span("init/total", tracer=_tracer):
+        timer.start("init/total")
+        wait_iterations = 0
+        while True:
+            buffer_size_current = ray.get(replay_buffer.size.remote())
+            ray.get(trajectory_collector.check_health.remote())
+            current_step_ready = ray.get(
+                replay_buffer.has_complete_batch.remote(
+                    step, num_prompts_per_step, max_trajectory_age_steps
+                )
             )
-        )
 
-        print(
-            f"  Wait iteration {wait_iterations}: buffer_size={buffer_size_current}, "
-            f"step {step} ready={current_step_ready}"
-        )
-
-        collector_status = ray.get(trajectory_collector.get_status.remote())
-        pipeline_ready = _startup_pipeline_ready(
-            replay_buffer,
-            collector_status,
-            current_step_ready=current_step_ready,
-            step=step,
-            num_prompts_per_step=num_prompts_per_step,
-            max_trajectory_age_steps=max_trajectory_age_steps,
-            max_num_steps=master_config.grpo.max_num_steps,
-        )
-        if current_step_ready and not pipeline_ready:
             print(
-                f"  Pipeline barrier: step {step} ready but "
-                f"step {step + 1} is not yet claimed — waiting for lookahead "
-                f"to prevent resume deadlock"
+                f"  Wait iteration {wait_iterations}: buffer_size={buffer_size_current}, "
+                f"step {step} ready={current_step_ready}"
             )
 
-        if pipeline_ready:
-            break
-
-        trajectories_needed = ray.get(
-            replay_buffer.get_trajectories_needed.remote(
-                step, num_prompts_per_step, max_trajectory_age_steps
+            collector_status = ray.get(trajectory_collector.get_status.remote())
+            pipeline_ready = _startup_pipeline_ready(
+                replay_buffer,
+                collector_status,
+                current_step_ready=current_step_ready,
+                step=step,
+                num_prompts_per_step=num_prompts_per_step,
+                max_trajectory_age_steps=max_trajectory_age_steps,
+                max_num_steps=master_config.grpo.max_num_steps,
             )
-        )
-        if buffer_size_current >= min_trajectories_needed and trajectories_needed > 0:
-            print(
-                f"  ⏳ Gap-filling in progress: need {trajectories_needed} more "
-                f"trajectories for step {step}"
+            if current_step_ready and not pipeline_ready:
+                print(
+                    f"  Pipeline barrier: step {step} ready but "
+                    f"step {step + 1} is not yet claimed — waiting for lookahead "
+                    f"to prevent resume deadlock"
+                )
+
+            if pipeline_ready:
+                break
+
+            trajectories_needed = ray.get(
+                replay_buffer.get_trajectories_needed.remote(
+                    step, num_prompts_per_step, max_trajectory_age_steps
+                )
+            )
+            if (
+                buffer_size_current >= min_trajectories_needed
+                and trajectories_needed > 0
+            ):
+                print(
+                    f"  ⏳ Gap-filling in progress: need {trajectories_needed} more "
+                    f"trajectories for step {step}"
+                )
+
+            awaited_target = step + 1 if current_step_ready else step
+            _raise_if_collector_stopped(
+                collector_status,
+                awaited_target=f"target={awaited_target}",
+                awaited_work="lookahead claim" if current_step_ready else "buffer fill",
+                action="start",
             )
 
-        awaited_target = step + 1 if current_step_ready else step
-        _raise_if_collector_stopped(
-            collector_status,
-            awaited_target=f"target={awaited_target}",
-            awaited_work="lookahead claim" if current_step_ready else "buffer fill",
-            action="start",
-        )
+            wait_iterations += 1
+            time.sleep(1.0)
 
-        wait_iterations += 1
-        time.sleep(1.0)
-
-    # Retained because the per-step timer.reset() below discards it; the
-    # efficiency snapshot re-supplies it every step.
-    init_total_s = timer.stop("init/total")
+        # Retained because the per-step timer.reset() below discards it; the
+        # efficiency snapshot re-supplies it every step.
+        init_total_s = timer.stop("init/total")
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
@@ -4967,8 +4980,8 @@ def async_grpo_train(
 
             with (
                 timer.time("total_step_time"),
-                managed_span(
-                    RLSpanGroup.STEP,
+                umbrella_span(
+                    RLSpanGroup.U_STEP,
                     "rl.grpo.step",
                     tracer=_tracer,
                     **{"rl.iteration": step + 1},

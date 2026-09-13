@@ -18,16 +18,20 @@ Algorithms should import ``managed_span`` / ``trace_fn`` from here (not raw
 nemo-lens) so every leaf span gets ``rl.bucket`` when applicable.
 
 Shared bucket tokens are ``productive`` | ``overhead`` | ``idle`` | ``wasted``.
-Umbrella groups (``job``, ``step``, ``rollout``, …) are timed but not tagged.
+Umbrella groups (``job``, ``step``, ``rollout``, …) are timed but not tagged;
+open those through ``umbrella_span`` / ``umbrella_trace_fn`` with the group's
+``U_`` alias, so the call site says which of the two it is.
 """
 
 from __future__ import annotations
 
 import functools
+import inspect
+import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import Enum
-from typing import Any, Iterator, Mapping, Optional
+from typing import Any, Callable, Iterator, Mapping, Optional, TypeVar, cast
 
 from nemo.lens import (
     is_span_group_enabled,
@@ -36,8 +40,13 @@ from nemo.lens import (
 from nemo.lens import (
     managed_span as _managed_span,
 )
+from nemo.lens import (
+    safe_set_span_attributes as _safe_set_span_attributes,
+)
 
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+
+logger = logging.getLogger(__name__)
 
 # OTel / OneLogger-shared attribute key (flat sinks encode this in the name).
 RL_BUCKET_ATTR = "rl.bucket"
@@ -48,9 +57,12 @@ RL_EFFICIENCY_CATEGORY_ATTR = "rl.efficiency.category"
 
 __all__ = [
     "managed_span",
+    "umbrella_span",
     "trace_fn",
+    "umbrella_trace_fn",
     "span_cm",
     "is_span_group_enabled",
+    "safe_set_span_attributes",
     "RL_BUCKET_ATTR",
     "Bucket",
     "UMBRELLA_GROUPS",
@@ -59,10 +71,33 @@ __all__ = [
     "bucket_for_efficiency_category",
     "current_trace_carrier",
     "remote_trace_context",
+    "dispatch_with_trace_context",
+    "trace_context_kwargs",
+    "accepts_trace_context",
+    "TRACE_CARRIER_KWARG",
     "bucket_scope",
+    "per_prompt_scope",
+    "in_per_prompt_scope",
     "efficiency_span",
+    "startup_span",
+    "setup_span",
     "RL_EFFICIENCY_CATEGORY_ATTR",
 ]
+
+
+def safe_set_span_attributes(span: Optional[Any], attributes: dict) -> None:
+    """Like the lens helper, but a no-op when *span* is None.
+
+    Every span helper in this module yields None for a disabled group, and lens's
+    version dereferences the span, so the raw one turns "telemetry is off" into
+    an ``AttributeError`` at the call site. Absorbing that here rather than
+    asking each caller to guard: the guard is invisible when it is missing (the
+    disabled path is the one nobody exercises locally) and the failure lands in
+    production code that has nothing to do with telemetry.
+    """
+    if span is None:
+        return
+    _safe_set_span_attributes(span, attributes)
 
 
 class Bucket(str, Enum):
@@ -75,31 +110,51 @@ class Bucket(str, Enum):
 
 
 # Span groups that are umbrellas / lifecycle only — no rl.bucket tag.
+# Spelled with the U_ aliases so this set and the call sites that use it read
+# the same; the values are identical to the unprefixed names.
 UMBRELLA_GROUPS: frozenset[str] = frozenset(
     {
-        RLSpanGroup.JOB,
-        RLSpanGroup.STEP,
-        RLSpanGroup.ROLLOUT,  # collect_rollouts umbrella (like Cosmos generate)
-        RLSpanGroup.MODEL_INIT,
-        RLSpanGroup.EVALUATE,  # eval pass; treat as umbrella unless timed as idle
+        RLSpanGroup.U_JOB,
+        RLSpanGroup.U_STEP,
+        RLSpanGroup.U_ROLLOUT,  # collect_rollouts umbrella
+        RLSpanGroup.U_MODEL_INIT,
+        RLSpanGroup.U_EVALUATE,  # eval pass; treat as umbrella unless timed as idle
+        # Startup is real overhead, but no subset of these spans is summable:
+        # the phases nest (rl.startup over rl.setup.workers over
+        # rl.vllm.load_model) and the worker builds run concurrently under
+        # parallel init, so a rollup adding them by rl.bucket would multiply
+        # startup rather than measure it. The flat number lives in the
+        # rl.setup.duration metric at phase=total_setup, which is the one value
+        # that cannot double-count. These spans are for shape only.
+        RLSpanGroup.U_SETUP,
+        # Per-prompt work on the single-controller path is exactly the work that
+        # overlaps itself: up to max_inflight_prompts rollouts are in flight at
+        # once (1280 in some recipes), so any bucket these carried would sum to
+        # a large multiple of the wall clock they happened in. That applies to
+        # the data-plane put inside a rollout as much as to the rollout span
+        # itself, which is why this group overrides DATA_PLANE's overhead
+        # bucket there -- see per_prompt_scope.
+        RLSpanGroup.U_PER_PROMPT,
     }
 )
 
 # Default classification for RLSpanGroup members that are leaf work.
-# logprob / advantage / reference_policy count as overhead (prep), not the
-# productive policy gradient update itself.
+# logprob / advantage count as overhead (prep), not the productive policy
+# gradient update itself.
+#
+# Every key is a group something here actually emits. A bucket for a group with
+# no call site is unreachable by construction -- this map is consulted only by
+# NeMo-RL's own managed_span wrapper -- so an entry added ahead of its emitter
+# is dead code that pre-commits the goodput classification without review.
 _DEFAULT_GROUP_BUCKET: Mapping[str, Bucket] = {
     RLSpanGroup.GENERATION: Bucket.PRODUCTIVE,
     RLSpanGroup.REWARD: Bucket.PRODUCTIVE,
     RLSpanGroup.POLICY_UPDATE: Bucket.PRODUCTIVE,
-    RLSpanGroup.FORWARD_BACKWARD: Bucket.PRODUCTIVE,
-    RLSpanGroup.OPTIMIZER: Bucket.PRODUCTIVE,
     RLSpanGroup.DATA_PROCESSING: Bucket.OVERHEAD,
+    RLSpanGroup.DATA_PLANE: Bucket.OVERHEAD,
     RLSpanGroup.CHECKPOINT: Bucket.OVERHEAD,
-    RLSpanGroup.LOAD_CHECKPOINT: Bucket.OVERHEAD,
     RLSpanGroup.LOGPROB: Bucket.OVERHEAD,
     RLSpanGroup.ADVANTAGE: Bucket.OVERHEAD,
-    RLSpanGroup.REFERENCE_POLICY: Bucket.OVERHEAD,
 }
 
 # Async efficiency category labels → bucket. Not RLSpanGroup members.
@@ -113,7 +168,7 @@ _DEFAULT_GROUP_BUCKET: Mapping[str, Bucket] = {
 # ``idle/buffer_starvation`` / ``idle/refit_bubble`` do exactly that in
 # ``nemo_rl/algorithms/grpo.py``.
 #
-# Two wall-clock categories stay Timer-only. ``idle/validation`` wraps
+# One wall-clock category stays Timer-only. ``idle/validation`` wraps
 # ``validate()``, which is already accounted as ``overhead``: its
 # ``rl.grpo.evaluate`` umbrella wraps the generate calls in
 # :func:`bucket_scope`, so on the sync rollout path the ``rl.vllm.generate``
@@ -122,15 +177,18 @@ _DEFAULT_GROUP_BUCKET: Mapping[str, Bucket] = {
 # ``rl.bucket``, and as ``idle`` it would contradict the label its own children
 # carry. (On the async path there are no such children — ``generate_async``
 # carries no span today — but the window is the same one, so the same
-# accounting applies.) ``init/total`` runs before the per-step loop, so it fills
-# no step-level gap.
+# accounting applies.)
+#
+# ``init/total`` is a span too, but an unbucketed one — it runs before the
+# per-step loop, concurrently with the generation fleet filling the buffer, so
+# it fills no step-level gap and cannot be summed beside the work it waits on.
 #
 # The collector-side half cannot be summed against a driver-side denominator:
 # it is timed in another process, concurrently with the driver's timeline, and
 # the batch-worker categories accumulate across threads (thread-seconds), so
 # they can exceed the wall time they happened in. Two of them are still worth
 # seeing in a trace and are emitted as *unbucketed* spans — see
-# :data:`COLLECTOR_LOOP_CATEGORIES`. The other two stay ``Timer``-only,
+# :data:`UNBUCKETED_SPAN_CATEGORIES`. The other two stay ``Timer``-only,
 # reported as ``efficiency/*`` scalars from
 # ``async_utils/trajectory_collector.py``: ``idle/buffer_full_backoff`` is a
 # precomputed duration spanning a retry loop with no block to wrap, and
@@ -141,7 +199,9 @@ _DEFAULT_GROUP_BUCKET: Mapping[str, Bucket] = {
 # ``nemo_rl/telemetry/metrics.py``); the per-entry notes say which are *also*
 # spans, and why the rest are metric-only.
 EFFICIENCY_CATEGORY_BUCKET: Mapping[str, Bucket] = {
-    "init/total": Bucket.OVERHEAD,  # metric only — pre-loop, fills no step gap
+    # Metric + span, but the span is unbucketed (trace-only) — see
+    # UNBUCKETED_SPAN_CATEGORIES.
+    "init/total": Bucket.OVERHEAD,
     "idle/buffer_starvation": Bucket.IDLE,  # metric + span rl.idle.buffer_starvation
     "idle/refit_bubble": Bucket.IDLE,  # metric + span rl.idle.refit_bubble
     "idle/validation": Bucket.IDLE,  # metric only — span double-counts generate
@@ -191,6 +251,20 @@ COLLECTOR_LOOP_CATEGORIES: frozenset[str] = frozenset(
     }
 )
 
+# Categories emitted as spans but without ``rl.bucket``: worth seeing in a
+# waterfall, not safe to add to a driver-side denominator.
+#
+# ``init/total`` is here for the same reason as the collector's waits, arrived
+# at from the other side. It is the driver blocking until the replay buffer has
+# a full batch, so on the driver's own clock it is honest idle time -- but the
+# generation fleet is busy for that entire window, and its ``rl.grpo.generation``
+# spans join this trace. Bucketing both would charge the same wall clock to two
+# buckets at once. The ``init/total`` *metric* keeps its bucket: it is read as a
+# single per-run number, not summed against sibling spans.
+UNBUCKETED_SPAN_CATEGORIES: frozenset[str] = COLLECTOR_LOOP_CATEGORIES | frozenset(
+    {"init/total"}
+)
+
 
 # Caller-supplied reclassification for spans opened further down the stack.
 # The same function can be productive or not depending on why it was called —
@@ -227,6 +301,46 @@ def bucket_scope(bucket: Bucket) -> Iterator[None]:
         yield
     finally:
         _BUCKET_OVERRIDE.reset(token)
+
+
+# Marks a region as per-prompt work, for spans opened below the caller.
+#
+# Needed because cardinality is a property of the call site, not of the
+# operation. One ``MetricsDataPlaneClient`` per process serves both the rollout
+# path, which puts once per prompt, and ``_advantage_stage``, which puts once
+# per batch -- same client, same ``put`` op, counts three orders of magnitude
+# apart. So neither the op name nor a constructor argument can tell them apart,
+# and the intent has to travel with the execution context, as it does for
+# :func:`bucket_scope`.
+_PER_PROMPT_SCOPE: ContextVar[bool] = ContextVar(
+    "nemo_rl_per_prompt_scope", default=False
+)
+
+
+@contextmanager
+def per_prompt_scope() -> Iterator[None]:
+    """Mark this block as per-prompt work.
+
+    Spans opened inside it that consult :func:`in_per_prompt_scope` move to
+    :data:`RLSpanGroup.PER_PROMPT`, so one group switch turns off every
+    per-prompt span at once rather than each site needing its own flag.
+
+    Propagates like any :class:`~contextvars.ContextVar`: to nested calls and
+    to coroutines started inside the block, but not to raw threads or other
+    processes. That suits the motivating case -- the rollout's put happens in
+    the same asyncio task that entered the scope -- but a data-plane call
+    handed to a thread pool would read as per-batch.
+    """
+    token = _PER_PROMPT_SCOPE.set(True)
+    try:
+        yield
+    finally:
+        _PER_PROMPT_SCOPE.reset(token)
+
+
+def in_per_prompt_scope() -> bool:
+    """Whether the caller is running inside :func:`per_prompt_scope`."""
+    return _PER_PROMPT_SCOPE.get()
 
 
 def goodput_span_attributes(group: str) -> dict[str, str]:
@@ -288,6 +402,185 @@ def remote_trace_context(carrier: Optional[Mapping[str, str]]) -> Iterator[None]
         otel_ctx.detach(token)
 
 
+#: Reserved kwarg the dispatch/receive pair passes the carrier in. Same spelling
+#: lens's ``ray_dispatch_with_context`` uses, so a call dispatched by either
+#: helper is understood by a method decorated with either one.
+TRACE_CARRIER_KWARG = "_otel_carrier"
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def trace_context_kwargs() -> dict[str, Any]:
+    """Carrier kwarg for a Ray call, or ``{}`` when there is nothing to send.
+
+    For dispatch that does not go through ``remote()`` directly -- notably
+    ``RayWorkerGroup.run_all_workers_*``, which takes the method by name and
+    forwards ``**kwargs`` -- spread this at the call site::
+
+        self.worker_group.run_all_workers_single_data(
+            "begin_train_step_presharded", loss_fn=loss_fn, **trace_context_kwargs()
+        )
+
+    Every argument goes by keyword: ``run_all_workers_single_data`` asserts it
+    was given none positionally.
+
+    Empty rather than a ``None`` carrier so a run with no recording span calls
+    the method with exactly its original signature, which keeps an undecorated
+    method working until it is wired.
+    """
+    carrier = current_trace_carrier()
+    return {TRACE_CARRIER_KWARG: carrier} if carrier else {}
+
+
+#: Methods already reported as not accepting the carrier, so the warning below
+#: is one per method per process rather than one per dispatch.
+_CARRIER_REFUSED: set[str] = set()
+
+
+def dispatch_with_trace_context(
+    remote_method: Any, /, *args: Any, **kwargs: Any
+) -> Any:
+    """``remote_method.remote(...)``, plus the caller's trace context.
+
+    The receiving method should be wrapped in :func:`accepts_trace_context`.
+    When it is not, Ray rejects the extra kwarg on the *caller* -- it validates
+    against the callee's recorded signature before submitting the task -- and
+    this retries without it, warning once. Losing the parent link degrades a
+    trace; raising here would abort a rollout over an observability kwarg,
+    which this module does not do anywhere else.
+    ``test_every_context_accepting_method_is_dispatched_with_a_carrier`` is what
+    actually keeps the two halves wired, at build time rather than at runtime.
+
+    Equivalent to lens's ``ray_dispatch_with_context`` and uses the same kwarg,
+    but skips the kwarg entirely when there is no recording span, so a run with
+    the ``job`` group disabled calls the method with its original signature.
+
+    Returns:
+        Whatever ``.remote()`` returned: normally an ``ObjectRef``, or an
+        ``ObjectRefGenerator`` when the handle was built with
+        ``.options(num_returns="streaming")`` -- which is how both NeMo-Gym
+        call sites use it.
+    """
+    carrier = trace_context_kwargs()
+    if not carrier:
+        return remote_method.remote(*args, **kwargs)
+    try:
+        return remote_method.remote(*args, **carrier, **kwargs)
+    except TypeError as exc:
+        if TRACE_CARRIER_KWARG not in str(exc):
+            raise
+        name = getattr(remote_method, "_method_name", None) or repr(remote_method)
+        if name not in _CARRIER_REFUSED:
+            _CARRIER_REFUSED.add(name)
+            logger.warning(
+                "%s does not accept a trace carrier, so its spans will start "
+                "their own trace; decorate it with @accepts_trace_context: %s",
+                name,
+                exc,
+            )
+        return remote_method.remote(*args, **kwargs)
+
+
+def _advertise_carrier(method: Any) -> None:
+    """Declare the reserved kwarg on the signature Ray actually reads.
+
+    Ray records an actor method's signature from ``inspect.unwrap(method)``
+    (``_ActorClassMethodMetadata.create``) and validates every ``.remote()``
+    call against it *on the caller*, before the task is submitted. A
+    ``functools.wraps`` wrapper sets ``__wrapped__``, so unwrapping walks
+    straight past our ``**kwargs`` to the original signature and the carrier
+    comes back as ``TypeError: got an unexpected keyword argument``. Ray hits
+    exactly this with its own ``_ray_trace_ctx`` and fixes it the same way, on
+    the same object, for the same reason -- see ``ray/util/tracing``.
+
+    A no-op when the unwrapped target already accepts ``**kwargs`` (everything
+    stacked under ``wrap_with_nvtx_name``, whose wrapper does not use
+    ``functools.wraps`` and so absorbs the carrier on its own) and when the
+    parameter is already declared, so decorating twice cannot duplicate it.
+    """
+    target = inspect.unwrap(method)
+    try:
+        current = inspect.signature(target)
+    except (TypeError, ValueError):
+        # Not introspectable, so Ray cannot have recorded a strict signature
+        # for it either. Nothing to advertise.
+        return
+    parameters = current.parameters
+    if TRACE_CARRIER_KWARG in parameters or any(
+        parameter.kind is parameter.VAR_KEYWORD for parameter in parameters.values()
+    ):
+        return
+    target.__signature__ = current.replace(
+        parameters=[
+            *parameters.values(),
+            inspect.Parameter(
+                TRACE_CARRIER_KWARG, inspect.Parameter.KEYWORD_ONLY, default=None
+            ),
+        ]
+    )
+
+
+def accepts_trace_context(method: _F) -> _F:
+    """Let a Ray method be parented to its caller's span.
+
+    Strips the reserved carrier kwarg and runs the body with that context
+    attached, so every span the method opens -- and every span opened by
+    anything it calls, including an ``aiohttp`` request auto-instrumented by
+    lens -- nests under the caller instead of starting a new trace.
+
+    Unlike lens's ``traced_remote_call`` this dispatches on the wrapped
+    callable's kind. That helper wraps everything in a ``def``, which returns a
+    coroutine or async generator without awaiting it, so the context detaches
+    before the body runs -- the async paths are precisely the ones that need
+    this (``NemoGym.run_rollouts`` is a streaming generator). It also does not
+    open a span of its own: the methods this decorates already open theirs, and
+    a second automatic span per call would double the trace's depth.
+
+    The return is cast back to the decorated method's own type: the wrappers
+    take ``**kwargs``, so without it every method this decorates would widen to
+    an untyped callable, and several of them live in files the ``pyrefly``
+    whitelist expects to be fully typed.
+    """
+    _advertise_carrier(method)
+
+    if inspect.isasyncgenfunction(method):
+
+        @functools.wraps(method)
+        async def agen_wrapper(*args: Any, **kwargs: Any) -> Any:
+            carrier = kwargs.pop(TRACE_CARRIER_KWARG, None)
+            # ``async for`` rather than driving ``__anext__`` by hand so that
+            # closing this generator early closes the inner one -- worth more
+            # than the precision the manual form would buy. The cost is that
+            # the context stays attached while the consumer handles each item
+            # instead of only while the body advances. Harmless here: an async
+            # actor call is its own asyncio task, and a task gets a private
+            # copy of the context, so the attachment cannot reach a concurrent
+            # rollout.
+            with remote_trace_context(carrier):
+                async for item in method(*args, **kwargs):
+                    yield item
+
+        return cast(_F, agen_wrapper)
+
+    if inspect.iscoroutinefunction(method):
+
+        @functools.wraps(method)
+        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            carrier = kwargs.pop(TRACE_CARRIER_KWARG, None)
+            with remote_trace_context(carrier):
+                return await method(*args, **kwargs)
+
+        return cast(_F, async_wrapper)
+
+    @functools.wraps(method)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        carrier = kwargs.pop(TRACE_CARRIER_KWARG, None)
+        with remote_trace_context(carrier):
+            return method(*args, **kwargs)
+
+    return cast(_F, wrapper)
+
+
 @contextmanager
 def managed_span(
     group: str, name: str, tracer=None, **attributes: Any
@@ -304,6 +597,72 @@ def managed_span(
         yield span
 
 
+# Span names already reported, so a helper called every step warns once.
+_LEAF_GROUP_AT_UMBRELLA_CALL: set[str] = set()
+
+
+def _warn_leaf_group_at_umbrella_call(group: str, name: str) -> None:
+    """Report ``umbrella_span`` being handed a leaf group, once per span name.
+
+    A warning rather than an exception. The mistake is static, and a drift test
+    rejects it at review time, which is both earlier and safer than a raise:
+    umbrella spans open at very different points in a run — ``rl.<algo>.job`` at
+    startup, ``rl.<algo>.evaluate`` not until the first validation — so raising
+    would turn a mistyped group into a job that dies hours in. Nothing else in
+    this package fails a run over telemetry either, and this check sits ahead of
+    the group gate, so a raise here could kill a run that has tracing switched
+    off entirely.
+
+    ``stack_info`` because the useful thing is the offending call site, and
+    there is no exception here whose traceback would point at it.
+    """
+    if name in _LEAF_GROUP_AT_UMBRELLA_CALL:
+        return
+    _LEAF_GROUP_AT_UMBRELLA_CALL.add(name)
+    bucket = bucket_for_span_group(group)
+    logger.warning(
+        "umbrella_span opened %r with span group %r, which is a leaf carrying "
+        "rl.bucket=%r; emitting it as a leaf span. Use managed_span for a leaf, "
+        "or pass one of the umbrella groups (%s).",
+        name,
+        group,
+        bucket.value if bucket else None,
+        ", ".join(sorted(UMBRELLA_GROUPS)),
+        stack_info=True,
+    )
+
+
+@contextmanager
+def umbrella_span(
+    group: str, name: str, tracer=None, **attributes: Any
+) -> Iterator[Any]:
+    """Span for an umbrella group: timed and nested, never bucketed.
+
+    Behaves like :func:`managed_span` on an umbrella group — the distinction is
+    at the call site, not in the output. Spell the group with its ``U_`` alias
+    (``RLSpanGroup.U_ROLLOUT``) so a reader can tell without a lookup that this
+    span is absent from a goodput rollup.
+
+    Reach for it whenever a span can overlap another instance of itself:
+    concurrent spans sum past the wall clock they happened in, so a bucket on
+    them multiplies rather than measures. The work underneath is still counted,
+    by the leaf spans nested inside.
+
+    Handed a leaf group, this warns and emits the span as a leaf instead — see
+    :func:`_warn_leaf_group_at_umbrella_call` for why that rather than raising.
+    """
+    if group not in UMBRELLA_GROUPS:
+        _warn_leaf_group_at_umbrella_call(group, name)
+        # Leaf semantics rather than no bucket at all: the call site is wrong,
+        # but the phase does have a bucket, and silently dropping it would
+        # understate the very rollup this helper exists to keep honest.
+        with managed_span(group, name, tracer=tracer, **attributes) as span:
+            yield span
+    else:
+        with _managed_span(group, name, tracer=tracer, **attributes) as span:
+            yield span
+
+
 @contextmanager
 def efficiency_span(category: str, tracer=None, **attributes: Any) -> Iterator[Any]:
     """Span for one efficiency category, tagged with that category's bucket.
@@ -314,7 +673,7 @@ def efficiency_span(category: str, tracer=None, **attributes: Any) -> Iterator[A
     :data:`EFFICIENCY_CATEGORY_BUCKET`, so ``idle/*`` lands in ``idle`` rather
     than defaulting to ``overhead`` the way an unknown leaf group would.
 
-    Categories in :data:`COLLECTOR_LOOP_CATEGORIES` are emitted without a
+    Categories in :data:`UNBUCKETED_SPAN_CATEGORIES` are emitted without a
     bucket — visible in a trace, invisible to a rollup. For the rest, two
     conditions have to hold at the call site. The phase must be measured on a
     single thread against wall time, since categories summed across concurrent
@@ -326,7 +685,7 @@ def efficiency_span(category: str, tracer=None, **attributes: Any) -> Iterator[A
     not a phase that does instrumented work.
     """
     bucket = bucket_for_efficiency_category(category)
-    if category in COLLECTOR_LOOP_CATEGORIES:
+    if category in UNBUCKETED_SPAN_CATEGORIES:
         bucket = None
     attrs: dict[str, Any] = {RL_EFFICIENCY_CATEGORY_ATTR: category}
     if bucket is not None:
@@ -340,6 +699,37 @@ def efficiency_span(category: str, tracer=None, **attributes: Any) -> Iterator[A
         yield span
 
 
+@contextmanager
+def startup_span(tracer=None, **attributes: Any) -> Iterator[Any]:
+    """Umbrella over everything between process start and the first step.
+
+    Open this in the entrypoint, around both ``init_ray()`` and the algorithm's
+    ``setup()``. Those are separate top-level calls, so without something
+    spanning them the startup phases arrive as unrelated root traces rather than
+    one waterfall.
+    """
+    with _managed_span(RLSpanGroup.SETUP, "rl.startup", tracer=tracer, **attributes):
+        yield
+
+
+@contextmanager
+def setup_span(phase: str, tracer=None, **attributes: Any) -> Iterator[Any]:
+    """One startup phase, named ``rl.setup.<phase>``.
+
+    Unbucketed and freely nestable — see :data:`UMBRELLA_GROUPS` for why the
+    startup group carries no bucket at all.
+
+    Use for a phase that does work (building workers, opening collectives). For
+    a phase that only *waits*, prefer :func:`efficiency_span` with the matching
+    ``init/*`` category, so the span and the ``efficiency/*`` scalar describe the
+    same interval.
+    """
+    with _managed_span(
+        RLSpanGroup.SETUP, f"rl.setup.{phase}", tracer=tracer, **attributes
+    ) as span:
+        yield span
+
+
 def trace_fn(group: str, name: str, tracer=None):
     """Decorator that wraps a function in a bucket-tagged ``managed_span``."""
 
@@ -347,6 +737,24 @@ def trace_fn(group: str, name: str, tracer=None):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             with managed_span(group, name, tracer=tracer):
+                return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def umbrella_trace_fn(group: str, name: str, tracer=None):
+    """Decorator form of :func:`umbrella_span`, for whole-function umbrellas.
+
+    The ``rl.<algo>.job`` spans are all of this shape: one span over one call,
+    covering everything the run does.
+    """
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            with umbrella_span(group, name, tracer=tracer):
                 return func(*args, **kwargs)
 
         return wrapper

@@ -51,7 +51,10 @@ from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorke
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueOutputSpec
-from nemo_rl.telemetry.setup import init_telemetry_worker
+from nemo_rl.telemetry.setup import (
+    init_telemetry_worker,
+    traced_worker_init,
+)
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
@@ -98,6 +101,7 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         else:
             return f"{self.__class__.__qualname__}"
 
+    @traced_worker_init("rl.value.load_model", **{"rl.backend": "dtensor_v2"})
     def __init__(
         self,
         config: ValueConfig,
