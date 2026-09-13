@@ -39,6 +39,11 @@ CURATED_METRICS_INCLUDE_PREFIXES = (
     "vllm:prompt_tokens_total",
     "vllm:inter_token_latency",
 )
+# Canonical series name -> every raw metric that can carry it, in precedence
+# order. A managed Dynamo worker exports the Dynamo gauge *and* the vLLM twin
+# underneath it, so an alias routinely has more than one source present.
+# ``snapshot`` takes the value from the first source present and consumes the
+# rest, so each quantity reaches the logger exactly once.
 CANONICAL_LOGGER_ALIASES = {
     "inflight_batch_sizes": [
         "dynamo_component_inflight_requests",
@@ -47,11 +52,16 @@ CANONICAL_LOGGER_ALIASES = {
     "num_pending_samples": [
         "dynamo_work_handler_queue_depth",
         "vllm_num_requests_waiting",
+        # vLLM (0.23.0, which the Dynamo venv pins) also exports the waiting
+        # count split by reason, and the curated ``vllm:num_requests_waiting``
+        # prefix matches it. Summed over its labels it is the same quantity, so
+        # list it as a source to be consumed rather than letting it through as a
+        # second waiting-request series.
+        "vllm_num_requests_waiting_by_reason",
     ],
     "kv_cache_usage_perc": [
         "dynamo_component_gpu_cache_usage_percent",
         "vllm_kv_cache_usage_perc",
-        "vllm_gpu_cache_usage_perc",
     ],
     "generation_tokens": [
         "vllm_generation_tokens_total",
@@ -189,10 +199,15 @@ class DynamoMetricsSampler:
         for alias, sources in CANONICAL_LOGGER_ALIASES.items():
             if alias in metrics:
                 continue
-            source = next((name for name in sources if name in metrics), None)
-            metrics[alias] = dict(metrics[source]) if source is not None else {}
-            if source is not None:
-                del metrics[source]
+            present = [name for name in sources if name in metrics]
+            metrics[alias] = dict(metrics[present[0]]) if present else {}
+            # Consume every source, not only the one that supplied the value.
+            # Deleting just the winner left each surviving twin in the dict to be
+            # plotted next to the alias it already fed -- the whole reason this
+            # backend shipped fourteen generation_metrics series where the vLLM
+            # backend ships four.
+            for name in present:
+                del metrics[name]
         return metrics
 
     def clear(self) -> None:
