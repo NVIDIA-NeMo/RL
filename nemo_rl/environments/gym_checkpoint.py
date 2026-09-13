@@ -706,6 +706,7 @@ class GymAgentExecutionStatus(GymExecutionIdentity):
         "park_requested",
         "parked",
         "external_wait_frozen",
+        "model_wait_frozen",
         "completed",
         "retired",
     ]
@@ -714,6 +715,7 @@ class GymAgentExecutionStatus(GymExecutionIdentity):
             "parked_with_boundary",
             "parked_without_boundary",
             "external_wait_frozen",
+            "model_wait_frozen",
         ]
         | None
     )
