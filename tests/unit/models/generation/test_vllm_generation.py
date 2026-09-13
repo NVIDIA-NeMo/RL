@@ -146,6 +146,44 @@ basic_dtensor_test_config: PolicyConfig = {
 }
 
 
+@pytest.mark.parametrize("backend", ["vllm", "dynamo"])
+@pytest.mark.parametrize(
+    ("temperature", "expected"),
+    [(1e-4, 1e-2), (0.0, 0.0), (1e-2, 1e-2), (1.0, 1.0)],
+)
+def test_configure_generation_config_matches_vllm_tiny_temperature_clamp(
+    backend: str, temperature: float, expected: float
+):
+    generation_config = deepcopy(basic_vllm_test_config)
+    generation_config["backend"] = backend
+    generation_config["temperature"] = temperature
+    generation_config["val_temperature"] = temperature
+
+    configured = configure_generation_config(
+        generation_config, MagicMock(pad_token_id=0, eos_token_id=1)
+    )
+
+    assert configured["temperature"] == expected
+    assert configured["val_temperature"] == expected
+
+
+@pytest.mark.parametrize("backend", ["sglang", "trtllm", "megatron"])
+def test_configure_generation_config_preserves_other_backend_tiny_temperature(
+    backend: str,
+):
+    generation_config = deepcopy(basic_vllm_test_config)
+    generation_config["backend"] = backend
+    generation_config["temperature"] = 1e-4
+    generation_config["val_temperature"] = 1e-4
+
+    configured = configure_generation_config(
+        generation_config, MagicMock(pad_token_id=0, eos_token_id=1)
+    )
+
+    assert configured["temperature"] == 1e-4
+    assert configured["val_temperature"] == 1e-4
+
+
 @pytest.mark.parametrize("async_engine", [False, True])
 def test_vllm_generation_selects_worker_extension(
     async_engine,

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -43,6 +44,25 @@ class TrainingSamplingParams:
     top_p: float = 1.0
     temperature: float = 1.0
 
+    def __post_init__(self) -> None:
+        """Normalize generation parameters to vLLM's logprob semantics.
+
+        Generation backends use ``temperature=0`` to select tokens greedily,
+        while the selected tokens' policy logprobs still come from the unscaled
+        model distribution. Top-k and top-p do not constrain greedy selection,
+        so training-time filtering must be disabled as well.
+        """
+        if not math.isfinite(self.temperature):
+            raise ValueError(f"temperature must be finite, got {self.temperature}")
+        if self.temperature < 0.0:
+            raise ValueError(
+                f"temperature must be non-negative, got {self.temperature}"
+            )
+        if self.temperature == 0.0:
+            self.temperature = 1.0
+            self.top_k = None
+            self.top_p = 1.0
+
 
 def _need_top_k_filtering(top_k: int | None) -> bool:
     """Check if top-k filtering is needed."""
@@ -64,6 +84,15 @@ def need_top_k_or_top_p_filtering(
     top_k = sampling_params.top_k
     top_p = sampling_params.top_p
     return _need_top_k_filtering(top_k) or _need_top_p_filtering(top_p)
+
+
+def apply_temperature_scaling(
+    logits: torch.Tensor, sampling_params: Optional[TrainingSamplingParams]
+) -> torch.Tensor:
+    """Apply the effective training temperature to logits in place."""
+    if sampling_params is not None and sampling_params.temperature != 1.0:
+        logits.div_(sampling_params.temperature)
+    return logits
 
 
 @torch.no_grad()

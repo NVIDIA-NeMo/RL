@@ -44,6 +44,7 @@ from transformers.models.gemma3.modeling_gemma3 import (
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
+    apply_temperature_scaling,
     apply_top_k_top_p,
     need_top_k_or_top_p_filtering,
 )
@@ -227,23 +228,6 @@ def extract_logits(
         return model.lm_head(outputs.last_hidden_state)
     else:
         return outputs.logits
-
-
-def apply_temperature_scaling(
-    logits: torch.Tensor, sampling_params: Optional[TrainingSamplingParams]
-) -> torch.Tensor:
-    """Apply temperature scaling to logits.
-
-    Args:
-        logits: Logits tensor to scale
-        sampling_params: Sampling parameters
-
-    Returns:
-        torch.Tensor: Temperature-scaled logits
-    """
-    if sampling_params is not None and sampling_params.temperature != 1.0:
-        logits.div_(sampling_params.temperature)
-    return logits
 
 
 def apply_top_k_top_p_filtering_for_local_logits(

@@ -113,6 +113,45 @@ def _mock_policy_generation() -> MagicMock:
     return policy_generation
 
 
+@pytest.mark.parametrize(
+    ("sampling_config", "error"),
+    [
+        ({"temperature": 0.5}, "non-unit training-time temperature"),
+        ({"top_k": 5}, "top-k/top-p training-time filtering"),
+        ({"top_p": 0.9}, "top-k/top-p training-time filtering"),
+    ],
+)
+def test_setup_rejects_fused_linear_logprobs_with_unsupported_sampling(
+    mock_grpo_components, sampling_config: dict[str, float | int], error: str
+) -> None:
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["megatron_cfg"] = {
+        "enabled": True,
+        "use_fused_linear_logprobs": True,
+    }
+    master_config.policy["sequence_packing"] = {"enabled": False}
+    generation_config = master_config.policy["generation"]
+    generation_config.update(sampling_config)
+    # Keep validation sampling aligned so setup reaches the fused-path guard
+    # exercised by this test instead of the earlier train/validation check.
+    generation_config.update(
+        {f"val_{name}": value for name, value in sampling_config.items()}
+    )
+    master_config.grpo.val_period = 0
+    master_config.grpo.batch_multiplier = 1
+    master_config.data.update({"shuffle": False, "num_workers": 0})
+
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger"),
+        patch("nemo_rl.algorithms.grpo.CheckpointManager") as checkpointer_cls,
+        patch("nemo_rl.algorithms.grpo.StatefulDataLoader"),
+        pytest.raises(AssertionError, match=error),
+    ):
+        checkpointer_cls.return_value.get_latest_checkpoint_path.return_value = None
+        checkpointer_cls.return_value.load_training_info.return_value = {}
+        setup(master_config, MagicMock(), MagicMock(), None)
+
+
 def test_save_async_replay_buffer_checkpoint(tmp_path):
     replay_buffer = MagicMock()
     replay_buffer.save_to_path.remote.return_value = 7
@@ -205,7 +244,7 @@ def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
     policy_generation.weight_synchronizer = None
     kv_scales = {"layer.0": 0.5}
 
-    refit_policy_generation(
+    metrics = refit_policy_generation(
         policy,
         policy_generation,
         colocated_inference=True,
@@ -217,6 +256,32 @@ def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
         buffer_size_bytes=1024**3,
         kv_scales=kv_scales,
     )
+    assert metrics == {"generation_workers_updated": 1.0}
+
+
+@pytest.mark.parametrize("colocated_inference", [True, False])
+@pytest.mark.parametrize(
+    "acknowledgements",
+    [[], [False], [True, False], [True, None]],
+)
+@patch("nemo_rl.algorithms.grpo.ray")
+def test_refit_policy_generation_requires_a_worker_acknowledgement(
+    mock_ray: MagicMock,
+    acknowledgements: list[bool | None],
+    colocated_inference: bool,
+) -> None:
+    mock_ray.get.side_effect = [None, acknowledgements]
+    policy = MagicMock()
+    policy_generation = MagicMock()
+    policy_generation.weight_synchronizer = None
+
+    with pytest.raises(RuntimeError, match="Updating weights.*failed"):
+        refit_policy_generation(
+            policy,
+            policy_generation,
+            colocated_inference=colocated_inference,
+            _refit_buffer_size_gb=1.0,
+        )
 
 
 def test_megatron_m2n_refit_delegates_entirely_to_the_synchronizer() -> None:
