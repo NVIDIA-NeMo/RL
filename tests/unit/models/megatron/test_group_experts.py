@@ -1062,8 +1062,12 @@ def test_native_grouped_bf16_experts_route_to_misc_instead_of_raising() -> None:
     assert misc == [task]
 
 
+@pytest.mark.parametrize("te_grouped", [False, True])
+@pytest.mark.parametrize("ep_rank", [0, 2])
 def test_native_conversion_builder_expands_bf16_grouped_experts_for_misc(
     monkeypatch: pytest.MonkeyPatch,
+    te_grouped: bool,
+    ep_rank: int,
 ) -> None:
     from megatron.bridge.models.conversion import model_bridge
     from megatron.bridge.models.conversion import quant_bridge
@@ -1075,9 +1079,11 @@ def test_native_conversion_builder_expands_bf16_grouped_experts_for_misc(
     parameter = GroupedTensor(
         (16, 64), torch.bfloat16, num_tensors=2,
         shapes=[(8, 64), (8, 64)], data=backing,
-    )
+    ) if te_grouped else backing.view(2, 8, 64)
+    expert_ids = [ep_rank * 2, ep_rank * 2 + 1]
+    expanded_names = [f"{global_name}{index}" for index in expert_ids]
     owner = SimpleNamespace(config=SimpleNamespace())
-    mapping = SimpleNamespace(is_expert=True, ep_rank=0)
+    mapping = SimpleNamespace(is_expert=True, ep_rank=ep_rank)
     validated_names: list[str] = []
 
     class Registry:
@@ -1085,7 +1091,7 @@ def test_native_conversion_builder_expands_bf16_grouped_experts_for_misc(
             pass
 
         def megatron_to_hf_lookup(self, name: str) -> object | None:
-            return mapping if name in {f"{global_name}0", f"{global_name}1"} else None
+            return mapping if name in {f"{global_name}0", *expanded_names} else None
 
     registry = Registry()
 
@@ -1125,8 +1131,8 @@ def test_native_conversion_builder_expands_bf16_grouped_experts_for_misc(
     worker.model = SimpleNamespace(
         config=SimpleNamespace(
             moe_single_grouped_weight=True,
-            num_moe_experts=2,
-            expert_model_parallel_size=1,
+            num_moe_experts=8,
+            expert_model_parallel_size=4,
         ),
         named_parameters=lambda: [(global_name, parameter)],
     )
@@ -1151,11 +1157,8 @@ def test_native_conversion_builder_expands_bf16_grouped_experts_for_misc(
 
     tasks = worker._build_native_mxfp8_conversion_tasks()
 
-    assert validated_names == [f"{global_name}0", f"{global_name}1"]
-    assert [task.global_param_name for task in tasks] == [
-        f"{global_name}0",
-        f"{global_name}1",
-    ]
+    assert validated_names == expanded_names
+    assert [task.global_param_name for task in tasks] == expanded_names
     assert tasks[0].param_weight is not None
     assert tasks[1].param_weight is not None
     for increment in (10, 20):
