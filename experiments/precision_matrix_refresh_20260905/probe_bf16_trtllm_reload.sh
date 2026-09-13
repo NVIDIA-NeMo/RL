@@ -22,6 +22,7 @@ cd /source
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH=/source
 LOCAL_ROOT=/raid/scratch/${SLURM_JOB_USER}/trtllm-local-refit-probe-v0251
+export PYTHONPYCACHEPREFIX=$LOCAL_ROOT/pycache
 export XDG_CACHE_HOME=$LOCAL_ROOT/cache
 export VLLM_CACHE_ROOT=$LOCAL_ROOT/vllm
 export TORCHINDUCTOR_CACHE_DIR=$LOCAL_ROOT/inductor
