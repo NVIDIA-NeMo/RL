@@ -614,7 +614,7 @@ def _patch_real_quant_load(monkeypatch, backend, forwarded=None):
         monkeypatch.setattr(
             backend.VllmInternalWorkerExtension,
             "_load_weights",
-            lambda self, weights: forwarded.extend(weights) or "loaded",
+            lambda self, weights, coverage=None: forwarded.extend(weights) or "loaded",
         )
 
 
@@ -1130,6 +1130,21 @@ def test_modelopt_moe_manifest_requires_complete_w4a4_family(monkeypatch):
         )
 
 
+def test_real_quant_prepare_refit_info_rejects_draft_manifest(monkeypatch):
+    """A draft manifest must fail at preparation, before any weight is loaded."""
+    backend = _import_vllm_quant_backend(monkeypatch)
+    extension = _make_real_quant_extension(backend, torch.nn.Module(), [])
+    _patch_real_quant_load(monkeypatch, backend)
+
+    with pytest.raises(RuntimeError, match="does not support draft finalization"):
+        extension.prepare_refit_info(
+            {
+                "model.layers.0.mlp.up_proj.weight": ((4, 4), torch.uint8),
+                "draft.layers.0.self_attn.qkv_proj.weight": ((4, 4), torch.bfloat16),
+            }
+        )
+
+
 def test_real_quant_load_weights_batches_full_experts_and_expands_global_scales(
     monkeypatch,
 ):
@@ -1386,7 +1401,7 @@ def test_real_quant_pre_ack_fence_is_device_wide_and_load_does_not_fence(
     monkeypatch.setattr(
         backend.VllmInternalWorkerExtension,
         "_load_weights",
-        lambda _self, _weights: events.append("load") or "loaded",
+        lambda _self, _weights, coverage=None: events.append("load") or "loaded",
     )
     monkeypatch.setattr(
         backend,
@@ -1700,7 +1715,7 @@ def test_real_quant_reload_keeps_vllm_config_active_during_layerwise_processing(
         # reconstructs its kernel during the yielded weight-load phase.
         assert config_mod.get_current_vllm_config() is vllm_config
         calls.append("load")
-        finish()
+        finish(False)
 
     assert config_mod.current is None
     assert calls == [
@@ -1998,7 +2013,7 @@ def test_real_quant_ipc_rejects_invalid_key_manifest(
     extension.zmq_socket = FakeSocket()
     extension.state_dict_info = state_dict_info
     extension.maybe_init_zmq = lambda: None
-    extension._load_weights = lambda _weights: None
+    extension._load_weights = lambda _weights, coverage=None: None
     monkeypatch.setattr(
         backend.VllmQuantInternalWorkerExtension,
         "_is_real_quant_model",
@@ -2080,7 +2095,8 @@ def test_real_quant_ipc_payload_loads_weights_and_handles_gpt_oss(monkeypatch):
     }
     extension.maybe_init_zmq = lambda: None
 
-    def load_weights(weights):
+    def load_weights(weights, *, coverage=None):
+        assert coverage is None
         for name, weight in weights:
             view_refs.append(weakref.ref(weight))
             loaded.append((name, weight.clone()))

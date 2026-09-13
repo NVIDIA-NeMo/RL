@@ -47,6 +47,355 @@ def _make_collective_update_extension(backend):
     return ext, state_info
 
 
+@pytest.mark.vllm
+@pytest.mark.parametrize("speculator_type", ["dflash", "dspark"])
+def test_prepare_refit_info_builds_common_speculator_manifest(
+    monkeypatch, speculator_type
+):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.speculator_runtime import RunnerFamily
+
+    draft_model = object()
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        get_draft_model=lambda: draft_model,
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(method=speculator_type)
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_backend,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=1),
+    )
+    state_dict_info = {
+        "model.weight": ((2,), torch.float32),
+        "draft.model.weight": ((2,), torch.float32),
+    }
+
+    ext.prepare_refit_info(state_dict_info)
+
+    assert ext._draft_runtime_adapter is not None
+    assert ext._draft_runtime_adapter.runner_family is RunnerFamily.ACCESSOR
+    assert ext._draft_runtime_adapter.model is draft_model
+    assert ext._model_update_manifest is not None
+    assert ext._model_update_manifest.target.ordered_names == ("model.weight",)
+    assert ext._model_update_manifest.draft is not None
+    assert ext._model_update_manifest.draft.ordered_names == ("draft.model.weight",)
+
+
+@pytest.mark.vllm
+def test_prepare_nccl_reshard_refit_info_builds_draft_manifest(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    draft_model = object()
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        get_draft_model=lambda: draft_model,
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(method="dflash")
+        ),
+    )
+    ext.pp_comm_groups = {}
+    ext._uses_unquantized_flashinfer_trtllm = lambda: False
+    ext._validate_native_layerwise_refit = MagicMock()
+    ext.build_hf_to_local_param_map = MagicMock(return_value={})
+    monkeypatch.setattr(
+        vllm_backend,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=1),
+    )
+
+    ext.prepare_nccl_reshard_refit_info(
+        {
+            "layer_names": [],
+            "per_layer_params": {},
+            "misc_meta": {
+                "model.norm.weight": {
+                    "shape": [2],
+                    "dtype": "torch.float32",
+                },
+                "draft.model.weight": {
+                    "shape": [2],
+                    "dtype": "torch.float32",
+                },
+            },
+        }
+    )
+
+    assert ext._draft_runtime_adapter is not None
+    assert ext._draft_runtime_adapter.model is draft_model
+    assert ext._model_update_manifest is not None
+    assert ext._model_update_manifest.draft is not None
+    assert ext._model_update_manifest.draft.ordered_names == ("draft.model.weight",)
+    ext._validate_native_layerwise_refit.assert_called_once_with("nccl_reshard")
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("speculator_type", ["dflash", "dspark"])
+def test_common_speculator_refit_loads_then_finalizes_target_and_draft(
+    monkeypatch, speculator_type
+):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+    from nemo_rl.models.generation.vllm.speculator_runtime import (
+        DraftRuntimeAdapter,
+        ModelUpdateCoverage,
+        ModelUpdateManifest,
+    )
+
+    call_order = []
+    target_model = SimpleNamespace(
+        load_weights=MagicMock(
+            side_effect=lambda **_: call_order.append("load_target")
+        ),
+        modules=lambda: (),
+    )
+    draft_model = SimpleNamespace(
+        load_weights=MagicMock(side_effect=lambda **_: call_order.append("load_draft")),
+        named_modules=lambda: (),
+    )
+    target_config = object()
+    draft_config = object()
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(architectures=[]),
+        speculative_config=SimpleNamespace(
+            method=speculator_type, draft_model_config=draft_config
+        ),
+    )
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.device = torch.device("cpu")
+    ext.model_config = target_config
+    ext.model_runner = SimpleNamespace(model=target_model, vllm_config=vllm_config)
+    ext._draft_runtime_adapter = DraftRuntimeAdapter.resolve(
+        SimpleNamespace(get_draft_model=lambda: draft_model),
+        speculator_type=speculator_type,
+        vllm_version="0.27.1",
+        pp_rank=0,
+        pp_size=1,
+    )
+    ext._model_update_manifest = ModelUpdateManifest.from_state_dict_info(
+        {
+            "model.weight": ((2,), torch.float32),
+            "draft.model.weight": ((2,), torch.float32),
+        },
+        target_owner_ranks=(0,),
+        draft_owner_ranks=(0,),
+    )
+    coverage = ModelUpdateCoverage(ext._model_update_manifest, rank=0)
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+
+    def process_weights_after_loading(model, _model_config, _device):
+        call_order.append(
+            "finalize_draft" if model is draft_model else "finalize_target"
+        )
+
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        process_weights_after_loading,
+    )
+
+    weights = [
+        ("model.weight", torch.ones(2)),
+        ("draft.model.weight", torch.ones(2)),
+    ]
+    with ext._weight_update_lifecycle("collective") as finalize:
+        ext._load_weights(weights, coverage=coverage)
+        coverage.require_complete()
+        finalize(coverage.has_draft)
+
+    assert call_order == [
+        "load_target",
+        "load_draft",
+        "finalize_target",
+        "finalize_draft",
+    ]
+    draft_model.load_weights.assert_called_once()
+    assert draft_model.load_weights.call_args.kwargs["weights"][0][0] == "model.weight"
+
+
+@pytest.mark.vllm
+def test_partial_refit_failure_makes_worker_fail_closed(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=torch.nn.Module(),
+        vllm_config=SimpleNamespace(speculative_config=None),
+    )
+    ext.model_config = object()
+    ext.device = object()
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        MagicMock(side_effect=RuntimeError("conversion failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="conversion failed"):
+        with ext._weight_update_lifecycle("collective") as finalize:
+            finalize(False)
+
+    with pytest.raises(RuntimeError, match="unusable after a partial refit"):
+        with ext._weight_update_lifecycle("collective"):
+            pass
+
+
+@pytest.mark.vllm
+def test_nccl_reshard_refit_failure_is_fail_closed_and_nonfatal(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=torch.nn.Module(),
+        vllm_config=SimpleNamespace(speculative_config=None),
+    )
+    ext.model_config = object()
+    ext.device = object()
+    ext.model_update_group = object()
+
+    class _ExplodingInfo:
+        def __getitem__(self, key):
+            raise RuntimeError("bulk receive failed")
+
+        def get(self, key, default=None):
+            raise RuntimeError("bulk receive failed")
+
+    ext.nccl_reshard_refit_info = _ExplodingInfo()
+    ext.hf_to_local_param_map = {}
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        vllm_backend,
+        "packed_broadcast_preflight_consumer",
+        lambda _group, _src: None,
+    )
+
+    # A failure inside the bulk receive must not propagate (nonfatal contract,
+    # matching ipc/collective) but must poison the worker.
+    assert ext.nccl_reshard_refit() is False
+    assert ext._refit_unusable_reason is not None
+    assert "bulk receive failed" in ext._refit_unusable_reason
+
+    # Poisoned worker never reports success again.
+    assert ext.nccl_reshard_refit() is False
+
+
+@pytest.mark.vllm
+def test_nccl_reshard_preflight_failure_is_fail_closed_and_nonfatal(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=object(), vllm_config=SimpleNamespace(speculative_config=None)
+    )
+    ext.model_config = object()
+    ext.device = object()
+    ext.nccl_reshard_refit_info = {"layer_names": []}
+    ext.hf_to_local_param_map = {}
+    ext.model_update_group = object()
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+
+    def failing_preflight(_group, _src):
+        raise RuntimeError("train-signaled preflight failure")
+
+    monkeypatch.setattr(
+        vllm_backend, "packed_broadcast_preflight_consumer", failing_preflight
+    )
+
+    # A preflight failure must follow the same contract as every other
+    # transport failure: swallowed to False (nonfatal) and worker poisoned.
+    assert ext.nccl_reshard_refit() is False
+    assert ext._refit_unusable_reason is not None
+    assert "preflight failure" in ext._refit_unusable_reason
+    assert ext.nccl_reshard_refit() is False
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("has_draft", [False, True])
+def test_nccl_reshard_refit_finalizes_transported_draft_selectively(
+    monkeypatch, has_draft
+):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_update_group = object()
+    ext.pp_comm_groups = {}
+    ext.nccl_reshard_refit_info = {"layer_names": []}
+    ext.hf_to_local_param_map = {}
+    ext._model_update_manifest = SimpleNamespace(draft=object() if has_draft else None)
+    ext._receive_and_load_misc_params = MagicMock()
+    finalize = MagicMock()
+    monkeypatch.setattr(
+        vllm_backend,
+        "packed_broadcast_preflight_consumer",
+        lambda _group, _src: None,
+    )
+    monkeypatch.setattr(vllm_backend.torch.cuda, "Stream", lambda: object())
+    monkeypatch.setattr(vllm_backend.torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(vllm_backend.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(vllm_backend.torch.distributed, "get_rank", lambda: 1)
+
+    assert ext._nccl_reshard_refit_impl(finalize) is True
+
+    ext._receive_and_load_misc_params.assert_called_once_with()
+    finalize.assert_called_once_with(has_draft)
+
+
+@pytest.mark.vllm
+def test_fp8_kv_postprocess_failure_makes_worker_fail_closed(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=torch.nn.Module(),
+        vllm_config=SimpleNamespace(speculative_config=None),
+    )
+    ext.model_config = object()
+    ext.device = object()
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        MagicMock(),
+    )
+    ext._maybe_process_fp8_kv_cache = MagicMock(
+        side_effect=RuntimeError("KV scale conversion failed")
+    )
+
+    with pytest.raises(RuntimeError, match="KV scale conversion failed"):
+        with ext._weight_update_lifecycle("collective") as finalize:
+            finalize(False)
+
+    with pytest.raises(RuntimeError, match="unusable after a partial refit"):
+        with ext._weight_update_lifecycle("collective"):
+            pass
+
+
 def _write_sharded_checkpoint(model_dir, shards):
     """Write safetensors shards plus a model.safetensors.index.json.
 
@@ -76,6 +425,7 @@ def _make_extension_with_drafter(mtp_start_layer_idx, num_mtp_layers):
         mtp_start_layer_idx=mtp_start_layer_idx, num_mtp_layers=num_mtp_layers
     )
     ext.model_runner = MagicMock()
+    ext.model_runner.get_draft_model = None
     draft_model = torch.nn.Module()
     setattr(draft_model, "model", predictor)
     ext.model_runner.drafter.model = draft_model
@@ -328,7 +678,7 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
     for _ in range(2):
         with ext._weight_update_lifecycle("collective") as finalize:
             call_order.append("load")
-            finalize()
+            finalize(False)
         assert ext._nrl_layerwise_reload_active is False
 
     expected_cycle = [
@@ -442,7 +792,7 @@ def test_mixed_mxfp8_native_refit_processes_each_module_once(monkeypatch, transp
 
     with ext._weight_update_lifecycle(transport) as finalize:
         call_order.append("transfer")
-        finalize()
+        finalize(False)
 
     assert call_order == [
         "config_enter",
@@ -610,7 +960,7 @@ def test_layerwise_reload_preserves_deferred_weight_across_buffer_reuse(monkeypa
 
         transport_buffer.copy_(torch.tensor([7.0, 8.0]))
         ext._load_full_hf_weights([("layer.second", transport_buffer)])
-        finalize()
+        finalize(False)
 
     torch.testing.assert_close(model.layer.first, torch.tensor([1.0, 2.0]))
     torch.testing.assert_close(model.layer.second, torch.tensor([7.0, 8.0]))
@@ -724,7 +1074,7 @@ def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
     )
 
     with ext._weight_update_lifecycle("collective") as finalize:
-        finalize()
+        finalize(False)
 
     process.assert_called_once_with(model, model_config, ext.device)
     ext._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
@@ -1058,7 +1408,7 @@ def test_native_collective_refit_uses_one_transport_buffer(monkeypatch):
 
     @contextlib.contextmanager
     def lifecycle(_transport):
-        yield lambda: None
+        yield lambda _finalize_draft: None
 
     ext._weight_update_lifecycle = lifecycle
     observed_num_buffers = None
@@ -1104,7 +1454,7 @@ def test_update_weights_from_collective_uses_legacy_loader_by_default(monkeypatc
     def lifecycle(transport):
         assert transport == "collective"
         call_order.append("lifecycle")
-        yield lambda: call_order.append("finalize")
+        yield lambda _finalize_draft: call_order.append("finalize")
 
     def load_weights(weights):
         call_order.append("load")
@@ -1630,7 +1980,9 @@ def test_update_weights_via_ipc_acks_manifest_error_and_returns_false(monkeypatc
 
     @contextlib.contextmanager
     def lifecycle(_transport):
-        yield lambda: pytest.fail("an incomplete transfer must not be finalized")
+        yield lambda _finalize_draft: pytest.fail(
+            "an incomplete transfer must not be finalized"
+        )
 
     ext._weight_update_lifecycle = lifecycle
 
@@ -1816,7 +2168,9 @@ def test_load_mtp_weights_from_disk_without_drafter(
     ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
     ext.device = torch.device("cpu")
     ext.model_runner = MagicMock()
+    ext.model_runner.get_draft_model = None
     ext.model_runner.drafter = None
+    ext.model_runner.speculator = None
     ext._load_draft_weights = MagicMock()
     monkeypatch.setattr(
         "nemo_rl.models.generation.vllm.vllm_backend.get_pp_group",
