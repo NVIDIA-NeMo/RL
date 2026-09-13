@@ -429,6 +429,7 @@ def test_checkpoint_prepare_waits_for_draining_policy_model() -> None:
     env._control = AsyncMock(side_effect=discover_control)
     asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
     calls = []
+    agent_requests = []
 
     async def prepare_control(method, path, *, server_name, **_kwargs):
         calls.append((method, path, server_name))
@@ -450,15 +451,17 @@ def test_checkpoint_prepare_waits_for_draining_policy_model() -> None:
                         "future_worker_metric": 7,
                     }
                 },
-                "inflight_total": 0,
+                "inflight_total": 1,
                 "response_inflight_total": 0,
                 "generation_pending_total": 0,
+                "generation_cut_proof": {"proof_digest": "b" * 64},
                 "waiters_total": 0,
                 "inflight": [],
                 "tombstones": [],
                 "future_status_metric": 9,
             }
         if server_name == "agent":
+            agent_requests.append(_kwargs["json"])
             return {
                 "state": "preparing",
                 "ready_to_commit": True,
@@ -478,10 +481,28 @@ def test_checkpoint_prepare_waits_for_draining_policy_model() -> None:
 
     env._control = AsyncMock(side_effect=prepare_control)
 
-    result = asyncio.run(env.prepare_checkpoint("snapshot-8", time.time() + 10.0))
+    deadline_ts = time.time() + 10.0
+    result = asyncio.run(env.prepare_checkpoint("snapshot-8", deadline_ts))
 
     assert result["ready"] is True
     assert any(path.endswith("/status") for _method, path, _server in calls)
+    assert agent_requests == [
+        {
+            "schema_version": 1,
+            "checkpoint_id": "snapshot-8",
+            "deadline_ts": deadline_ts,
+            "allow_model_wait_boundary": True,
+        }
+    ]
+    assert next(
+        index
+        for index, (_method, path, _server) in enumerate(calls)
+        if path.endswith("/status")
+    ) < next(
+        index
+        for index, (_method, path, server) in enumerate(calls)
+        if server == "agent"
+    )
 
 
 def test_checkpoint_prepare_timeout_resumes_touched_participants() -> None:
@@ -564,7 +585,8 @@ def test_checkpoint_prepare_timeout_resumes_touched_participants() -> None:
     with pytest.raises(TimeoutError, match="remained 'draining'"):
         asyncio.run(env.prepare_checkpoint("snapshot-9", time.time() + 10.0))
 
-    assert resume_order == ["tools", "policy", "agent"]
+    # Policy reconciliation now happens before later participants are touched.
+    assert resume_order == ["policy"]
 
 
 def test_checkpoint_prepare_lost_response_resumes_attempted_participant() -> None:
