@@ -33,6 +33,7 @@ from nemo_rl.environments.gym_checkpoint import (
     GymExecutionIdentity,
     GymResourcesPrepareResponse,
     gym_generation_cut_proofs,
+    gym_generation_cut_receipts,
     gym_generation_cut_staging_keys,
 )
 
@@ -142,6 +143,25 @@ def test_generation_cut_proof_exposes_durable_tq_prefix_keys() -> None:
     assert gym_generation_cut_staging_keys(prepare) == {
         "__generation_cut__/checkpoint-1/r0/c1"
     }
+
+
+def test_generation_cut_receipts_are_filtered_by_model_server() -> None:
+    policy_receipt = {
+        "checkpoint_id": "checkpoint-1",
+        "cut_id": "policy-cut",
+        "inventory": {"server_name": "policy"},
+    }
+    other_receipt = {
+        "checkpoint_id": "checkpoint-1",
+        "cut_id": "other-cut",
+        "inventory": {"server_name": "other-policy"},
+    }
+    proofs = (
+        {"generation_cut_receipt": policy_receipt},
+        {"workers": [{"generation_cut_receipt": other_receipt}]},
+    )
+
+    assert gym_generation_cut_receipts(proofs, server_name="policy") == [policy_receipt]
 
 
 @pytest.mark.parametrize(
@@ -661,6 +681,18 @@ def test_checkpoint_commit_restore_and_resume_fan_out() -> None:
             123.0,
             "/tmp/snapshot-7",
             source_checkpoint_id="snapshot-7",
+            generation_cut_proofs=(
+                {
+                    "generation_cut_receipt": {
+                        "checkpoint_id": "snapshot-7",
+                        "cut_id": "policy-cut",
+                        "inventory": {"server_name": "policy"},
+                    }
+                },
+            ),
+            generation_cut_exclusions=(
+                {"rollout_id": "rollout-1", "attempt_index": 1},
+            ),
         )
     )
     resumed = asyncio.run(env.resume_checkpoint("restore-7", 123.0))
@@ -691,6 +723,16 @@ def test_checkpoint_commit_restore_and_resume_fan_out() -> None:
     assert commit_calls[1][2]["continuation_indexes"] == [continuation_index]
     restore_calls = calls[3:6]
     assert "include_storage_reference_index" not in restore_calls[0][2]
+    assert restore_calls[0][2]["generation_cut_receipts"] == [
+        {
+            "checkpoint_id": "snapshot-7",
+            "cut_id": "policy-cut",
+            "inventory": {"server_name": "policy"},
+        }
+    ]
+    assert restore_calls[0][2]["generation_cut_exclusions"] == [
+        {"rollout_id": "rollout-1", "attempt_index": 1}
+    ]
     assert "include_continuation_index" not in restore_calls[1][2]
 
 

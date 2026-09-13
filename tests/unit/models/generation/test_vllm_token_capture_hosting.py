@@ -280,7 +280,12 @@ def _worker_with_capture(sink: _MemorySink):
         "_fetch_chain_prefix",
         "_capture_admission",
         "_resolve_admission_prefix",
+        "_resolve_generation_cut",
         "_enter_request_prefix",
+        "_get_request_capture",
+        "_pop_request_capture",
+        "_remember_completed_capture",
+        "_finish_request_capture_after_checkpoint_gate",
     ):
         setattr(
             worker, name, getattr(VllmAsyncGenerationWorkerImpl, name).__get__(worker)
@@ -294,13 +299,23 @@ def _worker_with_capture(sink: _MemorySink):
 
 
 class _MemoryPrefixSource:
-    def __init__(self, deltas: dict[str, list[int]]) -> None:
+    def __init__(
+        self,
+        deltas: dict[str, list[int]],
+        records: dict[str, StagedCallRecord] | None = None,
+    ) -> None:
         self.deltas = deltas
+        self.records = records or {}
         self.calls: list[list[str]] = []
+        self.fetch_calls: list[list[str]] = []
 
     def fetch_prefix_token_ids(self, staging_keys: list[str]) -> list[int]:
         self.calls.append(list(staging_keys))
         return [token for key in staging_keys for token in self.deltas[key]]
+
+    def fetch(self, staging_keys: list[str]):
+        self.fetch_calls.append(list(staging_keys))
+        return [self.records[key] for key in staging_keys]
 
 
 def _served_content(gen_ids, logprobs):
@@ -446,6 +461,117 @@ def test_generation_cut_stages_latest_prefix_without_completing_live_call():
     )
     assert len(sink.records) == 1
     assert sink.records[0].token_ids_delta == [10, 11, 12, 13, 14]
+
+
+def test_restored_generation_cut_is_extended_and_retired_on_completion():
+    sink = _MemorySink()
+    original_worker = _worker_with_capture(sink)
+    original_request = _FakeRequest(
+        ng_capture={
+            "rollout_id": "r0",
+            "model_call_id": "c1",
+            "mode": "text",
+        },
+        stream=False,
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        original_worker, original_request, [10, 11]
+    )
+    progress = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(
+                token_ids=[12, 13],
+                logprobs=[
+                    {12: SimpleNamespace(logprob=-0.1)},
+                    {13: SimpleNamespace(logprob=-0.2)},
+                ],
+            )
+        ]
+    )
+    VllmAsyncGenerationWorkerImpl._observe_request_capture(
+        original_worker, original_request, progress
+    )
+    inventory = GenerationCutInventory.build(
+        checkpoint_id="checkpoint-1",
+        server_name="policy",
+        active_prefixes=[
+            GenerationCutPrefix(
+                ticket_id="ticket-1",
+                rollout_id="r0",
+                attempt_index=0,
+                model_call_id="c1",
+                admitted_at=1.0,
+            )
+        ],
+    )
+    receipt = VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(
+        original_worker, inventory
+    )
+    cut_key = receipt.prefixes[0].staging_key
+    assert cut_key is not None
+    cut_record = sink.generation_prefix_records[-1][1]
+
+    resumed_worker = _worker_with_capture(sink)
+    resumed_worker._staging_source = _MemoryPrefixSource(
+        {}, records={cut_key: cut_record}
+    )
+    request = _FakeRequest(
+        ng_capture={
+            "rollout_id": "r0-a1",
+            "model_call_id": "c2",
+            "mode": "text",
+            "generation_cut": {
+                "source_capture_key": "r0",
+                "source_model_call_id": "c1",
+                "staging_key": cut_key,
+                "generation_token_count": 2,
+                "digest": cut_record.digest,
+            },
+        },
+        stream=False,
+    )
+    admission = resumed_worker._capture_admission(request)
+    cut = resumed_worker._resolve_generation_cut(admission)
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        resumed_worker,
+        request,
+        [10, 11, 12, 13],
+        admission=admission,
+        prefix_token_ids=[],
+        generation_cut=cut,
+        resumed_generation_token_ids=[12, 13],
+    )
+    tokenizer = MagicMock()
+    tokenizer.decode.return_value = "partial tail"
+    output = SimpleNamespace(token_ids=[14], text=" tail")
+    VllmAsyncGenerationWorkerImpl._restore_response_prefix(
+        resumed_worker,
+        request,
+        SimpleNamespace(outputs=[output]),
+        tokenizer=tokenizer,
+    )
+    tokenizer.decode.assert_called_once_with([12, 13, 14])
+    assert output.text == "partial tail"
+    output.token_ids.append(15)
+    VllmAsyncGenerationWorkerImpl._restore_response_prefix(
+        resumed_worker,
+        request,
+        SimpleNamespace(outputs=[output]),
+        tokenizer=tokenizer,
+    )
+    tokenizer.decode.assert_called_with([12, 13, 14, 15])
+
+    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        resumed_worker,
+        request,
+        _served_content([14], [-0.3]),
+    )
+
+    final_record = sink.records[-1]
+    assert content["ng_commit_coords"]["rollout_id"] == "r0-a1"
+    assert final_record.token_ids_delta == [10, 11, 12, 13, 14]
+    assert final_record.token_mask_delta == [0.0, 0.0, 1.0, 1.0, 1.0]
+    assert final_record.generation_log_probs_delta == [0.0, 0.0, -0.1, -0.2, -0.3]
 
 
 def test_checkpoint_gate_holds_terminal_stage_until_reopened():

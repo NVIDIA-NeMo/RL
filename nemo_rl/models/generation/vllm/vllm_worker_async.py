@@ -75,6 +75,7 @@ class _RequestCaptureState:
     prompt_token_ids: list[int]
     generated_token_ids: list[int] = field(default_factory=list)
     generated_logprobs: list[float] = field(default_factory=list)
+    resumed_generation_token_ids: list[int] = field(default_factory=list)
     observation_error: str | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -617,6 +618,8 @@ class VllmAsyncGenerationWorkerImpl(
         *,
         admission: Any | None = None,
         prefix_token_ids: list[int] | None = None,
+        generation_cut: Any | None = None,
+        resumed_generation_token_ids: list[int] | None = None,
     ) -> None:
         """Admit one ledger-forwarded call into the capture layer.
 
@@ -640,9 +643,19 @@ class VllmAsyncGenerationWorkerImpl(
         call = capture.begin_call(
             admission,
             prefix_token_ids=prefix_token_ids,
+            generation_cut=generation_cut,
+            generation_cut_staging_key=(
+                admission.generation_cut.staging_key
+                if admission.generation_cut is not None
+                else None
+            ),
             stream=bool(getattr(request, "stream", False)),
         )
-        state = _RequestCaptureState(call=call, prompt_token_ids=list(prompt_token_ids))
+        state = _RequestCaptureState(
+            call=call,
+            prompt_token_ids=list(prompt_token_ids),
+            resumed_generation_token_ids=list(resumed_generation_token_ids or ()),
+        )
         with self._capture_registry_lock:
             if call.model_call_id in self._capture_calls_by_model_call_id:
                 raise RuntimeError(
@@ -671,6 +684,23 @@ class VllmAsyncGenerationWorkerImpl(
             state.generated_token_ids = generation_token_ids
             state.generated_logprobs = generation_logprobs
             state.observation_error = None
+
+    def _restore_response_prefix(
+        self, request: Any, request_output: Any, *, tokenizer: Any
+    ) -> None:
+        """Prepend the durable assistant prefix before vLLM parses the response."""
+        state = self._get_request_capture(request)
+        if state is None or not state.resumed_generation_token_ids:
+            return
+        outputs = getattr(request_output, "outputs", None)
+        if not outputs:
+            return
+        output = outputs[0]
+        with state.lock:
+            output.text = tokenizer.decode(
+                state.resumed_generation_token_ids
+                + list(getattr(output, "token_ids", ()) or ())
+            )
 
     def _pop_request_capture(self, request: Any) -> _RequestCaptureState | None:
         with self._capture_registry_lock:
@@ -736,6 +766,22 @@ class VllmAsyncGenerationWorkerImpl(
         if admission.staging_chain:
             return self._fetch_chain_prefix(list(admission.staging_chain))
         return list(admission.required_prefix_token_ids)
+
+    def _resolve_generation_cut(self, admission: Any) -> Any | None:
+        """Fetch the digest-validated staged snapshot named by an admission."""
+        continuation = admission.generation_cut
+        if continuation is None:
+            return None
+        if self._staging_source is None:
+            raise RuntimeError(
+                "_staging_source not initialized; call setup_token_capture() first"
+            )
+        snapshots = self._staging_source.fetch([continuation.staging_key])
+        if len(snapshots) != 1:
+            raise RuntimeError(
+                "generation-cut fetch did not return exactly one snapshot"
+            )
+        return snapshots[0]
 
     def _enter_request_prefix(self, request: Any, prefix_token_ids: list[int]) -> None:
         """Attach the resolved prefix to the request through the capture adapter.
@@ -890,9 +936,10 @@ class VllmAsyncGenerationWorkerImpl(
                 state = self._capture_calls_by_model_call_id.get(prefix.model_call_id)
                 completed = self._completed_capture_calls.get(prefix.model_call_id)
             if state is None:
-                if (
-                    completed is not None
-                    and completed.coords.rollout_id != prefix.rollout_id
+                if completed is not None and completed.coords.rollout_id != (
+                    prefix.rollout_id
+                    if prefix.attempt_index == 0
+                    else f"{prefix.rollout_id}-a{prefix.attempt_index}"
                 ):
                     raise RuntimeError(
                         "generation-prefix inventory identity does not match the "
@@ -918,7 +965,12 @@ class VllmAsyncGenerationWorkerImpl(
                     )
                 continue
 
-            if state.call.rollout_id != prefix.rollout_id:
+            expected_capture_key = (
+                prefix.rollout_id
+                if prefix.attempt_index == 0
+                else f"{prefix.rollout_id}-a{prefix.attempt_index}"
+            )
+            if state.call.rollout_id != expected_capture_key:
                 raise RuntimeError(
                     "generation-prefix inventory identity does not match the "
                     f"active call: model_call_id={prefix.model_call_id!r}, "
@@ -954,7 +1006,9 @@ class VllmAsyncGenerationWorkerImpl(
                     disposition="durable_prefix",
                     frozen_buffer_id=f"active/{inventory.checkpoint_id}",
                     staging_key=result.staging_key,
-                    prefix_token_count=len(generated_token_ids),
+                    prefix_token_count=sum(
+                        mask == 1.0 for mask in record.token_mask_delta
+                    ),
                     prefix_digest=record.digest,
                 )
             )
@@ -1154,11 +1208,42 @@ class VllmAsyncGenerationWorkerImpl(
                 # the single splice path for staged and inline prefixes.
                 admission = worker_self._capture_admission(request)
                 capture_prefix_token_ids: list[int] | None = None
-                if admission is not None and admission.mode == "token_in":
+                generation_cut = None
+                resumed_generation_token_ids: list[int] = []
+                if admission is not None:
                     capture_prefix_token_ids = await asyncio.to_thread(
                         worker_self._resolve_admission_prefix, admission
                     )
-                    worker_self._enter_request_prefix(request, capture_prefix_token_ids)
+                    generation_cut = await asyncio.to_thread(
+                        worker_self._resolve_generation_cut, admission
+                    )
+                    engine_prefix_token_ids = list(capture_prefix_token_ids)
+                    if generation_cut is not None:
+                        engine_prefix_token_ids.extend(generation_cut.token_ids_delta)
+                        resumed_generation_token_ids = [
+                            token_id
+                            for token_id, mask in zip(
+                                generation_cut.token_ids_delta,
+                                generation_cut.token_mask_delta,
+                            )
+                            if mask == 1.0
+                        ]
+                        if actual_request_max_tokens is not None:
+                            remaining_output_tokens = (
+                                actual_request_max_tokens
+                                - admission.generation_cut.generation_token_count
+                            )
+                            if remaining_output_tokens <= 0:
+                                raise VLLMValidationError(
+                                    "Durable generation prefix already exhausts max_tokens.",
+                                    parameter="max_tokens",
+                                    value=actual_request_max_tokens,
+                                )
+                            actual_request_max_tokens = remaining_output_tokens
+                    if engine_prefix_token_ids:
+                        worker_self._enter_request_prefix(
+                            request, engine_prefix_token_ids
+                        )
 
                 if (
                     not hasattr(request, "required_prefix_token_ids")
@@ -1174,7 +1259,12 @@ class VllmAsyncGenerationWorkerImpl(
                     # Token capture, text mode: the full render is the exact
                     # engine prompt.
                     worker_self._begin_request_capture(
-                        request, res[1][0]["prompt_token_ids"], admission=admission
+                        request,
+                        res[1][0]["prompt_token_ids"],
+                        admission=admission,
+                        prefix_token_ids=capture_prefix_token_ids,
+                        generation_cut=generation_cut,
+                        resumed_generation_token_ids=resumed_generation_token_ids,
                     )
                     return res
 
@@ -1218,12 +1308,15 @@ class VllmAsyncGenerationWorkerImpl(
 
                 engine_prompt = res[1][0]
 
-                final_prompt_token_ids = replace_prefix_tokens(
-                    tokenizer=self.renderer.tokenizer,
-                    model_prefix_token_ids=model_prefix_token_ids,
-                    template_prefix_token_ids=actual_corresponding_token_ids,
-                    template_token_ids=engine_prompt["prompt_token_ids"],
-                )
+                if generation_cut is not None:
+                    final_prompt_token_ids = model_prefix_token_ids
+                else:
+                    final_prompt_token_ids = replace_prefix_tokens(
+                        tokenizer=self.renderer.tokenizer,
+                        model_prefix_token_ids=model_prefix_token_ids,
+                        template_prefix_token_ids=actual_corresponding_token_ids,
+                        template_token_ids=engine_prompt["prompt_token_ids"],
+                    )
 
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
 
@@ -1243,6 +1336,8 @@ class VllmAsyncGenerationWorkerImpl(
                     final_prompt_token_ids,
                     admission=admission,
                     prefix_token_ids=capture_prefix_token_ids,
+                    generation_cut=generation_cut,
+                    resumed_generation_token_ids=resumed_generation_token_ids,
                 )
 
                 return res
@@ -1326,6 +1421,11 @@ class VllmAsyncGenerationWorkerImpl(
                     async for res in result_generator:
                         final_res = res
                         worker_self._observe_request_capture(request, res)
+                        worker_self._restore_response_prefix(
+                            request,
+                            res,
+                            tokenizer=self.renderer.tokenizer,
+                        )
                         yield res
 
                 response = await super().chat_completion_full_generator(
