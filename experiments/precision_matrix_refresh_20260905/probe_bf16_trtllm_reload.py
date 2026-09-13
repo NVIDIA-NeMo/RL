@@ -47,13 +47,14 @@ def main() -> None:
         )
         initialize_model_parallel(world)
         init_workspace_manager(local_rank)
-        experts, hidden, intermediate = 8, 256, 3712
-        local_width = intermediate // world
+        experts, hidden = 8, 256
         torch.manual_seed(13)
         inputs = torch.randn(16, hidden, dtype=torch.bfloat16) / 8
         router = torch.randn(16, experts, dtype=torch.float32)
 
-        for gated in (True, False):
+        # Native vLLM pads non-gated experts; gated experts require aligned I.
+        for gated, intermediate in ((True, 4096), (False, 2688), (False, 3712)):
+            local_width = intermediate // world
 
             def weights(update: int) -> dict[str, torch.Tensor]:
                 torch.manual_seed(31 + update)
@@ -116,7 +117,7 @@ def main() -> None:
                 owner.quant_method.process_weights_after_loading(owner)
                 return layer
 
-            layer = fresh(0, f"reload_{gated}")
+            layer = fresh(0, f"reload_{gated}_{intermediate}")
             bindings = {
                 "up": LocalExpertBinding(
                     "routed_experts.w13_weight",
@@ -136,7 +137,7 @@ def main() -> None:
                     (experts, local_width, hidden),
                 )
             for update in (1, 2):
-                reference = fresh(update, f"reference_{gated}_{update}")
+                reference = fresh(update, f"reference_{gated}_{intermediate}_{update}")
                 reload = LocalBf16ExpertReload(layer, bindings)
                 initialize_layerwise_reload(layer.routed_experts)
                 for name, value in weights(update).items():
@@ -161,7 +162,11 @@ def main() -> None:
                 assert torch.isfinite(actual).all()
                 results.append(
                     dict(
-                        gated=gated, update=update, packed_equal=True, output_equal=True
+                        gated=gated,
+                        local_width=local_width,
+                        update=update,
+                        packed_equal=True,
+                        output_equal=True,
                     )
                 )
         torch.cuda.synchronize()
