@@ -79,7 +79,7 @@ def test_refit_policy_generation_uses_attached_checkpoint_engine_synchronizer():
     from nemo_rl.algorithms import grpo as grpo_mod
     from nemo_rl.models.generation.vllm import VllmGeneration
 
-    policy = object()
+    policy = MagicMock()
     kv_scales = {"layer_0": 1.0}
 
     generation = MagicMock(spec=VllmGeneration)
@@ -98,6 +98,7 @@ def test_refit_policy_generation_uses_attached_checkpoint_engine_synchronizer():
     generation.weight_synchronizer.sync_weights.assert_called_once_with(
         timer=None, kv_scales=kv_scales
     )
+    policy.sync_params_before_refit.assert_called_once_with()
     assert result == {"transfer_s": 1.0}
 
 
