@@ -86,6 +86,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayMetadataState,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    SamplerSelection,
     TransactionalAdmissionSampler,
     create_sampler,
 )
@@ -2460,6 +2461,9 @@ class SingleControllerActor:
             version_during_step = self._trainer_version
             groups_dispatched = 0
             evicted_stale_prompt_groups = 0
+            # Trajectory age, in trainer versions, of every group this step trains
+            # on. Accumulated across selects: a step is assembled from several.
+            step_trajectory_ages: list[int] = []
             min_sample_version = None
             step_open = False
             chunks_dispatched = 0
@@ -2526,11 +2530,18 @@ class SingleControllerActor:
                         training_claim_ids_before = (
                             self._buffer.training_owned_group_ids()
                         )
-                        train_meta, num_groups = await self._sampler.select(
+                        selection = await self._sampler.select(
                             current_train_weight=self._trainer_version,
                             min_prompt_groups=min_prompt_groups,
                             max_prompt_groups=max_prompt_groups,
                         )
+                        if isinstance(selection, SamplerSelection):
+                            train_meta = selection.meta
+                            num_groups = selection.num_groups
+                            step_trajectory_ages.extend(selection.trajectory_ages)
+                        else:
+                            # Preserve the two-tuple contract for external samplers.
+                            train_meta, num_groups = selection
                         training_claim_ids_after = (
                             self._buffer.training_owned_group_ids()
                         )
@@ -2966,6 +2977,18 @@ class SingleControllerActor:
                             )
                 self._retune_lookahead_versions()
                 self._rollout_manager.set_weight_version(self._trainer_version)
+                if step_trajectory_ages:
+                    # Keep the pre-SC async GRPO metric name so both paths can be
+                    # compared on one dashboard. The max exposes the long tail
+                    # that ready_first permits but eviction counters cannot show.
+                    step_metrics.update(
+                        {
+                            "avg_trajectory_age": (
+                                sum(step_trajectory_ages) / len(step_trajectory_ages)
+                            ),
+                            "max_trajectory_age": max(step_trajectory_ages),
+                        }
+                    )
                 step_metrics.update(
                     {
                         "evicted_stale_prompt_groups": evicted_stale_prompt_groups,
