@@ -18,10 +18,12 @@ import os
 import warnings
 from collections import defaultdict
 from typing import (
+    TYPE_CHECKING,
     Any,
     AsyncGenerator,
     Optional,
     Union,
+    cast,
 )
 
 import numpy as np
@@ -63,6 +65,9 @@ from nemo_rl.utils.multimodal_payload_metrics import (
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 from nemo_rl.weight_sync.membership import RefitMembership
 
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -101,6 +106,12 @@ def _record_vllm_generation_metrics(
 
 
 class VllmGeneration(GenerationInterface):
+    @classmethod
+    def validate_settings(cls, master_config: "MasterConfig") -> None:
+        """Reject pure-config vLLM settings the SC entrypoint cannot honor."""
+        generation_config = cast(VllmConfig, master_config.policy["generation"])
+        assert_reload_refit_config_supported(generation_config)
+
     @staticmethod
     def init_cluster_placement_groups(
         cluster: RayVirtualCluster,
