@@ -129,6 +129,13 @@ def _make_mtp_refit_extension(
     return ext, drafter_model
 
 
+def test_native_refit_accepts_disk_loaded_mtp_regardless_of_policy_probe():
+    ext, _ = _make_mtp_refit_extension(from_disk=True)
+    ext._mtp_drafter_refit_enabled = lambda: True
+
+    ext._validate_native_speculative_refit()
+
+
 class _RecordingGroup:
     """Stands in for StatelessProcessGroup so no port is bound and no CUDA is touched."""
 
@@ -209,9 +216,15 @@ def test_init_collective_keeps_generation_ranks_after_the_training_ranks(
     assert recording_group.instances[0].kwargs["rank"] == 4
 
 
-def _make_unquantized_moe_model(
-    moe_backend: str, expert_placement_strategy: str = "linear"
+def _unquantized_moe_module(
+    moe_backend: str, expert_placement_strategy: str | None = "linear"
 ) -> torch.nn.Module:
+    """A realized unquantized MoE layer.
+
+    ``expert_placement_strategy=None`` builds a module that carries no placement
+    attribute at all, which is the case the nccl_reshard guard must refuse
+    rather than read as linear.
+    """
     from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
         UnquantizedMoeBackend,
     )
@@ -220,15 +233,58 @@ def _make_unquantized_moe_model(
     )
 
     quant_method = UnquantizedFusedMoEMethod.__new__(UnquantizedFusedMoEMethod)
+    torch.nn.Module.__init__(quant_method)
     quant_method.unquantized_backend = UnquantizedMoeBackend(moe_backend)
-    model = torch.nn.Module()
     module = torch.nn.Module()
     module.__dict__["quant_method"] = quant_method
-    module.expert_map_manager = SimpleNamespace(
-        placement_strategy=expert_placement_strategy
-    )
-    model.add_module("moe", module)
+    if expert_placement_strategy is not None:
+        module.expert_map_manager = SimpleNamespace(
+            placement_strategy=expert_placement_strategy
+        )
+    return module
+
+
+def _quantized_moe_module() -> torch.nn.Module:
+    """A MoE layer inside the quantization recipe, so not an unquantized method."""
+    module = torch.nn.Module()
+    module.quant_method = object()
+    return module
+
+
+def _moe_model(modules: list[torch.nn.Module]) -> torch.nn.Module:
+    model = torch.nn.Module()
+    model.quant_method = object()
+    model.layers = torch.nn.ModuleList(modules)
     return model
+
+
+def _make_unquantized_moe_model(
+    moe_backend: str, expert_placement_strategy: str | None = "linear"
+) -> torch.nn.Module:
+    module = _unquantized_moe_module(moe_backend, expert_placement_strategy)
+    return _moe_model([module])
+
+
+def _make_quantized_moe_model() -> torch.nn.Module:
+    return _moe_model([_quantized_moe_module()])
+
+
+def _make_mixed_precision_moe_model(moe_backend: str) -> torch.nn.Module:
+    """The production layout: BF16 boundary layers beside quantized ones.
+
+    ``keep_bf16_first_layers``/``keep_bf16_last_layers`` put the boundary layers
+    outside the recipe, so they realize an unquantized method while the rest of
+    the stack realizes the quantized one. The engine still carries a
+    ``quant_config``, which is why reading the config rather than the realized
+    modules gets this case wrong.
+    """
+    modules = [
+        _unquantized_moe_module(moe_backend),
+        _quantized_moe_module(),
+        _quantized_moe_module(),
+        _unquantized_moe_module(moe_backend),
+    ]
+    return _moe_model(modules)
 
 
 @pytest.mark.vllm
@@ -695,7 +751,7 @@ def test_layerwise_reload_propagates_detach_error_after_successful_load(monkeypa
 def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
-    model = SimpleNamespace(modules=lambda: [])
+    model = _make_quantized_moe_model()
     model_config = object()
     vllm_config = SimpleNamespace(
         kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
@@ -728,6 +784,181 @@ def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
 
     process.assert_called_once_with(model, model_config, ext.device)
     ext._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
+    ext._maybe_process_fp8_kv_cache.assert_not_called()
+
+
+@pytest.mark.vllm
+def test_fp8_kv_cache_does_not_add_a_second_model_wide_pass(monkeypatch):
+    """One refit runs ``process_weights_after_loading`` exactly once.
+
+    ``_maybe_process_fp8_kv_cache`` calls the same model-wide helper that
+    ``finalize()`` already ran, and vLLM's second loop in that helper -- over the
+    attention modules -- *is* the KV-scale pass it wants. So with an FP8 KV cache
+    the non-native lifecycle made two full passes, and the first loop of the
+    second pass re-enters every FusedMoE quant method. The quantized ones survive
+    that on vLLM's sticky ``_already_called_process_weights_after_loading`` flag.
+    ``UnquantizedFusedMoEMethod`` has no such flag and its ``_setup_kernel``
+    re-reads the live ``w13_weight``/``w2_weight``, so the extra pass silently
+    repeats the FlashInfer TRTLLM block permutation on exactly the BF16 boundary
+    experts of a mixed-precision model -- no exception, just wrong numerics.
+
+    Nothing on the worker is stubbed here: the real ``_uses_fp8_kv_cache`` reads a
+    real ``cache_config``, and the model answers ``parameters()``, so a
+    regression surfaces as a second call rather than as a mock never asked to
+    fire. That mock is what hid this in the two lifecycle tests above.
+    """
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    model = _make_mixed_precision_moe_model("FlashInfer TRTLLM")
+    model.parameters = lambda: iter([torch.zeros(1)])
+    model_config = object()
+    vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+        quant_config=object(),
+        cache_config=SimpleNamespace(cache_dtype="fp8"),
+    )
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=model, vllm_config=vllm_config, model_config=model_config
+    )
+    ext.model_config = model_config
+    ext.device = torch.device("cpu")
+    ext._maybe_process_mtp_drafter_after_loading = MagicMock()
+
+    # The premise: without this the test would pass for the wrong reason.
+    assert ext._uses_fp8_kv_cache()
+
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    process = MagicMock()
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        process,
+    )
+
+    with ext._weight_update_lifecycle("nccl_reshard") as finalize:
+        finalize()
+
+    process.assert_called_once_with(model, model_config, ext.device)
+
+
+@pytest.mark.vllm
+def test_the_non_native_finalizer_clears_the_exactly_once_guard(monkeypatch):
+    """Otherwise the model-wide pass is a no-op on every quantized module.
+
+    ``process_weights_after_loading`` guards itself with a sticky attribute so it
+    runs once per load, and vLLM sets that attribute during engine startup --
+    upstream, a load happens once per process. A refit is a second load, and
+    only vLLM's own layerwise reload clears the guard. On the non-native path
+    there is no layerwise reload, so unless the finalizer clears the guard
+    itself the rebuild is skipped and the kernel keeps serving the previous
+    step's layout: no exception, no log, just a policy generating from stale
+    experts.
+
+    The guard is read at call time rather than after the fact, because clearing
+    it *after* the pass would look identical at the end and fix nothing.
+    """
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod,
+    )
+
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    model = _make_mixed_precision_moe_model("FlashInfer TRTLLM")
+    quantized = [
+        module
+        for module in model.modules()
+        if not isinstance(
+            getattr(module, "quant_method", None), UnquantizedFusedMoEMethod
+        )
+    ]
+    model_config = object()
+    vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+        quant_config=object(),
+        cache_config=SimpleNamespace(cache_dtype="auto"),
+    )
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=model, vllm_config=vllm_config, model_config=model_config
+    )
+    ext.model_config = model_config
+    ext.device = torch.device("cpu")
+    ext._maybe_process_mtp_drafter_after_loading = MagicMock()
+
+    # The state vLLM leaves behind after building the engine.
+    for module in model.modules():
+        module._already_called_process_weights_after_loading = True
+
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    still_guarded = []
+
+    def process(*_args, **_kwargs):
+        still_guarded.extend(
+            module
+            for module in model.modules()
+            if hasattr(module, "_already_called_process_weights_after_loading")
+        )
+
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        process,
+    )
+
+    with ext._weight_update_lifecycle("nccl_reshard") as finalize:
+        finalize()
+
+    # The premise: a model with nothing to skip would pass either way.
+    assert quantized
+    assert still_guarded == []
+
+
+@pytest.mark.vllm
+def test_kv_cache_pass_still_runs_when_the_transport_never_finalized(monkeypatch):
+    """The skip is conditional on finalize() having run, not on reaching the end.
+
+    A transport that returns without calling ``finalize`` -- an early bail, an
+    empty manifest -- did not run ``process_weights_after_loading``, so the
+    KV-scale pass is still owed. Making the skip unconditional would trade a
+    double application for a missing one, which is the worse of the two: stale
+    KV scales produce wrong attention numerics with nothing in the log.
+    """
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    model = SimpleNamespace(modules=lambda: [])
+    vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+        quant_config=object(),
+    )
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=vllm_config)
+    ext.model_config = object()
+    ext.device = torch.device("cpu")
+    ext._maybe_process_mtp_drafter_after_loading = MagicMock()
+    ext._maybe_process_fp8_kv_cache = MagicMock()
+
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    process = MagicMock()
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        process,
+    )
+
+    with ext._weight_update_lifecycle("collective"):
+        pass
+
+    process.assert_not_called()
     ext._maybe_process_fp8_kv_cache.assert_called_once_with()
 
 
@@ -771,6 +1002,21 @@ def test_realized_moe_backend_controls_native_refit_lifecycle():
     ext.model_runner.vllm_config.kernel_config.moe_backend = "auto"
 
     assert ext._uses_unquantized_flashinfer_trtllm() is True
+
+
+@pytest.mark.vllm
+def test_a_fully_quantized_model_does_not_use_the_unquantized_lifecycle():
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=_make_quantized_moe_model(),
+        vllm_config=SimpleNamespace(quant_config=object()),
+    )
+
+    assert ext._uses_unquantized_flashinfer_trtllm() is False
 
 
 @pytest.mark.vllm
@@ -846,16 +1092,51 @@ def test_unquantized_trtllm_param_ids_are_scoped_to_realized_modules(monkeypatch
 
 
 @pytest.mark.vllm
+def test_a_bf16_boundary_layer_pulls_a_quantized_model_into_the_lifecycle():
+    """The first/last-BF16 case: quant_config set, some MoE layers unquantized.
+
+    This is the layout production runs. Deciding on ``quant_config`` alone reads
+    it as fully quantized and sends it down the bulk
+    ``process_weights_after_loading`` path, which never rebuilds the TRTLLM
+    kernel's private layout for the boundary layers that actually need it.
+    """
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=_make_mixed_precision_moe_model("FlashInfer TRTLLM"),
+        vllm_config=SimpleNamespace(quant_config=object()),
+    )
+
+    assert ext._uses_unquantized_flashinfer_trtllm() is True
+
+    # And only because of the backend, not because the model is mixed: a mixed
+    # model on TRITON has nothing the native lifecycle is needed for.
+    ext.model_runner.model = _make_mixed_precision_moe_model("TRITON")
+    assert ext._uses_unquantized_flashinfer_trtllm() is False
+
+
+@pytest.mark.vllm
 @pytest.mark.parametrize(
-    ("moe_backend", "quant_config", "expected"),
+    ("make_model", "quant_config", "expected"),
     [
-        ("FlashInfer TRTLLM", None, True),
-        ("TRITON", None, False),
-        ("FlashInfer TRTLLM", object(), True),
+        (lambda: _make_unquantized_moe_model("FlashInfer TRTLLM"), None, True),
+        (lambda: _make_unquantized_moe_model("TRITON"), None, False),
+        (lambda: _make_quantized_moe_model(), object(), False),
+        # Mixed precision is fatal for the same reason a BF16 model is: the
+        # boundary layers ran through the native lifecycle, so a failed update
+        # leaves their kernel layout describing weights that no longer exist.
+        (
+            lambda: _make_mixed_precision_moe_model("FlashInfer TRTLLM"),
+            object(),
+            True,
+        ),
     ],
 )
 def test_weight_update_errors_are_fatal_only_for_native_trtllm_refit(
-    moe_backend, quant_config, expected
+    make_model, quant_config, expected
 ):
     from nemo_rl.models.generation.vllm import vllm_backend
 
@@ -863,7 +1144,7 @@ def test_weight_update_errors_are_fatal_only_for_native_trtllm_refit(
         vllm_backend.VllmInternalWorkerExtension
     )
     ext.model_runner = SimpleNamespace(
-        model=_make_unquantized_moe_model(moe_backend),
+        model=make_model(),
         vllm_config=SimpleNamespace(quant_config=quant_config),
     )
 
@@ -892,8 +1173,11 @@ def test_unquantized_reload_rejects_cotrained_mtp_during_prepare():
     assert not hasattr(ext, "state_dict_info")
 
 
-@pytest.mark.vllm
-def test_native_refit_rejects_round_robin_expert_placement_for_nccl_only():
+def _make_nccl_reshard_validation_extension(
+    expert_placement_strategy: str | None = "linear",
+    cache_dtype: str = "auto",
+):
+    """A worker whose only job is to answer ``_validate_native_layerwise_refit``."""
     from nemo_rl.models.generation.vllm import vllm_backend
 
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
@@ -901,16 +1185,31 @@ def test_native_refit_rejects_round_robin_expert_placement_for_nccl_only():
     )
     ext.model_runner = SimpleNamespace(
         model=_make_unquantized_moe_model(
-            "FlashInfer TRTLLM", expert_placement_strategy="round_robin"
+            "FlashInfer TRTLLM", expert_placement_strategy
         ),
         vllm_config=SimpleNamespace(
             kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
             quant_config=None,
+            cache_config=SimpleNamespace(cache_dtype=cache_dtype),
         ),
     )
     ext._mtp_drafter_refit_enabled = lambda: False
+    return ext
 
-    # Placement only constrains the nccl_reshard staging path.
+
+@pytest.mark.vllm
+def test_native_refit_rejects_round_robin_expert_placement_for_nccl_only():
+    """Placement constrains nccl_reshard staging, not the vLLM-owned reload.
+
+    ``nccl_reshard`` writes the MoE weights itself into expert slots it assumes
+    are laid out linearly. The ``ipc``/``collective`` paths hand that work to
+    vLLM's own loaders, which honour whatever placement the engine realized, so
+    rejecting them too would refuse a configuration that works.
+    """
+    ext = _make_nccl_reshard_validation_extension(
+        expert_placement_strategy="round_robin"
+    )
+
     ext._validate_native_layerwise_refit("collective")
 
     with pytest.raises(RuntimeError, match="linear expert placement"):
@@ -919,57 +1218,50 @@ def test_native_refit_rejects_round_robin_expert_placement_for_nccl_only():
 
 @pytest.mark.vllm
 def test_native_refit_uses_realized_expert_placement():
-    from nemo_rl.models.generation.vllm import vllm_backend
+    """The realized modules decide, not ``parallel_config``.
 
-    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
-        vllm_backend.VllmInternalWorkerExtension
+    A conflicting ``parallel_config.expert_placement_strategy`` is exactly the
+    trap: reading the config would reject an engine whose modules actually came
+    up linear, which is the same config-versus-realization mistake C5 was.
+    """
+    ext = _make_nccl_reshard_validation_extension(expert_placement_strategy="linear")
+    ext.model_runner.vllm_config.parallel_config = SimpleNamespace(
+        expert_placement_strategy="round_robin"
     )
-    # The realized per-module placement (linear) wins over a conflicting
-    # parallel_config setting; validation must consult the modules.
-    ext.model_runner = SimpleNamespace(
-        model=_make_unquantized_moe_model(
-            "FlashInfer TRTLLM", expert_placement_strategy="linear"
-        ),
-        vllm_config=SimpleNamespace(
-            kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
-            parallel_config=SimpleNamespace(expert_placement_strategy="round_robin"),
-            quant_config=None,
-        ),
-    )
-    ext._mtp_drafter_refit_enabled = lambda: False
 
     ext._validate_native_layerwise_refit("nccl_reshard")
 
 
 @pytest.mark.vllm
 def test_native_refit_rejects_undeterminable_expert_placement():
-    from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
-        UnquantizedMoeBackend,
-    )
-    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
-        UnquantizedFusedMoEMethod,
-    )
+    """An absent placement attribute is refused, never assumed to be linear.
 
-    from nemo_rl.models.generation.vllm import vllm_backend
-
-    quant_method = UnquantizedFusedMoEMethod.__new__(UnquantizedFusedMoEMethod)
-    quant_method.unquantized_backend = UnquantizedMoeBackend("FlashInfer TRTLLM")
-    module = SimpleNamespace(quant_method=quant_method)
-
-    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
-        vllm_backend.VllmInternalWorkerExtension
-    )
-    ext.model_runner = SimpleNamespace(
-        model=SimpleNamespace(modules=lambda: [module]),
-        vllm_config=SimpleNamespace(
-            kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
-            quant_config=None,
-        ),
-    )
-    ext._mtp_drafter_refit_enabled = lambda: False
+    A vLLM version that renames the attribute would otherwise silently take the
+    linear-staging path on a round-robin engine and write every expert to the
+    wrong slot.
+    """
+    ext = _make_nccl_reshard_validation_extension(expert_placement_strategy=None)
 
     with pytest.raises(RuntimeError, match="could not determine"):
         ext._validate_native_layerwise_refit("nccl_reshard")
+
+
+@pytest.mark.vllm
+def test_prepare_nccl_reshard_refit_info_validates_before_any_transfer():
+    """The guard is wired into setup, not merely defined.
+
+    Validation that is never called is the failure mode this pins: the check
+    has to run in ``prepare_nccl_reshard_refit_info``, which happens once
+    before the first weight moves, rather than partway through a refit.
+    """
+    ext = _make_nccl_reshard_validation_extension(
+        expert_placement_strategy="round_robin"
+    )
+
+    with pytest.raises(RuntimeError, match="linear expert placement"):
+        ext.prepare_nccl_reshard_refit_info({})
+
+    assert not hasattr(ext, "nccl_reshard_refit_info")
 
 
 @pytest.mark.vllm
@@ -1357,7 +1649,6 @@ def test_update_weights_from_collective_preserves_mtp_batched_loading(monkeypatc
         "config_enter",
         "process_mtp",
         "config_exit",
-        "kv",
         "gc",
         "empty_cache",
     ]
@@ -2132,3 +2423,152 @@ def test_maybe_process_mtp_drafter_after_loading_noop_when_disk_loaded(monkeypat
     ext._maybe_process_mtp_drafter_after_loading()
 
     process_weights.assert_not_called()
+
+
+def _recording_quant_method():
+    """A minimal real ``QuantizeMethodBase`` that records what it processed."""
+    from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+
+    class _RecordingQuantMethod(QuantizeMethodBase):
+        def __init__(self):
+            self.processed = []
+
+        def create_weights(self, layer, *args, **kwargs):
+            raise NotImplementedError
+
+        def apply(self, layer, *args, **kwargs):
+            raise NotImplementedError
+
+        def process_weights_after_loading(self, layer):
+            self.processed.append(layer)
+
+    return _RecordingQuantMethod()
+
+
+def _module_with_params(count: int = 1) -> torch.nn.Module:
+    module = torch.nn.Module()
+    for index in range(count):
+        module.register_parameter(
+            f"w{index}", torch.nn.Parameter(torch.empty(2), requires_grad=False)
+        )
+    module.quant_method = _recording_quant_method()
+    return module
+
+
+def _attention_module_with_param() -> torch.nn.Module:
+    """An ``Attention`` instance without running its heavyweight constructor."""
+    from vllm.model_executor.layers.attention import Attention
+
+    module = Attention.__new__(Attention)
+    torch.nn.Module.__init__(module)
+    module.register_parameter(
+        "w0", torch.nn.Parameter(torch.empty(2), requires_grad=False)
+    )
+    module.quant_method = _recording_quant_method()
+    return module
+
+
+def _param_ids(module: torch.nn.Module) -> set[int]:
+    return {id(param) for param in module.parameters(recurse=False)}
+
+
+@pytest.mark.vllm
+def test_bulk_written_modules_are_the_only_ones_rebuilt():
+    """The mixed-precision nccl_reshard hole: BF16 boundary layers stay unprocessed.
+
+    Their weights arrive through destinations bound to the runtime tensors, so
+    the layerwise finalizer restores the fresh values but never runs
+    ``process_weights_after_loading``. For an unquantized TRTLLM MoE that leaves
+    canonical ``[gate; up]`` where the kernel expects its own repack.
+    """
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    bulk = _module_with_params()
+    native = _module_with_params()
+    untouched = _module_with_params()
+
+    model = torch.nn.Module()
+    model.add_module("bulk", bulk)
+    model.add_module("native", native)
+    model.add_module("untouched", untouched)
+
+    vllm_backend._rebuild_kernel_layouts_after_bulk_writes(
+        model, _param_ids(bulk), _param_ids(native)
+    )
+
+    assert bulk.quant_method.processed == [bulk]
+    # Already processed inside the reload; a second pass double-applies the
+    # shuffle while the block scales move only once.
+    assert native.quant_method.processed == []
+    # Received nothing, so its kernel layout still matches its weights.
+    assert untouched.quant_method.processed == []
+
+
+@pytest.mark.vllm
+def test_a_module_holding_both_bulk_and_native_params_is_left_to_the_reload():
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    module = _module_with_params(count=2)
+    value, scale = module.parameters(recurse=False)
+
+    model = torch.nn.Module()
+    model.add_module("mixed", module)
+
+    vllm_backend._rebuild_kernel_layouts_after_bulk_writes(
+        model, {id(value)}, {id(scale)}
+    )
+
+    assert module.quant_method.processed == []
+
+
+@pytest.mark.vllm
+def test_attention_is_left_to_the_finalizers_deferred_pass():
+    """vLLM processes attention after the linears; rebuilding it here repeats that."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    attention = _attention_module_with_param()
+
+    model = torch.nn.Module()
+    model.add_module("attn", attention)
+
+    vllm_backend._rebuild_kernel_layouts_after_bulk_writes(
+        model, _param_ids(attention), set()
+    )
+
+    assert attention.quant_method.processed == []
+
+
+@pytest.mark.vllm
+def test_the_sticky_process_guard_is_cleared_before_rebuilding():
+    """Stock vLLM latches this flag, so leaving it set makes the rebuild a no-op."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    module = _module_with_params()
+    module._already_called_process_weights_after_loading = True
+
+    model = torch.nn.Module()
+    model.add_module("bulk", module)
+
+    vllm_backend._rebuild_kernel_layouts_after_bulk_writes(
+        model, _param_ids(module), set()
+    )
+
+    assert module.quant_method.processed == [module]
+    assert not hasattr(module, "_already_called_process_weights_after_loading")
+
+
+@pytest.mark.vllm
+def test_a_fully_native_refit_rebuilds_nothing():
+    """No bulk destinations means every module went through the reload loaders."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    module = _module_with_params()
+
+    model = torch.nn.Module()
+    model.add_module("native", module)
+
+    vllm_backend._rebuild_kernel_layouts_after_bulk_writes(
+        model, set(), _param_ids(module)
+    )
+
+    assert module.quant_method.processed == []
