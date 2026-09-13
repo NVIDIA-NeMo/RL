@@ -781,6 +781,14 @@ class VllmAsyncGenerationWorkerImpl(
             raise RuntimeError(
                 "generation-cut fetch did not return exactly one snapshot"
             )
+        LOGGER.info(
+            "generation prefix restored: rollout_id=%s model_call_id=%s "
+            "source_model_call_id=%s prefix_tokens=%d",
+            admission.rollout_id,
+            admission.model_call_id,
+            continuation.source_model_call_id,
+            continuation.generation_token_count,
+        )
         return snapshots[0]
 
     def _enter_request_prefix(self, request: Any, prefix_token_ids: list[int]) -> None:
@@ -885,6 +893,21 @@ class VllmAsyncGenerationWorkerImpl(
                 generated_len=len(generated_token_ids),
             )
         coords = self.token_capture.complete_call_from_response(call, payload)
+        if call.generation_cut is not None:
+            prefix_tokens = sum(
+                mask == 1.0 for mask in call.generation_cut.token_mask_delta
+            )
+            LOGGER.info(
+                "generation prefix completed: rollout_id=%s model_call_id=%s "
+                "source_model_call_id=%s prefix_tokens=%d tail_tokens=%d "
+                "total_generation_tokens=%d",
+                call.rollout_id,
+                call.model_call_id,
+                call.generation_cut.model_call_id,
+                prefix_tokens,
+                len(generated_token_ids),
+                prefix_tokens + len(generated_token_ids),
+            )
         self._remember_completed_capture(
             call.model_call_id,
             coords,
@@ -1240,6 +1263,13 @@ class VllmAsyncGenerationWorkerImpl(
                                     value=actual_request_max_tokens,
                                 )
                             actual_request_max_tokens = remaining_output_tokens
+                            request_min_tokens = getattr(request, "min_tokens", None)
+                            if request_min_tokens is not None:
+                                request.min_tokens = max(
+                                    0,
+                                    request_min_tokens
+                                    - admission.generation_cut.generation_token_count,
+                                )
                     if engine_prefix_token_ids:
                         worker_self._enter_request_prefix(
                             request, engine_prefix_token_ids

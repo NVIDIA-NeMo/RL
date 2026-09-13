@@ -320,6 +320,7 @@ def test_checkpoint_prepare_fans_out_using_component_routes() -> None:
             "workers": {"acknowledged": 1, "expected": 1},
             "inflight_total": 0,
             "waiters_total": 0,
+            "generation_cut_proof": {"proof_digest": "a" * 64},
         },
         "agent": {
             "state": "preparing",
@@ -354,11 +355,14 @@ def test_checkpoint_prepare_fans_out_using_component_routes() -> None:
         assert method == "POST"
         assert path.endswith("/prepare") or path.endswith("/pause")
         assert timeout_s > 0
-        assert json == {
+        expected_request = {
             "schema_version": 1,
             "checkpoint_id": "snapshot-7",
             "deadline_ts": deadline_ts,
         }
+        if server_name == "agent":
+            expected_request["allow_model_wait_boundary"] = True
+        assert json == expected_request
         return responses[server_name]
 
     env._control = AsyncMock(side_effect=prepare_control)
