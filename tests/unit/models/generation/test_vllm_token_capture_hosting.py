@@ -23,6 +23,7 @@ a mock worker group.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from copy import deepcopy
 from types import SimpleNamespace
@@ -463,7 +464,8 @@ def test_generation_cut_stages_latest_prefix_without_completing_live_call():
     assert sink.records[0].token_ids_delta == [10, 11, 12, 13, 14]
 
 
-def test_restored_generation_cut_is_extended_and_retired_on_completion():
+def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
+    caplog.set_level(logging.INFO)
     sink = _MemorySink()
     original_worker = _worker_with_capture(sink)
     original_request = _FakeRequest(
@@ -572,6 +574,8 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion():
     assert final_record.token_ids_delta == [10, 11, 12, 13, 14]
     assert final_record.token_mask_delta == [0.0, 0.0, 1.0, 1.0, 1.0]
     assert final_record.generation_log_probs_delta == [0.0, 0.0, -0.1, -0.2, -0.3]
+    assert "generation prefix restored:" in caplog.text
+    assert "prefix_tokens=2 tail_tokens=1 total_generation_tokens=3" in caplog.text
 
 
 def test_checkpoint_gate_holds_terminal_stage_until_reopened():
