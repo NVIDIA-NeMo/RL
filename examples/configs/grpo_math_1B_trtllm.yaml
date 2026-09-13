@@ -17,6 +17,31 @@ policy:
       # diverge from grpo.async_grpo (single source of truth).
       in_flight_weight_updates: ${grpo.async_grpo.in_flight_weight_updates}
       recompute_kv_cache_after_weight_updates: ${grpo.async_grpo.recompute_kv_cache_after_weight_updates}
+      # Prefill/decode disaggregation. A replica is num_context_engines context
+      # engines plus num_generation_engines generation engines, fronted by one
+      # disagg server that exposes the single URL NeMo-Gym talks to. The replica
+      # count is derived from the inference cluster size, not configured.
+      # Requires colocated.enabled=false and trtllm_cfg.expose_http_server=true.
+      disaggregation:
+        enabled: false
+        # Engines per replica; the two are independent, so the P:D ratio is free.
+        num_context_engines: 1
+        num_generation_engines: 1
+        # Stateful, so a trajectory's turns keep reaching the context engine
+        # holding its prefix: conversation | kv_cache_aware
+        ctx_router: conversation
+        # Stateless: a generation engine receives KV freshly on every turn, so
+        # it has nothing worth returning to: round_robin | load_balancing
+        gen_router: load_balancing
+        # TRT-LLM CacheTransceiverConfig backend for the KV handoff:
+        # DEFAULT | UCX | NIXL | MOONCAKE | MPI
+        cache_transceiver_backend: DEFAULT
+        # Per-role overrides merged over trtllm_cfg (TP, the MoE split, and any
+        # other trtllm_cfg key). Uncomment to give the roles different shapes.
+        # ctx_trtllm_kwargs:
+        #   tensor_parallel_size: 4
+        # gen_trtllm_kwargs:
+        #   tensor_parallel_size: 2
     trtllm_kwargs:
       batch_wait_timeout_iters: 32
       batch_wait_max_tokens_ratio: 0.5
