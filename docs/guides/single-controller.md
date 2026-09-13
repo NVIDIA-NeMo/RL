@@ -89,6 +89,11 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 
 ## Checkpointing and Replay Recovery
 
+Single-Controller does not have a validation loop yet. When checkpointing is
+enabled, `checkpointing.metric_name` must therefore be `null` or a
+`train:<name>` metric; setup rejects other values instead of letting top-k
+retention silently become a no-op.
+
 With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint contains:
 
 - The normal model, dataloader, and controller state, plus optimizer state when configured.
