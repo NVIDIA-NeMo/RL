@@ -30,6 +30,10 @@ export BASE_NAME="${BASE_NAME:-async_grpo_${experiment}}"
 export WANDB_PROJECT="${WANDB_PROJECT:-Nemotron-omni-RL-debug}"
 export WANDB_RUN_NAME="${WANDB_RUN_NAME:-${cluster_name}_${experiment}}"
 export ENV_FILE="${ENV_FILE:-/lustre/fsw/portfolios/nemotron/users/ehosseiniasl/.codex/credentials.env}"
+# Keep multi-terabyte checkpoints and their HF exports outside the source tree.
+# /lustre and /scratch are aliases for the same CMH quota, so this is an
+# organizational/safety boundary rather than a separate storage allocation.
+export RESULTS_DIR="${RESULTS_DIR:-/lustre/fsw/portfolios/nemotron/projects/nemotron_omni_vision/users/ehosseiniasl/results/${BASE_NAME}}"
 
 export CONTAINER="${CONTAINER:-/scratch/fsw/portfolios/nemotron/projects/nemotron_omni_vision/users/ehosseiniasl/images/rl-gym.67009223-gym_ln_fix.sqsh}"
 export MODEL_PATH="${MODEL_PATH:-/lustre/fsw/portfolios/nemotron/users/arushig/workspace/output/stage2_text_rl_with_r3_step120}"
