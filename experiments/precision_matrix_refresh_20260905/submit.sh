@@ -516,6 +516,38 @@ ${DATASET_STAGE_COMMAND}"
 
 export CONTAINER
 export MOUNTS="/lustre:/lustre,/home:/home,${WANDB_HOME}/.netrc:/root/.netrc"
+if [[ -n "${VLLM_PADDING_SOURCE:-}" ]]; then
+  : "${VLLM_PADDING_SHA:?Pin the tested vLLM commit}"
+  if [[ "${NRL_FORCE_REBUILD_VENVS}" != false || "${NEMO_RL_PY_EXECUTABLES_SYSTEM}" != 0 ]]; then
+    echo "The tested vLLM overlay requires the prebuilt actor environment" >&2
+    exit 2
+  fi
+  VLLM_RESOLVED_SHA=$(git -C "${VLLM_PADDING_SOURCE}" rev-parse "${VLLM_PADDING_SHA}^{commit}")
+  if [[ "${VLLM_RESOLVED_SHA}" != "${VLLM_PADDING_SHA}" ]]; then
+    echo "VLLM_PADDING_SHA must be a full commit SHA" >&2
+    exit 2
+  fi
+  VLLM_FILES=(
+    vllm/model_executor/layers/quantization/utils/flashinfer_utils.py
+    vllm/model_executor/layers/fused_moe/oracle/unquantized.py
+  )
+  VLLM_SNAPSHOT_ROOT=/home/${USER}/.cache/nemo-rl-vllm-overlays
+  VLLM_SNAPSHOT=${VLLM_SNAPSHOT_ROOT}/${VLLM_RESOLVED_SHA}
+  mkdir -p "${VLLM_SNAPSHOT_ROOT}"
+  if [[ ! -d "${VLLM_SNAPSHOT}" ]]; then
+    VLLM_STAGE=$(mktemp -d "${VLLM_SNAPSHOT_ROOT}/.stage.XXXXXX")
+    git -C "${VLLM_PADDING_SOURCE}" archive "${VLLM_RESOLVED_SHA}" "${VLLM_FILES[@]}" | tar -xf - -C "${VLLM_STAGE}"
+    mv -T "${VLLM_STAGE}" "${VLLM_SNAPSHOT}"
+  fi
+  VLLM_PACKAGE=${ACTOR_VENV_ROOT}/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/lib/python3.13/site-packages
+  for file in "${VLLM_FILES[@]}"; do
+    git -C "${VLLM_PADDING_SOURCE}" show "${VLLM_RESOLVED_SHA}:${file}" | cmp -s - "${VLLM_SNAPSHOT}/${file}"
+    MOUNTS+=",${VLLM_SNAPSHOT}/${file}:${VLLM_PACKAGE}/${file}:ro"
+  done
+  printf 'vllm_overlay_commit=%s\n' "${VLLM_RESOLVED_SHA}"
+  sha256sum "${VLLM_FILES[@]/#/${VLLM_SNAPSHOT}/}"
+  COMMAND="export PYTHONDONTWRITEBYTECODE=1 PYTHONPYCACHEPREFIX=${LOCAL_JOB_ROOT}/pycache; ${COMMAND}"
+fi
 if [[ "${CLUSTER}" == oci ]]; then
   MOUNTS="${MOUNTS},/raid/scratch:/raid/scratch"
 fi
