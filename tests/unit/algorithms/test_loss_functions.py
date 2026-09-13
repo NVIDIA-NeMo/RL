@@ -54,6 +54,68 @@ def test_clipped_pg_loss_config_rejects_invalid_reference_kl_penalty(
         ClippedPGLossConfig(reference_policy_kl_penalty=invalid_penalty)
 
 
+@pytest.mark.parametrize(
+    "token_level_loss,sequence_level_importance_ratios",
+    [(True, False), (False, False), (False, True)],
+)
+@pytest.mark.parametrize("force_on_policy_ratio", [True, False])
+@pytest.mark.parametrize("invalid_logprob", [-200.0, float("-inf"), float("nan")])
+def test_clipped_pg_loss_masks_extreme_values_before_exponentiation(
+    token_level_loss: bool,
+    force_on_policy_ratio: bool,
+    invalid_logprob: float,
+    sequence_level_importance_ratios: bool,
+) -> None:
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            token_level_loss=token_level_loss,
+            force_on_policy_ratio=force_on_policy_ratio,
+            reference_policy_kl_penalty=0.01,
+            use_importance_sampling_correction=True,
+            sequence_level_importance_ratios=sequence_level_importance_ratios,
+        )
+    )
+    mask = torch.tensor([[0.0, 0.0, 1.0], [0.0, 1.0, 1.0]])
+    sample_mask = torch.tensor([1.0, 0.0])
+    results = []
+    for excluded_value in [0.0, invalid_logprob]:
+        current = torch.tensor(
+            [[excluded_value, -1.0], [excluded_value, excluded_value]],
+            requires_grad=True,
+        )
+        unfiltered = torch.tensor(
+            [[excluded_value, -1.0], [excluded_value, excluded_value]],
+            requires_grad=True,
+        )
+        old = torch.tensor(
+            [[0.0, excluded_value, -1.0], [0.0, excluded_value, excluded_value]]
+        )
+        data = BatchedDataDict(
+            {
+                "token_mask": mask,
+                "sample_mask": sample_mask,
+                "advantages": torch.tensor(
+                    [[0.0, excluded_value, 1.0], [0.0, excluded_value, excluded_value]]
+                ),
+                "prev_logprobs": old,
+                "generation_logprobs": torch.tensor(
+                    [[0.0, excluded_value, -1.0], [0.0, excluded_value, excluded_value]]
+                ),
+                "reference_policy_logprobs": old.clone(),
+                "curr_logprobs_unfiltered": unfiltered,
+            }
+        )
+        loss, metrics = loss_fn(current, data, torch.tensor(1.0), torch.tensor(1.0))
+        loss.backward()
+        assert torch.isfinite(loss)
+        assert torch.isfinite(current.grad).all()
+        assert torch.isfinite(unfiltered.grad).all()
+        assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
+        results.append((loss.detach(), current.grad, unfiltered.grad))
+    for actual, expected in zip(results[1], results[0]):
+        torch.testing.assert_close(actual, expected)
+
+
 def setup_dpo_loss_test_data(vocab_size=16, batch_size=1):
     seq_len = 4
     data = {
