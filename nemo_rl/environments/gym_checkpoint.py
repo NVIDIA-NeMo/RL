@@ -560,6 +560,9 @@ class GymModelCheckpointCommitRequest(GymCheckpointDirectoryRequest):
 class GymModelCheckpointRestoreRequest(GymCheckpointDirectoryRequest):
     """Model restore request returning its external-storage index."""
 
+    generation_cut_receipts: list[dict[str, object]] = Field(default_factory=list)
+    generation_cut_exclusions: list[GymExecutionIdentity] = Field(default_factory=list)
+
 
 class GymWorkerAcknowledgements(_StrictWireModel):
     acknowledged: NonNegativeInt
@@ -741,8 +744,56 @@ def gym_generation_cut_proofs(
     return tuple(proofs)
 
 
+def gym_generation_cut_receipts(
+    proofs: tuple[dict[str, object], ...],
+    *,
+    server_name: str,
+) -> list[dict[str, object]]:
+    """Extract opaque cut receipts owned by one policy model server."""
+    found: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for proof in proofs:
+        candidates: list[object] = [proof.get("generation_cut_receipt")]
+        workers = proof.get("workers")
+        if workers is not None:
+            if not isinstance(workers, list):
+                raise ValueError("Gym generation-cut proof workers must be a list")
+            for worker in workers:
+                if not isinstance(worker, Mapping):
+                    raise ValueError(
+                        "Gym generation-cut worker proof must be an object"
+                    )
+                candidates.append(worker.get("generation_cut_receipt"))
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            if not isinstance(candidate, Mapping):
+                raise ValueError("Gym generation-cut receipt must be an object")
+            inventory = candidate.get("inventory")
+            if not isinstance(inventory, Mapping):
+                raise ValueError(
+                    "Gym generation-cut receipt inventory must be an object"
+                )
+            if inventory.get("server_name") != server_name:
+                continue
+            checkpoint_id = candidate.get("checkpoint_id")
+            cut_id = candidate.get("cut_id")
+            if not isinstance(checkpoint_id, str) or not isinstance(cut_id, str):
+                raise ValueError(
+                    "Gym generation-cut receipt requires checkpoint_id and cut_id"
+                )
+            identity = (checkpoint_id, cut_id)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            found.append(dict(candidate))
+    return found
+
+
 def gym_generation_cut_staging_keys(
-    prepare: GymCheckpointPrepareResult,
+    prepare: GymCheckpointPrepareResult | tuple[dict[str, object], ...],
+    *,
+    excluded_replacements: set[tuple[str, int]] | None = None,
 ) -> set[str]:
     """Extract every durable-prefix TQ key named by Gym's cut proofs."""
 
@@ -767,7 +818,13 @@ def gym_generation_cut_staging_keys(
         return found
 
     keys: set[str] = set()
-    for proof in gym_generation_cut_proofs(prepare):
+    excluded = excluded_replacements or set()
+    proofs = (
+        gym_generation_cut_proofs(prepare)
+        if isinstance(prepare, GymCheckpointPrepareResult)
+        else prepare
+    )
+    for proof in proofs:
         for receipt in receipts(proof):
             prefixes = receipt.get("prefixes")
             if not isinstance(prefixes, list):
@@ -784,6 +841,14 @@ def gym_generation_cut_staging_keys(
                     raise ValueError(
                         f"unknown Gym generation-cut disposition {disposition!r}"
                     )
+                rollout_id = prefix.get("rollout_id")
+                attempt_index = prefix.get("attempt_index")
+                if (
+                    isinstance(rollout_id, str)
+                    and isinstance(attempt_index, int)
+                    and (rollout_id, attempt_index + 1) in excluded
+                ):
+                    continue
                 staging_key = prefix.get("staging_key")
                 if not isinstance(staging_key, str) or not staging_key:
                     raise ValueError(
@@ -1135,6 +1200,7 @@ class GymModelRestoreResponse(_StrictWireModel):
     tombstones: list[GymExecutionIdentity]
     source_attempts: list[GymExecutionIdentity]
     storage_reference_index: GymCheckpointArtifactReference
+    generation_cuts_restored: NonNegativeInt = 0
 
 
 class GymAgentRestoreResponse(_StrictWireModel):

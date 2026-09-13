@@ -95,6 +95,7 @@ from nemo_rl.environments.gym_checkpoint import (
     GymResourcesResumeResponse,
     GymSingleWorkerModelStatusResponse,
     gym_capture_key,
+    gym_generation_cut_receipts,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym_multimodal import (
@@ -1389,6 +1390,8 @@ Depending on your data shape, you may want to change these values."""
         deadline_ts: float,
         checkpoint_dir: str,
         source_checkpoint_id: Optional[str] = None,
+        generation_cut_proofs: tuple[dict[str, object], ...] = (),
+        generation_cut_exclusions: tuple[dict[str, object], ...] = (),
     ) -> dict[str, Any]:
         """Restore every stateful participant but leave admission paused."""
         if self._active_gym_checkpoint_id not in (None, checkpoint_id):
@@ -1428,6 +1431,14 @@ Depending on your data shape, you may want to change these values."""
                     checkpoint_id=checkpoint_id,
                     deadline_ts=deadline_ts,
                     checkpoint_dir=checkpoint_dir,
+                    generation_cut_receipts=gym_generation_cut_receipts(
+                        generation_cut_proofs,
+                        server_name=participant.server_name,
+                    ),
+                    generation_cut_exclusions=[
+                        GymExecutionIdentity.model_validate(item)
+                        for item in generation_cut_exclusions
+                    ],
                 ).model_dump(mode="json")
                 payload = GymModelRestoreResponse.model_validate(
                     await self._control(
