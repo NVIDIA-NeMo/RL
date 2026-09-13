@@ -122,6 +122,51 @@ MXFP8 configurations should use `quantization_ignore_patterns` instead.
 (`precision: "fp8"` without `is_mx`) has no pattern-based replacement yet and
 must continue to use `quantization_ignored_layer_kws`.
 
+### FP8 quantization diagnostics
+
+Set `NRL_LOG_LAYER_QUANTIZATION` to `1`, `true`, `yes`, or `on`
+(case-insensitive) to log Megatron/vLLM layer quantization decisions. Megatron
+logs from distributed rank 0. vLLM logs from the first outer NeMo-RL
+generation-DP engine, and within that engine only tensor-parallel rank 0 logs;
+pipeline-parallel stages are not filtered so PP>1 still reports every stage's
+layers. Entries use the `[LayerQuantization]` prefix and report whether the
+matched layer ran quantized or stayed in BF16, plus the reason when available.
+
+Set `NRL_DUMP_FP8_QUANTIZATION_IGNORE` to one of the same truthy values to dump
+the FP8 ignore inputs and the merged values passed to vLLM. The first outer
+NeMo-RL generation worker writes `report.json` in the job's current working
+directory by default. Set
+`NRL_DUMP_FP8_QUANTIZATION_IGNORE_PATH=/path/to/report.json` to choose another
+path. Stdout prints `NRL_FP8_QUANTIZATION_IGNORE_DUMP_FILE=<path>`.
+
+Example `report.json`:
+
+```json
+{
+  "generated": {
+    "ignore": ["lm_head", "model.layers.*.mlp.gate"],
+    "ignored_layers": ["lm_head"]
+  },
+  "passed_to_vllm": {
+    "ignore": ["lm_head", "model.layers.*.mlp.gate"],
+    "ignored_layers": ["lm_head"]
+  },
+  "sources": {
+    "default_ignored_layers": ["lm_head"],
+    "num_layers_in_bf16": [],
+    "quantization_ignore_patterns": {
+      "match_error": null,
+      "matches": {
+        "lm_head": ["lm_head"],
+        "model.layers.*.mlp.gate": ["model.layers.0.mlp.gate"]
+      },
+      "patterns": ["lm_head", "model.layers.*.mlp.gate"]
+    },
+    "quantization_ignored_layer_kws": []
+  }
+}
+```
+
 To train with FP8, you need to set the Megatron path and configure it using the following settings:
 
 ```yaml

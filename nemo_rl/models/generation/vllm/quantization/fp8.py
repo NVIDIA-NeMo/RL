@@ -16,13 +16,14 @@ import os
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from typing import Any
 from unittest.mock import patch
 
 import ray
 import torch
 from accelerate import init_empty_weights
-from transformers import AutoConfig, AutoModel
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -32,10 +33,17 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
 
+from nemo_rl.models.generation.vllm.patches import (
+    _patch_vllm_modelopt_layer_quantization_logging,
+)
 from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
     pad_flashinfer_scale_k,
 )
 from nemo_rl.models.generation.vllm.utils import is_grouped_moe_expert_weight_name
+from nemo_rl.utils.quantization_logging import (
+    FP8_QUANTIZATION_IGNORE_DUMP_ENV,
+    is_truthy_env_var,
+)
 
 logger = init_logger(__name__)
 
@@ -86,6 +94,13 @@ fp8_patches_applied = False
 
 original_run_engine_core = EngineCoreProc.run_engine_core
 original_init = CoreEngineProcManager.__init__
+
+
+def _should_build_fp8_quantization_ignore_report() -> bool:
+    return (
+        is_truthy_env_var(FP8_QUANTIZATION_IGNORE_DUMP_ENV)
+        and os.environ.get("RANK") == "0"
+    )
 
 
 def my_init(*args, **kwargs):
@@ -162,6 +177,8 @@ def apply_fp8_patches(self, fp8_config):
 
     # Apply weight-related patches only when using FP8 weights (precision=fp8)
     if global_fp8_config.use_fp8_weights:
+        _patch_vllm_modelopt_layer_quantization_logging(logger)
+
         if not global_fp8_config.refit_with_reload_api:
             # Native reload_weights owns weight materialization and post-load
             # processing; these patches are only needed by the legacy refit path.
@@ -326,12 +343,12 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         fp8_block_quant_kwargs = dict(MXFP8_BLOCK_QUANT_KWARGS)
     else:
         fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
+    bf16_params = []
     if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
         with init_empty_weights():
             model = AutoModel.from_config(config, trust_remote_code=True)
         param_names = [name for name, _ in model.named_parameters()]
 
-        bf16_params = []
         if num_first_layers_in_bf16 > 0:
             layers = [l for l in range(num_first_layers_in_bf16)]
             bf16_params.extend(_get_params_in_layers(param_names, layers))
@@ -348,6 +365,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
 
         fp8_block_quant_kwargs["ignored_layers"] = bf16_params
     quantization_ignored_layer_kws = vllm_cfg.get("quantization_ignored_layer_kws")
+    keyword_ignored_layers = []
     if "quantization_ignored_layer_kws" in vllm_cfg:
         warnings.warn(
             "quantization_ignored_layer_kws is deprecated in NeMo RL 0.8; "
@@ -369,6 +387,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             for n in param_names
             if any(p in n for p in quantization_ignored_layer_kws)
         ]
+        keyword_ignored_layers = ignored_layers
         if "ignored_layers" not in fp8_block_quant_kwargs:
             fp8_block_quant_kwargs["ignored_layers"] = ignored_layers
         else:
@@ -399,7 +418,49 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         "hf_overrides": {"quantization_config": fp8_block_quant_kwargs},
     }
 
-    return vllm_kwargs
+    ignore_report = None
+    if _should_build_fp8_quantization_ignore_report():
+        pattern_matches = {}
+        pattern_match_error = None
+        if quantization_ignore_patterns:
+            try:
+                pattern_param_names = _enumerate_module_prefixes(config)
+                for pattern in quantization_ignore_patterns:
+                    has_glob = any(char in pattern for char in "*?[")
+                    pattern_matches[pattern] = [
+                        name
+                        for name in pattern_param_names
+                        if fnmatchcase(name, pattern)
+                        or (
+                            name.startswith("model.")
+                            and fnmatchcase(name.removeprefix("model."), pattern)
+                        )
+                        or (not has_glob and pattern in name)
+                    ]
+            except Exception as error:
+                pattern_match_error = f"{type(error).__name__}: {error}"
+
+        ignore_report = {
+            "sources": {
+                "num_layers_in_bf16": list(dict.fromkeys(bf16_params)),
+                "quantization_ignored_layer_kws": list(
+                    dict.fromkeys(keyword_ignored_layers)
+                ),
+                "quantization_ignore_patterns": {
+                    "patterns": list(quantization_ignore_patterns or []),
+                    "matches": pattern_matches,
+                    "match_error": pattern_match_error,
+                },
+                "default_ignored_layers": list(DEFAULT_QUANTIZATION_IGNORED_LAYERS),
+            },
+            "generated": {
+                "ignored_layers": list(
+                    fp8_block_quant_kwargs.get("ignored_layers", [])
+                ),
+                "ignore": list(fp8_block_quant_kwargs.get("ignore", [])),
+            },
+        }
+    return vllm_kwargs, ignore_report
 
 
 def is_fp8_model(vllm_config):
@@ -424,6 +485,37 @@ def is_fp8_model(vllm_config):
         return True
 
     return False
+
+
+def _enumerate_module_prefixes(config) -> list[str]:
+    """Enumerate checkpoint parameter names in vllm's module-prefix namespace.
+
+    ``AutoModel`` builds the *base* model, so ``lm_head`` -- which lives on the
+    ``ForCausalLM`` wrapper -- is never enumerated and any ``lm_head`` pattern
+    reports zero matches even though vllm does exclude that layer. The causal-LM
+    class carries the head and already emits the full ``model.``/``backbone.``
+    prefix that vllm uses, so no prefix is synthesised here. Architectures with
+    no causal-LM mapping (vision-language configs, encoders) fall back to the
+    base model with the historical prefix synthesis.
+
+    ``remove_duplicate=False`` keeps ``lm_head.weight`` when it is tied to
+    ``embed_tokens.weight``; the default dedup by tensor identity drops it.
+    """
+    with init_empty_weights():
+        try:
+            model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+        except (KeyError, ValueError):
+            model = AutoModel.from_config(config, trust_remote_code=True)
+            return [
+                f"model.{name}".removesuffix(".weight").replace(
+                    "model.backbone.", "backbone."
+                )
+                for name, _ in model.named_parameters(remove_duplicate=False)
+            ]
+    return [
+        name.removesuffix(".weight")
+        for name, _ in model.named_parameters(remove_duplicate=False)
+    ]
 
 
 def _get_params_in_layers(param_names, layers):
