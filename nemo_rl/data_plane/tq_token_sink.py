@@ -99,6 +99,18 @@ STAGING_FIELDS = [
 
 _MODE_TO_CODE = {"text": 0, "token_in": 1}
 _CODE_TO_MODE = {code: mode for mode, code in _MODE_TO_CODE.items()}
+GENERATION_CUT_STAGING_PREFIX = "__generation_cut__/"
+
+
+def generation_cut_staging_key(
+    checkpoint_id: str, rollout_id: str, model_call_id: str
+) -> str:
+    """Return a checkpoint-scoped key that cannot collide with a completed call."""
+    if not checkpoint_id or not rollout_id or not model_call_id:
+        raise ValueError("generation-cut key components must be non-empty")
+    return (
+        f"{GENERATION_CUT_STAGING_PREFIX}{checkpoint_id}/{rollout_id}/{model_call_id}"
+    )
 
 
 def _bytes_tensor(value: bytes) -> torch.Tensor:
@@ -158,10 +170,25 @@ class TQTokenSink:
         self._staging_partition = staging_partition
 
     def stage(self, record: StagedCallRecord) -> StageResult:
+        return self._stage_at_key(record, record.staging_key)
+
+    def stage_generation_prefix(
+        self, record: StagedCallRecord, *, checkpoint_id: str
+    ) -> StageResult:
+        """Stage an immutable active-call prefix under a checkpoint-scoped key."""
+        return self._stage_at_key(
+            record,
+            generation_cut_staging_key(
+                checkpoint_id,
+                record.rollout_id,
+                record.model_call_id,
+            ),
+        )
+
+    def _stage_at_key(self, record: StagedCallRecord, key: str) -> StageResult:
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.records import StageResult
 
-        key = record.staging_key
         try:
             field_dict = {
                 "token_ids_delta": torch.tensor(

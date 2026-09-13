@@ -21,6 +21,7 @@ import time
 import uuid
 import warnings
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -47,6 +48,7 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
+    extract_selected_token_logprobs,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
@@ -58,6 +60,58 @@ from nemo_rl.models.generation.openai_server_utils import (
 from nemo_rl.telemetry.setup import shutdown_telemetry
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class _RequestCaptureState:
+    """Latest cumulative token progress for one in-flight captured request."""
+
+    call: Any
+    prompt_token_ids: list[int]
+    generated_token_ids: list[int] = field(default_factory=list)
+    generated_logprobs: list[float] = field(default_factory=list)
+    observation_error: str | None = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+@dataclass(frozen=True)
+class _CompletedCaptureState:
+    """Bounded terminal evidence retained across the response/cut race."""
+
+    coords: Any
+    generation_token_count: int
+
+
+class _CheckpointCaptureGate:
+    """Drain active terminal writes and block new ones across a TQ snapshot."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._open = True
+        self._active = 0
+
+    def enter(self) -> None:
+        with self._condition:
+            while not self._open:
+                self._condition.wait()
+            self._active += 1
+
+    def exit(self) -> None:
+        with self._condition:
+            self._active -= 1
+            if self._active == 0:
+                self._condition.notify_all()
+
+    def close_and_wait(self) -> None:
+        with self._condition:
+            self._open = False
+            while self._active:
+                self._condition.wait()
+
+    def reopen(self) -> None:
+        with self._condition:
+            self._open = True
+            self._condition.notify_all()
 
 
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
@@ -195,9 +249,16 @@ class VllmAsyncGenerationWorkerImpl(
         # the set_rollout_weight_version fan-out from the SC's _sync_weights.
         self.token_capture = None
         self._rollout_weight_version = 0
-        # In-flight captured calls keyed by id(request): (ActiveCall, the
-        # exact engine prompt ids recorded at preprocess time).
-        self._capture_calls: dict[int, tuple[Any, list[int]]] = {}
+        # In-flight captured calls keyed by request and by Gym's stable call ID.
+        self._capture_calls: dict[int, _RequestCaptureState] = {}
+        self._capture_calls_by_model_call_id: dict[str, _RequestCaptureState] = {}
+        self._completed_capture_calls: dict[str, _CompletedCaptureState] = {}
+        self._generation_cut_receipts: dict[tuple[str, str], Any] = {}
+        self._capture_registry_lock = threading.Lock()
+        self._capture_sink: Any | None = None
+        self._generation_prefix_cuts_enabled = False
+        self._generation_cut_control_token: str | None = None
+        self._generation_checkpoint_gate = _CheckpointCaptureGate()
         self._staging_source: Any | None = None
         # Guarded by _prefix_cache_lock: _fetch_chain_prefix runs on executor
         # threads (asyncio.to_thread), so lookups/evictions can be concurrent.
@@ -465,7 +526,12 @@ class VllmAsyncGenerationWorkerImpl(
         self.token_capture = capture
 
     async def setup_token_capture(
-        self, dp_cfg: dict[str, Any], staging_partition: str
+        self,
+        dp_cfg: dict[str, Any],
+        staging_partition: str,
+        *,
+        generation_prefix_cuts_enabled: bool = False,
+        generation_cut_control_token: str | None = None,
     ) -> bool:
         """Host ledger-authoritative token capture in this worker.
 
@@ -486,6 +552,13 @@ class VllmAsyncGenerationWorkerImpl(
 
         dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
         sink = TQTokenSink(dp_client, staging_partition=staging_partition)
+        if generation_prefix_cuts_enabled and not generation_cut_control_token:
+            raise ValueError(
+                "generation-prefix cuts require a non-empty control bearer token"
+            )
+        self._capture_sink = sink
+        self._generation_prefix_cuts_enabled = generation_prefix_cuts_enabled
+        self._generation_cut_control_token = generation_cut_control_token
         self._staging_source = TQTokenSource(
             dp_client, staging_partition=staging_partition
         )
@@ -549,7 +622,59 @@ class VllmAsyncGenerationWorkerImpl(
             prefix_token_ids=prefix_token_ids,
             stream=bool(getattr(request, "stream", False)),
         )
-        self._capture_calls[id(request)] = (call, list(prompt_token_ids))
+        state = _RequestCaptureState(call=call, prompt_token_ids=list(prompt_token_ids))
+        with self._capture_registry_lock:
+            if call.model_call_id in self._capture_calls_by_model_call_id:
+                raise RuntimeError(
+                    f"model call {call.model_call_id!r} is already active in token capture"
+                )
+            self._capture_calls[id(request)] = state
+            self._capture_calls_by_model_call_id[call.model_call_id] = state
+
+    def _observe_request_capture(self, request: Any, request_output: Any) -> None:
+        """Atomically replace one request's latest cumulative token snapshot."""
+        with self._capture_registry_lock:
+            state = self._capture_calls.get(id(request))
+        if state is None:
+            return
+        outputs = getattr(request_output, "outputs", None)
+        if not outputs:
+            return
+        try:
+            generation_token_ids = list(getattr(outputs[0], "token_ids", ()) or ())
+            generation_logprobs = extract_selected_token_logprobs(outputs[0])
+        except (RuntimeError, TypeError, ValueError) as error:
+            with state.lock:
+                state.observation_error = f"{type(error).__name__}: {error}"
+            return
+        with state.lock:
+            state.generated_token_ids = generation_token_ids
+            state.generated_logprobs = generation_logprobs
+            state.observation_error = None
+
+    def _pop_request_capture(self, request: Any) -> _RequestCaptureState | None:
+        with self._capture_registry_lock:
+            state = self._capture_calls.pop(id(request), None)
+            if state is not None:
+                self._capture_calls_by_model_call_id.pop(state.call.model_call_id, None)
+            return state
+
+    def _get_request_capture(self, request: Any) -> _RequestCaptureState | None:
+        with self._capture_registry_lock:
+            return self._capture_calls.get(id(request))
+
+    def _remember_completed_capture(
+        self, model_call_id: str, coords: Any, generation_token_count: int
+    ) -> None:
+        with self._capture_registry_lock:
+            self._completed_capture_calls[model_call_id] = _CompletedCaptureState(
+                coords=coords,
+                generation_token_count=generation_token_count,
+            )
+            if len(self._completed_capture_calls) > 100_000:
+                self._completed_capture_calls.pop(
+                    next(iter(self._completed_capture_calls))
+                )
 
     def _fetch_chain_prefix(self, staging_chain: list[str]) -> list[int]:
         """Assemble prefix token ids from staging_chain, with a worker-local LRU cache."""
@@ -651,6 +776,16 @@ class VllmAsyncGenerationWorkerImpl(
         payload["choices"] = [choice]
 
     def _finish_request_capture(self, request: Any, content: dict) -> dict:
+        """Run terminal token staging outside an active checkpoint cut."""
+        self._generation_checkpoint_gate.enter()
+        try:
+            return self._finish_request_capture_after_checkpoint_gate(request, content)
+        finally:
+            self._generation_checkpoint_gate.exit()
+
+    def _finish_request_capture_after_checkpoint_gate(
+        self, request: Any, content: dict
+    ) -> dict:
         """Stage the finished call and ride its coords on the response.
 
         Fail-closed: the sink write happens inside complete_call —
@@ -660,16 +795,18 @@ class VllmAsyncGenerationWorkerImpl(
         the only token store on this path, so the worker->gate hop carries
         text + delta ids + coords only.
         """
-        state = self._capture_calls.pop(id(request), None)
+        state = self._get_request_capture(request)
         if state is None:
             return content
-        call, prompt_token_ids = state
+        call = state.call
+        prompt_token_ids = state.prompt_token_ids
         payload = dict(content)
         # vLLM's OpenAI response carries no prompt ids; the adapter reads the
         # preprocess-time engine prompt off the payload (see
         # nemo_gym.token_id_capture.adapters.vllm.extract_prompt_ids).
         payload["prompt_token_ids"] = prompt_token_ids
         adapter = self.token_capture.adapter
+        generated_token_ids: list[int] = []
         if adapter is not None:
             try:
                 generated_token_ids, _ = adapter.extract_generation(payload)
@@ -682,6 +819,12 @@ class VllmAsyncGenerationWorkerImpl(
                 generated_len=len(generated_token_ids),
             )
         coords = self.token_capture.complete_call_from_response(call, payload)
+        self._remember_completed_capture(
+            call.model_call_id,
+            coords,
+            len(generated_token_ids),
+        )
+        self._pop_request_capture(request)
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
             # The delta-aligned routes were staged to TQ above; the served
@@ -694,9 +837,116 @@ class VllmAsyncGenerationWorkerImpl(
 
     def _abort_request_capture(self, request: Any, *, reason: str) -> None:
         """Drop the in-flight capture state for a request that errored."""
-        state = self._capture_calls.pop(id(request), None)
+        state = self._pop_request_capture(request)
         if state is not None and self.token_capture is not None:
-            self.token_capture.fail_call(state[0], reason=reason)
+            coords = self.token_capture.fail_call(state.call, reason=reason)
+            self._remember_completed_capture(state.call.model_call_id, coords, 0)
+
+    def _checkpoint_generation_cut(self, inventory: Any) -> Any:
+        """Stage a stable prefix for every call named by Gym's frozen inventory."""
+        from nemo_gym._checkpoint.model_control_contracts import (
+            GenerationCutPrefixAck,
+            GenerationCutReceipt,
+        )
+
+        capture = self.token_capture
+        sink = self._capture_sink
+        if capture is None or sink is None:
+            raise RuntimeError("generation-prefix cuts require token capture setup")
+        receipt_key = (inventory.checkpoint_id, inventory.inventory_digest)
+        with self._capture_registry_lock:
+            cached_receipt = self._generation_cut_receipts.get(receipt_key)
+        if cached_receipt is not None:
+            return cached_receipt
+        acknowledgements = []
+        for prefix in inventory.active_prefixes:
+            with self._capture_registry_lock:
+                state = self._capture_calls_by_model_call_id.get(prefix.model_call_id)
+                completed = self._completed_capture_calls.get(prefix.model_call_id)
+            if state is None:
+                if (
+                    completed is not None
+                    and completed.coords.rollout_id != prefix.rollout_id
+                ):
+                    raise RuntimeError(
+                        "generation-prefix inventory identity does not match the "
+                        f"completed call: model_call_id={prefix.model_call_id!r}"
+                    )
+                if completed is not None and completed.coords.disposition == "staged":
+                    acknowledgements.append(
+                        GenerationCutPrefixAck(
+                            **prefix.model_dump(mode="json"),
+                            disposition="durable_prefix",
+                            frozen_buffer_id=f"terminal/{inventory.checkpoint_id}",
+                            staging_key=completed.coords.staging_key,
+                            prefix_token_count=completed.generation_token_count,
+                            prefix_digest=completed.coords.digest,
+                        )
+                    )
+                else:
+                    acknowledgements.append(
+                        GenerationCutPrefixAck(
+                            **prefix.model_dump(mode="json"),
+                            disposition="durable_failure",
+                        )
+                    )
+                continue
+
+            if state.call.rollout_id != prefix.rollout_id:
+                raise RuntimeError(
+                    "generation-prefix inventory identity does not match the "
+                    f"active call: model_call_id={prefix.model_call_id!r}, "
+                    f"inventory_rollout_id={prefix.rollout_id!r}, "
+                    f"worker_rollout_id={state.call.rollout_id!r}"
+                )
+
+            with state.lock:
+                generated_token_ids = list(state.generated_token_ids)
+                generated_logprobs = list(state.generated_logprobs)
+                observation_error = state.observation_error
+            if observation_error is not None:
+                raise RuntimeError(
+                    f"cannot cut model call {prefix.model_call_id!r}: {observation_error}"
+                )
+            record = capture.build_prefix_record(
+                state.call,
+                prompt_token_ids=state.prompt_token_ids,
+                generated_token_ids=generated_token_ids,
+                generated_logprobs=generated_logprobs,
+            )
+            result = sink.stage_generation_prefix(
+                record, checkpoint_id=inventory.checkpoint_id
+            )
+            if not result.ok:
+                raise RuntimeError(
+                    f"generation-prefix staging failed for {prefix.model_call_id!r}: "
+                    f"{result.error}"
+                )
+            acknowledgements.append(
+                GenerationCutPrefixAck(
+                    **prefix.model_dump(mode="json"),
+                    disposition="durable_prefix",
+                    frozen_buffer_id=f"active/{inventory.checkpoint_id}",
+                    staging_key=result.staging_key,
+                    prefix_token_count=len(generated_token_ids),
+                    prefix_digest=record.digest,
+                )
+            )
+        receipt = GenerationCutReceipt(
+            checkpoint_id=inventory.checkpoint_id,
+            cut_id=f"worker-{inventory.inventory_digest}",
+            inventory_digest=inventory.inventory_digest,
+            inventory=inventory,
+            backend_snapshot_id=f"tq-{inventory.inventory_digest}",
+            prefixes=tuple(acknowledgements),
+        )
+        with self._capture_registry_lock:
+            self._generation_cut_receipts[receipt_key] = receipt
+            if len(self._generation_cut_receipts) > 256:
+                self._generation_cut_receipts.pop(
+                    next(iter(self._generation_cut_receipts))
+                )
+        return receipt
 
     # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
@@ -706,7 +956,7 @@ class VllmAsyncGenerationWorkerImpl(
         from logging import LogRecord
         from typing import List, Optional, Union
 
-        from fastapi import Request
+        from fastapi import Header, HTTPException, Request
         from fastapi.responses import JSONResponse, StreamingResponse
         from vllm.entrypoints.chat_utils import load_chat_template
         from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -989,6 +1239,36 @@ class VllmAsyncGenerationWorkerImpl(
         # belongs on the renderer subclass.
         worker_self = self
 
+        @app.post("/ng-control/v1/generation-cut")
+        async def checkpoint_generation_cut(
+            inventory: dict[str, Any],
+            authorization: str | None = Header(default=None),
+        ):
+            """Persist one checkpoint's frozen active-call prefixes to TQ."""
+            import secrets
+
+            from nemo_gym._checkpoint.model_control_contracts import (
+                GenerationCutInventory,
+            )
+
+            expected = worker_self._generation_cut_control_token
+            supplied = (
+                authorization.removeprefix("Bearer ")
+                if authorization is not None and authorization.startswith("Bearer ")
+                else ""
+            )
+            if not worker_self._generation_prefix_cuts_enabled or expected is None:
+                raise HTTPException(
+                    status_code=404, detail="generation-prefix cuts are disabled"
+                )
+            if not secrets.compare_digest(supplied, expected):
+                raise HTTPException(status_code=401, detail="invalid control bearer")
+            typed_inventory = GenerationCutInventory.model_validate(inventory)
+            receipt = await asyncio.to_thread(
+                worker_self._checkpoint_generation_cut, typed_inventory
+            )
+            return receipt.model_dump(mode="json")
+
         class NeMoRLOpenAIServingChatMixin:
             async def chat_completion_full_generator(
                 self,
@@ -1019,6 +1299,7 @@ class VllmAsyncGenerationWorkerImpl(
                     nonlocal final_res
                     async for res in result_generator:
                         final_res = res
+                        worker_self._observe_request_capture(request, res)
                         yield res
 
                 response = await super().chat_completion_full_generator(
@@ -2026,6 +2307,23 @@ class VllmAsyncGenerationWorkerImpl(
         await self.llm.pause_generation(mode="keep", clear_cache=clear_cache)
         return True
 
+    async def pause_generation_for_checkpoint_async(self) -> bool:
+        """Freeze decoding and block terminal staging before a checkpoint cut."""
+        assert self.llm is not None, (
+            "Attempting to checkpoint-pause an uninitialized vLLM or non-model-owner"
+        )
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "pause_generation_for_checkpoint_async requires async_engine=True"
+            )
+        await asyncio.to_thread(self._generation_checkpoint_gate.close_and_wait)
+        try:
+            await self.llm.pause_generation(mode="keep", clear_cache=False)
+        except BaseException:
+            self._generation_checkpoint_gate.reopen()
+            raise
+        return True
+
     async def resume_generation_async(self) -> bool:
         """Resume vLLM generation after an in-flight weight update."""
         assert self.llm is not None, (
@@ -2038,6 +2336,19 @@ class VllmAsyncGenerationWorkerImpl(
             )
 
         await self.llm.resume_generation()
+        return True
+
+    async def resume_generation_after_checkpoint_async(self) -> bool:
+        """Resume decoding, then release terminal token staging."""
+        assert self.llm is not None, (
+            "Attempting to checkpoint-resume an uninitialized vLLM or non-model-owner"
+        )
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "resume_generation_after_checkpoint_async requires async_engine=True"
+            )
+        await self.llm.resume_generation()
+        self._generation_checkpoint_gate.reopen()
         return True
 
     async def sleep_async(self):
