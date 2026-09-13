@@ -187,6 +187,80 @@ def test_native_source_map_includes_logical_bf16_bulk(
     assert source_map.get(bf16_name, role="weight_scale") is None
 
 
+@pytest.mark.parametrize("gated", [False, True])
+@pytest.mark.parametrize("expert_start", [0, 4])
+def test_native_source_map_real_fused_bf16_views_refresh(
+    monkeypatch: pytest.MonkeyPatch, gated: bool, expert_start: int
+) -> None:
+    from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
+    from megatron.bridge.models.conversion.param_mapping import (
+        FusedExpertMapping,
+        FusedGatedExpertMapping,
+    )
+    from megatron.core import parallel_state
+
+    monkeypatch.setattr(parallel_state, "get_pipeline_model_parallel_rank", lambda: 0)
+    prefix = "model.layers.1.mlp.experts"
+    projections = ("gate_proj", "up_proj") if gated else ("down_proj",)
+    tensors = [torch.full((8, 64), i + 1, dtype=torch.bfloat16) for i in range(2)]
+    tasks = []
+    for local_id in (1, 0):
+        name = (
+            f"decoder.layers.1.mlp.experts.local_experts.{expert_start + local_id}."
+            f"linear_fc{1 if gated else 2}.weight"
+        )
+        mapping = (
+            FusedGatedExpertMapping(name, f"{prefix}.gate_up_proj")
+            if gated
+            else FusedExpertMapping(name, f"{prefix}.down_proj")
+        )
+        tasks.append(
+            WeightConversionTask(
+                pp_rank=0,
+                vp_stage=0,
+                param_name=name,
+                global_param_name=name,
+                megatron_module=None,
+                param_weight=tensors[local_id],
+                mapping=mapping,
+            )
+        )
+
+    worker = _native_worker([])
+    worker.refit_payload_mode = "hf_export"
+    worker._native_bf16_bulk_conversion_tasks = tasks
+    info = {
+        "layer_names": ["model.layers.1"],
+        "per_layer_params": {
+            "model.layers.1": [
+                {
+                    "name": f"{prefix}.{projection}.weight",
+                    "grouped_expert_proj": projection,
+                    "components": [
+                        {
+                            "role": "weight",
+                            "global_shape": (expert_start + 2, 4 if gated else 8, 64),
+                            "dtype": "torch.bfloat16",
+                        }
+                    ],
+                }
+                for projection in projections
+            ]
+        },
+    }
+    source_map = worker.build_hf_to_local_param_map(info)
+    for increment in (0, 10, 20):
+        for tensor in tensors:
+            tensor.add_(increment)
+        for projection_id, projection in enumerate(projections):
+            expected = torch.stack(
+                [tensor.chunk(2, dim=0)[projection_id] if gated else tensor for tensor in tensors]
+            )
+            spec = source_map.get(f"{prefix}.{projection}.weight", role="weight")
+            actual = worker._materialize_local_refit_spec(spec, {}).buf
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_group_experts_stacks_in_order():
     prefix = "model.layers.0.mlp.experts"
     e0 = torch.randn(1536, 4096)
