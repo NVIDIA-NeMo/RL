@@ -1055,6 +1055,7 @@ class VllmAsyncGenerationWorkerImpl(
             ServingTokenization,
         )
         from vllm.renderers.online_renderer import OnlineRenderer
+        from vllm.sampling_params import RequestOutputKind
         from vllm.exceptions import VLLMValidationError
         from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
         from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
@@ -1358,6 +1359,19 @@ class VllmAsyncGenerationWorkerImpl(
             # Ledger-authoritative token capture: the call identity the ledger
             # attaches (rollout_id, call_id, parent_call_id, prev_len, mode).
             ng_capture: Optional[dict[str, Any]] = None
+
+            def to_sampling_params(self, *args, **kwargs):
+                sampling_params = super().to_sampling_params(*args, **kwargs)
+                if (
+                    worker_self._generation_prefix_cuts_enabled
+                    and self.ng_capture is not None
+                ):
+                    # Gym's public request remains non-streaming, but prefix
+                    # cuts need vLLM to publish cumulative in-flight outputs
+                    # to the internal full-response generator. FINAL_ONLY
+                    # otherwise yields nothing until the request completes.
+                    sampling_params.output_kind = RequestOutputKind.CUMULATIVE
+                return sampling_params
 
         # vLLM 0.25 routes both /v1/chat/completions and /tokenize through
         # OnlineRenderer.preprocess_chat, so the prefix-token override
