@@ -94,26 +94,28 @@ def _value_batch_size(value: Any) -> int:
         ) from error
 
 
-def _copy_batch_value(value: Any) -> Any:
-    if isinstance(value, torch.Tensor):
-        return value.detach().clone()
-    return deepcopy(value)
+def _is_identity_indices(indices: list[int], batch_size: int) -> bool:
+    return len(indices) == batch_size and all(
+        index == position for position, index in enumerate(indices)
+    )
 
 
 def _select_batch_value(value: Any, indices: list[int]) -> Any:
+    if _is_identity_indices(indices, _value_batch_size(value)):
+        return value
     if isinstance(value, torch.Tensor):
         index = torch.tensor(indices, dtype=torch.long, device=value.device)
-        return value.index_select(0, index).detach().clone()
+        return value.index_select(0, index)
     if isinstance(value, PackedTensor):
         if not indices:
             return PackedTensor.empty_rows_like(value, 0)
-        return deepcopy(value.slice(indices))
+        return value.slice(indices)
     if isinstance(value, tuple):
-        return tuple(deepcopy(value[index]) for index in indices)
+        return tuple(value[index] for index in indices)
     if isinstance(value, list):
-        return [deepcopy(value[index]) for index in indices]
+        return [value[index] for index in indices]
     try:
-        return deepcopy(value[indices])
+        return value[indices]
     except (IndexError, KeyError, TypeError) as error:
         raise TypeError(
             f"Cannot select rows from local field type {type(value).__name__}."
@@ -385,7 +387,7 @@ class LocalDataPlaneClient(DataPlaneClient):
                         f"Local field {name!r} has batch size {actual_size}, "
                         f"expected {len(sample_ids)}."
                     )
-                batch[name] = _copy_batch_value(value)
+                batch[name] = value
 
         partition.sample_ids = list(sample_ids)
         partition.batch = batch

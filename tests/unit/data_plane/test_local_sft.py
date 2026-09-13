@@ -87,6 +87,39 @@ def test_local_round_trip_preserves_tensor_and_packed_tensor_fields() -> None:
     assert torch.equal(pixels.tensors[1], torch.full((2, 2), 2.0))
 
 
+def test_local_full_fetch_shares_tensor_storage() -> None:
+    client = _client()
+    _register(client)
+    input_ids = torch.tensor([[1, 2, 0], [3, 4, 5]])
+    pixel_rows = [torch.full((1, 2), 1.0), torch.full((2, 2), 2.0)]
+    pixels = PackedTensor(
+        pixel_rows,
+        dim_to_pack=0,
+        preprocess_mode="pad_to_max_shape",
+    ).enable_deduplication()
+    fields = local_batch_to_tensordict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": torch.tensor([2, 3]),
+            "pixel_values": pixels,
+            "source_ids": ["source-a", "source-b"],
+        },
+        batch_size=2,
+    )
+    meta = client.put_samples(
+        sample_ids=["a", "b"],
+        partition_id="step-0",
+        fields=fields,
+        tags=[{"source": "source-a"}, {"source": "source-b"}],
+    )
+    batch = materialize_local(client.get_data(meta))
+
+    assert batch["input_ids"].data_ptr() == input_ids.data_ptr()
+    fetched_pixels = batch["pixel_values"]
+    assert fetched_pixels.tensors[0] is pixel_rows[0]
+    assert fetched_pixels.tensors[1] is pixel_rows[1]
+
+
 def test_local_subset_preserves_requested_order_and_packed_rows() -> None:
     client = _client()
     _register(client)
