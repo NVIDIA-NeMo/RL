@@ -104,6 +104,7 @@ from nemo_rl.environments.gym_checkpoint import (
     GymCheckpointTopology,
     gym_checkpoint_continuations,
     gym_checkpoint_staging_keys,
+    gym_generation_cut_staging_keys,
     validate_gym_checkpoint_manifests,
     validate_gym_checkpoint_restore_artifacts,
 )
@@ -779,6 +780,15 @@ def _spinup_gym(
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     enable_router_replay = router_replay_enabled(policy_config)
+    if (
+        master_config.rollout_checkpointing.gym.generation_prefix_cuts_enabled
+        and enable_router_replay
+    ):
+        raise NotImplementedError(
+            "generation-prefix recovery does not yet preserve the original "
+            "per-token routed-expert trace; disable policy.router_replay or "
+            "generation-prefix cuts"
+        )
     shard_set = build_nemo_gym_actors(
         master_config.env,
         base_urls=base_urls,
@@ -1431,13 +1441,6 @@ def setup_single_controller(
             )
     snapshot_resolution_seconds = time.monotonic() - snapshot_resolution_started
     if resolved_snapshot is not None:
-        if resolved_snapshot.manifest.gym_generation_cut_proofs:
-            raise NotImplementedError(
-                "the selected rollout snapshot contains active generation-prefix "
-                "cuts, but token-prefix restore is not implemented in capture "
-                "phase 1; select an earlier snapshot or wait for the prefix-replay "
-                "phase before restoring this cut"
-            )
         recovery_checkpoint_path = str(resolved_snapshot.path)
         save_state.current_epoch = resolved_snapshot.manifest.current_epoch
         save_state.sampler_dispatch_index = (
@@ -1930,6 +1933,7 @@ def setup_single_controller(
 
     restored_gym_checkpoint_staging_keys: tuple[str, ...] = ()
     restored_gym_checkpoint_continuations: tuple[GymCheckpointContinuation, ...] = ()
+    generation_cut_exclusions: tuple[dict[str, object], ...] = ()
     if saved_gym_checkpoint is not None:
         assert resolved_snapshot is not None
         assert gym_checkpoint_topology is not None
@@ -1941,17 +1945,45 @@ def setup_single_controller(
             resolved_snapshot.path,
             saved_gym_checkpoint,
         )
+        restored_gym_checkpoint_continuations = gym_checkpoint_continuations(
+            resolved_snapshot.path,
+            saved_gym_checkpoint,
+        )
+        restart_only_resources = set(gym_checkpoint_topology.restart_only_resources())
+        excluded_generation_cut_replacements = {
+            (
+                continuation.rollout_id,
+                continuation.replacement_attempt_index,
+            )
+            for continuation in restored_gym_checkpoint_continuations
+            if restart_only_resources
+            and (
+                continuation.resource_state_revisions is None
+                or bool(
+                    restart_only_resources.intersection(
+                        name
+                        for name, _revision in continuation.resource_state_revisions
+                    )
+                )
+            )
+        }
+        generation_cut_exclusions = tuple(
+            {"rollout_id": rollout_id, "attempt_index": attempt_index}
+            for rollout_id, attempt_index in sorted(
+                excluded_generation_cut_replacements
+            )
+        )
         restored_gym_checkpoint_staging_keys = tuple(
             sorted(
                 gym_checkpoint_staging_keys(
                     resolved_snapshot.path,
                     saved_gym_checkpoint,
                 )
+                | gym_generation_cut_staging_keys(
+                    resolved_snapshot.manifest.gym_generation_cut_proofs,
+                    excluded_replacements=excluded_generation_cut_replacements,
+                )
             )
-        )
-        restored_gym_checkpoint_continuations = gym_checkpoint_continuations(
-            resolved_snapshot.path,
-            saved_gym_checkpoint,
         )
 
     # SimpleStorage's dedicated storage actors already exist, so preserve its
@@ -1979,6 +2011,7 @@ def setup_single_controller(
 
     if saved_gym_checkpoint is not None:
         assert resolved_snapshot is not None
+        assert gym_checkpoint_topology is not None
         awaitable_gym_actor = sole_nemo_gym_checkpoint_actor(env_handles["nemo_gym"])
         gym_checkpoint_restore_operation_id = f"restore-{uuid.uuid4().hex}"
         restore_deadline_ts = time.time() + rollout_checkpoint_cfg.gym.prepare_timeout_s
@@ -1989,6 +2022,8 @@ def setup_single_controller(
                     restore_deadline_ts,
                     str(resolved_snapshot.path),
                     saved_gym_checkpoint.checkpoint_id,
+                    resolved_snapshot.manifest.gym_generation_cut_proofs,
+                    generation_cut_exclusions,
                 )
             )
         )
