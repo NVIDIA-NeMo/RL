@@ -154,4 +154,4 @@ backend-path = ["."]
 # username (build-custom-trtllm.sh's caller does).
 # The ref is user/zongfeij/rl @ 1.3.0rc23: 
 url = "https://${GITLAB_CLONE_ACCESS_TOKEN}@gitlab-master.nvidia.com/ftp/tekit.git"
-ref = "854bcea1448d7c0429acae0d718483f018e8a919"   # pragma: allowlist secret
+ref = "b1cecb7c9db5d48e131c1bbc24ccfab955018553"   # pragma: allowlist secret
