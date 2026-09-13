@@ -119,7 +119,7 @@ def configure_deferred_evaluation(config: dict) -> dict | None:
         # checkpoint the whole run.)
         save_period=first,
         # The rules require every step from val_start_at until the stop step;
-        # never prune the window.
+        # never prune the window (None keeps all checkpoints).
         keep_top_k=None,
     )
     return deferred

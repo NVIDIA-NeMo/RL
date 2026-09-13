@@ -92,7 +92,7 @@ class CheckpointingConfig(TypedDict):
     metric_name: str | None
     higher_is_better: bool
     save_period: int
-    keep_top_k: NotRequired[int]
+    keep_top_k: NotRequired[int | None]  # None keeps all checkpoints
     checkpoint_must_save_by: NotRequired[str | None]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
     save_optimizer: NotRequired[bool]  # Default: True
