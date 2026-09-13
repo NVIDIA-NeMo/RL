@@ -31,7 +31,7 @@ from nemo_rl.algorithms.loss import (
     DistillationLossDataDict,
     DistillationLossFn,
 )
-from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.algorithms.utils import check_train_dataloader_not_empty, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
@@ -299,6 +299,12 @@ def setup(
         shuffle=data_config["shuffle"],
         collate_fn=rl_collate_fn,
         drop_last=True,
+    )
+    check_train_dataloader_not_empty(
+        dataloader,
+        dataset=train_dataset,
+        batch_size=distillation_config.num_prompts_per_step,
+        batch_size_source="distillation.num_prompts_per_step",
     )
 
     if last_checkpoint_path:

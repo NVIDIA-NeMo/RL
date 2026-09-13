@@ -2787,7 +2787,11 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node(
     with (
         patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
         patch("nemo_rl.algorithms.grpo.CheckpointManager") as mock_checkpointer,
-        patch("nemo_rl.algorithms.grpo.StatefulDataLoader"),
+        patch(
+            "nemo_rl.algorithms.grpo.StatefulDataLoader",
+            # The zero-batch setup guard reads len(); a bare MagicMock is 0.
+            **{"return_value.__len__.return_value": 10},
+        ),
         pytest.raises(
             AssertionError,
             match="policy.generation.colocated.resources.gpus_per_node must be explicitly set",
@@ -3065,7 +3069,11 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(
     with (
         patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
         patch("nemo_rl.algorithms.grpo.CheckpointManager") as mock_checkpointer,
-        patch("nemo_rl.algorithms.grpo.StatefulDataLoader"),
+        patch(
+            "nemo_rl.algorithms.grpo.StatefulDataLoader",
+            # The zero-batch setup guard reads len(); a bare MagicMock is 0.
+            **{"return_value.__len__.return_value": 10},
+        ),
         pytest.raises(
             AssertionError,
             match="policy.generation.colocated.resources.gpus_per_node must be explicitly set",
@@ -3114,7 +3122,11 @@ def test_noncolocated_opd_teacher_must_fit_on_one_cluster_node(
     with (
         patch("nemo_rl.algorithms.grpo.Logger"),
         patch("nemo_rl.algorithms.grpo.CheckpointManager") as mock_checkpointer,
-        patch("nemo_rl.algorithms.grpo.StatefulDataLoader"),
+        patch(
+            "nemo_rl.algorithms.grpo.StatefulDataLoader",
+            # The zero-batch setup guard reads len(); a bare MagicMock is 0.
+            **{"return_value.__len__.return_value": 10},
+        ),
         patch(
             "nemo_rl.algorithms.grpo.opd_module.reserve_teacher_clusters"
         ) as mock_reserve_teacher_clusters,

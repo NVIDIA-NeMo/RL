@@ -59,6 +59,7 @@ from nemo_rl.algorithms.reward_functions import (
 from nemo_rl.algorithms.utils import (
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
+    check_train_dataloader_not_empty,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_efficiency_summary,
@@ -673,6 +674,17 @@ def setup(
             collate_fn=rl_collate_fn,
             drop_last=True,
             num_workers=data_config["num_workers"],
+        )
+        check_train_dataloader_not_empty(
+            dataloader,
+            dataset=dataset,
+            batch_size=dataloader_batch_size,
+            batch_size_source=(
+                "num_prompts_per_dataloader * batch_multiplier"
+                if data_config["use_multiple_dataloader"]
+                else "num_prompts_per_step * batch_multiplier"
+            ),
+            context=f" for task '{suffix.removeprefix('_')}'" if suffix else "",
         )
         if last_checkpoint_path is not None:
             load_dataloader_state(dataloader, last_checkpoint_path, data_config, suffix)

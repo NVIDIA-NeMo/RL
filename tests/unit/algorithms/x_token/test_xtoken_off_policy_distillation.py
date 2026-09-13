@@ -275,7 +275,9 @@ def mock_xtoken_components():
 # ---------------------------------------------------------------------------
 
 
-def _patched_setup_call(master_config, *, student_vocab=32, teacher_vocab=24):
+def _patched_setup_call(
+    master_config, *, student_vocab=32, teacher_vocab=24, dataloader_len=10
+):
     """Drive setup() with every heavy collaborator patched out."""
     student_tok = _make_tokenizer(student_vocab)
     teacher_tok = _make_tokenizer(teacher_vocab)
@@ -299,7 +301,10 @@ def _patched_setup_call(master_config, *, student_vocab=32, teacher_vocab=24):
         mock_cp_cls.return_value.get_latest_checkpoint_path.return_value = None
         mock_cp_cls.return_value.load_training_info.return_value = None
         mock_cp_cls.return_value.get_resume_paths.return_value = (None, None)
-        mock_dl_cls.side_effect = lambda *a, **kw: MagicMock(spec=StatefulDataLoader)
+        # The zero-batch setup guard reads len(); a bare MagicMock is 0.
+        mock_dl_cls.side_effect = lambda *a, **kw: MagicMock(
+            spec=StatefulDataLoader, **{"__len__.return_value": dataloader_len}
+        )
         mock_policy_cls.side_effect = lambda *a, **kw: MagicMock(data_parallel_size=1)
 
         result = setup(
@@ -315,6 +320,20 @@ def _patched_setup_call(master_config, *, student_vocab=32, teacher_vocab=24):
             "loss": mock_loss_cls,
             "checkpointer": mock_cp_cls,
         }
+
+
+def test_setup_rejects_empty_train_dataloader():
+    """#921 guard: a train dataloader that would yield zero batches must fail
+    setup with an actionable error naming the configured batch size."""
+    with pytest.raises(ValueError, match="zero batches") as excinfo:
+        _patched_setup_call(_make_master_config(), dataloader_len=0)
+    assert "distillation.num_prompts_per_step" in str(excinfo.value)
+
+
+def test_setup_accepts_single_batch_train_dataloader():
+    """A dataset exactly one batch long (len(dataloader) == 1) passes the guard."""
+    _, mocks = _patched_setup_call(_make_master_config(), dataloader_len=1)
+    assert mocks["policy"].called
 
 
 def test_empty_teachers_list_rejected_at_config_load():
@@ -418,7 +437,10 @@ def test_setup_val_dataloader_gating(
         mock_cp_cls.return_value.get_latest_checkpoint_path.return_value = None
         mock_cp_cls.return_value.load_training_info.return_value = None
         mock_cp_cls.return_value.get_resume_paths.return_value = (None, None)
-        mock_dl_cls.side_effect = lambda *a, **kw: MagicMock(spec=StatefulDataLoader)
+        # The zero-batch setup guard reads len(); a bare MagicMock is 0.
+        mock_dl_cls.side_effect = lambda *a, **kw: MagicMock(
+            spec=StatefulDataLoader, **{"__len__.return_value": 10}
+        )
         mock_policy_cls.side_effect = lambda *a, **kw: MagicMock(data_parallel_size=1)
 
         (
@@ -770,7 +792,10 @@ def test_setup_builds_one_policy_per_teacher():
         mock_cp_cls.return_value.get_latest_checkpoint_path.return_value = None
         mock_cp_cls.return_value.load_training_info.return_value = None
         mock_cp_cls.return_value.get_resume_paths.return_value = (None, None)
-        mock_dl_cls.side_effect = lambda *a, **kw: MagicMock(spec=StatefulDataLoader)
+        # The zero-batch setup guard reads len(); a bare MagicMock is 0.
+        mock_dl_cls.side_effect = lambda *a, **kw: MagicMock(
+            spec=StatefulDataLoader, **{"__len__.return_value": 10}
+        )
         mock_policy_cls.side_effect = lambda *a, **kw: MagicMock(data_parallel_size=1)
 
         (_student, teachers, *_rest) = setup(

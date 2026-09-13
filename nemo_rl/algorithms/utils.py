@@ -1081,3 +1081,41 @@ def print_efficiency_summary(
     loggable["efficiency/efficiency_pct_is_per_step"] = float(pct_is_per_step)
 
     return loggable
+
+
+def check_train_dataloader_not_empty(
+    dataloader: Any,
+    *,
+    dataset: Any,
+    batch_size: int,
+    batch_size_source: str,
+    context: str = "",
+) -> None:
+    """Fail fast when the training dataloader would yield zero batches.
+
+    With ``drop_last=True``, an oversized batch can prevent all gradient
+    updates. Skip this check if the dataloader or dataset has no defined length.
+
+    Args:
+        dataloader: Training dataloader.
+        dataset: Underlying training dataset.
+        batch_size: Effective dataloader batch size.
+        batch_size_source: Configuration key or expression shown in the error.
+        context: Optional suffix identifying the dataloader in the error.
+    """
+    try:
+        num_batches = len(dataloader)
+        dataset_size = len(dataset)
+    except TypeError:
+        # Iterable-style dataset without a length; nothing to pre-check.
+        return
+    if num_batches > 0:
+        return
+    raise ValueError(
+        f"The train dataloader{context} would yield zero batches: "
+        f"{batch_size_source}={batch_size} exceeds the dataset size "
+        f"({dataset_size} samples), and with drop_last=True the only, partial "
+        f"batch is dropped. Training would silently complete without a single "
+        f"gradient update. Reduce {batch_size_source} to at most the dataset "
+        f"size, or provide more data."
+    )
