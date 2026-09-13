@@ -113,6 +113,25 @@ def generation_cut_staging_key(
     )
 
 
+def _staging_key_matches_snapshot(key: str, snapshot: StagedCallBaseSnapshot) -> bool:
+    """Validate a physical TQ key against the row's logical call identity.
+
+    Completed calls use their logical ``rollout_id/model_call_id`` identity as
+    the physical key. Generation cuts add a checkpoint namespace in front of
+    that same identity so multiple immutable cuts cannot collide. The staged
+    Gym snapshot intentionally contains only the logical identity, so compare
+    the suffix for checkpoint-scoped keys while retaining exact validation for
+    ordinary rows.
+    """
+    if key == snapshot.staging_key:
+        return True
+    if not key.startswith(GENERATION_CUT_STAGING_PREFIX):
+        return False
+    checkpoint_and_identity = key.removeprefix(GENERATION_CUT_STAGING_PREFIX)
+    checkpoint_id, separator, logical_key = checkpoint_and_identity.partition("/")
+    return bool(checkpoint_id and separator and logical_key == snapshot.staging_key)
+
+
 def _bytes_tensor(value: bytes) -> torch.Tensor:
     """Encode non-empty bytes as one jagged TQ row."""
     if not value:
@@ -464,7 +483,7 @@ class TQTokenSource:
         for index, key in enumerate(staging_keys):
             row = _select_row(rows, index)
             snapshot = _row_to_base_snapshot(row)
-            if snapshot.staging_key != key:
+            if not _staging_key_matches_snapshot(key, snapshot):
                 raise KeyError(
                     f"staged row identity mismatch: requested {key!r}, got {snapshot.staging_key!r}"
                 )
