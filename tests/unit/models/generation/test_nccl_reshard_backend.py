@@ -886,7 +886,7 @@ def test_nccl_reshard_lifecycle_repeats_for_trtllm_moe_modules(monkeypatch):
     for cycle in range(2):
         with ext._weight_update_lifecycle("nccl_reshard") as finalize:
             call_order.append(("transfer", cycle))
-            finalize()
+            finalize(False)
 
     assert call_order == [
         ("initialize", trtllm_moe),
@@ -934,7 +934,7 @@ def test_nccl_reshard_refit_runs_transport_lifecycle(monkeypatch):
 
     assert ext.nccl_reshard_refit() is True
     assert lifecycle_calls == ["nccl_reshard"]
-    finalize.assert_called_once_with()
+    finalize.assert_called_once_with(False)
 
 
 def test_build_hf_to_local_param_map_quantizes_bf16_for_mxfp8(monkeypatch):
