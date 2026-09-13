@@ -108,7 +108,11 @@ def test_checkpoint_requests_use_required_new_only_artifact_contract() -> None:
     expected_common = {"schema_version": GYM_CHECKPOINT_SCHEMA_VERSION, **common}
 
     assert GymAgentCheckpointDirectoryRequest(**common).model_dump() == expected_common
-    assert GymModelCheckpointRestoreRequest(**common).model_dump() == expected_common
+    assert GymModelCheckpointRestoreRequest(**common).model_dump() == {
+        **expected_common,
+        "generation_cut_receipts": [],
+        "generation_cut_exclusions": [],
+    }
     assert GymModelCheckpointCommitRequest(
         **common,
         continuation_indexes=[],
