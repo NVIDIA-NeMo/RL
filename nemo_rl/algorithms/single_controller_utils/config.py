@@ -758,6 +758,9 @@ class GymRolloutCheckpointConfig(BaseModel, extra="forbid"):
 
     capability_discovery_enabled: bool = False
     participant_checkpointing_enabled: bool = False
+    # Freeze active vLLM requests at snapshot time and persist their current
+    # token prefixes instead of waiting for every model response to finish.
+    generation_prefix_cuts_enabled: bool = False
     prepare_timeout_s: Annotated[float, Field(gt=0)] = 300.0
 
     @model_validator(mode="after")
@@ -769,6 +772,14 @@ class GymRolloutCheckpointConfig(BaseModel, extra="forbid"):
             raise ValueError(
                 "participant_checkpointing_enabled=true requires "
                 "capability_discovery_enabled=true"
+            )
+        if (
+            self.generation_prefix_cuts_enabled
+            and not self.participant_checkpointing_enabled
+        ):
+            raise ValueError(
+                "generation_prefix_cuts_enabled=true requires "
+                "participant_checkpointing_enabled=true"
             )
         return self
 

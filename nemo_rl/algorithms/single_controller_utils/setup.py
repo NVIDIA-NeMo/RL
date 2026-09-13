@@ -788,7 +788,12 @@ def _spinup_gym(
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
         # Ledger config rides into Gym's policy model server.
         token_capture=(
-            master_config.token_capture.model_dump()
+            {
+                **master_config.token_capture.model_dump(),
+                "generation_prefix_cuts_enabled": (
+                    master_config.rollout_checkpointing.gym.generation_prefix_cuts_enabled
+                ),
+            }
             if master_config.token_capture.enabled
             else None
         ),
@@ -1426,6 +1431,13 @@ def setup_single_controller(
             )
     snapshot_resolution_seconds = time.monotonic() - snapshot_resolution_started
     if resolved_snapshot is not None:
+        if resolved_snapshot.manifest.gym_generation_cut_proofs:
+            raise NotImplementedError(
+                "the selected rollout snapshot contains active generation-prefix "
+                "cuts, but token-prefix restore is not implemented in capture "
+                "phase 1; select an earlier snapshot or wait for the prefix-replay "
+                "phase before restoring this cut"
+            )
         recovery_checkpoint_path = str(resolved_snapshot.path)
         save_state.current_epoch = resolved_snapshot.manifest.current_epoch
         save_state.sampler_dispatch_index = (
@@ -2080,7 +2092,14 @@ def setup_single_controller(
         # Host Gym's capture core in every vLLM DP leader (in-worker DP
         # client + TQTokenSink + the single install_capture call), and give
         # workers the initial weight version to stamp on captured calls.
-        generation.setup_token_capture(dp_config, token_capture_cfg.staging_partition)
+        generation.setup_token_capture(
+            dp_config,
+            token_capture_cfg.staging_partition,
+            generation_prefix_cuts_enabled=(
+                rollout_checkpoint_cfg.gym.generation_prefix_cuts_enabled
+            ),
+            generation_cut_control_token=token_capture_cfg.control_auth_token,
+        )
         generation.set_rollout_weight_version(0)
 
     if weight_synchronizer is None:
