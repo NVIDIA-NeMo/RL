@@ -145,9 +145,9 @@ from nemo_rl.environments.gym_checkpoint import (
     GymCheckpointCommitResult,
     GymCheckpointPrepareResult,
     GymCompletedExecution,
+    gym_checkpoint_staging_keys,
     gym_generation_cut_proofs,
     gym_generation_cut_staging_keys,
-    gym_checkpoint_staging_keys,
     validate_gym_checkpoint_manifests,
 )
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
@@ -1814,6 +1814,7 @@ class SingleControllerActor:
         timeout_s = self._master_config.rollout_checkpointing.gym.prepare_timeout_s
         gym_actor = self._nemo_gym_checkpoint_actor()
         prepared = False
+        generation_cut_staging_keys: set[str] = set()
         self._gym_checkpoint_rollout_permitted.clear()
         try:
             # A completed agent result blocks Gym prepare until RL has durably
@@ -1846,6 +1847,7 @@ class SingleControllerActor:
                     time.time() + timeout_s,
                 )
             )
+            generation_cut_staging_keys = gym_generation_cut_staging_keys(prepare)
             if not prepare.ready:
                 raise RuntimeError(
                     f"Gym checkpoint {checkpoint_id!r} returned an incomplete cut"
@@ -1876,17 +1878,20 @@ class SingleControllerActor:
             )
             return prepare, checkpoint
         except BaseException as checkpoint_error:
+            recovery_errors: list[BaseException] = [checkpoint_error]
+            try:
+                await self._clear_generation_cut_staging_rows(
+                    generation_cut_staging_keys
+                )
+            except BaseException as cleanup_error:
+                recovery_errors.append(cleanup_error)
             if prepared:
                 try:
                     await self._release_prepared_gym_checkpoint(
                         checkpoint_id, committed=False
                     )
                 except BaseException as abort_error:
-                    raise BaseExceptionGroup(
-                        "Gym checkpoint failed and participant admission could not "
-                        "be restored",
-                        [checkpoint_error, abort_error],
-                    )
+                    recovery_errors.append(abort_error)
             else:
                 if self._generation_checkpoint_pause_id == checkpoint_id:
                     try:
@@ -1895,13 +1900,16 @@ class SingleControllerActor:
                             timeout_s=timeout_s,
                         )
                     except BaseException as resume_error:
-                        raise BaseExceptionGroup(
-                            "Gym checkpoint prepare failed and generation could "
-                            "not be resumed",
-                            [checkpoint_error, resume_error],
-                        )
-                    self._generation_checkpoint_pause_id = None
+                        recovery_errors.append(resume_error)
+                    else:
+                        self._generation_checkpoint_pause_id = None
                 self._gym_checkpoint_rollout_permitted.set()
+            if len(recovery_errors) > 1:
+                raise BaseExceptionGroup(
+                    "Gym checkpoint failed and checkpoint admission cleanup also "
+                    "failed",
+                    recovery_errors,
+                )
             raise
 
     async def _release_prepared_gym_checkpoint(
@@ -4058,7 +4066,6 @@ class SingleControllerActor:
         checkpoint_path: PathLike,
         *,
         gym_staging_keys: set[str] | None = None,
-        generation_cut_staging_keys: set[str] | None = None,
     ) -> _RolloutCheckpointCut:
         """Save TQ and capture matching restart state under the barrier.
 
@@ -4122,22 +4129,6 @@ class SingleControllerActor:
             rollout_recovery_group_count=len(recovery_state["groups"]),
         )
         tq_save_seconds = time.monotonic() - tq_save_started
-        # The immutable TQ checkpoint now owns these active-prefix rows. Remove
-        # only checkpoint-scoped copies from the live staging partition so
-        # periodic cuts do not accumulate. A terminal row may also appear in a
-        # cut receipt due to a completion race; it is deliberately retained for
-        # the live finalizer.
-        ephemeral_cut_keys = sorted(
-            key
-            for key in generation_cut_staging_keys or ()
-            if key.startswith(GENERATION_CUT_STAGING_PREFIX)
-        )
-        if ephemeral_cut_keys:
-            await self._call_dp(
-                "clear_samples",
-                sample_ids=ephemeral_cut_keys,
-                partition_id=self._master_config.token_capture.staging_partition,
-            )
         return _RolloutCheckpointCut(
             dataloader_state=dataloader_state,
             sampler_dispatch_index=self._sampler.dispatch_index,
@@ -4151,6 +4142,23 @@ class SingleControllerActor:
             mutation_version=self._data_plane_checkpoint_barrier.mutation_version,
             tq_save_seconds=tq_save_seconds,
         )
+
+    async def _clear_generation_cut_staging_rows(
+        self,
+        generation_cut_staging_keys: set[str],
+    ) -> None:
+        """Remove checkpoint-only prefix rows from live TQ state."""
+        ephemeral_cut_keys = sorted(
+            key
+            for key in generation_cut_staging_keys
+            if key.startswith(GENERATION_CUT_STAGING_PREFIX)
+        )
+        if ephemeral_cut_keys:
+            await self._call_dp(
+                "clear_samples",
+                sample_ids=ephemeral_cut_keys,
+                partition_id=self._master_config.token_capture.staging_partition,
+            )
 
     async def _write_rollout_checkpoint_sidecars(
         self,
@@ -4349,6 +4357,7 @@ class SingleControllerActor:
             gym_checkpoint: Optional[GymCheckpointCommitResult] = None
             gym_staging_keys: set[str] = set()
             generation_cut_staging_keys: set[str] = set()
+            generation_cut_rows_cleared = False
             # A failed attempt removes its temporary directory, so its numeric
             # snapshot sequence can be reused. Gym retires every completed or
             # aborted control ID, however; add a nonce so the next attempt is not
@@ -4401,12 +4410,25 @@ class SingleControllerActor:
                             cut,
                             tmp_path,
                             gym_staging_keys=gym_staging_keys,
-                            generation_cut_staging_keys=generation_cut_staging_keys,
                         )
+                        # The immutable TQ checkpoint now owns these active-prefix
+                        # rows. Remove only checkpoint-scoped copies from the live
+                        # staging partition so periodic cuts do not accumulate. A
+                        # terminal row may also appear in a cut receipt due to a
+                        # completion race; it is deliberately retained for the live
+                        # finalizer.
+                        await self._clear_generation_cut_staging_rows(
+                            generation_cut_staging_keys
+                        )
+                        generation_cut_rows_cleared = True
                 barrier_released = time.monotonic()
 
                 if trainer_state_changed:
                     await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
+                    await self._clear_generation_cut_staging_rows(
+                        generation_cut_staging_keys
+                    )
+                    generation_cut_rows_cleared = True
                     if gym_checkpoint is not None:
                         gym_abort_attempted = True
                         await self._release_prepared_gym_checkpoint(
@@ -4473,8 +4495,16 @@ class SingleControllerActor:
                 )
                 snapshot_commit_seconds = time.monotonic() - snapshot_commit_started
             except BaseException as save_error:
+                recovery_errors: list[BaseException] = [save_error]
                 if tmp_path.exists():
                     await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
+                if not generation_cut_rows_cleared:
+                    try:
+                        await self._clear_generation_cut_staging_rows(
+                            generation_cut_staging_keys
+                        )
+                    except BaseException as cleanup_error:
+                        recovery_errors.append(cleanup_error)
                 if gym_checkpoint is not None and not gym_abort_attempted:
                     try:
                         await self._release_prepared_gym_checkpoint(
@@ -4482,11 +4512,12 @@ class SingleControllerActor:
                             committed=False,
                         )
                     except BaseException as abort_error:
-                        raise BaseExceptionGroup(
-                            "rollout checkpoint failed and Gym participant admission "
-                            "could not be restored",
-                            [save_error, abort_error],
-                        )
+                        recovery_errors.append(abort_error)
+                if len(recovery_errors) > 1:
+                    raise BaseExceptionGroup(
+                        "rollout checkpoint failed and checkpoint cleanup also failed",
+                        recovery_errors,
+                    )
                 raise
 
             self._last_rollout_snapshot_mutation_version = snapshot_cut.mutation_version

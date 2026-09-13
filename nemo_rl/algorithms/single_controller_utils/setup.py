@@ -199,6 +199,21 @@ class SingleControllerActorArgs:
     value_loss_fn: Optional[LossFunction] = None
 
 
+def _validate_generation_prefix_restore_compatibility(
+    *,
+    generation_cut_proofs: tuple[dict[str, object], ...],
+    generation_prefix_cuts_enabled: bool,
+) -> None:
+    """Reject a prefix-bearing snapshot before starting an incompatible run."""
+    if generation_cut_proofs and not generation_prefix_cuts_enabled:
+        raise ValueError(
+            "The selected rollout snapshot contains durable generation-prefix "
+            "cuts. Set "
+            "rollout_checkpointing.gym.generation_prefix_cuts_enabled=true "
+            "to restore it."
+        )
+
+
 def _maybe_restore_native_data_plane_checkpoint(
     policy: TQPolicy,
     *,
@@ -1329,6 +1344,14 @@ def setup_single_controller(
             )
     snapshot_resolution_seconds = time.monotonic() - snapshot_resolution_started
     if resolved_snapshot is not None:
+        _validate_generation_prefix_restore_compatibility(
+            generation_cut_proofs=(
+                resolved_snapshot.manifest.gym_generation_cut_proofs
+            ),
+            generation_prefix_cuts_enabled=(
+                rollout_checkpoint_cfg.gym.generation_prefix_cuts_enabled
+            ),
+        )
         recovery_checkpoint_path = str(resolved_snapshot.path)
         save_state.current_epoch = resolved_snapshot.manifest.current_epoch
         save_state.sampler_dispatch_index = (

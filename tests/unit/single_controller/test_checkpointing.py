@@ -101,7 +101,9 @@ from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
 from nemo_rl.environments.gym_checkpoint import (
+    GymCheckpointCommitResult,
     GymCheckpointContinuation,
+    GymCheckpointPrepareResult,
     GymCheckpointTopology,
 )
 from nemo_rl.experience.rollout_recovery import (
@@ -715,11 +717,13 @@ class _FakeGymCheckpointActor:
         fail_prepare: bool = False,
         fail_commit: bool = False,
         fail_resume_attempts: int = 0,
+        generation_cut_staging_key: Optional[str] = None,
     ):
         self.events = events
         self.fail_prepare = fail_prepare
         self.fail_commit = fail_commit
         self.fail_resume_attempts = fail_resume_attempts
+        self.generation_cut_staging_key = generation_cut_staging_key
         self.checkpoint_ids: list[str] = []
         self.acknowledge_completed_executions = _AsyncRemoteMethod(self._acknowledge)
         self.prepare_checkpoint = _AsyncRemoteMethod(self._prepare)
@@ -737,7 +741,44 @@ class _FakeGymCheckpointActor:
         self.events.append("prepare")
         if self.fail_prepare:
             raise TimeoutError("Gym prompt group did not drain")
-        return {"checkpoint_id": checkpoint_id, "ready": True, "participants": []}
+        participants: list[dict[str, Any]] = []
+        if self.generation_cut_staging_key is not None:
+            participants.append(
+                {
+                    "participant": {
+                        "server_name": "policy",
+                        "component": "responses_api_models",
+                        "participant_name": "policy",
+                    },
+                    "ready": True,
+                    "payload": {
+                        "state": "paused",
+                        "workers": {"acknowledged": 1, "expected": 1},
+                        "inflight_total": 1,
+                        "response_inflight_total": 0,
+                        "generation_pending_total": 0,
+                        "generation_cut_proof": {
+                            "checkpoint_id": checkpoint_id,
+                            "generation_cut_receipt": {
+                                "prefixes": [
+                                    {
+                                        "disposition": "durable_prefix",
+                                        "staging_key": (
+                                            self.generation_cut_staging_key
+                                        ),
+                                    }
+                                ]
+                            },
+                        },
+                        "waiters_total": 0,
+                    },
+                }
+            )
+        return {
+            "checkpoint_id": checkpoint_id,
+            "ready": True,
+            "participants": participants,
+        }
 
     async def _commit(
         self,
@@ -2383,6 +2424,118 @@ class TestPeriodicRolloutCheckpoint:
         ]
         assert actor._generation_checkpoint_pause_id is None
         assert actor._gym_checkpoint_rollout_permitted.is_set()
+
+    def test_generation_prefix_cut_commit_failure_clears_staging_rows(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        events: list[str] = []
+        staging_key = "__generation_cut__/checkpoint-1/r0/c1"
+        actor._generation_prefix_cuts_enabled = True
+        actor._gen = _CheckpointGeneration(events)
+        actor._env_handles = {
+            "nemo_gym": _FakeGymCheckpointActor(
+                events,
+                fail_commit=True,
+                generation_cut_staging_key=staging_key,
+            )
+        }
+
+        try:
+            with pytest.raises(OSError, match="Gym checkpoint storage failed"):
+                asyncio.run(
+                    actor._prepare_and_commit_gym_checkpoint("checkpoint-1", tmp_path)
+                )
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert actor._dp_client.clear_calls == [([staging_key], _STAGING_PARTITION_ID)]
+        assert events == [
+            "generation-pause",
+            "prepare",
+            "commit",
+            "abort",
+            "generation-resume",
+        ]
+        assert actor._generation_checkpoint_pause_id is None
+        assert actor._gym_checkpoint_rollout_permitted.is_set()
+
+    def test_generation_prefix_rows_are_cleared_when_snapshot_save_fails(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        staging_key = "__generation_cut__/checkpoint-1/r0/c1"
+        prepare = GymCheckpointPrepareResult.model_validate(
+            {
+                "checkpoint_id": "checkpoint-1",
+                "ready": True,
+                "participants": [
+                    {
+                        "participant": {
+                            "server_name": "policy",
+                            "component": "responses_api_models",
+                            "participant_name": "policy",
+                        },
+                        "ready": True,
+                        "payload": {
+                            "state": "paused",
+                            "workers": {"acknowledged": 1, "expected": 1},
+                            "inflight_total": 1,
+                            "response_inflight_total": 0,
+                            "generation_pending_total": 0,
+                            "generation_cut_proof": {
+                                "checkpoint_id": "checkpoint-1",
+                                "generation_cut_receipt": {
+                                    "prefixes": [
+                                        {
+                                            "disposition": "durable_prefix",
+                                            "staging_key": staging_key,
+                                        }
+                                    ]
+                                },
+                            },
+                            "waiters_total": 0,
+                        },
+                    }
+                ],
+            }
+        )
+        checkpoint = GymCheckpointCommitResult(
+            checkpoint_id="checkpoint-1",
+            participants=[],
+        )
+        actor._gym_participant_checkpointing_enabled = True
+
+        async def fail_snapshot(*_args: Any, **_kwargs: Any) -> None:
+            raise OSError("injected snapshot failure")
+
+        prepare_checkpoint = AsyncMock(return_value=(prepare, checkpoint))
+        release_checkpoint = AsyncMock()
+        try:
+            with (
+                patch.object(
+                    actor,
+                    "_prepare_and_commit_gym_checkpoint",
+                    prepare_checkpoint,
+                ),
+                patch.object(actor, "_capture_rollout_checkpoint_cut", fail_snapshot),
+                patch.object(
+                    actor,
+                    "_release_prepared_gym_checkpoint",
+                    release_checkpoint,
+                ),
+                pytest.raises(OSError, match="injected snapshot failure"),
+            ):
+                asyncio.run(actor._save_rollout_checkpoint(force=True))
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert actor._dp_client.clear_calls == [([staging_key], _STAGING_PARTITION_ID)]
+        checkpoint_id = prepare_checkpoint.await_args.args[0]
+        release_checkpoint.assert_awaited_once_with(
+            checkpoint_id,
+            committed=False,
+        )
 
     def test_gym_prepare_timeout_keeps_previous_snapshot_and_reopens_admission(
         self, tmp_path: Path
