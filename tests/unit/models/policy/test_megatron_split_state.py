@@ -340,11 +340,12 @@ class TestBegin:
         assert w._train_step_state["gbs"] == w.cfg["train_global_batch_size"]
         assert w._train_step_state["mbs"] == w.cfg["train_micro_batch_size"]
 
-    def test_records_mtp_enabled_from_model_config(self, mock_module_symbols):
+    def test_records_mtp_enabled_in_step_state(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         w.model.config.mtp_num_layers = 2
+        w.mtp_enabled = True
         w.begin_train_step(loss_fn=w._test_loss_fn)
         assert w._train_step_state["mtp_enabled"] is True
 
@@ -353,6 +354,7 @@ class TestBegin:
 
         w = _make_worker(LossType.SEQUENCE_LEVEL)
         w.model.config.mtp_num_layers = 2
+        w.mtp_enabled = True
         with pytest.raises(ValueError, match="mtp_detach_heads"):
             w.begin_train_step(loss_fn=w._test_loss_fn)
         assert getattr(w, "_train_step_state", None) is None
@@ -362,6 +364,7 @@ class TestBegin:
 
         w = _make_worker(LossType.SEQUENCE_LEVEL)
         w.model.config.mtp_num_layers = 2
+        w.mtp_enabled = True
         w.model.config.mtp_detach_heads = True
         w.begin_train_step(loss_fn=w._test_loss_fn)
         assert w._train_step_state["mtp_detach_heads"] is True
@@ -371,6 +374,7 @@ class TestBegin:
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         w.model.config.mtp_num_layers = 2
+        w.mtp_enabled = True
         w.begin_train_step(loss_fn=w._test_loss_fn)
         assert w._train_step_state["mtp_detach_heads"] is False
 
@@ -381,6 +385,7 @@ class TestBegin:
 
         w = _make_worker(LossType.SEQUENCE_LEVEL)
         w.model.config.mtp_num_layers = 2
+        w.mtp_enabled = True
         w.model.config.mtp_loss_scaling_factor = 0.0
         w.begin_train_step(loss_fn=w._test_loss_fn)
         assert w._train_step_state["mtp_detach_heads"] is False
@@ -574,6 +579,7 @@ class TestTrainMicrobatch:
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         w.model.config.mtp_num_layers = 2
+        w.mtp_enabled = True
         batch = _fake_batch()
         batch["token_mask"][0, 5] = 0
         batch["sample_mask"][3] = 0
@@ -757,6 +763,7 @@ class TestFinish:
 
         w = _make_worker(LossType.SEQUENCE_LEVEL)
         w.model.config.mtp_num_layers = 2
+        w.mtp_enabled = True
         w.model.config.mtp_detach_heads = True
         mtp_param, other_param = self._mtp_params()
         w.model.parameters = MagicMock(return_value=[mtp_param, other_param])
@@ -784,6 +791,7 @@ class TestFinish:
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         w.model.config.mtp_num_layers = 2
+        w.mtp_enabled = True
         w.model.config.mtp_detach_heads = True
         mtp_param, _ = self._mtp_params()
         w.model.parameters = MagicMock(return_value=[mtp_param])
@@ -891,6 +899,7 @@ class TestFinish:
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         w.model.config.mtp_num_layers = 2
+        w.mtp_enabled = True
         w.optimizer.grad_norms_by_group = {"mtp": 1.25}
 
         def _collect(
@@ -1074,6 +1083,7 @@ class TestAbort:
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         w.model.config.mtp_num_layers = 1
+        w.mtp_enabled = True
         w.model.config.mtp_grad_scale_func = lambda: torch.tensor(7.0)
         w.begin_train_step(loss_fn=w._test_loss_fn)
         assert w.model.config.mtp_grad_scale_func is None
