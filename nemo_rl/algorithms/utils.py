@@ -35,6 +35,58 @@ if TYPE_CHECKING:
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
+ACTOR_TOKEN_COUNT_METRIC = "num_valid_actor_tokens"
+ACTOR_TOKEN_MEAN_METRICS = frozenset(
+    {"probs_ratio", "probs_ratio_clamped", "approx_entropy"}
+)
+PREV_TOKEN_COUNT_METRIC = "num_valid_prev_tokens"
+PREV_TOKEN_MEAN_METRICS = frozenset(
+    {
+        "token_mult_prob_error",
+        "gen_kl_error",
+        "policy_kl_error",
+        "js_divergence_error",
+    }
+)
+SAMPLING_RATIO_TOKEN_COUNT_METRIC = "num_valid_sampling_importance_ratio_tokens"
+IS_OOB_TOKEN_COUNT_METRIC = "num_valid_is_oob_tokens"
+
+_FILTER_AWARE_TOKEN_METRIC_GROUPS = (
+    (ACTOR_TOKEN_COUNT_METRIC, ACTOR_TOKEN_MEAN_METRICS),
+    (PREV_TOKEN_COUNT_METRIC, PREV_TOKEN_MEAN_METRICS),
+    (SAMPLING_RATIO_TOKEN_COUNT_METRIC, frozenset({"sampling_importance_ratio"})),
+    (IS_OOB_TOKEN_COUNT_METRIC, frozenset({"is_oob_ratio"})),
+)
+
+
+def finalize_actor_token_metrics(metrics: dict[str, Any]) -> None:
+    """Normalize filter-aware token metric numerators after aggregation.
+
+    ``ClippedPGLossFn`` emits raw numerator fragments for metrics whose mask can
+    narrow after the original global token count was computed, together with a
+    matching retained-token count. Callers first sum both across every
+    microbatch and data-parallel rank, then call this helper exactly once.
+    Normalizing fragments locally would weight sparse shards and packed
+    sequences equally instead of by their retained-token counts.
+
+    Args:
+        metrics: Step metrics whose loss fragments have already been summed.
+            The mapping is updated in place.
+    """
+    for count_metric, mean_metrics in _FILTER_AWARE_TOKEN_METRIC_GROUPS:
+        if count_metric not in metrics:
+            continue
+        count = float(metrics[count_metric])
+        if count < 0:
+            raise ValueError(f"{count_metric} must be non-negative, got {count}")
+        for metric_name in mean_metrics:
+            if metric_name not in metrics:
+                continue
+            metrics[metric_name] = (
+                float(metrics[metric_name]) / count if count > 0 else 0.0
+            )
+
+
 def get_gdpo_reward_component_keys(batch) -> list[str]:
     """Return batch keys that are named reward components (e.g. reward/correctness) in sorted order."""
     return sorted(
@@ -229,7 +281,7 @@ def masked_mean(
 
 def mask_out_neg_inf_logprobs(
     logprobs: torch.Tensor, mask: torch.Tensor, logprobs_name: str
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Mask out negative infinity log probabilities.
 
     Handling sampling mask mismatch:
@@ -238,13 +290,22 @@ def mask_out_neg_inf_logprobs(
     token X may fall outside the training policy's top-k/p set -> curr_logprobs[X] = -inf, prev_logprobs[X] = -inf
     Detect positions with -inf in any logprobs (generation_logprobs is always finite for valid tokens)
 
+    The substituted ``0.0`` is *not* a neutral value: it means log p = 0, i.e.
+    p = 1, while ``generation_logprobs`` at the same position is finite and
+    typically around -5. Anything that compares the two -- the importance ratio,
+    ``token_mult_prob_error``, the sequence-level weights -- reads a large
+    fabricated difference unless the position is also dropped from the reduction
+    mask. Callers must therefore fold ``keep`` into their own mask; returning it
+    is what makes the warning above true.
+
     Args:
         logprobs: Log probabilities.
         mask: Mask.
         logprobs_name: Name of the logprobs tensor. Used for printing warning messages.
 
     Returns:
-        Masked log probabilities.
+        ``(logprobs, keep)``, where ``keep`` is 0 at positions whose logprob was
+        -inf and 1 elsewhere, with the same shape as ``mask``.
     """
     is_neginf = torch.isinf(logprobs)
     neginf_count = (is_neginf & mask.bool()).sum().item()
@@ -254,10 +315,11 @@ def mask_out_neg_inf_logprobs(
             "(policy top-k/top-p mismatch). Masking out these positions."
         )
 
-    mask = mask * (~is_neginf).float()
+    keep = (~is_neginf).to(mask.dtype)
+    mask = mask * keep
     logprobs = torch.where(mask.bool(), logprobs, 0.0)
 
-    return logprobs
+    return logprobs, keep
 
 
 def masked_var(

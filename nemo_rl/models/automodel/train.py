@@ -790,7 +790,12 @@ class LogprobsPostProcessor:
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
         if need_top_k_or_top_p_filtering(self.sampling_params):
             mask = data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1)
-            token_logprobs = mask_out_neg_inf_logprobs(
+            # The narrowed mask cannot travel with prev_logprobs today:
+            # LogprobOutputSpec carries logprobs only. The curr side publishes
+            # its narrowing as curr_logprobs_keep_mask, which covers the actor
+            # reduction; a prev-side -inf at a position the curr side kept is
+            # left for a follow-up that widens the spec.
+            token_logprobs, _ = mask_out_neg_inf_logprobs(
                 token_logprobs, mask, "prev_logprobs"
             )
 

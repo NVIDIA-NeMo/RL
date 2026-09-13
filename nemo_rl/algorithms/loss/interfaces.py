@@ -31,7 +31,7 @@ class MetricNormalizer(enum.Enum):
     Losses reduce most metrics with ``masked_mean(...,
     global_normalization_factor=...)`` where the factor is the global valid
     *token* count, the global valid *sequence* count, or absent entirely (raw
-    counts, per-microbatch means, extrema). Split-API trainers run each
+    counts/numerator fragments, per-microbatch means, extrema). Split-API trainers run each
     microbatch with placeholder ``global_valid_*=1`` (collecting raw sums) and
     rescale once per optimizer step — to do that they must know, per metric,
     which denominator applies.
