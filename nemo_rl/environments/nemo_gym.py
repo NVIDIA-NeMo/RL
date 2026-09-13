@@ -1038,6 +1038,7 @@ Depending on your data shape, you may want to change these values."""
         ).model_dump(mode="json")
         results: list[GymParticipantPrepareResult] = []
         touched: list[GymDiscoveredParticipant] = []
+        generation_cut_prepared = False
         try:
             for discovered in self._ordered_checkpoint_participants():
                 participant = discovered.participant
@@ -1073,13 +1074,23 @@ Depending on your data shape, you may want to change these values."""
                         )
                         and payload.workers.acknowledged == payload.workers.expected
                     )
+                    generation_cut_prepared = (
+                        ready and payload.generation_cut_proof is not None
+                    )
                 elif participant.component == "responses_api_agents":
                     if capabilities.checkpoint_mode != "export_restore":
                         continue
                     touched.append(discovered)
                     payload = await self._prepare_agent_checkpoint(
                         discovered,
-                        request=request,
+                        request=(
+                            {
+                                **request,
+                                "allow_model_wait_boundary": True,
+                            }
+                            if generation_cut_prepared
+                            else request
+                        ),
                         deadline_ts=deadline_ts,
                     )
                     ready = payload.ready_to_commit
