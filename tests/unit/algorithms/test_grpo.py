@@ -2756,6 +2756,66 @@ def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping(
     assert surviving_prompts == ["prompt_1", "prompt_1", "prompt_1"]
 
 
+@pytest.mark.parametrize(
+    ("kv_cache_dtype", "precision", "error"),
+    [
+        ("fp8", "fp8", "DTensor backend is not supported"),
+        ("fp8_e4m3", "fp8", "DTensor backend is not supported"),
+        ("fp8_ds_mla", "fp8", None),
+        ("fp8_ds_mla", "bfloat16", "requires precision='fp8'"),
+        ("auto", "bfloat16", None),
+    ],
+)
+def test_setup_dtensor_fp8_kv_cache_guard(
+    mock_grpo_components, monkeypatch, kv_cache_dtype, precision, error
+):
+    import nemo_rl.algorithms.grpo as grpo_mod
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.val_period = 0
+    master_config.grpo.batch_multiplier = 1
+    master_config.data.update(shuffle=False, num_workers=0)
+    master_config.policy.update(
+        model_name="deepseek-v4-test",
+        dtensor_cfg={"enabled": True},
+        megatron_cfg={"enabled": False},
+    )
+    master_config.policy["generation"]["vllm_cfg"].update(
+        async_engine=False, precision=precision, kv_cache_dtype=kv_cache_dtype
+    )
+    checkpointer = MagicMock()
+    checkpointer.get_latest_checkpoint_path.return_value = None
+    checkpointer.load_training_info.return_value = None
+    checkpointer.get_resume_paths.return_value = (None, None)
+    monkeypatch.setattr(grpo_mod, "Logger", MagicMock())
+    monkeypatch.setattr(grpo_mod, "CheckpointManager", lambda _config: checkpointer)
+    monkeypatch.setattr(grpo_mod, "StatefulDataLoader", MagicMock())
+    monkeypatch.setattr(grpo_mod, "RayVirtualCluster", MagicMock())
+    monkeypatch.setattr(
+        grpo_mod, "prepare_segment_topology", lambda *_args: (None, [], {})
+    )
+
+    class GenerationInitReached(Exception):
+        pass
+
+    generation_init = MagicMock(side_effect=GenerationInitReached)
+    monkeypatch.setattr(grpo_mod, "VllmGeneration", generation_init)
+    policy_init = MagicMock(
+        side_effect=AssertionError("Policy initialization is unexpected")
+    )
+    monkeypatch.setattr(grpo_mod, "Policy", policy_init)
+
+    with (
+        pytest.raises(AssertionError, match=error)
+        if error
+        else pytest.raises(GenerationInitReached)
+    ):
+        grpo_mod.setup(master_config, MagicMock(), MagicMock(), None)
+
+    assert generation_init.call_count == int(error is None)
+    policy_init.assert_not_called()
+
+
 def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node(
     mock_grpo_components,
 ):

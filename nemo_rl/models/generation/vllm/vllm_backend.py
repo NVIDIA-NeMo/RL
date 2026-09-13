@@ -27,6 +27,7 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     preinit_nixl_from_vllm_config,
     resolve_rollout_rank,
 )
+from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -636,11 +637,14 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         return sorted(applier.discover_native_skips(state_dict_info))
 
     def _uses_fp8_kv_cache(self) -> bool:
-        """Return whether this worker owns an FP8 KV cache."""
+        """Return whether this worker owns separately refittable FP8 KV scales."""
         vllm_config = getattr(self.model_runner, "vllm_config", None)
         cache_config = getattr(vllm_config, "cache_config", None)
         kv_cache_dtype = getattr(cache_config, "cache_dtype", None)
-        return kv_cache_dtype is not None and "fp8" in str(kv_cache_dtype).lower()
+        if kv_cache_dtype is None:
+            return False
+        kv_cache_dtype = str(kv_cache_dtype).lower()
+        return kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES
 
     def _maybe_process_fp8_kv_cache(self) -> None:
         """Process weights after loading for FP8 KV cache (static scales)."""
@@ -978,9 +982,21 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
     def _uses_native_layerwise_refit(self, transport: WeightUpdateTransport) -> bool:
         """Return whether this transport needs vLLM's layerwise lifecycle."""
-        return transport in ("ipc", "collective", "nccl_reshard") and (
-            self._uses_unquantized_flashinfer_trtllm()
-        )
+        return (
+            transport in ("ipc", "collective", "nccl_reshard")
+            and self._uses_unquantized_flashinfer_trtllm()
+        ) or (transport in ("ipc", "collective") and self._uses_deepseek_v4_fp8_refit())
+
+    def _uses_deepseek_v4_fp8_refit(self) -> bool:
+        """Return whether the realized rollout model needs DSV4 FP8 reload hooks."""
+        model = self.model_runner.model
+        config = getattr(model, "config", None)
+        if getattr(config, "model_type", None) != "deepseek_v4":
+            return False
+
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        return fp8.is_fp8_model(self.model_runner.vllm_config)
 
     def _validate_native_layerwise_refit(
         self, transport: WeightUpdateTransport | None = None
@@ -1034,15 +1050,19 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         self, transport: UnsupportedNativeRefitTransport
     ) -> None:
         """Reject transports that cannot run the native layerwise lifecycle."""
-        if not self._uses_unquantized_flashinfer_trtllm():
-            return
-
         label = transport.replace("_", "-")
-        raise RuntimeError(
-            f"{label} refit does not support the unquantized FlashInfer "
-            "TRTLLM MoE backend yet because it bypasses vLLM's native "
-            "layerwise reload lifecycle"
-        )
+        if self._uses_unquantized_flashinfer_trtllm():
+            raise RuntimeError(
+                f"{label} refit does not support the unquantized FlashInfer "
+                "TRTLLM MoE backend yet because it bypasses vLLM's native "
+                "layerwise reload lifecycle"
+            )
+        if self._uses_deepseek_v4_fp8_refit():
+            raise RuntimeError(
+                f"{label} refit does not support DeepSeek V4 FP8 because it "
+                "bypasses the model's prepare/finalize refit hooks. Use IPC "
+                "or collective refit with refit_with_reload_api=False."
+            )
 
     @contextmanager
     def _weight_update_lifecycle(
@@ -1055,6 +1075,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         """
         if self._uses_native_layerwise_refit(transport):
             self._validate_native_layerwise_refit(transport)
+            use_deepseek_v4_fp8 = self._uses_deepseek_v4_fp8_refit()
             previous_failure = self._nrl_layerwise_reload_failure
             if previous_failure is not None:
                 raise RuntimeError(
@@ -1068,19 +1089,27 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             )
 
             model = self.model_runner.model
-            # Restore only the realized BF16 TRTLLM modules. MXFP8 modules own
-            # checkpoint-scale parameters created after vLLM recorded reload
-            # metadata, so restoring the whole mixed model would delete those
-            # parameters. Their layouts are rebuilt separately after transfer.
-            reload_targets = _unquantized_flashinfer_trtllm_modules(model)
+            # DSV4 needs a full-model reload; BF16 TRTLLM reload stays scoped
+            # to its realized modules so mixed-model MXFP8 metadata survives.
+            reload_targets = (
+                [model]
+                if use_deepseek_v4_fp8
+                else _unquantized_flashinfer_trtllm_modules(model)
+            )
             reloaded_module_ids = _reload_target_module_ids(reload_targets)
+            added_skip_tensors: set[str] = set()
+            if use_deepseek_v4_fp8:
+                from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
 
             def finalize() -> None:
                 with torch.device(self.device):
                     finalize_layerwise_reload(model, self.model_config)
-                    _process_mxfp8_modules_after_native_reload(
-                        model, reloaded_module_ids
-                    )
+                    if use_deepseek_v4_fp8:
+                        deepseek_v4_fp8.finalize_refit(model)
+                    else:
+                        _process_mxfp8_modules_after_native_reload(
+                            model, reloaded_module_ids
+                        )
                     _refresh_hpc_modules_after_layerwise_reload(model)
                     self._maybe_process_mtp_drafter_after_loading()
                 torch.cuda.synchronize()
@@ -1088,6 +1117,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             try:
                 with set_current_vllm_config(self.model_runner.vllm_config):
                     with torch.device(self.device):
+                        if use_deepseek_v4_fp8:
+                            added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)
                         for reload_target in reload_targets:
                             initialize_layerwise_reload(reload_target)
                     self._nrl_layerwise_reload_active = True
@@ -1097,6 +1128,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 raise
             finally:
                 self._nrl_layerwise_reload_active = False
+                if use_deepseek_v4_fp8:
+                    deepseek_v4_fp8.restore_refit(added_skip_tensors)
 
             return
 
@@ -1119,7 +1152,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
     def _weight_update_errors_are_fatal(self) -> bool:
         """Whether transport errors should propagate instead of returning False."""
-        return self._uses_unquantized_flashinfer_trtllm()
+        return self._uses_unquantized_flashinfer_trtllm() or (
+            self._nrl_layerwise_reload_failure is not None
+        )
 
     def _synchronize_before_ipc_data_ack(self) -> None:
         """Fence work consuming one IPC data batch before its acknowledgment."""
@@ -1273,6 +1308,14 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             "state_dict_info is not prepared. "
             "Please call prepare_refit_info when initializing the worker."
         )
+
+        if refit_with_reload_api and self._uses_deepseek_v4_fp8_refit():
+            raise RuntimeError(
+                "DeepSeek V4 FP8 does not support refit_with_reload_api=True "
+                "because it bypasses the model's prepare/finalize refit hooks. "
+                "Set refit_with_reload_api=False to use the supported "
+                "collective refit lifecycle."
+            )
 
         try:
             if refit_with_reload_api:

@@ -28,10 +28,13 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.utils import replace_parameter
 from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
 
+from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
+from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
 from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
     pad_flashinfer_scale_k,
 )
@@ -64,6 +67,7 @@ class FP8Config:
     kv_cache_dtype: str = "auto"
     use_fp8_weights: bool = True  # Whether model weights are quantized to FP8
     is_mx: bool = False
+    is_deepseek_v4: bool = False
     refit_with_reload_api: bool = False
 
 
@@ -199,9 +203,13 @@ def apply_fp8_patches(self, fp8_config):
 
             # Static scales mode: patch process_weights_after_loading to preserve
             # k_scale/v_scale for manual updates.
-            func5_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
-            patcher5 = patch(func5_path, process_weights_after_loading_kv)
-            fp8_state.vllm_patches.append(patcher5)
+            if global_fp8_config.kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES:
+                func5_path = (
+                    "vllm.model_executor.layers.quantization.kv_cache."
+                    "BaseKVCacheMethod.process_weights_after_loading"
+                )
+                patcher5 = patch(func5_path, process_weights_after_loading_kv)
+                fp8_state.vllm_patches.append(patcher5)
 
         # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher
         # SNR compared to plain fp32 scaling factors. This feature is still under active research.
@@ -230,9 +238,23 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
 
     # Validate configuration: kv_cache_dtype
-    if kv_cache_dtype not in ["auto", "fp8", "fp8_e4m3"]:
+    supported_kv_cache_dtypes = ["auto", "fp8", "fp8_e4m3", "fp8_ds_mla"]
+    if kv_cache_dtype not in supported_kv_cache_dtypes:
         raise ValueError(
-            f"kv_cache_dtype must be one of ['auto', 'fp8', 'fp8_e4m3'], but got {kv_cache_dtype}"
+            f"kv_cache_dtype must be one of {supported_kv_cache_dtypes}, but got {kv_cache_dtype}"
+        )
+
+    # Sparse MLA canonicalizes every quantized cache to fp8_ds_mla inside the
+    # worker. Reject spellings that would make the driver try to synchronize
+    # per-tensor k/v scales that the realized DeepSeek V4 cache cannot consume.
+    if (
+        getattr(config, "model_type", None) == "deepseek_v4"
+        and kv_cache_dtype.startswith("fp8")
+        and kv_cache_dtype != "fp8_ds_mla"
+    ):
+        raise ValueError(
+            "DeepSeek V4 requires kv_cache_dtype='fp8_ds_mla' when using an "
+            f"FP8 KV cache, but got {kv_cache_dtype!r}."
         )
 
     # Validate configuration: kv_cache_dtype=fp8 requires precision=fp8
@@ -291,6 +313,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         "model_parallel_size": model_parallel_size,
         "kv_cache_dtype": kv_cache_dtype,
         "use_fp8_weights": use_fp8_weights,
+        "is_deepseek_v4": getattr(config, "model_type", None) == "deepseek_v4",
         "refit_with_reload_api": bool(vllm_cfg.get("refit_with_reload_api")),
     }
     if is_mx:
@@ -311,9 +334,10 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         )
     global_fp8_config = FP8Config(**fp8_config_kwargs)
 
+    # Keep existing DeepGEMM behavior unless a recipe explicitly opts into E8M0.
     if vllm_cfg.get("use_deep_gemm", False) and not is_mx:
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
-        os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
+        os.environ.setdefault("VLLM_USE_DEEP_GEMM_E8M0", "0")
 
     if vllm_cfg["async_engine"]:
         EngineCoreProc.run_engine_core = my_run_engine_core
@@ -461,12 +485,14 @@ def _get_params_in_layers(param_names, layers):
 
 
 def _get_module_from_param_name(model, name: str):
+    name = deepseek_v4_fp8.map_checkpoint_name(model, name)
+
     # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
     # The module path is all but the last part (the parameter's own name)
     path_parts = name.split(".")
     module_path = path_parts[:-1]
     # Replace with the fused model name
-    packed_modules_mapping = model.packed_modules_mapping
+    packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     reversed_mapping = {
         original_name: fused_name
         for fused_name, original_names_list in packed_modules_mapping.items()
@@ -474,6 +500,9 @@ def _get_module_from_param_name(model, name: str):
     }
     if module_path[-1] in reversed_mapping.keys():
         module_path[-1] = reversed_mapping[module_path[-1]]
+
+    module_path = deepseek_v4_fp8.remap_packed_module_path(model, module_path)
+
     if hasattr(model, "hf_to_vllm_mapper") and hasattr(
         model.hf_to_vllm_mapper, "orig_to_new_prefix"
     ):
@@ -636,7 +665,9 @@ def load_weights(
         model_load_weights = model_runner.model.load_weights
     model_load_weights(
         get_quantized_weight_iterator(
-            weights, model_runner, refit_with_reload_api=False
+            weights,
+            model_runner,
+            refit_with_reload_api=False,
         )
     )
 
@@ -826,6 +857,7 @@ def _expand_grouped_moe_expert_to_fp8(key, weight):
 # Ref: https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1175
 # Patches this method to not create new torch.nn.Parameter for layer weights
 # to maintain weight loaders.
+# BMM layouts are the exception because their post-processed tensor shape changes.
 def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
     assert layer.weight_block_size is not None
 
@@ -837,25 +869,38 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
         should_use_deepgemm_for_fp8_linear,
     )
 
+    is_bmm = getattr(layer, "is_bmm", False)
+
     # On Blackwell or Hopper, if E8M0 for DeepGemm is used, we need to
     # requantize the weight and input to the specific scale
     # at the same time.
     should_use_deepgemm = should_use_deepgemm_for_fp8_linear(
-        layer.orig_dtype, layer.weight.shape
+        layer.orig_dtype, tuple(layer.weight.shape)
     )
     if should_use_deepgemm:
         # vLLM 0.25 keeps the block scale under weight_scale_inv (see
         # Fp8BlockScaledMMLinearKernel/DeepGemm process_weights_after_loading).
+        bmm_batch_size = getattr(layer, "bmm_batch_size", 0)
         dg_weight, dg_weight_scale = deepgemm_post_process_fp8_weight_block(
             wq=layer.weight.data,
             ws=layer.weight_scale_inv.data,
             quant_block_shape=tuple(layer.weight_block_size),
             use_e8m0=is_deep_gemm_e8m0_used(),
+            is_bmm=is_bmm,
+            bmm_batch_size=bmm_batch_size,
         )
-        # This is the only part we change from the original function.
-        # Instead of creating new torch.nn.Parameter, we update the data in place.
-        layer.weight.data.copy_(dg_weight)
-        layer.weight_scale_inv.data.copy_(dg_weight_scale)
+        if is_bmm:
+            replace_parameter(layer, "weight", dg_weight, prefer_copy=True)
+            replace_parameter(
+                layer,
+                "weight_scale_inv",
+                dg_weight_scale,
+                prefer_copy=True,
+            )
+        else:
+            # Instead of creating new torch.nn.Parameter, we update the data in place.
+            layer.weight.data.copy_(dg_weight)
+            layer.weight_scale_inv.data.copy_(dg_weight_scale)
 
 
 def process_weights_after_loading(self, layer) -> None:
@@ -1138,11 +1183,23 @@ def process_weights_after_loading_moe(self, layer) -> None:
         w2_input_scale=w2_input_scale,
     )
 
-    # Use .copy_() to preserve weight_loader attribute on Parameters.
-    layer.w13_weight.copy_(w13)
-    layer.w2_weight.copy_(w2)
-    getattr(layer, f"w13_{self.weight_scale_name}").copy_(w13_scale)
-    getattr(layer, f"w2_{self.weight_scale_name}").copy_(w2_scale)
+    if global_fp8_config.is_deepseek_v4:
+        # DSV4 restores checkpoint layouts before refit. Preserve compatible
+        # storage and retain loaders when converting to a different layout.
+        replace_parameter(layer, "w13_weight", w13, prefer_copy=True)
+        replace_parameter(layer, "w2_weight", w2, prefer_copy=True)
+        replace_parameter(
+            layer, f"w13_{self.weight_scale_name}", w13_scale, prefer_copy=True
+        )
+        replace_parameter(
+            layer, f"w2_{self.weight_scale_name}", w2_scale, prefer_copy=True
+        )
+    else:
+        # Use .copy_() to preserve weight_loader attribute on Parameters.
+        layer.w13_weight.copy_(w13)
+        layer.w2_weight.copy_(w2)
+        getattr(layer, f"w13_{self.weight_scale_name}").copy_(w13_scale)
+        getattr(layer, f"w2_{self.weight_scale_name}").copy_(w2_scale)
 
     # Set up the MoE kernel on initial load only (same as upstream _setup_kernel
     # but without replace_parameter). Gate on is None, not hasattr, because
