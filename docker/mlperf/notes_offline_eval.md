@@ -96,6 +96,35 @@ vs 256 at this checker pin).
 Unit tests: `tests/unit/algorithms/test_mlperf_grpo_deferred.py` and
 `test_mlperf_grpo_logging.py` (15 tests, in-container pass).
 
+## Full-spec run (oci-jhb, qualified 64-node shape)
+
+Job 367663 (exit 0): GBS 256 (16x16), pass@4, `VAL_START_AT=18`,
+`MAX_STEPS=19`, target 0.69. Training ran 19 steps at full capacity (no inline
+validation), wrote `step_18` and `step_19` (741G weights-only each). The
+deferred phase restored step 18, refit vLLM, and measured pass@4 = **0.7410**
+(>= 0.69) on the 251-task validation set, so step 19 was never evaluated.
+
+```
+/results file: (oci-jhb)
+/scratch/fsw/portfolios/coreai/projects/coreai_mlperf_training/users/jpiotrowski/offline-eval-results/qwen35-deferred-spec3-260913134041/260913135524191054819_1_mllog.log
+
+run_start      t=1789333589530
+block_start    step=0 samples=4864
+tracked_stats  steps=1..19 (train + timing each)
+block_stop     step=19 samples=4864 t=1789340490400  <- step-19 weight update
+eval_start     step=18 samples=4608 t=1789341041466  <- wall time, after training
+eval_accuracy  value=0.7410358786582947 samples=4608
+eval_stop      step=18
+run_stop       status=success samples=4608 t=1789340105384  <- step-18 weight update
+```
+
+4608 = 256 * ceil(2.5 + 3840/256) is exactly the rules formula's first
+evaluation sample, and the 6.1.0 compliance checker (logging pin 23787ba4)
+passes the log's structure end to end; the only failing check is
+`eval_samples == 256` versus the qualified 251-task set, which is the pending
+upstream checker update (mlcommons/logging PR 475), not an implementation
+deviation. Measured score (run_start -> run_stop): 108.6 minutes.
+
 ## Review outcomes (grok-4.6 review, addressed in-tree)
 
 - **Retention**: `keep_top_k=None` in deferred mode (the earlier
