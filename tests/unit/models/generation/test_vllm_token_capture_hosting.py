@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -33,6 +34,10 @@ import pytest
 
 nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 
+from nemo_gym._checkpoint.model_control_contracts import (  # noqa: E402
+    GenerationCutInventory,
+    GenerationCutPrefix,
+)
 from nemo_gym.token_id_capture.staging.capture import (  # noqa: E402
     CaptureError,
     RolloutTokenCapture,
@@ -42,15 +47,12 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     StagedCallRecord,
     StageResult,
 )
-from nemo_gym._checkpoint.model_control_contracts import (  # noqa: E402
-    GenerationCutInventory,
-    GenerationCutPrefix,
-)
 
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
     _CheckpointCaptureGate,
+    _remaining_generation_limits_after_prefix,
 )
 
 pytestmark = pytest.mark.nemo_gym
@@ -234,6 +236,65 @@ def test_generation_checkpoint_control_fans_out(
     gen.worker_group.run_all_workers_single_data.assert_called_once_with(
         worker_method,
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
+
+
+def test_generation_checkpoint_control_isolated_from_blocked_default_executor():
+    async def scenario() -> None:
+        worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+        worker._generation_checkpoint_executor = ThreadPoolExecutor(max_workers=1)
+        gate = _CheckpointCaptureGate()
+        gate.close_and_wait()
+        default_thread_started = threading.Event()
+
+        def wait_at_closed_gate() -> None:
+            default_thread_started.set()
+            gate.enter()
+            gate.exit()
+
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        blocked_completion = asyncio.create_task(asyncio.to_thread(wait_at_closed_gate))
+        while not default_thread_started.is_set():
+            await asyncio.sleep(0)
+
+        try:
+            result = await asyncio.wait_for(
+                worker._run_generation_checkpoint_control(lambda: "cut-ready"),
+                timeout=1.0,
+            )
+            assert result == "cut-ready"
+        finally:
+            gate.reopen()
+            await blocked_completion
+            worker._generation_checkpoint_executor.shutdown()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("max_tokens", "min_tokens", "generation_token_count", "expected"),
+    [
+        (10, 6, 3, (7, 3)),
+        (None, 6, 3, (None, 3)),
+        (10, None, 3, (7, None)),
+        (None, None, 3, (None, None)),
+        (10, 2, 3, (7, 0)),
+    ],
+)
+def test_restored_generation_prefix_reduces_independent_output_limits(
+    max_tokens: int | None,
+    min_tokens: int | None,
+    generation_token_count: int,
+    expected: tuple[int | None, int | None],
+) -> None:
+    assert (
+        _remaining_generation_limits_after_prefix(
+            max_tokens=max_tokens,
+            min_tokens=min_tokens,
+            generation_token_count=generation_token_count,
+        )
+        == expected
     )
 
 

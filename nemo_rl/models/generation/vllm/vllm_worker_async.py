@@ -21,6 +21,7 @@ import time
 import uuid
 import warnings
 from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Optional, cast
 
@@ -86,6 +87,21 @@ class _CompletedCaptureState:
 
     coords: Any
     generation_token_count: int
+
+
+def _remaining_generation_limits_after_prefix(
+    *,
+    max_tokens: int | None,
+    min_tokens: int | None,
+    generation_token_count: int,
+) -> tuple[int | None, int | None]:
+    """Return output limits for the suffix after restoring generated tokens."""
+    if generation_token_count < 0:
+        raise ValueError("generation_token_count must be non-negative")
+    return (
+        None if max_tokens is None else max_tokens - generation_token_count,
+        None if min_tokens is None else max(0, min_tokens - generation_token_count),
+    )
 
 
 class _CheckpointCaptureGate:
@@ -265,6 +281,13 @@ class VllmAsyncGenerationWorkerImpl(
         self._generation_prefix_cuts_enabled = False
         self._generation_cut_control_token: str | None = None
         self._generation_checkpoint_gate = _CheckpointCaptureGate()
+        # Terminal capture writes use asyncio's shared default executor. Keep
+        # checkpoint control on an isolated thread so a closed gate cannot let
+        # waiting completions consume every thread needed to create the cut.
+        self._generation_checkpoint_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="nrl-generation-checkpoint",
+        )
         self._staging_source: Any | None = None
         # Guarded by _prefix_cache_lock: _fetch_chain_prefix runs on executor
         # threads (asyncio.to_thread), so lookups/evictions can be concurrent.
@@ -937,6 +960,18 @@ class VllmAsyncGenerationWorkerImpl(
             coords = self.token_capture.fail_call(state.call, reason=reason)
             self._remember_completed_capture(state.call.model_call_id, coords, 0)
 
+    async def _run_generation_checkpoint_control(
+        self,
+        operation: Callable[..., Any],
+        *args: Any,
+    ) -> Any:
+        """Run cut control independently of blocked terminal capture writes."""
+        return await asyncio.get_running_loop().run_in_executor(
+            self._generation_checkpoint_executor,
+            operation,
+            *args,
+        )
+
     def _checkpoint_generation_cut(self, inventory: Any) -> Any:
         """Stage a stable prefix for every call named by Gym's frozen inventory."""
         from nemo_gym._checkpoint.model_control_contracts import (
@@ -1252,11 +1287,17 @@ class VllmAsyncGenerationWorkerImpl(
                             )
                             if mask == 1.0
                         ]
-                        if actual_request_max_tokens is not None:
-                            remaining_output_tokens = (
-                                actual_request_max_tokens
-                                - admission.generation_cut.generation_token_count
-                            )
+                        (
+                            remaining_output_tokens,
+                            remaining_min_tokens,
+                        ) = _remaining_generation_limits_after_prefix(
+                            max_tokens=actual_request_max_tokens,
+                            min_tokens=getattr(request, "min_tokens", None),
+                            generation_token_count=(
+                                admission.generation_cut.generation_token_count
+                            ),
+                        )
+                        if remaining_output_tokens is not None:
                             if remaining_output_tokens <= 0:
                                 raise VLLMValidationError(
                                     "Durable generation prefix already exhausts max_tokens.",
@@ -1264,13 +1305,8 @@ class VllmAsyncGenerationWorkerImpl(
                                     value=actual_request_max_tokens,
                                 )
                             actual_request_max_tokens = remaining_output_tokens
-                            request_min_tokens = getattr(request, "min_tokens", None)
-                            if request_min_tokens is not None:
-                                request.min_tokens = max(
-                                    0,
-                                    request_min_tokens
-                                    - admission.generation_cut.generation_token_count,
-                                )
+                        if remaining_min_tokens is not None:
+                            request.min_tokens = remaining_min_tokens
                     if engine_prefix_token_ids:
                         worker_self._enter_request_prefix(
                             request, engine_prefix_token_ids
@@ -1429,7 +1465,7 @@ class VllmAsyncGenerationWorkerImpl(
             if not secrets.compare_digest(supplied, expected):
                 raise HTTPException(status_code=401, detail="invalid control bearer")
             typed_inventory = GenerationCutInventory.model_validate(inventory)
-            receipt = await asyncio.to_thread(
+            receipt = await worker_self._run_generation_checkpoint_control(
                 worker_self._checkpoint_generation_cut, typed_inventory
             )
             return receipt.model_dump(mode="json")
@@ -2486,7 +2522,9 @@ class VllmAsyncGenerationWorkerImpl(
             raise RuntimeError(
                 "pause_generation_for_checkpoint_async requires async_engine=True"
             )
-        await asyncio.to_thread(self._generation_checkpoint_gate.close_and_wait)
+        await self._run_generation_checkpoint_control(
+            self._generation_checkpoint_gate.close_and_wait
+        )
         try:
             await self.llm.pause_generation(mode="keep", clear_cache=False)
         except BaseException:
@@ -2598,6 +2636,19 @@ class VllmAsyncGenerationWorkerImpl(
             print(f"Error during vLLM shutdown: {e}")
             return False
         finally:
+            generation_checkpoint_gate = getattr(
+                self, "_generation_checkpoint_gate", None
+            )
+            if generation_checkpoint_gate is not None:
+                generation_checkpoint_gate.reopen()
+            generation_checkpoint_executor = getattr(
+                self, "_generation_checkpoint_executor", None
+            )
+            if generation_checkpoint_executor is not None:
+                generation_checkpoint_executor.shutdown(
+                    wait=False,
+                    cancel_futures=True,
+                )
             # Flush buffered spans/metrics before the actor goes away. Off the
             # event loop: the flush blocks on a network export with a 5s
             # timeout, and this is an async actor whose other coroutines --
