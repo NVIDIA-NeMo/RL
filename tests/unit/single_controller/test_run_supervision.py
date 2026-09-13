@@ -37,8 +37,12 @@ def _bare_actor():
     ctrl._train_steps = 0
     ctrl._trainer_version = 0
     ctrl._master_config = SimpleNamespace(
-        rollout_checkpointing=SimpleNamespace(snapshot_attempt_interval_s=None)
+        rollout_checkpointing=SimpleNamespace(
+            snapshot_attempt_interval_s=None,
+            telemetry_interval_s=None,
+        )
     )
+    ctrl._buffer = SimpleNamespace(target_step_list=[])
     ctrl._rollout_checkpoint_stop_requested = asyncio.Event()
     ctrl._weight_synchronizer = SimpleNamespace(is_stale=False, shutdown=lambda: None)
     ctrl._logger = SimpleNamespace(finish=lambda: None)
@@ -46,7 +50,10 @@ def _bare_actor():
     ctrl._finalizer_actors = []
     # run() stamps the rollout manager with the starting weight version before
     # it launches any pump.
-    ctrl._rollout_manager = SimpleNamespace(set_weight_version=lambda _v: None)
+    ctrl._rollout_manager = SimpleNamespace(
+        set_weight_version=lambda _v: None,
+        recovery_ledger=SimpleNamespace(groups=lambda: []),
+    )
 
     async def _noop():
         return None
@@ -59,6 +66,7 @@ def _bare_actor():
 
     ctrl._maybe_restore_rollout_recovery = _noop_restore_recovery
     ctrl._maybe_restore_replacement_reserve = _noop
+    ctrl._log_rollout_restore_metrics = lambda **_kwargs: None
     return ctrl
 
 
