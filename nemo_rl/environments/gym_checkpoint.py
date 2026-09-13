@@ -640,6 +640,7 @@ class GymAgentExecutionStatus(GymExecutionIdentity):
         "running",
         "park_requested",
         "parked",
+        "model_wait_frozen",
         "completed",
         "retired",
     ]
@@ -647,6 +648,7 @@ class GymAgentExecutionStatus(GymExecutionIdentity):
         Literal[
             "parked_with_boundary",
             "parked_without_boundary",
+            "model_wait_frozen",
         ]
         | None
     )
