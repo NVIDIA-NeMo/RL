@@ -59,6 +59,7 @@ def test_http_sampling_params_match_the_direct_path():
         sampling_params_cls,
         sampling_config={"temperature": 0.8, "top_p": 0.9, "top_k": 20},
         stop_token_ids=[9],
+        stop_strings=None,
         max_tokens=4,
     )
 
@@ -68,10 +69,48 @@ def test_http_sampling_params_match_the_direct_path():
         top_k=20,
         max_tokens=4,
         stop_token_ids=[9],
+        stop=None,
         include_stop_str_in_output=True,
         logprobs=True,
         logprobs_simple_format=True,
     )
+
+
+def test_http_sampling_params_forward_stop_strings():
+    """Stop strings must reach TRT-LLM as ``stop``, next to the token-id list.
+
+    The two are separate controls: ``stop_token_ids`` cannot express a multi-token
+    string like ``</answer>``, so dropping ``stop`` left the HTTP rollout path
+    generating past a boundary the config had asked it to stop at.
+    """
+    sampling_params_cls = MagicMock()
+
+    _build_sampling_params(
+        sampling_params_cls,
+        sampling_config={"temperature": 0.8, "top_p": 0.9, "top_k": 20},
+        stop_token_ids=[9],
+        stop_strings=["</answer>", "<eot>"],
+        max_tokens=4,
+    )
+
+    kwargs = sampling_params_cls.call_args.kwargs
+    assert kwargs["stop"] == ["</answer>", "<eot>"]
+    assert kwargs["stop_token_ids"] == [9]
+
+
+def test_http_sampling_params_empty_stop_strings_stay_none():
+    """[] must not reach TRT-LLM as an empty list; None keeps its own default."""
+    sampling_params_cls = MagicMock()
+
+    _build_sampling_params(
+        sampling_params_cls,
+        sampling_config={"temperature": 1.0, "top_p": 1.0, "top_k": None},
+        stop_token_ids=None,
+        stop_strings=[],
+        max_tokens=8,
+    )
+
+    assert sampling_params_cls.call_args.kwargs["stop"] is None
 
 
 def test_http_sampling_params_map_null_top_k_and_empty_stop_tokens():
@@ -82,6 +121,7 @@ def test_http_sampling_params_map_null_top_k_and_empty_stop_tokens():
         sampling_params_cls,
         sampling_config={"temperature": 1.0, "top_p": 1.0, "top_k": None},
         stop_token_ids=None,
+        stop_strings=None,
         max_tokens=8,
     )
 
@@ -91,6 +131,7 @@ def test_http_sampling_params_map_null_top_k_and_empty_stop_tokens():
         top_k=0,
         max_tokens=8,
         stop_token_ids=None,
+        stop=None,
         include_stop_str_in_output=True,
         logprobs=True,
         logprobs_simple_format=True,
