@@ -28,7 +28,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Literal, TypeAlias, TypeVar, cast
+from typing import Annotated, Literal, Mapping, TypeAlias, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, model_validator
 
@@ -616,6 +616,11 @@ class GymModelPrepareResponse(_StrictWireModel):
     state: Literal["accepting", "draining", "paused"]
     workers: GymWorkerAcknowledgements
     inflight_total: NonNegativeInt
+    response_inflight_total: NonNegativeInt | None = None
+    generation_pending_total: NonNegativeInt | None = None
+    # Gym owns the nested generation-cut proof schema. RL persists the opaque
+    # validated payload and extracts only its durable TQ staging keys.
+    generation_cut_proof: dict[str, object] | None = None
     waiters_total: NonNegativeInt
 
 
@@ -638,6 +643,7 @@ class GymSingleWorkerModelStatusResponse(_LiveResponseWireModel):
     inflight_total: NonNegativeInt
     response_inflight_total: NonNegativeInt | None = None
     generation_pending_total: NonNegativeInt | None = None
+    generation_cut_proof: dict[str, object] | None = None
     waiters_total: NonNegativeInt
     inflight: list[GymModelInflightRequest]
     tombstones: list[GymExecutionIdentity]
@@ -666,6 +672,7 @@ class GymCoordinatorModelStatusResponse(_LiveResponseWireModel):
     inflight_total: NonNegativeInt
     response_inflight_total: NonNegativeInt | None = None
     generation_pending_total: NonNegativeInt | None = None
+    generation_cut_proof: dict[str, object] | None = None
     waiters_total: NonNegativeInt
     per_worker: dict[str, GymCoordinatorWorkerStatus]
 
@@ -767,6 +774,71 @@ class GymCheckpointPrepareResult(_StrictWireModel):
     checkpoint_id: str
     ready: bool
     participants: list[GymParticipantPrepareResult]
+
+
+def gym_generation_cut_proofs(
+    prepare: GymCheckpointPrepareResult,
+) -> tuple[dict[str, object], ...]:
+    """Return opaque policy-model cut proofs in deterministic participant order."""
+    proofs = [
+        dict(result.payload.generation_cut_proof)
+        for result in prepare.participants
+        if isinstance(result.payload, GymModelPrepareResponse)
+        and result.payload.generation_cut_proof is not None
+    ]
+    return tuple(proofs)
+
+
+def gym_generation_cut_staging_keys(
+    prepare: GymCheckpointPrepareResult,
+) -> set[str]:
+    """Extract every durable-prefix TQ key named by Gym's cut proofs."""
+
+    def receipts(proof: Mapping[str, object]) -> list[Mapping[str, object]]:
+        direct = proof.get("generation_cut_receipt")
+        if isinstance(direct, Mapping):
+            return [direct]
+        workers = proof.get("workers")
+        if workers is None:
+            return []
+        if not isinstance(workers, list):
+            raise ValueError("Gym generation-cut proof workers must be a list")
+        found: list[Mapping[str, object]] = []
+        for worker in workers:
+            if not isinstance(worker, Mapping):
+                raise ValueError("Gym generation-cut worker proof must be an object")
+            receipt = worker.get("generation_cut_receipt")
+            if receipt is not None:
+                if not isinstance(receipt, Mapping):
+                    raise ValueError("Gym generation-cut receipt must be an object")
+                found.append(receipt)
+        return found
+
+    keys: set[str] = set()
+    for proof in gym_generation_cut_proofs(prepare):
+        for receipt in receipts(proof):
+            prefixes = receipt.get("prefixes")
+            if not isinstance(prefixes, list):
+                raise ValueError("Gym generation-cut receipt prefixes must be a list")
+            for prefix in prefixes:
+                if not isinstance(prefix, Mapping):
+                    raise ValueError(
+                        "Gym generation-cut prefix acknowledgement must be an object"
+                    )
+                disposition = prefix.get("disposition")
+                if disposition == "durable_failure":
+                    continue
+                if disposition != "durable_prefix":
+                    raise ValueError(
+                        f"unknown Gym generation-cut disposition {disposition!r}"
+                    )
+                staging_key = prefix.get("staging_key")
+                if not isinstance(staging_key, str) or not staging_key:
+                    raise ValueError(
+                        "durable Gym generation-cut prefix requires a staging key"
+                    )
+                keys.add(staging_key)
+    return keys
 
 
 class GymModelCommitResponse(_StrictWireModel):
