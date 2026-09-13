@@ -389,6 +389,7 @@ def vlm_preference_preprocessor(
     placeholder_style_processors = {
         "NemotronNanoVLV2Processor",
         "NemotronH_Nano_Omni_Reasoning_V3Processor",
+        "NemotronH_Super_Omni_Reasoning_V3Processor",
         "NemotronH_Omni_Reasoning_V3Processor",
     }
     message_processor = (

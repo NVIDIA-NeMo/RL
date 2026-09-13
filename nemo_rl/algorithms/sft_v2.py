@@ -197,17 +197,6 @@ class SFTSingleControllerActor:
             // self._placement_plan.logical_world_size,
             "max_sequence_length": config.data["max_input_seq_length"],
             "placement_fingerprint": self._placement_plan.placement_hash,
-            "packing_algorithm": config.policy["sequence_packing"]["algorithm"]
-            if config.data["energon"].packing_buffer_size is not None
-            else None,
-            # This caps sources per physical pack. Energon's similarly named
-            # max_samples_per_sequence instead controls sequential shard reads.
-            "max_sequences_per_bin": config.policy["sequence_packing"].get(
-                "max_sequences_per_bin"
-            ),
-            "sequence_length_pad_multiple": config.policy[
-                "make_sequence_length_divisible_by"
-            ],
             "only_unmask_final": config.sft.only_unmask_final,
         }
         if self._loader_states is None:
@@ -252,17 +241,26 @@ class SFTSingleControllerActor:
     def _run_train_step(self) -> dict[str, Any]:
         started = time.monotonic()
         envelopes = self._load_envelopes()
+        loader_wait = time.monotonic() - started
         train_started = time.monotonic()
         step_open = False
         try:
+            phase_started = time.monotonic()
             self._trainer.begin_train_step(self._loss_fn)
+            begin_train_step = time.monotonic() - phase_started
             step_open = True
-            self._trainer.train_placed_microbatches(
+            phase_started = time.monotonic()
+            placed_phases = self._trainer.train_placed_microbatches(
                 [envelope.meta for envelope in envelopes]
             )
+            train_placed_microbatches = time.monotonic() - phase_started
+            phase_started = time.monotonic()
             train_results = self._trainer.finish_train_step()
+            finish_train_step = time.monotonic() - phase_started
             step_open = False
+            phase_started = time.monotonic()
             self._owner_call("commit_sft_batch")
+            commit_sft_batch = time.monotonic() - phase_started
         except Exception:
             if step_open:
                 try:
@@ -289,6 +287,12 @@ class SFTSingleControllerActor:
             "loader_latency_mean": statistics.fmean(loader_seconds),
             "loader_copy_imbalance": loader_latency_max - min(loader_seconds),
             "policy_time": policy_seconds,
+            "begin_train_step": begin_train_step,
+            "train_placed_microbatches": train_placed_microbatches,
+            "finish_train_step": finish_train_step,
+            "commit_sft_batch": commit_sft_batch,
+            "loader_wait": loader_wait,
+            "queue_depth": 1,
             "total_step_time": time.monotonic() - started,
             "valid_tokens": valid_tokens,
             "source_samples": sum(len(envelope.source_ids) for envelope in envelopes),
@@ -298,6 +302,23 @@ class SFTSingleControllerActor:
             "valid_tokens_per_second": valid_tokens
             / max(time.monotonic() - started, 1e-12),
         }
+        if isinstance(placed_phases, dict):
+            for key, value in placed_phases.items():
+                metrics[f"placed_{key}"] = float(value)
+        phase_names = sorted(
+            {
+                phase
+                for envelope in envelopes
+                for phase in envelope.load_phase_seconds
+            }
+        )
+        for phase in phase_names:
+            values = [
+                envelope.load_phase_seconds.get(phase, 0.0) for envelope in envelopes
+            ]
+            metric_phase = phase.replace("-", "_")
+            metrics[f"loader_{metric_phase}_max"] = max(values)
+            metrics[f"loader_{metric_phase}_mean"] = statistics.fmean(values)
         metrics.update(self._policy_metrics(train_results))
         return metrics
 
@@ -315,9 +336,13 @@ class SFTSingleControllerActor:
                 metrics[key] = np.sum(values).item()
         for key, value in train_results.get("moe_metrics", {}).items():
             metrics[f"moe/{key}"] = value
+        for key, value in train_results.get("mtp_metrics", {}).items():
+            metrics[f"mtp/{key}"] = value
         for key in ("total_flops", "num_ranks", "theoretical_tflops"):
             if key in train_results:
                 metrics[key] = train_results[key]
+        for key, value in train_results.get("step_phases", {}).items():
+            metrics[f"worker_{key}"] = float(value)
         return metrics
 
     def _owner_call(self, method_name: str) -> list[Any]:
@@ -400,8 +425,8 @@ def setup_sft_v2(
         raise ValueError("SFTv2 supports only the Megatron policy backend.")
     sequence_packing = master_config.policy["sequence_packing"]
     dynamic_batching = master_config.policy["dynamic_batching"]
-    energon_packing = master_config.data["energon"].packing_buffer_size is not None
-    if not energon_packing:
+    energon_packing = master_config.data["energon"].task_encoder.packing
+    if energon_packing is None:
         if sequence_packing["enabled"] or dynamic_batching["enabled"]:
             raise ValueError("SFTv2 without Energon packing requires fixed batching.")
     else:
@@ -411,7 +436,7 @@ def setup_sft_v2(
             raise ValueError(
                 "Energon packing requires sequence_packing enabled with fuse_loss."
             )
-        if sequence_packing.get("algorithm") not in {
+        if energon_packing.name not in {
             algorithm.value for algorithm in PackingAlgorithm
         }:
             raise ValueError("Energon SFT requires a supported packing algorithm.")
@@ -445,7 +470,7 @@ def setup_sft_v2(
     max_sequence_length = master_config.data["max_input_seq_length"]
     if max_sequence_length is None:
         raise ValueError("SFTv2 requires data.max_input_seq_length.")
-    if energon_packing:
+    if energon_packing is not None:
         megatron_cfg = master_config.policy["megatron_cfg"]
         if (
             megatron_cfg.get("moe_token_dispatcher_type") == "flex"
@@ -454,20 +479,22 @@ def setup_sft_v2(
             raise ValueError("Energon packing does not support HybridEP flex dispatch.")
 
         cp_size = megatron_cfg["context_parallel_size"]
-        tp_size = megatron_cfg["tensor_model_parallel_size"]
-        pad_multiple = master_config.policy["make_sequence_length_divisible_by"]
-        parallel_multiple = (2 * cp_size if cp_size > 1 else 1) * (
-            tp_size if tp_size > 1 and megatron_cfg["sequence_parallel"] else 1
-        )
+        pack_options = energon_packing.options
+        if pack_options.max_sequence_length != max_sequence_length:
+            raise ValueError(
+                "Energon pack capacity must match data.max_input_seq_length."
+            )
+        pad_multiple = pack_options.sequence_length_pad_multiple
+        parallel_multiple = 2 * cp_size if cp_size > 1 else 1
         if pad_multiple % parallel_multiple != 0:
             raise ValueError(
-                "Energon packing requires make_sequence_length_divisible_by to "
+                "Energon packing requires sequence_length_pad_multiple to "
                 f"be a multiple of {parallel_multiple}."
             )
         if max_sequence_length % pad_multiple != 0:
             raise ValueError(
                 "Energon packing requires max_input_seq_length to be divisible by "
-                "make_sequence_length_divisible_by."
+                "sequence_length_pad_multiple."
             )
 
         fp8_cfg = megatron_cfg.get("fp8_cfg") or {}

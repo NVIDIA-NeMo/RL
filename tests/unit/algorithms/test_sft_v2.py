@@ -49,6 +49,13 @@ def _envelope(rank: int, *, source_count: int = 1) -> StepEnvelope:
         sequence_lengths=(8,),
         load_seconds=0.1 + rank * 0.1,
         valid_tokens=4,
+        load_phase_seconds={
+            "iter": 0.01 + rank * 0.01,
+            "prepare": 0.02,
+            "post-prepare": 0.03,
+            "tensordict": 0.04,
+            "publish": 0.05,
+        },
     )
 
 
@@ -59,6 +66,12 @@ def _controller() -> object:
         "loss": 1.0,
         "grad_norm": 0.5,
         "all_mb_metrics": {},
+        "mtp_metrics": {"mtp_1_loss": 0.25},
+        "step_phases": {"fetch": 0.1, "fwd_bwd": 0.2},
+    }
+    controller._trainer.train_placed_microbatches.return_value = {
+        "stamp_pad": 0.01,
+        "dispatch": 0.02,
     }
     controller._master_config = SimpleNamespace()
     controller._save_state = SFTV2SaveState(0, 0, 0, "hash")
@@ -86,7 +99,9 @@ def _valid_setup_config(
         "backend": "energon",
         "validation": None,
         "max_input_seq_length": 128,
-        "energon": SimpleNamespace(packing_buffer_size=None),
+        "energon": SimpleNamespace(
+            task_encoder=SimpleNamespace(packing=None),
+        ),
     }
     data.update(data_overrides or {})
     policy = {
@@ -128,6 +143,23 @@ def test_train_step_orders_split_policy_lifecycle_and_commit() -> None:
     assert metrics["valid_tokens"] == 8
     assert metrics["source_samples"] == 3
     assert metrics["physical_packs"] == 2
+    assert metrics["loader_iter_max"] == 0.02
+    assert metrics["loader_iter_mean"] == pytest.approx(0.015)
+    assert metrics["loader_prepare_mean"] == 0.02
+    assert metrics["loader_post_prepare_max"] == 0.03
+    assert metrics["loader_tensordict_mean"] == 0.04
+    assert metrics["loader_publish_max"] == 0.05
+    assert metrics["loader_wait"] >= 0.0
+    assert metrics["queue_depth"] == 1
+    assert metrics["begin_train_step"] >= 0.0
+    assert metrics["train_placed_microbatches"] >= 0.0
+    assert metrics["finish_train_step"] >= 0.0
+    assert metrics["commit_sft_batch"] >= 0.0
+    assert metrics["placed_stamp_pad"] == 0.01
+    assert metrics["placed_dispatch"] == 0.02
+    assert metrics["worker_fetch"] == 0.1
+    assert metrics["worker_fwd_bwd"] == 0.2
+    assert metrics["mtp/mtp_1_loss"] == 0.25
 
 
 def test_train_step_aborts_policy_and_loader_on_training_failure() -> None:
@@ -292,7 +324,17 @@ def test_setup_rejects_unsupported_energon_packing_layouts(
     config = _valid_setup_config(
         data_overrides={
             "max_input_seq_length": 130,
-            "energon": SimpleNamespace(packing_buffer_size=64),
+            "energon": SimpleNamespace(
+                task_encoder=SimpleNamespace(
+                    packing=SimpleNamespace(
+                        name="greedy_knapsack",
+                        options=SimpleNamespace(
+                            max_sequence_length=130,
+                            sequence_length_pad_multiple=policy_multiple,
+                        ),
+                    )
+                )
+            ),
         },
         policy_overrides={
             "megatron_cfg": megatron_overrides,

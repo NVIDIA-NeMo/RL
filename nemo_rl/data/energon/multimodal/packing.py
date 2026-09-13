@@ -91,10 +91,17 @@ def prepare_packed_sft_batch(
     *,
     tokenizer: PreTrainedTokenizerBase,
     only_unmask_final: bool,
+    loss_mask_mode: str | None = None,
 ) -> BatchedDataDict[Any]:
     """Create model tensors for a batch of physical Energon packs."""
     if not packs or tokenizer.pad_token_id is None:
         raise ValueError("Packed SFT requires packs and a tokenizer pad token.")
+    if loss_mask_mode not in (None, "precomputed"):
+        raise ValueError(f"Unsupported packed SFT loss_mask_mode={loss_mask_mode!r}.")
+    if loss_mask_mode == "precomputed" and only_unmask_final:
+        raise ValueError(
+            "only_unmask_final cannot override precomputed packed SFT loss masks."
+        )
     capacities = {pack.pack_capacity for pack in packs}
     if len(capacities) != 1:
         raise ValueError("All physical packs in a batch need one capacity.")
@@ -108,9 +115,29 @@ def prepare_packed_sft_batch(
         logs = [
             [dict(message) for message in sample.message_log] for sample in pack.samples
         ]
-        add_loss_mask_to_message_log(
-            logs, roles_to_train_on=["assistant"], only_unmask_final=only_unmask_final
-        )
+        if loss_mask_mode == "precomputed":
+            for log in logs:
+                for message in log:
+                    tokens = message.get("token_ids")
+                    mask = message.get("token_loss_mask")
+                    if (
+                        not isinstance(tokens, torch.Tensor)
+                        or not isinstance(mask, torch.Tensor)
+                        or tokens.ndim != 1
+                        or mask.ndim != 1
+                        or tokens.shape != mask.shape
+                        or bool(((mask != 0) & (mask != 1)).any())
+                    ):
+                        raise ValueError(
+                            "Precomputed packed SFT masks must be binary vectors "
+                            "matching each token vector."
+                        )
+        else:
+            add_loss_mask_to_message_log(
+                logs,
+                roles_to_train_on=["assistant"],
+                only_unmask_final=only_unmask_final,
+            )
         templates = {
             key: value
             for log in logs

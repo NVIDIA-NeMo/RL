@@ -96,11 +96,17 @@ class TestPreshardedWrappers:
 
     def test_train_microbatch_fetches_attaches_then_dispatches(self):
         w = _SplitStubWorker()
+        w._train_step_state = {"step_phases": {}}
         meta = _meta()
         out = w.train_microbatch_presharded(meta=meta)
         assert out is None  # metrics accumulate in the open-step state
         assert [c[0] for c in w.calls] == ["fetch", "attach", "train_microbatch"]
         assert w.calls[-1][1] == {"data_from": meta}
+        assert set(w._train_step_state["step_phases"]) == {
+            "fetch",
+            "attach_pack",
+            "train_microbatch",
+        }
 
     def test_finish_tags_replica_leader(self):
         leader = _SplitStubWorker(is_leader=True)
@@ -218,6 +224,7 @@ class TestTQPolicySplitFanout:
                 "global_loss": 1.0,
                 "grad_norm": 0.5,
                 "all_mb_metrics": {"loss": [0.1]},
+                "step_phases": {"fetch": 0.2 if leader else 99.0},
                 "is_replica_leader": leader,
             }
 
@@ -234,6 +241,7 @@ class TestTQPolicySplitFanout:
         assert out["all_mb_metrics"]["loss"] == [0.1, 0.1]  # twins dropped
         # _aggregate_train_results surfaces global_loss under "loss"
         assert out["loss"] == 1.0
+        assert out["step_phases"] == {"fetch": 0.2}
 
     def test_finish_propagates_mtp_metrics(self):
         """Worker-reduced MTP metrics survive the TQPolicy aggregation layer."""

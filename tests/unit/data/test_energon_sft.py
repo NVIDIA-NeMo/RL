@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import io
+import os
 from copy import deepcopy
 from typing import Any
 
@@ -28,8 +29,11 @@ pytest.importorskip("megatron.energon")
 
 pytestmark = pytest.mark.mcore
 
+from megatron.energon import WorkerConfig  # noqa: E402
+
 from nemo_rl.algorithms.sft import prepare_sft_batch  # noqa: E402
 from nemo_rl.data.collate_fn import rl_collate_fn  # noqa: E402
+from nemo_rl.data.energon import sft_dataloader  # noqa: E402
 from nemo_rl.data.energon.config import (  # noqa: E402
     EnergonLoaderConfig,
     EnergonSourceConfig,
@@ -50,6 +54,7 @@ from nemo_rl.data.energon.sft_dataloader import (  # noqa: E402
     _identity_fingerprint,
     _loader_config,
     _loader_identity,
+    _set_nvdataset_cache_dir,
     build_energon_sft_loader,
 )
 from nemo_rl.data.interfaces import TaskDataSpec  # noqa: E402
@@ -395,8 +400,13 @@ def test_task_encoder_runs_split_encode_and_batch_lifecycle_methods():
 
     assert encoder.encode_batch(batch) is batch
     assert batch["source_ids"] == ["sample-0"]
-    with pytest.raises(RuntimeError, match="packing is not configured"):
-        encoder.select_samples_to_pack([preencoded])
+    worker_config = WorkerConfig(rank=0, world_size=1, num_workers=0)
+    worker_config.worker_activate(0)
+    try:
+        with pytest.raises(RuntimeError, match="packing is not configured"):
+            encoder.select_samples_to_pack([preencoded])
+    finally:
+        worker_config.worker_deactivate()
 
 
 class _FakeLoader:
@@ -470,24 +480,62 @@ def test_energon_config_validates_sequence_packing():
     assert config.topology_mapper == "default"
     assert config.task_encoder.name == "generic_sft"
     assert [cooker.name for cooker in config.cookers] == ["generic_conversation"]
+    assert config.cache_pool_max_gbytes is None
+    assert config.cache_pool_num_workers == 1
+    assert config.gc_collect_every_n_steps == 100000
+    assert config.nvdataset_cache_dir is None
 
     source = EnergonSourceConfig(
         path="/data/prepared", split="train", virtual_epoch_length=10
     )
     assert source.virtual_epoch_length == 10
     packed = EnergonLoaderConfig(
-        model_family="qwen", packing_buffer_size=10, max_samples_per_sequence=2
+        model_family="qwen",
+        max_samples_per_sequence=2,
+        task_encoder={
+            "packing": {
+                "name": "balanced_greedy_knapsack",
+                "buffer_size": 10,
+                "options": {
+                    "max_sequence_length": 128,
+                    "sequence_length_pad_multiple": 8,
+                    "balanced_knapsack_delta": 5,
+                },
+            }
+        },
     )
-    assert packed.packing_buffer_size == 10
+    assert packed.packing_buffer_size is None
+    assert packed.task_encoder.packing is not None
+    assert packed.task_encoder.packing.buffer_size == 10
     assert packed.max_samples_per_sequence == 2
-    for field in ("packing_buffer_size", "max_samples_per_sequence"):
+    for field in ("max_samples_per_sequence",):
         for value in (0, -1):
             with pytest.raises(ValueError):
                 EnergonLoaderConfig(model_family="qwen", **{field: value})
     with pytest.raises(ValueError):
+        EnergonLoaderConfig(model_family="qwen", packing_buffer_size=10)
+    with pytest.raises(ValueError):
         EnergonLoaderConfig.model_validate({})
     with pytest.raises(ValueError):
         EnergonLoaderConfig.model_validate({"model_family": "unsupported"})
+
+    for field in (
+        "cache_pool_max_gbytes",
+        "cache_pool_num_workers",
+        "gc_collect_every_n_steps",
+    ):
+        with pytest.raises(ValueError):
+            EnergonLoaderConfig(model_family="qwen", **{field: 0})
+
+
+def test_nvdataset_cache_dir_updates_env_and_energon_global(monkeypatch):
+    monkeypatch.delenv("NVDATASET_CACHE_DIR", raising=False)
+    monkeypatch.setattr(sft_dataloader.energon_epath, "NVDATASET_CACHE_DIR", None)
+
+    _set_nvdataset_cache_dir("/cache/dss")
+
+    assert os.environ["NVDATASET_CACHE_DIR"] == "/cache/dss"
+    assert str(sft_dataloader.energon_epath.NVDATASET_CACHE_DIR) == "/cache/dss"
 
 
 def _identity(
@@ -599,9 +647,6 @@ def test_train_loader_rejects_shuffle_false():
             logical_rank=0,
             logical_world_size=1,
             placement_fingerprint="same-placement",
-            packing_algorithm=None,
-            max_sequences_per_bin=None,
-            sequence_length_pad_multiple=1,
             only_unmask_final=False,
         )
 
@@ -636,3 +681,41 @@ def test_config_rejects_options_for_the_generic_task_encoder():
                 },
             }
         )
+
+
+def test_config_validates_nemotron_task_encoder_options():
+    config = EnergonLoaderConfig.model_validate(
+        {
+            "model_family": "nemotron",
+            "task_encoder": {
+                "name": "nemotron_multimodal",
+                "options": {
+                    "prompt_format": "nemotron6-moe",
+                    "thinking_trace_format": "ultra",
+                    "audio_subsampling_factor": 8,
+                },
+            },
+            "cookers": ["nemotron_conversation"],
+        }
+    )
+
+    assert config.task_encoder.options.prompt_format == "nemotron6-moe"
+    assert config.task_encoder.options.thinking_trace_format == "ultra"
+    assert config.task_encoder.options.audio_subsampling_factor == 8
+
+    for options in (
+        {"audio_subsampling_factor": 3},
+        {"min_audio_duration_seconds": 31.0},
+        {"max_audio_duration_seconds": 29.0},
+        {"unknown_option": True},
+    ):
+        with pytest.raises(ValueError):
+            EnergonLoaderConfig.model_validate(
+                {
+                    "model_family": "nemotron",
+                    "task_encoder": {
+                        "name": "nemotron_multimodal",
+                        "options": options,
+                    },
+                }
+            )

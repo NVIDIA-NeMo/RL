@@ -58,7 +58,10 @@ def test_train_placed_microbatches_keeps_fields_and_replica_delivery() -> None:
         _meta(1, ["input_ids", "image_grid_thw"]),
     ]
 
-    assert policy.train_placed_microbatches(dp_metas) is None
+    phases = policy.train_placed_microbatches(dp_metas)
+
+    assert set(phases) == {"stamp_pad", "dispatch"}
+    assert all(value >= 0.0 for value in phases.values())
 
     dispatch = worker_group.run_all_workers_sharded_data.call_args
     dispatched = dispatch.kwargs["meta"]
