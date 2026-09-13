@@ -114,6 +114,7 @@ MXFP8_CASES = {
         "segment_size": 4,
         "async_engine": None,
         "moe_backend": "flashinfer_trtllm",
+        "refit_optimizations": True,
         "train_global_batch_size": 2048,
         "ignore_patterns": [
             "model.layers.*.self_attn.*",
@@ -140,6 +141,7 @@ MXFP8_CASES = {
         "segment_size": 4,
         "async_engine": None,
         "moe_backend": "flashinfer_trtllm",
+        "refit_optimizations": True,
         "ignore_patterns": [
             "model.layers.*.self_attn.*",
             "lm_head",
@@ -163,6 +165,7 @@ MXFP8_CASES = {
         "async_engine": True,
         "tensor_parallel_size": 4,
         "moe_backend": "flashinfer_trtllm",
+        "refit_optimizations": True,
         "ignore_patterns": [
             "model.layers.*.self_attn.*",
             "model.layers.*.mlp.gate",
@@ -246,6 +249,10 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
     assert config["logger"]["wandb"]["name"] == case_name
     assert vllm_cfg["precision"] == "fp8"
     assert vllm_cfg["is_mx"] is True
+    if expected.get("refit_optimizations"):
+        assert vllm_cfg["refit_prequantize"] is True
+        assert vllm_cfg["refit_cache_loader_routes"] is True
+        assert config["policy"]["megatron_cfg"]["enabled"] is True
     assert "quantization_ignored_layer_kws" not in vllm_cfg
     assert vllm_cfg["quantization_ignore_patterns"] == expected["ignore_patterns"]
     assert cluster["num_nodes"] == expected["nodes"]
@@ -274,6 +281,42 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
     assert async_grpo["in_flight_weight_updates"] is expected_async
     if expected_async:
         assert config["policy"]["generation"]["colocated"]["enabled"] is False
+
+
+@pytest.mark.parametrize(
+    "case_name",
+    (
+        "grpo-qwen3-30ba3b-4n4g-mxfp8-rollout",
+        "grpo-qwen3-32b-4n4g-mxfp8-rollout",
+        "grpo-qwen3-235b-16n4g-mxfp8-rollout",
+    ),
+)
+def test_sync_qwen3_mxfp8_rollout_recipes_enable_refit_optimizations(
+    case_name: str,
+) -> None:
+    config = _load_resolved_yaml(PERF_CONFIG_DIR / f"{case_name}.yaml")
+    vllm_cfg = config["policy"]["generation"]["vllm_cfg"]
+
+    assert vllm_cfg["refit_prequantize"] is True
+    assert vllm_cfg["refit_cache_loader_routes"] is True
+
+
+@pytest.mark.parametrize(
+    "case_name",
+    (
+        "grpo-qwen3-30ba3b-4n4g-async-1off-mxfp8-rollout",
+        "grpo-qwen3-32b-8n4g-async-1off-mxfp8-rollout",
+        "grpo-qwen3-235b-32n4g-async-1off-mxfp8-rollout",
+    ),
+)
+def test_async_qwen3_mxfp8_rollout_recipes_skip_sync_refit_optimizations(
+    case_name: str,
+) -> None:
+    config = _load_resolved_yaml(PERF_CONFIG_DIR / f"{case_name}.yaml")
+    vllm_cfg = config["policy"]["generation"]["vllm_cfg"]
+
+    assert not vllm_cfg.get("refit_prequantize", False)
+    assert not vllm_cfg.get("refit_cache_loader_routes", False)
 
 
 def test_mxfp8_rollout_recipes_are_in_gb200_performance_suite() -> None:

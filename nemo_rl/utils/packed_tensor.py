@@ -60,6 +60,8 @@ def packed_broadcast_producer(
         None
 
     """
+    if buffer_size_bytes is not None and buffer_size_bytes <= 0:
+        raise ValueError("buffer_size_bytes must be > 0")
     target_packed_tensor_size = (
         get_target_packed_tensor_size()
         if buffer_size_bytes is None

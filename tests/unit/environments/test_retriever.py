@@ -53,6 +53,7 @@ basic_vllm_test_config: VllmConfig = {
     "vllm_cfg": {
         "async_engine": False,
         "precision": "bfloat16",
+        "refit_cache_loader_routes": False,
         "tensor_parallel_size": 1,
         "pipeline_parallel_size": 1,
         "expert_parallel_size": 1,

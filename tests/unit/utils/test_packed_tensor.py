@@ -23,6 +23,18 @@ from nemo_rl.utils.packed_tensor import (
 )
 
 
+@pytest.mark.parametrize("buffer_size_bytes", [0, -1])
+def test_producer_rejects_nonpositive_buffer_size(buffer_size_bytes):
+    with pytest.raises(ValueError, match="buffer_size_bytes must be > 0"):
+        packed_broadcast_producer(
+            iterator=iter([]),
+            group=None,
+            src=0,
+            post_iter_func=lambda x: x,
+            buffer_size_bytes=buffer_size_bytes,
+        )
+
+
 class MockCommunicationGroup:
     """Mock communication group for testing broadcast operations."""
 
