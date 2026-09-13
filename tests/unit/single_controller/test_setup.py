@@ -84,6 +84,21 @@ from nemo_rl.utils.config import (
 _REAL_BUILD_GENERATION = sc_setup_mod._build_generation
 
 
+def test_generation_prefix_restore_requires_enabled_runtime() -> None:
+    proofs = ({"checkpoint_id": "checkpoint-1"},)
+
+    with pytest.raises(ValueError, match="contains durable generation-prefix cuts"):
+        sc_setup_mod._validate_generation_prefix_restore_compatibility(
+            generation_cut_proofs=proofs,
+            generation_prefix_cuts_enabled=False,
+        )
+
+    sc_setup_mod._validate_generation_prefix_restore_compatibility(
+        generation_cut_proofs=proofs,
+        generation_prefix_cuts_enabled=True,
+    )
+
+
 class _CheckpointingCustomSampler(WindowedSampler):
     """Custom sampler whose static capability must be validated during setup."""
 
