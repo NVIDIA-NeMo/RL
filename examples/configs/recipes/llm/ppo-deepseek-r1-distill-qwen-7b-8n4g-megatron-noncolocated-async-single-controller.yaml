@@ -172,3 +172,4 @@ checkpointing:
   checkpoint_dir: results/ppo-deepseek-r1-distill-qwen-7b-8n4g-megatron-noncolocated-async-single-controller
   metric_name: null
   save_period: 10
+  save_data_plane: true
