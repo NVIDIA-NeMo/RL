@@ -52,6 +52,7 @@ def _build_sampling_params(
     *,
     sampling_config: dict[str, Any],
     stop_token_ids: list[int] | None,
+    stop_strings: list[str] | None,
     max_tokens: int,
 ) -> Any:
     """Build the TRT-LLM sampling params for one HTTP rollout request.
@@ -65,6 +66,8 @@ def _build_sampling_params(
             helper stays importable and testable without the TRT-LLM runtime.
         sampling_config: NeMo-RL generation config (temperature / top_p / top_k).
         stop_token_ids: Extra stop tokens from the generation config, if any.
+        stop_strings: Stop strings from the generation config, if any. TRT-LLM
+            spells these ``stop``, alongside the token-id list.
         max_tokens: Output cap for this request, already clamped to the context window.
 
     Returns:
@@ -73,12 +76,14 @@ def _build_sampling_params(
     # TRT-LLM spells "no top-k restriction" as 0, the generation config as null.
     top_k_cfg = sampling_config["top_k"]
     stop_ids = list(stop_token_ids or [])
+    stops = list(stop_strings or [])
     return sampling_params_cls(
         temperature=float(sampling_config["temperature"]),
         top_p=float(sampling_config["top_p"]),
         top_k=int(top_k_cfg) if top_k_cfg is not None else 0,
         max_tokens=int(max_tokens),
         stop_token_ids=stop_ids or None,
+        stop=stops or None,
         # Include generated stop tokens so the adapter can trim tokens and logprobs together.
         include_stop_str_in_output=True,
         logprobs=True,
@@ -93,6 +98,7 @@ def create_app(
     max_seq_len: int,
     sampling_config: dict[str, Any],
     stop_token_ids: list[int] | None = None,
+    stop_strings: list[str] | None = None,
     default_chat_template_kwargs: dict[str, Any] | None = None,
     tool_parser: str | None = None,
     reasoning_parser: str | None = None,
@@ -241,6 +247,7 @@ def create_app(
             TrtSamplingParams,
             sampling_config=sampling_config,
             stop_token_ids=stop_token_ids,
+            stop_strings=stop_strings,
             max_tokens=max_tokens,
         )
 
@@ -513,6 +520,7 @@ def start_server(
     max_seq_len: int,
     sampling_config: dict[str, Any],
     stop_token_ids: list[int] | None = None,
+    stop_strings: list[str] | None = None,
     host: str = "0.0.0.0",
     port: int = 0,
     default_chat_template_kwargs: dict[str, Any] | None = None,
@@ -540,6 +548,7 @@ def start_server(
         max_seq_len=max_seq_len,
         sampling_config=sampling_config,
         stop_token_ids=stop_token_ids,
+        stop_strings=stop_strings,
         default_chat_template_kwargs=default_chat_template_kwargs,
         tool_parser=tool_parser,
         reasoning_parser=reasoning_parser,
