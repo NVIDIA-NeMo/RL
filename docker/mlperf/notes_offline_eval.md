@@ -95,3 +95,60 @@ vs 256 at this checker pin).
 
 Unit tests: `tests/unit/algorithms/test_mlperf_grpo_deferred.py` and
 `test_mlperf_grpo_logging.py` (15 tests, in-container pass).
+
+## Review outcomes (grok-4.6 review, addressed in-tree)
+
+- **Retention**: `keep_top_k=None` in deferred mode (the earlier
+  `max(..., 2)` floor could prune required endpoints), and the evaluator
+  rejects a checkpoint series that does not start at `val_start_at` or has
+  gaps, instead of scoring a partial window.
+- **Inline-mode timing**: with the held-eval fix, a target-reaching inline
+  `run_stop` is emitted when the step's logging completes, i.e. after the
+  (non-default) checkpoint write rather than before it. This matches the
+  accepted optimized fix (fc0426345d); the qualified inline recipe does not
+  checkpoint, and the residual delay is seconds.
+- **Timestamp placement**: `training_step_end_time_ms` is stamped at the end
+  of `policy.train()` — the weight update itself. The refit that follows
+  publishes the weights to vLLM but does not update them; the rules exclude
+  checkpoint-write time, not refit time.
+- **`save_period=val_start_at`**: intentional; it suppresses the recipe's
+  periodic pre-window saves while the every-step-from-`val_start_at` rule in
+  the async loop covers the window. (`save_period=1` would checkpoint the
+  whole run.)
+- Dataloader/replay-buffer state stays in the deferred checkpoints: native
+  contents keep them resumable training checkpoints, and the extra write is
+  bounded (one or two window saves).
+- The held-eval logger machinery is the requested last-step-mllog fix (the
+  reference dropped the final step's train stats on target hit), not
+  offline-eval machinery; offline eval itself never triggers it
+  (`val_period=0`).
+
+## Design alternatives considered
+
+**Async checkpoint saving — possible, not worth it.** Saves on this stack are
+synchronous: `_create_checkpoint_config` hardcodes `async_save=False` and the
+recipe's `megatron_cfg.checkpoint.async_strategy` is unwired; bridge async
+saves would additionally need `GlobalState.initialize_async_checkpoint_worker()`
+(never called here). Completeness is published by the `tmp_step_N -> step_N`
+rename after `policy.save_checkpoint` returns, so async saving would require
+delaying the rename until the async finalize callbacks run, plus a blocking
+drain of the final save before the policy actors shut down (worker `shutdown`
+does not finalize async saves). The only score-relevant win is overlapping the
+step-H write with step-H+1 training (one save in the recommended H/H+1 stop);
+the final checkpoint's write time is already excluded from the score by the
+backdated `run_stop`. Not worth the shared-checkpoint-path blast radius for
+this flow.
+
+**Existing lifecycle hooks — reused where they fit.** The implementation rides
+on: the stock checkpoint path (`init_tmp_checkpoint`/`finalize_checkpoint`),
+`setup()`'s native restore (the single-symlink checkpoint view, no custom
+loader), the existing `validate()`, the trainer epilogue's actor shutdown,
+`mlperf_logger.finalize()` (gated by `defer_run_stop`), and run.sub's
+per-experiment subshell for the second driver. Hooks deliberately not reused:
+inline `val_at_end` validation (on the training clock, does not consume
+checkpoints), `checkpoint_must_save_by`/`TimeoutChecker` (wall-clock, wrong
+dimension), and top-k pruning (violates the every-step window). The genuinely
+new machinery is minimal: the config switch, the per-checkpoint weight-update
+timestamp, the every-step save predicate, the second-process evaluator, and
+cluster/PG release between phases (no existing hook releases
+`RayVirtualCluster`s after GRPO).
