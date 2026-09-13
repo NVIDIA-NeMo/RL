@@ -338,7 +338,7 @@ class MegatronGeneration(GenerationInterface):
                     "read by the native MCore refit (refit_transport='mcore')."
                 )
         # Populated after the first prepare_for_generation (which starts the HTTP server).
-        self.dp_openai_server_base_urls: list[Optional[str]] = []
+        self.dp_openai_server_base_urls: list[str] = []
         # Installed by setup via create_weight_synchronizer.
         self.weight_synchronizer: Optional["WeightSynchronizer"] = None
         # The nccl_reshard synchronizer records its current rank layout before
