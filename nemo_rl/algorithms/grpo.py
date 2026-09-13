@@ -86,6 +86,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
+from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.interfaces import (
     FRONTIER_ORDINAL_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
@@ -162,6 +163,7 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
+from nemo_rl.weight_sync.nccl_reshard_utils import check_nccl_reshard_refit_support
 
 # ===============================================================================
 # Configuration
@@ -491,35 +493,6 @@ def _needs_hf_refit_handshake(
     if generation_backend == "megatron":
         return False
     return not (nccl_reshard_refit_enabled and not colocated_inference)
-
-
-def shutdown_environments(
-    task_to_env: dict[str, EnvironmentInterface] | None,
-    val_task_to_env: dict[str, EnvironmentInterface] | None,
-) -> None:
-    """Shut down each unique environment actor before generation stops."""
-    seen_environment_handles: set[int] = set()
-    for environment_map in (task_to_env, val_task_to_env):
-        if environment_map is None:
-            continue
-        for task_name, environment in environment_map.items():
-            handle_id = id(environment)
-            if handle_id in seen_environment_handles:
-                continue
-            seen_environment_handles.add(handle_id)
-
-            print(f"🛑 Shutting down environment {task_name}...")
-            try:
-                ray.get(environment.shutdown.remote(), timeout=10)
-            except Exception as shutdown_error:
-                print(
-                    f"Environment {task_name} graceful shutdown failed: "
-                    f"{shutdown_error}"
-                )
-                try:
-                    ray.kill(environment)
-                except Exception as kill_error:
-                    print(f"Error stopping environment {task_name}: {kill_error}")
 
 
 def setup(
@@ -1261,13 +1234,15 @@ def setup(
     # plane exists. Default is the plain Policy class — legacy behavior.
     _make_policy = policy_factory if policy_factory is not None else Policy
 
-    def init_policy(reserved_http_server_port: Optional[int] = None):
+    def init_policy(reserved_http_server_ports: Optional[dict[int, int]] = None):
         """Initialize policy training workers."""
         t0 = time.perf_counter()
         extra_policy_kwargs = {}
-        if reserved_http_server_port is not None:
+        if reserved_http_server_ports is not None:
             # Colocated Megatron generation serves HTTP from the training workers.
-            extra_policy_kwargs["reserved_http_server_port"] = reserved_http_server_port
+            extra_policy_kwargs["reserved_http_server_ports"] = (
+                reserved_http_server_ports
+            )
         p = _make_policy(
             cluster=train_cluster,
             config=policy_config,
@@ -1306,7 +1281,7 @@ def setup(
         return pg, time.perf_counter() - t0
 
     def init_megatron_generation(
-        policy=None, reserved_http_server_port: Optional[int] = None
+        policy=None, reserved_http_server_ports: Optional[dict[int, int]] = None
     ):
         """Initialize Megatron generation."""
         t0 = time.perf_counter()
@@ -1317,7 +1292,7 @@ def setup(
             policy=policy if colocated_inference else None,
             processor=processor,
             skip_weight_load=not colocated_inference,
-            reserved_http_server_port=reserved_http_server_port,
+            reserved_http_server_ports=reserved_http_server_ports,
         )
         return mg, time.perf_counter() - t0
 
@@ -1414,26 +1389,30 @@ def setup(
                 flush=True,
             )
             reserve_t0 = time.perf_counter()
-            reserved_url, reserved_http_server_port, port_holder = (
-                MegatronGeneration.reserve_http_server_address(
+            reserved_urls, reserved_http_server_ports, port_holders = (
+                MegatronGeneration.reserve_http_server_addresses(
                     train_cluster if colocated_inference else inference_cluster,
                     policy_config,
                 )
             )
             reserve_time = time.perf_counter() - reserve_t0
             setup_timing_metrics.generation_init_reserve_time_s = reserve_time
-            print(f"  ✓ Reserved Megatron server URL: {reserved_url}", flush=True)
+            print(
+                f"  ✓ Reserved {len(reserved_urls)} Megatron server URL(s): "
+                f"{reserved_urls}",
+                flush=True,
+            )
 
             def init_nemo_gym():
-                """Spin up NeMo Gym servers against the reserved URL."""
-                return _spinup_nemo_gym([reserved_url], generation_config["model_name"])
+                """Spin up NeMo Gym servers against the reserved URLs."""
+                return _spinup_nemo_gym(reserved_urls, generation_config["model_name"])
 
             # Exactly one task adopts the reserved port: the policy when colocated
             # (generation wraps it), else the dedicated generation policy.
-            policy_port, generation_port = (
-                (reserved_http_server_port, None)
+            policy_ports, generation_ports = (
+                (reserved_http_server_ports, None)
                 if colocated_inference
-                else (None, reserved_http_server_port)
+                else (None, reserved_http_server_ports)
             )
 
             def init_megatron_generation_task(policy_future):
@@ -1442,7 +1421,7 @@ def setup(
                     p, _ = policy_future.result()
                     return init_megatron_generation(p)
                 return init_megatron_generation(
-                    reserved_http_server_port=generation_port
+                    reserved_http_server_ports=generation_ports
                 )
 
             print("  ⚡ Init tasks: policy, megatron_generation, nemo_gym", flush=True)
@@ -1450,7 +1429,7 @@ def setup(
             try:
                 with ThreadPoolExecutor(max_workers=3) as executor:
                     policy_future = executor.submit(
-                        init_policy, reserved_http_server_port=policy_port
+                        init_policy, reserved_http_server_ports=policy_ports
                     )
                     generation_future = executor.submit(
                         init_megatron_generation_task, policy_future
@@ -1469,7 +1448,8 @@ def setup(
                         init_megatron_weight_synchronizer(policy, policy_generation)
                     nemo_gym_actor, nemo_gym_time = nemo_gym_future.result()
             finally:
-                ray.kill(port_holder)
+                for port_holder in port_holders:
+                    ray.kill(port_holder)
 
             if colocated_inference:
                 setup_timing_metrics.parallel_init_enabled = 0.0
@@ -1723,27 +1703,26 @@ def setup(
         generation_config.get("refit_transport") == "nccl_reshard"
     )
     if nccl_reshard_refit_enabled:
-        from nemo_rl.weight_sync.nccl_reshard_utils import (
-            check_nccl_reshard_refit_support,
-        )
-
         check_nccl_reshard_refit_support(master_config)
 
-    if generation_config.get("refit_transport") is not None and backend != "vllm":
+    refit_transport = generation_config.get("refit_transport")
+    if refit_transport is not None and not (
+        backend == "vllm"
+        or (backend == "megatron" and refit_transport in ("mcore", "nccl_reshard"))
+    ):
         raise NotImplementedError(
-            "Non-default refit transports are only supported for the vLLM "
-            f"generation backend, but policy.generation.backend={backend!r}. "
-            "Set policy.generation.refit_transport=null. Support for other "
-            "generation backends is tracked in "
-            "https://github.com/NVIDIA-NeMo/RL/issues/3288."
+            f"refit_transport={refit_transport!r} is not supported for "
+            f"policy.generation.backend={backend!r}. "
+            "Set policy.generation.refit_transport=null. Megatron generation "
+            "supports refit_transport='mcore' or 'nccl_reshard'."
         )
 
     if backend == "megatron":
         if policy_generation.weight_synchronizer is None:
             init_megatron_weight_synchronizer(policy, policy_generation)
         if enable_nemo_gym:
-            MegatronGeneration.verify_served_address(
-                policy_generation.dp_openai_server_base_urls, reserved_url
+            MegatronGeneration.verify_served_addresses(
+                policy_generation.dp_openai_server_base_urls, reserved_urls
             )
     # if it is not colocated inference, initialize collective communication for update weights
     elif (
@@ -1842,7 +1821,9 @@ def setup(
         ) is None and _needs_hf_refit_handshake(
             backend, nccl_reshard_refit_enabled, colocated_inference
         ):
-            state_dict_info = policy.prepare_refit_info()
+            state_dict_info = policy.prepare_refit_info(
+                refit_payload_mode=policy_generation.get_refit_payload_mode()
+            )
             if policy_generation is not None:
                 policy_generation.prepare_refit_info(state_dict_info)
 
@@ -2890,8 +2871,7 @@ def _validation_early_stop_message(
     )
 
 
-@umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.grpo.job")
-def grpo_train(
+def _grpo_train_impl(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
     wrapped_dataloader: StatefulDataLoader | MultipleDataloaderWrapper,
@@ -4083,6 +4063,43 @@ def grpo_train(
     # so without this the daemon finalization thread would be killed before the
     # final tmp_step_N is renamed.
     checkpointer.shutdown()
+
+
+@umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.grpo.job")
+def grpo_train(
+    policy: ColocatablePolicyInterface,
+    policy_generation: Optional[GenerationInterface],
+    wrapped_dataloader: StatefulDataLoader | MultipleDataloaderWrapper,
+    val_dataloader: Optional[StatefulDataLoader],
+    tokenizer: TokenizerType,
+    loss_fn: LossFunction,
+    task_to_env: dict[str, EnvironmentInterface],
+    val_task_to_env: Optional[dict[str, EnvironmentInterface]],
+    logger: Logger,
+    checkpointer: CheckpointManager,
+    grpo_save_state: GRPOSaveState,
+    master_config: MasterConfig,
+    processor: Optional[AutoProcessor] = None,
+) -> None:
+    """Run GRPO training and always tear down its environments."""
+    try:
+        _grpo_train_impl(
+            policy=policy,
+            policy_generation=policy_generation,
+            wrapped_dataloader=wrapped_dataloader,
+            val_dataloader=val_dataloader,
+            tokenizer=tokenizer,
+            loss_fn=loss_fn,
+            task_to_env=task_to_env,
+            val_task_to_env=val_task_to_env,
+            logger=logger,
+            checkpointer=checkpointer,
+            grpo_save_state=grpo_save_state,
+            master_config=master_config,
+            processor=processor,
+        )
+    finally:
+        shutdown_environments(task_to_env, val_task_to_env)
 
 
 def validate(

@@ -75,6 +75,7 @@ from nemo_rl.models.dtensor.parallelize import (
     get_grad_norm,
     to_local_if_dtensor,
 )
+from nemo_rl.models.generation.interfaces import RefitPayloadMode
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
     pack_sequences,
@@ -1846,8 +1847,11 @@ class DTensorPolicyWorkerImpl(
         return self.model.config
 
     @torch.no_grad()
-    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+    def prepare_refit_info(
+        self, *, refit_payload_mode: RefitPayloadMode = "hf_export"
+    ) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
+        del refit_payload_mode
         state_dict_info = {}
         for name, tensor in self.model.state_dict().items():
             # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective

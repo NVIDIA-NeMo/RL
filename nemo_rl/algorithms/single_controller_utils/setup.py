@@ -103,6 +103,7 @@ from nemo_rl.experience.rollout_manager import (
     RolloutRetryPolicy,
     RolloutTimeouts,
 )
+from nemo_rl.experience.rollout_recovery import ROLLOUT_RECOVERY_STATE_FILENAME
 from nemo_rl.experience.rollouts import (
     get_nemo_gym_thinking_tags,
     resolve_reward_penalty_config,
@@ -165,6 +166,7 @@ class SingleControllerActorArgs:
     # Defaulted fields must follow the required ones above, so these stay last.
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None
+    rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None
     # None when async_rl.generation_fleet_health is disabled; the SingleController
     # drives the probe loop when it is present.
     fleet_monitor: Optional[GenerationFleetHealth] = None
@@ -490,7 +492,7 @@ def _build_generation(
     master_config: MasterConfig,
     *,
     defer_model_load: bool = False,
-    reserved_http_server_port: Optional[int] = None,
+    reserved_http_server_ports: Optional[dict[int, int]] = None,
     tokenizer: Optional[PreTrainedTokenizerBase] = None,
     processor: Optional[AutoProcessor] = None,
 ) -> tuple[Any, float]:
@@ -500,7 +502,8 @@ def _build_generation(
         inference_cluster: Ray virtual cluster the generation workers run on.
         master_config: SC MasterConfig.
         defer_model_load: If True (for the NeMo-Gym flow), reserve OpenAI server URLs without loading weights; caller runs gen.load_and_start() later (vLLM only).
-        reserved_http_server_port: OpenAI server port pre-published to NeMo-Gym (Megatron only).
+        reserved_http_server_ports: OpenAI server ports pre-published to NeMo-Gym,
+            keyed by the distributed rank that adopts each one (Megatron only).
         tokenizer: Tokenizer for the dedicated Megatron inference policy (Megatron only).
         processor: Optional AutoProcessor for VLM paths (Megatron only).
 
@@ -551,7 +554,7 @@ def _build_generation(
             config=master_config.policy,
             tokenizer=tokenizer,
             cluster=inference_cluster,
-            reserved_http_server_port=reserved_http_server_port,
+            reserved_http_server_ports=reserved_http_server_ports,
             processor=processor,
             skip_weight_load=True,
         )
@@ -591,7 +594,7 @@ def _build_trainer(
     *,
     weights_path: Optional[Path],
     optimizer_path: Optional[Path],
-    reserved_http_server_port: Optional[int] = None,
+    reserved_http_server_ports: Optional[dict[int, int]] = None,
 ) -> tuple[Any, float]:
     """Build the TQ-mediated trainer (driver-side TQPolicy).
 
@@ -602,8 +605,8 @@ def _build_trainer(
         processor: Optional AutoProcessor for VLM paths.
         weights_path: Checkpointed policy weights to resume from, or None.
         optimizer_path: Checkpointed optimizer state to resume from, or None.
-        reserved_http_server_port: Pre-published OpenAI server port for NeMo Gym;
-            set only when colocated Megatron generation serves from the trainer's rank 0.
+        reserved_http_server_ports: Pre-published OpenAI server ports for NeMo Gym,
+            keyed by the colocated Megatron trainer rank that adopts each one.
 
     Returns:
         A tuple of (TQPolicy trainer, wall time spent in this call).
@@ -621,7 +624,7 @@ def _build_trainer(
         init_optimizer=True,
         init_reference_model=init_reference_model,
         dp_cfg=master_config.data_plane,
-        reserved_http_server_port=reserved_http_server_port,
+        reserved_http_server_ports=reserved_http_server_ports,
     )
     return trainer, time.perf_counter() - t0
 
@@ -1039,6 +1042,38 @@ def setup_single_controller(
         "single_controller_utils.setup requires policy.generation in master_config"
     )
 
+    telemetry_interval_s = master_config.rollout_checkpointing.telemetry_interval_s
+    if telemetry_interval_s is not None:
+        generation_backend = generation_config["backend"]
+        if generation_backend != "vllm":
+            warnings.warn(
+                "rollout_checkpointing.telemetry_interval_s is enabled with "
+                f"policy.generation.backend={generation_backend!r}. Canonical "
+                "rollout telemetry will be recorded, but vLLM token, request, "
+                "and KV-cache signals are unavailable for this backend.",
+                stacklevel=2,
+            )
+        else:
+            vllm_cfg = cast(dict[str, Any], generation_config)["vllm_cfg"]
+            if not vllm_cfg.get("enable_vllm_metrics_logger"):
+                warnings.warn(
+                    "rollout_checkpointing.telemetry_interval_s is enabled, but "
+                    "policy.generation.vllm_cfg.enable_vllm_metrics_logger is "
+                    "false. Canonical rollout telemetry will be recorded, but "
+                    "vLLM token, request, and KV-cache signals will be absent.",
+                    stacklevel=2,
+                )
+            elif not vllm_cfg["async_engine"]:
+                warnings.warn(
+                    "rollout_checkpointing.telemetry_interval_s and "
+                    "policy.generation.vllm_cfg.enable_vllm_metrics_logger are "
+                    "enabled, but vLLM metric collection requires "
+                    "policy.generation.vllm_cfg.async_engine=true. Canonical "
+                    "rollout telemetry will be recorded, but vLLM token, request, "
+                    "and KV-cache signals will be absent.",
+                    stacklevel=2,
+                )
+
     if data_config["use_multiple_dataloader"]:
         raise NotImplementedError(
             "single_controller_utils does not support "
@@ -1194,6 +1229,7 @@ def setup_single_controller(
         if save_state.trainer_version is not None
         else save_state.current_step
     )
+    snapshot_resolution_started = time.monotonic()
     if (
         trainer_checkpoint_path is not None
         and rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
@@ -1233,6 +1269,7 @@ def setup_single_controller(
                 expected_trainer_version=0,
                 expected_bootstrap_fingerprint=bootstrap_digest,
             )
+    snapshot_resolution_seconds = time.monotonic() - snapshot_resolution_started
     if resolved_snapshot is not None:
         recovery_checkpoint_path = str(resolved_snapshot.path)
         save_state.current_epoch = resolved_snapshot.manifest.current_epoch
@@ -1249,6 +1286,18 @@ def setup_single_controller(
             f"without considering newer periodic snapshots: {trainer_checkpoint_path}",
             flush=True,
         )
+    recovery_path = (
+        Path(recovery_checkpoint_path) if recovery_checkpoint_path is not None else None
+    )
+    has_rollout_checkpoint_payload = recovery_path is not None and (
+        (recovery_path / REPLAY_BUFFER_METADATA_FILENAME).is_file()
+        or (recovery_path / ROLLOUT_RECOVERY_STATE_FILENAME).is_file()
+    )
+    rollout_checkpoint_load_metrics: Optional[dict[str, float]] = (
+        {"snapshot_resolution_seconds": snapshot_resolution_seconds}
+        if has_rollout_checkpoint_payload
+        else None
+    )
 
     # ==========================
     # Setup Dataset & Environments
@@ -1294,7 +1343,12 @@ def setup_single_controller(
         print(
             f"📦 Restoring dataloader state from checkpoint: {recovery_checkpoint_path}"
         )
+        dataloader_load_started = time.monotonic()
         load_dataloader_state(dataloader, recovery_checkpoint_path, data_config)
+        if rollout_checkpoint_load_metrics is not None:
+            rollout_checkpoint_load_metrics["dataloader_load_seconds"] = (
+                time.monotonic() - dataloader_load_started
+            )
 
     _clamp_max_num_steps(master_config, dataloader)
     _maybe_inject_megatron_train_iters(master_config)
@@ -1341,15 +1395,15 @@ def setup_single_controller(
     # is disabled or NeMo-Gym is not in play -- it is Gym that needs one stable URL.
     generation_router = None
     megatron_backend = generation_config["backend"] == "megatron"
-    megatron_reserved_url = None
-    megatron_port_holder = None
-    reserved_http_server_port = None
+    megatron_reserved_urls: list[str] = []
+    megatron_port_holders: list[Any] = []
+    reserved_http_server_ports = None
     weight_synchronizer: Optional[WeightSynchronizer] = None
     if megatron_backend:
         generation_config["model_name"] = master_config.policy["model_name"]
 
     def _build_trainer_and_value(
-        reserved_http_server_port: Optional[int] = None,
+        reserved_http_server_ports: Optional[dict[int, int]] = None,
     ) -> tuple[Any, Optional[TQValue], dict[str, float]]:
         """Build the trainer, then the critic when this is a PPO run.
 
@@ -1359,8 +1413,8 @@ def setup_single_controller(
         to GPU before returning so callers see the same state GRPO leaves them.
 
         Args:
-            reserved_http_server_port: Pre-published OpenAI server port for the trainer's rank 0;
-                only the colocated Megatron serial build passes one.
+            reserved_http_server_ports: Pre-published OpenAI server ports keyed
+                by trainer rank; only colocated Megatron passes them.
 
         Returns:
             A tuple of (TQPolicy trainer, TQValue critic or None, per-phase wall
@@ -1374,7 +1428,7 @@ def setup_single_controller(
             processor,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
-            reserved_http_server_port=reserved_http_server_port,
+            reserved_http_server_ports=reserved_http_server_ports,
         )
         if not is_ppo_run(master_config):
             return trainer, None, time_metrics
@@ -1440,10 +1494,10 @@ def setup_single_controller(
         """
         time_metrics = {}
 
-        # Colocated Megatron generation serves from the trainer's workers,
-        # so rank 0 of the trainer adopts the pre-published OpenAI socket.
+        # Colocated Megatron generation serves from the trainer's workers, so
+        # every frontend-hosting trainer rank adopts its pre-published socket.
         trainer, value, train_side_metrics = _build_trainer_and_value(
-            reserved_http_server_port=reserved_http_server_port,
+            reserved_http_server_ports=reserved_http_server_ports,
         )
         time_metrics.update(train_side_metrics)
 
@@ -1473,22 +1527,24 @@ def setup_single_controller(
 
     if use_nemo_gym:
         if megatron_backend:
-            # Megatron serves from rank 0 of the generation workers; pre-publish that address.
+            # Megatron serves one frontend per model-parallel group; pre-publish
+            # every address so Gym can spread sessions over all of them.
             t0 = time.perf_counter()
             (
-                megatron_reserved_url,
-                reserved_http_server_port,
-                megatron_port_holder,
-            ) = MegatronGeneration.reserve_http_server_address(
+                megatron_reserved_urls,
+                reserved_http_server_ports,
+                megatron_port_holders,
+            ) = MegatronGeneration.reserve_http_server_addresses(
                 inference_cluster,
                 master_config.policy,
             )
             gen_reserve_time = time.perf_counter() - t0
             print(
-                f"  ✓ Reserved Megatron server URL: {megatron_reserved_url}",
+                f"  ✓ Reserved {len(megatron_reserved_urls)} Megatron server URL(s): "
+                f"{megatron_reserved_urls}",
                 flush=True,
             )
-            gym_base_urls: list[Optional[str]] = [megatron_reserved_url]
+            gym_base_urls: list[Optional[str]] = list(megatron_reserved_urls)
         else:
             # defer generation, only get base_urls for nemo_gym spinup
             generation, gen_reserve_time = _build_generation(
@@ -1510,7 +1566,7 @@ def setup_single_controller(
                 else gym_base_urls
             )
         except BaseException:
-            if megatron_port_holder is not None:
+            for megatron_port_holder in megatron_port_holders:
                 ray.kill(megatron_port_holder)
             raise
         # add nemo_gym spinup task
@@ -1544,7 +1600,7 @@ def setup_single_controller(
                 _build_generation,
                 inference_cluster=inference_cluster,
                 master_config=master_config,
-                reserved_http_server_port=reserved_http_server_port,
+                reserved_http_server_ports=reserved_http_server_ports,
                 tokenizer=tokenizer,
                 processor=processor,
             )
@@ -1562,7 +1618,7 @@ def setup_single_controller(
             else:
                 generation, gen_load_time = submitted["generation"].result()
                 trainer, value, time_metrics = submitted["trainer"].result()
-            if megatron_reserved_url is not None:
+            if megatron_reserved_urls:
                 # Gym initialization needs a live URL that will respond to health checks.
                 # Megatron generation can only respond to health checks once initialized.
                 # The Megatron engine cannot be initialized with dummy weights.
@@ -1589,8 +1645,9 @@ def setup_single_controller(
                 env_handles["nemo_gym"], gym_time = submitted["nemo_gym"].result()
                 setup_timing_metrics.nemo_gym_init_time_s = gym_time
     finally:
-        if megatron_port_holder is not None:
-            # Rank 0 adopted (or will never adopt) the held socket; drop the holder.
+        for megatron_port_holder in megatron_port_holders:
+            # The frontend ranks adopted (or will never adopt) the held sockets;
+            # drop the holders.
             ray.kill(megatron_port_holder)
 
     setup_timing_metrics.generation_init_time_s = gen_reserve_time + gen_load_time
@@ -1602,6 +1659,7 @@ def setup_single_controller(
     # Native TQ restore must run through the trainer's bootstrap client before
     # the normal SC data-plane client is created or any rollout/train data-plane
     # operation starts.
+    data_plane_load_started = time.monotonic()
     data_plane_checkpoint_metadata = _maybe_restore_native_data_plane_checkpoint(
         trainer,
         last_checkpoint_path=recovery_checkpoint_path,
@@ -1609,15 +1667,19 @@ def setup_single_controller(
         partition_id=partition_id,
         sampler_name=master_config.async_rl.sampler.name,
     )
+    if rollout_checkpoint_load_metrics is not None:
+        rollout_checkpoint_load_metrics["tq_load_seconds"] = (
+            time.monotonic() - data_plane_load_started
+        )
 
     if use_nemo_gym:
         # the two fields are only meaningful when use_nemo_gym enabled
         setup_timing_metrics.generation_init_reserve_time_s = gen_reserve_time
         setup_timing_metrics.generation_init_load_time_s = gen_load_time
 
-    if megatron_reserved_url is not None:
-        MegatronGeneration.verify_served_address(
-            generation.dp_openai_server_base_urls, megatron_reserved_url
+    if megatron_reserved_urls:
+        MegatronGeneration.verify_served_addresses(
+            generation.dp_openai_server_base_urls, megatron_reserved_urls
         )
 
     # Loading a teacher with the same checkpoint as the student must happen only
@@ -1854,6 +1916,7 @@ def setup_single_controller(
         last_checkpoint_path=recovery_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         bootstrap_identity=bootstrap_identity,
+        rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
         finalizer_actors=finalizer_actors,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,

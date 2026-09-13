@@ -17,6 +17,8 @@ tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n4g-megatron_generation.sh
 tests/test_suites/llm/grpo-nanov3-30BA3B-4n4g-megatron_generation-noncolocated-async-gym.sh
 tests/test_suites/llm/grpo-nanov3-30BA3B-4n4g-megatron_generation-colocated-reshard-async-gym.sh
 tests/test_suites/llm/grpo-nanov3-30BA3B-4n4g-megatron_generation-noncolocated-mxfp8-rollouts.sh
+tests/test_suites/llm/grpo-nanov3-30BA3B-4n4g-megatron_generation-noncolocated-mxfp8-rollouts-packed-refit.sh
+tests/test_suites/llm/grpo-nanov3-30BA3B-4n4g-megatron_generation-noncolocated-mxfp8-rollouts-flashinfer.sh
 
 # BF16 FlashInfer TRTLLM + NCCL reshard numerical correctness
 tests/test_suites/llm/grpo-qwen3.5-35ba3b-6n4g-async-1off-bf16-trtllm.sh

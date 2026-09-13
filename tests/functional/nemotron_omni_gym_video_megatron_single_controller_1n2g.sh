@@ -104,6 +104,7 @@ uv run --no-sync python examples/run_grpo_single_controller.py \
     ++policy.megatron_cfg.optimizer.exp_avg_sq_dtype=bfloat16 \
     ++policy.megatron_cfg.optimizer.store_param_remainders=false \
     policy.generation.backend=megatron \
+    +policy.generation.refit_transport=mcore \
     ++policy.generation.bad_words=null \
     policy.generation.colocated.enabled=false \
     policy.generation.colocated.resources.num_nodes=1 \
@@ -127,6 +128,7 @@ uv run --no-sync python examples/run_grpo_single_controller.py \
     policy.generation.mcore_generation_config.enable_chunked_prefill=true \
     ++policy.generation.mcore_generation_config.async_sched_mode=async \
     policy.generation.mcore_generation_config.enable_prefix_caching=true \
+    ++async_rl.generation_fleet_health.refit_timeout_s=null \
     policy.generation.mcore_generation_config.max_model_len=1024 \
     policy.generation.mcore_generation_config.max_tokens=1024 \
     ++policy.generation.mcore_generation_config.video_num_frames=8 \

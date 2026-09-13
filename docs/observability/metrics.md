@@ -51,6 +51,72 @@ Unlike `rl.efficiency.seconds`, these phases overlap each other by construction:
 
 Read one phase at a time. For "what did startup cost", use `phase=total_setup` — that is the one value that cannot double-count. The `rl.setup.*` spans give the same phases their shape in a trace; see [Span groups — Startup](span-groups.md#startup-what-happens-before-the-first-step).
 
+## W&B history step axes
+
+W&B's internal `_step` is a monotonically increasing history-row number, not a
+NeMo-RL trainer step. Trainer-correlated metrics are buffered into one history
+row and carry the explicit `nemo_rl/step` field. Use `nemo_rl/step` when plotting
+or joining training metrics by optimizer step; relying on `_step` also counts
+independently committed telemetry rows and can misalign the series.
+
+Independent event streams use their own custom axes and do not carry
+`nemo_rl/step`. In particular, Single-Controller rollout benchmark series under
+`rollout/throughput/*`, `timing/rollout_checkpoint/*`,
+`timing/rollout_recovery/*`, and `rollout/checkpoint_outcome/*` use
+`telemetry/wall_time_seconds`, recorded as Unix wall-clock time. This lets those
+series continue through a long or paused trainer step and across process restart
+without changing the meaning of the trainer-step axis.
+
+## Single-Controller rollout recovery metrics
+
+Wall-clock rollout telemetry sampling is disabled by default. Enable it without
+changing the checkpoint cadence by setting, for example:
+
+```yaml
+rollout_checkpointing:
+  telemetry_interval_s: 30.0
+```
+
+This records one throughput and controller-pressure sample every 30 seconds.
+Set the value back to `null` to disable the sampler. Detailed per-interval
+metric dictionaries are printed to the controller log only when
+`async_rl.diagnostics: true`; configured metric backends receive them either
+way.
+
+The rollout checkpoint benchmark focuses on the following questions:
+
+1. Did checkpointing reduce raw generation or usable rollout throughput?
+2. Which save or restore phase took the time?
+3. How much live data-plane work waited behind the checkpoint barrier?
+4. Did scheduled checkpoint attempts succeed at the intended cadence?
+5. How much completed rollout work was reused after restart?
+
+| Prefix | Important fields | Meaning |
+|---|---|---|
+| `rollout/throughput` | `generation_output_tokens_per_second`, `committed_output_tokens_per_second`, `committed_groups_per_second` | Raw backend decoding throughput compared with output committed for training. The raw metric is absent when the backend does not expose compatible cumulative counters. With token capture, committed tokens are counted exactly from valid staged rows; without token capture, they are estimated by multiplying the reported per-sample mean by the number of completions, so compare like-for-like runs. |
+| `rollout/throughput` | `checkpoint_blocked_mutations`, `checkpoint_mutation_wait_seconds_p95`, `checkpoint_mutation_wait_seconds_max` | Number and latency of live data-plane mutations delayed by an exclusive checkpoint. |
+| `timing/rollout_checkpoint` | `total_save_seconds`, `tq_save_seconds`, `barrier_wait_seconds`, `exclusive_hold_seconds`, `sidecar_save_seconds`, `snapshot_commit_seconds` | End-to-end save latency and its storage, fencing, controller-sidecar, and atomic-publication components. |
+| `timing/rollout_checkpoint` | `snapshot_rows`, `replay_rows`, `staging_rows`, `replay_groups`, `ledger_groups`, `controller_sidecar_bytes` | Logical volume captured by the snapshot. `controller_sidecar_bytes` excludes the native TQ payload because the current TQ checkpoint API does not report bytes written. NeMo-RL deliberately does not recursively scan the shared checkpoint directory because that scan would perturb the benchmark. |
+| `rollout/checkpoint_outcome` | `completed`, `skipped`, `failed`, `reason_*`, `seconds_since_previous_success`, `seconds_since_last_success` | Result, actionable reason, and effective cadence of every scheduled checkpoint attempt. |
+| `timing/rollout_recovery` | `snapshot_resolution_seconds`, `dataloader_load_seconds`, `tq_load_seconds`, `replay_metadata_load_seconds`, `recovery_prepare_seconds`, `total_load_seconds` | Rollout-state restore latency. `total_load_seconds` is the sum of these non-overlapping restore phases. |
+| `timing/rollout_recovery` | `groups_complete_restored`, `groups_unfinished_found`, `siblings_reused`, `siblings_rerun`, `redispatch_schedule_seconds` | Training-ready groups restored without generation, unfinished groups found for redispatch, and sibling work preserved or rerun after restart. |
+
+Recovery counters describe work reconstructed at restore time, not a promise
+that every restored group will eventually train. After recovery, the configured
+sampler may still evict a restored group under its normal staleness rules (for
+example, when a `windowed` sampler finds that the group's policy version has
+fallen outside its valid window).
+
+`barrier_wait_seconds` and mutation wait latency measure opposite sides of the
+same fence. The former is how long the checkpoint waits for already-running
+mutations; the latter is how long rollout or training mutations wait for the
+checkpoint to release its exclusive cut.
+
+The vLLM request, KV-cache, controller-waiter, buffer-occupancy, and per-mutation
+kind fields are diagnostic drill-down signals. They are useful when one of the
+primary throughput or barrier metrics regresses, but do not need to appear on
+the primary rollout checkpoint dashboard.
+
 ## Async efficiency metrics (`rl.efficiency.*`)
 
 Async GRPO measures where wall time goes with a `Timer` and logs the result as `efficiency/*` scalars (`print_efficiency_summary` in `nemo_rl/algorithms/utils.py`). Those same values are teed to OTel as one **dimensioned** gauge rather than one instrument per category, so adding a category needs no instrument change.

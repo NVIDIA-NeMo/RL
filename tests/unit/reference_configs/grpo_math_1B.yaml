@@ -374,7 +374,9 @@ policy:
     val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
-    # null = topology default (IPC colocated, NCCL non-colocated).
+    # null = topology default (IPC colocated, NCCL non-colocated). For
+    # non-colocated Megatron generation it selects the packed collective; use
+    # mcore for native refit.
     # Non-colocated vLLM also supports vllm_s3_sparse, vllm_zmq_sparse, and nixl.
     refit_transport: null
     worker_extension_cls_fqn: null
@@ -395,6 +397,8 @@ policy:
       #   cuda_graph_impl "none"  -> omit inference_cuda_graph_scope
       #   cuda_graph_impl "local" -> inference_cuda_graph_scope "layer" or "block"
       cuda_graph_impl: "local"
+      cuda_graph_sizing_distribution: hybrid  # MCore default: exponential prefill/mixed graphs and linear decode graphs.
+      cuda_graph_max_tokens: 512  # MCore default token ceiling for captured prefill/mixed graphs.
       inference_cuda_graph_scope: "block"
       buffer_size_gb: 10
       num_cuda_graphs: 4  # Number of CUDA graphs to pre-compile for different batch sizes
@@ -402,16 +406,23 @@ policy:
       use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
       enable_chunked_prefill: true  # Split long prefills into chunks for better memory management
       enable_prefix_caching: false  # Reuse KV blocks across requests sharing a prompt prefix.
+      prefix_caching_mamba_gb: null  # MCore default: no Mamba-state prefix-cache budget.
+      prefix_caching_eviction_policy: lru  # MCore default prefix-cache eviction policy.
+      prefix_caching_coordinator_policy: longest_prefix  # MCore default DP routing policy.
+      prefix_cache_ttl_seconds: 300.0  # MCore default coordinator cache-entry lifetime.
+      prefix_caching_routing_alpha: 1.0  # MCore default load penalty for prefix-affinity routing.
       max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
       kv_cache_management_mode: "persist"  # KV cache lifecycle across suspend/resume. Options: "persist", "offload", "recompute".
       async_sched_mode: "async"  # Dynamic-batching scheduler mode. Options: "legacy", "async". "async" hides scheduler CPU time behind GPU compute.
       materialize_only_last_token_logits: true  # Materialize logits only for the last token of each sequence during decode.
       num_speculative_tokens: 0
+      refit_backend: null  # Native MCore copy-service backend, used only when refit_transport="mcore". Options: "gloo", "nccl", or "nccl_m2n" ("nvshmem" is currently broken, see https://github.com/NVIDIA-NeMo/RL/issues/3646).
+      refit_execution_batch_bytes: null  # Native MCore refit staging limit. null matches NeMo-RL's collective default (2% of total GPU memory, capped at 5 GiB); set a positive byte count to override.
       logprobs_mode: processed_logprobs  # Return log-probs after sampling processors. Use raw_logprobs for parity with policy recomputation.
-      refit_backend: "nccl"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo" or "nccl"
       offload_policy_before_refit: false  # Keep policy state on GPU by default. Enable when a non-colocated Megatron refit needs additional GPU headroom for transfer staging.
       parsers: []  # OpenAI tool-call / response parser names exposed by the HTTP server (only used if expose_http_server=true).
       expose_http_server: false  # Start an OpenAI-compatible HTTP server alongside the persistent engine. Required for NeMo-Gym.
+      http_server_num_replicas: 8  # HTTP frontend event loops per model-parallel coordinator.
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}

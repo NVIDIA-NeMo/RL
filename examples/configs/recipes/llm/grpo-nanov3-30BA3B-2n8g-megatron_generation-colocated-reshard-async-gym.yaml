@@ -1,10 +1,4 @@
 defaults: ../../../nemo_gym/grpo_nanov3.yaml
-# Async colocated GRPO + gym on Megatron generation with a resharded inference
-# layout: training runs TP2xCP2xEP8 across all 16 GPUs; every wake reshards the
-# weights into TP4xEP4 inference_optimized models on the same GPUs. One nightly
-# covers the async loop with in-flight updates, the gym HTTP ingress, colocated
-# reshard, and (via the suite's save_period=val_period=4) the save-bound
-# deferred-wake path.
 grpo:
   async_grpo:
     enabled: true
@@ -23,7 +17,9 @@ policy:
     context_parallel_size: 2
   generation:
     backend: megatron
+    refit_transport: mcore
     mcore_generation_config:
+      refit_backend: nccl
       tensor_model_parallel_size: 4
       expert_model_parallel_size: 4
 logger:

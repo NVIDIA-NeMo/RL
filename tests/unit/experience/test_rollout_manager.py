@@ -221,10 +221,21 @@ class _FakeBuffer:
 
 
 class _FakeImpl:
-    """Stand-in for AsyncRolloutImpl that returns a sentinel record."""
+    """Stand-in for AsyncRolloutImpl that returns a typed sentinel record."""
 
     def __init__(self, record="sentinel-record", on_run=None) -> None:
-        self._record = record
+        self._record = (
+            record
+            if isinstance(record, PromptGroupRecord)
+            else PromptGroupRecord(
+                prompt_idx=0,
+                prompt=[],
+                extra_env_info=None,
+                metadata={"sentinel": record},
+                completions=[],
+                rollout_metrics={},
+            )
+        )
         self._on_run = on_run
 
     async def run_rollout(self, input_sample):
@@ -257,6 +268,10 @@ def _make_manager(
         else RolloutRetryPolicy.single_attempt()
     )
     mgr._stats = RolloutStats()
+    mgr._canonical_groups_finalized = 0
+    mgr._canonical_output_tokens = 0
+    mgr._recovery_siblings_reused = 0
+    mgr._recovery_siblings_redispatched = 0
     mgr._skipped_prompts = 0
     mgr._consecutive_infra_drops = 0
     return mgr
@@ -441,10 +456,62 @@ class TestGenerateAndPushFlow:
         assert len(buf.commit_calls) == 1
         gid, record, start_v, end_v = buf.commit_calls[0]
         assert gid in buf._slots
-        assert record == "r0"
+        assert isinstance(record, PromptGroupRecord)
+        assert record.metadata["sentinel"] == "r0"
         assert start_v == 0
         assert end_v == 0
         assert len(mgr.recovery_ledger) == 0
+        assert mgr.telemetry_snapshot()["committed_groups"] == 1
+
+    def test_publication_and_recovery_telemetry_are_cumulative(self):
+        mgr = _make_manager(_FakeBuffer(), _FakeImpl())
+
+        mgr.record_canonical_publication(42)
+        mgr.record_recovery_siblings(reused=3, redispatched=1)
+
+        assert mgr.telemetry_snapshot() == {
+            "committed_groups": 1,
+            "committed_output_tokens": 42,
+            "recovery_siblings_reused": 3,
+            "recovery_siblings_rerun": 1,
+        }
+
+    @pytest.mark.parametrize(
+        ("mean_output_tokens", "expected_output_tokens"),
+        [(3.75, 8), (-2.0, 0)],
+        ids=["rounded-group-total", "negative-total-clamped"],
+    )
+    def test_non_capture_commit_estimates_committed_output_tokens(
+        self,
+        mean_output_tokens: float,
+        expected_output_tokens: int,
+    ) -> None:
+        """The legacy path rounds its per-sample mean and clamps bad totals."""
+        completions = [
+            Completion(
+                message_log=[],
+                env_extras=None,
+                truncated=False,
+                reward=0.0,
+            )
+            for _ in range(2)
+        ]
+        record = PromptGroupRecord(
+            prompt_idx=0,
+            prompt=[],
+            extra_env_info=None,
+            metadata={},
+            completions=completions,
+            rollout_metrics={"mean_gen_tokens_per_sample": mean_output_tokens},
+        )
+        mgr = _make_manager(_FakeBuffer(), _FakeImpl(record=record))
+
+        _run(mgr.generate_and_push({"prompt": "p"}))
+
+        assert (
+            mgr.telemetry_snapshot()["committed_output_tokens"]
+            == expected_output_tokens
+        )
 
     def test_ledger_hands_ownership_to_canonical_buffer_on_commit(self):
         buf = _FakeBuffer()
@@ -1721,6 +1788,10 @@ def _make_capture_manager(
         else RolloutRetryPolicy.single_attempt()
     )
     mgr._stats = RolloutStats()
+    mgr._canonical_groups_finalized = 0
+    mgr._canonical_output_tokens = 0
+    mgr._recovery_siblings_reused = 0
+    mgr._recovery_siblings_redispatched = 0
     mgr._skipped_prompts = 0
     mgr._consecutive_infra_drops = 0
     mgr._recovery_ledger = RolloutRecoveryLedger()

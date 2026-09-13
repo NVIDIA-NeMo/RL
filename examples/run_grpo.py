@@ -21,8 +21,8 @@ from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.grpo import (
     MasterConfig,
+    grpo_train,
     setup,
-    shutdown_environments,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
@@ -32,6 +32,7 @@ from nemo_rl.data_plane.factory import (
     select_sync_trainer,
 )
 from nemo_rl.distributed.virtual_cluster import init_ray
+from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.telemetry.instrumentation import setup_span, startup_span
 from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
@@ -175,6 +176,7 @@ def main() -> None:
                 print(f"  {label}: {value:.1f}s")
         print("=" * 60 + "\n", flush=True)
 
+        trainer_owns_environment_shutdown = False
         try:
             # Check if async mode is enabled
             if config.grpo.async_grpo.enabled:
@@ -224,6 +226,7 @@ def main() -> None:
                 # Two parallel synchronous trainers (verl-style — main_ppo.py vs
                 # main_ppo_sync.py). data_plane.enabled selects which one runs.
                 trainer = select_sync_trainer(master_config)
+                trainer_owns_environment_shutdown = trainer is grpo_train
                 # grpo_train_sync defers checkpoint finalization to the checkpointer's
                 # background threads; the context manager guarantees they are flushed on
                 # exit. (grpo_train also flushes internally; shutdown() is idempotent.)
@@ -243,7 +246,8 @@ def main() -> None:
                         master_config,
                     )
         finally:
-            shutdown_environments(task_to_env, val_task_to_env)
+            if not trainer_owns_environment_shutdown:
+                shutdown_environments(task_to_env, val_task_to_env)
             try:
                 policy_generation.shutdown()
             except Exception as error:

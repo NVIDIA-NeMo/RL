@@ -24,11 +24,12 @@ is shared; the subclasses supply the transport-specific connect and transfer
 and own the GPU phase transitions around them.
 
 Colocated:
-  1. policy.offload_before_refit()                        -- free GPU for staging
-  2. generation.prepare_for_generation(tags=["weights"])   -- allocate buffers
-  3. _refit()                                              -- Ray CUDA-IPC transfer
-  4. policy.offload_after_refit()                          -- restore optimizer state
-  5. generation.prepare_for_generation(tags=["kv_cache"])  -- rebuild KV cache
+  1. policy.sync_params_before_refit()                     -- materialize updates
+  2. policy.offload_before_refit()                         -- free GPU for staging
+  3. generation.prepare_for_generation(tags=["weights"])   -- allocate buffers
+  4. _refit()                                              -- Ray CUDA-IPC transfer
+  5. policy.offload_after_refit()                          -- restore optimizer state
+  6. generation.prepare_for_generation(tags=["kv_cache"])  -- rebuild KV cache
 
 Disaggregated:
   1. generation.prepare_for_generation(tags=["weights"])
@@ -88,7 +89,9 @@ class _SGLangWeightSynchronizer(WeightSynchronizer):
         return self._stale
 
     def init_communicator(self) -> None:
-        state_dict_info = self._policy.prepare_refit_info()
+        state_dict_info = self._policy.prepare_refit_info(
+            refit_payload_mode=self._generation.get_refit_payload_mode()
+        )
         self._generation.prepare_refit_info(state_dict_info)
 
     def shutdown(self) -> None:
@@ -242,6 +245,7 @@ class SGLangColocatedWeightSynchronizer(_SGLangWeightSynchronizer):
         kv_scales: Optional[dict[str, float]] = None,
     ) -> Optional[dict[str, float]]:
         self._reject_kv_scales(kv_scales)
+        self._policy.sync_params_before_refit()
         self._policy.offload_before_refit()
 
         sync_succeeded = False

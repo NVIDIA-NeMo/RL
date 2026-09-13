@@ -84,7 +84,13 @@ def create_weight_synchronizer(
             f"Supported backends: {sorted(_SUPPORTED_BACKENDS)}"
         )
 
-    checkpoint_engine_config = checkpoint_engine_refit_config(generation.cfg)
+    # Megatron owns its refit selectors (including "mcore"); the vLLM-oriented
+    # checkpoint-engine normalization rejects that valid Megatron value.
+    checkpoint_engine_config = (
+        None
+        if generation_backend == MEGATRON_BACKEND
+        else checkpoint_engine_refit_config(generation.cfg)
+    )
     if checkpoint_engine_config is not None:
         if colocated:
             raise ValueError(
@@ -124,6 +130,7 @@ def create_weight_synchronizer(
             colocated=colocated,
             train_cluster=train_cluster,
             inference_cluster=inference_cluster,
+            refit_timeout_s=refit_timeout_s,
         )
 
     if generation_backend == SGLANG_BACKEND:

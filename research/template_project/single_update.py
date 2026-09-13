@@ -120,7 +120,9 @@ def main(config: MasterConfig) -> None:
     print(f"  ✓ Results for return_input: {results}")
 
     # Prepare refit info once before first refit
-    state_dict_info = policy.prepare_refit_info()
+    state_dict_info = policy.prepare_refit_info(
+        refit_payload_mode=policy_generation.get_refit_payload_mode()
+    )
     policy_generation.prepare_refit_info(state_dict_info or {})
 
     # Create tiny numeric batch and train with NLLLossFn

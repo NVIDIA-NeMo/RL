@@ -13,6 +13,7 @@
 # limitations under the License.
 import logging
 import os
+import random
 import socket
 import sys
 import time
@@ -148,6 +149,9 @@ def uv_py_executable(extras: Sequence[str]) -> str:
 #
 # Python port-range bounds below are half-open: [low, high).
 #
+#   1150-1199    Data plane (TQ/mooncake)        (DEFAULT_DATA_PLANE_PORT_RANGE_*, driver-local
+#                                                 allocation: metadata server, master RPC,
+#                                                 master metrics)
 #   [1202, 1300) SingleController gen. router    (driver-local allocation)
 #   1313-1399    Dynamo etcd/NATS control plane  (driver-local allocation)
 #   1400-1999    Master address / TCPStore       (cluster.master_port_range_low/high)
@@ -191,6 +195,16 @@ DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH = 8999
 # Master address / TCPStore range, tucked below the Ray worker-gRPC band (2000+).
 DEFAULT_MASTER_PORT_RANGE_LOW = 1400
 DEFAULT_MASTER_PORT_RANGE_HIGH = 1999
+# One band for every port the data plane binds on the driver: mooncake's
+# metadata server, the master's RPC endpoint, and the master's metrics server.
+# The defaults those three land on -- 50050 and 50051 from TransferQueue's
+# config.yaml, 9003 from mooncake_master's own gflag -- all sit inside the
+# 9000-65000 ephemeral range these nodes use, so the kernel can hand one out as
+# a source port for outgoing traffic before the master binds it. This band is
+# the gap left below the Ray GCS ports (1200+) — see ray.sub's port map. Fifty
+# ports is ample: one master serves the whole job.
+DEFAULT_DATA_PLANE_PORT_RANGE_LOW = 1150
+DEFAULT_DATA_PLANE_PORT_RANGE_HIGH = 1200
 
 # ---------------------------------------------------------------------------
 # Topology resource keys
@@ -248,14 +262,22 @@ def _bind_socket_in_range(
     port_range_high: int,
     max_retries: int | None = 50,
     excluded_ports: set[int] | None = None,
+    rng: Optional[random.Random] = None,
 ) -> int:
     """Try to bind *sock* to a random port in [port_range_low, port_range_high).
 
     When *max_retries* is ``None``, try every non-excluded port once. Otherwise,
     preserve the existing bounded random-retry behavior.
-    """
-    import random
 
+    Args:
+        rng: Source of candidate ports. Defaults to the ``random`` module. That
+            module's state is process-wide and seeded per run, so every rank of a
+            job draws the same sequence; ranks sharing a node then contend for one
+            port, and whichever binds after the others have closed silently reuses
+            it. Pass a rank-seeded ``random.Random`` to decorrelate them.
+
+    Raises ``RuntimeError`` after *max_retries* failed attempts.
+    """
     excluded = excluded_ports or set()
     if max_retries is None:
         candidates = [
@@ -263,7 +285,10 @@ def _bind_socket_in_range(
             for port in range(port_range_low, port_range_high)
             if port not in excluded
         ]
-        random.shuffle(candidates)
+        if rng is None:
+            random.shuffle(candidates)
+        else:
+            rng.shuffle(candidates)
         for port in candidates:
             try:
                 sock.bind(("", port))
@@ -273,7 +298,10 @@ def _bind_socket_in_range(
         retry_description = f"all {len(candidates)} available ports"
     else:
         for _ in range(max_retries):
-            port = random.randint(port_range_low, port_range_high - 1)
+            if rng is None:
+                port = random.randint(port_range_low, port_range_high - 1)
+            else:
+                port = rng.randint(port_range_low, port_range_high - 1)
             if port in excluded:
                 continue
             try:
@@ -295,7 +323,15 @@ def _get_free_port_local(
     *,
     max_retries: int | None = 50,
     excluded_ports: set[int] | None = None,
+    rng: Optional[random.Random] = None,
 ) -> int:
+    """Find a free port, holding it only long enough to learn its number.
+
+    Args:
+        rng: Source of candidate ports; see :func:`_bind_socket_in_range`. Callers
+            that run on several ranks of one node should pass a rank-seeded
+            generator, or they will all be handed the same port.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         port = _bind_socket_in_range(
             s,
@@ -303,6 +339,7 @@ def _get_free_port_local(
             port_range_high,
             max_retries=max_retries,
             excluded_ports=excluded_ports,
+            rng=rng,
         )
         s.listen(1)
 
@@ -341,6 +378,42 @@ def _get_free_consecutive_ports_local(
         f"Could not find {consecutive} consecutive free ports in "
         f"[{port_range_low}, {port_range_high})."
     )
+
+
+def _reserve_data_plane_ports(count: int) -> list[int]:
+    """Reserve *count* distinct ports for the data plane's driver-side servers.
+
+    The defaults those servers land on -- 50050 and 50051 from TransferQueue's
+    ``config.yaml``, 9003 from mooncake_master's ``metrics_port`` gflag -- sit
+    inside the 9000-65000 ephemeral range these nodes use. The kernel can
+    therefore hand any of them to an outgoing connection during the minutes
+    between job start and the master's bind, after which the master dies with
+    EADDRINUSE. That is why ray.sub's port map keeps every service below 9000,
+    and this allocates from the band that map leaves free.
+
+    Every one of these ports is passed to the servers explicitly and reaches
+    clients through the TQ controller actor rather than being assumed, so
+    relocating them costs nothing.
+
+    ``excluded_ports`` keeps the returned ports distinct, and
+    ``_get_free_port_local`` binds without ``SO_REUSEADDR``, matching
+    mooncake_master: a port obtainable only by reusing a lingering slot is not
+    one the master could bind either.
+
+    Returns:
+        *count* ports from the data-plane band, in allocation order.
+    """
+    reserved: list[int] = []
+    for _ in range(count):
+        reserved.append(
+            _get_free_port_local(
+                DEFAULT_DATA_PLANE_PORT_RANGE_LOW,
+                DEFAULT_DATA_PLANE_PORT_RANGE_HIGH,
+                max_retries=None,
+                excluded_ports=set(reserved),
+            )
+        )
+    return reserved
 
 
 def init_ray(log_dir: Optional[str] = None) -> None:

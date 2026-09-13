@@ -22,12 +22,14 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
+    CheckpointMutationKind,
     DataPlaneCheckpointBarrier,
     DataPlaneMutationCut,
     TQReplayBuffer,
@@ -105,6 +107,11 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     ctrl._finalizer_actors = []
     ctrl._replacement_reserve = deque()
     ctrl._rollout_recovery_enabled = False
+    ctrl._rollout_slot_waiters = 0
+    ctrl._rollout_permitted_waiters = 0
+    ctrl._buffer_capacity_waiters = 0
+    ctrl._rollout_completion_durations_s = deque(maxlen=10_000)
+    ctrl._rollout_queue_wait_durations_s = deque(maxlen=10_000)
 
 
 class _PausingMutationBarrier(DataPlaneCheckpointBarrier):
@@ -116,8 +123,10 @@ class _PausingMutationBarrier(DataPlaneCheckpointBarrier):
         self.release_mutation = asyncio.Event()
 
     @asynccontextmanager
-    async def mutation(self) -> AsyncIterator[DataPlaneMutationCut]:
-        async with super().mutation() as cut:
+    async def mutation(
+        self, kind: CheckpointMutationKind = "other"
+    ) -> AsyncIterator[DataPlaneMutationCut]:
+        async with super().mutation(kind) as cut:
             yield cut
             self.mutation_applied.set()
             await self.release_mutation.wait()
@@ -280,71 +289,49 @@ def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
     assert ctrl._inflight_rollouts == 0
 
 
-@pytest.mark.parametrize(
-    ("restored", "expected_new_dispatches"),
-    [
-        # Room left for a partial top-up.
-        (1, 1),
-        # Target step already full: the whole batch is dropped.
-        (2, 0),
-        # More restored than a batch: still zero, never negative.
-        (3, 0),
-    ],
-)
-def test_rollout_pump_tops_up_restored_target_step(
-    restored: int,
-    expected_new_dispatches: int,
-) -> None:
-    # On resume the buffer holds groups still stamped for the next target
-    # step. In-order selection consumes a target step as one fixed-size batch,
-    # so the pump must dispatch only the shortfall — a full batch on top would
-    # leave surplus groups that are never selected and whose capacity permits
-    # are held until evict.
-    buffer = _RecordingBuffer([0] * restored)
+def test_reserved_admission_rejects_an_occupied_target_step() -> None:
+    """A stale sampler cursor must not silently discard newly yielded prompts."""
+    buffer = _RecordingBuffer([0])
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
     ctrl._buffer = buffer
-    ctrl._async_cfg = SimpleNamespace(
-        max_inflight_prompts=2, diagnostics=False, rollout_failure=_failure_cfg()
+    ctrl._rollout_manager = SimpleNamespace(
+        mark_prompt_group_admitted=MagicMock(),
+        discard_prompt_group=MagicMock(),
     )
-    ctrl._master_config = SimpleNamespace(
-        grpo=GRPOConfig.model_construct(max_num_epochs=1)
-    )
-    ctrl._algo_cfg = ctrl._master_config.grpo
-    ctrl._rollout_manager = _RecordingRolloutManager(buffer)
-    # lookahead=0 keeps the single batch on target_step 0.
     ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
-    ctrl._dataloader = [
-        BatchedDataDict(
-            {
-                "message_log": [
-                    [{"role": "user", "content": "p0"}],
-                    [{"role": "user", "content": "p1"}],
-                ]
-            }
-        )
-    ]
-    ctrl._rollout_permitted = asyncio.Event()
-    ctrl._rollout_permitted.set()
-    ctrl._rollout_exhausted = asyncio.Event()
-    ctrl._buffer_capacity = asyncio.Semaphore(4)
-    ctrl._inflight_rollouts = 0
-    ctrl._inflight_by_group_id = {}
-    ctrl._dispatched_rollouts = set()
     ctrl._trainer_version = 0
-    ctrl._current_epoch = 0
-    _init_pump_ledgers(ctrl)
+    ctrl._sampler_stamps_target_steps = False
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
 
-    asyncio.run(ctrl._rollout_pump())
+    with pytest.raises(RuntimeError, match="already contains 1 group"):
+        asyncio.run(ctrl._admit_reserved_prompt_groups(["new-group"]))
 
-    # Only the shortfall was dispatched on top of the restored groups.
-    assert buffer.target_step_list == [0] * (restored + expected_new_dispatches)
-    # A dispatched prompt keeps its permit (the train pump releases it after
-    # consuming the group), so exactly one permit per dispatch is held and the
-    # dropped prompts consume none.
-    assert ctrl._buffer_capacity._value == 4 - expected_new_dispatches
-    assert ctrl._inflight_rollouts == 0
-    assert ctrl._rollout_exhausted.is_set()
+    assert buffer.target_step_list == [0]
+    ctrl._rollout_manager.mark_prompt_group_admitted.assert_not_called()
+    ctrl._rollout_manager.discard_prompt_group.assert_not_called()
+
+
+def test_non_recovery_reserve_drain_rejects_an_occupied_target_step() -> None:
+    """The ordinary spare-pool admission enforces the same cursor invariant."""
+    buffer = _RecordingBuffer([0])
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._algo_cfg = SimpleNamespace(num_prompts_per_step=1)
+    ctrl._buffer = buffer
+    ctrl._replacement_reserve = deque([{"idx": 0}])
+    ctrl._rollout_recovery_enabled = False
+    ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
+    ctrl._trainer_version = 0
+    launched: list[Any] = []
+
+    async def launch(*args: Any) -> None:
+        launched.append(args)
+
+    with pytest.raises(RuntimeError, match="already contains 1 group"):
+        asyncio.run(ctrl._drain_reserve_into_steps(launch))
+
+    assert launched == []
 
 
 class _SkippingRolloutManager:

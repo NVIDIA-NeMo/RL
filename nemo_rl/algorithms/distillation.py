@@ -52,6 +52,7 @@ from nemo_rl.environments.nemo_gym import (
     should_use_nemo_gym,
     spinup_nemo_gym_actor,
 )
+from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
@@ -598,7 +599,9 @@ def setup(
         )
         student_generation.weight_synchronizer.init_communicator()
     elif student_generation is not None:
-        state_dict_info = student_policy.prepare_refit_info()
+        state_dict_info = student_policy.prepare_refit_info(
+            refit_payload_mode=student_generation.get_refit_payload_mode()
+        )
         student_generation.prepare_refit_info(state_dict_info)
 
     # if it is not colocated inference, initialize collective communication for update weights
@@ -644,8 +647,7 @@ def setup(
 # ===============================================================================
 
 
-@umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.distillation.job")
-def distillation_train(
+def _distillation_train_impl(
     student_policy: ColocatablePolicyInterface,
     teacher_policy: ColocatablePolicyInterface,
     student_generation: Optional[GenerationInterface],
@@ -1160,7 +1162,12 @@ def distillation_train(
                 metrics["global_valid_toks"] / total_time / total_num_gpus
             )
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
-            logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
+            logger.log_metrics(
+                timing_metrics,
+                total_steps + 1,
+                prefix="timing/train",
+                step_finished=True,
+            )
 
             timer.reset()
             current_step += 1
@@ -1187,6 +1194,43 @@ def distillation_train(
     # without this the daemon finalization thread could be killed before the
     # final tmp_step_N is renamed.
     checkpointer.shutdown()
+
+
+@umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.distillation.job")
+def distillation_train(
+    student_policy: ColocatablePolicyInterface,
+    teacher_policy: ColocatablePolicyInterface,
+    student_generation: Optional[GenerationInterface],
+    dataloader: StatefulDataLoader,
+    val_dataloader: Optional[StatefulDataLoader],
+    tokenizer: TokenizerType,
+    loss_fn: DistillationLossFn,
+    task_to_env: dict[str, EnvironmentInterface],
+    val_task_to_env: Optional[dict[str, EnvironmentInterface]],
+    logger: Logger,
+    checkpointer: CheckpointManager,
+    distillation_save_state: DistillationSaveState,
+    master_config: MasterConfig,
+) -> None:
+    """Run distillation training and always tear down its environments."""
+    try:
+        _distillation_train_impl(
+            student_policy=student_policy,
+            teacher_policy=teacher_policy,
+            student_generation=student_generation,
+            dataloader=dataloader,
+            val_dataloader=val_dataloader,
+            tokenizer=tokenizer,
+            loss_fn=loss_fn,
+            task_to_env=task_to_env,
+            val_task_to_env=val_task_to_env,
+            logger=logger,
+            checkpointer=checkpointer,
+            distillation_save_state=distillation_save_state,
+            master_config=master_config,
+        )
+    finally:
+        shutdown_environments(task_to_env, val_task_to_env)
 
 
 def validate(

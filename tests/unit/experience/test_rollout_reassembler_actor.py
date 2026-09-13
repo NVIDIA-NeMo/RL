@@ -140,6 +140,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "group_min_wv",
         "group_max_wv",
         "staging_keys",
+        "canonical_output_tokens",
         "metrics",
         "dropped",
         "drop_reason",
