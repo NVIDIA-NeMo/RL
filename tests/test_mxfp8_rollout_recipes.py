@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -331,6 +332,41 @@ def test_qwen3_235b_mxfp8_recipes_keep_baseline_runtime_knobs() -> None:
         assert "max_num_steps" not in grpo_config
         assert "val_batch_size" not in grpo_config
         assert "max_val_samples" not in grpo_config
+
+
+ASYNC_MXFP8_RECIPE_PATHS = sorted(
+    PERF_CONFIG_DIR.glob("*-async-1off-mxfp8-rollout.yaml")
+)
+
+
+def test_async_mxfp8_recipe_discovery_is_not_empty() -> None:
+    # An empty parametrize list collects as a silent SKIP, which would leave
+    # the nccl_reshard guard dead if the recipe directory or naming changes.
+    assert ASYNC_MXFP8_RECIPE_PATHS
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    ASYNC_MXFP8_RECIPE_PATHS,
+    ids=lambda path: path.stem,
+)
+def test_async_mxfp8_recipes_use_nccl_reshard(config_path: Path) -> None:
+    config = _load_resolved_yaml(config_path)
+
+    assert config["policy"]["generation"]["refit_transport"] == "nccl_reshard"
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    ASYNC_MXFP8_RECIPE_PATHS,
+    ids=lambda path: path.stem,
+)
+def test_async_mxfp8_recipes_pass_nccl_reshard_validation(config_path: Path) -> None:
+    nccl_reshard_utils = pytest.importorskip("nemo_rl.weight_sync.nccl_reshard_utils")
+    config = _load_resolved_yaml(config_path)
+    master_config = SimpleNamespace(policy=config["policy"])
+
+    nccl_reshard_utils.check_nccl_reshard_refit_support(master_config)
 
 
 def test_deepseek_mxfp8_launchers_handle_unset_and_spaced_checkpoint_paths() -> None:

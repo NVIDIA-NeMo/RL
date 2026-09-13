@@ -10,6 +10,7 @@ policy:
   megatron_cfg:
     expert_model_parallel_size: 8
   generation:
+    refit_transport: nccl_reshard
     colocated:
       enabled: false
       resources:
