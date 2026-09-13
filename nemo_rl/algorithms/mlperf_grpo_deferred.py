@@ -114,8 +114,13 @@ def configure_deferred_evaluation(config: dict) -> dict | None:
         enabled=True,
         metric_name=None,
         save_optimizer=False,
+        # Suppress periodic saves before the evaluation window; the async loop
+        # saves every step from val_start_at on. (save_period=1 would wrongly
+        # checkpoint the whole run.)
         save_period=first,
-        keep_top_k=max(checkpointing.get("keep_top_k") or 0, 2),
+        # The rules require every step from val_start_at until the stop step;
+        # never prune the window.
+        keep_top_k=None,
     )
     return deferred
 
@@ -344,6 +349,15 @@ def evaluate_endpoints(
     grpo = config["grpo"]
     threshold = float(grpo["deferred_evaluation"]["threshold"])
     checkpoints = discover_checkpoints(checkpoint_root)
+    # The rules require a checkpoint after every step from val_start_at until
+    # the stop step; reject a pruned or partial window.
+    steps = [int(path.name.removeprefix("step_")) for path in checkpoints]
+    first = grpo["val_start_at"]
+    if steps != list(range(first, steps[-1] + 1)):
+        raise ValueError(
+            f"checkpoint series must start at val_start_at={first} and be "
+            f"contiguous, got {steps}"
+        )
     for checkpoint in checkpoints:
         step = int(checkpoint.name.removeprefix("step_"))
         saved_config, info = read_checkpoint(checkpoint, step)

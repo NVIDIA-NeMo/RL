@@ -82,6 +82,8 @@ def test_configure_mutates_training_config(monkeypatch, tmp_path) -> None:
     assert checkpointing["save_period"] == 2
     assert checkpointing["save_optimizer"] is False
     assert checkpointing["metric_name"] is None
+    # Never prune the evaluation window.
+    assert checkpointing["keep_top_k"] is None
     assert config["logger"]["mlperf"]["defer_run_stop"] is True
 
 
@@ -170,6 +172,18 @@ def test_endpoints_all_miss_aborts_at_final_checkpoint(monkeypatch, tmp_path) ->
     assert run_stop[1]["metadata"]["status"] == "aborted"
     assert run_stop[1]["metadata"]["samples_count"] == 384
     assert run_stop[1]["time_ms"] == 333
+
+
+def test_endpoints_reject_noncontiguous_checkpoints(monkeypatch, tmp_path) -> None:
+    root = tmp_path / "ckpt"
+    _write_checkpoint(root, 2, timestamp_ms=222, samples=16)
+    _write_checkpoint(root, 4, timestamp_ms=444, samples=32)  # step 3 missing
+    monkeypatch.setattr(
+        deferred, "evaluate_checkpoint", lambda *args, **kwargs: 1.0
+    )
+    config, _ = deferred.read_checkpoint(root / "step_2", 2)
+    with pytest.raises(ValueError, match="contiguous"):
+        deferred.evaluate_endpoints(root, tmp_path / "eval", config, _FakeMllogger())
 
 
 def test_read_checkpoint_validation(tmp_path) -> None:
