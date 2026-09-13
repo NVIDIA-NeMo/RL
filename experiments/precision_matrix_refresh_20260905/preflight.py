@@ -48,6 +48,8 @@ def main() -> None:
                     if performance:
                         original = load_config(root / fields["config"])
                         if model == "qwen35":
+                            scope_key = "policy.generation.vllm_cfg.quantization_ignore_patterns"
+                            assert OmegaConf.select(cfg, scope_key) == OmegaConf.select(original, scope_key), "Launcher replaced Qwen3.5 quantization scope"
                             base = load_config(root / "examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml")
                             for key in (
                                 "grpo.num_prompts_per_step",

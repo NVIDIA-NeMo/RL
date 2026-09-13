@@ -368,7 +368,8 @@ if [[ "${PERFORMANCE_RECIPE}" == 1 ]]; then
   if [[ "${MODE}" == async ]]; then
     COMMON_OVERRIDES+=("++policy.generation.refit_transport=nccl_reshard")
   fi
-  if [[ "${ARM}" == *-mxfp8 ]]; then
+  # Qwen3.5 inherits its vision/GDN/shared-expert exclusions from its YAML.
+  if [[ "${ARM}" == *-mxfp8 && "${MODEL}" != qwen35 ]]; then
     if [[ "${MODEL}" == super ]]; then
       IGNORE_PATTERNS='["*layers.*.mixer.qkv_proj","*layers.*.mixer.o_proj","*layers.*.mixer.in_proj","*layers.*.mixer.out_proj","*layers.*.mixer.up_proj","*layers.*.mixer.down_proj","*layers.*.mixer.gate","*layers.*.mixer.shared_experts.*","*layers.*.mixer.fc1_latent_proj","*layers.*.mixer.fc2_latent_proj","*mtp.*","lm_head"]'
     else
