@@ -39,6 +39,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+from nemo_rl.data.multimodal_utils import NATIVE_MULTIMODAL_KEYS
 from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -572,6 +573,11 @@ class AsyncRolloutImpl:
     ) -> tuple[Completion, dict]:
         """Run one multi-turn rollout for a single generation index."""
         current_message_log = copy.deepcopy(input_sample["message_log"])
+        native_generation_data = {
+            key: input_sample[key]
+            for key in NATIVE_MULTIMODAL_KEYS
+            if key in input_sample
+        }
         current_extra_env_info = copy.deepcopy(input_sample["extra_env_info"])
         current_stop_strings = input_sample.get("stop_strings", None)
         task_name = input_sample["task_name"]
@@ -599,6 +605,11 @@ class AsyncRolloutImpl:
                 break
 
             turn_count += 1
+            turn_native_generation_data = dict(native_generation_data)
+            # Raw processor content describes only the original conversation.
+            # Later turns keep the media but use the updated pre-tokenized prefix.
+            if turn_count > 1 and "vllm_content" in turn_native_generation_data:
+                turn_native_generation_data["vllm_content"] = None
 
             # Generate response for this sample using async generation.
             # A failure here must not be absorbed: returning a partial completion
@@ -612,6 +623,7 @@ class AsyncRolloutImpl:
                 ) = await self._generate_response(
                     current_message_log,
                     current_stop_strings,
+                    native_generation_data=turn_native_generation_data,
                 )
             except Exception as e:
                 raise _classify_generation_failure(
@@ -738,6 +750,8 @@ class AsyncRolloutImpl:
         self,
         message_log: list[dict],
         stop_strings: list[str] | None,
+        *,
+        native_generation_data: dict[str, Any] | None = None,
     ) -> tuple[dict, torch.Tensor, dict[str, Any]]:
         """Generate a single-turn response for one sample.
 
@@ -762,6 +776,12 @@ class AsyncRolloutImpl:
         generation_input_data.update(
             flat_messages.get_multimodal_dict(as_tensors=False)
         )
+        if native_generation_data:
+            # This method handles one sample; vLLM's formatter expects batched
+            # native content/media side channels.
+            generation_input_data.update(
+                {key: [value] for key, value in native_generation_data.items()}
+            )
 
         # Generate response
         # TODO: update generate_async to return a single item directly

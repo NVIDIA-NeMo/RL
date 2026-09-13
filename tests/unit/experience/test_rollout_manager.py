@@ -101,7 +101,7 @@ def _with_cut(buffer, callback):
     return _run(apply())
 
 
-def test_generate_response_forwards_message_log_media_to_generation() -> None:
+def test_generate_response_forwards_all_vllm_media_to_generation() -> None:
     captured: dict[str, BatchedDataDict] = {}
 
     class _Generation:
@@ -131,6 +131,7 @@ def test_generate_response_forwards_message_log_media_to_generation() -> None:
     manager._deadline_registry = None
     pixel_values = PackedTensor(torch.ones(2, 3, 4, 4), dim_to_pack=0)
     imgs_sizes = PackedTensor(torch.tensor([[4, 4], [4, 4]]), dim_to_pack=0)
+    native_image = object()
     message_log = [
         {
             "role": "user",
@@ -147,13 +148,22 @@ def test_generate_response_forwards_message_log_media_to_generation() -> None:
     ]
 
     assistant_message, input_lengths, _ = _run(
-        manager._generate_response(message_log, ["<stop>"])
+        manager._generate_response(
+            message_log,
+            ["<stop>"],
+            native_generation_data={
+                "vllm_content": "rendered prompt",
+                "vllm_images": [native_image],
+            },
+        )
     )
 
     generation_data = captured["data"]
     assert generation_data["input_ids"].tolist() == [[1, 2, 3, 4, 5]]
     assert generation_data["input_lengths"].tolist() == [5]
     assert generation_data["stop_strings"] == [["<stop>"]]
+    assert generation_data["vllm_content"] == ["rendered prompt"]
+    assert generation_data["vllm_images"] == [[native_image]]
     assert isinstance(generation_data["pixel_values"], PackedTensor)
     assert isinstance(generation_data["imgs_sizes"], PackedTensor)
     assert torch.equal(
