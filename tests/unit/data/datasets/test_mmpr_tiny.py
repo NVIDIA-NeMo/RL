@@ -241,7 +241,8 @@ class TestVLMProcessorMMPRTiny:
         assert result["task_name"] == "mmpr-tiny"
         user_message = result["message_log"][0]
         assert torch.equal(user_message["num_frames"].as_tensor(), torch.tensor([1]))
-        assert user_message["pixel_values"].pad_to_max_shape is True
+        assert user_message["pixel_values"].preprocess_mode == "patchify"
+        assert user_message["pixel_values"].preprocess_kwargs == {"patch_dim": 16}
         assert user_message["pixel_values"].as_tensor().dtype == torch.float32
 
     def test_text_only_row_preserves_formatted_vllm_content(self):

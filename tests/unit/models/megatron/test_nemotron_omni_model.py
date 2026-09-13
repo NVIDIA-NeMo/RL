@@ -241,7 +241,8 @@ def _deduplicated_expanded_fixture(device: torch.device):
             "pixel_values": PackedTensor(
                 [image.clone(), image.clone()],
                 dim_to_pack=0,
-                pad_to_max_shape=True,
+                preprocess_mode="patchify",
+                preprocess_kwargs={"patch_dim": 16},
             ),
             "imgs_sizes": PackedTensor(
                 [image_size.clone(), image_size.clone()],
@@ -252,7 +253,8 @@ def _deduplicated_expanded_fixture(device: torch.device):
     pixel_row = PackedTensor(
         image,
         dim_to_pack=0,
-        pad_to_max_shape=True,
+        preprocess_mode="patchify",
+        preprocess_kwargs={"patch_dim": 16},
     ).enable_deduplication()
     image_size_row = PackedTensor(
         image_size,

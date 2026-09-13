@@ -389,6 +389,7 @@ def vlm_preference_preprocessor(
     placeholder_style_processors = {
         "NemotronNanoVLV2Processor",
         "NemotronH_Nano_Omni_Reasoning_V3Processor",
+        "NemotronH_Omni_Reasoning_V3Processor",
     }
     message_processor = (
         _NemotronOmniPreferenceProcessorProxy(processor)
@@ -404,25 +405,33 @@ def vlm_preference_preprocessor(
             task_data_spec,
         )
 
-        # Mirror the canonical Nemotron Omni metadata contract. Dynamic-resolution
-        # image batches may differ spatially across rows, while imgs_sizes
-        # preserves the true crop consumed by model-owned patchification.
+        # Mirror the canonical Nemotron Omni metadata. Record native image sizes
+        # before patchification removes the spatial dimensions.
         for raw_message in message_log:
             message = cast(Any, raw_message)
             pixel_values = message.get("pixel_values")
             if not isinstance(pixel_values, PackedTensor):
                 continue
-            pixel_values.pad_to_max_shape = True
-            pixels = pixel_values.as_tensor()
-            if pixels is not None and pixels.ndim == 4 and "imgs_sizes" not in message:
-                num_images, _, height, width = pixels.shape
+            if "imgs_sizes" not in message:
+                image_sizes: list[list[int]] = []
+                for pixels in pixel_values.iter_logical_segments():
+                    if pixels is None:
+                        continue
+                    if pixels.ndim != 4:
+                        raise ValueError(
+                            "Nemotron Omni pixel values must be [N, C, H, W] "
+                            f"before patchification, got {tuple(pixels.shape)}"
+                        )
+                    image_sizes.extend(
+                        [[int(pixels.shape[-2]), int(pixels.shape[-1])]]
+                        * int(pixels.shape[0])
+                    )
                 message["imgs_sizes"] = PackedTensor(
-                    torch.tensor(
-                        [[height, width]] * num_images,
-                        dtype=torch.long,
-                    ),
+                    torch.tensor(image_sizes, dtype=torch.long),
                     dim_to_pack=0,
                 )
+            pixel_values.preprocess_mode = "patchify"
+            pixel_values.preprocess_kwargs = {"patch_dim": 16}
             imgs_sizes = message.get("imgs_sizes")
             if isinstance(imgs_sizes, PackedTensor) and "num_frames" not in message:
                 sizes = imgs_sizes.as_tensor()
