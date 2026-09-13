@@ -158,6 +158,30 @@ class _SteppingClock:
 # ── fakes ────────────────────────────────────────────────────────────────────
 
 
+class _FakeGeneration:
+    """Generation stand-in for train-pump tests that do not run rollouts."""
+
+    requires_kv_scale_sync = False
+
+    def snapshot_step_metrics(self) -> None:
+        pass
+
+    def get_step_metrics(self) -> dict[str, float]:
+        return {}
+
+
+class _CheckpointGeneration(_FakeGeneration):
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    def pause_generation_for_checkpoint(self, *, timeout_s=None) -> bool:
+        self._events.append("generation-pause")
+        return True
+
+    def resume_generation_after_checkpoint(self, *, timeout_s=None) -> bool:
+        self._events.append("generation-resume")
+        return True
+
 class _FakeTrainer:
     """TQPolicy stand-in: train methods are no-ops, save_checkpoint records calls."""
 
@@ -1639,6 +1663,15 @@ class TestPeriodicRolloutCheckpoint:
         with pytest.raises(ValidationError, match="restore_mode"):
             RolloutCheckpointConfig.model_validate({"restore_mode": "none"})
 
+    def test_generation_prefix_cuts_require_gym_participant_checkpointing(self):
+        with pytest.raises(
+            ValidationError,
+            match="generation_prefix_cuts_enabled=true requires",
+        ):
+            RolloutCheckpointConfig.model_validate(
+                {"gym": {"generation_prefix_cuts_enabled": True}}
+            )
+
     @pytest.mark.parametrize(
         "config",
         [
@@ -1982,6 +2015,90 @@ class TestPeriodicRolloutCheckpoint:
         assert len(set(gym_actor.checkpoint_ids)) == 2
         assert actor._gym_checkpoint_rollout_permitted.is_set()
 
+    def test_generation_prefix_cut_freezes_engine_until_gym_release(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        events: list[str] = []
+        actor._generation_prefix_cuts_enabled = True
+        actor._gen = _CheckpointGeneration(events)
+        actor._env_handles = {"nemo_gym": _FakeGymCheckpointActor(events)}
+        actor._gym_checkpoint_topology = GymCheckpointTopology.model_validate(
+            {
+                "schema_version": 1,
+                "participants": [
+                    {
+                        "participant": {
+                            "server_name": "agent-route",
+                            "component": "responses_api_agents",
+                            "participant_name": "test-agent",
+                        },
+                        "schema_version": 1,
+                        "admission_states": ["accepting"],
+                        "checkpoint_mode": "export_restore",
+                        "concurrency_contract": "serialized_per_session",
+                        "multi_process": {
+                            "mode": "single_worker",
+                            "num_workers": 1,
+                        },
+                        "instance_role": None,
+                        "features": ["completed_result_acknowledgement"],
+                    }
+                ],
+            }
+        )
+
+        async def scenario() -> None:
+            prepare, checkpoint = await actor._prepare_and_commit_gym_checkpoint(
+                "checkpoint-1", tmp_path
+            )
+            assert prepare.checkpoint_id == checkpoint.checkpoint_id == "checkpoint-1"
+            assert actor._generation_checkpoint_pause_id == "checkpoint-1"
+            assert not actor._gym_checkpoint_rollout_permitted.is_set()
+            await actor._release_prepared_gym_checkpoint("checkpoint-1", committed=True)
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert events == [
+            "generation-pause",
+            "prepare",
+            "commit",
+            "resume",
+            "generation-resume",
+        ]
+        assert actor._generation_checkpoint_pause_id is None
+        assert actor._gym_checkpoint_rollout_permitted.is_set()
+
+    def test_generation_prefix_cut_prepare_failure_resumes_engine(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        events: list[str] = []
+        actor._generation_prefix_cuts_enabled = True
+        actor._gen = _CheckpointGeneration(events)
+        actor._env_handles = {
+            "nemo_gym": _FakeGymCheckpointActor(events, fail_prepare=True)
+        }
+
+        try:
+            with pytest.raises(TimeoutError, match="prompt group did not drain"):
+                asyncio.run(
+                    actor._prepare_and_commit_gym_checkpoint("checkpoint-1", tmp_path)
+                )
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert events == [
+            "generation-pause",
+            "prepare",
+            "generation-resume",
+        ]
+        assert actor._generation_checkpoint_pause_id is None
+        assert actor._gym_checkpoint_rollout_permitted.is_set()
+
     def test_gym_prepare_timeout_keeps_previous_snapshot_and_reopens_admission(
         self, tmp_path: Path
     ) -> None:
@@ -2038,9 +2155,7 @@ class TestPeriodicRolloutCheckpoint:
         assert resolved is not None
         assert resolved.path.name == "snapshot_000001"
         assert {
-            child.name
-            for child in resolved.path.parent.iterdir()
-            if child.is_dir()
+            child.name for child in resolved.path.parent.iterdir() if child.is_dir()
         } == {"snapshot_000001"}
 
     def test_gym_staging_index_failure_aborts_and_reopens_admission(

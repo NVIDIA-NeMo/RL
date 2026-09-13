@@ -32,6 +32,40 @@ VLLM_LOGPROB_FLOOR = -9999.0
 # The expert-id range vs carry dtype is model-constant, so it is verified on the
 # first non-empty routed-experts tensor per process and skipped afterwards.
 G_ROUTED_EXPERTS_RANGE_CHECKED = False
+
+
+def extract_selected_token_logprobs(generation_details: Any) -> list[float]:
+    """Return the log probability selected for each cumulative output token."""
+    generation_token_ids = list(getattr(generation_details, "token_ids", ()) or ())
+    generation_logprob_details = getattr(generation_details, "logprobs", None)
+    if generation_logprob_details is None:
+        if generation_token_ids:
+            raise RuntimeError(
+                "vLLM generation output with token IDs did not include logprobs"
+            )
+        return []
+    if len(generation_token_ids) != len(generation_logprob_details):
+        raise RuntimeError(
+            "vLLM returned mismatched generation token IDs and log probabilities: "
+            f"token_count={len(generation_token_ids)}, "
+            f"logprob_count={len(generation_logprob_details)}"
+        )
+    selected_logprobs: list[float] = []
+    for token_id, position_logprobs in zip(
+        generation_token_ids, generation_logprob_details, strict=True
+    ):
+        selected_token_logprob = position_logprobs.get(token_id)
+        if selected_token_logprob is None:
+            raise RuntimeError(
+                "vLLM generation log probabilities did not include the selected "
+                f"token: token_id={token_id}"
+            )
+        selected_logprobs.append(
+            max(float(selected_token_logprob.logprob), VLLM_LOGPROB_FLOOR)
+        )
+    return selected_logprobs
+
+
 GROUPED_MOE_MXFP8_REFIT_ERROR = (
     "MXFP8 refit does not support grouped MoE expert weights."
 )
