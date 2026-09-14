@@ -247,6 +247,20 @@ sbatch --segment=${SEGMENT} -N ${DGXNNODES} --gpus-per-node=${DGXNGPU} \
     --time=${WALLTIME} -A <account> run.sub
 ```
 
+### Checkpoint retention
+
+Deferred checkpoints are reproducible weights-only artifacts (hundreds of GB
+each) whose only consumer is the in-job evaluation. `RETAIN_GRPO_CHECKPOINTS=0`
+(default) removes this run's `step_<N>` and partial `tmp_step_<N>` directories
+during final teardown, after the training and evaluation writers have stopped.
+This applies on success, non-convergence, failure, and handled termination
+signals; it also removes the final checkpoint when an earlier endpoint passed.
+Set `RETAIN_GRPO_CHECKPOINTS=1` before submission to keep them. Only `0` and
+`1` are accepted. Inline-validation runs and their resume checkpoints are
+unchanged, and the initial HF/MCore model inputs are never touched. Cleanup
+failures produce warnings without replacing the benchmark exit status. No
+backup is made; retain checkpoints explicitly if you need a reload.
+
 ## Authoritative multi-GBS profiles
 
 One full common YAML owns the qualified algorithm and system behavior. Four

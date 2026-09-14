@@ -62,11 +62,14 @@ echo "PROLOG_START $(date +%s)"
 : "${SRUN_KILL_ON_BAD_EXIT:=0}"
 : "${DEFERRED_OFFLINE_EVAL:=0}"
 : "${WALLTIME_OFFLINE_EVAL:=240}"
+: "${RETAIN_GRPO_CHECKPOINTS:=0}"
 export DEFERRED_OFFLINE_EVAL
-case "${DEFERRED_OFFLINE_EVAL}" in
-    0|1) ;;
-    *) echo "ERROR: DEFERRED_OFFLINE_EVAL must be 0 or 1" >&2; exit 1 ;;
-esac
+for _flag in DEFERRED_OFFLINE_EVAL RETAIN_GRPO_CHECKPOINTS; do
+    case "${!_flag}" in
+        0|1) ;;
+        *) echo "ERROR: ${_flag} must be 0 or 1" >&2; exit 1 ;;
+    esac
+done
 if [[ "${DEFERRED_OFFLINE_EVAL}" == "1" ]]; then
     # Checkpoint evaluation runs as a second driver in the same allocation;
     # the mllog must describe exactly one fresh experiment.
@@ -161,9 +164,43 @@ mkdir -p "${RAY_CLUSTER_LOG_DIR}"
 source ${RUNSUB_DIR}/config_mounts.sh
 echo _cont_mounts="${_cont_mounts}"
 
+# Deferred runs emit reproducible weights-only checkpoints (hundreds of GB
+# each) whose only consumer is the in-job evaluation; retire them once the
+# writers have stopped unless RETAIN_GRPO_CHECKPOINTS=1. Inline-validation
+# runs and resume checkpoints are untouched. Cleanup failures only warn and
+# never replace the benchmark exit status.
+cleanup_deferred_checkpoints() {
+    if [[ "${DEFERRED_OFFLINE_EVAL}" != "1" || "${RETAIN_GRPO_CHECKPOINTS}" == "1" ]]; then
+        return 0
+    fi
+    # No training trial was entered (for example a failed container prolog).
+    if [[ ! "${_experiment_index:-}" =~ ^[0-9]+$ || -z "${LOGDIR:-}" ]]; then
+        return 0
+    fi
+    local root directory target
+    if ! root="$(realpath -e -- "${CHECKPOINTS_DIR:-${LOGDIR}/checkpoint}")"; then
+        echo "WARNING: checkpoint root missing; nothing to clean" >&2
+        return 0
+    fi
+    directory="${root}/${_experiment_index}"
+    if [[ "${directory}" != "${root}/"* ]]; then
+        echo "WARNING: checkpoint dir escapes its root; skipping cleanup" >&2
+        return 0
+    fi
+    for target in "${directory}"/step_* "${directory}"/tmp_step_*; do
+        [[ "${target##*/}" =~ ^(tmp_)?step_[0-9]+$ ]] || continue
+        [[ -e "${target}" || -L "${target}" ]] || continue
+        echo "teardown: deleting deferred checkpoint ${target}"
+        rm -rf --one-file-system --preserve-root=all -- "${target}" || \
+            echo "WARNING: checkpoint cleanup failed: ${target}" >&2
+    done
+    return 0
+}
+
 cleanup_containers() {
     touch "${RAY_CLUSTER_LOG_DIR}/ENDED" || true
-    cleanup_pyxis
+    cleanup_pyxis || true
+    cleanup_deferred_checkpoints
 }
 trap cleanup_containers TERM EXIT
 
