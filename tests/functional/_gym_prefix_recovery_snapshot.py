@@ -121,6 +121,8 @@ def _legacy_active_prefixes(manifest: dict[str, Any]) -> list[dict[str, Any]]:
                 if isinstance(prefix, dict)
                 and prefix.get("disposition") == "durable_prefix"
                 and str(prefix.get("frozen_buffer_id", "")).startswith("active/")
+                and isinstance(prefix.get("staging_keys"), list)
+                and bool(prefix["staging_keys"])
                 and isinstance(prefix.get("prefix_token_count"), int)
                 and prefix["prefix_token_count"] > 0
             )
@@ -193,6 +195,8 @@ def _lineage_active_prefixes(
             and row.get("model_call_id") not in committed_calls
             and row.get("disposition") == "durable_prefix"
             and str(row.get("frozen_buffer_id", "")).startswith("active/")
+            and isinstance(row.get("staging_keys"), list)
+            and bool(row["staging_keys"])
             and isinstance(row.get("prefix_token_count"), int)
             and row["prefix_token_count"] > 0
         )
@@ -440,7 +444,7 @@ def inspect_snapshot(
         "source_attempt_index": prefix["attempt_index"],
         "restored_attempt_index": prefix["attempt_index"] + 1,
         "source_model_call_id": prefix["model_call_id"],
-        "staging_key": prefix["staging_key"],
+        "staging_keys": prefix["staging_keys"],
         "prefix_token_count": prefix["prefix_token_count"],
         "prefix_digest": prefix["prefix_digest"],
         "boundary_index": boundary["boundary_index"],

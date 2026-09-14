@@ -128,7 +128,7 @@ def test_generation_cut_proof_exposes_durable_tq_prefix_keys() -> None:
             "prefixes": [
                 {
                     "disposition": "durable_prefix",
-                    "staging_key": "__generation_cut__/checkpoint-1/r0/c1",
+                    "staging_keys": ["__generation_cut__/checkpoint-1/r0/c1"],
                 },
                 {"disposition": "durable_failure"},
             ]
