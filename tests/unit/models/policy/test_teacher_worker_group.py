@@ -12,6 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
+from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+import torch
+
+from nemo_rl.distributed import worker_groups
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.megatron.router_replay import router_replay_enabled
+from nemo_rl.models.policy.teacher_worker_group import (
+    TeacherWorkerGroup,
+    create_teacher_configs_from_opd_config,
+)
+
 
 def test_teacher_resource_config_defaults():
     from nemo_rl.algorithms.opd import TeacherResourceConfig
@@ -169,3 +184,116 @@ def test_provider_override_allowlist_is_explicit_keys_only():
     # student configs carry no allowlist: every key applies as before
     student_megatron_cfg = {"radio_force_cpe_eval_mode": True}
     assert provider_override_allowed(student_megatron_cfg, "radio_force_cpe_eval_mode")
+
+
+@pytest.fixture
+def student_policy_config() -> dict[str, Any]:
+    return {
+        "model_name": "/student",
+        "router_replay": {
+            "enabled": True,
+            "transport": "ray",
+            "_store_run_instance_id": "student-run",
+        },
+        "megatron_cfg": {"enabled": True},
+        "sequence_packing": {
+            "enabled": False,
+            "algorithm": "modified_first_fit_decreasing",
+            "logprob_mb_tokens": 16,
+        },
+        "dynamic_batching": {"enabled": False},
+    }
+
+
+@pytest.fixture
+def mock_ray_worker_group(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    mock_group = MagicMock()
+    monkeypatch.setattr(worker_groups, "RayWorkerGroup", mock_group)
+    return mock_group
+
+
+def _make_teacher_group(policy_config: dict[str, Any]) -> TeacherWorkerGroup:
+    (teacher_cfg,) = create_teacher_configs_from_opd_config(
+        {
+            "teacher_model_by_agent_name": {"teacher": "/teacher"},
+            "non_colocated_teachers": {
+                "default_teacher_cfg": {"gpus_per_node": 2, "micro_batch_size": 1}
+            },
+        }
+    )
+    cluster = MagicMock()
+    cluster.world_size.return_value = 2
+    return TeacherWorkerGroup(teacher_cfg, cluster, policy_config, MagicMock())
+
+
+@pytest.mark.parametrize(
+    "replay_config",
+    [
+        None,
+        {"enabled": False},
+        {"enabled": True, "transport": "inline"},
+        {
+            "enabled": True,
+            "transport": "ray",
+            "_store_run_instance_id": "student-run",
+        },
+    ],
+    ids=["absent", "disabled", "inline", "ray"],
+)
+def test_teacher_disables_student_router_replay(
+    student_policy_config: dict[str, Any],
+    mock_ray_worker_group: MagicMock,
+    replay_config: dict[str, Any] | None,
+) -> None:
+    if replay_config is None:
+        del student_policy_config["router_replay"]
+    else:
+        student_policy_config["router_replay"] = replay_config
+    original_policy_config = deepcopy(student_policy_config)
+
+    teacher = _make_teacher_group(student_policy_config)
+
+    # Check the config actually sent to MegatronPolicyWorker, not just the
+    # group wrapper: this controls both the worker guard and MCore routers.
+    worker_builder = mock_ray_worker_group.call_args.args[1]
+    worker_config = worker_builder.args[0]
+    assert worker_config is teacher.cfg
+    assert not router_replay_enabled(worker_config)
+    assert student_policy_config == original_policy_config
+
+
+@pytest.mark.parametrize("use_sequence_packing", [False, True])
+def test_teacher_logprobs_explicitly_skip_router_replay(
+    student_policy_config: dict[str, Any],
+    mock_ray_worker_group: MagicMock,
+    use_sequence_packing: bool,
+) -> None:
+    student_policy_config["sequence_packing"]["enabled"] = use_sequence_packing
+    teacher = _make_teacher_group(student_policy_config)
+    mock_group = mock_ray_worker_group.return_value
+
+    def fake_get_results(_futures: Any) -> list[BatchedDataDict]:
+        call = mock_group.run_all_workers_sharded_data.call_args
+        assert call.args == ("get_logprobs",)
+        assert call.kwargs["common_kwargs"] == {
+            "micro_batch_size": 1,
+            "require_router_replay": False,
+        }
+        # The collector supplies tokens/lengths, not student expert routes.
+        shards = call.kwargs["data"]
+        assert all("routed_experts" not in shard for shard in shards)
+        return [
+            BatchedDataDict(logprobs=shard["input_ids"].float()) for shard in shards
+        ]
+
+    mock_group.get_all_worker_results.side_effect = fake_get_results
+    data = BatchedDataDict(
+        input_ids=torch.tensor([[1, 2, 0, 0], [3, 4, 5, 6]]),
+        input_lengths=torch.tensor([2, 4]),
+    )
+
+    result = teacher.get_logprobs(data)
+
+    # Preserve the teacher-logprob result contract, including unpacking order.
+    assert set(result) == {"reference_logprobs"}
+    torch.testing.assert_close(result["reference_logprobs"], data["input_ids"].float())
