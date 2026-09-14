@@ -43,7 +43,8 @@ _GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES = (
 
 def assert_reload_refit_config_supported(config: VllmConfig) -> None:
     """Reject pure-config combinations unsupported by vLLM reload refit."""
-    if not config["vllm_cfg"].get("refit_with_reload_api"):
+    vllm_cfg = config.get("vllm_cfg")
+    if not vllm_cfg or not vllm_cfg.get("refit_with_reload_api"):
         return
 
     assert not config["colocated"]["enabled"], (
