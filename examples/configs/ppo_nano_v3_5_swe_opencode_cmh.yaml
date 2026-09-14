@@ -205,6 +205,18 @@ loss_fn:
   kl_input_clamp_value: null
   kl_output_clamp_value: null
 
+  # KL(pi_gen || pi_curr) penalty toward the behaviour (rollout) policy.
+  # Bounds cumulative drift across async steps; clamps must stay set (k3
+  # blows up exponentially on bf16 logprob outliers). These clamps are
+  # deliberately separate from kl_{input,output}_clamp_value above, which are
+  # null here — that is why enabling this term is safe in this config.
+  # Uses curr_logprobs (nucleus-filtered when policy.generation.top_p < 1),
+  # matching the other pi_gen-facing terms (actor IS weights, approx_entropy).
+  behaviour_kl_penalty: 0.0
+  behaviour_kl_type: "k3"
+  behaviour_kl_input_clamp_value: 20.0
+  behaviour_kl_output_clamp_value: 10.0
+
   # Defaults from the validated 7B math PPO run (symmetric 0.2 clip + dual-clip
   # c=3), not the GRPO-DAPO asymmetric 0.2/0.28. Overridable from the script.
   ratio_clip_min: 0.2
@@ -339,8 +351,8 @@ policy:
       params_dtype: "float32"
 
       adam_beta1: 0.9
-      adam_beta2: 0.999
-      adam_eps: 1e-8
+      adam_beta2: 0.95
+      adam_eps: 1e-10
 
       sgd_momentum: 0.9
 
@@ -365,7 +377,7 @@ policy:
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
       overlap_grad_reduce: false
-      overlap_param_gather: true
+      overlap_param_gather: false
       average_in_collective: false
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
@@ -606,8 +618,8 @@ value:
       params_dtype: "float32"
 
       adam_beta1: 0.9
-      adam_beta2: 0.999
-      adam_eps: 1e-8
+      adam_beta2: 0.95
+      adam_eps: 1e-15
 
       sgd_momentum: 0.9
 
@@ -632,7 +644,7 @@ value:
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
       overlap_grad_reduce: false
-      overlap_param_gather: true
+      overlap_param_gather: false
       average_in_collective: false
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
@@ -721,7 +733,7 @@ env:
         swe_agents:
           agent_max_turns: 200
           concurrency: ${mul:2, ${mul:${ppo.num_prompts_per_step}, ${ppo.num_generations_per_prompt}}}
-          swebench_agent_timeout: 2700
+          swebench_agent_timeout: 3600
           swebench_tests_timeout: 900
           run_with_mixed_prompts: true
           dataset_path: ${data.train.data_path}
@@ -733,10 +745,8 @@ env:
             - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/sweb.eval.arm64.{instance_id}.sif"
             - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/swebench/swe-bench.eval.arm64.{instance_id}.sif"
             - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/mercor/swebenchpro_ots/{instance_id}.sif"
-            - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/mercor/images_0501/{instance_id}.sif"
-            - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/mercor/images_0402/{instance_id}.sif"
-            - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/mercor/all_images/{instance_id}.sif"
             - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/mercor/{instance_id}.sif"
+            - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/mercor/sweagentv2/{instance_id}.sif"
             - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/swegym/sweb.eval.arm64.{instance_id}.sif"
     swe_agents_val:
       responses_api_agents:

@@ -102,6 +102,8 @@ ppo:
   # automatically when a nonzero KL penalty is requested.
   skip_reference_policy_logprobs_calculation: true
   seq_logprob_error_threshold: 2
+  log_rollout_dump: true
+  rollout_dump_period: 5  # dump every N PPO steps (when log_rollout_dump is true)
 
   # GAE with VAPO decoupled lambdas (defaults match the validated 7B math PPO
   # run: lambda_value=1.0, length-adaptive lambda_policy with alpha=0.05).
@@ -363,7 +365,7 @@ policy:
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
       overlap_grad_reduce: false
-      overlap_param_gather: true
+      overlap_param_gather: false
       average_in_collective: false
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
@@ -630,7 +632,7 @@ value:
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
       overlap_grad_reduce: false
-      overlap_param_gather: true
+      overlap_param_gather: false
       average_in_collective: false
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"

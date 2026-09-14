@@ -343,7 +343,7 @@ policy:
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
       overlap_grad_reduce: false
-      overlap_param_gather: true
+      overlap_param_gather: false
       average_in_collective: false
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
@@ -614,7 +614,7 @@ value:
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
       overlap_grad_reduce: false
-      overlap_param_gather: true
+      overlap_param_gather: false
       average_in_collective: false
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
