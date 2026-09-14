@@ -2850,6 +2850,8 @@ def compute_and_apply_seq_logprob_error_masking(
     sample_mask = train_data["sample_mask"]
     prev_logprobs = train_data["prev_logprobs"][:, 1:]
     generation_logprobs = train_data["generation_logprobs"][:, 1:]
+    # -inf prev_logprobs mark top-k/top-p mismatches that the loss drops; drop them here too.
+    token_mask = token_mask * torch.isfinite(prev_logprobs)
     seq_mult_prob_error, valid_seq_mask = compute_seq_logprob_errors(
         policy_logprobs=prev_logprobs,
         generation_logprobs=generation_logprobs,
