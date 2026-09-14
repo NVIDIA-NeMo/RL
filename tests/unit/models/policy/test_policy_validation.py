@@ -503,6 +503,23 @@ def test_dtensor_dp_replicate_size_requires_v2(
     mock_ray_worker_group.assert_not_called()
 
 
+@patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
+def test_dtensor_fsdp_output_dtype_requires_v2(
+    mock_ray_worker_group,
+    tiny_llama_model_path,
+):
+    """Test that fsdp_output_dtype requires the Automodel DTensor v2 worker."""
+    cluster = create_mock_cluster(world_size=8)
+    tokenizer = create_mock_tokenizer()
+    config = create_dtensor_config(tiny_llama_model_path, tp=1)
+    config["dtensor_cfg"]["fsdp_output_dtype"] = "bfloat16"
+
+    with pytest.raises(ValueError, match="_v2: true"):
+        Policy(cluster=cluster, config=config, tokenizer=tokenizer)
+
+    mock_ray_worker_group.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "world_size,tp,pp,cp,should_pass,expected_error_type,description",
     [

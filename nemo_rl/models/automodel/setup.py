@@ -295,7 +295,7 @@ def validate_and_prepare_config(
         raise ValueError(f"Unknown precision: {precision}")
     dtype = STRING_TO_DTYPE[precision]
     fsdp_output_dtype = config["dtensor_cfg"].get("fsdp_output_dtype", "float32")
-    if fsdp_output_dtype not in ("float32", "bfloat16", "float16"):
+    if fsdp_output_dtype not in STRING_TO_DTYPE:
         raise ValueError(f"Unknown FSDP output dtype: {fsdp_output_dtype}")
 
     # Get other configuration values

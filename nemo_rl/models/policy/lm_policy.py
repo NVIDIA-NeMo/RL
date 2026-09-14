@@ -258,6 +258,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                         "(Automodel DTensor v2 backend). HSDP is not supported with the "
                         "V1 DTensor worker."
                     )
+                if (
+                    config["dtensor_cfg"].get("fsdp_output_dtype", "float32")
+                    != "float32"
+                ):
+                    raise ValueError(
+                        "fsdp_output_dtype requires policy.dtensor_cfg._v2: true "
+                        "(Automodel DTensor v2 backend). The V1 DTensor worker always "
+                        "produces float32 module outputs."
+                    )
                 worker_builder_cls_fqn = resolve_policy_worker_cls(
                     "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker",
                     config,
