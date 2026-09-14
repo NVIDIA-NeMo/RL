@@ -165,6 +165,27 @@ def test_inference_optimized_pins_generation_etp_to_one() -> None:
 
 
 @pytest.mark.mcore
+def test_merged_inference_config_preserves_mxfp8_parameter_filters() -> None:
+    config = deepcopy(basic_megatron_test_config)
+    inference_cfg = config["generation"]["mcore_generation_config"]
+    inference_cfg["inference_mxfp8_include_parameters"] = (
+        r"\.mlp\.experts\.linear_fc[12]\."
+    )
+    inference_cfg["inference_mxfp8_exclude_parameters"] = r"\.layers\.(?:0|1)\."
+
+    merged = merged_inference_megatron_cfg(config)
+
+    assert (
+        merged["inference_mxfp8_include_parameters"]
+        == inference_cfg["inference_mxfp8_include_parameters"]
+    )
+    assert (
+        merged["inference_mxfp8_exclude_parameters"]
+        == inference_cfg["inference_mxfp8_exclude_parameters"]
+    )
+
+
+@pytest.mark.mcore
 def test_inference_optimized_rejects_explicit_generation_etp_above_one() -> None:
     config = deepcopy(basic_megatron_test_config)
     config["generation"]["mcore_generation_config"]["transformer_impl"] = (

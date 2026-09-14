@@ -1176,6 +1176,81 @@ class TestApplyPrecisionConfig:
             _apply_precision_config(model_cfg, config, torch.float32)
             assert model_cfg.pipeline_dtype == expected_dtype
 
+    def test_applies_mxfp8_inference_parameter_filters(self):
+        """Dedicated inference providers receive both selection filters."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "inference_mxfp8_include_parameters": (
+                    r".*mlp\.experts\.linear_fc[12]"
+                ),
+                "inference_mxfp8_exclude_parameters": r".*shared_experts.*",
+            }
+        }
+
+        _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert (
+            model_cfg.inference_mxfp8_include_parameters
+            == r".*mlp\.experts\.linear_fc[12]"
+        )
+        assert model_cfg.inference_mxfp8_exclude_parameters == r".*shared_experts.*"
+
+    def test_colocated_inference_model_applies_generation_filters(self, monkeypatch):
+        """Colocated inference applies generation filters before finalization."""
+        import nemo_rl.models.megatron.setup as setup
+
+        include_pattern = r".*mlp\.experts\.linear_fc[12]"
+        provider = SimpleNamespace(
+            pipeline_model_parallel_size=1,
+            tensor_model_parallel_size=1,
+            context_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+            sequence_parallel=False,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
+            transformer_impl="inference_optimized",
+        )
+
+        def finalize():
+            assert provider.inference_mxfp8_include_parameters == include_pattern
+
+        provider.finalize = MagicMock(side_effect=finalize)
+        inference_model = MagicMock()
+        get_model = MagicMock(return_value=[inference_model])
+        monkeypatch.setattr(setup, "_apply_parallelism_config", lambda *_: None)
+        monkeypatch.setattr(setup, "_apply_moe_config", lambda *_: None)
+        monkeypatch.setattr(
+            setup, "build_inference_pg_collection", lambda *_args, **_kwargs: object()
+        )
+        monkeypatch.setattr(setup, "get_model", get_model)
+        monkeypatch.setattr(setup, "inference_model_alloc_region", MagicMock)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+
+        policy_cfg = {
+            "megatron_cfg": {
+                "transformer_impl": "inference_optimized",
+                "freeze_moe_router": False,
+                "inference_mxfp8_include_parameters": include_pattern,
+            }
+        }
+        megatron_cfg = SimpleNamespace(
+            ddp=object(),
+            dist=SimpleNamespace(use_tp_pp_dp_mapping=False),
+            rng=SimpleNamespace(data_parallel_random_init=False),
+        )
+
+        result = setup.build_inference_model(policy_cfg, megatron_cfg, provider)
+
+        assert result is inference_model
+        provider.finalize.assert_called_once_with()
+        assert get_model.call_args.args[0] is provider
+
     @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
     def test_loads_te_precision_config_when_configured(
         self, mock_load_recipe, tmp_path

@@ -738,9 +738,18 @@ def test_megatron_m2n_rejects_weights_with_no_local_destination(
 
 
 @pytest.mark.parametrize("grouped_gemm_backend", ["torch", "flashinfer"])
+@pytest.mark.parametrize(
+    ("include_pattern", "exclude_pattern"),
+    [
+        (None, None),
+        (r"\.mlp\.experts\.linear_fc[12]\.", r"\.layers\.(?:0|1)\."),
+    ],
+)
 def test_prepare_mxfp8_refit_replaces_only_quantized_parameters_idempotently(
     monkeypatch: pytest.MonkeyPatch,
     grouped_gemm_backend: str,
+    include_pattern: str | None,
+    exclude_pattern: str | None,
 ) -> None:
     from nemo_rl.models.generation.megatron import megatron_worker as worker_module
     from nemo_rl.models.generation.megatron.megatron_worker import (
@@ -752,6 +761,8 @@ def test_prepare_mxfp8_refit_replaces_only_quantized_parameters_idempotently(
         transformer_impl="inference_optimized",
         fp8_recipe="mxfp8",
         inference_grouped_gemm_backend=grouped_gemm_backend,
+        inference_mxfp8_include_parameters=include_pattern,
+        inference_mxfp8_exclude_parameters=exclude_pattern,
     )
     core.decoder = torch.nn.Module()
     core.decoder.weight = torch.nn.Parameter(torch.zeros(2, 2))
@@ -782,7 +793,16 @@ def test_prepare_mxfp8_refit_replaces_only_quantized_parameters_idempotently(
 
     assert weight_task.destination is quantized_destination
     assert norm_task.destination is core.decoder.norm
-    quantize.assert_called_once_with(core.decoder, backend="triton")
+    if include_pattern is None and exclude_pattern is None:
+        quantize.assert_called_once_with(core.decoder, backend="triton")
+    else:
+        quantize.assert_called_once_with(
+            core.decoder,
+            backend="triton",
+            include_pattern=include_pattern,
+            exclude_pattern=exclude_pattern,
+            _filter_prefix="decoder.",
+        )
 
     # Rebuilds happen after lazy engine initialization. They must reuse the
     # persistent destination map instead of quantizing/rebinding storage again.

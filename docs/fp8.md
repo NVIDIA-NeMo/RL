@@ -176,6 +176,41 @@ the same `fp8_quantization_recipe` as `fp8_cfg.fp8_recipe`. Recipe
 `training_recipe` and `evaluation_recipe` fields `fp8_param` and `fp4_param`
 are rejected; use `fp8_cfg.fp8_param` for supported FP8 parameter storage.
 
+### Selective MXFP8 for Megatron generation
+
+The inference-optimized Megatron backend can retain only selected parameters in
+MXFP8 while materializing every unmatched parameter in BF16. The filters use
+Python regular expressions against MCore's fully qualified parameter names;
+the exclusion expression takes precedence over inclusion.
+
+For example, this keeps only routed expert FC1 and FC2 projections in MXFP8.
+The training-side first/last-layer policy remains in effect, so the first two
+and last four layers stay in BF16:
+
+```yaml
+policy:
+  megatron_cfg:
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 2
+    num_layers_at_end_in_bf16: 4
+  generation:
+    backend: megatron
+    mcore_generation_config:
+      transformer_impl: inference_optimized
+      inference_grouped_gemm_backend: flashinfer
+      fp8_cfg:
+        enabled: true
+        fp8: e4m3
+        fp8_recipe: mxfp8
+        fp8_param: true
+      inference_mxfp8_include_parameters: '\.mlp\.experts\.linear_fc[12]\.'
+      inference_mxfp8_exclude_parameters: null
+```
+
+These filters select inference storage independently of batch-invariant
+execution. They are preserved for dedicated and colocated Megatron generation
+models and across native or NeMo-RL M-to-N refits.
+
 ## Compatibility Note for DeepSeek-Style FP8 Training
 
 The TransformerEngine implementation for this recipe requires **CUDA version ≥ 12.9**. The current NeMo RL container uses CUDA 13.2 (via `docker/Dockerfile`), which satisfies this requirement. Users on older setups should check out the latest code and build the container from `docker/Dockerfile` ([instructions](docker.md)).
