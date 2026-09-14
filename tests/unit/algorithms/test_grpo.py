@@ -6246,3 +6246,27 @@ def test_grpo_train_shuts_down_environments_after_success():
         )
 
     shutdown.assert_called_once_with(task_to_env, task_to_env)
+
+
+@pytest.mark.parametrize(
+    ("backend", "nccl_reshard", "release_grads", "expected"),
+    [
+        ("vllm", False, False, False),
+        ("vllm", False, True, True),
+        ("vllm", True, False, True),
+        ("dynamo", False, False, True),
+    ],
+)
+def test_noncolocated_refit_synchronizer_selection(
+    backend, nccl_reshard, release_grads, expected
+):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    assert (
+        grpo_mod._uses_managed_noncolocated_refit(
+            generation_backend=backend,
+            nccl_reshard_refit_enabled=nccl_reshard,
+            release_grads_before_refit=release_grads,
+        )
+        is expected
+    )

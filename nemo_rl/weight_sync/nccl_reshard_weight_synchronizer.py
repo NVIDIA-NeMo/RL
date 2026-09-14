@@ -30,10 +30,14 @@ Lifecycle:
     3. policy.prepare_nccl_reshard_refit_info()
        -> generation.prepare_nccl_reshard_refit_info()   -- backend-agnostic metadata
   sync_weights():
+    policy.offload_before_refit()                       -- optional trainer memory release
     policy.nccl_reshard_refit(kv_scales) + generation.nccl_reshard_refit(); verify.
 
-Like the collective transport, this is a pure data mover. Backend-specific
-phase transitions are owned by the caller.
+Like the collective transport, this is normally a pure data mover: policy and
+generation run on separate GPU clusters, so restore is owned by the orchestrator,
+not here. Trainer offload is disabled by default, but large quantized exports can
+opt in when their temporary tensors need more trainer GPU headroom -- the reshard
+only moves params, so releasing grad buffers/optimizer state/caches first is safe.
 """
 
 from collections.abc import Sequence
@@ -119,6 +123,11 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         sync_policy_params: Whether this synchronizer owns the pre-transfer policy
             parameter sync. A lifecycle wrapper may perform it earlier and disable it
             here to avoid a duplicate worker round trip.
+        release_grads_before_refit: Whether to run the policy's existing refit
+            offload lifecycle before the reshard transfer. Mirrors
+            :class:`CollectiveWeightSynchronizer`; only touches gradient buffers,
+            optimizer state, and cached tensors, never params, so it is safe for a
+            transport that only moves params.
     """
 
     def __init__(
@@ -130,13 +139,15 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         refit_timeout_s: Optional[float] = None,
         *,
         sync_policy_params: bool = True,
-    ):
+        release_grads_before_refit: bool = False,
+    ) -> None:
         self._policy = policy
         self._generation = generation
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
         self._refit_timeout_s = refit_timeout_s
         self._sync_policy_params = sync_policy_params
+        self._release_grads_before_refit = release_grads_before_refit
         self._stale = True
         # What the communicators were last built over. None until init_communicator.
         self._built_membership: Optional[RefitMembership] = None
@@ -193,6 +204,9 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
     ) -> None:
         if self._sync_policy_params:
             self._policy.sync_params_before_refit()
+        if self._release_grads_before_refit:
+            self._policy.offload_before_refit()
+
         timer_context = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
             if timer is not None

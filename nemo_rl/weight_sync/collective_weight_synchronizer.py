@@ -21,12 +21,14 @@ established NCCL process group.
 
 Lifecycle per sync:
   1. policy.sync_params_before_refit()            -- materialize optimizer updates
+     policy.offload_before_refit()                 -- optional trainer memory release
   2. policy.broadcast_weights_for_collective()    -- send via NCCL
      generation.update_weights_from_collective()  -- receive via NCCL
   3. Verify transfer success
 
-No offload/restore steps are needed since policy and generation run on
-separate GPUs with dedicated memory.
+Policy and generation run on separate GPUs. Trainer offload is disabled by
+default, but large quantized exports can opt in when their temporary tensors
+need more trainer GPU headroom.
 """
 
 from collections.abc import Sequence
@@ -99,6 +101,8 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         sync_policy_params: Whether this synchronizer owns the pre-transfer policy
             parameter sync. A lifecycle wrapper may perform it earlier and disable it
             here to avoid a duplicate worker round trip.
+        release_grads_before_refit: Whether to run the policy's existing refit
+            offload lifecycle before exporting weights.
     """
 
     def __init__(
@@ -110,7 +114,8 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         refit_timeout_s: Optional[float] = None,
         *,
         sync_policy_params: bool = True,
-    ):
+        release_grads_before_refit: bool = False,
+    ) -> None:
         # None disarms the abort watchdog in every worker, which is the default and
         # reproduces the pre-existing behaviour exactly.
         self._refit_timeout_s = refit_timeout_s
@@ -119,6 +124,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
         self._sync_policy_params = sync_policy_params
+        self._release_grads_before_refit = release_grads_before_refit
         self._stale = True
         # What the communicator was last built over. None until init_communicator.
         self._built_membership: Optional[RefitMembership] = None
@@ -131,6 +137,9 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
     ) -> None:
         if self._sync_policy_params:
             self._policy.sync_params_before_refit()
+        if self._release_grads_before_refit:
+            self._policy.offload_before_refit()
+
         timer_context = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
             if timer is not None
