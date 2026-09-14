@@ -145,21 +145,6 @@ def _with_mirrors(fields: Sequence[str]) -> list[str]:
     return [*plain, *(_hash_field(f) for f in plain)]
 
 
-def _hash_field(name: str) -> str:
-    return f"{name}{_HASH_SUFFIX}"
-
-
-def _with_mirrors(fields: Sequence[str]) -> list[str]:
-    """``fields`` followed by one mirror column each.
-
-    Idempotent: ``meta.fields`` comes back from ``put_samples`` already
-    carrying the mirrors, and suffixing those would ask for
-    ``tokens_hash_hash``.
-    """
-    plain = [f for f in fields if not f.endswith(_HASH_SUFFIX)]
-    return [*plain, *(_hash_field(f) for f in plain)]
-
-
 # Rows a client may write between reconciliations of its live-key accounting
 # against the partition. One metadata call per this many rows put, so a client
 # that clears its own writes never makes one.
