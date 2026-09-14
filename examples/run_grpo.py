@@ -33,7 +33,10 @@ from nemo_rl.data_plane.factory import (
 )
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.utils import shutdown_environments
-from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation import (
+    configure_generation_config,
+    draft_full_refit_enabled,
+)
 from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
 from nemo_rl.utils.config import (
     load_config,
@@ -122,6 +125,7 @@ def main() -> None:
                 tokenizer,
                 has_refit_draft_weights=has_refit_draft_weights,
                 trains_mtp=trains_mtp,
+                draft_full_refit=draft_full_refit_enabled(config.policy),
             )
 
         # setup data

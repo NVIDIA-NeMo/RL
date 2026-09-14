@@ -152,6 +152,33 @@ def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
     return enable_prefix_caching
 
 
+def _draft_module_sharing_disable_required(config: dict[str, Any]) -> bool:
+    """Whether this worker's engine needs the draft module-sharing disable.
+
+    Full-stream draft co-training refits the drafter's trained
+    embed_tokens/lm_head. Under load_format="dummy" the pinned vLLM would
+    alias those drafter modules to the target model's (no checkpoint load
+    ever marks them as owned), and the draft refit would then overwrite the
+    policy's serving weights through the alias. The method name alone
+    doesn't imply a full stream -- Megatron block-drafter paths can use the
+    same dspark/dflash method names with a headless exporter that relies on
+    module sharing, just like the megatron eagle3 path does -- so gate on
+    _draft_full_refit (true only for DTensor-v2 co-training, which always
+    streams the drafter's entire state_dict) for all three methods.
+    """
+    load_format = config["vllm_cfg"]["load_format"]
+    spec_cfg = config.get("vllm_kwargs", {}).get("speculative_config")
+    if load_format != "dummy" or spec_cfg is None:
+        return False
+    method = spec_cfg.get("method")
+    # Mirrors vllm_backend.COTRAINED_SPECULATIVE_METHODS; not imported to
+    # avoid pulling in vllm_backend's eager vllm import here (this runs at
+    # actor-creation time, before the engine -- or vllm itself -- exists).
+    return method in ("dspark", "dflash", "eagle3") and bool(
+        config.get("_draft_full_refit")
+    )
+
+
 def _merge_fp8_kwargs(vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]) -> None:
     """Merge fp8 init kwargs into ``vllm_kwargs`` in place, preserving user overrides.
 
@@ -224,6 +251,7 @@ class BaseVllmGenerationWorker:
         num_gpus: int | float,
         bundle_indices: Optional[tuple[int, list[int]]] = None,
         num_gpus_per_node: Optional[int] = None,
+        config: Optional[dict[str, Any]] = None,
     ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any], dict[str, Any]]:
         """Provides complete worker configuration for vLLM tensor and pipeline parallelism.
 
@@ -348,6 +376,15 @@ class BaseVllmGenerationWorker:
         env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         # Skip vllm P2P check and rely on driver to report peer to peer capability.
         env_vars["VLLM_SKIP_P2P_CHECK"] = "1"
+
+        # Set via runtime_env (not a later os.environ mutation in __init__)
+        # because this actor's own vLLM engine spawns further Ray actors for
+        # each TP rank when tensor_parallel_size > 1 (e.g. RayWorkerProc); a
+        # parent actor's runtime os.environ changes are invisible to those
+        # child actors, but runtime_env.env_vars set here is inherited by
+        # them.
+        if config is not None and _draft_module_sharing_disable_required(config):
+            env_vars["NRL_DRAFT_DISABLE_MODULE_SHARING"] = "1"
 
         return resources, env_vars, init_kwargs, runtime_env
 
@@ -575,6 +612,27 @@ class BaseVllmGenerationWorker:
             and self._mtp_speculative_enabled
             and not mtp_weights_from_refit
         )
+
+        # Full-stream draft co-training refits the drafter's trained
+        # embed_tokens/lm_head. Under load_format="dummy" the pinned vLLM would
+        # alias those drafter modules to the target model's (no checkpoint load
+        # ever marks them as owned), and the draft refit would then overwrite
+        # the policy's serving weights through the alias. Disable the sharing
+        # before engine creation; the env flag re-applies it in any spawned
+        # vLLM executor worker. dspark/dflash exist only on the DTensor-v2
+        # full-stream path; eagle3 is gated on _draft_full_refit because the
+        # megatron eagle3 trainer streams a PARTIAL set (no embed_tokens) and
+        # relies on the drafter sharing the target's embedding.
+        if _draft_module_sharing_disable_required(self.cfg):
+            # Deferred import: vllm_backend imports vllm eagerly, which only
+            # this vLLM-venv worker process should pay for.
+            from nemo_rl.models.generation.vllm.vllm_backend import (
+                DRAFT_DISABLE_MODULE_SHARING_ENV,
+                disable_draft_module_sharing,
+            )
+
+            os.environ[DRAFT_DISABLE_MODULE_SHARING_ENV] = "1"
+            disable_draft_module_sharing()
 
         if (
             len(get_nsight_config_if_pattern_matches("vllm_generation_worker")) > 0

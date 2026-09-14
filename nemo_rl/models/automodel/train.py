@@ -47,7 +47,11 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     apply_top_k_top_p,
     need_top_k_or_top_p_filtering,
 )
-from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
+from nemo_rl.algorithms.loss import (
+    DraftRuntimeLossWrapper,
+    SequencePackingLossWrapper,
+    prepare_loss_input,
+)
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -229,6 +233,13 @@ def extract_logits(
         return outputs.logits
 
 
+def will_scale_temperature(
+    sampling_params: Optional[TrainingSamplingParams],
+) -> bool:
+    """Whether apply_temperature_scaling will mutate the logits in place."""
+    return sampling_params is not None and sampling_params.temperature != 1.0
+
+
 def apply_temperature_scaling(
     logits: torch.Tensor, sampling_params: Optional[TrainingSamplingParams]
 ) -> torch.Tensor:
@@ -241,7 +252,7 @@ def apply_temperature_scaling(
     Returns:
         torch.Tensor: Temperature-scaled logits
     """
-    if sampling_params is not None and sampling_params.temperature != 1.0:
+    if will_scale_temperature(sampling_params):
         logits.div_(sampling_params.temperature)
     return logits
 
@@ -344,6 +355,16 @@ def forward_with_post_processing_fn(
     # Extract logits from model outputs
     logits = extract_logits(model, outputs)
     del outputs
+
+    # Draft co-training distills against the policy's raw logits; stash them
+    # before the (in-place) temperature scaling below mutates the tensor.
+    if (
+        isinstance(post_processing_fn, LossPostProcessor)
+        and post_processing_fn.draft_runtime is not None
+    ):
+        post_processing_fn.draft_runtime.stash_teacher_logits(
+            logits, will_scale_inplace=will_scale_temperature(sampling_params)
+        )
 
     # Apply temperature scaling only for sampling-oriented post-processors
     # Score computations should use unscaled logits
@@ -553,6 +574,7 @@ class LossPostProcessor:
         dp_size: int,
         enable_seq_packing: bool = False,
         sampling_params: Optional[TrainingSamplingParams] = None,
+        draft_runtime: Optional[Any] = None,
     ):
         """Initialize LossPostProcessor.
 
@@ -566,6 +588,10 @@ class LossPostProcessor:
             dp_size: Data parallel size
             enable_seq_packing: Whether sequence packing is enabled
             sampling_params: Sampling parameters
+            draft_runtime: Optional draft co-training runtime (dspark/dflash
+                or eagle3); when set, the policy loss is combined with the
+                draft loss and the policy's raw logits are stashed as the
+                distillation teacher before temperature scaling.
         """
         self.loss_fn: LossFunction = loss_fn
         self.cfg: PolicyConfig = cfg
@@ -574,6 +600,9 @@ class LossPostProcessor:
         self.dp_size = dp_size
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
+        self.draft_runtime = draft_runtime
+        if draft_runtime is not None and enable_seq_packing:
+            raise ValueError("Draft co-training does not support sequence packing.")
         self._cp_gradient_fanout = (
             cp_size
             if cp_size > 1
@@ -655,6 +684,18 @@ class LossPostProcessor:
                 cu_seqlens_q_padded=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
             )
             loss, loss_metrics = loss_fn(
+                logits,
+                data_dict,
+                global_valid_seqs,
+                global_valid_toks,
+            )
+        elif self.draft_runtime is not None:
+            draft_wrapper = DraftRuntimeLossWrapper(
+                loss_fn=self.loss_fn,
+                prepare_fn=prepare_loss_input_wrapped,
+                draft_runtime=self.draft_runtime,
+            )
+            loss, loss_metrics = draft_wrapper(
                 logits,
                 data_dict,
                 global_valid_seqs,

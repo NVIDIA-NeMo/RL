@@ -1,0 +1,33 @@
+defaults: grpo-qwen3-8b-4n8g-automodel.yaml
+# Qwen3-8B GRPO math baseline with EAGLE3 draft co-training (DTensor v2
+# backend), 4 nodes x 8 GPUs. EAGLE3 sibling of
+# grpo-qwen3-8b-4n8g-automodel-dspark.yaml: policy-side
+# settings are inherited unchanged (including tp=2 and activation
+# checkpointing); the RedHatAI/Qwen3-8B-speculator.eagle3 drafter trains
+# alongside the policy with the speculators-style TTT unrolling
+# (teacher-forced multi-step forward over the rollout, distilling the
+# policy's own logits mapped into the reduced draft vocabulary) and is
+# refit into vLLM (draft.* weight stream) for speculative-decoding
+# generation. Draft architecture fields (aux layer ids, draft_vocab_size,
+# d2t/t2d maps, norm_before_residual, layer family) come from the draft
+# checkpoint's config.json; only training options are set here.
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-8b-4n8g-automodel-eagle3
+policy:
+  draft:
+    enabled: true
+    model_name: RedHatAI/Qwen3-8B-speculator.eagle3
+    loss_weight: 1.0
+    # speculator_type/learning_rate/ttt_steps/ttt_step_loss_decay/
+    # train_embed_and_head all match the exemplar's eagle3 defaults, so
+    # they're inherited rather than repeated here (config_cli.py minimize).
+  generation:
+    vllm_kwargs:
+      speculative_config:
+        method: "eagle3"
+        model: ${policy.draft.model_name}
+        # One proposal per TTT step the drafter is trained to unroll.
+        num_speculative_tokens: 3
+logger:
+  wandb:
+    name: grpo-qwen3-8b-4n8g-automodel-eagle3
