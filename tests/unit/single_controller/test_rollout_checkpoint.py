@@ -1003,7 +1003,7 @@ def test_manifest_rejects_invalid_gym_topology_fingerprint():
 
 def test_manifest_round_trips_opaque_generation_cut_proofs():
     manifest = RolloutSnapshotManifest(
-        schema_version=ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+        schema_version=5,
         base_train_step=0,
         trainer_version=0,
         current_epoch=0,
@@ -1019,6 +1019,21 @@ def test_manifest_round_trips_opaque_generation_cut_proofs():
     )
 
     assert restored.gym_generation_cut_proofs == manifest.gym_generation_cut_proofs
+
+
+def test_current_manifest_omits_legacy_generation_cut_proofs():
+    manifest = RolloutSnapshotManifest(
+        schema_version=ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+        base_train_step=0,
+        trainer_version=0,
+        current_epoch=0,
+        sampler_dispatch_index=-1,
+        mutation_version=0,
+        rolled_back_train_group_count=0,
+        bootstrap_fingerprint="fingerprint-v1",
+    )
+
+    assert "gym_generation_cut_proofs" not in manifest.to_dict()
 
 
 def test_manifest_rejects_dispatch_index_below_initial_state():
