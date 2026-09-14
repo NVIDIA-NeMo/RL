@@ -594,6 +594,18 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
         stream=False,
     )
     admission = resumed_worker._capture_admission(request)
+    bad_admission = admission.model_copy(
+        update={
+            "generation_cut": admission.generation_cut.model_copy(
+                update={"digest": "0" * 64}
+            )
+        }
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="checkpoint coordinates do not match the staged prefix",
+    ):
+        resumed_worker._resolve_generation_cut(bad_admission)
     cut = resumed_worker._resolve_generation_cut(admission)
     VllmAsyncGenerationWorkerImpl._begin_request_capture(
         resumed_worker,
@@ -636,6 +648,7 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
     assert final_record.token_mask_delta == [0.0, 0.0, 1.0, 1.0, 1.0]
     assert final_record.generation_log_probs_delta == [0.0, 0.0, -0.1, -0.2, -0.3]
     assert "generation prefix restored:" in caplog.text
+    assert f"prefix_digest={cut_record.digest}" in caplog.text
     assert "prefix_tokens=2 tail_tokens=1 total_generation_tokens=3" in caplog.text
 
 
