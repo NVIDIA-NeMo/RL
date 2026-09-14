@@ -18,13 +18,9 @@ policy:
     enabled: true
     model_name: RedHatAI/Qwen3-8B-speculator.eagle3
     loss_weight: 1.0
-    speculator_type: "eagle3"
-    # Draft param-group lr; must far exceed the policy RL lr so the draft
-    # tracks policy drift (same rationale as the dspark recipe).
-    learning_rate: 1.0e-04
-    ttt_steps: 3
-    ttt_step_loss_decay: 1.0
-    train_embed_and_head: true
+    # speculator_type/learning_rate/ttt_steps/ttt_step_loss_decay/
+    # train_embed_and_head all match the exemplar's eagle3 defaults, so
+    # they're inherited rather than repeated here (config_cli.py minimize).
   generation:
     vllm_kwargs:
       speculative_config:
