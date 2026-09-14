@@ -62,6 +62,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
+    SamplerSelection,
     WindowedSamplerConfig,
     sampler_supports_buffer_checkpoint,
 )
@@ -245,7 +246,7 @@ class _FakeSampler:
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[KVBatchMeta, int]:
+    ) -> SamplerSelection:
         n = max_prompt_groups
         sample_ids = [f"s{self._step}-{i}" for i in range(n)]
         self._step += 1
@@ -256,7 +257,7 @@ class _FakeSampler:
             sequence_lengths=[16] * n,
             tags=[{"weight_version": current_train_weight}] * n,
         )
-        return meta, n
+        return SamplerSelection(meta=meta, num_groups=n, trajectory_ages=(0,) * n)
 
     @property
     def is_on_policy(self) -> bool:
@@ -290,9 +291,9 @@ class _ExhaustingSampler(_FakeSampler):
         super().__init__()
         self._remaining = steps
 
-    async def select(self, **kwargs) -> tuple[Optional[KVBatchMeta], int]:
+    async def select(self, **kwargs) -> SamplerSelection:
         if self._remaining == 0:
-            return None, 0
+            return SamplerSelection(meta=None, num_groups=0, trajectory_ages=())
         self._remaining -= 1
         return await super().select(**kwargs)
 
@@ -311,11 +312,10 @@ class _RestoredGroupsSampler(_FakeSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[Optional[KVBatchMeta], int]:
-        del current_train_weight
+    ) -> SamplerSelection:
         selected = self._groups[:max_prompt_groups]
         if len(selected) < min_prompt_groups:
-            return None, 0
+            return SamplerSelection(meta=None, num_groups=0, trajectory_ages=())
         del self._groups[: len(selected)]
         # Legacy local-removal contract: a sampler without training claims drops
         # the rows from the replay index at selection, so a checkpoint taken
@@ -323,8 +323,8 @@ class _RestoredGroupsSampler(_FakeSampler):
         self._buffer.drop_groups([group["group_id"] for group in selected])
 
         metas = [group["meta"] for group in selected]
-        return (
-            KVBatchMeta(
+        return SamplerSelection(
+            meta=KVBatchMeta(
                 partition_id=_PARTITION_ID,
                 task_name=None,
                 sample_ids=[sid for meta in metas for sid in meta.sample_ids],
@@ -333,7 +333,10 @@ class _RestoredGroupsSampler(_FakeSampler):
                 ],
                 tags=[tag for meta in metas for tag in (meta.tags or [])],
             ),
-            len(selected),
+            num_groups=len(selected),
+            trajectory_ages=tuple(
+                current_train_weight - group["start_weight"] for group in selected
+            ),
         )
 
 
