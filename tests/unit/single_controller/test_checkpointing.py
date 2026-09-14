@@ -184,6 +184,7 @@ class _CheckpointGeneration(_FakeGeneration):
         self._events.append("generation-resume")
         return True
 
+
 class _FakeTrainer:
     """TQPolicy stand-in: train methods are no-ops, save_checkpoint records calls."""
 
