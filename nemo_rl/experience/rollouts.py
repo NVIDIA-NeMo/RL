@@ -2277,6 +2277,45 @@ def _tensorize_nemo_gym_result(result: dict) -> None:
     )
 
 
+_NEMO_GYM_TOKEN_TRUNCATION_STOP_REASONS = frozenset(
+    {"max_output_tokens", "context_length"}
+)
+
+
+def _nemo_gym_result_hit_max_tokens(
+    result: Mapping[str, Any], max_total_tokens_per_sample: int
+) -> bool:
+    """Return whether the main policy rollout exhausted a token limit.
+
+    Prefer explicit Responses/Gym termination reasons. The summed message-token
+    count is only a fallback: it can omit chat-template and tool-schema overhead,
+    especially when a multi-turn request is rejected before producing output.
+    """
+    full_result = result.get("full_result")
+    if isinstance(full_result, Mapping):
+        response = full_result.get("response")
+        if isinstance(response, Mapping):
+            incomplete_details = response.get("incomplete_details")
+            if (
+                isinstance(incomplete_details, Mapping)
+                and incomplete_details.get("reason") == "max_output_tokens"
+            ):
+                return True
+
+            metadata = response.get("metadata")
+            if (
+                isinstance(metadata, Mapping)
+                and metadata.get("stop_reason")
+                in _NEMO_GYM_TOKEN_TRUNCATION_STOP_REASONS
+            ):
+                return True
+
+    return (
+        sum(len(message["token_ids"]) for message in result["message_log"])
+        >= max_total_tokens_per_sample
+    )
+
+
 async def run_async_nemo_gym_rollout(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
@@ -2703,8 +2742,9 @@ def _postprocess_single_nemo_gym_group(
                 ),
                 "total_tokens": sum(len(m["token_ids"]) for m in r["message_log"]),
                 "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
-                "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"])
-                == max_total_tokens_per_sample,
+                "hit_max_tokens": _nemo_gym_result_hit_max_tokens(
+                    r, max_total_tokens_per_sample
+                ),
                 # max_gen_tokens_per_turn: Diagnostic for long single generations
                 "max_gen_tokens_per_turn": max(
                     (
