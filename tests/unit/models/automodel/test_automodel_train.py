@@ -35,10 +35,12 @@ from nemo_rl.models.automodel.data import (
     make_processed_microbatch_iterator,
 )
 from nemo_rl.models.automodel.train import (
+    FullLogitsPostProcessor,
     LogprobsPostProcessor,
     LossPostProcessor,
     PreparedModelForward,
     ScorePostProcessor,
+    SparseLogitsPostProcessor,
     TopkLogitsPostProcessor,
     apply_temperature_scaling,
     automodel_forward_backward,
@@ -580,6 +582,54 @@ class TestLossPostProcessor:
         # Verify the wrapper was called instead of raw loss_fn
         mock_wrapper_instance.assert_called_once()
 
+    @patch("nemo_rl.models.automodel.train.SequencePackingLossWrapper")
+    @patch("nemo_rl.models.automodel.train.XTokenSequencePackingLossWrapper")
+    def test_xtoken_packing_selects_axis_aware_wrapper_only(
+        self,
+        mock_xtoken_wrapper_class,
+        mock_generic_wrapper_class,
+        base_cfg,
+        mock_device_mesh,
+        mock_cp_mesh,
+        mock_tp_mesh,
+        processed_inputs_with_flash,
+    ):
+        from nemo_rl.algorithms.loss.loss_functions import (
+            CrossTokenizerDistillationLossFn,
+        )
+
+        loss_fn = object.__new__(CrossTokenizerDistillationLossFn)
+        wrapper = MagicMock(return_value=(torch.tensor(0.5), {}))
+        mock_xtoken_wrapper_class.return_value = wrapper
+        processor = LossPostProcessor(
+            loss_fn=loss_fn,
+            cfg=base_cfg,
+            device_mesh=mock_device_mesh,
+            cp_mesh=mock_cp_mesh,
+            tp_mesh=mock_tp_mesh,
+            cp_size=1,
+            dp_size=1,
+            enable_seq_packing=True,
+        )
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.zeros(1, 8, dtype=torch.long),
+                "sample_mask": torch.ones(1),
+            }
+        )
+
+        processor(
+            logits=torch.randn(1, 8, 4),
+            data_dict=data,
+            processed_inputs=processed_inputs_with_flash,
+            global_valid_seqs=torch.tensor(1.0),
+            global_valid_toks=torch.tensor(1.0),
+        )
+
+        mock_xtoken_wrapper_class.assert_called_once()
+        mock_generic_wrapper_class.assert_not_called()
+        wrapper.assert_called_once()
+
     def test_loss_processor_initialization(
         self,
         base_cfg,
@@ -750,6 +800,74 @@ class TestTopkLogitsPostProcessor:
 
         assert vals.shape == (batch_size, seq_len, k)
         assert idx.shape == (batch_size, seq_len, k)
+
+
+# =====================
+# Test SparseLogitsPostProcessor
+# =====================
+@pytest.mark.automodel
+class TestSparseLogitsPostProcessor:
+    def test_row_topk_logz_padding_and_forced_label(self, base_cfg, monkeypatch):
+        """Sparse export keeps exact logZ and ignores padded vocab columns."""
+        group = object()
+        mesh = MagicMock()
+        mesh.get_group.return_value = group
+
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda _group: 0)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda _group: 1)
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_reduce",
+            lambda tensor, op=None, group=None: tensor,
+        )
+
+        def _all_gather(outputs, tensor, group=None):
+            assert len(outputs) == 1
+            outputs[0].copy_(tensor)
+
+        monkeypatch.setattr(torch.distributed, "all_gather", _all_gather)
+
+        processor = SparseLogitsPostProcessor(
+            cfg=base_cfg,
+            tp_mesh=mesh,
+            cp_mesh=mesh,
+            cp_size=1,
+            k=3,
+            temperature=2.0,
+            vocab_size=5,
+            gt_filter_topk=2,
+        )
+        # Column 5 is padded lm-head vocabulary. Its enormous value must not
+        # affect top-k support or the exact full-real-vocabulary normalizer.
+        logits = torch.tensor(
+            [[[5.0, 4.0, 3.0, 2.0, -7.0, 1000.0], [0.0, 1.0, 2.0, 3.0, 4.0, 900.0]]]
+        )
+        data = BatchedDataDict(
+            {"force_include_token_ids": torch.tensor([[4, 4]], dtype=torch.long)}
+        )
+
+        values, token_ids, log_z, gt_in_topk = processor(
+            logits=logits,
+            data_dict=data,
+            processed_inputs=MagicMock(),
+            original_batch_size=1,
+            original_seq_len=2,
+        )
+
+        assert torch.equal(
+            token_ids,
+            torch.tensor([[[0, 1, 4], [2, 3, 4]]], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            values,
+            torch.tensor([[[5.0, 4.0, -7.0], [2.0, 3.0, 4.0]]]),
+        )
+        torch.testing.assert_close(
+            log_z,
+            torch.logsumexp(logits[..., :5] / 2.0, dim=-1),
+        )
+        assert gt_in_topk is not None
+        assert torch.equal(gt_in_topk, torch.tensor([[False, True]]))
 
 
 # =====================
@@ -1924,6 +2042,57 @@ class TestTopkLogitsPostProcessorSeqPacking:
         # Result should be unpacked to original shape
         assert vals.shape == (original_batch_size, original_seq_len, k)
         assert idx.shape == (original_batch_size, original_seq_len, k)
+
+
+class TestFullLogitsPostProcessorSeqPacking:
+    def test_restores_one_dense_row_per_logical_sample(self):
+        processor = FullLogitsPostProcessor(
+            cfg={"sequence_packing": {"enabled": True}},
+            device_mesh=MagicMock(),
+            cp_mesh=None,
+            tp_mesh=MagicMock(),
+            cp_size=1,
+            enable_seq_packing=True,
+        )
+        processed_inputs = MagicMock()
+        processed_inputs.flash_attn_kwargs.cu_seqlens_q = torch.tensor(
+            [0, 3, 5], dtype=torch.int32
+        )
+        processed_inputs.flash_attn_kwargs.cu_seqlens_q_padded = torch.tensor(
+            [0, 4, 6], dtype=torch.int32
+        )
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.zeros(2, 6, dtype=torch.long),
+                "input_lengths": torch.tensor([3, 2]),
+            }
+        )
+        packed_logits = torch.tensor(
+            [
+                [
+                    [1.0, 101.0],
+                    [2.0, 102.0],
+                    [3.0, 103.0],
+                    [99.0, 199.0],
+                    [10.0, 110.0],
+                    [11.0, 111.0],
+                ]
+            ]
+        )
+
+        restored = processor(
+            logits=packed_logits,
+            data_dict=data,
+            processed_inputs=processed_inputs,
+            original_batch_size=2,
+            original_seq_len=6,
+        )
+
+        assert restored.shape == (2, 6, 2)
+        assert torch.equal(restored[0, :3], packed_logits[0, :3].float())
+        assert torch.equal(restored[1, :2], packed_logits[0, 4:6].float())
+        assert torch.count_nonzero(restored[0, 3:]) == 0
+        assert torch.count_nonzero(restored[1, 2:]) == 0
 
 
 # =====================

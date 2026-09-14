@@ -404,6 +404,7 @@ def wrap_loss_fn_with_input_preparation(
     vocab_parallel_rank: Optional[int] = None,
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    global_valid_kd_toks: Tensor | None = None,
     global_valid_chunks_by_idx: dict[int, torch.Tensor] | None = None,
 ) -> tuple[Tensor, dict[str, Any]]:
     """Wraps a loss function to handle input preparation for megatron policy worker."""
@@ -421,6 +422,8 @@ def wrap_loss_fn_with_input_preparation(
     extra_loss_kwargs: dict[str, Any] = {}
     if global_valid_chunks_by_idx:
         extra_loss_kwargs["global_valid_chunks_by_idx"] = global_valid_chunks_by_idx
+    if global_valid_kd_toks is not None:
+        extra_loss_kwargs["global_valid_kd_toks"] = global_valid_kd_toks
     loss, loss_metrics = loss_fn(
         data=data,
         global_valid_seqs=global_valid_seqs,

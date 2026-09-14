@@ -19,6 +19,11 @@ import torch
 
 from nemo_rl.algorithms.loss.interfaces import LossType
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.packing import (
+    LockstepPackingItem,
+    SidePackingSpec,
+    build_lockstep_packing_plan,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.data import (
     ProcessedInputs,
@@ -286,6 +291,124 @@ class TestGetMicrobatchIterator:
 
 @pytest.mark.automodel
 class TestProcessMicrobatch:
+    @staticmethod
+    def _planned_microbatch(*, fixed_tail: bool = True):
+        plan = build_lockstep_packing_plan(
+            batch_uid=17,
+            items=(
+                LockstepPackingItem(sample_id="a", batch_item_id=10),
+                LockstepPackingItem(sample_id="b", batch_item_id=11),
+            ),
+            sides=(
+                SidePackingSpec(
+                    side_id="student",
+                    capacity=12,
+                    raw_lengths=(3, 2),
+                    effective_lengths=(4, 4),
+                    physical_size_fn=(lambda _lengths: 12) if fixed_tail else None,
+                ),
+            ),
+            data_parallel_size=1,
+        )
+        mb = BatchedDataDict(
+            {
+                "input_ids": torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]]),
+                "input_lengths": torch.tensor([3, 2]),
+                "sample_mask": torch.ones(2),
+                "batch_item_id": torch.tensor([10, 11]),
+                "kd_token_mask": torch.tensor(
+                    [[0, 1, 1, 0], [0, 1, 0, 0]], dtype=torch.bool
+                ),
+                "student_semantic_regions": [
+                    ((10, "assistant", "eot", 1, 3),),
+                    ((11, "assistant", "eot", 1, 2),),
+                ],
+            }
+        )
+        mb.lockstep_packing_plan = plan
+        mb.lockstep_side_id = "student"
+        mb.lockstep_bin_indices = (0,)
+        return mb
+
+    @patch("torch.Tensor.cuda", lambda self: self)
+    def test_plan_driven_packing_materializes_exact_raw_and_padded_geometry(
+        self, mock_tokenizer
+    ):
+        mb = self._planned_microbatch()
+        semantic_regions = mb["student_semantic_regions"]
+
+        result = process_microbatch(
+            mb=mb,
+            tokenizer=mock_tokenizer,
+            enable_seq_packing=True,
+            cfg={
+                "dtensor_cfg": {"sequence_parallel": False},
+                "sequence_packing": {"train_mb_tokens": 999},
+            },
+            cp_size=1,
+        )
+
+        assert result.input_ids.tolist() == [[1, 2, 3, 2, 4, 5, 2, 2, 2, 2, 2, 2]]
+        assert result.position_ids.tolist() == [[0, 1, 2, 0, 0, 1, 0, 0, 0, 0, 0, 0]]
+        assert result.flash_attn_kwargs.cu_seqlens_q.tolist() == [0, 3, 5]
+        assert result.flash_attn_kwargs.cu_seqlens_q_padded.tolist() == [0, 4, 12]
+        assert result.flash_attn_kwargs.cu_seq_lens_q.tolist() == [0, 4, 12]
+        assert result.seq_len == 12
+        # Logical metadata is retained for MBS1 loss calls and never forwarded
+        # through the model-input materializer.
+        assert mb["student_semantic_regions"] == semantic_regions
+        assert mb["kd_token_mask"].shape == (2, 4)
+
+    @patch("torch.Tensor.cuda", lambda self: self)
+    def test_plan_driven_packing_rejects_order_and_length_drift(self, mock_tokenizer):
+        cfg = {
+            "dtensor_cfg": {"sequence_parallel": False},
+            "sequence_packing": {"train_mb_tokens": 12},
+        }
+        wrong_order = self._planned_microbatch()
+        wrong_order["batch_item_id"] = torch.tensor([11, 10])
+        with pytest.raises(ValueError, match="batch_item_id order"):
+            process_microbatch(wrong_order, mock_tokenizer, True, cfg, 1)
+
+        wrong_length = self._planned_microbatch()
+        wrong_length["input_lengths"] = torch.tensor([2, 2])
+        with pytest.raises(ValueError, match="input lengths drifted"):
+            process_microbatch(wrong_length, mock_tokenizer, True, cfg, 1)
+
+    @patch("torch.Tensor.cuda", lambda self: self)
+    def test_plan_driven_tp_training_requires_fixed_physical_tail(self, mock_tokenizer):
+        mb = self._planned_microbatch(fixed_tail=False)
+        with pytest.raises(ValueError, match="requires every student bin"):
+            process_microbatch(
+                mb=mb,
+                tokenizer=mock_tokenizer,
+                enable_seq_packing=True,
+                cfg={
+                    "dtensor_cfg": {
+                        "sequence_parallel": False,
+                        "tensor_parallel_size": 2,
+                    },
+                    "sequence_packing": {"train_mb_tokens": 12},
+                },
+                cp_size=1,
+            )
+
+        fixed_tail_mb = self._planned_microbatch()
+        result = process_microbatch(
+            mb=fixed_tail_mb,
+            tokenizer=mock_tokenizer,
+            enable_seq_packing=True,
+            cfg={
+                "dtensor_cfg": {
+                    "sequence_parallel": False,
+                    "tensor_parallel_size": 2,
+                },
+                "sequence_packing": {"train_mb_tokens": 12},
+            },
+            cp_size=1,
+        )
+        assert result.seq_len == 12
+
     def test_regular_batching(self, mock_tokenizer):
         # Create test microbatch
         mb = BatchedDataDict(
@@ -914,6 +1037,10 @@ class TestProcessGlobalBatch:
             {
                 "input_ids": torch.zeros(3, 4, dtype=torch.long),
                 "sample_mask": sample_mask,
+                "kd_token_mask": torch.tensor(
+                    [[0, 1, 0, 1], [1, 1, 1, 1], [0, 1, 1, 0]],
+                    dtype=torch.bool,
+                ),
                 "alignment_0_pair_valid": torch.tensor(
                     [[1, 1, 0], [1, 1, 1], [1, 0, 0]], dtype=torch.bool
                 ),
@@ -927,7 +1054,7 @@ class TestProcessGlobalBatch:
         data.get_batch.return_value = batch
 
         def double_counts(values, *args, **kwargs):
-            torch.testing.assert_close(values.cpu(), torch.tensor([2, 8, 3, 5]))
+            torch.testing.assert_close(values.cpu(), torch.tensor([2, 8, 4, 3, 5]))
             values.mul_(2)
 
         mock_all_reduce.side_effect = double_counts
@@ -943,6 +1070,7 @@ class TestProcessGlobalBatch:
         assert {
             i: count.item() for i, count in result["global_valid_chunks_by_idx"].items()
         } == {0: 6, 2: 10}
+        assert result["global_valid_kd_toks"].item() == 8
 
     @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
     def test_with_token_mask(self, mock_all_reduce, mock_loss_fn, mock_dp_mesh):

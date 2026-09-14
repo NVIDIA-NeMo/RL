@@ -24,15 +24,26 @@ import pytest
 import torch
 import zmq
 
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.utils import (
+    DENSE_TEACHER_IPC_FLAT_LAYOUT,
     IPCProtocol,
     aggregate_per_sample_handles,
     calculate_aligned_size,
     ensure_teacher_ipc_buffer,
+    ensure_teacher_ipc_row_buffer,
+    ensure_teacher_ipc_token_buffer,
+    extract_batch_item_ids,
+    extract_teacher_ipc_valid_lengths,
+    get_dense_ipc_sequence_layout,
     get_megatron_checkpoint_dir,
+    localize_teacher_ipc_valid_lengths,
+    partition_teacher_ipc_row_buffer,
+    partition_teacher_ipc_token_buffer,
     rebuild_cuda_tensor_from_ipc,
     resolve_model_class,
     stream_weights_via_ipc_zmq_impl,
+    validate_compact_teacher_ipc_handle,
 )
 
 
@@ -652,6 +663,38 @@ class TestStreamWeightsViaIPC:
 
 
 class TestAggregatePerSampleHandles:
+    @staticmethod
+    def _dense_handle(
+        batch_item_id,
+        shard,
+        *,
+        tp_rank=0,
+        tp_size=1,
+        cp_rank=0,
+        cp_size=1,
+        full_seq_len=8,
+        full_vocab_size=12,
+        global_seq_start=None,
+    ):
+        local_seq_len = full_seq_len // cp_size
+        local_vocab_size = full_vocab_size // tp_size
+        if global_seq_start is None:
+            global_seq_start = cp_rank * local_seq_len
+        return {
+            "batch_item_id": batch_item_id,
+            "shard": shard,
+            "tp_rank": tp_rank,
+            "tp_size": tp_size,
+            "cp_rank": cp_rank,
+            "cp_size": cp_size,
+            "actual_shape": (local_seq_len, local_vocab_size),
+            "global_seq_start": global_seq_start,
+            "full_seq_len": full_seq_len,
+            "vocab_start_index": tp_rank * local_vocab_size,
+            "vocab_end_index": (tp_rank + 1) * local_vocab_size,
+            "full_vocab_size": full_vocab_size,
+        }
+
     def test_orders_by_dp_rank(self):
         out = aggregate_per_sample_handles(
             [
@@ -682,6 +725,237 @@ class TestAggregatePerSampleHandles:
                 ]
             )
 
+    def test_identity_aware_aggregation_uses_exact_canonical_order(self):
+        out = aggregate_per_sample_handles(
+            [
+                {
+                    "dp_rank": 1,
+                    "per_sample_handles": [
+                        self._dense_handle(30, "a30", tp_rank=0, tp_size=2),
+                        self._dense_handle(10, "a10", tp_rank=0, tp_size=2),
+                    ],
+                },
+                {
+                    "dp_rank": 0,
+                    "per_sample_handles": [
+                        self._dense_handle(20, "a20", tp_rank=0, tp_size=2)
+                    ],
+                },
+                {
+                    "dp_rank": 1,
+                    "per_sample_handles": [
+                        self._dense_handle(10, "b10", tp_rank=1, tp_size=2),
+                        self._dense_handle(30, "b30", tp_rank=1, tp_size=2),
+                    ],
+                },
+                {
+                    "dp_rank": 0,
+                    "per_sample_handles": [
+                        self._dense_handle(20, "b20", tp_rank=1, tp_size=2)
+                    ],
+                },
+            ],
+            canonical_batch_item_ids=(10, 20, 30),
+        )
+
+        assert [item["batch_item_id"] for item in out] == [10, 20, 30]
+        assert [[h["shard"] for h in item["teacher_shards"]] for item in out] == [
+            ["a10", "b10"],
+            ["a20", "b20"],
+            ["a30", "b30"],
+        ]
+
+    @pytest.mark.parametrize(
+        "worker_results,match",
+        [
+            (
+                [{"dp_rank": 0, "per_sample_handles": [{"shard": "missing"}]}],
+                "carry batch_item_id",
+            ),
+            (
+                [
+                    {
+                        "dp_rank": 0,
+                        "per_sample_handles": [
+                            {"batch_item_id": 1},
+                            {"batch_item_id": 1},
+                        ],
+                    }
+                ],
+                "duplicate handles",
+            ),
+            (
+                [
+                    {
+                        "dp_rank": 0,
+                        "per_sample_handles": [{"batch_item_id": 1}],
+                    },
+                    {
+                        "dp_rank": 0,
+                        "per_sample_handles": [{"batch_item_id": 2}],
+                    },
+                ],
+                "inconsistent batch_item_id sets",
+            ),
+        ],
+    )
+    def test_identity_aware_aggregation_rejects_invalid_records(
+        self, worker_results, match
+    ):
+        with pytest.raises(ValueError, match=match):
+            aggregate_per_sample_handles(
+                worker_results,
+                canonical_batch_item_ids=(1, 2),
+            )
+
+    def test_identity_aware_aggregation_rejects_missing_tp_cp_shard(self):
+        worker_results = [
+            {
+                "dp_rank": 0,
+                "per_sample_handles": [
+                    self._dense_handle(
+                        1,
+                        f"tp{tp_rank}cp{cp_rank}",
+                        tp_rank=tp_rank,
+                        tp_size=2,
+                        cp_rank=cp_rank,
+                        cp_size=2,
+                    )
+                ],
+            }
+            for tp_rank, cp_rank in ((0, 0), (0, 1), (1, 0))
+        ]
+        with pytest.raises(ValueError, match="incomplete TP/CP shard coverage"):
+            aggregate_per_sample_handles(worker_results, canonical_batch_item_ids=(1,))
+
+    def test_identity_aware_aggregation_rejects_duplicate_coordinate(self):
+        duplicate = self._dense_handle(1, "duplicate")
+        with pytest.raises(ValueError, match="duplicate shard coordinate"):
+            aggregate_per_sample_handles(
+                [
+                    {"dp_rank": 0, "per_sample_handles": [duplicate]},
+                    {"dp_rank": 0, "per_sample_handles": [dict(duplicate)]},
+                ],
+                canonical_batch_item_ids=(1,),
+            )
+
+    def test_identity_aware_aggregation_rejects_sequence_coverage_gap(self):
+        with pytest.raises(ValueError, match="gap or overlap"):
+            aggregate_per_sample_handles(
+                [
+                    {
+                        "dp_rank": 0,
+                        "per_sample_handles": [
+                            self._dense_handle(1, "cp0", cp_rank=0, cp_size=2)
+                        ],
+                    },
+                    {
+                        "dp_rank": 0,
+                        "per_sample_handles": [
+                            self._dense_handle(
+                                1,
+                                "cp1",
+                                cp_rank=1,
+                                cp_size=2,
+                                global_seq_start=3,
+                            )
+                        ],
+                    },
+                ],
+                canonical_batch_item_ids=(1,),
+            )
+
+    def test_identity_aware_aggregation_rejects_vocab_coverage_gap(self):
+        tp0 = self._dense_handle(1, "tp0", tp_rank=0, tp_size=2)
+        tp1 = self._dense_handle(1, "tp1", tp_rank=1, tp_size=2)
+        tp1["vocab_start_index"] = 5
+        tp1["vocab_end_index"] = 11
+        with pytest.raises(ValueError, match="gap or overlap"):
+            aggregate_per_sample_handles(
+                [
+                    {"dp_rank": 0, "per_sample_handles": [tp0]},
+                    {"dp_rank": 0, "per_sample_handles": [tp1]},
+                ],
+                canonical_batch_item_ids=(1,),
+            )
+
+    def test_identity_aware_aggregation_rejects_compact_valid_length_drift(self):
+        cp0 = self._dense_handle(1, "cp0", cp_rank=0, cp_size=2)
+        cp1 = self._dense_handle(1, "cp1", cp_rank=1, cp_size=2)
+        cp0.update(
+            {
+                "ipc_layout": DENSE_TEACHER_IPC_FLAT_LAYOUT,
+                "payload_ipc": "cp0",
+                "storage_shape": (4, 12),
+                "storage_token_offset": 0,
+                "storage_used_tokens": 4,
+                "storage_capacity_tokens": 4,
+                "stored_seq_len": 4,
+                "valid_seq_len": 5,
+                "dtype": torch.float32,
+            }
+        )
+        cp1.update(
+            {
+                "ipc_layout": DENSE_TEACHER_IPC_FLAT_LAYOUT,
+                "payload_ipc": None,
+                "storage_shape": (0, 12),
+                "storage_token_offset": 0,
+                "storage_used_tokens": 0,
+                "storage_capacity_tokens": 0,
+                "stored_seq_len": 0,
+                "valid_seq_len": 4,
+                "dtype": torch.float32,
+            }
+        )
+
+        with pytest.raises(ValueError, match="disagree on valid_seq_len"):
+            aggregate_per_sample_handles(
+                [
+                    {"dp_rank": 0, "per_sample_handles": [cp0]},
+                    {"dp_rank": 0, "per_sample_handles": [cp1]},
+                ],
+                canonical_batch_item_ids=(1,),
+            )
+
+
+class TestExtractBatchItemIds:
+    def test_accepts_tensor_and_validates_cardinality(self):
+        assert extract_batch_item_ids(
+            {"batch_item_id": torch.tensor([7, 3])}, 2, required=True
+        ) == [7, 3]
+        with pytest.raises(ValueError, match="cardinality"):
+            extract_batch_item_ids({"batch_item_id": [7]}, 2, required=True)
+
+    def test_required_identity_is_not_synthesized(self):
+        assert extract_batch_item_ids({}, 2, required=False) is None
+        with pytest.raises(ValueError, match="requires batch_item_id"):
+            extract_batch_item_ids({}, 2, required=True)
+
+
+class TestDenseIpcSequenceLayout:
+    def test_uses_logical_rectangle_not_packed_physical_bin(self):
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.zeros(2, 6, dtype=torch.long),
+                "input_lengths": torch.tensor([3, 2]),
+            }
+        )
+        # This is the physical scheduler geometry for a packed bin. It must not
+        # leak into dense teacher handle metadata, whose sequence axis is T_t=6.
+        data.micro_batch_lengths = [[12]]
+
+        assert get_dense_ipc_sequence_layout(data, cp_rank=0, cp_size=2) == (
+            6,
+            3,
+            0,
+        )
+        assert get_dense_ipc_sequence_layout(data, cp_rank=1, cp_size=2) == (
+            6,
+            3,
+            3,
+        )
+
 
 class TestEnsureTeacherIpcBuffer:
     def test_alloc_reuse_and_grow(self):
@@ -692,3 +966,191 @@ class TestEnsureTeacherIpcBuffer:
         assert s2 is s and h2 is h
         s3, _ = ensure_teacher_ipc_buffer(s, h, 3, 1, 4, 8, torch.float32, dev)
         assert s3 is not s and s3.shape == (3, 1, 4, 8)
+
+    def test_max_cardinality_preallocation_keeps_handle_stable(self):
+        dev = torch.device("cpu")
+        storage, handle = ensure_teacher_ipc_buffer(
+            None, None, 3, 4, 6, 8, torch.float32, dev
+        )
+        for variable_batch_size in (1, 4, 2):
+            next_storage, next_handle = ensure_teacher_ipc_buffer(
+                storage,
+                handle,
+                3,
+                variable_batch_size,
+                6,
+                8,
+                torch.float32,
+                dev,
+            )
+            assert next_storage is storage
+            assert next_handle is handle
+
+
+class TestCompactTeacherIpcRowBuffer:
+    def test_variable_cardinality_bins_use_only_logical_rows(self):
+        # Qualification rank 3 is the worst old rectangular allocation:
+        # 6 bins * max(14 rows) = 84 rectangles for only 32 logical rows.
+        batch_sizes = [3, 5, 8, 14, 1, 1]
+        seq_len = 2
+        vocab_size = 3
+        storage = ensure_teacher_ipc_row_buffer(
+            None,
+            sum(batch_sizes),
+            seq_len,
+            vocab_size,
+            torch.float32,
+            torch.device("cpu"),
+        )
+        partitions = partition_teacher_ipc_row_buffer(storage, batch_sizes)
+
+        assert storage.shape == (32, seq_len, vocab_size)
+        assert len(batch_sizes) * max(batch_sizes) == 84
+        assert storage.numel() == 32 * seq_len * vocab_size
+
+        expected_offset = 0
+        for bin_index, (row_offset, bin_view) in enumerate(partitions):
+            batch_size = batch_sizes[bin_index]
+            assert row_offset == expected_offset
+            assert bin_view.shape == (1, batch_size, seq_len, vocab_size)
+            assert bin_view.is_contiguous()
+            assert bin_view.storage_offset() == row_offset * seq_len * vocab_size
+            # This is the exact indexing ABI used by dense IPC consumers.
+            for sample_index_in_buf in range(batch_size):
+                bin_view[0, sample_index_in_buf].fill_(bin_index + 1)
+                assert torch.equal(
+                    bin_view[0, sample_index_in_buf],
+                    storage[row_offset + sample_index_in_buf],
+                )
+            expected_offset += batch_size
+        assert expected_offset == storage.shape[0]
+
+    def test_reuses_row_capacity_and_grows_before_partitioning(self):
+        device = torch.device("cpu")
+        storage = ensure_teacher_ipc_row_buffer(None, 8, 2, 3, torch.float32, device)
+        reused = ensure_teacher_ipc_row_buffer(storage, 5, 2, 3, torch.float32, device)
+        assert reused is storage
+
+        grown = ensure_teacher_ipc_row_buffer(storage, 9, 2, 3, torch.float32, device)
+        assert grown is not storage
+        assert grown.shape == (9, 2, 3)
+
+        with pytest.raises(ValueError, match="exceed storage capacity"):
+            partition_teacher_ipc_row_buffer(reused, [5, 4])
+
+
+class TestCompactTeacherIpcTokenBuffer:
+    def test_reuses_token_capacity_and_grows_only_when_required(self):
+        device = torch.device("cpu")
+        storage = ensure_teacher_ipc_token_buffer(
+            None,
+            total_tokens=8,
+            vocab_size=3,
+            dtype=torch.float32,
+            device=device,
+        )
+        reused = ensure_teacher_ipc_token_buffer(
+            storage,
+            total_tokens=5,
+            vocab_size=3,
+            dtype=torch.float32,
+            device=device,
+        )
+        grown = ensure_teacher_ipc_token_buffer(
+            storage,
+            total_tokens=9,
+            vocab_size=3,
+            dtype=torch.float32,
+            device=device,
+        )
+
+        assert reused is storage
+        assert grown is not storage
+        assert grown.shape == (9, 3)
+
+    def test_qualification_like_capacity_is_sum_of_valid_cp_prefixes(self):
+        full_seq_len = 3912
+        valid_lengths_by_microbatch = [
+            [3912, 2744, 1512],
+            [2056, 1956, 1912, 264],
+        ]
+        flat_valid_lengths = [
+            value for microbatch in valid_lengths_by_microbatch for value in microbatch
+        ]
+        localized_by_cp = [
+            localize_teacher_ipc_valid_lengths(
+                flat_valid_lengths,
+                full_seq_len=full_seq_len,
+                cp_rank=cp_rank,
+                cp_size=2,
+            )
+            for cp_rank in range(2)
+        ]
+
+        assert sum(map(sum, localized_by_cp)) == sum(flat_valid_lengths)
+        for local_valid_lengths in localized_by_cp:
+            storage = ensure_teacher_ipc_token_buffer(
+                None,
+                total_tokens=sum(local_valid_lengths),
+                vocab_size=3,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+            )
+            assert storage.shape == (sum(local_valid_lengths), 3)
+            assert storage.shape[0] < len(flat_valid_lengths) * (full_seq_len // 2)
+
+    def test_partitions_unequal_rows_without_allocation_or_padding(self):
+        valid_lengths_by_microbatch = [[4, 2], [0, 3]]
+        storage = ensure_teacher_ipc_token_buffer(
+            None,
+            total_tokens=9,
+            vocab_size=2,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        partitions = partition_teacher_ipc_token_buffer(
+            storage, valid_lengths_by_microbatch
+        )
+
+        assert [[offset for offset, _ in values] for values in partitions] == [
+            [0, 4],
+            [6, 6],
+        ]
+        assert [[tuple(view.shape) for _, view in values] for values in partitions] == [
+            [(4, 2), (2, 2)],
+            [(0, 2), (3, 2)],
+        ]
+        assert all(
+            view.untyped_storage().data_ptr() == storage.untyped_storage().data_ptr()
+            for values in partitions
+            for _, view in values
+        )
+
+    def test_extracts_raw_lengths_only_for_packed_rows(self):
+        data = {
+            "input_lengths": torch.tensor([5, 2], dtype=torch.int64),
+        }
+        assert extract_teacher_ipc_valid_lengths(
+            data, 2, full_seq_len=8, compact_padding=True
+        ) == [5, 2]
+        assert extract_teacher_ipc_valid_lengths(
+            {}, 2, full_seq_len=8, compact_padding=False
+        ) == [8, 8]
+
+    def test_compact_handle_rejects_out_of_bounds_offset(self):
+        handle = {
+            "ipc_layout": DENSE_TEACHER_IPC_FLAT_LAYOUT,
+            "payload_ipc": "payload",
+            "storage_shape": (4, 3),
+            "storage_token_offset": 3,
+            "storage_used_tokens": 4,
+            "storage_capacity_tokens": 4,
+            "stored_seq_len": 2,
+            "valid_seq_len": 2,
+            "actual_shape": (4, 3),
+            "global_seq_start": 0,
+            "full_seq_len": 4,
+            "dtype": torch.float32,
+        }
+        with pytest.raises(ValueError, match="outside storage bounds"):
+            validate_compact_teacher_ipc_handle(handle)

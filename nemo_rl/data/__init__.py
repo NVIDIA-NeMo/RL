@@ -40,6 +40,16 @@ class ResponseDatasetConfig(TypedDict):
     video_temporal_patch_size: NotRequired[int]
     video_maintain_aspect_ratio: NotRequired[bool]
     min_generation_tokens: NotRequired[int]
+    # Arrow/raw-text dataset fields used by xToken distillation.
+    data_files: NotRequired[str | list[str] | None]
+    text_key: NotRequired[str | None]
+    characters_per_sample: NotRequired[int | None]
+    # Native OpenAI-format chat adapter fields.
+    chat_key: NotRequired[str]
+    use_preserving_dataset: NotRequired[bool]
+    system_key: NotRequired[str | None]
+    system_prompt: NotRequired[str | None]
+    tool_key: NotRequired[str | None]
 
 
 class PreferenceDatasetConfig(TypedDict):
@@ -85,6 +95,13 @@ class DataConfig(TypedDict):
     use_multiple_dataloader: NotRequired[bool]
     num_prompts_per_dataloader: NotRequired[int]
     custom_dataloader: NotRequired[str]
+    # Cross-tokenizer collator controls.
+    collator_mode: NotRequired[Literal["text", "chat"]]
+    drop_first_assistant_chunk_kl: NotRequired[bool]
+    include_thinking_in_loss: NotRequired[bool]
+    native_thinking_alignment: NotRequired[bool]
+    kd_alignment_regions: NotRequired[list[str] | None]
+    num_packed_rows: NotRequired[int]
     # dataset configs
     train: (
         ResponseDatasetConfig

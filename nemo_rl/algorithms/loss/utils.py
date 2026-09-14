@@ -510,9 +510,12 @@ def prepare_loss_input(
         (
             student_logits_contig,
             teacher_full_logits_by_idx,
+            teacher_sparse_logits_by_idx,
             aligns_by_idx,
+            dense_reconstruction_fallbacks_by_idx,
             tp_group,
             cp_group,
+            dp_cp_group,
         ) = prepare_xtoken_cross_tokenizer_loss_input(
             logits,
             data,
@@ -525,9 +528,14 @@ def prepare_loss_input(
             "logits": logits,
             "student_logits_contig": student_logits_contig,
             "teacher_full_logits_by_idx": teacher_full_logits_by_idx,
+            "teacher_sparse_logits_by_idx": teacher_sparse_logits_by_idx,
             "aligns_by_idx": aligns_by_idx,
+            "dense_reconstruction_fallbacks_by_idx": (
+                dense_reconstruction_fallbacks_by_idx
+            ),
             "tp_group": tp_group,
             "cp_group": cp_group,
+            "dp_cp_group": dp_cp_group,
         }
         if cp_sharder is not None:
             next_token_logprobs = get_cp_sharded_next_token_logprobs(

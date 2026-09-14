@@ -103,10 +103,10 @@ def _v6_knobs(fwd_path, rev_path, v_t):
         "common_indices_from_subtoks": True,
         "pseudo_target_path": fwd_path,
         "reverse_pseudo_target_path": rev_path,
-        "kl_chunk_shift": False,
+        "kl_chunk_shift": True,
         "prefix_bidir_v3_position_0_kl": True,
         "prefix_bidir_v3_loss_fn": "jsd",
-        "prefix_bidir_v3_last_pos_loss_fn": "jsd",
+        "prefix_bidir_v3_last_pos_loss_fn": "kl",
         "prefix_bidir_v3_jsd_beta": 0.5,
         "prefix_bidir_v3_mismatch_pos0_alpha": 0.2,
         "prefix_bidir_v3_mismatch_loss_beta": 2.0,
@@ -190,7 +190,13 @@ def _build_case(name, tmpdir, seed=0):
 # ----------------------------------------------------------------------------- #
 # This-branch runner (in-process).
 # ----------------------------------------------------------------------------- #
-def _run_this_branch(fx):
+def _run_this_branch(
+    fx,
+    *,
+    teacher_sparse_payload=None,
+    sample_mask=None,
+    global_valid_chunks=None,
+):
     from nemo_rl.algorithms.loss.loss_functions import (
         CrossTokenizerDistillationLossFn,
     )
@@ -224,13 +230,24 @@ def _run_this_branch(fx):
         "prefix_bidir_v3_mismatch_pos0_alpha": knobs[
             "prefix_bidir_v3_mismatch_pos0_alpha"
         ],
-        "prefix_bidir_v3_mismatch_loss_beta": knobs["prefix_bidir_v3_mismatch_loss_beta"],
+        "prefix_bidir_v3_mismatch_loss_beta": knobs[
+            "prefix_bidir_v3_mismatch_loss_beta"
+        ],
         "prefix_bidir_v3_noise_filter_topk": knobs["prefix_bidir_v3_noise_filter_topk"],
+        "teacher_topk_ipc_k": v_t if teacher_sparse_payload is not None else 0,
+        "teacher_topk_ipc_support_mode": "row_topk",
+        # Full support needs no forced insertion. Keeping this false also makes
+        # dense and sparse mismatch eligibility identical for this regression.
+        "teacher_topk_ipc_keep_realized": False,
     }
     loss_fn = CrossTokenizerDistillationLossFn(cfg)
     student_logits = fx["student_logits"].clone().requires_grad_(True)
+    if sample_mask is None:
+        sample_mask = torch.ones(fx["student_ids"].shape[0], dtype=torch.bool)
+    if global_valid_chunks is None:
+        global_valid_chunks = fx["global_valid_chunks"]
     align = LocalizedAlignment(
-        sample_mask=torch.ones(fx["student_ids"].shape[0], dtype=torch.bool),
+        sample_mask=sample_mask,
         pair_valid=fx["pair_valid"],
         student_input_ids=fx["student_ids"],
         teacher_input_ids=fx["teacher_ids"],
@@ -241,10 +258,11 @@ def _run_this_branch(fx):
     loss, metrics = loss_fn._compute_prefix_bidir_partition_kl_v3(
         0,
         student_logits,
-        fx["teacher_logits"].clone(),
+        None if teacher_sparse_payload is not None else fx["teacher_logits"].clone(),
         align,
+        teacher_sparse_payload=teacher_sparse_payload,
         teacher_vocab_size=v_t,
-        global_valid_chunks=torch.tensor(fx["global_valid_chunks"]),
+        global_valid_chunks=torch.as_tensor(global_valid_chunks, dtype=torch.float32),
     )
     loss.backward()
     return loss.detach(), metrics, student_logits.grad.detach()
@@ -254,7 +272,7 @@ def _run_this_branch(fx):
 # Upstream (mingyu) subprocess runner — written to disk, run with the upstream
 # nemo_rl on sys.path. Reconstructs the same fixture from the serialized file.
 # ----------------------------------------------------------------------------- #
-_UPSTREAM_RUNNER = '''
+_UPSTREAM_RUNNER = """
 import os, sys
 UPSTREAM_ROOT = sys.argv[1]
 FIXTURE = sys.argv[2]
@@ -318,7 +336,7 @@ torch.save(
     OUT,
 )
 print("[upstream] loss=", float(loss))
-'''
+"""
 
 
 def _run_upstream(fx, tmpdir):
@@ -354,7 +372,14 @@ def _assert_parity(case_name):
 
     torch.testing.assert_close(this_loss, up_loss, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(this_grad, up_grad, rtol=1e-4, atol=1e-4)
-    for key in ("kl_common_per_chunk", "kl_partition_last_per_chunk", "top1_acc_per_chunk"):
+    for key in (
+        "kl_common_per_chunk",
+        "kl_partition_first_per_chunk",
+        "kl_partition_last_per_chunk",
+        "kl_mismatch_combined_per_chunk",
+        "kl_mismatch_scaled_per_chunk",
+        "top1_acc_per_chunk",
+    ):
         assert abs(float(this_metrics[key]) - float(up_metrics[key])) < 1e-4, (
             f"{case_name}: metric {key} differs: "
             f"{this_metrics[key]} vs {up_metrics[key]}"
@@ -380,10 +405,486 @@ def test_v6_parity_with_mismatch():
     assert metrics["num_common_chunks"] > 0
 
 
+def test_v6_sparse_full_support_matches_dense():
+    """The production sparse consumer matches dense when support is complete."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fx = _build_case("with_mismatch", tmp)
+        dense_loss, dense_metrics, dense_grad = _run_this_branch(fx)
+
+        teacher_logits = fx["teacher_logits"].clone()
+        token_ids = torch.arange(fx["v_t"], dtype=torch.int32).view(1, 1, -1)
+        token_ids = token_ids.expand(*teacher_logits.shape).clone()
+        sparse_payload = (
+            teacher_logits,
+            token_ids,
+            torch.logsumexp(teacher_logits / fx["knobs"]["temperature"], dim=-1),
+            None,
+        )
+        sparse_loss, sparse_metrics, sparse_grad = _run_this_branch(
+            fx,
+            teacher_sparse_payload=sparse_payload,
+        )
+
+    torch.testing.assert_close(sparse_loss, dense_loss, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(sparse_grad, dense_grad, rtol=1e-5, atol=1e-6)
+    assert sparse_metrics["num_common_chunks"] == dense_metrics["num_common_chunks"]
+    assert sparse_metrics["num_mismatch_chunks"] == dense_metrics["num_mismatch_chunks"]
+
+
+def test_v6_dense_teacher_stays_cp_local_and_slices_padded_vocab(monkeypatch):
+    """Dense v6 never sequence-gathers teacher logits and excludes padded cols."""
+    from nemo_rl.algorithms.loss import loss_functions as loss_functions_module
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fx = _build_case("with_mismatch", tmp)
+        baseline_loss, baseline_metrics, baseline_grad = _run_this_branch(fx)
+
+        padded_fx = dict(fx)
+        padded_fx["teacher_logits"] = torch.cat(
+            [
+                fx["teacher_logits"],
+                torch.full(
+                    (*fx["teacher_logits"].shape[:-1], 3),
+                    1.0e4,
+                    dtype=fx["teacher_logits"].dtype,
+                ),
+            ],
+            dim=-1,
+        )
+        original_gather = loss_functions_module.allgather_cp_contiguous_tensor
+
+        def reject_dense_teacher_gather(tensor, group, seq_dim=1):
+            if (
+                tensor.ndim == 3
+                and not tensor.requires_grad
+                and tensor.shape[-1] >= fx["v_t"]
+            ):
+                raise AssertionError(
+                    "dense teacher logits entered a full-sequence CP gather"
+                )
+            return original_gather(tensor, group, seq_dim)
+
+        monkeypatch.setattr(
+            loss_functions_module,
+            "allgather_cp_contiguous_tensor",
+            reject_dense_teacher_gather,
+        )
+        padded_loss, padded_metrics, padded_grad = _run_this_branch(padded_fx)
+
+    torch.testing.assert_close(padded_loss, baseline_loss, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(padded_grad, baseline_grad, rtol=1e-5, atol=1e-6)
+    for key in (
+        "kl_common_per_chunk",
+        "kl_partition_first_per_chunk",
+        "kl_partition_last_per_chunk",
+        "kl_mismatch_combined_per_chunk",
+        "kl_mismatch_scaled_per_chunk",
+        "top1_acc_per_chunk",
+        "num_common_chunks",
+        "num_mismatch_chunks",
+    ):
+        assert padded_metrics[key] == pytest.approx(baseline_metrics[key])
+
+
+def test_dense_teacher_lookup_broadcasts_repeated_out_of_order_queries():
+    """The CP1 lookup seam preserves arbitrary advanced-index semantics."""
+    from nemo_rl.algorithms.loss.loss_functions import (
+        CrossTokenizerDistillationLossFn,
+    )
+
+    teacher = torch.tensor(
+        [
+            [[-4.0, 0.0, 2.0], [3.0, -2.0, 1.0]],
+            [[7.0, 5.0, -1.0], [0.0, -6.0, 8.0]],
+        ]
+    )
+    batch = torch.tensor([[1], [0], [1]])
+    positions = torch.tensor([[1], [0], [1]])
+    token_ids = torch.tensor([[2, 0, 2], [1, 2, 1], [0, 1, 0]])
+    actual = CrossTokenizerDistillationLossFn._lookup_cp_sharded_teacher_logits(
+        teacher,
+        batch,
+        positions,
+        token_ids,
+        cp_group=None,
+    )
+    b_full, p_full, t_full = torch.broadcast_tensors(batch, positions, token_ids)
+    expected = teacher[b_full, p_full, t_full]
+    torch.testing.assert_close(actual, expected)
+
+
+def test_student_lookup_tp1_cp1_preserves_repeated_query_gradients():
+    """The owner-lookup fast path matches advanced indexing and its gradient."""
+    from nemo_rl.algorithms.loss.loss_functions import (
+        CrossTokenizerDistillationLossFn,
+    )
+
+    student = torch.randn(2, 3, 5, requires_grad=True)
+    reference = student.detach().clone().requires_grad_(True)
+    batch = torch.tensor([[1], [0], [1]])
+    positions = torch.tensor([[2], [0], [2]])
+    token_ids = torch.tensor([[4, 0, 4], [1, 3, 1], [2, 2, 2]])
+    weights = torch.arange(1, 10, dtype=student.dtype).view(3, 3)
+
+    actual = CrossTokenizerDistillationLossFn._lookup_tp_cp_sharded_student_logits(
+        student,
+        batch,
+        positions,
+        token_ids,
+        tp_group=None,
+        cp_group=None,
+    )
+    b_full, p_full, t_full = torch.broadcast_tensors(batch, positions, token_ids)
+    expected = reference[b_full, p_full, t_full]
+    torch.testing.assert_close(actual, expected)
+
+    (actual * weights).sum().backward()
+    (expected * weights).sum().backward()
+    torch.testing.assert_close(student.grad, reference.grad)
+
+
+def test_student_lookup_tp2_cp2_preserves_outer_product_gradients(monkeypatch):
+    """Compact broadcast queries preserve owner masking and local gradients."""
+    from nemo_rl.algorithms.loss import loss_functions as loss_functions_module
+
+    tp_group = object()
+    cp_group = object()
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(
+        torch.distributed,
+        "get_rank",
+        lambda group: 1 if group is tp_group else 0,
+    )
+    collective_calls = []
+
+    def tp_reduce(values, group):
+        collective_calls.append(("tp", group))
+        return values
+
+    def cp_reduce(values, group):
+        collective_calls.append(("cp", group))
+        return values
+
+    monkeypatch.setattr(
+        loss_functions_module,
+        "group_all_reduce_sum_with_grad",
+        tp_reduce,
+    )
+    monkeypatch.setattr(
+        loss_functions_module,
+        "group_all_reduce_sum_with_grad_backward_sum",
+        cp_reduce,
+    )
+
+    student = torch.randn(2, 3, 5, requires_grad=True)
+    reference = student.detach().clone().requires_grad_(True)
+    batch = torch.tensor([[1], [0], [1]])
+    positions = torch.tensor([[0], [4], [2]])
+    token_ids = torch.tensor([[0, 6, 9, 4]])
+    weights = torch.arange(1, 13, dtype=student.dtype).view(3, 4)
+
+    actual = loss_functions_module.CrossTokenizerDistillationLossFn._lookup_tp_cp_sharded_student_logits(
+        student,
+        batch,
+        positions,
+        token_ids,
+        tp_group=tp_group,
+        cp_group=cp_group,
+    )
+    expected = reference[
+        batch,
+        positions.remainder(reference.shape[1]),
+        token_ids.remainder(reference.shape[2]),
+    ]
+    expected = torch.where(positions // reference.shape[1] == 0, expected, 0.0)
+    expected = torch.where(token_ids // reference.shape[2] == 1, expected, 0.0)
+
+    torch.testing.assert_close(actual, expected)
+    (actual * weights).sum().backward()
+    (expected * weights).sum().backward()
+    torch.testing.assert_close(student.grad, reference.grad)
+    assert collective_calls == [("tp", tp_group), ("cp", cp_group)]
+
+
+def test_student_lookup_dense_common_query_saves_compact_indices(monkeypatch):
+    """The qualification-sized owner lookup retains no dense index storage."""
+    from nemo_rl.algorithms.loss import loss_functions as loss_functions_module
+
+    tp_group = object()
+    cp_group = object()
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
+    collective_calls = []
+
+    def tp_reduce(values, group):
+        collective_calls.append(("tp", group))
+        return values
+
+    def cp_reduce(values, group):
+        collective_calls.append(("cp", group))
+        return values
+
+    monkeypatch.setattr(
+        loss_functions_module,
+        "group_all_reduce_sum_with_grad",
+        tp_reduce,
+    )
+    monkeypatch.setattr(
+        loss_functions_module,
+        "group_all_reduce_sum_with_grad_backward_sum",
+        cp_reduce,
+    )
+
+    row_count = 64
+    common_width = 109_567
+    student = torch.arange(8, dtype=torch.float32).view(1, 2, 4)
+    student.requires_grad_(True)
+    batch = torch.zeros((row_count, 1), dtype=torch.long)
+    # Rank CP0/TP0 owns none of these queries. It must still execute both
+    # collectives, and the autograd graph must retain only the compact axes.
+    positions = torch.full((row_count, 1), 2, dtype=torch.long)
+    token_ids = (torch.arange(common_width) % 4 + 4).view(1, common_width)
+    saved_storage = []
+
+    def save_tensor(tensor):
+        if tensor.dtype in (torch.long, torch.bool):
+            saved_storage.append((tensor.dtype, tensor.untyped_storage().nbytes()))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(save_tensor, lambda tensor: tensor):
+        actual = loss_functions_module.CrossTokenizerDistillationLossFn._lookup_tp_cp_sharded_student_logits(
+            student,
+            batch,
+            positions,
+            token_ids,
+            tp_group=tp_group,
+            cp_group=cp_group,
+        )
+        actual.sum().backward()
+
+    assert actual.shape == (row_count, common_width)
+    assert torch.count_nonzero(actual) == 0
+    assert torch.count_nonzero(student.grad) == 0
+    assert collective_calls == [("tp", tp_group), ("cp", cp_group)]
+    long_storage = sorted(size for dtype, size in saved_storage if dtype == torch.long)
+    bool_storage = sorted(size for dtype, size in saved_storage if dtype == torch.bool)
+    assert long_storage == [row_count * 8, row_count * 8, common_width * 8]
+    assert bool_storage == [row_count, common_width]
+
+
+@pytest.mark.parametrize(
+    ("batch", "position", "token", "match"),
+    [
+        (torch.tensor([-1]), torch.tensor([0]), torch.tensor([0]), "batch"),
+        (torch.tensor([0]), torch.tensor([3]), torch.tensor([0]), "sequence"),
+        (torch.tensor([0]), torch.tensor([0]), torch.tensor([5]), "vocabulary"),
+    ],
+)
+def test_student_lookup_rejects_queries_before_collectives(
+    batch: torch.Tensor,
+    position: torch.Tensor,
+    token: torch.Tensor,
+    match: str,
+):
+    """Malformed globally replicated owner queries fail before communication."""
+    from nemo_rl.algorithms.loss.loss_functions import (
+        CrossTokenizerDistillationLossFn,
+    )
+
+    with pytest.raises(IndexError, match=match):
+        CrossTokenizerDistillationLossFn._lookup_tp_cp_sharded_student_logits(
+            torch.zeros(1, 3, 5),
+            batch,
+            position,
+            token,
+            tp_group=None,
+            cp_group=None,
+        )
+
+
+def test_student_lookup_rejects_nonbroadcastable_queries_before_collectives(
+    monkeypatch,
+):
+    """Incompatible compact query axes fail before either collective."""
+    from nemo_rl.algorithms.loss import loss_functions as loss_functions_module
+
+    collective_calls = []
+
+    def unexpected_collective(values, group):
+        collective_calls.append(group)
+        return values
+
+    monkeypatch.setattr(
+        loss_functions_module,
+        "group_all_reduce_sum_with_grad",
+        unexpected_collective,
+    )
+    monkeypatch.setattr(
+        loss_functions_module,
+        "group_all_reduce_sum_with_grad_backward_sum",
+        unexpected_collective,
+    )
+
+    with pytest.raises(RuntimeError):
+        loss_functions_module.CrossTokenizerDistillationLossFn._lookup_tp_cp_sharded_student_logits(
+            torch.zeros(1, 3, 5),
+            torch.zeros(2, dtype=torch.long),
+            torch.zeros(3, dtype=torch.long),
+            torch.zeros(2, dtype=torch.long),
+            tp_group=object(),
+            cp_group=object(),
+        )
+
+    assert collective_calls == []
+
+
+def test_v6_student_logits_never_enter_rank3_gathers(monkeypatch):
+    """The v6 student path gathers only scalar log-normalizers across CP."""
+    from nemo_rl.algorithms.loss import loss_functions as loss_functions_module
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fx = _build_case("with_mismatch", tmp)
+        baseline_loss, baseline_metrics, baseline_grad = _run_this_branch(fx)
+        original_gather = loss_functions_module.allgather_cp_contiguous_tensor
+
+        def reject_rank3_gather(tensor, group, seq_dim=1):
+            if tensor.ndim == 3:
+                raise AssertionError("v6 attempted a rank-3 CP gather")
+            return original_gather(tensor, group, seq_dim)
+
+        monkeypatch.setattr(
+            loss_functions_module,
+            "allgather_cp_contiguous_tensor",
+            reject_rank3_gather,
+        )
+        loss, metrics, grad = _run_this_branch(fx)
+
+    torch.testing.assert_close(loss, baseline_loss, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(grad, baseline_grad, rtol=1e-5, atol=1e-6)
+    for key in (
+        "kl_common_per_chunk",
+        "kl_partition_first_per_chunk",
+        "kl_partition_last_per_chunk",
+        "top1_acc_per_chunk",
+        "num_common_chunks",
+        "num_mismatch_chunks",
+    ):
+        assert metrics[key] == pytest.approx(baseline_metrics[key])
+
+
+def _single_sample_case(fx, sample_idx):
+    """Slice the batched fixture while retaining its on-disk v6 tables/config."""
+    single = dict(fx)
+    for key in (
+        "student_logits",
+        "teacher_logits",
+        "student_ids",
+        "teacher_ids",
+        "s_spans",
+        "t_spans",
+        "pair_valid",
+        "num_chunks",
+    ):
+        single[key] = fx[key][sample_idx : sample_idx + 1].clone()
+    single["global_valid_chunks"] = float(
+        single["pair_valid"][0, : single["num_chunks"][0]].sum().item()
+    )
+    return single
+
+
+@pytest.mark.parametrize("case_name", ["common_only", "with_mismatch"])
+def test_v6_sample_mask_matches_single_sample_and_zeroes_masked_grad(case_name):
+    """Masked rows affect neither v6 cohorts nor forward/backward numerators."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fx = _build_case(case_name, tmp)
+        single = _single_sample_case(fx, 0)
+        single_loss, single_metrics, single_grad = _run_this_branch(single)
+
+        sample_mask = torch.tensor([True, False])
+        masked_loss, masked_metrics, masked_grad = _run_this_branch(
+            fx,
+            sample_mask=sample_mask,
+            global_valid_chunks=single["global_valid_chunks"],
+        )
+
+        # Corrupt every logit in the masked row. It must not change selected
+        # cohorts, scalar numerators, or the valid row's gradient.
+        corrupted = dict(fx)
+        corrupted["student_logits"] = fx["student_logits"].clone()
+        corrupted["teacher_logits"] = fx["teacher_logits"].clone()
+        corrupted["student_logits"][1] = torch.linspace(
+            -50.0,
+            50.0,
+            corrupted["student_logits"][1].numel(),
+        ).reshape_as(corrupted["student_logits"][1])
+        corrupted["teacher_logits"][1] = torch.linspace(
+            75.0,
+            -75.0,
+            corrupted["teacher_logits"][1].numel(),
+        ).reshape_as(corrupted["teacher_logits"][1])
+        corrupt_loss, corrupt_metrics, corrupt_grad = _run_this_branch(
+            corrupted,
+            sample_mask=sample_mask,
+            global_valid_chunks=single["global_valid_chunks"],
+        )
+
+    torch.testing.assert_close(masked_loss, single_loss, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(masked_grad[0], single_grad[0], rtol=1e-5, atol=1e-6)
+    assert torch.count_nonzero(masked_grad[1]).item() == 0
+    torch.testing.assert_close(corrupt_loss, masked_loss, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(corrupt_grad, masked_grad, rtol=1e-5, atol=1e-6)
+
+    for key in (
+        "kl_common_per_chunk",
+        "kl_partition_last_per_chunk",
+        "kl_partition_first_per_chunk",
+        "top1_acc_per_chunk",
+        "num_common_chunks",
+        "num_mismatch_chunks",
+        "num_noise_filtered_common_chunks",
+        "num_noise_filtered_mismatch_chunks",
+        "num_valid_samples",
+    ):
+        assert masked_metrics[key] == pytest.approx(single_metrics[key])
+        assert corrupt_metrics[key] == pytest.approx(masked_metrics[key])
+
+
+@pytest.mark.parametrize("case_name", ["common_only", "with_mismatch"])
+def test_v6_all_samples_masked_is_zero_safe(case_name):
+    """An empty v6 cohort returns connected zero with an exactly zero gradient."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fx = _build_case(case_name, tmp)
+        loss, metrics, grad = _run_this_branch(
+            fx,
+            sample_mask=torch.zeros(2, dtype=torch.bool),
+            global_valid_chunks=0.0,
+        )
+
+    assert torch.isfinite(loss)
+    assert torch.equal(loss, torch.zeros_like(loss))
+    assert torch.count_nonzero(grad).item() == 0
+    for key in (
+        "kl_common_per_chunk",
+        "kl_partition_last_per_chunk",
+        "kl_partition_first_per_chunk",
+        "top1_acc_per_chunk",
+        "num_common_chunks",
+        "num_mismatch_chunks",
+        "num_noise_filtered_common_chunks",
+        "num_noise_filtered_mismatch_chunks",
+        "num_valid_samples",
+    ):
+        assert metrics[key] == pytest.approx(0.0)
+
+
 if __name__ == "__main__":
     # Direct runner (in-container): ensure this RL checkout's nemo_rl wins over
     # the container's baked copy / venv site-package.
-    _RL_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    _RL_ROOT = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
+    )
     sys.path.insert(0, _RL_ROOT)
     import nemo_rl as _nrl  # noqa: E402
 

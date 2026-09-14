@@ -432,6 +432,107 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         return grad_input, None, None, None, None, None, None
 
 
+class ChunkedVocabParallelLogsumexp(torch.autograd.Function):
+    """Memory-bounded full-vocabulary logsumexp for TP-sharded logits.
+
+    Forward computes one sequence chunk at a time and saves only the original
+    logits. Backward recomputes the distributed softmax chunk-by-chunk, avoiding
+    a persistent full-sequence fp32 softmax while preserving exact gradients on
+    each TP vocabulary shard.
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        vocab_parallel_logits: torch.Tensor,
+        temperature: float,
+        chunk_size: int,
+        tp_group: torch.distributed.ProcessGroup,
+    ) -> torch.Tensor:
+        work_dtype = (
+            torch.float32
+            if vocab_parallel_logits.dtype in (torch.float16, torch.bfloat16)
+            else vocab_parallel_logits.dtype
+        )
+        batch_size, seq_size, _ = vocab_parallel_logits.shape
+        output = torch.empty(
+            (batch_size, seq_size),
+            dtype=work_dtype,
+            device=vocab_parallel_logits.device,
+        )
+
+        for chunk_start in range(0, seq_size, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, seq_size)
+            scaled = (
+                vocab_parallel_logits[:, chunk_start:chunk_end, :].to(work_dtype)
+                / temperature
+            )
+            logits_max = torch.amax(scaled, dim=-1)
+            torch.distributed.all_reduce(
+                logits_max,
+                op=torch.distributed.ReduceOp.MAX,
+                group=tp_group,
+            )
+            scaled.sub_(logits_max.unsqueeze(-1)).exp_()
+            sum_exp = scaled.sum(dim=-1)
+            torch.distributed.all_reduce(
+                sum_exp,
+                op=torch.distributed.ReduceOp.SUM,
+                group=tp_group,
+            )
+            output[:, chunk_start:chunk_end] = sum_exp.log_().add_(logits_max)
+
+        ctx.save_for_backward(vocab_parallel_logits)
+        ctx.temperature = temperature
+        ctx.chunk_size = chunk_size
+        ctx.tp_group = tp_group
+        return output
+
+    @staticmethod
+    def backward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, None, None]:
+        (vocab_parallel_logits,) = ctx.saved_tensors
+        temperature = ctx.temperature
+        chunk_size = ctx.chunk_size
+        tp_group = ctx.tp_group
+        work_dtype = (
+            torch.float32
+            if vocab_parallel_logits.dtype in (torch.float16, torch.bfloat16)
+            else vocab_parallel_logits.dtype
+        )
+        seq_size = int(vocab_parallel_logits.shape[1])
+        grad_input = torch.empty_like(vocab_parallel_logits)
+
+        for chunk_start in range(0, seq_size, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, seq_size)
+            scaled = (
+                vocab_parallel_logits[:, chunk_start:chunk_end, :].to(work_dtype)
+                / temperature
+            )
+            logits_max = torch.amax(scaled, dim=-1)
+            torch.distributed.all_reduce(
+                logits_max,
+                op=torch.distributed.ReduceOp.MAX,
+                group=tp_group,
+            )
+            scaled.sub_(logits_max.unsqueeze(-1)).exp_()
+            sum_exp = scaled.sum(dim=-1)
+            torch.distributed.all_reduce(
+                sum_exp,
+                op=torch.distributed.ReduceOp.SUM,
+                group=tp_group,
+            )
+            scaled.div_(sum_exp.unsqueeze(-1))
+            scaled.mul_(
+                grad_output[:, chunk_start:chunk_end].unsqueeze(-1) / temperature
+            )
+            grad_input[:, chunk_start:chunk_end, :].copy_(scaled)
+
+        return grad_input, None, None, None
+
+
 class DistributedLogprobWithSampling(torch.autograd.Function):
     """Custom autograd function for computing log probabilities with top-k/top-p sampling.
 
@@ -1167,7 +1268,7 @@ def from_parallel_logits_to_logprobs(
         target = torch.nn.functional.pad(target, (0, pad_len), value=0)
 
     # Shard the targets by context parallelism
-    cp_rank = torch.distributed.get_rank(cp_group)
+    cp_rank = 0 if cp_group is None else torch.distributed.get_rank(cp_group)
     target = _get_tokens_on_this_cp_rank(target, cp_rank, cp_size, seq_dim=1)
 
     if need_top_k_or_top_p_filtering(sampling_params):
@@ -1470,6 +1571,54 @@ class _AllReduceSum(torch.autograd.Function):
         return grad_out, None
 
 
+class _AllReduceSumWithBackwardSum(torch.autograd.Function):
+    """SUM all-reduce whose backward also SUM-reduces replicated gradients.
+
+    This variant is for a replicated full-sequence loss under context
+    parallelism. Every CP rank evaluates the same numerator and the outer loss
+    wrapper divides by the CP size; summing the backward signal restores the
+    full gradient on the one rank that owned each sequence value.
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        x: torch.Tensor,
+        group: Optional[torch.distributed.ProcessGroup],
+    ) -> torch.Tensor:
+        should_reduce = (
+            group is not None
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(group) > 1
+        )
+        ctx.group = group
+        ctx.should_reduce = should_reduce
+        if not should_reduce:
+            return x
+        out = x.clone()
+        torch.distributed.all_reduce(
+            out,
+            op=torch.distributed.ReduceOp.SUM,
+            group=group,
+        )
+        return out
+
+    @staticmethod
+    def backward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        grad_out: torch.Tensor,
+    ) -> tuple[torch.Tensor, None]:
+        if not ctx.should_reduce:
+            return grad_out, None
+        grad_input = grad_out.clone()
+        torch.distributed.all_reduce(
+            grad_input,
+            op=torch.distributed.ReduceOp.SUM,
+            group=ctx.group,
+        )
+        return grad_input, None
+
+
 def group_all_reduce_sum_with_grad(
     x: torch.Tensor,
     group: Optional[torch.distributed.ProcessGroup],
@@ -1482,6 +1631,21 @@ def group_all_reduce_sum_with_grad(
     of ``None`` (or world size <= 1, or dist uninitialized) is a no-op.
     """
     return _AllReduceSum.apply(x, group)
+
+
+def group_all_reduce_sum_with_grad_backward_sum(
+    x: torch.Tensor,
+    group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Differentiable SUM whose backward also SUMs over ``group``.
+
+    Use this only when every group rank computes a replica of the same
+    full-domain numerator and an outer ``1 / world_size`` loss scale must be
+    cancelled in backward. Tensor-parallel vocabulary reductions should use
+    :func:`group_all_reduce_sum_with_grad` instead, because their backward must
+    remain rank-local.
+    """
+    return _AllReduceSumWithBackwardSum.apply(x, group)
 
 
 def group_all_reduce_sum(
@@ -1556,8 +1720,9 @@ class AllGatherCPTensor(torch.autograd.Function):
         )
 
         index = torch.tensor(
-            [cp_rank, (2 * cp_size - cp_rank - 1)], device="cpu", pin_memory=True
-        ).cuda(non_blocking=True)
+            [cp_rank, (2 * cp_size - cp_rank - 1)],
+            device=grad_output.device,
+        )
 
         grad_input = grad_output.index_select(seq_dim, index)
         grad_input = grad_input.view(
@@ -1695,6 +1860,72 @@ def vocab_parallel_log_softmax(
     if tp_group is not None and torch.distributed.get_world_size(tp_group) > 1:
         return _compute_distributed_log_softmax_with_grad(scaled, group=tp_group)
     return torch.log_softmax(scaled, dim=-1)
+
+
+def chunked_vocab_parallel_logsumexp(
+    logits: torch.Tensor,
+    temperature: float,
+    *,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    chunk_size: int = 256,
+) -> torch.Tensor:
+    """Compute exact full-vocabulary logsumexp without gathering TP logits.
+
+    The result keeps the local sequence layout and drops only the vocabulary
+    axis. At TP>1 the forward and backward are recomputed in fixed sequence
+    chunks; at TP1 this uses ordinary ``torch.logsumexp`` in the same chunks so
+    the unsharded arithmetic remains unchanged.
+
+    Args:
+        logits: ``[B, S_local, V_local]`` logits, optionally vocab-sharded.
+        temperature: Positive softmax temperature.
+        tp_group: Tensor-parallel process group, or ``None`` for TP1.
+        chunk_size: Positive sequence-axis work bound.
+
+    Returns:
+        Full-vocabulary log-normalizers with shape ``[B, S_local]``.
+    """
+    if temperature <= 0.0:
+        raise ValueError(f"temperature must be > 0, got {temperature}")
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
+    if isinstance(logits, DTensor):
+        logits = logits.to_local()
+    if logits.ndim != 3:
+        raise ValueError(
+            "vocab-parallel logsumexp expects [B, S, V] logits, got "
+            f"{tuple(logits.shape)}"
+        )
+
+    tp_size = (
+        torch.distributed.get_world_size(tp_group)
+        if tp_group is not None and torch.distributed.is_initialized()
+        else 1
+    )
+    if tp_size > 1:
+        assert tp_group is not None
+        return ChunkedVocabParallelLogsumexp.apply(
+            logits,
+            float(temperature),
+            int(chunk_size),
+            tp_group,
+        )
+
+    work_dtype = (
+        torch.float32
+        if logits.dtype in (torch.float16, torch.bfloat16)
+        else logits.dtype
+    )
+    chunks = [
+        torch.logsumexp(
+            logits[:, start : start + chunk_size, :].to(work_dtype) / temperature,
+            dim=-1,
+        )
+        for start in range(0, logits.shape[1], chunk_size)
+    ]
+    if not chunks:
+        return torch.empty((logits.shape[0], 0), dtype=work_dtype, device=logits.device)
+    return torch.cat(chunks, dim=1)
 
 
 def vocab_parallel_full_log_softmax(

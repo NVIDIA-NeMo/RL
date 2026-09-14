@@ -29,6 +29,7 @@ from megatron.core.parallel_state import (
 from megatron.core.utils import StragglerDetector
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
+from nemo_rl.algorithms.x_token.packing_loss import resolve_lockstep_bin_geometry
 from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
@@ -54,8 +55,8 @@ class ProcessedInputs:
     position_ids: Optional[torch.Tensor]
     packed_seq_params: Optional[PackedSeqParams]
     cu_seqlens_padded: Optional[torch.Tensor]
-    mtp_loss_mask: Optional[torch.Tensor] = None
     padding_mask: Optional[torch.Tensor] = None
+    mtp_loss_mask: Optional[torch.Tensor] = None
     routed_experts: Optional[torch.Tensor] = None
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
     original_seq_length: Optional[int] = None
@@ -98,8 +99,8 @@ class ProcessedMicrobatch:
     position_ids: Optional[torch.Tensor]
     packed_seq_params: Optional[PackedSeqParams]
     cu_seqlens_padded: Optional[torch.Tensor]
-    mtp_loss_mask: Optional[torch.Tensor] = None
     padding_mask: Optional[torch.Tensor] = None
+    mtp_loss_mask: Optional[torch.Tensor] = None
     routed_experts: Optional[torch.Tensor] = None
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
     original_seq_length: Optional[int] = None
@@ -173,8 +174,8 @@ def make_processed_microbatch_iterator(
             position_ids=processed_inputs.position_ids,
             packed_seq_params=processed_inputs.packed_seq_params,
             cu_seqlens_padded=processed_inputs.cu_seqlens_padded,
-            mtp_loss_mask=processed_inputs.mtp_loss_mask,
             padding_mask=processed_inputs.padding_mask,
+            mtp_loss_mask=processed_inputs.mtp_loss_mask,
             routed_experts=processed_inputs.routed_experts,
             routed_experts_cp_sharded=processed_inputs.routed_experts_cp_sharded,
             original_seq_length=processed_inputs.original_seq_length,
@@ -413,8 +414,8 @@ def process_microbatch(
         seq_lengths = None  # Will be set if using packed sequences
         cu_seqlens = None
         cu_seqlens_padded = None
-        mtp_loss_mask = None
         padding_mask = None
+        mtp_loss_mask = None
         media_token_validity_mask = None
 
         if pack_sequences:
@@ -428,8 +429,21 @@ def process_microbatch(
 
             # Get sequence lengths and context parallel size
             seq_lengths = data_dict[seq_length_key]
+            planned_geometry = resolve_lockstep_bin_geometry(
+                data_dict, input_lengths=seq_lengths
+            )
+            planned_physical_tokens = (
+                planned_geometry.physical_tokens
+                if planned_geometry is not None
+                else pad_full_seq_to
+            )
 
             if delegate_pack_to_model:
+                if planned_geometry is not None:
+                    raise NotImplementedError(
+                        "Plan-driven packing cannot delegate materialization to "
+                        "the model."
+                    )
                 has_mtp_loss_mask = "mtp_loss_mask" in data_dict
                 assert not has_mtp_loss_mask or delegate_mtp_loss_mask_to_model, (
                     "MTP training requires a self-packing VLM that advertises "
@@ -513,10 +527,34 @@ def process_microbatch(
                     seq_lengths,
                     pad_individual_seqs_to_multiple_of,
                     pad_packed_seq_to_multiple_of,
-                    pad_full_seq_to,
+                    planned_physical_tokens,
                     cp_rank=get_context_parallel_rank(),
                     cp_size=get_context_parallel_world_size(),
                 )
+                if planned_geometry is not None:
+                    actual_raw_cu = tuple(int(value) for value in cu_seqlens.tolist())
+                    actual_padded_cu = tuple(
+                        int(value) for value in cu_seqlens_padded.tolist()
+                    )
+                    if actual_raw_cu != planned_geometry.raw_cu_seqlens:
+                        raise ValueError(
+                            "Megatron raw cumulative boundaries drifted from the "
+                            f"selected lockstep bin: actual={actual_raw_cu}, "
+                            f"planned={planned_geometry.raw_cu_seqlens}."
+                        )
+                    if actual_padded_cu != planned_geometry.padded_cu_seqlens:
+                        raise ValueError(
+                            "Megatron padded cumulative boundaries drifted from "
+                            f"the selected lockstep bin: actual={actual_padded_cu}, "
+                            f"planned={planned_geometry.padded_cu_seqlens}."
+                        )
+                    if input_ids.shape[1] != planned_geometry.physical_tokens:
+                        raise ValueError(
+                            "Megatron materialized physical size drifted from the "
+                            f"selected lockstep bin: actual={input_ids.shape[1]}, "
+                            f"planned={planned_geometry.physical_tokens}."
+                        )
+
                 if model_slices_context_parallel_inputs:
                     packed_seq_params = PackedSeqParams(
                         cu_seqlens_q=cu_seqlens,
@@ -587,6 +625,32 @@ def process_microbatch(
                         f"padding_mask shape {padding_mask.shape} must match "
                         f"model input shape {input_ids_cp_sharded.shape}."
                     )
+
+                # GPT's MoE router must exclude both physical padding and
+                # sample_mask=0 rows from aux/z-loss and capacity accounting.
+                # Models that own CP slicing (currently Nemotron Omni/LLaVA)
+                # do not accept a padding_mask forward kwarg, so preserve their
+                # existing packed multimodal contract until the wrapper plumbs
+                # the mask through to its language model.
+                if not model_slices_context_parallel_inputs:
+                    router_padding_mask = _make_packed_router_padding_mask(
+                        seq_lengths,
+                        cu_seqlens_padded,
+                        sample_mask=data_dict.get("sample_mask"),
+                        cp_rank=get_context_parallel_rank(),
+                        cp_size=get_context_parallel_world_size(),
+                        device=input_ids_cp_sharded.device,
+                    )
+                    padding_mask = (
+                        router_padding_mask
+                        if padding_mask is None
+                        else padding_mask | router_padding_mask
+                    )
+                    assert padding_mask.shape == input_ids_cp_sharded.shape, (
+                        f"padding_mask shape {padding_mask.shape} must match "
+                        f"model input shape {input_ids_cp_sharded.shape}."
+                    )
+                materialized_physical_tokens = int(input_ids.shape[1])
                 # routed_experts and the R3 trace token identity ride the SAME
                 # per-seq zigzag CP sharding as input_ids, re-derived from
                 # cu_seqlens_padded.
@@ -668,7 +732,7 @@ def process_microbatch(
                         seq_lengths,
                         pad_individual_seqs_to_multiple_of,
                         pad_packed_seq_to_multiple_of,
-                        pad_full_seq_to,
+                        materialized_physical_tokens,
                         cp_rank=get_context_parallel_rank(),
                         cp_size=get_context_parallel_world_size(),
                     )
@@ -707,7 +771,7 @@ def process_microbatch(
                         seq_lengths,
                         pad_individual_seqs_to_multiple_of,
                         pad_packed_seq_to_multiple_of,
-                        pad_full_seq_to,
+                        materialized_physical_tokens,
                         cp_rank=get_context_parallel_rank(),
                         cp_size=get_context_parallel_world_size(),
                     )
@@ -746,7 +810,7 @@ def process_microbatch(
                         seq_lengths,
                         pad_individual_seqs_to_multiple_of,
                         pad_packed_seq_to_multiple_of,
-                        pad_full_seq_to,
+                        materialized_physical_tokens,
                         cp_rank=get_context_parallel_rank(),
                         cp_size=get_context_parallel_world_size(),
                     )
@@ -775,7 +839,52 @@ def process_microbatch(
                         input_ids,
                         data_dict["input_lengths"],
                     )
-            input_ids_cp_sharded = input_ids
+            attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
+                data=input_ids,
+                eod_token=0,  # used for loss_mask, which we don't use
+                pad_token=0,  # used for loss_mask, which we don't use
+                reset_position_ids=False,
+                reset_attention_mask=False,
+                eod_mask_loss=False,
+                pad_mask_loss=False,
+            )
+            cp_size = get_context_parallel_world_size()
+            if cp_size > 1:
+                # Unpacked context parallelism. mcore expects each rank to be
+                # handed its load-balanced sequence shard -- chunks ``cp_rank``
+                # and ``2*cp-1-cp_rank`` of ``2*cp`` -- exactly what
+                # Megatron-LM's get_batch_on_this_cp_rank produces and what the
+                # packed path above already does per sequence. position_ids ride
+                # the same layout.
+                #
+                # The dense [1, 1, S, S] mask built above is dropped: it is the
+                # plain causal mask (reset_position_ids / reset_attention_mask
+                # are both False), which the attention backend applies itself,
+                # and TE's context-parallel attention requires that implicit
+                # causal path rather than an arbitrary full-sequence mask.
+                if routed_experts is not None:
+                    raise NotImplementedError(
+                        "Router replay (routed_experts) with context parallelism "
+                        "requires sequence packing, so routed_experts can ride "
+                        "the same per-sequence CP layout as input_ids."
+                    )
+                assert input_ids.shape[1] % (cp_size * 2) == 0, (
+                    "Context parallelism load-balances the sequence into "
+                    f"2*cp={cp_size * 2} chunks, so the padded sequence length "
+                    f"({input_ids.shape[1]}) must be a multiple of it. Set "
+                    "policy.make_sequence_length_divisible_by to "
+                    "tensor_model_parallel_size * context_parallel_size * 2."
+                )
+                cp_rank = get_context_parallel_rank()
+                input_ids_cp_sharded = _get_tokens_on_this_cp_rank(
+                    input_ids, cp_rank, cp_size, seq_dim=1
+                )
+                position_ids = _get_tokens_on_this_cp_rank(
+                    position_ids, cp_rank, cp_size, seq_dim=1
+                )
+                attention_mask = None
+            else:
+                input_ids_cp_sharded = input_ids
             verified_token_count = _verify_r3_trace_cp_token_alignment(
                 source_input_ids=data_dict["input_ids"],
                 source_routed_experts=data_dict.get("routed_experts"),
@@ -791,23 +900,23 @@ def process_microbatch(
                 cp_rank=get_context_parallel_rank(),
                 cp_size=get_context_parallel_world_size(),
             )
-            attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
-                data=input_ids,
-                eod_token=0,  # used for loss_mask, which we don't use
-                pad_token=0,  # used for loss_mask, which we don't use
-                reset_position_ids=False,
-                reset_attention_mask=False,
-                eod_mask_loss=False,
-                pad_mask_loss=False,
-            )
             if "mtp_loss_mask" in data_dict:
                 mtp_loss_mask = data_dict["mtp_loss_mask"]
-            # Unpacked: rows still are samples, so the mask is already in the
-            # layout the model will see.
+                if cp_size > 1:
+                    mtp_loss_mask = _get_tokens_on_this_cp_rank(
+                        mtp_loss_mask, cp_rank, cp_size, seq_dim=1
+                    )
             if "media_token_validity_mask" in data_dict:
                 media_token_validity_mask = data_dict[
                     "media_token_validity_mask"
                 ].bool()
+                if cp_size > 1:
+                    media_token_validity_mask = _get_tokens_on_this_cp_rank(
+                        media_token_validity_mask,
+                        cp_rank,
+                        cp_size,
+                        seq_dim=1,
+                    )
     return ProcessedInputs(
         input_ids=input_ids,
         input_ids_cp_sharded=input_ids_cp_sharded,
@@ -815,8 +924,8 @@ def process_microbatch(
         position_ids=position_ids,
         packed_seq_params=packed_seq_params,
         cu_seqlens_padded=cu_seqlens_padded,
-        mtp_loss_mask=mtp_loss_mask,
         padding_mask=padding_mask,
+        mtp_loss_mask=mtp_loss_mask,
         routed_experts=routed_experts,
         routed_experts_cp_sharded=routed_experts_cp_sharded,
         original_seq_length=original_seq_length,
@@ -865,6 +974,51 @@ def _make_r3_trace_token_identity(
         ),
         dim=-1,
     )
+
+
+def _make_packed_router_padding_mask(
+    seq_lengths: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    *,
+    sample_mask: Optional[torch.Tensor],
+    cp_rank: int,
+    cp_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build GPT's CP-local MoE padding mask in native per-sequence order."""
+    if cu_seqlens_padded.numel() != seq_lengths.numel() + 1:
+        raise ValueError(
+            "Padded boundaries must contain one entry per packed sequence plus one."
+        )
+    if sample_mask is not None and sample_mask.numel() != seq_lengths.numel():
+        raise ValueError("sample_mask must contain one entry per packed sequence.")
+
+    valid_segments: list[torch.Tensor] = []
+    for sequence_index in range(int(seq_lengths.numel())):
+        raw_length = int(seq_lengths[sequence_index].item())
+        padded_length = int(
+            (
+                cu_seqlens_padded[sequence_index + 1]
+                - cu_seqlens_padded[sequence_index]
+            ).item()
+        )
+        if padded_length < raw_length:
+            raise ValueError(
+                f"Packed sequence {sequence_index} has raw length {raw_length} "
+                f"but padded length {padded_length}."
+            )
+        valid = torch.zeros(padded_length, dtype=torch.bool, device=device)
+        sample_is_valid = sample_mask is None or bool(
+            sample_mask[sequence_index].item()
+        )
+        if sample_is_valid:
+            valid[:raw_length] = True
+        if cp_size > 1:
+            valid = _get_tokens_on_this_cp_rank(
+                valid, cp_rank=cp_rank, cp_size=cp_size, seq_dim=0
+            )
+        valid_segments.append(valid)
+    return ~torch.cat(valid_segments).unsqueeze(0)
 
 
 def _verify_r3_trace_cp_token_alignment(
@@ -996,6 +1150,8 @@ def process_global_batch(
         - batch: The extracted batch
         - global_valid_seqs: Number of valid sequences across all ranks
         - global_valid_toks: Number of valid tokens across all ranks
+        - global_valid_chunks_by_idx: Number of valid cross-tokenizer alignment
+          chunks for each teacher across all data-parallel ranks
     """
     batch = data.get_batch(batch_idx=batch_idx, batch_size=batch_size)
 
@@ -1010,10 +1166,41 @@ def process_global_batch(
         local_valid_toks = torch.sum(
             batch["token_mask"][:, 1:] * batch["sample_mask"].unsqueeze(-1)
         )
+    kd_token_mask = batch.get("kd_token_mask", batch.get("token_mask"))
+    if kd_token_mask is None:
+        local_valid_kd_toks = local_valid_toks
+    else:
+        local_valid_kd_toks = torch.sum(
+            kd_token_mask[:, 1:] * batch["sample_mask"].unsqueeze(-1)
+        )
 
-    to_reduce = torch.tensor([local_valid_seqs, local_valid_toks]).cuda()
+    local_valid_chunks_by_idx: dict[int, torch.Tensor] = {}
+    for key, pair_valid in batch.items():
+        if not key.startswith("alignment_") or not key.endswith("_pair_valid"):
+            continue
+        teacher_idx = key.removeprefix("alignment_").removesuffix("_pair_valid")
+        if not teacher_idx.isdigit():
+            continue
+        sample_mask = batch["sample_mask"].to(pair_valid.dtype).unsqueeze(-1)
+        local_valid_chunks_by_idx[int(teacher_idx)] = torch.sum(
+            pair_valid * sample_mask
+        )
+
+    chunk_teacher_indices = sorted(local_valid_chunks_by_idx)
+    to_reduce = torch.stack(
+        [
+            local_valid_seqs,
+            local_valid_toks,
+            local_valid_kd_toks,
+            *(local_valid_chunks_by_idx[i] for i in chunk_teacher_indices),
+        ]
+    ).cuda()
     torch.distributed.all_reduce(to_reduce, group=dp_group)
-    global_valid_seqs, global_valid_toks = to_reduce[0], to_reduce[1]
+    global_valid_seqs, global_valid_toks, global_valid_kd_toks = to_reduce[:3]
+    global_valid_chunks_by_idx = {
+        teacher_idx: to_reduce[offset + 3]
+        for offset, teacher_idx in enumerate(chunk_teacher_indices)
+    }
 
     if hasattr(loss_fn, "loss_type") and loss_fn.loss_type == LossType.TOKEN_LEVEL:
         assert "token_mask" in batch, (
@@ -1024,6 +1211,8 @@ def process_global_batch(
         "batch": batch,
         "global_valid_seqs": global_valid_seqs,
         "global_valid_toks": global_valid_toks,
+        "global_valid_kd_toks": global_valid_kd_toks,
+        "global_valid_chunks_by_idx": global_valid_chunks_by_idx,
     }
 
 
@@ -1164,7 +1353,13 @@ def _pack_sequences_for_megatron(
     pad_packed_seq_to: Optional[int] = None,
     cp_rank: int = 0,
     cp_size: int = 1,
-) -> tuple[torch.Tensor, PackedSeqParams, torch.Tensor, Optional[torch.Tensor]]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    PackedSeqParams,
+    torch.Tensor,
+    torch.Tensor,
+]:
     """Pack sequences for Megatron model processing with optional context parallelism.
 
     Args:
@@ -1325,8 +1520,8 @@ def _pack_sequences_for_megatron(
     # total_tokens is required for PackedSeqParams.__post_init__ to build
     # seq_idx, which Mamba uses to reset SSM state at sample boundaries.
     packed_seq_params = PackedSeqParams(
-        cu_seqlens_q=cu_seqlens_padded,
-        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
         cu_seqlens_q_padded=cu_seqlens_padded,
         cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=int(max_seqlen),

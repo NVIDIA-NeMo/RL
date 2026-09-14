@@ -30,6 +30,7 @@ from torch.distributed.tensor import DTensor
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.x_token.packing_loss import XTOKEN_LOGICAL_METRICS_KEY
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
@@ -49,6 +50,7 @@ from nemo_rl.models.automodel.train import (
     LogprobsPostProcessor,
     LossPostProcessor,
     ScorePostProcessor,
+    SparseLogitsPostProcessor,
     TopkLogitsPostProcessor,
     aggregate_training_statistics,
     automodel_forward_backward,
@@ -64,6 +66,8 @@ from nemo_rl.models.policy.interfaces import (
 )
 from nemo_rl.models.policy.utils import (
     ensure_teacher_ipc_buffer,
+    extract_batch_item_ids,
+    get_handle_from_tensor,
     get_runtime_env_for_policy_worker,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -268,6 +272,7 @@ class DTensorPolicyWorkerV2Impl(
         # IPC-imported storage without pinning an orphaned producer allocation.
         self._teacher_ipc_storage: Optional[torch.Tensor] = None
         self._teacher_ipc_handle: Optional[tuple[Any, ...]] = None
+        self._teacher_sparse_ipc_buffer: Optional[list[torch.Tensor]] = None
 
         # Validate configuration and prepare runtime settings
         runtime_config = validate_and_prepare_config(
@@ -476,6 +481,9 @@ class DTensorPolicyWorkerV2Impl(
                 batch = gb_result["batch"]
                 global_valid_seqs = gb_result["global_valid_seqs"]
                 global_valid_toks = gb_result["global_valid_toks"]
+                global_valid_kd_toks = gb_result.get(
+                    "global_valid_kd_toks", global_valid_toks
+                )
                 global_valid_chunks_by_idx = gb_result["global_valid_chunks_by_idx"]
                 # Native V6 gathers the full sequence and computes a replicated
                 # chunk numerator on every CP rank. Its denominator therefore
@@ -510,6 +518,7 @@ class DTensorPolicyWorkerV2Impl(
                     allow_flash_attn_args=self.allow_flash_attn_args,
                     global_valid_seqs=global_valid_seqs,
                     global_valid_toks=global_valid_toks,
+                    global_valid_kd_toks=global_valid_kd_toks,
                     global_valid_chunks_by_idx=global_valid_chunks_by_idx,
                     sampling_params=self.sampling_params,
                     sequence_dim=sequence_dim,
@@ -525,14 +534,29 @@ class DTensorPolicyWorkerV2Impl(
                 for mb_idx, (loss, loss_metrics) in enumerate(mb_results):
                     # Only process valid (non-dummy) batches for metrics
                     if mb_idx < iterator_len:
-                        num_valid_samples = loss_metrics["num_valid_samples"]
-                        loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
-                        loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
-                        loss_metrics["global_valid_toks"] = global_valid_toks.item()
-
-                        if num_valid_samples > 0:
+                        logical_metrics = loss_metrics.pop(
+                            XTOKEN_LOGICAL_METRICS_KEY, None
+                        )
+                        metric_records = (
+                            logical_metrics
+                            if logical_metrics is not None
+                            else [loss_metrics]
+                        )
+                        valid_metric_records = []
+                        for metric_record in metric_records:
+                            if metric_record["num_valid_samples"] <= 0:
+                                continue
+                            metric_record["lr"] = self.optimizer.param_groups[0]["lr"]
+                            metric_record["global_valid_seqs"] = (
+                                global_valid_seqs.item()
+                            )
+                            metric_record["global_valid_toks"] = (
+                                global_valid_toks.item()
+                            )
+                            valid_metric_records.append(metric_record)
+                        if valid_metric_records:
                             mb_losses.append(loss.item())
-                            all_mb_metrics.append(loss_metrics)
+                            all_mb_metrics.extend(valid_metric_records)
 
                 grad_norm: Optional[float | torch.Tensor] = None
                 if not eval_mode:
@@ -892,6 +916,17 @@ class DTensorPolicyWorkerV2Impl(
         full_seq_len = target_local_seq * self.cp_size
         global_seq_start = cp_rank * full_seq_len // self.cp_size
 
+        planned_batch_capacity = forward_batch_size
+        if data.micro_batch_indices is not None:
+            if len(data.micro_batch_indices) != 1:
+                raise ValueError(
+                    "Dense teacher IPC expects one local microbatch plan, got "
+                    f"{len(data.micro_batch_indices)}."
+                )
+            planned_batch_capacity = max(
+                end - start for start, end in data.micro_batch_indices[0]
+            )
+
         per_sample_handles: list[dict[str, Any]] = []
         storage: Optional[torch.Tensor] = None
         payload_ipc: Optional[tuple[Any, ...]] = None
@@ -933,21 +968,36 @@ class DTensorPolicyWorkerV2Impl(
                         vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0
                     )
                 batch_size_mb, seq_len_mb, local_vocab_size = vals.shape
-
-                self._teacher_ipc_storage, self._teacher_ipc_handle = (
-                    ensure_teacher_ipc_buffer(
-                        self._teacher_ipc_storage,
-                        self._teacher_ipc_handle,
-                        iterator_len,
-                        batch_size_mb,
-                        target_local_seq,
-                        local_vocab_size,
-                        vals.dtype,
-                        vals.device,
-                    )
+                batch_item_ids = extract_batch_item_ids(
+                    processed_mb.data_dict,
+                    batch_size_mb,
+                    required=self.enable_seq_packing,
                 )
-                storage = self._teacher_ipc_storage
-                payload_ipc = self._teacher_ipc_handle
+
+                # Allocate against the complete planned cardinality before the
+                # first handle is published. Later variable-cardinality bins
+                # must never grow the storage and invalidate earlier handles.
+                if storage is None:
+                    self._teacher_ipc_storage, self._teacher_ipc_handle = (
+                        ensure_teacher_ipc_buffer(
+                            self._teacher_ipc_storage,
+                            self._teacher_ipc_handle,
+                            iterator_len,
+                            planned_batch_capacity,
+                            target_local_seq,
+                            local_vocab_size,
+                            vals.dtype,
+                            vals.device,
+                        )
+                    )
+                    storage = self._teacher_ipc_storage
+                    payload_ipc = self._teacher_ipc_handle
+                assert storage is not None and payload_ipc is not None
+                if batch_size_mb > storage.shape[1]:
+                    raise ValueError(
+                        "Dense teacher IPC microbatch exceeds its preallocated "
+                        f"cardinality: rows={batch_size_mb}, capacity={storage.shape[1]}."
+                    )
                 storage[buf_idx, :batch_size_mb, :seq_len_mb, :local_vocab_size].copy_(
                     vals
                 )
@@ -956,28 +1006,31 @@ class DTensorPolicyWorkerV2Impl(
                 vocab_start_index = tp_rank * local_vocab_size
                 vocab_end_index = (tp_rank + 1) * local_vocab_size
                 for sample_index_in_buf in range(batch_size_mb):
-                    per_sample_handles.append(
-                        {
-                            "payload_ipc": payload_ipc,
-                            "buf_idx": buf_idx,
-                            "sample_index_in_buf": sample_index_in_buf,
-                            "storage_shape": tuple(storage.shape),
-                            "actual_shape": (target_local_seq, local_vocab_size),
-                            "dtype": storage.dtype,
-                            "tp_rank": tp_rank,
-                            "cp_rank": cp_rank,
-                            "tp_size": self.tp_size,
-                            "cp_size": self.cp_size,
-                            "world_rank": world_rank,
-                            "vocab_start_index": vocab_start_index,
-                            "vocab_end_index": vocab_end_index,
-                            "global_seq_start": global_seq_start,
-                            "full_vocab_size": full_vocab_size,
-                            "full_seq_len": full_seq_len,
-                            "vocab_sharded": self.tp_size > 1,
-                            "sequence_sharded": self.cp_size > 1,
-                        }
-                    )
+                    handle_record = {
+                        "payload_ipc": payload_ipc,
+                        "buf_idx": buf_idx,
+                        "sample_index_in_buf": sample_index_in_buf,
+                        "storage_shape": tuple(storage.shape),
+                        "actual_shape": (target_local_seq, local_vocab_size),
+                        "dtype": storage.dtype,
+                        "tp_rank": tp_rank,
+                        "cp_rank": cp_rank,
+                        "tp_size": self.tp_size,
+                        "cp_size": self.cp_size,
+                        "world_rank": world_rank,
+                        "vocab_start_index": vocab_start_index,
+                        "vocab_end_index": vocab_end_index,
+                        "global_seq_start": global_seq_start,
+                        "full_vocab_size": full_vocab_size,
+                        "full_seq_len": full_seq_len,
+                        "vocab_sharded": self.tp_size > 1,
+                        "sequence_sharded": self.cp_size > 1,
+                    }
+                    if batch_item_ids is not None:
+                        handle_record["batch_item_id"] = batch_item_ids[
+                            sample_index_in_buf
+                        ]
+                    per_sample_handles.append(handle_record)
         # The storage copies above are async on the current stream; force them
         # to complete before the IPC handles are consumed by the student
         # process, so the consumer can't observe a partially written buffer
@@ -985,10 +1038,229 @@ class DTensorPolicyWorkerV2Impl(
         torch.cuda.synchronize()
         return {"per_sample_handles": per_sample_handles, "dp_rank": dp_rank}
 
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_topk_logits_ipc")
+    def get_topk_logits_ipc(
+        self,
+        data: BatchedDataDict[Any],
+        *,
+        k: int,
+        temperature: float,
+        vocab_size: Optional[int] = None,
+        micro_batch_size: Optional[int] = None,
+        support_mode: str,
+        gt_filter_topk: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Run a teacher forward and expose row-top-k + logZ via CUDA IPC."""
+        if k <= 0:
+            raise ValueError(f"k must be > 0 for get_topk_logits_ipc, got {k}")
+        if temperature <= 0.0:
+            raise ValueError(
+                f"temperature must be > 0 for get_topk_logits_ipc, got {temperature}"
+            )
+        if support_mode != "row_topk":
+            raise NotImplementedError(
+                "DTensor-V2 sparse teacher IPC currently supports only "
+                f"support_mode='row_topk', got {support_mode!r}."
+            )
+        gt_filter_topk_value = int(gt_filter_topk or 0)
+        if gt_filter_topk_value < 0:
+            raise ValueError(
+                "gt_filter_topk must be >= 0 for get_topk_logits_ipc, "
+                f"got {gt_filter_topk_value}"
+            )
+
+        forward_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+        sequence_dim, seq_dim_size = check_sequence_dim(data)
+        target_local_seq = seq_dim_size // self.cp_size
+        post_processor = SparseLogitsPostProcessor(
+            cfg=self.cfg,
+            tp_mesh=self.tp_mesh,
+            cp_mesh=self.cp_mesh,
+            cp_size=self.cp_size,
+            k=k,
+            temperature=temperature,
+            vocab_size=vocab_size,
+            gt_filter_topk=gt_filter_topk_value,
+        )
+
+        output_logits: list[torch.Tensor] = []
+        output_indices: list[torch.Tensor] = []
+        output_log_z: list[torch.Tensor] = []
+        output_gt_in_topk: list[torch.Tensor] = []
+        self.model.eval()
+        with torch.no_grad():
+            data.to("cuda")
+            processed_iterator, iterator_len = get_microbatch_iterator(
+                data,
+                self.cfg,
+                forward_batch_size,
+                self.dp_mesh,
+                tokenizer=self.tokenizer,
+                cp_size=self.cp_size,
+            )
+            for batch_idx, processed_mb in enumerate(processed_iterator):
+                processed_inputs = processed_mb.processed_inputs
+                prepared = prepare_model_forward(
+                    self.model,
+                    processed_inputs,
+                    device_mesh=self.device_mesh,
+                    cp_size=self.cp_size,
+                    padding_token_id=self.tokenizer.pad_token_id or 0,
+                    is_reward_model=False,
+                    allow_flash_attn_args=self.allow_flash_attn_args,
+                )
+                with prepared.model_context_factory(), self._autocast_context():
+                    sparse_values, _metrics, _ = forward_with_post_processing_fn(
+                        model=self.model,
+                        prepared=prepared,
+                        post_processing_fn=post_processor,
+                        processed_mb=processed_mb,
+                        sampling_params=self.sampling_params,
+                        sequence_dim=sequence_dim,
+                    )
+                if batch_idx >= iterator_len:
+                    continue
+                topk_logits, topk_indices, log_z, gt_in_topk = sparse_values
+                pad_needed = target_local_seq - topk_logits.shape[1]
+                if pad_needed > 0:
+                    topk_logits = torch.nn.functional.pad(
+                        topk_logits,
+                        (0, 0, 0, pad_needed, 0, 0),
+                        mode="constant",
+                        value=0.0,
+                    )
+                    topk_indices = torch.nn.functional.pad(
+                        topk_indices,
+                        (0, 0, 0, pad_needed, 0, 0),
+                        mode="constant",
+                        value=0,
+                    )
+                    log_z = torch.nn.functional.pad(
+                        log_z,
+                        (0, pad_needed, 0, 0),
+                        mode="constant",
+                        value=0.0,
+                    )
+                    if gt_in_topk is not None:
+                        gt_in_topk = torch.nn.functional.pad(
+                            gt_in_topk,
+                            (0, pad_needed, 0, 0),
+                            mode="constant",
+                            value=False,
+                        )
+                output_logits.append(topk_logits.contiguous())
+                output_indices.append(topk_indices.to(torch.int32).contiguous())
+                output_log_z.append(log_z.contiguous())
+                if gt_in_topk is not None:
+                    output_gt_in_topk.append(gt_in_topk.to(torch.int32).contiguous())
+
+        if not output_logits:
+            raise RuntimeError("No valid microbatches produced sparse teacher logits.")
+        final_logits = torch.cat(output_logits, dim=0)
+        final_indices = torch.cat(output_indices, dim=0)
+        final_log_z = torch.cat(output_log_z, dim=0)
+        final_gt_in_topk = (
+            torch.cat(output_gt_in_topk, dim=0) if output_gt_in_topk else None
+        )
+
+        sparse_sources = [final_logits, final_indices, final_log_z]
+        if final_gt_in_topk is not None:
+            sparse_sources.append(final_gt_in_topk)
+        existing_sparse_storage = self._teacher_sparse_ipc_buffer or []
+        sparse_storage: list[torch.Tensor] = []
+        sparse_views: list[torch.Tensor] = []
+        for tensor_idx, source in enumerate(sparse_sources):
+            storage = (
+                existing_sparse_storage[tensor_idx]
+                if tensor_idx < len(existing_sparse_storage)
+                else None
+            )
+            needs_reallocation = (
+                storage is None
+                or storage.ndim != source.ndim
+                or any(
+                    storage.shape[dim] < source.shape[dim] for dim in range(source.ndim)
+                )
+                or storage.dtype != source.dtype
+                or storage.device != source.device
+            )
+            if needs_reallocation:
+                storage = torch.empty_like(source)
+            target = storage[tuple(slice(0, size) for size in source.shape)]
+            target.copy_(source)
+            sparse_storage.append(storage)
+            sparse_views.append(target)
+        self._teacher_sparse_ipc_buffer = sparse_storage
+        final_logits = sparse_views[0]
+        final_indices = sparse_views[1]
+        final_log_z = sparse_views[2]
+        final_gt_in_topk = sparse_views[3] if len(sparse_views) == 4 else None
+        torch.cuda.synchronize()
+
+        sparse_bytes = (
+            final_logits.numel() * final_logits.element_size()
+            + final_indices.numel() * final_indices.element_size()
+            + final_log_z.numel() * final_log_z.element_size()
+        )
+        if final_gt_in_topk is not None:
+            sparse_bytes += final_gt_in_topk.numel() * final_gt_in_topk.element_size()
+        full_vocab = int(vocab_size or final_indices.max().item() + 1)
+        full_bytes_estimate = (
+            final_logits.shape[0]
+            * final_logits.shape[1]
+            * full_vocab
+            * final_logits.element_size()
+        )
+        print(
+            "Sparse teacher IPC buffer: "
+            f"shape={tuple(final_logits.shape)} "
+            f"support_mode={support_mode} "
+            f"bytes={sparse_bytes / (1024**3):.2f}GiB "
+            f"full_est={full_bytes_estimate / (1024**3):.2f}GiB",
+            flush=True,
+        )
+
+        cp_rank = self.cp_mesh.get_local_rank()
+        dp_rank = self.dp_mesh.get_local_rank()
+        global_seq_start = cp_rank * final_logits.shape[1]
+        per_sample_handles: list[dict[str, Any]] = []
+        for sample_idx in range(final_logits.shape[0]):
+            logits_sample = final_logits[sample_idx]
+            indices_sample = final_indices[sample_idx]
+            log_z_sample = final_log_z[sample_idx]
+            handle: dict[str, Any] = {
+                "topk_logits_ipc": get_handle_from_tensor(logits_sample),
+                "topk_indices_ipc": get_handle_from_tensor(indices_sample),
+                "log_z_ipc": get_handle_from_tensor(log_z_sample),
+                "topk_shape": tuple(logits_sample.shape),
+                "topk_dtype": logits_sample.dtype,
+                "indices_dtype": indices_sample.dtype,
+                "log_z_dtype": log_z_sample.dtype,
+                "cp_rank": cp_rank,
+                "cp_size": self.cp_size,
+                "global_seq_start": global_seq_start,
+                "full_seq_len": final_logits.shape[1] * self.cp_size,
+            }
+            if final_gt_in_topk is not None:
+                gt_sample = final_gt_in_topk[sample_idx]
+                handle.update(
+                    {
+                        "gt_in_topk_ipc": get_handle_from_tensor(gt_sample),
+                        "gt_in_topk_dtype": gt_sample.dtype,
+                    }
+                )
+            per_sample_handles.append(handle)
+        return {"per_sample_handles": per_sample_handles, "dp_rank": dp_rank}
+
     def release_ipc_buffer(self) -> None:
         """Free the persistent teacher-logit IPC storage. Called once at end of training/validation."""
         self._teacher_ipc_storage = None
         self._teacher_ipc_handle = None
+        self._teacher_sparse_ipc_buffer = None
         gc.collect()
         torch.cuda.empty_cache()
 

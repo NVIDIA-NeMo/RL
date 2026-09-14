@@ -223,6 +223,7 @@ class DTensorConfig(TypedDict):
 
 class SequencePackingConfigDisabled(TypedDict):
     enabled: Literal[False]
+    fuse_loss: NotRequired[bool]
 
 
 class SequencePackingConfig(TypedDict):
@@ -231,6 +232,7 @@ class SequencePackingConfig(TypedDict):
     # Not required because some algorithms like SFT don't calculate log probs
     logprob_mb_tokens: NotRequired[int]
     algorithm: str
+    sequence_length_round: NotRequired[int]
     # Preserve the packer's order (or omit for backward compatibility), or
     # execute each DP rank's assigned bins largest-first for allocator reuse.
     microbatch_order: NotRequired[Literal["packer", "largest_first"]]
@@ -287,6 +289,13 @@ class MegatronOptimizerConfig(TypedDict):
     # distributed optimizer
     use_distributed_optimizer: bool
     use_precision_aware_optimizer: bool
+    # Precision-aware optimizer tensor dtypes. These are optional MCore
+    # pass-throughs; when omitted, MCore owns their defaults.
+    main_grads_dtype: NotRequired[str]
+    main_params_dtype: NotRequired[str]
+    exp_avg_dtype: NotRequired[str]
+    exp_avg_sq_dtype: NotRequired[str]
+    store_param_remainders: NotRequired[bool]
     clip_grad: float
     # knob to enable optimizer cpu offload
     optimizer_cpu_offload: bool
@@ -312,8 +321,12 @@ class MegatronSchedulerConfig(TypedDict):
 
 class MegatronDDPConfig(TypedDict):
     grad_reduce_in_fp32: bool
+    # Communicate low-precision gradients while accumulating each reduced shard
+    # in FP32, then cast the result back to the gradient-buffer dtype.
+    reduce_scatter_with_fp32_accumulation: NotRequired[bool]
     overlap_grad_reduce: bool
     overlap_param_gather: bool
+    use_megatron_fsdp: NotRequired[bool]
     use_custom_fsdp: bool
     data_parallel_sharding_strategy: str
 

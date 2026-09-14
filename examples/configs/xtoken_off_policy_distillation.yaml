@@ -68,10 +68,20 @@ loss_fn:
   # Drop chunks whose realized teacher label fell outside the teacher's true
   # top-k (0 disables the filter).
   prefix_bidir_v3_noise_filter_topk: 0
+  # Teacher-logit IPC transport for cross-tokenizer teachers. 0 keeps the
+  # exact dense full-vocab path; k > 0 sends row-wise sparse support with the
+  # exact full-vocab log-normalizer and a rest bucket.
+  teacher_topk_ipc_k: 0
+  # Sparse support selection. The current port supports row-wise top-k
+  # independently at each teacher position.
+  teacher_topk_ipc_support_mode: "row_topk"
+  # When sparse transport is active, reserve each realized teacher label in
+  # the support. This also permits one-element mismatch support in v6.
+  teacher_topk_ipc_keep_realized: true
   # Advanced (unset => v6 defaults): the non-1-to-1 mismatch weighting
   # (prefix_bidir_v3_mismatch_pos0_alpha / _mismatch_loss_beta, both require
-  # position_0_kl: true), the pure-ALM baseline (prefix_bidir_v3_pure_alm), and
-  # the sparse teacher-IPC top-k path (teacher_topk_ipc_k, ...). See
+  # position_0_kl: true) and the pure-ALM baseline
+  # (prefix_bidir_v3_pure_alm). See
   # CrossTokenizerDistillationLossConfig for the full set.
   # ---- Multi-teacher aggregation (defaults reproduce single-teacher) ----
   # kd_loss_mode: how per-teacher KD terms are combined.
@@ -110,6 +120,12 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: true
+  # Replay the exact expert assignments captured by a student vLLM rollout.
+  # When enabled, xToken requires per-message token_ids + routed_experts,
+  # verifies that they match the freshly tokenized student sequence, and fails
+  # before training if the metadata is missing or stale. Megatron-only.
+  router_replay:
+    enabled: false
   dtensor_cfg:
     enabled: true
     _v2: true
@@ -126,11 +142,15 @@ policy:
     # on every rank first. Lowers peak memory for large checkpoints.
     shard_before_load: false
   # Megatron-Core backend base for the student (disabled by default). xToken
-  # cross-tokenizer distillation supports Megatron only at
-  # pipeline_model_parallel_size == 1 and context_parallel_size == 1 (v0).
+  # cross-tokenizer distillation supports Megatron tensor, context AND pipeline
+  # parallelism. Under PP only the last stage holds logits, so only it exports
+  # teacher-logit IPC handles; on >1 node the whole tp*cp*pp group must fit in
+  # one node so that stage stays co-located with the importing student ranks.
   # Recipes select it by setting megatron_cfg.enabled: true and
   # dtensor_cfg.enabled: false. A Megatron student's optimizer / scheduler live
   # HERE (megatron_cfg.optimizer / .scheduler), not at policy.optimizer / .scheduler.
+  # With context_parallel_size > 1 set make_sequence_length_divisible_by to
+  # tensor_model_parallel_size * context_parallel_size * 2.
   megatron_cfg:
     enabled: false
     empty_unused_memory_level: 0
@@ -219,6 +239,7 @@ policy:
     algorithm: "modified_first_fit_decreasing"
     microbatch_order: "packer"
     sequence_length_round: 64
+    fuse_loss: false
   optimizer:
     name: "torch.optim.AdamW"
     kwargs:
@@ -287,7 +308,8 @@ teachers:
       shard_before_load: false
     # Megatron-Core backend base for this teacher (inference-only; disabled by
     # default). Recipes set megatron_cfg.enabled: true + dtensor_cfg.enabled:
-    # false to run the teacher on Megatron. xToken requires PP == 1 and CP == 1.
+    # false to run the teacher on Megatron. TP/CP/PP are all supported and may
+    # differ from the student's.
     megatron_cfg:
       enabled: false
       empty_unused_memory_level: 0
@@ -371,6 +393,7 @@ teachers:
       algorithm: "modified_first_fit_decreasing"
       microbatch_order: "packer"
       sequence_length_round: 64
+      fuse_loss: false
     optimizer:
       name: "torch.optim.AdamW"
       kwargs:
@@ -425,6 +448,7 @@ teachers:
   #     algorithm: "modified_first_fit_decreasing"
   #     microbatch_order: "packer"
   #     sequence_length_round: 64
+  #     fuse_loss: false
   #   optimizer:
   #     name: "torch.optim.AdamW"
   #     kwargs:

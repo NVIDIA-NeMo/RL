@@ -68,10 +68,20 @@ loss_fn:
   # Drop chunks whose realized teacher label fell outside the teacher's true
   # top-k (0 disables the filter).
   prefix_bidir_v3_noise_filter_topk: 0
+  # Teacher-logit IPC transport for cross-tokenizer teachers. 0 keeps the
+  # exact dense full-vocab path; k > 0 sends row-wise sparse support with the
+  # exact full-vocab log-normalizer and a rest bucket.
+  teacher_topk_ipc_k: 0
+  # Sparse support selection. The current port supports row-wise top-k
+  # independently at each teacher position.
+  teacher_topk_ipc_support_mode: "row_topk"
+  # When sparse transport is active, reserve each realized teacher label in
+  # the support. This also permits one-element mismatch support in v6.
+  teacher_topk_ipc_keep_realized: true
   # Advanced (unset => v6 defaults): the non-1-to-1 mismatch weighting
   # (prefix_bidir_v3_mismatch_pos0_alpha / _mismatch_loss_beta, both require
-  # position_0_kl: true), the pure-ALM baseline (prefix_bidir_v3_pure_alm), and
-  # the sparse teacher-IPC top-k path (teacher_topk_ipc_k, ...). See
+  # position_0_kl: true) and the pure-ALM baseline
+  # (prefix_bidir_v3_pure_alm). See
   # CrossTokenizerDistillationLossConfig for the full set.
   # ---- Multi-teacher aggregation (defaults reproduce single-teacher) ----
   # kd_loss_mode: how per-teacher KD terms are combined.
@@ -85,6 +95,11 @@ loss_fn:
   sum_weights_metric: null
   alpha: 1.0                  # softmax temperature on dynamic teacher weights
   normalize_teacher_by_vocab: false  # rescale by log(V_t_i)/log(min_j V_t_j)
+  # Per-teacher routing observability is emitted under the training prefix:
+  #   train/teacher_<i>/routed_samples  - non-padding rows sent to teacher i
+  #   train/teacher_<i>/routed_tokens   - input tokens in teacher i's tokenizer
+  #   train/teacher_<i>/weighted_kl     - contribution to train/kl_loss after
+  #                                       teacher weight / vocab normalization
 
 checkpointing:
   enabled: false
@@ -143,6 +158,7 @@ policy:
     algorithm: "modified_first_fit_decreasing"
     microbatch_order: "packer"
     sequence_length_round: 64
+    fuse_loss: false
   optimizer:
     name: "torch.optim.AdamW"
     kwargs:
@@ -207,7 +223,7 @@ teachers:
       # A teacher runs inference-only, so "bfloat16" here halves initialization
       # and resident parameter memory at no cost — there is no optimizer whose
       # master weights would lose precision.
-      load_precision: "float32"
+      load_precision: "bfloat16"
       shard_before_load: false
     max_grad_norm: 1.0
     dynamic_batching:
@@ -222,6 +238,7 @@ teachers:
       algorithm: "modified_first_fit_decreasing"
       microbatch_order: "packer"
       sequence_length_round: 64
+      fuse_loss: false
     optimizer:
       name: "torch.optim.AdamW"
       kwargs:
@@ -266,7 +283,7 @@ teachers:
       # A teacher runs inference-only, so "bfloat16" here halves initialization
       # and resident parameter memory at no cost — there is no optimizer whose
       # master weights would lose precision.
-      load_precision: "float32"
+      load_precision: "bfloat16"
       shard_before_load: false
     max_grad_norm: 1.0
     dynamic_batching:
@@ -281,6 +298,7 @@ teachers:
       algorithm: "modified_first_fit_decreasing"
       microbatch_order: "packer"
       sequence_length_round: 64
+      fuse_loss: false
     optimizer:
       name: "torch.optim.AdamW"
       kwargs:

@@ -18,7 +18,7 @@ import traceback
 import warnings
 from datetime import timedelta
 from enum import Enum
-from typing import Any, Dict, Iterable, Optional, cast
+from typing import Any, Dict, Iterable, Mapping, Optional, cast
 
 import torch
 import torch.distributed as dist
@@ -83,6 +83,7 @@ HF_AUTOMODEL_FACTORY: Dict[str, Any] = {
 }
 
 AUTOMODEL_FACTORY: Dict[str, Any] = HF_AUTOMODEL_FACTORY
+DENSE_TEACHER_IPC_FLAT_LAYOUT = "flat_valid_prefix_v1"
 
 if NEMO_AUTOMODEL_AVAILABLE:
     AUTOMODEL_FACTORY = {
@@ -319,26 +320,769 @@ def ensure_teacher_ipc_buffer(
     return storage, handle
 
 
+def ensure_teacher_ipc_row_buffer(
+    storage: Optional[torch.Tensor],
+    total_rows: int,
+    seq_len: int,
+    vocab_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Lazy-allocate a compact ``[sum(B_mb), T, V]`` teacher IPC slab.
+
+    Only the row capacity may be reused at a larger size. Sequence/vocabulary
+    geometry, dtype, and device must match exactly so every exported bin view is
+    contiguous and preserves the existing ``[1, B_mb, T, V]`` IPC contract.
+    """
+    if total_rows <= 0 or seq_len <= 0 or vocab_size <= 0:
+        raise ValueError(
+            "Dense teacher IPC dimensions must be positive, got "
+            f"rows={total_rows}, seq_len={seq_len}, vocab_size={vocab_size}."
+        )
+    needs_realloc = (
+        storage is None
+        or storage.ndim != 3
+        or storage.shape[0] < total_rows
+        or tuple(storage.shape[1:]) != (seq_len, vocab_size)
+        or storage.dtype != dtype
+        or storage.device != device
+    )
+    if needs_realloc:
+        storage = torch.empty(
+            (total_rows, seq_len, vocab_size),
+            dtype=dtype,
+            device=device,
+        )
+    return storage
+
+
+def partition_teacher_ipc_row_buffer(
+    storage: torch.Tensor, batch_sizes: Iterable[int]
+) -> list[tuple[int, torch.Tensor]]:
+    """Return compact row offsets and legacy-compatible 4-D bin views.
+
+    Each view has shape ``[1, B_mb, T, V]`` and addresses a disjoint contiguous
+    range of the shared row slab. Exporting the views through CUDA IPC therefore
+    keeps existing consumers' ``buf_idx=0`` / bin-local sample indexing and
+    zero-copy fast path while avoiding ``N_mb * max(B_mb)`` padding rows.
+    """
+    if storage.ndim != 3:
+        raise ValueError(
+            "Dense teacher IPC row storage must be three-dimensional, got "
+            f"shape={tuple(storage.shape)}."
+        )
+    normalized_batch_sizes = [int(batch_size) for batch_size in batch_sizes]
+    if any(batch_size <= 0 for batch_size in normalized_batch_sizes):
+        raise ValueError(
+            "Dense teacher IPC microbatch cardinalities must be positive, got "
+            f"{normalized_batch_sizes}."
+        )
+    total_rows = sum(normalized_batch_sizes)
+    if total_rows > storage.shape[0]:
+        raise ValueError(
+            "Dense teacher IPC row partitions exceed storage capacity: "
+            f"rows={total_rows}, capacity={storage.shape[0]}."
+        )
+
+    partitions: list[tuple[int, torch.Tensor]] = []
+    row_offset = 0
+    for batch_size in normalized_batch_sizes:
+        next_offset = row_offset + batch_size
+        partitions.append((row_offset, storage[row_offset:next_offset].unsqueeze(0)))
+        row_offset = next_offset
+    return partitions
+
+
+def extract_teacher_ipc_valid_lengths(
+    data: Mapping[str, Any],
+    expected_batch_size: int,
+    *,
+    full_seq_len: int,
+    compact_padding: bool,
+) -> list[int]:
+    """Return the logical valid prefix length for every teacher row.
+
+    Packed :class:`FullLogitsPostProcessor` uses ``input_lengths`` as its
+    authoritative raw boundary. It either zero-fills the remainder of a logical
+    dense row or streams only the valid prefix; the compact consumer reconstructs
+    the omitted suffix as zero in both cases. The unpacked path does not promise
+    zero logits at padding positions, so it deliberately retains the complete
+    logical width.
+    """
+    if expected_batch_size <= 0 or full_seq_len <= 0:
+        raise ValueError(
+            "Dense teacher IPC row geometry must be positive, got "
+            f"rows={expected_batch_size}, full_seq_len={full_seq_len}."
+        )
+    if not compact_padding:
+        return [full_seq_len] * expected_batch_size
+
+    values = data.get("input_lengths")
+    if values is None:
+        raise ValueError(
+            "Packed dense teacher IPC requires input_lengths on every logical "
+            "microbatch row."
+        )
+    if isinstance(values, torch.Tensor):
+        if values.ndim != 1:
+            raise ValueError(
+                "input_lengths must be a one-dimensional tensor, got shape "
+                f"{tuple(values.shape)}."
+            )
+        if torch.is_floating_point(values) or torch.is_complex(values):
+            raise TypeError(
+                "input_lengths must use an integer dtype for dense teacher IPC, "
+                f"got {values.dtype}."
+            )
+        normalized = [int(value) for value in values.detach().cpu().tolist()]
+    elif isinstance(values, (list, tuple)):
+        normalized = [int(value) for value in values]
+    else:
+        raise TypeError(
+            "input_lengths must be a one-dimensional tensor, list, or tuple, "
+            f"got {type(values).__name__}."
+        )
+    if len(normalized) != expected_batch_size:
+        raise ValueError(
+            "input_lengths cardinality does not match the logical microbatch: "
+            f"lengths={len(normalized)}, rows={expected_batch_size}."
+        )
+    invalid = [value for value in normalized if value < 0 or value > full_seq_len]
+    if invalid:
+        raise ValueError(
+            "Dense teacher IPC input_lengths must lie within the logical "
+            f"sequence width [0, {full_seq_len}], got {invalid}."
+        )
+    return normalized
+
+
+def localize_teacher_ipc_valid_lengths(
+    valid_lengths: Iterable[int],
+    *,
+    full_seq_len: int,
+    cp_rank: int,
+    cp_size: int,
+) -> list[int]:
+    """Intersect global valid prefixes with one teacher CP rectangle."""
+    if cp_size <= 0 or cp_rank < 0 or cp_rank >= cp_size:
+        raise ValueError(
+            f"Invalid context-parallel coordinates: rank={cp_rank}, size={cp_size}."
+        )
+    if full_seq_len <= 0 or full_seq_len % cp_size != 0:
+        raise ValueError(
+            f"Logical dense teacher width {full_seq_len} must be positive and "
+            f"divisible by context-parallel size {cp_size}."
+        )
+    local_seq_len = full_seq_len // cp_size
+    global_seq_start = cp_rank * local_seq_len
+    global_seq_end = global_seq_start + local_seq_len
+    localized: list[int] = []
+    for value in valid_lengths:
+        valid_seq_len = int(value)
+        if valid_seq_len < 0 or valid_seq_len > full_seq_len:
+            raise ValueError(
+                "Dense teacher IPC valid length must lie within the logical "
+                f"sequence width [0, {full_seq_len}], got {valid_seq_len}."
+            )
+        localized.append(max(0, min(valid_seq_len, global_seq_end) - global_seq_start))
+    return localized
+
+
+def can_reuse_teacher_ipc_token_buffer(
+    storage: Optional[torch.Tensor],
+    *,
+    total_tokens: int,
+    vocab_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> bool:
+    """Return whether ``storage`` can hold one compact teacher IPC payload."""
+    if total_tokens < 0 or vocab_size <= 0:
+        raise ValueError(
+            "Dense teacher IPC token geometry is invalid, got "
+            f"tokens={total_tokens}, vocab_size={vocab_size}."
+        )
+    return (
+        storage is not None
+        and storage.ndim == 2
+        and storage.shape[0] >= total_tokens
+        and storage.shape[1] == vocab_size
+        and storage.dtype == dtype
+        and storage.device == device
+    )
+
+
+def ensure_teacher_ipc_token_buffer(
+    storage: Optional[torch.Tensor],
+    *,
+    total_tokens: int,
+    vocab_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Lazy-allocate a flat ``[sum(valid_local_T), V]`` teacher IPC slab."""
+    if not can_reuse_teacher_ipc_token_buffer(
+        storage,
+        total_tokens=total_tokens,
+        vocab_size=vocab_size,
+        dtype=dtype,
+        device=device,
+    ):
+        storage = torch.empty(
+            (total_tokens, vocab_size),
+            dtype=dtype,
+            device=device,
+        )
+    assert storage is not None
+    return storage
+
+
+def partition_teacher_ipc_token_buffer(
+    storage: torch.Tensor,
+    valid_lengths_by_microbatch: Iterable[Iterable[int]],
+) -> list[list[tuple[int, torch.Tensor]]]:
+    """Return token offsets and allocation-free row views into a flat slab."""
+    if storage.ndim != 2:
+        raise ValueError(
+            "Dense teacher IPC token storage must be two-dimensional, got "
+            f"shape={tuple(storage.shape)}."
+        )
+    normalized = [
+        [int(valid_length) for valid_length in microbatch_lengths]
+        for microbatch_lengths in valid_lengths_by_microbatch
+    ]
+    if any(valid_length < 0 for lengths in normalized for valid_length in lengths):
+        raise ValueError(
+            "Dense teacher IPC local valid lengths must be non-negative, got "
+            f"{normalized}."
+        )
+    total_tokens = sum(sum(lengths) for lengths in normalized)
+    if total_tokens > storage.shape[0]:
+        raise ValueError(
+            "Dense teacher IPC token partitions exceed storage capacity: "
+            f"tokens={total_tokens}, capacity={storage.shape[0]}."
+        )
+
+    partitions: list[list[tuple[int, torch.Tensor]]] = []
+    token_offset = 0
+    for microbatch_lengths in normalized:
+        microbatch_partitions: list[tuple[int, torch.Tensor]] = []
+        for valid_length in microbatch_lengths:
+            next_offset = token_offset + valid_length
+            microbatch_partitions.append(
+                (token_offset, storage[token_offset:next_offset])
+            )
+            token_offset = next_offset
+        partitions.append(microbatch_partitions)
+    return partitions
+
+
+def validate_compact_teacher_ipc_handle(
+    handle: Mapping[str, Any],
+) -> Optional[tuple[int, int, int, int]]:
+    """Validate compact dense-IPC metadata and return its physical geometry.
+
+    Legacy rectangular handles have no ``ipc_layout`` field and return
+    ``None``.  Compact handles return ``(token_offset, stored_seq_len,
+    used_tokens, local_vocab_size)``.  Unknown or partial schemas fail loudly
+    so a malformed handle cannot silently read another row's logits.
+    """
+    layout = handle.get("ipc_layout")
+    if layout is None:
+        return None
+    if layout != DENSE_TEACHER_IPC_FLAT_LAYOUT:
+        raise ValueError(f"Unsupported dense teacher IPC layout {layout!r}.")
+
+    required_fields = {
+        "actual_shape",
+        "dtype",
+        "full_seq_len",
+        "global_seq_start",
+        "payload_ipc",
+        "storage_capacity_tokens",
+        "storage_shape",
+        "storage_token_offset",
+        "storage_used_tokens",
+        "stored_seq_len",
+        "valid_seq_len",
+    }
+    missing_fields = required_fields - handle.keys()
+    if missing_fields:
+        raise ValueError(
+            "Compact dense teacher IPC handle is missing metadata "
+            f"{sorted(missing_fields)}."
+        )
+
+    actual_shape = handle["actual_shape"]
+    storage_shape = handle["storage_shape"]
+    if (
+        not isinstance(actual_shape, (list, tuple, torch.Size))
+        or len(actual_shape) != 2
+    ):
+        raise ValueError(
+            "Compact dense teacher IPC actual_shape must be two-dimensional, "
+            f"got {actual_shape!r}."
+        )
+    if (
+        not isinstance(storage_shape, (list, tuple, torch.Size))
+        or len(storage_shape) != 2
+    ):
+        raise ValueError(
+            "Compact dense teacher IPC storage_shape must be two-dimensional, "
+            f"got {storage_shape!r}."
+        )
+
+    local_seq_len, local_vocab_size = (int(value) for value in actual_shape)
+    capacity_tokens, storage_vocab_size = (int(value) for value in storage_shape)
+    full_seq_len = int(handle["full_seq_len"])
+    global_seq_start = int(handle["global_seq_start"])
+    valid_seq_len = int(handle["valid_seq_len"])
+    stored_seq_len = int(handle["stored_seq_len"])
+    token_offset = int(handle["storage_token_offset"])
+    used_tokens = int(handle["storage_used_tokens"])
+    declared_capacity = int(handle["storage_capacity_tokens"])
+
+    if (
+        local_seq_len <= 0
+        or local_vocab_size <= 0
+        or full_seq_len <= 0
+        or global_seq_start < 0
+        or global_seq_start + local_seq_len > full_seq_len
+    ):
+        raise ValueError(
+            "Compact dense teacher IPC has invalid logical sequence/vocabulary "
+            f"geometry: actual_shape={tuple(actual_shape)}, global_seq_start="
+            f"{global_seq_start}, full_seq_len={full_seq_len}."
+        )
+    if storage_vocab_size != local_vocab_size or capacity_tokens < 0:
+        raise ValueError(
+            "Compact dense teacher IPC storage shape disagrees with the logical "
+            f"vocabulary shard: storage_shape={tuple(storage_shape)}, "
+            f"actual_shape={tuple(actual_shape)}."
+        )
+    if declared_capacity != capacity_tokens:
+        raise ValueError(
+            "Compact dense teacher IPC storage capacity metadata disagrees with "
+            f"storage_shape: declared={declared_capacity}, shape={capacity_tokens}."
+        )
+    if valid_seq_len < 0 or valid_seq_len > full_seq_len:
+        raise ValueError(
+            "Compact dense teacher IPC valid_seq_len lies outside the logical "
+            f"sequence: valid={valid_seq_len}, full={full_seq_len}."
+        )
+    expected_stored_seq_len = max(
+        0,
+        min(valid_seq_len, global_seq_start + local_seq_len) - global_seq_start,
+    )
+    if stored_seq_len != expected_stored_seq_len:
+        raise ValueError(
+            "Compact dense teacher IPC stored_seq_len disagrees with the valid "
+            f"CP overlap: stored={stored_seq_len}, expected="
+            f"{expected_stored_seq_len}."
+        )
+    if (
+        used_tokens < 0
+        or used_tokens > capacity_tokens
+        or token_offset < 0
+        or token_offset > used_tokens
+        or token_offset + stored_seq_len > used_tokens
+    ):
+        raise ValueError(
+            "Compact dense teacher IPC token range is outside storage bounds: "
+            f"offset={token_offset}, stored={stored_seq_len}, used={used_tokens}, "
+            f"capacity={capacity_tokens}."
+        )
+    if stored_seq_len > 0 and handle["payload_ipc"] is None:
+        raise ValueError(
+            "Compact dense teacher IPC omitted payload_ipc for a non-empty row."
+        )
+    return token_offset, stored_seq_len, used_tokens, local_vocab_size
+
+
+def extract_batch_item_ids(
+    data: Mapping[str, Any],
+    expected_batch_size: int,
+    *,
+    required: bool,
+) -> list[int] | None:
+    """Read occurrence identities from one logical microbatch.
+
+    Packed teacher IPC must be routed by occurrence identity rather than by a
+    bin-local position. The helper accepts the tensor or list representation
+    used by :class:`BatchedDataDict`, validates cardinality, and deliberately
+    does not synthesize identities when the controller did not provide them.
+    """
+    values = data.get("batch_item_id")
+    if values is None:
+        if required:
+            raise ValueError(
+                "Packed dense teacher IPC requires batch_item_id on every "
+                "logical microbatch row."
+            )
+        return None
+    if isinstance(values, torch.Tensor):
+        if values.ndim != 1:
+            raise ValueError(
+                "batch_item_id must be a one-dimensional tensor, got shape "
+                f"{tuple(values.shape)}."
+            )
+        normalized = [int(value) for value in values.detach().cpu().tolist()]
+    else:
+        normalized = [int(value) for value in values]
+    if len(normalized) != expected_batch_size:
+        raise ValueError(
+            "batch_item_id cardinality does not match the logical microbatch: "
+            f"ids={len(normalized)}, rows={expected_batch_size}."
+        )
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(
+            f"batch_item_id values must be unique within a microbatch, got {normalized}."
+        )
+    return normalized
+
+
+def get_dense_ipc_sequence_layout(
+    data: Mapping[str, Any], *, cp_rank: int, cp_size: int
+) -> tuple[int, int, int]:
+    """Return logical dense-IPC ``(full, local, start)`` sequence geometry.
+
+    Packed backend schedulers operate on a physical bin width, which can be
+    much larger than the original per-sample token rectangle restored by the
+    full-logit postprocessor. IPC metadata must describe that logical rectangle
+    rather than the packed scheduler width so teacher masks and alignment axes
+    agree with reconstruction.
+    """
+    if cp_size <= 0 or cp_rank < 0 or cp_rank >= cp_size:
+        raise ValueError(
+            f"Invalid context-parallel coordinates: rank={cp_rank}, size={cp_size}."
+        )
+    input_ids = data.get("input_ids")
+    if not isinstance(input_ids, torch.Tensor) or input_ids.ndim < 2:
+        raise ValueError(
+            "Dense teacher IPC requires input_ids with a logical sequence axis."
+        )
+    full_seq_len = int(input_ids.shape[1])
+    if full_seq_len % cp_size != 0:
+        raise ValueError(
+            f"Logical dense teacher width {full_seq_len} must be divisible by "
+            f"context-parallel size {cp_size}."
+        )
+    local_seq_len = full_seq_len // cp_size
+    return full_seq_len, local_seq_len, cp_rank * local_seq_len
+
+
+def _validate_dense_ipc_shard_coverage(
+    batch_item_id: int, teacher_shards: list[dict[str, Any]]
+) -> None:
+    """Validate that one sample has a complete, non-overlapping TP/CP grid."""
+    required_fields = {
+        "actual_shape",
+        "cp_rank",
+        "cp_size",
+        "full_seq_len",
+        "full_vocab_size",
+        "global_seq_start",
+        "tp_rank",
+        "tp_size",
+        "vocab_end_index",
+        "vocab_start_index",
+    }
+    first = teacher_shards[0]
+    missing_fields = required_fields - first.keys()
+    if missing_fields:
+        raise ValueError(
+            f"Dense teacher IPC shard for batch_item_id={batch_item_id} is "
+            f"missing coverage metadata {sorted(missing_fields)}."
+        )
+
+    tp_size = int(first["tp_size"])
+    cp_size = int(first["cp_size"])
+    full_seq_len = int(first["full_seq_len"])
+    full_vocab_size = int(first["full_vocab_size"])
+    if tp_size <= 0 or cp_size <= 0:
+        raise ValueError(
+            f"Dense teacher IPC for batch_item_id={batch_item_id} has invalid "
+            f"parallel sizes tp_size={tp_size}, cp_size={cp_size}."
+        )
+    if full_seq_len <= 0 or full_vocab_size <= 0:
+        raise ValueError(
+            f"Dense teacher IPC for batch_item_id={batch_item_id} has invalid "
+            f"logical shape ({full_seq_len}, {full_vocab_size})."
+        )
+
+    coordinates: set[tuple[int, int]] = set()
+    sequence_ranges: dict[int, tuple[int, int]] = {}
+    vocab_ranges: dict[int, tuple[int, int]] = {}
+    layouts: set[Optional[str]] = set()
+    valid_seq_lengths: set[int] = set()
+    compact_geometry_by_cp: dict[int, tuple[int, int, int, int]] = {}
+    for shard in teacher_shards:
+        missing_fields = required_fields - shard.keys()
+        if missing_fields:
+            raise ValueError(
+                f"Dense teacher IPC shard for batch_item_id={batch_item_id} is "
+                f"missing coverage metadata {sorted(missing_fields)}."
+            )
+        shard_tp_size = int(shard["tp_size"])
+        shard_cp_size = int(shard["cp_size"])
+        shard_full_seq_len = int(shard["full_seq_len"])
+        shard_full_vocab_size = int(shard["full_vocab_size"])
+        if (
+            shard_tp_size != tp_size
+            or shard_cp_size != cp_size
+            or shard_full_seq_len != full_seq_len
+            or shard_full_vocab_size != full_vocab_size
+        ):
+            raise ValueError(
+                "Dense teacher IPC shards disagree on topology or logical shape "
+                f"for batch_item_id={batch_item_id}."
+            )
+
+        tp_rank = int(shard["tp_rank"])
+        cp_rank = int(shard["cp_rank"])
+        if tp_rank < 0 or tp_rank >= tp_size or cp_rank < 0 or cp_rank >= cp_size:
+            raise ValueError(
+                f"Dense teacher IPC shard for batch_item_id={batch_item_id} has "
+                f"out-of-range coordinate (tp={tp_rank}, cp={cp_rank}) for "
+                f"topology ({tp_size}, {cp_size})."
+            )
+        coordinate = (tp_rank, cp_rank)
+        if coordinate in coordinates:
+            raise ValueError(
+                f"Dense teacher IPC has duplicate shard coordinate {coordinate} "
+                f"for batch_item_id={batch_item_id}."
+            )
+        coordinates.add(coordinate)
+        layouts.add(shard.get("ipc_layout"))
+
+        actual_shape = shard["actual_shape"]
+        if (
+            not isinstance(actual_shape, (list, tuple, torch.Size))
+            or len(actual_shape) != 2
+        ):
+            raise ValueError(
+                f"Dense teacher IPC shard for batch_item_id={batch_item_id} must "
+                f"have two-dimensional actual_shape, got {actual_shape!r}."
+            )
+        local_seq_len, local_vocab_size = (int(value) for value in actual_shape)
+        seq_start = int(shard["global_seq_start"])
+        seq_end = seq_start + local_seq_len
+        vocab_start = int(shard["vocab_start_index"])
+        vocab_end = int(shard["vocab_end_index"])
+        if (
+            local_seq_len <= 0
+            or local_vocab_size <= 0
+            or seq_start < 0
+            or seq_end > full_seq_len
+            or vocab_start < 0
+            or vocab_end > full_vocab_size
+            or vocab_end - vocab_start != local_vocab_size
+        ):
+            raise ValueError(
+                f"Dense teacher IPC shard {coordinate} for "
+                f"batch_item_id={batch_item_id} has invalid rectangle "
+                f"seq=[{seq_start}, {seq_end}), vocab=[{vocab_start}, {vocab_end}), "
+                f"actual_shape={tuple(actual_shape)}, full_shape="
+                f"({full_seq_len}, {full_vocab_size})."
+            )
+
+        sequence_range = (seq_start, seq_end)
+        prior_sequence_range = sequence_ranges.setdefault(cp_rank, sequence_range)
+        if prior_sequence_range != sequence_range:
+            raise ValueError(
+                f"Dense teacher IPC shards for cp_rank={cp_rank} disagree on "
+                f"sequence range for batch_item_id={batch_item_id}."
+            )
+        vocab_range = (vocab_start, vocab_end)
+        prior_vocab_range = vocab_ranges.setdefault(tp_rank, vocab_range)
+        if prior_vocab_range != vocab_range:
+            raise ValueError(
+                f"Dense teacher IPC shards for tp_rank={tp_rank} disagree on "
+                f"vocabulary range for batch_item_id={batch_item_id}."
+            )
+
+        compact_geometry = validate_compact_teacher_ipc_handle(shard)
+        if compact_geometry is not None:
+            token_offset, stored_seq_len, used_tokens, _ = compact_geometry
+            valid_seq_len = int(shard["valid_seq_len"])
+            valid_seq_lengths.add(valid_seq_len)
+            storage_capacity_tokens = int(shard["storage_capacity_tokens"])
+            geometry = (
+                token_offset,
+                stored_seq_len,
+                used_tokens,
+                storage_capacity_tokens,
+            )
+            prior_geometry = compact_geometry_by_cp.setdefault(cp_rank, geometry)
+            if prior_geometry != geometry:
+                raise ValueError(
+                    "Compact dense teacher IPC TP shards disagree on physical "
+                    f"storage geometry for cp_rank={cp_rank}, "
+                    f"batch_item_id={batch_item_id}."
+                )
+
+    if len(layouts) != 1:
+        raise ValueError(
+            "Dense teacher IPC shards mix incompatible storage layouts for "
+            f"batch_item_id={batch_item_id}: {sorted(map(str, layouts))}."
+        )
+    if layouts != {None} and len(valid_seq_lengths) != 1:
+        raise ValueError(
+            "Compact dense teacher IPC shards disagree on valid_seq_len for "
+            f"batch_item_id={batch_item_id}: {sorted(valid_seq_lengths)}."
+        )
+
+    expected_coordinates = {
+        (tp_rank, cp_rank) for tp_rank in range(tp_size) for cp_rank in range(cp_size)
+    }
+    if coordinates != expected_coordinates:
+        raise ValueError(
+            "Dense teacher IPC has incomplete TP/CP shard coverage for "
+            f"batch_item_id={batch_item_id}: missing="
+            f"{sorted(expected_coordinates - coordinates)}, unexpected="
+            f"{sorted(coordinates - expected_coordinates)}."
+        )
+
+    sequence_cursor = 0
+    for cp_rank in range(cp_size):
+        seq_start, seq_end = sequence_ranges[cp_rank]
+        if seq_start != sequence_cursor:
+            raise ValueError(
+                "Dense teacher IPC sequence shards contain a gap or overlap for "
+                f"batch_item_id={batch_item_id} before cp_rank={cp_rank}: "
+                f"expected start {sequence_cursor}, got {seq_start}."
+            )
+        sequence_cursor = seq_end
+    if sequence_cursor != full_seq_len:
+        raise ValueError(
+            "Dense teacher IPC sequence shards do not cover the logical axis for "
+            f"batch_item_id={batch_item_id}: covered={sequence_cursor}, "
+            f"expected={full_seq_len}."
+        )
+
+    vocab_cursor = 0
+    for tp_rank in range(tp_size):
+        vocab_start, vocab_end = vocab_ranges[tp_rank]
+        if vocab_start != vocab_cursor:
+            raise ValueError(
+                "Dense teacher IPC vocabulary shards contain a gap or overlap for "
+                f"batch_item_id={batch_item_id} before tp_rank={tp_rank}: "
+                f"expected start {vocab_cursor}, got {vocab_start}."
+            )
+        vocab_cursor = vocab_end
+    if vocab_cursor != full_vocab_size:
+        raise ValueError(
+            "Dense teacher IPC vocabulary shards do not cover the logical axis for "
+            f"batch_item_id={batch_item_id}: covered={vocab_cursor}, "
+            f"expected={full_vocab_size}."
+        )
+
+
 def aggregate_per_sample_handles(
     worker_results: list[dict[str, Any]],
+    canonical_batch_item_ids: Optional[Iterable[int]] = None,
 ) -> list[dict[str, Any]]:
     """Flatten teacher per-sample IPC handles into a global-batch-ordered list.
 
     Each worker returns ``{"dp_rank": int, "per_sample_handles": list}`` where
     the handle list is in local sample order; the several workers sharing a
-    ``dp_rank`` are TP/CP replicas that each contribute one shard per sample.
+    ``dp_rank`` are TP/CP/PP replicas that each contribute one shard per sample.
     Concatenating samples in ``sorted(dp_rank)`` order reproduces the original
     global sample order (rank 0 holds the first ``gbs/dp`` samples, rank 1 the
     next, ...), so the result is a length-``gbs`` list independent of the
     teacher's DP degree. Element ``i`` is ``{"teacher_shards": [shard, ...]}``
     holding all TP×CP shards of global sample ``i``.
+
+    Workers that contribute no handles are skipped. Under pipeline parallelism
+    only the LAST stage holds logits, so every earlier stage returns an empty
+    list; without this filter the per-``dp_rank`` length check below would fire
+    on those empty contributions.
+
+    When ``canonical_batch_item_ids`` is supplied, positional ordering is not
+    used: every record must carry ``batch_item_id``, TP/CP replicas on one DP
+    rank must report identical identity sets, and every sample must have a
+    complete, non-overlapping TP×CP shard grid covering its full logical
+    sequence/vocabulary rectangle. The aggregate is returned in exact canonical
+    order. Omitting the IDs retains the legacy unpacked behavior.
     """
+    nonempty_results = [
+        worker_result
+        for worker_result in worker_results
+        if worker_result["per_sample_handles"]
+    ]
+    assert nonempty_results, (
+        "No teacher worker returned full-logits IPC handles. Under pipeline "
+        "parallelism only the last stage produces them, so this means the "
+        "last-stage results were not collected."
+    )
+    if canonical_batch_item_ids is not None:
+        canonical_ids = tuple(int(value) for value in canonical_batch_item_ids)
+        if len(set(canonical_ids)) != len(canonical_ids):
+            raise ValueError(
+                f"canonical_batch_item_ids must be unique, got {canonical_ids}."
+            )
+        shards_by_item: dict[int, list[dict[str, Any]]] = {}
+        owner_dp_by_item: dict[int, int] = {}
+        identity_sets_by_dp: dict[int, list[set[int]]] = {}
+        for worker_result in nonempty_results:
+            dp_rank = int(worker_result["dp_rank"])
+            seen_by_worker: set[int] = set()
+            for handle in worker_result["per_sample_handles"]:
+                if "batch_item_id" not in handle:
+                    raise ValueError(
+                        "Identity-aware dense teacher IPC requires every handle "
+                        "record to carry batch_item_id."
+                    )
+                batch_item_id = int(handle["batch_item_id"])
+                if batch_item_id in seen_by_worker:
+                    raise ValueError(
+                        "A teacher worker returned duplicate handles for "
+                        f"batch_item_id={batch_item_id}."
+                    )
+                seen_by_worker.add(batch_item_id)
+                owner_dp = owner_dp_by_item.setdefault(batch_item_id, dp_rank)
+                if owner_dp != dp_rank:
+                    raise ValueError(
+                        f"batch_item_id={batch_item_id} was returned by multiple "
+                        f"data-parallel ranks ({owner_dp} and {dp_rank})."
+                    )
+                shards_by_item.setdefault(batch_item_id, []).append(handle)
+            identity_sets_by_dp.setdefault(dp_rank, []).append(seen_by_worker)
+        for dp_rank, worker_identity_sets in identity_sets_by_dp.items():
+            expected = worker_identity_sets[0]
+            if any(
+                identity_set != expected for identity_set in worker_identity_sets[1:]
+            ):
+                raise ValueError(
+                    f"Teacher shard replicas for dp_rank={dp_rank} returned "
+                    f"inconsistent batch_item_id sets: {worker_identity_sets}."
+                )
+        actual_ids = set(shards_by_item)
+        canonical_id_set = set(canonical_ids)
+        if actual_ids != canonical_id_set:
+            missing = sorted(canonical_id_set - actual_ids)
+            unexpected = sorted(actual_ids - canonical_id_set)
+            raise ValueError(
+                "Dense teacher IPC identities do not cover the canonical batch: "
+                f"missing={missing}, unexpected={unexpected}."
+            )
+        for batch_item_id in canonical_ids:
+            _validate_dense_ipc_shard_coverage(
+                batch_item_id, shards_by_item[batch_item_id]
+            )
+        return [
+            {
+                "batch_item_id": batch_item_id,
+                "teacher_shards": shards_by_item[batch_item_id],
+            }
+            for batch_item_id in canonical_ids
+        ]
+
     handles_by_dp_rank: dict[int, list[list[dict[str, Any]]]] = {}
-    for worker_result in worker_results:
+    for worker_result in nonempty_results:
+        per_sample_handles = worker_result["per_sample_handles"]
         dp_rank = worker_result["dp_rank"]
-        handles_by_dp_rank.setdefault(dp_rank, []).append(
-            worker_result["per_sample_handles"]
-        )
+        handles_by_dp_rank.setdefault(dp_rank, []).append(per_sample_handles)
     aggregated: list[dict[str, Any]] = []
     for dp_rank in sorted(handles_by_dp_rank.keys()):
         worker_handles_in_dp = handles_by_dp_rank[dp_rank]

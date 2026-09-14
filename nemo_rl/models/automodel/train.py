@@ -49,7 +49,12 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 )
 from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
+from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
+from nemo_rl.algorithms.x_token.packing_loss import (
+    XTOKEN_LOGICAL_METRICS_KEY,
+    XTokenSequencePackingLossWrapper,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     distributed_vocab_topk,
@@ -68,6 +73,7 @@ PostProcessingFunction = Union[
     "LossPostProcessor",
     "LogprobsPostProcessor",
     "TopkLogitsPostProcessor",
+    "SparseLogitsPostProcessor",
     "FullLogitsPostProcessor",
     "ScorePostProcessor",
 ]
@@ -101,13 +107,35 @@ def _build_model_batch(
     if processed_inputs.position_ids is not None:
         model_batch["position_ids"] = processed_inputs.position_ids
     if processed_inputs.has_flash_attention:
-        model_batch["flash_attn_kwargs"] = processed_inputs.flash_attn_kwargs
+        flash_kwargs = processed_inputs.flash_attn_kwargs
+        if hasattr(flash_kwargs, "cu_seq_lens_q"):
+            # Current Transformers/Automodel forwards these kwargs directly to
+            # flash-attention.  Keep the legacy nested object for generic
+            # callers, but use the verified upstream spelling for planned
+            # packing so raw segment boundaries isolate logical samples.
+            model_batch.update(
+                {
+                    "cu_seq_lens_q": flash_kwargs.cu_seq_lens_q,
+                    "cu_seq_lens_k": flash_kwargs.cu_seq_lens_k,
+                    "max_length_q": flash_kwargs.max_length_q,
+                    "max_length_k": flash_kwargs.max_length_k,
+                }
+            )
+        else:
+            model_batch["flash_attn_kwargs"] = flash_kwargs
 
     if processed_inputs.is_multimodal:
         model_batch.update(
             filter_multimodal_kwargs_for_model(model, processed_inputs.vlm_kwargs)
         )
-        model_batch.pop("flash_attn_kwargs", None)
+        for key in (
+            "flash_attn_kwargs",
+            "cu_seq_lens_q",
+            "cu_seq_lens_k",
+            "max_length_q",
+            "max_length_k",
+        ):
+            model_batch.pop(key, None)
 
     is_gemma3 = isinstance(model, Gemma3ForCausalLM) or isinstance(
         model, Gemma3ForConditionalGeneration
@@ -122,7 +150,14 @@ def _build_model_batch(
             )
 
     if is_reward_model or not allow_flash_attn_args:
-        model_batch.pop("flash_attn_kwargs", None)
+        for key in (
+            "flash_attn_kwargs",
+            "cu_seq_lens_q",
+            "cu_seq_lens_k",
+            "max_length_q",
+            "max_length_k",
+        ):
+            model_batch.pop(key, None)
 
     if clone_model_tensors:
         # Automodel may pad or shard these tensors in place. Keep the loss-side
@@ -296,6 +331,7 @@ def forward_with_post_processing_fn(
     processed_mb: ProcessedMicrobatch,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
+    global_valid_kd_toks: Optional[torch.Tensor] = None,
     global_valid_chunks_by_idx: Optional[dict[int, torch.Tensor]] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     sequence_dim: int = 1,
@@ -355,6 +391,7 @@ def forward_with_post_processing_fn(
             LossPostProcessor,
             LogprobsPostProcessor,
             TopkLogitsPostProcessor,
+            SparseLogitsPostProcessor,
             FullLogitsPostProcessor,
         ),
     ):
@@ -372,12 +409,13 @@ def forward_with_post_processing_fn(
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
             cp_sharder=cp_sharder,
+            global_valid_kd_toks=global_valid_kd_toks,
             global_valid_chunks_by_idx=global_valid_chunks_by_idx,
             sequence_dim=sequence_dim,
         )
     elif isinstance(
         post_processing_fn,
-        (LogprobsPostProcessor, TopkLogitsPostProcessor),
+        (LogprobsPostProcessor, TopkLogitsPostProcessor, SparseLogitsPostProcessor),
     ):
         result = post_processing_fn(
             logits=logits,
@@ -390,9 +428,17 @@ def forward_with_post_processing_fn(
         )
         if isinstance(post_processing_fn, LogprobsPostProcessor):
             metrics = {"logprobs": result}
-        else:
+        elif isinstance(post_processing_fn, TopkLogitsPostProcessor):
             vals, idx = result
             metrics = {"topk_logits": vals, "topk_indices": idx}
+        else:
+            vals, idx, log_z, gt_in_topk = result
+            metrics = {
+                "topk_logits": vals,
+                "topk_indices": idx,
+                "log_z": log_z,
+                "gt_in_topk": gt_in_topk,
+            }
     elif isinstance(post_processing_fn, FullLogitsPostProcessor):
         result = post_processing_fn(
             logits=logits,
@@ -428,6 +474,7 @@ def automodel_forward_backward(
     allow_flash_attn_args: bool = True,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
+    global_valid_kd_toks: Optional[torch.Tensor] = None,
     global_valid_chunks_by_idx: Optional[dict[int, torch.Tensor]] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     sequence_dim: int = 1,
@@ -498,6 +545,7 @@ def automodel_forward_backward(
                 processed_mb=processed_mb,
                 global_valid_seqs=global_valid_seqs,
                 global_valid_toks=global_valid_toks,
+                global_valid_kd_toks=global_valid_kd_toks,
                 global_valid_chunks_by_idx=global_valid_chunks_by_idx,
                 sampling_params=sampling_params,
                 sequence_dim=sequence_dim,
@@ -514,11 +562,19 @@ def automodel_forward_backward(
                 if not is_dummy:
                     ## scale by the number of global batches so we get the correct
                     ## value when summing metrics across all microbatches
-                    for k in metrics.keys():
-                        if "_min" in k or "_max" in k:
-                            continue
-
-                        metrics[k] /= num_global_batches
+                    logical_metrics = metrics.get(XTOKEN_LOGICAL_METRICS_KEY)
+                    if logical_metrics is not None:
+                        for logical_metric in logical_metrics:
+                            for key in logical_metric:
+                                if "_min" not in key and "_max" not in key:
+                                    logical_metric[key] /= num_global_batches
+                    for key in metrics:
+                        if (
+                            key != XTOKEN_LOGICAL_METRICS_KEY
+                            and "_min" not in key
+                            and "_max" not in key
+                        ):
+                            metrics[key] /= num_global_batches
                 else:
                     # Zero out loss for dummy batches
                     result = result * 0
@@ -606,6 +662,7 @@ class LossPostProcessor:
         global_valid_toks: torch.Tensor,
         *,
         cp_sharder: Optional[ContextParallelSharder],
+        global_valid_kd_toks: Optional[torch.Tensor] = None,
         global_valid_chunks_by_idx: Optional[dict[int, torch.Tensor]] = None,
         sequence_dim: int = 1,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -619,6 +676,8 @@ class LossPostProcessor:
             global_valid_toks: Global valid token count
             cp_sharder: Per-microbatch Automodel sequence-layout owner, or None
                 when context parallelism is inactive.
+            global_valid_kd_toks: Global valid knowledge-distillation token count
+                for losses normalized over aligned teacher/student tokens.
             global_valid_chunks_by_idx: Global valid alignment-chunk counts by teacher
             sequence_dim: Sequence dimension
 
@@ -659,12 +718,24 @@ class LossPostProcessor:
             extra_loss_kwargs["global_valid_chunks_by_idx"] = global_valid_chunks_by_idx
         # Wrap loss function for sequence packing if needed
         if self.enable_seq_packing:
-            loss_fn = SequencePackingLossWrapper(
+            is_xtoken_loss = isinstance(self.loss_fn, CrossTokenizerDistillationLossFn)
+            packing_wrapper = (
+                XTokenSequencePackingLossWrapper
+                if is_xtoken_loss
+                else SequencePackingLossWrapper
+            )
+            loss_fn = packing_wrapper(
                 loss_fn=self.loss_fn,
                 prepare_fn=prepare_loss_input_wrapped,
                 cu_seqlens_q=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
-                cu_seqlens_q_padded=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
+                cu_seqlens_q_padded=getattr(
+                    processed_inputs.flash_attn_kwargs,
+                    "cu_seqlens_q_padded",
+                    processed_inputs.flash_attn_kwargs.cu_seqlens_q,
+                ),
             )
+            if is_xtoken_loss:
+                extra_loss_kwargs["global_valid_kd_toks"] = global_valid_kd_toks
             loss, loss_metrics = loss_fn(
                 logits,
                 data_dict,
@@ -676,11 +747,14 @@ class LossPostProcessor:
             loss_input, data_dict = prepare_loss_input_wrapped(
                 logits, data_dict, self.loss_fn
             )
+            direct_loss_kwargs = dict(extra_loss_kwargs)
+            if isinstance(self.loss_fn, CrossTokenizerDistillationLossFn):
+                direct_loss_kwargs["global_valid_kd_toks"] = global_valid_kd_toks
             loss, loss_metrics = self.loss_fn(
                 data=data_dict,
                 global_valid_seqs=global_valid_seqs,
                 global_valid_toks=global_valid_toks,
-                **extra_loss_kwargs,
+                **direct_loss_kwargs,
                 **loss_input,
             )
 
@@ -781,9 +855,15 @@ class LogprobsPostProcessor:
                 device=token_logprobs.device,
             )
             cu_seqlens = processed_inputs.flash_attn_kwargs.cu_seqlens_q
+            cu_seqlens_padded = getattr(
+                processed_inputs.flash_attn_kwargs,
+                "cu_seqlens_q_padded",
+                cu_seqlens,
+            )
             for i in range(original_batch_size):
-                start = cu_seqlens[i].item() + 1
-                end = cu_seqlens[i + 1].item()
+                raw_length = int((cu_seqlens[i + 1] - cu_seqlens[i]).item())
+                start = cu_seqlens_padded[i].item() + 1
+                end = cu_seqlens_padded[i].item() + raw_length
                 seq_len_actual = input_lengths[i].item()
                 unpacked_logprobs[i, 1:seq_len_actual] = token_logprobs[0, start:end]
             token_logprobs = unpacked_logprobs
@@ -990,10 +1070,16 @@ class TopkLogitsPostProcessor:
             )
 
             cu_seqlens = processed_inputs.flash_attn_kwargs.cu_seqlens_q
+            cu_seqlens_padded = getattr(
+                processed_inputs.flash_attn_kwargs,
+                "cu_seqlens_q_padded",
+                cu_seqlens,
+            )
 
             for i in range(original_batch_size):
-                start = cu_seqlens[i].item()
-                end = cu_seqlens[i + 1].item()
+                raw_length = int((cu_seqlens[i + 1] - cu_seqlens[i]).item())
+                start = cu_seqlens_padded[i].item()
+                end = start + raw_length
                 seq_len_actual = input_lengths[i].item()
 
                 # Extract the corresponding portion from packed results
@@ -1007,6 +1093,258 @@ class TopkLogitsPostProcessor:
         return vals, idx
 
 
+class SparseLogitsPostProcessor:
+    """Compute sparse teacher payloads over TP and contiguous CP windows."""
+
+    def __init__(
+        self,
+        cfg: PolicyConfig,
+        tp_mesh: Any,
+        cp_mesh: Any,
+        cp_size: int,
+        k: int,
+        temperature: float,
+        vocab_size: Optional[int],
+        gt_filter_topk: int = 0,
+    ) -> None:
+        self.cfg = cfg
+        self.tp_mesh = tp_mesh
+        self.cp_mesh = cp_mesh
+        self.cp_size = cp_size
+        self.k = k
+        self.temperature = temperature
+        self.vocab_size = vocab_size
+        self.gt_filter_topk = gt_filter_topk
+
+    @staticmethod
+    def _normalize_force_ids(
+        logits: torch.Tensor,
+        force_ids: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if force_ids is None:
+            return None
+        force_ids = force_ids.to(device=logits.device, dtype=torch.long)
+        if force_ids.shape[:2] == logits.shape[:2]:
+            return force_ids
+        common_batch = min(int(force_ids.shape[0]), int(logits.shape[0]))
+        common_seq = min(int(force_ids.shape[1]), int(logits.shape[1]))
+        if common_batch <= 0 or common_seq <= 0:
+            return None
+        trimmed = torch.full(
+            logits.shape[:2], -1, device=logits.device, dtype=torch.long
+        )
+        trimmed[:common_batch, :common_seq] = force_ids[:common_batch, :common_seq]
+        return trimmed
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        data_dict: BatchedDataDict[Any],
+        processed_inputs: ProcessedInputs,
+        original_batch_size: int,
+        original_seq_len: int,
+        *,
+        cp_sharder: Optional[ContextParallelSharder],
+        sequence_dim: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        del processed_inputs, original_batch_size, original_seq_len
+        local_logits = (
+            logits.to_local() if isinstance(logits, DTensor) else logits
+        ).to(torch.float32)
+        tp_group = self.tp_mesh.get_group()
+        tp_rank = torch.distributed.get_rank(tp_group)
+        tp_size = torch.distributed.get_world_size(tp_group)
+        local_vocab_size = int(local_logits.shape[-1])
+        if self.vocab_size is None and not isinstance(logits, DTensor):
+            raise ValueError(
+                "vocab_size is required for raw tensor logits under tensor parallelism"
+            )
+        full_vocab_size = int(self.vocab_size or local_vocab_size * tp_size)
+        if full_vocab_size <= 0 or full_vocab_size > local_vocab_size * tp_size:
+            raise ValueError(
+                "vocab_size must be within the physical distributed lm-head "
+                f"width; got vocab_size={full_vocab_size}, "
+                f"physical_width={local_vocab_size * tp_size}."
+            )
+        vocab_is_replicated = tp_size > 1 and local_vocab_size == full_vocab_size
+        vocab_start = (
+            tp_rank * full_vocab_size
+            if vocab_is_replicated
+            else tp_rank * local_vocab_size
+        )
+        valid_local_vocab = max(0, min(local_vocab_size, full_vocab_size - vocab_start))
+        if valid_local_vocab < local_vocab_size:
+            local_logits = local_logits.clone()
+            local_logits[..., valid_local_vocab:] = -torch.inf
+
+        actual_k = min(int(self.k), full_vocab_size)
+        real_logits: Optional[torch.Tensor] = None
+        if tp_size == 1:
+            # Match the reference TP1 producer exactly: slice padded lm-head
+            # columns before both reductions, then use native logsumexp/topk.
+            real_logits = local_logits[..., :full_vocab_size]
+            log_z = torch.logsumexp(real_logits / float(self.temperature), dim=-1)
+            top_vals, top_idx = torch.topk(real_logits, k=actual_k, dim=-1)
+        else:
+            scaled_logits = local_logits / float(self.temperature)
+            global_max = scaled_logits.amax(dim=-1)
+            torch.distributed.all_reduce(
+                global_max, op=torch.distributed.ReduceOp.MAX, group=tp_group
+            )
+            exp_sum = torch.exp(scaled_logits - global_max.unsqueeze(-1)).sum(dim=-1)
+            torch.distributed.all_reduce(
+                exp_sum, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            )
+            log_z = global_max + torch.log(exp_sum)
+            top_vals, top_idx = distributed_vocab_topk(
+                local_logits,
+                k=actual_k,
+                tp_group=tp_group,
+                vocab_start_index=vocab_start,
+                vocab_end_index=vocab_start + local_vocab_size,
+            )
+
+        force_ids = self._normalize_force_ids(
+            local_logits,
+            self._localize_force_ids(
+                data_dict.get("force_include_token_ids"),
+                local_logits.shape[1],
+                cp_sharder=cp_sharder,
+            ),
+        )
+        gt_in_topk: Optional[torch.Tensor] = None
+        if self.gt_filter_topk > 0:
+            if force_ids is None:
+                raise ValueError(
+                    "gt_filter_topk requires force_include_token_ids in teacher data"
+                )
+            filter_k = min(self.gt_filter_topk, full_vocab_size)
+            if tp_size == 1:
+                assert real_logits is not None
+                filter_idx = torch.topk(real_logits, k=filter_k, dim=-1).indices
+            else:
+                _, filter_idx = distributed_vocab_topk(
+                    local_logits,
+                    k=filter_k,
+                    tp_group=tp_group,
+                    vocab_start_index=vocab_start,
+                    vocab_end_index=vocab_start + local_vocab_size,
+                )
+            valid_force = (force_ids >= 0) & (force_ids < full_vocab_size)
+            gt_in_topk = valid_force & (
+                filter_idx.to(torch.long) == force_ids.unsqueeze(-1)
+            ).any(dim=-1)
+
+        if force_ids is not None and top_vals.shape[-1] > 0:
+            valid_force = (force_ids >= 0) & (force_ids < full_vocab_size)
+            already_present = (top_idx.to(torch.long) == force_ids.unsqueeze(-1)).any(
+                dim=-1
+            )
+            need_force = valid_force & ~already_present
+            if tp_size == 1:
+                assert real_logits is not None
+                forced_vals = real_logits.gather(
+                    dim=-1,
+                    index=force_ids.clamp(0, full_vocab_size - 1).unsqueeze(-1),
+                ).squeeze(-1)
+            else:
+                owned = (force_ids >= vocab_start) & (
+                    force_ids < vocab_start + valid_local_vocab
+                )
+                local_force_idx = (force_ids - vocab_start).clamp(
+                    min=0, max=max(local_vocab_size - 1, 0)
+                )
+                forced_vals = local_logits.gather(
+                    dim=-1, index=local_force_idx.unsqueeze(-1)
+                ).squeeze(-1)
+                forced_vals = torch.where(
+                    owned, forced_vals, torch.full_like(forced_vals, -torch.inf)
+                )
+                torch.distributed.all_reduce(
+                    forced_vals, op=torch.distributed.ReduceOp.MAX, group=tp_group
+                )
+            replace_slot = top_vals.argmin(dim=-1)
+            replacement_vals = torch.where(
+                need_force,
+                forced_vals,
+                top_vals.gather(-1, replace_slot.unsqueeze(-1)).squeeze(-1),
+            )
+            replacement_idx = torch.where(
+                need_force,
+                force_ids,
+                top_idx.to(torch.long)
+                .gather(-1, replace_slot.unsqueeze(-1))
+                .squeeze(-1),
+            )
+            top_vals = top_vals.clone()
+            top_idx = top_idx.clone()
+            top_vals.scatter_(
+                -1, replace_slot.unsqueeze(-1), replacement_vals.unsqueeze(-1)
+            )
+            top_idx.scatter_(
+                -1,
+                replace_slot.unsqueeze(-1),
+                replacement_idx.to(top_idx.dtype).unsqueeze(-1),
+            )
+
+        sorted_idx, sort_perm = torch.sort(top_idx.to(torch.int32), dim=-1)
+        sorted_vals = torch.gather(top_vals, dim=-1, index=sort_perm)
+        if cp_sharder is not None:
+            sorted_vals = self._gather_and_slice_cp(
+                sorted_vals, cp_sharder, sequence_dim
+            )
+            sorted_idx = self._gather_and_slice_cp(
+                sorted_idx, cp_sharder, sequence_dim
+            )
+            log_z = self._gather_and_slice_cp(log_z, cp_sharder, sequence_dim)
+            if gt_in_topk is not None:
+                gt_in_topk = self._gather_and_slice_cp(
+                    gt_in_topk, cp_sharder, sequence_dim
+                )
+        return sorted_vals, sorted_idx, log_z, gt_in_topk
+
+    def _gather_and_slice_cp(
+        self,
+        tensor: torch.Tensor,
+        cp_sharder: ContextParallelSharder,
+        sequence_dim: int,
+    ) -> torch.Tensor:
+        """Restore canonical order, then emit this CP rank's IPC window."""
+        full = cp_sharder.gather_token_tensor(
+            tensor, seq_dim=sequence_dim, trim=True
+        )
+        full_seq_len = int(full.shape[sequence_dim])
+        if full_seq_len % self.cp_size != 0:
+            raise ValueError(
+                "X-token teacher sequence length must be divisible by the "
+                "teacher context parallel size, but got "
+                f"sequence_length={full_seq_len}, cp_size={self.cp_size}."
+            )
+        cp_rank = torch.distributed.get_rank(self.cp_mesh.get_group())
+        local_len = full_seq_len // self.cp_size
+        return full.narrow(
+            sequence_dim, cp_rank * local_len, local_len
+        ).contiguous()
+
+    def _localize_force_ids(
+        self,
+        force_ids: Optional[torch.Tensor],
+        local_seq_len: int,
+        *,
+        cp_sharder: Optional[ContextParallelSharder],
+    ) -> Optional[torch.Tensor]:
+        """Map canonical labels into the model-owned local CP layout."""
+        if force_ids is None or cp_sharder is None:
+            return force_ids
+        local = cp_sharder.shard_token_tensor(force_ids, seq_dim=1, fill=-1)
+        if local.shape[1] != local_seq_len:
+            raise ValueError(
+                "CP-local force-id length does not match local teacher logits: "
+                f"force_ids={local.shape[1]}, logits={local_seq_len}."
+            )
+        return local
+
+
 class FullLogitsPostProcessor:
     """Export this rank's raw teacher logits (full vocab, no reduction at the worker).
 
@@ -1016,7 +1354,9 @@ class FullLogitsPostProcessor:
     are supported and may differ from the student's: under TP each rank emits
     its vocab shard, under CP it allgathers and re-emits its contiguous seq
     slice; the IPC consumer reassembles the global ``[B, T_t, V_t]``.
-    Sequence packing raises ``NotImplementedError``.
+    With CP1 sequence packing, packed logits are restored to one dense logical
+    row per input sample before export. Sparse packed IPC remains a separate,
+    guarded path.
     """
 
     def __init__(
@@ -1052,22 +1392,67 @@ class FullLogitsPostProcessor:
         cp_sharder: Optional[ContextParallelSharder],
         sequence_dim: int = 1,
     ) -> torch.Tensor:
-        if self.enable_seq_packing:
-            raise NotImplementedError(
-                "FullLogitsPostProcessor: sequence packing is not supported in v0."
-            )
         if isinstance(logits, DTensor):
             logits = logits.to_local()
         # fp32 for the consumer's precision-sensitive log_softmax / top-k /
         # projection (KL math), and a dtype-consistent IPC buffer producer<->consumer.
         logits = logits.to(torch.float32)
 
+        if self.enable_seq_packing:
+            if self.cp_size != 1:
+                raise NotImplementedError(
+                    "Packed DTensor full-logit export currently supports only "
+                    "context_parallel_size=1."
+                )
+            if logits.ndim != 3 or logits.shape[0] != 1:
+                raise ValueError(
+                    "Packed DTensor logits must have shape [1, T, V], got "
+                    f"{tuple(logits.shape)}."
+                )
+            cu_seqlens = processed_inputs.flash_attn_kwargs.cu_seqlens_q
+            cu_seqlens_padded = getattr(
+                processed_inputs.flash_attn_kwargs,
+                "cu_seqlens_q_padded",
+                cu_seqlens,
+            )
+            if int(cu_seqlens.numel()) != original_batch_size + 1:
+                raise ValueError(
+                    "Packed DTensor cu_seqlens cardinality does not match the "
+                    f"logical batch: entries={cu_seqlens.numel()}, "
+                    f"batch={original_batch_size}."
+                )
+            unpacked = logits.new_zeros(
+                (original_batch_size, original_seq_len, logits.shape[-1])
+            )
+            input_lengths = data_dict["input_lengths"]
+            for sample_index in range(original_batch_size):
+                raw_start = int(cu_seqlens[sample_index].item())
+                raw_end = int(cu_seqlens[sample_index + 1].item())
+                raw_length = int(input_lengths[sample_index].item())
+                if raw_end - raw_start != raw_length:
+                    raise ValueError(
+                        "Packed DTensor raw boundary disagrees with input_lengths "
+                        f"for sample {sample_index}: cu={raw_end - raw_start}, "
+                        f"input_length={raw_length}."
+                    )
+                padded_start = int(cu_seqlens_padded[sample_index].item())
+                physical_end = padded_start + raw_length
+                if raw_length > original_seq_len or physical_end > logits.shape[1]:
+                    raise ValueError(
+                        "Packed DTensor logits cannot be restored for sample "
+                        f"{sample_index}: physical_end={physical_end}, raw_length={raw_length}, "
+                        f"packed_width={logits.shape[1]}, logical_width={original_seq_len}."
+                    )
+                unpacked[sample_index, :raw_length].copy_(
+                    logits[0, padded_start:physical_end]
+                )
+            return unpacked
+
         # Automodel's CP layout is not contiguous per rank, but the IPC consumer
-        # routes by contiguous ``global_seq_start`` over the teacher CP group.
-        # Restore canonical order (trimming Automodel's CP padding) and emit this
-        # rank's contiguous slice, else heterogeneous teacher_cp != student_cp
-        # lands teacher data at the wrong seq positions in the consumer's dest
-        # tensor.
+        # routes by contiguous ``global_seq_start`` over the teacher CP
+        # group. Restore global order and emit this rank's contiguous slice, else
+        # heterogeneous teacher_cp != student_cp lands teacher data at the wrong
+        # seq positions in the consumer's dest tensor.
         if cp_sharder is not None and self.cp_mesh is not None:
             full = cp_sharder.gather_token_tensor(
                 logits, seq_dim=sequence_dim, trim=True

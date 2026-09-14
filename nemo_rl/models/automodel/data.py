@@ -25,9 +25,11 @@ from torch import nn
 from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
+from nemo_rl.algorithms.x_token.packing_loss import resolve_lockstep_bin_geometry
 from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.huggingface.common import (
+    FlashAttentionKwargs,
     get_flash_attention_kwargs,
     pack_sequences,
 )
@@ -85,6 +87,101 @@ def filter_multimodal_kwargs_for_model(
     return {
         key: value for key, value in multimodal_kwargs.items() if key in accepted_kwargs
     }
+
+
+@dataclass
+class PaddedFlashAttentionKwargs(FlashAttentionKwargs):
+    """Flash-attention metadata with distinct logical and physical offsets."""
+
+    cu_seqlens_q_padded: torch.Tensor
+    cu_seqlens_k_padded: torch.Tensor
+
+    @property
+    def cu_seq_lens_q(self) -> torch.Tensor:
+        """Physical segment boundaries consumed by HF flash-attention."""
+        return self.cu_seqlens_q_padded
+
+    @property
+    def cu_seq_lens_k(self) -> torch.Tensor:
+        """Physical segment boundaries consumed by HF flash-attention."""
+        return self.cu_seqlens_k_padded
+
+    @property
+    def max_length_q(self) -> int:
+        return self.max_seqlen_q
+
+    @property
+    def max_length_k(self) -> int:
+        return self.max_seqlen_k
+
+
+def _materialize_planned_packed_inputs(
+    *,
+    input_ids: torch.Tensor,
+    input_lengths: torch.Tensor,
+    raw_cu_seqlens: tuple[int, ...],
+    padded_cu_seqlens: tuple[int, ...],
+    physical_tokens: int,
+    padding_value: int,
+) -> tuple[torch.Tensor, torch.Tensor, PaddedFlashAttentionKwargs]:
+    """Materialize exactly one controller-planned packed row."""
+    if len(raw_cu_seqlens) != input_ids.shape[0] + 1:
+        raise ValueError(
+            "Planned raw cumulative boundaries do not match the logical batch "
+            f"size {input_ids.shape[0]}."
+        )
+    if len(padded_cu_seqlens) != len(raw_cu_seqlens):
+        raise ValueError("Planned raw and padded boundaries have different shapes.")
+    if padded_cu_seqlens[-1] != physical_tokens:
+        raise ValueError(
+            f"Planned padded boundaries end at {padded_cu_seqlens[-1]}, not "
+            f"physical size {physical_tokens}."
+        )
+
+    token_segments: list[torch.Tensor] = []
+    position_segments: list[torch.Tensor] = []
+    for row in range(input_ids.shape[0]):
+        raw_length = int(input_lengths[row].item())
+        padded_length = padded_cu_seqlens[row + 1] - padded_cu_seqlens[row]
+        if raw_length > input_ids.shape[1] or padded_length < raw_length:
+            raise ValueError(
+                f"Cannot materialize planned row {row}: raw_length={raw_length}, "
+                f"padded_length={padded_length}, source_width={input_ids.shape[1]}."
+            )
+        token_segment = input_ids[row, :raw_length]
+        position_segment = torch.arange(
+            raw_length, dtype=torch.long, device=input_ids.device
+        )
+        if padded_length > raw_length:
+            padding = padded_length - raw_length
+            token_segment = torch.nn.functional.pad(
+                token_segment, (0, padding), value=padding_value
+            )
+            position_segment = torch.nn.functional.pad(position_segment, (0, padding))
+        token_segments.append(token_segment)
+        position_segments.append(position_segment)
+
+    packed_input_ids = torch.cat(token_segments).unsqueeze(0)
+    packed_position_ids = torch.cat(position_segments).unsqueeze(0)
+    if packed_input_ids.shape[1] != physical_tokens:
+        raise ValueError(
+            "Materialized lockstep physical size drifted: got "
+            f"{packed_input_ids.shape[1]}, planned {physical_tokens}."
+        )
+    raw_cu = torch.tensor(raw_cu_seqlens, dtype=torch.int32, device=input_ids.device)
+    padded_cu = torch.tensor(
+        padded_cu_seqlens, dtype=torch.int32, device=input_ids.device
+    )
+    physical_lengths = padded_cu[1:] - padded_cu[:-1]
+    flash_kwargs = PaddedFlashAttentionKwargs(
+        cu_seqlens_q=raw_cu,
+        cu_seqlens_k=raw_cu.clone(),
+        max_seqlen_q=int(physical_lengths.max().item()),
+        max_seqlen_k=int(physical_lengths.max().item()),
+        cu_seqlens_q_padded=padded_cu,
+        cu_seqlens_k_padded=padded_cu.clone(),
+    )
+    return packed_input_ids, packed_position_ids, flash_kwargs
 
 
 @dataclass
@@ -261,23 +358,58 @@ def process_microbatch(
     input_ids = mb.get("input_ids").cuda()
 
     if enable_seq_packing:
-        input_ids, position_ids, _ = pack_sequences(
-            input_ids=input_ids,
-            input_lengths=mb["input_lengths"],
-            packed_sequence_size=[
-                len(mb["input_lengths"])
-            ],  # flash attention 2 expects flattened input
-            padding_value=tokenizer.eos_token_id,
-            return_attention_mask=False,
-            min_seq_len=cfg["sequence_packing"][
-                "train_mb_tokens"
-            ],  # TODO: this is a WAR for sequence packing, we should fix this. Without this, backward will fail when TP is enabled.
+        planned_geometry = resolve_lockstep_bin_geometry(
+            mb, input_lengths=mb["input_lengths"]
         )
+        if planned_geometry is not None:
+            if cp_size != 1:
+                raise NotImplementedError(
+                    "Plan-driven Automodel packing currently supports only "
+                    "context_parallel_size=1."
+                )
+            tp_size = int(cfg.get("dtensor_cfg", {}).get("tensor_parallel_size", 1))
+            train_mb_tokens = int(cfg["sequence_packing"]["train_mb_tokens"])
+            if (
+                getattr(mb, "lockstep_side_id", None) == "student"
+                and tp_size > 1
+                and planned_geometry.physical_tokens != train_mb_tokens
+            ):
+                raise ValueError(
+                    "Plan-driven Automodel training with tensor_parallel_size>1 "
+                    "requires every student bin to preserve the fixed "
+                    "train_mb_tokens tail used by generic sequence packing: "
+                    f"planned={planned_geometry.physical_tokens}, "
+                    f"train_mb_tokens={train_mb_tokens}. Configure the student "
+                    "SidePackingSpec physical_size_fn to return train_mb_tokens."
+                )
+            input_ids, position_ids, flash_attn_kwargs = (
+                _materialize_planned_packed_inputs(
+                    input_ids=input_ids,
+                    input_lengths=mb["input_lengths"],
+                    raw_cu_seqlens=planned_geometry.raw_cu_seqlens,
+                    padded_cu_seqlens=planned_geometry.padded_cu_seqlens,
+                    physical_tokens=planned_geometry.physical_tokens,
+                    padding_value=tokenizer.eos_token_id,
+                )
+            )
+        else:
+            input_ids, position_ids, _ = pack_sequences(
+                input_ids=input_ids,
+                input_lengths=mb["input_lengths"],
+                packed_sequence_size=[
+                    len(mb["input_lengths"])
+                ],  # flash attention 2 expects flattened input
+                padding_value=tokenizer.eos_token_id,
+                return_attention_mask=False,
+                min_seq_len=cfg["sequence_packing"][
+                    "train_mb_tokens"
+                ],  # TODO: this is a WAR for sequence packing, we should fix this. Without this, backward will fail when TP is enabled.
+            )
+            flash_attn_kwargs = get_flash_attention_kwargs(
+                input_lengths=mb["input_lengths"],
+            )
         seq_len = input_ids.shape[1]
         attention_mask = None
-        flash_attn_kwargs = get_flash_attention_kwargs(
-            input_lengths=mb["input_lengths"],
-        )
     else:
         batch_size, seq_len = input_ids.shape
 
@@ -357,6 +489,13 @@ def process_global_batch(
         local_valid_toks = torch.sum(
             batch["token_mask"][:, 1:] * batch["sample_mask"].unsqueeze(-1)
         )
+    kd_token_mask = batch.get("kd_token_mask", batch.get("token_mask"))
+    if kd_token_mask is None:
+        local_valid_kd_toks = local_valid_toks
+    else:
+        local_valid_kd_toks = torch.sum(
+            kd_token_mask[:, 1:] * batch["sample_mask"].unsqueeze(-1)
+        )
 
     local_valid_chunks_by_idx: dict[int, torch.Tensor] = {}
     for key, pair_valid in batch.items():
@@ -375,13 +514,14 @@ def process_global_batch(
         [
             local_valid_seqs,
             local_valid_toks,
+            local_valid_kd_toks,
             *(local_valid_chunks_by_idx[i] for i in chunk_teacher_indices),
         ]
     ).cuda()
     torch.distributed.all_reduce(to_reduce, group=dp_group)
-    global_valid_seqs, global_valid_toks = to_reduce[0], to_reduce[1]
+    global_valid_seqs, global_valid_toks, global_valid_kd_toks = to_reduce[:3]
     global_valid_chunks_by_idx = {
-        teacher_idx: to_reduce[offset + 2]
+        teacher_idx: to_reduce[offset + 3]
         for offset, teacher_idx in enumerate(chunk_teacher_indices)
     }
 
@@ -394,6 +534,7 @@ def process_global_batch(
         "batch": batch,
         "global_valid_seqs": global_valid_seqs,
         "global_valid_toks": global_valid_toks,
+        "global_valid_kd_toks": global_valid_kd_toks,
         "global_valid_chunks_by_idx": global_valid_chunks_by_idx,
     }
 

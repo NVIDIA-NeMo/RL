@@ -31,6 +31,7 @@ from nemo_rl.algorithms.loss.interfaces import (
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.algorithms.x_token.loss_utils import (
     LocalizedAlignment,
+    SparseTeacherLogits,
     build_exact_token_map,
     ce_label_mask,
     next_token_accuracy,
@@ -42,12 +43,14 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     DistributedCrossEntropy,
     allgather_cp_contiguous_tensor,
+    chunked_vocab_parallel_logsumexp,
     cp_shift_next,
+    get_next_token_logprobs_from_logits,
     group_all_reduce_sum,
     group_all_reduce_sum_with_grad,
+    group_all_reduce_sum_with_grad_backward_sum,
     vocab_parallel_full_log_softmax,
     vocab_parallel_gather_columns,
-    vocab_parallel_gather_logits,
 )
 from nemo_rl.models.dtensor.parallelize import to_local_if_dtensor
 
@@ -57,6 +60,8 @@ if TYPE_CHECKING:
     from nemo_rl.algorithms.opd import OnPolicyDistillationFullConfig
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
+
+XTOKEN_STUDENT_LOSS_CHUNK_SIZE = 256
 
 
 class DraftCrossEntropyLossConfig(TypedDict):
@@ -1797,7 +1802,7 @@ class DistillationLossFn(LossFunction):
 
         metrics = {
             "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
-            "num_valid_samples": data["input_ids"].shape[0],
+            "num_valid_samples": data["sample_mask"].sum().item(),
         }
 
         return kl_loss, metrics
@@ -1932,7 +1937,7 @@ class MseValueLossFn(LossFunction):
             "values_max": values_max,
             "returns_sq_mean": returns_sq_mean,
             "residual_sq_mean": residual_sq_mean,
-            "num_valid_samples": int(values.shape[0]),
+            "num_valid_samples": sample_mask.sum().item(),
         }
 
         return loss, metrics
@@ -2146,12 +2151,12 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
     # Sparse teacher transport: when > 0, the teacher exports top-k logits +
     # ids + full-vocab logZ via IPC and v6 computes KL/JSD over the explicit
     # top-k support plus one rest bucket instead of full teacher logits.
-    teacher_topk_ipc_k: NotRequired[int]
-    # Sparse teacher IPC support policy: "row_topk" | "microbatch_global_topk".
-    teacher_topk_ipc_support_mode: NotRequired[str]
+    teacher_topk_ipc_k: int
+    # Sparse teacher IPC support policy. Currently only "row_topk" is supported.
+    teacher_topk_ipc_support_mode: str
     # Reserve the realized teacher label as support and use the remaining k-1
     # slots for teacher alternatives (sparse path).
-    teacher_topk_ipc_keep_realized: NotRequired[bool]
+    teacher_topk_ipc_keep_realized: bool
     # Per-teacher forward pseudo-target table .pt paths (keys ``subtoks`` /
     # ``lengths``: student->teacher sub-token chains), needed for each cross-tok
     # teacher's prefix-support index unless pure_alm=True. ``None`` for
@@ -2172,12 +2177,13 @@ class CrossTokenizerDistillationLossDataDict(TypedDict):
     dynamic set of keys produced by ``CrossTokenizerCollator`` / the trainer and
     so cannot be enumerated here:
 
-    - Every teacher: ``teacher_{i}_full_logits_ipc`` — List[B] of CUDA IPC handle
-      dicts (``payload_ipc`` + ``buf_idx``/``sample_index_in_buf`` + TP/CP shard
-      metadata) from ``Policy.get_full_logits_ipc``.
-      ``rebuild_teacher_full_logits_from_ipc`` (in ``prepare_loss_input``)
-      P2P-reads and reassembles full-vocab teacher logits, routing across
-      heterogeneous teacher/student TP/CP.
+    - Every teacher contributes exactly one logits transport. Same-tokenizer
+      teachers and dense cross-tokenizer teachers use
+      ``teacher_{i}_full_logits_ipc`` (List[B] of CUDA IPC handle dicts with
+      TP/CP shard metadata). Sparse cross-tokenizer teachers use
+      ``teacher_{i}_sparse_logits_ipc`` with row-top-k logits/token ids, the
+      exact full-vocabulary log-normalizer, and optional realized-label
+      membership. ``prepare_loss_input`` P2P-reads and reassembles either form.
     - Cross-tokenizer teacher only: ``teacher_{i}_input_ids`` /
       ``teacher_{i}_token_mask`` ``[B, T_t]`` and ``alignment_{i}_*``
       (``pair_valid`` / ``pair_is_correct`` ``[B, max_pairs]``;
@@ -2190,6 +2196,7 @@ class CrossTokenizerDistillationLossDataDict(TypedDict):
     input_ids: torch.Tensor
     input_lengths: torch.Tensor
     token_mask: torch.Tensor
+    kd_token_mask: NotRequired[torch.Tensor]
     sample_mask: torch.Tensor
 
 
@@ -2219,9 +2226,13 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         student_logits_contig: CP-relaid contiguous student logits shared by
             every teacher's KD term.
         teacher_full_logits_by_idx: ``dict[int, [B, T, V_t]]`` full-vocab teacher
-            logits per teacher, rebuilt from the CUDA IPC handles by
+            logits for dense teachers, rebuilt from CUDA IPC handles by
             ``prepare_loss_input`` (see
             :func:`nemo_rl.algorithms.x_token.loss_utils.rebuild_teacher_full_logits_from_ipc`).
+        teacher_sparse_logits_by_idx: Per-sparse-teacher row-top-k logits,
+            token ids, exact full-vocabulary log-normalizers, and optional
+            realized-label top-k membership, reconstructed for the full
+            teacher sequence.
         aligns_by_idx: ``dict[int, LocalizedAlignment]`` per teacher (cross-tok:
             localized chunk alignment; same-tok: thin, student fields only).
 
@@ -2233,6 +2244,8 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         aggregated KD term), ``ce_loss``, ``kl_loss_scale``, ``accuracy``,
         ``num_valid_samples``. Per-teacher metrics are suffixed ``_t{i}`` (e.g.
         ``kl_loss_t0``, ``top1_acc_per_chunk_t0``, ``weight_t0``);
+        routing observability is reported as ``teacher_{i}/routed_samples``,
+        ``teacher_{i}/routed_tokens``, and ``teacher_{i}/weighted_kl``;
         ``select_teacher`` additionally reports ``selected_teacher``.
     """
 
@@ -2372,6 +2385,16 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         """A teacher is same-vocab (direct KL, no projection) iff its path is None."""
         return self.projection_matrix_paths[i] is None
 
+    @staticmethod
+    def _student_kd_mask(align: LocalizedAlignment) -> torch.Tensor:
+        """Return the semantic KD mask, with legacy text-batch fallback."""
+        mask = align.student_kd_token_mask
+        if mask is None:
+            mask = align.student_token_mask
+        if mask is None:
+            raise ValueError("localized alignment is missing a student KD token mask")
+        return to_local_if_dtensor(mask)
+
     def __call__(
         self,
         data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
@@ -2384,7 +2407,10 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         *,
         student_next_token_logprobs: Optional[torch.Tensor] = None,
         student_next_token_mask: Optional[torch.Tensor] = None,
+        teacher_sparse_logits_by_idx: Optional[dict[int, SparseTeacherLogits]] = None,
+        dense_reconstruction_fallbacks_by_idx: Optional[dict[int, int]] = None,
         global_valid_chunks_by_idx: Optional[dict[int, torch.Tensor]] = None,
+        global_valid_kd_toks: Optional[torch.Tensor] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
         dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -2397,10 +2423,11 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         magnitude, ``kl_loss_weight`` / ``ce_loss_scale`` ignored), else
         fixed-weighted. The single-teacher path is just ``num_teachers == 1``.
 
-        ``student_logits_contig`` (CP-relaid) and the per-teacher ``aligns_by_idx``
-        / ``teacher_full_logits_by_idx`` are precomputed in ``prepare_loss_input``;
-        the Automodel CP path also supplies its sequence-local CE inputs.
-        Production callers provide
+        ``student_logits_contig`` (CP-relaid), the per-teacher ``aligns_by_idx``,
+        and the dense and sparse teacher-logit dictionaries are precomputed in
+        ``prepare_loss_input``. The Automodel CP path also supplies its
+        sequence-local CE inputs; Megatron keeps the raw TP/CP-sharded
+        ``logits`` for its memory-efficient CE path. Production callers provide
         ``global_valid_chunks_by_idx`` from the full batch before microbatching.
 
         ``dp_cp_group`` is the group the global normalizers reduce over. It is
@@ -2411,6 +2438,13 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         the DTensor path, which has no pipeline axis to deadlock on).
         """
         self._dp_cp_group = dp_cp_group
+        teacher_sparse_logits_by_idx = teacher_sparse_logits_by_idx or {}
+        dense_reconstruction_fallbacks_by_idx = (
+            dense_reconstruction_fallbacks_by_idx or {}
+        )
+        kd_normalizer = (
+            global_valid_toks if global_valid_kd_toks is None else global_valid_kd_toks
+        )
         ce_loss = self._compute_ce(
             logits,
             data,
@@ -2428,7 +2462,8 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 data,
                 teacher_full_logits_by_idx,
                 aligns_by_idx,
-                global_valid_toks,
+                kd_normalizer,
+                teacher_sparse_logits_by_idx=teacher_sparse_logits_by_idx,
                 global_valid_chunks_by_idx=global_valid_chunks_by_idx,
                 tp_group=tp_group,
                 cp_group=cp_group,
@@ -2439,7 +2474,8 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 data,
                 teacher_full_logits_by_idx,
                 aligns_by_idx,
-                global_valid_toks,
+                kd_normalizer,
+                teacher_sparse_logits_by_idx=teacher_sparse_logits_by_idx,
                 global_valid_chunks_by_idx=global_valid_chunks_by_idx,
                 tp_group=tp_group,
                 cp_group=cp_group,
@@ -2450,7 +2486,8 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 data,
                 teacher_full_logits_by_idx,
                 aligns_by_idx,
-                global_valid_toks,
+                kd_normalizer,
+                teacher_sparse_logits_by_idx=teacher_sparse_logits_by_idx,
                 global_valid_chunks_by_idx=global_valid_chunks_by_idx,
                 tp_group=tp_group,
                 cp_group=cp_group,
@@ -2497,10 +2534,44 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             "ce_loss": ce_loss.item(),
             "kl_loss_scale": kl_scale.item(),
             "accuracy": accuracy.item(),
-            "num_valid_samples": data["input_ids"].shape[0],
+            "num_valid_samples": to_local_if_dtensor(data["sample_mask"]).sum().item(),
+            "ipc_reconstruction_fallbacks": sum(
+                dense_reconstruction_fallbacks_by_idx.values()
+            ),
         }
+        for teacher_idx, fallback_count in sorted(
+            dense_reconstruction_fallbacks_by_idx.items()
+        ):
+            metrics[f"ipc_reconstruction_fallbacks_t{teacher_idx}"] = fallback_count
         metrics.update(per_teacher_metrics)
+        metrics.update(self._teacher_routing_metrics(data))
         return loss, metrics
+
+    def _teacher_routing_metrics(
+        self,
+        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
+    ) -> dict[str, int]:
+        """Count the logical samples and input tokens routed to each teacher.
+
+        Every teacher forward receives the microbatch, regardless of how its KD
+        term is aggregated later. Cross-tokenizer teachers are counted on their
+        own tokenization; same-tokenizer teachers reuse the student tokenization.
+        Masked padding rows and their tokens do not contribute.
+        """
+        sample_mask = to_local_if_dtensor(data["sample_mask"]).bool()
+        routed_samples = int(sample_mask.sum().item())
+        metrics: dict[str, int] = {}
+        for teacher_idx in range(self.num_teachers):
+            token_mask_key = (
+                "token_mask"
+                if self._teacher_is_same_vocab(teacher_idx)
+                else f"teacher_{teacher_idx}_token_mask"
+            )
+            token_mask = to_local_if_dtensor(data[token_mask_key]).bool()
+            routed_tokens = int((token_mask & sample_mask.unsqueeze(-1)).sum().item())
+            metrics[f"teacher_{teacher_idx}/routed_samples"] = routed_samples
+            metrics[f"teacher_{teacher_idx}/routed_tokens"] = routed_tokens
+        return metrics
 
     # ------------------------------------------------------------------ #
     # Multi-teacher aggregation
@@ -2514,6 +2585,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         aligns_by_idx: dict[int, LocalizedAlignment],
         global_valid_toks: torch.Tensor,
         *,
+        teacher_sparse_logits_by_idx: dict[int, SparseTeacherLogits],
         tp_group: Optional[torch.distributed.ProcessGroup],
         cp_group: Optional[torch.distributed.ProcessGroup],
         global_valid_chunks_by_idx: Optional[dict[int, torch.Tensor]] = None,
@@ -2525,7 +2597,18 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         localized alignment. Both consume the shared CP-relaid student logits and
         route TP/CP through the parameterized loss-mode helpers.
         """
+        has_full_logits = i in teacher_full_logits_by_idx
+        has_sparse_logits = i in teacher_sparse_logits_by_idx
+        if has_full_logits == has_sparse_logits:
+            raise ValueError(
+                f"Teacher {i} must provide exactly one dense or sparse logits "
+                f"payload; dense={has_full_logits}, sparse={has_sparse_logits}."
+            )
         if self._teacher_is_same_vocab(i):
+            if has_sparse_logits:
+                raise ValueError(
+                    f"Same-vocab teacher {i} requires full teacher logits."
+                )
             return self._compute_same_vocab_kl(
                 i,
                 student_logits_contig,
@@ -2545,8 +2628,9 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         kd, v6_metrics = self._compute_prefix_bidir_partition_kl_v3(
             i,
             student_logits_contig,
-            teacher_full_logits_by_idx[i],
+            teacher_full_logits_by_idx.get(i),
             aligns_by_idx[i],
+            teacher_sparse_payload=teacher_sparse_logits_by_idx.get(i),
             teacher_vocab_size=self.teacher_vocab_sizes[i],
             tp_group=tp_group,
             cp_group=cp_group,
@@ -2628,7 +2712,15 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         if teacher.shape[-1] > v_s:
             teacher = teacher[..., :v_s]
         vocab_topk = min(self.vocab_topk, teacher.shape[-1])
-        topk_idx = select_teacher_topk_indices(teacher, vocab_topk, cp_group=cp_group)
+        next_mask = cp_shift_next(self._student_kd_mask(align), cp_group, fill=0)
+        sample_mask = to_local_if_dtensor(align.sample_mask)
+        valid_predictors = next_mask.bool() & sample_mask.unsqueeze(-1).bool()
+        topk_idx = select_teacher_topk_indices(
+            teacher,
+            vocab_topk,
+            valid_mask=valid_predictors,
+            cp_group=cp_group,
+        )
 
         # [B, T, K] instead of the all-gathered [B, T, V]: the K-subset
         # renormalization cancels the full-vocab partition function, so the
@@ -2708,9 +2800,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         ``masked_mean`` over ``global_valid_toks``, scaled by ``T**2``.
         """
         T = self.temperature
-        next_mask = cp_shift_next(
-            to_local_if_dtensor(align.student_token_mask), cp_group, fill=0
-        )
+        next_mask = cp_shift_next(self._student_kd_mask(align), cp_group, fill=0)
         sample_mask = to_local_if_dtensor(align.sample_mask)
         mask = next_mask.float() * sample_mask.unsqueeze(-1).float()
         return (
@@ -2727,6 +2817,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         aligns_by_idx: dict[int, LocalizedAlignment],
         global_valid_toks: torch.Tensor,
         *,
+        teacher_sparse_logits_by_idx: dict[int, SparseTeacherLogits],
         tp_group: Optional[torch.distributed.ProcessGroup],
         cp_group: Optional[torch.distributed.ProcessGroup],
         global_valid_chunks_by_idx: Optional[dict[int, torch.Tensor]] = None,
@@ -2739,6 +2830,11 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         """
         device = student_logits_contig.device
         if self.sum_weights_metric is not None:
+            if teacher_sparse_logits_by_idx:
+                raise ValueError(
+                    "sum_weights_metric requires full teacher logits and cannot "
+                    "be used with sparse teacher IPC."
+                )
             weights = self._compute_dynamic_weights(
                 data, teacher_full_logits_by_idx, aligns_by_idx
             )
@@ -2769,6 +2865,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 teacher_full_logits_by_idx,
                 aligns_by_idx,
                 global_valid_toks,
+                teacher_sparse_logits_by_idx=teacher_sparse_logits_by_idx,
                 global_valid_chunks_by_idx=global_valid_chunks_by_idx,
                 tp_group=tp_group,
                 cp_group=cp_group,
@@ -2783,6 +2880,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 )
                 weighted = weighted * v_scale
             total_kd = weighted if total_kd is None else total_kd + weighted
+            per_metrics[f"teacher_{i}/weighted_kl"] = float(weighted.item())
             for k, v in m_i.items():
                 per_metrics[f"{k}_t{i}"] = v
             per_metrics[f"weight_t{i}"] = float(weights[i].item())
@@ -2797,6 +2895,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         aligns_by_idx: dict[int, LocalizedAlignment],
         global_valid_toks: torch.Tensor,
         *,
+        teacher_sparse_logits_by_idx: dict[int, SparseTeacherLogits],
         tp_group: Optional[torch.distributed.ProcessGroup],
         cp_group: Optional[torch.distributed.ProcessGroup],
         global_valid_chunks_by_idx: Optional[dict[int, torch.Tensor]] = None,
@@ -2828,6 +2927,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                     teacher_full_logits_by_idx,
                     aligns_by_idx,
                     global_valid_toks,
+                    teacher_sparse_logits_by_idx=teacher_sparse_logits_by_idx,
                     global_valid_chunks_by_idx=global_valid_chunks_by_idx,
                     tp_group=tp_group,
                     cp_group=cp_group,
@@ -2835,6 +2935,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 w = self.teacher_weights[i]
                 weighted = kd_i * w
                 total_kd = weighted if total_kd is None else total_kd + weighted
+                per_metrics[f"teacher_{i}/weighted_kl"] = float(weighted.item())
                 for k, v in m_i.items():
                     per_metrics[f"{k}_t{i}"] = v
                 per_metrics[f"weight_t{i}"] = float(w)
@@ -2856,7 +2957,12 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             tp_group=tp_group,
             cp_group=cp_group,
         )
-        return kd, {"kl_loss": kd.item()}
+        per_metrics: dict[str, Any] = {"kl_loss": kd.item()}
+        for i, weight in enumerate(self.teacher_weights):
+            per_metrics[f"teacher_{i}/weighted_kl"] = float(
+                kd.item() * weight / total_w
+            )
+        return kd, per_metrics
 
     def _dp_global_masked_mean(
         self, values: torch.Tensor, mask: torch.Tensor
@@ -2892,11 +2998,17 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         aligns_by_idx: dict[int, LocalizedAlignment],
         global_valid_toks: torch.Tensor,
         *,
+        teacher_sparse_logits_by_idx: dict[int, SparseTeacherLogits],
         tp_group: Optional[torch.distributed.ProcessGroup],
         cp_group: Optional[torch.distributed.ProcessGroup],
         global_valid_chunks_by_idx: Optional[dict[int, torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Use only the teacher with the lowest next-token CE on its own tokens."""
+        if teacher_sparse_logits_by_idx:
+            raise ValueError(
+                "kd_loss_mode='select_teacher' requires full teacher logits and "
+                "cannot be used with sparse teacher IPC."
+            )
         with torch.no_grad():
             ces: list[float] = []
             for i in range(self.num_teachers):
@@ -2921,11 +3033,15 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             teacher_full_logits_by_idx,
             aligns_by_idx,
             global_valid_toks,
+            teacher_sparse_logits_by_idx=teacher_sparse_logits_by_idx,
             global_valid_chunks_by_idx=global_valid_chunks_by_idx,
             tp_group=tp_group,
             cp_group=cp_group,
         )
         per_metrics: dict[str, Any] = {f"{k}_t{best}": v for k, v in m.items()}
+        for i in range(self.num_teachers):
+            per_metrics[f"teacher_{i}/weighted_kl"] = 0.0
+        per_metrics[f"teacher_{best}/weighted_kl"] = float(kd.item())
         per_metrics["selected_teacher"] = best
         return kd, per_metrics
 
@@ -2946,7 +3062,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         if self._teacher_is_same_vocab(i):
             align = aligns_by_idx[i]
             ids = to_local_if_dtensor(align.student_input_ids)
-            token_mask = to_local_if_dtensor(align.student_token_mask)
+            token_mask = self._student_kd_mask(align)
         else:
             ids = to_local_if_dtensor(data[f"teacher_{i}_input_ids"])
             token_mask = to_local_if_dtensor(data[f"teacher_{i}_token_mask"])
@@ -3035,14 +3151,15 @@ class CrossTokenizerDistillationLossFn(LossFunction):
     ) -> torch.Tensor:
         """Next-token CE on the student side (TP/CP handled by the helpers).
 
-        DTensor logits carry their own device mesh, so the vocab-parallel
-        log-prob helper resolves TP/CP from it. Megatron returns a *plain*
-        tensor that is vocab-sharded (TP) and, under CP, sequence-sharded, while
-        the microbatch dict still holds the full ``[B, S]`` ids/masks — so both
-        axes are gathered here first, exactly as the v6 KD term does with the
-        same tensors. Both gathers are no-ops at TP=CP=1, leaving the unsharded
-        result byte-identical. The Automodel CP path supplies sequence-local
-        target log-probabilities instead, avoiding those full-tensor gathers.
+        The Automodel CP path supplies sequence-local target log-probabilities,
+        avoiding full-tensor gathers. DTensor logits otherwise carry their own
+        device mesh, so the vocab-parallel log-prob helper resolves TP/CP from
+        it. Megatron returns a *plain* tensor that is vocab-sharded (TP) and
+        load-balanced sequence-sharded (CP). Compute only the target
+        log-probabilities in fixed sequence chunks and gather the resulting
+        ``[B, S]`` scalars across CP; never materialize a rank-3 full-sequence or
+        full-vocabulary tensor. Ordinary unsharded tensors keep their existing
+        path.
         """
         if student_next_token_logprobs is not None:
             assert student_next_token_mask is not None
@@ -3061,14 +3178,37 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             # disjoint rank-local windows at a single gradient fanout.
             return group_all_reduce_sum_with_grad(local_ce, cp_group)
 
-        if not isinstance(logits, DTensor) and student_logits_contig is not None:
-            ce_logits = allgather_cp_contiguous_tensor(student_logits_contig, cp_group)
-            ce_logits = vocab_parallel_gather_logits(ce_logits, tp_group=tp_group)
-        else:
-            ce_logits = logits
-        per_token_ce = student_next_token_ce(
-            ce_logits, input_ids=data["input_ids"], seq_index=data.get("seq_index")
+        tp_size = (
+            torch.distributed.get_world_size(tp_group)
+            if tp_group is not None and torch.distributed.is_initialized()
+            else 1
         )
+        cp_size = (
+            torch.distributed.get_world_size(cp_group)
+            if cp_group is not None and torch.distributed.is_initialized()
+            else 1
+        )
+        if (
+            not isinstance(logits, DTensor)
+            and tp_group is not None
+            and (tp_size > 1 or cp_size > 1)
+        ):
+            vocab_parallel_rank = torch.distributed.get_rank(tp_group)
+            per_token_ce = -get_next_token_logprobs_from_logits(
+                input_ids=data["input_ids"],
+                next_token_logits=logits,
+                seq_index=data.get("seq_index"),
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=tp_group,
+                context_parallel_group=cp_group,
+                chunk_size=XTOKEN_STUDENT_LOSS_CHUNK_SIZE,
+            )
+        else:
+            per_token_ce = student_next_token_ce(
+                logits,
+                input_ids=data["input_ids"],
+                seq_index=data.get("seq_index"),
+            )
         label_mask = ce_label_mask(
             token_mask=data["token_mask"],
             sample_mask=data["sample_mask"],
@@ -3640,6 +3780,269 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         return keep_mask & candidate_mask
 
     @staticmethod
+    def _lookup_cp_sharded_teacher_logits(
+        teacher_logits: torch.Tensor,
+        batch_indices: torch.Tensor,
+        global_positions: torch.Tensor,
+        token_ids: torch.Tensor,
+        cp_group: Optional[torch.distributed.ProcessGroup],
+    ) -> torch.Tensor:
+        """Fetch arbitrary dense-teacher logits without gathering ``[B,T,V]``.
+
+        ``teacher_logits`` is the caller's contiguous CP-local sequence window
+        with a fully reconstructed vocabulary.  The query tensors broadcast to
+        one common shape and use global sequence positions.  Under CP, exactly
+        one rank owns each position; that owner fills the queried values and a
+        no-grad SUM makes the small result available on every CP replica.  This
+        preserves v6's replicated numerator while avoiding a full dense
+        sequence gather for Qwen-sized vocabularies.
+
+        Every caller must issue the same queries in the same order on every CP
+        rank.  v6 constructs them only from globally gathered ids/spans and
+        replicated alignment metadata.
+        """
+        batch_indices, global_positions, token_ids = torch.broadcast_tensors(
+            batch_indices,
+            global_positions,
+            token_ids,
+        )
+        if batch_indices.numel() == 0:
+            return torch.empty_like(batch_indices, dtype=teacher_logits.dtype)
+
+        cp_size = (
+            torch.distributed.get_world_size(cp_group)
+            if cp_group is not None
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(cp_group) > 1
+            else 1
+        )
+        if cp_size == 1:
+            return teacher_logits[batch_indices, global_positions, token_ids]
+
+        batch_size, local_seq_len, vocab_size = teacher_logits.shape
+        full_seq_len = local_seq_len * cp_size
+        # These tensors are replicated query metadata. Validate on every rank
+        # before entering the collective so malformed input cannot strand peers
+        # in all_reduce after only the owning rank raises an indexing error.
+        if (
+            int(batch_indices.min().item()) < 0
+            or int(batch_indices.max().item()) >= batch_size
+        ):
+            raise IndexError(
+                "dense teacher batch query is out of bounds: "
+                f"batch_size={batch_size}, range="
+                f"[{int(batch_indices.min().item())}, "
+                f"{int(batch_indices.max().item())}]"
+            )
+        if (
+            int(global_positions.min().item()) < 0
+            or int(global_positions.max().item()) >= full_seq_len
+        ):
+            raise IndexError(
+                "dense teacher sequence query is out of bounds: "
+                f"full_seq_len={full_seq_len}, range="
+                f"[{int(global_positions.min().item())}, "
+                f"{int(global_positions.max().item())}]"
+            )
+        if int(token_ids.min().item()) < 0 or int(token_ids.max().item()) >= vocab_size:
+            raise IndexError(
+                "dense teacher vocabulary query is out of bounds: "
+                f"vocab_size={vocab_size}, range="
+                f"[{int(token_ids.min().item())}, {int(token_ids.max().item())}]"
+            )
+
+        cp_rank = torch.distributed.get_rank(cp_group)
+        flat_batch = batch_indices.reshape(-1)
+        flat_positions = global_positions.reshape(-1)
+        flat_tokens = token_ids.reshape(-1)
+        owners = torch.div(flat_positions, local_seq_len, rounding_mode="floor")
+        owned = owners == cp_rank
+        values = torch.zeros(
+            flat_batch.shape,
+            dtype=teacher_logits.dtype,
+            device=teacher_logits.device,
+        )
+        with torch.no_grad():
+            if bool(owned.any().item()):
+                values[owned] = teacher_logits[
+                    flat_batch[owned],
+                    flat_positions[owned] - cp_rank * local_seq_len,
+                    flat_tokens[owned],
+                ]
+            torch.distributed.all_reduce(
+                values,
+                op=torch.distributed.ReduceOp.SUM,
+                group=cp_group,
+            )
+        return values.view(batch_indices.shape)
+
+    @staticmethod
+    def _lookup_tp_cp_sharded_student_logits(
+        student_logits: torch.Tensor,
+        batch_indices: torch.Tensor,
+        global_positions: torch.Tensor,
+        token_ids: torch.Tensor,
+        *,
+        tp_group: Optional[torch.distributed.ProcessGroup],
+        cp_group: Optional[torch.distributed.ProcessGroup],
+    ) -> torch.Tensor:
+        """Fetch arbitrary differentiable logits from TP/CP student shards.
+
+        ``student_logits`` has a contiguous CP-local sequence window and a
+        contiguous TP-local vocabulary interval. Query tensors are globally
+        replicated and broadcast to one shape. Exactly one TP/CP coordinate
+        owns each value; a TP SUM with rank-local backward and then a CP SUM
+        with backward SUM reproduces the former full-gather gradient semantics
+        under the outer ``loss / CP`` scaling, without a rank-3 gather.
+        """
+        query_shape = torch.broadcast_shapes(
+            batch_indices.shape,
+            global_positions.shape,
+            token_ids.shape,
+        )
+        if query_shape.numel() == 0:
+            return torch.empty(
+                query_shape,
+                dtype=student_logits.dtype,
+                device=student_logits.device,
+            )
+
+        tp_size = (
+            torch.distributed.get_world_size(tp_group)
+            if tp_group is not None and torch.distributed.is_initialized()
+            else 1
+        )
+        cp_size = (
+            torch.distributed.get_world_size(cp_group)
+            if cp_group is not None and torch.distributed.is_initialized()
+            else 1
+        )
+        batch_size, local_seq_len, local_vocab_size = student_logits.shape
+        full_seq_len = local_seq_len * cp_size
+        full_vocab_size = local_vocab_size * tp_size
+
+        batch_min = int(batch_indices.min().item())
+        batch_max = int(batch_indices.max().item())
+        if batch_min < 0 or batch_max >= batch_size:
+            raise IndexError(
+                "student batch query is out of bounds: "
+                f"batch_size={batch_size}, range=[{batch_min}, {batch_max}]"
+            )
+        position_min = int(global_positions.min().item())
+        position_max = int(global_positions.max().item())
+        if position_min < 0 or position_max >= full_seq_len:
+            raise IndexError(
+                "student sequence query is out of bounds: "
+                f"full_seq_len={full_seq_len}, range="
+                f"[{position_min}, {position_max}]"
+            )
+        token_min = int(token_ids.min().item())
+        token_max = int(token_ids.max().item())
+        if token_min < 0 or token_max >= full_vocab_size:
+            raise IndexError(
+                "student vocabulary query is out of bounds: "
+                f"full_vocab_size={full_vocab_size}, range="
+                f"[{token_min}, {token_max}]"
+            )
+
+        if tp_size == 1 and cp_size == 1:
+            return student_logits[batch_indices, global_positions, token_ids]
+
+        tp_rank = torch.distributed.get_rank(tp_group) if tp_size > 1 else 0
+        cp_rank = torch.distributed.get_rank(cp_group) if cp_size > 1 else 0
+        position_owners = torch.div(
+            global_positions,
+            local_seq_len,
+            rounding_mode="floor",
+        )
+        token_owners = torch.div(
+            token_ids,
+            local_vocab_size,
+            rounding_mode="floor",
+        )
+        local_values = student_logits[
+            batch_indices,
+            global_positions.remainder(local_seq_len),
+            token_ids.remainder(local_vocab_size),
+        ]
+        # Keep the separable owner masks compact. In the dense-common path their
+        # shapes are [rows, 1] and [1, vocab], so broadcasting them only inside
+        # ``where`` avoids retaining full [rows, vocab] index/mask tensors in the
+        # autograd graph. ``where`` also avoids propagating a non-owner NaN via
+        # ``NaN * 0``.
+        values = torch.where(position_owners == cp_rank, local_values, 0.0)
+        values = torch.where(token_owners == tp_rank, values, 0.0)
+        values = group_all_reduce_sum_with_grad(values, tp_group)
+        values = group_all_reduce_sum_with_grad_backward_sum(values, cp_group)
+        return values
+
+    @staticmethod
+    def _cp_sharded_teacher_target_in_topk(
+        teacher_logits: torch.Tensor,
+        *,
+        batch_index: int,
+        global_position: int,
+        token_id: int,
+        k: int,
+        cp_group: Optional[torch.distributed.ProcessGroup],
+    ) -> bool:
+        """Return exact target-in-top-k membership for a CP-sharded dense row."""
+        batch_size, local_seq_len, vocab_size = teacher_logits.shape
+        cp_size = (
+            torch.distributed.get_world_size(cp_group)
+            if cp_group is not None
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(cp_group) > 1
+            else 1
+        )
+        full_seq_len = local_seq_len * cp_size
+        if not 0 <= batch_index < batch_size:
+            raise IndexError(
+                f"teacher top-k batch index {batch_index} outside [0, {batch_size})"
+            )
+        if not 0 <= global_position < full_seq_len:
+            raise IndexError(
+                "teacher top-k position outside the full sequence: "
+                f"position={global_position}, full_seq_len={full_seq_len}"
+            )
+        if not 0 <= token_id < vocab_size:
+            raise IndexError(
+                f"teacher top-k token id {token_id} outside [0, {vocab_size})"
+            )
+        k = min(int(k), vocab_size)
+        if k <= 0:
+            return False
+        if k == vocab_size:
+            return True
+
+        if cp_size == 1:
+            topk_ids = torch.topk(
+                teacher_logits[batch_index, global_position],
+                k=k,
+                dim=-1,
+            ).indices
+            return bool((topk_ids == token_id).any().item())
+
+        cp_rank = torch.distributed.get_rank(cp_group)
+        owner = global_position // local_seq_len
+        found = torch.zeros((), dtype=torch.int32, device=teacher_logits.device)
+        with torch.no_grad():
+            if cp_rank == owner:
+                local_position = global_position - owner * local_seq_len
+                topk_ids = torch.topk(
+                    teacher_logits[batch_index, local_position],
+                    k=k,
+                    dim=-1,
+                ).indices
+                found.fill_(int(bool((topk_ids == token_id).any().item())))
+            torch.distributed.all_reduce(
+                found,
+                op=torch.distributed.ReduceOp.SUM,
+                group=cp_group,
+            )
+        return bool(found.item())
+
+    @staticmethod
     def _unique_bidir_pairs_cpu(
         pairs,
         swap: bool = False,
@@ -3692,6 +4095,8 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         alm_bce_tau: float = 1.0,
         teacher_sparse: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         teacher_sparse_keep_realized: bool = False,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, int, int, list[int], list[bool]]:
         """Batched partition-KL over a flat list of mismatch chunk records.
 
@@ -3917,7 +4322,15 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # ---- Student prefix chain (batched gather) ----
         if Pmax_s > 0:
             s_prefix_logits = (
-                student_logits[b_idx[:, None], s_pred_pos, s_label_id] / temperature
+                self._lookup_tp_cp_sharded_student_logits(
+                    student_logits,
+                    b_idx[:, None],
+                    s_pred_pos,
+                    s_label_id,
+                    tp_group=tp_group,
+                    cp_group=cp_group,
+                )
+                / temperature
             )
             s_prefix_scores = (
                 s_prefix_logits.to(accum_dtype)
@@ -3954,7 +4367,14 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             else:
                 assert teacher_logits is not None
                 t_prefix_logits = (
-                    teacher_logits[b_idx[:, None], t_pred_pos, t_label_id] / temperature
+                    self._lookup_cp_sharded_teacher_logits(
+                        teacher_logits,
+                        b_idx[:, None],
+                        t_pred_pos,
+                        t_label_id,
+                        cp_group,
+                    )
+                    / temperature
                 )
                 t_prefix_scores = (
                     t_prefix_logits.to(accum_dtype)
@@ -3970,7 +4390,15 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
         # ---- Final-position support scores (batched gather) ----
         s_final_logits = (
-            student_logits[b_idx[:, None], s_last[:, None], s_ids] / temperature
+            self._lookup_tp_cp_sharded_student_logits(
+                student_logits,
+                b_idx[:, None],
+                s_last[:, None],
+                s_ids,
+                tp_group=tp_group,
+                cp_group=cp_group,
+            )
+            / temperature
         )
         s_final_scores = s_final_logits.to(accum_dtype) - student_log_z[
             b_idx, s_last
@@ -4024,7 +4452,14 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             else:
                 assert teacher_logits is not None
                 t_final_logits = (
-                    teacher_logits[b_idx[:, None], t_last[:, None], t_ids] / temperature
+                    self._lookup_cp_sharded_teacher_logits(
+                        teacher_logits,
+                        b_idx[:, None],
+                        t_last[:, None],
+                        t_ids,
+                        cp_group,
+                    )
+                    / temperature
                 )
                 t_final_scores = t_final_logits.to(accum_dtype) - teacher_log_z[
                     b_idx, t_last
@@ -4107,9 +4542,10 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         self,
         i: int,
         student_logits: torch.Tensor,
-        teacher_full_logits: torch.Tensor,
+        teacher_full_logits: Optional[torch.Tensor],
         align: LocalizedAlignment,
         *,
+        teacher_sparse_payload: Optional[SparseTeacherLogits] = None,
         teacher_vocab_size: int,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -4126,39 +4562,48 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         ``teacher_full_logits`` is the reassembled full-vocab teacher window,
         and ``align`` carries the localized student/teacher input ids, per-chunk
         global position spans, ``pair_valid`` and ``num_chunks``. The body is
-        native TP/CP-correct: ``student_logits`` is vocab-gathered across
-        ``tp_group`` and sequence-gathered across ``cp_group`` (teacher likewise
-        on the sequence) so the arbitrary vocab-column / global-span indexing is
-        materialized full. Production supplies ``global_valid_chunks`` from the
-        full batch; direct callers retain a WORLD-reduced fallback. All gathers
-        are no-ops at world size 1 (single-GPU byte-exact).
+        native TP/CP-correct: student and dense-teacher rank-3 logits remain
+        sharded. Exact full-vocabulary log-normalizers are computed in bounded
+        TP chunks and gathered across CP only after reducing to ``[B,T]``;
+        arbitrary support values use bounded owner reductions. Production
+        supplies ``global_valid_chunks`` from the full batch; direct callers
+        retain a WORLD-reduced fallback. Collectives are no-ops at world size 1
+        (single-GPU byte-exact).
 
         Returns ``(loss, metrics_dict)``.
         """
         cfg = self.cfg
         device = student_logits.device
-        # ----- Native TP/CP gather (Phase 2) -----------------------------
-        # v6 indexes arbitrary vocab columns (common/support token ids) and
-        # arbitrary sequence positions (global chunk spans), and takes a full-
-        # vocab logsumexp per position. Under TP the vocab is sharded and under
-        # CP the sequence is windowed, so both must be materialized full before
-        # any indexing. CP is a contiguous sequence all-gather (the student is
-        # relaid to a contiguous window and the teacher is contiguous-block
-        # sharded); TP is a raw-logit vocab all-gather. The axes are orthogonal
-        # so they compose. Both are no-ops at world size 1 -> the single-GPU
-        # path (and CPU parity) is byte-exact. Spans / input_ids arrive global
-        # from prepare_xtoken_cross_tokenizer_loss_input.
-        student_logits = allgather_cp_contiguous_tensor(student_logits, cp_group)
-        student_logits = vocab_parallel_gather_logits(student_logits, tp_group=tp_group)
-        with torch.no_grad():
-            teacher_full_logits = allgather_cp_contiguous_tensor(
-                teacher_full_logits, cp_group
+        # ----- Native TP/CP sharded access -------------------------------
+        # Both rank-3 tensors stay sequence-local. Student logits additionally
+        # stay vocabulary-local; all arbitrary student support accesses below
+        # use differentiable TP/CP owner reductions. Spans / input_ids arrive
+        # global from the loss-input adapter.
+        if teacher_sparse_payload is None:
+            if teacher_full_logits is None:
+                raise ValueError("Dense v6 transport is missing teacher logits.")
+        elif teacher_full_logits is not None:
+            raise ValueError(
+                "v6 received both dense and sparse teacher-logit payloads."
             )
-        # B is the per-sample loop bound; S is the student-side
+        # B is the per-sample loop bound; S is the global student-side
         # predictor-position bound used in the classify-loop range check.
-        # V_s (student vocab) is implicitly bounded by the logits gather
-        # indices (common_student_idx_t) so we don't bind it here.
-        B, S, _ = student_logits.shape
+        B, student_local_seq_len, _ = student_logits.shape
+        student_tp_size = (
+            torch.distributed.get_world_size(tp_group)
+            if tp_group is not None
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(tp_group) > 1
+            else 1
+        )
+        student_cp_size = (
+            torch.distributed.get_world_size(cp_group)
+            if cp_group is not None
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(cp_group) > 1
+            else 1
+        )
+        S = student_local_seq_len * student_cp_size
 
         # v6 preset knobs (with safe defaults matching tokenalign args
         # defaults at line 6420-6434):
@@ -4268,11 +4713,11 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 "prefix_bidir_v3_noise_filter_topk must be >= 0, "
                 f"got {noise_filter_topk}"
             )
-        teacher_topk_ipc_k = int(cfg.get("teacher_topk_ipc_k", 0) or 0)
+        teacher_topk_ipc_k = int(cfg["teacher_topk_ipc_k"])
         teacher_topk_keep_realized = teacher_topk_ipc_k > 0 and (
             pure_alm
             or teacher_topk_ipc_k == 1
-            or bool(cfg.get("teacher_topk_ipc_keep_realized", True))
+            or bool(cfg["teacher_topk_ipc_keep_realized"])
         )
         # mtom_as_alm=True and rest_bucket=True are baked in for v6 per
         # the porting spec (Section 8 hard constraints 7 + 8).
@@ -4280,23 +4725,35 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         rest_bucket = True
 
         v_t = int(teacher_vocab_size)
-        # RL uses always-full teacher transport: ``teacher_full_logits`` is the
-        # reassembled full-vocab teacher logits (rebuilt from IPC in
-        # prepare_xtoken_cross_tokenizer_loss_input). The sparse-IPC top-k path
-        # from the upstream port is left unwired — ``teacher_sparse_payload``
-        # stays None and its downstream branches are inert.
-        teacher_sparse_payload: Optional[
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
-        ] = None
         teacher_gt_in_topk: Optional[torch.Tensor] = None
-        # Slice teacher logits to the real tokenizer vocab (drop any padded
-        # lm_head columns beyond len(tokenizer)) BEFORE indexing.
-        if teacher_full_logits.shape[-1] > v_t:
-            teacher_full_logits = teacher_full_logits[..., :v_t]
-        teacher_logits: Optional[torch.Tensor] = teacher_full_logits
-        # V_t is implicit (common_teacher_idx_t bounds it); bind T (teacher-side
-        # predictor bound) and B2 (sanity check).
-        B2, T, _ = teacher_logits.shape
+        teacher_logits: Optional[torch.Tensor] = None
+        if teacher_sparse_payload is not None:
+            (
+                teacher_topk_logits,
+                _,
+                teacher_log_z,
+                teacher_gt_in_topk,
+            ) = teacher_sparse_payload
+            B2, T, _ = teacher_topk_logits.shape
+        else:
+            assert teacher_full_logits is not None
+            # Slice teacher logits to the real tokenizer vocab (drop any padded
+            # lm_head columns beyond len(tokenizer)) BEFORE indexing.
+            if teacher_full_logits.shape[-1] > v_t:
+                teacher_full_logits = teacher_full_logits[..., :v_t]
+            teacher_logits = teacher_full_logits
+            # V_t is implicit (common_teacher_idx_t bounds it). Dense teacher
+            # logits are a contiguous CP-local sequence window, while spans and
+            # input ids use global positions.
+            B2, teacher_local_seq_len, _ = teacher_logits.shape
+            teacher_cp_size = (
+                torch.distributed.get_world_size(cp_group)
+                if cp_group is not None
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_world_size(cp_group) > 1
+                else 1
+            )
+            T = teacher_local_seq_len * teacher_cp_size
         assert B == B2, f"batch size mismatch: student={B} teacher={B2}"
 
         # ----- Lazy caches (per-device) ----------------------------------
@@ -4368,6 +4825,8 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
         teacher_gt_in_topk_np: Optional[np.ndarray] = None
         teacher_filter_topk_indices_np: Optional[np.ndarray] = None
+        dense_noise_filter_cp_sharded = False
+        filter_k = 0
         if noise_filter_topk > 0:
             if teacher_sparse_payload is not None:
                 if teacher_gt_in_topk is None:
@@ -4382,7 +4841,8 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             else:
                 assert teacher_logits is not None
                 filter_k = min(noise_filter_topk, int(teacher_logits.shape[-1]))
-                if filter_k > 0:
+                dense_noise_filter_cp_sharded = teacher_cp_size > 1
+                if filter_k > 0 and not dense_noise_filter_cp_sharded:
                     with torch.no_grad():
                         teacher_filter_topk_indices_np = (
                             torch.topk(
@@ -4413,17 +4873,31 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                     ):
                         return False
                 return True
-            if teacher_filter_topk_indices_np is None:
-                return False
             for pred_pos, label_pos in zip(pred_positions, label_positions):
-                if pred_pos < 0 or pred_pos >= teacher_filter_topk_indices_np.shape[1]:
+                if pred_pos < 0 or pred_pos >= T:
                     return False
                 if label_pos < 0 or label_pos >= inp_t_np.shape[1]:
                     return False
                 label_id = int(inp_t_np[b_idx, label_pos])
-                if not bool(
-                    np.any(teacher_filter_topk_indices_np[b_idx, pred_pos] == label_id)
-                ):
+                if dense_noise_filter_cp_sharded:
+                    assert teacher_logits is not None
+                    found = self._cp_sharded_teacher_target_in_topk(
+                        teacher_logits,
+                        batch_index=b_idx,
+                        global_position=pred_pos,
+                        token_id=label_id,
+                        k=filter_k,
+                        cp_group=cp_group,
+                    )
+                elif teacher_filter_topk_indices_np is not None:
+                    found = bool(
+                        np.any(
+                            teacher_filter_topk_indices_np[b_idx, pred_pos] == label_id
+                        )
+                    )
+                else:
+                    found = False
+                if not found:
                     return False
             return True
 
@@ -4434,7 +4908,22 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # localized alignment.
         s_spans = to_local_if_dtensor(align.student_spans)  # [B, max_pairs, 2]
         t_spans = to_local_if_dtensor(align.teacher_spans)  # [B, max_pairs, 2]
-        pair_valid = to_local_if_dtensor(align.pair_valid)  # [B, max_pairs]
+        sample_mask = to_local_if_dtensor(align.sample_mask).bool()  # [B]
+        if sample_mask.ndim != 1 or sample_mask.shape[0] != B:
+            raise ValueError(
+                "v6 sample_mask must have shape [B]: "
+                f"expected ({B},), got {tuple(sample_mask.shape)}."
+            )
+        pair_valid = to_local_if_dtensor(align.pair_valid).bool()  # [B, max_pairs]
+        if pair_valid.ndim != 2 or pair_valid.shape[0] != B:
+            raise ValueError(
+                "v6 pair_valid must have shape [B, max_pairs]: "
+                f"expected first dimension {B}, got {tuple(pair_valid.shape)}."
+            )
+        # Gate the authoritative chunk-validity tensor before classification.
+        # Every downstream numerator, count, metric, and student gradient is
+        # derived from the resulting common/mismatch cohorts.
+        pair_valid = pair_valid & sample_mask.unsqueeze(-1)
         num_chunks = to_local_if_dtensor(align.num_chunks)  # [B]
         # Host-side copies for the classification loop (no GPU sync per
         # chunk).
@@ -4545,7 +5034,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # Partition-KL (rest_bucket=True) needs log Z[b, s] for every
         # (b, predictor) position the chunk loops reference. Chunked along
         # the seq axis to bound peak fp32 temporary (tokenalign.py:6647-6661).
-        def _precompute_log_z(_logits: torch.Tensor, _chunk: int = 256):
+        def _precompute_local_log_z(_logits: torch.Tensor, _chunk: int = 256):
             _B, _S, _V = _logits.shape
             _out = torch.empty(
                 (_B, _S),
@@ -4558,11 +5047,29 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 _out[:, _s:_end] = torch.logsumexp(_chunk_t, dim=-1)
             return _out
 
-        student_log_z = _precompute_log_z(student_logits)
+        student_log_z_local = chunked_vocab_parallel_logsumexp(
+            student_logits,
+            temperature,
+            tp_group=tp_group,
+            chunk_size=XTOKEN_STUDENT_LOSS_CHUNK_SIZE,
+        )
+        # Only the scalar normalizer per student row crosses CP. Backward of
+        # this contiguous gather SUMs the replicated CP gradient, cancelling
+        # the outer loss / CP scaling exactly as the deleted rank-3 gather did.
+        student_log_z = allgather_cp_contiguous_tensor(
+            student_log_z_local,
+            cp_group,
+        )
         if teacher_sparse_payload is None:
             assert teacher_logits is not None
             with torch.no_grad():
-                teacher_log_z = _precompute_log_z(teacher_logits)
+                teacher_log_z_local = _precompute_local_log_z(teacher_logits)
+                # Only the scalar normalizer per teacher row is materialized
+                # across CP. The multi-GiB dense logits stay sequence-sharded.
+                teacher_log_z = allgather_cp_contiguous_tensor(
+                    teacher_log_z_local,
+                    cp_group,
+                )
 
         # ----- Common-vocab KL (tokenalign.py:6663-6743) ----------------
         if common_chunks:
@@ -4605,7 +5112,12 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
             _env_common_mb = os.environ.get("TOKENALIGN_COMMON_LOOP_MB")
             common_mb = int(_env_common_mb) if _env_common_mb else len(common_chunks)
-            if teacher_sparse_payload is not None and not _env_common_mb:
+            if student_tp_size > 1 or student_cp_size > 1:
+                # Student owner lookups issue TP/CP collectives. Fix the row
+                # bound in code so environment drift cannot change collective
+                # counts or order across ranks, regardless of teacher transport.
+                common_mb = min(len(common_chunks), 64)
+            elif teacher_sparse_payload is not None and not _env_common_mb:
                 common_mb = min(common_mb, 64)
             teacher_to_common_student = None
             if teacher_sparse_payload is not None and not pure_alm:
@@ -4628,13 +5140,28 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 common_valid_row = None
                 if pure_alm:
                     student_common_logp = (
-                        student_logits[sb, sp, rs].to(accum_dtype) / temperature
+                        self._lookup_tp_cp_sharded_student_logits(
+                            student_logits,
+                            sb,
+                            sp,
+                            rs,
+                            tp_group=tp_group,
+                            cp_group=cp_group,
+                        ).to(accum_dtype)
+                        / temperature
                         - student_log_z[sb, sp]
                     ).unsqueeze(-1)
                     if teacher_sparse_payload is None:
                         assert teacher_logits is not None
                         teacher_common_logp = (
-                            teacher_logits[sb, tp, rt].to(accum_dtype) / temperature
+                            self._lookup_cp_sharded_teacher_logits(
+                                teacher_logits,
+                                sb,
+                                tp,
+                                rt,
+                                cp_group,
+                            ).to(accum_dtype)
+                            / temperature
                             - teacher_log_z[sb, tp]
                         ).unsqueeze(-1)
                         common_valid_row = torch.ones(
@@ -4672,21 +5199,24 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 elif teacher_sparse_payload is None:
                     assert teacher_logits is not None
                     student_common_logits = (
-                        student_logits[
+                        self._lookup_tp_cp_sharded_student_logits(
+                            student_logits,
                             sb[:, None],
                             sp[:, None],
                             common_student_idx_t[None, :],
-                        ]
+                            tp_group=tp_group,
+                            cp_group=cp_group,
+                        )
                         / temperature
                     )
-                    teacher_common_logits = (
-                        teacher_logits[
-                            sb[:, None],
-                            tp[:, None],
-                            common_teacher_idx_t[None, :],
-                        ]
-                        / temperature
+                    teacher_common_logits = self._lookup_cp_sharded_teacher_logits(
+                        teacher_logits,
+                        sb[:, None],
+                        tp[:, None],
+                        common_teacher_idx_t[None, :],
+                        cp_group,
                     )
+                    teacher_common_logits = teacher_common_logits / temperature
                     # rest_bucket=True path (the v3/v6 default — baked in).
                     s_log_z_mb = student_log_z[sb, sp].unsqueeze(-1)
                     t_log_z_mb = teacher_log_z[sb, tp].unsqueeze(-1)
@@ -4720,7 +5250,14 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                         )
                     safe_student_ids = mapped_student.clamp_min(0)
                     student_common_logits = (
-                        student_logits[sb[:, None], sp[:, None], safe_student_ids]
+                        self._lookup_tp_cp_sharded_student_logits(
+                            student_logits,
+                            sb[:, None],
+                            sp[:, None],
+                            safe_student_ids,
+                            tp_group=tp_group,
+                            cp_group=cp_group,
+                        )
                         / temperature
                     )
                     student_common_logp = student_common_logits.to(
@@ -4755,7 +5292,15 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                             realized_common_student == rs
                         )
                         s_real_logp = (
-                            student_logits[sb, sp, rs].to(accum_dtype) / temperature
+                            self._lookup_tp_cp_sharded_student_logits(
+                                student_logits,
+                                sb,
+                                sp,
+                                rs,
+                                tp_group=tp_group,
+                                cp_group=cp_group,
+                            ).to(accum_dtype)
+                            / temperature
                             - student_log_z[sb, sp]
                         )
                         student_common_logp = torch.cat(
@@ -5102,6 +5647,8 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                         )
                     ),
                     teacher_sparse_keep_realized=teacher_topk_keep_realized,
+                    tp_group=tp_group,
+                    cp_group=cp_group,
                 )
                 if v3_position_0_kl:
                     v3_pos0_records = [
@@ -5130,7 +5677,6 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             b_idx_np = np.zeros((K,), dtype=np.int64)
             s_first_np = np.zeros((K,), dtype=np.int64)
             t_first_np = np.zeros((K,), dtype=np.int64)
-            valid_row_np = np.zeros((K,), dtype=bool)
 
             for k, rec in enumerate(v3_pos0_records):
                 b_i, s_first_pred, t_first_pred, *_ = rec
@@ -5142,80 +5688,159 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             t_first = torch.from_numpy(t_first_np).to(device, non_blocking=True)
 
             NEG_INF = -1.0e30
+
+            def _position_0_partition_sum(
+                s_logp: torch.Tensor,
+                t_logp: torch.Tensor,
+                excluded: torch.Tensor,
+                valid_rows: torch.Tensor,
+            ) -> torch.Tensor:
+                s_logp_with_rest = self._append_rest_bucket_logp(s_logp)
+                t_logp_with_rest = self._append_rest_bucket_logp(t_logp)
+                if v3_loss_fn == "bce":
+                    per_pos = self._binary_power_bce_from_logp(
+                        s_logp_with_rest,
+                        t_logp_with_rest,
+                        tau=v3_alm_bce_tau,
+                    )
+                elif v3_loss_fn == "jsd":
+                    per_pos = _generalized_jsd(
+                        s_logp_with_rest,
+                        t_logp_with_rest,
+                        v3_jsd_beta,
+                    )
+                elif not reverse_kl:
+                    per_pos = torch.nn.functional.kl_div(
+                        s_logp_with_rest,
+                        t_logp_with_rest,
+                        reduction="none",
+                        log_target=True,
+                    )
+                else:
+                    per_pos = torch.nn.functional.kl_div(
+                        t_logp_with_rest,
+                        s_logp_with_rest,
+                        reduction="none",
+                        log_target=True,
+                    )
+
+                keep_mask_support = (~excluded).to(per_pos.dtype)
+                rest_keep = torch.ones(
+                    (s_logp.shape[0], 1),
+                    device=device,
+                    dtype=per_pos.dtype,
+                )
+                full_keep_mask = torch.cat(
+                    [keep_mask_support, rest_keep],
+                    dim=-1,
+                )
+                per_chunk_sum = (per_pos * full_keep_mask).sum(dim=-1)
+                return (
+                    (per_chunk_sum * valid_rows.to(per_chunk_sum.dtype))
+                    .sum()
+                    .to(accum_dtype)
+                )
+
             if teacher_sparse_payload is None:
+                assert teacher_logits is not None
                 common_t_cpu = common_teacher_idx_t.detach().cpu().tolist()
                 common_s_cpu = common_student_idx_t.detach().cpu().tolist()
                 V_common = len(common_s_cpu)
                 t_to_pair_slot = {int(t): i for i, t in enumerate(common_t_cpu)}
                 s_to_pair_slot = {int(s): i for i, s in enumerate(common_s_cpu)}
-                exclude_mask_np = np.zeros((K, V_common), dtype=bool)
-
-                for k, rec in enumerate(v3_pos0_records):
-                    (
-                        _b_i,
-                        _s_first_pred,
-                        _t_first_pred,
-                        r_s_id,
-                        r_t_id,
-                        slast_set,
-                    ) = rec
-                    n_excluded = 0
-                    slot = s_to_pair_slot.get(int(r_s_id))
-                    if slot is not None and not exclude_mask_np[k, slot]:
-                        exclude_mask_np[k, slot] = True
-                        n_excluded += 1
-                    slot = t_to_pair_slot.get(int(r_t_id))
-                    if slot is not None and not exclude_mask_np[k, slot]:
-                        exclude_mask_np[k, slot] = True
-                        n_excluded += 1
-                    for sid in slast_set:
-                        slot = s_to_pair_slot.get(int(sid))
-                        if slot is not None and not exclude_mask_np[k, slot]:
-                            exclude_mask_np[k, slot] = True
+                # Qualification's exact common support has 109,567 columns.
+                # Bound every intermediate and every TP/CP owner reduction by
+                # a fixed row cap; TP1/CP1 retains its original arithmetic.
+                pos0_mb = 8 if student_tp_size > 1 or student_cp_size > 1 else K
+                pos0_sum = torch.tensor(0.0, device=device, dtype=accum_dtype)
+                for mb_start in range(0, K, pos0_mb):
+                    mb_end = min(mb_start + pos0_mb, K)
+                    mb_records = v3_pos0_records[mb_start:mb_end]
+                    mb_size = mb_end - mb_start
+                    exclude_mask_np = np.zeros((mb_size, V_common), dtype=bool)
+                    valid_row_mb_np = np.zeros((mb_size,), dtype=bool)
+                    for row, rec in enumerate(mb_records):
+                        (
+                            _b_i,
+                            _s_first_pred,
+                            _t_first_pred,
+                            r_s_id,
+                            r_t_id,
+                            slast_set,
+                        ) = rec
+                        n_excluded = 0
+                        slot = s_to_pair_slot.get(int(r_s_id))
+                        if slot is not None and not exclude_mask_np[row, slot]:
+                            exclude_mask_np[row, slot] = True
                             n_excluded += 1
-                    valid_row_np[k] = (V_common - n_excluded) >= 1
+                        slot = t_to_pair_slot.get(int(r_t_id))
+                        if slot is not None and not exclude_mask_np[row, slot]:
+                            exclude_mask_np[row, slot] = True
+                            n_excluded += 1
+                        for sid in slast_set:
+                            slot = s_to_pair_slot.get(int(sid))
+                            if slot is not None and not exclude_mask_np[row, slot]:
+                                exclude_mask_np[row, slot] = True
+                                n_excluded += 1
+                        valid_row_mb_np[row] = (V_common - n_excluded) >= 1
 
-                exclude_mask = torch.from_numpy(exclude_mask_np).to(
-                    device,
-                    non_blocking=True,
-                )
-                valid_row_v3 = torch.from_numpy(valid_row_np).to(
-                    device,
-                    non_blocking=True,
-                )
-                s_full_logits = (
-                    student_logits[
-                        b_idx_v3[:, None],
-                        s_first[:, None],
-                        common_student_idx_t[None, :],
-                    ].to(accum_dtype)
-                    / temperature
-                )
-                s_log_z_v3 = student_log_z[b_idx_v3, s_first].unsqueeze(-1)
-                s_logp_v3 = s_full_logits - s_log_z_v3
-                s_logp_v3 = torch.where(
-                    exclude_mask,
-                    torch.full_like(s_logp_v3, NEG_INF),
-                    s_logp_v3,
-                )
-
-                with torch.no_grad():
-                    assert teacher_logits is not None
-                    t_full_logits = (
-                        teacher_logits[
-                            b_idx_v3[:, None],
-                            t_first[:, None],
-                            common_teacher_idx_t[None, :],
-                        ].to(accum_dtype)
+                    exclude_mask = torch.from_numpy(exclude_mask_np).to(
+                        device,
+                        non_blocking=True,
+                    )
+                    valid_row_v3 = torch.from_numpy(valid_row_mb_np).to(
+                        device,
+                        non_blocking=True,
+                    )
+                    b_mb = b_idx_v3[mb_start:mb_end]
+                    s_first_mb = s_first[mb_start:mb_end]
+                    t_first_mb = t_first[mb_start:mb_end]
+                    s_full_logits = (
+                        self._lookup_tp_cp_sharded_student_logits(
+                            student_logits,
+                            b_mb[:, None],
+                            s_first_mb[:, None],
+                            common_student_idx_t[None, :],
+                            tp_group=tp_group,
+                            cp_group=cp_group,
+                        ).to(accum_dtype)
                         / temperature
                     )
-                    t_log_z_v3 = teacher_log_z[b_idx_v3, t_first].unsqueeze(-1)
-                    t_logp_v3 = t_full_logits - t_log_z_v3
-                    t_logp_v3 = torch.where(
+                    s_logp_v3 = s_full_logits - student_log_z[
+                        b_mb, s_first_mb
+                    ].unsqueeze(-1)
+                    s_logp_v3 = torch.where(
                         exclude_mask,
-                        torch.full_like(t_logp_v3, NEG_INF),
-                        t_logp_v3,
+                        torch.full_like(s_logp_v3, NEG_INF),
+                        s_logp_v3,
                     )
+                    with torch.no_grad():
+                        t_full_logits = (
+                            self._lookup_cp_sharded_teacher_logits(
+                                teacher_logits,
+                                b_mb[:, None],
+                                t_first_mb[:, None],
+                                common_teacher_idx_t[None, :],
+                                cp_group,
+                            ).to(accum_dtype)
+                            / temperature
+                        )
+                        t_logp_v3 = t_full_logits - teacher_log_z[
+                            b_mb, t_first_mb
+                        ].unsqueeze(-1)
+                        t_logp_v3 = torch.where(
+                            exclude_mask,
+                            torch.full_like(t_logp_v3, NEG_INF),
+                            t_logp_v3,
+                        )
+                    pos0_sum = pos0_sum + _position_0_partition_sum(
+                        s_logp_v3,
+                        t_logp_v3,
+                        exclude_mask,
+                        valid_row_v3,
+                    )
+                denom = max(len(support_sizes), 1)
+                v3_pos0_loss_term = pos0_sum / float(denom)
             else:
                 teacher_topk_logits, teacher_topk_indices, _, _ = teacher_sparse_payload
                 teacher_to_common_student = self._get_v3_teacher_to_common_student(
@@ -5256,9 +5881,14 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 exclude_mask = ~support_mask
                 safe_student_ids = mapped_student.clamp_min(0)
                 s_full_logits = (
-                    student_logits[
-                        b_idx_v3[:, None], s_first[:, None], safe_student_ids
-                    ].to(accum_dtype)
+                    self._lookup_tp_cp_sharded_student_logits(
+                        student_logits,
+                        b_idx_v3[:, None],
+                        s_first[:, None],
+                        safe_student_ids,
+                        tp_group=tp_group,
+                        cp_group=cp_group,
+                    ).to(accum_dtype)
                     / temperature
                 )
                 s_logp_v3 = s_full_logits - student_log_z[b_idx_v3, s_first].unsqueeze(
@@ -5277,51 +5907,13 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                     t_logp_v3,
                     torch.full_like(t_logp_v3, NEG_INF),
                 )
-
-            s_logp_with_rest = self._append_rest_bucket_logp(s_logp_v3)
-            t_logp_with_rest = self._append_rest_bucket_logp(t_logp_v3)
-
-            if v3_loss_fn == "bce":
-                per_pos = self._binary_power_bce_from_logp(
-                    s_logp_with_rest,
-                    t_logp_with_rest,
-                    tau=v3_alm_bce_tau,
-                )
-            elif v3_loss_fn == "jsd":
-                per_pos = _generalized_jsd(
-                    s_logp_with_rest,
-                    t_logp_with_rest,
-                    v3_jsd_beta,
-                )
-            elif not reverse_kl:
-                per_pos = torch.nn.functional.kl_div(
-                    s_logp_with_rest,
-                    t_logp_with_rest,
-                    reduction="none",
-                    log_target=True,
-                )
-            else:
-                per_pos = torch.nn.functional.kl_div(
-                    t_logp_with_rest,
-                    s_logp_with_rest,
-                    reduction="none",
-                    log_target=True,
-                )
-
-            keep_mask_support = (~exclude_mask).to(per_pos.dtype)
-            rest_keep = torch.ones(
-                (K, 1),
-                device=device,
-                dtype=per_pos.dtype,
-            )
-            full_keep_mask = torch.cat(
-                [keep_mask_support, rest_keep],
-                dim=-1,
-            )
-            per_chunk_sum = (per_pos * full_keep_mask).sum(dim=-1)  # (K,)
-            per_chunk_sum = per_chunk_sum * valid_row_v3.to(per_chunk_sum.dtype)
-            denom = max(len(support_sizes), 1)
-            v3_pos0_loss_term = per_chunk_sum.sum().to(accum_dtype) / float(denom)
+                denom = max(len(support_sizes), 1)
+                v3_pos0_loss_term = _position_0_partition_sum(
+                    s_logp_v3,
+                    t_logp_v3,
+                    exclude_mask,
+                    valid_row_v3,
+                ) / float(denom)
 
         # ----- Combine + T^2 scale (tokenalign.py:7362-7425) -----------
         effective_mismatch_count = len(support_sizes)
@@ -5427,7 +6019,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             "num_noise_filtered_common_chunks": noise_filtered_common_chunks,
             "num_noise_filtered_mismatch_chunks": noise_filtered_mismatch_chunks,
             "top1_acc_per_chunk": float(top1_accuracy),
-            "num_valid_samples": B,
+            "num_valid_samples": sample_mask.sum().item(),
         }
         if uses_additive_coefficients:
             assert mismatch_pos0_alpha is not None

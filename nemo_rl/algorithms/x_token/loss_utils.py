@@ -24,6 +24,7 @@ Used by both :mod:`token_aligner` and
   :func:`nemo_rl.distributed.model_utils.group_all_reduce_sum` for the global
   valid-chunk denominator.
 - Teacher-logit IPC: :func:`rebuild_teacher_full_logits_from_ipc`,
+  :func:`rebuild_teacher_sparse_logits_from_ipc`,
   :func:`assemble_teacher_logits_from_shards`,
   :func:`collect_overlapping_teacher_shards` reassemble full-vocab teacher
   logits from per-rank shards across heterogeneous TP/CP.
@@ -59,6 +60,14 @@ if TYPE_CHECKING:
     from nemo_automodel.components.distributed.context_parallel import (
         ContextParallelSharder,
     )
+
+
+SparseTeacherLogits = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+]
 
 
 def alignment_from_flat_batch(data: Mapping[str, Any]) -> AlignmentBatch:
@@ -274,6 +283,7 @@ def select_teacher_topk_indices(
     teacher_logits: torch.Tensor,
     k: int,
     *,
+    valid_mask: Optional[torch.Tensor] = None,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> torch.Tensor:
     """Sorted global top-``k`` teacher-vocab ids by max importance over the microbatch.
@@ -281,18 +291,33 @@ def select_teacher_topk_indices(
     Importance is the per-vocab max over flattened ``(B*T)`` teacher logits. With
     ``cp_group`` world > 1 the sequence is CP-sharded, so the local max only sees
     this rank's slice; an ``all_reduce(MAX)`` makes every rank pick the same
-    subset. No gradient.
+    subset. When ``valid_mask`` is provided, invalid predictor rows are excluded
+    from the vocabulary-column maximum. If no valid predictor exists globally,
+    the first ``k`` columns are returned deterministically. No gradient.
     """
     vocab_size = teacher_logits.shape[-1]
+    if valid_mask is not None and valid_mask.shape != teacher_logits.shape[:-1]:
+        raise ValueError(
+            "valid_mask must match teacher_logits without its vocabulary axis: "
+            f"expected {tuple(teacher_logits.shape[:-1])}, got "
+            f"{tuple(valid_mask.shape)}."
+        )
     with torch.no_grad():
         # reshape (not view): a preceding next-token shift can leave the teacher
         # logits non-contiguous.
         teacher_flat = teacher_logits.reshape(-1, vocab_size)
+        if valid_mask is not None:
+            valid_flat = valid_mask.to(device=teacher_logits.device, dtype=torch.bool)
+            teacher_flat = teacher_flat.masked_fill(
+                ~valid_flat.reshape(-1, 1), float("-inf")
+            )
         importance = teacher_flat.max(dim=0).values
         if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1:
             torch.distributed.all_reduce(
                 importance, op=torch.distributed.ReduceOp.MAX, group=cp_group
             )
+        if torch.isneginf(importance).all():
+            return torch.arange(k, device=teacher_logits.device)
         top_indices = torch.topk(importance, k=k, dim=-1).indices
         return top_indices.sort().values
 
@@ -318,6 +343,10 @@ class LocalizedAlignment:
     # next-token-accuracy metric and the same-tokenizer KD path.
     student_input_ids: Optional[torch.Tensor] = None
     student_token_mask: Optional[torch.Tensor] = None
+    # KD semantic targets may be narrower than the SFT/CE role mask in chat
+    # mode (assistant content plus an explicitly identified EOT token). Text
+    # mode aliases this to ``student_token_mask``.
+    student_kd_token_mask: Optional[torch.Tensor] = None
     # Filled post-construction for the v6 (prefix_bidir_partition_kl_v3) path:
     # this CP rank's contiguous teacher input ids, per-chunk contiguous position
     # spans ``[B, max_pairs, 2]`` derived from the unshifted chunk ids, and the
@@ -338,14 +367,14 @@ def localize_alignment(
     """Localize the chunk-alignment data-dict fields for the local CP shard.
 
     Unwraps the ``{alignment_prefix}*`` / ``sample_mask`` entries from DTensor to
-    their local tensors. Student-seq fields (``student_chunk_id``) come from
-    ``cp_buffers`` in PyTorch's *load-balanced* (``2*cp`` interleaved) CP layout,
-    not contiguous — the caller
-    (:func:`prepare_xtoken_cross_tokenizer_loss_input`) must relayout them to this
-    rank's contiguous window via :func:`cp_load_balanced_to_contiguous` before use.
-    The teacher-seq ``teacher_chunk_id`` is full, so it is sliced contiguously to
-    this CP rank's ``teacher_seq_len`` window to match the IPC consumer's
-    contiguous teacher-logit slice.
+    their local tensors. Student-seq fields (``student_chunk_id``) are left in
+    whatever layout the backend produced — load-balanced CP shards on the
+    DTensor worker (``cp_buffers``), full ``[B, S]`` on Megatron — and the caller
+    (:func:`prepare_xtoken_cross_tokenizer_loss_input`) relays them to this
+    rank's contiguous window via :func:`_student_seq_to_contiguous_window`.
+    The teacher-seq ``teacher_chunk_id`` is full on both backends, so it is
+    sliced contiguously to this CP rank's ``teacher_seq_len`` window to match the
+    IPC consumer's contiguous teacher-logit slice.
 
     Args:
         alignment_prefix: Data-dict key prefix for this teacher's alignment
@@ -468,12 +497,24 @@ def collect_overlapping_teacher_shards(
     student_seq_start = student_cp_rank * full_seq_len // student_cp_size
     student_seq_end = (student_cp_rank + 1) * full_seq_len // student_cp_size
 
+    from nemo_rl.models.policy.utils import validate_compact_teacher_ipc_handle
+
     matches: list[tuple[dict[str, Any], slice, slice, slice, slice]] = []
     for handle in teacher_shards:
         teacher_vocab_start = int(handle["vocab_start_index"])
         teacher_vocab_end = int(handle["vocab_end_index"])
         teacher_seq_start = int(handle["global_seq_start"])
-        teacher_seq_end = teacher_seq_start + int(handle["actual_shape"][0])
+        compact_geometry = validate_compact_teacher_ipc_handle(handle)
+        stored_seq_len = (
+            compact_geometry[1]
+            if compact_geometry is not None
+            else int(handle["actual_shape"][0])
+        )
+        # A compact shard's omitted suffix is logically present but known zero.
+        # Plan copies only for the physically stored prefix; ``dest`` is
+        # zero-initialized by the caller and therefore reconstructs the exact
+        # old dense rectangle.
+        teacher_seq_end = teacher_seq_start + stored_seq_len
 
         overlap_seq_start = max(student_seq_start, teacher_seq_start)
         overlap_seq_end = min(student_seq_end, teacher_seq_end)
@@ -494,6 +535,85 @@ def collect_overlapping_teacher_shards(
     return matches
 
 
+def _rebuild_compact_teacher_ipc_storage(
+    handle: Mapping[str, Any], device: int
+) -> tuple[torch.Tensor, tuple[int, int, int, int]]:
+    """Map and validate one compact producer slab without copying it."""
+    from nemo_rl.models.policy.utils import (
+        rebuild_cuda_tensor_from_ipc,
+        validate_compact_teacher_ipc_handle,
+    )
+
+    compact_geometry = validate_compact_teacher_ipc_handle(handle)
+    if compact_geometry is None:
+        raise ValueError("Expected a compact dense teacher IPC handle.")
+    _token_offset, stored_seq_len, _used_tokens, _local_vocab_size = compact_geometry
+    if stored_seq_len <= 0:
+        raise ValueError("A zero-length compact IPC row has no storage to rebuild.")
+    src_full = rebuild_cuda_tensor_from_ipc(handle["payload_ipc"], device).detach()
+    expected_storage_shape = tuple(int(value) for value in handle["storage_shape"])
+    if tuple(src_full.shape) != expected_storage_shape or src_full.ndim != 2:
+        raise ValueError(
+            "Compact dense teacher IPC rebuilt an unexpected storage shape: "
+            f"actual={tuple(src_full.shape)}, expected={expected_storage_shape}."
+        )
+    if not src_full.is_contiguous():
+        raise ValueError("Compact dense teacher IPC storage must be contiguous.")
+    if src_full.dtype != handle["dtype"]:
+        raise ValueError(
+            "Compact dense teacher IPC rebuilt an unexpected dtype: "
+            f"actual={src_full.dtype}, expected={handle['dtype']}."
+        )
+    return src_full, compact_geometry
+
+
+def _rebuild_teacher_ipc_row(handle: Mapping[str, Any], device: int) -> torch.Tensor:
+    """Return the physically stored ``[T_stored, V_local]`` row view."""
+    from nemo_rl.models.policy.utils import (
+        rebuild_cuda_tensor_from_ipc,
+        validate_compact_teacher_ipc_handle,
+    )
+
+    compact_geometry = validate_compact_teacher_ipc_handle(handle)
+    if compact_geometry is not None:
+        token_offset, stored_seq_len, _used_tokens, local_vocab_size = compact_geometry
+        if stored_seq_len == 0:
+            raise ValueError("A zero-length compact IPC row has no physical view.")
+        src_full, _ = _rebuild_compact_teacher_ipc_storage(handle, device)
+        return src_full[token_offset : token_offset + stored_seq_len, :local_vocab_size]
+
+    src_full = rebuild_cuda_tensor_from_ipc(handle["payload_ipc"], device).detach()
+    actual_shape = handle["actual_shape"]
+    if (
+        not isinstance(actual_shape, (list, tuple, torch.Size))
+        or len(actual_shape) != 2
+    ):
+        raise ValueError(
+            "Dense teacher IPC actual_shape must be two-dimensional, got "
+            f"{actual_shape!r}."
+        )
+    local_seq_len, local_vocab_size = (int(value) for value in actual_shape)
+    buf_idx = int(handle["buf_idx"])
+    sample_idx = int(handle["sample_index_in_buf"])
+    if (
+        src_full.ndim != 4
+        or buf_idx < 0
+        or buf_idx >= src_full.shape[0]
+        or sample_idx < 0
+        or sample_idx >= src_full.shape[1]
+        or local_seq_len <= 0
+        or local_seq_len > src_full.shape[2]
+        or local_vocab_size <= 0
+        or local_vocab_size > src_full.shape[3]
+    ):
+        raise ValueError(
+            "Dense teacher IPC rectangular handle is outside rebuilt storage: "
+            f"storage={tuple(src_full.shape)}, buf_idx={buf_idx}, "
+            f"sample_idx={sample_idx}, actual_shape={tuple(actual_shape)}."
+        )
+    return src_full[buf_idx, sample_idx, :local_seq_len, :local_vocab_size]
+
+
 def assemble_teacher_logits_from_shards(
     teacher_shards: list[dict[str, Any]],
     student_cp_rank: int,
@@ -505,8 +625,6 @@ def assemble_teacher_logits_from_shards(
     ``device`` is a CUDA device index (matches
     :func:`rebuild_cuda_tensor_from_ipc`'s ``device_id`` signature).
     """
-    from nemo_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
-
     if not teacher_shards:
         raise ValueError("teacher_shards must be non-empty")
     full_seq_len = int(teacher_shards[0]["full_seq_len"])
@@ -531,14 +649,7 @@ def assemble_teacher_logits_from_shards(
         full_seq_len=full_seq_len,
     )
     for handle, src_seq, src_vocab, dest_seq, dest_vocab in matches:
-        # Producer's IPC payload is the full contiguous storage
-        # [N_microbatches, B_mb, T_t_local, V_t_local]; index the slot
-        # then the sample row, then apply the seq/vocab overlap slices.
-        src_full = rebuild_cuda_tensor_from_ipc(handle["payload_ipc"], device).detach()
-        buf_idx = int(handle["buf_idx"])
-        sample_idx = int(handle["sample_index_in_buf"])
-        local_seq_t, local_vocab_t = handle["actual_shape"]
-        src = src_full[buf_idx, sample_idx, :local_seq_t, :local_vocab_t]
+        src = _rebuild_teacher_ipc_row(handle, device)
         dest[dest_seq, dest_vocab] = src[src_seq, src_vocab].to(torch.float32)
     return dest
 
@@ -571,23 +682,80 @@ def _try_zero_copy_teacher_logits(
     student_seq_start = student_cp_rank * full_seq_len // student_cp_size
     student_seq_end = (student_cp_rank + 1) * full_seq_len // student_cp_size
 
-    # Exactly one full-vocab shard must cover this student rank's seq range.
+    from nemo_rl.models.policy.utils import validate_compact_teacher_ipc_handle
+
+    # Exactly one physically stored full-vocab shard must cover this student
+    # rank's seq range. A compact zero suffix is logical coverage, but cannot be
+    # represented by a view and therefore takes the zero-filling fallback.
     chosen: list[dict[str, Any]] = []
     for entry in per_sample_entries:
-        covering = [
-            h
-            for h in entry["teacher_shards"]
-            if int(h["vocab_start_index"]) == 0
-            and int(h["vocab_end_index"]) == full_vocab_size
-            and int(h["global_seq_start"]) <= student_seq_start
-            and int(h["global_seq_start"]) + int(h["actual_shape"][0])
-            >= student_seq_end
-        ]
+        covering = []
+        for handle in entry["teacher_shards"]:
+            compact_geometry = validate_compact_teacher_ipc_handle(handle)
+            stored_seq_len = (
+                compact_geometry[1]
+                if compact_geometry is not None
+                else int(handle["actual_shape"][0])
+            )
+            if (
+                int(handle["vocab_start_index"]) == 0
+                and int(handle["vocab_end_index"]) == full_vocab_size
+                and int(handle["global_seq_start"]) <= student_seq_start
+                and int(handle["global_seq_start"]) + stored_seq_len >= student_seq_end
+            ):
+                covering.append(handle)
         if len(covering) != 1:
             return None
         chosen.append(covering[0])
 
-    # All samples must form a contiguous slab in one storage slot.
+    compact_geometries = [
+        validate_compact_teacher_ipc_handle(handle) for handle in chosen
+    ]
+    if any(geometry is not None for geometry in compact_geometries):
+        if any(geometry is None for geometry in compact_geometries):
+            raise ValueError(
+                "Dense teacher IPC zero-copy candidates mix compact and "
+                "rectangular storage layouts."
+            )
+        h0 = chosen[0]
+        payload = h0["payload_ipc"]
+        teacher_seq_start = int(h0["global_seq_start"])
+        seq_lo = student_seq_start - teacher_seq_start
+        seq_hi = student_seq_end - teacher_seq_start
+        first_geometry = compact_geometries[0]
+        assert first_geometry is not None
+        first_offset, first_stored_len, _, local_vocab_size = first_geometry
+        for index, (handle, geometry) in enumerate(
+            zip(chosen, compact_geometries, strict=True)
+        ):
+            assert geometry is not None
+            token_offset, stored_seq_len, _, handle_vocab_size = geometry
+            if (
+                handle["payload_ipc"] != payload
+                or int(handle["global_seq_start"]) != teacher_seq_start
+                or tuple(handle["storage_shape"]) != tuple(h0["storage_shape"])
+                or handle["dtype"] != h0["dtype"]
+                or handle_vocab_size != local_vocab_size
+                or stored_seq_len != first_stored_len
+                or token_offset != first_offset + index * first_stored_len
+            ):
+                return None
+        src_full, _ = _rebuild_compact_teacher_ipc_storage(h0, device)
+        if len(chosen) == 1:
+            return src_full[
+                first_offset + seq_lo : first_offset + seq_hi,
+                :local_vocab_size,
+            ].unsqueeze(0)
+        return src_full.as_strided(
+            size=(len(chosen), seq_hi - seq_lo, local_vocab_size),
+            stride=(first_stored_len * local_vocab_size, local_vocab_size, 1),
+            storage_offset=(
+                src_full.storage_offset() + (first_offset + seq_lo) * local_vocab_size
+            ),
+        )
+
+    # Legacy rectangular samples must form a contiguous slab in one storage
+    # slot.
     h0 = chosen[0]
     payload = h0["payload_ipc"]
     buf_idx = int(h0["buf_idx"])
@@ -611,8 +779,14 @@ def rebuild_teacher_full_logits_from_ipc(
     per_sample_entries: list[dict[str, Any]],
     cp_group: Optional[torch.distributed.ProcessGroup],
     device: int,
-) -> torch.Tensor:
-    """Rebuild ``[B, T_t/CP_s, V_t]`` teacher logits for this student rank.
+) -> tuple[torch.Tensor, int]:
+    """Rebuild teacher logits and report actual fallback reconstructions.
+
+    Returns ``([B, T_t/CP_s, V_t], fallback_count)``. ``fallback_count`` is
+    zero when the zero-copy view is used and otherwise counts the logical rows
+    that went through shard assembly.  Reporting the value from this branch,
+    instead of predicting it from controller-side topology, keeps IPC
+    observability tied to the path that actually ran.
 
     Fast path (zero-copy view via :func:`_try_zero_copy_teacher_logits`): when the
     teacher is not vocab-sharded and each sample's seq range is covered by a
@@ -636,7 +810,7 @@ def rebuild_teacher_full_logits_from_ipc(
         device=device,
     )
     if view is not None:
-        return view
+        return view, 0
 
     rebuilt = [
         assemble_teacher_logits_from_shards(
@@ -647,7 +821,123 @@ def rebuild_teacher_full_logits_from_ipc(
         )
         for entry in per_sample_entries
     ]
-    return torch.stack(rebuilt, dim=0)
+    # Packed xToken executes the loss at logical MBS1. Preserve the assembled
+    # row's storage in that overwhelmingly common path: torch.stack would
+    # allocate and copy another full [T_t/CP_s, V_t] tensor (about 1.24 GiB for
+    # Qwen3-14B at TP2/CP2) only to add a unit batch dimension.
+    if len(rebuilt) == 1:
+        return rebuilt[0].unsqueeze(0), 1
+    return torch.stack(rebuilt, dim=0), len(rebuilt)
+
+
+def rebuild_teacher_sparse_logits_from_ipc(
+    per_sample_entries: list[dict[str, Any]],
+    *,
+    device: int,
+) -> SparseTeacherLogits:
+    """Rebuild full-sequence sparse teacher payloads from per-CP-shard IPC."""
+    from nemo_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
+
+    if not per_sample_entries:
+        raise ValueError("Sparse teacher IPC payload is empty.")
+
+    per_sample_logits: list[torch.Tensor] = []
+    per_sample_indices: list[torch.Tensor] = []
+    per_sample_log_z: list[torch.Tensor] = []
+    per_sample_gt_in_topk: list[torch.Tensor] = []
+    has_gt_in_topk: Optional[bool] = None
+
+    for sample_entry in per_sample_entries:
+        shards = sample_entry.get("teacher_shards", [sample_entry])
+        shards = sorted(shards, key=lambda shard: int(shard["global_seq_start"]))
+        if not shards:
+            raise ValueError("Sparse teacher IPC sample has no sequence shards.")
+        shard_has_gt = ["gt_in_topk_ipc" in shard for shard in shards]
+        if len(set(shard_has_gt)) != 1:
+            raise ValueError(
+                "Sparse teacher IPC handles mix gt_in_topk and non-gt_in_topk "
+                "payloads within one sample."
+            )
+        if has_gt_in_topk is None:
+            has_gt_in_topk = shard_has_gt[0]
+        elif has_gt_in_topk != shard_has_gt[0]:
+            raise ValueError(
+                "Sparse teacher IPC handles mix gt_in_topk and non-gt_in_topk "
+                "payloads across samples."
+            )
+
+        expected_start = 0
+        for shard in shards:
+            shard_start = int(shard["global_seq_start"])
+            if shard_start != expected_start:
+                raise ValueError(
+                    "Sparse teacher CP shards must cover the sequence "
+                    f"contiguously; expected start {expected_start}, got "
+                    f"{shard_start}."
+                )
+            expected_start += int(shard["topk_shape"][0])
+        full_seq_len = int(shards[0]["full_seq_len"])
+        if expected_start != full_seq_len:
+            raise ValueError(
+                "Sparse teacher CP shards do not cover the full sequence: "
+                f"covered={expected_start}, full_seq_len={full_seq_len}."
+            )
+
+        per_sample_logits.append(
+            torch.cat(
+                [
+                    rebuild_cuda_tensor_from_ipc(
+                        shard["topk_logits_ipc"], device
+                    ).detach()
+                    for shard in shards
+                ],
+                dim=0,
+            )
+        )
+        per_sample_indices.append(
+            torch.cat(
+                [
+                    rebuild_cuda_tensor_from_ipc(
+                        shard["topk_indices_ipc"], device
+                    ).detach()
+                    for shard in shards
+                ],
+                dim=0,
+            )
+        )
+        per_sample_log_z.append(
+            torch.cat(
+                [
+                    rebuild_cuda_tensor_from_ipc(shard["log_z_ipc"], device).detach()
+                    for shard in shards
+                ],
+                dim=0,
+            )
+        )
+        if has_gt_in_topk:
+            per_sample_gt_in_topk.append(
+                torch.cat(
+                    [
+                        rebuild_cuda_tensor_from_ipc(
+                            shard["gt_in_topk_ipc"], device
+                        ).detach()
+                        for shard in shards
+                    ],
+                    dim=0,
+                )
+            )
+
+    gt_in_topk = (
+        torch.stack(per_sample_gt_in_topk, dim=0).to(torch.bool)
+        if has_gt_in_topk
+        else None
+    )
+    return (
+        torch.stack(per_sample_logits, dim=0).float(),
+        torch.stack(per_sample_indices, dim=0).to(torch.int32),
+        torch.stack(per_sample_log_z, dim=0).float(),
+        gt_in_topk,
+    )
 
 
 def valid_chunk_mask(
@@ -1058,6 +1348,72 @@ def _chunk_ids_to_spans(chunk_id: torch.Tensor, max_pairs: int) -> torch.Tensor:
     return spans
 
 
+def loss_replica_group(
+    cp_group: Optional[torch.distributed.ProcessGroup],
+) -> Optional[torch.distributed.ProcessGroup]:
+    """Group over which to reduce the loss's global normalizers, or ``None``.
+
+    The loss needs a "sum one contribution per distinct sample shard" group. The
+    obvious choice, ``torch.distributed.group.WORLD``, **deadlocks under pipeline
+    parallelism**: only the last stage runs the loss, so a WORLD collective is
+    never joined by the earlier stages and every rank hangs until the NCCL
+    watchdog fires.
+
+    Megatron's data-parallel(-with-CP) group is the right group instead: its
+    members all share the same pipeline-stage / tensor-parallel coordinates, so
+    it is confined to the stage that actually runs the loss, and it spans exactly
+    the DP x CP axes the normalizers want. Returns ``None`` when Megatron is not
+    the active backend (DTensor, or a single-process / CPU test), leaving callers
+    on their existing WORLD path.
+    """
+    if cp_group is None or not torch.distributed.is_initialized():
+        return None
+    try:
+        # Local import keeps the optional Megatron dependency boundary intact;
+        # a non-Megatron caller falls back to None.
+        from megatron.core import parallel_state
+    except ImportError:
+        return None
+    if not parallel_state.is_initialized():
+        return None
+    return parallel_state.get_data_parallel_group(with_context_parallel=True)
+
+
+def _student_seq_to_contiguous_window(
+    x: torch.Tensor,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    *,
+    data_is_cp_sharded: bool,
+    seq_dim: int = 1,
+) -> torch.Tensor:
+    """Relay a student-sequence data tensor to this CP rank's contiguous window.
+
+    The two training backends hand the loss different layouts for the
+    student-sequence entries of the microbatch dict:
+
+    * DTensor worker: the buffers were CP-sharded in place by PyTorch's
+      ``context_parallel``, i.e. they are in the *load-balanced* (``2*cp``
+      interleaved) layout and must be all-gathered before the contiguous window
+      can be sliced out (``data_is_cp_sharded=True``).
+    * Megatron worker: only the model input and the returned logits are
+      CP-sharded; the microbatch dict the loss sees still holds the FULL
+      ``[B, S]`` tensors, so this rank's window is a plain ``narrow``
+      (``data_is_cp_sharded=False``).
+
+    No-op without a CP group (or at CP world size 1), so both single-GPU paths
+    are byte-identical to before.
+    """
+    if cp_group is None or torch.distributed.get_world_size(cp_group) <= 1:
+        return x
+    if data_is_cp_sharded:
+        return cp_load_balanced_to_contiguous(x, cp_group=cp_group, seq_dim=seq_dim)
+    local = to_local_if_dtensor(x)
+    cp_size = torch.distributed.get_world_size(cp_group)
+    cp_rank = torch.distributed.get_rank(cp_group)
+    local_len = local.shape[seq_dim] // cp_size
+    return local.narrow(seq_dim, cp_rank * local_len, local_len).contiguous()
+
+
 def prepare_xtoken_cross_tokenizer_loss_input(
     logits: torch.Tensor,
     data: Mapping[str, Any],
@@ -1069,16 +1425,19 @@ def prepare_xtoken_cross_tokenizer_loss_input(
 ) -> tuple[
     torch.Tensor,
     Dict[int, torch.Tensor],
+    Dict[int, SparseTeacherLogits],
     Dict[int, LocalizedAlignment],
+    Dict[int, int],
+    Optional[torch.distributed.ProcessGroup],
     Optional[torch.distributed.ProcessGroup],
     Optional[torch.distributed.ProcessGroup],
 ]:
     """Build the per-teacher cross-tokenizer distillation loss pieces from student logits + IPC teacher data.
 
-    Rebuilds each teacher's full-vocab logits from its per-rank CUDA IPC handles
-    (``teacher_{i}_full_logits_ipc``) and does the shared CP-resolution the loss
-    needs. The contiguous student logits / input_ids / token_mask are relaid once
-    and shared across teachers. Per teacher, a localized alignment is built: a
+    Rebuilds each teacher's dense full-vocab or sparse top-k + logZ logits from
+    its per-rank CUDA IPC handles and does the shared CP-resolution the loss
+    needs. The contiguous student logits / input_ids / token_mask are relaid
+    once and shared across teachers. Per teacher, a localized alignment is built: a
     cross-tokenizer teacher (``projection_matrix_paths[i]`` set) gets the
     localized, next-token-shifted chunk alignment from its ``alignment_{i}_*``
     keys; a same-tokenizer teacher (``None`` path) gets a thin alignment carrying
@@ -1094,7 +1453,13 @@ def prepare_xtoken_cross_tokenizer_loss_input(
             replaces the legacy load-balanced CP relayout for student tensors.
 
     Returns:
-        ``(student_logits_contig, teacher_full_logits_by_idx, aligns_by_idx, tp_group, cp_group)``.
+        ``(student_logits_contig, teacher_full_logits_by_idx,
+        teacher_sparse_logits_by_idx, aligns_by_idx,
+        dense_reconstruction_fallbacks_by_idx, tp_group, cp_group,
+        dp_cp_group)``. The reconstruction counts come from the actual dense
+        rebuild branch. ``dp_cp_group`` is the group the loss reduces its global
+        normalizers over; see :func:`loss_replica_group` for why it must not be
+        ``WORLD`` under pipeline parallelism.
     """
     if isinstance(logits, DTensor):
         mesh = logits.device_mesh
@@ -1105,13 +1470,19 @@ def prepare_xtoken_cross_tokenizer_loss_input(
             if cp_sharder is not None
             else (mesh.get_group("cp") if "cp" in mesh_names else None)
         )
+        # The DTensor worker CP-shards the microbatch dict itself (torch's
+        # ``context_parallel(buffers=...)``) on the legacy path. The model-owned
+        # sharder path restores those buffers before loss preparation.
+        data_is_cp_sharded = cp_sharder is None
     else:
         cp_group = context_parallel_group
         tp_group = vocab_parallel_group
+        data_is_cp_sharded = False
 
     device = torch.cuda.current_device()
 
-    # Student CP relay is computed once and shared by every teacher's KD term.
+    # Student CP relay is computed once and shared by every teacher's KD term
+    # and the next-token-accuracy metric.
     # Automodel restores its own model layout before NeMo RL selects the
     # contiguous IPC-consumer window. Legacy callers retain the existing
     # load-balanced-to-contiguous conversion.
@@ -1147,27 +1518,76 @@ def prepare_xtoken_cross_tokenizer_loss_input(
         student_token_mask = to_local_if_dtensor(data["token_mask"])[
             :, student_seq_start : student_seq_start + student_seq_len
         ].contiguous()
+        student_kd_token_mask = to_local_if_dtensor(
+            data.get("kd_token_mask", data["token_mask"])
+        )[:, student_seq_start : student_seq_start + student_seq_len].contiguous()
     else:
+        # Logits are load-balanced on both backends. Student-sequence data is
+        # load-balanced only for the legacy DTensor path; Megatron leaves it
+        # full, so select its contiguous window directly.
         student_logits_contig = cp_load_balanced_to_contiguous(
             logits, cp_group=cp_group
         )
-        student_input_ids = cp_load_balanced_to_contiguous(
-            data["input_ids"], cp_group=cp_group
+        student_input_ids = _student_seq_to_contiguous_window(
+            data["input_ids"], cp_group, data_is_cp_sharded=data_is_cp_sharded
         )
-        student_token_mask = cp_load_balanced_to_contiguous(
-            data["token_mask"], cp_group=cp_group
+        student_token_mask = _student_seq_to_contiguous_window(
+            data["token_mask"], cp_group, data_is_cp_sharded=data_is_cp_sharded
+        )
+        student_kd_token_mask = _student_seq_to_contiguous_window(
+            data.get("kd_token_mask", data["token_mask"]),
+            cp_group,
+            data_is_cp_sharded=data_is_cp_sharded,
         )
     sample_mask = to_local_if_dtensor(data["sample_mask"])
 
     teacher_full_logits_by_idx: Dict[int, torch.Tensor] = {}
+    teacher_sparse_logits_by_idx: Dict[int, SparseTeacherLogits] = {}
     aligns_by_idx: Dict[int, LocalizedAlignment] = {}
+    dense_reconstruction_fallbacks_by_idx: Dict[int, int] = {}
+    student_cp_size = (
+        torch.distributed.get_world_size(cp_group) if cp_group is not None else 1
+    )
     for i, proj_path in enumerate(projection_matrix_paths):
-        teacher_full_logits = rebuild_teacher_full_logits_from_ipc(
-            data[f"teacher_{i}_full_logits_ipc"],
-            cp_group=cp_group,
-            device=device,
-        )
-        teacher_full_logits_by_idx[i] = teacher_full_logits
+        sparse_key = f"teacher_{i}_sparse_logits_ipc"
+        full_key = f"teacher_{i}_full_logits_ipc"
+        has_sparse_logits = sparse_key in data
+        has_full_logits = full_key in data
+        if has_sparse_logits == has_full_logits:
+            raise ValueError(
+                f"Teacher {i} must provide exactly one dense or sparse logits "
+                f"IPC payload; dense={has_full_logits}, sparse={has_sparse_logits}."
+            )
+        if has_sparse_logits:
+            if proj_path is None:
+                raise ValueError(
+                    f"Same-vocab teacher {i} cannot use sparse xToken IPC."
+                )
+            teacher_sparse_logits = rebuild_teacher_sparse_logits_from_ipc(
+                data[sparse_key],
+                device=device,
+            )
+            teacher_sparse_logits_by_idx[i] = teacher_sparse_logits
+            full_teacher_seq_len = int(teacher_sparse_logits[0].shape[1])
+            if full_teacher_seq_len % student_cp_size != 0:
+                raise ValueError(
+                    "Sparse teacher sequence length must be divisible by the "
+                    f"student CP size; teacher={i}, seq={full_teacher_seq_len}, "
+                    f"student_cp={student_cp_size}."
+                )
+            teacher_seq_len = full_teacher_seq_len // student_cp_size
+        else:
+            (
+                teacher_full_logits,
+                dense_reconstruction_fallbacks,
+            ) = rebuild_teacher_full_logits_from_ipc(
+                data[full_key],
+                cp_group=cp_group,
+                device=device,
+            )
+            teacher_full_logits_by_idx[i] = teacher_full_logits
+            dense_reconstruction_fallbacks_by_idx[i] = dense_reconstruction_fallbacks
+            teacher_seq_len = int(teacher_full_logits.shape[1])
         if proj_path is None:
             # Same-tokenizer teacher: identity token alignment, no chunk
             # localization. Carry only the shared student fields.
@@ -1175,10 +1595,10 @@ def prepare_xtoken_cross_tokenizer_loss_input(
                 sample_mask=sample_mask,
                 student_input_ids=student_input_ids,
                 student_token_mask=student_token_mask,
+                student_kd_token_mask=student_kd_token_mask,
             )
             continue
         alignment_prefix = f"alignment_{i}_"
-        teacher_seq_len = teacher_full_logits.shape[1]
         if cp_sharder is not None:
             student_chunk_id_source_full = to_local_if_dtensor(
                 data[f"{alignment_prefix}student_chunk_id"]
@@ -1204,12 +1624,14 @@ def prepare_xtoken_cross_tokenizer_loss_input(
         else:
             align = localize_alignment(
                 data,
-                teacher_seq_len=teacher_full_logits.shape[1],
+                teacher_seq_len=teacher_seq_len,
                 alignment_prefix=alignment_prefix,
                 cp_group=cp_group,
             )
-            student_chunk_id_contig = cp_load_balanced_to_contiguous(
-                align.student_chunk_id, cp_group=cp_group
+            student_chunk_id_contig = _student_seq_to_contiguous_window(
+                align.student_chunk_id,
+                cp_group,
+                data_is_cp_sharded=data_is_cp_sharded,
             )
             teacher_chunk_id_contig = align.teacher_chunk_id
             cp_rank = (
@@ -1222,7 +1644,7 @@ def prepare_xtoken_cross_tokenizer_loss_input(
 
         # Contiguous, UNSHIFTED chunk ids -> per-chunk position spans for the v6
         # path. v6 reads spans and applies its own per-chunk kl_chunk_shift, so
-        # it must not derive them from next-token-shifted chunk ids.
+        # it must NOT see the P-KL/gold next-token-shifted chunk ids.
         max_pairs = align.pair_valid.shape[1]
         # GLOBAL spans: the v6 KD term gathers the student/teacher logits to the
         # full sequence, so its spans must index global positions. Gather the
@@ -1279,11 +1701,15 @@ def prepare_xtoken_cross_tokenizer_loss_input(
             )
         align.student_input_ids = student_input_ids
         align.student_token_mask = student_token_mask
+        align.student_kd_token_mask = student_kd_token_mask
         aligns_by_idx[i] = align
     return (
         student_logits_contig,
         teacher_full_logits_by_idx,
+        teacher_sparse_logits_by_idx,
         aligns_by_idx,
+        dense_reconstruction_fallbacks_by_idx,
         tp_group,
         cp_group,
+        loss_replica_group(cp_group),
     )

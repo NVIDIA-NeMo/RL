@@ -349,6 +349,32 @@ def find_similar_special_tokens(
     return special_token_mappings
 
 
+def _resolve_vocab_size(config, model_name):
+    """Vocab size from either a plain text config or a multimodal one.
+
+    Multimodal configs (Gemma-3, the Qwen3.5/3.6 VL family, ...) nest the
+    language-model fields under ``text_config``, so ``config.vocab_size`` does
+    not exist. Resolve it structurally -- via transformers' own
+    ``get_text_config()``, falling back to the nested attribute -- rather than by
+    sniffing the model name: the previous name list matched "qwen3.5" and so
+    silently missed Qwen3.6, whose config nests exactly the same way.
+    """
+    candidates = []
+    if hasattr(config, "get_text_config"):
+        candidates.append(config.get_text_config())
+    candidates.append(getattr(config, "text_config", None))
+    candidates.append(config)
+    for candidate in candidates:
+        vocab_size = getattr(candidate, "vocab_size", None)
+        if vocab_size is not None:
+            return vocab_size
+    raise ValueError(
+        f"Could not resolve vocab_size for {model_name!r} from config "
+        f"{type(config).__name__}: neither the config nor its text_config "
+        f"exposes vocab_size."
+    )
+
+
 def parse_arguments():
     """Parse command line arguments for the multi-token projection script."""
     parser = argparse.ArgumentParser(
@@ -541,20 +567,8 @@ if __name__ == "__main__":
     tokenizer_teacher_total_vocab_size = len(tokenizer_teacher)
     model_A_config = AutoConfig.from_pretrained(student_model_name)
     model_B_config = AutoConfig.from_pretrained(teacher_model_name)
-    # Gemma and Qwen3.5 nest `vocab_size` under `config.text_config`; the
-    # rest of the supported families expose it directly on the top-level
-    # config. Mirrors the PT reference.
-    student_name_lower = student_model_name.lower()
-    if "gemma" in student_name_lower or "qwen3.5" in student_name_lower:
-        source_vocab_size = model_A_config.text_config.vocab_size
-    else:
-        source_vocab_size = model_A_config.vocab_size
-
-    teacher_name_lower = teacher_model_name.lower()
-    if "gemma" in teacher_name_lower or "qwen3.5" in teacher_name_lower:
-        target_vocab_size = model_B_config.text_config.vocab_size
-    else:
-        target_vocab_size = model_B_config.vocab_size
+    source_vocab_size = _resolve_vocab_size(model_A_config, student_model_name)
+    target_vocab_size = _resolve_vocab_size(model_B_config, teacher_model_name)
 
     tokenizer_student_total_vocab_size = source_vocab_size
     tokenizer_teacher_total_vocab_size = target_vocab_size

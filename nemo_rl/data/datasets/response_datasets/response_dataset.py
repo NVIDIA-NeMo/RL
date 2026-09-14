@@ -12,10 +12,83 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
+import json
+from collections.abc import Mapping
 from typing import Any, Optional
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 from nemo_rl.data.datasets.utils import load_dataset_from_path
+
+
+_SOURCE_ID_KEYS = ("sample_id", "id", "uuid")
+
+
+def resolve_source_sample_id(
+    data: Mapping[str, Any],
+    raw_ordinal: int,
+    *,
+    data_path: str,
+    subset: str | None,
+    split: str | None,
+) -> str:
+    """Resolve a durable identity before dataset transformations.
+
+    Explicit source identities are retained verbatim (after conversion to a
+    string). Otherwise, the identity combines a collision-resistant digest of
+    the complete dataset namespace with the original row ordinal. JSON
+    serialization keeps path/subset/split boundaries unambiguous.
+
+    Args:
+        data: Unmodified source row.
+        raw_ordinal: Row position in the source before filtering or splitting.
+        data_path: Local path, shard/glob, URL, or Hugging Face dataset name.
+        subset: Optional Hugging Face subset/config name.
+        split: Requested source split. ``None`` has the loader's effective
+            default of ``"train"``.
+
+    Returns:
+        The upstream identity, when present, or a deterministic synthesized ID.
+    """
+    for key in _SOURCE_ID_KEYS:
+        value = data.get(key)
+        if value is not None:
+            source_id = str(value)
+            if source_id.strip():
+                return source_id
+
+    namespace = json.dumps(
+        {
+            "data_path": data_path,
+            "split": split or "train",
+            "subset": subset,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    namespace_digest = hashlib.sha256(namespace.encode("utf-8")).hexdigest()
+    return f"source-row:{namespace_digest}:{raw_ordinal}"
+
+
+def attach_source_sample_id(
+    data: Mapping[str, Any],
+    raw_ordinal: int,
+    *,
+    data_path: str,
+    subset: str | None,
+    split: str | None,
+) -> dict[str, str]:
+    """Build the ``Dataset.map`` update that attaches source identity."""
+    return {
+        "sample_id": resolve_source_sample_id(
+            data,
+            raw_ordinal,
+            data_path=data_path,
+            subset=subset,
+            split=split,
+        )
+    }
 
 
 class ResponseDataset(RawDataset):
@@ -60,6 +133,22 @@ class ResponseDataset(RawDataset):
         # load from local or huggingface
         self.dataset = load_dataset_from_path(data_path, subset, split)
 
+        # Attach identity to untouched source rows. Formatting removes source
+        # columns and validation splitting reorders/selects rows, so neither
+        # operation may be allowed to invent identity afterward.
+        self.dataset = self.dataset.map(
+            attach_source_sample_id,
+            with_indices=True,
+            remove_columns=["sample_id"]
+            if "sample_id" in self.dataset.column_names
+            else None,
+            fn_kwargs={
+                "data_path": data_path,
+                "subset": subset,
+                "split": split,
+            },
+        )
+
         # format the dataset
         if "messages" not in self.dataset.column_names:
             self.dataset = self.dataset.map(
@@ -82,4 +171,5 @@ class ResponseDataset(RawDataset):
                 {"role": "assistant", "content": data[self.output_key]},
             ],
             "task_name": self.task_name,
+            "sample_id": data["sample_id"],
         }

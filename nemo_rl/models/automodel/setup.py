@@ -70,6 +70,7 @@ from nemo_rl.models.automodel.config import (
     ModelAndOptimizerState,
     RuntimeConfig,
 )
+from nemo_rl.models.automodel.nemotron_h_cp import apply_nemotron_h_cp_fixes
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig, TokenizerConfig
 from nemo_rl.models.policy.utils import configure_dynamo_cache, resolve_model_class
 
@@ -932,6 +933,13 @@ def setup_model_and_optimizer(
         moe_parallel_config=moe_config if ep_size > 1 else None,
         activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
     )
+
+    # Automodel's NemotronH parallelization strategy crashes (and would silently
+    # skip Mamba CP) on the HF remote-code model at context_parallel_size > 1.
+    # Must run per worker process, before from_pretrained parallelizes the model.
+    # Gated on CP > 1 so a CP=1 run keeps byte-identical model construction.
+    if config["dtensor_cfg"]["context_parallel_size"] > 1:
+        apply_nemotron_h_cp_fixes()
 
     shard_before_load = bool(config["dtensor_cfg"].get("shard_before_load", False))
     print(

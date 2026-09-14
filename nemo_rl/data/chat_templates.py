@@ -24,27 +24,33 @@ class COMMON_CHAT_TEMPLATES:
 
 
 def find_rendered_message_content_span(
-    text: str,
-    content: str,
-    cursor: int = 0,
-) -> tuple[int, int, str] | None:
-    """Find a message's content span in chat-template-rendered ``text``.
+    rendered: str,
+    probe_rendered: str,
+    sentinel: str,
+) -> tuple[int, int] | None:
+    """Map one sentinel-probed message-content insertion onto a real render.
 
-    Some chat templates apply Jinja ``trim`` / ``rstrip`` to message content, so
-    the exact ``content`` string may not appear verbatim in ``text``. Search for
-    the exact content first, then whitespace-trimmed variants, starting at
-    ``cursor``. Returns ``(start, end, matched_variant)`` or ``None``.
+    ``probe_rendered`` must be produced from the same complete conversation as
+    ``rendered``, with exactly one message's content replaced by ``sentinel``.
+    The text surrounding that unique sentinel structurally anchors the content
+    insertion, so content repeated in role headers, tools, or other turns cannot
+    be mistaken for the target. The returned span covers the template-rendered
+    content, including any escaping and excluding whitespace removed by the
+    template. ``None`` means the probe was ambiguous or changed text outside the
+    target insertion.
     """
-    if not content:
+    if probe_rendered.count(sentinel) != 1:
         return None
 
-    candidates = (content, content.rstrip(), content.lstrip(), content.strip())
-    seen: set[str] = set()
-    for candidate in candidates:
-        if not candidate or candidate in seen:
-            continue
-        seen.add(candidate)
-        pos = text.find(candidate, cursor)
-        if pos >= 0:
-            return pos, pos + len(candidate), candidate
-    return None
+    probe_start = probe_rendered.index(sentinel)
+    probe_end = probe_start + len(sentinel)
+    prefix = probe_rendered[:probe_start]
+    suffix = probe_rendered[probe_end:]
+    if not rendered.startswith(prefix) or (suffix and not rendered.endswith(suffix)):
+        return None
+
+    content_start = len(prefix)
+    content_end = len(rendered) - len(suffix) if suffix else len(rendered)
+    if content_end < content_start:
+        return None
+    return content_start, content_end
