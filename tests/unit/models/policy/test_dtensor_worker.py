@@ -28,7 +28,7 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.flops_tracker import FLOPTracker, get_hf_config
-from tests.unit.test_utils import SimpleLossFn
+from tests.unit.test_utils import SimpleLossFn, UnitSequenceLossFn
 
 
 class _FakeTrainableModel:
@@ -41,24 +41,6 @@ class _FakeTrainableModel:
 
     def eval(self):
         self.eval_called = True
-
-
-class _UnitSequenceLossFn(SimpleLossFn):
-    """Give each valid sequence unit loss, with a graph for backward."""
-
-    def __call__(
-        self,
-        logits: torch.Tensor,
-        data: BatchedDataDict,
-        global_valid_seqs: torch.Tensor,
-        global_valid_toks: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        num_valid_samples = data["sample_mask"].sum()
-        loss = logits.float().mean() * 0 + num_valid_samples / global_valid_seqs
-        return loss, {
-            "loss": loss.item(),
-            "num_valid_samples": num_valid_samples.item(),
-        }
 
 
 def test_dtensor_prepare_for_training_restores_optimizer(monkeypatch):
@@ -1116,7 +1098,7 @@ class TestTwoGPUCluster:
             )
 
             policy.prepare_for_training()
-            results = policy.train(data, _UnitSequenceLossFn(), eval_mode=eval_mode)
+            results = policy.train(data, UnitSequenceLossFn(), eval_mode=eval_mode)
 
             # Each global batch has mean sequence loss 1, irrespective of dummies.
             torch.testing.assert_close(results["loss"], torch.ones(2))
