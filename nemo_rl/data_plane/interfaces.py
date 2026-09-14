@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PositiveInt
 from tensordict import TensorDict
 
 DATA_PLANE_CHECKPOINT_SCHEMA_VERSION = 2
@@ -80,6 +80,11 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     admitted and never shrink — so raise it only when a per-key payload (one
     sample of one field) genuinely exceeds it, not for headroom.
 
+    ``use_gdr`` lets CUDA-initialized clients transfer through TransferQueue's
+    persistent GPU staging buffer. ``gdr_staging_buffer_mb`` is the positive
+    HBM capacity of that buffer per active GDR client. CPU-only clients keep
+    using the registered host-buffer path.
+
     Every RDMA rail on the host is offered to mooncake (see ``rdma_devices``).
     That is only safe with ``MC_ENABLE_DEST_DEVICE_AFFINITY=1``, which pins each
     transfer's peer rail to the local one by name; on a rail-isolated RoCE
@@ -91,6 +96,8 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     local_buffer_size: int = 4294967296  # 4 GiB per client process
     reuse_registered_buffers: bool = True
     staging_buffer_size: int = 268435456  # 256 MiB per pool slot
+    use_gdr: bool = False
+    gdr_staging_buffer_mb: PositiveInt = 1024
 
 
 class DataPlaneConfig(TypedDict):

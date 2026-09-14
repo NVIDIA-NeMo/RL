@@ -10,6 +10,10 @@ grpo:
     enabled: true
     max_trajectory_age_steps: 2
     in_flight_weight_updates: true
+async_rl:
+  generation_fleet_health:
+    # Native MCore refit has no worker-side abort hook for a deadline.
+    refit_timeout_s: null
 loss_fn:
   reference_policy_kl_penalty: 0.0
   use_importance_sampling_correction: true
@@ -34,8 +38,10 @@ policy:
     activation_checkpointing: true
   generation:
     backend: megatron
+    refit_transport: mcore
     bad_words: null
     mcore_generation_config:
+      refit_backend: nccl
       expose_http_server: true
       buffer_size_gb: 8
       num_cuda_graphs: -1

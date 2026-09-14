@@ -23,10 +23,13 @@ no GPU).
 skipped where vllm is unavailable.
 """
 
+import contextlib
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
+from torch.distributed._tensor import Shard
 
 pytest.importorskip("vllm")  # module-top `import vllm` in vllm_backend
 
@@ -35,6 +38,7 @@ from nemo_rl.models.generation.vllm.vllm_backend import (  # noqa: E402
 )
 from nemo_rl.weight_sync.nccl_reshard_utils import (  # noqa: E402
     HFToLocalParamMap,
+    MeshInfo,
 )
 
 pytestmark = pytest.mark.vllm
@@ -54,7 +58,16 @@ def _make_ext(vllm_params):
         named_modules=lambda: [],
     )
     ext.model_runner = SimpleNamespace(model=model)
+    ext._unquantized_flashinfer_trtllm_param_ids = lambda: set()
     return ext
+
+
+def _enable_trtllm_staging(ext):
+    """Mark every synthetic model parameter as owned by a BF16 TRTLLM module."""
+    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+    ext._unquantized_flashinfer_trtllm_param_ids = lambda: {
+        id(param) for _, param in ext.model_runner.model.named_parameters()
+    }
 
 
 def _param(*shape):
@@ -73,26 +86,35 @@ def test_build_mapping_ffn_only():
                 {
                     "name": "model.layers.0.mlp.gate_proj.weight",
                     "global_shape": [256, H],
+                    "dtype": "torch.float32",
                 },
-                {"name": "model.layers.0.mlp.up_proj.weight", "global_shape": [256, H]},
+                {
+                    "name": "model.layers.0.mlp.up_proj.weight",
+                    "global_shape": [256, H],
+                    "dtype": "torch.float32",
+                },
                 {
                     "name": "model.layers.0.mlp.down_proj.weight",
                     "global_shape": [H, 256],
+                    "dtype": "torch.float32",
                 },
                 # MoE experts: gate/up -> w13 halves, down -> w2.
                 {
                     "name": "model.layers.0.mlp.experts.gate_proj.weight",
                     "global_shape": [E, 128, H],
+                    "dtype": "torch.float32",
                     "grouped_expert_proj": "gate_proj",
                 },
                 {
                     "name": "model.layers.0.mlp.experts.up_proj.weight",
                     "global_shape": [E, 128, H],
+                    "dtype": "torch.float32",
                     "grouped_expert_proj": "up_proj",
                 },
                 {
                     "name": "model.layers.0.mlp.experts.down_proj.weight",
                     "global_shape": [E, H, 128],
+                    "dtype": "torch.float32",
                     "grouped_expert_proj": "down_proj",
                 },
             ]
@@ -322,6 +344,597 @@ def test_build_hf_to_local_param_map_specs_and_roundtrip():
     egctx.buf.fill_(5.0)
     eg.post(egctx)
     assert torch.equal(w13[:, 0:Pl, :], torch.full_like(w13[:, 0:Pl, :], 5.0))
+
+
+def test_build_hf_to_local_param_map_stages_trtllm_local_experts():
+    """Packed TRTLLM storage receives canonical EP-local weights via load_weights."""
+    H, E, P = 16, 4, 32
+    expert_name = "model.layers.0.mlp.experts.gate_proj.weight"
+    refit_info = {
+        "gen_tp_size": 2,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": expert_name,
+                    "global_shape": [E, P, H],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "gate_proj",
+                    "dst_mesh_info": MeshInfo(torch.tensor([8, 9])),
+                    "dst_placements": [Shard(0)],
+                }
+            ]
+        },
+    }
+    packed_w13 = torch.full((128, 16, 24, 64), 7.0)
+    ext = _make_ext(
+        {
+            "model.layers.0.mlp.experts.routed_experts.w13_weight": packed_w13,
+        }
+    )
+    ext.device = torch.device("cpu")
+    ext.pp_comm_groups = {0: SimpleNamespace(rank=9)}
+    _enable_trtllm_staging(ext)
+    ext._load_full_hf_weights = MagicMock(
+        return_value={"model.layers.0.mlp.experts.routed_experts.w13_weight"}
+    )
+
+    spec = ext.build_hf_to_local_param_map(refit_info).get(expert_name)
+    assert spec is not None and spec.pre is not None and spec.post is not None
+
+    ctx = spec.pre(spec.base)
+    assert ctx.buf.shape == (2, P, H)
+    assert ctx.buf.dtype == torch.bfloat16
+    ctx.buf[0].fill_(2.0)
+    ctx.buf[1].fill_(3.0)
+    spec.post(ctx)
+
+    loaded_weights = ext._load_full_hf_weights.call_args.args[0]
+    assert [name for name, _ in loaded_weights] == [
+        "model.layers.0.mlp.experts.2.gate_proj.weight",
+        "model.layers.0.mlp.experts.3.gate_proj.weight",
+    ]
+    torch.testing.assert_close(
+        loaded_weights[0][1], torch.full((P, H), 2.0, dtype=torch.bfloat16)
+    )
+    torch.testing.assert_close(
+        loaded_weights[1][1], torch.full((P, H), 3.0, dtype=torch.bfloat16)
+    )
+    torch.testing.assert_close(packed_w13, torch.full_like(packed_w13, 7.0))
+
+
+def test_build_hf_to_local_param_map_stages_nemotron_lightning_padded_experts():
+    """Receive the logical Nano/Lightning weight instead of its padded runtime form."""
+    num_experts, intermediate_size, hidden_size = 128, 928, 2688
+    expert_name = "backbone.layers.0.mlp.experts.up_proj.weight"
+    runtime_name = "model.layers.0.mlp.experts.routed_experts.w13_weight"
+    refit_info = {
+        "gen_tp_size": 1,
+        "layer_names": ["backbone.layers.0"],
+        "per_layer_params": {
+            "backbone.layers.0": [
+                {
+                    "name": expert_name,
+                    "global_shape": [
+                        num_experts,
+                        intermediate_size,
+                        hidden_size,
+                    ],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "up_proj",
+                    "dst_mesh_info": MeshInfo(torch.tensor([0])),
+                    "dst_placements": [Shard(0)],
+                }
+            ]
+        },
+    }
+    packed_runtime = torch.empty(
+        num_experts,
+        hidden_size // 64,
+        1024,
+        64,
+        dtype=torch.bfloat16,
+        device="meta",
+    )
+    ext = _make_ext({runtime_name: packed_runtime})
+    ext.device = torch.device("meta")
+    ext.pp_comm_groups = {0: SimpleNamespace(rank=0)}
+    _enable_trtllm_staging(ext)
+    ext._load_full_hf_weights = MagicMock(return_value={runtime_name})
+
+    spec = ext.build_hf_to_local_param_map(refit_info).get(expert_name)
+    assert spec is not None and spec.pre is not None and spec.post is not None
+
+    ctx = spec.pre(spec.base)
+    assert ctx.buf.shape == (num_experts, intermediate_size, hidden_size)
+    assert ctx.buf.dtype == torch.bfloat16
+    assert ctx.buf.numel() != packed_runtime.numel()
+    spec.post(ctx)
+
+    loaded_weights = ext._load_full_hf_weights.call_args.args[0]
+    assert len(loaded_weights) == num_experts
+    assert loaded_weights[0][0] == "backbone.layers.0.mlp.experts.0.up_proj.weight"
+    assert loaded_weights[-1][0] == "backbone.layers.0.mlp.experts.127.up_proj.weight"
+    assert loaded_weights[0][1].shape == (intermediate_size, hidden_size)
+
+
+def test_build_hf_to_local_param_map_stages_only_bf16_trtllm_experts(
+    monkeypatch,
+):
+    """Mixed MXFP8 models stage only first/last BF16 expert layers."""
+    num_experts, intermediate_size, hidden_size = 2, 64, 32
+    first_bf16_name = "backbone.layers.0.mlp.experts.up_proj.weight"
+    mxfp8_name = "backbone.layers.1.mlp.experts.up_proj.weight"
+    last_bf16_name = "backbone.layers.2.mlp.experts.up_proj.weight"
+    first_bf16_runtime_name = "model.layers.0.mlp.experts.routed_experts.w13_weight"
+    mxfp8_runtime_name = "model.layers.1.mlp.experts.routed_experts.w13_weight"
+    last_bf16_runtime_name = "model.layers.2.mlp.experts.routed_experts.w13_weight"
+    refit_info = {
+        "gen_tp_size": 1,
+        "layer_names": [
+            "backbone.layers.0",
+            "backbone.layers.1",
+            "backbone.layers.2",
+        ],
+        "per_layer_params": {
+            "backbone.layers.0": [
+                {
+                    "name": first_bf16_name,
+                    "global_shape": [num_experts, intermediate_size, hidden_size],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "up_proj",
+                    "dst_mesh_info": MeshInfo(torch.tensor([0])),
+                    "dst_placements": [Shard(0)],
+                }
+            ],
+            "backbone.layers.1": [
+                {
+                    "name": mxfp8_name,
+                    "global_shape": [num_experts, intermediate_size, hidden_size],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "up_proj",
+                    "dst_mesh_info": MeshInfo(torch.tensor([0])),
+                    "dst_placements": [Shard(0)],
+                }
+            ],
+            "backbone.layers.2": [
+                {
+                    "name": last_bf16_name,
+                    "global_shape": [num_experts, intermediate_size, hidden_size],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "up_proj",
+                    "dst_mesh_info": MeshInfo(torch.tensor([0])),
+                    "dst_placements": [Shard(0)],
+                }
+            ],
+        },
+    }
+    first_bf16_runtime = torch.empty(
+        num_experts, hidden_size // 16, intermediate_size, 16, dtype=torch.bfloat16
+    )
+    last_bf16_runtime = torch.empty(
+        num_experts, hidden_size // 16, intermediate_size, 16, dtype=torch.bfloat16
+    )
+    mxfp8_runtime = torch.empty(
+        num_experts, intermediate_size, hidden_size, dtype=torch.float8_e4m3fn
+    )
+    mxfp8_scale = torch.empty(
+        num_experts, intermediate_size, hidden_size // 32, dtype=torch.uint8
+    )
+    ext = _make_ext(
+        {
+            first_bf16_runtime_name: first_bf16_runtime,
+            mxfp8_runtime_name: mxfp8_runtime,
+            f"{mxfp8_runtime_name}_scale_from_checkpoint": mxfp8_scale,
+            last_bf16_runtime_name: last_bf16_runtime,
+        }
+    )
+    ext.device = torch.device("cpu")
+    ext.pp_comm_groups = {0: SimpleNamespace(rank=0)}
+    _enable_trtllm_staging(ext)
+    ext._unquantized_flashinfer_trtllm_param_ids = lambda: {
+        id(first_bf16_runtime),
+        id(last_bf16_runtime),
+    }
+    ext._load_full_hf_weights = MagicMock(return_value=None)
+
+    def fake_quantize(weight):
+        return (
+            torch.full_like(weight, 3, dtype=torch.float8_e4m3fn),
+            torch.full(
+                (*weight.shape[:-1], weight.shape[-1] // 32),
+                7,
+                dtype=torch.uint8,
+            ),
+        )
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.quantization.fp8.quantize_mxfp8_weight",
+        fake_quantize,
+    )
+
+    specs = ext.build_hf_to_local_param_map(refit_info)
+    first_bf16_spec = specs.get(first_bf16_name)
+    mxfp8_spec = specs.get(mxfp8_name)
+    last_bf16_spec = specs.get(last_bf16_name)
+    assert first_bf16_spec is not None and first_bf16_spec.pre is not None
+    assert first_bf16_spec.post is not None and first_bf16_spec.base is None
+    assert mxfp8_spec is not None and mxfp8_spec.pre is not None
+    assert mxfp8_spec.post is not None and mxfp8_spec.base is not None
+    assert last_bf16_spec is not None and last_bf16_spec.pre is not None
+    assert last_bf16_spec.post is not None and last_bf16_spec.base is None
+
+    first_bf16_spec.post(first_bf16_spec.pre(first_bf16_spec.base))
+    mxfp8_spec.post(mxfp8_spec.pre(mxfp8_spec.base))
+    last_bf16_spec.post(last_bf16_spec.pre(last_bf16_spec.base))
+
+    assert ext._load_full_hf_weights.call_count == 2
+    loaded_source_names = {
+        weight_name
+        for call in ext._load_full_hf_weights.call_args_list
+        for weight_name, _ in call.args[0]
+    }
+    assert loaded_source_names == {
+        f"backbone.layers.0.mlp.experts.{expert}.up_proj.weight"
+        for expert in range(num_experts)
+    } | {
+        f"backbone.layers.2.mlp.experts.{expert}.up_proj.weight"
+        for expert in range(num_experts)
+    }
+    assert torch.all(mxfp8_runtime.float() == 3)
+    assert torch.all(mxfp8_scale == 7)
+
+
+def test_build_hf_to_local_param_map_stages_qwen35_wrapped_experts():
+    """Qwen3.5 wrapper prefixes and RoutedExperts names survive staged reload."""
+    hidden_size, num_experts, intermediate_size = 16, 4, 32
+    hf_prefix = "model.language_model.layers.0.mlp.experts"
+    runtime_prefix = "language_model.model.layers.0.mlp.experts"
+    expert_name = f"{hf_prefix}.down_proj.weight"
+    runtime_name = f"{runtime_prefix}.routed_experts.w2_weight"
+    refit_info = {
+        "gen_tp_size": 2,
+        "layer_names": ["model.language_model.layers.0"],
+        "per_layer_params": {
+            "model.language_model.layers.0": [
+                {
+                    "name": expert_name,
+                    "global_shape": [
+                        num_experts,
+                        hidden_size,
+                        intermediate_size,
+                    ],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "down_proj",
+                    "dst_mesh_info": MeshInfo(torch.tensor([8, 9])),
+                    "dst_placements": [Shard(0)],
+                }
+            ]
+        },
+    }
+    packed_w2 = torch.full((128, 16, 24, 64), 7.0)
+    ext = _make_ext({runtime_name: packed_w2})
+    ext.device = torch.device("cpu")
+    ext.pp_comm_groups = {0: SimpleNamespace(rank=9)}
+    _enable_trtllm_staging(ext)
+    ext._load_full_hf_weights = MagicMock(return_value={f"{runtime_prefix}.w2_weight"})
+
+    spec = ext.build_hf_to_local_param_map(refit_info).get(expert_name)
+    assert spec is not None and spec.pre is not None and spec.post is not None
+    spec.post(spec.pre(spec.base))
+
+    loaded_weights = ext._load_full_hf_weights.call_args.args[0]
+    assert [name for name, _ in loaded_weights] == [
+        f"{hf_prefix}.2.down_proj.weight",
+        f"{hf_prefix}.3.down_proj.weight",
+    ]
+
+
+def test_build_hf_to_local_param_map_requires_pp_groups_for_trtllm_staging():
+    """A missing NCCL communicator fails before staged expert placement."""
+    expert_name = "model.layers.0.mlp.experts.down_proj.weight"
+    refit_info = {
+        "gen_tp_size": 1,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": expert_name,
+                    "global_shape": [2, 16, 32],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "down_proj",
+                    "dst_mesh_info": MeshInfo(torch.tensor([0])),
+                    "dst_placements": [Shard(0)],
+                }
+            ]
+        },
+    }
+    ext = _make_ext(
+        {"model.layers.0.mlp.experts.routed_experts.w2_weight": torch.empty(2, 16, 32)}
+    )
+    ext.device = torch.device("cpu")
+    ext.pp_comm_groups = None
+    _enable_trtllm_staging(ext)
+
+    with pytest.raises(RuntimeError, match="before.*per-PP-stage groups"):
+        ext.build_hf_to_local_param_map(refit_info)
+
+
+def test_build_hf_to_local_param_map_rejects_missing_trtllm_destination():
+    """The staged load must report the fused destination parameter."""
+    hidden_size, num_experts, intermediate_size = 16, 4, 32
+    expert_name = "model.layers.0.mlp.experts.down_proj.weight"
+    refit_info = {
+        "gen_tp_size": 2,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": expert_name,
+                    "global_shape": [
+                        num_experts,
+                        hidden_size,
+                        intermediate_size,
+                    ],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "down_proj",
+                    "dst_mesh_info": MeshInfo(torch.tensor([8, 9])),
+                    "dst_placements": [Shard(0)],
+                }
+            ]
+        },
+    }
+    ext = _make_ext(
+        {
+            "model.layers.0.mlp.experts.routed_experts.w2_weight": torch.empty(
+                128, 16, 24, 64
+            ),
+        }
+    )
+    ext.device = torch.device("cpu")
+    ext.pp_comm_groups = {0: SimpleNamespace(rank=9)}
+    _enable_trtllm_staging(ext)
+    ext._load_full_hf_weights = MagicMock(
+        return_value={"model.layers.0.mlp.experts.w13_weight"}
+    )
+
+    spec = ext.build_hf_to_local_param_map(refit_info).get(expert_name)
+    assert spec is not None and spec.pre is not None and spec.post is not None
+
+    with pytest.raises(RuntimeError, match="w2_weight"):
+        spec.post(spec.pre(spec.base))
+
+
+def test_build_hf_to_local_param_map_rejects_trtllm_tensor_sharding():
+    """TRTLLM expert staging supports expert-parallel destination shards only."""
+    expert_name = "model.layers.0.mlp.experts.gate_proj.weight"
+    refit_info = {
+        "gen_tp_size": 2,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": expert_name,
+                    "global_shape": [4, 32, 16],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "gate_proj",
+                    "dst_mesh_info": MeshInfo(torch.tensor([8, 9])),
+                    "dst_placements": [Shard(1)],
+                }
+            ]
+        },
+    }
+    ext = _make_ext(
+        {
+            "model.layers.0.mlp.experts.routed_experts.w13_weight": torch.empty(
+                128, 16, 24, 64
+            ),
+        }
+    )
+    _enable_trtllm_staging(ext)
+
+    with pytest.raises(ValueError, match="unsupported tensor shard dimensions"):
+        ext.build_hf_to_local_param_map(refit_info)
+
+
+def test_prepare_nccl_reshard_refit_info_validates_before_building_map(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext._validate_native_layerwise_refit = MagicMock(
+        side_effect=RuntimeError("unsupported weight update")
+    )
+    ext.build_hf_to_local_param_map = MagicMock()
+    restore_refit_info_placements = MagicMock()
+    monkeypatch.setattr(
+        "nemo_rl.weight_sync.nccl_reshard_utils.restore_refit_info_placements",
+        restore_refit_info_placements,
+    )
+
+    with pytest.raises(RuntimeError, match="unsupported weight update"):
+        ext.prepare_nccl_reshard_refit_info({"layer_names": []})
+
+    ext._validate_native_layerwise_refit.assert_called_once_with("nccl_reshard")
+    restore_refit_info_placements.assert_not_called()
+    ext.build_hf_to_local_param_map.assert_not_called()
+    assert not hasattr(ext, "nccl_reshard_refit_info")
+
+
+def test_nccl_reshard_trtllm_refit_rejects_fp8_kv_cache(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=object())
+    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+    ext._uses_fp8_kv_cache = lambda: True
+    monkeypatch.setattr(
+        vllm_backend,
+        "_unquantized_flashinfer_trtllm_modules",
+        lambda _model: [SimpleNamespace(expert_placement_strategy="linear")],
+    )
+
+    with pytest.raises(RuntimeError, match="FP8 KV cache"):
+        ext._validate_native_layerwise_refit("nccl_reshard")
+
+
+@pytest.mark.parametrize("prepare_before_comm", [False, True])
+def test_legacy_refit_map_is_built_after_comm_groups_exist(
+    monkeypatch, prepare_before_comm
+):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.device = torch.device("cpu")
+    ext.pp_comm_groups = None
+    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+    ext._validate_native_layerwise_refit = MagicMock()
+    expected_map = HFToLocalParamMap()
+    ext.build_hf_to_local_param_map = MagicMock(return_value=expected_map)
+    refit_info = {"layer_names": [], "per_layer_params": {}}
+    monkeypatch.setattr(
+        "nemo_rl.weight_sync.nccl_reshard_utils.restore_refit_info_placements",
+        lambda value: value,
+    )
+
+    class _FakeGroup:
+        def __init__(self, *, rank, **_kwargs):
+            self.rank = rank
+
+        def init_nccl_communicator(self, *, device):
+            assert device == torch.device("cpu")
+
+    monkeypatch.setattr(
+        "nemo_rl.distributed.stateless_process_group.StatelessProcessGroup",
+        _FakeGroup,
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    if prepare_before_comm:
+        ext.prepare_nccl_reshard_refit_info(refit_info)
+        ext.build_hf_to_local_param_map.assert_not_called()
+
+    ext.init_nccl_reshard_comm_group(
+        rank_prefix=0,
+        pp_ips=["127.0.0.1"],
+        pp_ports=[29500],
+        pp_size=1,
+        train_ranks_per_stage=8,
+        sub_world_size=10,
+    )
+
+    assert ext.pp_comm_groups[0].rank == 8
+    if not prepare_before_comm:
+        ext.build_hf_to_local_param_map.assert_not_called()
+        ext.prepare_nccl_reshard_refit_info(refit_info)
+
+    ext.build_hf_to_local_param_map.assert_called_once_with(refit_info)
+    assert ext.hf_to_local_param_map is expected_map
+
+
+def test_nccl_reshard_lifecycle_repeats_for_trtllm_moe_modules(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    model = torch.nn.Module()
+    trtllm_moe = torch.nn.Module()
+    model_config = object()
+    vllm_config = object()
+    call_order = []
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=vllm_config)
+    ext.model_config = model_config
+    ext.device = torch.device("cpu")
+    ext._uses_unquantized_flashinfer_trtllm = lambda: True
+    ext._validate_native_layerwise_refit = lambda _transport=None: None
+    ext._maybe_process_mtp_drafter_after_loading = lambda: call_order.append("mtp")
+
+    monkeypatch.setattr(
+        vllm_backend,
+        "_unquantized_flashinfer_trtllm_modules",
+        lambda _model: [trtllm_moe],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        vllm_backend,
+        "_refresh_hpc_modules_after_layerwise_reload",
+        lambda _model: None,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
+        lambda module: call_order.append(("initialize", module)),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.reload.finalize_layerwise_reload",
+        lambda reload_model, config: call_order.append(
+            ("finalize", reload_model, config)
+        ),
+    )
+
+    for cycle in range(2):
+        with ext._weight_update_lifecycle("nccl_reshard") as finalize:
+            call_order.append(("transfer", cycle))
+            finalize()
+
+    assert call_order == [
+        ("initialize", trtllm_moe),
+        ("transfer", 0),
+        ("finalize", model, model_config),
+        "mtp",
+        ("initialize", trtllm_moe),
+        ("transfer", 1),
+        ("finalize", model, model_config),
+        "mtp",
+    ]
+
+
+def test_nccl_reshard_refit_runs_transport_lifecycle(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.nccl_reshard_refit_info = {
+        "layer_names": [],
+        "per_layer_params": {},
+        "misc_meta": {},
+    }
+    ext.pp_comm_groups = {}
+    ext._receive_and_load_misc_params = MagicMock()
+    ext._maybe_process_fp8_kv_cache = MagicMock()
+    finalize = MagicMock()
+    lifecycle_calls = []
+
+    @contextlib.contextmanager
+    def lifecycle(transport):
+        lifecycle_calls.append(transport)
+        yield finalize
+
+    ext._weight_update_lifecycle = lifecycle
+    monkeypatch.setattr(torch.cuda, "Stream", lambda: object())
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        lambda *_args: pytest.fail("transport lifecycle must own finalization"),
+    )
+
+    assert ext.nccl_reshard_refit() is True
+    assert lifecycle_calls == ["nccl_reshard"]
+    finalize.assert_called_once_with()
 
 
 def test_build_hf_to_local_param_map_quantizes_bf16_for_mxfp8(monkeypatch):

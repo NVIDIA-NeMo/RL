@@ -30,6 +30,10 @@ from nemo_rl.data_plane.codec import (
     response_from_nested,
     to_nested_by_length,
 )
+from nemo_rl.data_plane.schema import (
+    OPD_FULL_HIDDEN_STATES_FIELD,
+    OPD_FULL_LOGITS_FIELD,
+)
 
 from ._rollout_shapes import make_rollout_batch
 
@@ -257,3 +261,57 @@ def test_pack_jagged_fields_forced_per_token_field_drops_extra_padding() -> None
     assert torch.equal(out["advantages"][1], advantages[1, :5])
     assert torch.equal(out["advantages"][0, 3:], torch.zeros(2))
     assert torch.equal(out["extra_2d"], extra)
+
+
+# ── 3-D per-token columns (full-vocabulary MOPD teacher payload) ────────────
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_pack_jagged_fields_round_trips_a_3d_teacher_payload(
+    dtype: torch.dtype,
+) -> None:
+    """``teacher_full_*`` is the first 3-D column to enter TOKEN_ALIGNED_FIELDS.
+
+    Everything else on that list is ``(N, S)``. The seq dim must be trimmed to
+    each row's own length while the payload width is left alone; the input is
+    deliberately wider than ``max(lengths)`` because mcore SP rounds the
+    forward output's seq dim up to a multiple of TP.
+    """
+    lengths = torch.tensor([3, 5], dtype=torch.long)
+    hidden = torch.randn(2, 8, 4).to(dtype)
+
+    td = pack_jagged_fields(
+        {OPD_FULL_HIDDEN_STATES_FIELD: hidden},
+        lengths=lengths,
+        token_aligned_fields=frozenset({OPD_FULL_HIDDEN_STATES_FIELD}),
+    )
+    out = materialize(td, layout="padded")[OPD_FULL_HIDDEN_STATES_FIELD]
+
+    assert out.shape == (2, 5, 4)
+    assert out.dtype == dtype
+    assert torch.equal(out[0, :3], hidden[0, :3])
+    assert torch.equal(out[1], hidden[1, :5])
+    assert torch.equal(out[0, 3:], torch.zeros(2, 4, dtype=dtype))
+
+
+def test_materialize_pads_a_3d_payload_on_the_seq_dim_only() -> None:
+    """``pad_to_seqlen`` must widen S and leave the payload width untouched.
+
+    ``materialize`` builds its pad spec as ``[0, 0] * (dim - 2) + [0, pad]``,
+    and ``F.pad`` reads that from the last dimension backwards -- so a 3-D
+    column only pads correctly because of the leading ``[0, 0]``.
+    """
+    lengths = torch.tensor([2, 4], dtype=torch.long)
+    payload = torch.randn(2, 4, 3)
+
+    td = pack_jagged_fields(
+        {OPD_FULL_LOGITS_FIELD: payload},
+        lengths=lengths,
+        token_aligned_fields=frozenset({OPD_FULL_LOGITS_FIELD}),
+    )
+    out = materialize(td, layout="padded", pad_to_seqlen=6)[OPD_FULL_LOGITS_FIELD]
+
+    assert out.shape == (2, 6, 3)
+    assert torch.equal(out[0, :2], payload[0, :2])
+    assert torch.equal(out[1, :4], payload[1, :4])
+    assert torch.equal(out[0, 2:], torch.zeros(4, 3))

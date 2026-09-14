@@ -24,6 +24,7 @@ from dataclasses import fields, is_dataclass, replace
 from typing import Any, Callable, Optional, TypeVar, cast
 
 import torch
+import yaml
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.model_provider import ModelProviderMixin, get_model
 from megatron.bridge.peft.lora import LoRA
@@ -55,15 +56,17 @@ from megatron.bridge.training.setup import (
     _create_peft_pre_wrap_hook,
     _update_model_config_funcs,
 )
-from megatron.bridge.training.state import GlobalState
+from megatron.bridge.training.state import GlobalState, TrainState
 from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.utils.cuda_graph import set_cuda_graph_modules
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.inference.shards import build_inference_pg_collection
+from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import load_quantization_recipe
+from megatron.core.rerun_state_machine import RerunMode, get_rerun_state_machine
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
@@ -312,7 +315,11 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
     validate_router_replay_config,
 )
-from nemo_rl.models.policy import MegatronConfig, PolicyConfig
+from nemo_rl.models.policy import (
+    MegatronConfig,
+    MegatronPeftConfig,
+    PolicyConfig,
+)
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
     get_megatron_checkpoint_dir,
@@ -554,7 +561,11 @@ def _get_hf_config_overrides_hash(overrides: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
 
 
-def _resolve_iter_dir_from_root(path: str, not_found_msg: str) -> str:
+def _resolve_iter_dir_from_root(
+    path: str,
+    not_found_msg: str,
+    config_key: str = "pretrained_checkpoint.path",
+) -> str:
     """Resolve the latest iteration directory under ``path``.
 
     Checks ``latest_checkpointed_iteration.txt`` first; falls back to scanning
@@ -570,7 +581,7 @@ def _resolve_iter_dir_from_root(path: str, not_found_msg: str) -> str:
             return os.path.join(path, f"iter_{int(iteration_str):07d}")
         except ValueError:
             raise ValueError(
-                f"pretrained_checkpoint.path={path!r}: "
+                f"{config_key}={path!r}: "
                 f"latest_checkpointed_iteration.txt contains unexpected value "
                 f"{iteration_str!r}; expected an integer or 'release'."
             )
@@ -585,6 +596,178 @@ def _resolve_iter_dir_from_root(path: str, not_found_msg: str) -> str:
     if not iter_subdirs:
         raise FileNotFoundError(not_found_msg)
     return os.path.join(path, iter_subdirs[-1])
+
+
+def _resolve_peft_restore_dir(restore_from: str) -> str:
+    """Resolve a ``megatron_cfg.peft.restore_from`` path to an iteration directory.
+
+    Accepts either a specific iteration directory (containing run_config.yaml)
+    or a checkpoint root with a latest_checkpointed_iteration.txt tracker file /
+    iter_* subdirectories.
+    """
+    if not os.path.isdir(restore_from):
+        raise FileNotFoundError(
+            f"megatron_cfg.peft.restore_from={restore_from!r} does not exist or is "
+            "not a directory. It must point to a native Megatron-Bridge PEFT "
+            "checkpoint (an iter_XXXXXXX directory or a checkpoint root "
+            "containing one)."
+        )
+    if os.path.exists(os.path.join(restore_from, "run_config.yaml")):
+        return restore_from
+    resolved = _resolve_iter_dir_from_root(
+        restore_from,
+        f"megatron_cfg.peft.restore_from={restore_from!r} does not contain "
+        "run_config.yaml, latest_checkpointed_iteration.txt, or any iter_* "
+        "subdirectories. It must point to a native Megatron-Bridge PEFT "
+        "checkpoint (an iter_XXXXXXX directory or a checkpoint root containing "
+        "one).",
+        config_key="megatron_cfg.peft.restore_from",
+    )
+    if not os.path.exists(os.path.join(resolved, "run_config.yaml")):
+        raise FileNotFoundError(
+            f"megatron_cfg.peft.restore_from={restore_from!r}: resolved to "
+            f"iteration directory {resolved!r} but it does not contain "
+            "run_config.yaml."
+        )
+    return resolved
+
+
+def _validate_peft_restore_config(
+    restore_dir: str, peft_cfg: MegatronPeftConfig
+) -> None:
+    """Fail closed if the donor checkpoint's PEFT config is incompatible.
+
+    Adapter tensors are loadable only when the rank (dim) matches, and only
+    functionally equivalent when the scaling (alpha) matches, so both must
+    agree with this run's ``megatron_cfg.peft`` before any weights are loaded.
+    The targeted module sets must match as well: the adapter-only distributed
+    load only raises on donor keys missing from the checkpoint, while
+    unrequested donor keys are discarded silently (DCP's ASSUME_OK_UNEXPECTED
+    skips the mismatch check), so a superset donor would otherwise load with
+    no diagnostics and leave this run's extra adapters at fresh init.
+    """
+    run_config_path = os.path.join(restore_dir, "run_config.yaml")
+    with open(run_config_path) as f:
+        run_config = yaml.safe_load(f)
+    saved_peft = run_config.get("peft") if isinstance(run_config, dict) else None
+    if not isinstance(saved_peft, dict):
+        raise ValueError(
+            f"megatron_cfg.peft.restore_from={restore_dir!r}: {run_config_path} "
+            "has no 'peft' section. restore_from requires a checkpoint saved "
+            "with PEFT enabled."
+        )
+    for key in ("dim", "alpha"):
+        if key not in saved_peft:
+            raise ValueError(
+                f"megatron_cfg.peft.restore_from={restore_dir!r}: the donor "
+                f"checkpoint's run_config.yaml peft section has no {key!r} key; "
+                "cannot verify compatibility with this run's peft config."
+            )
+        if int(saved_peft[key]) != int(peft_cfg[key]):
+            raise ValueError(
+                f"megatron_cfg.peft.restore_from={restore_dir!r}: donor "
+                f"checkpoint peft.{key}={saved_peft[key]} does not match this "
+                f"run's peft.{key}={peft_cfg[key]}. Warm starting requires the "
+                "same LoRA rank and scaling; train a new adapter instead."
+            )
+    for key in ("target_modules", "exclude_modules"):
+        if key not in saved_peft:
+            raise ValueError(
+                f"megatron_cfg.peft.restore_from={restore_dir!r}: the donor "
+                f"checkpoint's run_config.yaml peft section has no {key!r} key; "
+                "cannot verify compatibility with this run's peft config."
+            )
+        if set(saved_peft[key] or []) != set(peft_cfg[key] or []):
+            raise ValueError(
+                f"megatron_cfg.peft.restore_from={restore_dir!r}: donor "
+                f"checkpoint peft.{key}={saved_peft[key]} does not match this "
+                f"run's peft.{key}={peft_cfg[key]}. Warm starting requires the "
+                "donor to target the same modules; train a new adapter instead."
+            )
+    # These megatron-bridge LoRA fields change the adapter shape/key layout
+    # for MoE expert layers. NeMo RL never sets them (a run always uses the
+    # bridge defaults), but a native Megatron-Bridge donor checkpoint may
+    # have; a mismatch would restore onto a different adapter layout.
+    lora_field_defaults = {field.name: field.default for field in fields(LoRA)}
+    for key in (
+        "normalize_moe_lora",
+        "share_expert_adapters",
+        "experts_shared_outer_loras",
+    ):
+        default = lora_field_defaults[key]
+        if key in saved_peft and saved_peft[key] != peft_cfg.get(key, default):
+            raise ValueError(
+                f"megatron_cfg.peft.restore_from={restore_dir!r}: donor "
+                f"checkpoint peft.{key}={saved_peft[key]} does not match this "
+                f"run's peft.{key}={peft_cfg.get(key, default)}. Warm starting "
+                "requires the same MoE adapter layout; train a new adapter "
+                "instead."
+            )
+
+
+def _create_peft_warm_start_hook(
+    megatron_cfg: ConfigContainer,
+    state: GlobalState,
+    restore_dir: str,
+) -> Callable[[list[MegatronModule]], list[MegatronModule]]:
+    """Create a pre-wrap hook that warm-starts LoRA adapters from a donor checkpoint.
+
+    The hook must run immediately after the PEFT pre-wrap hook (which loads the
+    pretrained base weights and attaches fresh adapters). It routes the donor
+    load through Megatron-Bridge's PEFT-resume path: loading from
+    ``checkpoint.load`` with PEFT configured and ``finetune=False`` filters the
+    generated sharded state dict to adapter keys and drops to a non-strict
+    load, so an adapter-only donor checkpoint restores cleanly onto the fresh
+    base with distributed resharding handled by the torch_dist loader.
+    """
+
+    def peft_warm_start_hook(model: list[MegatronModule]) -> list[MegatronModule]:
+        ckpt_cfg = megatron_cfg.checkpoint
+        rerun_state_machine = get_rerun_state_machine()
+        original_rerun_mode = rerun_state_machine.get_mode()
+        original_load = ckpt_cfg.load
+        original_finetune = ckpt_cfg.finetune
+        original_load_optim = ckpt_cfg.load_optim
+        original_load_rng = ckpt_cfg.load_rng
+        ckpt_cfg.load = restore_dir
+        # finetune=False is required for the adapter-only filter, but
+        # optimizer/RNG state must not come from the donor run.
+        ckpt_cfg.finetune = False
+        ckpt_cfg.load_optim = False
+        ckpt_cfg.load_rng = False
+        # Bridge restores rerun metadata independently of load_rng/load_optim.
+        # A disabled machine ignores donor rerun state, and setup is serialized,
+        # so temporarily disabling it makes this adapter load weights-only.
+        rerun_state_machine.set_mode(RerunMode.DISABLED)
+        try:
+            _load_checkpoint_from_path(
+                load_dir=restore_dir,
+                state=state,
+                model=model,
+                optimizer=None,
+                opt_param_scheduler=None,
+                checkpointing_context={},
+                skip_load_to_model_and_opt=False,
+                ignore_ckpt_step=True,
+            )
+        finally:
+            ckpt_cfg.load = original_load
+            ckpt_cfg.finetune = original_finetune
+            ckpt_cfg.load_optim = original_load_optim
+            ckpt_cfg.load_rng = original_load_rng
+            rerun_state_machine.set_mode(original_rerun_mode)
+        # finetune=False also pulled the donor run's train state (step, consumed
+        # samples) and fed it to the global microbatch calculator. This is a
+        # warm start, not a resume: reset both so the new run starts at step 0.
+        state.train_state = TrainState()
+        update_num_microbatches(consumed_samples=0, verbose=False)
+        print(
+            f"Warm-started PEFT adapters from {restore_dir} "
+            "(optimizer, RNG, and train state start fresh)."
+        )
+        return model
+
+    return peft_warm_start_hook
 
 
 def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
@@ -1627,28 +1810,23 @@ def _create_megatron_config(
     # fp8_param_gather and reuse_grad_buf_for_mxfp8_param_ag are derived: both are
     # only valid when fp8 is enabled, fp8_param=True, and recipe is mxfp8. Mcore's
     # DDP __post_init__ asserts they remain in sync, so we centralize the derivation
-    # rather than exposing two redundant YAML knobs that can disagree.
+    # rather than exposing two redundant YAML knobs that can disagree. The optimizer
+    # fp8_recipe comes from the same canonical model config so it selects the
+    # matching main-parameter representation.
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
-    reuse_grad_buf_for_mxfp8_param_ag = (
-        fp8_param_enabled and fp8_cfg.get("fp8_recipe") == "mxfp8"
+    fp8_recipe = (
+        fp8_cfg.get("fp8_recipe") if fp8_cfg and fp8_cfg.get("enabled", False) else None
     )
+    reuse_grad_buf_for_mxfp8_param_ag = fp8_param_enabled and fp8_recipe == "mxfp8"
     overlap_param_gather = config["megatron_cfg"]["distributed_data_parallel_config"][
         "overlap_param_gather"
     ]
     optimizer_kwargs = {
         **_resolve_optimizer_dtype_kwargs(config["megatron_cfg"]["optimizer"]),
+        "fp8_recipe": fp8_recipe,
         "overlap_param_gather": overlap_param_gather,
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }
-    # OptimizerConfig.__post_init__ treats fp8_recipe=None as "no fp8 params" and
-    # lets the precision-aware optimizer keep fp32 masters inside FusedAdam,
-    # leaving None placeholders in shard_fp32_from_float16_groups; with
-    # reuse_grad_buf_for_mxfp8_param_ag the shared param buffer must be refilled
-    # from those masters each step, so the recipe has to be plumbed to the
-    # optimizer just like Megatron pretrain's get_megatron_optimizer_config does.
-    if fp8_cfg is not None and fp8_cfg.get("enabled", False):
-        optimizer_kwargs["fp8_recipe"] = fp8_cfg.get("fp8_recipe")
-
     # Fused linear logprobs run the decoder but read output_layer.weight directly
     # instead of calling output_layer.forward(). Megatron's distributed-optimizer
     # overlap_param_gather prefetch chain assumes every param-gather bucket
@@ -1973,6 +2151,11 @@ def setup_model_and_optimizer(
     pre_wrap_hook = []
 
     use_peft = policy_cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
+    if not use_peft and policy_cfg["megatron_cfg"].get("peft", {}).get("restore_from"):
+        raise ValueError(
+            "megatron_cfg.peft.restore_from is set but megatron_cfg.peft.enabled "
+            "is False. Enable PEFT to warm start from an adapter checkpoint."
+        )
     draft_enabled = "draft" in policy_cfg and policy_cfg["draft"]["enabled"]
     resume_checkpoint_exists = (
         megatron_cfg.checkpoint.load is not None
@@ -2069,8 +2252,15 @@ def setup_model_and_optimizer(
             a2a_experimental=peft_cfg["a2a_experimental"],
             lora_dtype=peft_cfg["lora_dtype"],
         )
+        # Resolve and validate the warm-start donor checkpoint up front so a
+        # bad path or mismatched donor fails before any model construction.
+        peft_restore_dir = None
+        if peft_cfg.get("restore_from") is not None:
+            peft_restore_dir = _resolve_peft_restore_dir(peft_cfg["restore_from"])
+            _validate_peft_restore_config(peft_restore_dir, peft_cfg)
     else:
         peft = None
+        peft_restore_dir = None
 
     megatron_cfg.peft = peft
 
@@ -2121,6 +2311,14 @@ def setup_model_and_optimizer(
             return model
 
         pre_wrap_hook.extend([composed_peft_hook])
+
+        # Warm start the adapters from the donor checkpoint after the base
+        # weights are loaded and fresh adapters are attached. Skipped when
+        # resuming: the resume checkpoint already carries this run's adapters.
+        if peft_restore_dir is not None and not resume_checkpoint_exists:
+            pre_wrap_hook.append(
+                _create_peft_warm_start_hook(megatron_cfg, state, peft_restore_dir)
+            )
 
     if draft_enabled:
         draft_pre_wrap_hook = _create_draft_pre_wrap_hook(
@@ -2398,6 +2596,21 @@ def setup_reference_model_state(
 
         ref_pre_wrap_hooks.extend([composed_peft_hook])
 
+        # Anchor the reference policy to the warm-started initial policy: with
+        # restore_from set, the policy starts from the donor adapters, so the
+        # reference must include them too (zero-init adapters would anchor KL
+        # to the bare base model). Unlike the policy model this runs on resumes
+        # as well — the reference must stay anchored to the initial policy.
+        peft_restore_from = config["megatron_cfg"].get("peft", {}).get("restore_from")
+        if peft_restore_from is not None:
+            ref_pre_wrap_hooks.append(
+                _create_peft_warm_start_hook(
+                    ref_megatron_cfg,
+                    ref_state,
+                    _resolve_peft_restore_dir(peft_restore_from),
+                )
+            )
+
     try:
         reference_model = get_model(
             megatron_cfg.model,
@@ -2455,6 +2668,127 @@ def setup_reference_model_state(
         clear_global_router_replay_instances()
 
     return reference_state_dict
+
+
+def load_teacher_output_layer_weight(
+    *,
+    teacher_pretrained_path: str,
+    local_vocab_size: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Load this rank's shard of a teacher checkpoint's LM-head weight.
+
+    Full-vocabulary MOPD ships the teacher's hidden states and projects them on
+    the student side, which needs the teacher's ``output_layer.weight``. Only
+    that one tensor is read: instantiating a second Megatron model just to reach
+    it is far more fragile, since provider and config objects accumulate
+    runtime-only distributed state during live training.
+
+    The request is built at the **student's** tensor-parallel rank and size.
+    Re-sharding a teacher saved at a different tensor-parallel width is
+    dist_checkpointing's ordinary by-offset load and needs no special flag.
+    ``allow_shape_mismatch=True`` covers a different case: a teacher whose
+    *padded* vocabulary differs from the student's. Megatron pads to a multiple
+    of ``make_vocab_size_divisible_by * tp_size``, so the two widths diverge
+    whenever the parallel sizes do. Under that flag mcore zero-initializes and
+    partially loads instead of raising, so rows above the narrower of the two
+    padded widths come back as zeros. Those are pad slots rather than real
+    vocabulary entries, so the objective is unaffected in practice -- but this
+    is a silent fallback, not a re-sharding mechanism.
+
+    Args:
+        teacher_pretrained_path: Megatron checkpoint root of the teacher.
+        local_vocab_size: This rank's vocabulary shard width.
+        dtype: Dtype to materialize the shard in.
+
+    Returns:
+        The ``[local_vocab_size, hidden_size]`` weight shard on CPU.
+
+    Raises:
+        FileNotFoundError: If the checkpoint root holds no readable iteration.
+        KeyError: If neither an output-layer nor a tied-embedding weight exists.
+        TypeError: If the loaded checkpoint entry is not a ``torch.Tensor``.
+        ValueError: If the checkpoint tensor is not a rank-2 matrix.
+    """
+    from megatron.bridge.training.utils.checkpoint_utils import (
+        TRACKER_PREFIX,
+        get_checkpoint_name,
+        get_checkpoint_train_state_filename,
+        is_checkpoint_iteration_directory,
+        read_train_state,
+    )
+    from megatron.core import dist_checkpointing
+    from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
+
+    if not checkpoint_exists(teacher_pretrained_path):
+        raise FileNotFoundError(
+            "opd_full needs the teacher LM head, but no Megatron checkpoint is "
+            f"readable at {teacher_pretrained_path!r}."
+        )
+    # validate_model_paths returns a checkpoint root on the HF-cache path but an
+    # already-resolved iteration directory for an explicit pretrained_checkpoint.
+    # Detect which, instead of assuming a root and failing on a missing tracker.
+    # Bridge owns this decision (four markers, MSC-aware) and checkpoint_exists
+    # above already delegates to it.
+    if is_checkpoint_iteration_directory(teacher_pretrained_path):
+        checkpoint_dir = teacher_pretrained_path
+    else:
+        # prefix is required: the default returns train_state.pt, not
+        # latest_train_state.pt.
+        train_state_filename = get_checkpoint_train_state_filename(
+            teacher_pretrained_path, prefix=TRACKER_PREFIX
+        )
+        train_state = read_train_state(train_state_filename)
+        checkpoint_dir = get_checkpoint_name(
+            teacher_pretrained_path, train_state.step, release=False
+        )
+
+    tensor_metadata = dist_checkpointing.load_tensors_metadata(checkpoint_dir)
+    if "output_layer.weight" in tensor_metadata:
+        checkpoint_key = "output_layer.weight"
+    elif "embedding.word_embeddings.weight" in tensor_metadata:
+        # Tied embedding/output checkpoints store the LM head under the
+        # embedding tensor's checkpoint key.
+        checkpoint_key = "embedding.word_embeddings.weight"
+    else:
+        available_keys = sorted(tensor_metadata)
+        raise KeyError(
+            "Could not find a teacher LM-head tensor in "
+            f"{checkpoint_dir!r}. Expected 'output_layer.weight' or "
+            "'embedding.word_embeddings.weight'; got "
+            f"{len(available_keys)} keys, first few: {available_keys[:8]}."
+        )
+
+    global_shape = tuple(tensor_metadata[checkpoint_key].global_shape)
+    if len(global_shape) != 2:
+        raise ValueError(
+            f"Teacher LM-head tensor {checkpoint_key!r} must be rank 2, got "
+            f"global shape {global_shape}."
+        )
+    teacher_hidden_size = int(global_shape[1])
+
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    weight_template = torch.empty(
+        (int(local_vocab_size), teacher_hidden_size), dtype=dtype, device="cpu"
+    )
+    sharded_template = make_tp_sharded_tensor_for_checkpoint(
+        weight_template,
+        key=checkpoint_key,
+        allow_shape_mismatch=True,
+        tp_group=pg_collection.tp,
+        dp_cp_group=pg_collection.dp_cp,
+    )
+    loaded = dist_checkpointing.load(
+        {checkpoint_key: sharded_template},
+        checkpoint_dir,
+        validate_access_integrity=False,
+    )[checkpoint_key]
+    if not isinstance(loaded, torch.Tensor):
+        raise TypeError(
+            f"Expected a Tensor for {checkpoint_key!r} from {checkpoint_dir!r}, "
+            f"got {type(loaded).__name__}."
+        )
+    return loaded.detach().to(device="cpu", dtype=dtype, copy=True)
 
 
 def finalize_megatron_setup(
