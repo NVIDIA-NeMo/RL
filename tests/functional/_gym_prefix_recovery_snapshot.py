@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import tarfile
 import time
 from pathlib import Path
 from typing import Any
@@ -59,6 +60,22 @@ def _participant_manifest(snapshot: Path, participant: dict[str, Any]) -> Path:
     if _digest(path) != reference["manifest_digest"]:
         raise AssertionError(f"participant manifest digest mismatch for {path}")
     return path
+
+
+def _read_artifact(snapshot: Path, reference: dict[str, Any]) -> list[dict[str, Any]]:
+    path = (snapshot / reference["relative_path"]).resolve()
+    path.relative_to(snapshot.resolve())
+    payload = path.read_bytes()
+    if hashlib.sha256(payload).hexdigest() != reference["sha256"]:
+        raise AssertionError(f"artifact digest mismatch for {path}")
+    if len(payload) != reference["bytes"]:
+        raise AssertionError(f"artifact byte count mismatch for {path}")
+    records = [json.loads(line) for line in payload.splitlines() if line.strip()]
+    if len(records) != reference["records"]:
+        raise AssertionError(f"artifact record count mismatch for {path}")
+    if not all(isinstance(record, dict) for record in records):
+        raise TypeError(f"artifact rows must be objects in {path}")
+    return records
 
 
 def _worker_proofs(proof: dict[str, Any]) -> list[dict[str, Any]]:
@@ -126,12 +143,93 @@ def _matching_attempt(
 def _agent_records(snapshot: Path, participant: dict[str, Any]) -> list[dict[str, Any]]:
     manifest_path = _participant_manifest(snapshot, participant)
     manifest = _read_json(manifest_path)
+    if manifest.get("schema_version") != 2:
+        raise AssertionError(
+            "prefix recovery requires the archive-only Gym agent checkpoint schema"
+        )
+    indexed = _read_artifact(snapshot, manifest["record_index"])
+    archives = manifest.get("archives")
+    if not isinstance(archives, list):
+        raise TypeError("agent checkpoint archives must be a list")
+    if manifest.get("records") != len(indexed):
+        raise AssertionError("agent checkpoint record count does not match its index")
+
+    archive_names = [item.get("name") for item in archives if isinstance(item, dict)]
+    indexed_archive_names = {item.get("archive") for item in indexed}
+    if len(archive_names) != len(archives) or len(set(archive_names)) != len(
+        archive_names
+    ):
+        raise AssertionError(
+            "agent checkpoint manifest contains invalid or duplicate archives"
+        )
+    if set(archive_names) != indexed_archive_names:
+        raise AssertionError(
+            "agent checkpoint archive inventory does not match its index"
+        )
+
     records: list[dict[str, Any]] = []
-    for name, expected_digest in manifest.get("files", {}).items():
-        path = manifest_path.parent / name
-        if _digest(path) != expected_digest:
-            raise AssertionError(f"agent boundary digest mismatch for {path}")
-        records.append(_read_json(path))
+    for archive_reference in archives:
+        archive_path = (manifest_path.parent / archive_reference["name"]).resolve()
+        archive_path.relative_to(snapshot.resolve())
+        if not archive_path.is_file():
+            raise FileNotFoundError(archive_path)
+        if archive_path.stat().st_size != archive_reference["bytes"]:
+            raise AssertionError(
+                f"agent archive byte count mismatch for {archive_path}"
+            )
+        if _digest(archive_path) != archive_reference["sha256"]:
+            raise AssertionError(f"agent archive digest mismatch for {archive_path}")
+        expected = [
+            item for item in indexed if item["archive"] == archive_reference["name"]
+        ]
+        if len(expected) != archive_reference["members"]:
+            raise AssertionError(
+                f"agent archive member count mismatch for {archive_path}"
+            )
+        try:
+            with tarfile.open(archive_path, mode="r:") as archive:
+                infos = archive.getmembers()
+                if [info.name for info in infos] != [
+                    item["member"] for item in expected
+                ]:
+                    raise AssertionError(
+                        f"agent archive inventory mismatch for {archive_path}"
+                    )
+                for info, member in zip(infos, expected, strict=True):
+                    if not info.isfile():
+                        raise AssertionError(
+                            f"agent archive member is not a regular file: {info.name}"
+                        )
+                    extracted = archive.extractfile(info)
+                    if extracted is None:
+                        raise AssertionError(
+                            f"agent archive member cannot be read: {info.name}"
+                        )
+                    payload = extracted.read()
+                    if (
+                        len(payload) != member["bytes"]
+                        or hashlib.sha256(payload).hexdigest() != member["sha256"]
+                    ):
+                        raise AssertionError(
+                            f"agent archive member is corrupted: {info.name}"
+                        )
+                    record = json.loads(payload)
+                    if not isinstance(record, dict):
+                        raise TypeError(
+                            f"agent archive member must be an object: {info.name}"
+                        )
+                    if (
+                        record.get("rollout_id"),
+                        record.get("attempt_index"),
+                    ) != (member["rollout_id"], member["attempt_index"]):
+                        raise AssertionError(
+                            f"agent archive member identity mismatch: {info.name}"
+                        )
+                    records.append(record)
+        except tarfile.TarError as error:
+            raise AssertionError(
+                f"agent archive cannot be read: {archive_path}"
+            ) from error
     return records
 
 
@@ -184,7 +282,11 @@ def inspect_snapshot(
     _participant_manifest(
         snapshot, _participant(gym_checkpoint, "responses_api_models")
     )
-    _participant_manifest(snapshot, resources)
+    resources_manifest_path = _participant_manifest(snapshot, resources)
+    if agent.get("payload", {}).get("records", 0) < 1:
+        raise AssertionError("Gym agent has no saved continuation boundary")
+    if resources.get("payload", {}).get("sessions", 0) < 1:
+        raise AssertionError("Gym resources participant has no saved environment")
     matching_boundaries = [
         record
         for record in _agent_records(snapshot, agent)
@@ -196,6 +298,37 @@ def inspect_snapshot(
             "active generation cut has no unique saved agent continuation boundary"
         )
     boundary = matching_boundaries[0]
+    resource_revisions = boundary.get("resource_state_revisions")
+    if not isinstance(resource_revisions, dict) or not resource_revisions:
+        raise AssertionError("saved agent boundary has no resource state revision")
+
+    resources_manifest = _read_json(resources_manifest_path)
+    matching_resource_states: list[dict[str, Any]] = []
+    for name, expected_digest in resources_manifest.get("files", {}).items():
+        resource_path = resources_manifest_path.parent / name
+        if _digest(resource_path) != expected_digest:
+            raise AssertionError(f"resources state digest mismatch for {resource_path}")
+        resource_state = _read_json(resource_path)
+        if (
+            resource_state.get("rollout_id") == prefix["rollout_id"]
+            and resource_state.get("attempt_index") == prefix["attempt_index"]
+        ):
+            matching_resource_states.append(resource_state)
+    if len(matching_resource_states) != 1:
+        raise AssertionError(
+            "active generation cut has no unique saved resources state"
+        )
+    resource_name = resources["participant"]["participant_name"]
+    expected_resource_revision = resource_revisions.get(resource_name)
+    if (
+        not isinstance(expected_resource_revision, int)
+        or expected_resource_revision < 1
+        or matching_resource_states[0].get("state_revision")
+        != expected_resource_revision
+    ):
+        raise AssertionError(
+            "agent boundary and resources snapshot disagree about state revision"
+        )
 
     recovery = torch.load(snapshot / "rollout_recovery.pt", weights_only=True)
     if not isinstance(recovery, dict):
@@ -219,7 +352,7 @@ def inspect_snapshot(
         "prefix_token_count": prefix["prefix_token_count"],
         "prefix_digest": prefix["prefix_digest"],
         "boundary_index": boundary["boundary_index"],
-        "resource_state_revisions": boundary.get("resource_state_revisions", {}),
+        "resource_state_revisions": resource_revisions,
         "group_id": group["group_id"],
     }
 
@@ -294,6 +427,17 @@ def verify_restore(args: argparse.Namespace) -> None:
     restored_key = _capture_key(
         selected["rollout_id"], selected["restored_attempt_index"]
     )
+    source_key = _capture_key(selected["rollout_id"], selected["source_attempt_index"])
+    source_dispatches = [
+        event
+        for event in events
+        if event.get("event") == "dispatch"
+        and source_key in event.get("rollout_ids", [])
+    ]
+    if source_dispatches:
+        raise AssertionError(
+            f"source rollout attempt {source_key!r} was redispatched after restore"
+        )
     dispatches = [
         event
         for event in events
@@ -318,7 +462,7 @@ def verify_restore(args: argparse.Namespace) -> None:
     log = args.run_log.read_text(errors="replace")
     restored_pattern = re.compile(
         r"generation prefix restored: rollout_id=(\S+) model_call_id=(\S+) "
-        r"source_model_call_id=(\S+) prefix_tokens=(\d+)"
+        r"source_model_call_id=(\S+) prefix_tokens=(\d+) prefix_digest=([0-9a-f]{64})"
     )
     restored = [
         match
@@ -332,6 +476,8 @@ def verify_restore(args: argparse.Namespace) -> None:
         )
     if int(restored[0].group(4)) != selected["prefix_token_count"]:
         raise AssertionError("replacement request restored the wrong prefix length")
+    if restored[0].group(5) != selected["prefix_digest"]:
+        raise AssertionError("replacement request restored the wrong prefix digest")
 
     completed_pattern = re.compile(
         r"generation prefix completed: rollout_id=(\S+) model_call_id=(\S+) "
