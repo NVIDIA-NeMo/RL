@@ -22,7 +22,6 @@ from typing import Any, Optional, cast
 
 import ray
 import torch
-from transformers import AutoConfig
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
@@ -605,7 +604,10 @@ class BaseVllmGenerationWorker:
 
         # Override HF config for gpt-oss models to ensure compatibility with megatron
         # The megatron --> hf export is done in bf16, so we disable quantization
-        hf_config = AutoConfig.from_pretrained(self.model_name, trust_remote_code=True)
+        # Keep vLLM optional for code paths that do not use the generation backend.
+        from vllm.transformers_utils.config import get_config
+
+        hf_config = get_config(self.model_name, trust_remote_code=True)
         self.routed_experts_dtype = resolve_routed_experts_dtype(
             get_num_routed_experts(hf_config)
         )

@@ -28,6 +28,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.linear import LinearBase
+from vllm.transformers_utils.config import get_config
 from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
@@ -226,7 +227,12 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     use_fp8_weights = vllm_cfg.get("precision") == "fp8"
     if vllm_cfg.get("is_mx") and not use_fp8_weights:
         raise ValueError("is_mx=True requires precision='fp8'")
-    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    try:
+        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    except ValueError:
+        # vLLM can ship configuration backports for architectures that are not
+        # registered in the pinned Transformers release.
+        config = get_config(model_name, trust_remote_code=True)
     kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
 
     # Validate configuration: kv_cache_dtype
@@ -442,6 +448,12 @@ def _get_params_in_layers(param_names, layers):
 
 
 def _get_module_from_param_name(model, name: str):
+    mapper = getattr(model, "hf_to_vllm_mapper", None)
+    if mapper is not None and hasattr(mapper, "get_rename_mapper"):
+        mapped_names = mapper.get_rename_mapper().apply_list([name])
+        if mapped_names:
+            name = mapped_names[0]
+
     # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
     # The module path is all but the last part (the parameter's own name)
     path_parts = name.split(".")
@@ -455,19 +467,21 @@ def _get_module_from_param_name(model, name: str):
     }
     if module_path[-1] in reversed_mapping.keys():
         module_path[-1] = reversed_mapping[module_path[-1]]
-    if hasattr(model, "hf_to_vllm_mapper") and hasattr(
-        model.hf_to_vllm_mapper, "orig_to_new_prefix"
+    if (
+        mapper is not None
+        and not hasattr(mapper, "get_rename_mapper")
+        and hasattr(mapper, "orig_to_new_prefix")
     ):
-        if module_path[0] in model.hf_to_vllm_mapper.orig_to_new_prefix:
-            module_path[0] = model.hf_to_vllm_mapper.orig_to_new_prefix[module_path[0]]
-    if hasattr(model, "hf_to_vllm_mapper") and hasattr(
-        model.hf_to_vllm_mapper, "orig_to_new_substr"
+        if module_path[0] in mapper.orig_to_new_prefix:
+            module_path[0] = mapper.orig_to_new_prefix[module_path[0]]
+    if (
+        mapper is not None
+        and not hasattr(mapper, "get_rename_mapper")
+        and hasattr(mapper, "orig_to_new_substr")
     ):
         for i in range(len(module_path)):
-            if module_path[i] in model.hf_to_vllm_mapper.orig_to_new_substr:
-                module_path[i] = model.hf_to_vllm_mapper.orig_to_new_substr[
-                    module_path[i]
-                ]
+            if module_path[i] in mapper.orig_to_new_substr:
+                module_path[i] = mapper.orig_to_new_substr[module_path[i]]
 
     current_module = model
     try:
@@ -1091,7 +1105,7 @@ def process_weights_after_loading_moe(self, layer) -> None:
     the weight_loader attribute which we need for refit.
 
     Updated for vLLM 0.25 which passes a RoutedExperts module as `layer` and
-    sets up the MoE kernel via make_fp8_moe_kernel(routing_tables=..., layer=...).
+    sets up the MoE kernel with the layer's expert routing tables.
     """
     from vllm.model_executor.layers.quantization.fp8 import (
         convert_to_fp8_moe_kernel_format,
@@ -1138,7 +1152,6 @@ def process_weights_after_loading_moe(self, layer) -> None:
             fp8_backend=self.fp8_backend,
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
-            layer=layer,
         )
 
 
@@ -1386,7 +1399,6 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
             fp8_backend=self.mxfp8_backend,
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
-            layer=layer,
         )
 
 

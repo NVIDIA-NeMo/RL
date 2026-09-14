@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import patch
+
 import pytest
 
 from nemo_rl.models.huggingface.common import ModelFlag, is_gemma_model
@@ -54,3 +56,11 @@ def test_gemma_models(model_name):
 def test_non_gemma_models(model_name):
     assert not is_gemma_model(model_name)
     assert not ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(model_name)
+
+
+def test_vllm_load_format_auto_ignores_unknown_transformers_architecture():
+    with patch(
+        "nemo_rl.models.huggingface.common.AutoConfig.from_pretrained",
+        side_effect=ValueError("unknown model type"),
+    ):
+        assert not ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches("unknown-model")

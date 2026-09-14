@@ -23,6 +23,7 @@ maintainers = [
 ]
 dependencies = [
   "setuptools",
+  "setuptools_scm",                                                                                     # Required for editable custom vLLM version metadata
   "pip",                                                                                                 # Required for frozen environments; uv venv --seed may not reliably install pip
   "ninja",                                                                                               # for flash-attn parallel build
   "torch==2.11.0",
@@ -62,6 +63,7 @@ dependencies = [
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
   "pyzmq",
+  "socksio==1.0.0",                                                                                       # Required when httpx uses the container's SOCKS proxy
   "soundfile>=0.13.1",
   "nccl4py; sys_platform != 'darwin'",                                                                                       # for non-colocated refit
   "cuda-bindings; sys_platform != 'darwin'",                                                                                 # for non-colocated refit
@@ -85,7 +87,7 @@ dependencies = [
   # gated-chunk backward with a RuntimeError pointing at this exact pip install.
   # Keep the base range broad for both supported Linux architectures; backend
   # extras tighten the version as required.
-  "tilelang>=0.1.9,<0.1.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "tilelang>=0.1.9,<0.1.13; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Data-plane stack — promoted to base so worker venvs (built by
   # nemo_rl.utils.venvs.create_local_venv via bare `uv sync`, no extras)
   # automatically include them. Removes the need for a `[data-plane]`
@@ -150,23 +152,24 @@ automodel = [
 ]
 vllm = [
   "transformers==5.12.1",
-  "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "tilelang==0.1.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "cuda-python",
   "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
   # deep_ep also needs libibverbs-dev
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
-  # Default wheels on GitHub are cu130. See v0.25.1 release assets:
-  # https://github.com/vllm-project/vllm/releases/tag/v0.25.1
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1-cp38-abi3-manylinux_2_28_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1-cp38-abi3-manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "vllm==0.25.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@29d31c095796f3c8ece47ee9cdcc167051bbeed9 ; platform_machine == 'x86_64'",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
+  # Local editable checkout of vLLM PR #53906 at 8f8cc414d1c7648aad8808ba94e7c7fb1b6a72c2.
+  "vllm",
+  # Matches this PR checkout's CUDA test environment; 2.6.1 lacks the
+  # NamespaceTool type imported by the vLLM CLI.
+  "openai==2.44.0",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.13",
-  "flashinfer-cubin==0.6.13",
-  "flashinfer-jit-cache==0.6.13",
-  "nvidia-cutlass-dsl[cu13]==4.5.2",
+  "flashinfer-python==0.6.18",
+  "flashinfer-cubin==0.6.18",
+  "flashinfer-jit-cache==0.6.18",
+  "nvidia-cutlass-dsl[cu13]==4.6.2",
 ]
 sglang = [
   # sgl-project/sglang branch `sglang-miles` (based on v0.5.16). Needed for the
@@ -252,9 +255,13 @@ nemo_gym = ["nemo_gym"]
 build = [
   # Build requirement for TE
   "torch==2.11.0",
-  # Build requirement for TE
+  # Build requirements for TE and the local editable vLLM checkout
   "setuptools",
+  "setuptools-scm>=8.0",
+  "setuptools-rust>=1.9.0",
+  "wheel",
   "packaging",
+  "jinja2",
   "einops",
   # Build requirement for nemo_run
   "hatchling",
@@ -298,6 +305,7 @@ test = [
 # build_wheel triggers the actual ~60-min compilation (during `uv sync --extra trtllm`).
 tensorrt-llm = { path = "3rdparty/TensorRT-LLM-workspace" }
 nemo-automodel = { path = "3rdparty/Automodel-workspace/Automodel", editable = true }
+vllm = { path = "3rdparty/vllm", editable = true, extra = "vllm" }
 megatron-bridge = { path = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge", editable = true }
 # Keep Gym as an editable path dependency rather than a workspace member. Both
 # projects define a ``vllm`` extra with intentionally different server stacks;
@@ -332,8 +340,16 @@ nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v
 flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA", rev = "b7643bd54521f563b839b98289b5cd048c062ba2" }
 nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "c3b913b9cc1d82d5a0af9fa77b4db87829e6f158" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.6.0" }
-flashinfer-cubin = { index = "flashinfer", extra = "sglang" }
-flashinfer-jit-cache = { index = "flashinfer-cu130" }
+flashinfer-cubin = [
+  { index = "flashinfer", extra = "sglang" },
+  { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.18/flashinfer_cubin-0.6.18-py3-none-any.whl", extra = "vllm" },
+]
+flashinfer-jit-cache = [
+  { index = "flashinfer-cu130", extra = "sglang" },
+  { index = "flashinfer-cu130", extra = "mcore" },
+  { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.18/flashinfer_jit_cache-0.6.18%2Bcu130-cp39-abi3-manylinux_2_28_x86_64.whl", extra = "vllm", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+  { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.18/flashinfer_jit_cache-0.6.18%2Bcu130-cp39-abi3-manylinux_2_28_aarch64.whl", extra = "vllm", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
+]
 
 [tool.uv.workspace]
 members = [
@@ -383,6 +399,7 @@ no-build-isolation-package = [
   "deep_ep",
   "flash_mla",
   "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
+  "vllm",                     # local editable PR checkout; compile against the selected project Torch/CUDA toolchain
   "tensorrt-llm",             # custom PEP 517 backend calls build-custom-trtllm.sh; needs torch/CUDA from main venv
 ]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
@@ -405,7 +422,7 @@ override-dependencies = [
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.15",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
-  "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "nvidia-cudnn-frontend==1.27.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous;
   # 2.30.7 additionally fixes hangs in the NCCL m2n reshard (<link to NCCL release note / internal bug>).
   # An override is required because torch 2.11.0+cu130 pins nvidia-nccl-cu13==2.28.9.
@@ -416,12 +433,20 @@ override-dependencies = [
   "fastapi[standard]>=0.133.0,<0.137.0",
   "nvidia-modelopt[torch]>=0.44.0a0",
   "torch==2.11.0",
-  # Floor only: trtllm (<1.4.0) and vllm (>=1.7.0) are incompatible, and the
-  # universal lock resolves 1.3.0 either way. Pre-existing on main.
-  "llguidance>=1.3.0",
+  # vLLM main declares the Torch 2.13 companion release. The editable custom
+  # build intentionally targets NeMo-RL's selected Torch 2.11 CUDA stack.
+  "torchvision==0.26.0",
+  # The workspace-local vLLM source also applies when nemo-gym[vllm] is
+  # resolved, so keep that package's FlashInfer requirement on the PR's 0.6.18.
+  { package = { name = "nemo-gym" }, dependencies = ["flashinfer-python==0.6.18", "openai>=2.6.1"] },
+  # vLLM (>=1.7,<1.8) and TRT-LLM (>=1.3,<1.4) intentionally use different
+  # llguidance versions; the extras conflict matrix lets uv split them.
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
-  "setuptools>=80.10.2",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
+  # Keep the security floor while respecting Torch (<82) and the local vLLM
+  # build backend (<81).
+  "setuptools>=80.10.2,<81",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@29d31c095796f3c8ece47ee9cdcc167051bbeed9 ; platform_machine == 'x86_64'",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
   # Override sglang's xgrammar==0.1.32 to address CVE GHSA-7rgv-gqhr-fxg3.
@@ -443,10 +468,9 @@ override-dependencies = [
   "pytest>=9.0.3",
   "langchain>=0.3.28",      # Address CVE-2025-65106
   "langchain-core>=0.3.80", # Address CVE-2025-65106
-  # Forces numpy past tensorrt-llm's `numpy>=2.0.0,<2.4` cap (resolves to
-  # 2.5.x). The original driver — TransferQueue pinning `numpy<2.0.0` — is
-  # gone as of TQ v0.1.9; drop this override once the trtllm cap lifts.
-  "numpy>=2.1.0",
+  # The original TransferQueue `numpy<2.0.0` driver is gone as of TQ v0.1.9.
+  # Keep NumPy below 2.5 for the Numba version used by the vLLM extra.
+  "numpy>=2.1.0,<2.5",
   # av (PyAV) carries CVE-bundled codec libs (libx264, libx265, libopenh264, libmp3lame).
   # It is only needed by megatron-bridge's optional WAN diffusion path, which installs it
   # at test time via scripts/install_diffusion_deps.sh. Exclude from the shipped container.
@@ -495,31 +519,102 @@ constraint-dependencies = [
 
 # Workaround for https://github.com/NVIDIA/cutlass/issues/3259: libs-base
 # and libs-cu13 wheels overlap and race on shared paths. libs-cu13 is a
-# functional superset at 4.5.2, so drop libs-base to make installs deterministic.
+# functional superset, so drop libs-base to make installs deterministic.
 exclude-dependencies = ["nvidia-cutlass-dsl-libs-base"]
 
 conflicts = [
-  [{ extra = "fsdp" }, { extra = "sglang" }],
-  [{ extra = "automodel" }, { extra = "sglang" }],
-  [{ extra = "mcore" }, { extra = "sglang" }],
-  [{ extra = "vllm" }, { extra = "sglang" }],
-  [{ extra = "automodel" }, { extra = "fsdp" }],
-  [{ extra = "automodel" }, { extra = "mcore" }],
-  [{ extra = "automodel" }, { extra = "vllm" }],
-  [{ extra = "vllm" }, { extra = "mcore" }],
-  [{ extra = "trtllm" }, { extra = "vllm" }],
-  [{ extra = "trtllm" }, { extra = "sglang" }],
-  [{ extra = "trtllm" }, { extra = "automodel" }],
-  [{ extra = "trtllm" }, { extra = "mcore" }],
-  [{ extra = "trtllm" }, { extra = "fsdp" }],
-  [{ extra = "trtllm" }, { extra = "modelopt" }],
-  [{ extra = "trtllm" }, { extra = "nvrx" }],
-  [{ extra = "trtllm" }, { extra = "nemo_gym" }],
-  # Gym pins openai==2.44.0 (merged PR #2872 tree) while sglang==0.5.12.post1
-  # pins openai==2.6.1; no environment installs both extras together.
-  # Spelled nemo_gym (the raw extras-table key): uv < 0.12 compares conflict
-  # entries against unnormalized extra names and rejects "nemo-gym".
-  [{ extra = "nemo_gym" }, { extra = "sglang" }],
+  [
+    { package = "nemo-rl", extra = "automodel" },
+    { package = "nemo-gym", extra = "vllm" },
+  ],
+  [
+    { package = "nemo-rl", extra = "vllm" },
+    { package = "nemo-gym", extra = "vllm" },
+  ],
+  [
+    { package = "nemo-rl", extra = "sglang" },
+    { package = "nemo-gym", extra = "vllm" },
+  ],
+  [
+    { package = "nemo-rl", extra = "mcore" },
+    { package = "nemo-gym", extra = "vllm" },
+  ],
+  [
+    { package = "nemo-rl", extra = "trtllm" },
+    { package = "nemo-gym", extra = "vllm" },
+  ],
+  [
+    { package = "nemo-rl", extra = "fsdp" },
+    { package = "nemo-gym", extra = "vllm" },
+  ],
+  [
+    { extra = "fsdp" },
+    { extra = "sglang" },
+  ],
+  [
+    { extra = "automodel" },
+    { extra = "sglang" },
+  ],
+  [
+    { extra = "mcore" },
+    { extra = "sglang" },
+  ],
+  [
+    { extra = "vllm" },
+    { extra = "sglang" },
+  ],
+  [
+    { extra = "automodel" },
+    { extra = "fsdp" },
+  ],
+  [
+    { extra = "fsdp" },
+    { extra = "vllm" },
+  ],
+  [
+    { extra = "automodel" },
+    { extra = "mcore" },
+  ],
+  [
+    { extra = "automodel" },
+    { extra = "vllm" },
+  ],
+  [
+    { extra = "vllm" },
+    { extra = "mcore" },
+  ],
+  [
+    { extra = "trtllm" },
+    { extra = "vllm" },
+  ],
+  [
+    { extra = "trtllm" },
+    { extra = "sglang" },
+  ],
+  [
+    { extra = "trtllm" },
+    { extra = "automodel" },
+  ],
+  [
+    { extra = "trtllm" },
+    { extra = "mcore" },
+  ],
+  [
+    { extra = "trtllm" },
+    { extra = "fsdp" },
+  ],
+  [
+    { extra = "trtllm" },
+    { extra = "modelopt" },
+  ],
+  [
+    { extra = "trtllm" },
+    { extra = "nvrx" },
+  ],
+  [
+    { extra = "trtllm" },
+    { extra = "nemo_gym" },
+  ],
 ]
 
 
@@ -584,7 +679,7 @@ requires-dist = ["torch", "packaging", "ninja"]
 [[tool.uv.dependency-metadata]]
 name = "transformer-engine"
 version = "2.15.0+42b8400"
-requires-dist = ["torch", "pydantic", "importlib-metadata>=1.0", "packaging"]
+requires-dist = ["torch", "pydantic", "importlib-metadata>=1.0", "packaging", "nvdlfw-inspect"]
 
 [[tool.uv.dependency-metadata]]
 name = "transformer-engine-torch"

@@ -50,9 +50,15 @@ class ModelFlag(Enum):
     def matches(self, model_name: str) -> bool:
         match self:
             case ModelFlag.VLLM_LOAD_FORMAT_AUTO:
-                return is_gemma_model(model_name) or is_nano_nemotron_vl_model(
-                    model_name
-                )
+                try:
+                    return is_gemma_model(model_name) or is_nano_nemotron_vl_model(
+                        model_name
+                    )
+                except ValueError:
+                    # Some vLLM-native architectures are not registered with the
+                    # Transformers version used by the generation actor. They do
+                    # not require NeMo RL's model-specific load-format override.
+                    return False
             case _:
                 raise ValueError(f"Unknown ModelFlag: {self}")
 

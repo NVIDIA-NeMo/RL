@@ -111,6 +111,63 @@ def test_init_fp8_uses_mxfp8_quantization_config(
     assert "VLLM_USE_DEEP_GEMM_E8M0" not in fp8.os.environ
 
 
+def test_init_fp8_falls_back_to_vllm_config_registry(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    vllm_config = types.SimpleNamespace(num_hidden_layers=4)
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("unknown model")),
+    )
+    monkeypatch.setattr(fp8, "get_config", lambda *_args, **_kwargs: vllm_config)
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "auto",
+            "async_engine": False,
+        },
+        "vllm-native-model",
+        model_parallel_size=1,
+    )
+
+    assert fp8.global_fp8_config.use_fp8_weights is True
+
+
+def test_get_module_from_param_name_applies_vllm_prefix_and_packed_mappers(
+    fp8_module,
+):
+    from vllm.model_executor.models.utils import WeightsMapper
+
+    fp8 = fp8_module
+    target = torch.nn.Linear(2, 2, bias=False)
+    attention = torch.nn.Module()
+    attention.in_proj_qkvbfg_a = target
+    layer = torch.nn.Module()
+    layer.self_attn = attention
+    decoder = torch.nn.Module()
+    decoder.layers = torch.nn.ModuleList([layer])
+    causal_lm = torch.nn.Module()
+    causal_lm.model = decoder
+    model = torch.nn.Module()
+    model.language_model = causal_lm
+    model.packed_modules_mapping = {"in_proj_qkvbfg_a": ["q_proj", "k_proj", "v_proj"]}
+    model.hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.language_model.": "language_model.model.",
+        }
+    )
+
+    module = fp8._get_module_from_param_name(
+        model,
+        "model.language_model.layers.0.self_attn.q_proj.weight",
+    )
+
+    assert module is target
+
+
 def test_init_fp8_passes_modelopt_ignore_patterns_without_hf_expansion(
     fp8_module, monkeypatch
 ):
@@ -746,6 +803,79 @@ def test_process_mxfp8_moe_refit_rejects_non_flashinfer_backend(fp8_module):
         fp8_module.process_weights_after_loading_mxfp8_moe(quant_method, object())
 
 
+def test_process_fp8_moe_uses_current_vllm_kernel_signature(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(torch.zeros(2, 4, 3), requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(torch.zeros(2, 3, 2), requires_grad=False)
+    layer.w13_weight_scale_inv = torch.nn.Parameter(
+        torch.ones(2, 4, 1), requires_grad=False
+    )
+    layer.w2_weight_scale_inv = torch.nn.Parameter(
+        torch.ones(2, 3, 1), requires_grad=False
+    )
+    layer.w13_input_scale = None
+    layer.w2_input_scale = None
+    routing_tables = (object(), object(), object())
+    layer._expert_routing_tables = lambda: routing_tables
+
+    moe_config = object()
+    moe_quant_config = object()
+    fp8_backend = object()
+    experts_cls = object()
+    quant_method = types.SimpleNamespace(
+        weight_scale_name="weight_scale_inv",
+        fp8_backend=fp8_backend,
+        moe=moe_config,
+        moe_kernel=None,
+        experts_cls=experts_cls,
+        get_fused_moe_quant_config=lambda _layer: moe_quant_config,
+    )
+
+    from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
+
+    monkeypatch.setattr(
+        vllm_fp8,
+        "convert_to_fp8_moe_kernel_format",
+        lambda **kwargs: (
+            kwargs["w13"],
+            kwargs["w2"],
+            kwargs["w13_scale"],
+            kwargs["w2_scale"],
+        ),
+    )
+    kernel = object()
+    kernel_calls = []
+
+    def make_kernel(
+        *,
+        moe_quant_config,
+        moe_config,
+        fp8_backend,
+        experts_cls,
+        routing_tables,
+    ):
+        kernel_calls.append(
+            (
+                moe_quant_config,
+                moe_config,
+                fp8_backend,
+                experts_cls,
+                routing_tables,
+            )
+        )
+        return kernel
+
+    monkeypatch.setattr(vllm_fp8, "make_fp8_moe_kernel", make_kernel)
+
+    fp8.process_weights_after_loading_moe(quant_method, layer)
+
+    assert quant_method.moe_kernel is kernel
+    assert kernel_calls == [
+        (moe_quant_config, moe_config, fp8_backend, experts_cls, routing_tables)
+    ]
+
+
 def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
     from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 
@@ -844,7 +974,6 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
         "fp8_backend": Fp8MoeBackend.FLASHINFER_TRTLLM,
         "experts_cls": experts_cls,
         "routing_tables": (None, None, None),
-        "layer": layer,
     }
 
 

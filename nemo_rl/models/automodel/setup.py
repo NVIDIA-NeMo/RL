@@ -38,6 +38,7 @@ from nemo_automodel.components.distributed.config import (
 from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.tensor_utils import get_cpu_state_dict
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
+from torch.distributed.tensor import DTensor
 from transformers import (
     AutoConfig,
     AutoProcessor,
@@ -94,6 +95,41 @@ def _requires_fp32_model_load(
         and optimizer_cfg
         and not _has_optimizer_fp32_master(optimizer_cfg, init_optimizer)
     )
+
+
+def _filter_optimizer_parameters(
+    parameters: list[torch.nn.Parameter], optimizer_name: str
+) -> list[torch.nn.Parameter]:
+    """Drop rank-local empty DTensor shards before constructing TE FusedAdam.
+
+    FSDP2 can produce empty local shards when a parameter's leading dimension
+    is smaller than the shard mesh. TE FusedAdam's multi-tensor kernel does not
+    accept empty tensors and can fault at the first optimizer step.
+    """
+    if optimizer_name not in TE_FUSED_ADAM_OPTIMIZER_NAMES:
+        return parameters
+
+    filtered = [
+        parameter
+        for parameter in parameters
+        if (
+            parameter.to_local().numel()
+            if isinstance(parameter, DTensor)
+            else parameter.numel()
+        )
+        > 0
+    ]
+    if parameters and not filtered:
+        raise ValueError(
+            "Every trainable parameter has a zero-numel local shard on this rank; "
+            "Transformer Engine FusedAdam cannot update an empty parameter list."
+        )
+    if len(filtered) != len(parameters):
+        print(
+            f"Dropped {len(parameters) - len(filtered)} zero-numel local parameter "
+            "shard(s) from Transformer Engine FusedAdam."
+        )
+    return filtered
 
 
 def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
@@ -801,7 +837,8 @@ def setup_model_and_optimizer(
     # Initialize optimizer
     optimizer = None
     if init_optimizer:
-        optimizer_cls = get_class(config["optimizer"]["name"])
+        optimizer_name = config["optimizer"]["name"]
+        optimizer_cls = get_class(optimizer_name)
         optimizer_kwargs = dict(config["optimizer"]["kwargs"])
         # Resolve string-valued torch dtypes (e.g. "torch.bfloat16" -> torch.bfloat16)
         for key, value in optimizer_kwargs.items():
@@ -812,10 +849,11 @@ def setup_model_and_optimizer(
         # p.grad-is-None check, so passing frozen params (e.g. the visual
         # encoder in text-only training) causes DCP to save unused state that
         # later fails to reshard on resume.
-        optimizer = optimizer_cls(
-            (p for p in model.parameters() if p.requires_grad),
-            **optimizer_kwargs,
+        optimizer_parameters = _filter_optimizer_parameters(
+            [parameter for parameter in model.parameters() if parameter.requires_grad],
+            optimizer_name,
         )
+        optimizer = optimizer_cls(optimizer_parameters, **optimizer_kwargs)
 
     # Initialize scheduler
     scheduler = None

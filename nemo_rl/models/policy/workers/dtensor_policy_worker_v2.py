@@ -300,7 +300,7 @@ class DTensorPolicyWorkerV2Impl(
                     "dequantize_base_checkpoint", False
                 ),
                 "is_peft": self.lora_enabled,
-                "is_async": True,
+                "is_async": False,
             },
         )
 

@@ -32,6 +32,7 @@ from nemo_rl.models.automodel.config import DistributedContext
 from nemo_rl.models.automodel.setup import (
     ModelAndOptimizerState,
     RuntimeConfig,
+    _filter_optimizer_parameters,
     _has_optimizer_fp32_master,
     _maybe_set_force_hf,
     _requires_fp32_model_load,
@@ -135,6 +136,28 @@ class TestModelLoadDtypeSelection:
         cfg = {"name": "torch.optim.AdamW", "kwargs": {"master_weights": True}}
         assert _has_optimizer_fp32_master(cfg, init_optimizer=True) is False
         assert _requires_fp32_model_load(cfg, init_optimizer=True) is True
+
+    def test_te_fused_adam_drops_empty_local_parameters(self, capsys):
+        empty = torch.nn.Parameter(torch.empty(0))
+        kept = torch.nn.Parameter(torch.ones(1))
+
+        result = _filter_optimizer_parameters([empty, kept], self.FUSED_ADAM["name"])
+
+        assert result == [kept]
+        assert "Dropped 1 zero-numel local parameter shard" in capsys.readouterr().out
+
+    def test_non_te_optimizer_keeps_empty_local_parameters(self):
+        empty = torch.nn.Parameter(torch.empty(0))
+
+        result = _filter_optimizer_parameters([empty], self.ADAMW["name"])
+
+        assert result == [empty]
+
+    def test_te_fused_adam_rejects_all_empty_local_parameters(self):
+        empty = torch.nn.Parameter(torch.empty(0))
+
+        with pytest.raises(ValueError, match="Every trainable parameter"):
+            _filter_optimizer_parameters([empty], self.FUSED_ADAM["name"])
 
 
 @pytest.mark.automodel
