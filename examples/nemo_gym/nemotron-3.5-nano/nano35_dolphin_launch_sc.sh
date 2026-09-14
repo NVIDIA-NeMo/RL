@@ -60,6 +60,7 @@ set -euo pipefail
 #   REFIT_TRANSPORT=null         # fall back to the full-tensor NCCL broadcast
 #   ROLLOUT_CHECKPOINT_INTERVAL_S=120
 #   ROLLOUT_TELEMETRY_INTERVAL_S=30
+#   ROUTER_REPLAY_ENABLED=1      # replay vLLM MoE routes during training
 #   GYM_SOURCE_ROOT=<repo>/3rdparty/Gym-workspace/Gym
 #   MOUNT_LOCAL_GYM=0            # selectively overlay token-capture code
 #
@@ -128,6 +129,20 @@ NUM_STORAGE_UNITS="${NUM_STORAGE_UNITS:-16}"
 MAX_LOOKAHEAD_VERSIONS="${MAX_LOOKAHEAD_VERSIONS:-4}"
 ROLLOUT_CHECKPOINT_INTERVAL_S="${ROLLOUT_CHECKPOINT_INTERVAL_S:-300}"
 ROLLOUT_TELEMETRY_INTERVAL_S="${ROLLOUT_TELEMETRY_INTERVAL_S:-60}"
+ROUTER_REPLAY_ENABLED="${ROUTER_REPLAY_ENABLED:-0}"
+
+case "${ROUTER_REPLAY_ENABLED}" in
+  0)
+    _ROUTER_REPLAY_OVERRIDES=()
+    ;;
+  1)
+    _ROUTER_REPLAY_OVERRIDES=("++policy.router_replay.enabled=true")
+    ;;
+  *)
+    echo "ROUTER_REPLAY_ENABLED must be 0 or 1, got '${ROUTER_REPLAY_ENABLED}'." >&2
+    exit 1
+    ;;
+esac
 
 # Emit only fields belonging to the selected discriminated sampler config.
 # Hydra's `+` form is required when switching away from the in_order block
@@ -220,6 +235,7 @@ echo "  Sampler    : ${SAMPLER} (slack ${MAX_LOOKAHEAD_VERSIONS})"
 echo "  Capacity   : buffer ${_MAX_BUFFERED_ROLLOUTS} groups (x${BUFFER_RETENTION_MULTIPLIER}), ${_MAX_INFLIGHT_PROMPTS} in flight"
 echo "  TQ units   : ${NUM_STORAGE_UNITS}"
 echo "  Rollout ckpt: interval=${ROLLOUT_CHECKPOINT_INTERVAL_S}s, telemetry=${ROLLOUT_TELEMETRY_INTERVAL_S}s"
+echo "  Router replay: enabled=${ROUTER_REPLAY_ENABLED} (exclude MTP=${NRL_ROUTER_REPLAY_EXCLUDE_MTP:-1})"
 echo "================================================================"
 echo ""
 
@@ -254,6 +270,7 @@ exec bash "${SCRIPT_DIR}/nano35_dolphin_launch.sh" \
   "async_rl.max_buffered_rollouts=${_MAX_BUFFERED_ROLLOUTS}" \
   "data_plane.simple.num_storage_units=${NUM_STORAGE_UNITS}" \
   "policy.generation.refit_transport=${REFIT_TRANSPORT}" \
+  "${_ROUTER_REPLAY_OVERRIDES[@]}" \
   "rollout_checkpointing.snapshot_attempt_interval_s=${ROLLOUT_CHECKPOINT_INTERVAL_S}" \
   "rollout_checkpointing.telemetry_interval_s=${ROLLOUT_TELEMETRY_INTERVAL_S}" \
   "++grpo.invalid_tool_call_advantage=null" \
