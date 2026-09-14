@@ -38,6 +38,7 @@ class ResponseDatasetConfig(TypedDict):
     video_temporal_patch_size: NotRequired[int]
     video_maintain_aspect_ratio: NotRequired[bool]
     min_generation_tokens: NotRequired[int]
+    image_max_num_tiles: NotRequired[int]
 
 
 class PreferenceDatasetConfig(TypedDict):
@@ -57,6 +58,7 @@ class PreferenceDatasetConfig(TypedDict):
     video_temporal_patch_size: NotRequired[int]
     video_maintain_aspect_ratio: NotRequired[bool]
     min_generation_tokens: NotRequired[int]
+    image_max_num_tiles: NotRequired[int]
 
 
 class DataConfig(TypedDict):

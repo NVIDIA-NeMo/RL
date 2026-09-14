@@ -34,9 +34,13 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.data.multimodal_utils import (
     attach_image_model_inputs_to_message,
+    count_image_placeholder_runs,
     encode_images_in_examples,
     extract_input_image_sources_from_responses_messages,
+    image_size_from_source,
+    predicted_static_image_num_tokens,
     resolve_to_image,
+    supports_image_placeholder_run_parity,
     uses_image_placeholder,
 )
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
@@ -543,9 +547,15 @@ def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
     """
     images: list[Image.Image] = []
     if item.get("type") == "function_call_output":
+        # Tool outputs are free text. Only an inline image data URL (what
+        # image_tools_agent / gym_v_agent emit) is an image here; a bash/curl
+        # output that merely starts with "http://", "https://" or "file://"
+        # (e.g. a printed URL list or a tool error) must not trigger a network
+        # fetch or file open — the training data has such rows (blend lines
+        # 417/422/4090/12153/12162) and the policy saw them as text.
         src = item.get("output")
-        if isinstance(src, str) and _looks_like_image_src(src):
-            images.append(resolve_to_image(src))
+        if isinstance(src, str) and src.startswith("data:image/"):
+            _append_resolved_image(images, src)
         return images
     content = item.get("content") or []
     if not isinstance(content, list):
@@ -562,8 +572,28 @@ def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
             src = src.get("url")
         if src is None:
             continue
-        images.append(resolve_to_image(src))
+        _append_resolved_image(images, src)
     return images
+
+
+def _append_resolved_image(images: list[Image.Image], src: Any) -> None:
+    """Resolve ``src`` and append it, skipping sources that are not loadable images.
+
+    Tool outputs are free text: a terminal tool error such as
+    ``"/project/assets/resource.txt: Unsupported scheme.\n"`` passes the prefix
+    heuristic in ``_looks_like_image_src`` yet is not a file. Letting PIL raise
+    here propagates through ``run_rollouts`` and drops the entire rollout batch
+    (job 7068977 lost 376/512 groups), so unresolvable sources are logged and
+    contribute zero images instead.
+    """
+    try:
+        images.append(resolve_to_image(src))
+    except (FileNotFoundError, OSError, ValueError) as e:
+        preview = src if isinstance(src, str) else type(src).__name__
+        print(
+            f"[nemo_gym] skipping non-image source in trajectory ({type(e).__name__}): {preview[:120]!r}",
+            flush=True,
+        )
 
 
 def _is_trainable_output_item(item: dict) -> bool:
@@ -664,6 +694,7 @@ def _attach_multimodal_data_to_user_message(
     images: list[Image.Image],
     processor: Any,
     pad_dynamic_image_shapes: bool = False,
+    expected_num_tokens_per_image: "list[int] | None" = None,
 ) -> None:
     """Attach per-turn multimodal tensors to ``user_message``.
 
@@ -680,6 +711,7 @@ def _attach_multimodal_data_to_user_message(
         images=images,
         processor=processor,
         pad_dynamic_image_shapes=pad_dynamic_image_shapes,
+        expected_num_tokens_per_image=expected_num_tokens_per_image,
     )
 
 
@@ -1032,6 +1064,47 @@ Depending on your data shape, you may want to change these values."""
             and initial_media_matches_raw_input
             and returned_media_matches_raw_input
         )
+        parity_processor = (
+            processor
+            if processor is not None
+            and supports_image_placeholder_run_parity(processor)
+            else None
+        )
+        # Dedup omission is only safe when the statically-budgeted tensors the
+        # driver pre-attached provably match the rollout's per-image expansion.
+        # vLLM sizes image tiles per request (shrinking as prompts approach
+        # max_model_len), so budget-bound rows must be attached here, from the
+        # rollout tokens, instead.
+        if (
+            initial_multimodal_data_omitted
+            and parity_processor is not None
+            and raw_initial_sources
+        ):
+            first_trainable_item = next(
+                (
+                    item
+                    for item in response["output"]
+                    if _is_trainable_output_item(item)
+                ),
+                None,
+            )
+            predicted = predicted_static_image_num_tokens(
+                parity_processor,
+                [image_size_from_source(source) for source in raw_initial_sources],
+            )
+            first_turn_runs = (
+                count_image_placeholder_runs(
+                    first_trainable_item["prompt_token_ids"], parity_processor
+                )
+                if first_trainable_item is not None
+                else []
+            )
+            if (
+                predicted is None
+                or len(first_turn_runs) < len(predicted)
+                or first_turn_runs[: len(predicted)] != predicted
+            ):
+                initial_multimodal_data_omitted = False
         if initial_multimodal_data_omitted:
             media_messages, _ = _without_initial_image_sources(
                 media_messages, raw_initial_sources
@@ -1168,6 +1241,29 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 images_this_turn = (
                     per_turn_images[turn_idx] if turn_idx < len(per_turn_images) else []
                 )
+                expected_num_tokens: "list[int] | None" = None
+                if images_this_turn and parity_processor is not None:
+                    turn_runs = count_image_placeholder_runs(
+                        new_prompt_token_ids, parity_processor
+                    )
+                    # Under dedup omission, turn 0's leading runs belong to the
+                    # initial images whose (verified) tensors the driver
+                    # restores; only the trailing runs are attached here.
+                    omitted_leading_runs = (
+                        len(raw_initial_sources)
+                        if initial_multimodal_data_omitted and turn_idx == 0
+                        else 0
+                    )
+                    if len(turn_runs) != omitted_leading_runs + len(images_this_turn):
+                        raise ValueError(
+                            f"Rollout/image mismatch on NeMo Gym turn {turn_idx}: "
+                            f"the prompt delta contains {len(turn_runs)} image "
+                            f"placeholder runs but {len(images_this_turn)} images "
+                            f"were collected for this turn (plus "
+                            f"{omitted_leading_runs} deduplicated initial images). "
+                            "Refusing to train on misaligned media."
+                        )
+                    expected_num_tokens = turn_runs[omitted_leading_runs:]
                 _attach_multimodal_data_to_user_message(
                     user_message,
                     images=images_this_turn,
@@ -1179,6 +1275,7 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                     pad_dynamic_image_shapes=getattr(
                         self, "_pad_dynamic_image_shapes", False
                     ),
+                    expected_num_tokens_per_image=expected_num_tokens,
                 )
             # Valid tool calls go through the structured API (tool_calls field) and get
             # executed by NeMo-Gym. If tool call patterns appear in the text content instead,
