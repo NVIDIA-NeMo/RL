@@ -694,6 +694,38 @@ class TestSetup:
         patched_factories["_build_clusters"].assert_not_called()
         patched_factories["_build_trainer"].assert_not_called()
 
+    def test_warns_when_rollout_telemetry_lacks_vllm_metrics(self, patched_factories):
+        mc = _make_master_config()
+        mc.rollout_checkpointing.telemetry_interval_s = 30.0
+        mc.policy["generation"]["vllm_cfg"] = {"async_engine": True}
+
+        with pytest.warns(UserWarning, match="vLLM token, request, and KV-cache"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_warns_when_vllm_telemetry_uses_sync_engine(self, patched_factories):
+        mc = _make_master_config()
+        mc.rollout_checkpointing.telemetry_interval_s = 30.0
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": False,
+            "enable_vllm_metrics_logger": True,
+        }
+
+        with pytest.warns(UserWarning, match="async_engine=true"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_non_vllm_telemetry_warning_has_no_vllm_config_guidance(
+        self, patched_factories
+    ):
+        mc = _make_master_config(backend="sglang")
+        mc.rollout_checkpointing.telemetry_interval_s = 30.0
+
+        with pytest.warns(UserWarning) as warning_records:
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        messages = [str(record.message) for record in warning_records]
+        assert any("backend='sglang'" in message for message in messages)
+        assert all("enable_vllm_metrics_logger" not in message for message in messages)
+
     def test_rejects_mooncake_data_plane_checkpointing(self):
         mc = _make_master_config()
         mc.data_plane["backend"] = "mooncake_cpu"
@@ -1796,6 +1828,7 @@ class TestSetup:
         mc.policy["generation"]["top_k"] = None
         return mc
 
+    @pytest.mark.mcore
     @pytest.mark.parametrize("colocated", [True, False])
     @pytest.mark.parametrize(
         ("scenario", "error_match"),
@@ -1816,11 +1849,11 @@ class TestSetup:
     ):
         """Megatron generation setup: gym and native legs, colocated or not.
 
-        gym: reserve rank-0's URL, spin Gym up on it, build trainer and engine
-        in parallel (the engine through _build_generation with the reserved
-        port), run the initial refit while Gym is still waiting -- the
-        skip-load engine only starts serving then -- cross-check the served
-        address, reap the port holder.
+        gym: reserve every frontend URL, spin Gym up on them, build trainer and
+        engine in parallel (the engine through _build_generation with the
+        reserved ports), run the initial refit while Gym is still waiting --
+        the skip-load engine only starts serving then -- cross-check the served
+        addresses, reap every port holder.
         gym_served_mismatch: the served-vs-reserved cross-check fires after the
         builds when the engine comes up on a different address.
         gym_router_failure: the holder is created before the executor
@@ -1847,13 +1880,21 @@ class TestSetup:
         if scenario == "gym_router_failure":
             mc.async_rl.generation_router.enabled = True
         tokenizer = MagicMock(pad_token_id=0)
-        reserved_url = "http://10.0.0.1:5555/v1"
-        served_url = (
-            "http://10.0.0.9:7/v1"
+        reserved_urls = [
+            "http://10.0.0.1:5555/v1",
+            "http://10.0.0.2:6666/v1",
+        ]
+        reserved_http_server_ports = {0: 5555, 2: 6666}
+        served_urls = (
+            ["http://10.0.0.9:7/v1", reserved_urls[1]]
             if scenario == "gym_served_mismatch"
-            else reserved_url
+            # The worker-group completion order need not match reservation.
+            else list(reversed(reserved_urls))
         )
-        port_holder = MagicMock(name="port_holder")
+        port_holders = [
+            MagicMock(name="port_holder_rank_0"),
+            MagicMock(name="port_holder_rank_2"),
+        ]
         fake_gym_actor = MagicMock(name="nemo_gym_actor")
         weight_sync = patched_factories["create_weight_synchronizer"].return_value
         # Run the real _build_generation (MegatronGeneration is mocked below) so its
@@ -1891,17 +1932,17 @@ class TestSetup:
             patch.object(sc_setup_mod, "ray") as mock_ray,
             router_patch,
         ):
-            mock_megatron.reserve_http_server_address.return_value = (
-                reserved_url,
-                5555,
-                port_holder,
+            mock_megatron.reserve_http_server_addresses.return_value = (
+                reserved_urls,
+                reserved_http_server_ports,
+                port_holders,
             )
             # Wire the real check through the class mock so the
             # served-vs-reserved legs exercise the genuine logic.
-            mock_megatron.verify_served_address = (
-                MegatronGeneration.verify_served_address
+            mock_megatron.verify_served_addresses = (
+                MegatronGeneration.verify_served_addresses
             )
-            mock_megatron.return_value.dp_openai_server_base_urls = [served_url]
+            mock_megatron.return_value.dp_openai_server_base_urls = served_urls
             if error_match is None:
                 actor_args, metrics = setup_single_controller(mc, tokenizer)
             else:
@@ -1913,16 +1954,15 @@ class TestSetup:
         # Reservation + holder lifecycle exist on the gym legs only; every gym
         # leg — success or either failure — reaps the holder exactly once.
         if gym:
-            # Always the inference cluster: when colocated, _build_clusters
-            # returns the train cluster twice, so the two are the same object
-            # in production (the mocked distinction here is not).
-            mock_megatron.reserve_http_server_address.assert_called_once_with(
+            mock_megatron.reserve_http_server_addresses.assert_called_once_with(
                 inference_cluster,
                 mc.policy,
             )
-            mock_ray.kill.assert_called_once_with(port_holder)
+            assert [call.args for call in mock_ray.kill.call_args_list] == [
+                (port_holder,) for port_holder in port_holders
+            ]
         else:
-            mock_megatron.reserve_http_server_address.assert_not_called()
+            mock_megatron.reserve_http_server_addresses.assert_not_called()
             mock_ray.kill.assert_not_called()
 
         if scenario == "gym_router_failure":
@@ -1939,8 +1979,8 @@ class TestSetup:
         # port adopted by the engine (gym) or absent (native).
         patched_factories["_build_trainer"].assert_called_once()
         _, trainer_kwargs = patched_factories["_build_trainer"].call_args
-        assert trainer_kwargs["reserved_http_server_port"] == (
-            5555 if colocated and gym else None
+        assert trainer_kwargs["reserved_http_server_ports"] == (
+            reserved_http_server_ports if colocated and gym else None
         )
         if colocated:
             patched_factories["_build_generation"].assert_not_called()
@@ -1956,7 +1996,7 @@ class TestSetup:
                 config=mc.policy,
                 tokenizer=tokenizer,
                 cluster=inference_cluster,
-                reserved_http_server_port=5555 if gym else None,
+                reserved_http_server_ports=reserved_http_server_ports if gym else None,
                 processor=None,
                 skip_weight_load=True,
             )
@@ -1968,7 +2008,7 @@ class TestSetup:
             # cross-check — so the mismatch leg sees it too. The initial refit
             # must happen during that wait because it starts Megatron's server.
             _, spinup_kwargs = mock_spinup.call_args
-            assert spinup_kwargs["base_urls"] == [reserved_url]
+            assert spinup_kwargs["base_urls"] == reserved_urls
             # The initial refit ran in setup, against the collective brought up
             # there; the served-address check reads the URLs it populated.
             weight_sync.init_communicator.assert_called_once_with()
@@ -1992,6 +2032,10 @@ class TestSetup:
         assert factory_kwargs["generation_backend"] == "megatron"
         assert factory_kwargs["colocated"] is colocated
         assert factory_kwargs["inference_cluster"] is inference_cluster
+        assert (
+            factory_kwargs["refit_timeout_s"]
+            == mc.async_rl.generation_fleet_health.refit_timeout_s
+        )
         if gym:
             assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
             assert metrics.nemo_gym_init_time_s is not None

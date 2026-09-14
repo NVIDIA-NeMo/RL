@@ -18,6 +18,7 @@ import asyncio
 import copy
 import enum
 import json
+import math
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -30,6 +31,7 @@ from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
+    CheckpointMutationKind,
     DataPlaneCheckpointBarrier,
     DataPlaneMutationCut,
     PostWriteEnrichmentError,
@@ -1605,6 +1607,10 @@ class RolloutManager:
         self._data_plane_checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
         self._env_handles = task_to_env
         self._weight_version: int = 0
+        self._canonical_groups_finalized = 0
+        self._canonical_output_tokens = 0
+        self._recovery_siblings_reused = 0
+        self._recovery_siblings_redispatched = 0
         # Run-wide, shared across concurrent generate_and_push calls. Safe as a plain
         # int: every caller runs on the SingleController's single event loop.
         self._skipped_prompts: int = 0
@@ -1658,7 +1664,9 @@ class RolloutManager:
         self._data_plane_checkpoint_barrier = barrier
 
     @asynccontextmanager
-    async def _recovery_mutation(self) -> AsyncIterator[DataPlaneMutationCut]:
+    async def _recovery_mutation(
+        self, kind: CheckpointMutationKind = "recovery_retries"
+    ) -> AsyncIterator[DataPlaneMutationCut]:
         """Serialize short lineage transitions with native TQ snapshots."""
         barrier = self._data_plane_checkpoint_barrier
         if barrier is None:
@@ -1666,8 +1674,27 @@ class RolloutManager:
                 "RolloutManager must be bound to the SingleController data-plane "
                 "checkpoint barrier before mutating rollout recovery state"
             )
-        async with barrier.mutation() as cut:
+        async with barrier.mutation(kind) as cut:
             yield cut
+
+    def telemetry_snapshot(self) -> dict[str, int]:
+        """Return cumulative committed-publication and recovery counters."""
+        return {
+            "committed_groups": self._canonical_groups_finalized,
+            "committed_output_tokens": self._canonical_output_tokens,
+            "recovery_siblings_reused": self._recovery_siblings_reused,
+            "recovery_siblings_rerun": self._recovery_siblings_redispatched,
+        }
+
+    def record_canonical_publication(self, output_tokens: int) -> None:
+        """Count one prompt group after its canonical TQ commit succeeds."""
+        self._canonical_groups_finalized += 1
+        self._canonical_output_tokens += max(0, int(output_tokens))
+
+    def record_recovery_siblings(self, *, reused: int, redispatched: int) -> None:
+        """Count sibling work avoided and repeated after a process restart."""
+        self._recovery_siblings_reused += max(0, int(reused))
+        self._recovery_siblings_redispatched += max(0, int(redispatched))
 
     def reserve_prompt_group(
         self,
@@ -1969,14 +1996,24 @@ class RolloutManager:
                 raise
 
             self._stats.committed += 1
+            rollout_metrics = record.rollout_metrics
+            mean_output_tokens = rollout_metrics.get("mean_gen_tokens_per_sample", 0)
+            output_tokens = 0
+            if isinstance(mean_output_tokens, (int, float)):
+                total_output_tokens = float(mean_output_tokens) * len(
+                    record.completions
+                )
+                if math.isfinite(total_output_tokens):
+                    output_tokens = max(0, round(total_output_tokens))
+            self.record_canonical_publication(output_tokens)
             # A commit proves the fleet is answering, which is exactly the claim the
             # consecutive budget is testing, so it clears the run of drops. Placed on
             # the success path rather than in the infra handler so that a prompt which
             # succeeded on a retry also counts -- the fleet recovered either way.
             self._consecutive_infra_drops = 0
             if lineage_group_id is not None:
-                async with (
-                    self._tq_buffer.data_plane_checkpoint_barrier.mutation()
+                async with self._tq_buffer.data_plane_checkpoint_barrier.mutation(
+                    "group_removals"
                 ) as cut:
                     self._recovery_ledger.discard_group(cut, lineage_group_id)
             return RolloutOutcome.COMMITTED
@@ -2038,7 +2075,7 @@ class RolloutManager:
         owns_recovery_group = lineage_group_id is None
         recovery_group_id = lineage_group_id
         if recovery_group_id is None:
-            async with self._recovery_mutation() as cut:
+            async with self._recovery_mutation("prompt_reservations") as cut:
                 recovery_group_id = self.reserve_prompt_group(
                     cut,
                     input_sample,
@@ -2222,7 +2259,7 @@ class RolloutManager:
                 pending_group_results[generation_index] = result
                 if len(pending_group_results) < recovery_group.expected_generations:
                     return
-                async with self._recovery_mutation() as cut:
+                async with self._recovery_mutation("sibling_seals") as cut:
                     self._recovery_ledger.mark_group_sealed(
                         cut,
                         group_id,
@@ -2230,7 +2267,7 @@ class RolloutManager:
                     )
                 return
 
-            async with self._recovery_mutation() as cut:
+            async with self._recovery_mutation("sibling_seals") as cut:
                 self._recovery_ledger.mark_sibling_sealed(
                     cut,
                     group_id,
