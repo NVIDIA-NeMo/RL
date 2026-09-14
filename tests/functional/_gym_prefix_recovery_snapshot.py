@@ -98,9 +98,9 @@ def _worker_proofs(proof: dict[str, Any]) -> list[dict[str, Any]]:
     return workers
 
 
-def _active_prefixes(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+def _legacy_active_prefixes(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     prefixes: list[dict[str, Any]] = []
-    proofs = manifest.get("gym_generation_cut_proofs")
+    proofs = manifest.get("gym_generation_cut_proofs", [])
     if not isinstance(proofs, list):
         raise TypeError("snapshot generation-cut proofs must be a list")
     for proof in proofs:
@@ -125,6 +125,89 @@ def _active_prefixes(manifest: dict[str, Any]) -> list[dict[str, Any]]:
                 and prefix["prefix_token_count"] > 0
             )
     return prefixes
+
+
+def _lineage_active_prefixes(
+    snapshot: Path,
+    gym_checkpoint: dict[str, Any],
+) -> list[dict[str, Any]]:
+    model = _participant(gym_checkpoint, "responses_api_models")
+    manifest_path = _participant_manifest(snapshot, model)
+    ledger_manifest = _read_json(manifest_path)
+    indexed = _read_artifact(snapshot, ledger_manifest["lineage_index"])
+    rows_by_capture_key: dict[str, list[dict[str, Any]]] = {}
+    for archive_reference in ledger_manifest.get("archives", []):
+        archive_path = (manifest_path.parent / archive_reference["name"]).resolve()
+        archive_path.relative_to(snapshot.resolve())
+        if archive_path.stat().st_size != archive_reference["bytes"]:
+            raise AssertionError(
+                f"model lineage archive byte count mismatch for {archive_path}"
+            )
+        if _digest(archive_path) != archive_reference["sha256"]:
+            raise AssertionError(
+                f"model lineage archive digest mismatch for {archive_path}"
+            )
+        expected = {
+            item["member"]: item
+            for item in indexed
+            if item["archive"] == archive_reference["name"]
+        }
+        with tarfile.open(archive_path, mode="r:") as archive:
+            for info in archive.getmembers():
+                member = expected.get(info.name)
+                if member is None or not info.isfile():
+                    raise AssertionError(
+                        f"unexpected model lineage archive member: {archive_path}/{info.name}"
+                    )
+                extracted = archive.extractfile(info)
+                if extracted is None:
+                    raise AssertionError(
+                        f"model lineage archive member cannot be read: {info.name}"
+                    )
+                payload = extracted.read()
+                if (
+                    len(payload) != member["bytes"]
+                    or hashlib.sha256(payload).hexdigest() != member["sha256"]
+                ):
+                    raise AssertionError(
+                        f"model lineage archive member is corrupted: {info.name}"
+                    )
+                rows_by_capture_key[member["capture_key"]] = [
+                    json.loads(line) for line in payload.splitlines() if line.strip()
+                ]
+
+    prefixes: list[dict[str, Any]] = []
+    for rows in rows_by_capture_key.values():
+        committed_calls = {
+            row.get("model_call_id")
+            for row in rows
+            if row.get("event") != "generation_cut"
+            and row.get("failure_reason") is None
+            and isinstance(row.get("staging_key"), str)
+        }
+        prefixes.extend(
+            row
+            for row in rows
+            if row.get("event") == "generation_cut"
+            and row.get("checkpoint_id") == gym_checkpoint["checkpoint_id"]
+            and row.get("model_call_id") not in committed_calls
+            and row.get("disposition") == "durable_prefix"
+            and str(row.get("frozen_buffer_id", "")).startswith("active/")
+            and isinstance(row.get("prefix_token_count"), int)
+            and row["prefix_token_count"] > 0
+        )
+    return prefixes
+
+
+def _active_prefixes(
+    snapshot: Path,
+    manifest: dict[str, Any],
+    gym_checkpoint: dict[str, Any],
+) -> list[dict[str, Any]]:
+    legacy = _legacy_active_prefixes(manifest)
+    if legacy:
+        return legacy
+    return _lineage_active_prefixes(snapshot, gym_checkpoint)
 
 
 def _matching_attempt(
@@ -266,7 +349,7 @@ def inspect_snapshot(
         if not required.exists():
             raise FileNotFoundError(required)
 
-    prefixes = _active_prefixes(manifest)
+    prefixes = _active_prefixes(snapshot, manifest, gym_checkpoint)
     if not prefixes:
         raise AssertionError("snapshot has no non-empty active generation prefix")
     prefixes = [
