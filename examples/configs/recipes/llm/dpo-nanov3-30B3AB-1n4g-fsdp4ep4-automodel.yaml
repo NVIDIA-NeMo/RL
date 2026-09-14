@@ -1,4 +1,4 @@
-defaults: ./dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel.yaml
+defaults: ./dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel.v2.yaml
 policy:
   dtensor_cfg:
     expert_parallel_size: 4

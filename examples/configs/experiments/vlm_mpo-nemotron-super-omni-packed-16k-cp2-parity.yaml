@@ -1,0 +1,26 @@
+# Super 16K CP2 packed qualification. Every packed item remains one
+# chosen/rejected MPO pair.
+defaults: vlm_mpo-nemotron-super-omni-nopack-2k-parity.yaml
+
+policy:
+  max_total_sequence_length: 16384
+  # CP2 contributes a factor of 4 and TP8+SP contributes a factor of 8.
+  make_sequence_length_divisible_by: 32
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: 65536
+    logprob_mb_tokens: 65536
+    algorithm: modified_first_fit_decreasing
+    fuse_loss: true
+    pair_grouping_key: pair_index
+    max_sequences_per_bin: 1
+  megatron_cfg:
+    context_parallel_size: 2
+
+data:
+  max_input_seq_length: 16384
+
+checkpointing:
+  # Stop before the four-hour partition limit so the dependent segment can
+  # restore model, optimizer, scheduler, MPO, and dataloader state safely.
+  checkpoint_must_save_by: 00:03:45:00

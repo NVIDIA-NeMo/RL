@@ -17,9 +17,37 @@
 import pytest
 
 from nemo_rl.models.generation.vllm.worker_utils import (
+    find_tokenizer_required_architectures,
     resolve_data_parallel_local_rank,
     resolve_distributed_executor_backend,
 )
+
+
+@pytest.mark.parametrize(
+    ("architectures", "expected"),
+    [
+        (None, []),
+        ([], []),
+        (["Gemma4ForCausalLM"], []),
+        (
+            ["Gemma4ForConditionalGeneration"],
+            ["Gemma4ForConditionalGeneration"],
+        ),
+        (
+            [
+                "Gemma4ForCausalLM",
+                "Gemma4UnifiedForConditionalGeneration",
+                "Mistral3ForConditionalGeneration",
+            ],
+            [
+                "Gemma4UnifiedForConditionalGeneration",
+                "Mistral3ForConditionalGeneration",
+            ],
+        ),
+    ],
+)
+def test_find_tokenizer_required_architectures(architectures, expected):
+    assert find_tokenizer_required_architectures(architectures) == expected
 
 
 @pytest.mark.parametrize(

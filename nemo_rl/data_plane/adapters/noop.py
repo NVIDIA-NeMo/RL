@@ -39,7 +39,12 @@ from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 
 
 def _reject_non_tensor_leaves(td: TensorDict) -> None:
-    """No pickle on the bus. Mirror of the TQ adapter check.
+    """No pickle on the bus. NoOp-only, not a data-plane rule.
+
+    The ABC allows ``NonTensorStack`` / ``NonTensorData`` leaves and both the
+    TQ and local adapters accept them. This adapter keeps rows as plain tensor
+    dicts with no encoder behind it, so it rejects them here instead of
+    storing something it cannot hand back.
 
     Walk the leaves via ``keys()`` + indexed lookup rather than
     ``items()``, because some tensordict versions skip ``NonTensorData``

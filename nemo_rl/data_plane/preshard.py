@@ -23,6 +23,7 @@ first cross-DP collective.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Optional
 
 import torch
@@ -140,8 +141,6 @@ def shard_meta_for_dp(
         # pyrefly: ignore  # no-matching-overload
         idx_list: list[int] = shard[META_IDX].tolist()
         flat_idx.extend(idx_list)
-        rank_sample_ids = [meta.sample_ids[i] for i in idx_list]
-        rank_seqlens = [seq_lens[i] for i in idx_list]
         rank_extra = dict(base_extra)
         # Per-shard packing metadata — set by ``shard_by_batch_size`` when
         # sequence_packing or dynamic_batching is enabled. Workers'
@@ -158,16 +157,11 @@ def shard_meta_for_dp(
             val = getattr(shard, attr, None)
             if val is not None:
                 rank_extra[attr] = val
-        out.append(
-            KVBatchMeta(
-                partition_id=meta.partition_id,
-                task_name=meta.task_name,
-                sample_ids=rank_sample_ids,
-                fields=meta.fields,
-                sequence_lengths=rank_seqlens,
-                extra_info=rank_extra,
-            )
-        )
+        # ``subset`` owns per-sample projection: it slices ``sample_ids``,
+        # ``sequence_lengths`` and ``tags`` together, so a sidecar added to
+        # ``KVBatchMeta`` later cannot go missing on the presharded path.
+        # Only ``extra_info`` is per-shard rather than per-sample.
+        out.append(replace(meta.subset(idx_list), extra_info=rank_extra))
 
     # Build inverse permutation: unsorted[orig_idx] = position_in_aggregated.
     # When workers' results are concatenated in DP-rank order, row `j` of

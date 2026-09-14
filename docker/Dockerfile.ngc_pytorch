@@ -97,6 +97,9 @@ ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
 # Ensure DeepEP is built for H100 and B200
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
 
+# Build HybridEP with inter-node transport support.
+ENV HYBRID_EP_MULTINODE=1
+
 # Ensure HybridEP/DeepEP JIT compilation can find nvcc at runtime
 ENV CUDA_HOME=/usr/local/cuda
 
@@ -114,6 +117,10 @@ sed -i 's/= \[{ requirement = "torch", match-runtime = true }\]/= []/g' pyprojec
 # The venv is symlinked to avoid bloating the layer size
 uv venv --system-site-packages ${UV_PROJECT_ENVIRONMENT}
 uv pip install --no-cache-dir --no-deps /tmp/build_vllm/vllm/vllm*.whl
+apt-get update
+# DeepEP's multinode link needs the exact filename libnvidia-ml.so.1; the CUDA base
+# only ships stubs/libnvidia-ml.so. Purged again after the syncs below.
+apt-get install -y --no-install-recommends libnvidia-ml-dev
 # Ensure nvshmem is installed before building DeepEP
 uv sync --link-mode symlink --locked --inexact --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --extra vllm --no-install-project $UV_NO_INSTALL_PACKAGES
@@ -121,6 +128,9 @@ uv sync --link-mode symlink --locked --inexact --extra mcore --no-install-projec
 uv sync --link-mode symlink --locked --inexact --extra automodel --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --extra modelopt --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
+apt-get purge -y libnvidia-ml-dev
+apt-get autoremove -y
+rm -rf /var/lib/apt/lists/*
 EOF
 
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs

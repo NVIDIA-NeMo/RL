@@ -436,12 +436,8 @@ class TimeoutChecker:
         self.previous_iteration_time: Optional[float] = None
         self.fit_last_save_time = fit_last_save_time
 
-    def check_save(self):
-        # Flush
-        sys.stdout.flush()
-        sys.stderr.flush()
-
-        # Already saved after timeout
+    def would_save(self) -> bool:
+        """Return whether the deadline is due without consuming the signal."""
         if self.last_saved:
             return False
 
@@ -453,14 +449,23 @@ class TimeoutChecker:
                 self.iteration_times
             )
             if elapsed_time + average_iteration_time >= self.last_save_time:
-                self.last_saved = True
                 return True
 
         if elapsed_time >= self.last_save_time:
-            self.last_saved = True
             return True
 
         return False
+
+    def check_save(self):
+        # Flush
+        sys.stdout.flush()
+        sys.stderr.flush()
+
+        if not self.would_save():
+            return False
+
+        self.last_saved = True
+        return True
 
     def start_iterations(self):
         self.previous_iteration_time = time.time()

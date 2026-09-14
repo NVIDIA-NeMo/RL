@@ -74,6 +74,11 @@ class VllmSpecificArgs(TypedDict):
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
     enforce_eager: NotRequired[bool]
     enable_return_routed_experts: NotRequired[bool]
+    # Collect vLLM request, cache, and cumulative token counters in a model-owner
+    # background thread for performance diagnostics.
+    enable_vllm_metrics_logger: NotRequired[bool]
+    # Sampling cadence for the optional vLLM metrics logger.
+    vllm_metrics_logger_interval: NotRequired[float]
     # Whether to show a tqdm progress bar during generation. Defaults to vLLM's own default (True) when absent. Only applies when async_engine is False.
     use_tqdm: NotRequired[bool]
     # By default, NeMo RL only has a Python handle to the vllm.LLM generation engine. The expose_http_server flag here will expose that generation engine as an HTTP server.
@@ -98,6 +103,10 @@ class VllmSpecificArgs(TypedDict):
     # for per-recipe knobs (e.g. forcing a specific fused-MoE backend) without
     # affecting other test cases.
     env_vars: NotRequired[dict[str, str]]
+    # Opt into vLLM's native reload_weights API for refit. The default stays
+    # False so existing IPC/NCCL refit behavior keeps using NeMo-RL's legacy
+    # loader path.
+    refit_with_reload_api: NotRequired[bool]
     # A filepath that can be imported to register a vLLM reasoning parser
     reasoning_parser_plugin: NotRequired[str]
 
@@ -189,6 +198,12 @@ class VllmConfig(GenerationConfig):
     # colocated CUDA-IPC refit, where packed export tensors can stay on GPU.
     real_quant_export_cpu_offload: NotRequired[bool]
     real_quant_ignore: NotRequired[list[str]]
+
+    # FQN of a worker extension class to use instead of the resolved default
+    # generation worker. Must be a subclass of the resolved worker and cannot
+    # be combined with quant_cfg. Its runtime environment must already be in
+    # ACTOR_ENVIRONMENT_REGISTRY.
+    worker_extension_cls_fqn: NotRequired[str | None]
 
 
 def resolve_vllm_video_config(config: VllmConfig) -> VllmVideoConfig | None:
@@ -289,7 +304,7 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
         raise ValueError(
             "vllm_cfg.reset_encoder_cache_after_weight_update is not supported "
             f"with refit_transport={transport!r}: this transport's refit path "
-            "does not reset the multimodal encoder cache, so stale vision "
+            "does not reset the multimodal encoder cache, so stale multimodal "
             "embeddings would silently survive weight updates. Supported "
             "transports: null (collective/IPC) and 'nccl_reshard'."
         )

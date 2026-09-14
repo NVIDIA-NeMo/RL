@@ -58,6 +58,8 @@ _REGISTERED_FIELDS = [
     "advantages",
     "token_mask",
     "sample_mask",
+    "mask_sample",
+    "truncated",
     "total_reward",
     "prompt_ids_for_adv",
 ]
@@ -94,6 +96,8 @@ def _populate_group(
             "input_lengths": torch.tensor([seq_len] * group_size).long(),
             "token_mask": torch.ones(group_size, seq_len, dtype=torch.long),
             "sample_mask": torch.ones(group_size, dtype=torch.long),
+            "mask_sample": torch.zeros(group_size, dtype=torch.bool),
+            "truncated": torch.zeros(group_size, dtype=torch.bool),
             "generation_logprobs": torch.zeros(
                 group_size, seq_len, dtype=torch.float32
             ),
@@ -138,6 +142,11 @@ def _prepopulate_buffer(
     # Group id follows pack_payload's "{group_uuid}_g{i}" convention.
     group_id = meta.sample_ids[0].rpartition("_g")[0]
     buffer._group_ids.append(group_id)
+    # Token-capture bookkeeping: a hand-inserted, already-finalized slot owns
+    # no rollout ids and no staged rows. Every parallel list must stay in
+    # lockstep or remove() indexes past the end.
+    buffer._rollout_ids_list.append(None)
+    buffer._staging_keys_list.append(None)
 
 
 @pytest.fixture(scope="function")
@@ -297,12 +306,18 @@ def test_train_pump_drives_mcore_training_step(
             sync_weights=lambda *, kv_scales=None: None,
         )
         adv_est = _FakeAdvEstimator()
-        # Rollout manager stub — SC.__init__ only touches ._tq_buffer.
+        # Rollout manager stub — recovery is disabled for this native rollout test,
+        # but SC still binds the shared data-plane checkpoint barrier at startup; the
+        # pump additionally publishes versions and resumes request-deadline clocks.
         rollout_manager = SimpleNamespace(
             _tq_buffer=None,
+            recovery_ledger=None,
+            set_data_plane_checkpoint_barrier=lambda _barrier: None,
             set_weight_version=lambda v: ray.get(
                 log.record.remote("set_weight_version", {"version": int(v)})
             ),
+            suspend_request_deadlines=lambda: None,
+            resume_request_deadlines=lambda: None,
         )
 
         master_config = MasterConfig.model_construct(
@@ -349,7 +364,13 @@ def test_train_pump_drives_mcore_training_step(
         )
 
         actor_args = SingleControllerActorArgs(
-            gen_handle=None,
+            # Continuous-serving stub: the pump asks blocks_training() before
+            # every step's trainer GPU work.
+            gen_handle=SimpleNamespace(
+                blocks_training=lambda: False,
+                snapshot_step_metrics=lambda: None,
+                get_step_metrics=lambda: {},
+            ),  # type: ignore[arg-type]
             trainer_handle=trainer,
             env_handles={},
             train_cluster=None,  # type: ignore[arg-type]
@@ -364,6 +385,7 @@ def test_train_pump_drives_mcore_training_step(
             partition_id=_PARTITION_ID,
             save_state=_initial_grpo_save_state(),
             last_checkpoint_path=None,
+            finalizer_actors=[],
         )
         ctrl = _RecordingSingleControllerActor.remote(
             metric_log_handle=log,

@@ -26,7 +26,7 @@ VLMMessageLogType = list[dict[str, Union[str, torch.Tensor, PackedTensor]]]
 
 # Flattened message log where all tensors and data are concatenated together for a conversation
 # Converts a conversation from list-of-turns format to key-value format with concatenated tensors
-FlatMessagesType = dict[str, Union[list[str], torch.Tensor]]
+FlatMessagesType = dict[str, Union[list[str], torch.Tensor, PackedTensor]]
 
 PathLike = Union[str, "os.PathLike[Any]"]
 TokenizerType = PreTrainedTokenizerBase
@@ -44,12 +44,13 @@ class DatumSpec(TypedDict):
 
 
 class PreferenceDatumSpec(TypedDict):
-    message_log_chosen: LLMMessageLogType
-    message_log_rejected: LLMMessageLogType
+    message_log_chosen: LLMMessageLogType | VLMMessageLogType
+    message_log_rejected: LLMMessageLogType | VLMMessageLogType
     length_chosen: int
     length_rejected: int
     loss_multiplier: float
     idx: int
+    task_name: NotRequired[str]
 
 
 @dataclass

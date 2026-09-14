@@ -32,8 +32,20 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_group_utils import recursive_merge_options
 from nemo_rl.utils.venvs import (
+    add_hf_modules_cache_to_pythonpath,
     create_local_venv_on_each_node,
 )
+
+
+def _get_initializer_env_vars(env_vars: dict[str, str]) -> dict[str, str]:
+    """Build the environment needed to unpickle worker constructor arguments."""
+    initializer_env_vars = {
+        key: env_vars[key] if key in env_vars else os.environ[key]
+        for key in ("HF_HOME", "HF_MODULES_CACHE", "PYTHONPATH")
+        if key in env_vars or key in os.environ
+    }
+
+    return add_hf_modules_cache_to_pythonpath(initializer_env_vars)
 
 
 @dataclass
@@ -502,11 +514,7 @@ class RayWorkerGroup:
         # import-related variables that trust_remote_code classes need to
         # resolve their generated modules have to travel with it.
         unique_pg_indices = sorted({pg_idx for pg_idx, _ in bundle_indices_list})
-        initializer_env_vars = {
-            key: env_vars[key]
-            for key in ("HF_HOME", "HF_MODULES_CACHE", "PYTHONPATH")
-            if key in env_vars
-        }
+        initializer_env_vars = _get_initializer_env_vars(env_vars)
         initializer_runtime_env = {}
         if py_executable != sys.executable:
             initializer_runtime_env["py_executable"] = py_executable

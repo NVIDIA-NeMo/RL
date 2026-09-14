@@ -133,6 +133,14 @@ policy:
       buffer_size_gb: 10               # Memory buffer size for requests, total buffer size is 2x this value (active requests + paused requests)
       num_cuda_graphs: 16              # Number of CUDA graphs to pre-allocate
       max_tokens: 16384                # Maximum number of tokens for inference
+      cuda_graph_sizing_distribution: hybrid
+      cuda_graph_max_tokens: 512
+      prefix_caching_mamba_gb: null
+      prefix_caching_eviction_policy: lru
+      prefix_caching_coordinator_policy: longest_prefix
+      prefix_cache_ttl_seconds: 300.0
+      prefix_caching_routing_alpha: 1.0
+      http_server_num_replicas: 8
 ```
 
 ### Configuration Parameters
@@ -143,6 +151,54 @@ The `mcore_generation_config` section controls Megatron Core inference engine be
 - **num_cuda_graphs**: Number of CUDA graphs to pre-allocate for different batch sizes. More graphs can improve performance by avoiding runtime graph capture, but consume more memory.
 - **max_tokens**: Maximum total number of tokens (across all requests) that can be processed simultaneously. This limits the maximum batch size and sequence length combinations. Increasing this might throw OOM depending on vocab size and buffer size allocated. 
 
+#### CUDA-graph capture
+
+- **cuda_graph_sizing_distribution** (`hybrid`) and **cuda_graph_max_tokens** (`512`) bound graph-capture cost while keeping decode graphs dense and prefill graphs compact. Use `exponential` or `linear` when one layout is a better fit for a known workload.
+- **inference_cuda_graph_scope** controls where local inference graphs live: `layer` owns them per Transformer/Mamba layer and `block` owns them per enclosing block. `none` runs eagerly. This setting only applies with `cuda_graph_impl: local`.
+
+#### Prefix-cache routing and HTTP frontends
+
+- **prefix_caching_mamba_gb** (`null`) leaves Mamba-state prefix caching disabled until a hybrid Mamba model has an explicit GPU budget.
+- **prefix_caching_eviction_policy** (`lru`), **prefix_caching_coordinator_policy** (`longest_prefix`), **prefix_cache_ttl_seconds** (`300.0`), and **prefix_caching_routing_alpha** (`1.0`) retain useful prefixes while steering requests toward cache hits without ignoring an overloaded inference rank.
+- **http_server_num_replicas** (`8`) sets the number of CPU HTTP frontends per model-parallel coordinator. These frontends spread request parsing, prompt processing, and cache-key work across CPU cores.
+
+### Multimodal Megatron Generation
+
+Megatron inference supports image and video inputs in NeMo-RL. Enable multimodal processing with `policy.is_vlm: true`, use the `megatron` generation backend, and provide a `megatron_inference_wrapper`. The wrapper must subclass `megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper.AbstractModelInferenceWrapper` in Megatron-Core and declare `supports_<modality> = True` for each supported modality.
+
+```yaml
+policy:
+  is_vlm: true
+  generation:
+    backend: megatron
+    mcore_generation_config:
+      megatron_inference_wrapper: megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper.NemotronOmniInferenceWrapper
+      image_dynamic_resolution: true
+      video_num_frames: 16
+      video_temporal_patch_size: 2
+      video_target_num_patches: 2048
+      video_maintain_aspect_ratio: true
+      vision_embedding_cache_max_bytes: 0
+      allow_stale_multimodal_embeddings: false
+data:
+  default:
+    num_frames: 16
+    video_temporal_patch_size: 2
+    video_target_num_patches: 2048
+    video_maintain_aspect_ratio: true
+```
+
+- `image_dynamic_resolution` preserves variable image shapes instead of forcing one fixed resolution; for example, a wide image uses a wider patch grid than a square image.
+- `vision_model_type` optionally selects the MCore vision encoder type used by image and video preprocessing. Set it to the encoder expected by the inference wrapper; when omitted, MCore uses its default (`radio`).
+- `num_frames` controls uniform video-frame sampling. Use `video_num_frames` for the corresponding MCore key.
+- `video_temporal_patch_size` groups sampled frames into temporal tubelets; for example, size `2` turns 16 frames into 8 temporal groups.
+- `video_target_num_patches` sets `num_patches_per_frame = patch_height * patch_width <= video_target_num_patches`, which produces `num_patches_per_frame * num_frames / video_temporal_patch_size` total video patches prior to spatial merging (i.e. further grouped / concatenated into MxM patch blocks) that are provided to the vision encoder.
+- `video_maintain_aspect_ratio=true` keeps `patch_width / patch_height ~= source_width / source_height`; `false` uses `patch_width = patch_height ~= sqrt(video_target_num_patches)` (for example, `sqrt(256) = 16`).
+- `vision_embedding_cache_max_bytes` limits GPU memory used to reuse vision embeddings for repeated media; `0` disables the cache, while `1073741824` permits up to 1 GiB.
+- `allow_stale_multimodal_embeddings` controls whether cached embeddings survive model-weight changes. Keep it `false` for RL refits; use `true` only when weights remain fixed.
+- `expose_http_server` should be `true` for NeMo Gym.
+
+Keep the video preprocessing values identical in `data.default` and `mcore_generation_config` to avoid disparity between the training policy and inference generation.
 
 ## Usage Examples
 
@@ -208,11 +264,18 @@ policy:
       buffer_size_gb: 10
       num_cuda_graphs: 16
       max_tokens: 16384
+      cuda_graph_sizing_distribution: hybrid
+      cuda_graph_max_tokens: 512
+      prefix_caching_mamba_gb: null
+      prefix_caching_eviction_policy: lru
+      prefix_caching_coordinator_policy: longest_prefix
+      prefix_cache_ttl_seconds: 300.0
+      prefix_caching_routing_alpha: 1.0
+      http_server_num_replicas: 8
 ```
 
-For a complete example, see:
-- **Configuration**: `examples/configs/recipes/llm/grpo-llama3.2-1b-instruct-1n8g-megatron_generation.yaml`
-- **Test Script**: `tests/functional/grpo_megatron_generation.sh`
+For a complete example, see
+`examples/configs/recipes/llm/grpo-llama3.2-1b-instruct-1n8g-megatron_generation.yaml`.
 
 ## Extend with New Backends
 

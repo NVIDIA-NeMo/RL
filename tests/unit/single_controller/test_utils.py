@@ -139,12 +139,14 @@ class TestReduceAdvantagePumpMetrics:
             rewards=[torch.tensor([1.0, 3.0])],
             masked_advantages=[torch.tensor([-1.0, 0.0, 2.0])],
             sequence_lengths=[4, 6],
+            num_mask_sample_filtered=[1, 2],
         )
         assert out["reward"] == pytest.approx(2.0)
         assert out["advantages/mean"] == pytest.approx(1.0 / 3.0)
         assert out["advantages/max"] == pytest.approx(2.0)
         assert out["advantages/min"] == pytest.approx(-1.0)
         assert out["total_num_tokens"] == pytest.approx(10.0)
+        assert out["num_mask_sample_filtered"] == pytest.approx(3.0)
 
     def test_empty_advantages_tensor_yields_zeros(self) -> None:
         out = reduce_advantage_pump_metrics(

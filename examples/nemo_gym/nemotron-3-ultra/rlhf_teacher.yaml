@@ -319,6 +319,7 @@ policy:
     vllm_cfg:
       async_engine: true
       precision: ${policy.precision}
+      refit_with_reload_api: false
       kv_cache_dtype: "auto"
       tensor_parallel_size: 8
       pipeline_parallel_size: 1

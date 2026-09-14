@@ -72,6 +72,7 @@ from nemo_rl.models.megatron.setup import (
     setup_distributed,
     setup_model_and_optimizer,
     validate_and_set_config,
+    validate_megatron_config,
     validate_model_paths,
 )
 from nemo_rl.models.megatron.train import (
@@ -408,7 +409,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         ) and (runtime_config.model_cfg.fp16 or runtime_config.model_cfg.bf16)
 
         # Validate configuration
-        self.megatron_cfg.validate()
+        validate_megatron_config(self.megatron_cfg, self._policy_like_cfg)
 
         assert self.megatron_cfg.model.virtual_pipeline_model_parallel_size in (
             None,

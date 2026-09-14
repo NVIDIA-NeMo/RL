@@ -61,6 +61,29 @@ def _load_megatron_common_state_dict(iteration_dir: Path) -> dict[str, Any]:
     return load_common_state_dict(str(iteration_dir))
 
 
+def _load_megatron_sharded_metadata_keys(iteration_dir: Path) -> set[str]:
+    """Load the keys of tensors and objects stored in a torch_dist checkpoint."""
+    try:
+        from megatron.core.dist_checkpointing.serialization import (
+            load_sharded_metadata,
+        )
+    except ImportError as error:
+        raise RuntimeError(
+            "Megatron-Core is required to inspect optimizer state in the distributed "
+            f"checkpoint at {iteration_dir}. Install NeMo-RL with the `mcore` extra."
+        ) from error
+
+    return {str(key) for key in load_sharded_metadata(str(iteration_dir))}
+
+
+def _is_megatron_optimizer_key(key: str) -> bool:
+    """Return whether a flattened Megatron checkpoint key belongs to the optimizer."""
+    # ChainedOptimizer prefixes every sharded key when a model has multiple
+    # sub-optimizers (for example, dense and expert parameters in MoE models).
+    key = re.sub(r"^chained_\d+\.", "", key)
+    return key == "optimizer" or key.startswith(("optimizer.", "optimizer/"))
+
+
 def validate_warm_start_checkpoint(
     warm_start: PathLike, model_component: str = "value"
 ) -> None:
@@ -268,6 +291,14 @@ class CheckpointManager:
                     # state from the weights_path.
                     return weights_path, optimizer_path
 
+                # Modern torch_dist checkpoints shard optimizer tensors separately
+                # from the common state. Inspect stored keys rather than trusting
+                # run_config.save_optim, which only records configuration intent.
+                if (iteration_dir / "metadata.json").exists():
+                    sharded_keys = _load_megatron_sharded_metadata_keys(iteration_dir)
+                    if any(_is_megatron_optimizer_key(key) for key in sharded_keys):
+                        return weights_path, optimizer_path
+
             warnings.warn(
                 f"Optimizer state not found at {optimizer_path} (DTensor path), and no embedded "
                 f"optimizer state detected under {weights_path} (Megatron path). "
@@ -322,7 +353,9 @@ class CheckpointManager:
         # save config
         if run_config is not None:
             with open(save_dir / "config.yaml", "w") as f:
-                yaml.safe_dump(run_config.model_dump(), f)
+                # JSON mode converts enums and other Pydantic-supported scalar
+                # types to the primitive values expected by safe YAML.
+                yaml.safe_dump(run_config.model_dump(mode="json"), f)
 
         return Path(os.path.abspath(save_dir))
 
