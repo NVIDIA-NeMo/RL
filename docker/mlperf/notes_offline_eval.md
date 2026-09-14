@@ -62,15 +62,19 @@ carries it in `training_info.json`.
 
 It is deliberately not the timestamp of the step's `tracked_stats`
 POINT_IN_TIME mllog event. That event is emitted at the step's logging call at
-the end of the loop iteration — after the refit/weight sync, the checkpoint
-write itself, and the per-step jsonl dump (in the spec run: ~14s of refit and
-~55s of checkpoint write intervene). Reusing it would charge exactly the
-checkpoint-write time the rule excludes. The mllog timestamps are
-observability artifacts tied to logging call sites; the weight-update instant
-has no event of its own, and the separate evaluator process could not recover
-it from the append-only log even if it did. `training_info.json` is written
-atomically with the checkpoint, so the timestamp travels with the weights it
-describes.
+the end of the loop iteration — after the refit drain and weight sync, the
+checkpoint write itself, and the per-step jsonl dump. Measured on the spec
+run's step 18 (the gap between its weight update and its event was 285.2s):
+230.7s rollout drain before refit (`exposed_generation`), 13.9s refit
+(`weight_sync`), 34.2s checkpoint write (`timing/train/checkpointing`), ~6s of
+metrics reduction and jsonl dump. Reusing the event time would charge the
+checkpoint-write time the rule excludes; the event could move before the
+checkpoint block, but it would still sit after the ~245s refit tail and would
+still not be the weight-update instant — and the evaluator, a separate later
+process, needs the value stored with the checkpoint regardless. The mllog
+timestamps are observability artifacts tied to logging call sites;
+`training_info.json` is written atomically with the checkpoint, so the
+timestamp travels with the weights it describes.
 
 Also fixed here (ported from optimized fc0426345d): the trainers log a step's
 validation before its train metrics, and a target-reaching eval used to emit
