@@ -348,26 +348,12 @@ class MegatronPayloadStageResult:
     response_metadata: dict[str, Any]
 
 
-# Request-metadata keys the Megatron chat endpoint writes when it defers the prompt
-# prefix splice to the engine's RequestPromptPreparer. They must match
-# ``megatron.core.inference.inference_request.PREFIX_SPLICE_*``; they are spelled
-# out here (rather than imported) so this module stays importable in the vLLM
-# worker and finalizer environments, which do not ship Megatron.
 PREFIX_SPLICE_SUFFIX_FIELD = "prefix_splice_suffix_token_ids"
 PREFIX_SPLICE_BOUNDARY_FIELD = "prefix_splice_boundary_token_id"
 
 
 class ChainPrefixCache:
-    """Worker-local cache of resolved ``staging_chain`` prefixes.
-
-    Moved verbatim from ``VllmAsyncGenerationWorkerImpl._fetch_chain_prefix`` so the
-    vLLM worker and the Megatron prompt preparer share one implementation. Entries
-    map a staging key to the full prefix through that key; the deepest cached key
-    bounds the TQ read to the chain's uncached suffix; eviction drops the oldest
-    insertion past 256 entries. Thread-safe: the vLLM worker calls ``fetch`` from
-    ``asyncio.to_thread`` executor threads, and the TQ read stays outside the lock
-    so concurrent fetches overlap.
-    """
+    """Worker-local cache of resolved ``staging_chain`` prefixes."""
 
     def __init__(self, source: Any | None = None) -> None:
         self._source = source
@@ -412,13 +398,7 @@ class ChainPrefixCache:
 def resolve_admission_prefix(
     admission: Any, chain_prefix: ChainPrefixCache
 ) -> list[int]:
-    """Resolve a ``CaptureAdmission`` to the flat prefix the engine prompt starts with.
-
-    Moved verbatim from ``VllmAsyncGenerationWorkerImpl._resolve_admission_prefix``.
-    A ``staging_chain`` is fetched through the cached TransferQueue read; an inline
-    ``required_prefix_token_ids`` is used as is; a text root has no prefix. Length
-    checks are the caller's (``begin_call`` / the Megatron preparer's ``prev_len`` check).
-    """
+    """Resolve a ``CaptureAdmission`` to the flat prefix the engine prompt starts with."""
     if admission.mode == "text":
         return []
     if admission.staging_chain:
