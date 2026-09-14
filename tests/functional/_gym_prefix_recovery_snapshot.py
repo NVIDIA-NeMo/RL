@@ -439,6 +439,7 @@ def select_snapshot(args: argparse.Namespace) -> None:
     deadline = time.monotonic() + args.timeout_s
     last_error = "no published bootstrap snapshot"
     while time.monotonic() < deadline:
+        newest_error = None
         for snapshot in _published_bootstrap_snapshots(args.checkpoint_dir):
             try:
                 selected = inspect_snapshot(
@@ -453,7 +454,8 @@ def select_snapshot(args: argparse.Namespace) -> None:
                 TypeError,
                 ValueError,
             ) as error:
-                last_error = f"{snapshot}: {type(error).__name__}: {error}"
+                if newest_error is None:
+                    newest_error = f"{snapshot}: {type(error).__name__}: {error}"
                 continue
             args.selection.parent.mkdir(parents=True, exist_ok=True)
             args.selection.write_text(
@@ -466,6 +468,8 @@ def select_snapshot(args: argparse.Namespace) -> None:
                 flush=True,
             )
             return
+        if newest_error is not None:
+            last_error = newest_error
         try:
             os.kill(args.pid, 0)
         except ProcessLookupError as error:
