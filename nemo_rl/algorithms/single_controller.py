@@ -140,6 +140,13 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
+from nemo_rl.environments.gym_checkpoint import (
+    GymCheckpointCommitResult,
+    GymCheckpointPrepareResult,
+    GymCompletedExecution,
+    gym_checkpoint_staging_keys,
+    validate_gym_checkpoint_manifests,
+)
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
@@ -148,6 +155,7 @@ from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
     PromptGroupPhase,
+    RolloutAttemptStatus,
     RolloutRecoveryState,
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
@@ -493,6 +501,16 @@ class SingleControllerActor:
         self._bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = (
             actor_args.bootstrap_identity
         )
+        self._gym_checkpoint_topology = actor_args.gym_checkpoint_topology
+        self._gym_checkpoint_restore_operation_id = (
+            actor_args.gym_checkpoint_restore_operation_id
+        )
+        self._restored_gym_checkpoint_staging_keys = set(
+            actor_args.gym_checkpoint_staging_keys
+        )
+        self._restored_gym_checkpoint_continuations = tuple(
+            actor_args.gym_checkpoint_continuations
+        )
         self._rollout_checkpoint_stop_requested = asyncio.Event()
         # Narrow unsafe window after an optimizer mutates model state and before
         # SC publishes the matching TQ cleanup and trainer counters. Gradient
@@ -503,6 +521,16 @@ class SingleControllerActor:
         # Gate: cleared during _sync_weights, set when generation may proceed
         self._rollout_permitted: asyncio.Event = asyncio.Event()
         self._rollout_permitted.set()
+        # Independent admission owner for Gym checkpoint preparation. Weight
+        # synchronization and checkpointing may overlap; separate events avoid
+        # one operation reopening admission while the other still needs it shut.
+        self._gym_checkpoint_rollout_permitted: asyncio.Event = asyncio.Event()
+        self._gym_checkpoint_rollout_permitted.set()
+        self._gym_participant_checkpointing_enabled = (
+            master_config.rollout_checkpointing.gym.participant_checkpointing_enabled
+        )
+        self._gym_completed_acknowledgement_lock = asyncio.Lock()
+        self._gym_completed_acknowledgement_task: Optional[asyncio.Task[None]] = None
 
         # Set only after _rollout_pump exhausts its configured epochs and all
         # dispatched tasks finish successfully. Rollout failures propagate
@@ -609,6 +637,15 @@ class SingleControllerActor:
             recovery_prepare_seconds=recovery_prepare_seconds,
             restored_replay_groups=restored_replay_groups,
         )
+        if self._gym_checkpoint_restore_operation_id is not None:
+            await self._discard_restart_only_gym_continuations()
+            await self._nemo_gym_checkpoint_actor().resume_checkpoint.remote(
+                self._gym_checkpoint_restore_operation_id,
+                time.time()
+                + self._master_config.rollout_checkpointing.gym.prepare_timeout_s,
+            )
+            self._gym_checkpoint_restore_operation_id = None
+        self._schedule_completed_gym_acknowledgement_drain()
 
         # Start the rollout and train pumps, plus the watchdog
         rollout_task = asyncio.create_task(self._rollout_pump())
@@ -690,6 +727,13 @@ class SingleControllerActor:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            acknowledgement_task = self._gym_completed_acknowledgement_task
+            if acknowledgement_task is not None:
+                acknowledgement_task.cancel()
+                await asyncio.gather(
+                    acknowledgement_task,
+                    return_exceptions=True,
+                )
             for actor in self._finalizer_actors:
                 try:
                     ray.kill(actor, no_restart=True)
@@ -961,6 +1005,7 @@ class SingleControllerActor:
                     cut,
                     replay_metadata=canonical_state,
                     clear_unreferenced=True,
+                    gym_staging_keys=self._restored_gym_checkpoint_staging_keys,
                 )
             await self._rehydrate_rollout_recovery_prompts(cut)
         self._sampler_stamps_target_steps = (
@@ -1299,10 +1344,12 @@ class SingleControllerActor:
         *,
         replay_metadata: Optional[TQReplayMetadataState],
         clear_unreferenced: bool,
+        gym_staging_keys: set[str] | None = None,
     ) -> int:
         """Validate staging ownership while the caller holds a stable cut."""
         cut.require_live()
         expected_staging_keys = self._rollout_recovery_ledger.expected_staging_keys()
+        expected_staging_keys.update(gym_staging_keys or ())
         if replay_metadata is not None:
             for group in replay_metadata["groups"]:
                 for tag in group["meta"].tags or []:
@@ -1543,6 +1590,261 @@ class SingleControllerActor:
         ) as cut:
             await self._cleanup_known_finalization_request_unlocked(cut, request)
 
+    def _nemo_gym_checkpoint_actor(self) -> Any:
+        try:
+            return self._env_handles["nemo_gym"]
+        except KeyError as error:
+            raise RuntimeError(
+                "Gym participant checkpointing is enabled without a nemo_gym actor"
+            ) from error
+
+    async def _discard_restart_only_gym_continuations(self) -> None:
+        """Make interrupted attempts start fresh when resource state cannot restore."""
+        checkpoint_id = self._gym_checkpoint_restore_operation_id
+        topology = self._gym_checkpoint_topology
+        if checkpoint_id is None or topology is None:
+            return
+        restart_only_resources = topology.restart_only_resources()
+        if not restart_only_resources:
+            return
+
+        candidates = {
+            (
+                group.logical_rollout_id(sibling.generation_index),
+                sibling.current_attempt.attempt_index + 1,
+            )
+            for group in self._rollout_recovery_ledger.groups()
+            for sibling in group.siblings
+            if sibling.current_attempt.status is not RolloutAttemptStatus.SEALED
+        }
+        executions = []
+        staging_keys: set[str] = set()
+        restart_only = set(restart_only_resources)
+        resource_modes = {
+            contract.participant.server_name: contract.checkpoint_mode
+            for contract in topology.participants
+            if contract.participant.component == "resources_servers"
+        }
+        for continuation in self._restored_gym_checkpoint_continuations:
+            execution = (
+                continuation.rollout_id,
+                continuation.replacement_attempt_index,
+            )
+            if execution not in candidates:
+                continue
+            resource_revisions = continuation.resource_state_revisions
+            if resource_revisions is not None:
+                dependencies = {name for name, _revision in resource_revisions}
+                unknown = dependencies - set(resource_modes)
+                if unknown:
+                    raise RuntimeError(
+                        "restored Gym continuation refers to undiscovered resources: "
+                        f"rollout_id={continuation.rollout_id!r}, "
+                        f"resources={sorted(unknown)!r}"
+                    )
+                if not dependencies.intersection(restart_only):
+                    continue
+            executions.append(
+                {
+                    "rollout_id": continuation.rollout_id,
+                    "attempt_index": continuation.replacement_attempt_index,
+                }
+            )
+            staging_keys.update(continuation.staging_keys)
+        if not executions:
+            return
+
+        result = await self._nemo_gym_checkpoint_actor().discard_restored_agent_continuations.remote(
+            checkpoint_id,
+            time.time()
+            + self._master_config.rollout_checkpointing.gym.prepare_timeout_s,
+            executions,
+        )
+        if staging_keys:
+            async with self._data_plane_checkpoint_barrier.mutation(
+                "gym_restart_cleanup"
+            ):
+                await self._call_dp(
+                    "clear_samples",
+                    sample_ids=sorted(staging_keys),
+                    partition_id=self._master_config.token_capture.staging_partition,
+                )
+            self._restored_gym_checkpoint_staging_keys.difference_update(staging_keys)
+        print(
+            "📦 Restarting unfinished Gym executions from their initial task: "
+            f"executions={result['executions']}, "
+            f"resources={','.join(restart_only_resources)}",
+            flush=True,
+        )
+
+    def _schedule_completed_gym_acknowledgement_drain(self) -> None:
+        """Schedule delivery for ledger-backed Gym acknowledgement obligations."""
+        if not self._gym_participant_checkpointing_enabled:
+            return
+        if not self._rollout_recovery_ledger.pending_completed_execution_acknowledgements():
+            return
+
+        task = self._gym_completed_acknowledgement_task
+        if task is None or task.done():
+            self._gym_completed_acknowledgement_task = asyncio.create_task(
+                self._drain_completed_gym_acknowledgements_best_effort()
+            )
+
+    async def _flush_completed_gym_acknowledgements(self) -> int:
+        """Send all currently queued acknowledgements as one idempotent batch."""
+        if not self._gym_participant_checkpointing_enabled:
+            return 0
+        async with self._gym_completed_acknowledgement_lock:
+            pending = self._rollout_recovery_ledger.pending_completed_execution_acknowledgements()
+            if not pending:
+                return 0
+            payload = [
+                GymCompletedExecution(
+                    receipt={
+                        "rollout_id": rollout_id,
+                        "attempt_index": attempt_index,
+                        "execution_generation": execution_generation,
+                        "result_identity": result_identity,
+                        "result_digest": result_digest,
+                    },
+                    agent_name=agent_name,
+                ).model_dump(mode="json")
+                for (
+                    rollout_id,
+                    attempt_index,
+                    agent_name,
+                    execution_generation,
+                    result_identity,
+                    result_digest,
+                ) in pending
+            ]
+            await self._nemo_gym_checkpoint_actor().acknowledge_completed_executions.remote(
+                payload
+            )
+            # The HTTP call deliberately runs without a mutation cut. If a
+            # checkpoint lands after Gym accepts the idempotent ACK but before
+            # this removal, it preserves the obligation and safely retries it.
+            async with self._data_plane_checkpoint_barrier.mutation(
+                "gym_acknowledgements"
+            ) as cut:
+                self._rollout_recovery_ledger.mark_completed_executions_acknowledged(
+                    cut,
+                    pending,
+                )
+            return len(pending)
+
+    async def _drain_completed_gym_acknowledgements_best_effort(self) -> None:
+        """Keep rollout publication fast; checkpoint preparation retries strictly."""
+        try:
+            # A completion can be queued while the current HTTP request is in
+            # flight. Keep draining until one serialized pass observes no work;
+            # otherwise that completion would wait for the next group or save.
+            while await self._flush_completed_gym_acknowledgements():
+                pass
+        except (Exception, asyncio.CancelledError) as error:
+            if isinstance(error, asyncio.CancelledError):
+                raise
+            print(
+                "Gym completed-result acknowledgement will be retried before "
+                f"checkpoint preparation: {type(error).__name__}: {error}",
+                flush=True,
+            )
+
+    async def _wait_for_rollout_admission(self) -> None:
+        """Wait until neither weight sync nor Gym checkpointing owns admission."""
+        while True:
+            await self._rollout_permitted.wait()
+            await self._gym_checkpoint_rollout_permitted.wait()
+            if (
+                self._rollout_permitted.is_set()
+                and self._gym_checkpoint_rollout_permitted.is_set()
+            ):
+                return
+
+    async def _prepare_and_commit_gym_checkpoint(
+        self,
+        checkpoint_id: str,
+        checkpoint_dir: Path,
+    ) -> GymCheckpointCommitResult:
+        """Park Gym and write participant state into an unpublished snapshot."""
+        timeout_s = self._master_config.rollout_checkpointing.gym.prepare_timeout_s
+        gym_actor = self._nemo_gym_checkpoint_actor()
+        prepared = False
+        self._gym_checkpoint_rollout_permitted.clear()
+        try:
+            # A completed agent result blocks Gym prepare until RL has durably
+            # adopted it. Flush every canonical result queued by finalization
+            # before asking Gym to park the remaining active executions.
+            await self._flush_completed_gym_acknowledgements()
+            prepare = GymCheckpointPrepareResult.model_validate(
+                await gym_actor.prepare_checkpoint.remote(
+                    checkpoint_id,
+                    time.time() + timeout_s,
+                )
+            )
+            if not prepare.ready:
+                raise RuntimeError(
+                    f"Gym checkpoint {checkpoint_id!r} returned an incomplete cut"
+                )
+            prepared = True
+            checkpoint = GymCheckpointCommitResult.model_validate(
+                await gym_actor.commit_checkpoint.remote(
+                    checkpoint_id,
+                    time.time() + timeout_s,
+                    str(checkpoint_dir),
+                )
+            )
+            if checkpoint.checkpoint_id != checkpoint_id:
+                raise RuntimeError(
+                    "Gym checkpoint commit returned the wrong checkpoint ID: "
+                    f"expected={checkpoint_id!r}, "
+                    f"actual={checkpoint.checkpoint_id!r}"
+                )
+            if self._gym_checkpoint_topology is None:
+                raise RuntimeError(
+                    "Gym participant checkpointing requires a discovered topology"
+                )
+            self._gym_checkpoint_topology.validate_checkpoint_participants(checkpoint)
+            await asyncio.to_thread(
+                validate_gym_checkpoint_manifests,
+                checkpoint_dir,
+                checkpoint,
+            )
+            return checkpoint
+        except BaseException as checkpoint_error:
+            if prepared:
+                try:
+                    await self._release_prepared_gym_checkpoint(
+                        checkpoint_id, committed=False
+                    )
+                except BaseException as abort_error:
+                    raise BaseExceptionGroup(
+                        "Gym checkpoint failed and participant admission could not "
+                        "be restored",
+                        [checkpoint_error, abort_error],
+                    )
+            else:
+                self._gym_checkpoint_rollout_permitted.set()
+            raise
+
+    async def _release_prepared_gym_checkpoint(
+        self,
+        checkpoint_id: str,
+        *,
+        committed: bool,
+    ) -> None:
+        """Resume Gym after publish, or abort it after a failed local save."""
+        timeout_s = self._master_config.rollout_checkpointing.gym.prepare_timeout_s
+        gym_actor = self._nemo_gym_checkpoint_actor()
+        method = (
+            gym_actor.resume_checkpoint if committed else gym_actor.abort_checkpoint
+        )
+        await method.remote(checkpoint_id, time.time() + timeout_s)
+        # Reopen local admission only after Gym confirms that its own admission
+        # fence has been released. If the RPC fails, keeping this event cleared
+        # fails closed instead of dispatching requests into a possibly paused Gym.
+        self._gym_checkpoint_rollout_permitted.set()
+
     async def _finalize_with_actor(
         self, request: "ReassemblyRequest"
     ) -> Optional["FinalizedGroup"]:
@@ -1656,8 +1958,9 @@ class SingleControllerActor:
                                 [commit_error, cleanup_error],
                             )
                         raise
+                    # Sealing already persisted any Gym acknowledgement obligation.
                     # Canonical TQ rows plus replay metadata now own the completed
-                    # group; keep only unfinished work in the lineage sidecar.
+                    # group, so only unfinished lineage remains in the sidecar.
                     ledger.discard_group(cut, request.group_id)
                     self._rollout_manager.record_canonical_publication(
                         finalized.canonical_output_tokens
@@ -1807,6 +2110,11 @@ class SingleControllerActor:
                                     prompt,
                                     target_step=target_step,
                                     inflight_registry=self._inflight_by_group_id,
+                                    on_gym_acknowledgements_ready=(
+                                        self._schedule_completed_gym_acknowledgement_drain
+                                        if self._gym_participant_checkpointing_enabled
+                                        else None
+                                    ),
                                 )
                             else:
                                 request = await self._rollout_manager.generate_for_finalization(
@@ -1814,6 +2122,11 @@ class SingleControllerActor:
                                     target_step=target_step,
                                     inflight_registry=self._inflight_by_group_id,
                                     lineage_group_id=lineage_group_id,
+                                    on_gym_acknowledgements_ready=(
+                                        self._schedule_completed_gym_acknowledgement_drain
+                                        if self._gym_participant_checkpointing_enabled
+                                        else None
+                                    ),
                                 )
                             if not inflight_count_released:
                                 self._inflight_rollouts -= 1
@@ -1902,7 +2215,7 @@ class SingleControllerActor:
                             # observes the same pause a first dispatch does
                             # instead of pushing new generation into a
                             # weight-sync window.
-                            await self._rollout_permitted.wait()
+                            await self._wait_for_rollout_admission()
                             # The next generate_for_finalization call is a
                             # brand-new generation and must be re-counted
                             # against the same concurrency limiter a first
@@ -2003,7 +2316,7 @@ class SingleControllerActor:
                         # A substitution is a fresh rollout, not a continuation of the one
                         # that failed, so it observes the same pause a first dispatch does
                         # instead of pushing new generation into a weight-sync window.
-                        await self._rollout_permitted.wait()
+                        await self._wait_for_rollout_admission()
             finally:
                 if not inflight_count_released:
                     self._inflight_rollouts -= 1
@@ -2067,7 +2380,7 @@ class SingleControllerActor:
             # wait for rollout to be permitted
             self._rollout_permitted_waiters += 1
             try:
-                await self._rollout_permitted.wait()
+                await self._wait_for_rollout_admission()
             finally:
                 self._rollout_permitted_waiters -= 1
             dispatch_started = time.monotonic()
@@ -3633,6 +3946,8 @@ class SingleControllerActor:
         self,
         cut: DataPlaneMutationCut,
         checkpoint_path: PathLike,
+        *,
+        gym_staging_keys: set[str] | None = None,
     ) -> _RolloutCheckpointCut:
         """Save TQ and capture matching restart state under the barrier.
 
@@ -3675,6 +3990,7 @@ class SingleControllerActor:
                 cut,
                 replay_metadata=replay_metadata,
                 clear_unreferenced=False,
+                gym_staging_keys=gym_staging_keys,
             )
         tq_save_started = time.monotonic()
         await self._save_data_plane_checkpoint(
@@ -3766,6 +4082,7 @@ class SingleControllerActor:
                 )
             if (
                 not force
+                and not self._gym_participant_checkpointing_enabled
                 and self._last_rollout_snapshot_mutation_version
                 == self._data_plane_checkpoint_barrier.mutation_version
             ):
@@ -3831,7 +4148,33 @@ class SingleControllerActor:
             tmp_path, final_path, snapshot_sequence = await asyncio.to_thread(
                 prepare_snapshot_paths, anchor
             )
+            gym_checkpoint: Optional[GymCheckpointCommitResult] = None
+            gym_staging_keys: set[str] = set()
+            # A failed attempt removes its temporary directory, so its numeric
+            # snapshot sequence can be reused. Gym retires every completed or
+            # aborted control ID, however; add a nonce so the next attempt is not
+            # rejected as a stale coordinator.
+            checkpoint_id = (
+                f"rollout-step-{expected_train_step}-snapshot-{snapshot_sequence}-"
+                f"{uuid.uuid4().hex}"
+            )
+            if self._gym_participant_checkpointing_enabled:
+                try:
+                    gym_checkpoint = await self._prepare_and_commit_gym_checkpoint(
+                        checkpoint_id,
+                        tmp_path,
+                    )
+                except BaseException:
+                    if tmp_path.exists():
+                        await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
+                    raise
             try:
+                if gym_checkpoint is not None:
+                    gym_staging_keys = await asyncio.to_thread(
+                        gym_checkpoint_staging_keys,
+                        tmp_path,
+                        gym_checkpoint,
+                    )
                 barrier_requested = time.monotonic()
                 async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
                     barrier_acquired = time.monotonic()
@@ -3841,13 +4184,20 @@ class SingleControllerActor:
                         or self._trainer_version != expected_trainer_version
                     ):
                         await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
+                        if gym_checkpoint is not None:
+                            await self._release_prepared_gym_checkpoint(
+                                checkpoint_id,
+                                committed=False,
+                            )
                         return _RolloutCheckpointSaveResult(
                             saved=False,
                             reason="trainer_state_changed",
                         )
                     snapshot_epoch = self._current_epoch
                     snapshot_cut = await self._capture_rollout_checkpoint_cut(
-                        cut, tmp_path
+                        cut,
+                        tmp_path,
+                        gym_staging_keys=gym_staging_keys,
                     )
                 barrier_released = time.monotonic()
 
@@ -3869,6 +4219,12 @@ class SingleControllerActor:
                         snapshot_cut.rolled_back_train_group_count
                     ),
                     bootstrap_fingerprint=snapshot_fingerprint,
+                    gym_topology_fingerprint=(
+                        self._gym_checkpoint_topology.fingerprint()
+                        if self._gym_checkpoint_topology is not None
+                        else None
+                    ),
+                    gym_checkpoint=gym_checkpoint,
                 )
                 manifest_text = (
                     json.dumps(manifest.to_dict(), sort_keys=True, indent=2) + "\n"
@@ -3889,10 +4245,28 @@ class SingleControllerActor:
                     ),
                 )
                 snapshot_commit_seconds = time.monotonic() - snapshot_commit_started
-            except BaseException:
+            except BaseException as save_error:
                 if tmp_path.exists():
                     await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
+                if gym_checkpoint is not None:
+                    try:
+                        await self._release_prepared_gym_checkpoint(
+                            checkpoint_id,
+                            committed=False,
+                        )
+                    except BaseException as abort_error:
+                        raise BaseExceptionGroup(
+                            "rollout checkpoint failed and Gym participant admission "
+                            "could not be restored",
+                            [save_error, abort_error],
+                        )
                 raise
+
+            if gym_checkpoint is not None:
+                await self._release_prepared_gym_checkpoint(
+                    checkpoint_id,
+                    committed=True,
+                )
 
             self._last_rollout_snapshot_mutation_version = snapshot_cut.mutation_version
             self._last_missing_rollout_snapshot_anchor = None

@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from examples import run_grpo_single_controller
+from nemo_rl.environments.gym_checkpoint import gym_capture_key
 from nemo_rl.experience.rollout_manager import RolloutCompletionCallback
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 
@@ -71,7 +72,7 @@ class _InstrumentedNemoGymRolloutImpl:
         matches = [
             group
             for group in self._recovery_ledger.groups()
-            if rollout_id_set.intersection(group.gate_rollout_ids)
+            if rollout_id_set.intersection(group.logical_rollout_ids)
         ]
         if len(matches) != 1:
             raise RuntimeError(
@@ -86,16 +87,34 @@ class _InstrumentedNemoGymRolloutImpl:
             self._selected_sibling_sealed = asyncio.Event()
         return self._selected_sibling_sealed
 
+    def _record_forwarded_completion(
+        self,
+        *,
+        completion: Any,
+        fields: dict[str, Any],
+    ) -> None:
+        self._append_event(
+            "completion_forwarded",
+            **fields,
+            reward=float(completion.reward),
+        )
+
     async def run_rollout(
         self,
         input_sample: Any,
         *,
         rollout_ids: list[str] | None = None,
+        attempt_indices: list[int] | None = None,
         generation_indices: list[int] | None = None,
         on_completion: RolloutCompletionCallback | None = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
     ) -> Any:
-        if rollout_ids is None or generation_indices is None or on_completion is None:
+        if (
+            rollout_ids is None
+            or attempt_indices is None
+            or generation_indices is None
+            or on_completion is None
+        ):
             raise RuntimeError(
                 "sibling recovery hook requires the token-capture rollout path"
             )
@@ -106,12 +125,18 @@ class _InstrumentedNemoGymRolloutImpl:
 
         group = self._find_group(rollout_ids)
         indices = list(generation_indices)
+        capture_rollout_ids = [
+            gym_capture_key(rollout_id, attempt_index)
+            for rollout_id, attempt_index in zip(
+                rollout_ids, attempt_indices, strict=True
+            )
+        ]
         fields = {
             "group_id": group.group_id,
             "prompt_idx": int(input_sample["idx"]),
             "target_step": group.target_step,
             "generation_indices": indices,
-            "rollout_ids": list(rollout_ids),
+            "rollout_ids": capture_rollout_ids,
         }
         self._append_event("dispatch", **fields)
 
@@ -135,11 +160,15 @@ class _InstrumentedNemoGymRolloutImpl:
             completion_fields = {
                 **fields,
                 "generation_index": generation_index,
-                "rollout_id": rollout_ids[generation_index],
+                "rollout_id": capture_rollout_ids[generation_index],
             }
             if selected:
                 if not sealed_in_selected_call:
                     await on_completion(generation_index, completion)
+                    self._record_forwarded_completion(
+                        completion=completion,
+                        fields=completion_fields,
+                    )
                     sealed_in_selected_call = True
                     self._append_event("sibling_sealed", **completion_fields)
                     self._sibling_sealed_event().set()
@@ -163,10 +192,15 @@ class _InstrumentedNemoGymRolloutImpl:
             ):
                 await self._sibling_sealed_event().wait()
             await on_completion(generation_index, completion)
+            self._record_forwarded_completion(
+                completion=completion,
+                fields=completion_fields,
+            )
 
         result = await self._delegate.run_rollout(
             input_sample,
             rollout_ids=rollout_ids,
+            attempt_indices=attempt_indices,
             generation_indices=indices,
             on_completion=_instrumented_completion,
             recovery_granularity=recovery_granularity,
