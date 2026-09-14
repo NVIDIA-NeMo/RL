@@ -296,7 +296,7 @@ class ReinforcePlusPlusAdvantageEstimator:
                 logprobs_policy,
                 logprobs_reference,
                 kl_type=self.kl_type,
-            ).masked_fill(~torch.isfinite(logprobs_policy), 0.0)
+            )
             adv = adv - self.kl_coef * kl
 
         # global normalization across the batch
@@ -431,9 +431,7 @@ class GeneralizedAdvantageEstimator:
             and logprobs_policy is not None
             and logprobs_reference is not None
         ):
-            kl = calculate_kl(
-                logprobs_policy, logprobs_reference, self.kl_type
-            ).masked_fill(~torch.isfinite(logprobs_policy), 0.0)
+            kl = calculate_kl(logprobs_policy, logprobs_reference, self.kl_type)
             token_level_rewards = token_level_rewards - self.kl_coef * kl
 
         # Place terminal reward at the last response token (last mask=1
@@ -644,11 +642,7 @@ class OPDAdvantageEstimator:
             raise ValueError("OPD requires prev_logprobs")
 
         # Â_MOPD,t = sg[log π_teacher - log π_student]  (Equation 8)
-        distill_advantages = (
-            (teacher_logprobs - prev_logprobs)
-            .masked_fill(~torch.isfinite(prev_logprobs), 0.0)
-            .detach()
-        )
+        distill_advantages = (teacher_logprobs - prev_logprobs).detach()
 
         # Apply mask
         advantages = distill_advantages * mask

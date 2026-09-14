@@ -57,6 +57,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 )
 from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
+from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
@@ -1335,6 +1336,13 @@ class DTensorPolicyWorkerImpl(
                 )
             all_log_probs_padded.append(lp)
         token_logprobs = torch.cat(all_log_probs_padded, dim=0)
+
+        # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
+        if need_top_k_or_top_p_filtering(self.sampling_params):
+            mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
+            token_logprobs = mask_out_neg_inf_logprobs(
+                token_logprobs, mask, "prev_logprobs"
+            )
 
         return_data["logprobs"] = token_logprobs.cpu()
         self.timer.stop("get_logprobs")
