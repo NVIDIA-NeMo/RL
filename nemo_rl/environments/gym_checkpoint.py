@@ -48,6 +48,7 @@ GYM_AGENT_CONTINUATION_INDEX_FEATURE = "agent_continuation_index_v1"
 GYM_AGENT_DISCARD_RESTORED_CONTINUATION_FEATURE = "discard_restored_continuation_v1"
 GYM_AGENT_RESOURCE_DEPENDENCY_INDEX_FEATURE = "agent_resource_dependency_index_v1"
 GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE = "external_storage_reference_index_v1"
+GYM_GENERATION_CUT_LINEAGE_FEATURE = "generation_cut_lineage_v1"
 
 _IDENTITY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
 
@@ -391,13 +392,18 @@ class GymCheckpointTopology(_StrictWireModel):
                 f"unexpected={sorted(actual - expected)!r}"
             )
 
-    def validate_turn_recovery_capabilities(self) -> None:
+    def validate_turn_recovery_capabilities(
+        self,
+        *,
+        generation_prefix_cuts_enabled: bool = False,
+    ) -> None:
         """Require the Gym features used by coordinated turn recovery."""
         missing_acknowledgement: list[str] = []
         missing_continuation_index: list[str] = []
         missing_fresh_restart: list[str] = []
         missing_resource_dependencies: list[str] = []
         missing_storage_reference_index: list[str] = []
+        missing_generation_cut_lineage: list[str] = []
         requires_fresh_restart = bool(self.restart_only_resources())
         for contract in self.participants:
             if contract.checkpoint_mode != "export_restore":
@@ -428,12 +434,21 @@ class GymCheckpointTopology(_StrictWireModel):
             elif (
                 contract.participant.component == "responses_api_models"
                 and contract.instance_role == "policy"
-                and GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE
-                not in contract.features
             ):
-                missing_storage_reference_index.append(
-                    contract.participant.participant_name
-                )
+                if (
+                    GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE
+                    not in contract.features
+                ):
+                    missing_storage_reference_index.append(
+                        contract.participant.participant_name
+                    )
+                if (
+                    generation_prefix_cuts_enabled
+                    and GYM_GENERATION_CUT_LINEAGE_FEATURE not in contract.features
+                ):
+                    missing_generation_cut_lineage.append(
+                        contract.participant.participant_name
+                    )
 
         if missing_acknowledgement:
             raise RuntimeError(
@@ -464,6 +479,12 @@ class GymCheckpointTopology(_StrictWireModel):
                 "Gym participant checkpointing requires external-storage "
                 "reference indexes from every stateful policy model; "
                 f"missing={missing_storage_reference_index!r}"
+            )
+        if missing_generation_cut_lineage:
+            raise RuntimeError(
+                "Gym generation-prefix recovery requires durable lineage cuts "
+                "from every stateful policy model; "
+                f"missing={missing_generation_cut_lineage!r}"
             )
 
 
@@ -865,6 +886,7 @@ class GymModelCommitResponse(_StrictWireModel):
     rows: NonNegativeInt
     excluded_tombstoned: NonNegativeInt
     excluded_inactive: NonNegativeInt = 0
+    generation_cut_records: NonNegativeInt = 0
     manifest_digest: Sha256Digest
     storage_reference_index: GymCheckpointArtifactReference
 
@@ -968,12 +990,14 @@ def validate_gym_checkpoint_manifests(
 
 
 class GymExternalStorageReference(_StrictWireModel):
-    """One TQ staging row required by a parked Gym continuation."""
+    """One TQ staging row required by a Gym recovery point."""
 
     schema_version: Literal[1] = GYM_CHECKPOINT_SCHEMA_VERSION
     capture_key: str = Field(min_length=1, pattern=_IDENTITY_PATTERN)
     boundary_model_call_id: str = Field(min_length=1)
-    kind: Literal["token_capture_staging"] = "token_capture_staging"
+    kind: Literal["token_capture_staging", "generation_prefix_cut"] = (
+        "token_capture_staging"
+    )
     key: str = Field(min_length=1)
 
 
@@ -1124,6 +1148,17 @@ def gym_checkpoint_staging_keys(
     return set(_gym_checkpoint_external_storage_references(checkpoint_dir, checkpoint))
 
 
+def gym_checkpoint_generation_cut_records(
+    checkpoint: GymCheckpointCommitResult,
+) -> int:
+    """Return the number of prefix cuts embedded in Gym model lineage."""
+    return sum(
+        result.payload.generation_cut_records
+        for result in checkpoint.participants
+        if isinstance(result.payload, GymModelCommitResponse)
+    )
+
+
 def gym_checkpoint_continuations(
     checkpoint_dir: Path,
     checkpoint: GymCheckpointCommitResult,
@@ -1152,10 +1187,14 @@ def gym_checkpoint_continuations(
                 )
             roots_by_capture_key[root.capture_key] = root
 
-    references = _gym_checkpoint_external_storage_references(
-        checkpoint_dir,
-        checkpoint,
-    )
+    references = {
+        key: reference
+        for key, reference in _gym_checkpoint_external_storage_references(
+            checkpoint_dir,
+            checkpoint,
+        ).items()
+        if reference.kind == "token_capture_staging"
+    }
     keys_by_capture_key: dict[str, list[str]] = {}
     for key, reference in references.items():
         root = roots_by_capture_key.get(reference.capture_key)

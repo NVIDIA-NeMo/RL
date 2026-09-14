@@ -98,6 +98,13 @@ def test_generation_prefix_restore_requires_enabled_runtime() -> None:
         generation_prefix_cuts_enabled=True,
     )
 
+    with pytest.raises(ValueError, match="contains durable generation-prefix cuts"):
+        sc_setup_mod._validate_generation_prefix_restore_compatibility(
+            generation_cut_proofs=(),
+            generation_cut_records=1,
+            generation_prefix_cuts_enabled=False,
+        )
+
 
 class _CheckpointingCustomSampler(WindowedSampler):
     """Custom sampler whose static capability must be validated during setup."""
