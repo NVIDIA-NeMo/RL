@@ -178,5 +178,55 @@ def test_verify_restore_checks_prefix_digest_and_terminal_split(
     )
 
     _HELPER.verify_restore(
-        argparse.Namespace(selection=selection, events=events, run_log=log)
+        argparse.Namespace(
+            selection=selection,
+            events=events,
+            run_log=log,
+            profile="basic",
+            audit_events=None,
+        )
     )
+
+
+def test_workplace_restore_audit_requires_one_mutation(tmp_path: Path) -> None:
+    selected = {
+        "rollout_id": "rollout-a",
+        "source_attempt_index": 0,
+        "restored_attempt_index": 1,
+    }
+    audit = tmp_path / "audit.jsonl"
+    events = [
+        {
+            "event": "mutation_applied",
+            "rollout_id": "rollout-a",
+            "attempt_index": 0,
+            "sentinel_count": 1,
+        },
+        {
+            "event": "state_restored",
+            "rollout_id": "rollout-a",
+            "attempt_index": 1,
+            "sentinel_count": 1,
+        },
+        {
+            "event": "state_verified",
+            "rollout_id": "rollout-a",
+            "attempt_index": 1,
+            "sentinel_count": 1,
+        },
+    ]
+    audit.write_text("".join(json.dumps(event) + "\n" for event in events))
+
+    _HELPER._verify_workplace_audit(selected, audit)
+
+    events.append(
+        {
+            "event": "mutation_applied",
+            "rollout_id": "rollout-a",
+            "attempt_index": 1,
+            "sentinel_count": 2,
+        }
+    )
+    audit.write_text("".join(json.dumps(event) + "\n" for event in events))
+    with pytest.raises(AssertionError, match="exactly once"):
+        _HELPER._verify_workplace_audit(selected, audit)
