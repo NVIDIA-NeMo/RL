@@ -19,6 +19,7 @@ import ray
 import torch
 from transformers import AutoModelForCausalLM
 
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn, NLLLossFn
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.utils import get_tokenizer
@@ -41,6 +42,22 @@ class _FakeTrainableModel:
 
     def eval(self):
         self.eval_called = True
+
+
+def test_dtensor_greedy_temperature_keeps_logits_finite_and_unscaled():
+    from nemo_rl.models.policy.workers.dtensor_policy_worker import (
+        DTensorPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(DTensorPolicyWorkerImpl)
+    worker.sampling_params = TrainingSamplingParams(temperature=0.0)
+    logits = torch.randn(2, 10, 100)
+    original = logits.clone()
+
+    result = DTensorPolicyWorkerImpl._apply_temperature_scaling(worker, logits)
+
+    assert torch.equal(result, original)
+    assert torch.isfinite(result).all()
 
 
 def test_dtensor_prepare_for_training_restores_optimizer(monkeypatch):
