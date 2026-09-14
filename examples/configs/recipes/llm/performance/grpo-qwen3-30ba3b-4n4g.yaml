@@ -22,11 +22,7 @@ policy:
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
   megatron_cfg:
     enabled: true
-    empty_unused_memory_level: 1
-    tensor_model_parallel_size: 1
-    pipeline_model_parallel_size: 1
     expert_model_parallel_size: 16
-    sequence_parallel: false
     moe_grouped_gemm: true
     optimizer:
       lr: 3.0e-07
@@ -37,12 +33,8 @@ policy:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
   generation:
-    vllm_cfg:
-      tensor_parallel_size: 1
     vllm_kwargs:
-      # vLLM 0.20's default FlashInfer TRTLLM MoE backend isn't refit-compatible,
-      # change to triton to keep same behavior as vLLM 0.17.
-      moe_backend: triton
+      moe_backend: flashinfer_trtllm
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-4n4g
   wandb_enabled: true
