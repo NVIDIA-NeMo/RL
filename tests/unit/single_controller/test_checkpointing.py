@@ -184,6 +184,14 @@ class _CheckpointGeneration(_FakeGeneration):
         self._events.append("generation-resume")
         return True
 
+    def resume_generation_after_cut(self, *, timeout_s=None) -> bool:
+        self._events.append("generation-resume-after-cut")
+        return True
+
+    def finish_generation_checkpoint(self, *, timeout_s=None) -> bool:
+        self._events.append("generation-finish-checkpoint")
+        return True
+
 
 class _FakeTrainer:
     """TQPolicy stand-in: train methods are no-ops, save_checkpoint records calls."""
@@ -2057,7 +2065,7 @@ class TestPeriodicRolloutCheckpoint:
         assert len(set(gym_actor.checkpoint_ids)) == 2
         assert actor._gym_checkpoint_rollout_permitted.is_set()
 
-    def test_generation_prefix_cut_freezes_engine_until_gym_release(
+    def test_generation_prefix_cut_resumes_decoding_before_gym_release(
         self, tmp_path: Path
     ) -> None:
         actor = self._actor(tmp_path)
@@ -2096,6 +2104,7 @@ class TestPeriodicRolloutCheckpoint:
             )
             assert prepare.checkpoint_id == checkpoint.checkpoint_id == "checkpoint-1"
             assert actor._generation_checkpoint_pause_id == "checkpoint-1"
+            assert actor._generation_checkpoint_decoding_resumed
             assert not actor._gym_checkpoint_rollout_permitted.is_set()
             await actor._release_prepared_gym_checkpoint("checkpoint-1", committed=True)
 
@@ -2107,11 +2116,13 @@ class TestPeriodicRolloutCheckpoint:
         assert events == [
             "generation-pause",
             "prepare",
+            "generation-resume-after-cut",
             "commit",
             "resume",
-            "generation-resume",
+            "generation-finish-checkpoint",
         ]
         assert actor._generation_checkpoint_pause_id is None
+        assert not actor._generation_checkpoint_decoding_resumed
         assert actor._gym_checkpoint_rollout_permitted.is_set()
 
     def test_generation_prefix_cut_prepare_failure_resumes_engine(
@@ -2139,6 +2150,7 @@ class TestPeriodicRolloutCheckpoint:
             "generation-resume",
         ]
         assert actor._generation_checkpoint_pause_id is None
+        assert not actor._generation_checkpoint_decoding_resumed
         assert actor._gym_checkpoint_rollout_permitted.is_set()
 
     def test_generation_prefix_cut_commit_failure_clears_staging_rows(
@@ -2169,11 +2181,13 @@ class TestPeriodicRolloutCheckpoint:
         assert events == [
             "generation-pause",
             "prepare",
+            "generation-resume-after-cut",
             "commit",
             "abort",
-            "generation-resume",
+            "generation-finish-checkpoint",
         ]
         assert actor._generation_checkpoint_pause_id is None
+        assert not actor._generation_checkpoint_decoding_resumed
         assert actor._gym_checkpoint_rollout_permitted.is_set()
 
     def test_generation_prefix_rows_are_cleared_when_snapshot_save_fails(
