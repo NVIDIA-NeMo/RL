@@ -20,6 +20,7 @@ import argparse
 import hashlib
 import json
 import os
+import tarfile
 import time
 from pathlib import Path
 from typing import Any
@@ -86,6 +87,99 @@ def _read_artifact(snapshot: Path, reference: dict[str, Any]) -> list[dict[str, 
         raise AssertionError(f"artifact record count mismatch for {path}")
     if not all(isinstance(record, dict) for record in records):
         raise TypeError(f"artifact rows must be objects in {path}")
+    return records
+
+
+def _read_agent_records(snapshot: Path, manifest_path: Path) -> list[dict[str, Any]]:
+    """Validate and read the archive-only Gym agent checkpoint format."""
+    manifest = _read_json(manifest_path)
+    if manifest.get("schema_version") != 2:
+        raise AssertionError(
+            "functional recovery requires the archive-only Gym agent checkpoint schema"
+        )
+    indexed = _read_artifact(snapshot, manifest["record_index"])
+    archives = manifest.get("archives")
+    if not isinstance(archives, list):
+        raise TypeError("agent checkpoint archives must be a list")
+    if manifest.get("records") != len(indexed):
+        raise AssertionError("agent checkpoint record count does not match its index")
+
+    archive_names = [item.get("name") for item in archives if isinstance(item, dict)]
+    indexed_archive_names = {item.get("archive") for item in indexed}
+    if len(archive_names) != len(archives) or len(set(archive_names)) != len(
+        archive_names
+    ):
+        raise AssertionError(
+            "agent checkpoint manifest contains invalid or duplicate archives"
+        )
+    if set(archive_names) != indexed_archive_names:
+        raise AssertionError(
+            "agent checkpoint archive inventory does not match its index"
+        )
+
+    records: list[dict[str, Any]] = []
+    for archive_reference in archives:
+        archive_path = (manifest_path.parent / archive_reference["name"]).resolve()
+        archive_path.relative_to(snapshot.resolve())
+        if not archive_path.is_file():
+            raise FileNotFoundError(archive_path)
+        if archive_path.stat().st_size != archive_reference["bytes"]:
+            raise AssertionError(
+                f"agent archive byte count mismatch for {archive_path}"
+            )
+        if _digest(archive_path) != archive_reference["sha256"]:
+            raise AssertionError(f"agent archive digest mismatch for {archive_path}")
+        expected = [
+            item for item in indexed if item["archive"] == archive_reference["name"]
+        ]
+        if len(expected) != archive_reference["members"]:
+            raise AssertionError(
+                f"agent archive member count mismatch for {archive_path}"
+            )
+        try:
+            with tarfile.open(archive_path, mode="r:") as archive:
+                infos = archive.getmembers()
+                if [info.name for info in infos] != [
+                    item["member"] for item in expected
+                ]:
+                    raise AssertionError(
+                        f"agent archive inventory mismatch for {archive_path}"
+                    )
+                for info, member in zip(infos, expected, strict=True):
+                    if not info.isfile():
+                        raise AssertionError(
+                            f"agent archive member is not a regular file: {info.name}"
+                        )
+                    extracted = archive.extractfile(info)
+                    if extracted is None:
+                        raise AssertionError(
+                            f"agent archive member cannot be read: {info.name}"
+                        )
+                    payload = extracted.read()
+                    if (
+                        len(payload) != member["bytes"]
+                        or hashlib.sha256(payload).hexdigest() != member["sha256"]
+                    ):
+                        raise AssertionError(
+                            f"agent archive member is corrupted: {info.name}"
+                        )
+                    record = json.loads(payload)
+                    if not isinstance(record, dict):
+                        raise TypeError(
+                            f"agent archive member must be an object: {info.name}"
+                        )
+                    if (record.get("rollout_id"), record.get("attempt_index")) != (
+                        member["rollout_id"],
+                        member["attempt_index"],
+                    ):
+                        raise AssertionError(
+                            f"agent archive member identity mismatch: {info.name}"
+                        )
+                    records.append(record)
+        except tarfile.TarError as error:
+            raise AssertionError(
+                f"agent archive cannot be read: {archive_path}"
+            ) from error
     return records
 
 
@@ -170,8 +264,7 @@ def inspect_snapshot(
             "Gym storage references contain a rollout with no parked continuation"
         )
 
-    agent_manifest = _read_json(agent_manifest_path)
-    agent_dir = agent_manifest_path.parent
+    agent_records = _read_agent_records(snapshot, agent_manifest_path)
     recovery = torch.load(snapshot / "rollout_recovery.pt", weights_only=True)
     if not isinstance(recovery, dict):
         raise TypeError("rollout recovery sidecar is not a mapping")
@@ -187,11 +280,7 @@ def inspect_snapshot(
         )
 
     candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    for name, expected_digest in agent_manifest.get("files", {}).items():
-        record_path = agent_dir / name
-        if _digest(record_path) != expected_digest:
-            raise AssertionError(f"agent boundary digest mismatch for {record_path}")
-        record = _read_json(record_path)
+    for record in agent_records:
         pending_model = record.get("pending_model")
         if (
             record.get("boundary_index", 0) < 1
