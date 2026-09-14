@@ -978,7 +978,9 @@ def setup(
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
     if backend != "sglang":
-        state_dict_info = policy.prepare_refit_info()
+        state_dict_info = policy.prepare_refit_info(
+            refit_payload_mode=policy_generation.get_refit_payload_mode()
+        )
         if policy_generation is not None:
             policy_generation.prepare_refit_info(state_dict_info)
 

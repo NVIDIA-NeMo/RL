@@ -23,6 +23,15 @@ policy:
   dtensor_cfg:
     enabled: false
   megatron_cfg:
+    # HybridEP settings
+    moe_token_dispatcher_type: flex
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32
+    env_vars:
+      NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "8"
+      NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: "128"
+      NVLINK_DOMAIN_SIZE: "8"
+      USE_MNNVL: "0"
     enabled: true
     empty_unused_memory_level: 1
     tensor_model_parallel_size: 2

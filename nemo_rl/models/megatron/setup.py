@@ -1810,28 +1810,23 @@ def _create_megatron_config(
     # fp8_param_gather and reuse_grad_buf_for_mxfp8_param_ag are derived: both are
     # only valid when fp8 is enabled, fp8_param=True, and recipe is mxfp8. Mcore's
     # DDP __post_init__ asserts they remain in sync, so we centralize the derivation
-    # rather than exposing two redundant YAML knobs that can disagree.
+    # rather than exposing two redundant YAML knobs that can disagree. The optimizer
+    # fp8_recipe comes from the same canonical model config so it selects the
+    # matching main-parameter representation.
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
-    reuse_grad_buf_for_mxfp8_param_ag = (
-        fp8_param_enabled and fp8_cfg.get("fp8_recipe") == "mxfp8"
+    fp8_recipe = (
+        fp8_cfg.get("fp8_recipe") if fp8_cfg and fp8_cfg.get("enabled", False) else None
     )
+    reuse_grad_buf_for_mxfp8_param_ag = fp8_param_enabled and fp8_recipe == "mxfp8"
     overlap_param_gather = config["megatron_cfg"]["distributed_data_parallel_config"][
         "overlap_param_gather"
     ]
     optimizer_kwargs = {
         **_resolve_optimizer_dtype_kwargs(config["megatron_cfg"]["optimizer"]),
+        "fp8_recipe": fp8_recipe,
         "overlap_param_gather": overlap_param_gather,
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }
-    # OptimizerConfig.__post_init__ treats fp8_recipe=None as "no fp8 params" and
-    # lets the precision-aware optimizer keep fp32 masters inside FusedAdam,
-    # leaving None placeholders in shard_fp32_from_float16_groups; with
-    # reuse_grad_buf_for_mxfp8_param_ag the shared param buffer must be refilled
-    # from those masters each step, so the recipe has to be plumbed to the
-    # optimizer just like Megatron pretrain's get_megatron_optimizer_config does.
-    if fp8_cfg is not None and fp8_cfg.get("enabled", False):
-        optimizer_kwargs["fp8_recipe"] = fp8_cfg.get("fp8_recipe")
-
     # Fused linear logprobs run the decoder but read output_layer.weight directly
     # instead of calling output_layer.forward(). Megatron's distributed-optimizer
     # overlap_param_gather prefetch chain assumes every param-gather bucket
@@ -2673,6 +2668,127 @@ def setup_reference_model_state(
         clear_global_router_replay_instances()
 
     return reference_state_dict
+
+
+def load_teacher_output_layer_weight(
+    *,
+    teacher_pretrained_path: str,
+    local_vocab_size: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Load this rank's shard of a teacher checkpoint's LM-head weight.
+
+    Full-vocabulary MOPD ships the teacher's hidden states and projects them on
+    the student side, which needs the teacher's ``output_layer.weight``. Only
+    that one tensor is read: instantiating a second Megatron model just to reach
+    it is far more fragile, since provider and config objects accumulate
+    runtime-only distributed state during live training.
+
+    The request is built at the **student's** tensor-parallel rank and size.
+    Re-sharding a teacher saved at a different tensor-parallel width is
+    dist_checkpointing's ordinary by-offset load and needs no special flag.
+    ``allow_shape_mismatch=True`` covers a different case: a teacher whose
+    *padded* vocabulary differs from the student's. Megatron pads to a multiple
+    of ``make_vocab_size_divisible_by * tp_size``, so the two widths diverge
+    whenever the parallel sizes do. Under that flag mcore zero-initializes and
+    partially loads instead of raising, so rows above the narrower of the two
+    padded widths come back as zeros. Those are pad slots rather than real
+    vocabulary entries, so the objective is unaffected in practice -- but this
+    is a silent fallback, not a re-sharding mechanism.
+
+    Args:
+        teacher_pretrained_path: Megatron checkpoint root of the teacher.
+        local_vocab_size: This rank's vocabulary shard width.
+        dtype: Dtype to materialize the shard in.
+
+    Returns:
+        The ``[local_vocab_size, hidden_size]`` weight shard on CPU.
+
+    Raises:
+        FileNotFoundError: If the checkpoint root holds no readable iteration.
+        KeyError: If neither an output-layer nor a tied-embedding weight exists.
+        TypeError: If the loaded checkpoint entry is not a ``torch.Tensor``.
+        ValueError: If the checkpoint tensor is not a rank-2 matrix.
+    """
+    from megatron.bridge.training.utils.checkpoint_utils import (
+        TRACKER_PREFIX,
+        get_checkpoint_name,
+        get_checkpoint_train_state_filename,
+        is_checkpoint_iteration_directory,
+        read_train_state,
+    )
+    from megatron.core import dist_checkpointing
+    from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
+
+    if not checkpoint_exists(teacher_pretrained_path):
+        raise FileNotFoundError(
+            "opd_full needs the teacher LM head, but no Megatron checkpoint is "
+            f"readable at {teacher_pretrained_path!r}."
+        )
+    # validate_model_paths returns a checkpoint root on the HF-cache path but an
+    # already-resolved iteration directory for an explicit pretrained_checkpoint.
+    # Detect which, instead of assuming a root and failing on a missing tracker.
+    # Bridge owns this decision (four markers, MSC-aware) and checkpoint_exists
+    # above already delegates to it.
+    if is_checkpoint_iteration_directory(teacher_pretrained_path):
+        checkpoint_dir = teacher_pretrained_path
+    else:
+        # prefix is required: the default returns train_state.pt, not
+        # latest_train_state.pt.
+        train_state_filename = get_checkpoint_train_state_filename(
+            teacher_pretrained_path, prefix=TRACKER_PREFIX
+        )
+        train_state = read_train_state(train_state_filename)
+        checkpoint_dir = get_checkpoint_name(
+            teacher_pretrained_path, train_state.step, release=False
+        )
+
+    tensor_metadata = dist_checkpointing.load_tensors_metadata(checkpoint_dir)
+    if "output_layer.weight" in tensor_metadata:
+        checkpoint_key = "output_layer.weight"
+    elif "embedding.word_embeddings.weight" in tensor_metadata:
+        # Tied embedding/output checkpoints store the LM head under the
+        # embedding tensor's checkpoint key.
+        checkpoint_key = "embedding.word_embeddings.weight"
+    else:
+        available_keys = sorted(tensor_metadata)
+        raise KeyError(
+            "Could not find a teacher LM-head tensor in "
+            f"{checkpoint_dir!r}. Expected 'output_layer.weight' or "
+            "'embedding.word_embeddings.weight'; got "
+            f"{len(available_keys)} keys, first few: {available_keys[:8]}."
+        )
+
+    global_shape = tuple(tensor_metadata[checkpoint_key].global_shape)
+    if len(global_shape) != 2:
+        raise ValueError(
+            f"Teacher LM-head tensor {checkpoint_key!r} must be rank 2, got "
+            f"global shape {global_shape}."
+        )
+    teacher_hidden_size = int(global_shape[1])
+
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    weight_template = torch.empty(
+        (int(local_vocab_size), teacher_hidden_size), dtype=dtype, device="cpu"
+    )
+    sharded_template = make_tp_sharded_tensor_for_checkpoint(
+        weight_template,
+        key=checkpoint_key,
+        allow_shape_mismatch=True,
+        tp_group=pg_collection.tp,
+        dp_cp_group=pg_collection.dp_cp,
+    )
+    loaded = dist_checkpointing.load(
+        {checkpoint_key: sharded_template},
+        checkpoint_dir,
+        validate_access_integrity=False,
+    )[checkpoint_key]
+    if not isinstance(loaded, torch.Tensor):
+        raise TypeError(
+            f"Expected a Tensor for {checkpoint_key!r} from {checkpoint_dir!r}, "
+            f"got {type(loaded).__name__}."
+        )
+    return loaded.detach().to(device="cpu", dtype=dtype, copy=True)
 
 
 def finalize_megatron_setup(
