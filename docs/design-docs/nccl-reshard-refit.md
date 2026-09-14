@@ -98,9 +98,11 @@ single `ValueError` listing every violation. The current requirements are:
   Megatron-Core and vLLM can run generation with PP, and training-side Megatron
   PP is supported here; the missing piece is generation-stage-aware destination
   routing in `nccl_reshard`.
-* **No ModelOpt real quantization** — `policy.generation.real_quant=false`. Real-quant
-  rollouts refit through vLLM's layerwise-reload weight loaders, which the bulk
-  `xferdtensor` writes bypass.
+* **ModelOpt real NVFP4 quantization** is supported for a BF16 Megatron trainer
+  and vLLM generation in `W4A16` or `W4A4` mode. The receiver converts routed
+  MoE expert weights while installing each resharded BF16 shard. This path
+  currently requires generation TP=EP=PP=1; `W4A4` also requires a static
+  calibration artifact. Other real-quant combinations remain unsupported.
 
 Operational knobs:
 

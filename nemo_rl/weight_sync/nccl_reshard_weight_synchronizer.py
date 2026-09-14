@@ -352,7 +352,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         )
         ray.get(futures_train + futures_inference)
 
-        # 3. Refit metadata.  Train builds backend-agnostic per-layer metadata
+        # 3. Refit metadata. Train builds backend-agnostic per-layer metadata
         #    (HF naming convention); gen maps it into its own fused layout
         #    (e.g. vLLM's w13/w2).
         #
