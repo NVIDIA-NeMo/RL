@@ -27,6 +27,15 @@ from pathlib import Path
 from typing import Any
 
 
+_PROFILES = ("basic", "workplace")
+_WORKPLACE_EVENT = {
+    "event_name": "NeMo RL checkpoint recovery sentinel",
+    "participant_email": "checkpoint-recovery@example.com",
+    "event_start": "2025-01-15 10:00:00",
+    "duration": "30",
+}
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text())
     if not isinstance(value, dict):
@@ -237,6 +246,7 @@ def inspect_snapshot(
     snapshot: Path,
     *,
     max_generation_tokens: int,
+    profile: str = "basic",
 ) -> dict[str, Any]:
     """Validate a published bootstrap snapshot containing a non-empty live cut."""
     import torch
@@ -279,9 +289,8 @@ def inspect_snapshot(
 
     agent = _participant(gym_checkpoint, "responses_api_agents")
     resources = _participant(gym_checkpoint, "resources_servers")
-    _participant_manifest(
-        snapshot, _participant(gym_checkpoint, "responses_api_models")
-    )
+    model = _participant(gym_checkpoint, "responses_api_models")
+    _participant_manifest(snapshot, model)
     resources_manifest_path = _participant_manifest(snapshot, resources)
     if agent.get("payload", {}).get("records", 0) < 1:
         raise AssertionError("Gym agent has no saved continuation boundary")
@@ -320,11 +329,11 @@ def inspect_snapshot(
         )
     resource_name = resources["participant"]["participant_name"]
     expected_resource_revision = resource_revisions.get(resource_name)
+    resource_state = matching_resource_states[0]
     if (
         not isinstance(expected_resource_revision, int)
         or expected_resource_revision < 1
-        or matching_resource_states[0].get("state_revision")
-        != expected_resource_revision
+        or resource_state.get("state_revision") != expected_resource_revision
     ):
         raise AssertionError(
             "agent boundary and resources snapshot disagree about state revision"
@@ -341,7 +350,7 @@ def inspect_snapshot(
     if attempt.get("status") != "dispatched":
         raise AssertionError("a cut generation must remain dispatched in the RL ledger")
 
-    return {
+    selected = {
         "snapshot_path": str(snapshot.resolve()),
         "checkpoint_id": gym_checkpoint["checkpoint_id"],
         "rollout_id": prefix["rollout_id"],
@@ -354,7 +363,69 @@ def inspect_snapshot(
         "boundary_index": boundary["boundary_index"],
         "resource_state_revisions": resource_revisions,
         "group_id": group["group_id"],
+        "profile": profile,
     }
+    if profile == "workplace":
+        if model.get("payload", {}).get("rows", 0) < 1:
+            raise AssertionError(
+                "combined Workplace checkpoint has no committed first model call"
+            )
+        if (
+            boundary.get("boundary_kind") != "turn_complete"
+            or boundary.get("boundary_index", 0) < 3
+            or not boundary.get("last_committed_model_call_id")
+            or boundary.get("pending_model") is not None
+        ):
+            raise AssertionError(
+                "combined Workplace checkpoint is not parked after its completed first turn"
+            )
+        output_types = {
+            item.get("type")
+            for item in boundary.get("output_items", [])
+            if isinstance(item, dict)
+        }
+        if not {"function_call", "function_call_output"}.issubset(output_types):
+            raise AssertionError(
+                "combined Workplace checkpoint is missing its tool-call transcript"
+            )
+        if prefix["model_call_id"] == boundary["last_committed_model_call_id"]:
+            raise AssertionError(
+                "generation prefix must belong to the model call after the committed turn"
+            )
+        if expected_resource_revision < 2:
+            raise AssertionError(
+                "combined Workplace checkpoint has no committed environment mutation"
+            )
+        sentinel_count = _workplace_sentinel_count(resource_state.get("state") or {})
+        if sentinel_count != 1:
+            raise AssertionError(
+                "combined Workplace checkpoint must contain exactly one sentinel "
+                f"calendar event, got {sentinel_count}"
+            )
+        selected.update(
+            last_committed_model_call_id=boundary["last_committed_model_call_id"],
+            checkpoint_sentinel_count=sentinel_count,
+        )
+    return selected
+
+
+def _workplace_sentinel_count(state: dict[str, Any]) -> int:
+    try:
+        payload = state["containers"]["calendar"]["_calendar_events"]
+        frame = json.loads(payload)
+        columns = frame["columns"]
+        rows = frame["data"]
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise AssertionError(
+            "Workplace checkpoint has no serialized calendar state"
+        ) from error
+    return sum(
+        all(
+            str(row[columns.index(field)]) == value
+            for field, value in _WORKPLACE_EVENT.items()
+        )
+        for row in rows
+    )
 
 
 def _published_bootstrap_snapshots(checkpoint_dir: Path) -> list[Path]:
@@ -373,6 +444,7 @@ def select_snapshot(args: argparse.Namespace) -> None:
                 selected = inspect_snapshot(
                     snapshot,
                     max_generation_tokens=args.max_generation_tokens,
+                    profile=args.profile,
                 )
             except (
                 AssertionError,
@@ -501,6 +573,53 @@ def verify_restore(args: argparse.Namespace) -> None:
         raise AssertionError(
             "combined terminal row duplicated or omitted generation tokens"
         )
+    if args.profile == "workplace":
+        _verify_workplace_audit(selected, args.audit_events)
+
+
+def _verify_workplace_audit(
+    selected: dict[str, Any],
+    audit_path: Path | None,
+) -> None:
+    if audit_path is None or not audit_path.is_file():
+        raise AssertionError("Workplace prefix recovery produced no audit events")
+    events = [
+        json.loads(line) for line in audit_path.read_text().splitlines() if line.strip()
+    ]
+    rollout_id = selected["rollout_id"]
+    source_attempt = selected["source_attempt_index"]
+    restored_attempt = selected["restored_attempt_index"]
+    mutations = [
+        event
+        for event in events
+        if event.get("event") == "mutation_applied"
+        and event.get("rollout_id") == rollout_id
+    ]
+    expected_mutations = [
+        event
+        for event in mutations
+        if event.get("attempt_index") == source_attempt
+        and event.get("sentinel_count") == 1
+    ]
+    if len(expected_mutations) != 1 or len(mutations) != 1:
+        raise AssertionError(
+            "Workplace sentinel mutation did not execute exactly once before the "
+            f"crash: events={mutations!r}"
+        )
+    for event_name in ("state_restored", "state_verified"):
+        matches = [
+            event
+            for event in events
+            if event.get("event") == event_name
+            and event.get("rollout_id") == rollout_id
+            and event.get("attempt_index") == restored_attempt
+            and event.get("sentinel_count") == 1
+        ]
+        if len(matches) != 1:
+            raise AssertionError(
+                f"Workplace state was not observed exactly once at {event_name}: "
+                f"events={matches!r}"
+            )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -514,11 +633,14 @@ def _parser() -> argparse.ArgumentParser:
     select.add_argument("run_log", type=Path)
     select.add_argument("timeout_s", type=float)
     select.add_argument("max_generation_tokens", type=int)
+    select.add_argument("--profile", choices=_PROFILES, default="basic")
 
     verify = subparsers.add_parser("verify-restore")
     verify.add_argument("selection", type=Path)
     verify.add_argument("events", type=Path)
     verify.add_argument("run_log", type=Path)
+    verify.add_argument("--profile", choices=_PROFILES, default="basic")
+    verify.add_argument("--audit-events", type=Path)
     return parser
 
 
