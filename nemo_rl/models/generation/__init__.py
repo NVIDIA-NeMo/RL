@@ -64,10 +64,13 @@ def draft_full_refit_enabled(policy_cfg: dict) -> bool:
     megatron eagle3 path streams a partial set instead. Feeds the
     ``draft_full_refit`` argument of :func:`configure_generation_config`.
     """
-    draft_cfg = policy_cfg.get("draft") or {}
+    from nemo_rl.models.policy.draft_config import coerce_draft_config
+
+    draft_config = coerce_draft_config(policy_cfg.get("draft"))
     dtensor_cfg = policy_cfg.get("dtensor_cfg") or {}
     return (
-        bool(draft_cfg.get("enabled", False))
+        draft_config is not None
+        and bool(draft_config.enabled)
         and bool(dtensor_cfg.get("enabled", False))
         and bool(dtensor_cfg.get("_v2", False))
     )

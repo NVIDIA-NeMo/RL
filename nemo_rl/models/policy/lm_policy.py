@@ -42,9 +42,9 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.policy import (
     BLOCK_DRAFT_ALGOS,
-    DRAFT_ALGOS,
     PolicyConfig,
 )
+from nemo_rl.models.policy.draft_config import coerce_draft_config
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -154,8 +154,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
-        draft_cfg = config.get("draft", {})
-        draft_enabled = bool(draft_cfg.get("enabled", False))
+        # Normalize in place: every downstream reader (workers, setup, train)
+        # accesses draft config by attribute, so a hand-built PolicyConfig has
+        # to be validated here rather than only inside MasterConfig. This
+        # mirrors NVIDIA-NeMo/RL#3701's Policy.__init__ contract so both
+        # backends share one draft-config normalization point.
+        draft_config = coerce_draft_config(config.get("draft"))
+        if draft_config is not None:
+            config["draft"] = draft_config
+        draft_enabled = draft_config is not None and draft_config.enabled
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
@@ -166,17 +173,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "reserved_http_server_ports is only supported by the Megatron "
                 "worker (policy.megatron_cfg.enabled=true)."
             )
-        # The exemplar YAML always sets policy.draft.algo (config-conventions
-        # v1 TypedDict rule), so every recipe inherits a value -- but use
-        # .get() rather than a bare subscript so a config whose draft: block
-        # predates that default raises the actionable ValueError below
-        # instead of an opaque KeyError.
-        draft_algo = draft_cfg.get("algo") if draft_enabled else None
-        if draft_enabled and draft_algo not in DRAFT_ALGOS:
-            raise ValueError(
-                f"policy.draft.algo must be one of {set(DRAFT_ALGOS)} "
-                f"when policy.draft.enabled=true, got {draft_algo!r}."
-            )
+        draft_algo = draft_config.speculator_type if draft_enabled else None
         dtensor_cfg = config.get("dtensor_cfg", {})
         dtensor_v2_enable = dtensor_enable and dtensor_cfg.get("_v2", False)
         if draft_enabled and draft_algo == "eagle3":
@@ -185,26 +182,27 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             # draft support.
             if not megatron_enable and not dtensor_v2_enable:
                 raise ValueError(
-                    "policy.draft.algo=eagle3 requires the Megatron backend "
-                    "(policy.megatron_cfg.enabled=true) or the DTensor v2 "
-                    "backend (policy.dtensor_cfg.enabled=true and "
+                    "policy.draft.speculator_type=eagle3 requires the Megatron "
+                    "backend (policy.megatron_cfg.enabled=true) or the DTensor "
+                    "v2 backend (policy.dtensor_cfg.enabled=true and "
                     "policy.dtensor_cfg._v2=true)."
                 )
         if draft_enabled and draft_algo in BLOCK_DRAFT_ALGOS:
             if megatron_enable or not dtensor_v2_enable:
                 raise ValueError(
-                    f"policy.draft.algo={draft_algo} requires the DTensor v2 backend "
-                    "(policy.dtensor_cfg.enabled=true and policy.dtensor_cfg._v2=true)."
+                    f"policy.draft.speculator_type={draft_algo} requires the "
+                    "DTensor v2 backend (policy.dtensor_cfg.enabled=true and "
+                    "policy.dtensor_cfg._v2=true)."
                 )
         if draft_enabled and (
             draft_algo in BLOCK_DRAFT_ALGOS
             or (draft_algo == "eagle3" and dtensor_v2_enable)
         ):
-            if draft_cfg.get("model_name") is None:
+            if draft_config.model_name is None:
                 raise ValueError(
-                    f"policy.draft.algo={draft_algo} requires a pretrained draft "
-                    "checkpoint; set policy.draft.model_name (from-scratch draft "
-                    "init is not supported)."
+                    f"policy.draft.speculator_type={draft_algo} requires a "
+                    "pretrained draft checkpoint; set policy.draft.model_name "
+                    "(from-scratch draft init is not supported)."
                 )
             unsupported = {
                 # Under sequence parallelism the layer outputs seen by the
@@ -218,7 +216,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             enabled_unsupported = [name for name, on in unsupported.items() if on]
             if enabled_unsupported:
                 raise ValueError(
-                    f"policy.draft.algo={draft_algo} does not support: "
+                    f"policy.draft.speculator_type={draft_algo} does not support: "
                     f"{', '.join(enabled_unsupported)}. Disable these options to "
                     "co-train a draft."
                 )

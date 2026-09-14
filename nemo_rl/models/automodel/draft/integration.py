@@ -34,7 +34,7 @@ from nemo_rl.models.automodel.draft.common import DSparkForwardOutput
 from nemo_rl.models.automodel.draft.draft_qwen3 import Qwen3DSparkModel
 from nemo_rl.models.automodel.draft.eagle3_llama import Eagle3DraftModel
 from nemo_rl.models.automodel.draft.loss import compute_dspark_loss
-from nemo_rl.models.policy import Eagle3DraftOptions
+from nemo_rl.models.policy import Eagle3DraftConfig
 
 DSPARK_REQUIRED_CONFIG_FIELDS = ("block_size", "target_layer_ids", "mask_token_id")
 DRAFT_CHECKPOINT_DIRNAME = "draft"
@@ -81,7 +81,7 @@ def load_draft_hf_config(
         if spec_type != algo:
             raise ValueError(
                 f"Draft checkpoint {model_name} is a speculators "
-                f"{spec_type!r} model but policy.draft.algo={algo!r}."
+                f"{spec_type!r} model but policy.draft.speculator_type={algo!r}."
             )
         if algo == "eagle3":
             return _adapt_speculators_eagle3_config(
@@ -351,13 +351,13 @@ def validate_dspark_draft_config(
     sample_from_anchor = bool(getattr(draft_hf_config, "sample_from_anchor", True))
     if algo == "dspark" and not sample_from_anchor:
         raise ValueError(
-            "policy.draft.algo=dspark requires the next-token block layout "
+            "policy.draft.speculator_type=dspark requires the next-token block layout "
             "(sample_from_anchor=true), but the checkpoint uses the dflash "
             "bonus-anchor layout; run it as algo=dflash instead."
         )
     if algo == "dflash" and sample_from_anchor:
         raise ValueError(
-            "policy.draft.algo=dflash requires the bonus-anchor block layout "
+            "policy.draft.speculator_type=dflash requires the bonus-anchor block layout "
             "(sample_from_anchor=false), but the checkpoint uses the "
             "next-token layout; run it as algo=dspark instead."
         )
@@ -365,26 +365,26 @@ def validate_dspark_draft_config(
     if algo == "dflash":
         if int(getattr(draft_hf_config, "markov_rank", 0) or 0) > 0:
             raise ValueError(
-                "policy.draft.algo=dflash but the checkpoint carries a Markov "
+                "policy.draft.speculator_type=dflash but the checkpoint carries a Markov "
                 f"head (markov_rank={draft_hf_config.markov_rank}); run it as "
                 "algo=dspark instead."
             )
         if bool(getattr(draft_hf_config, "enable_confidence_head", False)):
             raise ValueError(
-                "policy.draft.algo=dflash but the checkpoint carries a "
+                "policy.draft.speculator_type=dflash but the checkpoint carries a "
                 "confidence head; run it as algo=dspark instead."
             )
         if confidence_alpha != 0:
             raise ValueError(
-                "policy.draft.algo=dflash requires "
-                "policy.draft.dspark.confidence_loss_alpha=0 (DFlash has no "
+                "policy.draft.speculator_type=dflash requires "
+                "policy.draft.confidence_loss_alpha=0 (DFlash has no "
                 f"confidence head), got {confidence_alpha}."
             )
     if confidence_alpha > 0 and not bool(
         getattr(draft_hf_config, "enable_confidence_head", False)
     ):
         raise ValueError(
-            "policy.draft.dspark.confidence_loss_alpha > 0 but the draft checkpoint "
+            "policy.draft.confidence_loss_alpha > 0 but the draft checkpoint "
             "has no confidence head (enable_confidence_head is false in config.json). "
             "Set confidence_loss_alpha: 0.0 or use a checkpoint with a confidence head."
         )
@@ -433,7 +433,7 @@ def build_dspark_draft_model(
 
 def build_eagle3_draft_model(
     model_name: str,
-    eagle3_options: "Eagle3DraftOptions",
+    eagle3_options: "Eagle3DraftConfig",
     torch_dtype: torch.dtype,
     mesh: Any,
     target_num_hidden_layers: int,
@@ -466,8 +466,7 @@ def build_eagle3_draft_model(
         )
     if int(eagle3_options.ttt_steps) < 1:
         raise ValueError(
-            f"policy.draft.eagle3.ttt_steps must be >= 1, got "
-            f"{eagle3_options.ttt_steps}."
+            f"policy.draft.ttt_steps must be >= 1, got {eagle3_options.ttt_steps}."
         )
 
     # LlamaRotaryEmbedding sizes its cos/sin cache from config.torch_dtype,
@@ -1029,7 +1028,7 @@ class Eagle3Runtime(_DraftRuntimeBase):
     def __init__(
         self,
         draft_model: Eagle3DraftModel,
-        eagle3_options: Eagle3DraftOptions,
+        eagle3_options: Eagle3DraftConfig,
         loss_weight: float,
         dp_group: Optional[dist.ProcessGroup],
         tp_group: Optional[dist.ProcessGroup] = None,

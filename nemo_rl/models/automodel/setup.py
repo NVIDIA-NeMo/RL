@@ -66,8 +66,6 @@ from nemo_rl.models.automodel.config import (
     RuntimeConfig,
 )
 from nemo_rl.models.policy import (
-    DSparkDraftOptions,
-    Eagle3DraftOptions,
     LoRAConfig,
     PolicyConfig,
     TokenizerConfig,
@@ -923,16 +921,16 @@ def setup_model_and_optimizer(
 
     # Build the DSpark draft model before optimizer construction so its params
     # join the optimizer (and any optimizer-state resume) from the start.
-    draft_cfg = config.get("draft", {}) or {}
-    # lm_policy.py already validated policy.draft.algo in DRAFT_ALGOS when
-    # enabled=true, so enablement alone is the gate here.
-    draft_enabled = bool(draft_cfg.get("enabled", False))
+    # lm_policy.py's Policy.__init__ already coerced policy.draft into a
+    # validated Eagle3DraftConfig/DSparkDraftConfig/DFlashDraftConfig
+    # instance (and validated speculator_type in DRAFT_ALGOS when
+    # enabled=true), so this reads it by attribute rather than re-validating.
+    draft_config = config.get("draft")
+    draft_enabled = draft_config is not None and draft_config.enabled
     draft_model = None
     composite_model = None
     if draft_enabled:
-        # Required key, not a call-site default: the exemplar YAML always
-        # sets policy.draft.algo (config-conventions v1 TypedDict rule).
-        draft_algo = draft_cfg["algo"]
+        draft_algo = draft_config.speculator_type
         from nemo_rl.models.automodel.draft.integration import (
             PolicyWithDraft,
             build_dspark_draft_model,
@@ -946,40 +944,28 @@ def setup_model_and_optimizer(
         # The shared optimizer's master weights preserve update precision.
         draft_dtype = runtime_config.dtype
         if draft_algo == "eagle3":
-            # The BaseModel centralizes the option defaults (v2 config
-            # convention); the loaded dict is validated against it once here.
-            eagle3_options = Eagle3DraftOptions.model_validate(
-                draft_cfg.get("eagle3", {}) or {}
-            )
             target_text_config = (
                 getattr(model_config, "text_config", None) or model_config
             )
             draft_model = build_eagle3_draft_model(
-                model_name=draft_cfg["model_name"],
-                eagle3_options=eagle3_options,
+                model_name=draft_config.model_name,
+                eagle3_options=draft_config,
                 torch_dtype=draft_dtype,
                 mesh=device_mesh["dp_cp"],
                 target_num_hidden_layers=target_text_config.num_hidden_layers,
                 policy_model=model,
             )
-            draft_learning_rate = float(eagle3_options.learning_rate)
-            draft_ttt_steps = int(eagle3_options.ttt_steps)
+            draft_learning_rate = float(draft_config.learning_rate)
+            draft_ttt_steps = int(draft_config.ttt_steps)
         else:
-            # The BaseModel centralizes the option defaults (v2 config
-            # convention); the loaded dict is validated against it once here
-            # and passed on fully populated so downstream consumers never
-            # fall back to call-site defaults.
-            dspark_options = DSparkDraftOptions.model_validate(
-                draft_cfg.get("dspark", {}) or {}
-            )
             draft_model = build_dspark_draft_model(
-                model_name=draft_cfg["model_name"],
-                dspark_options=dspark_options.model_dump(),
+                model_name=draft_config.model_name,
+                dspark_options=draft_config.model_dump(),
                 torch_dtype=draft_dtype,
                 mesh=device_mesh["dp_cp"],
                 algo=draft_algo,
             )
-            draft_learning_rate = float(dspark_options.learning_rate)
+            draft_learning_rate = float(draft_config.learning_rate)
             draft_ttt_steps = None
         composite_model = PolicyWithDraft(policy=model, draft=draft_model)
 
@@ -1073,7 +1059,7 @@ def setup_model_and_optimizer(
                 scheduler=scheduler,
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
-                model_name=draft_cfg["model_name"],
+                model_name=draft_config.model_name,
                 algo=draft_algo,
                 ttt_steps=draft_ttt_steps,
             )

@@ -57,7 +57,7 @@ from nemo_rl.models.automodel.train import (
     prepare_model_forward,
 )
 from nemo_rl.models.generation.interfaces import RefitPayloadMode
-from nemo_rl.models.policy import DSparkDraftOptions, Eagle3DraftOptions, PolicyConfig
+from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -387,15 +387,13 @@ class DTensorPolicyWorkerV2Impl(
                 Eagle3Runtime,
             )
 
-            draft_cfg = config.get("draft", {})
-            # Required key, not a call-site default: the exemplar YAML
-            # always sets policy.draft.algo (config-conventions v1
-            # TypedDict rule), and self.draft_model is only built when
-            # draft is enabled.
-            self.draft_algo = draft_cfg["algo"]
-            # loss_weight has no call-site default: its default lives in the
-            # exemplar YAML (grpo_math_1B.yaml) like every other draft knob.
-            loss_weight = float(draft_cfg["loss_weight"])
+            # lm_policy.py's Policy.__init__ already coerced policy.draft
+            # into a validated Eagle3DraftConfig/DSparkDraftConfig/
+            # DFlashDraftConfig instance, and self.draft_model is only built
+            # when draft is enabled.
+            draft_config = config["draft"]
+            self.draft_algo = draft_config.speculator_type
+            loss_weight = float(draft_config.loss_weight)
             common_groups = dict(
                 dp_group=self.dp_mesh.get_group(),
                 tp_group=self.tp_mesh.get_group(),
@@ -404,18 +402,14 @@ class DTensorPolicyWorkerV2Impl(
             if self.draft_algo == "eagle3":
                 self.draft_runtime = Eagle3Runtime(
                     draft_model=self.draft_model,
-                    eagle3_options=Eagle3DraftOptions.model_validate(
-                        draft_cfg.get("eagle3", {}) or {}
-                    ),
+                    eagle3_options=draft_config,
                     loss_weight=loss_weight,
                     **common_groups,
                 )
             else:
                 self.draft_runtime = DSparkRuntime(
                     draft_model=self.draft_model,
-                    dspark_options=DSparkDraftOptions.model_validate(
-                        draft_cfg.get("dspark", {}) or {}
-                    ).model_dump(),
+                    dspark_options=draft_config.model_dump(),
                     loss_weight=loss_weight,
                     **common_groups,
                 )
@@ -1606,7 +1600,7 @@ class DTensorPolicyWorkerV2Impl(
                 weights_path,
                 meta=draft_meta_record(
                     self.draft_model,
-                    self.cfg["draft"]["model_name"],
+                    self.cfg["draft"].model_name,
                     self.optimizer,
                     algo=self.draft_algo,
                     train_embed_and_head=train_embed_and_head,
@@ -1650,7 +1644,7 @@ class DTensorPolicyWorkerV2Impl(
                 scheduler=self.scheduler,
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
-                model_name=self.cfg["draft"]["model_name"],
+                model_name=self.cfg["draft"].model_name,
                 algo=self.draft_algo,
                 ttt_steps=ttt_steps,
             )

@@ -14,7 +14,7 @@ DTensor-v2 drafters and their config surface. For GRPO fundamentals, see the
 
 ## Supported Drafters
 
-| `policy.draft.algo` | Drafter family | Checkpoint examples | Requires |
+| `policy.draft.speculator_type` | Drafter family | Checkpoint examples | Requires |
 | --- | --- | --- | --- |
 | `"dspark"` | DSpark block drafter (multi-token block proposal) | `deepseek-ai/dspark_qwen3_8b_block7` | `policy.dtensor_cfg.enabled=true`, `policy.dtensor_cfg._v2=true` |
 | `"dflash"` | DFlash block drafter (markov-free, confidence-free variant of DSpark) | `RedHatAI/*-speculator.dflash` | same as `dspark` |
@@ -45,16 +45,15 @@ policy:
   draft:
     enabled: true
     model_name: deepseek-ai/dspark_qwen3_8b_block7
-    algo: "dspark"
+    speculator_type: "dspark"
     loss_weight: 1.0
-    dspark:
-      num_anchors: 32
-      learning_rate: 1.0e-04
-      ce_loss_alpha: 0.1
-      l1_loss_alpha: 0.9
-      confidence_loss_alpha: 1.0
-      loss_decay_gamma: 4.0
-      train_embed_and_head: true
+    num_anchors: 32
+    learning_rate: 1.0e-04
+    ce_loss_alpha: 0.1
+    l1_loss_alpha: 0.9
+    confidence_loss_alpha: 1.0
+    loss_decay_gamma: 4.0
+    train_embed_and_head: true
   generation:
     vllm_kwargs:
       speculative_config:
@@ -67,25 +66,22 @@ policy:
 
 #### DFlash
 
-Same shape as DSpark (both configure through the `dspark:` sub-block), but
-DFlash checkpoints have no confidence head, so `confidence_loss_alpha` must
-be `0.0`:
+Same fields as DSpark, but DFlash checkpoints have no confidence head, so
+`confidence_loss_alpha` defaults to `0.0` for `speculator_type: "dflash"`:
 
 ```yaml
 policy:
   draft:
     enabled: true
     model_name: RedHatAI/Qwen3-8B-speculator.dflash
-    algo: "dflash"
+    speculator_type: "dflash"
     loss_weight: 1.0
-    dspark:
-      num_anchors: 32
-      learning_rate: 1.0e-04
-      ce_loss_alpha: 0.1
-      l1_loss_alpha: 0.9
-      confidence_loss_alpha: 0.0
-      loss_decay_gamma: 4.0
-      train_embed_and_head: true
+    num_anchors: 32
+    learning_rate: 1.0e-04
+    ce_loss_alpha: 0.1
+    l1_loss_alpha: 0.9
+    loss_decay_gamma: 4.0
+    train_embed_and_head: true
   generation:
     vllm_kwargs:
       speculative_config:
@@ -104,11 +100,11 @@ policy:
     enabled: true
     model_name: RedHatAI/Qwen3-8B-speculator.eagle3
     loss_weight: 1.0
-    eagle3:
-      learning_rate: 1.0e-04
-      ttt_steps: 3
-      ttt_step_loss_decay: 1.0
-      train_embed_and_head: true
+    speculator_type: "eagle3"
+    learning_rate: 1.0e-04
+    ttt_steps: 3
+    ttt_step_loss_decay: 1.0
+    train_embed_and_head: true
   generation:
     vllm_kwargs:
       speculative_config:
@@ -117,21 +113,24 @@ policy:
         num_speculative_tokens: 3
 ```
 
-`algo` defaults to `"eagle3"` when omitted, so it can be left out (as in the
-snippet above) unless you want it explicit for readability.
+`speculator_type` defaults to `"eagle3"` when omitted, so it can be left out
+(as in the snippet above) unless you want it explicit for readability.
 
 ### Config Reference
 
-`policy.draft`:
+`policy.draft` is a discriminated union keyed on `speculator_type`, with each
+family's fields declared directly on `policy.draft` (no nested sub-blocks).
+
+Shared across all three:
 
 | Field | Description |
 | --- | --- |
 | `enabled` | Attach and train a draft model alongside the policy. |
 | `model_name` | Pretrained draft checkpoint to start from. Required -- from-scratch draft init is not supported. |
-| `algo` | `"eagle3"` (default), `"dspark"`, or `"dflash"`. |
+| `speculator_type` | `"eagle3"` (default), `"dspark"`, or `"dflash"`. |
 | `loss_weight` | Weight on the auxiliary draft loss term. |
 
-`policy.draft.dspark` (shared by `dspark` and `dflash`):
+`speculator_type: "dspark"` / `"dflash"`:
 
 | Field | Default | Description |
 | --- | --- | --- |
@@ -139,11 +138,11 @@ snippet above) unless you want it explicit for readability.
 | `learning_rate` | `1e-4` | Draft param-group learning rate -- needs to be well above the policy's RL learning rate to track policy drift. |
 | `ce_loss_alpha` | `0.1` | Cross-entropy weight against the rollout tokens. |
 | `l1_loss_alpha` | `0.9` | Total-variation distillation weight against the policy's raw logits. |
-| `confidence_loss_alpha` | `1.0` | Confidence-head BCE weight; must be `0.0` for `dflash` (no confidence head). |
+| `confidence_loss_alpha` | `1.0` (dspark) / `0.0` (dflash) | Confidence-head BCE weight; `dflash` has no confidence head, so its default is `0.0`. |
 | `loss_decay_gamma` | `4.0` | Exponential per-block-position decay on the loss mask. |
 | `train_embed_and_head` | `true` | Train the draft's `embed_tokens`/`lm_head` instead of keeping the checkpoint copies frozen. |
 
-`policy.draft.eagle3`:
+`speculator_type: "eagle3"`:
 
 | Field | Default | Description |
 | --- | --- | --- |

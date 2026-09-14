@@ -1902,7 +1902,7 @@ def _create_draft_pre_wrap_hook(
 
     def draft_pre_wrap_hook(model: list[MegatronModule]) -> list[MegatronModule]:
         """Optionally preload the base policy, then attach the draft module to the owner chunk."""
-        if not draft_cfg["enabled"]:
+        if not draft_cfg.enabled:
             return model
 
         # Base pretrained checkpoints do not contain draft weights, so load the
@@ -2156,7 +2156,7 @@ def setup_model_and_optimizer(
             "megatron_cfg.peft.restore_from is set but megatron_cfg.peft.enabled "
             "is False. Enable PEFT to warm start from an adapter checkpoint."
         )
-    draft_enabled = "draft" in policy_cfg and policy_cfg["draft"]["enabled"]
+    draft_enabled = "draft" in policy_cfg and policy_cfg["draft"].enabled
     resume_checkpoint_exists = (
         megatron_cfg.checkpoint.load is not None
         and checkpoint_exists(megatron_cfg.checkpoint.load)
