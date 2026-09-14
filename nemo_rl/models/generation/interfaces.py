@@ -630,6 +630,28 @@ class GenerationInterface(ABC):
             f"{type(self).__name__}"
         )
 
+    def resume_generation_after_cut(self, *, timeout_s: Optional[float] = None) -> bool:
+        """Resume decoding while terminal writes remain checkpoint-fenced.
+
+        A backend with buffer-swap support may continue filling a fresh live
+        buffer after its cut is durable. The completed response must remain
+        fenced until :meth:`finish_generation_checkpoint` publishes or aborts
+        the coordinated snapshot.
+        """
+        raise NotImplementedError(
+            "generation-prefix buffer swapping is not supported for "
+            f"{type(self).__name__}"
+        )
+
+    def finish_generation_checkpoint(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Release terminal writes after a split cut lifecycle resolves."""
+        raise NotImplementedError(
+            "generation-prefix buffer swapping is not supported for "
+            f"{type(self).__name__}"
+        )
+
     def blocks_training(self) -> bool:
         """Whether this engine must stand down before a training step.
 

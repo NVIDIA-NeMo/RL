@@ -64,16 +64,116 @@ LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
+class _RequestCaptureBuffer:
+    """One append-only generation segment owned by an in-flight request."""
+
+    sequence: int
+    generated_token_ids: list[int] = field(default_factory=list)
+    generated_logprobs: list[float] = field(default_factory=list)
+
+
+@dataclass
+class _FrozenRequestCaptureBuffer:
+    """An active buffer detached for a checkpoint write."""
+
+    checkpoint_id: str
+    buffer: _RequestCaptureBuffer
+
+
+@dataclass
 class _RequestCaptureState:
-    """Latest cumulative token progress for one in-flight captured request."""
+    """Append-only token buffers for one in-flight captured request.
+
+    vLLM publishes cumulative progress. ``observe`` converts it to a suffix
+    and appends that suffix to the current active buffer. A checkpoint swaps
+    the active buffer under ``lock`` and performs its blocking TQ write after
+    releasing the lock, so later observations can continue in a fresh buffer.
+
+    The first buffer-swap implementation still materializes one cumulative
+    checkpoint row to preserve the existing Gym wire contract. A later
+    lineage change can persist the sealed buffers as independent deltas.
+    """
 
     call: Any
     prompt_token_ids: list[int]
-    generated_token_ids: list[int] = field(default_factory=list)
-    generated_logprobs: list[float] = field(default_factory=list)
     resumed_generation_token_ids: list[int] = field(default_factory=list)
     observation_error: str | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
+    sealed_generated_token_ids: list[int] = field(default_factory=list)
+    sealed_generated_logprobs: list[float] = field(default_factory=list)
+    active_buffer: _RequestCaptureBuffer = field(
+        default_factory=lambda: _RequestCaptureBuffer(sequence=0)
+    )
+    frozen_buffer: _FrozenRequestCaptureBuffer | None = None
+    observed_generation_token_count: int = 0
+    next_buffer_sequence: int = 1
+
+    def observe(
+        self,
+        generated_token_ids: list[int],
+        generated_logprobs: list[float],
+    ) -> None:
+        """Append only progress not already observed from a cumulative output."""
+        if len(generated_token_ids) != len(generated_logprobs):
+            self.observation_error = (
+                "generated token IDs and log probabilities must have equal lengths"
+            )
+            return
+        if len(generated_token_ids) < self.observed_generation_token_count:
+            self.observation_error = (
+                "cumulative generation output regressed from "
+                f"{self.observed_generation_token_count} to "
+                f"{len(generated_token_ids)} tokens"
+            )
+            return
+        start = self.observed_generation_token_count
+        self.active_buffer.generated_token_ids.extend(generated_token_ids[start:])
+        self.active_buffer.generated_logprobs.extend(generated_logprobs[start:])
+        self.observed_generation_token_count = len(generated_token_ids)
+        self.observation_error = None
+
+    def freeze_for_checkpoint(
+        self, checkpoint_id: str
+    ) -> tuple[str, list[int], list[float]]:
+        """Swap the active buffer and return this checkpoint's stable prefix."""
+        if self.frozen_buffer is not None:
+            raise RuntimeError(
+                "cannot start a generation cut while another cut is in progress"
+            )
+        buffer = self.active_buffer
+        self.active_buffer = _RequestCaptureBuffer(sequence=self.next_buffer_sequence)
+        self.next_buffer_sequence += 1
+        self.frozen_buffer = _FrozenRequestCaptureBuffer(
+            checkpoint_id=checkpoint_id,
+            buffer=buffer,
+        )
+        return (
+            f"active/{checkpoint_id}/{buffer.sequence}",
+            self.sealed_generated_token_ids + buffer.generated_token_ids,
+            self.sealed_generated_logprobs + buffer.generated_logprobs,
+        )
+
+    def seal_frozen_buffer(self, checkpoint_id: str) -> None:
+        """Adopt a successfully staged frozen buffer into the live prefix."""
+        frozen = self._require_frozen_buffer(checkpoint_id)
+        self.sealed_generated_token_ids.extend(frozen.generated_token_ids)
+        self.sealed_generated_logprobs.extend(frozen.generated_logprobs)
+        self.frozen_buffer = None
+
+    def rollback_frozen_buffer(self, checkpoint_id: str) -> None:
+        """Restore a failed cut ahead of progress collected after its swap."""
+        frozen = self._require_frozen_buffer(checkpoint_id)
+        self.active_buffer.generated_token_ids[:0] = frozen.generated_token_ids
+        self.active_buffer.generated_logprobs[:0] = frozen.generated_logprobs
+        self.frozen_buffer = None
+
+    def _require_frozen_buffer(self, checkpoint_id: str) -> _RequestCaptureBuffer:
+        frozen = self.frozen_buffer
+        if frozen is None or frozen.checkpoint_id != checkpoint_id:
+            raise RuntimeError(
+                f"generation cut {checkpoint_id!r} does not own the frozen buffer"
+            )
+        return frozen.buffer
 
 
 @dataclass(frozen=True)
@@ -276,6 +376,7 @@ class VllmAsyncGenerationWorkerImpl(
         self._generation_prefix_cuts_enabled = False
         self._generation_cut_control_token: str | None = None
         self._generation_checkpoint_gate = _CheckpointCaptureGate()
+        self._generation_checkpoint_decoding_paused = False
         # Terminal capture writes use asyncio's shared default executor. Keep
         # checkpoint control on an isolated thread so a closed gate cannot let
         # waiting completions consume every thread needed to create the cut.
@@ -668,7 +769,7 @@ class VllmAsyncGenerationWorkerImpl(
             self._capture_calls_by_model_call_id[call.model_call_id] = state
 
     def _observe_request_capture(self, request: Any, request_output: Any) -> None:
-        """Atomically replace one request's latest cumulative token snapshot."""
+        """Append one request's new suffix from a cumulative vLLM output."""
         with self._capture_registry_lock:
             state = self._capture_calls.get(id(request))
         if state is None:
@@ -684,9 +785,7 @@ class VllmAsyncGenerationWorkerImpl(
                 state.observation_error = f"{type(error).__name__}: {error}"
             return
         with state.lock:
-            state.generated_token_ids = generation_token_ids
-            state.generated_logprobs = generation_logprobs
-            state.observation_error = None
+            state.observe(generation_token_ids, generation_logprobs)
 
     def _restore_response_prefix(
         self, request: Any, request_output: Any, *, tokenizer: Any
@@ -1023,32 +1122,43 @@ class VllmAsyncGenerationWorkerImpl(
                 )
 
             with state.lock:
-                generated_token_ids = list(state.generated_token_ids)
-                generated_logprobs = list(state.generated_logprobs)
                 observation_error = state.observation_error
+                if observation_error is None:
+                    (
+                        frozen_buffer_id,
+                        generated_token_ids,
+                        generated_logprobs,
+                    ) = state.freeze_for_checkpoint(inventory.checkpoint_id)
             if observation_error is not None:
                 raise RuntimeError(
                     f"cannot cut model call {prefix.model_call_id!r}: {observation_error}"
                 )
-            record = capture.build_prefix_record(
-                state.call,
-                prompt_token_ids=state.prompt_token_ids,
-                generated_token_ids=generated_token_ids,
-                generated_logprobs=generated_logprobs,
-            )
-            result = sink.stage_generation_prefix(
-                record, checkpoint_id=inventory.checkpoint_id
-            )
-            if not result.ok:
-                raise RuntimeError(
-                    f"generation-prefix staging failed for {prefix.model_call_id!r}: "
-                    f"{result.error}"
+            try:
+                record = capture.build_prefix_record(
+                    state.call,
+                    prompt_token_ids=state.prompt_token_ids,
+                    generated_token_ids=generated_token_ids,
+                    generated_logprobs=generated_logprobs,
                 )
+                result = sink.stage_generation_prefix(
+                    record, checkpoint_id=inventory.checkpoint_id
+                )
+                if not result.ok:
+                    raise RuntimeError(
+                        "generation-prefix staging failed for "
+                        f"{prefix.model_call_id!r}: {result.error}"
+                    )
+            except Exception:
+                with state.lock:
+                    state.rollback_frozen_buffer(inventory.checkpoint_id)
+                raise
+            with state.lock:
+                state.seal_frozen_buffer(inventory.checkpoint_id)
             acknowledgements.append(
                 GenerationCutPrefixAck(
                     **prefix.model_dump(mode="json"),
                     disposition="durable_prefix",
-                    frozen_buffer_id=f"active/{inventory.checkpoint_id}",
+                    frozen_buffer_id=frozen_buffer_id,
                     staging_key=result.staging_key,
                     prefix_token_count=sum(
                         mask == 1.0 for mask in record.token_mask_delta
@@ -2511,6 +2621,9 @@ class VllmAsyncGenerationWorkerImpl(
         await self._run_generation_checkpoint_control(
             self._generation_checkpoint_gate.close_and_wait
         )
+        # Record intent before the RPC. If an engine applies the pause but its
+        # acknowledgement is lost, cleanup must still issue a matching resume.
+        self._generation_checkpoint_decoding_paused = True
         try:
             await self.llm.pause_generation(mode="keep", clear_cache=False)
         except BaseException:
@@ -2541,7 +2654,35 @@ class VllmAsyncGenerationWorkerImpl(
             raise RuntimeError(
                 "resume_generation_after_checkpoint_async requires async_engine=True"
             )
+        await self._resume_checkpoint_decoding_if_paused()
+        self._generation_checkpoint_gate.reopen()
+        return True
+
+    async def _resume_checkpoint_decoding_if_paused(self) -> None:
+        """Idempotently match one successful or ambiguous checkpoint pause."""
+        if not self._generation_checkpoint_decoding_paused:
+            return
         await self.llm.resume_generation()
+        self._generation_checkpoint_decoding_paused = False
+
+    async def resume_generation_after_cut_async(self) -> bool:
+        """Resume decoding while terminal token staging remains blocked."""
+        assert self.llm is not None, (
+            "Attempting to checkpoint-resume an uninitialized vLLM or non-model-owner"
+        )
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "resume_generation_after_cut_async requires async_engine=True"
+            )
+        await self._resume_checkpoint_decoding_if_paused()
+        return True
+
+    async def finish_generation_checkpoint_async(self) -> bool:
+        """Release terminal token staging after the TQ snapshot is durable."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "finish_generation_checkpoint_async requires async_engine=True"
+            )
         self._generation_checkpoint_gate.reopen()
         return True
 
