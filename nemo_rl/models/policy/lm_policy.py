@@ -134,10 +134,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "reserved_http_server_port is only supported by the Megatron "
                 "worker (policy.megatron_cfg.enabled=true)."
             )
-        # Required key, not a call-site default: the exemplar YAML always
-        # sets policy.draft.algo (config-conventions v1 TypedDict rule), so
-        # every recipe inherits a value.
-        draft_algo = draft_cfg["algo"] if draft_enabled else None
+        # The exemplar YAML always sets policy.draft.algo (config-conventions
+        # v1 TypedDict rule), so every recipe inherits a value -- but use
+        # .get() rather than a bare subscript so a config whose draft: block
+        # predates that default raises the actionable ValueError below
+        # instead of an opaque KeyError.
+        draft_algo = draft_cfg.get("algo") if draft_enabled else None
         if draft_enabled and draft_algo not in DRAFT_ALGOS:
             raise ValueError(
                 f"policy.draft.algo must be one of {set(DRAFT_ALGOS)} "
