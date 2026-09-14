@@ -162,9 +162,15 @@ def test_every_forbidden_key_is_rejected(key) -> None:
         assert_metadata_only({key: [1, 2, 3]})
 
 
-@pytest.mark.parametrize("startup_fails", [False, True])
+@pytest.mark.parametrize(
+    ("startup_fails", "cleanup_fails"),
+    [(False, False), (True, False), (True, True)],
+    ids=["ready", "startup-failure", "cleanup-failure"],
+)
 def test_factory_selects_gym_environment_and_waits_for_dependencies(
     startup_fails: bool,
+    cleanup_fails: bool,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     actor_fqn = "nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor"
     assert ACTOR_ENVIRONMENTS[actor_fqn] == ["nemo_gym"]
@@ -189,10 +195,19 @@ def test_factory_selects_gym_environment_and_waits_for_dependencies(
     ):
         options.return_value.remote.side_effect = actors
         if startup_fails:
-            get.side_effect = ray.exceptions.RayError("missing orjson")
-            with pytest.raises(ray.exceptions.RayError, match="missing orjson"):
+            startup_error = ray.exceptions.RayError("missing nemo_gym")
+            get.side_effect = startup_error
+            if cleanup_fails:
+                kill.side_effect = [RuntimeError("kill failed"), None]
+            with pytest.raises(ray.exceptions.RayError) as exc_info:
                 create_rollout_reassembler_actors(dp_config, config, num_workers=2)
+            assert exc_info.value is startup_error
             assert kill.call_args_list == [call(actor) for actor in actors]
+            if cleanup_fails:
+                assert (
+                    "finalizer actor termination failed: kill failed"
+                    in capsys.readouterr().out
+                )
         else:
             assert (
                 create_rollout_reassembler_actors(dp_config, config, num_workers=2)
@@ -212,20 +227,19 @@ def test_factory_selects_gym_environment_and_waits_for_dependencies(
         )
 
 
-@pytest.mark.parametrize("missing_module", ["nemo_gym", "orjson"])
-def test_dependency_check_propagates_missing_direct_and_transitive_imports(
-    monkeypatch: pytest.MonkeyPatch, missing_module: str
+def test_dependency_check_propagates_import_error(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     original_import = builtins.__import__
+    import_error = ModuleNotFoundError("No module named 'nemo_gym'", name="nemo_gym")
 
     def fail_rebuild_import(name: str, *args: Any, **kwargs: Any) -> Any:
         if name == "nemo_gym.token_id_capture.staging.rebuild":
-            raise ModuleNotFoundError(
-                f"No module named '{missing_module}'", name=missing_module
-            )
+            raise import_error
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", fail_rebuild_import)
     actor = object.__new__(RolloutReassemblerActor.__ray_metadata__.modified_class)
-    with pytest.raises(ModuleNotFoundError, match=missing_module):
+    with pytest.raises(ModuleNotFoundError) as exc_info:
         actor.check_dependencies()
+    assert exc_info.value is import_error

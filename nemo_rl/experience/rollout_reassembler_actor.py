@@ -197,7 +197,11 @@ def create_rollout_reassembler_actors(
     try:
         ray.get([actor.check_dependencies.remote() for actor in actors])
     except ray.exceptions.RayError:
+        # Cleanup errors must not hide the startup failure or skip other actors.
         for actor in actors:
-            ray.kill(actor)
+            try:
+                ray.kill(actor)
+            except Exception as error:
+                print(f"finalizer actor termination failed: {error}", flush=True)
         raise
     return actors
