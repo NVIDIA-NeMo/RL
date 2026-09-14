@@ -521,17 +521,23 @@ configured; the explicit TQ checkpoint destination is the persistent location.
 New files use checksum-free format v3: no payload or index hashes are computed
 or verified. Legacy v1/v2 layouts remain readable, ignoring their historical
 hash fields. File/size and native-operation errors still fail the checkpoint.
+Each control-plane Ray wait uses a 200-second timeout, matching TQ Simple's
+default storage-request timeout. This is not a deadline for the whole checkpoint.
 
 This module supplies storage capability only. A caller such as Single
-Controller remains responsible for choosing the checkpoint boundary and must
-quiesce TQ writes and clears while `tq.save_checkpoint` runs. Direct SAVE supports
-the TCP/RDMA CPU segments created by TQ's Mooncake client, including when GDR
-staging is enabled. Replica movement, segment unmount and store close must also
-remain paused until SAVE finishes: the writer borrows local addresses rather
-than acquiring a new native memory lease. Same-host peer addresses are not
-local process addresses. The checkpoint
-contains every controller-referenced TQ field as encoded raw objects, including
-log probabilities, router indices, non-tensor values, and GDR chunks. It does
+Controller remains responsible for choosing the checkpoint boundary. Objects
+selected by the controller snapshot must remain unchanged until all SAVE
+acknowledgements complete. Generation may keep writing unrelated fresh keys,
+while commits and destructive clears wait at the existing checkpoint barrier.
+Direct SAVE supports the TCP/RDMA CPU segments created by TQ's Mooncake client,
+including when GDR staging is enabled. Overwrites, replica movement, segment
+unmount and store close
+affecting selected objects must also wait until SAVE finishes: hard pinning
+prevents eviction, not explicit mutation, and the writer borrows local addresses
+rather than acquiring a new native memory lease. Same-host peer addresses are
+not local process addresses. The checkpoint contains every controller-referenced
+TQ field as encoded raw objects, including log probabilities, router indices,
+non-tensor values, and GDR chunks. It does
 not contain model weights, unfinished generations, vLLM KV cache, or Gym state.
 
 Restore requires a fresh, empty Mooncake/TQ system. Attach every client that

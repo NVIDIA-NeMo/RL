@@ -166,6 +166,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         data_plane_checkpoint_metadata=None,
         partition_includes_multimodal_fields=False,
         bootstrap_identity=None,
+        rollout_checkpoint_load_metrics=None,
     )
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -201,13 +202,21 @@ def test_resumed_mooncake_init_restores_without_partition_registration(
         "replay_manifest_digest": "digest-0",
         "replay_group_count": 0,
     }
+    clock = MagicMock(return_value=10.0)
+    monkeypatch.setattr(single_controller.time, "monotonic", clock)
+
+    def load_checkpoint(_checkpoint_path: object) -> dict[str, Any]:
+        clock.return_value = 15.0
+        return metadata
+
     dp_client = MagicMock(name="dp_client")
-    dp_client.load_checkpoint.return_value = metadata
+    dp_client.load_checkpoint.side_effect = load_checkpoint
     master_config = _grpo_master_config(tmp_path)
     master_config.data_plane = _data_plane_config("mooncake_cpu")
     actor_args = _actor_args_for_init(
         dp_client=dp_client,
         last_checkpoint_path=str(checkpoint_path),
+        rollout_checkpoint_load_metrics={"snapshot_resolution_seconds": 1.0},
     )
 
     controller = _init_controller(master_config, actor_args)
@@ -216,6 +225,10 @@ def test_resumed_mooncake_init_restores_without_partition_registration(
     single_controller.configure_checkpoint_workers.assert_called_once_with([])
     dp_client.register_partition.assert_not_called()
     assert controller._data_plane_checkpoint_metadata == metadata
+    assert controller._rollout_checkpoint_load_metrics == {
+        "snapshot_resolution_seconds": 1.0,
+        "tq_load_seconds": 5.0,
+    }
 
 
 @pytest.mark.parametrize(

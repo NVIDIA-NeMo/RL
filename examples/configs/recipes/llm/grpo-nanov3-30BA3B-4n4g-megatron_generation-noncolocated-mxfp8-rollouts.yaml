@@ -25,7 +25,9 @@ policy:
     enabled: false
   generation:
     backend: megatron
+    refit_transport: mcore
     mcore_generation_config:
+      refit_backend: nccl
       transformer_impl: inference_optimized
       inference_grouped_gemm_backend: torch
       inference_moe_token_dispatcher_type: nvls

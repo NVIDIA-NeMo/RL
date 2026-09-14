@@ -35,6 +35,9 @@ run_test() {
 }
 
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller.sh
+# Same non-colocated vLLM SingleController smoke, but install refitted weights
+# through vLLM's native reload_weights API.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_reload_refit.sh
 run_test fast uv run --no-sync bash ./tests/functional/ppo_async_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_gym_single_controller.sh
@@ -176,6 +179,8 @@ run_test      env VICTIM_STATE=serving uv run --no-sync bash ./tests/functional/
 run_test      uv run --no-sync bash ./tests/functional/grpo_checkpoint_single_controller.sh
 # Native TQ + metadata-only completed replay recovery (#3480).
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_tq_recovery.sh
+# Same recovery flow with Mooncake CPU storage; skips without an RDMA device.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_mooncake_tq_recovery.sh
 # Deterministic process restart with an admitted group held before canonical TQ
 # commit, followed by exact-once redispatch at its stable group ID.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_unfinished_recovery.sh

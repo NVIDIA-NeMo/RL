@@ -434,7 +434,7 @@ def test_failed_checkpoint_load_leaves_client_in_dirty_state(
 
 
 @pytest.mark.parametrize("operation", ["save", "load"])
-def test_mooncake_checkpoint_lifecycle_fails_loudly(
+def test_unsupported_backend_checkpoint_lifecycle_fails_loudly(
     monkeypatch,
     tmp_path,
     operation: str,
@@ -449,12 +449,12 @@ def test_mooncake_checkpoint_lifecycle_fails_loudly(
     monkeypatch.setattr(tq_adapter.tq, "load_checkpoint", load)
 
     client = object.__new__(tq_adapter.TQDataPlaneClient)
-    client._backend = "mooncake_cpu"
+    client._backend = "future_backend"
     client._supports_checkpointing = False
     client._data_operations_started = False
     checkpoint_dir = tmp_path / "step-7"
 
-    with pytest.raises(NotImplementedError, match="mooncake_cpu"):
+    with pytest.raises(NotImplementedError, match="future_backend"):
         if operation == "save":
             client.save_checkpoint(checkpoint_dir)
         else:

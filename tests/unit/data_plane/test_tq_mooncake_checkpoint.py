@@ -196,7 +196,6 @@ def _manager(store: _FakeStore, manager_id: str = "manager-a") -> Any:
         "gdr_staging_buffer_mb": 1024,
         "checkpoint": {
             "enabled": True,
-            "timeout_s": 10.0,
         },
     }
     replica_config = SimpleNamespace(
@@ -442,6 +441,65 @@ def test_physical_keys_bulk_status_and_fallback_preserve_sorted_deduplication(
     assert _physical_keys(state) == _physical_keys(_controller_state())
 
 
+@pytest.mark.parametrize("published_before_cut", [True, False])
+def test_save_uses_controller_production_cut_during_fresh_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    published_before_cut: bool,
+) -> None:
+    cluster = _source_cluster()
+    managers = _managers(cluster, _SOURCE_IDENTITIES)
+    state = _controller_state()
+    staging = SimpleNamespace(
+        global_indexes={2},
+        field_name_mapping={"tokens": 0},
+        production_status=_StatusMatrix({(2, 0): 0}),
+        field_custom_backend_meta={},
+    )
+    state["partitions"]["rollout_staging"] = staging
+    staging_key = "2@tokens"
+    staging_payload = b"new staging tokens"
+
+    def publish_staging() -> None:
+        # TQ publishes production only after the native payload write completes.
+        cluster.objects[staging_key] = staging_payload
+        cluster.owners[staging_key] = (_SOURCE_IDENTITIES[0][1],)
+        staging.production_status = _StatusMatrix({(2, 0): 1})
+
+    if published_before_cut:
+        publish_staging()
+    checkpoint_dir = _checkpoint_dir(tmp_path)
+    with checkpoint_plugin._controller_path(checkpoint_dir).open("wb") as output:
+        pickle.dump(state, output)
+
+    def publish_after_discovery(request: Any, _response: Any) -> None:
+        if not published_before_cut and request.body["operation"] == "DISCOVER_SAVE":
+            # The row was allocated in the cut, but its payload was not published.
+            # A fresh write during SAVE must not change the selected old objects.
+            publish_staging()
+
+    _wire_participants(
+        monkeypatch,
+        [_participant(manager) for manager in managers],
+        observe_response=publish_after_discovery,
+    )
+    _save_storage_checkpoint(managers[0], str(checkpoint_dir))
+
+    expected = _payloads()
+    if published_before_cut:
+        expected[staging_key] = staging_payload
+    assert staging.production_status[2, 0] == 1
+    assert cluster.objects[staging_key] == staging_payload
+    assert checkpoint_plugin._controller_keys(checkpoint_dir) == sorted(expected)
+    assert _saved_payloads(checkpoint_dir) == expected
+
+    restored_cluster = _FakeCluster({}, {})
+    restored_manager = _manager(_FakeStore(restored_cluster, "10.1.0.1:13301"))
+    _wire_participants(monkeypatch, [_participant(restored_manager)])
+    _load_storage_checkpoint(restored_manager, str(checkpoint_dir))
+    assert restored_cluster.objects == expected
+
+
 def test_empty_checkpoint_needs_no_participants_or_load_controller_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -573,10 +631,7 @@ def test_distributed_checkpoint_round_trip_over_command_only_rpc(
 
 
 def test_checkpoint_timeout_matches_simple_default() -> None:
-    assert (
-        checkpoint_plugin._checkpoint_timeout_s({"checkpoint": {"enabled": True}})
-        == 200.0
-    )
+    assert checkpoint_plugin._DEFAULT_TIMEOUT_S == 200.0
 
 
 def test_participant_timeout_is_fatal_to_the_checkpoint_caller(
@@ -829,9 +884,11 @@ def test_checkpoint_participant_rejects_unsupported_runtime_modes(
         _participant(manager)
 
 
+@pytest.mark.parametrize("restore_count", [2, 3])
 def test_owner_distributed_checkpoint_round_trip_uses_current_participants(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    restore_count: int,
 ) -> None:
     source_cluster = _source_cluster()
     source_managers = _managers(source_cluster, _SOURCE_IDENTITIES)
@@ -885,7 +942,8 @@ def test_owner_distributed_checkpoint_round_trip_uses_current_participants(
     current_identities = [
         ("current-a", "10.1.0.1:13301"),
         ("current-b", "10.1.0.2:13302"),
-    ]
+        ("current-c", "10.1.0.3:13303"),
+    ][:restore_count]
     restored_cluster = _FakeCluster({}, {})
     restore_managers = _managers(restored_cluster, current_identities)
     restore_participants = [_participant(manager) for manager in restore_managers]
@@ -897,9 +955,10 @@ def test_owner_distributed_checkpoint_round_trip_uses_current_participants(
     assert set(restored_cluster.owners.values()) <= {
         (endpoint,) for endpoint in current_endpoints
     }
-    assert {
-        endpoint for endpoint, _, _ in restored_cluster.upsert_calls
-    } == current_endpoints
+    upsert_endpoints = {endpoint for endpoint, _, _ in restored_cluster.upsert_calls}
+    assert upsert_endpoints <= current_endpoints
+    # Whole shards are indivisible: a third participant has no work for two shards.
+    assert len(upsert_endpoints) == min(restore_count, len(manifest["shards"]))
     assert all(
         endpoint == preferred_segment
         for endpoint, _, preferred_segment in restored_cluster.upsert_calls
@@ -1132,14 +1191,62 @@ def test_load_manifest_rejects_a_non_mapping(
         checkpoint_plugin._load_manifest(tmp_path)
 
 
-def test_restore_rejects_a_truncated_owner_shard(
+@pytest.mark.parametrize("location", ["manifest", "index"])
+@pytest.mark.parametrize(
+    "shard_name",
+    [
+        "../part-00000.bin",
+        "/tmp/part-00000.bin",
+        "part-subdir/part-00000.bin",
+        "",
+        None,
+        123,
+        "checkpoint.bin",
+        "part-00000.tmp",
+    ],
+)
+def test_restore_rejects_invalid_shard_names(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    shard_name: Any,
+    location: str,
+) -> None:
+    checkpoint_dir, _, _, _ = _save_distributed_checkpoint(monkeypatch, tmp_path)
+    storage_dir = checkpoint_dir / "mooncake_storage"
+    manifest = _manifest(checkpoint_dir)
+    if location == "manifest":
+        manifest["shards"][0]["shard"] = shard_name
+        (storage_dir / "manifest.json").write_text(json.dumps(manifest))
+    else:
+        index_path = storage_dir / f"{manifest['shards'][0]['shard']}.index.json"
+        index = json.loads(index_path.read_text())
+        index["objects"][0]["shard"] = shard_name
+        index_path.write_text(json.dumps(index))
+    cluster = _FakeCluster({}, {})
+    manager = _manager(_FakeStore(cluster, "10.1.0.1:13301"))
+    _wire_participants(monkeypatch, [_participant(manager)])
+
+    with pytest.raises(ValueError, match="Invalid Mooncake checkpoint shard name"):
+        _load_storage_checkpoint(manager, str(checkpoint_dir))
+
+    assert cluster.upsert_calls == []
+
+
+@pytest.mark.parametrize("damage", ["missing", "truncated", "extended"])
+def test_restore_rejects_a_missing_or_wrong_size_owner_shard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    damage: str,
 ) -> None:
     checkpoint_dir, _, _, _ = _save_distributed_checkpoint(monkeypatch, tmp_path)
     first = _manifest_objects(checkpoint_dir)[0]
     path = checkpoint_dir / "mooncake_storage" / first["shard"]
-    path.write_bytes(path.read_bytes()[:-1])
+    if damage == "missing":
+        path.unlink()
+    elif damage == "truncated":
+        path.write_bytes(path.read_bytes()[:-1])
+    else:
+        path.write_bytes(path.read_bytes() + b"extra")
     cluster = _FakeCluster({}, {})
     managers = _managers(cluster, [("current-a", "10.1.0.1:13301")])
     _wire_participants(monkeypatch, [_participant(managers[0])])
@@ -1148,6 +1255,8 @@ def test_restore_rejects_a_truncated_owner_shard(
         ValueError, match="Missing or corrupt Mooncake checkpoint shard"
     ):
         _load_storage_checkpoint(managers[0], str(checkpoint_dir))
+
+    assert cluster.upsert_calls == []
 
 
 def test_restore_rejects_a_different_gdr_layout(
@@ -1176,12 +1285,79 @@ def test_restore_checks_clean_store_inside_its_single_load_round(
     restore_manager = _managers(cluster, [("current-a", endpoint)])[0]
     calls = _wire_participants(monkeypatch, [_participant(restore_manager)])
 
-    with pytest.raises(RuntimeError, match="requires a clean store"):
+    with pytest.raises(
+        RuntimeError,
+        match="requires a clean store: key '0@router_indices' already exists",
+    ):
         _load_storage_checkpoint(restore_manager, str(checkpoint_dir))
 
     assert len(calls) == 1
     assert calls[0][0].body["operation"] == "LOAD_SHARDS"
     assert cluster.upsert_calls == []
+
+
+@pytest.mark.parametrize("error_code", [-600, -900])
+def test_restore_reports_existence_query_errors_without_writes_or_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: int,
+) -> None:
+    checkpoint_dir, _, _, _ = _save_distributed_checkpoint(monkeypatch, tmp_path)
+    cluster = _FakeCluster({}, {})
+    store = _FakeStore(cluster, "10.1.0.1:13301")
+    manager = _manager(store)
+    _wire_participants(monkeypatch, [_participant(manager)])
+    queries: list[list[str]] = []
+
+    def failed_query(keys: list[str]) -> list[int]:
+        queries.append(list(keys))
+        return [error_code, *([0] * (len(keys) - 1))]
+
+    monkeypatch.setattr(store, "batch_is_exist", failed_query)
+    with pytest.raises(RuntimeError, match="Mooncake existence check failed") as error:
+        _load_storage_checkpoint(manager, str(checkpoint_dir))
+
+    assert len(queries) == 1
+    assert str(error.value) == (
+        f"Mooncake existence check failed for key {queries[0][0]!r}: "
+        f"error code {error_code}"
+    )
+    assert cluster.objects == {}
+    assert cluster.upsert_calls == []
+    assert store.registrations == []
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        None,
+        "00",
+        {"a": 0, "b": 0},
+        [],
+        [0],
+        [0, 0, 0],
+        [False, 0],
+        [0, "0"],
+        [2, 0],
+        [0, 1.0],
+    ],
+)
+def test_clean_store_rejects_malformed_existence_responses(
+    monkeypatch: pytest.MonkeyPatch,
+    response: Any,
+) -> None:
+    store = _FakeStore(_FakeCluster({}, {}), "10.1.0.1:13301")
+    queries: list[list[str]] = []
+
+    def malformed_query(keys: list[str]) -> Any:
+        queries.append(list(keys))
+        return response
+
+    monkeypatch.setattr(store, "batch_is_exist", malformed_query)
+    with pytest.raises(RuntimeError, match="Malformed Mooncake existence response"):
+        checkpoint_plugin._require_clean_store(store, ["a", "b"])
+
+    assert queries == [["a", "b"]]
 
 
 def test_plugin_install_does_not_change_the_normal_put_path(

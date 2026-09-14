@@ -26,12 +26,14 @@ sets of durable objects and upsert them into their own preferred segments
 before TQ restores controller metadata.  Saved client identities are not
 reused across restarts.
 
-The caller must keep writers and clears quiescent throughout both save and
-restore, including every owner's verification and ACK. During save, borrowed
-addresses also require that replicas are not moved and segments/store clients
-are not unmounted or closed. Hard-pinned CPU segments remain alive under this
-contract; same-host peer addresses are never dereferenced. All intended restore
-clients must connect before ``tq.load_checkpoint`` is called.
+During save, objects selected by the controller snapshot must remain unchanged
+until every owner's ACK. Generation may continue writing unrelated fresh keys,
+but overwrites and clears of selected objects must wait. Their borrowed CPU
+allocations must remain valid: do not move their replicas, unmount their segments,
+or close their store clients. Hard pinning prevents eviction, not these explicit
+mutations; same-host peer addresses are never dereferenced. During restore, keep
+writers and clears stopped through every owner's verification and ACK. All
+intended restore clients must connect before ``tq.load_checkpoint`` is called.
 Checkpoint files must remain immutable throughout restore. Each owner validates
 its indexes and key absence before writing. Storage load completes before TQ
 installs its controller; it does not independently reread the controller snapshot.
@@ -61,11 +63,11 @@ from typing import Any, Iterator, cast
 import ray
 import torch
 
-
 _PLUGIN_MARKER = "_nemo_rl_mooncake_checkpoint"
 _STORAGE_DIR = "mooncake_storage"
 _MANIFEST_FILE = "manifest.json"
-_DEFAULT_TIMEOUT_S = 200.0  # Match TQ Simple's default storage-request timeout.
+# Per Ray wait, not a whole-checkpoint deadline; match TQ Simple's default.
+_DEFAULT_TIMEOUT_S = 200.0
 _BATCH_KEYS = 400  # Match TQ's native Mooncake batch limit.
 _BATCH_BYTES = 64 * 1024 * 1024
 _BUFFER_ALIGNMENT = 256  # Match TQ's native transfer-buffer alignment.
@@ -98,13 +100,6 @@ def _checkpoint_enabled(config: Any) -> bool:
     # Internal TQ runtime mode, derived at bootstrap from NeMo-RL's existing
     # checkpointing settings and selected resume path.
     return _checkpoint_settings(config).get("enabled") is True
-
-
-def _checkpoint_timeout_s(config: Any) -> float:
-    value = _checkpoint_settings(config).get("timeout_s", _DEFAULT_TIMEOUT_S)
-    if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
-        raise ValueError("MooncakeStore.checkpoint.timeout_s must be positive")
-    return float(value)
 
 
 def _storage_layout(config: Any) -> dict[str, Any]:
@@ -819,9 +814,7 @@ class _CheckpointParticipant:
             raise ValueError("Mooncake save requires owner metadata references")
         # Discovery finishes everywhere before this call; no actor method must
         # execute recursively to produce a referenced group.
-        groups = ray.get(
-            references, timeout=_checkpoint_timeout_s(self._manager.config)
-        )
+        groups = ray.get(references, timeout=_DEFAULT_TIMEOUT_S)
         objects: list[_StoredObject] = []
         for group in groups:
             if (
@@ -896,8 +889,8 @@ class _CheckpointParticipant:
         with partial.open("xb") as output:
             for obj in objects:
                 # Borrow this process's hard-pinned CPU allocation, not a copy.
-                # The caller must keep writes/clears/moves and store teardown
-                # quiescent until all SAVE acknowledgements have completed.
+                # Selected objects must not be overwritten, cleared or moved,
+                # and their stores must stay alive until all SAVE ACKs complete.
                 allocation = (ctypes.c_ubyte * obj.size).from_address(obj.address)
                 # ctypes arrays expose a buffer; their type stubs omit it.
                 with memoryview(cast(Any, allocation)).cast("B") as view:
@@ -1064,7 +1057,7 @@ def _live_participants(
     try:
         responses = ray.get(
             [worker.mooncake_checkpoint.remote(body=body) for worker in workers],
-            timeout=_checkpoint_timeout_s(manager.config),
+            timeout=_DEFAULT_TIMEOUT_S,
         )
     except Exception as error:
         raise RuntimeError("Mooncake checkpoint worker discovery failed") from error
@@ -1159,7 +1152,7 @@ def _save_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
         discoveries,
         workers=workers,
         local=manager._checkpoint_participant,
-        timeout_s=_checkpoint_timeout_s(manager.config),
+        timeout_s=_DEFAULT_TIMEOUT_S,
     )
     _require_exact_responses(discoveries, plans, operation="discovery")
     references: dict[str, list[Any]] = {endpoint: [] for endpoint in endpoints}
@@ -1212,7 +1205,7 @@ def _save_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
         requests,
         workers=workers,
         local=manager._checkpoint_participant,
-        timeout_s=_checkpoint_timeout_s(manager.config),
+        timeout_s=_DEFAULT_TIMEOUT_S,
     )
     _require_exact_responses(requests, responses, operation="checkpoint")
     entries: list[_ShardIndex] = []
@@ -1359,12 +1352,22 @@ def _require_clean_store(
     for start in range(0, len(keys), _BATCH_KEYS):
         batch = keys[start : start + _BATCH_KEYS]
         existence = store.batch_is_exist(batch)
-        if (
-            not isinstance(existence, (list, tuple))
-            or len(existence) != len(batch)
-            or any(type(result) is not int or result != 0 for result in existence)
-        ):
-            raise RuntimeError("Mooncake storage restore requires a clean store")
+        if not isinstance(existence, (list, tuple)) or len(existence) != len(batch):
+            raise RuntimeError("Malformed Mooncake existence response")
+        for key, result in zip(batch, existence, strict=True):
+            if type(result) is not int or result > 1:
+                raise RuntimeError(
+                    f"Malformed Mooncake existence response for key {key!r}: {result!r}"
+                )
+            if result < 0:
+                raise RuntimeError(
+                    f"Mooncake existence check failed for key {key!r}: error code {result}"
+                )
+            if result == 1:
+                raise RuntimeError(
+                    "Mooncake storage restore requires a clean store: "
+                    f"key {key!r} already exists"
+                )
 
 
 def _load_sharded_checkpoint(
@@ -1409,7 +1412,7 @@ def _load_sharded_checkpoint(
         requests,
         workers=workers,
         local=manager._checkpoint_participant,
-        timeout_s=_checkpoint_timeout_s(manager.config),
+        timeout_s=_DEFAULT_TIMEOUT_S,
     )
     _require_exact_responses(requests, responses, operation="restore")
     for request in requests:
@@ -1473,7 +1476,7 @@ def _load_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
         requests,
         workers=workers,
         local=manager._checkpoint_participant,
-        timeout_s=_checkpoint_timeout_s(manager.config),
+        timeout_s=_DEFAULT_TIMEOUT_S,
     )
     _require_exact_responses(requests, responses, operation="restore")
     for request in requests:
@@ -1499,8 +1502,8 @@ def configure_checkpoint_workers(workers: list[Any]) -> None:
 
 def run_checkpoint_command(body: Mapping[str, Any]) -> dict[str, Any] | None:
     """Execute an actor command using only its already-attached local store."""
-    # Reading TQ's process-local singleton must not lazily create a client on
-    # generation ranks that do not own token capture.
+    # TQ's public get_client() asserts when no client is attached. Read the
+    # singleton so generation ranks without token capture can return None.
     from transfer_queue import interface as tq_interface
 
     client = tq_interface._TQ_CLIENT
