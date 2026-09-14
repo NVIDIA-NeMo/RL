@@ -1016,6 +1016,7 @@ class TestSetup:
             topology_ref
         )
         fake_finalizers = [MagicMock(name="finalizer")]
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
 
         with (
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
