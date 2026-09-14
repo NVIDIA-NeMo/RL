@@ -547,6 +547,15 @@ class AsyncTrajectoryCollector:
                     if not self.running:
                         break
 
+                # Refit and weight updates can wake this loop after validation
+                # pauses it. Check again before starting a batch.
+                if not self._manual_pause_cleared.is_set() and self.running:
+                    with (
+                        efficiency_span("idle/validation_pause", tracer=self._tracer),
+                        self._efficiency_timer.time("idle/validation_pause"),
+                    ):
+                        self._manual_pause_cleared.wait()
+
                 if not self.running:
                     break
 

@@ -1377,6 +1377,53 @@ class TestAsyncTrajectoryCollector:
         assert status["errored"] is False
         assert status["running"] is False
 
+    def test_collection_loop_defers_new_batch_while_manually_paused(self):
+        """Keep a weight update from bypassing a manual pause."""
+        collector = self.create_local_collector()
+        collector.running = True
+        processed = []
+        batch_processed = threading.Event()
+        should_pause_calls = []
+
+        def _fake_should_pause():
+            # Park on the first check. The weight update below wakes the loop.
+            should_pause_calls.append(1)
+            return len(should_pause_calls) == 1
+
+        collector._should_pause_for_generation_limits = _fake_should_pause
+
+        def _record_batch(batch):
+            processed.append(batch)
+            batch_processed.set()
+
+        collector._process_batch = _record_batch
+        collector.dataloader = [{"b": 0}]
+
+        loop_thread = threading.Thread(target=collector._collection_loop, daemon=True)
+        loop_thread.start()
+
+        deadline = time.time() + 5.0
+        while collector._generation_limit_cleared.is_set():
+            assert time.time() < deadline, "loop never reached generation-limit wait"
+            time.sleep(0.01)
+
+        collector.pause()
+        collector.set_weight_version(1)
+
+        assert not batch_processed.wait(0.5), (
+            "_process_batch ran while the collector was paused for validation"
+        )
+        assert processed == []
+
+        collector.resume()
+        assert batch_processed.wait(5.0), "batch not processed after resume"
+        assert processed == [{"b": 0}]
+
+        loop_thread.join(5.0)
+        assert not loop_thread.is_alive()
+        assert collector.data_exhausted is True
+        assert collector.collection_failed is False
+
     @pytest.mark.asyncio
     async def test_drain_payload_metrics_returns_collector_interval(self, monkeypatch):
         collector = self.create_local_collector()
