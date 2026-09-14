@@ -804,15 +804,27 @@ class VllmAsyncGenerationWorkerImpl(
             raise RuntimeError(
                 "generation-cut fetch did not return exactly one snapshot"
             )
+        snapshot = snapshots[0]
+        generation_token_count = sum(mask == 1.0 for mask in snapshot.token_mask_delta)
+        if (
+            snapshot.rollout_id != continuation.source_capture_key
+            or snapshot.model_call_id != continuation.source_model_call_id
+            or generation_token_count != continuation.generation_token_count
+            or snapshot.digest != continuation.digest
+        ):
+            raise RuntimeError(
+                "generation-cut checkpoint coordinates do not match the staged prefix"
+            )
         LOGGER.info(
             "generation prefix restored: rollout_id=%s model_call_id=%s "
-            "source_model_call_id=%s prefix_tokens=%d",
+            "source_model_call_id=%s prefix_tokens=%d prefix_digest=%s",
             admission.rollout_id,
             admission.model_call_id,
             continuation.source_model_call_id,
             continuation.generation_token_count,
+            continuation.digest,
         )
-        return snapshots[0]
+        return snapshot
 
     def _enter_request_prefix(self, request: Any, prefix_token_ids: list[int]) -> None:
         """Attach the resolved prefix to the request through the capture adapter.
