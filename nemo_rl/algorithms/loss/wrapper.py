@@ -382,6 +382,39 @@ class DraftLossWrapper:
         return combined_loss, metrics
 
 
+def wrap_loss_fn_with_input_preparation(
+    next_token_logits: Tensor,
+    data: BatchedDataDict[Any],
+    global_valid_seqs: Tensor | None,
+    global_valid_toks: Tensor | None,
+    loss_fn: LossFunction,
+    prepare_fn: Callable[Any, Any],
+    vocab_parallel_rank: Optional[int] = None,
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> tuple[Tensor, dict[str, Any]]:
+    """Wraps a loss function to handle input preparation for megatron policy worker."""
+    # prepare loss input
+    loss_input, data = prepare_fn(
+        logits=next_token_logits,
+        data=data,
+        loss_fn=loss_fn,
+        vocab_parallel_rank=vocab_parallel_rank,
+        vocab_parallel_group=vocab_parallel_group,
+        context_parallel_group=context_parallel_group,
+    )
+
+    # call loss function
+    loss, loss_metrics = loss_fn(
+        data=data,
+        global_valid_seqs=global_valid_seqs,
+        global_valid_toks=global_valid_toks,
+        **loss_input,
+    )
+
+    return loss, loss_metrics
+
+
 class DraftRuntimeLossWrapper:
     """Combine policy loss with a co-trained drafter loss (automodel path).
 
@@ -436,36 +469,3 @@ class DraftRuntimeLossWrapper:
         combined_loss = policy_loss + self.draft_runtime.loss_weight * draft_loss
         metrics.update(draft_metrics)
         return combined_loss, metrics
-
-
-def wrap_loss_fn_with_input_preparation(
-    next_token_logits: Tensor,
-    data: BatchedDataDict[Any],
-    global_valid_seqs: Tensor | None,
-    global_valid_toks: Tensor | None,
-    loss_fn: LossFunction,
-    prepare_fn: Callable[Any, Any],
-    vocab_parallel_rank: Optional[int] = None,
-    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> tuple[Tensor, dict[str, Any]]:
-    """Wraps a loss function to handle input preparation for megatron policy worker."""
-    # prepare loss input
-    loss_input, data = prepare_fn(
-        logits=next_token_logits,
-        data=data,
-        loss_fn=loss_fn,
-        vocab_parallel_rank=vocab_parallel_rank,
-        vocab_parallel_group=vocab_parallel_group,
-        context_parallel_group=context_parallel_group,
-    )
-
-    # call loss function
-    loss, loss_metrics = loss_fn(
-        data=data,
-        global_valid_seqs=global_valid_seqs,
-        global_valid_toks=global_valid_toks,
-        **loss_input,
-    )
-
-    return loss, loss_metrics
