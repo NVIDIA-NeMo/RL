@@ -162,10 +162,15 @@ class SequencePackingLossWrapper:
             # aggregate loss and metrics
             loss_accum += loss
             for k, v in metrics.items():
+                # ``*_min``/``*_max`` are extrema, not additive quantities.
+                # Preserve explicitly registered non-suffix metrics while also
+                # covering new loss metrics that follow the suffix contract.
+                is_min = k in _SEQ_METRIC_MIN or k.endswith("_min")
+                is_max = k in _SEQ_METRIC_MAX or k.endswith("_max")
                 if k not in metrics_accum:
-                    if k in _SEQ_METRIC_MIN:
+                    if is_min:
                         metrics_accum[k] = float("inf")
-                    elif k in _SEQ_METRIC_MAX:
+                    elif is_max:
                         metrics_accum[k] = float("-inf")
                     else:
                         metrics_accum[k] = 0
@@ -173,10 +178,10 @@ class SequencePackingLossWrapper:
                 val = v.item() if isinstance(v, torch.Tensor) and v.ndim == 0 else v
 
                 # Skip inf/-inf sentinel values (from sequences with no valid tokens)
-                if k in _SEQ_METRIC_MIN:
+                if is_min:
                     if not math.isinf(val):
                         metrics_accum[k] = min(metrics_accum[k], val)
-                elif k in _SEQ_METRIC_MAX:
+                elif is_max:
                     if not math.isinf(val):
                         metrics_accum[k] = max(metrics_accum[k], val)
                 else:
