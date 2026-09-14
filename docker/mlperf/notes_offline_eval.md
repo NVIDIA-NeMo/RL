@@ -52,6 +52,26 @@ the requested endpoint unchanged. MCore saves on this stack are synchronous
 (`async_save=False`), so the final checkpoint is fully written before the
 trainer exits.
 
+## Why `training_step_end_time_ms` is its own timestamp
+
+The rules score a run at the passing checkpoint's *weight-update* time and
+explicitly exclude checkpoint-write time from the score. That instant is when
+`policy.train()` returns in the training loop, so the loop stamps
+`grpo_save_state["training_step_end_time_ms"]` right there, and the checkpoint
+carries it in `training_info.json`.
+
+It is deliberately not the timestamp of the step's `tracked_stats`
+POINT_IN_TIME mllog event. That event is emitted at the step's logging call at
+the end of the loop iteration — after the refit/weight sync, the checkpoint
+write itself, and the per-step jsonl dump (in the spec run: ~14s of refit and
+~55s of checkpoint write intervene). Reusing it would charge exactly the
+checkpoint-write time the rule excludes. The mllog timestamps are
+observability artifacts tied to logging call sites; the weight-update instant
+has no event of its own, and the separate evaluator process could not recover
+it from the append-only log even if it did. `training_info.json` is written
+atomically with the checkpoint, so the timestamp travels with the weights it
+describes.
+
 Also fixed here (ported from optimized fc0426345d): the trainers log a step's
 validation before its train metrics, and a target-reaching eval used to emit
 `run_stop` first and drop the final step's `tracked_stats`. Evaluations
