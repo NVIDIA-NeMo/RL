@@ -573,10 +573,11 @@ class AsyncRolloutImpl:
     ) -> tuple[Completion, dict]:
         """Run one multi-turn rollout for a single generation index."""
         current_message_log = copy.deepcopy(input_sample["message_log"])
+        input_sample_data: Mapping[str, Any] = input_sample
         native_generation_data = {
-            key: input_sample[key]
+            key: input_sample_data[key]
             for key in NATIVE_MULTIMODAL_KEYS
-            if key in input_sample
+            if key in input_sample_data
         }
         current_extra_env_info = copy.deepcopy(input_sample["extra_env_info"])
         current_stop_strings = input_sample.get("stop_strings", None)
