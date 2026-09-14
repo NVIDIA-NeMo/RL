@@ -1699,6 +1699,40 @@ class VllmGeneration(GenerationInterface):
             raise RuntimeError("Failed to checkpoint-resume every async vLLM engine")
         return True
 
+    def resume_generation_after_cut(self, *, timeout_s: Optional[float] = None) -> bool:
+        """Resume decoding but retain the terminal-write checkpoint fence."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError("resume_generation_after_cut requires async_engine=True")
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        futures = self.worker_group.run_all_workers_single_data(
+            "resume_generation_after_cut_async",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        if not all(ray.get(futures, timeout=timeout_s)):
+            raise RuntimeError("Failed to resume every async vLLM engine after its cut")
+        return True
+
+    def finish_generation_checkpoint(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Release terminal capture writes after checkpoint publication."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "finish_generation_checkpoint requires async_engine=True"
+            )
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        futures = self.worker_group.run_all_workers_single_data(
+            "finish_generation_checkpoint_async",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        if not all(ray.get(futures, timeout=timeout_s)):
+            raise RuntimeError(
+                "Failed to release every async vLLM terminal checkpoint fence"
+            )
+        return True
+
     @property
     def requires_kv_scale_sync(self) -> bool:
         """Check if KV cache scales should be synchronized during refit.
