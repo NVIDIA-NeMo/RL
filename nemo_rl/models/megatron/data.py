@@ -1144,6 +1144,7 @@ def process_global_batch(
         - batch: The extracted batch
         - global_valid_seqs: Number of valid sequences across all ranks
         - global_valid_toks: Number of valid tokens across all ranks
+        - local_valid_toks: Number of valid tokens on this rank alone
     """
     batch = data.get_batch(batch_idx=batch_idx, batch_size=batch_size)
 
@@ -1160,6 +1161,9 @@ def process_global_batch(
         )
 
     to_reduce = torch.tensor([local_valid_seqs, local_valid_toks]).cuda()
+    # Keep this rank's own count: the MoE aux-loss gradient scale is per-rank, not
+    # global (see MegatronPolicyWorker._compute_moe_grad_scale).
+    local_valid_toks = to_reduce[1].clone()
     torch.distributed.all_reduce(to_reduce, group=dp_group)
     global_valid_seqs, global_valid_toks = to_reduce[0], to_reduce[1]
 
@@ -1172,6 +1176,7 @@ def process_global_batch(
         "batch": batch,
         "global_valid_seqs": global_valid_seqs,
         "global_valid_toks": global_valid_toks,
+        "local_valid_toks": local_valid_toks,
     }
 
 

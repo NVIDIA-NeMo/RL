@@ -1090,14 +1090,22 @@ class MegatronPolicyWorkerImpl(
 
                     # Set moe_grad_scale_func for MoE aux-loss gradient scaling.
                     # With calculate_per_token_loss=True, the router pre-multiplies
-                    # the aux loss by (num_local_tokens * tp_cp_group.size()), and
-                    # MoEAuxLossAutoScaler applies loss_scale to the gradient. Setting
-                    # loss_scale = 1/global_valid_toks (G = global valid token count)
-                    # normalizes the aux gradient consistently with the main per-token
-                    # SFT loss:
-                    #   (1/G) * N_local * tp_cp_size * aux_grad -> DDP SUM -> aux_grad / G
+                    # the aux loss by (num_local_tokens * tp_cp_group.size()), i.e. by
+                    # the microbatch's padded token count. Dividing by that count and
+                    # by global_valid_toks (G) leaves a supervised-token-weighted mean
+                    # of the aux loss:
+                    #   (V_local / padded) * padded * aux_grad / G -> DDP SUM
+                    #     -> sum(V_local * aux_grad) / G
+                    # See _compute_moe_grad_scale for why the padded count must not
+                    # stand in for the supervised one.
                     self._set_moe_grad_scale_func(  # pragma: no cover
-                        self._compute_moe_grad_scale(global_valid_toks)
+                        self._compute_moe_grad_scale(
+                            gb_result["local_valid_toks"],
+                            num_microbatches,
+                            micro_batch_size,
+                            padded_seq_length,
+                            global_valid_toks=global_valid_toks,
+                        )
                     )
                     # Set mtp_grad_scale_func for MTP loss scaling (scales by valid tokens)
                     mtp_scale = 1.0 / global_valid_toks.clamp(min=1).float()
@@ -1325,15 +1333,61 @@ class MegatronPolicyWorkerImpl(
         self.timer.stop("train")
         return metrics
 
-    def _compute_moe_grad_scale(self, global_valid_toks):
+    def _compute_moe_grad_scale(
+        self,
+        local_valid_toks,
+        num_microbatches: int,
+        micro_batch_size: int,
+        padded_seq_length: int,
+        global_valid_toks=None,
+    ):
         """Build a moe_grad_scale_func that normalizes the aux-loss gradient.
 
-        Returns a callable yielding loss_scale = 1/global_valid_toks (clamped to
-        avoid division by zero) so the MoE aux gradient is normalized consistently
-        with the main per-token SFT loss. See the call site in train() for the
-        full derivation.
+        With ``calculate_per_token_loss=True`` the router multiplies its aux loss by
+        the microbatch's *padded* token count -- ``num_local_tokens *
+        tp_cp_group.size()`` in ``MoETopKRouter.attach_and_log_load_balancing_loss``
+        -- on the assumption that the same count is the gradient denominator. NeMo-RL
+        divides by the *supervised* token count instead, so on a heavily masked recipe
+        the aux gradient is inflated by padded/supervised: the 67B Super VLM SFT recipe
+        trains ~22% of its packed tokens, giving the aux loss ~4.5x its configured
+        ``moe_aux_loss_coeff``.
+
+        Returning ``local_valid_toks / padded_toks`` cancels the router's padded count,
+        so the accumulated aux gradient is ``sum_mb(valid_toks_mb * d(aux_mb))``. The
+        later ``1/global_valid_toks`` rescale turns that into a supervised-token-weighted
+        mean of the aux loss -- what ``calculate_per_token_loss=True`` is defined to
+        produce, and what Megatron-LM gets for free under
+        ``--no-calculate-per-token-loss``.
+
+        The ratio is per-call rather than per-microbatch: every microbatch in a call
+        shares ``padded_seq_length``, and spreading the call's supervised tokens evenly
+        across its microbatches only redistributes weight *within* the call, leaving the
+        call's total aux weight exact.
+
+        Args:
+            local_valid_toks: Supervised tokens this rank contributes to the call.
+            num_microbatches: Pipeline microbatches in the call.
+            micro_batch_size: Sequences per microbatch.
+            padded_seq_length: Padded width of a microbatch, i.e. what the router counts.
+            global_valid_toks: Supply on the synchronous path, whose gradients are never
+                rescaled afterwards, so the ``1/N`` has to ride on this scale. Leave
+                None on the split path, where ``_finish_train_step_body`` applies
+                ``1/N`` to every gradient.
+
+        Returns:
+            Callable returning the scale as a size-1 tensor.
         """
-        moe_scale = 1.0 / global_valid_toks.clamp(min=1).float()
+        padded_toks = max(
+            1, int(num_microbatches) * int(micro_batch_size) * int(padded_seq_length)
+        )
+        # No device pin: mcore's _normalize_loss_scale moves whatever this returns
+        # onto the output tensor's device.
+        moe_scale = torch.as_tensor(local_valid_toks, dtype=torch.float32) / padded_toks
+        if global_valid_toks is not None:
+            moe_scale = (
+                moe_scale.to(global_valid_toks.device)
+                / global_valid_toks.clamp(min=1).float()
+            )
         return lambda: moe_scale
 
     def _set_moe_grad_scale_func(self, func):
@@ -1557,6 +1611,8 @@ class MegatronPolicyWorkerImpl(
         # Also clear any transient callable left by an interrupted older step.
         if state["mtp_enabled"]:
             self._set_mtp_grad_scale_func(None)
+        # Same for the MoE aux scale, which train_microbatch sets per chunk.
+        self._set_moe_grad_scale_func(None)
 
         # Null the three mcore hooks that would fire a mid-step DP reduce:
         #   grad_sync_func — PP scheduler's direct call on last-MB boundaries
@@ -1634,9 +1690,10 @@ class MegatronPolicyWorkerImpl(
             # values) to drop ``_train_step_state``.
             try:
                 self._set_mtp_grad_scale_func(None)
+                self._set_moe_grad_scale_func(None)
             except Exception:
                 log.exception(
-                    "failed to clear MTP gradient scaling after train_microbatch error"
+                    "failed to clear MTP/MoE gradient scaling after train_microbatch error"
                 )
             try:
                 self._restore_saved_mcore_hooks(state)
@@ -1749,6 +1806,19 @@ class MegatronPolicyWorkerImpl(
         )
         self._add_step_phase("mb_prep", time.monotonic() - prep_started)
 
+        # Rebase the MoE aux-loss gradient from padded onto supervised tokens.
+        # No global_valid_toks here: ``_finish_train_step_body`` already scales
+        # every accumulated gradient by 1/N, so this scale must carry only the
+        # padded-count cancellation. See _compute_moe_grad_scale.
+        self._set_moe_grad_scale_func(
+            self._compute_moe_grad_scale(
+                call_local_toks,
+                num_microbatches,
+                micro_batch_size,
+                padded_seq_length,
+            )
+        )
+
         # The critical wrap: hooks fire (accumulate main_grad) but the
         # per-call reduce dispatch is gated off.
         fwd_bwd_started = time.monotonic()
@@ -1780,6 +1850,9 @@ class MegatronPolicyWorkerImpl(
                     use_router_replay=use_router_replay,
                     router_replay_train=True,
                 )
+        # The scale is call-local; drop it so the next chunk cannot reuse this
+        # chunk's token counts and so it never reaches a serialized config.
+        self._set_moe_grad_scale_func(None)
         self._add_step_phase("fwd_bwd", time.monotonic() - fwd_bwd_started)
 
         empty_cache_started = time.monotonic()
@@ -1827,9 +1900,10 @@ class MegatronPolicyWorkerImpl(
             # abort_train_step to clear.
             try:
                 self._set_mtp_grad_scale_func(None)
+                self._set_moe_grad_scale_func(None)
             except Exception:
                 log.exception(
-                    "failed to clear MTP gradient scaling after finish_train_step error"
+                    "failed to clear MTP/MoE gradient scaling after finish_train_step error"
                 )
             try:
                 self._restore_saved_mcore_hooks(state)
@@ -1877,8 +1951,9 @@ class MegatronPolicyWorkerImpl(
 
         opt_started = time.monotonic()
         # No more forward/backward calls remain in this step. Clear the
-        # callable before optimizer/scheduler/checkpoint state can serialize it.
+        # callables before optimizer/scheduler/checkpoint state can serialize them.
         self._set_mtp_grad_scale_func(None)
+        self._set_moe_grad_scale_func(None)
 
         # End-of-step gradient finalization, exactly once per optimizer step.
         # ``begin_train_step`` nulled ``finalize_model_grads_func`` so mcore's
@@ -2120,10 +2195,11 @@ class MegatronPolicyWorkerImpl(
         state = getattr(self, "_train_step_state", None)
         if state is None:
             return
-        # Drop the step-local MTP scaler and restore the mcore hooks before
+        # Drop the step-local MTP/MoE scalers and restore the mcore hooks before
         # zero_grad_buffer touches anything.
         try:
             self._set_mtp_grad_scale_func(None)
+            self._set_moe_grad_scale_func(None)
         finally:
             self._restore_saved_mcore_hooks(state)
             self.model.zero_grad_buffer()

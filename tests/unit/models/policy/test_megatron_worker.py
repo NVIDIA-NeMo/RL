@@ -1751,8 +1751,30 @@ def test_set_moe_grad_scale_func_noop_when_no_config():
     MegatronPolicyWorkerImpl._set_moe_grad_scale_func(worker, lambda: 1.0)
 
 
-def test_compute_moe_grad_scale_normalizes_by_valid_tokens():
-    """_compute_moe_grad_scale should yield loss_scale = 1/global_valid_toks."""
+def test_compute_moe_grad_scale_rebases_padded_tokens_onto_supervised():
+    """Split path: scale must cancel the router's padded-token pre-multiply.
+
+    The router multiplies its aux loss by num_microbatches*mbs*padded_seq_length
+    worth of tokens, but only ``local_valid_toks`` of them carry loss, so the
+    scale is the ratio of the two. No global_valid_toks: the split path applies
+    1/N to every gradient at finish.
+    """
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+
+    # 2 microbatches * mbs 1 * 128 padded tokens = 256 padded, 64 supervised.
+    scale_fn = MegatronPolicyWorkerImpl._compute_moe_grad_scale(
+        worker, torch.tensor(64.0), 2, 1, 128
+    )
+    assert torch.allclose(scale_fn(), torch.tensor(0.25))
+
+
+def test_compute_moe_grad_scale_divides_by_global_tokens_on_sync_path():
+    """Sync path gradients are never rescaled later, so 1/G rides on this scale."""
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
@@ -1761,9 +1783,14 @@ def test_compute_moe_grad_scale_normalizes_by_valid_tokens():
     _disable_opd_full(worker)
 
     scale_fn = MegatronPolicyWorkerImpl._compute_moe_grad_scale(
-        worker, torch.tensor(4.0)
+        worker,
+        torch.tensor(64.0),
+        2,
+        1,
+        128,
+        global_valid_toks=torch.tensor(256.0),
     )
-    assert torch.allclose(scale_fn(), torch.tensor(0.25))
+    assert torch.allclose(scale_fn(), torch.tensor(0.25 / 256.0))
 
 
 def test_compute_moe_grad_scale_clamps_zero_valid_tokens():
@@ -1776,9 +1803,24 @@ def test_compute_moe_grad_scale_clamps_zero_valid_tokens():
     _disable_opd_full(worker)
 
     scale_fn = MegatronPolicyWorkerImpl._compute_moe_grad_scale(
-        worker, torch.tensor(0.0)
+        worker, torch.tensor(0.0), 1, 1, 128, global_valid_toks=torch.tensor(0.0)
     )
-    assert torch.allclose(scale_fn(), torch.tensor(1.0))
+    assert torch.allclose(scale_fn(), torch.tensor(0.0))
+
+
+def test_compute_moe_grad_scale_guards_zero_padded_tokens():
+    """A degenerate microbatch shape must not divide by zero."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+
+    scale_fn = MegatronPolicyWorkerImpl._compute_moe_grad_scale(
+        worker, torch.tensor(8.0), 0, 1, 0
+    )
+    assert torch.allclose(scale_fn(), torch.tensor(8.0))
 
 
 @pytest.mark.parametrize(
