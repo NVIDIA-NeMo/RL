@@ -4595,12 +4595,6 @@ class SingleControllerActor:
                 f"   {len(self._inflight_by_group_id)} in-flight rollout group(s) paused",
                 flush=True,
             )
-        else:
-            print(
-                "   generation backend has no native pause support; "
-                "in-flight requests retain their existing refit behavior",
-                flush=True,
-            )
 
         try:
             await self._sync_weights_within(kv_scales, "first")
