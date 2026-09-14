@@ -21,6 +21,7 @@ PHASE1_PID=""
 
 GYM_ROOT=${NEMO_GYM_SOURCE_DIR:-$PROJECT_ROOT/3rdparty/Gym-workspace/Gym}
 SNAPSHOT_INTERVAL_S=${SC_GYM_PREFIX_RECOVERY_INTERVAL_S:-1}
+PHASE2_SNAPSHOT_INTERVAL_S=${SC_GYM_PREFIX_RECOVERY_PHASE2_INTERVAL_S:-600}
 SNAPSHOT_TIMEOUT_S=${SC_GYM_PREFIX_RECOVERY_TIMEOUT_S:-2400}
 PHASE2_TIMEOUT_S=${SC_GYM_PREFIX_RECOVERY_PHASE2_TIMEOUT_S:-2400}
 NUM_PROMPTS=${SC_GYM_PREFIX_RECOVERY_NUM_PROMPTS:-2}
@@ -158,6 +159,14 @@ done
 for trainer_checkpoint in "$CHECKPOINT_DIR"/step_*; do
     if [[ -d "$trainer_checkpoint" ]]; then
         rm -rf "$trainer_checkpoint"
+    fi
+done
+
+# Phase 1 checkpoints aggressively to catch an active generation. Give the
+# restored request enough time to finish before another periodic cut begins.
+for index in "${!COMMON_OVERRIDES[@]}"; do
+    if [[ "${COMMON_OVERRIDES[$index]}" == ++rollout_checkpointing.snapshot_attempt_interval_s=* ]]; then
+        COMMON_OVERRIDES[$index]="++rollout_checkpointing.snapshot_attempt_interval_s=$PHASE2_SNAPSHOT_INTERVAL_S"
     fi
 done
 
