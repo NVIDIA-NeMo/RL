@@ -112,6 +112,8 @@ class TQPolicy(TQDriverMixin, Policy):
     rollout actor at first put + driver-/worker-written deltas).
     """
 
+    supports_dynamic_cp_dispatch = False
+
     def __init__(
         self,
         *args: Any,

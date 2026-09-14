@@ -14,6 +14,7 @@
 
 from typing import Any, Literal, NotRequired, TypedDict, Union
 
+from nemo_rl.distributed.dynamic_context_parallel import DynamicContextParallelConfig
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 
@@ -373,6 +374,7 @@ class MegatronConfig(TypedDict):
     pipeline_model_parallel_size: int
     num_layers_in_first_pipeline_stage: int | None
     num_layers_in_last_pipeline_stage: int | None
+    dynamic_context_parallel: NotRequired[DynamicContextParallelConfig]
     context_parallel_size: int
     # Nemotron Omni RADIO/provider booleans. Omit any field to retain the model
     # provider's checkpoint/default value.

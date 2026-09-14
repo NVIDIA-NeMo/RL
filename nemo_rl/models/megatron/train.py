@@ -18,7 +18,7 @@ from functools import partial
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
-from megatron.core import tensor_parallel
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -53,6 +53,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.utils import _pack_input_ids
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.dynamic_context_parallel import cp_loss_multiplier
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
@@ -64,6 +65,12 @@ from nemo_rl.models.megatron.data import ProcessedMicrobatch
 from nemo_rl.models.megatron.draft.hidden_capture import (
     get_capture_context,
 )
+from nemo_rl.models.megatron.dynamic_cp import (
+    RuntimeCPContext,
+    bind_attention_cp_group,
+    preserve_attention_cp_groups,
+    runtime_cp_from_packed,
+)
 from nemo_rl.models.megatron.opd_full_capture import get_opd_full_capture_context
 from nemo_rl.models.megatron.router_replay import (
     clear_router_replay,
@@ -71,6 +78,7 @@ from nemo_rl.models.megatron.router_replay import (
     set_router_replay_forward,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.dynamic_cp import dynamic_cp_config
 
 # Union type for any post-processing function (defined after classes below)
 PostProcessingFunction = Union[
@@ -79,6 +87,21 @@ PostProcessingFunction = Union[
     "TeacherFullPayloadPostProcessor",
     "TopkLogitsPostProcessor",
 ]
+
+
+def _postprocessing_cp_context(
+    packed_seq_params: Optional[PackedSeqParams],
+) -> RuntimeCPContext:
+    """Use task metadata for dynamic CP and existing accessors for static CP."""
+    if packed_seq_params is not None and isinstance(
+        getattr(packed_seq_params, "local_cp_size", None), int
+    ):
+        return runtime_cp_from_packed(packed_seq_params)
+    return RuntimeCPContext(
+        size=get_context_parallel_world_size(),
+        rank=0,
+        group=get_context_parallel_group(),
+    )
 
 
 def _prepare_padding_mask_for_model(
@@ -192,7 +215,11 @@ def model_forward(
     additional_kwargs = {}
     # Mamba models currently do not support packed_seq_params
     if packed_seq_params is not None:
-        additional_kwargs["packed_seq_params"] = packed_seq_params
+        additional_kwargs["packed_seq_params"] = (
+            bind_attention_cp_group(model, packed_seq_params)
+            if isinstance(getattr(packed_seq_params, "local_cp_size", None), int)
+            else packed_seq_params
+        )
 
     # Pass MTP loss mask to exclude prompt tokens from MTP loss
     if mtp_loss_mask is not None:
@@ -303,6 +330,20 @@ def forward_with_post_processing_fn(
     attention_mask = processed_mb.attention_mask
     position_ids = processed_mb.position_ids
     packed_seq_params = processed_mb.packed_seq_params
+    cp_context = (
+        _postprocessing_cp_context(packed_seq_params)
+        if packed_seq_params is not None
+        and isinstance(getattr(packed_seq_params, "local_cp_size", None), int)
+        else None
+    )
+    if packed_seq_params is not None and isinstance(
+        getattr(packed_seq_params, "local_cp_size", None), int
+    ):
+        # Every phase has one forward/backward per lane. Keep the barrier here,
+        # rather than in the iterator, so MCore reruns replay it as well.
+        torch.distributed.barrier(
+            group=parallel_state.get_data_parallel_group(with_context_parallel=True)
+        )
     cu_seqlens_padded = processed_mb.cu_seqlens_padded
     mtp_loss_mask = processed_mb.mtp_loss_mask
     padding_mask = processed_mb.padding_mask
@@ -425,6 +466,7 @@ def forward_with_post_processing_fn(
             input_ids=input_ids,
             cu_seqlens_padded=cu_seqlens_padded,
             original_seq_length=original_seq_length,
+            cp_context=cp_context,
         )
     elif isinstance(post_processing_fn, TeacherFullPayloadPostProcessor):
         assert original_seq_length is not None
@@ -433,6 +475,7 @@ def forward_with_post_processing_fn(
             input_ids=input_ids,
             cu_seqlens_padded=cu_seqlens_padded,
             original_seq_length=original_seq_length,
+            cp_context=cp_context,
             hidden_states=(
                 None
                 if opd_full_capture is None
@@ -445,6 +488,7 @@ def forward_with_post_processing_fn(
             data_dict=data_dict,
             cu_seqlens_padded=cu_seqlens_padded,
             original_seq_length=original_seq_length,
+            cp_context=cp_context,
         )
     else:
         raise TypeError(
@@ -519,7 +563,12 @@ def megatron_forward_backward(
     forward_backward_func = get_forward_backward_func()
     if use_router_replay:
         clear_router_replay(model)
-    with suspend_activation_offload_for_forward_only(model, forward_only):
+    with (
+        suspend_activation_offload_for_forward_only(model, forward_only),
+        preserve_attention_cp_groups(model)
+        if dynamic_cp_config(post_processing_fn.cfg) is not None
+        else nullcontext(),
+    ):
         try:
             return forward_backward_func(
                 forward_step_func=forward_step,
@@ -603,6 +652,7 @@ class LossPostProcessor:
         Returns:
             Callable: Function that takes output tensor and returns (loss, metrics) tuple
         """
+        cp_context = _postprocessing_cp_context(packed_seq_params)
         # A custom prepare_fn (e.g. value models) overrides the default logit prep.
         logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
         if self.prepare_fn is not None:
@@ -646,7 +696,7 @@ class LossPostProcessor:
                 cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
                 vocab_parallel_rank=get_tensor_model_parallel_rank(),
                 vocab_parallel_group=get_tensor_model_parallel_group(),
-                context_parallel_group=get_context_parallel_group(),
+                context_parallel_group=cp_context.group,
             )
             if "student_logits" in data_dict:
                 # draft + use_fused_linear_logprobs is rejected at setup in
@@ -662,7 +712,7 @@ class LossPostProcessor:
                     loss_weight=float(self.cfg["draft"]["loss_weight"]),
                     vocab_parallel_rank=get_tensor_model_parallel_rank(),
                     vocab_parallel_group=get_tensor_model_parallel_group(),
-                    context_parallel_group=get_context_parallel_group(),
+                    context_parallel_group=cp_context.group,
                     cu_seqlens_q=packed_seq_params.cu_seqlens_q,
                     cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
                     d2t=self.d2t,
@@ -675,7 +725,7 @@ class LossPostProcessor:
                 prepare_fn=prepare_loss_input_wrapped,
                 vocab_parallel_rank=get_tensor_model_parallel_rank(),
                 vocab_parallel_group=get_tensor_model_parallel_group(),
-                context_parallel_group=get_context_parallel_group(),
+                context_parallel_group=cp_context.group,
             )
             if "student_logits" in data_dict:
                 loss_fn_wrapped = DraftLossWrapper(
@@ -685,7 +735,7 @@ class LossPostProcessor:
                     loss_weight=float(self.cfg["draft"]["loss_weight"]),
                     vocab_parallel_rank=get_tensor_model_parallel_rank(),
                     vocab_parallel_group=get_tensor_model_parallel_group(),
-                    context_parallel_group=get_context_parallel_group(),
+                    context_parallel_group=cp_context.group,
                 )
 
         loss_fn_wrapped = partial(
@@ -695,27 +745,19 @@ class LossPostProcessor:
             global_valid_toks=global_valid_toks,
         )
 
-        if self.cp_normalize:
-            cp_size = get_context_parallel_world_size()
-            prev_loss_fn = loss_fn_wrapped
+        # MCore's unchanged no-pipeline executor scales by STATIC CP / MBs;
+        # differentiable logprob reconstruction replicates loss over ACTIVE CP.
+        multiplier = cp_loss_multiplier(
+            active_cp_size=cp_context.size,
+            schedule_cp_size=get_context_parallel_world_size(),
+            num_microbatches=self.num_microbatches,
+            replicated_cp_loss=self.cp_normalize,
+        )
+        loss_before_scaling = loss_fn_wrapped
 
-            def _div_by_cp_size(*args, **kwargs):
-                loss, metrics = prev_loss_fn(*args, **kwargs)
-                return loss / cp_size, metrics
-
-            loss_fn_wrapped = _div_by_cp_size
-
-        # Counteract Megatron's default loss averaging in schedules.py,
-        # which applies (* cp_size / num_microbatches) to the loss.
-        cp_size = get_context_parallel_world_size()
-        num_microbatches = self.num_microbatches
-        loss_fn_before_mcore_scaling = loss_fn_wrapped
-
-        def _counteract_mcore_loss_averaging(*args, **kwargs):
-            loss, metrics = loss_fn_before_mcore_scaling(*args, **kwargs)
-            return loss * num_microbatches / cp_size, metrics
-
-        loss_fn_wrapped = _counteract_mcore_loss_averaging
+        def loss_fn_wrapped(*args, **kwargs):
+            loss, metrics = loss_before_scaling(*args, **kwargs)
+            return loss * multiplier, metrics
 
         return loss_fn_wrapped
 
@@ -737,6 +779,7 @@ class LogprobsPostProcessor:
         input_ids: torch.Tensor,
         cu_seqlens_padded: torch.Tensor,
         original_seq_length: int,
+        cp_context: Optional[RuntimeCPContext] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes token log probabilities.
 
@@ -771,7 +814,11 @@ class LogprobsPostProcessor:
                     vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],
                     group=tp_grp,
                     inference_only=True,
-                    cp_group=get_context_parallel_group(),
+                    cp_group=(
+                        cp_context.group
+                        if cp_context is not None
+                        else get_context_parallel_group()
+                    ),
                     chunk_size=logprob_chunk_size,
                     sampling_params=self.sampling_params,
                 )
@@ -849,6 +896,7 @@ class TeacherFullPayloadPostProcessor:
         input_ids: torch.Tensor,
         cu_seqlens_padded: torch.Tensor,
         original_seq_length: int,
+        cp_context: Optional[RuntimeCPContext] = None,
         hidden_states: Optional[torch.Tensor] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create the post-processing function for a teacher full-payload forward.
@@ -870,9 +918,14 @@ class TeacherFullPayloadPostProcessor:
             input_ids=input_ids,
             cu_seqlens_padded=cu_seqlens_padded,
             original_seq_length=original_seq_length,
+            cp_context=cp_context,
         )
         pack = self.cfg["sequence_packing"]["enabled"]
-        cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
+        cp_size = (
+            cp_context.size
+            if cp_context is not None
+            else self.cfg["megatron_cfg"]["context_parallel_size"]
+        )
         batch_size = data_dict["input_ids"].shape[0]
         unpacked_seqlen = data_dict["input_ids"].shape[1]
         seq_lengths = data_dict["input_lengths"]
@@ -908,7 +961,11 @@ class TeacherFullPayloadPostProcessor:
                 )
 
             if cp_size > 1:
-                cp_grp = get_context_parallel_group()
+                cp_grp = (
+                    cp_context.group
+                    if cp_context is not None
+                    else get_context_parallel_group()
+                )
                 if pack:
                     # Per-sequence CP allgather. CP uses a load-balanced
                     # (2 x CP interleaved) layout per sequence, so gathering the
@@ -989,6 +1046,7 @@ class TopkLogitsPostProcessor:
         data_dict: BatchedDataDict[Any],
         cu_seqlens_padded: torch.Tensor,
         original_seq_length: int,
+        cp_context: Optional[RuntimeCPContext] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes top-k logits and indices.
 
@@ -1006,7 +1064,11 @@ class TopkLogitsPostProcessor:
                       (dummy_loss, {"topk_logits": values, "topk_indices": indices})
         """
         pack = self.cfg["sequence_packing"]["enabled"]
-        cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
+        cp_size = (
+            cp_context.size
+            if cp_context is not None
+            else self.cfg["megatron_cfg"]["context_parallel_size"]
+        )
         unpacked_seqlen = data_dict["input_ids"].shape[1]
         seq_lengths = data_dict["input_lengths"]
 
@@ -1029,8 +1091,12 @@ class TopkLogitsPostProcessor:
                 chunk_size=chunk_size,
             )
 
-            if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
-                cp_grp = get_context_parallel_group()
+            if cp_size > 1:
+                cp_grp = (
+                    cp_context.group
+                    if cp_context is not None
+                    else get_context_parallel_group()
+                )
                 if pack:
                     # Per-sequence CP allgather following packed-sequence logic
                     batch_size = data_dict["input_ids"].shape[0]

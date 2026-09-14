@@ -75,6 +75,8 @@ from megatron.core.utils import get_model_config
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
+from nemo_rl.models.megatron.dynamic_cp import initialize_dynamic_cp_runtime
+from nemo_rl.models.policy.dynamic_cp import dynamic_cp_config
 
 _HF_CONFIG_PATCHED = False
 
@@ -1194,6 +1196,12 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
     ]
     model_cfg.sequence_parallel = config["megatron_cfg"]["sequence_parallel"]
     model_cfg.context_parallel_size = config["megatron_cfg"]["context_parallel_size"]
+    if dynamic_cp_config(config) is not None:
+        # Bridge forwards this to initialize_model_parallel to create hybrid groups.
+        model_cfg.hybrid_context_parallel = (
+            torch.distributed.get_world_size() // model_cfg.tensor_model_parallel_size
+            > 1
+        )
 
     if model_cfg.context_parallel_size > 1:
         # Either NeMo-RL does the packing+CP-sharding itself (classic mcore
@@ -2107,6 +2115,16 @@ def setup_model_and_optimizer(
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
     )
+
+    if (
+        dynamic_cp_config(policy_cfg) is not None
+        and megatron_cfg.model.hybrid_context_parallel
+    ):
+        initialize_dynamic_cp_runtime()
+        # The Ray driver supplies already scheduled, uniform phases. Use MCore's
+        # standard no-pipeline executor, not its TP0 dataloader/redistribution loop.
+        # Hybrid process groups remain initialized; PackedSeqParams selects them.
+        megatron_cfg.model.hybrid_context_parallel = False
 
     if megatron_cfg.ft and megatron_cfg.ft.enable_ft_package:
         fault_tolerance.setup(megatron_cfg, state)

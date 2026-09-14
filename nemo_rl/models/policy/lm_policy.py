@@ -30,7 +30,7 @@ from nemo_rl.distributed.batched_data_dict import (
     SequencePackingArgs,
     SlicedDataDict,
 )
-from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.distributed.named_sharding import NamedSharding, replicated_axes
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
@@ -41,6 +41,12 @@ from nemo_rl.models.generation.interfaces import (
     RefitPayloadMode,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.dynamic_cp import (
+    build_cp_dispatch,
+    collect_cp_outputs,
+    dynamic_cp_config,
+    validate_dynamic_cp,
+)
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -90,6 +96,8 @@ def _aggregate_megatron_flops_metrics(
 
 
 class Policy(ColocatablePolicyInterface, GenerationInterface):
+    supports_dynamic_cp_dispatch = True
+
     def __init__(
         self,
         cluster: RayVirtualCluster,
@@ -329,6 +337,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "tensor_parallel",
             ],
         )
+
+        self.dynamic_cp = dynamic_cp_config(config) is not None
+        if self.dynamic_cp:
+            if not self.supports_dynamic_cp_dispatch:
+                raise ValueError(
+                    "Dynamic CP currently requires the Ray payload policy; TQ/split dispatch is not supported"
+                )
+            validate_dynamic_cp(config, lanes=cluster.world_size() // tp_size)
 
         pre_init_queue = RayQueue()
 
@@ -651,6 +667,25 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
         )
 
+    def _get_dynamic_cp_outputs(
+        self, method: str, data: BatchedDataDict, **kwargs: Any
+    ) -> BatchedDataDict:
+        dispatch = build_cp_dispatch(
+            data, self.cfg, self.sharding_annotations, batch_size=None, training=False
+        )
+        futures = self.worker_group.run_all_workers_sharded_data(
+            method,
+            data=dispatch.data,
+            cp_plan=dispatch.plans,
+            in_sharded_axes=["data_parallel", "context_parallel"],
+            replicate_on_axes=list(replicated_axes(dynamic_cp=True)),
+            output_is_replicated=list(replicated_axes(dynamic_cp=True)),
+            common_kwargs=kwargs,
+        )
+        return collect_cp_outputs(
+            self.worker_group.get_all_worker_results(futures), dispatch, data.size
+        )
+
     def get_logprobs(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
@@ -663,6 +698,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        if self.dynamic_cp:
+            return self._get_dynamic_cp_outputs("get_logprobs", data)
+
         with timer.time("get_logprobs/shard_data") if timer else nullcontext():
             sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
         self._report_sharded_payload(sharded_data, "policy_get_logprobs")
@@ -708,6 +746,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         Returns: Identical to get_logprobs.
         """
+        if self.dynamic_cp:
+            return self._get_dynamic_cp_outputs(
+                "get_reference_policy_logprobs", data, micro_batch_size=micro_batch_size
+            )
+
         with (
             timer.time("get_reference_policy_logprobs/shard_data")
             if timer
@@ -760,6 +803,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         timer: Optional[Timer] = None,
     ) -> BatchedDataDict[TopkLogitsOutputSpec]:
         """Dispatch get_topk_logits to workers (no CP/packed support initially)."""
+        if self.dynamic_cp:
+            return self._get_dynamic_cp_outputs(
+                "get_topk_logits", data, k=k, micro_batch_size=micro_batch_size
+            )
         with timer.time("get_topk_logits/shard_data") if timer else nullcontext():
             sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
 
@@ -880,12 +927,28 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
         # Shard and replicate the batch
         with timer.time("policy_training/sharding_data") if timer else nullcontext():
-            sharded_data = self._shard_for_train(data, batch_size)
-        self._report_sharded_payload(sharded_data, "policy_train")
+            dispatch = (
+                build_cp_dispatch(
+                    data,
+                    self.cfg,
+                    self.sharding_annotations,
+                    batch_size=batch_size,
+                    training=True,
+                )
+                if self.dynamic_cp
+                else None
+            )
+            sharded_data = (
+                dispatch.data
+                if dispatch is not None
+                else self._shard_for_train(data, batch_size)
+            )
+        if dispatch is None:
+            self._report_sharded_payload(sharded_data, "policy_train")
 
         if self.flops_tracker is not None:
             self.flops_tracker.reset()
-            for shard in sharded_data:
+            for shard in [data] if dispatch is not None else sharded_data:
                 input_lengths = shard["input_lengths"]
                 self.flops_tracker.track_batch(input_lengths.tolist())
 
@@ -898,17 +961,16 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             futures = self.worker_group.run_all_workers_sharded_data(
                 "train",
                 data=sharded_data,
-                in_sharded_axes=["data_parallel"],
-                replicate_on_axes=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
-                output_is_replicated=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
+                **({"cp_plan": dispatch.plans} if dispatch is not None else {}),
+                in_sharded_axes=["data_parallel", "context_parallel"]
+                if dispatch is not None
+                else ["data_parallel"],
+                replicate_on_axes=list(
+                    replicated_axes(dynamic_cp=dispatch is not None)
+                ),
+                output_is_replicated=list(
+                    replicated_axes(dynamic_cp=dispatch is not None)
+                ),
                 common_kwargs={
                     "loss_fn": loss_fn,
                     "eval_mode": eval_mode,

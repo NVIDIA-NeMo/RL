@@ -24,6 +24,10 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "nemo_rl/distributed/dynamic_context_parallel.py",
+  "nemo_rl/distributed/tensor_serialization.py",
+  "nemo_rl/models/policy/dynamic_cp.py",
+  "nemo_rl/models/megatron/dynamic_cp.py",
   # TODO: enable these once we have 100 correctness
   #"nemo_rl/**/*.py",
   #"examples/**/*.py",

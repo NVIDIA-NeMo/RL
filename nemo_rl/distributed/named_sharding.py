@@ -28,6 +28,17 @@ REPLICATED_AXES: tuple[str, ...] = (
 )
 
 
+def replicated_axes(*, dynamic_cp: bool = False) -> tuple[str, ...]:
+    """Axes sharing a dispatch result; runtime CP tasks have explicit owners.
+
+    REPLICATED_AXES remains the static-layout default. Dynamic CP callers
+    collect all CP lanes and deduplicate using their task plan instead.
+    """
+    return tuple(
+        axis for axis in REPLICATED_AXES if not dynamic_cp or axis != "context_parallel"
+    )
+
+
 class NamedSharding:
     """Represents an N-dimensional arrangement of ranks with named axes, facilitating data sharding, replication, and collection based on these axes.
 

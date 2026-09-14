@@ -58,7 +58,9 @@ from nemo_rl.data.multimodal_utils import (
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.dynamic_context_parallel import CPRankPlan
 from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.distributed.tensor_serialization import register_policy_tensor_serializer
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec, RefitPayloadMode
 from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationMixin,
@@ -104,6 +106,7 @@ from nemo_rl.models.megatron.train import (
     megatron_forward_backward,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.dynamic_cp import dynamic_cp_config
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -786,6 +789,13 @@ class MegatronPolicyWorkerImpl(
             if _model_accepts_media_token_validity_mask(self.model)
             else None
         )
+        if dynamic_cp_config(self.cfg) is not None:
+            register_policy_tensor_serializer()
+            if self.delegate_pack_to_model or self.model_slices_context_parallel_inputs:
+                raise ValueError("Dynamic CP requires NeMo-owned text-model packing")
+            if getattr(self._get_model_config(), "mtp_num_layers", None):
+                raise ValueError("Dynamic CP does not yet support MTP")
+
         if self.model_slices_context_parallel_inputs:
             if self.delegate_pack_to_model:
                 raise RuntimeError(
@@ -956,6 +966,7 @@ class MegatronPolicyWorkerImpl(
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         check_dim_skip_keys: Optional[Iterable[str]] = None,
+        cp_plan: Optional[CPRankPlan] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function.
 
@@ -986,13 +997,16 @@ class MegatronPolicyWorkerImpl(
         if mbs is None:
             mbs = self.cfg["train_micro_batch_size"]
         local_gbs = gbs // self.dp_size
-        total_dataset_size = torch.tensor(data.size, device="cuda")
-        torch.distributed.all_reduce(
-            total_dataset_size,
-            op=torch.distributed.ReduceOp.SUM,
-            group=parallel_state.get_data_parallel_group(),
-        )
-        num_global_batches = int(total_dataset_size.item()) // gbs
+        if cp_plan is not None:
+            num_global_batches = len(cp_plan.steps)
+        else:
+            total_dataset_size = torch.tensor(data.size, device="cuda")
+            torch.distributed.all_reduce(
+                total_dataset_size,
+                op=torch.distributed.ReduceOp.SUM,
+                group=parallel_state.get_data_parallel_group(),
+            )
+            num_global_batches = int(total_dataset_size.item()) // gbs
 
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
@@ -1020,16 +1034,26 @@ class MegatronPolicyWorkerImpl(
             losses = []
             total_num_microbatches = 0
             for gb_idx in range(num_global_batches):
-                gb_result = process_global_batch(
-                    data,
-                    loss_fn=loss_fn,
-                    dp_group=parallel_state.get_data_parallel_group(),
-                    batch_idx=gb_idx,
-                    batch_size=local_gbs,
-                )
-                batch = gb_result["batch"]
-                global_valid_seqs = gb_result["global_valid_seqs"]
-                global_valid_toks = gb_result["global_valid_toks"]
+                cp_step = cp_plan.steps[gb_idx] if cp_plan is not None else None
+                if cp_step is not None:
+                    batch = data
+                    global_valid_seqs = torch.tensor(
+                        cp_step.valid_sequences, device="cuda"
+                    )
+                    global_valid_toks = torch.tensor(
+                        cp_step.valid_tokens, device="cuda"
+                    )
+                else:
+                    gb_result = process_global_batch(
+                        data,
+                        loss_fn=loss_fn,
+                        dp_group=parallel_state.get_data_parallel_group(),
+                        batch_idx=gb_idx,
+                        batch_size=local_gbs,
+                    )
+                    batch = gb_result["batch"]
+                    global_valid_seqs = gb_result["global_valid_seqs"]
+                    global_valid_toks = gb_result["global_valid_toks"]
 
                 # Pre-compute the MTP loss mask, only when MTP is enabled, so
                 # process_microbatch can pack it.
@@ -1058,6 +1082,8 @@ class MegatronPolicyWorkerImpl(
                     delegate_pack_to_model=self.delegate_pack_to_model,
                     delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
                     model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+                    cp_plan=cp_plan,
+                    cp_step=cp_step,
                 )
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
@@ -1199,6 +1225,17 @@ class MegatronPolicyWorkerImpl(
                     # keep all microbatch metrics to be normalized later
                     gb_loss_metrics = []
                     mb_losses = []
+                    if cp_step is not None:
+                        assert cp_plan is not None
+                        if len(losses_reduced) != len(cp_step.assignments):
+                            raise ValueError(
+                                "MCore executed a different number of phases than planned"
+                            )
+                        losses_reduced = [
+                            metric
+                            for metric, task in zip(losses_reduced, cp_step.assignments)
+                            if task.sample_indices and cp_plan.lane == task.lane_start
+                        ]
                     for x in losses_reduced:
                         loss_metrics = {}
                         for k in x.keys():
@@ -1252,7 +1289,9 @@ class MegatronPolicyWorkerImpl(
         mb_metrics, global_loss = aggregate_training_statistics(
             all_mb_metrics=all_mb_metrics,
             losses=losses,
-            data_parallel_group=parallel_state.get_data_parallel_group(),
+            data_parallel_group=parallel_state.get_data_parallel_group(
+                with_context_parallel=cp_plan is not None
+            ),
         )
 
         metrics = {
@@ -1341,12 +1380,14 @@ class MegatronPolicyWorkerImpl(
         *,
         data: BatchedDataDict[Any],
         micro_batch_size: Optional[int] = None,
+        cp_plan: Optional[CPRankPlan] = None,
     ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
         with self.use_reference_model():
             reference_logprobs = self.get_logprobs(
                 data=data,
                 micro_batch_size=micro_batch_size,
                 require_router_replay=False,
+                cp_plan=cp_plan,
             )
 
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
@@ -2110,6 +2151,7 @@ class MegatronPolicyWorkerImpl(
         data: BatchedDataDict[Any],
         micro_batch_size: Optional[int] = None,
         require_router_replay: bool = True,
+        cp_plan: Optional[CPRankPlan] = None,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get the logprobs of the model for a batch of data.
 
@@ -2154,6 +2196,8 @@ class MegatronPolicyWorkerImpl(
             delegate_pack_to_model=self.delegate_pack_to_model,
             delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+            cp_plan=cp_plan,
+            cp_step=cp_plan.steps[0] if cp_plan is not None else None,
         )
 
         use_fused_linear_logprobs = self.cfg["megatron_cfg"].get(
@@ -2584,6 +2628,7 @@ class MegatronPolicyWorkerImpl(
         data: BatchedDataDict[GenerationDatumSpec],
         k: int,
         micro_batch_size: Optional[int] = None,
+        cp_plan: Optional[CPRankPlan] = None,
     ):
         """Get the top-k logits and indices for a batch of data.
 
@@ -2621,6 +2666,8 @@ class MegatronPolicyWorkerImpl(
             delegate_pack_to_model=self.delegate_pack_to_model,
             delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+            cp_plan=cp_plan,
+            cp_step=cp_plan.steps[0] if cp_plan is not None else None,
         )
 
         list_of_outputs = megatron_forward_backward(

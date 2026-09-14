@@ -26,18 +26,22 @@ from megatron.core.parallel_state import (
     get_context_parallel_rank,
     get_context_parallel_world_size,
 )
+from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.utils import StragglerDetector
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.dynamic_context_parallel import CPRankPlan, CPRankStep
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.common import _round_up_to_multiple
+from nemo_rl.models.megatron.dynamic_cp import RuntimeCPContext, planned_microbatches
 from nemo_rl.models.megatron.hybridep import (
     get_packed_seq_padding_mask,
     pad_packed_seq_for_hybridep,
     uses_hybridep_flex_dispatcher,
 )
+from nemo_rl.models.policy.dynamic_cp import dynamic_cp_config
 from nemo_rl.utils.r3_trace import (
     r3_trace_verify_forward_enabled,
     trace_cp_routed_experts,
@@ -241,6 +245,8 @@ def get_microbatch_iterator(
     delegate_pack_to_model: bool = False,
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
+    cp_plan: Optional[CPRankPlan] = None,
+    cp_step: Optional[CPRankStep] = None,
 ) -> Tuple[Iterator[ProcessedMicrobatch], int, int, int, int]:
     """Create a processed microbatch iterator from a batch of data.
 
@@ -262,6 +268,27 @@ def get_microbatch_iterator(
         - seq_dim_size: Sequence length dimension size
         - padded_seq_length: Padded sequence length for pipeline parallelism (may differ from seq_length)
     """
+    # This check also protects scoring entrypoints that have not adopted the
+    # driver plan: falling back to static CP would silently misroute samples.
+    if cp_plan is None and dynamic_cp_config(cfg) is not None:
+        raise ValueError("Dynamic CP execution requires a driver-provided rank plan")
+    if cp_plan is not None:
+        if cp_step is None:
+            raise ValueError(
+                "Dynamic CP iterator requires an explicit optimizer-step plan"
+            )
+        width = data["input_ids"].shape[1]
+        return (
+            RerunDataIterator(
+                planned_microbatches(data, cp_plan, cp_step, straggler_timer)
+            ),
+            len(cp_step.assignments),
+            1,
+            width,
+            width,
+        )
+    if cp_step is not None:
+        raise ValueError("CP step supplied without a rank plan")
     micro_batch_size = mbs
     pad_factor = 1
     pad_full_seq_to = None
@@ -363,6 +390,7 @@ def process_microbatch(
     straggler_timer: Optional[StragglerDetector] = None,
     create_packed_seq_padding_mask: bool = False,
     prepad_packed_seq_for_hybridep: bool = False,
+    cp_context: Optional[RuntimeCPContext] = None,
 ) -> ProcessedInputs:
     """Process a microbatch for Megatron model forward pass."""
     if create_packed_seq_padding_mask and model_slices_context_parallel_inputs:
@@ -374,6 +402,11 @@ def process_microbatch(
         raise NotImplementedError(
             "HybridEP input prepadding requires NeMo-owned sequence packing."
         )
+    cp_rank = cp_context.rank if cp_context is not None else get_context_parallel_rank()
+    cp_size = (
+        cp_context.size if cp_context is not None else get_context_parallel_world_size()
+    )
+    cp_group = cp_context.group if cp_context is not None else None
     ctx = straggler_timer(bdata=True) if straggler_timer is not None else nullcontext()
     with ctx:
         input_ids = data_dict["input_ids"]
@@ -500,8 +533,8 @@ def process_microbatch(
                     pad_individual_seqs_to_multiple_of,
                     pad_packed_seq_to_multiple_of,
                     pad_full_seq_to,
-                    cp_rank=get_context_parallel_rank(),
-                    cp_size=get_context_parallel_world_size(),
+                    cp_rank=cp_rank,
+                    cp_size=cp_size,
                 )
                 if model_slices_context_parallel_inputs:
                     packed_seq_params = PackedSeqParams(
@@ -545,26 +578,24 @@ def process_microbatch(
                             packed_seq_params=packed_seq_params,
                             cu_seqlens_padded=cu_seqlens_padded,
                             pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
-                            cp_rank=get_context_parallel_rank(),
-                            cp_size=get_context_parallel_world_size(),
+                            cp_rank=cp_rank,
+                            cp_size=cp_size,
                         )
                     full_padding_mask = get_packed_seq_padding_mask(
                         cu_seqlens=cu_seqlens,
                         cu_seqlens_padded=cu_seqlens_padded,
                         total_tokens=input_ids.shape[1],
                     )
-                    if (
-                        model_slices_context_parallel_inputs
-                        or get_context_parallel_world_size() == 1
-                    ):
+                    if model_slices_context_parallel_inputs or cp_size == 1:
                         padding_mask = full_padding_mask
                     else:
                         cp_partition_indices = get_packed_seq_cp_partition_indices(
                             packed_seq_params,
                             total_tokens=input_ids.shape[1],
-                            cp_size=get_context_parallel_world_size(),
-                            cp_rank=get_context_parallel_rank(),
+                            cp_size=cp_size,
+                            cp_rank=cp_rank,
                             device=input_ids.device,
+                            cp_group=cp_group,
                         )
                         padding_mask = full_padding_mask.index_select(
                             1, cp_partition_indices
@@ -588,16 +619,17 @@ def process_microbatch(
                         seq_lengths,
                         cu_seqlens,
                         cu_seqlens_padded,
-                        get_context_parallel_rank(),
-                        get_context_parallel_world_size(),
+                        cp_rank,
+                        cp_size,
                     )
                     if model_slices_context_parallel_inputs:
                         cp_partition_indices = get_packed_seq_cp_partition_indices(
                             packed_seq_params,
                             total_tokens=input_ids.shape[1],
-                            cp_size=get_context_parallel_world_size(),
-                            cp_rank=get_context_parallel_rank(),
+                            cp_size=cp_size,
+                            cp_rank=cp_rank,
                             device=input_ids.device,
+                            cp_group=cp_group,
                         )
                         routed_experts_cp_sharded = routed_experts.index_select(
                             1, cp_partition_indices
@@ -637,8 +669,8 @@ def process_microbatch(
                         else input_ids_cp_sharded
                     ),
                     cp_token_identity_verified_count=verified_token_count,
-                    cp_rank=get_context_parallel_rank(),
-                    cp_size=get_context_parallel_world_size(),
+                    cp_rank=cp_rank,
+                    cp_size=cp_size,
                 )
 
                 # Pack pre-computed mtp_loss_mask the same way as input_ids
@@ -655,8 +687,8 @@ def process_microbatch(
                         pad_individual_seqs_to_multiple_of,
                         pad_packed_seq_to_multiple_of,
                         pad_full_seq_to,
-                        cp_rank=get_context_parallel_rank(),
-                        cp_size=get_context_parallel_world_size(),
+                        cp_rank=cp_rank,
+                        cp_size=cp_size,
                     )
                     # Mirror the input_ids layout choice above. A model that
                     # slices CP itself receives the full THD row so it can insert
@@ -694,8 +726,8 @@ def process_microbatch(
                         pad_individual_seqs_to_multiple_of,
                         pad_packed_seq_to_multiple_of,
                         pad_full_seq_to,
-                        cp_rank=get_context_parallel_rank(),
-                        cp_size=get_context_parallel_world_size(),
+                        cp_rank=cp_rank,
+                        cp_size=cp_size,
                     )
                     # Mirror the input_ids layout choice above, for the same
                     # reason the MTP mask does: a model that slices CP itself
@@ -741,8 +773,8 @@ def process_microbatch(
                 token_identity_cp_sharded=token_identity_cp_sharded,
                 input_ids_cp_sharded=input_ids_cp_sharded,
                 cp_token_identity_verified_count=verified_token_count,
-                cp_rank=get_context_parallel_rank(),
-                cp_size=get_context_parallel_world_size(),
+                cp_rank=cp_rank,
+                cp_size=cp_size,
             )
             attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
                 data=input_ids,
@@ -761,6 +793,11 @@ def process_microbatch(
                 media_token_validity_mask = data_dict[
                     "media_token_validity_mask"
                 ].bool()
+    if cp_context is not None:
+        if packed_seq_params is None:
+            raise ValueError("Dynamic CP requires packed THD inputs")
+        packed_seq_params.local_cp_size = cp_size
+        packed_seq_params.cp_group = cp_group
     return ProcessedInputs(
         input_ids=input_ids,
         input_ids_cp_sharded=input_ids_cp_sharded,
