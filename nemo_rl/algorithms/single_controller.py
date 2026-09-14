@@ -146,7 +146,6 @@ from nemo_rl.environments.gym_checkpoint import (
     GymCheckpointPrepareResult,
     GymCompletedExecution,
     gym_checkpoint_staging_keys,
-    gym_generation_cut_proofs,
     gym_generation_cut_staging_keys,
     validate_gym_checkpoint_manifests,
 )
@@ -4480,11 +4479,6 @@ class SingleControllerActor:
                         else None
                     ),
                     gym_checkpoint=gym_checkpoint,
-                    gym_generation_cut_proofs=(
-                        gym_generation_cut_proofs(gym_prepare)
-                        if gym_prepare is not None and generation_cut_staging_keys
-                        else ()
-                    ),
                 )
                 manifest_text = (
                     json.dumps(manifest.to_dict(), sort_keys=True, indent=2) + "\n"
