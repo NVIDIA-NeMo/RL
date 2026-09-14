@@ -6432,3 +6432,27 @@ def test_grpo_train_sync_logs_data_plane_metrics_before_committing_the_step(
         if f"data_plane/{scope}/breakdown" in c.args
     ], "the per-op breakdown table was not logged"
     client.close()
+
+
+@pytest.mark.parametrize(
+    ("backend", "nccl_reshard", "release_grads", "expected"),
+    [
+        ("vllm", False, False, False),
+        ("vllm", False, True, True),
+        ("vllm", True, False, True),
+        ("dynamo", False, False, True),
+    ],
+)
+def test_noncolocated_refit_synchronizer_selection(
+    backend, nccl_reshard, release_grads, expected
+):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    assert (
+        grpo_mod._uses_managed_noncolocated_refit(
+            generation_backend=backend,
+            nccl_reshard_refit_enabled=nccl_reshard,
+            release_grads_before_refit=release_grads,
+        )
+        is expected
+    )
