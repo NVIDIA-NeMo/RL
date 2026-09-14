@@ -390,6 +390,17 @@ class DraftRuntimeLossWrapper:
     eagle3 TTT drafter) runs the draft forward on the hidden states and raw
     teacher logits captured during the policy forward (both detached, so the
     policy trunk's gradients are unchanged).
+
+    No context-parallel correction is needed here: the trainer's outer
+    backward multiplier (``dp*cp/cp_gradient_fanout``, see
+    ``LossPostProcessor``) is applied uniformly to the whole combined loss,
+    and that multiplier is calibrated for a loss that's *replicated* across
+    CP ranks (each local model contributes to cp_size loss consumers, hence
+    the ``/cp_gradient_fanout`` correction). The draft loss shares that same
+    replicated shape under CP -- its teacher/hidden inputs are allgathered
+    and computed identically on every CP rank -- so the policy-calibrated
+    outer multiplier already gives it the correct per-replica gradient scale
+    with no further adjustment.
     """
 
     def __init__(
@@ -397,19 +408,10 @@ class DraftRuntimeLossWrapper:
         loss_fn: Callable[..., tuple[torch.Tensor, dict[str, Any]]],
         prepare_fn: Callable[..., Any],
         draft_runtime: Any,
-        draft_loss_scale: float = 1.0,
     ):
         self.loss_fn = loss_fn
         self.prepare_fn = prepare_fn
         self.draft_runtime = draft_runtime
-        # Restores the draft's gradient scale under context parallelism: the
-        # trainer backprops (dp*cp/cp_gradient_fanout) * combined_loss, where
-        # the fanout division compensates the policy loss's CP gather fan-out.
-        # The draft loss is replicated across CP ranks (teacher/hiddens are
-        # allgathered) and its FSDP grads average over dp*cp, so it needs the
-        # full dp*cp multiplier; the caller passes cp_gradient_fanout here to
-        # cancel the division for the draft term only (1.0 when cp == 1).
-        self.draft_loss_scale = float(draft_loss_scale)
 
     def __call__(
         self,
@@ -431,10 +433,7 @@ class DraftRuntimeLossWrapper:
         )
 
         draft_loss, draft_metrics = self.draft_runtime.compute_loss(prepared_data)
-        combined_loss = (
-            policy_loss
-            + self.draft_runtime.loss_weight * self.draft_loss_scale * draft_loss
-        )
+        combined_loss = policy_loss + self.draft_runtime.loss_weight * draft_loss
         metrics.update(draft_metrics)
         return combined_loss, metrics
 

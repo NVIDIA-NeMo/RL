@@ -100,23 +100,3 @@ def test_draft_gradients_flow_only_through_draft_term():
     assert torch.isclose(draft_param.grad, torch.tensor(0.25 * 5.0))
     # The policy gradient must be independent of the draft term entirely.
     assert torch.isclose(policy_param.grad, torch.tensor(6.0))
-
-
-def test_draft_loss_scale_multiplies_draft_term_only():
-    """Under context parallelism the trainer backprops
-    (dp*cp/cp_gradient_fanout) * combined_loss; the draft term is replicated
-    across CP ranks and needs the full dp*cp multiplier, so the wrapper
-    rescales it by cp_gradient_fanout (no-op at cp=1)."""
-    policy_param = torch.tensor(2.0, requires_grad=True)
-    draft_param = torch.tensor(3.0, requires_grad=True)
-    runtime = _FakeDraftRuntime(draft_param * 5.0, loss_weight=0.5)
-    wrapper = DraftRuntimeLossWrapper(
-        loss_fn=_make_policy_loss_fn(policy_param),
-        prepare_fn=_fake_prepare_fn,
-        draft_runtime=runtime,
-        draft_loss_scale=4.0,
-    )
-    logits = torch.ones(2, 3)
-    combined, _ = wrapper(logits, {}, None, None)
-    expected_policy = logits.sum() * 2.0
-    assert torch.isclose(combined, expected_policy + 0.5 * 4.0 * (3.0 * 5.0))
