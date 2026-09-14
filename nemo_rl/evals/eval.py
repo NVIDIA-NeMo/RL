@@ -369,10 +369,10 @@ async def _run_env_eval_impl(
                 # Note: utils.py's format_prompt_for_vllm_generation uses pre-tokenized
                 # prompt_token_ids instead, since the training pipeline already has
                 # input_ids tensors. Both are valid vLLM inputs but may tokenize
-                # slightly differently. Only text-only rows have joinable
-                # string content; VLM rows carry a list of typed content parts.
+                # slightly differently. Truncated VLM rows also reach this branch,
+                # so stringify their content, which is still a list of typed parts.
                 fallback_content = "\n".join(
-                    message["content"] for message in message_log
+                    str(message["content"]) for message in message_log
                 )
                 prompts.append(fallback_content)
                 prompts_for_display.append(fallback_content)

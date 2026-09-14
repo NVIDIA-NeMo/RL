@@ -90,7 +90,8 @@ def test_vllm_utils_vlm_with_images_and_text():
     assert prompts[1]["multi_modal_data"]["image"] == ["img2a", "img2b"]
 
 
-def test_vllm_utils_vlm_with_custom_modality():
+def test_vllm_utils_forwards_unknown_modality_keys():
+    """NeMo-RL forwards keys; the served vLLM model validates supported modalities."""
     embedding = torch.ones(1, 2, 3)
     data = BatchedDataDict(
         {
@@ -106,6 +107,31 @@ def test_vllm_utils_vlm_with_custom_modality():
     assert prompts[0]["prompt_token_ids"] == [1, 2]
     assert multi_modal_data["image"] == "img"
     assert multi_modal_data["conditioning"] is embedding
+
+
+@pytest.mark.parametrize("empty_value", [None, [], ()])
+@pytest.mark.parametrize("content", [None, "formatted prompt"])
+def test_vllm_utils_omits_empty_modality_values(
+    empty_value: None | list | tuple, content: str | None
+) -> None:
+    audio = (torch.ones(4), 16000)
+    rows = [{"image": empty_value}, {"image": empty_value, "audio": audio}]
+    input_ids, input_lengths = _mk_inputs()
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "vllm_content": [content, content],
+            "vllm_multi_modal_data": rows,
+        }
+    )
+
+    prompts = format_prompt_for_vllm_generation(data)
+
+    assert prompts[0] == {"prompt_token_ids": input_ids[0].tolist()}
+    assert set(prompts[1]["multi_modal_data"]) == {"audio"}
+    assert prompts[1]["multi_modal_data"]["audio"] is audio
+    assert rows[1]["image"] is empty_value
 
 
 def test_vllm_utils_vlm_with_audio_and_video_intent_path():

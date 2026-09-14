@@ -191,9 +191,15 @@ def format_prompt_for_vllm_generation(
     multi_modal_rows = data.get(VLLM_MULTI_MODAL_DATA_KEY)
 
     def _get_multi_modal_data(index: int) -> dict[str, Any]:
-        if multi_modal_rows is None or multi_modal_rows[index] is None:
+        row = multi_modal_rows[index] if multi_modal_rows is not None else None
+        if not row:
             return {}
-        return dict(multi_modal_rows[index])
+        return {
+            modality: value
+            for modality, value in row.items()
+            if value is not None
+            and (not isinstance(value, (list, tuple)) or len(value) > 0)
+        }
 
     # vLLM-ready content and modality data share this formatter path.
     if content_rows is not None or multi_modal_rows is not None:
