@@ -53,6 +53,7 @@ from nemo_rl.algorithms.loss import (
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.utils import _pack_input_ids
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
+from nemo_rl.data.megatron_sft_packed import is_direct_packed_row
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
@@ -812,7 +813,7 @@ def should_reduce_loss_across_context_parallel(
     data: BatchedDataDict[Any] | dict[str, Any],
 ) -> bool:
     """Return whether scalar loss reporting must include context-parallel ranks."""
-    return "packed_cu_seqlens" in data and "target_ids" in data
+    return is_direct_packed_row(data)
 
 
 def strip_context_parallel_local_loss_metric(

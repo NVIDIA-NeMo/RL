@@ -299,45 +299,131 @@ def test_dataset_parser_preserves_messages_as_one_packed_row() -> None:
             id="missing-trailing-assistant",
         ),
         pytest.param([], "must start with a system message", id="empty-row"),
+        pytest.param(
+            [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": [{"type": "image"}]},
+                {"role": "assistant", "content": "answer"},
+            ],
+            "multimodal content is not supported",
+            id="non-string-content",
+        ),
     ],
 )
 def test_dataset_parser_rejects_invalid_packed_rows(
-    messages: list[dict[str, str]], error: str
+    messages: list[dict[str, Any]], error: str
 ) -> None:
     with pytest.raises(ValueError, match=error):
         _dataset_parser().format_data({"messages": messages})
 
 
+def test_packed_preprocessor_requires_cp_aligned_max_seq_length() -> None:
+    messages, turn_tokens = _parity_conversations([4])
+
+    with pytest.raises(ValueError, match="must be a multiple of"):
+        _preprocess(
+            messages,
+            _DummyTokenizer(turn_tokens),
+            max_seq_length=6,
+            prompt_format="identity",
+            context_parallel_size=4,
+        )
+
+
+def test_packed_preprocessor_warns_when_retokenization_overflows() -> None:
+    messages, turn_tokens = _parity_conversations([4, 4, 4])
+
+    with pytest.warns(UserWarning, match="overflowed max_seq_length"):
+        processed = _preprocess(
+            messages,
+            _DummyTokenizer(turn_tokens),
+            max_seq_length=4,
+            prompt_format="identity",
+        )
+
+    assert processed["input_ids"].shape == (4,)
+
+
+def test_resolve_packed_pad_token_uses_nested_processor_tokenizer() -> None:
+    class _Processor:
+        def __init__(self, tokenizer: _PadResolvingTokenizer) -> None:
+            self.tokenizer = tokenizer
+
+    processor = _Processor(_PadResolvingTokenizer(99))
+
+    assert (
+        _resolve_pad_token_id(
+            processor,
+            _prompt_config_with_pad_token("<custom-pad>"),
+        )
+        == 77
+    )
+
+
+def _parity_conversations(
+    conv_token_counts: list[int],
+) -> tuple[list[dict[str, str]], dict[tuple[str, str], list[int]]]:
+    """Build one (system, user, assistant) conversation per requested token count.
+
+    Every conversation starts with a system message, which is what
+    :func:`split_megatron_sft_conversations` treats as a segment boundary.
+    """
+    messages: list[dict[str, str]] = []
+    turn_tokens: dict[tuple[str, str], list[int]] = {}
+    next_token_id = 10
+    for conv_index, token_count in enumerate(conv_token_counts):
+        assert token_count >= 3, "a conversation needs system, user and assistant"
+        turn_lengths = {"system": 1, "user": 1, "assistant": token_count - 2}
+        for role in ("system", "user", "assistant"):
+            content = f"{role}-{conv_index}"
+            turn_tokens[(role, content)] = list(
+                range(next_token_id, next_token_id + turn_lengths[role])
+            )
+            next_token_id += turn_lengths[role]
+            messages.append({"role": role, "content": content})
+    return messages, turn_tokens
+
+
 @pytest.mark.mcore
-def test_packed_preprocessor_matches_megatron_without_appending_eod() -> None:
-    messages = [
-        {"role": "system", "content": "s"},
-        {"role": "user", "content": "u"},
-        {"role": "assistant", "content": "a"},
-    ]
-    turn_tokens = {
-        ("system", "s"): [10],
-        ("user", "u"): [20],
-        ("assistant", "a"): [30],
-    }
+@pytest.mark.parametrize(
+    ("conv_token_counts", "max_seq_length", "context_parallel_size", "cu_seqlens"),
+    [
+        pytest.param([3], 5, 1, [0, 5], id="single-conversation"),
+        pytest.param([3, 3], 8, 1, [0, 3, 8], id="two-segments"),
+        pytest.param([4, 3], 7, 1, [0, 4, 7], id="first-conversation-fills-exactly"),
+        pytest.param([4, 4], 8, 2, [0, 4, 8], id="cp-granularity-padding"),
+    ],
+)
+def test_packed_preprocessor_matches_megatron_without_appending_eod(
+    conv_token_counts: list[int],
+    max_seq_length: int,
+    context_parallel_size: int,
+    cu_seqlens: list[int],
+) -> None:
+    messages, turn_tokens = _parity_conversations(conv_token_counts)
 
     processed = _preprocess(
         messages,
         _DummyTokenizer(turn_tokens),
-        max_seq_length=5,
+        max_seq_length=max_seq_length,
         prompt_format="identity",
+        context_parallel_size=context_parallel_size,
     )
     megatron_processed = _megatron_preprocess(
         messages,
         _MegatronTokenizer(turn_tokens),
-        max_seq_length=5,
+        max_seq_length=max_seq_length,
+        context_parallel_size=context_parallel_size,
     )
 
     assert torch.equal(processed["input_ids"], megatron_processed["tokens"])
     assert torch.equal(processed["target_ids"], megatron_processed["labels"])
     assert torch.equal(processed["token_mask"], megatron_processed["loss_mask"])
     assert torch.equal(processed["position_ids"], megatron_processed["position_ids"])
-    assert torch.equal(processed["packed_cu_seqlens"], torch.tensor([0, 5]))
+    assert torch.equal(
+        processed["packed_cu_seqlens"],
+        torch.tensor(cu_seqlens, dtype=torch.int32),
+    )
     assert processed["packed_max_seqlen"] == megatron_processed["max_seqlen"].item()
 
 

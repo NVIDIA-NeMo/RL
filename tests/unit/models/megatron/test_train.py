@@ -1614,7 +1614,9 @@ def test_direct_model_loss_rejects_misaligned_target_mask():
             },
             True,
         ),
-        ({"packed_cu_seqlens": torch.tensor([[0, 4]])}, False),
+        # packed_cu_seqlens alone is enough: the direct collate is the only
+        # producer and it always emits target_ids alongside it.
+        ({"packed_cu_seqlens": torch.tensor([[0, 4]])}, True),
         ({"target_ids": torch.ones(1, 4)}, False),
     ],
 )

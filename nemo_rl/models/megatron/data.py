@@ -30,6 +30,11 @@ from megatron.core.parallel_state import (
 from megatron.core.utils import StragglerDetector, get_batch_on_this_cp_rank
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
+from nemo_rl.data.megatron_sft_packed import (
+    MEGATRON_SFT_PACKED_BATCH_FIELDS,
+    direct_packed_cp_granularity,
+    is_direct_packed_row,
+)
 from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
@@ -127,16 +132,7 @@ def _validate_direct_packed_microbatch(
     context_parallel_size: int,
 ) -> DirectPackedMetadata:
     """Validate direct-packed metadata before the batch moves to CUDA."""
-    required_keys = {
-        "target_ids",
-        "token_mask",
-        "sample_mask",
-        "position_ids",
-        "packed_cu_seqlens",
-        "packed_cu_seqlens_lengths",
-        "packed_max_seqlen",
-    }
-    missing_keys = sorted(required_keys.difference(data_dict.keys()))
+    missing_keys = sorted(MEGATRON_SFT_PACKED_BATCH_FIELDS.difference(data_dict.keys()))
     if missing_keys:
         raise ValueError(
             "Megatron direct packed rows are missing required fields: "
@@ -190,12 +186,13 @@ def _validate_direct_packed_microbatch(
             "packed_max_seqlen must equal the longest packed segment "
             f"({max(segment_lengths)})"
         )
+    cp_granularity = direct_packed_cp_granularity(context_parallel_size)
     if context_parallel_size > 1 and any(
-        length % (2 * context_parallel_size) != 0 for length in segment_lengths
+        length % cp_granularity != 0 for length in segment_lengths
     ):
         raise ValueError(
             "Direct packed SFT segment lengths must be divisible by "
-            f"2 * context_parallel_size ({2 * context_parallel_size})"
+            f"2 * context_parallel_size ({cp_granularity})"
         )
 
     target_aligned_loss_mask = data_dict["token_mask"] * data_dict[
@@ -252,7 +249,7 @@ def make_processed_microbatch_iterator(
 
     for data_dict in raw_iterator:
         direct_packed_metadata = None
-        if "packed_cu_seqlens" in data_dict:
+        if is_direct_packed_row(data_dict):
             direct_packed_metadata = _validate_direct_packed_microbatch(
                 data_dict,
                 context_parallel_size=get_context_parallel_world_size(),
@@ -393,7 +390,7 @@ def get_microbatch_iterator(
     create_packed_seq_padding_mask = False
     prepad_packed_seq_for_hybridep = False
 
-    direct_packed_rows = "packed_cu_seqlens" in data
+    direct_packed_rows = is_direct_packed_row(data)
     if direct_packed_rows:
         seq_dim_size = data["input_ids"].shape[1]
         domain_factor, kernel_divisor = _get_packed_sequence_alignment_factors(
@@ -406,8 +403,8 @@ def get_microbatch_iterator(
         if seq_dim_size % required_multiple != 0:
             raise ValueError(
                 f"Direct packed sequence length {seq_dim_size} must be divisible "
-                f"by {required_multiple}; regenerate the packed dataset with an "
-                "aligned sequence length"
+                f"by {required_multiple}; set data.max_input_seq_length to a "
+                "multiple of that value"
             )
     else:
         _, seq_dim_size = get_and_validate_seqlen(data)
@@ -505,7 +502,13 @@ def _get_direct_packed_bundle_on_this_cp_rank(
     cp_rank: int,
     direct_packed_metadata: Optional[DirectPackedMetadata] = None,
 ) -> tuple[dict[str, torch.Tensor], PackedSeqParams]:
-    """Apply current-main per-sequence zigzag CP sharding to packed row tensors."""
+    """Apply mcore per-document zigzag CP sharding to packed row tensors.
+
+    ``get_batch_on_this_cp_rank`` dispatches to
+    ``_get_batch_on_this_cp_rank_per_document_balancing`` because ``cu_seqlens``
+    is not None and ``is_hybrid_cp`` is False, which is why every packed segment
+    must be divisible by ``2 * cp_size``.
+    """
     if not batch:
         raise ValueError("Direct packed SFT CP sharding requires at least one tensor")
     if cp_size < 1 or not 0 <= cp_rank < cp_size:
@@ -528,10 +531,11 @@ def _get_direct_packed_bundle_on_this_cp_rank(
         segment_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
         if bool((segment_lengths <= 0).any().item()):
             raise ValueError("Direct packed SFT sequence boundaries must increase")
-        if cp_size > 1 and bool((segment_lengths % (2 * cp_size) != 0).any().item()):
+        cp_granularity = direct_packed_cp_granularity(cp_size)
+        if cp_size > 1 and bool((segment_lengths % cp_granularity != 0).any().item()):
             raise ValueError(
                 "Direct packed SFT segment lengths must be divisible by "
-                f"2 * context_parallel_size ({2 * cp_size})"
+                f"2 * context_parallel_size ({cp_granularity})"
             )
 
     cp_batch = {name: tensor.contiguous() for name, tensor in batch.items()}
@@ -630,7 +634,7 @@ def process_microbatch(
         loss_mask_cp_sharded = None
         media_token_validity_mask = None
 
-        if "packed_cu_seqlens" in data_dict:
+        if is_direct_packed_row(data_dict):
             if delegate_pack_to_model:
                 raise NotImplementedError(
                     "Megatron direct packed rows do not support "
@@ -1267,7 +1271,7 @@ def process_global_batch(
 
     if "token_mask" not in batch:
         local_valid_toks = local_valid_seqs * batch["input_ids"].shape[1]
-    elif "target_ids" in batch:
+    elif is_direct_packed_row(batch):
         local_valid_toks = torch.sum(
             batch["token_mask"] * batch["sample_mask"].unsqueeze(-1)
         )

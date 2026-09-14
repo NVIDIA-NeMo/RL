@@ -165,6 +165,33 @@ def _validate_direct_megatron_sft_setup(
                 "SFT cannot mix direct Megatron-LM prepacked and regular datasets"
             )
 
+    # Every MegatronSFTPackedDataset registers under task_name
+    # "megatron_sft_packed", so a second one overwrites the first in
+    # task_data_processors and the guard above still sees a single entry. The
+    # config is the only place the duplicate is still visible.
+    for split_name in ("train", "validation"):
+        split_config = master_config.data.get(split_name)
+        if split_config is None:
+            continue
+        entries = (
+            list(split_config)
+            if isinstance(split_config, (list, tuple))
+            else [split_config]
+        )
+        packed_entries = sum(
+            1
+            for entry in entries
+            if hasattr(entry, "get")
+            and entry.get("dataset_name") == "megatron_sft_packed"
+        )
+        if packed_entries > 1:
+            raise ValueError(
+                f"data.{split_name} configures {packed_entries} "
+                "megatron_sft_packed datasets, but they all register under the "
+                "same task name so only the last one would be used. Merge them "
+                "into one packed dataset."
+            )
+
     policy_config = master_config.policy
     megatron_cfg = policy_config.get("megatron_cfg")
     if megatron_cfg is None or not megatron_cfg["enabled"]:
@@ -213,6 +240,14 @@ def _validate_direct_megatron_sft_setup(
             "Megatron-LM prepacked SFT because its assistant-token loss masks "
             "were materialized during offline packing. Set "
             "sft.only_unmask_final=false or use the online SFT data path."
+        )
+
+    if "sequence_packing" in policy_config and policy_config["sequence_packing"].get(
+        "fuse_loss", False
+    ):
+        raise ValueError(
+            "Direct Megatron-LM prepacked SFT does not support "
+            "policy.sequence_packing.fuse_loss=true"
         )
 
     if type(loss_fn) is not NLLLossFn or loss_fn.use_fused_linear_logprobs:

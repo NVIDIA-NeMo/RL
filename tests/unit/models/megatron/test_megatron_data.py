@@ -1562,6 +1562,9 @@ class TestProcessGlobalBatch:
                 "target_ids": torch.zeros(1, 4, dtype=torch.long),
                 "token_mask": torch.ones(1, 4),
                 "sample_mask": torch.ones(1),
+                # packed_cu_seqlens is the marker for the direct path; a row
+                # carrying target_ids without it is a legacy online row.
+                "packed_cu_seqlens": torch.tensor([[0, 4]], dtype=torch.int32),
             }
         )
         data = MagicMock()
@@ -2121,6 +2124,43 @@ class TestMakeProcessedMicrobatchIterator:
         with pytest.raises(
             ValueError,
             match="packed_max_seqlen must equal the longest packed segment",
+        ):
+            _validate_direct_packed_microbatch(data, context_parallel_size=1)
+
+    def test_direct_packed_metadata_rejects_segments_below_cp_granularity(self):
+        from nemo_rl.models.megatron.data import _validate_direct_packed_microbatch
+
+        # Segments are 4 tokens each, so they cannot be zigzag-sharded across
+        # cp=4, which needs every segment to be a multiple of 8.
+        data = _direct_packed_microbatch()
+
+        with pytest.raises(
+            ValueError,
+            match="segment lengths must be divisible by",
+        ):
+            _validate_direct_packed_microbatch(data, context_parallel_size=4)
+
+    def test_direct_packed_metadata_rejects_non_increasing_boundaries(self):
+        from nemo_rl.models.megatron.data import _validate_direct_packed_microbatch
+
+        data = _direct_packed_microbatch()
+        data["packed_cu_seqlens"] = torch.tensor([[0, 9, 8]], dtype=torch.int32)
+
+        with pytest.raises(
+            ValueError,
+            match="packed_cu_seqlens must contain increasing boundaries",
+        ):
+            _validate_direct_packed_microbatch(data, context_parallel_size=1)
+
+    def test_direct_packed_metadata_requires_input_ids(self):
+        from nemo_rl.models.megatron.data import _validate_direct_packed_microbatch
+
+        data = _direct_packed_microbatch()
+        del data["input_ids"]
+
+        with pytest.raises(
+            ValueError,
+            match="missing required fields: input_ids",
         ):
             _validate_direct_packed_microbatch(data, context_parallel_size=1)
 

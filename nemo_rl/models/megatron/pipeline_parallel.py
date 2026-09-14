@@ -128,14 +128,22 @@ def broadcast_loss_metrics_from_last_stage(
 ) -> LossMetricPayloadT:
     """Broadcast loss metrics from the last pipeline stage to all stages.
 
-    This utility handles the common pattern where loss computation happens on the last
-    pipeline stage and needs to be broadcast to all other stages.
+    Loss is computed only on the last pipeline stage, so every other stage needs
+    the result handed to it before it can report metrics.
 
     Args:
-        loss_metrics: List of loss metrics if on last stage, None otherwise
+        loss_metrics: The payload on the last pipeline stage, ``None`` on every
+            other stage. Either a ``dict`` of metrics or a ``list`` of such
+            dicts; the same shape comes back on every rank.
 
     Returns:
-        List of loss metrics on all ranks
+        The payload, on every rank. On the last stage this is a materialized
+        copy (tensors moved to host) rather than the object that was passed in,
+        because it is what actually went over the wire.
+
+    Raises:
+        ValueError: The last pipeline stage passed ``loss_metrics=None``.
+        RuntimeError: The broadcast completed but delivered no payload.
     """
     if get_pipeline_model_parallel_world_size() == 1:
         if loss_metrics is None:

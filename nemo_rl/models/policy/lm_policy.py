@@ -24,6 +24,10 @@ from ray.util.queue import Queue as RayQueue
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data.megatron_sft_packed import (
+    MEGATRON_SFT_PACKED_BATCH_FIELDS,
+    is_direct_packed_row,
+)
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
@@ -66,16 +70,7 @@ from nemo_rl.utils.timer import Timer
 
 PathLike = Union[str, "os.PathLike[Any]"]
 
-_DIRECT_PACKED_SFT_REQUIRED_KEYS = {
-    "input_ids",
-    "target_ids",
-    "token_mask",
-    "position_ids",
-    "sample_mask",
-    "packed_cu_seqlens",
-    "packed_cu_seqlens_lengths",
-    "packed_max_seqlen",
-}
+_DIRECT_PACKED_SFT_REQUIRED_KEYS = MEGATRON_SFT_PACKED_BATCH_FIELDS
 
 
 def _aggregate_megatron_flops_metrics(
@@ -623,7 +618,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         scalar metrics (no per-row outputs to reorder).
         """
         dp_size = self.data_parallel_size
-        if "packed_cu_seqlens" in data:
+        if is_direct_packed_row(data):
             missing = _DIRECT_PACKED_SFT_REQUIRED_KEYS.difference(data)
             if missing:
                 raise ValueError(

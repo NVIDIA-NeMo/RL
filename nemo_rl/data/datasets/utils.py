@@ -191,6 +191,7 @@ def resolve_external_dataset_class(dataset_name: str) -> type:
 # they configured. Keys consumed by the dispatchers themselves (dataset_name,
 # env_name, processor, prompt_file, system_prompt_file) are deliberately absent.
 _BEHAVIORAL_DATASET_CONFIG_KEYS = (
+    "chat_key",
     "chosen_key",
     "data_path",
     "download_dir",

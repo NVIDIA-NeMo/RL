@@ -57,6 +57,11 @@ class MegatronSFTPackedDataset(RawDataset):
             raise ValueError(
                 "Megatron SFT packed records must end with an assistant message"
             )
+        if any(not isinstance(message["content"], str) for message in messages):
+            raise ValueError(
+                "Megatron SFT packed records require string content; "
+                "multimodal content is not supported on this path"
+            )
         return {"packed_messages": messages, "task_name": self.task_name}
 
     def set_processor(self) -> None:

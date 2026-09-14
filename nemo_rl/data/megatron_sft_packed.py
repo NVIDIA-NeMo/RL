@@ -14,6 +14,8 @@
 
 """Megatron-LM SFT packed JSONL preprocessing helpers."""
 
+import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -63,6 +65,39 @@ def validate_megatron_sft_prompt_format(prompt_format: str) -> None:
 
 
 class MegatronSFTPackedDatumSpec(DatumSpec):
+    """One offline-packed SFT row, pre-shifted for the direct Megatron-LM path.
+
+    A ``.jsonl.packed`` record is re-tokenized at load time into a single row of
+    exactly ``max_seq_length`` target-aligned positions: ``input_ids`` is the
+    pack without its last token and ``target_ids`` is the pack without its
+    first, so nothing downstream shifts again.
+
+    Attributes:
+        input_ids: ``[max_seq_length]`` token ids, ``pack[:-1]``.
+        target_ids: ``[max_seq_length]`` labels, ``pack[1:]``. Prompt positions
+            and segment boundaries carry ``IGNORE_INDEX``; trailing padding
+            carries the pad id.
+        token_mask: ``[max_seq_length]`` float mask, ``0.0`` wherever
+            ``target_ids`` is padding or ``IGNORE_INDEX``. This is not cosmetic:
+            mcore's fused cross-entropy clamps ``IGNORE_INDEX`` before the vocab
+            gather and forces ``predicted_logits = 0.0``, so an ignored position
+            still emits ``log(sum_exp_logits)`` - a large finite loss with a
+            non-zero gradient. ``token_mask`` is the only thing that zeroes both
+            the loss and the gradient at those positions.
+        position_ids: ``[max_seq_length]`` positions that restart at 0 on every
+            packed segment boundary.
+        packed_cu_seqlens: ``[num_segments + 1]`` int32 cumulative segment
+            boundaries, from 0 through the packed row length. Its presence is
+            the single marker that a row took this path; see
+            :func:`is_direct_packed_row`.
+        packed_max_seqlen: Longest packed segment, used to build
+            ``PackedSeqParams``.
+        packed_context_parallel_size: Context-parallel size the row was padded
+            for. Every segment length is a multiple of
+            :func:`direct_packed_cp_granularity` because mcore shards packed
+            rows with *per-document* zigzag.
+    """
+
     input_ids: torch.Tensor
     target_ids: torch.Tensor
     token_mask: torch.Tensor
@@ -70,6 +105,40 @@ class MegatronSFTPackedDatumSpec(DatumSpec):
     packed_cu_seqlens: torch.Tensor
     packed_max_seqlen: int
     packed_context_parallel_size: int
+
+
+MEGATRON_SFT_PACKED_FIELDS = frozenset(
+    MegatronSFTPackedDatumSpec.__annotations__
+) - frozenset(DatumSpec.__annotations__)
+
+
+# Fields a collated direct-packed microbatch carries. ``packed_context_parallel_size``
+# is consumed and validated by the collate itself, and the collate is what adds
+# ``sample_mask`` and ``packed_cu_seqlens_lengths``.
+MEGATRON_SFT_PACKED_BATCH_FIELDS = (
+    MEGATRON_SFT_PACKED_FIELDS - {"packed_context_parallel_size"}
+) | {"sample_mask", "packed_cu_seqlens_lengths"}
+
+
+def is_direct_packed_row(row: Mapping[str, Any]) -> bool:
+    """Return whether ``row`` came from the direct Megatron-LM prepacked path.
+
+    ``packed_cu_seqlens`` is the one authoritative marker. Every other field in
+    :data:`MEGATRON_SFT_PACKED_FIELDS` is emitted alongside it by
+    :func:`megatron_sft_packed_preprocessor`, so testing any other key answers a
+    different question and the answers drift apart.
+    """
+    return "packed_cu_seqlens" in row
+
+
+def direct_packed_cp_granularity(context_parallel_size: int) -> int:
+    """Return the token multiple every direct-packed segment must satisfy.
+
+    mcore shards packed rows with per-document zigzag, which cuts each document
+    into ``2 * cp_size`` chunks, so a segment length that is not a multiple of
+    this value cannot be sharded.
+    """
+    return 2 * context_parallel_size
 
 
 def split_megatron_sft_conversations(
@@ -207,17 +276,22 @@ def _tokenize_megatron_sft_conversation(
 
 
 def _resolve_pad_token_id(tokenizer: Any, prompt_config: _PromptConfig) -> int:
+    # An AutoProcessor exposes the text tokenizer as ``.tokenizer`` and has no
+    # ``convert_tokens_to_ids`` of its own.
+    text_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
     if prompt_config.pad_token is not None:
-        pad_token_id = int(tokenizer.convert_tokens_to_ids(prompt_config.pad_token))
-    elif tokenizer.pad_token_id is not None:
-        pad_token_id = int(tokenizer.pad_token_id)
+        pad_token_id = int(
+            text_tokenizer.convert_tokens_to_ids(prompt_config.pad_token)
+        )
+    elif text_tokenizer.pad_token_id is not None:
+        pad_token_id = int(text_tokenizer.pad_token_id)
     else:
         raise ValueError(
             "Megatron SFT packed data requires a pad token distinct from EOS"
         )
 
-    if tokenizer.eos_token_id is not None and pad_token_id == int(
-        tokenizer.eos_token_id
+    if text_tokenizer.eos_token_id is not None and pad_token_id == int(
+        text_tokenizer.eos_token_id
     ):
         raise ValueError(
             "Megatron SFT packed data requires a pad token distinct from EOS"
@@ -244,6 +318,13 @@ def megatron_sft_packed_preprocessor(
         raise ValueError("max_seq_length must be a positive integer")
     if context_parallel_size < 1:
         raise ValueError("context_parallel_size must be >= 1")
+    cp_granularity = direct_packed_cp_granularity(context_parallel_size)
+    if context_parallel_size > 1 and max_seq_length % cp_granularity != 0:
+        raise ValueError(
+            f"max_seq_length={max_seq_length} must be a multiple of "
+            f"2 * context_parallel_size ({cp_granularity}) for Megatron SFT "
+            "packed data; set data.max_total_sequence_length accordingly"
+        )
 
     prompt_config = _get_prompt_config(prompt_format, pad_token, assistant_prefix_len)
     pack_length = max_seq_length
@@ -263,7 +344,9 @@ def megatron_sft_packed_preprocessor(
         pack_targets.extend([pad] * pad_len)
         pack_positions.extend(range(start_position, start_position + pad_len))
 
-    for conversation in conversations:
+    truncated_conversation = False
+    dropped_conversations = 0
+    for conversation_index, conversation in enumerate(conversations):
         tokens, targets = _tokenize_megatron_sft_conversation(
             conversation,
             tokenizer,
@@ -278,14 +361,14 @@ def megatron_sft_packed_preprocessor(
         pack_positions.extend(range(len(tokens)))
 
         if context_parallel_size > 1:
-            pad_granularity = context_parallel_size * 2
-            mod_token_count = len(pack_tokens) % pad_granularity
+            mod_token_count = len(pack_tokens) % cp_granularity
             if mod_token_count != 0:
-                extend_with_padding(pad_granularity - mod_token_count)
+                extend_with_padding(cp_granularity - mod_token_count)
 
         cu_seqlens.append(len(pack_tokens))
 
         if len(pack_tokens) == pack_length:
+            dropped_conversations = len(conversations) - conversation_index - 1
             break
 
         if len(pack_tokens) >= pack_length + 1:
@@ -295,7 +378,25 @@ def megatron_sft_packed_preprocessor(
             pack_targets.append(pad)
             pack_positions = pack_positions[: pack_length + 1]
             cu_seqlens[-1] = len(pack_tokens) - 1
+            truncated_conversation = True
+            dropped_conversations = len(conversations) - conversation_index - 1
             break
+
+    if truncated_conversation or dropped_conversations:
+        # The offline packer already sized this row to max_seq_length. Overflow
+        # here means retokenization was more verbose than the packer's, so the
+        # tail of the row is silently thrown away.
+        truncation_note = (
+            "the last conversation was truncated and " if truncated_conversation else ""
+        )
+        warnings.warn(
+            f"Megatron SFT packed row idx={idx} overflowed max_seq_length="
+            f"{max_seq_length} during retokenization: {truncation_note}"
+            f"{dropped_conversations} of {len(conversations)} conversations were "
+            "dropped. The loader tokenizer and pack length must match the ones "
+            "the offline packer used.",
+            stacklevel=2,
+        )
 
     if len(pack_tokens) < pack_length + 1:
         extend_with_padding(pack_length + 1 - len(pack_tokens))
@@ -324,7 +425,6 @@ def megatron_sft_packed_preprocessor(
     cu_seqlens_tensor = torch.tensor(cu_seqlens, dtype=torch.int32)
     adjacent_diffs = cu_seqlens_tensor[1:] - cu_seqlens_tensor[:-1]
     if context_parallel_size > 1:
-        cp_granularity = 2 * context_parallel_size
         if bool((adjacent_diffs % cp_granularity != 0).any().item()):
             raise ValueError(
                 "Megatron SFT packed segment lengths must be divisible by "

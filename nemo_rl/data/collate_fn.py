@@ -21,21 +21,18 @@ from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
 )
-from nemo_rl.data.megatron_sft_packed import MegatronSFTPackedDatumSpec
+from nemo_rl.data.megatron_sft_packed import (
+    MEGATRON_SFT_PACKED_FIELDS,
+    MegatronSFTPackedDatumSpec,
+    direct_packed_cp_granularity,
+    is_direct_packed_row,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 TokenizerType = Union[PreTrainedTokenizerBase, AutoProcessor]
 
-_MEGATRON_SFT_PACKED_FIELDS = {
-    "input_ids",
-    "target_ids",
-    "token_mask",
-    "position_ids",
-    "packed_cu_seqlens",
-    "packed_max_seqlen",
-    "packed_context_parallel_size",
-}
-_MEGATRON_SFT_PACKED_REQUIRED_FIELDS = _MEGATRON_SFT_PACKED_FIELDS | {
+# Derived from the spec so the schema has exactly one definition.
+_MEGATRON_SFT_PACKED_REQUIRED_FIELDS = MEGATRON_SFT_PACKED_FIELDS | {
     "length",
     "loss_multiplier",
     "idx",
@@ -46,7 +43,7 @@ def _collate_megatron_sft_packed(
     data_batch: list[DatumSpec],
     megatron_sft_context_parallel_size: int | None,
 ) -> BatchedDataDict[Any] | None:
-    packed_rows = ["packed_cu_seqlens" in datum_spec for datum_spec in data_batch]
+    packed_rows = [is_direct_packed_row(datum_spec) for datum_spec in data_batch]
     if not any(packed_rows):
         return None
     if not all(packed_rows):
@@ -144,7 +141,7 @@ def _collate_megatron_sft_packed(
                 "context_parallel_size"
             )
         if context_parallel_size > 1:
-            cp_granularity = 2 * context_parallel_size
+            cp_granularity = direct_packed_cp_granularity(context_parallel_size)
             if bool((segment_lengths % cp_granularity != 0).any().item()):
                 raise ValueError(
                     "Packed Megatron SFT cu_seqlens segment lengths must be "
