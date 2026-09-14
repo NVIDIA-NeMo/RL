@@ -84,6 +84,9 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
         rows = [
             {
                 "_rowidx": index,
+                "_ng_rollout_id": f"group_g{index}",
+                "_ng_attempt_index": 0,
+                "_ng_capture_id": f"group_g{index}",
                 "task_source": "test_resources_server",
                 "responses_create_params": {"input": []},
             }
@@ -135,6 +138,107 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
     captured = capsys.readouterr()
     assert "1. resolved_agent: 1" in captured.err
     assert "task-source:test_resources_server" not in captured.err
+
+
+def test_token_capture_forwards_logical_id_and_attempt_unchanged() -> None:
+    row = {
+        "_rowidx": 0,
+        "_ng_rollout_id": "group_g0",
+        "_ng_attempt_index": 2,
+        "_ng_capture_id": "group_g0-a2",
+        "agent_ref": {"name": "agent"},
+        "responses_create_params": {"input": []},
+    }
+
+    class _RolloutCollectionHelper:
+        def run_examples(self, examples, head_server_config):
+            del head_server_config
+            forwarded = examples[0]
+            assert forwarded["_ng_rollout_id"] == "group_g0"
+            assert forwarded["_ng_attempt_index"] == 2
+            assert forwarded["_ng_capture_id"] == "group_g0-a2"
+
+            async def _completed_result():
+                return forwarded, {"response": {"output": []}}
+
+            return [_completed_result()]
+
+    class _MockSelf:
+        cfg = {}
+        rch = _RolloutCollectionHelper()
+        head_server_config = object()
+        _token_capture_enabled = True
+        _tokenizer = object()
+
+        def _require_spinup(self):
+            pass
+
+        async def _postprocess_receipt_mode(self, forwarded, result):
+            del result
+            assert forwarded["_ng_rollout_id"] == "group_g0"
+            assert forwarded["_ng_attempt_index"] == 2
+            assert forwarded["_ng_capture_id"] == "group_g0-a2"
+            return {"message_log": []}
+
+    async def _run() -> tuple:
+        stream = NemoGym.__ray_metadata__.modified_class.run_rollouts(
+            _MockSelf(), [row], "test"
+        )
+        return await stream.__anext__()
+
+    rowidx, _, _, _ = asyncio.run(_run())
+    assert rowidx == 0
+    assert row["_ng_rollout_id"] == "group_g0"
+    assert row["_ng_attempt_index"] == 2
+
+
+@pytest.mark.parametrize(
+    ("attempt_index", "capture_key"),
+    [(0, "logical-rollout"), (1, "logical-rollout-a1")],
+)
+def test_receipt_lookup_uses_attempt_qualified_capture_key(
+    attempt_index: int, capture_key: str
+) -> None:
+    class _MockSelf:
+        def __init__(self) -> None:
+            self.control_paths: list[str] = []
+
+        async def _control(self, method, path):
+            assert method == "GET"
+            self.control_paths.append(path)
+            return {}
+
+        def _assemble_receipt(
+            self,
+            rollout_id,
+            manifest,
+            *,
+            terminal_response_id,
+            scored_response,
+            reward,
+        ):
+            del manifest, terminal_response_id, scored_response, reward
+            return {"rollout_id": rollout_id}
+
+    mock_self = _MockSelf()
+    row = {
+        "_ng_rollout_id": "logical-rollout",
+        "_ng_attempt_index": attempt_index,
+        "_ng_capture_id": capture_key,
+    }
+    result = asyncio.run(
+        NemoGym.__ray_metadata__.modified_class._postprocess_receipt_mode(
+            mock_self,
+            row,
+            {"response": {}, "reward": 1.0},
+        )
+    )
+
+    assert row["_ng_rollout_id"] == "logical-rollout"
+    assert result["rollout_id"] == capture_key
+    assert mock_self.control_paths == [
+        f"/training-token-capture/control/rollouts/{capture_key}/manifest"
+    ]
 
 
 def test_multimodal_content_types_cover_responses_media_aliases():
@@ -1588,6 +1692,9 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
     async def _run():
         nemo_gym_row = {
             "_rowidx": 7,
+            "_ng_rollout_id": "group_g7",
+            "_ng_attempt_index": 0,
+            "_ng_capture_id": "group_g7",
             "agent_ref": {"name": "legacy_test_agent"},
             "responses_create_params": {
                 "input": [
@@ -1685,6 +1792,9 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
 
         row = {
             "_rowidx": 3,
+            "_ng_rollout_id": "group_g3",
+            "_ng_attempt_index": 0,
+            "_ng_capture_id": "group_g3",
             "task_source": "test_resources_server",
             "agent_ref": {"name": "mock-megatron-agent"},
             "responses_create_params": {
