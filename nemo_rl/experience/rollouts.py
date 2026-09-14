@@ -43,6 +43,7 @@ from nemo_rl.data.llm_message_utils import (
     get_keys_from_message_log,
 )
 from nemo_rl.data.multimodal_utils import (
+    ROLLOUT_MATCHED_MEDIA_KEY,
     NATIVE_MULTIMODAL_KEYS,
     VLLM_MULTIMODAL_DATA_KEYS,
     PackedTensor,
@@ -213,19 +214,37 @@ def _reattach_static_multimodal_payloads_to_result(
     result: dict[str, Any],
     source_message_log: list[dict[str, Any]],
 ) -> None:
-    """Restore static media to each Gym-authored message-log representation."""
+    """Restore static media to each Gym-authored message-log representation.
+
+    ``input_message_log`` is a slice of ``message_log``, so the two views alias
+    the same message dictionaries; share one processed-id set so each message
+    is handled once and a rollout-matched marker consumed while processing one
+    view cannot expose the same message to overwriting via the other.
+    """
+    processed_target_ids: set[int] = set()
     for log_key in ("input_message_log", "message_log"):
         target_log = result.get(log_key)
         if not target_log:
             continue
-        attach_static_multimodal_payload(target_log, source_message_log)
+        attach_static_multimodal_payload(
+            target_log, source_message_log, processed_target_ids
+        )
 
 
 def attach_static_multimodal_payload(
     target_message_log: list[dict[str, Any]],
     source_message_log: list[dict[str, Any]],
+    processed_target_ids: "set[int] | None" = None,
 ) -> None:
-    """Copy policy-ready media from static source turns to Gym-authored turns."""
+    """Copy policy-ready media from static source turns to Gym-authored turns.
+
+    Callers that attach to several views of the same rollout (e.g. a result's
+    ``input_message_log`` and ``message_log``, or a prompt log and its
+    completions) may alias the same message dictionaries across views. Pass one
+    shared ``processed_target_ids`` set across those calls: each unique message
+    is then processed exactly once, so a rollout-matched marker consumed on the
+    first view cannot leave later views free to overwrite the repaired media.
+    """
     source_users = [
         message for message in source_message_log if message.get("role") == "user"
     ]
@@ -238,6 +257,17 @@ def attach_static_multimodal_payload(
             "turns than the source prompt."
         )
     for source, target in zip(source_users, target_users):
+        if processed_target_ids is not None:
+            if id(target) in processed_target_ids:
+                continue
+            processed_target_ids.add(id(target))
+        if target.pop(ROLLOUT_MATCHED_MEDIA_KEY, False):
+            # The Gym actor attached rollout-matched media for this turn (e.g.
+            # after vetoing dedup omission on a budget-bound row); never
+            # overwrite it with the statically-budgeted prompt copy. Key
+            # presence alone is not provenance: targets may carry placeholder
+            # or stale payloads that this copy is expected to replace.
+            continue
         for key, value in source.items():
             if isinstance(value, PackedTensor) or key in NATIVE_MULTIMODAL_KEYS:
                 target[key] = value
