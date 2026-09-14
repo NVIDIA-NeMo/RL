@@ -474,7 +474,7 @@ class VllmInternalWorkerExtension:
         )
         dropped = len(policy_weights) - len(kept)
         if dropped and not getattr(self, "_logged_tied_alias_drop", False):
-            self._logged_tied_alias_drop = True
+            self._logged_tied_alias_drop = True  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
             logger.info(
                 "Refit dropped %d tied-embedding alias weight(s); vLLM ties %s",
                 dropped,
