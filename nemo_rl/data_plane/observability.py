@@ -160,7 +160,6 @@ def _with_mirrors(fields: Sequence[str]) -> list[str]:
     return [*plain, *(_hash_field(f) for f in plain)]
 
 
-
 # Rows a client may write between reconciliations of its live-key accounting
 # against the partition. One metadata call per this many rows put, so a client
 # that clears its own writes never makes one.
@@ -1814,6 +1813,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         fetch = list(select_fields)
         if self._verify_tensor_hash:
             fetch = _with_mirrors(select_fields)
+
         def read(columns):
             return self._run(
                 "get",
