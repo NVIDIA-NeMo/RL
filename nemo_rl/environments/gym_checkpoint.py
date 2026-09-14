@@ -920,12 +920,20 @@ def gym_generation_cut_staging_keys(
                     and (rollout_id, attempt_index + 1) in excluded
                 ):
                     continue
-                staging_key = prefix.get("staging_key")
-                if not isinstance(staging_key, str) or not staging_key:
+                staging_keys = prefix.get("staging_keys")
+                if not isinstance(staging_keys, list) or not staging_keys:
                     raise ValueError(
-                        "durable Gym generation-cut prefix requires a staging key"
+                        "durable Gym generation-cut prefix requires staging keys"
                     )
-                keys.add(staging_key)
+                if any(not isinstance(key, str) or not key for key in staging_keys):
+                    raise ValueError(
+                        "durable Gym generation-cut prefix contains an invalid staging key"
+                    )
+                if len(staging_keys) != len(set(staging_keys)):
+                    raise ValueError(
+                        "durable Gym generation-cut prefix contains duplicate staging keys"
+                    )
+                keys.update(staging_keys)
     return keys
 
 
