@@ -194,7 +194,8 @@ def test_async_collector_cleanup_precedes_profiler_drain_failure_propagation(cap
 
     assert events == ["drain", "flush", "kill"]
     assert (
-        "Error draining trajectory collector: drain failed" in capsys.readouterr().out
+        "Error settling trajectory collector profiling: drain failed"
+        in capsys.readouterr().out
     )
 
 
