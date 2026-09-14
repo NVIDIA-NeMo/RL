@@ -26,6 +26,7 @@ import torch
 from omegaconf import OmegaConf
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+from nemo_rl.algorithms import grpo as grpo_mod
 from nemo_rl.algorithms.advantage_estimator import (
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
@@ -60,7 +61,6 @@ from nemo_rl.algorithms.grpo import (
     grpo_train,
     refit_policy_generation,
     setup,
-    shutdown_environments,
     validate,
 )
 from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
@@ -70,6 +70,7 @@ from nemo_rl.algorithms.reward_functions import (
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
+from nemo_rl.data.dataloader import CyclingDataLoader
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -215,6 +216,51 @@ def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
     policy.stream_weights_via_ipc_zmq.assert_called_once_with(
         buffer_size_bytes=1024**3,
         kv_scales=kv_scales,
+    )
+
+
+def test_megatron_m2n_refit_delegates_entirely_to_the_synchronizer() -> None:
+    """MegatronWeightSynchronizer owns the engine lifecycle; the caller must not duplicate it.
+
+    ``refit_policy_generation`` returns as soon as a weight synchronizer is
+    present, so suspend/offload/prepare/resume must NOT be driven here — they
+    live inside ``MegatronWeightSynchronizer.sync_weights`` and are asserted in
+    ``tests/unit/weight_sync/test_weight_synchronizer.py``.
+    """
+    policy = MagicMock()
+    generation = object.__new__(MegatronGeneration)
+    generation.suspend_for_refit = MagicMock()
+    generation.prepare_for_generation = MagicMock()
+    generation.resume_after_refit = MagicMock()
+    generation.weight_synchronizer = MagicMock()
+    generation.weight_synchronizer.sync_weights.return_value = {"bytes": 16.0}
+
+    metrics = refit_policy_generation(
+        policy,
+        generation,
+        colocated_inference=False,
+        kv_scales={"layer.0": 0.5},
+    )
+
+    assert metrics == {"bytes": 16.0}
+    generation.weight_synchronizer.sync_weights.assert_called_once_with(
+        timer=None, kv_scales={"layer.0": 0.5}
+    )
+    generation.suspend_for_refit.assert_not_called()
+    generation.prepare_for_generation.assert_not_called()
+    generation.resume_after_refit.assert_not_called()
+    policy.offload_before_refit.assert_not_called()
+
+
+def test_refit_returns_empty_metrics_when_synchronizer_returns_none() -> None:
+    """``sync_weights`` returning None must not propagate as the metrics dict."""
+    generation = object.__new__(MegatronGeneration)
+    generation.weight_synchronizer = MagicMock()
+    generation.weight_synchronizer.sync_weights.return_value = None
+
+    assert (
+        refit_policy_generation(MagicMock(), generation, colocated_inference=False)
+        == {}
     )
 
 
@@ -841,12 +887,34 @@ def test_multimodal_dedup_rejects_unqualified_transfer_paths(
         _validate_multimodal_dedup_capability(master_config)
 
     master_config.policy["generation"]["backend"] = "vllm"
+
+    # Data plane + NeMo-Gym stays rejected: ``grpo_train_sync`` never calls
+    # ``attach_initial_nemo_gym_image_payloads``, so the run would silently
+    # train on the media a Gym dataset omits from ``extra_env_info``.
     master_config.data_plane = {"enabled": True}
-    with pytest.raises(NotImplementedError, match="data_plane.enabled=false"):
+    with patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=True):
+        with pytest.raises(NotImplementedError, match="NeMo-Gym"):
+            _validate_multimodal_dedup_capability(master_config)
+
+    # Data plane without Gym is supported: the wire format carries dedup
+    # (``PackedTensor.to_wire`` emits one row per *logical* row), and the Gym
+    # attach helper is itself gated on ``should_use_nemo_gym``. Rejecting this
+    # blocked every Nemotron-Omni recipe, since all of them set
+    # ``deduplicate_multimodal_data: true``.
+    with patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=False):
         _validate_multimodal_dedup_capability(master_config)
 
     master_config.data_plane = {"enabled": False}
     _validate_multimodal_dedup_capability(master_config)
+
+    # And with dedup off, nothing is gated — the guard returns before it looks
+    # at the backend or at NeMo-Gym, so a text-only sync GRPO + Gym run is not
+    # blocked by a multimodal validator.
+    master_config.grpo.deduplicate_multimodal_data = False
+    master_config.policy["generation"]["backend"] = "sglang"
+    master_config.data_plane = {"enabled": True}
+    with patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=True):
+        _validate_multimodal_dedup_capability(master_config)
 
 
 def test_grpo_sync_seq_logprob_error_helper_accepts_dict_result(monkeypatch):
@@ -1236,16 +1304,11 @@ def mock_async_grpo_infrastructure(
         checkpoint_cut_ordinal=checkpoint_cut_ordinal,
     )
 
-    # Patch venv creation
+    # Patch actor runtime environment creation
     stack.enter_context(
         patch(
-            "nemo_rl.algorithms.grpo.create_local_venv_on_each_node",
-            return_value="/fake/venv",
-        )
-    )
-    stack.enter_context(
-        patch(
-            "nemo_rl.algorithms.grpo.get_actor_python_env", return_value="/fake/python"
+            "nemo_rl.algorithms.grpo.make_actor_runtime_env",
+            return_value={"py_executable": "/fake/python", "env_vars": {}},
         )
     )
 
@@ -1956,35 +2019,6 @@ def test_async_grpo_awaits_resume_after_refit_failure(mock_grpo_components) -> N
             _initial_grpo_save_state(),
             master_config,
         )
-
-
-def test_shutdown_environments_drains_unique_actors_before_kill() -> None:
-    shared_environment = MagicMock()
-    failing_environment = MagicMock()
-    shared_shutdown_ref = object()
-    failing_shutdown_ref = object()
-    shared_environment.shutdown.remote.return_value = shared_shutdown_ref
-    failing_environment.shutdown.remote.return_value = failing_shutdown_ref
-
-    def get_or_fail(ref, timeout=None):
-        assert timeout == 10
-        if ref is failing_shutdown_ref:
-            raise RuntimeError("environment shutdown failed")
-        assert ref is shared_shutdown_ref
-        return True
-
-    with (
-        patch("nemo_rl.algorithms.grpo.ray.get", side_effect=get_or_fail),
-        patch("nemo_rl.algorithms.grpo.ray.kill") as ray_kill,
-    ):
-        shutdown_environments(
-            {"train": shared_environment, "failing": failing_environment},
-            {"validation": shared_environment},
-        )
-
-    shared_environment.shutdown.remote.assert_called_once_with()
-    failing_environment.shutdown.remote.assert_called_once_with()
-    ray_kill.assert_called_once_with(failing_environment)
 
 
 def test_should_use_nemo_gym_requires_dynamo_token_wrapper() -> None:
@@ -2990,12 +3024,11 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
     assert DynamoConfig.model_validate(dynamo_config).engine_world_size == 4
     synchronizer.init_communicator.assert_called_once_with()
     spinup_nemo_gym_actor.assert_called_once_with(
-        env_configs=master_config.env,
+        master_config.env,
         base_urls=["http://dynamo-wrapper.example/v1"],
         model_name=master_config.policy["model_name"],
         tokenizer=tokenizer,
         enable_router_replay=False,
-        routed_experts_dtype="int16",
         use_fastokens=False,
     )
 
@@ -3152,7 +3185,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
         def init_collective(self, *_args, **_kwargs):
             return []
 
-        def prepare_refit_info(self):
+        def prepare_refit_info(self, *, refit_payload_mode):
             return {}
 
     def legacy_policy_factory(
@@ -3189,6 +3222,9 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
 
         def prepare_refit_info(self, _state):
             pass
+
+        def get_refit_payload_mode(self):
+            return "hf_export"
 
         def init_collective(self, *_args, **_kwargs):
             return []
@@ -3291,7 +3327,7 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         def print_node_ip_and_gpu_id(self):
             pass
 
-        def prepare_refit_info(self):
+        def prepare_refit_info(self, *, refit_payload_mode):
             return {}
 
     class DummyTrtllmGeneration:
@@ -3303,6 +3339,9 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
 
         def prepare_refit_info(self, _state):
             pass
+
+        def get_refit_payload_mode(self):
+            return "hf_export"
 
     nemo_gym_actor = object()
     spinup_nemo_gym_actor = MagicMock(return_value=nemo_gym_actor)
@@ -3364,22 +3403,20 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
 
     assert result[2] is nemo_gym_actor
     spinup_nemo_gym_actor.assert_called_once_with(
-        env_configs=master_config.env,
+        master_config.env,
         base_urls=["http://trtllm.example/v1"],
         model_name="test-model",
         tokenizer=tokenizer,
         enable_router_replay=False,
-        routed_experts_dtype="int16",
         use_fastokens=False,
     )
 
 
+@pytest.mark.mcore
 def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
     monkeypatch, mock_grpo_components
 ):
-    """The initial refit must start a skip-load endpoint before Gym can finish."""
-    from nemo_rl.algorithms import grpo as grpo_mod
-
+    """The initial refit must start all skip-load endpoints before Gym can finish."""
     events = []
     gym_started = Event()
     engine_ready = Event()
@@ -3388,18 +3425,23 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
     checkpointer.load_training_info.return_value = None
     checkpointer.get_resume_paths.return_value = (None, None)
 
-    reserved_url = "http://megatron.example/v1"
-    port_holder = object()
+    reserved_urls = [
+        "http://megatron-a.example/v1",
+        "http://megatron-b.example/v1",
+    ]
+    reserved_http_server_ports = {0: 1234, 2: 5678}
+    port_holders = [object(), object()]
     generation = SimpleNamespace(
         weight_synchronizer=None,
         dp_openai_server_base_urls=[],
     )
     generation_cls = MagicMock(return_value=generation)
-    generation_cls.reserve_http_server_address.return_value = (
-        reserved_url,
-        1234,
-        port_holder,
+    generation_cls.reserve_http_server_addresses.return_value = (
+        reserved_urls,
+        reserved_http_server_ports,
+        port_holders,
     )
+    generation_cls.verify_served_addresses = MegatronGeneration.verify_served_addresses
 
     synchronizer = MagicMock()
     synchronizer.init_communicator.side_effect = lambda: events.append("init")
@@ -3407,14 +3449,16 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
     def sync_weights():
         assert gym_started.wait(timeout=5), "NeMo Gym did not start concurrently"
         events.append("sync")
-        generation.dp_openai_server_base_urls = [reserved_url]
+        # The served order is determined by worker completion, not the order
+        # addresses were reserved for Gym.
+        generation.dp_openai_server_base_urls = list(reversed(reserved_urls))
         engine_ready.set()
 
     synchronizer.sync_weights.side_effect = sync_weights
     nemo_gym_actor = object()
 
-    def spinup_nemo_gym_actor(**kwargs):
-        assert kwargs["base_urls"] == [reserved_url]
+    def spinup_nemo_gym_actor(_env_configs, **kwargs):
+        assert kwargs["base_urls"] == reserved_urls
         events.append("gym_started")
         gym_started.set()
         assert engine_ready.wait(timeout=5), (
@@ -3483,14 +3527,19 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
     result = grpo_mod.setup(master_config, MagicMock(), dataset, None)
 
     assert generation_cls.call_args.kwargs["skip_weight_load"] is True
-    assert generation_cls.call_args.kwargs["reserved_http_server_port"] == 1234
-    assert "reserved_http_server_port" not in policy_cls.call_args.kwargs
+    assert (
+        generation_cls.call_args.kwargs["reserved_http_server_ports"]
+        == reserved_http_server_ports
+    )
+    assert "reserved_http_server_ports" not in policy_cls.call_args.kwargs
     assert events.index("init") < events.index("sync")
     assert events.index("gym_started") < events.index("sync")
     assert events.index("sync") < events.index("gym_ready")
     synchronizer.init_communicator.assert_called_once_with()
     synchronizer.sync_weights.assert_called_once_with()
-    ray_kill.assert_called_once_with(port_holder)
+    assert [call.args for call in ray_kill.call_args_list] == [
+        (port_holder,) for port_holder in port_holders
+    ]
     setup_metrics = next(
         call.args[0]
         for call in logger.log_metrics.call_args_list
@@ -4590,6 +4639,7 @@ def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
     # Set max steps to 12
     master_config = mock_grpo_components["master_config"]
     master_config.grpo.max_num_steps = 12
+    master_config.grpo.max_num_epochs = 100
 
     grpo_save_state = _initial_grpo_save_state()
 
@@ -4657,7 +4707,7 @@ def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
 
 @pytest.mark.parametrize(
     "train_func", [grpo_train]
-)  # Only test sync version for epochs (async uses steps)
+)  # Sync coverage retained alongside the async regression below.
 def test_grpo_exit_on_max_epochs(mock_grpo_components, train_func):
     """Test that GRPO training loop exits when max_num_epochs is reached"""
     # Set max epochs to 2 and max steps to a large number
@@ -4707,6 +4757,63 @@ def test_grpo_exit_on_max_epochs(mock_grpo_components, train_func):
 
     # Verify we trained for exactly two epochs (20 batches)
     assert mock_grpo_components["policy"].train.call_count == 20
+
+
+def test_async_grpo_exit_on_max_epochs(mock_grpo_components, tmp_path):
+    """Async GRPO stops and saves at the epoch bound when it comes first."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_epochs = 2
+    master_config.grpo.max_num_steps = 100
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    master_config.checkpointing["enabled"] = True
+    master_config.checkpointing["save_period"] = 100
+    master_config.checkpointing["metric_name"] = None
+
+    checkpointer = mock_grpo_components["checkpointer"]
+    checkpointer.init_tmp_checkpoint.return_value = "/tmp/checkpoint"
+    checkpointer.checkpoint_dir = tmp_path
+
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+
+    grpo_save_state = _initial_grpo_save_state()
+    with (
+        mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+        patch(
+            "nemo_rl.algorithms.grpo.CyclingDataLoader",
+            wraps=CyclingDataLoader,
+        ) as cycling_dataloader_cls,
+        patch("nemo_rl.algorithms.grpo.torch.save"),
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            grpo_save_state,
+            master_config,
+        )
+
+    assert mock_grpo_components["policy"].train.call_count == 20
+    assert [
+        call.args[0] for call in checkpointer.init_tmp_checkpoint.call_args_list
+    ] == [20]
+    assert grpo_save_state.current_step == 20
+    assert grpo_save_state.total_steps == 20
+    assert master_config.grpo.max_num_steps == 20
+    cycling_dataloader_cls.assert_called_once_with(
+        mock_grpo_components["train_dataloader"]
+    )
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
@@ -6024,3 +6131,58 @@ def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
 )
 def test_needs_hf_refit_handshake(backend, nccl_reshard, colocated, expected):
     assert _needs_hf_refit_handshake(backend, nccl_reshard, colocated) is expected
+
+
+def test_grpo_train_shuts_down_environments_after_failure():
+    task_to_env = {"nemo_gym": MagicMock()}
+    val_task_to_env = task_to_env
+
+    with (
+        patch(
+            "nemo_rl.algorithms.grpo._grpo_train_impl",
+            side_effect=RuntimeError("rollout failed"),
+        ),
+        patch("nemo_rl.algorithms.grpo.shutdown_environments") as shutdown,
+        pytest.raises(RuntimeError, match="rollout failed"),
+    ):
+        grpo_train(
+            policy=MagicMock(),
+            policy_generation=MagicMock(),
+            wrapped_dataloader=MagicMock(),
+            val_dataloader=None,
+            tokenizer=MagicMock(),
+            loss_fn=MagicMock(),
+            task_to_env=task_to_env,
+            val_task_to_env=val_task_to_env,
+            logger=MagicMock(),
+            checkpointer=MagicMock(),
+            grpo_save_state=MagicMock(),
+            master_config=MagicMock(),
+        )
+
+    shutdown.assert_called_once_with(task_to_env, val_task_to_env)
+
+
+def test_grpo_train_shuts_down_environments_after_success():
+    task_to_env = {"nemo_gym": MagicMock()}
+
+    with (
+        patch("nemo_rl.algorithms.grpo._grpo_train_impl"),
+        patch("nemo_rl.algorithms.grpo.shutdown_environments") as shutdown,
+    ):
+        grpo_train(
+            policy=MagicMock(),
+            policy_generation=MagicMock(),
+            wrapped_dataloader=MagicMock(),
+            val_dataloader=None,
+            tokenizer=MagicMock(),
+            loss_fn=MagicMock(),
+            task_to_env=task_to_env,
+            val_task_to_env=task_to_env,
+            logger=MagicMock(),
+            checkpointer=MagicMock(),
+            grpo_save_state=MagicMock(),
+            master_config=MagicMock(),
+        )
+
+    shutdown.assert_called_once_with(task_to_env, task_to_env)

@@ -148,13 +148,19 @@ def _make_controller(
             ],
         ),
     )
-    ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
+    ctrl._rollout_manager = SimpleNamespace(
+        set_weight_version=MagicMock(),
+        suspend_request_deadlines=MagicMock(),
+        resume_request_deadlines=MagicMock(),
+    )
     ctrl._trainer_version = 7
     # _sync_weights now asks _should_use_nemo_gym before aborting stale in-flight
     # rollouts (upstream #3263). An empty env dict selects the native path, and an
     # empty registry makes _abort_stale_inflight a no-op -- neither is what this test
     # is about, but both have to exist for it to reach the refit.
-    ctrl._master_config = SimpleNamespace(env={})
+    ctrl._master_config = SimpleNamespace(
+        env={}, token_capture=SimpleNamespace(enabled=False)
+    )
     ctrl._inflight_by_group_id = {}
     ctrl._rollout_recovery_enabled = False
     return ctrl, monitor, sync

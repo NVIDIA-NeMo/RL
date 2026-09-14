@@ -1,0 +1,19 @@
+defaults: ./grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym.yaml
+# GB200 sizing: the same 8+8-GPU non-colocated split on 4-GPU nodes, so the
+# training group (CP2xEP8) and the dedicated inference group each span two
+# nodes and placement runs through the NVLink-domain topology path.
+checkpointing:
+  checkpoint_dir: results/grpo-nanov3-30BA3B-4n4g-megatron_generation-noncolocated-async-gym
+policy:
+  generation:
+    colocated:
+      resources:
+        gpus_per_node: 4
+        num_nodes: 2
+logger:
+  wandb:
+    name: grpo-nanov3-30BA3B-4n4g-megatron_generation-noncolocated-async-gym
+cluster:
+  gpus_per_node: 4
+  num_nodes: 4
+  segment_size: 2

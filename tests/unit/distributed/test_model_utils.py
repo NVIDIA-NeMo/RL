@@ -20,12 +20,16 @@ import torch
 
 from nemo_rl.algorithms.logits_sampling_utils import apply_top_k_top_p
 from nemo_rl.distributed.model_utils import (
+    ChunkedDistributedCrossEntropyToFixedLogits,
+    ChunkedDistributedEntropy,
     ChunkedDistributedGatherLogprob,
     ChunkedDistributedLogprob,
     ChunkedDistributedLogprobWithSampling,
+    ChunkedDistributedReverseKLToFixedLogits,
     DistributedLogprob,
     DistributedLogprobWithSampling,
     _compute_distributed_log_softmax,
+    _compute_distributed_selected_logprobs,
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
@@ -40,6 +44,104 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+
+
+def test_compute_distributed_selected_logprobs(monkeypatch):
+    """Selected-token path matches gathering a complete log-softmax tensor."""
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+
+    torch.manual_seed(42)
+    logits = torch.randn(2, 5, 11, dtype=torch.float32)
+    target = torch.randint(0, logits.shape[-1], (2, 5))
+    target_mask = torch.zeros_like(target, dtype=torch.bool)
+    target_mask[0, 3] = True
+
+    actual = _compute_distributed_selected_logprobs(
+        logits,
+        masked_target=target,
+        target_mask=target_mask,
+        group=None,
+    )
+    expected = (
+        torch.log_softmax(logits, dim=-1).gather(-1, target.unsqueeze(-1)).squeeze(-1)
+    )
+    expected[target_mask] = 0.0
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_compute_distributed_selected_logprobs_without_output_reduce(monkeypatch):
+    """The caller can own the final selected-logprob reduction."""
+    reduce_ops = []
+
+    def fake_all_reduce(tensor, *, op, group):
+        reduce_ops.append(op)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    torch.manual_seed(42)
+    logits = torch.randn(2, 5, 11, dtype=torch.float32)
+    target = torch.randint(0, logits.shape[-1], (2, 5))
+    target_mask = torch.zeros_like(target, dtype=torch.bool)
+
+    actual = _compute_distributed_selected_logprobs(
+        logits,
+        masked_target=target,
+        target_mask=target_mask,
+        group=None,
+        reduce_output=False,
+    )
+    expected = (
+        torch.log_softmax(logits, dim=-1).gather(-1, target.unsqueeze(-1)).squeeze(-1)
+    )
+
+    torch.testing.assert_close(actual, expected)
+    assert reduce_ops == [
+        torch.distributed.ReduceOp.MAX,
+        torch.distributed.ReduceOp.SUM,
+    ]
+
+
+def test_compute_distributed_selected_logprobs_tp_shards(monkeypatch):
+    """TP-local selected values reduce to full-vocabulary token logprobs."""
+    torch.manual_seed(123)
+    full_logits = torch.randn(2, 5, 12, dtype=torch.float32)
+    target = torch.randint(0, full_logits.shape[-1], (2, 5))
+    global_max = full_logits.amax(dim=-1, keepdim=True)
+    shifted_full_logits = full_logits - global_max
+    global_sum_exp = shifted_full_logits.exp().sum(dim=-1, keepdim=True)
+    expected = (
+        torch.log_softmax(full_logits, dim=-1)
+        .gather(-1, target.unsqueeze(-1))
+        .squeeze(-1)
+    )
+
+    shard_size = full_logits.shape[-1] // 2
+    for rank in range(2):
+        vocab_start = rank * shard_size
+        vocab_end = vocab_start + shard_size
+        target_mask = (target < vocab_start) | (target >= vocab_end)
+        masked_target = target - vocab_start
+        masked_target[target_mask] = 0
+        remote_selected_logprobs = expected.masked_fill(~target_mask, 0.0)
+
+        def fake_all_reduce(tensor, *, op, group):
+            if op == torch.distributed.ReduceOp.MAX:
+                tensor.copy_(global_max)
+            elif tensor.shape == global_sum_exp.shape:
+                tensor.copy_(global_sum_exp)
+            else:
+                tensor.add_(remote_selected_logprobs)
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+        actual = _compute_distributed_selected_logprobs(
+            full_logits[..., vocab_start:vocab_end].contiguous(),
+            masked_target=masked_target,
+            target_mask=target_mask,
+            group=None,
+        )
+        torch.testing.assert_close(actual, expected)
 
 
 @ray.remote(num_gpus=1)
@@ -1583,3 +1685,310 @@ def test_distributed_vocab_topk_ops(
         worker_group.shutdown(force=True)
     finally:
         cluster.shutdown()
+
+
+# ── Full-vocabulary MOPD divergence kernels ─────────────────────────────────
+# At TP=1 the distributed log-softmax degenerates to a plain one, so both
+# opd_full kernels can be pinned against a closed-form reference with no GPU and
+# no process group -- same monkeypatch style as _compute_distributed_selected_logprobs.
+
+
+@pytest.fixture
+def single_rank_collectives(monkeypatch):
+    """Neutralize the collectives so the kernels compute their TP=1 limit.
+
+    ``_compute_distributed_log_softmax`` reduces through two different entry
+    points -- ``torch.distributed.all_reduce`` for the running max and the
+    *differentiable* ``torch.distributed.nn.functional.all_reduce`` for the
+    normalizer -- and the per-token reduction uses the first one again. Patching
+    only one of them would silently leave a real collective in the path.
+    """
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor, *a, **kw: None)
+    monkeypatch.setattr(
+        torch.distributed.nn.functional,
+        "all_reduce",
+        lambda tensor, *a, **kw: tensor,
+    )
+
+
+def _student_teacher_reference(
+    student: torch.Tensor, teacher: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Closed-form [B, S] reverse KL, cross entropy, and sum_v p_s log p_s."""
+    student_log_probs = torch.log_softmax(student.float(), dim=-1)
+    teacher_log_probs = torch.log_softmax(teacher.float(), dim=-1)
+    student_probs = student_log_probs.exp()
+    return (
+        (student_probs * (student_log_probs - teacher_log_probs)).sum(-1),
+        (-student_probs * teacher_log_probs).sum(-1),
+        (student_probs * student_log_probs).sum(-1),
+    )
+
+
+@pytest.mark.parametrize("chunk_size", [1, 3, 7, 32])
+def test_student_teacher_kernels_match_closed_form(single_rank_collectives, chunk_size):
+    """Forward values and chunk invariance for both opd_full kernels.
+
+    chunk_size 3 and 7 straddle S=7 so both the ragged-tail and the
+    single-chunk ``out_chunks[0]`` shortcut are exercised; 32 > S covers the
+    "whole sequence at once" default that ``chunk_size: null`` resolves to.
+    """
+    torch.manual_seed(0)
+    student = torch.randn(2, 7, 11)
+    teacher = torch.randn(2, 7, 11)
+    expected_kl, expected_ce, expected_neg_entropy = _student_teacher_reference(
+        student, teacher
+    )
+
+    reverse_kl = ChunkedDistributedReverseKLToFixedLogits.apply(
+        student, teacher, chunk_size, None, True
+    )
+    cross_entropy = ChunkedDistributedCrossEntropyToFixedLogits.apply(
+        student, teacher, chunk_size, None, True
+    )
+
+    torch.testing.assert_close(reverse_kl, expected_kl, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(cross_entropy, expected_ce, rtol=1e-5, atol=1e-6)
+    # Both kernels normalize in fp32 regardless of the input dtype.
+    assert reverse_kl.dtype == torch.float32
+    assert cross_entropy.dtype == torch.float32
+
+
+def test_student_teacher_decomposition_identity(single_rank_collectives):
+    """entropy + cross entropy == reverse KL, the residual the recipe gates on.
+
+    ``opd_full_decomposition_error`` in the nightly recipe asserts this holds;
+    pin the true noise floor here so a regression cannot hide under that
+    recipe's much looser threshold.
+    """
+    torch.manual_seed(1)
+    student = torch.randn(3, 5, 13)
+    teacher = torch.randn(3, 5, 13)
+
+    reverse_kl = ChunkedDistributedReverseKLToFixedLogits.apply(
+        student, teacher, 2, None, True
+    )
+    cross_entropy = ChunkedDistributedCrossEntropyToFixedLogits.apply(
+        student, teacher, 2, None, True
+    )
+    neg_entropy = ChunkedDistributedEntropy.apply(student, 2, None, True)
+
+    torch.testing.assert_close(
+        neg_entropy + cross_entropy, reverse_kl, rtol=0, atol=1e-5
+    )
+
+
+@pytest.mark.parametrize(
+    "kernel",
+    [
+        ChunkedDistributedReverseKLToFixedLogits,
+        ChunkedDistributedCrossEntropyToFixedLogits,
+    ],
+)
+@pytest.mark.parametrize("chunk_size", [2, 5])
+def test_student_teacher_backward_matches_autograd(
+    single_rank_collectives, kernel, chunk_size
+):
+    """The hand-written backward equals autograd through the reference.
+
+    Both kernels share ``dL/dz = p_s * (w - L)``, which drops the
+    ``dw/dlog p_s`` term because it is constant and cancels against
+    ``sum_v p_s = 1``. That cancellation is the whole reason the two weights can
+    share one backward, and nothing else checks it.
+    """
+    torch.manual_seed(2)
+    teacher = torch.randn(2, 5, 9)
+    grad_output = torch.randn(2, 5)
+
+    student = torch.randn(2, 5, 9, requires_grad=True)
+    kernel.apply(student, teacher, chunk_size, None, False).mul(
+        grad_output
+    ).sum().backward()
+
+    reference_student = student.detach().clone().requires_grad_(True)
+    reference_kl, reference_ce, _ = _student_teacher_reference(
+        reference_student, teacher
+    )
+    reference = (
+        reference_kl
+        if kernel is ChunkedDistributedReverseKLToFixedLogits
+        else reference_ce
+    )
+    reference.mul(grad_output).sum().backward()
+
+    torch.testing.assert_close(
+        student.grad, reference_student.grad, rtol=1e-4, atol=1e-5
+    )
+
+
+def test_student_teacher_backward_leaves_teacher_gradient_free(
+    single_rank_collectives,
+):
+    """The teacher is a frozen constant: no gradient may flow back into it."""
+    torch.manual_seed(3)
+    student = torch.randn(1, 4, 6, requires_grad=True)
+    teacher = torch.randn(1, 4, 6, requires_grad=True)
+
+    ChunkedDistributedReverseKLToFixedLogits.apply(
+        student, teacher, 2, None, False
+    ).sum().backward()
+
+    assert student.grad is not None
+    assert teacher.grad is None
+
+
+def test_reverse_kl_vanishes_for_identical_logits(single_rank_collectives):
+    """The self-distillation invariant the nightly recipe gates on, unit-sized."""
+    torch.manual_seed(4)
+    logits = torch.randn(1, 4, 13)
+
+    reverse_kl = ChunkedDistributedReverseKLToFixedLogits.apply(
+        logits, logits.clone(), 4, None, True
+    )
+
+    torch.testing.assert_close(
+        reverse_kl, torch.zeros_like(reverse_kl), rtol=0, atol=1e-6
+    )
+
+
+def test_student_teacher_kernels_accept_bf16_logits(single_rank_collectives):
+    """bf16 logits in, fp32 value and fp32 grad out -- the mainline dtype path."""
+    torch.manual_seed(5)
+    student = torch.randn(1, 4, 8, dtype=torch.bfloat16, requires_grad=True)
+    teacher = torch.randn(1, 4, 8, dtype=torch.bfloat16)
+
+    reverse_kl = ChunkedDistributedReverseKLToFixedLogits.apply(
+        student, teacher, 2, None, False
+    )
+    reverse_kl.sum().backward()
+
+    assert reverse_kl.dtype == torch.float32
+    assert student.grad is not None
+    # The kernel hands autograd an fp32 grad for a bf16 input, matching
+    # ChunkedDistributedEntropy; autograd casts it back to the leaf's dtype.
+    assert student.grad.dtype == student.dtype
+
+
+@pytest.mark.parametrize(
+    ("student_shape", "teacher_shape", "match"),
+    [
+        ((2, 5, 9), (2, 5, 8), r"same \[B, S, V_local\] shape"),
+        ((5, 9), (5, 9), "must be rank 3"),
+    ],
+)
+def test_student_teacher_kernels_reject_misaligned_shards(
+    single_rank_collectives, student_shape, teacher_shape, match
+):
+    """A teacher shard that is not this rank's vocabulary window must not run."""
+    with pytest.raises(ValueError, match=match):
+        ChunkedDistributedReverseKLToFixedLogits.apply(
+            torch.randn(*student_shape), torch.randn(*teacher_shape), 2, None, True
+        )
+
+
+def test_student_teacher_reduction_normalizes_both_sides_across_tp(monkeypatch):
+    """Both distributions are TP-normalized, not just the student's.
+
+    This is the one part of the kernels that TP=1 cannot observe: skipping the
+    teacher's log-softmax collectives is exactly correct at TP=1 and silently
+    wrong at TP>1, because the teacher's softmax denominator would then only
+    span this rank's vocabulary shard. Assert the collective trace instead.
+    """
+    plain_ops: list[object] = []
+    autograd_ops: list[object] = []
+
+    def fake_all_reduce(tensor, *args, **kwargs):
+        plain_ops.append(kwargs["op"])
+
+    def fake_autograd_all_reduce(tensor, *args, **kwargs):
+        autograd_ops.append(kwargs["op"])
+        return tensor
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+    monkeypatch.setattr(
+        torch.distributed.nn.functional, "all_reduce", fake_autograd_all_reduce
+    )
+
+    torch.manual_seed(6)
+    # S=4 over chunks of 2 -> two chunks, so the counts below are per-chunk x2.
+    ChunkedDistributedReverseKLToFixedLogits.apply(
+        torch.randn(1, 4, 6), torch.randn(1, 4, 6), 2, None, True
+    )
+
+    # Per chunk: a MAX for the student log-softmax, a MAX for the teacher's, and
+    # a SUM for the per-token reduction across vocabulary shards.
+    assert (
+        plain_ops
+        == [
+            torch.distributed.ReduceOp.MAX,
+            torch.distributed.ReduceOp.MAX,
+            torch.distributed.ReduceOp.SUM,
+        ]
+        * 2
+    )
+    # Per chunk: one normalizer SUM for each of the two distributions.
+    assert autograd_ops == [torch.distributed.ReduceOp.SUM] * 4
+
+
+def test_student_teacher_backward_reduces_the_normalizer_across_tp(monkeypatch):
+    """``dL/dz = p_s * (w - L)`` needs the GLOBAL ``L`` in backward as well.
+
+    The forward trace above stops at ``inference_only=True``. Backward
+    recomputes both log-softmaxes and ``L`` from the saved shards, so a backward
+    that forgot the SUM all-reduce on ``L`` would be exact at TP=1 and silently
+    wrong at TP>1 -- the same blind spot, one call later.
+    """
+    plain_ops: list[object] = []
+    autograd_ops: list[object] = []
+
+    def fake_all_reduce(tensor, *args, **kwargs):
+        plain_ops.append(kwargs["op"])
+
+    def fake_autograd_all_reduce(tensor, *args, **kwargs):
+        autograd_ops.append(kwargs["op"])
+        return tensor
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+    monkeypatch.setattr(
+        torch.distributed.nn.functional, "all_reduce", fake_autograd_all_reduce
+    )
+
+    torch.manual_seed(7)
+    student = torch.randn(1, 4, 6, requires_grad=True)
+    reverse_kl = ChunkedDistributedReverseKLToFixedLogits.apply(
+        student, torch.randn(1, 4, 6), 2, None, False
+    )
+    # Keep only the backward's collectives.
+    plain_ops.clear()
+    autograd_ops.clear()
+
+    reverse_kl.sum().backward()
+
+    # Per chunk: MAX for the student log-softmax, MAX for the teacher's, and the
+    # SUM that turns the shard-local ``L`` into the global one.
+    assert (
+        plain_ops
+        == [
+            torch.distributed.ReduceOp.MAX,
+            torch.distributed.ReduceOp.MAX,
+            torch.distributed.ReduceOp.SUM,
+        ]
+        * 2
+    )
+    assert autograd_ops == [torch.distributed.ReduceOp.SUM] * 4
+
+
+def test_student_teacher_kernels_normalize_bf16_logits_in_fp32(
+    single_rank_collectives,
+):
+    """A log-softmax taken in bf16 is off by ~1e-2; the fp32 path is within 1e-5."""
+    torch.manual_seed(5)
+    student = torch.randn(1, 4, 8, dtype=torch.bfloat16)
+    teacher = torch.randn(1, 4, 8, dtype=torch.bfloat16)
+
+    reverse_kl = ChunkedDistributedReverseKLToFixedLogits.apply(
+        student, teacher, 2, None, True
+    )
+
+    expected_kl, _, _ = _student_teacher_reference(student, teacher)
+    torch.testing.assert_close(reverse_kl, expected_kl, rtol=1e-5, atol=1e-5)

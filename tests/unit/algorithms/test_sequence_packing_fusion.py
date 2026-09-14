@@ -22,6 +22,7 @@ For loss function, currently only supports ClippedPGLossFn.
 """
 
 import functools
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -35,7 +36,60 @@ from nemo_rl.algorithms.loss import (
     prepare_loss_input,
     prepare_packed_loss_input,
 )
+from nemo_rl.algorithms.loss.interfaces import LossInputType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+def test_prepare_packed_loss_input_preserves_prepacked_layout(monkeypatch):
+    """Prepacked rows keep their layout and shift targets per source."""
+    input_ids = torch.tensor([[10, 11, 12, 0, 20, 21, 0, 0]])
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": torch.tensor([8]),
+            "token_mask": torch.tensor([[0, 1, 1, 0, 0, 1, 0, 0]]),
+            "sample_mask": torch.ones(1),
+            "cu_seqlens": [torch.tensor([0, 3, 5], dtype=torch.int32)],
+            "cu_seqlens_padded": [torch.tensor([0, 4, 8], dtype=torch.int32)],
+        }
+    )
+    cu_seqlens = data["cu_seqlens"][0]
+    cu_seqlens_padded = data["cu_seqlens_padded"][0]
+    expected = torch.arange(7, dtype=torch.float32).unsqueeze(0)
+    call = {}
+
+    def fake_logprobs(logits, target, padded_boundaries, unpacked_seqlen, **kwargs):
+        call.update(
+            target=target,
+            padded_boundaries=padded_boundaries,
+            unpacked_seqlen=unpacked_seqlen,
+            kwargs=kwargs,
+        )
+        return expected
+
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.loss.utils."
+        "from_parallel_logits_to_logprobs_packed_sequences",
+        fake_logprobs,
+    )
+
+    loss_input, prepared_data = prepare_packed_loss_input(
+        logits=torch.zeros(1, 8, 4),
+        data=data,
+        loss_fn=SimpleNamespace(input_type=LossInputType.LOGPROB),
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        vocab_parallel_rank=0,
+        vocab_parallel_group=object(),
+    )
+
+    assert prepared_data is data
+    assert torch.equal(loss_input["next_token_logprobs"], expected)
+    assert torch.equal(call["target"], input_ids)
+    assert torch.equal(call["padded_boundaries"], cu_seqlens_padded)
+    assert call["unpacked_seqlen"] == input_ids.shape[1]
+    assert call["kwargs"]["target_is_pre_rolled"] is False
+    assert call["kwargs"]["return_packed_layout"] is True
 
 
 def _setup_2d_process_groups(rank, world_size, cp_size, tp_size):

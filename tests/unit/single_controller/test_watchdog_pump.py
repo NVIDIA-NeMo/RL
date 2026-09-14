@@ -339,7 +339,7 @@ class TestGenerationFleetProbe:
             shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=99)
         )
         ctrl = self._with_fleet(monitor, worker_alive=[True, False])
-        asyncio.run(_run_probe_ticks(ctrl, 1))
+        asyncio.run(ctrl._probe_generation_fleet())
         assert ctrl._stood_down == [0, 1], (
             "every policy worker must be told to stand its refit deadline down once a "
             f"generation shard is confirmed gone; saw {ctrl._stood_down}"

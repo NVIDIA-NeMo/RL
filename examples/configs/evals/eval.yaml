@@ -28,6 +28,8 @@ generation:
     gpu_memory_utilization: 0.9
     max_model_len: 2048
     enforce_eager: False
+    # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
+    refit_with_reload_api: false
   colocated:
     # true: generation shares training GPUs
     # false: uses dedicated generation resources

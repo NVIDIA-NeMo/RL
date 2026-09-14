@@ -14,13 +14,18 @@
 """ABC contract test, parameterized over every adapter.
 
 Every new adapter (TQ today, ``nv-dataplane`` later) must pass this. The
-test runs against the NoOp adapter by default — it doesn't require TQ to
-be installed, so CI exercises the contract on every push.
+test runs against the NoOp and process-local adapters — neither requires TQ
+to be installed, so CI exercises the contract on every push.
+
+Only rules the ABC states belong in the parameterized tests. Adapter-specific
+behavior goes in a non-parameterized test that names the adapter, like the
+NoOp ones at the bottom of this file.
 """
 
 from __future__ import annotations
 
 import pickle
+from dataclasses import replace
 
 import pytest
 import torch
@@ -31,14 +36,24 @@ from nemo_rl.data_plane import (
     KVBatchMeta,
     build_data_plane_client,
 )
+from nemo_rl.data_plane.adapters.local import (
+    LocalDataPlaneClient,
+    local_batch_to_tensordict,
+    materialize_local,
+)
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig
 
 
 def _build_noop() -> DataPlaneClient:
     return NoOpDataPlaneClient()
 
 
-@pytest.fixture(params=[_build_noop], ids=["noop"])
+def _build_local() -> DataPlaneClient:
+    return LocalDataPlaneClient(LocalDataPlaneConfig(max_partitions=2))
+
+
+@pytest.fixture(params=[_build_noop, _build_local], ids=["noop", "local"])
 def client(request) -> DataPlaneClient:
     c = request.param()
     yield c
@@ -67,6 +82,8 @@ def test_register_put_get_clear(client: DataPlaneClient):
 
     out = client.get_samples(sample_ids=keys, partition_id="p", select_fields=["x"])
     assert torch.equal(out["x"], torch.arange(4))
+    # ``keys`` is already sorted; the ABC does not pin the order, and the local
+    # adapter returns sorted IDs while NoOp returns insertion order.
     assert client.list_sample_ids("p") == keys
 
     client.clear_samples(sample_ids=None, partition_id="p")
@@ -98,31 +115,17 @@ def test_get_data_requires_field_selection(client: DataPlaneClient):
     client.register_partition(
         partition_id="p", fields=["x"], num_samples=1, consumer_tasks=["read"]
     )
-    client.put_samples(
+    meta = client.put_samples(
         sample_ids=["a"],
         partition_id="p",
         fields=TensorDict({"x": torch.tensor([1])}, batch_size=[1]),
     )
-    bare = KVBatchMeta(partition_id="p", task_name=None, sample_ids=["a"], fields=None)
+    # Reuse the returned meta rather than building a bare one. A bare meta
+    # carries no adapter-private extra_info, so the local adapter would reject
+    # it as stale before it ever reached the field-selection check.
+    bare = replace(meta, task_name=None, fields=None)
     with pytest.raises(ValueError):
         client.get_data(bare)
-
-
-def test_kv_batch_put_rejects_non_tensor_leaves(client: DataPlaneClient):
-    """P3 — adapter must reject non-tensor leaves in the fields TensorDict.
-
-    Uses ``NonTensorData`` (the supported tensordict primitive for
-    storing arbitrary Python objects in a TensorDict) — a plain string
-    in a regular TensorDict construction silently disappears in some
-    tensordict versions, so we'd never reach the validator.
-    """
-    NonTensorData = pytest.importorskip("tensordict").NonTensorData
-    client.register_partition(
-        partition_id="p", fields=["x"], num_samples=1, consumer_tasks=["read"]
-    )
-    bad = TensorDict({"x": NonTensorData("hello")}, batch_size=[1])
-    with pytest.raises(TypeError, match=r"non-tensor"):
-        client.put_samples(sample_ids=["a"], partition_id="p", fields=bad)
 
 
 def test_close_is_idempotent(client: DataPlaneClient):
@@ -190,6 +193,77 @@ def test_checkpoint_load_requires_clean_client(tmp_path) -> None:
     with pytest.raises(RuntimeError, match="clean data-plane client"):
         source.load_checkpoint(checkpoint_dir)
     source.close()
+
+
+def test_noop_put_rejects_non_tensor_leaves() -> None:
+    """NoOp-only. Rejecting non-tensor leaves is not a data-plane rule.
+
+    ``interfaces`` requires adapters to accept ``NonTensorStack`` /
+    ``NonTensorData`` leaves, and both TQ and the local adapter do. NoOp stores
+    rows as plain tensor dicts with no encoder behind it, so it rejects them.
+
+    Uses ``NonTensorData`` (the supported tensordict primitive for storing
+    arbitrary Python objects in a TensorDict) — a plain string in a regular
+    TensorDict construction silently disappears in some tensordict versions,
+    so we'd never reach the validator.
+    """
+    NonTensorData = pytest.importorskip("tensordict").NonTensorData
+    client = NoOpDataPlaneClient()
+    client.register_partition(
+        partition_id="p", fields=["x"], num_samples=1, consumer_tasks=["read"]
+    )
+    bad = TensorDict({"x": NonTensorData("hello")}, batch_size=[1])
+    with pytest.raises(TypeError, match=r"non-tensor"):
+        client.put_samples(sample_ids=["a"], partition_id="p", fields=bad)
+    client.close()
+
+
+def test_local_accepts_non_tensor_leaves() -> None:
+    """The other side of the rule above: local must keep non-tensor columns."""
+    client = _build_local()
+    client.register_partition(
+        partition_id="p", fields=["x"], num_samples=2, consumer_tasks=["read"]
+    )
+    fields = local_batch_to_tensordict({"x": ["hello", "world"]}, batch_size=2)
+    client.put_samples(sample_ids=["a", "b"], partition_id="p", fields=fields)
+
+    out = client.get_samples(
+        sample_ids=["a", "b"], partition_id="p", select_fields=["x"]
+    )
+    assert materialize_local(out)["x"] == ["hello", "world"]
+    client.close()
+
+
+def test_local_checkpoint_round_trip_restores_partitions(tmp_path) -> None:
+    """save_checkpoint and load_checkpoint must agree on the state filename."""
+    checkpoint_dir = tmp_path / "data-plane"
+    source = _build_local()
+    source.register_partition(
+        partition_id="p", fields=["x"], num_samples=3, consumer_tasks=["train"]
+    )
+    source.put_samples(
+        sample_ids=["a", "b", "c"],
+        partition_id="p",
+        fields=TensorDict({"x": torch.tensor([10, 20, 30])}, batch_size=[3]),
+    )
+    source.save_checkpoint(checkpoint_dir, metadata={"step": 7})
+
+    restored = _build_local()
+    assert restored.load_checkpoint(checkpoint_dir) == {"step": 7}
+    data = restored.get_samples(
+        sample_ids=["a", "b", "c"], partition_id="p", select_fields=["x"]
+    )
+    assert torch.equal(data["x"], torch.tensor([10, 20, 30]))
+
+    # A partition registered after the restore must not reuse a generation the
+    # checkpointed metas already hold.
+    restored.register_partition(
+        partition_id="q", fields=["x"], num_samples=1, consumer_tasks=["train"]
+    )
+    assert restored.list_sample_ids("p") == ["a", "b", "c"]
+
+    source.close()
+    restored.close()
 
 
 def test_noop_checkpoint_load_explains_missing_partitions(tmp_path) -> None:

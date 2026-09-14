@@ -33,9 +33,14 @@ uv run examples/run_vlm_grpo.py \
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # Only run metrics if the target step is reached
+# Logprob gate matches vlm_grpo-gemma4-e4b-geo3k-1n8g-automodel.sh, the VLM
+# family's existing bound. Median rather than max: a single long outlier
+# sequence dominates the step value, so max() tests the tail rather than
+# train/inference consistency.
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'max(data["train/reward"]) > 0.5'
+        'max(data["train/reward"]) > 0.5' \
+        'median(data["train/token_mult_prob_error"]) < 1.05'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"

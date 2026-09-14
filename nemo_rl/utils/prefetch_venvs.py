@@ -22,25 +22,25 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.utils.venvs import create_local_venv
 
 
-def prefetch_venvs(filters=None, negative_filters=None):
+def prefetch_venvs(filters=None):
     """Prefetch all virtual environments that will be used by workers.
 
     Args:
         filters: List of strings to match against actor FQNs. If provided, only
                 actors whose FQN contains at least one of the filter strings will
                 be prefetched. If None, all venvs are prefetched.
-        negative_filters: List of strings to exclude from prefetching. Actors whose
-                FQN contains any of these strings will be skipped.
+
+    Returns:
+        The FQNs whose venv failed to build. Empty when everything succeeded.
+        Callers are expected to treat a non-empty list as a failure -- see the
+        __main__ block, which exits 1.
     """
     print("Prefetching virtual environments...")
     if filters:
         print(f"Filtering for: {filters}")
-    if negative_filters:
-        print(f"Excluding: {negative_filters}")
 
     # Track statistics for summary
     skipped_by_filter = []
-    skipped_by_negative_filter = []
     skipped_system_python = []
     prefetched = []
     failed = []
@@ -51,10 +51,6 @@ def prefetch_venvs(filters=None, negative_filters=None):
         # Apply filters if provided
         if filters and not any(f in actor_fqn for f in filters):
             skipped_by_filter.append(actor_fqn)
-            continue
-        # Apply negative filters if provided
-        if negative_filters and any(f in actor_fqn for f in negative_filters):
-            skipped_by_negative_filter.append(actor_fqn)
             continue
         # Skip system python as it doesn't need a venv
         if py_executable == "python" or py_executable == sys.executable:
@@ -97,10 +93,6 @@ def prefetch_venvs(filters=None, negative_filters=None):
         print(f"  Skipped (filtered out): {len(skipped_by_filter)}")
         for actor_fqn in skipped_by_filter:
             print(f"    - {actor_fqn}")
-    if negative_filters:
-        print(f"  Skipped (negative filter): {len(skipped_by_negative_filter)}")
-        for actor_fqn in skipped_by_negative_filter:
-            print(f"    - {actor_fqn}")
     if failed:
         print(f"  Failed: {len(failed)}")
         for actor_fqn in failed:
@@ -108,6 +100,8 @@ def prefetch_venvs(filters=None, negative_filters=None):
 
     # Create convenience python wrapper scripts for frozen environment support (container-only)
     create_frozen_environment_symlinks(venv_configs)
+
+    return failed
 
 
 def create_frozen_environment_symlinks(venv_configs):
@@ -215,12 +209,6 @@ Examples:
 
   # Prefetch multiple specific venvs
   python -m nemo_rl.utils.prefetch_venvs vllm policy environment
-
-  # Prefetch all venvs except vLLM-related ones
-  python -m nemo_rl.utils.prefetch_venvs --negative-filters vllm
-
-  # Prefetch all venvs except vLLM and SGLang
-  python -m nemo_rl.utils.prefetch_venvs --negative-filters vllm sglang
         """,
     )
     parser.add_argument(
@@ -230,15 +218,13 @@ Examples:
         "contains at least one of these strings will be prefetched. "
         "If not provided, all venvs are prefetched.",
     )
-    parser.add_argument(
-        "--negative-filters",
-        nargs="*",
-        help="Filter strings to exclude from prefetching. Actors whose FQN "
-        "contains any of these strings will be skipped.",
-    )
     args = parser.parse_args()
 
-    prefetch_venvs(
-        filters=args.filters if args.filters else None,
-        negative_filters=args.negative_filters if args.negative_filters else None,
-    )
+    failed = prefetch_venvs(filters=args.filters if args.filters else None)
+    # Exit non-zero if any venv failed to build. The per-actor loop above keeps
+    # going after a failure so one broken venv does not hide the others, but the
+    # process must still fail: this runs in the image build, and exiting 0 here
+    # ships an image that is missing a venv, with the actor only dying the first
+    # time someone launches it.
+    if failed:
+        raise SystemExit(1)

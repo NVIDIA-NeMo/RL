@@ -19,7 +19,7 @@ import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollouts import (
-    _extract_mask_sample_flags,
+    _mask_sample_flags,
     _postprocess_single_nemo_gym_group,
     apply_reward_penalties,
     resolve_reward_penalty_config,
@@ -91,7 +91,7 @@ class _FakeTokenizer:
         return self.token_map[text]
 
 
-class TestExtractMaskSampleFlags:
+class TestMaskSampleFlags:
     def test_reads_mask_sample_from_instance_config(self):
         results = [
             {"full_result": {"instance_config": {"mask_sample": True}}},
@@ -101,7 +101,7 @@ class TestExtractMaskSampleFlags:
             {"full_result": {"instance_config": None}},
         ]
 
-        mask_sample = _extract_mask_sample_flags(results)
+        mask_sample = _mask_sample_flags(r["full_result"] for r in results)
 
         assert mask_sample.dtype == torch.bool
         assert torch.equal(

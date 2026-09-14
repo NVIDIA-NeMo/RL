@@ -1,0 +1,60 @@
+defaults: ../../sft_vlm_3B.yaml
+sft:
+  max_num_steps: 1000
+  val_period: 0
+  val_batches: 0
+  val_at_start: false
+policy:
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    apply_rope_fusion: false
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  optimizer: null
+checkpointing:
+  checkpoint_dir: results/sft_${policy.model_name}_clevr_energon_v2
+  metric_name: null
+data:
+  _override_: true
+  backend: energon
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  add_bos: true
+  add_eos: true
+  add_generation_prompt: false
+  shuffle: true
+  num_workers: 0
+  energon:
+    model_family: qwen
+    num_workers: 8
+    shuffle_buffer_size: 1000
+    processor_adapter: hf_multimodal
+    topology_mapper: default
+    task_encoder:
+      name: generic_sft
+      options: {}
+    cookers:
+    - name: generic_conversation
+      options: {}
+  train:
+    path: /data/nemorl-datasets/clevr
+    split: train
+    virtual_epoch_length: 4375
+  validation: null
+data_plane:
+  enabled: true
+  impl: local
+  max_partitions: 2
+logger:
+  wandb_enabled: true
+  log_dir: logs/sft-qwen2.5-vl-3b-clevr-energon-v2
+  wandb:
+    name: sft-qwen2.5-vl-3b-clevr-energon-v2
+  tensorboard:
+    log_dir: tb_logs-sft-qwen2.5-vl-3b-clevr-energon-v2
+  swanlab:
+    name: sft-qwen2.5-vl-3b-clevr-energon-v2
+  mlflow:
+    run_name: sft-qwen2.5-vl-3b-clevr-energon-v2

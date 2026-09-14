@@ -453,6 +453,8 @@ def test_sparse_refit_api_auth_dispatch_and_error_mapping(monkeypatch) -> None:
             return_value={"ok": True, "payloads": 3}
         )
         receiver._refit_collective_rpc = MagicMock(return_value=[])
+        engine_loop = MagicMock()
+        receiver.set_async_loop(engine_loop)
         app = FastAPI()
         receiver.setup_api_server(app)
         headers = {G_VLLM_REFIT_API_KEY_HEADER: "secret"}
@@ -480,7 +482,7 @@ def test_sparse_refit_api_auth_dispatch_and_error_mapping(monkeypatch) -> None:
         assert flush_response.status_code == 200
         assert zmq_flush_response.status_code == 200
         assert prepare_response.status_code == 200
-        assert receiver._refit_async_loop is not None
+        assert receiver._refit_async_loop is engine_loop
         receiver._apply_s3_manifest_payload.assert_awaited_once_with({"key": "key"})
         receiver._flush_queued_sparse_payloads.assert_called_once_with()
         receiver.flush_zmq_sparse_refit_relay.assert_called_once_with("transfer", 0)
@@ -554,7 +556,10 @@ def test_sync_sparse_refit_server_shutdown_cleans_transport_resources(
 async def test_async_sparse_refit_post_init_records_worker_locality() -> None:
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
     worker._sparse_refit_receiver = MagicMock()
+    worker.cfg = {"vllm_cfg": {"expose_http_server": False}}
     worker._mtp_load_from_disk = False
+    worker._mtp_speculative_enabled = True
+    worker._mtp_weights_from_refit = False
     worker.report_device_id_async = AsyncMock(return_value=["0"])
     worker.llm = MagicMock()
     worker.llm.collective_rpc = AsyncMock(return_value=["node-0", "node-0"])
@@ -565,8 +570,12 @@ async def test_async_sparse_refit_post_init_records_worker_locality() -> None:
     worker._sparse_refit_receiver.set_worker_hostnames.assert_called_once_with(
         ["node-0", "node-0"]
     )
+    worker._sparse_refit_receiver.set_async_loop.assert_called_once_with(
+        asyncio.get_running_loop()
+    )
     assert worker.llm.collective_rpc.await_args_list == [
         call("bind_numa", args=()),
+        call("configure_mtp_drafter_weight_source", args=(False,)),
         call("report_node_hostname", args=()),
     ]
 
@@ -575,6 +584,8 @@ def test_sync_post_init_binds_numa() -> None:
     worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
     worker._sparse_refit_receiver = None
     worker._mtp_load_from_disk = False
+    worker._mtp_speculative_enabled = True
+    worker._mtp_weights_from_refit = False
     worker.report_device_id = MagicMock(return_value=["0"])
     worker.llm = MagicMock()
 
@@ -583,6 +594,7 @@ def test_sync_post_init_binds_numa() -> None:
     assert worker.vllm_device_ids == ["0"]
     assert worker.llm.collective_rpc.call_args_list == [
         call("bind_numa", args=()),
+        call("configure_mtp_drafter_weight_source", args=(False,)),
     ]
 
 

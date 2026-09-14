@@ -33,6 +33,7 @@ from nemo_rl.algorithms.utils import (
     print_performance_metrics,
 )
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -263,6 +264,59 @@ def test_maybe_pad_last_batch():
     assert result["sample_mask"].shape[0] == expected_size
     assert "token_mask" not in result
     assert "reference_policy_logprobs" not in result
+
+    # Preference padding must append complete, uniquely identified pairs.
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.arange(18).reshape(6, 3),
+            "input_lengths": torch.full((6,), 3),
+            "sample_mask": torch.ones(6),
+            "pair_index": torch.tensor([0, 0, 1, 1, 2, 2]),
+            "is_chosen": torch.tensor([True, False, True, False, True, False]),
+        }
+    )
+    result = maybe_pad_last_batch(batch, dp_size=2, mbs=2)
+    assert result.size == 8
+    assert torch.equal(result["pair_index"], torch.tensor([0, 0, 1, 1, 2, 2, 3, 3]))
+    assert torch.equal(
+        result["is_chosen"],
+        torch.tensor([True, False, True, False, True, False, True, False]),
+    )
+    assert torch.equal(result["sample_mask"][-2:], torch.zeros(2))
+
+
+def test_maybe_pad_last_batch_preserves_multimodal_rows():
+    batch_size = 17
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.arange(batch_size * 4).reshape(batch_size, 4),
+            "input_lengths": torch.full((batch_size,), 4),
+            "sample_mask": torch.ones(batch_size),
+            "token_mask": torch.ones(batch_size, 4),
+            "mm_token_type_ids": torch.arange(batch_size * 4).reshape(batch_size, 4),
+            "pixel_values": PackedTensor(
+                [torch.full((1, 2), row) for row in range(batch_size)],
+                dim_to_pack=0,
+            ),
+            "sample_ids": list(range(batch_size)),
+        }
+    )
+
+    result = maybe_pad_last_batch(batch, dp_size=8, mbs=1)
+
+    assert result.size == 24
+    assert len(result["pixel_values"]) == 24
+    assert result["mm_token_type_ids"].shape[0] == 24
+    assert result["sample_ids"][-7:] == [batch_size - 1] * 7
+    assert torch.count_nonzero(result["sample_mask"][-7:]) == 0
+    assert torch.equal(
+        result["pixel_values"].tensors[-1],
+        result["pixel_values"].tensors[batch_size - 1],
+    )
+
+    shards = result.shard_by_batch_size(shards=8, batch_size=24)
+    assert len(shards) == 8
+    assert all(shard.size == 3 for shard in shards)
 
 
 # Performance Metrics Tests

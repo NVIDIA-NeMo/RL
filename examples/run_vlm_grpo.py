@@ -19,10 +19,14 @@ import time
 
 from omegaconf import OmegaConf
 
-from nemo_rl.algorithms.grpo import MasterConfig, async_grpo_train, grpo_train, setup
+from nemo_rl.algorithms.grpo import MasterConfig, async_grpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
-from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
+from nemo_rl.data_plane.factory import (
+    make_policy_factory,
+    maybe_configure_data_plane_env,
+    select_sync_trainer,
+)
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import (
@@ -125,7 +129,14 @@ def main() -> None:
             master_config,
             teacher_worker_groups,
             alias_to_group_alias,
-        ) = setup(config, tokenizer, dataset, val_dataset, processor=processor)
+        ) = setup(
+            config,
+            tokenizer,
+            dataset,
+            val_dataset,
+            processor=processor,
+            policy_factory=make_policy_factory(config.data_plane),
+        )
 
     rl_init_timer.record("total", time.perf_counter() - main_start)
     rl_init_metrics = rl_init_timer.get_timing_metrics(reduction_op="sum")
@@ -170,22 +181,27 @@ def main() -> None:
             processor=processor,
         )
     else:
-        print("🚀 Running synchronous GRPO training")
-        grpo_train(
-            policy,
-            policy_generation,
-            dataloader,
-            val_dataloader,
-            tokenizer,
-            loss_fn,
-            task_to_env,
-            val_task_to_env,
-            logger,
-            checkpointer,
-            grpo_state,
-            master_config,
-            processor=processor,
-        )
+        # ``select_sync_trainer`` prints which sync trainer it picked.
+        trainer = select_sync_trainer(master_config, label="VLM GRPO")
+        # grpo_train_sync defers checkpoint finalization to the checkpointer's
+        # background threads; the context manager guarantees they are flushed on
+        # exit. (grpo_train also flushes internally; shutdown() is idempotent.)
+        with checkpointer:
+            trainer(
+                policy,
+                policy_generation,
+                dataloader,
+                val_dataloader,
+                tokenizer,
+                loss_fn,
+                task_to_env,
+                val_task_to_env,
+                logger,
+                checkpointer,
+                grpo_state,
+                master_config,
+                processor=processor,
+            )
 
 
 if __name__ == "__main__":

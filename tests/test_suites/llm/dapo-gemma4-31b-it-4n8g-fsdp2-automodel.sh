@@ -33,13 +33,15 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
-    # Thresholds calibrated from the offpolicy baseline run (wandb project
-    # nemorl-gemma4-support, display name dapo-gemma4-31b-it-4n8g-fsdp2-automodel-offpolicy).
+    # Calibrated from recent nvidia/nemo-rl release runs and W&B run g31c1s91.
     uv run tests/check_metrics.py $JSON_METRICS \
+        'all_finite(data["train/loss"])' \
+        'all_finite(data["train/grad_norm"])' \
+        'all_finite(data["train/token_mult_prob_error"])' \
         'median(data["train/token_mult_prob_error"]) < 1.05' \
-        'mean(data["train/gen_kl_error"]) < 0.002' \
-        'data["train/reward"]["20"] > 0.1' \
-        'data["train/filtered_reward"]["20"] > -0.35'
+        'mean(data["train/gen_kl_error"]) < 0.001' \
+        'mean(data["train/reward"]) > 0.4' \
+        'mean(data["train/filtered_reward"]) > 0.05'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"

@@ -43,7 +43,7 @@ def run_router(args):
 class RouterActor:
     """Starts and owns the sglang router subprocess.
 
-    Runs under SGLANG_EXECUTABLE so it can import sglang_router.
+    Runs under PY_EXECUTABLES.SGLANG so it can import sglang_router.
     The driver (SYSTEM env) holds a handle to this actor and retrieves
     (router_ip, router_port) without ever importing sglang_router itself.
     """
