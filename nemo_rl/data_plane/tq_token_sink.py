@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -347,11 +348,95 @@ class MegatronPayloadStageResult:
     response_metadata: dict[str, Any]
 
 
+# Request-metadata keys the Megatron chat endpoint writes when it defers the prompt
+# prefix splice to the engine's RequestPromptPreparer. They must match
+# ``megatron.core.inference.inference_request.PREFIX_SPLICE_*``; they are spelled
+# out here (rather than imported) so this module stays importable in the vLLM
+# worker and finalizer environments, which do not ship Megatron.
+PREFIX_SPLICE_SUFFIX_FIELD = "prefix_splice_suffix_token_ids"
+PREFIX_SPLICE_BOUNDARY_FIELD = "prefix_splice_boundary_token_id"
+
+
+class ChainPrefixCache:
+    """Worker-local cache of resolved ``staging_chain`` prefixes.
+
+    Moved verbatim from ``VllmAsyncGenerationWorkerImpl._fetch_chain_prefix`` so the
+    vLLM worker and the Megatron prompt preparer share one implementation. Entries
+    map a staging key to the full prefix through that key; the deepest cached key
+    bounds the TQ read to the chain's uncached suffix; eviction drops the oldest
+    insertion past 256 entries. Thread-safe: the vLLM worker calls ``fetch`` from
+    ``asyncio.to_thread`` executor threads, and the TQ read stays outside the lock
+    so concurrent fetches overlap.
+    """
+
+    def __init__(self, source: Any | None = None) -> None:
+        self._source = source
+        self._cache: dict[str, list[int]] = {}
+        self._lock = threading.Lock()
+
+    def install(self, source: Any) -> None:
+        """Attach (or replace) the ``TQTokenSource`` and drop cached chains."""
+        with self._lock:
+            self._source = source
+            self._cache.clear()
+
+    def fetch(self, staging_chain: list[str]) -> list[int]:
+        """Assemble prefix token ids from staging_chain, with a worker-local LRU cache."""
+        cache = self._cache
+        with self._lock:
+            source = self._source
+            cached_ids: list[int] = []
+            miss_start = 0
+            for i, key in enumerate(staging_chain):
+                if key in cache:
+                    cached_ids = cache[key]
+                    miss_start = i + 1
+            miss_keys = staging_chain[miss_start:]
+        if not miss_keys:
+            return list(cached_ids)
+        if source is None:
+            raise RuntimeError(
+                "staging source not initialized; call setup_token_capture() first"
+            )
+        # TQ read stays outside the lock so concurrent fetches overlap.
+        fetched = source.fetch_prefix_token_ids(miss_keys)
+        result = cached_ids + fetched
+        last_key = staging_chain[-1]
+        with self._lock:
+            cache[last_key] = result
+            if len(cache) > 256:
+                del cache[next(iter(cache))]
+        return result
+
+
+def resolve_admission_prefix(
+    admission: Any, chain_prefix: ChainPrefixCache
+) -> list[int]:
+    """Resolve a ``CaptureAdmission`` to the flat prefix the engine prompt starts with.
+
+    Moved verbatim from ``VllmAsyncGenerationWorkerImpl._resolve_admission_prefix``.
+    A ``staging_chain`` is fetched through the cached TransferQueue read; an inline
+    ``required_prefix_token_ids`` is used as is; a text root has no prefix. Length
+    checks are the caller's (``begin_call`` / the Megatron preparer's ``prev_len`` check).
+    """
+    if admission.mode == "text":
+        return []
+    if admission.staging_chain:
+        return chain_prefix.fetch(list(admission.staging_chain))
+    return list(admission.required_prefix_token_ids)
+
+
 class TQMegatronPromptPreparer:
-    """Resolve a Gym-authorized staged prefix before MInf admits a request."""
+    """Resolve a Gym-authorized staged prefix before MInf admits a request.
+
+    Mirrors the vLLM worker: ``prepare_prompt`` resolves the prefix through the
+    shared ``resolve_admission_prefix`` / ``ChainPrefixCache`` pair, then splices
+    it at the boundary the Megatron endpoint described in ``request_metadata``.
+    """
 
     def __init__(self, source: TQTokenSource) -> None:
-        self._source = source
+        # Same cached chain resolution as the vLLM worker (see ChainPrefixCache).
+        self._chain_prefix = ChainPrefixCache(source)
 
     def prepare_prompt(
         self,
@@ -375,11 +460,7 @@ class TQMegatronPromptPreparer:
         if not isinstance(prompt, list):
             raise TypeError("MInf token-in capture requires a token-id list prompt")
 
-        prefix_token_ids = list(admission.required_prefix_token_ids)
-        if admission.staging_chain:
-            prefix_token_ids = self._source.fetch_prefix_token_ids(
-                list(admission.staging_chain)
-            )
+        prefix_token_ids = resolve_admission_prefix(admission, self._chain_prefix)
         if len(prefix_token_ids) != admission.prev_len:
             raise ValueError(
                 "MInf capture prefix length mismatch: "
@@ -392,8 +473,8 @@ class TQMegatronPromptPreparer:
         )
         updated_metadata["ng_capture"] = updated_admission.model_dump(mode="json")
 
-        suffix_token_ids = updated_metadata.get("ng_prompt_suffix_token_ids")
-        boundary_token_id = updated_metadata.get("ng_prefix_boundary_token_id")
+        suffix_token_ids = updated_metadata.get(PREFIX_SPLICE_SUFFIX_FIELD)
+        boundary_token_id = updated_metadata.get(PREFIX_SPLICE_BOUNDARY_FIELD)
         if suffix_token_ids is not None or boundary_token_id is not None:
             if not isinstance(suffix_token_ids, list) or any(
                 type(token_id) is not int for token_id in suffix_token_ids

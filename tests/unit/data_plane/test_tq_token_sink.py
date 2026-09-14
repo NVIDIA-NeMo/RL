@@ -38,11 +38,15 @@ from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
 )
 
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
+    PREFIX_SPLICE_BOUNDARY_FIELD,
+    PREFIX_SPLICE_SUFFIX_FIELD,
     STAGING_FIELDS,
+    ChainPrefixCache,
     TQMegatronPromptPreparer,
     TQMegatronTokenStager,
     TQTokenSink,
     TQTokenSource,
+    resolve_admission_prefix,
 )
 from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
     build_fixture_artifacts,
@@ -308,8 +312,8 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
         [80, 81, 99, 20, 21],
         request_metadata={
             "ng_capture": admission.model_dump(mode="json"),
-            "ng_prompt_suffix_token_ids": [99, 20, 21],
-            "ng_prefix_boundary_token_id": 99,
+            PREFIX_SPLICE_SUFFIX_FIELD: [99, 20, 21],
+            PREFIX_SPLICE_BOUNDARY_FIELD: 99,
         },
     )
 
@@ -351,3 +355,109 @@ def test_megatron_stager_declines_ineligible_requests(
         ),
     )
     assert result is None
+
+
+class _RecordingSource:
+    """Stand-in for TQTokenSource: records fetched keys, returns 2 tokens per key."""
+
+    def __init__(self):
+        self.calls = []
+
+    def fetch_prefix_token_ids(self, keys):
+        self.calls.append(list(keys))
+        return [int(k[1:]) * 10 + i for k in keys for i in range(2)]
+
+
+def test_chain_prefix_cache_fetches_only_uncached_suffix():
+    source = _RecordingSource()
+    cache = ChainPrefixCache(source)
+
+    assert cache.fetch(["k1", "k2"]) == [10, 11, 20, 21]
+    assert cache.fetch(["k1", "k2", "k3"]) == [10, 11, 20, 21, 30, 31]
+    assert cache.fetch(["k1", "k2"]) == [10, 11, 20, 21]
+    assert source.calls == [["k1", "k2"], ["k3"]]
+
+
+def test_chain_prefix_cache_requires_an_installed_source():
+    cache = ChainPrefixCache()
+    with pytest.raises(RuntimeError, match="setup_token_capture"):
+        cache.fetch(["k1"])
+    source = _RecordingSource()
+    cache.install(source)
+    assert cache.fetch(["k1"]) == [10, 11]
+
+
+def test_chain_prefix_cache_evicts_oldest_insertion_past_256_entries():
+    source = _RecordingSource()
+    cache = ChainPrefixCache(source)
+    for i in range(257):
+        cache.fetch([f"k{i}"])
+    # k0 was the first insertion and is gone; k1 is still a hit.
+    calls_before = len(source.calls)
+    cache.fetch(["k1"])
+    assert len(source.calls) == calls_before
+    cache.fetch(["k0"])
+    assert len(source.calls) == calls_before + 1
+
+
+def test_resolve_admission_prefix_dispatches_like_the_vllm_worker():
+    source = _RecordingSource()
+    cache = ChainPrefixCache(source)
+    text = SimpleNamespace(mode="text", staging_chain=[], required_prefix_token_ids=[])
+    inline = SimpleNamespace(
+        mode="token_in", staging_chain=[], required_prefix_token_ids=[7, 8]
+    )
+    chained = SimpleNamespace(
+        mode="token_in", staging_chain=["k1"], required_prefix_token_ids=[]
+    )
+
+    assert resolve_admission_prefix(text, cache) == []
+    assert resolve_admission_prefix(inline, cache) == [7, 8]
+    assert resolve_admission_prefix(chained, cache) == [10, 11]
+    assert source.calls == [["k1"]]
+
+
+def test_megatron_preparer_resolves_chains_through_the_shared_cache():
+    source = _RecordingSource()
+    preparer = TQMegatronPromptPreparer(source)
+    assert isinstance(preparer._chain_prefix, ChainPrefixCache)
+
+    child = nemo_gym.CaptureAdmission(
+        rollout_id="r0",
+        model_call_id="c2",
+        parent_call_id="c1",
+        prev_len=2,
+        mode="token_in",
+        staging_chain=["k1"],
+        parent_chain_hash="a" * 64,
+    )
+    grandchild = nemo_gym.CaptureAdmission(
+        rollout_id="r0",
+        model_call_id="c3",
+        parent_call_id="c2",
+        prev_len=4,
+        mode="token_in",
+        staging_chain=["k1", "k2"],
+        parent_chain_hash="b" * 64,
+    )
+    for admission, prompt, suffix in (
+        (child, [80, 99, 5], [99, 5]),
+        (grandchild, [80, 81, 82, 99, 6], [99, 6]),
+    ):
+        preparer.prepare_prompt(
+            prompt,
+            request_metadata={
+                "ng_capture": admission.model_dump(mode="json"),
+                PREFIX_SPLICE_SUFFIX_FIELD: suffix,
+                PREFIX_SPLICE_BOUNDARY_FIELD: 99,
+            },
+        )
+    # k1 was cached by the child call; the grandchild fetched only k2.
+    assert source.calls == [["k1"], ["k2"]]
+
+
+def test_prefix_splice_keys_match_megatron_constants():
+    """The endpoint writes Megatron's constants; the preparer reads NeMo-RL's copies."""
+    mcore = pytest.importorskip("megatron.core.inference.inference_request")
+    assert PREFIX_SPLICE_SUFFIX_FIELD == mcore.PREFIX_SPLICE_SUFFIX_FIELD
+    assert PREFIX_SPLICE_BOUNDARY_FIELD == mcore.PREFIX_SPLICE_BOUNDARY_FIELD
