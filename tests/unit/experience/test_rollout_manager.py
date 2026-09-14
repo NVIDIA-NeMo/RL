@@ -1967,7 +1967,7 @@ class TestGenerateForFinalizationFlow:
                     "test-agent",
                     1,
                     f"result-{canonical_ids[0]}-0",
-                    "1" * 64,
+                    f"{1:064x}",
                 )
             ],
             [
@@ -1977,7 +1977,7 @@ class TestGenerateForFinalizationFlow:
                     "test-agent",
                     1,
                     f"result-{canonical_ids[0]}-0",
-                    "1" * 64,
+                    f"{1:064x}",
                 ),
                 (
                     canonical_ids[1],
@@ -1985,7 +1985,7 @@ class TestGenerateForFinalizationFlow:
                     "test-agent",
                     1,
                     f"result-{canonical_ids[1]}-0",
-                    "1" * 64,
+                    f"{1:064x}",
                 ),
             ],
         ]
@@ -2223,7 +2223,7 @@ class TestGenerateForFinalizationFlow:
                     "test-agent",
                     2,
                     f"result-{request.group_id}_g0-1",
-                    "2" * 64,
+                    f"{2:064x}",
                 ),
                 (
                     f"{request.group_id}_g1",
@@ -2231,7 +2231,7 @@ class TestGenerateForFinalizationFlow:
                     "test-agent",
                     2,
                     f"result-{request.group_id}_g1-1",
-                    "2" * 64,
+                    f"{2:064x}",
                 ),
             ]
         ]
