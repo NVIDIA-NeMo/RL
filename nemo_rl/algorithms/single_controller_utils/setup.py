@@ -102,6 +102,7 @@ from nemo_rl.environments.gym_checkpoint import (
     GymCheckpointRestoreResult,
     GymCheckpointTopology,
     gym_checkpoint_continuations,
+    gym_checkpoint_generation_cut_records,
     gym_checkpoint_staging_keys,
     gym_generation_cut_staging_keys,
     validate_gym_checkpoint_manifests,
@@ -202,10 +203,13 @@ class SingleControllerActorArgs:
 def _validate_generation_prefix_restore_compatibility(
     *,
     generation_cut_proofs: tuple[dict[str, object], ...],
+    generation_cut_records: int = 0,
     generation_prefix_cuts_enabled: bool,
 ) -> None:
     """Reject a prefix-bearing snapshot before starting an incompatible run."""
-    if generation_cut_proofs and not generation_prefix_cuts_enabled:
+    if (
+        generation_cut_proofs or generation_cut_records > 0
+    ) and not generation_prefix_cuts_enabled:
         raise ValueError(
             "The selected rollout snapshot contains durable generation-prefix "
             "cuts. Set "
@@ -1348,6 +1352,13 @@ def setup_single_controller(
             generation_cut_proofs=(
                 resolved_snapshot.manifest.gym_generation_cut_proofs
             ),
+            generation_cut_records=(
+                gym_checkpoint_generation_cut_records(
+                    resolved_snapshot.manifest.gym_checkpoint
+                )
+                if resolved_snapshot.manifest.gym_checkpoint is not None
+                else 0
+            ),
             generation_prefix_cuts_enabled=(
                 rollout_checkpoint_cfg.gym.generation_prefix_cuts_enabled
             ),
@@ -1750,7 +1761,11 @@ def setup_single_controller(
         discovered = ray.get(gym_actor.discover_checkpoint_capabilities.remote())
         gym_checkpoint_topology = GymCheckpointTopology.model_validate(discovered)
         if rollout_checkpoint_cfg.gym.participant_checkpointing_enabled:
-            gym_checkpoint_topology.validate_turn_recovery_capabilities()
+            gym_checkpoint_topology.validate_turn_recovery_capabilities(
+                generation_prefix_cuts_enabled=(
+                    rollout_checkpoint_cfg.gym.generation_prefix_cuts_enabled
+                )
+            )
         if resolved_snapshot is not None:
             saved_topology_fingerprint = (
                 resolved_snapshot.manifest.gym_topology_fingerprint

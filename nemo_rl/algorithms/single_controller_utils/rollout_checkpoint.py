@@ -29,8 +29,8 @@ from typing import Any, Literal, Mapping, Optional, get_args
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 from nemo_rl.environments.gym_checkpoint import GymCheckpointCommitResult
 
-ROLLOUT_SNAPSHOT_SCHEMA_VERSION = 5
-_SUPPORTED_ROLLOUT_SNAPSHOT_SCHEMA_VERSIONS = frozenset({4, 5})
+ROLLOUT_SNAPSHOT_SCHEMA_VERSION = 6
+_SUPPORTED_ROLLOUT_SNAPSHOT_SCHEMA_VERSIONS = frozenset({4, 5, 6})
 BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION = 7
 BOOTSTRAP_DIRNAME = "bootstrap"
 BOOTSTRAP_MANIFEST_FILENAME = "manifest.json"
@@ -322,6 +322,10 @@ class RolloutSnapshotManifest:
             raise ValueError(
                 "rollout snapshot generation-cut proofs require schema version 5"
             )
+        if manifest.schema_version >= 6 and manifest.gym_generation_cut_proofs:
+            raise ValueError(
+                "rollout snapshot schema version 6 stores generation cuts in Gym lineage"
+            )
         if (
             min(
                 manifest.base_train_step,
@@ -349,6 +353,8 @@ class RolloutSnapshotManifest:
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
+        if self.schema_version >= 6:
+            payload.pop("gym_generation_cut_proofs", None)
         payload["gym_checkpoint"] = (
             self.gym_checkpoint.model_dump(mode="json")
             if self.gym_checkpoint is not None
