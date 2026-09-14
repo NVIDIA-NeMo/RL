@@ -180,6 +180,10 @@ class _CheckpointGeneration(_FakeGeneration):
         self._events.append("generation-pause")
         return True
 
+    def begin_generation_checkpoint(self, *, timeout_s=None) -> bool:
+        self._events.append("generation-fence")
+        return True
+
     def resume_generation_after_checkpoint(self, *, timeout_s=None) -> bool:
         self._events.append("generation-resume")
         return True
@@ -770,9 +774,9 @@ class _FakeGymCheckpointActor:
                                 "prefixes": [
                                     {
                                         "disposition": "durable_prefix",
-                                        "staging_key": (
+                                        "staging_keys": [
                                             self.generation_cut_staging_key
-                                        ),
+                                        ],
                                     }
                                 ]
                             },
@@ -2065,7 +2069,7 @@ class TestPeriodicRolloutCheckpoint:
         assert len(set(gym_actor.checkpoint_ids)) == 2
         assert actor._gym_checkpoint_rollout_permitted.is_set()
 
-    def test_generation_prefix_cut_resumes_decoding_before_gym_release(
+    def test_generation_prefix_cut_keeps_decoding_live_while_gym_prepares(
         self, tmp_path: Path
     ) -> None:
         actor = self._actor(tmp_path)
@@ -2103,8 +2107,7 @@ class TestPeriodicRolloutCheckpoint:
                 "checkpoint-1", tmp_path
             )
             assert prepare.checkpoint_id == checkpoint.checkpoint_id == "checkpoint-1"
-            assert actor._generation_checkpoint_pause_id == "checkpoint-1"
-            assert actor._generation_checkpoint_decoding_resumed
+            assert actor._generation_checkpoint_id == "checkpoint-1"
             assert not actor._gym_checkpoint_rollout_permitted.is_set()
             await actor._release_prepared_gym_checkpoint("checkpoint-1", committed=True)
 
@@ -2114,15 +2117,13 @@ class TestPeriodicRolloutCheckpoint:
             actor._checkpointer.shutdown()
 
         assert events == [
-            "generation-pause",
+            "generation-fence",
             "prepare",
-            "generation-resume-after-cut",
             "commit",
             "resume",
             "generation-finish-checkpoint",
         ]
-        assert actor._generation_checkpoint_pause_id is None
-        assert not actor._generation_checkpoint_decoding_resumed
+        assert actor._generation_checkpoint_id is None
         assert actor._gym_checkpoint_rollout_permitted.is_set()
 
     def test_generation_prefix_cut_prepare_failure_resumes_engine(
@@ -2145,15 +2146,14 @@ class TestPeriodicRolloutCheckpoint:
             actor._checkpointer.shutdown()
 
         assert events == [
-            "generation-pause",
+            "generation-fence",
             "prepare",
-            "generation-resume",
+            "generation-finish-checkpoint",
         ]
-        assert actor._generation_checkpoint_pause_id is None
-        assert not actor._generation_checkpoint_decoding_resumed
+        assert actor._generation_checkpoint_id is None
         assert actor._gym_checkpoint_rollout_permitted.is_set()
 
-    def test_generation_prefix_cut_commit_failure_clears_staging_rows(
+    def test_generation_prefix_cut_commit_failure_retains_staging_rows(
         self, tmp_path: Path
     ) -> None:
         actor = self._actor(tmp_path)
@@ -2177,20 +2177,18 @@ class TestPeriodicRolloutCheckpoint:
         finally:
             actor._checkpointer.shutdown()
 
-        assert actor._dp_client.clear_calls == [([staging_key], _STAGING_PARTITION_ID)]
+        assert actor._dp_client.clear_calls == []
         assert events == [
-            "generation-pause",
+            "generation-fence",
             "prepare",
-            "generation-resume-after-cut",
             "commit",
             "abort",
             "generation-finish-checkpoint",
         ]
-        assert actor._generation_checkpoint_pause_id is None
-        assert not actor._generation_checkpoint_decoding_resumed
+        assert actor._generation_checkpoint_id is None
         assert actor._gym_checkpoint_rollout_permitted.is_set()
 
-    def test_generation_prefix_rows_are_cleared_when_snapshot_save_fails(
+    def test_generation_prefix_rows_are_retained_when_snapshot_save_fails(
         self, tmp_path: Path
     ) -> None:
         actor = self._actor(tmp_path)
@@ -2219,7 +2217,7 @@ class TestPeriodicRolloutCheckpoint:
                                     "prefixes": [
                                         {
                                             "disposition": "durable_prefix",
-                                            "staging_key": staging_key,
+                                            "staging_keys": [staging_key],
                                         }
                                     ]
                                 },
@@ -2260,7 +2258,7 @@ class TestPeriodicRolloutCheckpoint:
         finally:
             actor._checkpointer.shutdown()
 
-        assert actor._dp_client.clear_calls == [([staging_key], _STAGING_PARTITION_ID)]
+        assert actor._dp_client.clear_calls == []
         checkpoint_id = prepare_checkpoint.await_args.args[0]
         release_checkpoint.assert_awaited_once_with(
             checkpoint_id,
@@ -3042,6 +3040,36 @@ class TestDataPlaneCheckpoint:
         assert asyncio.run(validate_inventory()) == 1
         assert dp_client.clear_calls == [(["orphan-key"], staging_partition)]
         assert dp_client.sample_ids == [gym_turn_key]
+
+    def test_rollout_recovery_inventory_clears_only_obsolete_generation_cuts(self):
+        staging_partition = "rollout_staging"
+        current_cut = "__generation_cut__/checkpoint-2/r0/c1"
+        obsolete_cut = "__generation_cut__/checkpoint-1/r1/c2"
+        unrelated = "unreferenced-normal-row"
+        dp_client = _StagingInventoryDPClient(
+            [current_cut, obsolete_cut, unrelated],
+            partition_id=staging_partition,
+        )
+        actor = object.__new__(_ACTOR_CLS)
+        actor._rollout_recovery_ledger = RolloutRecoveryLedger()
+        actor._master_config = SimpleNamespace(
+            token_capture=SimpleNamespace(staging_partition=staging_partition)
+        )
+        actor._dp_client = dp_client
+
+        async def validate_inventory() -> int:
+            async with DataPlaneCheckpointBarrier().mutation() as cut:
+                return await actor._validate_rollout_recovery_inventory(
+                    cut,
+                    replay_metadata=None,
+                    clear_unreferenced=False,
+                    clear_unreferenced_generation_cuts=True,
+                    gym_staging_keys={current_cut},
+                )
+
+        assert asyncio.run(validate_inventory()) == 1
+        assert dp_client.clear_calls == [([obsolete_cut], staging_partition)]
+        assert sorted(dp_client.sample_ids) == [current_cut, unrelated]
 
     def test_gated_sampler_writes_authoritative_tq_checkpoint(self, tmp_path):
         mc = _actor_master_config(
