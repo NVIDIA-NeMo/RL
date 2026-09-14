@@ -73,6 +73,84 @@ pytestmark = pytest.mark.mcore
 WORKER_MOD = "nemo_rl.models.policy.workers.megatron_policy_worker"
 
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        "dense",
+        "dropless",
+        "zero_aux",
+        "frozen_bias",
+        "zero_bias_rate",
+        "capacity",
+        "rank_capacity",
+        "graph_capacity",
+        "drop",
+        "sinkhorn",
+        "quantile_balancing",
+        "aux",
+        "z_loss",
+        "bias_update",
+    ],
+)
+def test_cc_padding_checks_nested_resolved_routers(case):
+    from megatron.core.transformer.moe.router import TopKRouter
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    # Real router type and module traversal, without GPU/collective construction.
+    router = TopKRouter.__new__(TopKRouter)
+    torch.nn.Module.__init__(router)
+    router.config = SimpleNamespace(
+        moe_router_load_balancing_type="none",
+        moe_aux_loss_coeff=0.0,
+        moe_z_loss_coeff=None,
+        moe_expert_capacity_factor=None,
+        moe_expert_rank_capacity_factor=None,
+        moe_pad_experts_for_cuda_graph_inference=False,
+        moe_token_dropping=False,
+        moe_router_bias_update_rate=0.001,
+    )
+    router.routing_type = "none"
+    router.enable_expert_bias = False
+    router.frozen_expert_bias = False
+    if case in ("capacity", "rank_capacity"):
+        field = (
+            "moe_expert_capacity_factor"
+            if case == "capacity"
+            else "moe_expert_rank_capacity_factor"
+        )
+        setattr(router.config, field, 1.0)
+    elif case == "graph_capacity":
+        router.config.moe_pad_experts_for_cuda_graph_inference = True
+    elif case == "drop":
+        router.config.moe_token_dropping = True
+    elif case in ("sinkhorn", "quantile_balancing"):
+        router.routing_type = case
+    elif case in ("aux", "zero_aux"):
+        router.config.moe_router_load_balancing_type = ["aux_loss", "global_aux_loss"]
+        router.routing_type = router.config.moe_router_load_balancing_type
+        router.config.moe_aux_loss_coeff = [0.0, 0.1 if case == "aux" else 0.0]
+    elif case == "z_loss":
+        router.config.moe_z_loss_coeff = 0.01
+    elif case in ("bias_update", "frozen_bias", "zero_bias_rate"):
+        router.enable_expert_bias = True
+        router.frozen_expert_bias = case == "frozen_bias"
+        if case == "zero_bias_rate":
+            router.config.moe_router_bias_update_rate = 0.0
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = torch.nn.Sequential(
+        torch.nn.Linear(2, 2),
+        torch.nn.Sequential() if case == "dense" else torch.nn.Sequential(router),
+    )
+    if case in ("dense", "dropless", "zero_aux", "frozen_bias", "zero_bias_rate"):
+        worker.validate_cc_execution_padding()
+    else:
+        with pytest.raises(ValueError, match="CC execution padding"):
+            worker.validate_cc_execution_padding()
+
+
 # ── Mock fabric ──────────────────────────────────────────────────────────
 
 
@@ -184,6 +262,7 @@ def _make_worker(loss_type):
     w.rank = 0
     # Also set in __init__: the finish path reads them to put the DDP forward
     # pre-hook back after the first optimizer step.
+
     w._log_gpu_mem = MagicMock()
 
     # Stash a loss_fn with the requested loss_type for tests that need one.
@@ -447,6 +526,69 @@ class TestTrainMicrobatch:
         assert iterator_kwargs["delegate_mtp_loss_mask_to_model"] is True
         assert iterator_kwargs["model_slices_context_parallel_inputs"] is False
 
+    @pytest.mark.parametrize("with_images", [False, True])
+    def test_derives_media_mask_before_iterator(
+        self, mock_module_symbols: dict[str, MagicMock], with_images: bool
+    ) -> None:
+        from nemo_rl.algorithms.loss.interfaces import LossType
+        from nemo_rl.data.multimodal_utils import PackedTensor
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.media_placeholder_token_id = 7
+        w.model_slices_context_parallel_inputs = True
+        batch = _fake_batch()
+        batch["input_ids"][:, 1] = 7
+        batch["token_mask"][:, 1] = 0
+        original_loss_mask = batch["token_mask"].clone()
+        if with_images:
+            # One image row, followed by seven rows spelling the same token
+            # without an image. The latter must not become image anchors.
+            image_row = PackedTensor([torch.ones(1, 3, 2, 2)], dim_to_pack=0)
+            batch["pixel_values"] = PackedTensor.concat(
+                [image_row, PackedTensor.empty_rows_like(image_row, 7)]
+            )
+        iterator = mock_module_symbols["gmi"]
+
+        def check_mask(data, *args, **kwargs):
+            expected = torch.ones_like(data["input_ids"], dtype=torch.bool)
+            expected[:, 1] = False
+            expected[0, 1] = with_images
+            torch.testing.assert_close(data["media_token_validity_mask"], expected)
+            torch.testing.assert_close(data["token_mask"], original_loss_mask)
+            assert kwargs["model_slices_context_parallel_inputs"] is True
+            return iterator.return_value
+
+        iterator.side_effect = check_mask
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(batch)
+        iterator.assert_called_once()
+        mock_module_symbols["mfb"].assert_called_once()
+
+    def test_media_mask_failure_restores_step_hooks(
+        self, mock_module_symbols: dict[str, MagicMock]
+    ) -> None:
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.media_placeholder_token_id = 7
+        original_finalize = w.model.config.finalize_model_grads_func
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        with (
+            patch(
+                f"{WORKER_MOD}.attach_media_token_validity_mask",
+                side_effect=ValueError("invalid media rows"),
+            ),
+            pytest.raises(ValueError, match="invalid media rows"),
+        ):
+            w.train_microbatch(_fake_batch())
+        assert w.model.config.grad_sync_func == "ORIGINAL_GRAD_SYNC_FUNC"
+        assert w.model.config.finalize_model_grads_func is original_finalize
+        mock_module_symbols["gmi"].assert_not_called()
+        mock_module_symbols["mfb"].assert_not_called()
+        w.optimizer.step.assert_not_called()
+        w.abort_train_step()
+        assert w._train_step_state is None
+
     def test_wraps_forward_backward_in_no_sync(self, mock_module_symbols):
         """The single most important assertion in this file. Without the
         no_sync wrap, mcore DDP dispatches a per-call cross-DP reduce on
@@ -606,6 +748,7 @@ class TestTrainMicrobatch:
         w.begin_train_step(loss_fn=w._test_loss_fn)
         w.train_microbatch(batch)
         assert "mtp_loss_mask" not in batch
+        assert "media_token_validity_mask" not in batch
         assert w.model.config.mtp_grad_scale_func is None
 
 

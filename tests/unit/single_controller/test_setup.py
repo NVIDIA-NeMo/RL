@@ -37,6 +37,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     CustomSamplerConfig,
+    InOrderSamplerConfig,
     ReadyFirstSamplerConfig,
     SamplerConfig,
     WindowedSampler,
@@ -67,7 +68,10 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     bootstrap_compatibility_identity,
     ensure_bootstrap_anchor,
 )
-from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
+from nemo_rl.data.multimodal_utils import (
+    PACKED_MULTIMODAL_FIELDS,
+    WIRE_MULTIMODAL_FIELDS,
+)
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
 from nemo_rl.data_plane.schema import SC_ROLLOUT_SCHEMA_FIELDS
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
@@ -329,6 +333,36 @@ def test_build_generation_passes_sglang_config():
         "Qwen/Qwen3-0.6B"
     )
     generation.finish_generation.assert_called_once_with()
+
+
+def test_cc_rejects_discovered_resume_even_when_checkpoint_saving_is_disabled(
+    tmp_path, patched_factories
+):
+    mc = _make_master_config(
+        megatron_enabled=True,
+        env={"should_use_nemo_gym": True},
+        sampler_cfg=InOrderSamplerConfig(max_lookahead_versions=0),
+    )
+    mc.token_capture.enabled = mc.token_capture.context_compaction = True
+    mc.async_rl.rollout_failure.min_step_batch_fraction = 1
+    mc.policy.update(
+        sequence_packing={"enabled": False},
+        dynamic_batching={"enabled": False},
+        train_micro_batch_size=1,
+        logprob_batch_size=1,
+    )
+    mc.policy["generation"]["vllm_cfg"] = {
+        "async_engine": True,
+        "expose_http_server": True,
+    }
+    mc.checkpointing["checkpoint_dir"] = str(tmp_path)
+    (tmp_path / "step_3").mkdir()
+    # Real discovery must reject before reading even a training-info file.
+    with pytest.raises(ValueError, match="CC checkpoint/resume"):
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+    patched_factories["setup_response_data"].assert_not_called()
+    patched_factories["_build_generation"].assert_not_called()
+    patched_factories["_build_trainer"].assert_not_called()
 
 
 def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
@@ -1615,7 +1649,10 @@ class TestSetup:
         ]
         assert WIRE_MULTIMODAL_FIELDS <= set(warmup_fields)
 
-    def test_token_capture_always_creates_finalizer_actor_pool(self, patched_factories):
+    @pytest.mark.parametrize("cc_mode", [False, True])
+    def test_token_capture_always_creates_finalizer_actor_pool(
+        self, patched_factories, cc_mode
+    ):
         mc = _make_master_config(backend="vllm")
         mc.policy["generation"].update(
             {
@@ -1631,6 +1668,21 @@ class TestSetup:
         mc.logger = {**mc.logger, "log_dir": "/tmp/test-token-capture"}
         mc.token_capture.enabled = True
         mc.token_capture.num_reassembler_workers = 3
+        policy = patched_factories["fake_policy"]
+        if cc_mode:
+            mc.token_capture.context_compaction = True
+            mc.env = {"should_use_nemo_gym": True}
+            mc.async_rl.sampler = InOrderSamplerConfig(max_lookahead_versions=0)
+            mc.async_rl.rollout_failure.min_step_batch_fraction = 1
+            mc.policy.update(
+                megatron_cfg={"enabled": True},
+                sequence_packing={"enabled": False},
+                dynamic_batching={"enabled": False},
+                train_micro_batch_size=1,
+                logprob_batch_size=1,
+            )
+            policy.cfg = mc.policy
+            policy.sharding_annotations.get_axis_size.return_value = 2
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
             None,
@@ -1645,6 +1697,11 @@ class TestSetup:
                 sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
             ),
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            patch.object(
+                sc_setup_mod.ray,
+                "get",
+                return_value=None,
+            ),
             patch(
                 "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
                 return_value=fake_actors,
@@ -1652,6 +1709,8 @@ class TestSetup:
         ):
             actor_args, _ = setup_single_controller(mc, tokenizer, processor=processor)
 
+        # Router padding capability is checked against actual selected batches.
+        policy.worker_group.run_all_workers_single_data.assert_not_called()
         (actor_dp_config, actor_config), actor_kwargs = (
             mock_create_finalizer_actors.call_args
         )
@@ -1664,7 +1723,12 @@ class TestSetup:
         assert not hasattr(actor_args.rollout_manager, "_finalizer")
         partition_calls = actor_args.dp_client.register_partition.call_args_list
         assert WIRE_MULTIMODAL_FIELDS <= set(partition_calls[0].kwargs["fields"])
-        assert WIRE_MULTIMODAL_FIELDS.isdisjoint(partition_calls[1].kwargs["fields"])
+        if cc_mode:
+            assert PACKED_MULTIMODAL_FIELDS <= set(partition_calls[1].kwargs["fields"])
+        else:
+            assert WIRE_MULTIMODAL_FIELDS.isdisjoint(
+                partition_calls[1].kwargs["fields"]
+            )
 
     def test_setup_timing_populated_for_noncolocated_vllm(self, patched_factories):
         """Non-colocated vLLM records every per-phase field."""

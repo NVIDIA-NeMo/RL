@@ -919,6 +919,7 @@ class AsyncNemoGymRolloutImpl:
         # Length-based reward shaping for low-effort prompts; None disables it.
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
+        context_compaction: bool = False,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -930,6 +931,7 @@ class AsyncNemoGymRolloutImpl:
         self._mask_env_flagged_samples = mask_env_flagged_samples
         self._log_full_result_tables = log_full_result_tables
         self._reward_penalty_config = reward_penalty_config
+        self._context_compaction = context_compaction
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
         self._deadline_registry = deadline_registry
         self._max_gym_row_attempts = (
@@ -1129,9 +1131,12 @@ class AsyncNemoGymRolloutImpl:
         received: set[int] = set()
         env_timing_metrics: Optional[dict[str, Any]] = None
 
-        async for result_ref in nemo_gym_env.run_rollouts.options(
-            num_returns="streaming"
-        ).remote(pending, timer_prefix):
+        options: dict[str, Any] = {"num_returns": "streaming"}
+        if self._context_compaction:
+            options["max_task_retries"] = 0
+        async for result_ref in nemo_gym_env.run_rollouts.options(**options).remote(
+            pending, timer_prefix
+        ):
             rowidx, resolved_agent_ref, result, timing_metrics = await result_ref
             # Validated against the original group, not the pending subset: on a
             # re-dispatch the row keeps its original index so results stay ordered.
@@ -1228,7 +1233,8 @@ class AsyncNemoGymRolloutImpl:
             last_error: Optional[Exception] = None
             max_row_attempts = (
                 1
-                if recovery_granularity is RecoveryGranularity.PROMPT_GROUP
+                if self._context_compaction
+                or recovery_granularity is RecoveryGranularity.PROMPT_GROUP
                 else self._max_gym_row_attempts
             )
             async with _Deadline(
@@ -1377,11 +1383,17 @@ class AsyncNemoGymRolloutImpl:
                 env_extras = dict(result["full_result"])
                 env_extras["ng_receipt"] = result["receipt"]
                 env_extras["ng_rollout_id"] = result["rollout_id"]
+                if self._context_compaction:
+                    if "logical_segments" not in result:
+                        raise ValueError(
+                            "CC dispatch requires a logical segment result for every owner"
+                        )
+                    env_extras["ng_logical_segments"] = result["logical_segments"]
                 completions.append(
                     Completion(
                         message_log=result["message_log"],
                         env_extras=env_extras,
-                        truncated=False,
+                        truncated=bool(result.get("truncated")),
                         # Same defensive read the receipt producer uses
                         # (nemo_gym._postprocess_receipt_mode): a gym result with
                         # no reward finalizes as 0.0 rather than a KeyError.
@@ -1428,17 +1440,33 @@ class AsyncNemoGymRolloutImpl:
             # Token-free receipts: token accounting comes from the manifest
             # (cum_len of the deepest chain; delta sums as the generation
             # proxy) instead of a message_log walk.
-            manifests = [
-                (((c.env_extras or {}).get("ng_receipt") or {}).get("manifest") or [])
-                for c in completions
-            ]
+            if self._context_compaction:
+                manifests = [
+                    [
+                        record
+                        for segment in c.env_extras["ng_logical_segments"]
+                        for record in (segment.receipt or {}).get("manifest", [])
+                        if record.get("response_id") in segment.selected_response_ids
+                    ]
+                    for c in completions
+                ]
+            else:
+                manifests = [
+                    (
+                        ((c.env_extras or {}).get("ng_receipt") or {}).get("manifest")
+                        or []
+                    )
+                    for c in completions
+                ]
             # .get with 0: _assemble_receipt ships raw ledger rows unvalidated
             # when CallRecord validation fails (it only stamps
             # capture_poisoned), so a malformed row must degrade a metric, not
             # fail the group as a deterministic data failure.
             turn_count = [len(m) for m in manifests]
             total_tokens = [
-                max((entry.get("cum_len", 0) for entry in m), default=0)
+                sum(entry.get("delta_len", 0) for entry in m)
+                if self._context_compaction
+                else max((entry.get("cum_len", 0) for entry in m), default=0)
                 for m in manifests
             ]
             assistant_tokens = [
@@ -1503,7 +1531,11 @@ class AsyncNemoGymRolloutImpl:
         # Agent-level metrics. Receipts are lineage records, not agent
         # results — keep them (and their manifests) out of the logged table.
         agent_extras = [
-            {k: v for k, v in (c.env_extras or {}).items() if k not in ("ng_receipt",)}
+            {
+                k: v
+                for k, v in (c.env_extras or {}).items()
+                if k not in ("ng_receipt", "ng_logical_segments")
+            }
             for c in completions
         ]
         for key in agent_extras[0].keys():
@@ -1550,6 +1582,8 @@ class RolloutManager:
         retry_policy: Optional[RolloutRetryPolicy] = None,
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
+        context_compaction: bool = False,
+        execution_row_multiple: int = 1,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -1566,6 +1600,10 @@ class RolloutManager:
         # Shared with the impl's request deadlines so the controller can pause their clocks
         # while a colocated engine is in training mode.
         self._request_deadlines = RequestDeadlineRegistry()
+        self._context_compaction = context_compaction
+        self._execution_row_multiple = execution_row_multiple
+        if context_compaction and not use_nemo_gym:
+            raise ValueError("context compaction requires the NeMo-Gym rollout path")
 
         if not use_nemo_gym:
             rollout_cls = AsyncRolloutImpl
@@ -1598,6 +1636,7 @@ class RolloutManager:
             retry_policy=self._retry_policy,
             stats=self._stats,
             effort_config=effort_config,
+            context_compaction=context_compaction,
         )
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
@@ -2072,6 +2111,12 @@ class RolloutManager:
         assert self._tq_buffer is not None, (
             "generate_for_finalization requires tq_buffer to be set at __init__"
         )
+        if (
+            self._context_compaction
+            and "loss_multiplier" in input_sample
+            and input_sample["loss_multiplier"] != 1.0
+        ):
+            raise ValueError("CC currently requires unit dataset loss_multiplier")
         owns_recovery_group = lineage_group_id is None
         recovery_group_id = lineage_group_id
         if recovery_group_id is None:
@@ -2105,6 +2150,8 @@ class RolloutManager:
                     inflight_registry=inflight_registry,
                 )
             except Exception as error:
+                if self._context_compaction:
+                    raise
                 reason = type(error).__name__
                 if classify_rollout_failure(error) is FailureClass.INFRA:
                     infra_attempts += 1
@@ -2194,6 +2241,9 @@ class RolloutManager:
             rollout_ids=list(rollout_ids),
         )
         pending_group_results: dict[int, SiblingSealResult] = {}
+        # CC does not retry or checkpoint; keep segment metadata in this request
+        # while the existing ledger tracks sibling completion and publication.
+        cc_segments = {}
 
         async def _record_streamed_completion(
             generation_index: int, completion: Completion
@@ -2206,6 +2256,16 @@ class RolloutManager:
             if "ng_receipt" not in env_extras:
                 raise ValueError("token-capture completion must contain ng_receipt")
             receipt = env_extras["ng_receipt"]
+            if self._context_compaction:
+                segments = env_extras.get("ng_logical_segments")
+                if not segments:
+                    raise ValueError("CC completion must contain logical segments")
+                if (
+                    generation_index in cc_segments
+                    and cc_segments[generation_index] != segments
+                ):
+                    raise ValueError("conflicting duplicate CC completion")
+                cc_segments[generation_index] = segments
             gate_rollout_id = env_extras.get("ng_rollout_id")
             if receipt is not None and not isinstance(receipt, dict):
                 raise ValueError(
@@ -2318,6 +2378,12 @@ class RolloutManager:
                 prompt_idx=int(recovery_group.prompt_id),
                 mask_sample=tuple(mask_sample),
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
+                logical_segments=(
+                    tuple(cc_segments[i] for i in range(len(rollout_ids)))
+                    if self._context_compaction
+                    else None
+                ),
+                execution_row_multiple=self._execution_row_multiple,
             )
             from nemo_rl.experience.rollout_reassembler_actor import (
                 assert_metadata_only,

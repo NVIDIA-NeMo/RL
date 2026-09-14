@@ -32,6 +32,7 @@ from nemo_rl.data.multimodal_utils import (
     media_sources_equal,
     uses_image_placeholder,
 )
+from nemo_rl.data_plane import DataPlaneClient, DataPlaneConfig, build_data_plane_client
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GYM_PORT_RANGE_HIGH,
     DEFAULT_GYM_PORT_RANGE_LOW,
@@ -45,6 +46,7 @@ from nemo_rl.environments.nemo_gym_multimodal import (
     _without_initial_media_sources,
     normalize_media_in_examples,
 )
+from nemo_rl.experience.cc_media import stage_segment_media
 from nemo_rl.experience.failures import (
     GymTransportError,
     RolloutDataFailure,
@@ -343,6 +345,12 @@ class NemoGym(EnvironmentInterface):
 
     def __init__(self, cfg: NemoGymConfig):
         self.cfg = cfg
+        capture_config = cfg.get("token_capture")
+        self._context_compaction = bool(
+            capture_config and capture_config.get("context_compaction")
+        )
+        if self._context_compaction and not capture_config.get("enabled"):
+            raise ValueError("context compaction requires external token capture")
         # Populated by _spinup. Declared here so a restarted actor -- Ray recreates it
         # through __init__, which does not start the Gym servers -- reports what
         # actually happened instead of an AttributeError from deep inside a rollout.
@@ -362,6 +370,8 @@ class NemoGym(EnvironmentInterface):
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
         self._processor: Optional[Any] = None
+        self._media_dp_client: Optional[DataPlaneClient] = None
+        self._media_staging_partition: Optional[str] = None
         tokenizer_config = cfg.get("tokenizer_config")
         if tokenizer_config:
             from nemo_rl.algorithms.utils import get_tokenizer
@@ -377,6 +387,15 @@ class NemoGym(EnvironmentInterface):
                 f"got {type(self._processor).__name__}. Update "
                 "attach_image_model_inputs_to_message before enabling."
             )
+
+    def setup_media_staging(
+        self, dp_config: DataPlaneConfig, staging_partition: str
+    ) -> None:
+        """Connect to the already registered staging partition; never bootstrap it."""
+        if not self._context_compaction:
+            raise ValueError("Media staging is only configured for CC capture")
+        self._media_dp_client = build_data_plane_client(dp_config, bootstrap=False)
+        self._media_staging_partition = staging_partition
 
     def _require_spinup(self) -> None:
         """Raise a diagnosable error if this instance never ran :meth:`_spinup`."""
@@ -675,7 +694,9 @@ Depending on your data shape, you may want to change these values."""
         timer = Timer()
         timer.start("_run_rollouts_total")
         nemo_gym_result_iterator = self.rch.run_examples(
-            examples=nemo_gym_examples, head_server_config=self.head_server_config
+            examples=nemo_gym_examples,
+            head_server_config=self.head_server_config,
+            **({"retry_requests": False} if self._context_compaction else {}),
         )
         # Gym resolves task_source to agent_ref synchronously in run_examples().
         # Build the counter afterward so completion rows use the resolved identity.
@@ -702,7 +723,11 @@ Depending on your data shape, you may want to change these values."""
                     raise
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                if self._token_capture_enabled:
+                if self._context_compaction:
+                    nemo_rl_result = await self._postprocess_cc_receipt_mode(
+                        nemo_gym_row, nemo_gym_result
+                    )
+                elif self._token_capture_enabled:
                     # Receipt mode: fetch the ledger manifest and assemble the
                     # receipt locally; token-free result. The canonical row is
                     # rebuilt by the finalizer, so no message_log walk (and no
@@ -756,6 +781,154 @@ Depending on your data shape, you may want to change these values."""
                 nemo_rl_result,
                 timing_metrics,
             )
+
+    async def _postprocess_cc_receipt_mode(self, row: dict, result: dict) -> dict:
+        """Resolve each explicitly selected segment using ordinary capture receipts.
+
+        Missing/malformed CC metadata or an unavailable manifest is fatal, never
+        an ordinary-capture fallback. No raw media or cumulative history leaves
+        this actor. Media materialization is added at this same boundary.
+        """
+        # Gym is optional outside its environment actor.
+        from nemo_gym.context_management.result import LogicalCCResult, LogicalCCSegment
+        from nemo_gym.token_id_capture.staging.records import RolloutReceipt
+
+        from nemo_rl.experience.rollout_reassembler import (
+            ActionOutputFlags,
+            SegmentReceipt,
+        )
+
+        logical = LogicalCCResult.model_validate(
+            result.get("context_compaction_result")
+        )
+        owner = row[_NG_ROLLOUT_ID_BODY_KEY]
+        if logical.logical_rollout_id != owner:
+            raise ValueError(
+                "CC result belongs to a different dispatched logical owner"
+            )
+        selected_terminal = logical.segments[-1].selected_actions[-1].response_id
+        if (result.get("response") or {}).get("id") != selected_terminal:
+            raise ValueError("CC selected terminal differs from the scored response")
+        reward = result.get("reward")
+        if (
+            isinstance(reward, bool)
+            or not isinstance(reward, (int, float))
+            or not math.isfinite(reward)
+        ):
+            raise ValueError("CC requires an explicit finite verifier reward")
+
+        # Bound concurrent read-only requests without retaining per-turn histories.
+        semaphore = asyncio.Semaphore(8)
+
+        async def receipt_for(segment: LogicalCCSegment) -> SegmentReceipt:
+            async with semaphore:
+                manifest = await self._control(
+                    "GET",
+                    f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/{segment.capture_rollout_id}/manifest",
+                )
+            receipt = self._assemble_receipt(
+                segment.capture_rollout_id,
+                manifest,
+                terminal_response_id=segment.selected_actions[-1].response_id,
+                reward=float(reward),
+            )
+            if logical.outcome == "execution_failure":
+                receipt.update(
+                    capture_poisoned=True, failure_reason="logical_execution_failure"
+                )
+            media = None
+            if segment.media_occurrence_refs and not receipt.get("capture_poisoned"):
+                parsed = RolloutReceipt.model_validate(receipt)
+                terminals = [
+                    record
+                    for record in parsed.manifest
+                    if record.model_call_id == parsed.terminal_model_call_id
+                    and record.response_id == segment.selected_actions[-1].response_id
+                ]
+                if (
+                    parsed.rollout_id != segment.capture_rollout_id
+                    or len(terminals) != 1
+                    or any(
+                        record.staging_key
+                        != f"{parsed.rollout_id}/{record.model_call_id}"
+                        for record in parsed.manifest
+                    )
+                ):
+                    raise ValueError(
+                        "Selected media terminal has invalid capture ownership"
+                    )
+                if (
+                    self._media_dp_client is None
+                    or self._media_staging_partition is None
+                ):
+                    raise RuntimeError("CC media staging is not configured")
+                media = await asyncio.to_thread(
+                    stage_segment_media,
+                    self._media_dp_client,
+                    staging_partition=self._media_staging_partition,
+                    terminal_staging_key=terminals[0].staging_key,
+                    media_assets=logical.media_assets,
+                    action_occurrences=[
+                        action.new_media_occurrence_refs
+                        for action in segment.selected_actions
+                    ],
+                    processor=self._processor,
+                    pad_dynamic_image_shapes=bool(
+                        self.cfg.get("pad_dynamic_image_shapes")
+                    ),
+                )
+            return SegmentReceipt(
+                capture_rollout_id=segment.capture_rollout_id,
+                receipt=receipt,
+                selected_response_ids=tuple(
+                    action.response_id for action in segment.selected_actions
+                ),
+                truncated=logical.outcome == "max_output_tokens"
+                or any(
+                    action.finish_reason in ("length", "max_output_tokens")
+                    for action in segment.selected_actions
+                ),
+                media=media,
+                action_flags=tuple(
+                    ActionOutputFlags(
+                        *_detect_invalid_tool_call_and_malformed_thinking(
+                            action.last_output_item.model_dump()
+                            if action.last_output_item is not None
+                            else {},
+                            invalid_tool_call_patterns=self.cfg.get(
+                                "invalid_tool_call_patterns"
+                            ),
+                            thinking_tags=self.cfg.get("thinking_tags"),
+                        )
+                    )
+                    for action in segment.selected_actions
+                ),
+            )
+
+        segments = tuple(
+            await asyncio.gather(*(receipt_for(s) for s in logical.segments))
+        )
+        # Keep scalar verifier metrics, not its echoed request, media or full transcript.
+        full_result = {
+            key: value
+            for key, value in result.items()
+            if isinstance(value, (str, int, float, bool))
+        }
+        full_result["instance_config"] = {
+            "mask_sample": bool(
+                (result.get("instance_config") or {}).get("mask_sample")
+            )
+        }
+        return {
+            "message_log": [],
+            "input_message_log": [],
+            "full_result": full_result,
+            "rollout_id": owner,
+            "receipt": None,
+            "logical_segments": segments,
+            "truncated": logical.outcome == "max_output_tokens"
+            or any(s.truncated for s in segments),
+        }
 
     async def _postprocess_receipt_mode(
         self, nemo_gym_row: dict, nemo_gym_result: dict
@@ -1444,6 +1617,9 @@ def spinup_nemo_gym_actor(
     nemo_gym_opts: dict[str, Any] = {
         "runtime_env": make_actor_runtime_env(NEMO_GYM_ACTOR_FQN)
     }
+    if token_capture and token_capture.get("context_compaction"):
+        # A lost actor response can follow an executed mutation. Never replay it.
+        nemo_gym_opts.update(max_restarts=0, max_task_retries=0)
     if env_configs["nemo_gym"].get("num_gpu_nodes", 0):
         nemo_gym_opts["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
             node_id=ray.get_runtime_context().get_node_id(),

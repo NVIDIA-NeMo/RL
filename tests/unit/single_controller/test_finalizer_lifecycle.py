@@ -30,7 +30,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
-from nemo_rl.experience.rollout_reassembler import FinalizedGroup
+from nemo_rl.experience.rollout_reassembler import FinalizedGroup, SegmentReceipt
 from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 from nemo_rl.experience.route_plan import (
     ROUTE_PLAN_SCHEMA_VERSION,
@@ -109,7 +109,6 @@ def _controller(actor: object) -> Any:
     ctrl._buffer = MagicMock()
     ctrl._buffer.commit_finalized = AsyncMock()
     ctrl._dp_client = _DataPlaneClient()
-    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._partition_id = "canonical"
     ctrl._master_config = SimpleNamespace(
         token_capture=SimpleNamespace(staging_partition="staging"),
@@ -309,4 +308,33 @@ def test_known_outcome_cleanup_runs_sync_clears_off_the_event_loop() -> None:
     ]
     assert ctrl._dp_client.clear_thread_ids
     assert all(tid != loop_thread_id for tid in ctrl._dp_client.clear_thread_ids)
+    ctrl._buffer.abort.assert_called_once_with("group")
+
+
+def test_known_cc_cleanup_enumerates_physical_rows_not_logical_owner_ids() -> None:
+    ctrl = _controller(SimpleNamespace())
+    request = ReassemblyRequest(
+        group_id="group",
+        rollout_ids=("group_g0", "group_g1"),
+        canonical_sample_ids=("group_g0", "group_g1"),
+        receipts=(None, None),
+        rewards=(0.0, 1.0),
+        mask_sample=(False, False),
+        fallback_weight_version=3,
+        prompt_idx=0,
+        logical_segments=(
+            (
+                SegmentReceipt("group_g0_s0", None, ()),
+                SegmentReceipt("group_g0_s1", None, ()),
+            ),
+            (),
+        ),
+    )
+    asyncio.run(ctrl._cleanup_known_finalization_request(request))
+    assert ctrl._dp_client.clear_calls == [
+        {
+            "sample_ids": ["group_g0_s0", "group_g0_s1", "group_g1_s0"],
+            "partition_id": "canonical",
+        }
+    ]
     ctrl._buffer.abort.assert_called_once_with("group")

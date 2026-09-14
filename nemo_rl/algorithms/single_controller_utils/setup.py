@@ -66,6 +66,7 @@ from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
+    cc_execution_row_multiple,
     is_ppo_run,
     validate_single_controller_config,
 )
@@ -78,7 +79,10 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
-from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
+from nemo_rl.data.multimodal_utils import (
+    PACKED_MULTIMODAL_FIELDS,
+    WIRE_MULTIMODAL_FIELDS,
+)
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
@@ -1188,6 +1192,8 @@ def setup_single_controller(
     # ==========================
     checkpointer = CheckpointManager(master_config.checkpointing)
     trainer_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    if token_capture_cfg.context_compaction and trainer_checkpoint_path is not None:
+        raise ValueError("CC checkpoint/resume is not supported initially")
     loaded_state = cast(
         Optional[dict[str, Any]],
         checkpointer.load_training_info(trainer_checkpoint_path),
@@ -1773,10 +1779,12 @@ def setup_single_controller(
         group_size = algo_cfg.num_generations_per_prompt
         num_rollout_samples = master_config.async_rl.max_buffered_rollouts * group_size
         partition_fields = fields_with_optional_routed_experts(
-            DP_TRAIN_FIELDS,
+            SC_ROLLOUT_SCHEMA_FIELDS
+            if token_capture_cfg.context_compaction
+            else DP_TRAIN_FIELDS,
             enabled=r3_enabled and not token_capture_cfg.defer_routed_experts_to_policy,
         )
-        if processor is not None:
+        if processor is not None or token_capture_cfg.context_compaction:
             partition_fields.extend(
                 field
                 for field in sorted(WIRE_MULTIMODAL_FIELDS)
@@ -1792,15 +1800,44 @@ def setup_single_controller(
         dp_client.register_partition(
             partition_id=token_capture_cfg.staging_partition,
             fields=list(STAGING_FIELDS)
-            + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else []),
+            + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else [])
+            + (
+                sorted(PACKED_MULTIMODAL_FIELDS)
+                if token_capture_cfg.context_compaction
+                else []
+            ),
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize", "prev_lp", "train"],
         )
         # Host Gym's capture core in every vLLM DP leader (in-worker DP
         # client + TQTokenSink + the single install_capture call), and give
         # workers the initial weight version to stamp on captured calls.
-        generation.setup_token_capture(dp_config, token_capture_cfg.staging_partition)
+        try:
+            generation.setup_token_capture(
+                dp_config,
+                token_capture_cfg.staging_partition,
+                context_compaction=token_capture_cfg.context_compaction,
+            )
+        except Exception as error:
+            if "No module named 'nemo_gym'" in str(error):
+                # Worker venvs are cached by actor class name
+                # (nemo_rl/utils/venvs.py), so a venv prebuilt before token
+                # capture predates the nemo_gym extra and is reused as-is.
+                raise RuntimeError(
+                    "token_capture.enabled requires nemo_gym inside the vLLM "
+                    "worker venv, but the cached worker venv predates it. "
+                    "Rebuild worker venvs (NRL_FORCE_REBUILD_VENVS=true) or "
+                    "delete $NEMO_RL_VENV_DIR/nemo_rl.models.generation.vllm."
+                    "vllm_worker_async.VllmAsyncGenerationWorker and rerun."
+                ) from error
+            raise
         generation.set_rollout_weight_version(0)
+        if token_capture_cfg.context_compaction:
+            ray.get(
+                env_handles["nemo_gym"].setup_media_staging.remote(
+                    dp_config, token_capture_cfg.staging_partition
+                )
+            )
 
     if weight_synchronizer is None:
         t0 = time.perf_counter()
@@ -1888,6 +1925,25 @@ def setup_single_controller(
             env_s=master_config.async_rl.rollout_failure.native.env_timeout_s,
         ),
         retry_policy=_build_retry_policy(master_config),
+        context_compaction=token_capture_cfg.context_compaction,
+        execution_row_multiple=(
+            cc_execution_row_multiple(
+                trainer.cfg,
+                dp_size=trainer.sharding_annotations.get_axis_size("data_parallel"),
+                logprobs_required=(
+                    not (
+                        master_config.loss_fn.force_on_policy_ratio
+                        and algo_cfg.seq_logprob_error_threshold is None
+                    )
+                    or (
+                        master_config.loss_fn.reference_policy_kl_penalty > 0
+                        and not algo_cfg.skip_reference_policy_logprobs_calculation
+                    )
+                ),
+            )
+            if token_capture_cfg.context_compaction
+            else 1
+        ),
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
     )
 

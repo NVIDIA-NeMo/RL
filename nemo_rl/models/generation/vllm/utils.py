@@ -13,6 +13,8 @@
 # limitations under the License.
 
 from collections import defaultdict
+from collections.abc import Mapping
+from dataclasses import is_dataclass, replace
 from typing import Any, Optional
 
 import torch
@@ -122,6 +124,223 @@ def assert_refit_unsupported_grouped_moe_params(
         and any(is_grouped_moe_expert_weight_name(name) for name in state_dict_info)
     ):
         raise AssertionError(GROUPED_MOE_MXFP8_REFIT_ERROR)
+
+
+def capture_image_geometry(
+    engine_prompt: Mapping[str, Any], *, prev_len: int
+) -> dict[str, Any]:
+    """Capture dynamic-image coordinates from the actual post-splice engine input.
+
+    Only new occurrences are stored. A digest of retained occurrences detects
+    re-rendered history whose image geometry/positions changed, without storing
+    every turn's full image prefix. The finalizer compares it to earlier deltas.
+    This initial CC image contract is the pinned Nano Nemotron dynamic tiler:
+    one CHW tensor and explicit H/W per image, not inferred from token count.
+    """
+    # Gym is optional outside captured rollouts.
+    from nemo_gym.token_id_capture.staging.digest import compute_extras_digest
+
+    tokens = engine_prompt["prompt_token_ids"]
+    placeholders = engine_prompt.get("mm_placeholders") or {}
+    kwargs = engine_prompt.get("mm_kwargs") or {}
+    if (set(placeholders) | set(kwargs)) - {"image"}:
+        raise ValueError("CC geometry capture currently supports images only")
+    ranges = placeholders.get("image", [])
+    items = kwargs.get("image", [])
+    if len(ranges) != len(items):
+        raise ValueError("Image placeholders and processor occurrences disagree")
+    retained, added = [], []
+    previous_end = 0
+    for span, item in zip(ranges, items, strict=True):
+        if item is None:
+            raise ValueError(
+                "CC image capture requires processor data, not cache references"
+            )
+        data = item.get_data()
+        pixels = data.get("pixel_values_flat")
+        sizes = data.get("imgs_sizes")
+        if isinstance(sizes, torch.Tensor):
+            sizes = sizes.tolist()
+        if (
+            not isinstance(pixels, torch.Tensor)
+            or pixels.ndim != 3
+            or pixels.shape[0] != 3
+            or not isinstance(sizes, (list, tuple))
+            or len(sizes) != 2
+            or any(type(size) is not int or size <= 0 for size in sizes)
+            or tuple(pixels.shape[-2:]) != tuple(sizes)
+        ):
+            raise ValueError(
+                "CC requires exact dynamic-image CHW/HW processor geometry"
+            )
+        offset, length = span.offset, span.length
+        if span.is_embed is not None:
+            mask = span.is_embed
+            if mask.dtype != torch.bool or tuple(mask.shape) != (length,):
+                raise ValueError("Invalid image embedding mask")
+            positions = mask.nonzero().flatten().tolist()
+            if not positions or positions != list(
+                range(positions[0], positions[-1] + 1)
+            ):
+                raise ValueError("CC requires contiguous image embedding positions")
+            offset, length = offset + positions[0], len(positions)
+        end = offset + length
+        if (
+            type(offset) is not int
+            or type(length) is not int
+            or offset < previous_end
+            or length <= 0
+            or end > len(tokens)
+            or offset < prev_len < end
+            or data.get("num_tokens_per_image") != length
+        ):
+            raise ValueError(
+                "Image span is invalid or crosses the captured prefix boundary"
+            )
+        token_id = tokens[offset]
+        if any(token != token_id for token in tokens[offset:end]):
+            raise ValueError(
+                "Image embedding span must contain one placeholder token ID"
+            )
+        occurrence = dict(
+            offset=offset,
+            length=length,
+            height=sizes[0],
+            width=sizes[1],
+            token_id=token_id,
+        )
+        (retained if end <= prev_len else added).append(occurrence)
+        previous_end = end
+    return {
+        "prefix_digest": compute_extras_digest({"images": retained}),
+        "images": added,
+    }
+
+
+def _find_token_span(tokens: list[int], span: list[int], start: int) -> int | None:
+    """Find the first nonempty span in linear time, including repeated pad runs."""
+    # KMP avoids repeatedly comparing/copying a long almost-matching media span.
+    fallback = [0] * len(span)
+    matched = 0
+    for index in range(1, len(span)):
+        while matched and span[index] != span[matched]:
+            matched = fallback[matched - 1]
+        if span[index] == span[matched]:
+            matched += 1
+        fallback[index] = matched
+    matched = 0
+    for index in range(start, len(tokens)):
+        while matched and tokens[index] != span[matched]:
+            matched = fallback[matched - 1]
+        if tokens[index] == span[matched]:
+            matched += 1
+            if matched == len(span):
+                return index - len(span) + 1
+    return None
+
+
+def remap_multimodal_placeholders(
+    *,
+    template_token_ids: list[int],
+    final_token_ids: list[int],
+    mm_placeholders: Mapping[str, list[Any]],
+) -> dict[str, list[Any]]:
+    """Move vLLM multimodal ranges into the final prompt coordinates.
+
+    vLLM computes multimodal placeholder offsets while preprocessing the
+    chat-template token sequence. NeMo-RL can subsequently replace the
+    re-tokenized history with the exact model-generated token prefix. Locate
+    each unchanged media-token span in that final sequence so its associated
+    multimodal features remain aligned.
+
+    Ranges are matched in global prompt order because different media items can
+    accumulate different shifts. Coincident ranges resolve to the same offset:
+    Qwen2.5-Omni derives an audio range from its paired video range with an
+    identical ``(offset, length)``, so a span is only consumed once.
+
+    A span that cannot be located fails closed rather than submitting token IDs
+    with incorrect multimodal positions. Note that an *ambiguous* match is not
+    detected: media spans are bare runs of one repeated pad token, so if a run
+    is longer in ``final_token_ids`` than in the template, a later item can
+    match inside an earlier item's run. Locating spans by search is only
+    necessary because the splice boundary computed by ``replace_prefix_tokens``
+    is not threaded through to here; passing it would make the suffix region
+    pure arithmetic and remove that ambiguity entirely.
+
+    Args:
+        template_token_ids: The chat-template token sequence vLLM used to
+            compute ``mm_placeholders``.
+        final_token_ids: The exact-token prompt produced by
+            ``replace_prefix_tokens``, which will be submitted to the engine.
+        mm_placeholders: vLLM's per-modality placeholder ranges, in
+            ``template_token_ids`` coordinates.
+
+    Returns:
+        A new per-modality mapping with the same item ordering, whose ranges are
+        expressed in ``final_token_ids`` coordinates.
+
+    Raises:
+        ValueError: If an input range is out of bounds for
+            ``template_token_ids``, or if a media span cannot be relocated in
+            ``final_token_ids``.
+        TypeError: If a range is neither a mapping nor a dataclass instance.
+    """
+    if template_token_ids == final_token_ids or not mm_placeholders:
+        return {modality: list(ranges) for modality, ranges in mm_placeholders.items()}
+
+    entries: list[tuple[int, str, int, Any, int]] = []
+    remapped = {modality: list(ranges) for modality, ranges in mm_placeholders.items()}
+    for modality, ranges in mm_placeholders.items():
+        for item_index, placeholder_range in enumerate(ranges):
+            if isinstance(placeholder_range, Mapping):
+                offset = int(placeholder_range["offset"])
+                length = int(placeholder_range["length"])
+            else:
+                offset = int(placeholder_range.offset)
+                length = int(placeholder_range.length)
+
+            if offset < 0 or length <= 0 or offset + length > len(template_token_ids):
+                raise ValueError(
+                    f"Invalid {modality} placeholder range {item_index}: "
+                    f"offset={offset}, length={length}, "
+                    f"template_length={len(template_token_ids)}"
+                )
+            entries.append((offset, modality, item_index, placeholder_range, length))
+
+    search_start = 0
+    resolved: dict[tuple[int, int], int] = {}
+    for old_offset, modality, item_index, placeholder_range, length in sorted(
+        entries, key=lambda entry: entry[0]
+    ):
+        # Two modalities can describe the same span, so a resolved offset is
+        # reused instead of scanning past it. Only a newly located span
+        # advances the cursor.
+        new_offset = resolved.get((old_offset, length))
+        if new_offset is None:
+            expected = template_token_ids[old_offset : old_offset + length]
+            new_offset = _find_token_span(final_token_ids, expected, search_start)
+            if new_offset is None:
+                raise ValueError(
+                    f"Could not locate {modality} placeholder range {item_index} "
+                    f"from template offset {old_offset} in the final exact-token prompt"
+                )
+            resolved[(old_offset, length)] = new_offset
+            search_start = new_offset + length
+
+        if isinstance(placeholder_range, Mapping):
+            updated_range = dict(placeholder_range)
+            updated_range["offset"] = new_offset
+        elif is_dataclass(placeholder_range):
+            updated_range = replace(placeholder_range, offset=new_offset)
+        else:
+            raise TypeError(
+                "Multimodal placeholder ranges must be mappings or dataclass "
+                f"instances, got {type(placeholder_range).__name__}"
+            )
+
+        remapped[modality][item_index] = updated_range
+
+    return remapped
 
 
 def _as_routed_experts_tensor(

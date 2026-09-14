@@ -206,6 +206,8 @@ data_plane:
 # single-controller recovery options require it.
 token_capture:
   enabled: false
+  # Require shared Gym CC results and disable mutation retries (opt-in).
+  context_compaction: false
   staging_partition: rollout_staging
 
 # Retry and restore policy for unfinished token-capture groups. "sibling" reuses

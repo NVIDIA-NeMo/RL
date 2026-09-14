@@ -156,17 +156,21 @@ def _generation_with_mock_group(*, async_engine: bool = True) -> VllmGeneration:
     return gen
 
 
-def test_generation_setup_token_capture_fans_out(monkeypatch):
+@pytest.mark.parametrize("context_compaction", [False, True])
+def test_generation_setup_token_capture_fans_out(monkeypatch, context_compaction):
     gen = _generation_with_mock_group()
     monkeypatch.setattr(
         "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
         lambda futures: futures,
     )
-    gen.setup_token_capture({"backend": "simple"}, "rollout_staging")
+    gen.setup_token_capture(
+        {"backend": "simple"}, "rollout_staging", context_compaction=context_compaction
+    )
     gen.worker_group.run_all_workers_single_data.assert_called_once_with(
         "setup_token_capture",
         dp_cfg={"backend": "simple"},
         staging_partition="rollout_staging",
+        context_compaction=context_compaction,
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
     )
 
@@ -205,6 +209,7 @@ def _worker_with_capture(sink: _MemorySink):
 
     worker = _fake_worker()
     worker._capture_calls = {}
+    worker._cc_capture_enabled = False
     worker._prefix_cache = {}
     worker._prefix_cache_lock = threading.Lock()
     worker._staging_source = None
@@ -365,7 +370,8 @@ def test_staging_chain_prefix_flows_through_adapter_and_begin_call():
     assert admission.required_prefix_token_ids == []
     # enter_prefix is the production writer of the request field.
     assert request.required_prefix_token_ids == prefix
-    call, prompt = worker._capture_calls[id(request)]
+    call, prompt, image_geometry = worker._capture_calls[id(request)]
+    assert image_geometry is None
     assert call.prefix_token_ids == prefix
     assert prompt == [10, 11, 12, 20]
 
