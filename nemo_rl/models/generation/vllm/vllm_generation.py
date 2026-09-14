@@ -18,10 +18,12 @@ import os
 import warnings
 from collections import defaultdict
 from typing import (
+    TYPE_CHECKING,
     Any,
     AsyncGenerator,
     Optional,
     Union,
+    cast,
 )
 
 import numpy as np
@@ -42,7 +44,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
-from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.config import (
+    REFITTABLE_FP8_KV_CACHE_DTYPES,
+    VllmConfig,
+)
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     assert_refit_unsupported_grouped_moe_params,
@@ -62,6 +67,9 @@ from nemo_rl.utils.multimodal_payload_metrics import (
 )
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 from nemo_rl.weight_sync.membership import RefitMembership
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +109,12 @@ def _record_vllm_generation_metrics(
 
 
 class VllmGeneration(GenerationInterface):
+    @classmethod
+    def validate_settings(cls, master_config: "MasterConfig") -> None:
+        """Reject pure-config vLLM settings the SC entrypoint cannot honor."""
+        generation_config = cast(VllmConfig, master_config.policy["generation"])
+        assert_reload_refit_config_supported(generation_config)
+
     @staticmethod
     def init_cluster_placement_groups(
         cluster: RayVirtualCluster,
@@ -1410,8 +1424,8 @@ class VllmGeneration(GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("stop_gpu_profiling")
         ray.get(futures)
 
-    def get_vllm_logger_metrics(self) -> dict[str, Any]:
-        """Collect vLLM logger metrics from vLLM workers (model-owner actors only)."""
+    def _collect_vllm_logger_metrics(self, worker_method_name: str) -> dict[str, Any]:
+        """Collect one logger payload from every model-owner vLLM worker."""
         if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             return {}
         if not self.cfg["vllm_cfg"].get("async_engine", False):
@@ -1422,7 +1436,7 @@ class VllmGeneration(GenerationInterface):
         for dp_idx in range(self.worker_group.dp_size):
             worker_idx = self.worker_group.get_dp_leader_worker_idx(dp_idx)
             future = self.worker_group.run_single_worker_single_data(
-                "get_vllm_logger_metrics",
+                worker_method_name,
                 worker_idx=worker_idx,
             )
             futures.append(future)
@@ -1456,6 +1470,14 @@ class VllmGeneration(GenerationInterface):
 
         return vllm_logger_metrics
 
+    def get_vllm_logger_metrics(self) -> dict[str, Any]:
+        """Collect vLLM metric histories for step-level performance reports."""
+        return self._collect_vllm_logger_metrics("get_vllm_logger_metrics")
+
+    def drain_latest_vllm_logger_metrics(self) -> dict[str, Any]:
+        """Consume bounded latest-value snapshots for frequent telemetry polls."""
+        return self._collect_vllm_logger_metrics("drain_latest_vllm_logger_metrics")
+
     def clear_vllm_logger_metrics(self) -> None:
         if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             return
@@ -1474,6 +1496,10 @@ class VllmGeneration(GenerationInterface):
     def get_logger_metrics(self) -> dict[str, Any]:
         """Get logger metrics for performance reporting."""
         return self.get_vllm_logger_metrics()
+
+    def drain_latest_logger_metrics(self) -> dict[str, Any]:
+        """Consume latest values without transferring full worker histories."""
+        return self.drain_latest_vllm_logger_metrics()
 
     def __del__(self) -> None:
         """Shuts down the worker groups when the object is deleted or is garbage collected.
@@ -1543,8 +1569,8 @@ class VllmGeneration(GenerationInterface):
     def requires_kv_scale_sync(self) -> bool:
         """Check if KV cache scales should be synchronized during refit.
 
-        Returns True if kv_cache_dtype is fp8/fp8_e4m3.
+        Only traditional per-tensor FP8 caches expose separately refittable
+        k_scale/v_scale parameters.
         """
-        return "kv_cache_dtype" in self.cfg["vllm_cfg"] and self.cfg["vllm_cfg"][
-            "kv_cache_dtype"
-        ].startswith("fp8")
+        kv_cache_dtype = self.cfg["vllm_cfg"].get("kv_cache_dtype")
+        return kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES
