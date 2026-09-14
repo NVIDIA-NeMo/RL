@@ -666,6 +666,7 @@ class SingleControllerActor:
             master_config.rollout_checkpointing.gym.generation_prefix_cuts_enabled
         )
         self._generation_checkpoint_pause_id: Optional[str] = None
+        self._generation_checkpoint_decoding_resumed = False
         self._gym_completed_acknowledgement_lock = asyncio.Lock()
         self._gym_completed_acknowledgement_task: Optional[asyncio.Task[None]] = None
         self._pending_gym_checkpoint_abort: Optional[_PendingGymCheckpointAbort]
@@ -2002,6 +2003,12 @@ class SingleControllerActor:
                 raise RuntimeError(
                     f"Gym checkpoint {checkpoint_id!r} returned an incomplete cut"
                 )
+            if self._generation_checkpoint_pause_id == checkpoint_id:
+                await asyncio.to_thread(
+                    self._gen.resume_generation_after_cut,
+                    timeout_s=timeout_s,
+                )
+                self._generation_checkpoint_decoding_resumed = True
             checkpoint = GymCheckpointCommitResult.model_validate(
                 await gym_actor.commit_checkpoint.remote(
                     checkpoint_id,
@@ -2065,6 +2072,7 @@ class SingleControllerActor:
                         recovery_errors.append(resume_error)
                     else:
                         self._generation_checkpoint_pause_id = None
+                        self._generation_checkpoint_decoding_resumed = False
                 self._gym_checkpoint_rollout_permitted.set()
             if len(recovery_errors) > 1:
                 raise BaseExceptionGroup(
@@ -2088,11 +2096,14 @@ class SingleControllerActor:
         )
         await method.remote(checkpoint_id, time.time() + timeout_s)
         if self._generation_checkpoint_pause_id == checkpoint_id:
-            await asyncio.to_thread(
-                self._gen.resume_generation_after_checkpoint,
-                timeout_s=timeout_s,
+            generation_release = (
+                self._gen.finish_generation_checkpoint
+                if self._generation_checkpoint_decoding_resumed
+                else self._gen.resume_generation_after_checkpoint
             )
+            await asyncio.to_thread(generation_release, timeout_s=timeout_s)
             self._generation_checkpoint_pause_id = None
+            self._generation_checkpoint_decoding_resumed = False
         # Reopen local admission only after Gym confirms that its own admission
         # fence and the generation engines have been released. If either call
         # fails, keeping this event cleared fails closed instead of dispatching
