@@ -139,6 +139,9 @@ def uv_py_executable(extras: Sequence[str]) -> str:
 #
 # Python port-range bounds below are half-open: [low, high).
 #
+#   1150-1199    Data plane (TQ/mooncake)        (DEFAULT_DATA_PLANE_PORT_RANGE_*, driver-local
+#                                                 allocation: metadata server, master RPC,
+#                                                 master metrics)
 #   [1202, 1300) SingleController gen. router    (driver-local allocation)
 #   1313-1399    Dynamo etcd/NATS control plane  (driver-local allocation)
 #   1400-1999    Master address / TCPStore       (cluster.master_port_range_low/high)
@@ -182,6 +185,16 @@ DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH = 8999
 # Master address / TCPStore range, tucked below the Ray worker-gRPC band (2000+).
 DEFAULT_MASTER_PORT_RANGE_LOW = 1400
 DEFAULT_MASTER_PORT_RANGE_HIGH = 1999
+# One band for every port the data plane binds on the driver: mooncake's
+# metadata server, the master's RPC endpoint, and the master's metrics server.
+# The defaults those three land on -- 50050 and 50051 from TransferQueue's
+# config.yaml, 9003 from mooncake_master's own gflag -- all sit inside the
+# 9000-65000 ephemeral range these nodes use, so the kernel can hand one out as
+# a source port for outgoing traffic before the master binds it. This band is
+# the gap left below the Ray GCS ports (1200+) — see ray.sub's port map. Fifty
+# ports is ample: one master serves the whole job.
+DEFAULT_DATA_PLANE_PORT_RANGE_LOW = 1150
+DEFAULT_DATA_PLANE_PORT_RANGE_HIGH = 1200
 
 # ---------------------------------------------------------------------------
 # Topology resource keys
@@ -355,6 +368,42 @@ def _get_free_consecutive_ports_local(
         f"Could not find {consecutive} consecutive free ports in "
         f"[{port_range_low}, {port_range_high})."
     )
+
+
+def _reserve_data_plane_ports(count: int) -> list[int]:
+    """Reserve *count* distinct ports for the data plane's driver-side servers.
+
+    The defaults those servers land on -- 50050 and 50051 from TransferQueue's
+    ``config.yaml``, 9003 from mooncake_master's ``metrics_port`` gflag -- sit
+    inside the 9000-65000 ephemeral range these nodes use. The kernel can
+    therefore hand any of them to an outgoing connection during the minutes
+    between job start and the master's bind, after which the master dies with
+    EADDRINUSE. That is why ray.sub's port map keeps every service below 9000,
+    and this allocates from the band that map leaves free.
+
+    Every one of these ports is passed to the servers explicitly and reaches
+    clients through the TQ controller actor rather than being assumed, so
+    relocating them costs nothing.
+
+    ``excluded_ports`` keeps the returned ports distinct, and
+    ``_get_free_port_local`` binds without ``SO_REUSEADDR``, matching
+    mooncake_master: a port obtainable only by reusing a lingering slot is not
+    one the master could bind either.
+
+    Returns:
+        *count* ports from the data-plane band, in allocation order.
+    """
+    reserved: list[int] = []
+    for _ in range(count):
+        reserved.append(
+            _get_free_port_local(
+                DEFAULT_DATA_PLANE_PORT_RANGE_LOW,
+                DEFAULT_DATA_PLANE_PORT_RANGE_HIGH,
+                max_retries=None,
+                excluded_ports=set(reserved),
+            )
+        )
+    return reserved
 
 
 def init_ray(log_dir: Optional[str] = None) -> None:
