@@ -21,7 +21,6 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
-from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.algorithms.x_token.loss_utils import (
     prepare_xtoken_cross_tokenizer_loss_input,
 )
@@ -370,6 +369,26 @@ def prepare_opd_full_loss_input(
     return loss_input
 
 
+def _drop_neginf_logprob_positions(
+    data: BatchedDataDict[Any], curr_logprobs: torch.Tensor
+) -> torch.Tensor:
+    """Mask out positions whose sampled token is outside the training-side top-k/top-p set.
+
+    Such positions carry -inf in curr and/or prev logprobs.
+    Remove them from token_mask and zero the -inf so downstream math stays finite.
+    """
+    bad = torch.isinf(curr_logprobs)
+    if "prev_logprobs" in data:
+        bad = bad | torch.isinf(data["prev_logprobs"][:, 1:])
+        data["prev_logprobs"] = data["prev_logprobs"].clone()
+        data["prev_logprobs"][:, 1:] = data["prev_logprobs"][:, 1:].masked_fill(
+            bad, 0.0
+        )
+    data["token_mask"] = data["token_mask"].clone()
+    data["token_mask"][:, 1:] *= (~bad).to(data["token_mask"].dtype)
+    return curr_logprobs.masked_fill(bad, 0.0)
+
+
 def prepare_loss_input(
     logits: torch.Tensor,
     data: BatchedDataDict[Any],
@@ -441,10 +460,7 @@ def prepare_loss_input(
 
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
         if need_top_k_or_top_p_filtering(sampling_params):
-            # mask out negative infinity logprobs
-            # prev_logprobs is already masked out in the previous step
-            mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
-            logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
+            logprobs = _drop_neginf_logprob_positions(data, logprobs)
 
             # compute unfiltered logprobs for reference policy KL penalty
             if (
@@ -763,8 +779,7 @@ def prepare_packed_loss_input(
     # Match prepare_loss_input behavior for top-k/top-p filtered training:
     # use filtered curr_logprobs for actor loss, but keep unfiltered values for KL.
     if need_top_k_or_top_p_filtering(sampling_params):
-        mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
-        logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
+        logprobs = _drop_neginf_logprob_positions(data, logprobs)
 
         if (
             hasattr(loss_fn, "reference_policy_kl_penalty")

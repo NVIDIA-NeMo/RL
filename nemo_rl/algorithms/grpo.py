@@ -2741,7 +2741,7 @@ def compute_and_apply_seq_logprob_error_masking(
     lp_error = torch.abs(generation_logprobs - prev_logprobs)
 
     # Use combined mask exactly as in loss function
-    mask = token_mask * sample_mask.unsqueeze(-1)
+    mask = token_mask * sample_mask.unsqueeze(-1) * torch.isfinite(prev_logprobs)
 
     # Calculate sequence-level multiplicative prob error.
     #
