@@ -1681,6 +1681,22 @@ class VllmGeneration(GenerationInterface):
             raise RuntimeError("Failed to checkpoint-pause every async vLLM engine")
         return True
 
+    def begin_generation_checkpoint(self, *, timeout_s: Optional[float] = None) -> bool:
+        """Fence terminal staging while vLLM keeps decoding during cut flushes."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError("begin_generation_checkpoint requires async_engine=True")
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        futures = self.worker_group.run_all_workers_single_data(
+            "begin_generation_checkpoint_async",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        if not all(ray.get(futures, timeout=timeout_s)):
+            raise RuntimeError(
+                "Failed to fence terminal staging on every async vLLM engine"
+            )
+        return True
+
     def resume_generation_after_checkpoint(
         self, *, timeout_s: Optional[float] = None
     ) -> bool:
