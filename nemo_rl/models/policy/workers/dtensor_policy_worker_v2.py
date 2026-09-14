@@ -297,14 +297,19 @@ class DTensorPolicyWorkerV2Impl(
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # Initialize checkpoint manager now that distributed is set up
+        requires_synchronous_checkpoint = (
+            getattr(runtime_config.model_config, "model_type", None) == "deepseek_v4"
+        )
         dtensor_cfg = config["dtensor_cfg"]
         checkpoint_config = build_checkpoint_config(
             dtensor_cfg,
             model_repo_id=config["model_name"],
             dequantize_base_checkpoint=config.get("dequantize_base_checkpoint", False),
             is_peft=self.lora_enabled,
-            # The algorithm finalizes policy writes before checkpoint rename.
-            is_async=True,
+            # Automodel's process-based async DCP cannot serialize the
+            # HF-adapted DeepSeek-V4 DTensor/view state. Other v2 models keep
+            # the pre-existing async checkpoint path.
+            is_async=not requires_synchronous_checkpoint,
         )
         self._init_checkpoint_manager(
             config_updates=checkpoint_config,
