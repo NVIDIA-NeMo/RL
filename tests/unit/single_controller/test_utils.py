@@ -112,6 +112,24 @@ class TestAggregateStepMetrics:
         assert out["lr"] == pytest.approx(0.2)
         assert out["some_sum_metric"] == pytest.approx(6.0)
 
+    def test_prev_metrics_use_their_retained_token_denominators(self) -> None:
+        result = {
+            "all_mb_metrics": {
+                "token_mult_prob_error": [6.0, 4.0],
+                "sampling_importance_ratio": [9.0, 3.0],
+                "is_oob_ratio": [1.0, 1.0],
+                "num_valid_prev_tokens": [3.0, 2.0],
+                "num_valid_sampling_importance_ratio_tokens": [3.0, 2.0],
+                "num_valid_is_oob_tokens": [3.0, 2.0],
+            }
+        }
+
+        out = aggregate_step_metrics(result)
+
+        assert out["token_mult_prob_error"] == pytest.approx(2.0)
+        assert out["sampling_importance_ratio"] == pytest.approx(12.0 / 5.0)
+        assert out["is_oob_ratio"] == pytest.approx(2.0 / 5.0)
+
     def test_min_max_all_inf_falls_back_to_neg_one(self) -> None:
         result = {
             "all_mb_metrics": {
@@ -131,6 +149,29 @@ class TestAggregateStepMetrics:
         out = aggregate_step_metrics(result)
         assert out["moe/load_balance"] == pytest.approx(4.0)
         assert out["mtp/acc"] == pytest.approx(4.0)
+
+    def test_actor_metrics_weight_uneven_microbatches_and_ranks_by_tokens(
+        self,
+    ) -> None:
+        """Raw fragments produce one global mean, not a sum of local means."""
+        # Flattened order is rank0/mb0, rank0/mb1, rank1/mb0, rank1/mb1.
+        # The last shard retained no actor tokens; the other three contain
+        # ratio sums/counts (4/2), (2/1), and (15/3).
+        result = {
+            "all_mb_metrics": {
+                "probs_ratio": [4.0, 2.0, 15.0, 0.0],
+                "probs_ratio_clamped": [3.0, 1.0, 6.0, 0.0],
+                "approx_entropy": [2.0, 4.0, 9.0, 0.0],
+                "num_valid_actor_tokens": [2.0, 1.0, 3.0, 0.0],
+            }
+        }
+
+        out = aggregate_step_metrics(result)
+
+        assert out["num_valid_actor_tokens"] == pytest.approx(6.0)
+        assert out["probs_ratio"] == pytest.approx(3.5)
+        assert out["probs_ratio_clamped"] == pytest.approx(10.0 / 6.0)
+        assert out["approx_entropy"] == pytest.approx(2.5)
 
 
 class TestReduceAdvantagePumpMetrics:
