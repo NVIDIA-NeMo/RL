@@ -538,8 +538,7 @@ class SingleControllerActor:
         self._generation_prefix_cuts_enabled = (
             master_config.rollout_checkpointing.gym.generation_prefix_cuts_enabled
         )
-        self._generation_checkpoint_pause_id: Optional[str] = None
-        self._generation_checkpoint_decoding_resumed = False
+        self._generation_checkpoint_id: Optional[str] = None
         self._gym_completed_acknowledgement_lock = asyncio.Lock()
         self._gym_completed_acknowledgement_task: Optional[asyncio.Task[None]] = None
 
@@ -1355,6 +1354,7 @@ class SingleControllerActor:
         *,
         replay_metadata: Optional[TQReplayMetadataState],
         clear_unreferenced: bool,
+        clear_unreferenced_generation_cuts: bool = False,
         gym_staging_keys: set[str] | None = None,
     ) -> int:
         """Validate staging ownership while the caller holds a stable cut."""
@@ -1385,6 +1385,23 @@ class SingleControllerActor:
                 f"(total={len(missing)})"
             )
         unreferenced = sorted(actual_staging_keys - expected_staging_keys)
+        stale_generation_cuts = [
+            key for key in unreferenced if key.startswith(GENERATION_CUT_STAGING_PREFIX)
+        ]
+        if clear_unreferenced_generation_cuts and stale_generation_cuts:
+            await self._call_dp(
+                "clear_samples",
+                sample_ids=stale_generation_cuts,
+                partition_id=staging_partition,
+            )
+            unreferenced = [
+                key for key in unreferenced if key not in stale_generation_cuts
+            ]
+            print(
+                "rollout recovery cleared obsolete generation-cut rows: "
+                f"count={len(stale_generation_cuts)}",
+                flush=True,
+            )
         if clear_unreferenced and unreferenced:
             await self._call_dp(
                 "clear_samples",
@@ -1781,7 +1798,6 @@ class SingleControllerActor:
         timeout_s = self._master_config.rollout_checkpointing.gym.prepare_timeout_s
         gym_actor = self._nemo_gym_checkpoint_actor()
         prepared = False
-        generation_cut_staging_keys: set[str] = set()
         self._gym_checkpoint_rollout_permitted.clear()
         try:
             # A completed agent result blocks Gym prepare until RL has durably
@@ -1791,41 +1807,34 @@ class SingleControllerActor:
             if self._generation_prefix_cuts_enabled:
                 try:
                     await asyncio.to_thread(
-                        self._gen.pause_generation_for_checkpoint,
+                        self._gen.begin_generation_checkpoint,
                         timeout_s=timeout_s,
                     )
-                except BaseException as pause_error:
+                except BaseException as fence_error:
                     try:
                         await asyncio.to_thread(
-                            self._gen.resume_generation_after_checkpoint,
+                            self._gen.finish_generation_checkpoint,
                             timeout_s=timeout_s,
                         )
-                    except BaseException as resume_error:
+                    except BaseException as release_error:
                         raise BaseExceptionGroup(
-                            "generation checkpoint pause failed and partially "
-                            "paused workers could not be resumed",
-                            [pause_error, resume_error],
+                            "generation checkpoint fencing failed and partially "
+                            "fenced workers could not be released",
+                            [fence_error, release_error],
                         )
                     raise
-                self._generation_checkpoint_pause_id = checkpoint_id
+                self._generation_checkpoint_id = checkpoint_id
             prepare = GymCheckpointPrepareResult.model_validate(
                 await gym_actor.prepare_checkpoint.remote(
                     checkpoint_id,
                     time.time() + timeout_s,
                 )
             )
-            generation_cut_staging_keys = gym_generation_cut_staging_keys(prepare)
             if not prepare.ready:
                 raise RuntimeError(
                     f"Gym checkpoint {checkpoint_id!r} returned an incomplete cut"
                 )
             prepared = True
-            if self._generation_checkpoint_pause_id == checkpoint_id:
-                await asyncio.to_thread(
-                    self._gen.resume_generation_after_cut,
-                    timeout_s=timeout_s,
-                )
-                self._generation_checkpoint_decoding_resumed = True
             checkpoint = GymCheckpointCommitResult.model_validate(
                 await gym_actor.commit_checkpoint.remote(
                     checkpoint_id,
@@ -1852,12 +1861,6 @@ class SingleControllerActor:
             return prepare, checkpoint
         except BaseException as checkpoint_error:
             recovery_errors: list[BaseException] = [checkpoint_error]
-            try:
-                await self._clear_generation_cut_staging_rows(
-                    generation_cut_staging_keys
-                )
-            except BaseException as cleanup_error:
-                recovery_errors.append(cleanup_error)
             if prepared:
                 try:
                     await self._release_prepared_gym_checkpoint(
@@ -1866,17 +1869,16 @@ class SingleControllerActor:
                 except BaseException as abort_error:
                     recovery_errors.append(abort_error)
             else:
-                if self._generation_checkpoint_pause_id == checkpoint_id:
+                if self._generation_checkpoint_id == checkpoint_id:
                     try:
                         await asyncio.to_thread(
-                            self._gen.resume_generation_after_checkpoint,
+                            self._gen.finish_generation_checkpoint,
                             timeout_s=timeout_s,
                         )
-                    except BaseException as resume_error:
-                        recovery_errors.append(resume_error)
+                    except BaseException as release_error:
+                        recovery_errors.append(release_error)
                     else:
-                        self._generation_checkpoint_pause_id = None
-                        self._generation_checkpoint_decoding_resumed = False
+                        self._generation_checkpoint_id = None
                 self._gym_checkpoint_rollout_permitted.set()
             if len(recovery_errors) > 1:
                 raise BaseExceptionGroup(
@@ -1899,15 +1901,12 @@ class SingleControllerActor:
             gym_actor.resume_checkpoint if committed else gym_actor.abort_checkpoint
         )
         await method.remote(checkpoint_id, time.time() + timeout_s)
-        if self._generation_checkpoint_pause_id == checkpoint_id:
-            generation_release = (
-                self._gen.finish_generation_checkpoint
-                if self._generation_checkpoint_decoding_resumed
-                else self._gen.resume_generation_after_checkpoint
+        if self._generation_checkpoint_id == checkpoint_id:
+            await asyncio.to_thread(
+                self._gen.finish_generation_checkpoint,
+                timeout_s=timeout_s,
             )
-            await asyncio.to_thread(generation_release, timeout_s=timeout_s)
-            self._generation_checkpoint_pause_id = None
-            self._generation_checkpoint_decoding_resumed = False
+            self._generation_checkpoint_id = None
         # Reopen local admission only after Gym confirms that its own admission
         # fence and the generation engines have been released. If either call
         # fails, keeping this event cleared fails closed instead of dispatching
@@ -4059,6 +4058,7 @@ class SingleControllerActor:
                 cut,
                 replay_metadata=replay_metadata,
                 clear_unreferenced=False,
+                clear_unreferenced_generation_cuts=True,
                 gym_staging_keys=gym_staging_keys,
             )
         tq_save_started = time.monotonic()
@@ -4085,23 +4085,6 @@ class SingleControllerActor:
             mutation_version=self._data_plane_checkpoint_barrier.mutation_version,
             tq_save_seconds=tq_save_seconds,
         )
-
-    async def _clear_generation_cut_staging_rows(
-        self,
-        generation_cut_staging_keys: set[str],
-    ) -> None:
-        """Remove checkpoint-only prefix rows from live TQ state."""
-        ephemeral_cut_keys = sorted(
-            key
-            for key in generation_cut_staging_keys
-            if key.startswith(GENERATION_CUT_STAGING_PREFIX)
-        )
-        if ephemeral_cut_keys:
-            await self._call_dp(
-                "clear_samples",
-                sample_ids=ephemeral_cut_keys,
-                partition_id=self._master_config.token_capture.staging_partition,
-            )
 
     async def _write_rollout_checkpoint_sidecars(
         self,
@@ -4285,8 +4268,6 @@ class SingleControllerActor:
             gym_prepare: Optional[GymCheckpointPrepareResult] = None
             gym_checkpoint: Optional[GymCheckpointCommitResult] = None
             gym_staging_keys: set[str] = set()
-            generation_cut_staging_keys: set[str] = set()
-            generation_cut_rows_cleared = False
             # A failed attempt removes its temporary directory, so its numeric
             # snapshot sequence can be reused. Gym retires every completed or
             # aborted control ID, however; add a nonce so the next attempt is not
@@ -4316,10 +4297,9 @@ class SingleControllerActor:
                         gym_checkpoint,
                     )
                 if gym_prepare is not None:
-                    generation_cut_staging_keys = gym_generation_cut_staging_keys(
-                        gym_prepare
+                    gym_staging_keys.update(
+                        gym_generation_cut_staging_keys(gym_prepare)
                     )
-                    gym_staging_keys.update(generation_cut_staging_keys)
                 barrier_requested = time.monotonic()
                 async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
                     barrier_acquired = time.monotonic()
@@ -4329,10 +4309,6 @@ class SingleControllerActor:
                         or self._trainer_version != expected_trainer_version
                     ):
                         await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
-                        await self._clear_generation_cut_staging_rows(
-                            generation_cut_staging_keys
-                        )
-                        generation_cut_rows_cleared = True
                         if gym_checkpoint is not None:
                             await self._release_prepared_gym_checkpoint(
                                 checkpoint_id,
@@ -4348,16 +4324,6 @@ class SingleControllerActor:
                         tmp_path,
                         gym_staging_keys=gym_staging_keys,
                     )
-                    # The immutable TQ checkpoint now owns these active-prefix
-                    # rows. Remove only checkpoint-scoped copies from the live
-                    # staging partition so periodic cuts do not accumulate. A
-                    # terminal row may also appear in a cut receipt due to a
-                    # completion race; it is deliberately retained for the live
-                    # finalizer.
-                    await self._clear_generation_cut_staging_rows(
-                        generation_cut_staging_keys
-                    )
-                    generation_cut_rows_cleared = True
                 barrier_released = time.monotonic()
 
                 sidecar_save_started = time.monotonic()
@@ -4408,13 +4374,6 @@ class SingleControllerActor:
                 recovery_errors: list[BaseException] = [save_error]
                 if tmp_path.exists():
                     await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
-                if not generation_cut_rows_cleared:
-                    try:
-                        await self._clear_generation_cut_staging_rows(
-                            generation_cut_staging_keys
-                        )
-                    except BaseException as cleanup_error:
-                        recovery_errors.append(cleanup_error)
                 if gym_checkpoint is not None:
                     try:
                         await self._release_prepared_gym_checkpoint(

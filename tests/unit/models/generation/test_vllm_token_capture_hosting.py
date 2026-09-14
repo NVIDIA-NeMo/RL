@@ -248,6 +248,7 @@ def test_generation_setup_token_capture_requires_async_engine():
     ("operation", "worker_method"),
     [
         ("pause_generation_for_checkpoint", "pause_generation_for_checkpoint_async"),
+        ("begin_generation_checkpoint", "begin_generation_checkpoint_async"),
         (
             "resume_generation_after_checkpoint",
             "resume_generation_after_checkpoint_async",
@@ -303,6 +304,50 @@ def test_generation_checkpoint_control_isolated_from_blocked_default_executor():
         finally:
             gate.reopen()
             await blocked_completion
+            worker._generation_checkpoint_executor.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_begin_generation_checkpoint_fences_terminal_stage_without_pausing_decode():
+    class _FakeLLM:
+        def __init__(self) -> None:
+            self.pause_calls = 0
+
+        async def pause_generation(self, **_kwargs) -> None:
+            self.pause_calls += 1
+
+    async def scenario() -> None:
+        worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+        worker.cfg = {"vllm_cfg": {"async_engine": True}}
+        worker.llm = _FakeLLM()
+        worker._generation_checkpoint_gate = _CheckpointCaptureGate()
+        worker._generation_checkpoint_executor = ThreadPoolExecutor(max_workers=1)
+
+        try:
+            await worker.begin_generation_checkpoint_async()
+            assert worker.llm.pause_calls == 0
+
+            entered = threading.Event()
+            released = threading.Event()
+
+            def enter_terminal_stage() -> None:
+                entered.set()
+                worker._generation_checkpoint_gate.enter()
+                released.set()
+                worker._generation_checkpoint_gate.exit()
+
+            thread = threading.Thread(target=enter_terminal_stage)
+            thread.start()
+            assert entered.wait(timeout=5.0)
+            assert not released.wait(timeout=0.05)
+
+            await worker.finish_generation_checkpoint_async()
+            assert released.wait(timeout=5.0)
+            thread.join(timeout=5.0)
+            assert not thread.is_alive()
+        finally:
+            worker._generation_checkpoint_gate.reopen()
             worker._generation_checkpoint_executor.shutdown()
 
     asyncio.run(scenario())
@@ -574,7 +619,9 @@ def test_generation_cut_stages_latest_prefix_without_completing_live_call():
     assert record.token_ids_delta == [10, 11, 12, 13]
     assert record.generation_log_probs_delta == [0.0, 0.0, -0.1, -0.2]
     assert receipt.prefixes[0].prefix_token_count == 2
-    assert receipt.prefixes[0].staging_key == ("__generation_cut__/checkpoint-1/r0/c1")
+    assert receipt.prefixes[0].staging_keys == (
+        "__generation_cut__/checkpoint-1/r0/c1",
+    )
     # A cut is a snapshot, not terminal completion. The ordinary response can
     # still finish later and stages the final call under its canonical key.
     assert id(request) in worker._capture_calls
@@ -690,15 +737,42 @@ def test_generation_cut_swaps_buffer_before_blocking_prefix_write():
     second_receipt = VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(
         worker, second_inventory
     )
-    assert sink.generation_prefix_records[1][1].token_ids_delta == [
-        10,
-        11,
-        12,
-        13,
-        14,
-        15,
-    ]
+    assert sink.generation_prefix_records[1][1].token_ids_delta == [14, 15]
     assert second_receipt.prefixes[0].frozen_buffer_id.endswith("/1")
+    assert second_receipt.prefixes[0].staging_keys == (
+        "__generation_cut__/checkpoint-1/r0/c1",
+        "__generation_cut__/checkpoint-2/r0/c1",
+    )
+    continuation = second_receipt.prefixes[0]
+    source = _MemoryPrefixSource(
+        {},
+        records={
+            key: record
+            for key, (_, record) in zip(
+                continuation.staging_keys,
+                sink.generation_prefix_records,
+                strict=True,
+            )
+        },
+    )
+    resumed_worker = _worker_with_capture(_MemorySink())
+    resumed_worker._staging_source = source
+    admission = CaptureAdmission(
+        rollout_id="r0-a1",
+        model_call_id="c2",
+        mode="text",
+        generation_cut={
+            "source_capture_key": "r0",
+            "source_model_call_id": "c1",
+            "staging_keys": continuation.staging_keys,
+            "generation_token_count": continuation.prefix_token_count,
+            "digest": continuation.prefix_digest,
+        },
+    )
+    restored = resumed_worker._resolve_generation_cut(admission, [])
+    assert source.fetch_calls == [list(continuation.staging_keys)]
+    assert restored.token_ids_delta == [10, 11, 12, 13, 14, 15]
+    assert restored.token_mask_delta == [0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
 
 
 def test_generation_cut_rolls_frozen_buffer_back_after_staging_failure():
@@ -799,8 +873,7 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
     receipt = VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(
         original_worker, inventory
     )
-    cut_key = receipt.prefixes[0].staging_key
-    assert cut_key is not None
+    (cut_key,) = receipt.prefixes[0].staging_keys
     cut_record = sink.generation_prefix_records[-1][1]
 
     resumed_worker = _worker_with_capture(sink)
@@ -815,7 +888,7 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
             "generation_cut": {
                 "source_capture_key": "r0",
                 "source_model_call_id": "c1",
-                "staging_key": cut_key,
+                "staging_keys": [cut_key],
                 "generation_token_count": 2,
                 "digest": cut_record.digest,
             },
@@ -834,8 +907,8 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
         RuntimeError,
         match="checkpoint coordinates do not match the staged prefix",
     ):
-        resumed_worker._resolve_generation_cut(bad_admission)
-    cut = resumed_worker._resolve_generation_cut(admission)
+        resumed_worker._resolve_generation_cut(bad_admission, [])
+    cut = resumed_worker._resolve_generation_cut(admission, [])
     VllmAsyncGenerationWorkerImpl._begin_request_capture(
         resumed_worker,
         request,
@@ -876,6 +949,7 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
     assert final_record.token_ids_delta == [10, 11, 12, 13, 14]
     assert final_record.token_mask_delta == [0.0, 0.0, 1.0, 1.0, 1.0]
     assert final_record.generation_log_probs_delta == [0.0, 0.0, -0.1, -0.2, -0.3]
+    assert resumed_worker._completed_capture_calls["c2"].generation_token_count == 3
     assert "generation prefix restored:" in caplog.text
     assert f"prefix_digest={cut_record.digest}" in caplog.text
     assert "prefix_tokens=2 tail_tokens=1 total_generation_tokens=3" in caplog.text

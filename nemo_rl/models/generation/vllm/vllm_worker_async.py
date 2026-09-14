@@ -89,9 +89,9 @@ class _RequestCaptureState:
     the active buffer under ``lock`` and performs its blocking TQ write after
     releasing the lock, so later observations can continue in a fresh buffer.
 
-    The first buffer-swap implementation still materializes one cumulative
-    checkpoint row to preserve the existing Gym wire contract. A later
-    lineage change can persist the sealed buffers as independent deltas.
+    Each successful cut stages only the detached buffer. The ordered TQ keys
+    remain in Gym lineage, while the sealed token arrays are retained locally
+    only to compute the cumulative digest advertised by the latest cut.
     """
 
     call: Any
@@ -101,6 +101,7 @@ class _RequestCaptureState:
     lock: threading.Lock = field(default_factory=threading.Lock)
     sealed_generated_token_ids: list[int] = field(default_factory=list)
     sealed_generated_logprobs: list[float] = field(default_factory=list)
+    generation_cut_staging_keys: list[str] = field(default_factory=list)
     active_buffer: _RequestCaptureBuffer = field(
         default_factory=lambda: _RequestCaptureBuffer(sequence=0)
     )
@@ -134,8 +135,8 @@ class _RequestCaptureState:
 
     def freeze_for_checkpoint(
         self, checkpoint_id: str
-    ) -> tuple[str, list[int], list[float]]:
-        """Swap the active buffer and return this checkpoint's stable prefix."""
+    ) -> tuple[str, list[int], list[float], list[int], list[float]]:
+        """Swap the active buffer and return its delta plus the stable prefix."""
         if self.frozen_buffer is not None:
             raise RuntimeError(
                 "cannot start a generation cut while another cut is in progress"
@@ -149,6 +150,8 @@ class _RequestCaptureState:
         )
         return (
             f"active/{checkpoint_id}/{buffer.sequence}",
+            list(buffer.generated_token_ids),
+            list(buffer.generated_logprobs),
             self.sealed_generated_token_ids + buffer.generated_token_ids,
             self.sealed_generated_logprobs + buffer.generated_logprobs,
         )
@@ -748,8 +751,8 @@ class VllmAsyncGenerationWorkerImpl(
             admission,
             prefix_token_ids=prefix_token_ids,
             generation_cut=generation_cut,
-            generation_cut_staging_key=(
-                admission.generation_cut.staging_key
+            generation_cut_staging_keys=(
+                admission.generation_cut.staging_keys
                 if admission.generation_cut is not None
                 else None
             ),
@@ -759,6 +762,11 @@ class VllmAsyncGenerationWorkerImpl(
             call=call,
             prompt_token_ids=list(prompt_token_ids),
             resumed_generation_token_ids=list(resumed_generation_token_ids or ()),
+            generation_cut_staging_keys=(
+                list(admission.generation_cut.staging_keys)
+                if admission.generation_cut is not None
+                else []
+            ),
         )
         with self._capture_registry_lock:
             if call.model_call_id in self._capture_calls_by_model_call_id:
@@ -869,8 +877,10 @@ class VllmAsyncGenerationWorkerImpl(
             return self._fetch_chain_prefix(list(admission.staging_chain))
         return list(admission.required_prefix_token_ids)
 
-    def _resolve_generation_cut(self, admission: Any) -> Any | None:
-        """Fetch the digest-validated staged snapshot named by an admission."""
+    def _resolve_generation_cut(
+        self, admission: Any, prefix_token_ids: list[int]
+    ) -> Any | None:
+        """Fetch and rebuild the cumulative staged prefix named by an admission."""
         continuation = admission.generation_cut
         if continuation is None:
             return None
@@ -878,22 +888,96 @@ class VllmAsyncGenerationWorkerImpl(
             raise RuntimeError(
                 "_staging_source not initialized; call setup_token_capture() first"
             )
-        snapshots = self._staging_source.fetch([continuation.staging_key])
-        if len(snapshots) != 1:
+        staging_keys = list(continuation.staging_keys)
+        snapshots = self._staging_source.fetch(staging_keys)
+        if len(snapshots) != len(staging_keys):
+            raise RuntimeError("generation-cut fetch did not return every staged chunk")
+        if not snapshots:
+            raise RuntimeError("generation-cut continuation has no staged chunks")
+        weight_versions = {snapshot.weight_version for snapshot in snapshots}
+        if len(weight_versions) != 1:
+            raise RuntimeError("generation-cut chunks span multiple policy versions")
+        token_ids_delta = [
+            token_id for snapshot in snapshots for token_id in snapshot.token_ids_delta
+        ]
+        token_mask_delta = [
+            mask for snapshot in snapshots for mask in snapshot.token_mask_delta
+        ]
+        generation_logprobs_delta = [
+            logprob
+            for snapshot in snapshots
+            for logprob in snapshot.generation_log_probs_delta
+        ]
+        if any(
+            mask == 0.0
+            for snapshot in snapshots[1:]
+            for mask in snapshot.token_mask_delta
+        ):
             raise RuntimeError(
-                "generation-cut fetch did not return exactly one snapshot"
+                "only the first generation-cut chunk may contain prompt tokens"
             )
-        snapshot = snapshots[0]
-        generation_token_count = sum(mask == 1.0 for mask in snapshot.token_mask_delta)
+
+        # Deferred: nemo_gym is an optional extra absent in non-Gym runs.
+        from nemo_gym.token_id_capture.staging.digest import (
+            EXTRAS_DIGEST_VERSION,
+            STAGING_DIGEST_VERSION,
+            compute_chain_hash,
+            compute_extras_digest,
+            compute_staging_digest,
+            hash_token_ids,
+        )
+        from nemo_gym.token_id_capture.staging.records import StagedCallBaseSnapshot
+
+        delta_len = len(token_ids_delta)
+        cum_len = admission.prev_len + delta_len
+        weight_version = next(iter(weight_versions))
+        extras_digest = compute_extras_digest(None)
+        chain_hash = compute_chain_hash(admission.parent_chain_hash, token_ids_delta)
+        cumulative_hash = hash_token_ids(prefix_token_ids + token_ids_delta)
+        digest = compute_staging_digest(
+            schema_version=admission.schema_version,
+            digest_version=STAGING_DIGEST_VERSION,
+            extras_digest_version=EXTRAS_DIGEST_VERSION,
+            rollout_id=continuation.source_capture_key,
+            model_call_id=continuation.source_model_call_id,
+            parent_call_id=admission.parent_call_id,
+            mode=admission.mode,
+            prev_len=admission.prev_len,
+            delta_len=delta_len,
+            cum_len=cum_len,
+            weight_version=weight_version,
+            token_ids_delta=token_ids_delta,
+            token_mask_delta=token_mask_delta,
+            generation_log_probs_delta=generation_logprobs_delta,
+            extras_digest=extras_digest,
+            chain_hash=chain_hash,
+            cumulative_hash=cumulative_hash,
+        )
+        generation_token_count = sum(mask == 1.0 for mask in token_mask_delta)
         if (
-            snapshot.rollout_id != continuation.source_capture_key
-            or snapshot.model_call_id != continuation.source_model_call_id
-            or generation_token_count != continuation.generation_token_count
-            or snapshot.digest != continuation.digest
+            generation_token_count != continuation.generation_token_count
+            or digest != continuation.digest
         ):
             raise RuntimeError(
                 "generation-cut checkpoint coordinates do not match the staged prefix"
             )
+        snapshot = StagedCallBaseSnapshot(
+            rollout_id=continuation.source_capture_key,
+            model_call_id=continuation.source_model_call_id,
+            parent_call_id=admission.parent_call_id,
+            mode=admission.mode,
+            prev_len=admission.prev_len,
+            delta_len=delta_len,
+            cum_len=cum_len,
+            weight_version=weight_version,
+            digest=digest,
+            token_ids_delta=token_ids_delta,
+            token_mask_delta=token_mask_delta,
+            generation_log_probs_delta=generation_logprobs_delta,
+            extras_digest=extras_digest,
+            chain_hash=chain_hash,
+            cumulative_hash=cumulative_hash,
+        )
         LOGGER.info(
             "generation prefix restored: rollout_id=%s model_call_id=%s "
             "source_model_call_id=%s prefix_tokens=%d prefix_digest=%s",
@@ -1007,10 +1091,12 @@ class VllmAsyncGenerationWorkerImpl(
                 generated_len=len(generated_token_ids),
             )
         coords = self.token_capture.complete_call_from_response(call, payload)
+        total_generation_token_count = len(generated_token_ids)
         if call.generation_cut is not None:
             prefix_tokens = sum(
                 mask == 1.0 for mask in call.generation_cut.token_mask_delta
             )
+            total_generation_token_count += prefix_tokens
             LOGGER.info(
                 "generation prefix completed: rollout_id=%s model_call_id=%s "
                 "source_model_call_id=%s prefix_tokens=%d tail_tokens=%d "
@@ -1025,7 +1111,7 @@ class VllmAsyncGenerationWorkerImpl(
         self._remember_completed_capture(
             call.model_call_id,
             coords,
-            len(generated_token_ids),
+            total_generation_token_count,
         )
         self._pop_request_capture(request)
         for choice in content.get("choices") or []:
@@ -1094,7 +1180,7 @@ class VllmAsyncGenerationWorkerImpl(
                             **prefix.model_dump(mode="json"),
                             disposition="durable_prefix",
                             frozen_buffer_id=f"terminal/{inventory.checkpoint_id}",
-                            staging_key=completed.coords.staging_key,
+                            staging_keys=(completed.coords.staging_key,),
                             prefix_token_count=completed.generation_token_count,
                             prefix_digest=completed.coords.digest,
                         )
@@ -1126,6 +1212,8 @@ class VllmAsyncGenerationWorkerImpl(
                 if observation_error is None:
                     (
                         frozen_buffer_id,
+                        chunk_token_ids,
+                        chunk_logprobs,
                         generated_token_ids,
                         generated_logprobs,
                     ) = state.freeze_for_checkpoint(inventory.checkpoint_id)
@@ -1133,37 +1221,71 @@ class VllmAsyncGenerationWorkerImpl(
                 raise RuntimeError(
                     f"cannot cut model call {prefix.model_call_id!r}: {observation_error}"
                 )
+            inherited_generation_token_count = (
+                state.call.admission.generation_cut.generation_token_count
+                if state.call.admission.generation_cut is not None
+                else 0
+            )
+            total_generation_token_count = inherited_generation_token_count + len(
+                generated_token_ids
+            )
+            if total_generation_token_count == 0:
+                with state.lock:
+                    state.rollback_frozen_buffer(inventory.checkpoint_id)
+                acknowledgements.append(
+                    GenerationCutPrefixAck(
+                        **prefix.model_dump(mode="json"),
+                        disposition="durable_failure",
+                    )
+                )
+                continue
             try:
-                record = capture.build_prefix_record(
+                cumulative_record = capture.build_prefix_record(
                     state.call,
                     prompt_token_ids=state.prompt_token_ids,
                     generated_token_ids=generated_token_ids,
                     generated_logprobs=generated_logprobs,
                 )
-                result = sink.stage_generation_prefix(
-                    record, checkpoint_id=inventory.checkpoint_id
-                )
-                if not result.ok:
-                    raise RuntimeError(
-                        "generation-prefix staging failed for "
-                        f"{prefix.model_call_id!r}: {result.error}"
+                result = None
+                if chunk_token_ids:
+                    chunk_record = (
+                        cumulative_record
+                        if not state.generation_cut_staging_keys
+                        else capture.build_generation_chunk_record(
+                            state.call,
+                            generated_token_ids=chunk_token_ids,
+                            generated_logprobs=chunk_logprobs,
+                        )
                     )
+                    result = sink.stage_generation_prefix(
+                        chunk_record, checkpoint_id=inventory.checkpoint_id
+                    )
+                    if not result.ok:
+                        raise RuntimeError(
+                            "generation-prefix staging failed for "
+                            f"{prefix.model_call_id!r}: {result.error}"
+                        )
+                    if result.staging_key is None:
+                        raise RuntimeError(
+                            "generation-prefix staging returned no staging key for "
+                            f"{prefix.model_call_id!r}"
+                        )
             except Exception:
                 with state.lock:
                     state.rollback_frozen_buffer(inventory.checkpoint_id)
                 raise
             with state.lock:
+                if result is not None:
+                    state.generation_cut_staging_keys.append(result.staging_key)
                 state.seal_frozen_buffer(inventory.checkpoint_id)
             acknowledgements.append(
                 GenerationCutPrefixAck(
                     **prefix.model_dump(mode="json"),
                     disposition="durable_prefix",
                     frozen_buffer_id=frozen_buffer_id,
-                    staging_key=result.staging_key,
-                    prefix_token_count=sum(
-                        mask == 1.0 for mask in record.token_mask_delta
-                    ),
-                    prefix_digest=record.digest,
+                    staging_keys=tuple(state.generation_cut_staging_keys),
+                    prefix_token_count=total_generation_token_count,
+                    prefix_digest=cumulative_record.digest,
                 )
             )
         receipt = GenerationCutReceipt(
@@ -1370,7 +1492,9 @@ class VllmAsyncGenerationWorkerImpl(
                         worker_self._resolve_admission_prefix, admission
                     )
                     generation_cut = await asyncio.to_thread(
-                        worker_self._resolve_generation_cut, admission
+                        worker_self._resolve_generation_cut,
+                        admission,
+                        capture_prefix_token_ids,
                     )
                     engine_prefix_token_ids = list(capture_prefix_token_ids)
                     if generation_cut is not None:
@@ -2629,6 +2753,17 @@ class VllmAsyncGenerationWorkerImpl(
         except BaseException:
             self._generation_checkpoint_gate.reopen()
             raise
+        return True
+
+    async def begin_generation_checkpoint_async(self) -> bool:
+        """Fence terminal staging without pausing vLLM decoding."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "begin_generation_checkpoint_async requires async_engine=True"
+            )
+        await self._run_generation_checkpoint_control(
+            self._generation_checkpoint_gate.close_and_wait
+        )
         return True
 
     async def resume_generation_async(self) -> bool:
