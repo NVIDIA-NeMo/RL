@@ -15,18 +15,31 @@
 
 Normal Mooncake PUTs remain memory-only. At an explicit TQ checkpoint, the
 controller commands the existing workers through their Ray actor handles.
-Each selected memory owner writes its own objects to a unique filesystem
-shard; only commands and completion metadata cross Ray. No checkpoint actors,
-registry, or additional messaging transport are created.
+Workers discover disjoint key slices and route ownership metadata through Ray
+object references. Each payload is written directly from its owning process's
+CPU segment: no payload crosses Ray, no native GET or staging copy is needed,
+and the coordinator never collects detailed object addresses/sizes. No new
+actors, registry, or normal PUT/CLEAR bookkeeping are introduced.
 
 Restore reverses the process: the current Mooncake clients read size-balanced
 sets of durable objects and upsert them into their own preferred segments
 before TQ restores controller metadata.  Saved client identities are not
 reused across restarts.
 
-The caller must keep writers and clears quiescent while ``tq.save_checkpoint``
-captures the controller and reads its referenced objects.  All intended
-restore clients must connect before ``tq.load_checkpoint`` is called.
+The caller must keep writers and clears quiescent throughout both save and
+restore, including every owner's verification and ACK. During save, borrowed
+addresses also require that replicas are not moved and segments/store clients
+are not unmounted or closed. Hard-pinned CPU segments remain alive under this
+contract; same-host peer addresses are never dereferenced. All intended restore
+clients must connect before ``tq.load_checkpoint`` is called.
+Checkpoint files must remain immutable throughout restore. Each owner validates
+its indexes and key absence before writing. Storage load completes before TQ
+installs its controller; it does not independently reread the controller snapshot.
+Failures may leave partial or overwritten objects and do not roll back peers'
+restores. A failed restore is unusable; start with a fresh restore environment.
+
+New checkpoints use checksum-free format v3. Legacy v1/v2 payload and index
+layouts remain readable, but their historical checksum fields are ignored.
 """
 
 from __future__ import annotations
@@ -43,9 +56,11 @@ from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, cast
 
 import ray
+import torch
+
 
 _PLUGIN_MARKER = "_nemo_rl_mooncake_checkpoint"
 _STORAGE_DIR = "mooncake_storage"
@@ -115,6 +130,10 @@ def _validate_metadata_mode(manager: Any) -> None:
 
 def _validate_checkpoint_runtime(manager: Any) -> None:
     _validate_metadata_mode(manager)
+    if manager.config.get("protocol", "tcp") not in {"tcp", "rdma"}:
+        raise NotImplementedError(
+            "Direct Mooncake checkpoints require TCP/RDMA CPU storage segments"
+        )
     replica_config = manager.storage_client.replica_config
     if getattr(replica_config, "with_hard_pin", None) is not True:
         raise NotImplementedError(
@@ -134,7 +153,8 @@ def _physical_keys(controller_state: Mapping[str, Any]) -> list[str]:
     if not isinstance(partitions, Mapping):
         raise ValueError("TQ controller checkpoint has no partitions mapping")
 
-    keys: set[str] = set()
+    # Preserve traversal order while deduplicating so the final sort can reuse runs.
+    keys: dict[str, None] = {}
     for partition in partitions.values():
         indexes = getattr(partition, "global_indexes", None)
         fields = getattr(partition, "field_name_mapping", None)
@@ -147,17 +167,44 @@ def _physical_keys(controller_state: Mapping[str, Any]) -> list[str]:
         if not isinstance(backend_meta, Mapping):
             raise ValueError("TQ partition has malformed backend metadata")
 
-        for global_index in indexes:
+        selected_statuses: list[list[int]] | None = None
+        if (
+            type(produced) is torch.Tensor
+            and produced.device.type == "cpu"
+            and produced.dtype == torch.int8
+            and produced.ndim == 2
+            and produced.layout == torch.strided
+            and produced.names == (None, None)
+            and type(indexes) in (set, list, tuple)
+            and type(fields) is dict
+        ):
+            rows = list(indexes)
+            columns = list(fields.values())
+            if all(
+                type(index) is int and -produced.shape[0] <= index < produced.shape[0]
+                for index in rows
+            ) and all(
+                type(column) is int and -produced.shape[1] <= column < produced.shape[1]
+                for column in columns
+            ):
+                # Row selection temporarily materializes all allocated columns;
+                # Python list storage scales with selected rows times fields.
+                selected_statuses = produced[rows][:, columns].tolist()
+
+        for row_position, global_index in enumerate(indexes):
             per_index_meta = backend_meta.get(global_index) or {}
             if not isinstance(per_index_meta, Mapping):
                 raise ValueError(
                     "TQ partition has malformed per-index backend metadata"
                 )
-            for field_name, column in fields.items():
-                status = produced[global_index, column]
-                item = getattr(status, "item", None)
-                if callable(item):
-                    status = item()
+            for field_position, (field_name, column) in enumerate(fields.items()):
+                if selected_statuses is not None:
+                    status = selected_statuses[row_position][field_position]
+                else:
+                    status = produced[global_index, column]
+                    item = getattr(status, "item", None)
+                    if callable(item):
+                        status = item()
                 if status != 1:
                     continue
 
@@ -171,9 +218,9 @@ def _physical_keys(controller_state: Mapping[str, Any]) -> list[str]:
                         or n_chunks <= 0
                     ):
                         raise ValueError(f"Invalid n_chunks for Mooncake key {key!r}")
-                    keys.update(f"{key}:c{i}" for i in range(n_chunks))
+                    keys.update((f"{key}:c{i}", None) for i in range(n_chunks))
                 else:
-                    keys.add(key)
+                    keys[key] = None
     return sorted(keys)
 
 
@@ -181,6 +228,14 @@ def _physical_keys(controller_state: Mapping[str, Any]) -> list[str]:
 class _StoredObject:
     key: str
     size: int
+    address: int
+
+
+@dataclass(frozen=True)
+class _SaveGroup:
+    controller_session: str
+    owner: str
+    objects: list[_StoredObject]
 
 
 @dataclass(frozen=True)
@@ -218,7 +273,14 @@ class _ManifestObject:
     shard: str
     offset: int
     size: int
-    sha256: str
+    saved_owner: str
+
+
+@dataclass(frozen=True)
+class _ShardIndex:
+    shard: str
+    object_count: int
+    payload_bytes: int
     saved_owner: str
 
 
@@ -231,7 +293,9 @@ def _controller_path(checkpoint_dir: Path) -> Path:
 
 def _controller_keys(checkpoint_dir: Path) -> list[str]:
     path = _controller_path(checkpoint_dir)
-    with path.open("rb") as controller_file:
+    with (
+        path.open("rb") as controller_file,
+    ):
         state = pickle.load(controller_file)
     if not isinstance(state, Mapping):
         raise ValueError("TQ controller checkpoint must contain a mapping")
@@ -309,7 +373,12 @@ def _registered_buffer(
 
 
 def _write_buffer(
-    output: Any, buffer: mmap.mmap, size: int, *, label: str, offset: int = 0
+    output: Any,
+    buffer: mmap.mmap | memoryview,
+    size: int,
+    *,
+    label: str,
+    offset: int = 0,
 ) -> None:
     view = memoryview(buffer)[offset : offset + size]
     try:
@@ -406,7 +475,14 @@ def _status_is_complete(status: Any) -> bool:
 def _complete_memory_replicas(
     descriptors: Any,
 ) -> list[tuple[str, int]]:
-    replicas: list[tuple[str, int]] = []
+    return [
+        (buffer.transport_endpoint, buffer.size)
+        for buffer in _complete_memory_buffers(descriptors)
+    ]
+
+
+def _complete_memory_buffers(descriptors: Any) -> list[Any]:
+    replicas: list[Any] = []
     if not isinstance(descriptors, (list, tuple)):
         return replicas
     for descriptor in descriptors:
@@ -420,7 +496,7 @@ def _complete_memory_replicas(
         endpoint = getattr(buffer, "transport_endpoint", None)
         size = getattr(buffer, "size", None)
         if isinstance(endpoint, str) and endpoint and isinstance(size, int):
-            replicas.append((endpoint, size))
+            replicas.append(buffer)
     return replicas
 
 
@@ -468,35 +544,16 @@ def _request_body(manager: Any, operation: str, **payload: Any) -> dict[str, Any
 
 
 def _safe_shard_name(value: Any) -> str:
-    if not isinstance(value, str) or not value or Path(value).name != value:
+    if (
+        not isinstance(value, str)
+        or not value
+        or (os.path.basename(value) if type(value) is str else Path(value).name)
+        != value
+    ):
         raise ValueError(f"Invalid Mooncake checkpoint shard name: {value!r}")
     if not value.startswith("part-") or not value.endswith(".bin"):
         raise ValueError(f"Invalid Mooncake checkpoint shard name: {value!r}")
     return value
-
-
-def _parse_stored_objects(values: Any) -> list[_StoredObject]:
-    if not isinstance(values, list):
-        raise ValueError("Mooncake checkpoint request has no object list")
-    objects: list[_StoredObject] = []
-    seen: set[str] = set()
-    for value in values:
-        if not isinstance(value, Mapping):
-            raise ValueError("Malformed Mooncake checkpoint object request")
-        key = value.get("key")
-        size = value.get("size")
-        if (
-            not isinstance(key, str)
-            or not key
-            or key in seen
-            or isinstance(size, bool)
-            or not isinstance(size, int)
-            or size <= 0
-        ):
-            raise ValueError(f"Malformed Mooncake checkpoint object: {value!r}")
-        seen.add(key)
-        objects.append(_StoredObject(key, size))
-    return objects
 
 
 def _manifest_object_from_mapping(value: Mapping[str, Any]) -> _ManifestObject:
@@ -504,7 +561,6 @@ def _manifest_object_from_mapping(value: Mapping[str, Any]) -> _ManifestObject:
     shard = value.get("shard")
     offset = value.get("offset")
     size = value.get("size")
-    digest = value.get("sha256")
     saved_owner = value.get("saved_owner")
     if not isinstance(key, str) or not key:
         raise ValueError(f"Malformed Mooncake checkpoint object: {value!r}")
@@ -516,14 +572,110 @@ def _manifest_object_from_mapping(value: Mapping[str, Any]) -> _ManifestObject:
         or isinstance(size, bool)
         or not isinstance(size, int)
         or size <= 0
-        or not isinstance(digest, str)
-        or len(digest) != 64
-        or any(char not in "0123456789abcdef" for char in digest)
         or not isinstance(saved_owner, str)
         or not saved_owner
     ):
         raise ValueError(f"Malformed Mooncake checkpoint entry for {key!r}")
-    return _ManifestObject(key, shard, offset, size, digest, saved_owner)
+    return _ManifestObject(key, shard, offset, size, saved_owner)
+
+
+def _shard_index_from_mapping(value: Any) -> _ShardIndex:
+    if not isinstance(value, Mapping):
+        raise ValueError("Malformed Mooncake shard index descriptor")
+    shard = _safe_shard_name(value.get("shard"))
+    count = value.get("object_count")
+    size = value.get("payload_bytes")
+    owner = value.get("saved_owner")
+    if (
+        type(count) is not int
+        or count <= 0
+        or type(size) is not int
+        or size <= 0
+        or not isinstance(owner, str)
+        or not owner
+    ):
+        raise ValueError(f"Malformed Mooncake shard index descriptor: {shard!r}")
+    return _ShardIndex(shard, count, size, owner)
+
+
+def _parse_shard_indexes(values: Any) -> list[_ShardIndex]:
+    if not isinstance(values, list):
+        raise ValueError("Mooncake checkpoint has no shard index list")
+    shards = [_shard_index_from_mapping(value) for value in values]
+    if len({shard.shard for shard in shards}) != len(shards):
+        raise ValueError("Duplicate Mooncake shard index")
+    return shards
+
+
+def _read_shard_indexes(root: Path, values: Any) -> list[_ManifestObject]:
+    storage_dir = root / _STORAGE_DIR
+    entries: list[_ManifestObject] = []
+    keys: set[str] = set()
+    for descriptor in _parse_shard_indexes(values):
+        index_path = storage_dir / f"{descriptor.shard}.index.json"
+        if index_path.is_symlink():
+            raise ValueError("Mooncake shard index must not be a symbolic link")
+        data = index_path.read_bytes()
+        index = json.loads(data)
+        if not isinstance(index, Mapping) or not isinstance(index.get("objects"), list):
+            raise ValueError("Malformed Mooncake shard index objects")
+        objects = index["objects"]
+        if len(objects) != descriptor.object_count:
+            raise ValueError("Mooncake shard index object count mismatch")
+        offset = 0
+        previous_key: str | None = None
+        for value in objects:
+            if not isinstance(value, Mapping):
+                raise ValueError("Malformed Mooncake shard index object")
+            entry = _manifest_object_from_mapping(value)
+            if (
+                entry.shard != descriptor.shard
+                or entry.saved_owner != descriptor.saved_owner
+                or entry.offset != offset
+                or entry.key in keys
+                or (previous_key is not None and entry.key <= previous_key)
+            ):
+                raise ValueError(f"Malformed Mooncake shard index entry: {entry.key!r}")
+            entries.append(entry)
+            keys.add(entry.key)
+            offset += entry.size
+            previous_key = entry.key
+        payload_path = storage_dir / descriptor.shard
+        if (
+            offset != descriptor.payload_bytes
+            or payload_path.is_symlink()
+            or not payload_path.is_file()
+            or payload_path.stat().st_size != offset
+        ):
+            raise ValueError(
+                f"Missing or corrupt Mooncake checkpoint shard: {descriptor.shard}"
+            )
+    return entries
+
+
+def _write_shard_index(
+    storage_dir: Path, *, shard: str, entries: list[dict[str, Any]], saved_owner: str
+) -> _ShardIndex:
+    target = storage_dir / f"{shard}.index.json"
+    if target.exists():
+        raise FileExistsError(f"Mooncake checkpoint index already exists: {target}")
+    data = (json.dumps({"objects": entries}, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    descriptor = _ShardIndex(
+        shard,
+        len(entries),
+        sum(entry["size"] for entry in entries),
+        saved_owner,
+    )
+    partial = storage_dir / f".{target.name}.{uuid.uuid4().hex}.partial"
+    with partial.open("xb") as output:
+        output.write(data)
+        output.flush()
+        os.fsync(output.fileno())
+    partial.rename(target)
+    _fsync_directory(storage_dir)
+    return descriptor
 
 
 def _local_replica_config(manager: Any, segment_name: str) -> Any:
@@ -578,9 +730,124 @@ class _CheckpointParticipant:
             }
         if operation == "SAVE_SHARD":
             return self._save_shard(body)
+        if operation == "DISCOVER_SAVE":
+            return self._discover_save(body)
         if operation == "LOAD_OBJECTS":
             return self._load_objects(body)
+        if operation == "LOAD_SHARDS":
+            return self._load_objects(body)
         raise ValueError(f"Unsupported Mooncake checkpoint operation: {operation!r}")
+
+    def _discover_save(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Query each key once and leave detailed plans with their Ray owners."""
+        keys = body.get("keys")
+        endpoints = body.get("current_endpoints")
+        if (
+            not isinstance(keys, list)
+            or not keys
+            or any(not isinstance(key, str) or not key for key in keys)
+            or any(left >= right for left, right in zip(keys, keys[1:]))
+            or not isinstance(endpoints, list)
+            or not endpoints
+            or any(
+                not isinstance(endpoint, str) or not endpoint for endpoint in endpoints
+            )
+            or len(set(endpoints)) != len(endpoints)
+            or self.info.transport_endpoint not in endpoints
+        ):
+            raise ValueError("Malformed Mooncake save key-slice request")
+        current_endpoints = set(endpoints)
+        groups: dict[str, list[_StoredObject]] = {}
+        for start in range(0, len(keys), _BATCH_KEYS):
+            descriptors = _batch_replicas(
+                self._store, keys[start : start + _BATCH_KEYS]
+            )
+            for key, values in descriptors.items():
+                replicas = _complete_memory_buffers(values)
+                eligible = [
+                    replica
+                    for replica in replicas
+                    if replica.transport_endpoint in current_endpoints
+                ]
+                if not eligible:
+                    raise RuntimeError(
+                        f"Mooncake key {key!r} has no COMPLETE memory replica "
+                        "owned by a live checkpoint participant"
+                    )
+                size = eligible[0].size
+                if any(
+                    type(replica.size) is not int
+                    or replica.size <= 0
+                    or replica.size != size
+                    for replica in replicas
+                ):
+                    raise RuntimeError(
+                        f"Mooncake replica sizes are invalid or inconsistent for {key!r}"
+                    )
+                # The usual single-replica path needs no placement search.
+                # Replicated objects use a canonical live owner, not global
+                # byte balancing: locality takes precedence over redistribution.
+                replica = (
+                    eligible[0]
+                    if len(eligible) == 1
+                    else min(eligible, key=lambda value: value.transport_endpoint)
+                )
+                address = getattr(replica, "buffer_address", None)
+                if type(address) is not int or address <= 0:
+                    raise RuntimeError(
+                        f"Mooncake replica has no CPU address for {key!r}"
+                    )
+                groups.setdefault(replica.transport_endpoint, []).append(
+                    _StoredObject(key, size, address)
+                )
+        return {
+            "ok": True,
+            "participant_id": self.info.participant_id,
+            "groups": {
+                owner: (
+                    ray.put(_SaveGroup(self.info.controller_session, owner, objects)),
+                    len(objects),
+                    sum(obj.size for obj in objects),
+                )
+                for owner, objects in groups.items()
+            },
+        }
+
+    def _resolve_save_objects(self, body: Mapping[str, Any]) -> list[_StoredObject]:
+        references = body.get("object_groups")
+        if not isinstance(references, list) or not references:
+            raise ValueError("Mooncake save requires owner metadata references")
+        # Discovery finishes everywhere before this call; no actor method must
+        # execute recursively to produce a referenced group.
+        groups = ray.get(
+            references, timeout=_checkpoint_timeout_s(self._manager.config)
+        )
+        objects: list[_StoredObject] = []
+        for group in groups:
+            if (
+                not isinstance(group, _SaveGroup)
+                or group.controller_session != self.info.controller_session
+                or group.owner != self.info.transport_endpoint
+            ):
+                raise ValueError(
+                    "Mooncake save metadata belongs to a different owner/session"
+                )
+            for obj in group.objects:
+                if (
+                    not isinstance(obj, _StoredObject)
+                    or not isinstance(obj.key, str)
+                    or not obj.key
+                    or type(obj.size) is not int
+                    or obj.size <= 0
+                    or type(obj.address) is not int
+                    or obj.address <= 0
+                ):
+                    raise ValueError("Malformed Mooncake owner memory descriptor")
+                objects.append(obj)
+        objects.sort(key=lambda obj: obj.key)
+        if not objects or any(a.key == b.key for a, b in zip(objects, objects[1:])):
+            raise ValueError("Empty or duplicate Mooncake owner save keys")
+        return objects
 
     def _checkpoint_root(self, body: Mapping[str, Any]) -> Path:
         value = body.get("checkpoint_root")
@@ -591,20 +858,29 @@ class _CheckpointParticipant:
             raise ValueError("Mooncake checkpoint_root must be absolute")
         return root
 
-    def _verify_local_owners(self, objects: list[_StoredObject]) -> None:
-        descriptors = _batch_replicas(self._store, [obj.key for obj in objects])
-        for obj in objects:
-            replicas = _complete_memory_replicas(descriptors[obj.key])
-            if (self.info.transport_endpoint, obj.size) not in replicas:
-                raise RuntimeError(
-                    f"Mooncake key {obj.key!r} no longer has a complete memory "
-                    f"replica owned by {self.info.transport_endpoint!r}"
-                )
+    def _verify_restored_objects(
+        self, entries: list[_ManifestObject], current_endpoints: set[str]
+    ) -> None:
+        # The preferred segment may fall back to another current participant.
+        # Keep the coordinator's original acceptance rule, not a self-only check.
+        for start in range(0, len(entries), _BATCH_KEYS):
+            batch = entries[start : start + _BATCH_KEYS]
+            descriptors = _batch_replicas(self._store, [entry.key for entry in batch])
+            for entry in batch:
+                replicas = _complete_memory_replicas(descriptors[entry.key])
+                if not any(
+                    endpoint in current_endpoints and size == entry.size
+                    for endpoint, size in replicas
+                ):
+                    raise RuntimeError(
+                        f"Restored Mooncake key {entry.key!r} has no COMPLETE memory "
+                        "replica on a current checkpoint participant"
+                    )
 
     def _save_shard(self, body: Mapping[str, Any]) -> dict[str, Any]:
         root = self._checkpoint_root(body)
         shard = _safe_shard_name(body.get("shard_name"))
-        objects = _parse_stored_objects(body.get("objects"))
+        objects = self._resolve_save_objects(body)
         storage_dir = root / _STORAGE_DIR
         if not storage_dir.is_dir():
             raise FileNotFoundError(
@@ -617,63 +893,71 @@ class _CheckpointParticipant:
 
         entries: list[dict[str, Any]] = []
         offset = 0
-        sizes = [obj.size for obj in objects]
-        with (
-            partial.open("xb") as output,
-            _checkpoint_buffer(self._store, sizes, label=shard) as buffer,
-        ):
-            for start, stop, offsets in _checkpoint_batches(sizes):
-                batch = objects[start:stop]
-                self._verify_local_owners(batch)
-                results = self._store.batch_get_into(
-                    [obj.key for obj in batch],
-                    [buffer.pointer + position for position in offsets],
-                    sizes[start:stop],
+        with partial.open("xb") as output:
+            for obj in objects:
+                # Borrow this process's hard-pinned CPU allocation, not a copy.
+                # The caller must keep writes/clears/moves and store teardown
+                # quiescent until all SAVE acknowledgements have completed.
+                allocation = (ctypes.c_ubyte * obj.size).from_address(obj.address)
+                # ctypes arrays expose a buffer; their type stubs omit it.
+                with memoryview(cast(Any, allocation)).cast("B") as view:
+                    _write_buffer(output, view, obj.size, label=obj.key)
+                entries.append(
+                    {
+                        "key": obj.key,
+                        "shard": shard,
+                        "offset": offset,
+                        "size": obj.size,
+                        "saved_owner": self.info.transport_endpoint,
+                    }
                 )
-                _check_batch_results(results, sizes[start:stop], operation="GET")
-                for obj, position in zip(batch, offsets, strict=True):
-                    with memoryview(buffer.payload)[
-                        position : position + obj.size
-                    ] as payload:
-                        digest = hashlib.sha256(payload).hexdigest()
-                    _write_buffer(
-                        output, buffer.payload, obj.size, label=obj.key, offset=position
-                    )
-                    entries.append(
-                        {
-                            "key": obj.key,
-                            "shard": shard,
-                            "offset": offset,
-                            "size": obj.size,
-                            "sha256": digest,
-                            "saved_owner": self.info.transport_endpoint,
-                        }
-                    )
-                    offset += obj.size
+                offset += obj.size
             output.flush()
             os.fsync(output.fileno())
         partial.rename(target)
         _fsync_directory(storage_dir)
+        descriptor = _write_shard_index(
+            storage_dir,
+            shard=shard,
+            entries=entries,
+            saved_owner=self.info.transport_endpoint,
+        )
         return {
             "ok": True,
             "participant_id": self.info.participant_id,
-            "objects": entries,
+            "shard": asdict(descriptor),
+            "saved_keys": [obj.key for obj in objects],
         }
 
     def _load_objects(self, body: Mapping[str, Any]) -> dict[str, Any]:
         root = self._checkpoint_root(body)
-        values = body.get("objects")
-        if not isinstance(values, list):
-            raise ValueError("Mooncake restore request has no object list")
-        entries = [
-            _manifest_object_from_mapping(value)
-            for value in values
-            if isinstance(value, Mapping)
-        ]
-        if len(entries) != len(values):
-            raise ValueError("Malformed Mooncake restore object")
+        if body.get("operation") == "LOAD_SHARDS":
+            entries = _read_shard_indexes(root, body.get("shards"))
+            _require_clean_store(self._store, [entry.key for entry in entries])
+        else:
+            values = body.get("objects")
+            if not isinstance(values, list):
+                raise ValueError("Mooncake restore request has no object list")
+            entries = [
+                _manifest_object_from_mapping(value)
+                for value in values
+                if isinstance(value, Mapping)
+            ]
+            if len(entries) != len(values):
+                raise ValueError("Malformed Mooncake restore object")
         if len({entry.key for entry in entries}) != len(entries):
             raise ValueError("Duplicate Mooncake restore key")
+
+        endpoint_values = body.get("current_endpoints")
+        if (
+            not isinstance(endpoint_values, list)
+            or not endpoint_values
+            or any(not isinstance(value, str) or not value for value in endpoint_values)
+            or len(set(endpoint_values)) != len(endpoint_values)
+            or self.info.transport_endpoint not in endpoint_values
+        ):
+            raise ValueError("Malformed Mooncake restore current endpoints")
+        current_endpoints = set(endpoint_values)
 
         config = _local_replica_config(self._manager, self.info.segment_name)
         storage_dir = root / _STORAGE_DIR
@@ -701,13 +985,6 @@ class _CheckpointParticipant:
                         label=entry.key,
                         offset=position,
                     )
-                    with memoryview(buffer.payload)[
-                        position : position + entry.size
-                    ] as value:
-                        if hashlib.sha256(value).hexdigest() != entry.sha256:
-                            raise ValueError(
-                                f"Corrupt Mooncake checkpoint payload for {entry.key!r}"
-                            )
                 results = self._store.batch_upsert_from(
                     [entry.key for entry in batch],
                     [buffer.pointer + position for position in offsets],
@@ -717,6 +994,9 @@ class _CheckpointParticipant:
                 _check_batch_results(results, [0] * len(batch), operation="restore")
                 restored.extend(entry.key for entry in batch)
 
+        # Each owner verifies only its disjoint assignment before acknowledging;
+        # quiescent writers/clears remain required until the whole restore ends.
+        self._verify_restored_objects(entries, current_endpoints)
         return {
             "ok": True,
             "participant_id": self.info.participant_id,
@@ -818,104 +1098,20 @@ def _live_participants(
     return sorted(live, key=lambda participant: participant.participant_id), handles
 
 
-def _owner_assignments(
-    store: Any,
-    keys: list[str],
-    participants: list[_ParticipantInfo],
-) -> dict[str, list[_StoredObject]]:
-    endpoint_to_participant = {
-        participant.transport_endpoint: participant for participant in participants
-    }
-    if len(endpoint_to_participant) != len(participants):
-        raise RuntimeError("Mooncake checkpoint participants have duplicate endpoints")
-    assignments: dict[str, list[_StoredObject]] = {
-        participant.participant_id: [] for participant in participants
-    }
-    assigned_bytes = {participant.participant_id: 0 for participant in participants}
-    for start in range(0, len(keys), _BATCH_KEYS):
-        batch_keys = keys[start : start + _BATCH_KEYS]
-        descriptors = _batch_replicas(store, batch_keys)
-        for key in batch_keys:
-            replicas = _complete_memory_replicas(descriptors[key])
-            candidates = [
-                endpoint_to_participant[endpoint]
-                for endpoint, _ in replicas
-                if endpoint in endpoint_to_participant
-            ]
-            if not candidates:
-                raise RuntimeError(
-                    f"Mooncake key {key!r} has no COMPLETE memory replica "
-                    "owned by a live checkpoint participant; disk-only/offloaded "
-                    "objects are not supported"
-                )
-            sizes = {size for _, size in replicas}
-            if len(sizes) != 1 or any(
-                type(size) is not int or size <= 0 for _, size in replicas
-            ):
-                raise RuntimeError(
-                    f"Mooncake replica sizes are invalid or inconsistent for {key!r}"
-                )
-            size = sizes.pop()
-            owner = min(
-                candidates,
-                key=lambda participant: (
-                    assigned_bytes[participant.participant_id],
-                    participant.participant_id,
-                ),
-            )
-            assignments[owner.participant_id].append(_StoredObject(key=key, size=size))
-            assigned_bytes[owner.participant_id] += size
-    return {
-        participant_id: assigned
-        for participant_id, assigned in assignments.items()
-        if assigned
-    }
-
-
-def _validate_save_response(
-    request: _ParticipantRequest, response: Mapping[str, Any]
-) -> list[_ManifestObject]:
-    if response.get("participant_id") != request.participant.participant_id:
-        raise RuntimeError("Mooncake checkpoint participant ACK identity mismatch")
-    expected = _parse_stored_objects(request.body.get("objects"))
-    values = response.get("objects")
-    if not isinstance(values, list) or len(values) != len(expected):
-        raise RuntimeError("Mooncake checkpoint participant ACK object mismatch")
-    entries: list[_ManifestObject] = []
-    expected_offset = 0
-    shard_name = request.body.get("shard_name")
-    for obj, value in zip(expected, values, strict=True):
-        if not isinstance(value, Mapping):
-            raise RuntimeError("Malformed Mooncake checkpoint participant ACK")
-        entry = _manifest_object_from_mapping(value)
-        if (
-            entry.key != obj.key
-            or entry.size != obj.size
-            or entry.offset != expected_offset
-            or entry.shard != shard_name
-            or entry.saved_owner != request.participant.transport_endpoint
-        ):
-            raise RuntimeError(
-                f"Mooncake checkpoint participant ACK mismatch for {obj.key!r}"
-            )
-        entries.append(entry)
-        expected_offset += obj.size
-    return entries
-
-
 def _write_manifest(
     storage_dir: Path,
     *,
     config: Any,
-    entries: list[_ManifestObject],
+    entries: list[_ShardIndex],
 ) -> None:
     manifest = {
+        "format_version": 3,
         "storage_layout": _storage_layout(config),
-        "objects": [asdict(entry) for entry in sorted(entries, key=lambda x: x.key)],
+        "shards": [asdict(entry) for entry in sorted(entries, key=lambda x: x.shard)],
     }
     partial = storage_dir / f".{_MANIFEST_FILE}.{uuid.uuid4().hex}.partial"
     with partial.open("x", encoding="utf-8") as output:
-        json.dump(manifest, output, indent=2, sort_keys=True)
+        output.write(json.dumps(manifest, indent=2, sort_keys=True))
         output.write("\n")
         output.flush()
         os.fsync(output.fileno())
@@ -924,42 +1120,94 @@ def _write_manifest(
 
 
 def _save_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
-    """Coordinate owner-local saves without carrying payload through manager."""
+    """Route metadata references; payload and detailed plans stay distributed."""
     _validate_checkpoint_runtime(manager)
     checkpoint_root = Path(checkpoint_dir).resolve()
     keys = _controller_keys(checkpoint_root)
     storage_dir = checkpoint_root / _STORAGE_DIR
     storage_dir.mkdir(parents=True, exist_ok=False)
     _fsync_directory(checkpoint_root)
-
     if not keys:
-        _write_manifest(
-            storage_dir,
-            config=manager.config,
-            entries=[],
-        )
+        _write_manifest(storage_dir, config=manager.config, entries=[])
         return
 
     participants, workers = _live_participants(manager)
     if not participants:
         raise RuntimeError("No live Mooncake checkpoint participants")
-    assignments = _owner_assignments(manager.storage_client._store, keys, participants)
-    by_id = {participant.participant_id: participant for participant in participants}
-    requests: list[_ParticipantRequest] = []
-    for index, participant_id in enumerate(sorted(assignments)):
-        participant = by_id[participant_id]
-        requests.append(
-            _ParticipantRequest(
-                participant,
-                _request_body(
-                    manager,
-                    "SAVE_SHARD",
-                    checkpoint_root=str(checkpoint_root),
-                    shard_name=f"part-{index:05d}.bin",
-                    objects=[asdict(obj) for obj in assignments[participant_id]],
-                ),
-            )
+    endpoints = [participant.transport_endpoint for participant in participants]
+    batch_count = (len(keys) + _BATCH_KEYS - 1) // _BATCH_KEYS
+    discoverers = participants[:batch_count]
+    discoveries = [
+        _ParticipantRequest(
+            participant,
+            _request_body(
+                manager,
+                "DISCOVER_SAVE",
+                keys=keys[
+                    (index * batch_count // len(discoverers)) * _BATCH_KEYS : (
+                        (index + 1) * batch_count // len(discoverers)
+                    )
+                    * _BATCH_KEYS
+                ],
+                current_endpoints=endpoints,
+            ),
         )
+        for index, participant in enumerate(discoverers)
+    ]
+    # Keep these responses (and nested refs) alive through the SAVE ACKs.
+    plans = _fanout_requests(
+        discoveries,
+        workers=workers,
+        local=manager._checkpoint_participant,
+        timeout_s=_checkpoint_timeout_s(manager.config),
+    )
+    _require_exact_responses(discoveries, plans, operation="discovery")
+    references: dict[str, list[Any]] = {endpoint: [] for endpoint in endpoints}
+    counts = dict.fromkeys(endpoints, 0)
+    sizes = dict.fromkeys(endpoints, 0)
+    for request in discoveries:
+        response = plans[request.participant.participant_id]
+        groups = response.get("groups")
+        if response.get(
+            "participant_id"
+        ) != request.participant.participant_id or not isinstance(groups, Mapping):
+            raise RuntimeError("Malformed Mooncake save discovery")
+        discovered_count = 0
+        for owner, group in groups.items():
+            if (
+                owner not in references
+                or not isinstance(group, (list, tuple))
+                or len(group) != 3
+            ):
+                raise RuntimeError("Malformed Mooncake save owner group")
+            reference, count, size = group
+            if (
+                type(count) is not int
+                or count <= 0
+                or type(size) is not int
+                or size <= 0
+            ):
+                raise RuntimeError("Malformed Mooncake save group sizes")
+            references[owner].append(reference)
+            counts[owner] += count
+            sizes[owner] += size
+            discovered_count += count
+        if discovered_count != len(request.body["keys"]):
+            raise RuntimeError("Mooncake save discovery did not cover its keys")
+    requests = [
+        _ParticipantRequest(
+            participant,
+            _request_body(
+                manager,
+                "SAVE_SHARD",
+                checkpoint_root=str(checkpoint_root),
+                shard_name=f"part-{index:05d}.bin",
+                object_groups=references[participant.transport_endpoint],
+            ),
+        )
+        for index, participant in enumerate(participants)
+        if references[participant.transport_endpoint]
+    ]
     responses = _fanout_requests(
         requests,
         workers=workers,
@@ -967,40 +1215,49 @@ def _save_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
         timeout_s=_checkpoint_timeout_s(manager.config),
     )
     _require_exact_responses(requests, responses, operation="checkpoint")
-
-    entries: list[_ManifestObject] = []
+    entries: list[_ShardIndex] = []
+    saved_keys: list[str] = []
     for request in requests:
-        response = responses.get(request.participant.participant_id)
-        if response is None:
-            raise RuntimeError(
-                "Missing Mooncake checkpoint ACK from "
-                f"{request.participant.participant_id}"
-            )
-        entries.extend(_validate_save_response(request, response))
-    if sorted(entry.key for entry in entries) != keys:
+        response = responses[request.participant.participant_id]
+        descriptor = _shard_index_from_mapping(response.get("shard"))
+        owner = request.participant.transport_endpoint
+        acknowledged = response.get("saved_keys")
+        if (
+            response.get("participant_id") != request.participant.participant_id
+            or not isinstance(acknowledged, list)
+            or any(not isinstance(key, str) or not key for key in acknowledged)
+            or descriptor.shard != request.body["shard_name"]
+            or descriptor.saved_owner != owner
+            or descriptor.object_count != counts[owner]
+            or descriptor.payload_bytes != sizes[owner]
+            or len(acknowledged) != counts[owner]
+        ):
+            raise RuntimeError("Mooncake checkpoint shard ACK mismatch")
+        entries.append(descriptor)
+        saved_keys.extend(acknowledged)
+    if sorted(saved_keys) != keys:
         raise RuntimeError("Mooncake checkpoint ACKs do not cover the controller cut")
-    packed_sizes: dict[str, int] = {}
     for entry in entries:
-        packed_sizes[entry.shard] = packed_sizes.get(entry.shard, 0) + entry.size
-    for shard, expected_size in packed_sizes.items():
-        shard_path = storage_dir / shard
-        if not shard_path.is_file() or shard_path.stat().st_size != expected_size:
+        shard_path = storage_dir / entry.shard
+        index_path = storage_dir / f"{entry.shard}.index.json"
+        if (
+            not shard_path.is_file()
+            or shard_path.stat().st_size != entry.payload_bytes
+            or not index_path.is_file()
+        ):
             raise RuntimeError(
-                f"Mooncake checkpoint shard {shard!r} was not durably packed as ACKed"
+                f"Mooncake checkpoint shard {entry.shard!r} was not durably packed as ACKed"
             )
-
-    _write_manifest(
-        storage_dir,
-        config=manager.config,
-        entries=entries,
-    )
+    _write_manifest(storage_dir, config=manager.config, entries=entries)
 
 
 def _load_manifest(
     checkpoint_root: Path,
-) -> tuple[list[_ManifestObject], dict[str, Any]]:
+) -> tuple[list[_ManifestObject] | list[_ShardIndex], dict[str, Any]]:
     storage_dir = checkpoint_root / _STORAGE_DIR
-    manifest = json.loads((storage_dir / _MANIFEST_FILE).read_text(encoding="utf-8"))
+    manifest_text = (storage_dir / _MANIFEST_FILE).read_text(encoding="utf-8")
+    manifest = json.loads(manifest_text)
+    del manifest_text
     if not isinstance(manifest, Mapping):
         raise ValueError("Mooncake checkpoint manifest must contain a mapping")
     raw_layout = manifest.get("storage_layout")
@@ -1015,6 +1272,13 @@ def _load_manifest(
         "use_gdr": raw_layout["use_gdr"],
         "gdr_staging_buffer_mb": raw_layout["gdr_staging_buffer_mb"],
     }
+
+    if "format_version" in manifest:
+        version = manifest["format_version"]
+        if type(version) is not int or version not in (2, 3) or "objects" in manifest:
+            raise ValueError("Unsupported Mooncake checkpoint manifest format version")
+        shards = _parse_shard_indexes(manifest.get("shards"))
+        return shards, layout
 
     values = manifest.get("objects")
     if not isinstance(values, list):
@@ -1043,9 +1307,14 @@ def _load_manifest(
 def _restore_assignments(
     entries: list[_ManifestObject], participants: list[_ParticipantInfo]
 ) -> dict[str, list[_ManifestObject]]:
+    shards: dict[str, list[_ManifestObject]] = {}
+    shard_bytes: dict[str, int] = {}
+    for entry in entries:
+        shards.setdefault(entry.shard, []).append(entry)
+        shard_bytes[entry.shard] = shard_bytes.get(entry.shard, 0) + entry.size
     assignments = {participant.participant_id: [] for participant in participants}
     assigned_bytes = {participant.participant_id: 0 for participant in participants}
-    for entry in sorted(entries, key=lambda value: (-value.size, value.key)):
+    for shard in sorted(shards, key=lambda value: (-shard_bytes[value], value)):
         participant = min(
             participants,
             key=lambda value: (
@@ -1053,10 +1322,10 @@ def _restore_assignments(
                 value.participant_id,
             ),
         )
-        assignments[participant.participant_id].append(entry)
-        assigned_bytes[participant.participant_id] += entry.size
+        assignments[participant.participant_id].extend(shards[shard])
+        assigned_bytes[participant.participant_id] += shard_bytes[shard]
     return {
-        participant_id: sorted(values, key=lambda value: value.key)
+        participant_id: sorted(values, key=lambda value: (value.shard, value.offset))
         for participant_id, values in assignments.items()
         if values
     }
@@ -1083,6 +1352,82 @@ def _validate_restore_response(
     return expected
 
 
+def _require_clean_store(
+    store: Any,
+    keys: list[str],
+) -> None:
+    for start in range(0, len(keys), _BATCH_KEYS):
+        batch = keys[start : start + _BATCH_KEYS]
+        existence = store.batch_is_exist(batch)
+        if (
+            not isinstance(existence, (list, tuple))
+            or len(existence) != len(batch)
+            or any(type(result) is not int or result != 0 for result in existence)
+        ):
+            raise RuntimeError("Mooncake storage restore requires a clean store")
+
+
+def _load_sharded_checkpoint(
+    manager: Any, root: Path, shards: list[_ShardIndex]
+) -> None:
+    participants, workers = _live_participants(manager)
+    if not participants:
+        raise RuntimeError("No live Mooncake checkpoint participants")
+    assignments: dict[str, list[_ShardIndex]] = {
+        participant.participant_id: [] for participant in participants
+    }
+    sizes = {participant.participant_id: 0 for participant in participants}
+    for shard in sorted(shards, key=lambda item: (-item.payload_bytes, item.shard)):
+        owner = min(
+            participants,
+            key=lambda item: (sizes[item.participant_id], item.participant_id),
+        )
+        assignments[owner.participant_id].append(shard)
+        sizes[owner.participant_id] += shard.payload_bytes
+    endpoints = sorted(participant.transport_endpoint for participant in participants)
+    requests = [
+        _ParticipantRequest(
+            participant,
+            _request_body(
+                manager,
+                "LOAD_SHARDS",
+                checkpoint_root=str(root),
+                shards=[
+                    asdict(shard)
+                    for shard in sorted(
+                        assignments[participant.participant_id],
+                        key=lambda item: item.shard,
+                    )
+                ],
+                current_endpoints=endpoints,
+            ),
+        )
+        for participant in participants
+        if assignments[participant.participant_id]
+    ]
+    responses = _fanout_requests(
+        requests,
+        workers=workers,
+        local=manager._checkpoint_participant,
+        timeout_s=_checkpoint_timeout_s(manager.config),
+    )
+    _require_exact_responses(requests, responses, operation="restore")
+    for request in requests:
+        response = responses[request.participant.participant_id]
+        keys = response.get("restored_keys")
+        count = sum(
+            shard.object_count
+            for shard in assignments[request.participant.participant_id]
+        )
+        if (
+            response.get("participant_id") != request.participant.participant_id
+            or not isinstance(keys, list)
+            or len(keys) != count
+            or any(not isinstance(key, str) or not key for key in keys)
+        ):
+            raise RuntimeError("Malformed Mooncake restore ACK")
+
+
 def _load_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
     """Restore payload on current clients before TQ loads its controller."""
     _validate_checkpoint_runtime(manager)
@@ -1094,25 +1439,17 @@ def _load_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
             "Mooncake checkpoint storage layout does not match this runtime: "
             f"saved={saved_layout}, current={current_layout}"
         )
-    expected_keys = _controller_keys(checkpoint_root)
-    if [entry.key for entry in entries] != expected_keys:
-        raise ValueError(
-            "Mooncake payload manifest does not match the TQ controller checkpoint"
+    if entries and isinstance(entries[0], _ShardIndex):
+        _load_sharded_checkpoint(
+            manager, checkpoint_root, cast(list[_ShardIndex], entries)
         )
+        return
+    entries = cast(list[_ManifestObject], entries)
 
     store = manager.storage_client._store
     if not entries:
         return
-    for start in range(0, len(entries), _BATCH_KEYS):
-        keys = [entry.key for entry in entries[start : start + _BATCH_KEYS]]
-        existence = store.batch_is_exist(keys)
-        if (
-            not isinstance(existence, (list, tuple))
-            or len(existence) != len(keys)
-            or any(type(result) is not int or result != 0 for result in existence)
-        ):
-            raise RuntimeError("Mooncake storage restore requires a clean store")
-
+    _require_clean_store(store, [entry.key for entry in entries])
     participants, workers = _live_participants(manager)
     if not participants:
         raise RuntimeError("No live Mooncake checkpoint participants")
@@ -1127,6 +1464,7 @@ def _load_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
                 "LOAD_OBJECTS",
                 checkpoint_root=str(checkpoint_root),
                 objects=[asdict(entry) for entry in assignments[participant_id]],
+                current_endpoints=sorted(current_endpoints),
             ),
         )
         for participant_id in sorted(assignments)
@@ -1138,30 +1476,9 @@ def _load_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
         timeout_s=_checkpoint_timeout_s(manager.config),
     )
     _require_exact_responses(requests, responses, operation="restore")
-    restored: list[str] = []
     for request in requests:
-        response = responses.get(request.participant.participant_id)
-        if response is None:
-            raise RuntimeError(
-                f"Missing Mooncake restore ACK from {request.participant.participant_id}"
-            )
-        restored.extend(_validate_restore_response(request, response))
-    if sorted(restored) != expected_keys:
-        raise RuntimeError("Mooncake restore ACKs do not cover the controller cut")
-
-    for start in range(0, len(entries), _BATCH_KEYS):
-        batch = entries[start : start + _BATCH_KEYS]
-        descriptors = _batch_replicas(store, [entry.key for entry in batch])
-        for entry in batch:
-            replicas = _complete_memory_replicas(descriptors[entry.key])
-            if not any(
-                endpoint in current_endpoints and size == entry.size
-                for endpoint, size in replicas
-            ):
-                raise RuntimeError(
-                    f"Restored Mooncake key {entry.key!r} has no COMPLETE memory "
-                    "replica on a current checkpoint participant"
-                )
+        response = responses[request.participant.participant_id]
+        _validate_restore_response(request, response)
 
 
 def configure_checkpoint_workers(workers: list[Any]) -> None:

@@ -478,15 +478,16 @@ also prepares this storage mode, even when saving new checkpoints is disabled.
 No additional Mooncake-specific checkpoint setting is needed. Ordinary PUTs
 remain in Mooncake memory and perform no checkpoint-related filesystem I/O.
 
-On `tq.save_checkpoint(...)`, the plugin enumerates every raw Mooncake object
-key referenced by the TQ controller snapshot and maps it to a live client with
-a complete memory replica. The coordinator then fans out metadata-only save
-requests. Each selected client reads only the objects it owns and writes one
-unique packed shard beneath the requested TQ checkpoint directory on the
-shared filesystem. The coordinator commits the offset/size/digest manifest
-only after every owner has flushed, fsynced, and acknowledged its exact shard.
-Other owners' payload bytes never pass through the coordinator; it writes any
-objects it owns directly, just like the other owners.
+On `tq.save_checkpoint(...)`, existing workers query disjoint slices of the
+controller's object keys and group their ownership metadata by destination.
+Ray object references route those groups directly to the owners; the
+coordinator forwards references, not per-object addresses or sizes. Each owner
+writes directly from its own hard-pinned CPU memory into one packed shard and
+an offset/size index. SAVE performs no native GET, staging-buffer copy, or
+buffer registration. Only metadata moves between processes. For multiple
+complete replicas, a canonical live owner is selected; this prioritizes
+locality, not global byte balancing. The coordinator publishes the small shard
+manifest after every owner has flushed, fsynced, and acknowledged its shard.
 
 SingleController supplies its existing policy/value/teacher, generation
 DP-leader (when token capture is enabled), and finalizer actor handles. Their
@@ -505,10 +506,11 @@ plugin must supply their existing owner handles with
 `configure_checkpoint_workers(...)` before save/load. Unreachable owners fail
 the checkpoint rather than silently falling back to centralized copying.
 
-On `tq.load_checkpoint(...)`, the plugin validates the manifest and controller
-key set, balances the durable objects over the currently connected clients,
-and asks those clients to read and verify their assigned slices on the shared
-filesystem. Each client requests its own Mooncake segment as the preferred
+On `tq.load_checkpoint(...)`, the plugin balances saved shards over currently
+connected clients. In one restore round, each client reads its indexes, checks
+its destination keys are absent, and loads its slices from the shared
+filesystem. There is no separate preflight round or extra controller-key scan.
+Each client requests its own Mooncake segment as the preferred
 destination, but Mooncake may place an object on another current participant
 when that segment lacks capacity. Saved process and segment identities are
 provenance only and are not reused after restart. TQ restores controller
@@ -516,9 +518,18 @@ metadata only after every object has a complete, correctly sized memory replica
 on a current checkpoint participant. No separate Mooncake `storage_root` is
 configured; the explicit TQ checkpoint destination is the persistent location.
 
+New files use checksum-free format v3: no payload or index hashes are computed
+or verified. Legacy v1/v2 layouts remain readable, ignoring their historical
+hash fields. File/size and native-operation errors still fail the checkpoint.
+
 This module supplies storage capability only. A caller such as Single
 Controller remains responsible for choosing the checkpoint boundary and must
-quiesce TQ writes and clears while `tq.save_checkpoint` runs. The checkpoint
+quiesce TQ writes and clears while `tq.save_checkpoint` runs. Direct SAVE supports
+the TCP/RDMA CPU segments created by TQ's Mooncake client, including when GDR
+staging is enabled. Replica movement, segment unmount and store close must also
+remain paused until SAVE finishes: the writer borrows local addresses rather
+than acquiring a new native memory lease. Same-host peer addresses are not
+local process addresses. The checkpoint
 contains every controller-referenced TQ field as encoded raw objects, including
 log probabilities, router indices, non-tensor values, and GDR chunks. It does
 not contain model weights, unfinished generations, vLLM KV cache, or Gym state.
