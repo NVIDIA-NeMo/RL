@@ -33,6 +33,7 @@ from ray.util.placement_group import PlacementGroup
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
+from nemo_rl.distributed.refit_watchdog import RefitAborted
 from nemo_rl.distributed.virtual_cluster import NVLINK_DOMAIN_UNKNOWN, RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.fleet_health import (
@@ -1532,7 +1533,9 @@ class VllmGeneration(GenerationInterface):
             print(f"Error invalidating vLLM caches: {e}")
             return False
 
-    def pause_generation_for_refit(self, *, clear_cache: bool) -> bool:
+    def pause_generation_for_refit(
+        self, *, clear_cache: bool, timeout_s: Optional[float] = None
+    ) -> bool:
         """Pause every async vLLM engine while preserving in-flight requests."""
         if not self.cfg["vllm_cfg"]["async_engine"]:
             raise RuntimeError("pause_generation_for_refit requires async_engine=True")
@@ -1546,11 +1549,19 @@ class VllmGeneration(GenerationInterface):
             worker.pause_generation_async.remote(clear_cache=clear_cache)
             for worker in self._refit_leader_workers()
         ]
-        if not all(ray.get(futures)):
+        try:
+            results = ray.get(futures, timeout=timeout_s)
+        except ray.exceptions.GetTimeoutError as exc:
+            raise RefitAborted(
+                f"vLLM generation pause did not return within {timeout_s}s"
+            ) from exc
+        if not all(results):
             raise RuntimeError("Failed to pause every async vLLM engine")
         return True
 
-    def resume_generation_after_refit(self) -> bool:
+    def resume_generation_after_refit(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
         """Resume every async vLLM engine paused for refit."""
         if not self.cfg["vllm_cfg"]["async_engine"]:
             raise RuntimeError(
@@ -1563,7 +1574,13 @@ class VllmGeneration(GenerationInterface):
             worker.resume_generation_async.remote()
             for worker in self._refit_leader_workers()
         ]
-        if not all(ray.get(futures)):
+        try:
+            results = ray.get(futures, timeout=timeout_s)
+        except ray.exceptions.GetTimeoutError as exc:
+            raise RefitAborted(
+                f"vLLM generation resume did not return within {timeout_s}s"
+            ) from exc
+        if not all(results):
             raise RuntimeError("Failed to resume every async vLLM engine")
         return True
 

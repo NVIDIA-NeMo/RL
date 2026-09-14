@@ -581,7 +581,9 @@ class GenerationInterface(ABC):
         """
         return False
 
-    def pause_generation_for_refit(self, *, clear_cache: bool) -> bool:
+    def pause_generation_for_refit(
+        self, *, clear_cache: bool, timeout_s: Optional[float] = None
+    ) -> bool:
         """Pause in-flight generation while preserving request state.
 
         Backends with native in-flight refit support override this hook. The default
@@ -593,6 +595,7 @@ class GenerationInterface(ABC):
         Args:
             clear_cache: Also clear the engine's reusable caches at pause time so
                 preserved requests recompute their KV after the weight update.
+            timeout_s: Maximum time to wait for engines to pause; None waits indefinitely.
 
         Returns:
             True if every engine paused; False when the backend has no native pause
@@ -601,12 +604,17 @@ class GenerationInterface(ABC):
         _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False
 
-    def resume_generation_after_refit(self) -> bool:
+    def resume_generation_after_refit(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
         """Resume generation paused by :meth:`pause_generation_for_refit`.
 
         The default implementation shares the once-per-backend warning emitted by
         :meth:`pause_generation_for_refit` and lets the refit continue for backends
         without native pause/resume support.
+
+        Args:
+            timeout_s: Maximum time to wait for engines to resume; None waits indefinitely.
 
         Returns:
             True if every engine resumed; False when the backend has no native resume

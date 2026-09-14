@@ -432,7 +432,8 @@ class TestLookaheadSchedule:
     ],
 )
 @pytest.mark.parametrize("use_nemo_gym", [False, True])
-def test_sync_weights_honors_recompute_kv_cache_config(
+@pytest.mark.asyncio
+async def test_sync_weights_honors_recompute_kv_cache_config(
     generation_pause_supported: bool,
     recompute_kv_cache: bool,
     expected_invalidation_calls: int,
@@ -464,10 +465,11 @@ def test_sync_weights_honors_recompute_kv_cache_config(
         ),
         requires_kv_scale_sync=False,
         resume_generation_after_refit=MagicMock(
-            side_effect=lambda: (events.append("resume") or generation_pause_supported)
+            side_effect=lambda **_: (
+                events.append("resume") or generation_pause_supported
+            )
         ),
     )
-    ctrl._inflight_by_group_id = {}
     ctrl._rollout_recovery_enabled = False
     ctrl._master_config = SimpleNamespace(
         env={"should_use_nemo_gym": use_nemo_gym},
@@ -483,13 +485,31 @@ def test_sync_weights_honors_recompute_kv_cache_config(
         token_capture=SimpleNamespace(enabled=False),
     )
 
-    asyncio.run(ctrl._sync_weights())
+    stale_task = asyncio.create_task(asyncio.Event().wait())
+    ctrl._inflight_by_group_id = {"stale-group": (stale_task, 0)}
+    ctrl._trainer_version = 1
+    ctrl._sampler = SimpleNamespace(should_abort_inflight=MagicMock(return_value=True))
+    try:
+        aborted = await ctrl._sync_weights()
+        assert aborted == (0 if use_nemo_gym else 1)
+        assert stale_task.cancelled() is (not use_nemo_gym)
+        if use_nemo_gym:
+            ctrl._sampler.should_abort_inflight.assert_not_called()
+        else:
+            ctrl._sampler.should_abort_inflight.assert_called_once_with(
+                start_weight_version=0, current_train_weight=1
+            )
+    finally:
+        stale_task.cancel()
+        await asyncio.gather(stale_task, return_exceptions=True)
 
     ctrl._weight_synchronizer.sync_weights.assert_called_once_with(kv_scales=None)
     ctrl._gen.pause_generation_for_refit.assert_called_once_with(
-        clear_cache=recompute_kv_cache
+        clear_cache=recompute_kv_cache, timeout_s=ctrl._refit_await_budget_s()
     )
-    ctrl._gen.resume_generation_after_refit.assert_called_once_with()
+    ctrl._gen.resume_generation_after_refit.assert_called_once_with(
+        timeout_s=ctrl._refit_await_budget_s()
+    )
     assert ctrl._gen.invalidate_kv_cache.call_count == expected_invalidation_calls
     assert events == [
         "pause",

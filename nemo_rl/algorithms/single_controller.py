@@ -4552,6 +4552,8 @@ class SingleControllerActor:
             else await self._abort_stale_inflight()
         )
 
+        # TODO(#2625): Add drain-gate support during refit.
+
         # Reconcile before the refit, not on a death event. The refit group is provably
         # idle here and every rank is synchronized, which is required because the
         # operations that change membership are themselves collectives. Doing it every
@@ -4585,18 +4587,20 @@ class SingleControllerActor:
         await self._reconcile_refit_membership()
 
         clear_cache = self._async_cfg.recompute_kv_cache_after_weight_updates
+        timeout_s = self._refit_await_budget_s()
+        generation_paused_for_refit = False
         print("⏸️ Requesting generation pause before refit", flush=True)
-        generation_paused_for_refit = await asyncio.to_thread(
-            self._gen.pause_generation_for_refit,
-            clear_cache=clear_cache,
-        )
-        if generation_paused_for_refit:
-            print(
-                f"   {len(self._inflight_by_group_id)} in-flight rollout group(s) paused",
-                flush=True,
-            )
-
         try:
+            generation_paused_for_refit = await asyncio.to_thread(
+                self._gen.pause_generation_for_refit,
+                clear_cache=clear_cache,
+                timeout_s=timeout_s,
+            )
+            if generation_paused_for_refit:
+                print(
+                    f"   {len(self._inflight_by_group_id)} in-flight rollout group(s) paused",
+                    flush=True,
+                )
             await self._sync_weights_within(kv_scales, "first")
         except (RefitAborted, RayActorError) as failure:
             # DETECT AND FAIL FAST, because this one cannot be recovered from.
@@ -4624,6 +4628,14 @@ class SingleControllerActor:
                 raise
             with self._recovery_window():
                 await self._recover_from_failed_refit(failure)
+                if not generation_paused_for_refit:
+                    # The failed pause may have reached only some engines. Pause all
+                    # surviving engines before retrying the refit.
+                    generation_paused_for_refit = await asyncio.to_thread(
+                        self._gen.pause_generation_for_refit,
+                        clear_cache=clear_cache,
+                        timeout_s=timeout_s,
+                    )
                 # Once only: a second failure is a real fault, not a membership problem,
                 # and retrying forever would recreate the wedge this exists to remove.
                 await self._sync_weights_within(kv_scales, "retry")
@@ -4640,7 +4652,7 @@ class SingleControllerActor:
 
         print("▶️ Requesting generation resume after refit", flush=True)
         generation_resumed_after_refit = await asyncio.to_thread(
-            self._gen.resume_generation_after_refit
+            self._gen.resume_generation_after_refit, timeout_s=timeout_s
         )
         if generation_paused_for_refit and not generation_resumed_after_refit:
             raise RuntimeError(

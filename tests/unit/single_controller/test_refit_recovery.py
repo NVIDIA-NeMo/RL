@@ -171,6 +171,67 @@ def _make_controller(
 ABORTED = RefitAborted("refit broadcast exceeded 60.0s and was aborted")
 
 
+@pytest.mark.parametrize("failure", [ABORTED, ray.exceptions.ActorDiedError()])
+def test_failed_pause_recovers_and_pauses_survivors_before_refit(failure):
+    ctrl, monitor, sync = _make_controller(failure)
+    ctrl._async_cfg.generation_fleet_health.refit_timeout_s = 1.0
+    events = []
+
+    def pause(**kwargs):
+        events.append("pause")
+        if events == ["pause"]:
+            raise failure
+        assert monitor.absent_shards() == [0]
+        return True
+
+    ctrl._gen.pause_generation_for_refit.side_effect = pause
+    sync.sync_weights = MagicMock(side_effect=lambda **_: events.append("sync"))
+
+    asyncio.run(ctrl._sync_weights())
+
+    assert events == ["pause", "pause", "sync"]
+    assert ctrl._gen.pause_generation_for_refit.call_args_list == [
+        mock.call(clear_cache=False, timeout_s=61.0),
+        mock.call(clear_cache=False, timeout_s=61.0),
+    ]
+    assert sync.reconciled_with[-1] == [0]
+    ctrl._gen.resume_generation_after_refit.assert_called_once_with(timeout_s=61.0)
+    assert ctrl._rollout_permitted.is_set()
+
+
+@pytest.mark.parametrize("failure", [ABORTED, ray.exceptions.ActorDiedError()])
+@pytest.mark.parametrize("with_monitor", [False, True])
+def test_unrecoverable_pause_stops_before_weight_transfer(failure, with_monitor):
+    ctrl, _, sync = _make_controller(failure, with_monitor=with_monitor)
+    ctrl._gen.pause_generation_for_refit.side_effect = failure
+
+    with pytest.raises(type(failure)):
+        asyncio.run(ctrl._sync_weights())
+
+    assert ctrl._gen.pause_generation_for_refit.call_count == (2 if with_monitor else 1)
+    assert sync.sync_calls == 0
+    ctrl._gen.resume_generation_after_refit.assert_not_called()
+    assert not ctrl._rollout_permitted.is_set()
+
+
+@pytest.mark.parametrize("failure", [ABORTED, ray.exceptions.ActorDiedError()])
+def test_failed_resume_keeps_dispatch_closed_without_retrying_refit(failure):
+    ctrl, _, sync = _make_controller(failure)
+    sync.sync_weights = MagicMock()
+    ctrl._gen.resume_generation_after_refit.side_effect = failure
+
+    with pytest.raises(type(failure)):
+        asyncio.run(ctrl._sync_weights())
+
+    sync.sync_weights.assert_called_once_with(kv_scales=None)
+    ctrl._gen.pause_generation_for_refit.assert_called_once_with(
+        clear_cache=False, timeout_s=None
+    )
+    ctrl._gen.resume_generation_after_refit.assert_called_once_with(timeout_s=None)
+    ctrl._rollout_manager.resume_request_deadlines.assert_not_called()
+    assert not ctrl._rollout_permitted.is_set()
+
+
 class TestDeathInsideTheCollective:
     """RefitAborted: the watchdog broke a collective a dead peer had stalled."""
 
@@ -205,13 +266,16 @@ class TestDeathInsideTheCollective:
         ctrl, _, sync = _make_controller(ABORTED)
         sync_calls_when_resumed: list[int] = []
         ctrl._gen.resume_generation_after_refit = MagicMock(
-            side_effect=lambda: sync_calls_when_resumed.append(sync.sync_calls) or True
+            side_effect=lambda **_: sync_calls_when_resumed.append(sync.sync_calls)
+            or True
         )
 
         asyncio.run(ctrl._sync_weights())
 
         assert sync.sync_calls == 2
-        ctrl._gen.pause_generation_for_refit.assert_called_once_with(clear_cache=False)
+        ctrl._gen.pause_generation_for_refit.assert_called_once_with(
+            clear_cache=False, timeout_s=None
+        )
         assert sync_calls_when_resumed == [2]
 
     def test_survivors_are_pulled_from_service_then_given_back(self):
