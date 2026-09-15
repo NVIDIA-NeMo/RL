@@ -917,6 +917,64 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
         setup(master_config, tokenizer, dataset, None)
 
 
+def test_distillation_train_shuts_down_environments_after_failure():
+    task_to_env = {"nemo_gym": MagicMock()}
+    val_task_to_env = task_to_env
+
+    with (
+        patch.object(
+            distil_mod,
+            "_distillation_train_impl",
+            side_effect=RuntimeError("rollout failed"),
+        ),
+        patch.object(distil_mod, "shutdown_environments") as shutdown,
+        pytest.raises(RuntimeError, match="rollout failed"),
+    ):
+        distillation_train(
+            student_policy=MagicMock(),
+            teacher_policy=MagicMock(),
+            student_generation=MagicMock(),
+            dataloader=MagicMock(),
+            val_dataloader=None,
+            tokenizer=MagicMock(),
+            loss_fn=MagicMock(),
+            task_to_env=task_to_env,
+            val_task_to_env=val_task_to_env,
+            logger=MagicMock(),
+            checkpointer=MagicMock(),
+            distillation_save_state=MagicMock(),
+            master_config=MagicMock(),
+        )
+
+    shutdown.assert_called_once_with(task_to_env, val_task_to_env)
+
+
+def test_distillation_train_shuts_down_environments_after_success():
+    task_to_env = {"nemo_gym": MagicMock()}
+
+    with (
+        patch.object(distil_mod, "_distillation_train_impl"),
+        patch.object(distil_mod, "shutdown_environments") as shutdown,
+    ):
+        distillation_train(
+            student_policy=MagicMock(),
+            teacher_policy=MagicMock(),
+            student_generation=MagicMock(),
+            dataloader=MagicMock(),
+            val_dataloader=None,
+            tokenizer=MagicMock(),
+            loss_fn=MagicMock(),
+            task_to_env=task_to_env,
+            val_task_to_env=task_to_env,
+            logger=MagicMock(),
+            checkpointer=MagicMock(),
+            distillation_save_state=MagicMock(),
+            master_config=MagicMock(),
+        )
+
+    shutdown.assert_called_once_with(task_to_env, task_to_env)
+
+
 @pytest.mark.parametrize("refit_transport", [None, "nixl"])
 def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
     """Smoke test: calling setup with a non-colocated config should succeed."""
@@ -1004,7 +1062,7 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
         def __init__(self, *args, **kwargs):
             pass
 
-        def prepare_refit_info(self):
+        def prepare_refit_info(self, *, refit_payload_mode):
             return {}
 
         def offload_after_refit(self):
@@ -1026,6 +1084,9 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
 
         def prepare_refit_info(self, *args, **kwargs):
             return None
+
+        def get_refit_payload_mode(self):
+            return "hf_export"
 
         def init_collective(self, *args, **kwargs):
             self.collective_calls.append((args, kwargs))
@@ -1153,7 +1214,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch):
         def offload_after_refit(self):
             return None
 
-        def prepare_refit_info(self):
+        def prepare_refit_info(self, *, refit_payload_mode):
             return {}
 
     class DummyVllmGeneration:
@@ -1174,6 +1235,9 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch):
 
         def prepare_refit_info(self, *args, **kwargs):
             self.prepare_refit_info_called = True
+
+        def get_refit_payload_mode(self):
+            return "hf_export"
 
     nemo_gym_actor = MagicMock()
 

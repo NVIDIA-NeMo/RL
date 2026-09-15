@@ -48,6 +48,7 @@ The bugs these catch:
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -149,6 +150,10 @@ def _make_worker(loss_type):
             },
         },
     }
+    w.megatron_cfg = SimpleNamespace(
+        optimizer=SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=False),
+        ddp=SimpleNamespace(overlap_param_gather=False),
+    )
     w.dp_size = 2
     w.cp_size = 1
     w.sampling_params = None
