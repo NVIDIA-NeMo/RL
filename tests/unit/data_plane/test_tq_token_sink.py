@@ -459,5 +459,9 @@ def test_megatron_preparer_resolves_chains_through_the_shared_cache():
 def test_prefix_splice_keys_match_megatron_constants():
     """The endpoint writes Megatron's constants; the preparer reads NeMo-RL's copies."""
     mcore = pytest.importorskip("megatron.core.inference.inference_request")
+    if not hasattr(mcore, "PREFIX_SPLICE_SUFFIX_FIELD"):
+        pytest.skip(
+            "pinned megatron-core predates MInf prefix-splice metadata (Megatron-LM #7015)"
+        )
     assert PREFIX_SPLICE_SUFFIX_FIELD == mcore.PREFIX_SPLICE_SUFFIX_FIELD
     assert PREFIX_SPLICE_BOUNDARY_FIELD == mcore.PREFIX_SPLICE_BOUNDARY_FIELD

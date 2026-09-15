@@ -87,7 +87,14 @@ dies after admission is poisoned from the capture middleware's `finally` hook.
 ### Megatron Inference payload staging
 
 MInf now uses the same canonical durability boundary through two generic engine
-hooks. Gym's complete `CaptureAdmission` travels as opaque request metadata.
+hooks. These hooks (`DynamicInferenceEngine.payload_stager` /
+`prompt_preparer`, the `RequestPayloadStager` protocol, and the prefix-splice
+request metadata) come from
+[NVIDIA/Megatron-LM PR #7015](https://github.com/NVIDIA/Megatron-LM/pull/7015)
+and are not yet in the Megatron-LM pinned through Megatron-Bridge; setup fails
+with a `NotImplementedError` naming that dependency until the pin is bumped.
+
+Gym's complete `CaptureAdmission` travels as opaque request metadata.
 Before engine admission, the model-parallel coordinator resolves an admitted
 `staging_chain` through `TQTokenSource`, splices the exact parent tokens into
 the rendered prompt, and broadcasts that prepared request to every rank. When

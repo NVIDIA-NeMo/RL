@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import contextlib
+import sys
 import threading
+import types
 from pathlib import Path
 from typing import Any, Optional
 from unittest.mock import MagicMock, patch
@@ -226,39 +228,52 @@ def _save_state(
     return state
 
 
-@pytest.mark.parametrize(
-    ("backend", "expected", "unexpected"),
-    [
-        (
-            "megatron",
-            "MegatronPolicyWorker environment",
-            "VllmAsyncGenerationWorker environment",
-        ),
-        (
-            "vllm",
-            "VllmAsyncGenerationWorker environment",
-            "MegatronPolicyWorker environment",
-        ),
-    ],
-)
-def test_missing_nemo_gym_remediation_is_backend_specific(
-    backend: str, expected: str, unexpected: str
+def _stub_megatron_inference_request(
+    monkeypatch: pytest.MonkeyPatch, inference_request: types.SimpleNamespace
 ) -> None:
-    import_error = ModuleNotFoundError("No module named 'nemo_gym'")
+    """Make ``from megatron.core.inference import inference_request`` resolve to a stub.
 
-    with pytest.raises(RuntimeError, match=expected) as exc_info:
-        sc_setup_mod._raise_missing_nemo_gym_error(import_error, backend)
-
-    assert unexpected not in str(exc_info.value)
-    assert exc_info.value.__cause__ is import_error
-    assert "NRL_FORCE_REBUILD_VENVS=true" in str(exc_info.value)
-    assert "$NEMO_RL_VENV_DIR" in str(exc_info.value)
-    worker_module = (
-        "nemo_rl.models.policy.workers.megatron_policy_worker"
-        if backend == "megatron"
-        else "nemo_rl.models.generation.vllm.vllm_worker_async"
+    Stubs the parent packages too, so the check does not depend on whether the
+    driver venv carries megatron-core (unit tests run without it).
+    """
+    for name in ("megatron", "megatron.core", "megatron.core.inference"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(
+        sys.modules, "megatron.core.inference.inference_request", inference_request
     )
-    assert worker_module in str(exc_info.value)
+
+
+def test_require_minf_capture_hooks_rejects_megatron_core_without_pr_7015(
+    monkeypatch,
+) -> None:
+    _stub_megatron_inference_request(
+        monkeypatch, types.SimpleNamespace(RequestPayloadStager=object)
+    )
+
+    with pytest.raises(NotImplementedError, match="lacks RequestPromptPreparer"):
+        sc_setup_mod._require_minf_capture_hooks()
+
+
+def test_require_minf_capture_hooks_accepts_megatron_core_with_pr_7015(
+    monkeypatch,
+) -> None:
+    _stub_megatron_inference_request(
+        monkeypatch,
+        types.SimpleNamespace(
+            RequestPayloadStager=object, RequestPromptPreparer=object
+        ),
+    )
+
+    assert sc_setup_mod._require_minf_capture_hooks() is None
+
+
+def test_require_minf_capture_hooks_defers_to_worker_without_megatron_core(
+    monkeypatch,
+) -> None:
+    # None in sys.modules makes the import raise ModuleNotFoundError.
+    monkeypatch.setitem(sys.modules, "megatron", None)
+
+    assert sc_setup_mod._require_minf_capture_hooks() is None
 
 
 @pytest.fixture
