@@ -101,7 +101,17 @@ stream instead of resetting its budget through gap-fill. Completed groups are
 not discarded from the live buffer, but this is not durable persistence and
 does not repair the underlying judge failure. The default is false to preserve
 existing GRPO behavior; PPO is unchanged. Native tests cover both policies.
-Durable judge-only retry remains unimplemented. Do not interpret a healthy judge endpoint or growing rollout counts
+The two strict verifier resources also support `judge_max_attempts` (default 1,
+range 1–8; regular smoke: 4). The retry decorator wraps only one
+`_generate_judge_evaluation` call. It repeats the same judge request on
+`JudgeError`, keeping the policy answer, prompts, 8K judge budget, temperature,
+and reasoning settings unchanged. A valid negative verdict returns immediately;
+it is never retried to seek a positive label. Math's required swapped-order
+check remains separate, with its own bounded attempts. Other exceptions are
+not retried. Final exhaustion still fails closed.
+
+This reuses an answer **in memory**, not across preemption or a new job. Durable
+judge-only retry remains unimplemented. Do not interpret a healthy judge endpoint or growing rollout counts
 as evidence that optimizer updates are progressing. Diagnose repeated tagged
 failures on a small verifier workload before restarting full training.
 

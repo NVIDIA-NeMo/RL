@@ -42,3 +42,8 @@ def test_regular_smoke_does_not_reset_failed_stream_budget_through_gap_fill():
     assert async_config.nemo_gym_stream_retries == 1
     assert async_config.nemo_gym_fail_on_retry_exhaustion is True
     assert async_config.max_generation_failures == 0
+    for resource in ("math_with_judge", "equivalence_llm_judge"):
+        verifier = config.env.nemo_gym[resource].resources_servers[resource]
+        assert verifier.fail_on_missing_judge_verdict is True
+        assert verifier.judge_max_attempts == 4
+        assert verifier.judge_responses_create_params.max_output_tokens == 8192

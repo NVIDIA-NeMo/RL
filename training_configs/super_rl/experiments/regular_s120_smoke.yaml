@@ -337,6 +337,7 @@ env:
             max_output_tokens: 8192
             temperature: 0
           fail_on_missing_judge_verdict: true
+          judge_max_attempts: 4
           should_use_judge: true
           domain: math
           verified: false
@@ -366,6 +367,7 @@ env:
             max_output_tokens: 8192
             temperature: 0
           fail_on_missing_judge_verdict: true
+          judge_max_attempts: 4
           # Gym starts this app in resources_servers/equivalence_llm_judge.
           judge_prompt_template_fpath: prompt_templates/equivalence_llm_judge.txt
           judge_endpoint_max_concurrency: 256
