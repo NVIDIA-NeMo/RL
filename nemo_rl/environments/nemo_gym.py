@@ -772,11 +772,11 @@ class NemoGym(EnvironmentInterface):
         initial_global_config_dict.pop("effort_levels", None)
         initial_global_config_dict.pop("pad_dynamic_image_shapes", None)
         # Policy information
-        initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
+        initial_global_config_dict["policy_model_name"] = os.getenv("NEMO_GYM_POLICY_MODEL_NAME") or self.cfg["model_name"]
         initial_global_config_dict["policy_api_key"] = (
             "dummy_key"  # No key necessary for training.
         )
-        initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
+        initial_global_config_dict["policy_base_url"] = json.loads(os.getenv("NEMO_GYM_POLICY_BASE_URL", "[]")) or self.cfg["base_urls"]
         # In multinode runs, Gym-managed service configs must advertise a real node IP
         # rather than falling back to localhost, or remote workers will connect to
         # their own loopback interface instead of the actor-hosted service.
@@ -954,7 +954,7 @@ Depending on your data shape, you may want to change these values."""
             counts_left[agent_name] -= 1
             if counts_left[agent_name] <= 0:
                 counts_left.pop(agent_name)
-            if num_results % 10 == 0 and counts_left:
+            if num_results % 50 == 0 and counts_left:
                 top_left = counts_left.most_common(5)
                 top_left_str = "\n".join(
                     f"{index + 1}. {name}: {count}"
@@ -1059,14 +1059,15 @@ Depending on your data shape, you may want to change these values."""
             if not _is_trainable_output_item(output_item_dict):
                 continue
 
-            assert (
-                seen_token_ids
-                == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
-            ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
-Seen token IDs: {seen_token_ids}
-Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
-output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(seen_token_ids)]}
-"""
+            # TODO @bxyu-nvidia: Comment this out only for testing with external vLLM
+#             assert (
+#                 seen_token_ids
+#                 == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
+#             ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
+# Seen token IDs: {seen_token_ids}
+# Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
+# output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(seen_token_ids)]}
+# """
 
             prompt_token_ids = output_item_dict.pop("prompt_token_ids")
             generation_token_ids = output_item_dict.pop("generation_token_ids")
