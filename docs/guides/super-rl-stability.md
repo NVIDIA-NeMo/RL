@@ -11,6 +11,46 @@ Required workloads are **CCC, CoT, TIR/ns_tools, SciCode, and equivalence
 judging**. Removing a route, disabling reasoning, lowering the agreed output
 budget, or converting a service failure into reward zero is not a repair.
 
+**Status: reviewable fix series, not yet an all-cluster certified, turnkey
+training recipe.** Native validation and the release blockers below are
+deliberately separate from local unit-test success. No training job was started
+while preparing this series. Existing experimental artifacts were not changed.
+
+## Commit review order
+
+Each implementation commit includes its own problem/usage/validation section in
+this document. Inspect with `git show <commit>`; base is PR3941, not current main.
+
+| Commit | Review scope | Ledger incidents |
+| --- | --- | --- |
+| `6ba9b8c` (already present) | Hosted DeepSeek V4 Flash provider/routes config; no Gym code patch | 2 |
+| `e4a56d0` | Stdlib JSON CCC staging with authority checks and no-clobber publication | 1 |
+| `b424dab` | Container cwd and persistent allocation identity | 3–4 |
+| `50de47b` | Clean sbatch environment and effective service CPU affinity | 9, prevention for 12–13 |
+| `abfbc77` | Exact-worker Megatron helper prebuild/read-only verification | 5 |
+| `c1dea86` | Minimal sandbox exception IPC patch and native regression | 14 |
+| `063c2fb` | Fail early on cross-runtime Ray replay restore | 15–19 |
+| `b7f9bf1` | Preserve W&B training scalars by excluding raw generation payload | PR3941 profile / metrics |
+| `681ec68` | Optional CCC concurrency config, no verifier semantic changes | 8, verifier only |
+| `5f6842c` | Compact valid-row Router Replay, without experimental CP-local fetch | 9 / memory and throughput |
+
+## What was intentionally not copied
+
+- Old job IDs, absolute user paths, submission receipts, logs, payload snapshots,
+  repeated `v1/v2/v3` wrappers, observer scripts and cluster allocation manifests.
+- TIR-to-CoT conversion and environment deletion scripts. All required routes
+  remain required; SciCode is not removed.
+- Ad-hoc pytest frontend borrowing, `sacct -P` string assertions, container
+  `/proc/environ` identity probes, and host ACL utilities (incidents 6–7, 10–13).
+  These were diagnostic-tool/placement problems, not reasons to patch the
+  learner. Run tests in the correct environment with writable test output; apply
+  shared-output permissions on a scheduled host with ACL tools and check every
+  ancestor's traversal permissions after the final writer exits.
+- Existing PR3941 checkpoint finalization and trained-frontier logic: retained
+  in place, not duplicated as patch files or hardcoded recovery scripts.
+- Unvalidated CP-local route fetch, 256/256 role rebalance and W&B buffering
+  candidates. They need separate correctness/performance review.
+
 ## CCC metadata staging: no driver dependency on orjson
 
 **Incident 1:** a preparation driver lacked `orjson`; staging exited before
@@ -260,3 +300,85 @@ the native Torch/Ray/Megatron environment; local collection is blocked by the
 missing dependencies. Historical native tests and three-step canaries validated
 the source algorithm, not this newly refactored branch. A new native canary
 must cover ragged inputs, model-owned CP, update/refit and checkpoint reload.
+
+## Required service contract before promotion
+
+Preserve source prompts, task order, effort labels and the agreed cumulative
+output budget. Inspect **effective requests**, not only row metadata. Keep
+reasoning enabled; final-code extraction and verifier failures must be fixed
+without suppressing the reasoning channel.
+
+| Workload | Required native evidence |
+| --- | --- |
+| CCC | Authorized metadata loaded; final code reaches compiler; identical shared mount; nonzero actual test counts and correct reward |
+| CoT | Original prompt/answer unchanged; math/other intended resource returns a valid reward; reasoning stays on |
+| TIR / ns_tools | Real sandbox persistent sessions, multiple tool turns, tool errors followed by continued state, concurrent sessions, cumulative budget and correct final extraction |
+| SciCode | Correct HDF5 test data and prompt assets; multi-substep execution; actual tests and rewards; cumulative generation budget |
+| equivalence judge | Correct resource/agent/model aliases and prompt; valid positive **and negative** verdicts; missing verdict/transport error cannot masquerade as reward zero |
+
+Keep `grpo.async_grpo.max_trajectory_age_steps=2`. A production-concurrency
+canary must allow at least three optimizer targets/steps; a one-step smoke
+truncates the async target window and does not cover the age-2 workload.
+Retain checkpoint save period 10, FT period 1 and one latest FT unless a reviewed
+recipe overrides them; derive the safe-save deadline from that partition's wall
+time, not from another cluster. Use
+`env.nemo_gym.global_aiohttp_connector_limit_per_host=16384` for the reviewed
+Blackwell profile and remove inherited explicit total-limit overrides.
+
+Resolve account, QoS, CPUs, node/GPU shape, mounts, interpreter and image per
+cluster. CMH/HSG have four-GPU Blackwell nodes; the H100 adapter must use its
+actual node shape and rederive parallelism. These fixes do not make an ARM
+container runnable on x86 or validate one universal topology.
+
+Promotion needs all routes, real optimizer updates/refit, complete checkpoint
+save/reload and delivered W&B scalars. Also agree on steady-state step time and
+GPU-hours per valid sample before scaling: three successful updates establish
+correctness, not acceptable throughput.
+
+## Open issues and release blockers
+
+| Item | Why not marked solved | Next code/validation boundary |
+| --- | --- | --- |
+| Complete pinned dependency closure | Local Gym, Bridge and Automodel submodules are uninitialized; the prior attempt to fetch Gym `749432dc…` from the configured origin failed. No pointer was silently replaced. | Resolve accessible, immutable upstream refs (including nested Megatron-LM), then native imports/config parsing; do not vendor mutable run copies as a substitute. |
+| Kimi effort / multi-turn budget integration | This PR3941 fix series does not yet port the old experiment's `reasoning_effort.py` and Gym-wide cumulative budget overlays. A YAML key alone does not implement them. | Review `nemo_rl/utils/reasoning_effort.py`, GRPO reward integration, Gym simple/ns_tools/SciCode agents and policy proxy together against the available Gym revision; prove per-call and cumulative token accounting with reasoning on. |
+| Judge missing-verdict / transport-failure contract | The experiment's bounded retry and `JudgeVerdictUnavailable` behavior were Gym-side overlays, not part of the provider YAML. Blindly copying them before verifying the pinned Gym failsafe could turn service failure into reward zero. | Review Gym `math_with_judge`, `equivalence_llm_judge` and judge client/failsafe together. Preserve the first valid verdict (including negative), bound retries, and propagate infrastructure failure. This is a production gate, not optional telemetry. |
+| Hosted judge outage / local HA service | The provider's auth DB exhaustion and empty 500s were external; a recovered canary did not fix service capacity. No local judge fleet is provisioned by this branch. | Prefer a dedicated self-hosted service for the requested production contract, with model/prompt/reasoning parity, independent replicas, bounded backpressure/retry, long-request load tests and replica-loss injection. Never silently change judge model or reward on failover. |
+| Policy NaN in incident 8 | Exact nonfinite field and numerical root cause were not captured in that event. Later non-reproduction is not a fix. | vLLM HTTP serialization / `vllm_worker_async.py`: add bounded, private field/request diagnostics, preserve the original exception, then reproduce with weight lineage. No `nan_to_num`. The job-bound snapshot logger is not copied. |
+| Sparse generation/learner logprob spikes | Threshold-2 filtering remained; root cause is unknown. | Fixed-input comparison of generation/logprob token alignment, masks, weight versions and routes. Keep existing filtering/penalties; do not raise the threshold to hide the issue. |
+| Learner / route-fetch throughput | Compact removes a memory intermediate, but does not eliminate remote reads, full packed CPU copies or collective waits. | Timeline on identical inputs; separate route transport, packing, forward/backward and collectives; then independently test CP-local reads and role split. No claimed end-to-end speedup here. |
+| Portable rollouts across preemption | Current persistence can contain old runtime references. | Durable actual route/token/reward data, atomic groups and consumption frontier; kill/restart the entire Ray cluster and verify no duplicate/omitted groups. |
+| W&B continuous GPU samples and resume axis | Raw payload filtering does not fix buffered GPU ticks or heartbeat state. | `nemo_rl/utils/logger.py` and GPU monitor: preserve independent samples and a monotonic cross-resume axis; test online/offline/resume/failure behavior before adoption. |
+| Cross-cluster and complete TIR/SciCode certification | Historical 18-step evidence used the CoT fallback. No native jobs were launched for this refactor. | Native ARM/x86 helper builds, all-route stateful canary, topology-faithful compact tests and distributed restore on each supported profile. |
+
+## Validation record for this series
+
+Local tests: **70 passed, 1 skipped**. The skipped test is the actual sandbox
+worker regression, which requires `NRL_SANDBOX_MODULE` and sandbox-native
+dependencies. The following selected tests were run with plugin autoload off
+and `--noconftest -p no:cacheprovider`; these tests use only their own/local
+fixtures, not the global Ray/GPU fixture:
+
+```text
+tests/unit/tools/test_stage_ccc.py
+tests/unit/tools/test_ray_sub_contract.py
+tests/unit/tools/test_clean_submission.py
+tests/unit/tools/test_build_mcore_helpers.py
+tests/unit/tools/test_sandbox_ipc.py
+tests/unit/tools/test_replay_checkpoint_contract.py
+tests/unit/tools/test_training_metrics_payload.py
+tests/unit/tools/test_ccc_concurrency_config.py
+tests/unit/environments/test_hosted_judge_configs.py
+tests/unit/algorithms/test_metric_utils.py
+```
+
+Native test attempts were **blocked at collection**, not passed or silently
+skipped: `test_grpo.py` lacked Ray; compact tests first lacked Torch. Run these
+in the pinned worker environment with the intended native fixtures. Source
+wiring checks are not model execution. Local validation also includes Ruff,
+Python syntax compilation and `bash -n ray.sub`; no live Slurm/provider/W&B
+requests or GPU jobs were used. Pyrefly is not installed locally; new standalone
+modules are included in its allow-list for native development/CI checking.
+
+The historical failure ledger and measurements remain unchanged. This document
+is self-contained for code review; access to private cluster artifacts is not
+implied by possession of the branch.
