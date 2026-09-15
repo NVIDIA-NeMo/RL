@@ -4,8 +4,9 @@
 defaults: ../../configs/grpo_math_1B_megatron_single_controller.yaml
 
 grpo:
-  num_prompts_per_step: 8
+  num_prompts_per_step: 16
   num_generations_per_prompt: 8
+  max_num_epochs: 2
   max_num_steps: 100
   skip_reference_policy_logprobs_calculation: true
 
@@ -17,9 +18,14 @@ loss_fn:
   truncated_importance_sampling_ratio: 5
   truncated_importance_sampling_ratio_min: 0.2
   truncated_importance_sampling_type: tis
-  force_on_policy_ratio: true
+  force_on_policy_ratio: false  # ready_first mixes policy versions, so real ratios are needed
 
 async_rl:
+  sampler:
+    name: ready_first
+    max_staleness_versions: 1
+  min_groups_for_streaming_train: 4
+  max_inflight_prompts: 32  # two batches generating at once
   rollout_failure:
     nemo_gym:
       rollout_timeout_s: 10800  # sandbox setup + agent + verifier + row retries
