@@ -34,7 +34,6 @@ from nemo_rl.data_plane.observability import (
     is_metrics_client,
     log_event,
     merge_snapshots,
-    step_metrics,
 )
 
 __all__ = [
@@ -50,6 +49,5 @@ __all__ = [
     "is_metrics_client",
     "log_event",
     "merge_snapshots",
-    "step_metrics",
     "materialize",
 ]

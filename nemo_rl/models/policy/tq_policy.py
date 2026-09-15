@@ -47,7 +47,6 @@ from nemo_rl.data_plane import (
     cluster_step_metrics,
     is_metrics_client,
     merge_snapshots,
-    step_metrics,
 )
 from nemo_rl.data_plane.column_io import round_up
 from nemo_rl.data_plane.driver_mixin import TQDriverMixin
@@ -155,12 +154,11 @@ class TQPolicy(TQDriverMixin, Policy):
         self._opd_full_field: Optional[str] = (
             self.cfg.get("on_policy_distillation_full") or {}
         ).get("payload_field")
-        # The baselines the step metrics are differenced against, one per
-        # scope: a driver snapshot and a merged one cover different sets of
-        # processes, so differencing across the two would report a cluster's
-        # traffic as a driver's. Kept per policy rather than in module state
-        # so two trainers in one process cannot interleave one baseline.
-        self._prev_dp_snapshot: dict[str, dict[str, Any]] = {}
+        # The baseline the cluster step metrics are differenced against. Kept
+        # per policy rather than in module state so two trainers in one
+        # process cannot interleave one baseline; the driver's own baseline
+        # stays on the client, which covers a different set of processes.
+        self._prev_cluster_snapshot: dict[str, Any] = {}
 
         # Forward to workers (replaces ``Policy.setup_data_plane`` call
         # site in the trainer — TQPolicy bundles bootstrap + worker
@@ -294,12 +292,11 @@ class TQPolicy(TQDriverMixin, Policy):
         data plane cost" rather than two that disagree by roughly the DP
         degree.
 
-        The differencing lives here rather than in the trainer because the
-        baselines belong with the client whose counters they baseline, and
-        because the fallback has to read the snapshot the collect already
-        took: collecting closes the driver's step window, so taking a second
-        step reading through ``dp_client.get_step_metrics`` would reset it
-        again and report every ``step/by_op/*/max_ms`` as 0.
+        Only the cluster baseline lives here; the driver's stays on the
+        client that owns those counters. The driver reading is taken every
+        step, even when the cluster view supersedes it, so that a step which
+        falls back after N cluster steps differences against last step rather
+        than reporting N steps' accumulated history as one.
         """
         if not is_metrics_client(self.dp_client):
             return None  # observability disabled -> plain adapter
@@ -310,34 +307,20 @@ class TQPolicy(TQDriverMixin, Policy):
         # the fallback path too, where it is the cost of an attempt that
         # failed.
         collect_ms = (time.perf_counter() - collect_started) * 1e3
-        if not snapshots:
-            return None
-        if len(snapshots) > 1:
-            merged = merge_snapshots(snapshots)
-            metrics = cluster_step_metrics(
-                merged,
-                self._prev_dp_snapshot.get("cluster", {}),
-                step_time_s,
-                collect_ms,
-            )
-            scope = "cluster"
-            self._prev_dp_snapshot["cluster"] = merged
-        else:
-            # Single process, or the fan-out could not reach the workers.
-            metrics = step_metrics(
-                snapshots[0],
-                self._prev_dp_snapshot.get("driver", {}),
-                step_time_s,
-                collect_ms,
-            )
-            scope = "driver"
-        # ``collect_data_plane_snapshots`` puts the driver's snapshot first,
-        # so it is read on both paths and its baseline is advanced on both.
-        # Otherwise the first step that falls back after N cluster steps would
-        # difference against an N-step-old reading and report the whole
-        # accumulated history as one step, with ``frac_of_step`` above 1.
-        self._prev_dp_snapshot["driver"] = snapshots[0]
-        return metrics, scope
+        # ``collect_data_plane_snapshots`` puts the driver's snapshot first
+        # and closing the step window is what reading it means, so the client
+        # is handed that snapshot rather than taking a second one -- a second
+        # reset would zero every ``step/by_op/*/max_ms``.
+        driver = self.dp_client.get_step_metrics(step_time_s, snapshots[0], collect_ms)
+        if len(snapshots) == 1:
+            # The fan-out could not reach the workers, or there are none.
+            return driver, "driver"
+        merged = merge_snapshots(snapshots)
+        metrics = cluster_step_metrics(
+            merged, self._prev_cluster_snapshot, step_time_s, collect_ms
+        )
+        self._prev_cluster_snapshot = merged
+        return metrics, "cluster"
 
     # ── 1-hop entrypoints (KVBatchMeta in, no re-fan-out) ──────────────────
 
