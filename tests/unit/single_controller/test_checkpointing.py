@@ -469,7 +469,6 @@ class _FakeWeightSynchronizer:
         self.shutdown_count += 1
 
 
-
 class _RefitRecordingTrainer(_FakeTrainer):
     """Records the offload calls the deferred-wake save path makes."""
 

@@ -9,10 +9,7 @@ state machine; serving workers coordinate only through the ledger, and NeMo RL
 
 The external staging contract (`StagingSink` / `StagingSource`), the vLLM
 worker capture path, and the `verify_and_linearize()` trust boundary are
-unchanged from the worker-custody design. The recipe exercising this path end
-to end is [Nano SWE with Token Capture](../guides/nano-swe-token-capture.md);
-the verification trust boundary is described in
-[Rollout Verification Boundary](rollout-verification-boundary.md).
+unchanged from the worker-custody design.
 
 ## Why a ledger and not a gate
 

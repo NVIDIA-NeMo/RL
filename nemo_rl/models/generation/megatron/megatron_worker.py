@@ -260,6 +260,7 @@ def _apply_inference_cuda_graph_scope(
             mcore_generation_config["inference_cuda_graph_scope"]
         ]
 
+
 if TYPE_CHECKING:
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
 
