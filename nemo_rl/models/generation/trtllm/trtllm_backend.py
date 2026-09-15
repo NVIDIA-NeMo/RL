@@ -33,6 +33,7 @@ import zmq
 from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
 
+from nemo_rl.models.generation.trtllm.quantization import fp8 as fp8_quantization
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -56,6 +57,27 @@ def _call_model_loader_hook_if_available(model_loader: Any, hook_name: str) -> b
     return True
 
 
+def _require_fp8_refit_hooks(model_loader: Any) -> None:
+    """Require TRT-LLM hooks for transactional Qwen3.5 FP8 refits."""
+    required_hooks = (
+        "begin_update_weights",
+        "finalize_update_weights",
+        "abort_update_weights",
+    )
+    missing_hooks = [
+        hook_name
+        for hook_name in required_hooks
+        if not callable(getattr(model_loader, hook_name, None))
+    ]
+    if not callable(getattr(WorkerExtension, "finalize_weight_update", None)):
+        missing_hooks.append("WorkerExtension.finalize_weight_update")
+    if missing_hooks:
+        raise RuntimeError(
+            "Qwen3.5 FP8 refit requires TRT-LLM weight-update hooks. "
+            f"Missing APIs: {missing_hooks}."
+        )
+
+
 class NcclExtension(WorkerExtension):
     """NCCL-based weight update extension for TRT-LLM Ray workers.
 
@@ -68,6 +90,14 @@ class NcclExtension(WorkerExtension):
     #  Collective initialisation (called once during setup)
     # ------------------------------------------------------------------ #
 
+    # Park the executor loop at a step boundary for the duration. Building the
+    # refit group is a blocking ncclCommInitRank across train+inference ranks,
+    # and the loop's own per-iteration object collectives are NCCL-backed since
+    # tekit 97b62625. Running both on the same device deadlocks: the loop's
+    # broadcast waits on peers whose main thread is inside ncclCommInitRank,
+    # which in turn waits on every rank. Observed as PG5 stalling at work 85
+    # after 84 clean iterations, then killed by the 600 s watchdog.
+    @control_action_decorator
     def init_collective(
         self,
         rank_prefix: int,
@@ -111,6 +141,59 @@ class NcclExtension(WorkerExtension):
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         self.state_dict_info = state_dict_info
+        model = self.engine.model_engine.model
+        if fp8_quantization.is_quantized_expert_refit(model.model_config.quant_config):
+            fp8_quantization.validate_fused_expert_layout(state_dict_info)
+            _require_fp8_refit_hooks(self.engine.model_engine.model_loader)
+
+    def _unwrap_compiled_model_for_refit(self) -> bool:
+        """Unwrap torch.compile before weights are loaded.
+
+        REQUIRED whenever torch.compile is enabled (which
+        ``torch_compile_config.enable_piecewise_cuda_graph: true`` does
+        implicitly). ``torch.compile`` wraps a submodule in an
+        ``OptimizedModule`` whose child is ``_orig_mod``, so every parameter
+        path under the compiled scope gains ``._orig_mod.`` -- e.g.
+        ``llm.model._orig_mod.embed_tokens.weight``. TRT-LLM's
+        ``load_weights`` matches checkpoint tensors by dotted path, and we load
+        with ``allow_partial_loading=True``, so the compiled subtree is
+        silently skipped and keeps its pre-refit weights. Nothing crashes: the
+        refit reports success and training continues on stale weights, which
+        shows up only as corrupted generations and a flat reward curve.
+
+        Returns True when the hook exists (older TRT-LLM releases lack it).
+        """
+        model_engine = self.engine.model_engine
+        # Renamed in TRT-LLM; the old name remains as an alias, so try both.
+        unwrap = getattr(model_engine, "unwrap_compiled_model_for_refit", None) or getattr(
+            model_engine, "release_piecewise_cuda_graphs_for_refit", None
+        )
+        if unwrap is None:
+            return False
+        unwrap()
+        return True
+
+    def _restore_compiled_model_after_refit(self) -> bool:
+        """Re-wrap torch.compile after weights are loaded and finalized.
+
+        Must run after all post-load processing, so the compiled callable is
+        rebuilt over the finalized model. On current TRT-LLM this reuses the
+        cached compiled artifact and leaves the piecewise captures intact
+        (refit does not move any tensor), so it costs a few seconds against
+        ~300 s of weight streaming.
+
+        If this is skipped after a successful unwrap the engine still produces
+        correct output -- it just runs eager, losing the torch.compile/PWCG
+        speedup until the next refit.
+        """
+        model_engine = self.engine.model_engine
+        restore = getattr(model_engine, "restore_compiled_model_after_refit", None) or getattr(
+            model_engine, "recapture_piecewise_cuda_graphs_after_refit", None
+        )
+        if restore is None:
+            return False
+        restore(self.engine.resource_manager)
+        return True
 
     def _finalize_weight_update(self) -> None:
         """Finalize refit using TRT-LLM's CUDA-graph-safe path when available."""
@@ -136,6 +219,34 @@ class NcclExtension(WorkerExtension):
                 module, "_weights_removed", False
             ):
                 module.post_load_weights()
+
+    def _ensure_refit_usable(self) -> None:
+        failure = getattr(self, "_fp8_refit_failure", None)
+        if failure is not None:
+            raise RuntimeError(
+                "This TRT-LLM worker is unusable after a failed partial FP8 "
+                f"refit and must be restarted. Original failure: {failure}"
+            )
+
+    def _abort_weight_update_after_failure(
+        self, model: Any, model_loader: Any, error: Exception
+    ) -> None:
+        fp8_refit_failed = fp8_quantization.is_quantized_expert_refit(
+            model.model_config.quant_config
+        )
+        if fp8_refit_failed:
+            # Record poisoning before abort: abort itself may fail, but this
+            # worker must never serve with partially updated FP8 weights.
+            self._fp8_refit_failure = repr(error)
+        try:
+            _call_model_loader_hook_if_available(model_loader, "abort_update_weights")
+        finally:
+            if fp8_refit_failed:
+                raise RuntimeError(
+                    "Partial Qwen3.5 FP8 refit failed after runtime weights may have "
+                    "been modified. The TRT-LLM worker is poisoned and must be "
+                    "restarted."
+                ) from error
 
     # ------------------------------------------------------------------ #
     #  NCCL weight receive + reload
@@ -165,11 +276,21 @@ class NcclExtension(WorkerExtension):
         )
         model_engine = self.engine.model_engine
         model = model_engine.model
+        self._ensure_refit_usable()
 
         def load_model_weight_func(weight_list):
+            if fp8_quantization.is_quantized_expert_refit(model.model_config.quant_config):
+                weights = fp8_quantization.load_weights(
+                    weight_list,
+                    is_mx=fp8_quantization.is_mxfp8_model(
+                        model.model_config.quant_config
+                    ),
+                )
+            else:
+                weights = dict(weight_list)
             model_engine.model_loader.reload(
                 model,
-                dict(weight_list),
+                weights,
                 allow_partial_loading=True,
             )
 
@@ -180,6 +301,10 @@ class NcclExtension(WorkerExtension):
                 # iter is enqueued, but its GPU forward may still be in flight.
                 # Block here so we don't overwrite weights mid-forward
                 torch.cuda.synchronize()
+                # Must precede any weight loading: while a torch.compile
+                # wrapper is installed, parameter paths carry "_orig_mod" and
+                # load_weights silently matches nothing.
+                self._unwrap_compiled_model_for_refit()
                 _call_model_loader_hook_if_available(
                     model_engine.model_loader, "begin_update_weights"
                 )
@@ -197,10 +322,19 @@ class NcclExtension(WorkerExtension):
                 self._finalize_weight_update()
                 torch.cuda.current_stream().synchronize()
 
-                self.engine.reset_prefix_cache()
+                # recompute_active_requests is only on TRT-LLM builds with the
+                # RL refit lifecycle (e.g. internal tekit user/zongfeij/rl); it
+                # replays warmup batches for in-flight requests after their KV
+                # is released by the new weights. Older/public TRT-LLM builds
+                # only have reset_prefix_cache, which is safe but coarser.
+                if not _call_model_loader_hook_if_available(
+                    self.engine, "recompute_active_requests"
+                ):
+                    self.engine.reset_prefix_cache()
+                self._restore_compiled_model_after_refit()
             except Exception as e:
-                _call_model_loader_hook_if_available(
-                    model_engine.model_loader, "abort_update_weights"
+                self._abort_weight_update_after_failure(
+                    model, model_engine.model_loader, e
                 )
                 print(f"Error in NcclExtension.update_weights_from_collective: {e}")
                 return False
@@ -238,11 +372,14 @@ class NcclExtension(WorkerExtension):
         )
         model_engine = self.engine.model_engine
         model = model_engine.model
+        self._ensure_refit_usable()
 
         buffer = None
         weights = None
         try:
             self.maybe_init_zmq()
+            # See _unwrap_compiled_model_for_refit: must precede any loading.
+            self._unwrap_compiled_model_for_refit()
             _call_model_loader_hook_if_available(
                 model_engine.model_loader, "begin_update_weights"
             )
@@ -281,6 +418,18 @@ class NcclExtension(WorkerExtension):
                     "Likely stale state_dict_info (wrong shape/dtype for some key)."
                 )
 
+                if fp8_quantization.is_quantized_expert_refit(model.model_config.quant_config):
+                    weights = fp8_quantization.load_weights(
+                        weights.items(),
+                        is_mx=fp8_quantization.is_mxfp8_model(
+                            model.model_config.quant_config
+                        ),
+                    )
+                    # Qwen3.5's mapper may retain split QKVZ/BA tensors until a
+                    # later IPC chunk completes the fusion group. Detach those
+                    # views before ACK lets the trainer reuse its transport buffer.
+                    weights = fp8_quantization.clone_mapper_staging_weights(weights)
+
                 model_engine.model_loader.reload(
                     model,
                     weights,
@@ -300,10 +449,11 @@ class NcclExtension(WorkerExtension):
             self.engine.reset_prefix_cache()
             gc.collect()
             torch.cuda.empty_cache()
+            self._restore_compiled_model_after_refit()
             return True
         except Exception as e:
-            _call_model_loader_hook_if_available(
-                model_engine.model_loader, "abort_update_weights"
+            self._abort_weight_update_after_failure(
+                model, model_engine.model_loader, e
             )
             print(
                 f"Error in NcclExtension.update_weights_via_ipc_zmq: {e}\n"
