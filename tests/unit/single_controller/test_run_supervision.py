@@ -34,6 +34,7 @@ def _bare_actor():
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
     ctrl._gen_fleet = None  # no fleet -> run() creates no probe task
+    ctrl._engine_supervisor = None  # no supervisor -> teardown has nothing to stop
     ctrl._train_steps = 0
     ctrl._trainer_version = 0
     ctrl._master_config = SimpleNamespace(
