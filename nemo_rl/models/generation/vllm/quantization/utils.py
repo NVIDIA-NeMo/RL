@@ -64,6 +64,7 @@ def resolve_module_from_param_name(
                 if replacement is None:
                     return None
                 mapped_name = mapped_name.replace(original, replacement)
+
     path_parts = mapped_name.split(".")
     if len(path_parts) < 2:
         return None
