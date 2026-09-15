@@ -31,7 +31,9 @@ from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
+    compute_engine_step_metrics,
     compute_spec_decode_metrics,
+    encode_counter_key,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
@@ -833,6 +835,151 @@ def test_compute_spec_decode_metrics():
     assert math.isclose(metrics["vllm/spec_acceptance_rate"], 0.8, rel_tol=1e-6)
 
 
+def _engine_snapshot(
+    prompt_tokens: float,
+    generation_tokens: float,
+    prompt_sum: float,
+    prompt_count: float,
+    gen_sum: float,
+    gen_count: float,
+    finished: dict[str, float],
+) -> dict[str, float]:
+    """Build a counter snapshot in the shape the worker reports."""
+    snapshot: dict[str, float] = {
+        "vllm:prompt_tokens": prompt_tokens,
+        "vllm:generation_tokens": generation_tokens,
+        encode_counter_key("vllm:request_prompt_tokens", "sum"): prompt_sum,
+        encode_counter_key("vllm:request_prompt_tokens", "count"): prompt_count,
+        encode_counter_key("vllm:request_generation_tokens", "sum"): gen_sum,
+        encode_counter_key("vllm:request_generation_tokens", "count"): gen_count,
+    }
+    for reason, value in finished.items():
+        snapshot[
+            encode_counter_key("vllm:request_success", f"finished_reason={reason}")
+        ] = value
+    return snapshot
+
+
+def test_engine_step_metrics_reports_token_length_and_outcome_deltas():
+    start = _engine_snapshot(
+        1000.0, 500.0, 1000.0, 10.0, 500.0, 10.0, {"stop": 8.0, "abort": 2.0}
+    )
+    # Over the step: 400 prompt tokens across 4 requests (mean 100), 600
+    # generated across 4 (mean 150), 3 finished normally and 1 was aborted.
+    end = _engine_snapshot(
+        1400.0, 1100.0, 1400.0, 14.0, 1100.0, 14.0, {"stop": 11.0, "abort": 3.0}
+    )
+
+    metrics = compute_engine_step_metrics(start, end)
+
+    assert metrics["vllm/prompt_tokens"] == 400.0
+    assert metrics["vllm/generation_tokens"] == 600.0
+    assert math.isclose(metrics["vllm/prompt_length_mean"], 100.0)
+    assert math.isclose(metrics["vllm/generation_length_mean"], 150.0)
+    assert metrics["vllm/generations_ok"] == 3.0
+    assert metrics["vllm/generations_failed"] == 1.0
+
+
+def test_length_is_truncation_aware_not_a_failure():
+    """``length`` means max_tokens was reached, which is routine in RL.
+
+    Counting it as a failure would report most of a well-behaved run as failed.
+    """
+    start = _engine_snapshot(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {"length": 0.0})
+    end = _engine_snapshot(10.0, 10.0, 10.0, 1.0, 10.0, 1.0, {"length": 5.0})
+
+    metrics = compute_engine_step_metrics(start, end)
+
+    assert metrics["vllm/generations_ok"] == 5.0
+    assert metrics["vllm/generations_failed"] == 0.0
+
+
+def test_an_unknown_finish_reason_counts_as_failed_not_dropped():
+    """``ok + failed`` must stay equal to the engine's own total.
+
+    vLLM has grown finish reasons before, so a reason this code has never heard
+    of has to land somewhere rather than vanish from both counters.
+    """
+    start = _engine_snapshot(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {})
+    end = _engine_snapshot(
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {"stop": 4.0, "some_future_reason": 6.0}
+    )
+
+    metrics = compute_engine_step_metrics(start, end)
+
+    assert metrics["vllm/generations_ok"] == 4.0
+    assert metrics["vllm/generations_failed"] == 6.0
+    assert metrics["vllm/generations_ok"] + metrics["vllm/generations_failed"] == 10.0
+
+
+def test_a_step_that_served_no_request_omits_the_means():
+    """A zero-count histogram is "no data", not a zero-length sequence."""
+    snapshot = _engine_snapshot(5.0, 5.0, 100.0, 2.0, 100.0, 2.0, {"stop": 1.0})
+
+    metrics = compute_engine_step_metrics(snapshot, snapshot)
+
+    assert "vllm/prompt_length_mean" not in metrics
+    assert "vllm/generation_length_mean" not in metrics
+
+
+def test_a_renamed_series_is_omitted_rather_than_reported_as_zero():
+    """vLLM renames these across releases; a gap beats a plausible-looking 0."""
+    metrics = compute_engine_step_metrics({}, {})
+
+    assert metrics == {}
+
+
+def test_engine_metrics_accept_the_alternate_total_suffixed_names():
+    """``vllm:prompt_tokens`` has also shipped as ``vllm:prompt_tokens_total``."""
+    metrics = compute_engine_step_metrics(
+        {"vllm:prompt_tokens_total": 1.0, "vllm:generation_tokens_total": 2.0},
+        {"vllm:prompt_tokens_total": 11.0, "vllm:generation_tokens_total": 22.0},
+    )
+
+    assert metrics["vllm/prompt_tokens"] == 10.0
+    assert metrics["vllm/generation_tokens"] == 20.0
+
+
+def test_engine_counters_survive_worker_aggregation():
+    """The engine series must not be dropped by the spec-decode filter.
+
+    They were: one substring check discarded every non-spec-decode series, so
+    the tokens and outcomes crossed the wire on every step and were thrown away.
+    """
+    counters = aggregate_spec_decode_counters(
+        [
+            {"vllm:prompt_tokens": 100.0, "vllm:num_requests_running": 3.0},
+            {"vllm:prompt_tokens": 50.0},
+        ]
+    )
+
+    assert counters["vllm:prompt_tokens"] == 150.0
+    # Still filtered: forwarding the whole ~40-series snapshot would put
+    # unbounded, version-dependent cardinality on the step metrics.
+    assert "vllm:num_requests_running" not in counters
+
+
+def test_near_miss_sibling_series_are_not_swept_in():
+    """The kept names are matched exactly, not as prefixes.
+
+    vLLM really ships ``vllm:prompt_tokens_by_source`` and
+    ``vllm:prompt_tokens_cached`` alongside ``vllm:prompt_tokens``. A prefix
+    test would forward both on every step for nothing, and the ``_by_source``
+    one is labelled, so it would arrive collapsed and meaningless.
+    """
+    counters = aggregate_spec_decode_counters(
+        [
+            {
+                "vllm:prompt_tokens": 100.0,
+                "vllm:prompt_tokens_by_source": 60.0,
+                "vllm:prompt_tokens_cached": 40.0,
+            }
+        ]
+    )
+
+    assert set(counters) == {"vllm:prompt_tokens"}
+
+
 def test_resolve_routed_experts_dtype_boundaries():
     assert resolve_routed_experts_dtype(None) == ROUTED_EXPERTS_FALLBACK_DTYPE
     assert resolve_routed_experts_dtype(8) == torch.int8
@@ -899,3 +1046,42 @@ def test_pad_and_align_rejects_expert_ids_overflowing_dtype(monkeypatch):
             device=torch.device("cpu"),
             routed_experts_dtype=torch.int8,
         )
+
+
+def _generation_stub(counters):
+    """Enough of a ``VllmGeneration`` to call ``get_step_metrics`` unbound.
+
+    Constructing the real class needs a Ray cluster and a loaded engine, and
+    none of that is what this exercises.
+    """
+    return SimpleNamespace(
+        _step_metrics_snapshot=counters,
+        _get_raw_spec_counters=lambda: counters,
+    )
+
+
+def test_step_metrics_survive_an_unreadable_engine_snapshot():
+    """A metrics failure must cost the metrics, not the run.
+
+    All four callers do ``metrics.update(policy_generation.get_step_metrics())``
+    with no guard, so anything raising in here ends training. The inputs are
+    vLLM's Prometheus series, whose names and shapes move between releases.
+    """
+    from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
+
+    stub = _generation_stub({"vllm:num_preemptions_total": 1.0})
+    stub._get_raw_spec_counters = MagicMock(side_effect=RuntimeError("reader gone"))
+
+    assert VllmGeneration.get_step_metrics(stub) == {}
+    # Reset even on failure, so the next step's snapshot is not seen as a double.
+    assert stub._step_metrics_snapshot is None
+
+
+def test_step_metrics_are_returned_when_the_snapshot_reads_cleanly():
+    from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
+
+    stub = _generation_stub({})
+    metrics = VllmGeneration.get_step_metrics(stub)
+
+    assert isinstance(metrics, dict)
+    assert stub._step_metrics_snapshot is None
