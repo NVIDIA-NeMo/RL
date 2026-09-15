@@ -222,7 +222,7 @@ class TrtllmAsyncGenerationWorkerImpl:
         # they can override anything above for advanced tuning.
         llm_kwargs.update(extra_trtllm_kwargs)
 
-        if engine_cfg["precision"] == "fp8":
+        if trtllm_cfg["precision"] == "fp8":
             # Import only in TRT-LLM actors so the base NeMo-RL environment
             # does not need the optional TRT-LLM dependency.
             from tensorrt_llm.llmapi.llm_args import MoeConfig
@@ -236,7 +236,7 @@ class TrtllmAsyncGenerationWorkerImpl:
             hf_config = AutoConfig.from_pretrained(
                 self.model_name, trust_remote_code=True
             )
-            is_mx = bool(engine_cfg.get("is_mx", False))
+            is_mx = bool(trtllm_cfg.get("is_mx", False))
             configure_fp8_llm_kwargs(
                 llm_kwargs,
                 model_type=hf_config.model_type,

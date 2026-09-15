@@ -322,11 +322,15 @@ class NcclExtension(WorkerExtension):
                 self._finalize_weight_update()
                 torch.cuda.current_stream().synchronize()
 
-                self.engine.recompute_active_requests()
-                # After recompute_active_requests, not before: with the full
-                # TRT-LLM lifecycle this replays warmup batches, and doing that
-                # once the in-flight requests have released their KV keeps the
-                # cache state clean.
+                # recompute_active_requests is only on TRT-LLM builds with the
+                # RL refit lifecycle (e.g. internal tekit user/zongfeij/rl); it
+                # replays warmup batches for in-flight requests after their KV
+                # is released by the new weights. Older/public TRT-LLM builds
+                # only have reset_prefix_cache, which is safe but coarser.
+                if not _call_model_loader_hook_if_available(
+                    self.engine, "recompute_active_requests"
+                ):
+                    self.engine.reset_prefix_cache()
                 self._restore_compiled_model_after_refit()
             except Exception as e:
                 self._abort_weight_update_after_failure(
