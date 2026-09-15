@@ -13,8 +13,9 @@ budget, or converting a service failure into reward zero is not a repair.
 
 **Status: reviewable fix series, not yet an all-cluster certified, turnkey
 training recipe.** Native validation and the release blockers below are
-deliberately separate from local unit-test success. No training job was started
-while preparing this series. Existing experimental artifacts were not changed.
+deliberately separate from local unit-test success. Initial extraction used no
+training jobs; subsequent AWS-CMH native validation is recorded below. Existing
+historical experimental artifacts were not rewritten.
 
 ## Commit review order
 
@@ -38,6 +39,12 @@ this document. Inspect with `git show <commit>`; base is PR3941, not current mai
 | `681ec68` | Optional CCC concurrency config, no verifier semantic changes | 8, verifier only |
 | `5f6842c` | Compact valid-row Router Replay, without experimental CP-local fetch | 9 / memory and throughput |
 | `4a90f87` | Reject unimplemented effort configs rather than silently ignoring them | Configuration safety before Kimi port |
+| `931268d` | Cumulative multi-call budgets and pinned Gym overlays | Whole-rollout output budget |
+| `fd4a384` | Missing judge verdicts and tagged failed rows fail closed | Judge failure semantics |
+| `2993312` | Image-owned Gym environment links and configured component imports | Native dependency closure |
+| `937cd07` | Component-relative equivalence prompt template | Constructor-time asset lookup |
+| `06176b1`, `f1e5560` | CPU service startup check and real sandbox prerequisites | Preflight dependency coverage |
+| `373e99c` | Independent scheduler horizon for a short smoke | Preserve intended warmup |
 
 ## Cumulative rollout budgets
 
@@ -418,20 +425,20 @@ local collection still requires the missing Ray/Torch stack.
 
 | Item | Why not marked solved | Next code/validation boundary |
 | --- | --- | --- |
-| Complete pinned dependency closure | Local Gym, Bridge and Automodel submodules are uninitialized; the prior attempt to fetch Gym `749432dc…` from the configured origin failed. No pointer was silently replaced. | Resolve accessible, immutable upstream refs (including nested Megatron-LM), then native imports/config parsing; do not vendor mutable run copies as a substitute. |
-| Kimi effort / multi-turn budget integration | This PR3941 fix series does not yet port the old experiment's `reasoning_effort.py` and Gym-wide cumulative budget overlays. A YAML key alone does not implement them. | Review `nemo_rl/utils/reasoning_effort.py`, GRPO reward integration, Gym simple/ns_tools/SciCode agents and policy proxy together against the available Gym revision; prove per-call and cumulative token accounting with reasoning on. |
-| Judge missing-verdict / transport-failure contract | The experiment's bounded retry and `JudgeVerdictUnavailable` behavior were Gym-side overlays, not part of the provider YAML. Blindly copying them before verifying the pinned Gym failsafe could turn service failure into reward zero. | Review Gym `math_with_judge`, `equivalence_llm_judge` and judge client/failsafe together. Preserve the first valid verdict (including negative), bound retries, and propagate infrastructure failure. This is a production gate, not optional telemetry. |
+| Complete pinned dependency closure | Exact Gym, Bridge, nested Megatron-LM and Automodel revisions were staged and checked in the AWS-CMH native runtime. That does not establish fresh upstream access or image compatibility everywhere. | Reproduce immutable source/image staging on each destination; preserve shallow Git boundaries when transferring partial histories. Do not replace pins or vendor mutable run copies. |
+| Kimi effort / multi-turn budget integration | Cumulative Gym budget overlays are implemented; Kimi reward shaping is not. The enabled-effort guard remains deliberate. | Port and review the typed effort schema and GRPO reward integration with end-to-end effective-request and reward tests. Ordinary-RL smoke is not Kimi certification. |
+| Judge missing-verdict / transport-failure contract | Strict verdict parsing and tagged-row rejection are implemented. Native boundary tests passed, but they are not end-to-end outage/load tests. | Preserve valid negative verdicts, bound retries and backpressure, and inject real transport/replica failures before production. Never turn service failure into reward zero. |
 | Hosted judge outage / local HA service | The provider's auth DB exhaustion and empty 500s were external; a recovered canary did not fix service capacity. No local judge fleet is provisioned by this branch. | Prefer a dedicated self-hosted service for the requested production contract, with model/prompt/reasoning parity, independent replicas, bounded backpressure/retry, long-request load tests and replica-loss injection. Never silently change judge model or reward on failover. |
 | Policy NaN in incident 8 | Exact nonfinite field and numerical root cause were not captured in that event. Later non-reproduction is not a fix. | vLLM HTTP serialization / `vllm_worker_async.py`: add bounded, private field/request diagnostics, preserve the original exception, then reproduce with weight lineage. No `nan_to_num`. The job-bound snapshot logger is not copied. |
 | Sparse generation/learner logprob spikes | Threshold-2 filtering remained; root cause is unknown. | Fixed-input comparison of generation/logprob token alignment, masks, weight versions and routes. Keep existing filtering/penalties; do not raise the threshold to hide the issue. |
 | Learner / route-fetch throughput | Compact removes a memory intermediate, but does not eliminate remote reads, full packed CPU copies or collective waits. | Timeline on identical inputs; separate route transport, packing, forward/backward and collectives; then independently test CP-local reads and role split. No claimed end-to-end speedup here. |
 | Portable rollouts across preemption | Current persistence can contain old runtime references. | Durable actual route/token/reward data, atomic groups and consumption frontier; kill/restart the entire Ray cluster and verify no duplicate/omitted groups. |
 | W&B continuous GPU samples and resume axis | Raw payload filtering does not fix buffered GPU ticks or heartbeat state. | `nemo_rl/utils/logger.py` and GPU monitor: preserve independent samples and a monotonic cross-resume axis; test online/offline/resume/failure behavior before adoption. |
-| Cross-cluster and complete TIR/SciCode certification | Historical 18-step evidence used the CoT fallback. No native jobs were launched for this refactor. | Native ARM/x86 helper builds, all-route stateful canary, topology-faithful compact tests and distributed restore on each supported profile. |
+| Cross-cluster and complete TIR/SciCode certification | Historical 18-step evidence used the CoT fallback. New AWS-CMH native service startup passed with all required routes, but this is not all-route model/task execution. | Native ARM/x86 helper builds, all-route stateful canary, topology-faithful compact tests and distributed restore on each supported profile. |
 
 ## Validation record for this series
 
-Local tests: **70 passed, 1 skipped**. The skipped test is the actual sandbox
+Initial extraction's local tests: **70 passed, 1 skipped**. The skipped test is the actual sandbox
 worker regression, which requires `NRL_SANDBOX_MODULE` and sandbox-native
 dependencies. The following selected tests were run with plugin autoload off
 and `--noconftest -p no:cacheprovider`; these tests use only their own/local
@@ -454,9 +461,22 @@ Native test attempts were **blocked at collection**, not passed or silently
 skipped: `test_grpo.py` lacked Ray; compact tests first lacked Torch. Run these
 in the pinned worker environment with the intended native fixtures. Source
 wiring checks are not model execution. Local validation also includes Ruff,
-Python syntax compilation and `bash -n ray.sub`; no live Slurm/provider/W&B
-requests or GPU jobs were used. Pyrefly is not installed locally; new standalone
+Python syntax compilation and `bash -n ray.sub`; that initial test batch used no
+live Slurm/provider/W&B requests or GPU jobs. Pyrefly is not installed locally; new standalone
 modules are included in its allow-list for native development/CI checking.
+
+Follow-up AWS-CMH ARM validation used training source `373e99c` and startup
+checker `f1e5560`, with receipts in
+[SCI2-118](https://linear.app/nvidia/issue/SCI2-118). Exact-worker helper ABI and
+read-only `make` verification passed, along with eight configured component
+imports, all twelve real Gym service health checks, complete CCC metadata
+loading, native recipe parsing and two tagged-judge-failure boundary tests.
+The initial full-service check failed because its wrapper omitted the sandbox;
+the successful repeat used the real sidecar and preserved the failed logs.
+CCC's native shell readiness probe also succeeded. These checks do not certify
+policy/judge inference, task rewards, optimizer updates, refit or checkpoint
+reload. The separately verified local judge serving canary does not substitute
+for integrated training or cross-cluster validation.
 
 The historical failure ledger and measurements remain unchanged. This document
 is self-contained for code review; access to private cluster artifacts is not
