@@ -73,6 +73,13 @@ This does not add unbounded retries or change native correct/incorrect labels.
 Pure verdict tests and native actor-boundary regression tests are separate; real
 judge responses and retry/failure behavior still require the serving smoke.
 
+The equivalence prompt path is relative to the component's working directory,
+`resources_servers/equivalence_llm_judge`, as selected by Gym's `RunHelper`.
+The regular recipe uses `prompt_templates/equivalence_llm_judge.txt`; prepending
+the Gym root instead points at a nonexistent file. Import-only checks do not
+catch this: the template is opened by the server constructor. Require actual
+service startup in the native runtime before allocating training GPUs.
+
 ## Excluded experimental artifacts
 
 - Old job IDs, absolute user paths, submission receipts, logs, payload snapshots,

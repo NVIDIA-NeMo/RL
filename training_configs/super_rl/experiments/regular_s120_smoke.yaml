@@ -361,7 +361,8 @@ env:
             max_output_tokens: 8192
             temperature: 0
           fail_on_missing_judge_verdict: true
-          judge_prompt_template_fpath: /opt/nemo-rl/3rdparty/Gym-workspace/Gym/prompt_templates/equivalence_llm_judge.txt
+          # Gym starts this app in resources_servers/equivalence_llm_judge.
+          judge_prompt_template_fpath: prompt_templates/equivalence_llm_judge.txt
           judge_endpoint_max_concurrency: 256
           judge_system_message: null
           judge_equal_label: '[[A=B]]'
@@ -535,4 +536,3 @@ async_rl:
       max_row_attempts: 3
   stall_watchdog:
     stall_timeout_s: 7500
-
