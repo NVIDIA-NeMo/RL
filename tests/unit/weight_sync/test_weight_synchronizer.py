@@ -14,7 +14,7 @@
 
 """Unit tests for the WeightSynchronizer abstraction and its implementations."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -310,6 +310,7 @@ def test_sglang_refit_recovers_before_reading_engine_state(
     gen.recover_updatable_engines.side_effect = recover_engines
     synchronizer_cls(policy, gen).sync_weights()
 
+    policy.sync_params_before_refit.assert_not_called()
     gen.recover_updatable_engines.assert_called_once_with()
     gen.assert_has_calls(
         [
@@ -322,7 +323,6 @@ def test_sglang_refit_recovers_before_reading_engine_state(
     if synchronizer_cls is SGLangColocatedWeightSynchronizer:
         lifecycle.assert_has_calls(
             [
-                call.policy.sync_params_before_refit(),
                 call.policy.offload_before_refit(),
                 call.generation.recover_updatable_engines(),
                 call.generation.prepare_for_generation(tags=["weights"]),
