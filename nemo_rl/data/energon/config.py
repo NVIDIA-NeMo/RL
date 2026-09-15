@@ -70,7 +70,10 @@ class EnergonLoaderConfig(BaseModel, extra="allow"):
             int,
             Field(
                 ge=1,
-                description="Maximum sequential sample run used when sharding a dataset.",
+                description=(
+                    "Maximum consecutive samples read from one shard before "
+                    "switching; this does not limit pack membership."
+                ),
             ),
         ]
         | None
@@ -80,7 +83,10 @@ class EnergonLoaderConfig(BaseModel, extra="allow"):
             int,
             Field(
                 ge=1,
-                description="Samples buffered by Energon for packing; None disables packing.",
+                description=(
+                    "Number of samples Energon buffers when forming packs; "
+                    "None disables Energon-owned packing."
+                ),
             ),
         ]
         | None

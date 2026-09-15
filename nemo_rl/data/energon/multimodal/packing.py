@@ -102,6 +102,15 @@ def prepare_packed_sft_batch(
     boundaries: list[torch.Tensor | None] = []
     padded_boundaries: list[torch.Tensor | None] = []
     source_ids: list[list[str]] = []
+    templates = {
+        key: value
+        for pack in packs
+        for sample in pack.samples
+        for message in sample.message_log
+        for key, value in message.items()
+        if key not in {"token_ids", "token_loss_mask"}
+        and isinstance(value, torch.Tensor)
+    }
 
     for pack in packs:
         logs = [
@@ -110,14 +119,6 @@ def prepare_packed_sft_batch(
         add_loss_mask_to_message_log(
             logs, roles_to_train_on=["assistant"], only_unmask_final=only_unmask_final
         )
-        templates = {
-            key: value
-            for log in logs
-            for message in log
-            for key, value in message.items()
-            if key not in {"token_ids", "token_loss_mask"}
-            and isinstance(value, torch.Tensor)
-        }
         lengths: list[int] = []
         combined: list[dict[str, Any]] = []
         token_dtype = torch.long

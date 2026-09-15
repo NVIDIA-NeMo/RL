@@ -5,11 +5,11 @@ policy:
     enabled: true
     fuse_loss: true
     algorithm: balanced_greedy_knapsack
+    max_sequences_per_bin: 16
 
 data:
   energon:
     packing_buffer_size: 64
-    max_samples_per_sequence: 16
 
 logger:
   log_dir: logs/sft-nemotron-omni-30b-clevr-energon-packing
