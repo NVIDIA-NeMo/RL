@@ -306,6 +306,7 @@ guides/prorlv2.md
 guides/swe-rl-qwen3.md
 guides/grpo.md
 guides/super-rl-stability.md
+guides/super-rl-launch.md
 guides/ppo.md
 guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md

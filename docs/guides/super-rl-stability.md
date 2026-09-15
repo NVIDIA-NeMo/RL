@@ -18,6 +18,10 @@ while preparing this series. Existing experimental artifacts were not changed.
 
 ## Commit review order
 
+The target repository/config/profile/user boundary and current read-only
+entrypoint are documented in [Super RL launch contract](super-rl-launch.md).
+Neither profile files nor a passing static check certify a runnable recipe.
+
 Each implementation commit includes its own problem/usage/validation section in
 this document. Inspect with `git show <commit>`; base is PR3941, not current main.
 
@@ -33,6 +37,7 @@ this document. Inspect with `git show <commit>`; base is PR3941, not current mai
 | `b7f9bf1` | Preserve W&B training scalars by excluding raw generation payload | PR3941 profile / metrics |
 | `681ec68` | Optional CCC concurrency config, no verifier semantic changes | 8, verifier only |
 | `5f6842c` | Compact valid-row Router Replay, without experimental CP-local fetch | 9 / memory and throughput |
+| `4a90f87` | Reject unimplemented effort configs rather than silently ignoring them | Configuration safety before Kimi port |
 
 ## What was intentionally not copied
 
