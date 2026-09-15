@@ -410,11 +410,13 @@ def _prepare_prepacked(
     *,
     model_slices_context_parallel_inputs: bool,
     create_padding_mask: bool = False,
+    mtp_enabled: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
     PackedSeqParams,
     torch.Tensor,
+    Optional[torch.Tensor],
     Optional[torch.Tensor],
 ]:
     input_ids = data["input_ids"]
@@ -469,21 +471,39 @@ def _prepare_prepacked(
             if model_slices_context_parallel_inputs
             else _slice_prepacked_for_cp(full_padding_mask, padded)
         )
-    # Keep physical boundaries in cu_seqlens_q as well as cu_seqlens_q_padded.
-    # MTP loss rolling still has consumers that use cu_seqlens_q as the wrap
-    # boundary, so logical boundaries can roll into padding or the next source.
+    position_ids = None
+    if mtp_enabled:
+        full_position_ids = torch.zeros_like(input_ids)
+        for physical_start, source_length in zip(padded[:-1], source_lengths):
+            source_length = int(source_length)
+            physical_start = int(physical_start)
+            full_position_ids[
+                :, physical_start : physical_start + source_length
+            ] = torch.arange(source_length, device=input_ids.device)
+        position_ids = (
+            full_position_ids
+            if model_slices_context_parallel_inputs
+            else _slice_prepacked_for_cp(full_position_ids, padded)
+        )
     params = PackedSeqParams(
-        cu_seqlens_q=padded,
-        cu_seqlens_kv=padded,
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu,
         cu_seqlens_q_padded=padded,
         cu_seqlens_kv_padded=padded,
         max_seqlen_q=int(padded_lengths.max()),
         max_seqlen_kv=int(padded_lengths.max()),
-        pad_between_seqs=False,
+        pad_between_seqs=not torch.equal(cu, padded),
         qkv_format="thd",
         total_tokens=input_ids_cp_sharded.shape[1],
     )
-    return input_ids, input_ids_cp_sharded, params, padded, padding_mask
+    return (
+        input_ids,
+        input_ids_cp_sharded,
+        params,
+        padded,
+        padding_mask,
+        position_ids,
+    )
 
 
 def process_microbatch(
@@ -567,12 +587,14 @@ def process_microbatch(
                     packed_seq_params,
                     cu_seqlens_padded,
                     padding_mask,
+                    position_ids,
                 ) = _prepare_prepacked(
                     data_dict,
                     model_slices_context_parallel_inputs=(
                         model_slices_context_parallel_inputs
                     ),
                     create_padding_mask=create_packed_seq_padding_mask,
+                    mtp_enabled=mtp_enabled,
                 )
                 original_seq_length = input_ids.shape[1]
                 routed_experts = data_dict.get("routed_experts")
@@ -596,7 +618,6 @@ def process_microbatch(
                         media_token_validity_mask = _slice_prepacked_for_cp(
                             media_token_validity_mask, cu_seqlens_padded
                         )
-                position_ids = None
                 attention_mask = None
             elif delegate_pack_to_model:
                 has_mtp_loss_mask = "mtp_loss_mask" in data_dict
