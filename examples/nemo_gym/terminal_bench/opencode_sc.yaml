@@ -1,0 +1,136 @@
+# Terminal Bench with the NeMo Gym OpenCode agent in OpenSandbox task containers.
+# Nemotron 3.5 Nano, Megatron training + vLLM generation on separate nodes.
+# Launch with examples/nemo_gym/terminal_bench/launch.sh.
+defaults: ../../configs/grpo_math_1B_megatron_single_controller.yaml
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  max_num_steps: 100
+  skip_reference_policy_logprobs_calculation: true
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_max: 0.28
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 5
+  truncated_importance_sampling_ratio_min: 0.2
+  truncated_importance_sampling_type: tis
+  force_on_policy_ratio: true
+
+async_rl:
+  rollout_failure:
+    nemo_gym:
+      rollout_timeout_s: 10800  # sandbox setup + agent + verifier + row retries
+  stall_watchdog:
+    stall_timeout_s: 12600
+
+token_capture:
+  enabled: true
+
+checkpointing:
+  enabled: true
+
+policy:
+  model_name: ???
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step},${grpo.num_generations_per_prompt}}
+  train_micro_batch_size: 1
+  max_total_sequence_length: 196608
+  logprob_chunk_size: 1024
+  make_sequence_length_divisible_by: ${mul:${mul:${policy.megatron_cfg.tensor_model_parallel_size},${policy.megatron_cfg.context_parallel_size}},2}
+  megatron_cfg:
+    activation_checkpointing: true
+    tensor_model_parallel_size: 4
+    context_parallel_size: 4
+    expert_model_parallel_size: 32
+    sequence_parallel: true
+    moe_router_dtype: fp32
+    use_fused_weighted_squared_relu: true
+    bias_activation_fusion: false
+    defer_fp32_logits: true
+    optimizer:
+      lr: 3.0e-6
+      min_lr: 3.0e-6
+      weight_decay: 0.0
+    scheduler:
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 3.0e-7
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.85
+      expose_http_server: true
+      reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: nano_v3
+        default_chat_template_kwargs:
+          enable_thinking: true
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: float32
+      mamba_cache_mode: align
+    colocated:
+      resources:
+        gpus_per_node: 4
+        num_nodes: ???
+
+data:
+  _override_: true
+  max_input_seq_length: null
+  shuffle: true
+  train:
+    dataset_name: NemoGymDataset
+    data_path: ???
+    processor: nemo_gym_data_processor
+
+env:
+  _override_: true
+  should_use_nemo_gym: true
+  nemo_gym:
+    use_absolute_ip: true
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - responses_api_agents/opencode_sandboxed_agent/configs/opencode_sandboxed_agent.yaml
+      - resources_servers/terminal_bench_2_1/configs/terminal_bench_2_1.yaml
+      - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          sampling_overrides:
+            temperature: ${policy.generation.temperature}
+            top_p: ${policy.generation.top_p}
+          chat_template_kwargs:
+            enable_thinking: true
+            truncate_history_thinking: false
+    tb_resources:
+      _inherit_from: terminal_bench_2_1_resources_server
+      resources_servers:
+        terminal_bench_2_1:
+          evaluation_timeout: 3600
+          sandbox_config:
+            ttl_s: 10800
+            metadata:
+              nemo.nvidia.com/resources: custom
+    tb_opencode:
+      _inherit_from: opencode_sandboxed_agent
+      responses_api_agents:
+        opencode_sandboxed_agent:
+          resources_server:
+            name: tb_resources
+          sandbox_timeout: 3600
+          opencode_max_context_window: ${policy.max_total_sequence_length}
+          remote_opencode_install_script_path: /mnt/s3-data/data/bxyu/opencode/install.sh
+          remote_opencode_binary_path: /mnt/s3-data/data/bxyu/opencode/opencode-linux-x64
+          opencode_config:
+            compaction:
+              auto: false
+              prune: false
+            tools:
+              task: false
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: ???
