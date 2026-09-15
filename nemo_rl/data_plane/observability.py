@@ -46,7 +46,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from time import monotonic
-from typing import Any, Callable, Literal, TypedDict
+from typing import Any, Callable, Literal, TypedDict, TypeGuard
 
 EventStatus = Literal["ok", "error", "timeout"]
 
@@ -476,7 +476,7 @@ def _td_bytes(td: TensorDict | None, max_nodes: int = 10_000) -> int:
 
 
 def _step_deltas(snap: dict[str, Any], prev: dict[str, Any]) -> dict[str, float]:
-    """The three series both step-metric paths report, identically.
+    """The five series both step-metric paths report, identically.
 
     Shared so the single-process and cluster views cannot drift on series
     names -- which is the whole point of the ``step/``/``now/`` convention
@@ -577,7 +577,9 @@ def _hash_deltas(hv: dict[str, int], prev_hv: dict[str, int]) -> dict[str, float
     """
     # ``guard_failures`` counts too: a guard that raised on the first put
     # records no rows, and gating on rows alone would make it look switched off.
-    if not hv or not (hv.get("rows_recorded") or hv.get("guard_failures")):
+    if not hv or not (
+        hv.get("rows_recorded") or hv.get("rows_checked") or hv.get("guard_failures")
+    ):
         return {}
     deltas: dict[str, float] = {
         f"step/hash/{name}": hv[name] - prev_hv.get(name, 0) for name in _HASH_FIELDS
@@ -718,8 +720,8 @@ def _derive_op_metrics(by_op: dict[str, Any], total_wall_ms: float) -> None:
     Shared by :meth:`MetricsDataPlaneClient.snapshot` and
     :func:`merge_snapshots` so a cluster-wide view is derived by exactly the
     same arithmetic as a single process -- percentiles off the (summed)
-    histogram, the fit off the (summed) sufficient statistics. Nothing
-    derived is ever averaged across processes.
+    histogram, rates off the (summed) totals. Nothing derived is ever
+    averaged across processes.
     """
     for stats in by_op.values():
         calls = stats["calls"]
@@ -817,9 +819,13 @@ def merge_snapshots(snapshots: "list[dict[str, Any]]") -> dict[str, Any]:
     merged["n_processes"] = len(snapshots)
     # The busiest single process, kept beside the sum: these ran concurrently
     # inside one step, so the sum is process-time and only the max is wall
-    # time the step could have waited on. ``frac_of_step`` differences it.
-    merged["max_process_wall_ms"] = max(
-        (s.get("total_wall_ms", 0.0) for s in snapshots), default=0.0
+    # time the step could have waited on. Reduced over the per-step
+    # accumulator, not the cumulative total: the difference of maxima is not
+    # the maximum of differences, so differencing the cumulative one reports
+    # the straggler's step only when the cumulative leader happens to be this
+    # step's straggler, and tends to the per-process mean as ranks grow.
+    merged["max_process_step_wall_ms"] = max(
+        (s.get("step_wall_ms", 0.0) for s in snapshots), default=0.0
     )
     _derive_op_metrics(by_op, merged["total_wall_ms"])
     merged.update(_comm_volume(by_op))
@@ -850,12 +856,12 @@ def cluster_step_metrics(
         collect_ms: Wall time the caller spent gathering and merging.
     """
     n_procs = max(merged.get("n_processes", 1), 1)
-    metrics = _step_metrics(merged, prev, step_time_s, collect_ms)
+    metrics = step_metrics(merged, prev, step_time_s, collect_ms)
     metrics["now/n_processes"] = n_procs
     return metrics
 
 
-def _step_metrics(
+def step_metrics(
     snap: dict[str, Any],
     prev: dict[str, Any],
     step_time_s: float,
@@ -878,14 +884,13 @@ def _step_metrics(
     """
     wall_ms = snap["total_wall_ms"] - prev.get("total_wall_ms", 0.0)
     overhead_ms = snap["self_ms"] - prev.get("self_ms", 0.0) + collect_ms
-    # The slowest single process. ``merge_snapshots`` computes it; the
-    # single-process path has no such key and for one process the max is the
-    # sum, so ``wall_ms`` is the fallback -- not ``wall_ms / n_procs``, which
-    # is the per-process mean this reduction replaced and would only be right
-    # by accident at ``n_procs == 1``.
-    slowest_ms = snap.get("max_process_wall_ms", wall_ms) - prev.get(
-        "max_process_wall_ms", 0.0
-    )
+    # The slowest single process this step. Both forms are already scoped to
+    # the step by the reset that read them, so neither is differenced:
+    # ``merge_snapshots`` reduces the per-process accumulator with a max, and
+    # a single process carries its own. ``wall_ms`` is the last resort for a
+    # snapshot predating either key -- not ``wall_ms / n_procs``, which is the
+    # per-process mean this reduction replaced.
+    slowest_ms = snap.get("max_process_step_wall_ms", snap.get("step_wall_ms", wall_ms))
     # step/ is a delta over this step; now/ is a level at this instant.
     # The unit alone does not distinguish them -- see README.md.
     metrics = _step_deltas(snap, prev)
@@ -995,8 +1000,8 @@ def breakdown_table(
 
     Built from the metrics dict that is logged rather than from the snapshot
     it came from, so the table and the series can never disagree: a value
-    withheld from the series (a percentile below the sample gate, a fit that
-    is not trustworthy) is absent from the table too.
+    withheld from the series (a percentile below the sample gate) is absent
+    from the table too.
 
     Args:
         metrics: A flat ``step/{op}/{field}`` dict from
@@ -1151,6 +1156,12 @@ class DataPlaneStats:
     # Aggregate wall time across every data-plane call, all statuses. This
     # is the "what did the data plane cost us" number; ``by_op`` splits it.
     total_wall_ms: float = 0.0
+    # The same wall time scoped to one step, by being zeroed when the reader
+    # closes the step window. A max is not differenceable, and the cluster
+    # view reduces this one with a max: differencing a max of cumulative
+    # totals gives the leader's step only when the cumulative leader is also
+    # this step's straggler, and drifts to the per-process mean otherwise.
+    step_wall_ms: float = 0.0
     by_op: dict[str, OpStats] = field(default_factory=dict)
     bytes_outstanding: int = 0
     peak_bytes_outstanding: int = 0
@@ -1235,8 +1246,9 @@ class MetricsDataPlaneClient(DataPlaneClient):
         wall time is producer wait, not transfer).
 
         Args:
-            reset_step_window: Zero each op's ``step_max_ms`` after reading
-                it, opening a fresh window. A maximum cannot be differenced
+            reset_step_window: Zero ``step_wall_ms`` and each op's
+                ``step_max_ms`` after reading them, opening a fresh window.
+                A maximum cannot be differenced
                 out of a cumulative counter the way ``calls`` and
                 ``wall_ms`` can, so the only way to scope one to a step is
                 to reset it -- and the reader that consumes it is the one
@@ -1261,6 +1273,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # occupancy (what is held) rather than traffic (what moved).
         out.update(_comm_volume(out["by_op"]))
         if reset_step_window:
+            self._stats.step_wall_ms = 0.0
             for bucket in self._stats.by_op.values():
                 bucket.step_max_ms = 0.0
         return out
@@ -1283,7 +1296,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self._prev_snapshot = snap
         # One process, and no fan-out to charge for: the cluster arithmetic
         # with n_procs=1 and collect_ms=0 is exactly this path.
-        return _step_metrics(snap, prev, step_time_s)
+        return step_metrics(snap, prev, step_time_s)
 
     def _record_put(self, partition_id: str, keys: list[str], n_bytes: int) -> None:
         """Attribute put bytes per key so a later ``clear_samples`` can subtract.
@@ -1369,7 +1382,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         metadata-only and documented for reconciliation; diffing against it
         ties the accounting to the sample's real lifetime.
 
-        The stale uids go through ``_record_clear`` so all three stores are
+        The stale uids go through ``_record_clear`` so both stores are
         released by the one rule a real clear uses.
         """
         try:
@@ -1659,6 +1672,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # largest contributor, so dropping it would understate the cost.
         stats = self._stats
         stats.total_wall_ms += wall_ms
+        stats.step_wall_ms += wall_ms
         bucket = stats.by_op.get(op)
         if bucket is None:
             # Not setdefault(): its default is evaluated eagerly, building a
@@ -1875,3 +1889,19 @@ class MetricsDataPlaneClient(DataPlaneClient):
             "",
             lambda: self._inner.close(),
         )
+
+
+def is_metrics_client(client: Any) -> TypeGuard[MetricsDataPlaneClient]:
+    """Whether ``client`` is the wrapper that carries the counters.
+
+    The one answer to "is observability on here", for the four call sites
+    that used to ask it three ways -- two of them by probing for a
+    ``snapshot`` attribute, which is not on the :class:`DataPlaneClient` ABC
+    and so is carried by anything that happens to define one. Disagreement
+    between them is silent and costs a scope: the cluster view falls back to
+    the driver's own counters, which are smaller by roughly the DP degree.
+
+    ``isinstance(None, ...)`` is ``False``, so this also covers "no client at
+    all" and the callers need no separate ``None`` check.
+    """
+    return isinstance(client, MetricsDataPlaneClient)
