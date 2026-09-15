@@ -104,3 +104,34 @@ against this host's real mask with passing/failing limits. Native multi-node
 Slurm/Pyxis service affinity must still be checked. Host cgroup/UID attribution
 belongs on the host, not in container `/proc/<pid>/environ` probes (incidents
 12–13). Do not infer every child process's affinity from a startup check alone.
+
+## Megatron helper compilation with immutable source
+
+**Incident 5:** `compile_helpers()` ran `make` in a read-only datasets package.
+The image also lacked `python3-config`, so the extension ABI suffix was empty.
+
+`tools/super_rl/build_mcore_helpers.py` creates a fresh copy of the datasets
+package. It changes only Makefile Python probes, uses the exact invoking worker
+Python and `sysconfig` for the extension suffix, forces compilation, exercises
+int32/int64 sample-index functions, and writes a checksum manifest only on
+success. Failed output directories are left for inspection, never reused.
+
+Run `build --source <installed-datasets-package> --output <new-runtime-package>`
+with the **exact Megatron worker interpreter inside its image**, in a CPU
+allocation. Do not use the lightweight staging driver's environment. NumPy,
+pybind11, make, and a C++ compiler must be available there. The Python entrypoint
+is the same script for ARM and x86; the compiled artifact is **not portable**
+between architectures, Python ABIs, images, or different worker paths.
+
+Then mount the runtime package read-only over the installed datasets package
+and run `verify --package <installed-datasets-package>` with that same worker
+interpreter. Verification requires a real read-only mount, matching hashes and
+runtime identity, correct import paths, real `utils.compile_helpers()`, and
+functional helper checks. Use this verification again before model startup.
+Build each worker/image/architecture combination separately; do not copy an ARM
+binary into H100's x86 environment.
+
+Local tests cover Makefile transformation, no-clobber/source isolation, and
+ABI/read-only rejection. This refactored script has **not** been compiled in
+the native ARM/x86 images in this change; the historical ARM implementation was
+validated, which is narrower evidence. No Megatron submodule pointer is changed.
