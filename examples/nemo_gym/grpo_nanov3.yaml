@@ -224,6 +224,8 @@ policy:
       max_model_len: ${policy.max_total_sequence_length}
       transformer_impl: "inference_optimized"
       cuda_graph_impl: "local"
+      cuda_graph_sizing_distribution: hybrid
+      cuda_graph_max_tokens: 512
       inference_cuda_graph_scope: "block"
       activation_checkpointing: false
       mamba_inference_ssm_states_dtype: "float32"
@@ -245,11 +247,18 @@ policy:
       kv_cache_management_mode: "persist"  # KV cache lifecycle across suspend/resume. Options: "persist", "offload", "recompute".
       materialize_only_last_token_logits: true
       num_speculative_tokens: 0
+      refit_backend: null  # Native MCore copy-service backend, used only when refit_transport="mcore". Options: "gloo", "nccl", or "nccl_m2n" ("nvshmem" is currently broken, see https://github.com/NVIDIA-NeMo/RL/issues/3646).
+      refit_execution_batch_bytes: null  # Native MCore refit staging limit. null matches NeMo-RL's collective default (2% of total GPU memory, capped at 5 GiB); set a positive byte count to override.
       logprobs_mode: processed_logprobs
-      refit_backend: "nccl"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo" or "nccl".
       offload_policy_before_refit: false
       expose_http_server: true
       enable_prefix_caching: true
+      prefix_caching_mamba_gb: null
+      prefix_caching_eviction_policy: lru
+      prefix_caching_coordinator_policy: longest_prefix
+      prefix_cache_ttl_seconds: 300.0
+      prefix_caching_routing_alpha: 1.0
+      http_server_num_replicas: 8
       parsers:
         - deepseek-r1-reasoning
         - qwen3-coder-tool

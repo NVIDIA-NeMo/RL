@@ -55,6 +55,7 @@ from nemo_rl.models.automodel.train import (
     forward_with_post_processing_fn,
     prepare_model_forward,
 )
+from nemo_rl.models.generation.interfaces import RefitPayloadMode
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
@@ -294,6 +295,9 @@ class DTensorPolicyWorkerV2Impl(
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # Initialize checkpoint manager now that distributed is set up
+        requires_synchronous_checkpoint = (
+            getattr(runtime_config.model_config, "model_type", None) == "deepseek_v4"
+        )
         self._init_checkpoint_manager(
             config_updates={
                 "model_repo_id": config["model_name"],
@@ -301,7 +305,10 @@ class DTensorPolicyWorkerV2Impl(
                     "dequantize_base_checkpoint", False
                 ),
                 "is_peft": self.lora_enabled,
-                "is_async": True,
+                # Automodel's process-based async DCP cannot serialize the
+                # HF-adapted DeepSeek-V4 DTensor/view state. Other v2 models keep
+                # the pre-existing async checkpoint path.
+                "is_async": not requires_synchronous_checkpoint,
             },
         )
 
@@ -1041,8 +1048,11 @@ class DTensorPolicyWorkerV2Impl(
         return self.model.config
 
     @torch.no_grad()
-    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+    def prepare_refit_info(
+        self, *, refit_payload_mode: RefitPayloadMode = "hf_export"
+    ) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
+        del refit_payload_mode
         state_dict_info = {}
         for name, tensor in self.model.state_dict().items():
             if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):

@@ -19,7 +19,7 @@ import torch
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.models.generation.interfaces import GenerationDatumSpec, RefitPayloadMode
 from nemo_rl.utils.timer import Timer
 
 
@@ -187,8 +187,14 @@ class ColocatablePolicyInterface(PolicyInterface):
         world_size: int,
         *,
         train_world_size: int,
+        rank_offset: int = 0,
         nccl_peer: str = "nemo",
     ) -> list[ray.ObjectRef]:
+        pass
+
+    @abstractmethod
+    def sync_params_before_refit(self) -> None:
+        """Materialize the latest policy parameters before weight transfer."""
         pass
 
     @abstractmethod
@@ -203,7 +209,11 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
-    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+    def prepare_refit_info(
+        self,
+        *,
+        refit_payload_mode: RefitPayloadMode,
+    ) -> Optional[dict[str, Any]]:
         pass
 
     @abstractmethod
@@ -278,6 +288,8 @@ class ColocatablePolicyInterface(PolicyInterface):
         gen_parallelism: dict[str, int],
         train_world_size: int,
         gen_world_size: int,
+        *,
+        refit_payload_mode: RefitPayloadMode,
     ) -> Any:
         """Prepare per-layer param metadata for nccl_reshard-based refit."""
         raise NotImplementedError

@@ -39,7 +39,11 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         logger={"log_dir": "/tmp/logs"},
         checkpointing={"enabled": False},
         async_rl=SimpleNamespace(
-            stall_watchdog=SimpleNamespace(interval_s=30.0, stall_timeout_s=600.0)
+            stall_watchdog=SimpleNamespace(interval_s=30.0, stall_timeout_s=600.0),
+            # model_construct skips validation, so nothing fills the real
+            # AsyncRLConfig defaults in here. main() reads this before init_ray() to
+            # decide on EngineCore reaping; off keeps that a no-op.
+            generation_fleet_health=SimpleNamespace(enabled=False),
         ),
         grpo=GRPOConfig(async_grpo=None),
     )
@@ -52,6 +56,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         trainer_handle=SimpleNamespace(shutdown=MagicMock()),
         value_handle=None,
     )
+    setup_single_controller = MagicMock(return_value=(actor_args, SetupTimingMetrics()))
     ray_get = MagicMock(return_value={})
     # The driver now polls ping() around the run. Report the run as ready on the first
     # check so these tests keep exercising the same path they always did.
@@ -89,7 +94,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     monkeypatch.setattr(
         run_grpo_single_controller,
         "setup_single_controller",
-        lambda *_args, **_kwargs: (actor_args, SetupTimingMetrics()),
+        setup_single_controller,
     )
     monkeypatch.setattr(
         run_grpo_single_controller.SingleControllerActor,
@@ -109,6 +114,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         ray_get=ray_get,
         ray_wait=ray_wait,
         ray_kill=ray_kill,
+        setup_single_controller=setup_single_controller,
     )
 
 
@@ -169,6 +175,24 @@ def test_main_configures_generation_for_trained_mtp(
     )
     assert (
         main_context.config.policy["generation"] is main_context.configured_generation
+    )
+
+
+def test_main_preserves_generation_config_through_setup(
+    main_context: SimpleNamespace,
+) -> None:
+    """main() forwards normalized generation config to setup_single_controller."""
+    main_context.generation_config["vllm_cfg"] = {"refit_with_reload_api": True}
+    main_context.configure_generation.side_effect = (
+        lambda generation, *_args, **_kwargs: generation
+    )
+
+    run_grpo_single_controller.main()
+
+    config_for_setup = main_context.setup_single_controller.call_args.args[0]
+    assert (
+        config_for_setup.policy["generation"]["vllm_cfg"]["refit_with_reload_api"]
+        is True
     )
 
 
