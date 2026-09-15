@@ -2172,6 +2172,9 @@ def setup_single_controller(
                 rollout_checkpoint_cfg.gym.generation_prefix_cuts_enabled
             ),
             generation_cut_control_token=token_capture_cfg.control_auth_token,
+            generation_chunk_flush_tokens=(
+                rollout_checkpoint_cfg.gym.generation_chunk_flush_tokens
+            ),
         )
         generation.set_rollout_weight_version(0)
 

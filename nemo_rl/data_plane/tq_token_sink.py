@@ -103,13 +103,20 @@ GENERATION_CUT_STAGING_PREFIX = "__generation_cut__/"
 
 
 def generation_cut_staging_key(
-    checkpoint_id: str, rollout_id: str, model_call_id: str
+    checkpoint_id: str,
+    rollout_id: str,
+    model_call_id: str,
+    *,
+    chunk_sequence: int,
 ) -> str:
-    """Return a checkpoint-scoped key that cannot collide with a completed call."""
+    """Return an immutable key for one checkpointed generation chunk."""
     if not checkpoint_id or not rollout_id or not model_call_id:
         raise ValueError("generation-cut key components must be non-empty")
+    if chunk_sequence < 0:
+        raise ValueError("generation-cut chunk sequence must be non-negative")
     return (
-        f"{GENERATION_CUT_STAGING_PREFIX}{checkpoint_id}/{rollout_id}/{model_call_id}"
+        f"{GENERATION_CUT_STAGING_PREFIX}{checkpoint_id}/{rollout_id}/"
+        f"{model_call_id}/{chunk_sequence}"
     )
 
 
@@ -128,8 +135,27 @@ def _staging_key_matches_snapshot(key: str, snapshot: StagedCallBaseSnapshot) ->
     if not key.startswith(GENERATION_CUT_STAGING_PREFIX):
         return False
     checkpoint_and_identity = key.removeprefix(GENERATION_CUT_STAGING_PREFIX)
-    checkpoint_id, separator, logical_key = checkpoint_and_identity.partition("/")
-    return bool(checkpoint_id and separator and logical_key == snapshot.staging_key)
+    checkpoint_id, checkpoint_separator, identity_and_sequence = (
+        checkpoint_and_identity.partition("/")
+    )
+    if (
+        checkpoint_id
+        and checkpoint_separator
+        and identity_and_sequence == snapshot.staging_key
+    ):
+        # Restore checkpoints written before generation chunks gained an
+        # explicit sequence component. New writes always use the format below.
+        return True
+    logical_key, sequence_separator, chunk_sequence = identity_and_sequence.rpartition(
+        "/"
+    )
+    return bool(
+        checkpoint_id
+        and checkpoint_separator
+        and sequence_separator
+        and chunk_sequence.isdecimal()
+        and logical_key == snapshot.staging_key
+    )
 
 
 def _bytes_tensor(value: bytes) -> torch.Tensor:
@@ -192,7 +218,11 @@ class TQTokenSink:
         return self._stage_at_key(record, record.staging_key)
 
     def stage_generation_prefix(
-        self, record: StagedCallRecord, *, checkpoint_id: str
+        self,
+        record: StagedCallRecord,
+        *,
+        checkpoint_id: str,
+        chunk_sequence: int,
     ) -> StageResult:
         """Stage an immutable active-call prefix under a checkpoint-scoped key."""
         return self._stage_at_key(
@@ -201,6 +231,7 @@ class TQTokenSink:
                 checkpoint_id,
                 record.rollout_id,
                 record.model_call_id,
+                chunk_sequence=chunk_sequence,
             ),
         )
 
