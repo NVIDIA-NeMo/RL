@@ -561,6 +561,30 @@ def test_sampling_params_preserve_bad_words():
     assert sampling_params["bad_words"] == ["<image>", "<img>"]
 
 
+def test_vllm_latest_metric_drain_prunes_worker_histories():
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"enable_vllm_metrics_logger": True}}
+    worker._vllm_metrics_lock = threading.Lock()
+    worker.inflight_batch_sizes = [1, 2]
+    worker.num_pending_samples = [3, 4]
+    worker.kv_cache_usage_perc = [0.2, 0.6]
+    worker.generation_tokens = [10, 30]
+
+    latest = worker.drain_latest_vllm_logger_metrics()
+
+    assert latest == {
+        "inflight_batch_sizes": [2],
+        "num_pending_samples": [4],
+        "kv_cache_usage_perc": [0.6],
+        "generation_tokens": [30],
+    }
+    assert worker.inflight_batch_sizes == [2]
+    assert worker.num_pending_samples == [4]
+    assert worker.kv_cache_usage_perc == [0.6]
+    assert worker.generation_tokens == [30]
+    assert latest["generation_tokens"] is not worker.generation_tokens
+
+
 def test_resolve_enable_prefix_caching_respects_explicit_config(monkeypatch):
     def raise_if_called():
         raise AssertionError("CUDA capability should not be queried")
@@ -1424,6 +1448,36 @@ def test_vllm_generation_rejects_unsupported_reload_refit_config(
 
     with pytest.raises(AssertionError, match=error_match):
         VllmGeneration(DummyCluster(), vllm_config)
+
+
+def test_vllm_validate_settings_rejects_unsupported_reload_refit_config():
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["colocated"]["enabled"] = True
+    vllm_config["vllm_cfg"]["refit_with_reload_api"] = True
+    master_config = types.SimpleNamespace(policy={"generation": vllm_config})
+
+    with pytest.raises(AssertionError, match="not supported yet.*colocated"):
+        VllmGeneration.validate_settings(master_config)
+
+
+def test_vllm_validate_settings_accepts_default_non_colocated_reload_refit():
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["colocated"]["enabled"] = False
+    vllm_config["refit_transport"] = None
+    vllm_config["vllm_cfg"]["refit_with_reload_api"] = True
+    master_config = types.SimpleNamespace(policy={"generation": vllm_config})
+
+    VllmGeneration.validate_settings(master_config)
+
+
+def test_vllm_validate_settings_accepts_missing_vllm_cfg_as_refit_disabled():
+    vllm_config = {
+        "backend": "vllm",
+        "colocated": {"enabled": False, "resources": {}},
+    }
+    master_config = types.SimpleNamespace(policy={"generation": vllm_config})
+
+    VllmGeneration.validate_settings(master_config)
 
 
 def test_vllm_policy_generation(policy, test_input_data, tokenizer):
