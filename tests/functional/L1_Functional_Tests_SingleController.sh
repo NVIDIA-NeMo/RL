@@ -35,6 +35,9 @@ run_test() {
 }
 
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller.sh
+# Same non-colocated vLLM SingleController smoke, but install refitted weights
+# through vLLM's native reload_weights API.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_reload_refit.sh
 run_test fast uv run --no-sync bash ./tests/functional/ppo_async_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_gym_single_controller.sh
@@ -122,6 +125,10 @@ run_test      env KILL_DURING_REFIT=true uv run --no-sync bash ./tests/functiona
 # reached -- job 6405953 passed it with RefitAborted appearing zero times. Only the frozen
 # reshard variant below makes a reshard refit actually abort.
 run_test      env REFIT_TRANSPORT=nccl_reshard KILL_DURING_REFIT=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
+# Restart and re-admission, which is a strictly stronger claim than surviving on a
+# smaller fleet: the engine is recreated and returns to the serving set. This is the only
+# coverage RayWorkerGroup.recreate_worker has -- it cannot be reached without GPUs.
+run_test      env RESTART_DEAD_SHARDS=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
 
 # The only variant that reaches the refit watchdog. The two above kill the victim, and a
 # killed actor produces ActorDiedError within milliseconds -- which recovers the run off
