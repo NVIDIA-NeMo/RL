@@ -474,6 +474,21 @@ class ClippedPGLossFn(LossFunction):
 
         mask = token_mask * sample_mask.unsqueeze(-1)
 
+        # Mask before exponentiation: multiplying an overflow by zero still yields NaN.
+        valid_tokens = mask.bool()
+        curr_logprobs = curr_logprobs.masked_fill(~valid_tokens, 0.0)
+        generation_logprobs = generation_logprobs.masked_fill(~valid_tokens, 0.0)
+        advantages = advantages.masked_fill(~valid_tokens, 0.0)
+        if prev_logprobs is not None:
+            prev_logprobs = prev_logprobs.masked_fill(~valid_tokens, 0.0)
+        if self.reference_policy_kl_penalty != 0:
+            reference_policy_logprobs = reference_policy_logprobs.masked_fill(
+                ~valid_tokens, 0.0
+            )
+            curr_logprobs_unfiltered = curr_logprobs_unfiltered.masked_fill(
+                ~valid_tokens, 0.0
+            )
+
         # For truly on-policy training, use curr_logprobs as prev_logprobs
         # This avoids computing prev_logprobs upstream
         if self.force_on_policy_ratio:
