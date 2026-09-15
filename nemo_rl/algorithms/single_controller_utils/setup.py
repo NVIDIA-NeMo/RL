@@ -1175,9 +1175,10 @@ def setup_single_controller(
                 "token_capture.enabled supports vllm or megatron; got "
                 f"{generation_config['backend']!r}"
             )
+        generation_config_dict = cast(dict[str, Any], generation_config)
         if (
             generation_config["backend"] == "vllm"
-            and not generation_config["vllm_cfg"]["async_engine"]
+            and not generation_config_dict["vllm_cfg"]["async_engine"]
         ):
             raise ValueError(
                 "token_capture.enabled requires "
@@ -1185,7 +1186,9 @@ def setup_single_controller(
                 "host is the worker's in-process HTTP server)"
             )
         if generation_config["backend"] == "megatron":
-            if not generation_config["mcore_generation_config"]["expose_http_server"]:
+            if not generation_config_dict["mcore_generation_config"][
+                "expose_http_server"
+            ]:
                 raise ValueError(
                     "Megatron token capture requires policy.generation."
                     "mcore_generation_config.expose_http_server=true"
