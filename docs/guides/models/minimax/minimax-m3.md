@@ -92,7 +92,7 @@ uv run examples/run_grpo.py \
 
 The following curve was produced with the reference recipe above:
 
-![MiniMax-M3 GRPO training curve](../assets/minimax_m3_grpo_curve.png)
+![MiniMax-M3 GRPO training curve](../../../assets/minimax_m3_grpo_curve.png)
 
 ## Known Issues
 
