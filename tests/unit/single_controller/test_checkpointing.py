@@ -1778,6 +1778,117 @@ class TestPeriodicRolloutCheckpoint:
         assert checkpoint_id.startswith("rollout-step-0-snapshot-1-")
         assert len(checkpoint_id.rsplit("-", 1)[-1]) == 32
 
+    def test_trainer_checkpoint_publishes_coordinated_gym_snapshot(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        events: list[str] = []
+        actor._gym_participant_checkpointing_enabled = True
+        actor._master_config.rollout_checkpointing.gym.participant_checkpointing_enabled = True
+        actor._env_handles = {"nemo_gym": _FakeGymCheckpointActor(events)}
+        actor._gym_checkpoint_topology = GymCheckpointTopology.model_validate(
+            {
+                "schema_version": 1,
+                "participants": [
+                    {
+                        "participant": {
+                            "server_name": "agent-route",
+                            "component": "responses_api_agents",
+                            "participant_name": "test-agent",
+                        },
+                        "schema_version": 1,
+                        "admission_states": ["accepting"],
+                        "checkpoint_mode": "export_restore",
+                        "concurrency_contract": "serialized_per_session",
+                        "multi_process": {
+                            "mode": "single_worker",
+                            "num_workers": 1,
+                        },
+                        "instance_role": None,
+                        "features": ["completed_result_acknowledgement"],
+                    }
+                ],
+            }
+        )
+        actor._train_steps = 1
+        actor._trainer_version = 1
+
+        try:
+            asyncio.run(
+                actor._save_checkpoint(
+                    {"loss": 1.0},
+                    is_policy_training_step=True,
+                )
+            )
+            actor._checkpointer.finalize_pending()
+        finally:
+            actor._checkpointer.shutdown()
+
+        step = tmp_path / "checkpoints" / "step_1"
+        snapshot = step / "rollout_snapshots" / "snapshot_000001"
+        assert step.is_dir()
+        assert not (tmp_path / "checkpoints" / "tmp_step_1").exists()
+        manifest = json.loads(
+            (snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).read_text()
+        )
+        assert manifest["base_train_step"] == 1
+        assert manifest["trainer_version"] == 1
+        assert manifest["gym_checkpoint"] is not None
+        assert events == ["prepare", "commit", "resume"]
+
+    def test_gym_boundary_failure_keeps_trainer_checkpoint_unpublished(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        events: list[str] = []
+        actor._gym_participant_checkpointing_enabled = True
+        actor._master_config.rollout_checkpointing.gym.participant_checkpointing_enabled = True
+        actor._env_handles = {
+            "nemo_gym": _FakeGymCheckpointActor(events, fail_commit=True)
+        }
+        actor._gym_checkpoint_topology = GymCheckpointTopology.model_validate(
+            {
+                "schema_version": 1,
+                "participants": [
+                    {
+                        "participant": {
+                            "server_name": "agent-route",
+                            "component": "responses_api_agents",
+                            "participant_name": "test-agent",
+                        },
+                        "schema_version": 1,
+                        "admission_states": ["accepting"],
+                        "checkpoint_mode": "export_restore",
+                        "concurrency_contract": "serialized_per_session",
+                        "multi_process": {
+                            "mode": "single_worker",
+                            "num_workers": 1,
+                        },
+                        "instance_role": None,
+                        "features": ["completed_result_acknowledgement"],
+                    }
+                ],
+            }
+        )
+        actor._train_steps = 1
+        actor._trainer_version = 1
+
+        try:
+            with pytest.raises(OSError, match="Gym checkpoint storage failed"):
+                asyncio.run(
+                    actor._save_checkpoint(
+                        {"loss": 1.0},
+                        is_policy_training_step=True,
+                    )
+                )
+        finally:
+            actor._checkpointer.shutdown()
+
+        checkpoint_root = tmp_path / "checkpoints"
+        assert not (checkpoint_root / "step_1").exists()
+        assert (checkpoint_root / "tmp_step_1").is_dir()
+        assert events == ["prepare", "commit", "abort"]
+
     def test_gym_ack_outbox_retries_without_holding_a_mutation_cut(
         self, tmp_path: Path
     ) -> None:

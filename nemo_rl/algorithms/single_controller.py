@@ -4314,10 +4314,28 @@ class SingleControllerActor:
         )
 
     async def _save_rollout_checkpoint(
-        self, *, force: bool = False
+        self,
+        *,
+        force: bool = False,
+        trainer_anchor: Optional[Path] = None,
     ) -> _RolloutCheckpointSaveResult:
-        """Publish one rollout-only snapshot anchored to durable trainer state."""
-        async with self._checkpoint_save_lock:
+        """Publish one rollout snapshot anchored to matching trainer state.
+
+        Periodic callers resolve an already-published trainer directory. A full
+        trainer save passes its temporary directory while holding the common
+        checkpoint lock, so the trainer and its mandatory Gym snapshot become
+        visible through one directory rename.
+        """
+        if trainer_anchor is not None and not self._checkpoint_save_lock.locked():
+            raise RuntimeError(
+                "trainer_anchor requires the checkpoint save lock"
+            )
+        save_guard = (
+            contextlib.nullcontext()
+            if trainer_anchor is not None
+            else self._checkpoint_save_lock
+        )
+        async with save_guard:
             if self._optimizer_commit_in_progress:
                 return _RolloutCheckpointSaveResult(
                     saved=False,
@@ -4336,7 +4354,19 @@ class SingleControllerActor:
 
             save_started = time.monotonic()
             await asyncio.to_thread(self._checkpointer.finalize_pending)
-            if self._train_steps == 0:
+            if trainer_anchor is not None:
+                if self._train_steps == 0:
+                    raise RuntimeError(
+                        "a trainer-boundary rollout snapshot requires a completed step"
+                    )
+                anchor = Path(trainer_anchor)
+                if not anchor.is_dir():
+                    raise FileNotFoundError(
+                        "trainer-boundary rollout snapshot anchor is missing: "
+                        f"{anchor}"
+                    )
+                snapshot_fingerprint = None
+            elif self._train_steps == 0:
                 if self._trainer_version != 0:
                     raise RuntimeError(
                         "bootstrap rollout snapshot requires trainer version zero"
@@ -4977,6 +5007,17 @@ class SingleControllerActor:
                 )
                 self._last_rollout_snapshot_mutation_version = (
                     self._data_plane_checkpoint_barrier.mutation_version
+                )
+
+        if self._gym_participant_checkpointing_enabled:
+            boundary_snapshot = await self._save_rollout_checkpoint(
+                force=True,
+                trainer_anchor=Path(checkpoint_path),
+            )
+            if not boundary_snapshot.saved:
+                raise RuntimeError(
+                    "trainer checkpoint could not publish its required Gym rollout "
+                    f"snapshot: {boundary_snapshot.reason}"
                 )
 
         # Save value model

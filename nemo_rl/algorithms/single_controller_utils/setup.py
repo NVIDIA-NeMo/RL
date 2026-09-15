@@ -1121,8 +1121,9 @@ def setup_single_controller(
         if rollout_checkpoint_cfg.restore_mode != "latest":
             raise ValueError(
                 "Gym participant checkpointing requires "
-                "rollout_checkpointing.restore_mode='latest'; full trainer "
-                "checkpoints do not yet contain Gym participant state"
+                "rollout_checkpointing.restore_mode='latest' so restore selects "
+                "the trainer checkpoint's coordinated Gym rollout snapshot or "
+                "a newer compatible periodic snapshot"
             )
     if (
         master_config.checkpointing.get("save_data_plane")

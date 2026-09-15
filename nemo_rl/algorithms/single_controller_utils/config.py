@@ -745,8 +745,9 @@ class GymRolloutCheckpointConfig(BaseModel, extra="forbid"):
     This is opt-in while the Gym control protocol is experimental. Discovery
     validates and fingerprints every participant before training starts.
     ``participant_checkpointing_enabled`` adds Gym participant state to each
-    periodic snapshot and enables completed-result acknowledgement. It requires
-    discovery so SC can validate the participant topology, acknowledgement,
+    periodic snapshot and to the coordinated rollout snapshot published with
+    every trainer checkpoint. It also enables completed-result acknowledgement.
+    Discovery lets SC validate the participant topology, acknowledgement,
     continuation-index, and external-storage-index capabilities before training
     starts.
     """
