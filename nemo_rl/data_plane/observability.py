@@ -28,6 +28,7 @@ bytes currently held in TQ, i.e. put minus cleared) and
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import monotonic
@@ -49,8 +50,30 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
+from nemo_rl.telemetry.instrumentation import (
+    in_per_prompt_scope,
+    is_span_group_enabled,
+    managed_span,
+    safe_set_span_attributes,
+    umbrella_span,
+)
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 
 logger = logging.getLogger(__name__)
+
+#: Reused rather than built per op: ``nullcontext`` holds no state, so one
+#: instance is safe to enter concurrently from any number of threads.
+_NO_SPAN = nullcontext(None)
+
+# Span attribute names for a data-plane op. ``op`` and ``partition`` are bounded
+# (a fixed op vocabulary, a handful of partitions), so they are safe as
+# attributes; the byte and key counts are per-op numbers recorded on the span
+# rather than metric labels.
+_OP_ATTR = "rl.data_plane.op"
+_PARTITION_ATTR = "rl.data_plane.partition"
+_KEYS_ATTR = "rl.data_plane.keys"
+_BYTES_ATTR = "rl.data_plane.bytes"
+_STATUS_ATTR = "rl.data_plane.status"
 
 
 def _td_bytes(td: TensorDict | None) -> int:
@@ -68,6 +91,29 @@ def _td_bytes(td: TensorDict | None) -> int:
 
 def log_event(event: DataPlaneEvent) -> None:
     logger.info("data_plane_event: %s", event)
+
+
+def _annotate(span: Any, n_keys: int, n_bytes: int, status: EventStatus) -> None:
+    """Record an op's outcome on its span.
+
+    Set after the call rather than at open because the byte and key counts are
+    only known once the inner client has returned. ``status`` distinguishes a
+    timeout from a generic error, which the exception the span already records
+    does not.
+    """
+    # safe_set_span_attributes absorbs a None span, but the dict below is built
+    # by the caller before it can: returning first keeps that allocation off
+    # the disabled path, which is the common case and runs once per op.
+    if span is None:
+        return
+    safe_set_span_attributes(
+        span,
+        {
+            _KEYS_ATTR: int(n_keys),
+            _BYTES_ATTR: int(n_bytes),
+            _STATUS_ATTR: status,
+        },
+    )
 
 
 @dataclass
@@ -169,6 +215,11 @@ class MetricsDataPlaneClient(DataPlaneClient):
     ) -> Any:
         """Run ``fn`` and emit one observability event with wall-time and status.
 
+        Also opens one span per op, which is what puts transfer-queue traffic in
+        the trace waterfall: on the single-controller path most of a step's
+        non-compute time is data-plane traffic, and without these spans that time
+        showed up only as a gap between phases.
+
         Args:
             op: Operation tag (``"put"``, ``"get"``, ``"clear"``, etc.).
             partition_id: Partition the op targets.
@@ -182,22 +233,53 @@ class MetricsDataPlaneClient(DataPlaneClient):
             Whatever ``fn`` returned.
         """
         t0 = monotonic()
-        try:
-            out = fn()
-        except TimeoutError:
-            self._emit(op, partition_id, n_keys, n_bytes, t0, "timeout")
-            raise
-        except Exception:
-            self._emit(op, partition_id, n_keys, n_bytes, t0, "error")
-            raise
-        # If the call returns a TensorDict, the read-side bytes are more
-        # informative than the input estimate.
-        if isinstance(out, TensorDict):
-            n_bytes = _td_bytes(out)
-        elif isinstance(out, KVBatchMeta) and not n_keys:
-            n_keys = len(out.sample_ids)
-        self._emit(op, partition_id, n_keys, n_bytes, t0, "ok")
-        return out
+        # One client per process serves both the rollout path, which puts once
+        # per prompt, and the batch stages, which put once per step. Same op,
+        # counts orders of magnitude apart, so the group has to come from the
+        # caller's scope rather than from ``op``. PER_PROMPT is an umbrella, so
+        # a rollout put is unbucketed where a batch put is overhead: rollouts
+        # overlap each other and training, and their durations would sum past
+        # the wall clock. Two branches rather than one variable group because
+        # the umbrella helper is what marks a span as unbucketed at the call
+        # site, and a drift test enforces the pairing statically.
+        per_prompt = in_per_prompt_scope()
+        group = RLSpanGroup.U_PER_PROMPT if per_prompt else RLSpanGroup.DATA_PLANE
+        if not is_span_group_enabled(group):
+            # Gate before building the name and the attribute dict, and before
+            # either helper's generator is created. This is the most frequent
+            # telemetry call site in the repo -- once per data-plane op, so once
+            # per prompt on the rollout path -- and those three allocations cost
+            # ~1.8us each, which a run that never enabled telemetry should not
+            # be paying. A shared no-op context is safe to reuse: nullcontext
+            # holds no state.
+            span_ctx: Any = _NO_SPAN
+        else:
+            name = f"rl.data_plane.{op}"
+            attributes = {_OP_ATTR: op, _PARTITION_ATTR: partition_id}
+            if per_prompt:
+                span_ctx = umbrella_span(RLSpanGroup.U_PER_PROMPT, name, **attributes)
+            else:
+                span_ctx = managed_span(RLSpanGroup.DATA_PLANE, name, **attributes)
+        with span_ctx as span:
+            try:
+                out = fn()
+            except TimeoutError:
+                _annotate(span, n_keys, n_bytes, "timeout")
+                self._emit(op, partition_id, n_keys, n_bytes, t0, "timeout")
+                raise
+            except Exception:
+                _annotate(span, n_keys, n_bytes, "error")
+                self._emit(op, partition_id, n_keys, n_bytes, t0, "error")
+                raise
+            # If the call returns a TensorDict, the read-side bytes are more
+            # informative than the input estimate.
+            if isinstance(out, TensorDict):
+                n_bytes = _td_bytes(out)
+            elif isinstance(out, KVBatchMeta) and not n_keys:
+                n_keys = len(out.sample_ids)
+            _annotate(span, n_keys, n_bytes, "ok")
+            self._emit(op, partition_id, n_keys, n_bytes, t0, "ok")
+            return out
 
     def _emit(
         self,
