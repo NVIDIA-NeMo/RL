@@ -444,9 +444,6 @@ class NemoGym(EnvironmentInterface):
         # NeMo-Gym server (same pattern as the pops in run_grpo_nemo_gym.py).
         initial_global_config_dict.pop("effort_levels", None)
         initial_global_config_dict.pop("pad_dynamic_image_shapes", None)
-        self.rollout_max_attempts_to_avoid_lp_nan = initial_global_config_dict.pop(
-            "rollout_max_attempts_to_avoid_lp_nan", 1
-        )
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
         initial_global_config_dict["policy_api_key"] = (
@@ -509,12 +506,6 @@ Depending on your data shape, you may want to change these values."""
         self._control_timeout_s = 60.0
         if self._token_capture_enabled:
             assert token_capture is not None
-            if self.rollout_max_attempts_to_avoid_lp_nan != 1:
-                raise ValueError(
-                    "token_capture.enabled requires "
-                    "rollout_max_attempts_to_avoid_lp_nan == 1: a NaN retry "
-                    "would resolve against the first attempt's ledger rows"
-                )
             policy_overrides = (
                 initial_global_config_dict.setdefault("policy_model", {})
                 .setdefault("responses_api_models", {})
@@ -937,7 +928,7 @@ Depending on your data shape, you may want to change these values."""
             )
         elif terminal_record is None:
             failure_reason = selection_reason or "missing_terminal_row"
-        receipt = {
+        return {
             "rollout_id": rollout_id,
             "reward": reward,
             "terminal_model_call_id": (
@@ -951,7 +942,6 @@ Depending on your data shape, you may want to change these values."""
             "terminal_selection": terminal_selection,
             "terminal_attribution_reason": attribution_reason,
         }
-        return receipt
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self,

@@ -46,7 +46,7 @@ id). Three surfaces make it the single record of capture state (the
   `resolve()` can never return them as parents.
 - `manifest(rollout_id)` — the token-free read-back (committed rows +
   failures), exposed over one bearer-protected control route:
-  `GET /training-token-capture/rollouts/{rollout_id}/manifest`.
+  `GET /training-token-capture/control/rollouts/{rollout_id}/manifest`.
 
 `InMemoryLineageStore` cannot serve the ledger role: its resolution index
 evicts rollouts under memory bounds, which is fine for a cache but not for a
@@ -97,7 +97,11 @@ Before engine admission, the model-parallel coordinator resolves an admitted
 the rendered prompt, and broadcasts that prepared request to every rank. When
 generation completes, the coordinator passes that admission, the exact
 `OffloadedRequestPayload`, and the finished request's policy epoch to
-`TQMegatronTokenStager`.
+`TQMegatronTokenStager`. A request that straddles a refit carries more than
+one `policy_epoch` boundary; the stager stamps the admission (oldest) epoch,
+matching vLLM's `begin_call` semantics and the finalizer's min-over-calls
+group tag, and counts the span (`epoch_span_count`, WARNING log) rather than
+masking the rollout.
 
 The stager invokes Gym's engine-neutral `RolloutTokenCapture`, which constructs
 the canonical delta and writes it through the same `TQTokenSink` used by vLLM.

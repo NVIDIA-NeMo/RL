@@ -1019,12 +1019,7 @@ class MegatronGenerationMixin:
             return
         if self.inference_client is None:
             raise RuntimeError("Megatron token capture is not initialized")
-        setter = getattr(self.inference_client, "set_generation_epoch", None)
-        if not callable(setter):
-            raise RuntimeError(
-                "Megatron token capture requires InferenceClient.set_generation_epoch"
-            )
-        setter(version)
+        self.inference_client.set_generation_epoch(version)
 
     def _build_sampling_params(
         self,
