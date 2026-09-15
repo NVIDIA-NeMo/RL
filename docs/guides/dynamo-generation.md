@@ -29,7 +29,7 @@ docker buildx build \
 The opt-in layer installs `ai-dynamo[vllm]==1.3.0.post1` in isolated Python
 3.12 under `/opt/dynamo_venv`, along with etcd v3.5.21 and NATS Server v2.11.6.
 It does not replace NeMo RL's normal Ray or vLLM dependencies: the standard
-NeMo RL vLLM environment currently uses vLLM 0.25.1, while this isolated
+NeMo RL vLLM environment currently uses vLLM 0.29.0, while this isolated
 Dynamo environment uses Dynamo's vLLM 0.23.0 pin. Both environments pin
 `nvidia-nccl-cu13==2.30.7` so their NCCL communicators use the same release.
 For a local source checkout, the same environment can be installed under

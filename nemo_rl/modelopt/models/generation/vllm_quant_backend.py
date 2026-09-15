@@ -23,6 +23,9 @@ import vllm  # noqa: F401
 import zmq
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
 
+from nemo_rl.modelopt.models.generation.vllm_quant_moe_amax import (
+    route_moe_input_quantizer_amax,
+)
 from nemo_rl.modelopt.utils import (
     MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
     matches_quant_ignore_pattern,
@@ -149,10 +152,11 @@ def _batch_fused_modelopt_moe_weights(
     loader still requires an expert id, so only the tiny per-expert global
     scales are exposed as scalar views.
 
-    Gated ``w13`` payloads are the exception on vLLM >= 0.25: they are emitted
-    as per-expert 2-D shards instead, because ``RoutedExperts.load_weights``'
-    fused-3D branch mis-transposes packed NVFP4. See the comment at the
-    emission site below.
+    ``w13`` payloads are the exception on vLLM >= 0.25: they are emitted as
+    per-expert 2-D shards instead, because ``RoutedExperts.load_weights``'
+    fused-3D branch mis-transposes packed NVFP4 (gated models) and, for
+    non-gated models that have no fused mapping at all, keeps only the first
+    gate/up half of each expert. See the comments at the emission sites below.
     """
     batched: list[tuple[str, torch.Tensor]] = []
     for name, tensor in weights:
@@ -171,11 +175,22 @@ def _batch_fused_modelopt_moe_weights(
         if target in {"w13_weight", "w13_weight_scale"}:
             target_suffix = "weight" if target == "w13_weight" else "weight_scale"
             if w13_num_shards_by_prefix.get(prefix) == 1:
-                batched.append(
+                # Non-gated experts (Nemotron-H: `ckpt_gate_proj_name="up_proj"`,
+                # no up shard) get no fused gate/up mapping from vLLM >= 0.28
+                # ("Unexpected gate/up projection names ... will be skipped"),
+                # so a batched 3-D tensor under `experts.0.up_proj` falls into
+                # `RoutedExperts.load_weights`' fused branch, which assumes a
+                # gate/up concatenation and keeps `chunk(2, dim=1)[0]`: half of
+                # every expert's rows. Half of w13 plus all of w2 is the
+                # "134701312/179601664 elements" layerwise-reload failure seen
+                # on the nanov3 w4a16 recipe. Emit per-expert 2-D shards, the
+                # same path the initial disk load takes.
+                batched.extend(
                     (
-                        f"{prefix}.experts.0.up_proj.{target_suffix}",
-                        tensor,
+                        f"{prefix}.experts.{expert_id}.up_proj.{target_suffix}",
+                        expert_weight,
                     )
+                    for expert_id, expert_weight in enumerate(tensor.unbind(0))
                 )
                 continue
             if tensor.ndim < 2 or tensor.shape[1] % 2 != 0:
@@ -666,6 +681,19 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                         self._get_modelopt_reload_roots(),
                         source_storage_ptrs,
                     )
+
+        # vLLM 0.28 routes every ``experts.*`` name through
+        # ``RoutedExperts.load_weights``, which resolves the rewritten name with a
+        # single ``getattr`` and therefore cannot reach the dotted quantizer
+        # buffers (``w13_input_quantizer._amax``). Fan the per-expert amax values
+        # into the fused quantizers here and keep them away from vLLM's loader.
+        # Checkpoint names (e.g. Nemotron-H's ``backbone.*``) only turn into the
+        # module's vLLM ``layer_name`` through the model's hf_to_vllm_mapper.
+        weights = route_moe_input_quantizer_amax(
+            self.model_runner.model,
+            weights,
+            mapper=getattr(self.model_runner.model, "hf_to_vllm_mapper", None),
+        )
 
         # MBridge exports K/V amax with the HF-semantic attention path, such as
         # ``self_attn.k_bmm_quantizer._amax``. ModelOpt installs these quantizers

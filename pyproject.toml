@@ -25,7 +25,7 @@ dependencies = [
   "setuptools",
   "pip",                                                                                                 # Required for frozen environments; uv venv --seed may not reliably install pip
   "ninja",                                                                                               # for flash-attn parallel build
-  "torch==2.11.0",
+  "torch==2.13.0",
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
   "ray[default]>=2.55.1",
@@ -49,7 +49,7 @@ dependencies = [
   "plotly",
   "sympy>=1.14.0",
   "pillow>=12.3.0",                                                                                      # Address CVE (Pillow 12.3.0)
-  "torchvision==0.26.0",
+  "torchvision==0.28.0",
   # torchaudio and torchcodec are NOT installed in the container image.
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
   # Keep the base range compatible with backend-specific pins while selecting 5.12.1
@@ -85,7 +85,7 @@ dependencies = [
   # gated-chunk backward with a RuntimeError pointing at this exact pip install.
   # Keep the base range broad for both supported Linux architectures; backend
   # extras tighten the version as required.
-  "tilelang>=0.1.9,<0.1.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "tilelang>=0.1.9,<0.1.13; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Data-plane stack — promoted to base so worker venvs (built by
   # nemo_rl.utils.venvs.create_local_venv via bare `uv sync`, no extras)
   # automatically include them. Removes the need for a `[data-plane]`
@@ -119,14 +119,11 @@ dependencies = [
 [project.optional-dependencies]
 fsdp = [
   "transformers==5.12.1",
-  # +cu13 wheels from GitHub match torch cu130; PyPI often resolves to +cu12 (libcudart.so.12).
-  # https://github.com/Dao-AILab/flash-attention/releases/tag/v2.8.1
-  "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
-  "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
+  # Build against the runtime torch/CUDA ABI; the old wheels target torch 2.10.
+  "flash-attn==2.8.1",
   "mamba-ssm",
   "causal-conv1d",
-  "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "tilelang>=0.1.9,<0.1.13; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 automodel = [
   "nemo-automodel[moe]",
@@ -136,9 +133,7 @@ automodel = [
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
-  "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
-  "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
+  "flash-attn==2.8.1",
   # Mirrors nemo-automodel's own `transformers==5.12.1` pin (Automodel r0.6.0).
   "transformers==5.12.1",
   "mistral-common>=1.11.0",
@@ -150,23 +145,21 @@ automodel = [
 ]
 vllm = [
   "transformers==5.12.1",
-  "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "tilelang==0.1.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "cuda-python",
   "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
   # deep_ep also needs libibverbs-dev
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
-  # Default wheels on GitHub are cu130. See v0.25.1 release assets:
-  # https://github.com/vllm-project/vllm/releases/tag/v0.25.1
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1-cp38-abi3-manylinux_2_28_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1-cp38-abi3-manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "vllm==0.25.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
+  # PyPI publishes the default cu130 wheels for both supported architectures.
+  # https://github.com/vllm-project/vllm/releases/tag/v0.29.0
+  "vllm==0.29.0",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.13",
-  "flashinfer-cubin==0.6.13",
-  "flashinfer-jit-cache==0.6.13",
-  "nvidia-cutlass-dsl[cu13]==4.5.2",
+  "flashinfer-python==0.6.18",
+  "flashinfer-cubin==0.6.18",
+  "flashinfer-jit-cache==0.6.18",
+  "nvidia-cutlass-dsl[cu13]==4.6.2",
 ]
 sglang = [
   # sgl-project/sglang branch `sglang-miles` (based on v0.5.16). Needed for the
@@ -206,9 +199,7 @@ mcore = [
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
-  "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
-  "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
+  "flash-attn==2.8.1",
   # mamba-ssm/causal-conv1d LOOK redundant (megatron-bridge[ssm] pulls them), but do not
   # remove them: [tool.uv.sources] git pins only attach to direct requirements, and the
   # conflicting extras resolve in separate forks — without these direct deps the mcore fork
@@ -220,7 +211,11 @@ mcore = [
   "flashinfer-cubin==0.6.8.post1",
   "flashinfer-jit-cache==0.6.8.post1",
   "flash_mla ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-  "nvidia-cutlass-dsl[cu13]==4.5.2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  # Keep on the same cutlass-dsl line as the vllm extra. 4.5.x is the only series whose
+  # libs-base and libs-cu13 wheels overwrite each other's files (cutlass#3259), and with
+  # libs-base no longer excluded a 4.5.x pin here would reintroduce that nondeterministic
+  # install into the training venv. flashinfer 0.6.8.post1 accepts >=4.4.2.
+  "nvidia-cutlass-dsl[cu13]==4.6.2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "torch-memory-saver>=0.0.9.post1",
   "nvshmem4py-cu13>=0.2.1",
   "cupy-cuda13x",
@@ -251,7 +246,7 @@ nemo_gym = ["nemo_gym"]
 # This is a default group so that we install these even with bare `uv sync`
 build = [
   # Build requirement for TE
-  "torch==2.11.0",
+  "torch==2.13.0",
   # Build requirement for TE
   "setuptools",
   "packaging",
@@ -330,9 +325,21 @@ nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v
 # FlashMLA derives its version from the Git revision in setup.py. Keep this pin
 # synchronized with the static dependency metadata below.
 flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA", rev = "b7643bd54521f563b839b98289b5cd048c062ba2" }
-nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "c3b913b9cc1d82d5a0af9fa77b4db87829e6f158" }
+# Pinned to exactly 5dde396bd (2026-08-04, "Fix vLLM 0.24+ compatibility"): it is the
+# first commit whose vLLM plugin survives vLLM 0.28 (the older plugin registers on
+# `fused_moe.layer.FusedMoE`, which 0.28 removed; ModelOpt swallows that AttributeError in
+# `import_plugin`, and NeMo-RL's explicit re-import then fails with "RowParallelLinear
+# already registered"). Do NOT move past 2ded5aba3 (#1550, 2026-08-07) without porting
+# nemo_rl/modelopt: it introduces per-expert `GroupedQuantizer` modules that break the
+# Megatron fakequant DDP hook bookkeeping (`KeyError: GroupedQuantizer(...)` in
+# `disable_forward_pre_hook`) and real-quant dist-checkpoint sharding validation
+# (`Invalid access pattern for ShardedTensor(... experts.N.linear_fc1.weight_quantizer._amax`).
+nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "5dde396bdf29c13636162840669d3f69002af9e6" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.6.0" }
-flashinfer-cubin = { index = "flashinfer", extra = "sglang" }
+flashinfer-cubin = [
+  { index = "flashinfer", extra = "sglang" },
+  { index = "flashinfer", extra = "vllm" },
+]
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
 
 [tool.uv.workspace]
@@ -408,17 +415,22 @@ override-dependencies = [
   "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous;
   # 2.30.7 additionally fixes hangs in the NCCL m2n reshard (<link to NCCL release note / internal bug>).
-  # An override is required because torch 2.11.0+cu130 pins nvidia-nccl-cu13==2.28.9.
+  # Keep NCCL shared with the isolated Dynamo environment across torch upgrades.
   "nvidia-nccl-cu13==2.30.7",
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform != 'darwin'",
   "opencv-python-headless; sys_platform == 'never'",
   "timm<=1.0.22",
   "fastapi[standard]>=0.133.0,<0.137.0",
   "nvidia-modelopt[torch]>=0.44.0a0",
-  "torch==2.11.0",
-  # Floor only: trtllm (<1.4.0) and vllm (>=1.7.0) are incompatible, and the
-  # universal lock resolves 1.3.0 either way. Pre-existing on main.
-  "llguidance>=1.3.0",
+  # Match the ABI of the vLLM 0.29.0 CUDA wheels.
+  "torch==2.13.0",
+  # vLLM 0.29 lists instanttensor (the optional `load_format="instanttensor"`
+  # safetensors loader) as an unconditional dependency, but it only publishes
+  # x86_64 wheels and its sdist compiles libaio/liburing/boost. vLLM imports it
+  # lazily and NeMo-RL never selects that load format, so keep the wheel on
+  # x86_64 and skip it on aarch64 (GB200) instead of building it from source.
+  "instanttensor>=0.1.9; platform_machine == 'x86_64'",
+  "llguidance>=1.7.0,<1.8.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
@@ -443,10 +455,13 @@ override-dependencies = [
   "pytest>=9.0.3",
   "langchain>=0.3.28",      # Address CVE-2025-65106
   "langchain-core>=0.3.80", # Address CVE-2025-65106
-  # Forces numpy past tensorrt-llm's `numpy>=2.0.0,<2.4` cap (resolves to
-  # 2.5.x). The original driver — TransferQueue pinning `numpy<2.0.0` — is
-  # gone as of TQ v0.1.9; drop this override once the trtllm cap lifts.
-  "numpy>=2.1.0",
+  # Forces numpy past tensorrt-llm's `numpy>=2.0.0,<2.4` cap. The original
+  # driver — TransferQueue pinning `numpy<2.0.0` — is gone as of TQ v0.1.9;
+  # drop this override once the trtllm cap lifts. The `<2.5` ceiling keeps the
+  # override inside numba's metadata bound: vLLM 0.28 pins `numba==0.65.0`,
+  # which requires `numpy<2.5` and refuses to import against 2.5.x
+  # ("Numba needs NumPy 2.4 or less"), leaving a broken numba in the vLLM venv.
+  "numpy>=2.1.0,<2.5",
   # av (PyAV) carries CVE-bundled codec libs (libx264, libx265, libopenh264, libmp3lame).
   # It is only needed by megatron-bridge's optional WAN diffusion path, which installs it
   # at test time via scripts/install_diffusion_deps.sh. Exclude from the shipped container.
@@ -493,10 +508,14 @@ constraint-dependencies = [
   "opencv-python-headless>=5.0.0",            # CVE floor: patches CVE-2025-9951, CVE-2025-1594, CVE-2024-31582 (bundled FFmpeg 5.1.6 in 4.x)
 ]
 
-# Workaround for https://github.com/NVIDIA/cutlass/issues/3259: libs-base
-# and libs-cu13 wheels overlap and race on shared paths. libs-cu13 is a
-# functional superset at 4.5.2, so drop libs-base to make installs deterministic.
-exclude-dependencies = ["nvidia-cutlass-dsl-libs-base"]
+# NOTE: do not exclude `nvidia-cutlass-dsl-libs-base` again. The 4.5.x workaround for
+# https://github.com/NVIDIA/cutlass/issues/3259 (libs-base and libs-cu13 wrote the same
+# paths) is obsolete: 4.6 split the wheels so libs-base ships the whole Python `cutlass`
+# DSL (`cutlass.cute`, `cutlass._mlir.dialects`, ...) and libs-cu13 only the CUDA-13
+# `_cutlass_ir` extension, with no overlapping files. flashinfer >= 0.6.16 imports
+# `cutlass.cute` at module load (`gdn_prefill` -> `delta_rule_dsl.varlen_helper`), and
+# vLLM 0.28 imports `flashinfer.gdn_prefill` eagerly, so excluding libs-base breaks every
+# Qwen3.5 model and every Blackwell vLLM worker with `ModuleNotFoundError: cutlass.cute`.
 
 conflicts = [
   [{ extra = "fsdp" }, { extra = "sglang" }],
@@ -541,6 +560,13 @@ flash_mla = [{ requirement = "torch", match-runtime = true }]
 # sync with docker/Dockerfile's BASE_IMAGE CUDA major version (currently cuda13.x).
 [tool.uv.extra-build-variables]
 torch-memory-saver = { TMS_CUDA_MAJOR = "13" }
+# flash-attn 2.8.1 has no prebuilt wheel for torch >= 2.11, so it compiles from the sdist.
+# Its setup.py sizes MAX_JOBS from psutil's *host* free memory (not the container cgroup)
+# and cpu_count()//2, then runs each nvcc with --threads 4; on nemo-ci's build runners that
+# fan-out gets the CUDA compiler OOM-killed (`ResourceExhausted`, dozens of
+# `Killed "$CICC_PATH/cicc"`) on both x86 and aarch64. 4 jobs x 4 threads built cleanly on
+# both architectures (2h47m aarch64, ~2h x86 alongside TE/flash-mla).
+flash-attn = { MAX_JOBS = "4" }
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
