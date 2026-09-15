@@ -57,8 +57,8 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/token_mult_prob_error") | .
         'max(data["train/on_policy_distillation/teacher_samples"]) > 0' \
         'max(data["train/on_policy_distillation/teacher_model_unique"]) == 1' \
         'max(data["train/on_policy_distillation/adv_std"]) < 0.01' \
-        'max(data.get("data_plane/cluster/step/hash/mismatches", data.get("data_plane/driver/step/hash/mismatches", {}))) == 0' \
-        'max(data.get("data_plane/cluster/step/hash/rows_checked", data.get("data_plane/driver/step/hash/rows_checked", {}))) > 0'
+        'max({**data.get("data_plane/cluster/step/hash/mismatches", {}), **data.get("data_plane/driver/step/hash/mismatches", {})}) == 0' \
+        'max({**data.get("data_plane/cluster/step/hash/rows_checked", {}), **data.get("data_plane/driver/step/hash/rows_checked", {})}) > 0'
 
     rm -rf "$CKPT_DIR"
 fi
