@@ -14,9 +14,10 @@
 
 from __future__ import annotations
 
+import re
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -263,6 +264,127 @@ def test_setup_rejects_a_validation_checkpoint_metric() -> None:
             _valid_setup_config(metric_name="val:val_loss"),
             MagicMock(),
         )
+
+
+@pytest.mark.parametrize(
+    (
+        "sequence_overrides",
+        "dynamic_enabled",
+        "megatron_overrides",
+        "pad_multiple",
+        "max_sequence_length",
+        "message",
+    ),
+    [
+        (
+            {"fuse_loss": False},
+            False,
+            {},
+            1,
+            128,
+            "Energon packing requires sequence_packing enabled with fuse_loss.",
+        ),
+        (
+            {"algorithm": "unknown"},
+            False,
+            {},
+            1,
+            128,
+            "Energon SFT requires a supported packing algorithm.",
+        ),
+        (
+            {},
+            True,
+            {},
+            1,
+            128,
+            "Energon packing does not support dynamic batching.",
+        ),
+        (
+            {},
+            False,
+            {},
+            4,
+            130,
+            "Energon packing requires max_input_seq_length to be divisible by make_sequence_length_divisible_by.",
+        ),
+        (
+            {},
+            False,
+            {"tensor_model_parallel_size": 2, "sequence_parallel": True},
+            1,
+            128,
+            "Energon packing requires make_sequence_length_divisible_by to be a multiple of 2.",
+        ),
+    ],
+)
+def test_setup_rejects_invalid_energon_packing_config(
+    sequence_overrides: dict[str, Any],
+    dynamic_enabled: bool,
+    megatron_overrides: dict[str, Any],
+    pad_multiple: int,
+    max_sequence_length: int,
+    message: str,
+) -> None:
+    from nemo_rl.algorithms.sft_v2 import setup_sft_v2
+
+    sequence_packing = {
+        "enabled": True,
+        "fuse_loss": True,
+        "algorithm": "greedy_knapsack",
+    }
+    sequence_packing.update(sequence_overrides)
+    config = _valid_setup_config(
+        data_overrides={
+            "max_input_seq_length": max_sequence_length,
+            "energon": SimpleNamespace(packing_buffer_size=64),
+        },
+        policy_overrides={
+            "megatron_cfg": megatron_overrides,
+            "sequence_packing": sequence_packing,
+            "dynamic_batching": {"enabled": dynamic_enabled},
+        },
+    )
+    config.policy["make_sequence_length_divisible_by"] = pad_multiple
+
+    with pytest.raises(ValueError, match=re.escape(message)):
+        setup_sft_v2(config, MagicMock())
+
+
+def test_setup_loaders_enables_packing_from_energon_buffer() -> None:
+    controller = object.__new__(_ACTOR_CLS)
+    controller._master_config = SimpleNamespace(
+        data={
+            "max_input_seq_length": 128,
+            "energon": SimpleNamespace(packing_buffer_size=64),
+        },
+        policy={
+            "train_global_batch_size": 4,
+            "sequence_packing": {
+                "algorithm": "balanced_greedy_knapsack",
+                "max_sequences_per_bin": 16,
+            },
+            "make_sequence_length_divisible_by": 8,
+        },
+        sft=SimpleNamespace(only_unmask_final=False),
+    )
+    controller._placement_plan = SimpleNamespace(
+        logical_world_size=2,
+        placement_hash="placement",
+    )
+    controller._loader_states = None
+    controller._trainer = MagicMock()
+    futures = [object(), object()]
+    controller._trainer.worker_group.run_all_workers_single_data.return_value = futures
+
+    with patch("nemo_rl.algorithms.sft_v2.ray.get", return_value=[True, True]):
+        controller._setup_loaders()
+
+    kwargs = (
+        controller._trainer.worker_group.run_all_workers_single_data.call_args.kwargs
+    )
+    assert kwargs["packing_algorithm"] == "balanced_greedy_knapsack"
+    assert kwargs["max_sequences_per_bin"] == 16
 
 
 @pytest.mark.parametrize(

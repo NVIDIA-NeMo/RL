@@ -1,4 +1,14 @@
 #!/bin/bash
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 export EXP_NAME=$(basename "$0" .sh)
+
+# ===== BEGIN CONFIG =====
+NUM_NODES=1
+GPUS_PER_NODE=2
+STEPS_PER_RUN=100
+MAX_STEPS=100
+NUM_RUNS=1
+NUM_MINUTES=60
+# ===== END CONFIG =====
+
 source "$SCRIPT_DIR/vlm_sft-qwen2.5-vl-3b-instruct-clevr-1n2g-megatrontp1-energon.v1.sh" "$@"

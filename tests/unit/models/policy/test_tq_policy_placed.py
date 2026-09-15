@@ -136,4 +136,17 @@ def test_train_placed_microbatches_accepts_producer_packing_shapes() -> None:
 
     policy.train_placed_microbatches(dp_metas)
 
-    worker_group.run_all_workers_sharded_data.assert_called_once()
+    dispatched = worker_group.run_all_workers_sharded_data.call_args.kwargs["meta"]
+    assert [meta.extra_info[MICRO_BATCH_INDICES] for meta in dispatched] == [
+        [[[0, 1], [1, 2]]],
+        [[[0, 1], [1, 2]]],
+    ]
+    assert [meta.extra_info[MICRO_BATCH_LENGTHS] for meta in dispatched] == [
+        [[8, 16]],
+        [[8, 16]],
+    ]
+    assert [meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] for meta in dispatched] == [
+        24,
+        24,
+    ]
+    assert [meta.task_name for meta in dispatched] == ["train", "train"]
