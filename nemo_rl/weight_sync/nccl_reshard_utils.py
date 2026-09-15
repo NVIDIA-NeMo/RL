@@ -781,22 +781,27 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
                     "fp8_cfg.fp8_recipe must be 'mxfp8' when FP8 is enabled."
                 )
 
-            # MCore's MXFP8 resolver supports the TE, Torch, FlashInfer, and
-            # vLLM inference grouped-GEMM selections. It keeps canonical
-            # Triton storage and adapts expert weights where needed.
+            # MXFP8 inference quantizes through resolve_mxfp8_backend, which
+            # only accepts the 'torch' and 'flashinfer' grouped-GEMM backends.
+            # MCore does reject this pairing at model build, but only against its
+            # own field names; validating here fails at config time and names the
+            # NeMo-RL key the user actually sets.
+            #
+            # An omitted key is NOT safe: MCore's TransformerConfig default is
+            # "vllm", which resolve_mxfp8_backend rejects. Resolve the default
+            # here so the omitted case fails at config time like the explicit one.
             gemm_backend = mcore_generation_cfg.get(
                 "inference_grouped_gemm_backend", "vllm"
             )
             if gen_fp8_cfg.get("enabled") and gemm_backend not in (
-                "te",
                 "torch",
                 "flashinfer",
-                "vllm",
             ):
                 violations.append(
                     "MXFP8 Megatron generation requires policy.generation."
                     "mcore_generation_config.inference_grouped_gemm_backend to be "
-                    f"'te', 'torch', 'flashinfer', or 'vllm' (got {gemm_backend!r})."
+                    f"'torch' or 'flashinfer' (got {gemm_backend!r}; MCore's "
+                    "default is 'vllm', so this key must be set explicitly)."
                 )
 
             # _prepare_mxfp8_refit only installs persistent MXFP8 destinations
