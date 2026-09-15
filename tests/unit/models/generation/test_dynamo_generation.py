@@ -164,7 +164,8 @@ def test_runtime_start_world_size_sender_geometry_and_shutdown(monkeypatch) -> N
 
     assert calls[:2] == ["init", "start"]
     assert generation.frontend_url == "http://10.0.0.1:3000/v1"
-    assert generation.dp_openai_server_base_urls == [None]
+    # No token wrapper started, so there is no OpenAI-compatible server to name.
+    assert generation.dp_openai_server_base_urls == []
     assert generation.get_inference_world_size() == 4
     sender = generation.get_collective_sender_spec()
     assert sender.nccl_peer == "vllm"
