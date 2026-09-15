@@ -27,3 +27,18 @@ hit the context ceiling before exhausting the cumulative output allowance.
 
 Implementation: `training_configs/super_rl/experiments/regular_s120_smoke.yaml`.
 Regression coverage: `tests/unit/tools/test_regular_recipe_assets.py`.
+
+## Output-format reward penalties
+
+The earlier regular recipe disabled unwanted-token and malformed-think-tag
+penalties. Both are now enabled, alongside the existing duplicated-reasoning
+and empty-final penalties. The existing implementation and token IDs are
+unchanged: unwanted `[2]`, think-open `12`, think-close `13`. Verify these IDs
+against the actual tokenizer before using another model.
+
+This deliberately changes the reward contract, not the source prompts or
+reasoning mode. Check unwanted-token/malformed-think-tag rates and inspect
+flagged multi-turn trajectories in the next smoke. If extraction or parsing
+incorrectly flags valid output, fix that source rather than silently disabling
+the requested penalty. Historical reward measurements remain unchanged and
+are not measurements of the new contract.

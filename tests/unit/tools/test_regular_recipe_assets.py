@@ -90,3 +90,18 @@ def test_regular_smoke_aligns_context_and_policy_serving_with_gold():
     for resource in ("math_with_judge", "equivalence_llm_judge"):
         verifier = config.env.nemo_gym[resource].resources_servers[resource]
         assert verifier.judge_responses_create_params.max_output_tokens == 8192
+
+
+def test_regular_smoke_enables_all_gold_output_penalties():
+    root = Path(__file__).resolve().parents[3]
+    config = OmegaConf.load(
+        root / "training_configs/super_rl/experiments/regular_s120_smoke.yaml"
+    )
+    penalties = config.reward_penalties
+    assert penalties.penalize_duplicated_reasoning is True
+    assert penalties.penalize_empty_final_answer is True
+    assert penalties.penalize_unwanted_tokens is True
+    assert penalties.penalize_malformed_think_tag is True
+    assert penalties.token_ids.unwanted == [2]
+    assert penalties.token_ids.think_open == 12
+    assert penalties.token_ids.think_close == 13

@@ -531,8 +531,8 @@ cluster:
 reward_penalties:
   penalize_duplicated_reasoning: true
   penalize_empty_final_answer: true
-  penalize_unwanted_tokens: false
-  penalize_malformed_think_tag: false
+  penalize_unwanted_tokens: true
+  penalize_malformed_think_tag: true
   token_ids:
     unwanted:
     - 2
