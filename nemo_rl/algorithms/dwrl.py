@@ -3215,15 +3215,23 @@ def async_dwrl_train(
                     penalize_invalid_tool_call = master_config["grpo"].get("penalize_invalid_tool_call", False)
                     if penalize_invalid_tool_call:
                         invalid_neg_adv = master_config["grpo"].get("invalid_tool_call_advantage", -5.0)
+                        advantages = train_data["advantages"]
+                        materialized_advantages = False
                         for i, message_log in enumerate(repeated_batch["message_log"]):
                             token_offset = 0
                             for j, message in enumerate(message_log):
                                 msg_len = len(message["token_ids"])
                                 is_assistant = message["role"] == "assistant" and "generation_logprobs" in message
                                 is_invalid = is_assistant and message.get("is_invalid_tool_call", False)
+                                if is_invalid and not materialized_advantages:
+                                    # GRPO/GDPO may expand per-sample advantages into zero-stride views;
+                                    # clone before span writes so penalties only affect targeted tokens.
+                                    advantages = advantages.clone()
+                                    train_data["advantages"] = advantages
+                                    materialized_advantages = True
                                 if is_invalid:
                                     print(f"Setting negative advantage ({invalid_neg_adv}) for invalid tool call in assistant message {i} {j}", flush=True)
-                                    train_data["advantages"][i, token_offset:token_offset + msg_len] = invalid_neg_adv
+                                    advantages[i, token_offset:token_offset + msg_len] = invalid_neg_adv
                                 token_offset += msg_len
 
                 print("▶ Preparing for training...")

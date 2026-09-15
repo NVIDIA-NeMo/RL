@@ -176,6 +176,7 @@ def main() -> None:
             tokenizer, config["data"], env_configs=None
         )
 
+        '''
         if config["grpo"]["max_val_samples"] is not None:
             raise ValueError(
                 """A non-null `grpo.max_val_samples` parameter is not supported.
@@ -191,6 +192,7 @@ The validation set you pass in will directly be used for validation with no addi
             )
             config["grpo"]["max_val_samples"] = len(val_dataset)
             config["grpo"]["val_batch_size"] = config["grpo"]["max_val_samples"]
+        '''
 
     # Print config
     print("Final config:")
