@@ -62,6 +62,15 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 NEMO_GYM_ACTOR_FQN = "nemo_rl.environments.nemo_gym.NemoGym"
 NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S = 120
 
+# The three server-type keys Gym nests under a top-level config entry. Gym's
+# constant is private (nemo_gym.discovery._SERVER_GROUP_KEYS), and the literal
+# list also appears in global_config.py, config_types.py, and cli/env.py.
+GYM_SERVER_TYPE_KEYS = (
+    "responses_api_agents",
+    "responses_api_models",
+    "resources_servers",
+)
+
 # Kept local so the Gym actor does not depend on model-config dtype resolution.
 # Must cover every name resolve_routed_experts_dtype can produce.
 _ROUTED_EXPERTS_DTYPES = {
@@ -77,6 +86,50 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+
+
+def _require_resolved_agent_refs(nemo_gym_examples: list[dict]) -> None:
+    """Fail readably when Gym did not stamp an agent_ref onto every row.
+
+    ``run_examples`` resolves ``task_source`` to ``agent_ref`` in place before it returns,
+    and every read after that point -- this module's counters, and Gym's own dispatch,
+    which posts to ``row["agent_ref"]["name"]`` -- assumes it happened. Unguarded, a row
+    that was not resolved surfaces as ``KeyError: 'agent_ref'`` inside a Ray TaskError
+    inside an ExceptionGroup, forty lines from anything that names the cause.
+
+    The cause worth naming is a version skew rather than a bad row. ``task_source`` routing
+    is new: an older Gym has no resolver, so a dataset prepared with a current Gym -- which
+    strips ``agent_ref`` and stamps ``task_source`` instead -- arrives unroutable. That
+    happens when the Gym actor's venv is older than the checkout that prepared the data,
+    which is what ``NRL_FORCE_REBUILD_VENVS=true`` exists to correct.
+    """
+    unresolved = [
+        index
+        for index, row in enumerate(nemo_gym_examples)
+        if not (row.get("agent_ref") or {}).get("name")
+    ]
+    if not unresolved:
+        return
+    task_sources = sorted(
+        {
+            source
+            for index in unresolved
+            if (source := nemo_gym_examples[index].get("task_source")) is not None
+        }
+    )
+    raise RuntimeError(
+        f"{len(unresolved)} of {len(nemo_gym_examples)} rollout rows have no agent_ref "
+        "after run_examples(), so Gym cannot route them and neither can this actor. "
+        + (
+            f"They carry task_source {task_sources}, which a current Gym resolves and an "
+            "older one ignores -- the Gym in this actor's venv is most likely older than "
+            "the checkout that prepared the data. Rebuild the actor venvs "
+            "(NRL_FORCE_REBUILD_VENVS=true) so both come from the same Gym."
+            if task_sources
+            else "They carry no task_source either, so nothing can route them: the "
+            "dataset was prepared without routing information."
+        )
+    )
 
 
 class NemoGymCompatibleConfig(Protocol):
@@ -593,6 +646,51 @@ Depending on your data shape, you may want to change these values."""
             )
         return await response.json()
 
+    def list_entries(self) -> Dict[str, List[str]]:
+        """Report which config entries this actor actually spawned.
+
+        Returns ``{entry_name: [server_type_keys]}`` read from Gym's *resolved*
+        config, so entries that arrived via ``config_paths`` are included. The
+        config NeMo RL passed in is not a substitute: it still holds
+        ``config_paths`` as file paths and none of the entries they expand
+        into, so reading it would miss every agent and judge loaded from a
+        path.
+
+        Entries whose server config has no ``entrypoint`` are omitted because
+        Gym does not start a process for them.
+
+        Callers compare these names across actors to build the agent->shard map
+        and to catch an entry duplicated across shards. Names are all that is
+        interpreted; what an entry *means* is Gym's business.
+        """
+        if self.rh is None:
+            raise RuntimeError(
+                "list_entries() needs a running Gym stack; call _spinup() first."
+            )
+
+        from nemo_gym.global_config import get_global_config_dict
+        from omegaconf import DictConfig
+
+        resolved = get_global_config_dict()
+        entries: Dict[str, List[str]] = {}
+        for name, entry in resolved.items():
+            if not isinstance(entry, (dict, DictConfig)):
+                continue
+            # Fixed key order so the map is stable across actors and runs.
+            types = []
+            for key in GYM_SERVER_TYPE_KEYS:
+                server_group = entry.get(key)
+                if not isinstance(server_group, (dict, DictConfig)):
+                    continue
+                if any(
+                    isinstance(server, (dict, DictConfig)) and "entrypoint" in server
+                    for server in server_group.values()
+                ):
+                    types.append(key)
+            if types:
+                entries[str(name)] = types
+        return entries
+
     async def run_rollouts(
         self,
         nemo_gym_examples: list[dict],
@@ -625,6 +723,7 @@ Depending on your data shape, you may want to change these values."""
         )
         # Gym resolves task_source to agent_ref synchronously in run_examples().
         # Build the counter afterward so completion rows use the resolved identity.
+        _require_resolved_agent_refs(nemo_gym_examples)
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
         num_results = 0

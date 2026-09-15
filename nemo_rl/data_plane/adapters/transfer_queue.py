@@ -35,6 +35,7 @@ import threading
 import time
 import warnings
 import weakref
+from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
 from queue import Empty, SimpleQueue
@@ -55,6 +56,7 @@ from nemo_rl.data_plane.interfaces import (
     backend_config,
     data_plane_supports_checkpointing,
 )
+from nemo_rl.distributed.virtual_cluster import _reserve_data_plane_ports
 
 LOGGER = logging.getLogger(__name__)
 
@@ -597,6 +599,127 @@ def _patch_mooncake_staging_buffers(max_bytes: int) -> None:
     cls._nrl_staging_patched = True
 
 
+class _MooncakeMasterArgv:
+    """Stand-in for the mooncake bootstrap module's ``subprocess`` reference.
+
+    Overrides ``Popen``, and only for ``mooncake_master``'s argv; everything
+    else the bootstrap reaches for (``STDOUT``, the offload client's launch)
+    delegates to the real module untouched.
+    """
+
+    def __init__(self, wrapped: Any, metrics_port: int) -> None:
+        self._wrapped = wrapped
+        self.metrics_port = metrics_port
+        self.master_launched = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped, name)
+
+    def Popen(self, args: Any, *rest: Any, **kwargs: Any) -> Any:
+        """Append ``--metrics_port`` when this is the master being launched."""
+        if (
+            isinstance(args, (list, tuple))
+            and args
+            and os.path.basename(str(args[0])) == "mooncake_master"
+        ):
+            args = [*args, f"--metrics_port={self.metrics_port}"]
+            self.master_launched = True
+        return self._wrapped.Popen(args, *rest, **kwargs)
+
+
+_METRICS_PORT_DRIFT_CONSEQUENCE = (
+    "the --metrics_port TQ omits cannot be applied, leaving mooncake_master's "
+    "metrics server on its 9003 default inside this node's ephemeral range"
+)
+
+
+def _patch_mooncake_master_metrics_port(port: int) -> None:
+    """Move mooncake_master's metrics server onto a reserved *port*.
+
+    ``MasterAdminServer::Start`` binds the metrics socket before it consults
+    ``enable_metric_reporting``, and the master exits non-zero if that bind
+    fails, so the ``metrics_port`` gflag default (9003) is a port the job
+    depends on whether or not anything scrapes it — and it sits inside the
+    ephemeral range these nodes hand out as source ports. TQ forwards no
+    ``--metrics_port``, nor a ``--config_path`` file that could carry one, so
+    without this the metrics server is the one data-plane port that cannot
+    move into ray.sub's band and the master can still lose a startup race it
+    has no reason to be in.
+
+    TQ does build the master's argv in this process, though: ``tq.init`` ->
+    ``_maybe_create_tq_storage`` -> ``initialize_mooncake_storage`` all run on
+    the driver, so appending the flag to the ``subprocess.Popen`` the bootstrap
+    calls is enough. gflags takes the last occurrence of a repeated flag, so
+    this stays correct if a future TQ revision starts passing its own.
+
+    The provider registry holds a ``functools.wraps`` wrapper closed over the
+    original bootstrap function, so rebinding the module attribute alone would
+    never be called — the same trap ``extract_field_schema`` has. Re-registering
+    is also where the drift check lives: if the bootstrap ever launches the
+    master by some other route the flag stops landing silently, putting the
+    metrics server back on 9003, so the bootstrap is required to have gone
+    through the wrapped ``Popen``.
+    """
+    # Imported here, not at module top, so a TQ that has moved these
+    # submodules reports the drift below instead of failing this file's import.
+    try:
+        from transfer_queue.storage.bootstrap import mooncake_bootstrap as _bs
+        from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
+    except ImportError as e:
+        raise _tq_shape_drift_error(
+            "storage.bootstrap is no longer importable",
+            _METRICS_PORT_DRIFT_CONSEQUENCE,
+            "import",
+        ) from e
+
+    installed = getattr(_bs, "subprocess", None)
+    if isinstance(installed, _MooncakeMasterArgv):
+        # The installed proxy is its own idempotence marker, rather than a
+        # separate _nrl_*_patched flag like the sibling patches use: it is the
+        # object that lets a re-init in the same process keep one wrapper and
+        # repoint it to the port this call reserved.
+        installed.metrics_port = port
+        return
+    if installed is None:
+        raise _tq_shape_drift_error(
+            "the mooncake bootstrap no longer launches the master via subprocess",
+            _METRICS_PORT_DRIFT_CONSEQUENCE,
+            "launch site",
+        )
+
+    bootstrap = StorageBootstrapProvider.get_provider("MooncakeStore")
+    if bootstrap is None:
+        raise _tq_shape_drift_error(
+            "MooncakeStore is no longer a registered bootstrap provider",
+            _METRICS_PORT_DRIFT_CONSEQUENCE,
+            "registry key",
+        )
+    # Rebound under a typed name because the None check above does not narrow
+    # ``get_provider``'s ``Callable | None`` inside the closure that calls it.
+    registered_bootstrap: Callable[..., Any] = bootstrap
+
+    argv = _MooncakeMasterArgv(installed, port)
+
+    def _bootstrap_with_metrics_port(conf: Any) -> Any:
+        argv.master_launched = False
+        result = registered_bootstrap(conf)
+        if not argv.master_launched:
+            raise _tq_shape_drift_error(
+                "the mooncake bootstrap ran without launching mooncake_master "
+                "through its subprocess.Popen",
+                _METRICS_PORT_DRIFT_CONSEQUENCE,
+                "launch site",
+            )
+        return result
+
+    # pyrefly: ignore[bad-assignment]  the proxy stands in for the module on purpose
+    _bs.subprocess = argv
+    # Upstream's own decorator, so the entry is stored exactly as TQ stores it.
+    StorageBootstrapProvider.register_provider("MooncakeStore")(
+        _bootstrap_with_metrics_port
+    )
+
+
 def _connect_existing() -> None:
     """Worker-process path: connect this process's client to the Ray cluster.
 
@@ -671,6 +794,12 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
                 "Mooncake backend requires a local node IP; "
                 "_get_local_node_ip() returned empty."
             )
+        # All three of the master's listening ports come from one band below
+        # the ephemeral floor. The metrics port reaches the master through a
+        # patched argv rather than the config below, because TQ forwards no
+        # --metrics_port — see _patch_mooncake_master_metrics_port.
+        metadata_port, master_port, metrics_port = _reserve_data_plane_ports(3)
+        _patch_mooncake_master_metrics_port(metrics_port)
         # Sizes are per client process and RDMA-pinned — see MooncakeCpuConfig
         # in nemo_rl/data_plane/interfaces.py for the per-node arithmetic.
         mooncake_cfg = backend_config(cfg)
@@ -684,8 +813,8 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
                     # _init_tq runs on the driver only — driver IS the
                     # head, so local_ip here is also the head's IP that
                     # mooncake_master + the metadata server bind to.
-                    "metadata_server": f"{local_ip}:50050",
-                    "master_server_address": f"{local_ip}:50051",
+                    "metadata_server": f"{local_ip}:{metadata_port}",
+                    "master_server_address": f"{local_ip}:{master_port}",
                     **_mooncake_transport_config(),
                     "use_gdr": bool(mooncake_cfg.use_gdr),
                     "gdr_staging_buffer_mb": int(mooncake_cfg.gdr_staging_buffer_mb),
