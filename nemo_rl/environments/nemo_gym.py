@@ -1468,6 +1468,16 @@ def build_nemo_gym_config(
     validate_nemo_gym_runtime_options(
         runtime_options, enable_router_replay=enable_router_replay
     )
+    if (
+        runtime_options.truncate_noncontiguous_episodes
+        and token_capture
+        and token_capture.get("enabled")
+    ):
+        raise ValueError(
+            "truncate_noncontiguous_episodes is not compatible with "
+            "token_capture.enabled: receipt mode bypasses the legacy token-prefix "
+            "check, so it cannot truncate non-contiguous episodes."
+        )
 
     # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
     # (where the detector reads them), not part of Gym's global config.

@@ -172,8 +172,8 @@ def test_spinup_nemo_gym_rejects_truncation_with_router_replay():
     with pytest.raises(ValueError, match="not compatible with router replay"):
         spinup_nemo_gym_actor(
             {"nemo_gym": {"truncate_noncontiguous_episodes": True}},
-            ["http://127.0.0.1:30000/v1"],
-            "test-model",
+            base_urls=["http://127.0.0.1:30000/v1"],
+            model_name="test-model",
             tokenizer=object(),
             enable_router_replay=True,
             use_fastokens=False,
@@ -1271,7 +1271,8 @@ def test_run_rollouts_requires_an_installed_tokenizer():
         asyncio.run(stream.__anext__())
 
 
-def test_nemo_gym_postprocess_uses_batch_decode():
+@pytest.mark.parametrize("truncate_noncontiguous_episodes", [False, True])
+def test_nemo_gym_postprocess_uses_batch_decode(truncate_noncontiguous_episodes):
     class _Tokenizer:
         def __init__(self):
             self.batch_decode_calls = []
@@ -1300,7 +1301,7 @@ def test_nemo_gym_postprocess_uses_batch_decode():
     }
 
     class _MockSelf:
-        cfg = {}
+        cfg = {"truncate_noncontiguous_episodes": truncate_noncontiguous_episodes}
 
     result = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
@@ -1324,6 +1325,7 @@ def test_nemo_gym_postprocess_uses_batch_decode():
 
 def _make_noncontiguous_nemo_gym_result():
     return {
+        "reward": 0.75,
         "response": {
             "output": [
                 {
@@ -1357,19 +1359,61 @@ def test_nemo_gym_postprocess_noncontiguous_asserts_when_truncation_disabled():
         )
 
 
-def test_nemo_gym_postprocess_noncontiguous_truncates_when_enabled():
+@pytest.mark.parametrize("divergent_prompt", [[1, 99, 3, 4], [1]])
+def test_nemo_gym_postprocess_noncontiguous_truncates_when_enabled(divergent_prompt):
     class _MockSelf:
         cfg = {"truncate_noncontiguous_episodes": True}
 
+    nemo_gym_result = _make_noncontiguous_nemo_gym_result()
+    output = nemo_gym_result["response"]["output"]
+    output[1]["prompt_token_ids"] = divergent_prompt
+    # Even a later turn that matches the retained prefix belongs to the dropped tail.
+    output.append(
+        {
+            "prompt_token_ids": [1, 2, 3, 4],
+            "generation_token_ids": [7],
+            "generation_log_probs": [-0.3],
+        }
+    )
+    dropped_tail = deepcopy(output[1:])
     result = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
-            _MockSelf(), {}, _make_noncontiguous_nemo_gym_result(), _JoinTokenizer()
+            _MockSelf(), {}, nemo_gym_result, _JoinTokenizer()
         )
     )
 
     assert len(result["message_log"]) == 2
     assert result["message_log"][0]["token_ids"].tolist() == [1, 2]
     assert result["message_log"][1]["token_ids"].tolist() == [3]
+    assert result["message_log"][1]["role"] == "assistant"
+    torch.testing.assert_close(
+        result["message_log"][1]["generation_logprobs"], torch.tensor([-0.1])
+    )
+    assert result["input_message_log"] == result["message_log"][:1]
+    assert result["full_result"]["reward"] == 0.75
+    assert output[0]["generation_str"] == "3"
+    assert output[1:] == dropped_tail
+
+
+@pytest.mark.parametrize("route_location", ["retained", "divergent", "required"])
+def test_nemo_gym_postprocess_rejects_truncation_of_routed_data(route_location):
+    nemo_gym_result = _make_noncontiguous_nemo_gym_result()
+    output = nemo_gym_result["response"]["output"]
+    if route_location == "retained":
+        output[0]["routed_experts"] = [[[0]], [[1]], [[2]]]
+    elif route_location == "divergent":
+        output[1]["routed_experts"] = [[[0]]] * 5
+
+    mock_self = SimpleNamespace(
+        cfg={
+            "truncate_noncontiguous_episodes": True,
+            "require_routed_experts": route_location == "required",
+        }
+    )
+    with pytest.raises(ValueError, match="Cannot truncate.*routed-expert data"):
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            mock_self, {}, nemo_gym_result, _JoinTokenizer()
+        )
 
 
 @pytest.mark.parametrize("include_initial_multimodal_data", [False, True])
