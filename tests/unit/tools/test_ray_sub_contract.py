@@ -79,3 +79,25 @@ def test_common_arguments_preserve_container_path_as_one_argument():
 
 def test_shell_syntax():
     subprocess.run(["bash", "-n", str(LAUNCHER)], check=True)
+
+
+def test_affinity_guard_checks_effective_mask():
+    function = fragment(
+        "check_cpu_affinity() {",
+        "########################################################\n# User defined variables",
+    )
+    cpus = len(os.sched_getaffinity(0))
+    for expected, success in [(cpus, True), (cpus + 1, False)]:
+        result = subprocess.run(
+            ["bash", "-eu", "-c", function + f"\ncheck_cpu_affinity {expected}"],
+            capture_output=True,
+        )
+        assert (result.returncode == 0) is success
+    text = LAUNCHER.read_text()
+    assert text.count("$(declare -f check_cpu_affinity)") == 3
+    sandbox = fragment(
+        'srun --output "$SANDBOX_PORTS_DIR', 'srun "${COMMON_SRUN_ARGS[@]}"'
+    )
+    assert '--cpus-per-task="$CPUS_PER_WORKER"' in sandbox
+    assert "--cpu-bind=cores" in sandbox
+    assert "COMMON_SRUN_ARGS+=(--overlap --cpu-bind=cores)" in text

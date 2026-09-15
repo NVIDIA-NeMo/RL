@@ -69,3 +69,38 @@ Do not restore the entire `SLURM_*` environment inside Ray.
 Validation: executable shell-fragment tests in `test_ray_sub_contract.py`, plus
 `bash -n ray.sub`. Native Pyxis cwd/mount validation remains required on each
 cluster. No compute-node hardware change is involved.
+
+## Submission environment and effective CPU affinity
+
+**Incident 9:** submitting from a two-CPU diagnostic step leaked its CPU mask
+and Slurm/MPI state into the new allocation. Ray, Gym and sandbox were confined
+to CPUs 0 and 5 despite a much larger allocation.
+
+`tools/super_rl/submit.py` constructs a fresh environment. It retains basic
+identity/locale variables and only explicitly requested workload variables;
+Slurm/PMI/step variables cannot be added through `--env`. Supply a site-specific
+client configuration with `--slurm-conf` if required. It is never hardcoded.
+
+```bash
+uv run tools/super_rl/submit.py --env CONTAINER --env MOUNTS --env COMMAND \
+  --env NRL_CONTAINER_WORKDIR --env CPUS_PER_WORKER --env GPUS_PER_NODE \
+  -- --account=<account> --partition=<partition> --nodes=<nodes> ray.sub
+```
+
+By default this only runs `sbatch --test-only`. Add `--submit` **before** `--`
+to submit after reviewing the request. Explicitly pass all required runtime
+variables, including sandbox settings; preferably have a versioned batch wrapper
+set them. Store credentials in private mounted files, not command-line values.
+There is no automatic retry: reconcile a failed or ambiguous submission first.
+
+`ray.sub` uses `--overlap --cpu-bind=cores` for Ray and explicitly requests the
+same `CPUS_PER_WORKER` for sandbox tasks. All three startup paths validate their
+actual procfs CPU affinity before services start. Configure CPUs from the
+allocation's scheduler contract, not the physical CPU count; e.g. the historic
+CMH allocation granted 140, not 144. No universal 140-CPU default is added.
+
+Validation: poisoned-environment and CLI tests; the affinity guard is executed
+against this host's real mask with passing/failing limits. Native multi-node
+Slurm/Pyxis service affinity must still be checked. Host cgroup/UID attribution
+belongs on the host, not in container `/proc/<pid>/environ` probes (incidents
+12–13). Do not infer every child process's affinity from a startup check alone.

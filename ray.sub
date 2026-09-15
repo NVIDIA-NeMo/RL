@@ -102,6 +102,32 @@ detect_cpus_per_node() {
   echo "$cpus"
 }
 
+# Check the process's effective mask, not the host's physical CPU count. This
+# uses only bash and procfs so it also runs in a minimal sandbox image.
+check_cpu_affinity() {
+  local expected="$1" key value allowed="" part count=0
+  local -a parts
+  while read -r key value; do
+    if [[ "$key" == "Cpus_allowed_list:" ]]; then allowed="$value"; break; fi
+  done < /proc/self/status
+  IFS=, read -r -a parts <<< "$allowed"
+  for part in "${parts[@]}"; do
+    if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      count=$((count + BASH_REMATCH[2] - BASH_REMATCH[1] + 1))
+    elif [[ "$part" =~ ^[0-9]+$ ]]; then
+      count=$((count + 1))
+    else
+      echo "Error: Cannot parse CPU affinity '$allowed'." >&2
+      return 1
+    fi
+  done
+  if (( count < expected )); then
+    echo "Error: Effective CPU affinity has $count CPUs; expected at least $expected ($allowed)." >&2
+    return 1
+  fi
+  echo "[INFO] Effective CPU affinity: $count CPUs ($allowed)"
+}
+
 ########################################################
 # User defined variables
 ########################################################
@@ -265,6 +291,8 @@ COMMON_SRUN_ARGS+=("--container-image=$CONTAINER")
 COMMON_SRUN_ARGS+=("--container-workdir=$NRL_CONTAINER_WORKDIR")
 # Pass partition/account explicitly for overlapping srun calls.
 COMMON_SRUN_ARGS+=(-p "$SLURM_JOB_PARTITION" -A "$SLURM_JOB_ACCOUNT")
+# Ray and verifier sidecars intentionally share each allocated node.
+COMMON_SRUN_ARGS+=(--overlap --cpu-bind=cores)
 # Number of CPUs per worker node. If the user did not set CPUS_PER_WORKER
 # explicitly, auto-detect it from SLURM so we claim every CPU the node actually
 # has (instead of the old GPUS_PER_NODE * 16 heuristic, which under-claims on
@@ -276,6 +304,10 @@ else
   log_phase "auto-detecting CPUs per node (scontrol show node)"
   CPUS_PER_WORKER=$(detect_cpus_per_node)
   echo "[INFO] Auto-detected CPUS_PER_WORKER=$CPUS_PER_WORKER from SLURM (CPUTot of first allocated node)."
+fi
+if ! [[ "$CPUS_PER_WORKER" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Error: CPUS_PER_WORKER must be a positive integer." >&2
+  exit 1
 fi
 
 # ---------------------------------------------------------------------------
@@ -606,6 +638,8 @@ fi
 # Give the head node actual resources to make it schedulable
 
 head_cmd=$(cat <<EOF
+$(declare -f check_cpu_affinity)
+check_cpu_affinity "$CPUS_PER_WORKER" || exit 1
 if [[ "\${RAY_SUB_DEBUG_ENV:-0}" == "1" ]]; then
   env | grep -viE '(WANDB_API_KEY|HF_TOKEN|API_KEY|TOKEN|SECRET|PASSWORD)=' || true
 fi
@@ -846,6 +880,8 @@ EOF
 # Worker nodes connect to the head. They're launched with a single batched srun
 # below; each task discovers its identity at runtime via SLURM_PROCID/SLURMD_NODENAME.
 worker_cmd=$(cat <<EOF
+$(declare -f check_cpu_affinity)
+check_cpu_affinity "$CPUS_PER_WORKER" || exit 1
 if [[ "\${RAY_SUB_DEBUG_ENV:-0}" == "1" ]]; then
   env | grep -viE '(WANDB_API_KEY|HF_TOKEN|API_KEY|TOKEN|SECRET|PASSWORD)=' || true
 fi
@@ -1020,9 +1056,12 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
     --kill-on-bad-exit=1 \
     --overlap \
     --nodes="$SLURM_JOB_NUM_NODES" \
+    --ntasks="$SLURM_JOB_NUM_NODES" \
     --ntasks-per-node=1 \
+    --cpus-per-task="$CPUS_PER_WORKER" \
+    --cpu-bind=cores \
     --export="$SANDBOX_EXPORTS" \
-    bash -xc '
+    bash -xc "$(declare -f check_cpu_affinity); check_cpu_affinity $CPUS_PER_WORKER || exit 1; "'
       ('"$SANDBOX_COMMAND"') &
       SANDBOX_PID=$!
       deadline=$((SECONDS + 300))
