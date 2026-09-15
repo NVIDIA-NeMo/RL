@@ -209,3 +209,22 @@ Tests exercise an oversized payload and preservation of every other metric,
 plus source wiring after summary generation. Actual W&B delivery still needs
 a native canary. This does **not** fix `commit=False` GPU sample merging,
 cross-resume relative time axes, or heartbeat state; those remain open.
+
+## CCC verifier concurrency is a configuration choice
+
+**Incident 8, verifier component only:** increasing `test_batch_size` from 4
+to 32 reduced a fixed-answer benchmark from 44.27 s to 6.79 s with identical
+rewards and 164 executed tests. This was not a 6.5x end-to-end training speedup,
+and it did not fix that incident's separate policy NaN.
+
+Merge `training_configs/super_rl/ccc_verifier_concurrency.yaml` **after** a
+complete recipe using NeMo-RL's `defaults` list. It changes only this field on
+the existing `competitive_coding_challenges_resources_server` alias. Use the
+corresponding override for a differently named alias. Do not put this fragment
+in Gym's `config_paths` or treat it as a complete environment definition.
+
+The merge test preserves CCC parameters, CoT, TIR, SciCode, equivalence, model,
+data and output cap. Before adopting 32 on another cluster, check allocated
+CPU capacity and the same `shared_dir` mount inside both resource server and
+sandbox. Compare fixed answers, rewards and actual test counts at both
+concurrency values. Keep sandbox timeouts/reward semantics unchanged.
