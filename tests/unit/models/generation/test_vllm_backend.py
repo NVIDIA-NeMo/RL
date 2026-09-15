@@ -533,7 +533,11 @@ def test_fp8_load_uses_buffer_safe_model_loader(monkeypatch):
 
 
 @pytest.mark.vllm
-def test_fp8_layerwise_reload_passes_entire_quantized_generator(monkeypatch):
+@pytest.mark.parametrize("native_reload", [False, True])
+@pytest.mark.parametrize("cache_loader_routes", [False, True])
+def test_fp8_layerwise_reload_passes_entire_quantized_generator(
+    monkeypatch, native_reload, cache_loader_routes
+):
     from nemo_rl.models.generation.vllm import vllm_backend
     from nemo_rl.models.generation.vllm.quantization import fp8
 
@@ -543,12 +547,13 @@ def test_fp8_layerwise_reload_passes_entire_quantized_generator(monkeypatch):
         received_weights.extend(weights)
         return {name for name, _ in received_weights}
 
-    model = SimpleNamespace(load_weights=model_load_weights)
+    model = torch.nn.Module()
+    model.load_weights = model_load_weights
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
     )
     ext.model_runner = SimpleNamespace(model=model, vllm_config=object())
-    ext._nrl_layerwise_reload_active = True
+    ext._nrl_layerwise_reload_active = native_reload
     source_weights = [("model.weight", torch.ones(2))]
     quantized_weights = [
         ("model.weight", torch.ones(2, dtype=torch.float8_e4m3fn)),
@@ -562,6 +567,9 @@ def test_fp8_layerwise_reload_passes_entire_quantized_generator(monkeypatch):
         yield from quantized_weights
 
     monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: True)
+    monkeypatch.setattr(
+        vllm_backend, "refit_cache_loader_routes_enabled", lambda _: cache_loader_routes
+    )
     monkeypatch.setattr(
         fp8, "get_quantized_weight_iterator", get_quantized_weight_iterator
     )

@@ -505,7 +505,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         return params
 
     def _load_full_hf_weights(
-        self, policy_weights: Iterable[tuple[str, torch.Tensor]]
+        self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> set[str] | None:
         """Load HF weights and detach any deferred reload tensors from transport storage.
 
@@ -515,7 +515,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         if not getattr(self, "_nrl_layerwise_reload_active", False):
             return load_weights_maybe_cached(
                 self.model_runner.model,
-                list(policy_weights),
+                list(weights),
                 cache_loader_routes=refit_cache_loader_routes_enabled(
                     self.model_runner.vllm_config
                 ),
@@ -524,7 +524,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         source_storage_ptrs: set[int] = set()
 
         def track_source_storage() -> Iterator[tuple[str, torch.Tensor]]:
-            for name, tensor in policy_weights:
+            for name, tensor in weights:
                 source_storage_ptrs.add(tensor.untyped_storage().data_ptr())
                 yield name, tensor
 
