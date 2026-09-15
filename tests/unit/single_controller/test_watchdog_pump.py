@@ -94,6 +94,8 @@ def _make_controller(
     # These tests cover stall detection, not fleet health or gym routing.
     ctrl._gen_fleet = None
     ctrl._generation_router = None
+    # No fleet health, so nothing ever reaches DEAD and there is nothing to restart.
+    ctrl._engine_supervisor = None
     return ctrl
 
 
@@ -258,6 +260,7 @@ class TestGenerationFleetProbe:
             stats=RolloutStats(), inflight=0, stall_timeout_s=1000.0, **kwargs
         )
         ctrl._gen_fleet = monitor
+        ctrl._engine_supervisor = None
         # A confirmed death stands the trainers' refit deadline down, so the fixture has to
         # carry the trainer handle it fans out over. Without it the probe's except clause
         # would swallow an AttributeError and the feature would silently no-op -- which is
@@ -275,21 +278,15 @@ class TestGenerationFleetProbe:
                 ]
             )
         )
-        ctrl._gen = SimpleNamespace(
-            worker_group=SimpleNamespace(
-                get_dp_leader_worker_idx=lambda shard: shard,
-                workers=[
-                    SimpleNamespace(
-                        is_alive=SimpleNamespace(
-                            remote=(lambda alive=alive: _completed())
-                            if alive
-                            else (lambda: _failed(ray.exceptions.ActorDiedError()))
-                        )
-                    )
-                    for alive in worker_alive
-                ],
-            )
-        )
+
+        # One stub, not four nested namespaces: the probe asks the backend by shard index
+        # and the shard-to-worker layout stays the backend's business.
+        def _liveness(shard_idx):
+            if worker_alive[shard_idx]:
+                return _completed()
+            return _failed(ray.exceptions.ActorDiedError())
+
+        ctrl._gen = SimpleNamespace(shard_liveness_ref=_liveness)
         return ctrl
 
     def test_a_live_fleet_stays_serving(self):
@@ -357,7 +354,9 @@ class TestGenerationFleetProbe:
         )
         ctrl = self._with_fleet(monitor, worker_alive=[True, True])
         ctrl._async_cfg.generation_fleet_health.probe_timeout_s = 0.001
-        ctrl._gen.worker_group.workers[1].is_alive.remote = lambda: asyncio.sleep(10.0)
+        ctrl._gen.shard_liveness_ref = lambda shard_idx: (
+            asyncio.sleep(10.0) if shard_idx == 1 else _completed()
+        )
         asyncio.run(_run_probe_ticks(ctrl, 2))
         assert ctrl._stood_down == [], (
             "a probe timeout is not proof of death; standing the deadline down on one "
@@ -375,11 +374,7 @@ class TestGenerationFleetProbe:
         )
         ctrl = self._with_fleet(monitor, worker_alive=[True])
         ctrl._async_cfg.generation_fleet_health.probe_timeout_s = 0.001
-        ctrl._gen.worker_group.workers = [
-            SimpleNamespace(
-                is_alive=SimpleNamespace(remote=lambda: asyncio.sleep(10.0))
-            )
-        ]
+        ctrl._gen.shard_liveness_ref = lambda shard_idx: asyncio.sleep(10.0)
         asyncio.run(_run_probe_ticks(ctrl, 3))
         assert monitor.state_of(0) is ShardState.SUSPECT
         assert monitor.absent_shards() == []
@@ -536,10 +531,7 @@ class TestGenerationFleetProbe:
                 concurrent -= 1
 
         ctrl = self._with_fleet(monitor, worker_alive=[True] * 4)
-        ctrl._gen.worker_group.workers = [
-            SimpleNamespace(is_alive=SimpleNamespace(remote=lambda: _slow()))
-            for _ in range(4)
-        ]
+        ctrl._gen.shard_liveness_ref = lambda shard_idx: _slow()
 
         async def _main():
             task = asyncio.ensure_future(ctrl._probe_generation_fleet())
@@ -550,6 +542,36 @@ class TestGenerationFleetProbe:
             return observed
 
         assert asyncio.run(_main()) == 4
+
+
+class TestABackendThatCannotBeProbed:
+    """An unprobeable backend must not read as a dead fleet.
+
+    The probe asks the backend for liveness by shard index. A backend that does not
+    implement it raises NotImplementedError, which the generic handler below would record
+    as a failed probe -- condemning every shard within unhealthy_threshold ticks and ending
+    the run as GenerationFleetExhausted. A healthy fleet reported as a dead one, with the
+    real cause (fleet health enabled on a backend that cannot support it) nowhere in sight.
+    """
+
+    def test_it_raises_naming_the_backend_instead_of_condemning_shards(self):
+        class _Unprobeable:
+            def shard_liveness_ref(self, shard_idx):
+                raise NotImplementedError
+
+        monitor = GenerationFleetHealth(
+            shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=1)
+        )
+        ctrl = _make_controller(stats=RolloutStats(), inflight=0, stall_timeout_s=600.0)
+        ctrl._gen_fleet = monitor
+        ctrl._gen = _Unprobeable()
+
+        with pytest.raises(RuntimeError, match="does not implement shard_liveness_ref"):
+            asyncio.run(ctrl._probe_generation_fleet())
+
+        assert monitor.serving_shards() == [0, 1], (
+            "no shard may be condemned for the backend's inability to be probed"
+        )
 
 
 class TestEnvHealthCheck:

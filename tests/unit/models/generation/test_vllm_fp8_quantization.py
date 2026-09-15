@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import types
 from pathlib import Path
 
@@ -35,6 +36,11 @@ def fp8_module():
     old_patches_applied = fp8.fp8_patches_applied
     old_run_engine_core = fp8.EngineCoreProc.run_engine_core
     old_core_manager_init = fp8.CoreEngineProcManager.__init__
+    env_keys = {
+        "VLLM_USE_DEEP_GEMM",
+        "VLLM_USE_DEEP_GEMM_E8M0",
+    }
+    old_env = {key: os.environ.get(key) for key in env_keys}
     fp8.global_fp8_config = None
     fp8.fp8_state = fp8.FP8State()
     fp8.fp8_patches_applied = False
@@ -47,6 +53,11 @@ def fp8_module():
         fp8.fp8_patches_applied = old_patches_applied
         fp8.EngineCoreProc.run_engine_core = old_run_engine_core
         fp8.CoreEngineProcManager.__init__ = old_core_manager_init
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 @pytest.mark.parametrize("async_engine", [False, True])
@@ -1375,6 +1386,331 @@ def test_multi_gpu_fp8_patches_before_model_load(fp8_module, monkeypatch, use_ra
         ]
 
 
+def test_fp8_ds_mla_skips_static_kv_scale_patch(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    patched_paths = []
+
+    class FakePatch:
+        def start(self):
+            pass
+
+    def fake_patch(path, _replacement):
+        patched_paths.append(path)
+        return FakePatch()
+
+    monkeypatch.setattr(fp8, "patch", fake_patch)
+
+    fp8.apply_fp8_patches(
+        None,
+        fp8.FP8Config(
+            use_fp8_weights=True,
+            model_parallel_size=1,
+            kv_cache_dtype="fp8_ds_mla",
+        ),
+    )
+
+    assert not any("BaseKVCacheMethod" in path for path in patched_paths)
+
+
+def test_init_fp8_accepts_fp8_ds_mla(fp8_module, monkeypatch):
+    fp8 = fp8_module
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    vllm_kwargs = fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "fp8_ds_mla",
+            "async_engine": False,
+        },
+        "dummy-model",
+        model_parallel_size=1,
+    )
+
+    assert vllm_kwargs["kv_cache_dtype"] == "fp8_ds_mla"
+    assert fp8.global_fp8_config.kv_cache_dtype == "fp8_ds_mla"
+
+
+def test_init_fp8_uses_explicit_e8m0_for_dsv4(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            num_hidden_layers=4,
+            model_type="deepseek_v4",
+        ),
+    )
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+    monkeypatch.delenv("VLLM_USE_DEEP_GEMM", raising=False)
+    monkeypatch.setenv("VLLM_USE_DEEP_GEMM_E8M0", "1")
+
+    vllm_kwargs = fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "fp8_ds_mla",
+            "async_engine": False,
+            "pow2_weight_scaling_factors": True,
+            "use_deep_gemm": True,
+        },
+        "dummy-model",
+        model_parallel_size=8,
+    )
+
+    quantization_config = vllm_kwargs["hf_overrides"]["quantization_config"]
+    assert "scale_fmt" not in quantization_config
+    assert quantization_config["fmt"] == "e4m3"
+    assert quantization_config["weight_block_size"] == [128, 128]
+    assert os.environ["VLLM_USE_DEEP_GEMM"] == "1"
+    assert os.environ["VLLM_USE_DEEP_GEMM_E8M0"] == "1"
+    assert fp8.global_fp8_config.is_deepseek_v4 is True
+
+
+def test_init_fp8_keeps_e8m0_disabled_for_other_deep_gemm_models(
+    fp8_module, monkeypatch
+):
+    fp8 = fp8_module
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            num_hidden_layers=4, model_type="deepseek_v3"
+        ),
+    )
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+    monkeypatch.delenv("VLLM_USE_DEEP_GEMM_E8M0", raising=False)
+
+    fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "auto",
+            "async_engine": False,
+            "use_deep_gemm": True,
+        },
+        "dummy-model",
+        model_parallel_size=8,
+    )
+
+    assert os.environ["VLLM_USE_DEEP_GEMM_E8M0"] == "0"
+    assert fp8.global_fp8_config.is_deepseek_v4 is False
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8", "fp8_e4m3"])
+def test_init_fp8_rejects_non_mla_fp8_cache_for_dsv4(
+    fp8_module, monkeypatch, kv_cache_dtype
+):
+    fp8 = fp8_module
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            num_hidden_layers=4, model_type="deepseek_v4"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="requires kv_cache_dtype='fp8_ds_mla'"):
+        fp8.init_fp8(
+            {
+                "precision": "fp8",
+                "kv_cache_dtype": kv_cache_dtype,
+                "async_engine": False,
+            },
+            "dummy-model",
+            model_parallel_size=8,
+        )
+
+
+def test_dsv4_module_lookup_maps_checkpoint_attention_to_fused_vllm_module(
+    fp8_module,
+):
+    import torch
+
+    fp8 = fp8_module
+
+    class DeepSeekV4ForCausalLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = types.SimpleNamespace(model_type="deepseek_v4")
+            self.model = torch.nn.Module()
+            layer = torch.nn.Module()
+            layer.attn = torch.nn.Module()
+            layer.attn.fused_wqa_wkv = torch.nn.Linear(2, 2, bias=False)
+            self.model.layers = torch.nn.ModuleList([layer])
+            self.hf_to_vllm_mapper = types.SimpleNamespace(
+                apply_list=lambda names: [f"model.{names[0]}"],
+            )
+
+    model = DeepSeekV4ForCausalLM()
+
+    module = fp8._get_module_from_param_name(model, "layers.0.attn.wq_a.weight")
+
+    assert module is model.model.layers[0].attn.fused_wqa_wkv
+
+
+def test_module_lookup_preserves_base_packed_and_mapper_handling(fp8_module):
+    import torch
+
+    fp8 = fp8_module
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = types.SimpleNamespace(model_type="other")
+            self.model = torch.nn.Module()
+            layer = torch.nn.Module()
+            layer.attn = torch.nn.Module()
+            layer.attn.qkv_proj = torch.nn.Linear(2, 2, bias=False)
+            self.model.layers = torch.nn.ModuleList([layer])
+            self.packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+            self.hf_to_vllm_mapper = types.SimpleNamespace(
+                orig_to_new_prefix={"transformer": "model"},
+                orig_to_new_substr={"self_attn": "attn"},
+            )
+
+    model = Model()
+
+    module = fp8._get_module_from_param_name(
+        model, "transformer.layers.0.self_attn.q_proj.weight"
+    )
+
+    assert module is model.model.layers[0].attn.qkv_proj
+
+
+def test_dsv4_routed_experts_refit_uses_immediate_raw_storage(fp8_module, monkeypatch):
+    import torch
+    from vllm.model_executor.model_loader.reload import meta
+
+    fp8 = fp8_module
+    from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
+
+    process_calls = []
+
+    class FakeRoutedExperts(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_experts = 2
+            self.hidden_size = 4
+            self.intermediate_size_per_partition = 3
+            self.weight_block_size = [2, 2]
+            self.w13_weight = torch.nn.Parameter(
+                torch.empty(2, 4, 4, dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            self.w2_weight = torch.nn.Parameter(
+                torch.empty(2, 4, 2, dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            self.w13_weight_scale_inv = torch.nn.Parameter(
+                torch.empty(2, 2, 2), requires_grad=False
+            )
+            self.w2_weight_scale_inv = torch.nn.Parameter(
+                torch.empty(2, 2, 1), requires_grad=False
+            )
+            self.quant_method = types.SimpleNamespace(
+                block_quant=True,
+                process_weights_after_loading=lambda layer: process_calls.append(layer),
+            )
+
+    layer = FakeRoutedExperts()
+    monkeypatch.setattr(deepseek_v4_fp8, "RoutedExperts", FakeRoutedExperts)
+    monkeypatch.setattr(deepseek_v4_fp8, "Fp8MoEMethod", type(layer.quant_method))
+    monkeypatch.setattr(meta, "SKIP_TENSORS", set())
+    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+
+    get_layerwise_info(layer).restore_metadata = (
+        {
+            "w13_weight": torch.empty(
+                (2, 6, 4), dtype=torch.float8_e4m3fn, device="meta"
+            ),
+            "w2_weight": torch.empty(
+                (2, 4, 3), dtype=torch.float8_e4m3fn, device="meta"
+            ),
+            "w13_weight_scale_inv": torch.empty(
+                (2, 3, 2), dtype=torch.float32, device="meta"
+            ),
+            "w2_weight_scale_inv": torch.empty(
+                (2, 2, 2), dtype=torch.float32, device="meta"
+            ),
+        },
+        {},
+    )
+    model = torch.nn.Sequential(layer)
+
+    added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)
+
+    assert layer.w13_weight.shape == (2, 6, 4)
+    assert layer.w2_weight.shape == (2, 4, 3)
+    assert layer.w13_weight_scale_inv.shape == (2, 3, 2)
+    assert layer.w2_weight_scale_inv.shape == (2, 2, 2)
+    assert {
+        "w13_weight",
+        "w2_weight",
+        "w13_weight_scale_inv",
+        "w2_weight_scale_inv",
+    }.issubset(meta.SKIP_TENSORS)
+
+    deepseek_v4_fp8.finalize_refit(model)
+    assert process_calls == [layer]
+    deepseek_v4_fp8.restore_refit(added_skip_tensors)
+
+
+def test_dsv4_bmm_post_process_uses_vllm_bmm_layout(fp8_module, monkeypatch):
+    import torch
+    from vllm.model_executor.layers.quantization.utils import fp8_utils
+    from vllm.utils import deep_gemm
+
+    fp8 = fp8_module
+    weight = torch.nn.Parameter(torch.zeros(4, 4), requires_grad=False)
+    scale = torch.nn.Parameter(torch.zeros(2, 2), requires_grad=False)
+
+    def weight_loader(*_args, **_kwargs):
+        pass
+
+    def scale_loader(*_args, **_kwargs):
+        pass
+
+    weight.weight_loader = weight_loader
+    scale.weight_loader = scale_loader
+    layer = types.SimpleNamespace(
+        weight=weight,
+        weight_scale_inv=scale,
+        weight_block_size=[2, 2],
+        orig_dtype=torch.bfloat16,
+        is_bmm=True,
+        bmm_batch_size=2,
+    )
+    calls = []
+
+    monkeypatch.setattr(
+        deep_gemm,
+        "should_use_deepgemm_for_fp8_linear",
+        lambda _dtype, _shape: True,
+    )
+    monkeypatch.setattr(deep_gemm, "is_deep_gemm_e8m0_used", lambda: True)
+
+    def post_process(**kwargs):
+        calls.append(kwargs)
+        return torch.ones(2, 2, 4), torch.ones(2, 1, 2, dtype=torch.int32)
+
+    monkeypatch.setattr(
+        fp8_utils, "deepgemm_post_process_fp8_weight_block", post_process
+    )
+
+    fp8.maybe_post_process_fp8_weight_block(layer)
+
+    assert layer.weight.shape == (2, 2, 4)
+    assert layer.weight_scale_inv.shape == (2, 1, 2)
+    assert layer.weight.weight_loader is weight_loader
+    assert layer.weight_scale_inv.weight_loader is scale_loader
+    assert calls[0]["is_bmm"] is True
+    assert calls[0]["bmm_batch_size"] == 2
+
+
 def test_process_weights_after_loading_copies_in_place_on_refit(monkeypatch):
     """Refit runs this every step; rebinding .data each time fragments memory.
 
@@ -1504,6 +1840,194 @@ def test_mxfp8_reload_iterator_emits_upstream_checkpoint_names(fp8_module, monke
     ]
     assert quantized[0][1].dtype == torch.float8_e4m3fn
     assert quantized[1][1].dtype == torch.uint8
+
+
+@pytest.mark.parametrize("is_deepseek_v4", [False, True])
+@pytest.mark.parametrize("change_layout", ["none", "dtype", "shape"])
+def test_process_fp8_moe_preserves_storage_and_loaders(
+    fp8_module, monkeypatch, change_layout, is_deepseek_v4
+):
+    from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
+
+    fp8_module.global_fp8_config = fp8_module.FP8Config(is_deepseek_v4=is_deepseek_v4)
+
+    def weight_loader(*_args, **_kwargs):
+        pass
+
+    shapes = {
+        "w13_weight": (2, 4, 4),
+        "w2_weight": (2, 4, 2),
+        "w13_weight_scale_inv": (2, 2, 2),
+        "w2_weight_scale_inv": (2, 2, 1),
+    }
+    layer = torch.nn.Module()
+    converted = {}
+    for name, shape in shapes.items():
+        param = torch.nn.Parameter(torch.zeros(shape), requires_grad=False)
+        param.weight_loader = weight_loader
+        layer.register_parameter(name, param)
+        target_shape = (
+            (shape[0], shape[2], shape[1]) if change_layout == "shape" else shape
+        )
+        target_dtype = torch.float32 if change_layout == "none" else torch.bfloat16
+        converted[name] = torch.ones(target_shape, dtype=target_dtype)
+    layer.w13_input_scale = None
+    layer.w2_input_scale = None
+    monkeypatch.setattr(
+        vllm_fp8,
+        "convert_to_fp8_moe_kernel_format",
+        lambda **_kwargs: tuple(value.clone() for value in converted.values()),
+    )
+    kernel = object()
+    quant_config = object()
+    method = types.SimpleNamespace(
+        weight_scale_name="weight_scale_inv",
+        fp8_backend=object(),
+        moe_kernel=kernel,
+        get_fused_moe_quant_config=lambda _layer: quant_config,
+    )
+    params = {name: getattr(layer, name) for name in shapes}
+    pointers = {name: param.data_ptr() for name, param in params.items()}
+
+    if not is_deepseek_v4 and change_layout == "shape":
+        # Preserve the old copy_ failure for incompatible shapes rather than
+        # silently replacing Parameters that an existing kernel may reference.
+        with pytest.raises(RuntimeError, match="size of tensor"):
+            fp8_module.process_weights_after_loading_moe(method, layer)
+        for name, param in params.items():
+            assert getattr(layer, name) is param
+            assert param.data_ptr() == pointers[name]
+        return
+
+    fp8_module.process_weights_after_loading_moe(method, layer)
+    if is_deepseek_v4 and change_layout != "none":
+        for name, param in params.items():
+            assert getattr(layer, name) is not param
+        params = {name: getattr(layer, name) for name in shapes}
+        pointers = {name: param.data_ptr() for name, param in params.items()}
+    for _ in range(2):
+        fp8_module.process_weights_after_loading_moe(method, layer)
+        for name, expected in converted.items():
+            param = getattr(layer, name)
+            assert param is params[name]
+            assert param.data_ptr() == pointers[name]
+            assert param.weight_loader is weight_loader
+            # Non-DSV4 copy_ retains the destination dtype even when the
+            # converter returns another dtype; prefer_copy would replace it.
+            torch.testing.assert_close(param, expected.to(dtype=param.dtype))
+    assert method.moe_kernel is kernel
+    assert method.moe_quant_config is quant_config
+
+
+def test_deepseek_v4_two_refits_preserve_kernel_fp32_scale_references(
+    fp8_module, monkeypatch
+):
+    """Keep real vLLM configs current across two compatible FP32-scale refits."""
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+    from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
+    from vllm.model_executor.model_loader import reload as vllm_reload
+    from vllm.model_executor.model_loader.reload.meta import SKIP_TENSORS
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+    from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
+
+    fp8_module.global_fp8_config = fp8_module.FP8Config(is_deepseek_v4=True)
+
+    class Experts(torch.nn.Module):
+        pass
+
+    # Preserve dtype/shape like the H100 FP32-scale path. Returning distinct
+    # storage ensures the test requires copy-back into the kernel's references.
+    def convert(*, w13, w2, w13_scale, w2_scale, **_kwargs):
+        return w13.clone(), w2.clone(), w13_scale * 2, w2_scale * 2
+
+    kernels = []
+
+    def make_kernel(*, moe_quant_config, **_kwargs):
+        kernel = types.SimpleNamespace(
+            fused_experts=types.SimpleNamespace(quant_config=moe_quant_config)
+        )
+        kernels.append(kernel)
+        return kernel
+
+    monkeypatch.setattr(deepseek_v4_fp8, "RoutedExperts", Experts)
+    # Fix backend selection and conversion so CI hardware cannot select a
+    # different scale layout. Keep the real method constructor/config builder.
+    monkeypatch.setattr(
+        vllm_fp8,
+        "select_fp8_moe_backend",
+        lambda **_kwargs: (Fp8MoeBackend.DEEPGEMM, object()),
+    )
+    # Install the same postprocessing override used by NeMo-RL at runtime.
+    monkeypatch.setattr(
+        vllm_fp8.Fp8MoEMethod,
+        "process_weights_after_loading",
+        fp8_module.process_weights_after_loading_moe,
+    )
+    monkeypatch.setattr(vllm_fp8, "convert_to_fp8_moe_kernel_format", convert)
+    monkeypatch.setattr(vllm_fp8, "make_fp8_moe_kernel", make_kernel)
+    layer = Experts()
+    shapes = {
+        "w13_weight": (2, 4, 4),
+        "w2_weight": (2, 4, 2),
+        "w13_weight_scale_inv": (2, 2, 2),
+        "w2_weight_scale_inv": (2, 2, 1),
+    }
+    for name, shape in shapes.items():
+        dtype = torch.float32 if "scale" in name else torch.float8_e4m3fn
+        param = torch.nn.Parameter(torch.zeros(shape, dtype=dtype), requires_grad=False)
+        param.weight_loader = default_weight_loader
+        layer.register_parameter(name, param)
+    layer.w13_input_scale = None
+    layer.w2_input_scale = None
+    layer._expert_routing_tables = lambda: None
+    layer.moe_config = types.SimpleNamespace(has_bias=False)
+    layer.quant_method = method = vllm_fp8.Fp8MoEMethod(
+        vllm_fp8.Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[2, 2]),
+        layer,
+    )
+    model = torch.nn.Sequential(layer)
+    vllm_reload.record_metadata_for_reloading(model)
+    method.process_weights_after_loading(layer)
+    kernel = method.moe_kernel
+    kernel_config = kernel.fused_experts.quant_config
+    params = dict(layer.named_parameters())
+    pointers = {name: param.data_ptr() for name, param in params.items()}
+    original_skip = set(SKIP_TENSORS)
+
+    for round_value in (1.0, 3.0):
+        previous_config = method.moe_quant_config
+        added = deepseek_v4_fp8.prepare_refit(model)
+        try:
+            vllm_reload.initialize_layerwise_reload(model)
+            for name, param in layer.named_parameters():
+                param.weight_loader(param, torch.full_like(param, round_value))
+            vllm_reload.finalize_layerwise_reload(model, types.SimpleNamespace())
+            deepseek_v4_fp8.finalize_refit(model)
+        finally:
+            deepseek_v4_fp8.restore_refit(added)
+
+        assert set(SKIP_TENSORS) == original_skip
+        assert method.moe_kernel is kernel
+        assert len(kernels) == 1
+        # Check the config retained by the original kernel, not just the new
+        # method.moe_quant_config assigned by postprocessing on each refit.
+        assert kernel.fused_experts.quant_config is kernel_config
+        assert method.moe_quant_config is not previous_config
+        for config in (method.moe_quant_config, kernel_config):
+            assert config.w1_scale is layer.w13_weight_scale_inv
+            assert config.w2_scale is layer.w2_weight_scale_inv
+            for scale in (config.w1_scale, config.w2_scale):
+                assert scale.dtype == torch.float32
+                torch.testing.assert_close(
+                    scale, torch.full_like(scale, round_value * 2)
+                )
+        for name, param in layer.named_parameters():
+            assert param is params[name]
+            assert param.data_ptr() == pointers[name]
+            assert param.weight_loader is default_weight_loader
+            expected = round_value * 2 if "scale" in name else round_value
+            torch.testing.assert_close(param.float(), torch.full(param.shape, expected))
 
 
 def _grouped_expert_model(fp8, monkeypatch, experts_dtype, wrap_language_model=False):
