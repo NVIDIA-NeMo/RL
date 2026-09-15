@@ -45,7 +45,11 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
-from nemo_rl.telemetry.instrumentation import managed_span, trace_fn
+from nemo_rl.telemetry.instrumentation import (
+    managed_span,
+    umbrella_span,
+    umbrella_trace_fn,
+)
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
@@ -419,8 +423,8 @@ def validate(
 
     with (
         timer.time("total_validation_time"),
-        managed_span(
-            RLSpanGroup.EVALUATE,
+        umbrella_span(
+            RLSpanGroup.U_EVALUATE,
             "rl.sft.evaluate",
             tracer=_tracer,
             **{"rl.step": step},
@@ -505,7 +509,7 @@ def validate(
     return val_metrics, timing_metrics
 
 
-@trace_fn(RLSpanGroup.JOB, "rl.sft.job")
+@umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.sft.job")
 def sft_train(
     policy,
     train_dataloader,
@@ -575,8 +579,8 @@ def sft_train(
 
             with (
                 timer.time("total_step_time"),
-                managed_span(
-                    RLSpanGroup.STEP,
+                umbrella_span(
+                    RLSpanGroup.U_STEP,
                     "rl.sft.step",
                     tracer=_tracer,
                     **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},

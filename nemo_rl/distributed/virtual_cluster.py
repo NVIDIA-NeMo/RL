@@ -28,10 +28,20 @@ from ray.util.placement_group import (
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from nemo_rl.telemetry.instrumentation import (
+    safe_set_span_attributes,
+    setup_span,
+)
 from nemo_rl.utils.venvs import add_hf_modules_cache_to_pythonpath
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# How init_ray obtained its cluster, recorded on the rl.setup.ray_init span.
+RAY_CLUSTER_SOURCE_ATTR = "rl.ray.cluster_source"
+RAY_CLUSTER_EXTERNAL = "attached_external"
+RAY_CLUSTER_REUSED_LOCAL = "reused_local"
+RAY_CLUSTER_STARTED_LOCAL = "started_local"
 
 
 class ClusterConfig(TypedDict):
@@ -407,6 +417,19 @@ def _reserve_data_plane_ports(count: int) -> list[int]:
 
 
 def init_ray(log_dir: Optional[str] = None) -> None:
+    """Initialise Ray, under a ``rl.setup.ray_init`` span.
+
+    Split from :func:`_init_ray` only so the span can record which of the three
+    outcomes below happened. Attaching to a cluster someone else is running and
+    booting a fresh one differ by tens of seconds, and that difference is the
+    usual reason two otherwise identical runs disagree on time-to-first-step.
+    """
+    with setup_span("ray_init") as span:
+        outcome = _init_ray(log_dir)
+        safe_set_span_attributes(span, {RAY_CLUSTER_SOURCE_ATTR: outcome})
+
+
+def _init_ray(log_dir: Optional[str] = None) -> str:
     """Initialise Ray.
 
     Try to attach to an existing local cluster.
@@ -423,6 +446,9 @@ def init_ray(log_dir: Optional[str] = None) -> None:
 
     Args:
         log_dir: Optional directory to store Ray logs and temp files.
+
+    Returns:
+        How the cluster was obtained: one of the ``RAY_CLUSTER_*`` constants.
     """
     # Strip MPI/PMIx/SLURM launcher vars from the driver env before they get
     # captured into runtime_env (both by `dict(os.environ)` below and by
@@ -475,7 +501,7 @@ def init_ray(log_dir: Optional[str] = None) -> None:
                 logger.info(
                     f"Connected to existing Ray cluster (driver CVD_TAG '{cvd_tag}' matched): {cluster_res}"
                 )
-                return
+                return RAY_CLUSTER_REUSED_LOCAL
 
             # If neither reuse condition is met, but we connected to *something*
             logger.info(
@@ -495,7 +521,7 @@ def init_ray(log_dir: Optional[str] = None) -> None:
         # Always reuse if it's an externally managed cluster.
         else:
             logger.info(f"Connected to existing Ray cluster: {cluster_res}")
-            return
+            return RAY_CLUSTER_EXTERNAL
 
     except ConnectionError:
         logger.debug("No existing Ray cluster found, will start a new one.")
@@ -519,6 +545,7 @@ def init_ray(log_dir: Optional[str] = None) -> None:
     logger.info(
         f"Started local cluster with tag '{cvd_tag}': {ray.cluster_resources()}"
     )
+    return RAY_CLUSTER_STARTED_LOCAL
 
 
 @ray.remote(num_gpus=1)

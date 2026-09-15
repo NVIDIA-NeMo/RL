@@ -39,15 +39,19 @@ the import path of modules that never emit anything.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
+import threading
 import uuid
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar, cast
 
 if TYPE_CHECKING:
-    from nemo.lens import NemoLensConfig, TelemetryHandle
+    from nemo.lens import TelemetryHandle
 
 logger = logging.getLogger(__name__)
+
+_F = TypeVar("_F", bound=Callable[..., Any])
 
 # Process-global handle. One per process (driver or Ray actor); ``None`` when
 # lens is absent or telemetry is disabled.
@@ -63,15 +67,20 @@ _RUN_ID_ENV = f"{_OTEL_PREFIX}_RUN_ID"
 # Set per worker by ``RayWorkerGroup`` from the group's ``name_prefix``.
 _WORKER_GROUP_ENV = "NRL_WORKER_GROUP"
 
+# Which stage of a model's lifecycle (pretrain -> SFT -> RL) produced this
+# telemetry. A backend collecting several NeMo products selects the RL stage on
+# this rather than on service names, which differ per launcher. Constant rather
+# than configurable: a process running this package *is* the RL stage. Seeded
+# into both the driver and the worker attributes, since a resource is per
+# process and neither path sees the other's.
+_CAMPAIGN_STAGE_ATTR = "nv.dl.campaign.stage"
+_CAMPAIGN_STAGE = "RL"
+
 # TelemetryConfig field -> NEMO_RL_OTEL_* env var. ``service_name`` maps to the
 # standard ``OTEL_SERVICE_NAME`` (lens reads it directly, unprefixed).
 _ENV_FIELD_MAP = {
     "enabled": f"{_OTEL_PREFIX}_ENABLED",
     "span_groups": f"{_OTEL_PREFIX}_SPAN_GROUPS",
-    "export_strategy": f"{_OTEL_PREFIX}_EXPORT_STRATEGY",
-    "export_rank": f"{_OTEL_PREFIX}_EXPORT_RANK",
-    "export_sample_rate": f"{_OTEL_PREFIX}_EXPORT_SAMPLE_RATE",
-    "sampler_enabled": f"{_OTEL_PREFIX}_SAMPLER_ENABLED",
     "traces_enabled": f"{_OTEL_PREFIX}_TRACES_ENABLED",
     "metrics_enabled": f"{_OTEL_PREFIX}_METRICS_ENABLED",
     "logs_enabled": f"{_OTEL_PREFIX}_LOGS_ENABLED",
@@ -157,9 +166,12 @@ def _build_resource_attributes(
     Only stable-for-the-run values belong here (algorithm, model, precision,
     parallelism). Per-step values are span tags; time-series values are metrics.
     Best-effort: a missing key simply omits that attribute — never raises.
-    ``dl.rank`` / ``dl.world_size`` are set by lens from the setup call, not here.
+    Rank identity comes from :func:`_rank_attributes`, which the callers merge in.
     """
-    attrs: dict[str, Any] = {"rl.algorithm": algorithm}
+    attrs: dict[str, Any] = {
+        _CAMPAIGN_STAGE_ATTR: _CAMPAIGN_STAGE,
+        "rl.algorithm": algorithm,
+    }
 
     model = _dig(master_config, "policy", "model_name")
     if model:
@@ -182,51 +194,22 @@ def _build_resource_attributes(
     return attrs
 
 
-def _always_export(
-    config: "NemoLensConfig",
-    rank: int,
-    world_size: int,
-) -> bool:
-    """Export-strategy override for singleton processes: always export."""
-    return True
+def _rank_attributes(rank: int, world_size: int) -> dict[str, Any]:
+    """Resource attributes identifying this process within its group.
 
+    Lens has no notion of rank: it neither filters nor samples on one, so every
+    process that sets up telemetry exports. Rank is recorded as a resource
+    attribute instead, which is what makes a single rank's spans selectable
+    afterwards -- filter on ``nv.dl.rank`` in the collector, or leave
+    ``telemetry.enabled`` false on the ranks that should stay quiet.
 
-def _unrank(config: "NemoLensConfig") -> Any:
-    """Disable rank-based span filtering for a process that has no real rank.
-
-    The driver and singleton actors such as ``AsyncTrajectoryCollector`` are not
-    members of a distributed group, so they pass a synthetic ``rank=0`` /
-    ``world_size=1``. Both of lens's rank filters then misfire on that made-up
-    rank, and the two are independent, so both have to be neutralised:
-
-    * ``export_strategy`` decides whether this process exports at all. A
-      strategy that selects among the ranks of a *group* has no meaning for a
-      singleton, and mutes it outright for any ``export_rank >= 1``.
-    * ``sampler_enabled`` installs a ``RankAwareSampler`` on the tracer
-      provider, which drops every span on ranks whose ``md5(rank)`` bucket
-      lands above ``export_sample_rate``. Rank 0's bucket is 0.785, so any
-      sample rate at or below that discards the process's spans *before* the
-      export decision is ever consulted.
-
-    The driver hosts the training loop and the metrics logger, and the
-    collector generates every async rollout, so either filter silently drops
-    the telemetry that matters most.
-
-    Mutating ``config`` here is process-local: it is rebuilt from the
-    environment in each process, and the propagated ``NEMO_RL_OTEL_*`` vars are
-    untouched, so ranked workers still honour what the user configured.
-
-    Returns the export-strategy override to hand to ``setup_telemetry``.
+    Passing rank at all is what keeps that filter available; lens warns when
+    ``nv.dl.rank`` is missing, because without it a process cannot be told
+    apart from its peers downstream.
     """
-    if config.sampler_enabled and config.export_sample_rate < 1.0:
-        logger.info(
-            "nemo-lens: disabling the rank sampler for this process "
-            "(sample_rate=%s applies to ranked workers, not to the driver or a "
-            "singleton actor)",
-            config.export_sample_rate,
-        )
-        config.sampler_enabled = False
-    return _always_export
+    from nemo.lens.semconv import NV_DL_RANK, NV_DL_WORLD_SIZE
+
+    return {NV_DL_RANK: rank, NV_DL_WORLD_SIZE: world_size}
 
 
 def init_telemetry_driver(
@@ -242,10 +225,6 @@ def init_telemetry_driver(
 
     Returns the :class:`TelemetryHandle`, or ``None`` if telemetry is disabled.
     Idempotent.
-
-    Raises:
-        ValueError: if ``telemetry.export_strategy`` names a strategy lens does
-            not have. Deliberately fatal on the driver, where the user sees it.
     """
     global _TELEMETRY_HANDLE, _TELEMETRY_INITIALISED
     if _TELEMETRY_INITIALISED:
@@ -257,14 +236,17 @@ def init_telemetry_driver(
     if tel is not None:
         _config_to_env(tel)
 
-    from nemo.lens import NemoLensConfig, registered_strategies, setup_telemetry
+    from nemo.lens import NemoLensConfig, setup_telemetry
 
-    from nemo_rl.telemetry.span_groups import RLSpanGroup
+    # Imported purely for the side effect: importing this module is what
+    # registers NeMo-RL's groups with lens's SpanRegistry, and setup_telemetry
+    # below resolves span_groups against whatever is registered by then. Without
+    # this every RL group would come back pending and select nothing.
+    from nemo_rl.telemetry import span_groups as _rl_span_groups  # noqa: F401
 
     config = NemoLensConfig.from_env(
         prefix=_OTEL_PREFIX,
         fallback_prefix=_OTEL_FALLBACK_PREFIX,
-        span_group_cls=RLSpanGroup,
     )
     if not config.enabled:
         _TELEMETRY_INITIALISED = True
@@ -285,34 +267,24 @@ def init_telemetry_driver(
         os.environ[_RUN_ID_ENV] = run_id
         config.run_id = run_id
 
-    # Passing _always_export below bypasses lens's registry lookup, which is
-    # what would otherwise reject a misspelled strategy. Validate it here so a
-    # typo fails on the driver, where the user sees it, instead of degrading to
-    # a warning inside every worker.
-    if config.export_strategy not in registered_strategies():
-        raise ValueError(
-            f"Unknown telemetry.export_strategy {config.export_strategy!r}. "
-            f"Registered strategies: {registered_strategies()}."
-        )
-
-    # Same reasoning, different field: lens resolves span_groups lazily, *after*
-    # it has installed the global tracer provider, so a typo there would take
-    # the process down with telemetry half-built and no handle to flush.
-    RLSpanGroup.resolve(config.span_groups)
-
+    # An unresolvable span_groups entry is warned about by lens itself, from
+    # set_span_group_spec inside the setup_telemetry call below. Not duplicated
+    # here: lens resolves the spec against every namespace registered in the
+    # process, so it can name the registered groups, presets and namespaces,
+    # where this module knows only its own -- and a warning that listed only
+    # NeMo-RL's groups would call a Megatron group unregistered.
+    #
     # Unguarded on purpose: _build_resource_attributes is total by construction
     # (missing keys omit an attribute), so a raise here is a real bug, and
     # swallowing it would drop rl.model / nemo.precision / dl.*_parallel.size
     # from every span and metric for the whole run.
     resource_attrs = _build_resource_attributes(master_config, algorithm)
+    # The driver is a singleton, not a member of a distributed group. Rank 0 of
+    # 1 is the honest description, and stating it silences lens's warning about
+    # a process that cannot be identified by rank downstream.
+    resource_attrs.update(_rank_attributes(rank=0, world_size=1))
 
-    handle = setup_telemetry(
-        config,
-        rank=0,
-        world_size=1,
-        resource_attributes=resource_attrs,
-        export_strategy=_unrank(config),
-    )
+    handle = setup_telemetry(config, resource_attributes=resource_attrs)
     # Only now, past everything that can raise: setting the guard earlier would
     # turn a retry after a failed setup into a silent None instead of the same
     # error. Lens leaves its own guard clear on that path, so a retry is safe.
@@ -353,12 +325,12 @@ def _worker_resource_attributes(
     """Build resource attributes identifying this worker process.
 
     ``RANK`` is group-local — the policy group and the generation group each
-    number their workers from zero — so ``dl.rank`` alone cannot tell their
+    number their workers from zero — so ``nv.dl.rank`` alone cannot tell their
     spans apart. ``rl.worker_group`` carries the group's ``name_prefix``
     (``lm_policy``, ``vllm_policy``, ...), which ``RayWorkerGroup`` exports as
     ``NRL_WORKER_GROUP``. Explicit ``extra`` attributes win.
     """
-    attrs: dict[str, Any] = {}
+    attrs: dict[str, Any] = {_CAMPAIGN_STAGE_ATTR: _CAMPAIGN_STAGE}
     worker_group = os.environ.get(_WORKER_GROUP_ENV, "").strip()
     if worker_group:
         attrs["rl.worker_group"] = worker_group
@@ -371,31 +343,27 @@ def init_telemetry_worker(
     rank: Optional[int] = None,
     world_size: Optional[int] = None,
     resource_attributes: Optional[dict[str, Any]] = None,
-    always_export: bool = False,
 ) -> Optional["TelemetryHandle"]:
     """Initialise telemetry inside a Ray actor (call once per worker process).
 
     Reads the ``NEMO_RL_OTEL_*`` env propagated from the driver via the Ray
     ``runtime_env``. ``rank`` / ``world_size`` default to the ``RANK`` /
-    ``WORLD_SIZE`` env vars the worker was launched with, which — together with
-    the export strategy — decide whether this worker exports.
+    ``WORLD_SIZE`` env vars the worker was launched with, and are recorded as
+    ``nv.dl.rank`` / ``nv.dl.world_size`` resource attributes.
+
+    Every worker that gets here exports. Narrowing that down is a downstream
+    decision now: filter on ``nv.dl.rank`` in the collector, or leave
+    ``telemetry.enabled`` false for the ranks that should stay quiet.
 
     Args:
         rank: This process's rank. Defaults to the ``RANK`` env var.
         world_size: Size of this process's group. Defaults to ``WORLD_SIZE``.
         resource_attributes: Extra resource attributes for this process.
-        always_export: Bypass the configured rank filters for this process, the
-            way the driver does (see :func:`_unrank`). Set it for a *singleton*
-            actor passing a synthetic ``rank`` / ``world_size``: the filters
-            select among the ranks of a distributed group, so applying them to
-            a made-up rank has no meaning and silently mutes the actor — e.g.
-            ``export_rank: 3`` never matches a synthetic rank 0. Ranked members
-            of a real worker group must leave this false.
 
-    Never raises: unlike the driver, a worker must not fail a training run over
-    optional observability, and the driver has already validated the same
-    config before any worker starts — so a genuine misconfiguration surfaces
-    there, loudly, rather than here.
+    Never raises: a worker must not fail a training run over optional
+    observability. The driver resolves the same config before any worker
+    starts, so a misconfiguration is already reported once, from the one
+    process whose log the user is reading — rather than once per worker.
 
     Returns the :class:`TelemetryHandle`, or ``None`` if telemetry is disabled
     or setup failed. Idempotent per process.
@@ -413,7 +381,9 @@ def init_telemetry_worker(
     try:
         from nemo.lens import NemoLensConfig, setup_telemetry
 
-        from nemo_rl.telemetry.span_groups import RLSpanGroup
+        # Imported for the side effect: registers NeMo-RL's span groups, which
+        # the spec in the config below resolves against.
+        import nemo_rl.telemetry.span_groups  # noqa: F401
 
         if rank is None:
             rank = int(os.environ.get("RANK", "0"))
@@ -423,19 +393,14 @@ def init_telemetry_worker(
         config = NemoLensConfig.from_env(
             prefix=_OTEL_PREFIX,
             fallback_prefix=_OTEL_FALLBACK_PREFIX,
-            span_group_cls=RLSpanGroup,
         )
         if not config.enabled:
             return None
 
-        handle = setup_telemetry(
-            config,
-            rank=rank,
-            world_size=world_size,
-            resource_attributes=_worker_resource_attributes(resource_attributes),
-            # None leaves lens to resolve config.export_strategy as usual.
-            export_strategy=_unrank(config) if always_export else None,
-        )
+        attrs = _worker_resource_attributes(resource_attributes)
+        attrs.update(_rank_attributes(rank=rank, world_size=world_size))
+
+        handle = setup_telemetry(config, resource_attributes=attrs)
         logger.info(
             "nemo-lens worker telemetry initialised (group=%s, rank=%s/%s, exporting=%s)",
             os.environ.get(_WORKER_GROUP_ENV, "?"),
@@ -454,6 +419,102 @@ def init_telemetry_worker(
         return handle
 
 
+#: Set once ``instrument_aiohttp_client`` has patched the client, so a second
+#: call is a no-op. The upstream instrumentor warns and skips on re-entry, and
+#: an actor that spins up more than once would otherwise log that warning on a
+#: path where nothing is wrong.
+_AIOHTTP_INSTRUMENTED = False
+
+
+def instrument_aiohttp_client() -> bool:
+    """Make outgoing ``aiohttp`` requests carry the caller's trace context.
+
+    The NeMo-Gym rollout path leaves this process over HTTP from inside Gym's
+    own client, so there is no request NeMo-RL can add a header to. Patching the
+    client library instead means every request Gym makes is stamped with a W3C
+    ``traceparent`` taken from the ambient context, which is what lets a Gym
+    server running :func:`nemo.lens.contrib.fastapi.instrument_fastapi` continue
+    the trace rather than start one.
+
+    Call after worker telemetry is up and before any ``ClientSession`` exists --
+    the instrumentor patches the class, so sessions built earlier keep the
+    unpatched behaviour.
+
+    Returns:
+        Whether the client is instrumented. ``False`` when telemetry is off, or
+        when the optional dependency is missing -- neither is fatal, because
+        losing the Gym half of a trace is not a reason to fail a rollout.
+    """
+    global _AIOHTTP_INSTRUMENTED
+    if _AIOHTTP_INSTRUMENTED:
+        return True
+    if get_telemetry_handle() is None:
+        return False
+    try:
+        from nemo.lens.contrib.aiohttp import instrument_aiohttp_client as _instrument
+
+        _instrument()
+    except ImportError:
+        # nemo-lens[aiohttp] pulls this in, so it is present in a normal
+        # install. Reachable when lens is pinned without the extra.
+        logger.warning(
+            "nemo-lens: aiohttp instrumentation unavailable, so NeMo-Gym HTTP "
+            "calls will start their own traces; install nemo-lens[aiohttp]",
+        )
+        return False
+    except Exception:
+        logger.warning(
+            "nemo-lens: aiohttp instrumentation failed; continuing without it",
+            exc_info=True,
+        )
+        return False
+    else:
+        _AIOHTTP_INSTRUMENTED = True
+        return True
+
+
+def traced_worker_init(span_name: str, **attributes: Any) -> Callable[[_F], _F]:
+    """Decorate a worker ``__init__`` so its model load lands in a span.
+
+    Training workers build and shard the model inside ``__init__``, which on a
+    large checkpoint is the longest single phase of a run's startup. Without
+    this the time is real but unattributed: the driver's ``rl.setup.workers``
+    span covers it as one block, and nothing says what the worker was doing.
+
+    Initialises worker telemetry before the body runs. A worker normally calls
+    :func:`init_telemetry_worker` itself a few lines into ``__init__``, but a
+    span cannot open before its provider exists, so the decorator hoists that
+    call ahead of the constructor; the body's own call then returns the handle
+    already made, being idempotent per process.
+
+    A ``None`` handle -- telemetry off, or its setup failed -- runs the
+    constructor untouched. That is also what keeps this safe when ``nemo.lens``
+    is absent: the span imports below are reached only once a handle exists,
+    which cannot happen without lens, so an install without it neither imports
+    nor pays for any of this.
+
+    The span belongs to the ``model_init`` umbrella and so carries no
+    ``rl.bucket``: it is startup rather than a phase of a training step, and
+    the goodput rollup measures steps.
+    """
+
+    def decorate(fn: _F) -> _F:
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            if init_telemetry_worker() is None:
+                return fn(*args, **kwargs)
+
+            from nemo_rl.telemetry.instrumentation import umbrella_span
+            from nemo_rl.telemetry.span_groups import RLSpanGroup
+
+            with umbrella_span(RLSpanGroup.U_MODEL_INIT, span_name, **attributes):
+                return fn(*args, **kwargs)
+
+        return cast(_F, wrapper)
+
+    return decorate
+
+
 def get_telemetry_handle() -> Optional["TelemetryHandle"]:
     """Return the process-global telemetry handle (``None`` if uninitialised).
 
@@ -465,20 +526,66 @@ def get_telemetry_handle() -> Optional["TelemetryHandle"]:
 
 
 def shutdown_telemetry(timeout_ms: int = 5000) -> None:
-    """Flush and shut down telemetry providers.
+    """Flush and shut down telemetry providers, returning within *timeout_ms*.
 
     Call on the driver at job end, and in each Ray actor's ``shutdown``: span
     and metric processors buffer in the background, so an actor that exits
     without flushing silently drops whatever it had not exported yet. A no-op
     when this process never initialised telemetry.
+
+    The budget is enforced here rather than passed down, because nothing below
+    honours it. ``TelemetryHandle.shutdown`` forwards ``timeout_ms`` to
+    ``force_flush(timeout_millis=...)``, and the SDK's ``BatchProcessor``
+    accepts that argument and then drains the whole queue regardless; the
+    ``provider.shutdown()`` calls that follow take no timeout at all and fall
+    back to the SDK's own 30s. Four unbounded calls in total. Against an
+    unreachable collector each buffered batch is retried with exponential
+    backoff, so the cost scales with the queue: 3k spans took 36s under a 5s
+    budget when measured.
+
+    That mattered because callers size their own timeouts on this one --
+    ``_flush_collector_telemetry`` in async GRPO allows 15s for a 3s quiesce
+    plus "its 5s export", then ``ray.kill``s the collector when the budget
+    blows, dropping the last rollout spans the flush exists to save.
+
+    So: run the flush on a daemon thread and stop waiting at the deadline. A
+    flush that overruns is abandoned rather than joined, which loses the same
+    spans an unreachable collector was going to lose anyway, and being a daemon
+    it never holds up process exit.
     """
     global _TELEMETRY_HANDLE
     handle = _TELEMETRY_HANDLE
     if handle is None:
         return
+    # Cleared before the flush, not after: a second caller should return at once
+    # rather than queue behind an export that is already overrunning, and the
+    # handle's own _shutdown_done guards the underlying providers.
+    _TELEMETRY_HANDLE = None
+
+    def _flush() -> None:
+        try:
+            handle.shutdown(timeout_ms=timeout_ms)
+        except Exception:
+            logger.warning("nemo-lens: error during telemetry shutdown", exc_info=True)
+
+    flusher = threading.Thread(target=_flush, name="nemo-lens-shutdown", daemon=True)
+    flusher.start()
+    flusher.join(timeout_ms / 1000)
+    if flusher.is_alive():
+        logger.warning(
+            "nemo-lens: telemetry flush exceeded %dms and was abandoned; "
+            "buffered spans and metrics may be lost. Usually means the OTLP "
+            "endpoint is unreachable.",
+            timeout_ms,
+        )
+
+    # Spans opened after this point would be built at full cost and then dropped
+    # by the shut-down processor, which also logs per span. Nothing should be
+    # emitting this late, but the paths that could are ordered by convention
+    # rather than enforcement, so close the gate instead of relying on it.
     try:
-        handle.shutdown(timeout_ms=timeout_ms)
+        from nemo.lens.state import set_enabled_span_groups
+
+        set_enabled_span_groups(frozenset())
     except Exception:
-        logger.warning("nemo-lens: error during telemetry shutdown", exc_info=True)
-    finally:
-        _TELEMETRY_HANDLE = None
+        logger.debug("nemo-lens: could not clear enabled span groups", exc_info=True)
