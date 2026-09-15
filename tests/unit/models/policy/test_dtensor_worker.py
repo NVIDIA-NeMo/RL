@@ -28,7 +28,7 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.flops_tracker import FLOPTracker, get_hf_config
-from tests.unit.test_utils import SimpleLossFn
+from tests.unit.test_utils import SimpleLossFn, UnitSequenceLossFn
 
 
 class _FakeTrainableModel:
@@ -384,6 +384,19 @@ def _test_dtensor_worker_training(policy, data, loss_fn):
         assert "loss" in results, "Training results should contain 'loss'"
         loss_tensor = results["loss"]
         verify_loss_tensor(loss_tensor)
+
+        # global_loss reports the mathematical objective, not the DP/CP factor
+        # applied only to compensate FSDP gradient averaging during backward.
+        # all_mb_metrics are divided by num_global_batches in the worker, so
+        # undo that scaling before comparing the two reporting paths.
+        num_global_batches = loss_tensor.numel()
+        scaled_metric_loss = sum(results["all_mb_metrics"]["loss"])
+        torch.testing.assert_close(
+            loss_tensor.sum(),
+            loss_tensor.new_tensor(scaled_metric_loss * num_global_batches),
+            rtol=1e-4,
+            atol=1e-5,
+        )
         losses.append(loss_tensor[-1].item())
 
         print(f"Training loss: {results['loss']}")
@@ -1023,6 +1036,73 @@ class TestTwoGPUCluster:
 
         # Clean up
         policy.shutdown()
+
+    @pytest.mark.timeout(180)
+    @pytest.mark.parametrize("eval_mode", [False, True])
+    def test_dtensor_packed_dummy_batches_do_not_affect_metrics(
+        self,
+        two_gpu_cluster: RayVirtualCluster,
+        tiny_llama_model_path: str,
+        monkeypatch: pytest.MonkeyPatch,
+        eval_mode: bool,
+    ) -> None:
+        """Uneven packed ranks must report only real samples across global batches."""
+        config = create_test_config(tiny_llama_model_path)
+        config["precision"] = "bfloat16"
+        config["dynamic_batching"]["enabled"] = False
+        config["make_sequence_length_divisible_by"] = 1
+        config["sequence_packing"] = {
+            "enabled": True,
+            "train_mb_tokens": 128,
+            "algorithm": "first_fit_decreasing",
+        }
+        tokenizer = get_tokenizer(config["tokenizer"])
+        policy = Policy(
+            cluster=two_gpu_cluster,
+            config=config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+        )
+        try:
+            # Two global batches, each with two long and two short sequences.
+            # Pack each rank independently to exercise the worker's dummy path:
+            # rank 0 has two real microbatches and rank 1 has one plus a dummy.
+            data = create_test_batch(mode="train", batch_size=8, seq_len=128)
+            data["input_lengths"] = torch.tensor([96, 96, 16, 16] * 2)
+            packing_args = {
+                **policy.sequence_packing_args,
+                "max_tokens_per_microbatch": 128,
+            }
+            sharded_data = []
+            for indices in ([0, 1, 4, 5], [2, 3, 6, 7]):
+                rank_data = data.select_indices(indices)
+                packed_shards, _ = rank_data.shard_by_batch_size(
+                    shards=1, batch_size=2, sequence_packing_args=packing_args
+                )
+                sharded_data.extend(packed_shards)
+            for batch_idx in range(2):
+                counts = [
+                    shard.get_batch(
+                        batch_idx=batch_idx, batch_size=2
+                    ).get_microbatch_iterator_for_packable_sequences_len()[0]
+                    for shard in sharded_data
+                ]
+                assert counts == [2, 1]
+            monkeypatch.setattr(
+                policy, "_shard_for_train", lambda data, batch_size: sharded_data
+            )
+
+            policy.prepare_for_training()
+            results = policy.train(data, UnitSequenceLossFn(), eval_mode=eval_mode)
+
+            # Each global batch has mean sequence loss 1, irrespective of dummies.
+            torch.testing.assert_close(results["loss"], torch.ones(2))
+            metrics = results["all_mb_metrics"]
+            assert len(metrics["loss"]) == 6
+            assert sum(metrics["loss"]) == pytest.approx(1.0)
+            assert sum(metrics["num_valid_samples"]) == pytest.approx(4.0)
+        finally:
+            policy.shutdown()
 
     @pytest.mark.timeout(180)
     def test_dtensor_loss_independent_of_microbatch_size_two_gpus(
