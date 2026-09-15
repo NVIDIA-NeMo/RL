@@ -58,6 +58,24 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
             gpus_per_node: 1  # inference GPUs; remainder go to training
     ```
 
+    For default non-colocated vLLM refit, the SingleController entrypoint uses the
+    same vLLM generation path as legacy GRPO/PPO, so you can opt into vLLM's
+    native reload API with:
+
+    ```yaml
+    policy:
+      generation:
+        backend: "vllm"
+        refit_transport: null
+        colocated:
+          enabled: false
+        vllm_cfg:
+          async_engine: true
+          refit_with_reload_api: true
+    ```
+
+    This reload API path has the same limitations described in [Weight Refit](./refit.md#vllm-reload-api).
+
 3. **One RL step = one training batch.** The batch a step trains on is the whole step (see `validate_single_controller_config` in [nemo_rl/algorithms/single_controller_utils/config.py](../../nemo_rl/algorithms/single_controller_utils/config.py)). A GRPO step is also one optimizer step. A PPO step applies `ppo.ppo_epochs` actor updates and `ppo.critic_ppo_epochs` critic updates over that same batch. Both counts must be at least 1 and can be configured independently; the exemplar defaults the critic count to `${ppo.ppo_epochs}`.
 
     ```python

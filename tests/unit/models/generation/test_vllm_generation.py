@@ -1450,6 +1450,36 @@ def test_vllm_generation_rejects_unsupported_reload_refit_config(
         VllmGeneration(DummyCluster(), vllm_config)
 
 
+def test_vllm_validate_settings_rejects_unsupported_reload_refit_config():
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["colocated"]["enabled"] = True
+    vllm_config["vllm_cfg"]["refit_with_reload_api"] = True
+    master_config = types.SimpleNamespace(policy={"generation": vllm_config})
+
+    with pytest.raises(AssertionError, match="not supported yet.*colocated"):
+        VllmGeneration.validate_settings(master_config)
+
+
+def test_vllm_validate_settings_accepts_default_non_colocated_reload_refit():
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["colocated"]["enabled"] = False
+    vllm_config["refit_transport"] = None
+    vllm_config["vllm_cfg"]["refit_with_reload_api"] = True
+    master_config = types.SimpleNamespace(policy={"generation": vllm_config})
+
+    VllmGeneration.validate_settings(master_config)
+
+
+def test_vllm_validate_settings_accepts_missing_vllm_cfg_as_refit_disabled():
+    vllm_config = {
+        "backend": "vllm",
+        "colocated": {"enabled": False, "resources": {}},
+    }
+    master_config = types.SimpleNamespace(policy={"generation": vllm_config})
+
+    VllmGeneration.validate_settings(master_config)
+
+
 def test_vllm_policy_generation(policy, test_input_data, tokenizer):
     """Test vLLM policy generation capabilities."""
     # Test generation

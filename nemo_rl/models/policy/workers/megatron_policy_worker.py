@@ -778,6 +778,8 @@ class MegatronPolicyWorkerImpl(
         self.model_slices_context_parallel_inputs = (
             _model_slices_context_parallel_inputs(self.model)
         )
+        mtp_num_layers = self._get_model_config().mtp_num_layers
+        self.mtp_enabled = mtp_num_layers is not None and mtp_num_layers > 0
         # A media placeholder is an ordinary vocabulary entry, so text that
         # legitimately contains it must not be read as an anchor demanding a
         # projected feature. Only models that accept the mask are sent one.
@@ -1033,10 +1035,11 @@ class MegatronPolicyWorkerImpl(
 
                 # Pre-compute the MTP loss mask, only when MTP is enabled, so
                 # process_microbatch can pack it.
-                model_config = self._get_model_config()
-                mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
-                mtp_enabled = mtp_num_layers is not None and mtp_num_layers > 0
-                if mtp_enabled and "token_mask" in batch and "sample_mask" in batch:
+                if (
+                    self.mtp_enabled
+                    and "token_mask" in batch
+                    and "sample_mask" in batch
+                ):
                     mtp_loss_mask = batch["token_mask"] * batch[
                         "sample_mask"
                     ].unsqueeze(-1)
@@ -1058,6 +1061,7 @@ class MegatronPolicyWorkerImpl(
                     delegate_pack_to_model=self.delegate_pack_to_model,
                     delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
                     model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+                    mtp_enabled=self.mtp_enabled,
                 )
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
@@ -1120,6 +1124,7 @@ class MegatronPolicyWorkerImpl(
                             global_valid_toks=global_valid_toks,
                             sampling_params=self.sampling_params,
                             straggler_timer=self.mcore_state.straggler_timer,
+                            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
                             draft_model=self.draft_model,
                             enable_hidden_capture=draft_enabled,
                             use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
@@ -1406,8 +1411,7 @@ class MegatronPolicyWorkerImpl(
             metric_normalizations = {}
 
         model_config = self._get_model_config()
-        mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
-        mtp_enabled = mtp_num_layers is not None and mtp_num_layers > 0
+        mtp_enabled = self.mtp_enabled
         mtp_detach_heads = bool(getattr(model_config, "mtp_detach_heads", False))
         mtp_loss_scaling_factor = getattr(model_config, "mtp_loss_scaling_factor", 0.1)
         loss_type = getattr(loss_fn, "loss_type", LossType.TOKEN_LEVEL)
@@ -1429,7 +1433,7 @@ class MegatronPolicyWorkerImpl(
                 "policy.megatron_cfg.mtp_detach_heads=True on the SingleController "
                 "split training path because the MTP auxiliary gradient must be "
                 "normalized by valid tokens independently of the main loss. "
-                f"Got loss_type={loss_type}, mtp_num_layers={mtp_num_layers}, "
+                f"Got loss_type={loss_type}, mtp_num_layers={model_config.mtp_num_layers}, "
                 f"mtp_loss_scaling_factor={mtp_loss_scaling_factor}."
             )
 
@@ -1714,6 +1718,7 @@ class MegatronPolicyWorkerImpl(
             delegate_pack_to_model=self.delegate_pack_to_model,
             delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+            mtp_enabled=self.mtp_enabled,
         )
         state["total_num_microbatches"] += int(num_microbatches)
 
@@ -1760,6 +1765,7 @@ class MegatronPolicyWorkerImpl(
                     global_valid_toks=placeholder_n,
                     sampling_params=self.sampling_params,
                     straggler_timer=self.mcore_state.straggler_timer,
+                    model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
                     draft_model=self.draft_model,
                     enable_hidden_capture=draft_enabled,
                     use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
@@ -2154,6 +2160,7 @@ class MegatronPolicyWorkerImpl(
             delegate_pack_to_model=self.delegate_pack_to_model,
             delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+            mtp_enabled=self.mtp_enabled,
         )
 
         use_fused_linear_logprobs = self.cfg["megatron_cfg"].get(
@@ -2183,6 +2190,7 @@ class MegatronPolicyWorkerImpl(
                 defer_fp32_logits=self.defer_fp32_logits,
                 sampling_params=self.sampling_params,
                 straggler_timer=self.mcore_state.straggler_timer,
+                model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
                 use_router_replay=use_router_replay,
                 router_replay_train=False,
@@ -2398,6 +2406,7 @@ class MegatronPolicyWorkerImpl(
             delegate_pack_to_model=self.delegate_pack_to_model,
             delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+            mtp_enabled=self.mtp_enabled,
         )
 
         list_of_outputs = megatron_forward_backward(
@@ -2416,6 +2425,7 @@ class MegatronPolicyWorkerImpl(
             defer_fp32_logits=self.defer_fp32_logits,
             sampling_params=self.sampling_params,
             straggler_timer=self.mcore_state.straggler_timer,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
             enable_opd_full_capture=(payload == "hidden_states"),
         )
 
@@ -2621,6 +2631,7 @@ class MegatronPolicyWorkerImpl(
             delegate_pack_to_model=self.delegate_pack_to_model,
             delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+            mtp_enabled=self.mtp_enabled,
         )
 
         list_of_outputs = megatron_forward_backward(
@@ -2634,6 +2645,7 @@ class MegatronPolicyWorkerImpl(
             defer_fp32_logits=self.defer_fp32_logits,
             sampling_params=self.sampling_params,
             straggler_timer=self.mcore_state.straggler_timer,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
         )
 
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
@@ -2768,8 +2780,7 @@ class MegatronPolicyWorkerImpl(
                 the model-parallel group, or None when unavailable (e.g. clip_grad == 0 or
                 mtp_detach_heads=False). Logged under "mtp_metrics" as "grad_norm".
         """
-        mtp_num_layers = getattr(self.model.config, "mtp_num_layers", None)
-        if mtp_num_layers is not None and mtp_num_layers > 0:
+        if self.mtp_enabled:
             from nemo_rl.models.megatron.common import get_mtp_metrics
 
             # MTP layers live only on the last pipeline stage, so the tracker is
