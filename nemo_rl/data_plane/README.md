@@ -458,7 +458,7 @@ and the workers' per-DP-rank `get_samples`, and neither appears in these
 series. Do not read `comm_volume_mb` as cluster-wide volume.
 
 `OpStats` is additive on purpose, and `merge_snapshots()` uses it: the
-histogram buckets and the regression sufficient statistics from every rank
+histogram buckets and the byte and wall-time totals from every rank
 *sum* into one cluster-wide view. Everything derived — percentiles, the
 throughput — is recomputed from the merged totals, never
 averaged across ranks (averaging per-rank percentiles does not give a
@@ -570,8 +570,8 @@ cluster sizes, `percent_of_dataplane` to attribute cost across ops within one st
 
 A stack of line charts answers "how did put's wall time trend"; this
 answers "where did the step go", which is a table. Cells are empty rather
-than zero where a series was withheld (a percentile below the sample gate,
-a fit that is not trustworthy) — a zero would read as a measurement. It is
+than zero where a series was withheld (a percentile below the sample
+gate) — a zero would read as a measurement. It is
 built from the same metrics dict that is logged, so the table and the
 series cannot disagree. Only wandb renders it; other backends skip it.
 
@@ -585,16 +585,21 @@ tell them apart:
 | `now/` | what is true at this instant; persists | `now/bytes_outstanding_mb` |
 
 A rising `now/bytes_outstanding_mb` is not an accumulation bug — it is the
-leak signal the metric exists for: bytes put and never cleared.
+leak signal the metric exists for: bytes put and never cleared. Expect a
+saw-tooth rather than a straight line on a process that never clears its
+own writes: the accounting reconciles itself against the store's live uids
+once every 16384 rows put, and the cluster view sums those per-process
+levels.
 
 Two more read differently in the cluster view and are named to say so:
 
-- **`step/frac_of_step` is per process.** `wall_ms` sums processes that ran
-  concurrently, so dividing it by one step's wall clock exceeded 1 whenever
-  they overlapped (measured 1.054 across ten processes) and read as "105%
-  of the step". Divided per process it is the mean share of the step a
-  process spent in the data plane, which is what the name claims.
-- **`step/{op}/max_ms` is scoped to the step by being reset**, not by being
+- **`step/frac_of_step` is the slowest process.** `wall_ms` sums processes
+  that ran concurrently, so dividing it by one step's wall clock exceeded 1
+  whenever they overlapped (measured 1.054 across ten processes) and read as
+  "105% of the step". Reduced with a max instead, it is the share of the step
+  the slowest process spent in the data plane — the cost the step actually
+  waited on, which is what the name claims.
+- **`step/by_op/{op}/max_ms` is scoped to the step by being reset**, not by being
   differenced. A maximum cannot be recovered from two cumulative readings
   the way `calls` and `wall_ms` can, so the reader that consumes it zeroes
   it — `snapshot(reset_step_window=True)`, which the once-per-step
@@ -719,6 +724,7 @@ One granularity: every row carries its own digest, formed from two parts.
 | the seed's dtype | precision (bf16 vs fp32 at equal width) | yes |
 | the seed's shape | length (a zero pad or a truncation) and trailing-dim layout | yes |
 | — | a permutation *within* one row | **no** — see below |
+| — | one or two rows of a constant-valued column, at even row length | **no** — see below |
 
 The shape never travels and is never compared: one integer per row per field
 is stored, and that is the whole reading. A shape change makes the seed
@@ -784,15 +790,28 @@ pack/unpack offsets are where one would live — swapping `_leaf_digests` for
 the `crc32` form is a one-function change.
 
 Verified by injecting corruption into the round trip. Caught: a
-single-element change in every dtype, a truncated row, a zeroed row, a
-bf16→fp32 precision change, a zero pad, a trailing-dim reshape, and a row
-served from the wrong sample — with **zero false alarms** over a 500-row
-randomized soak, every shard grouping from 1 to 256, reversed id order,
-field subsets and delta writes. Not caught, by the deliberate choice above:
-a reordering of elements *within* one row. Note the row-swap and the
-within-row cases differ — two rows exchanged between wire-in and wire-out
-land against the wrong sample ids and are caught, because each row carries
-its own digest. Known limits, measured rather than assumed:
+single-element change in every dtype, a truncated row, a zeroed row (unless
+the row was constant and of even length — see below), a bf16→fp32 precision
+change, a zero pad, a trailing-dim reshape, and a row served from the wrong
+sample — with **zero false alarms** over a 500-row randomized soak, every
+shard grouping from 1 to 256, reversed id order, field subsets and delta
+writes. Not caught, by the deliberate choice above: a reordering of elements
+*within* one row. Note the row-swap and the within-row cases differ — two
+rows exchanged between wire-in and wire-out land against the wrong sample
+ids and are caught, because each row carries its own digest, unless both
+rows are constant and of the same even length. Known limits, measured rather
+than assumed:
+
+- **A constant-valued row of even length folds to zero**, so its digest is
+  the `dtype|row shape` seed alone and is the same for every value. GRPO's
+  `advantages` is exactly that — one scalar expanded across the row — so at
+  an even row length two samples' advantages are indistinguishable and a
+  swap between them is not reported (missed 1/2 to 1/4 of the time for a
+  corruption confined to one or two such rows; a whole corrupted column is
+  still caught with probability 1 − 2⁻ᴺ, since every row would have to be
+  even-length at once). Odd lengths leave one unpaired element and are
+  caught. 0/1 columns such as `token_mask` are exposed the same way. Pinned
+  by `test_a_constant_row_of_even_length_collides_across_values`.
 
 - It compares digests, so it detects divergence, not its cause. A mismatch
   names the sample, the field, the row index and the row length; what
