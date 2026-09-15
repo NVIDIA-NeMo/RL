@@ -94,6 +94,36 @@ def test_replace_prefix_tokens_uses_last_eos_in_template_prefix():
     assert result == [100, 2, 77, 88]
 
 
+def test_replace_prefix_tokens_preserves_secondary_sampled_stop_token():
+    class _T:
+        eos_token_id = 2
+
+    result = replace_prefix_tokens(
+        tokenizer=_T(),
+        model_prefix_token_ids=[100, 3],
+        template_prefix_token_ids=[9, 2],
+        template_token_ids=[9, 2, 77, 88],
+        model_stop_token_ids={2, 3},
+    )
+
+    assert result == [100, 3, 77, 88]
+
+
+def test_replace_prefix_tokens_adds_template_eos_after_length_termination():
+    class _T:
+        eos_token_id = 2
+
+    result = replace_prefix_tokens(
+        tokenizer=_T(),
+        model_prefix_token_ids=[100, 55],
+        template_prefix_token_ids=[9, 2],
+        template_token_ids=[9, 2, 77, 88],
+        model_stop_token_ids={2, 3},
+    )
+
+    assert result == [100, 55, 2, 77, 88]
+
+
 def test_replace_prefix_tokens_qwen3_think_shift_picks_assistant_eos_not_user_eos():
     """Non-strict-prefix: Qwen3 strips <think> from history when the last message is a
     user turn, so the template's prefix region is shorter and a later user-turn EOS

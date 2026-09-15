@@ -24,6 +24,7 @@ from nemo_rl.models.generation.trtllm.trtllm_http_server import (
     _compute_splice_inputs,
     _make_parse_tool_calls,
     _resolve_tool_parser_name,
+    _tokens_for_response_text,
 )
 
 
@@ -94,6 +95,23 @@ def test_http_sampling_params_map_null_top_k_and_empty_stop_tokens():
         include_stop_str_in_output=True,
         logprobs=True,
         logprobs_simple_format=True,
+    )
+
+
+def test_response_text_excludes_stops_without_mutating_training_tokens():
+    generation_token_ids = [10, 20, 2, 3]
+
+    text_token_ids = _tokens_for_response_text(generation_token_ids, {2, 3})
+
+    assert text_token_ids == [10, 20]
+    assert generation_token_ids == [10, 20, 2, 3]
+
+
+def test_response_text_reuses_unterminated_generation_tokens():
+    generation_token_ids = [10, 20]
+
+    assert (
+        _tokens_for_response_text(generation_token_ids, {2, 3}) is generation_token_ids
     )
 
 
