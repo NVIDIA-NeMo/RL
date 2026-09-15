@@ -914,9 +914,18 @@ class VllmAsyncGenerationWorkerImpl(
             raise RuntimeError("generation-cut fetch did not return every staged chunk")
         if not snapshots:
             raise RuntimeError("generation-cut continuation has no staged chunks")
-        weight_versions = {snapshot.weight_version for snapshot in snapshots}
-        if len(weight_versions) != 1:
-            raise RuntimeError("generation-cut chunks span multiple policy versions")
+        weight_versions = [snapshot.weight_version for snapshot in snapshots]
+        if weight_versions != sorted(weight_versions):
+            raise RuntimeError(
+                "generation-cut chunk policy versions are not monotonically non-decreasing"
+            )
+        current_weight_version = self._rollout_weight_version
+        if weight_versions[-1] > current_weight_version:
+            raise RuntimeError(
+                "generation-cut prefix contains policy version "
+                f"{weight_versions[-1]}, newer than the current rollout version "
+                f"{current_weight_version}"
+            )
         token_ids_delta = [
             token_id for snapshot in snapshots for token_id in snapshot.token_ids_delta
         ]
@@ -950,7 +959,11 @@ class VllmAsyncGenerationWorkerImpl(
 
         delta_len = len(token_ids_delta)
         cum_len = admission.prev_len + delta_len
-        weight_version = next(iter(weight_versions))
+        # A cut chain may span retries performed after later weight updates.
+        # Its token-level behavior logprobs remain attached to their original
+        # chunks. The cumulative snapshot uses the oldest contributing version
+        # so downstream replay-buffer staleness checks remain conservative.
+        weight_version = weight_versions[0]
         extras_digest = compute_extras_digest(None)
         chain_hash = compute_chain_hash(admission.parent_chain_hash, token_ids_delta)
         cumulative_hash = hash_token_ids(prefix_token_ids + token_ids_delta)
@@ -1000,12 +1013,15 @@ class VllmAsyncGenerationWorkerImpl(
         )
         LOGGER.info(
             "generation prefix restored: rollout_id=%s model_call_id=%s "
-            "source_model_call_id=%s prefix_tokens=%d prefix_digest=%s",
+            "source_model_call_id=%s prefix_tokens=%d prefix_digest=%s "
+            "weight_version_span=[%d,%d]",
             admission.rollout_id,
             admission.model_call_id,
             continuation.source_model_call_id,
             continuation.generation_token_count,
             continuation.digest,
+            weight_versions[0],
+            weight_versions[-1],
         )
         return snapshot
 

@@ -798,6 +798,86 @@ def test_generation_cut_swaps_buffer_before_blocking_prefix_write():
     assert restored.token_mask_delta == [0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
 
 
+def test_generation_cut_restore_accepts_monotonic_mixed_policy_versions():
+    first_sink = _MemorySink()
+    first_capture = RolloutTokenCapture(
+        sink=first_sink,
+        weight_version_fn=lambda: 7,
+    )
+    first_call = first_capture.begin_call(
+        CaptureAdmission(rollout_id="r0", model_call_id="c1", mode="text")
+    )
+    first_chunk = first_capture.build_prefix_record(
+        first_call,
+        prompt_token_ids=[10, 11],
+        generated_token_ids=[12, 13],
+        generated_logprobs=[-0.1, -0.2],
+    )
+    first_key = "__generation_cut__/checkpoint-1/r0/c1"
+    second_admission = CaptureAdmission(
+        rollout_id="r0-a1",
+        model_call_id="c2",
+        mode="text",
+        generation_cut={
+            "source_capture_key": "r0",
+            "source_model_call_id": "c1",
+            "staging_keys": [first_key],
+            "generation_token_count": 2,
+            "digest": first_chunk.digest,
+        },
+    )
+    second_capture = RolloutTokenCapture(
+        sink=_MemorySink(),
+        weight_version_fn=lambda: 9,
+    )
+    second_call = second_capture.begin_call(
+        second_admission,
+        prefix_token_ids=[],
+        generation_cut=first_chunk,
+        generation_cut_staging_keys=second_admission.generation_cut.staging_keys,
+    )
+    second_chunk = second_capture.build_generation_chunk_record(
+        second_call,
+        generated_token_ids=[14, 15],
+        generated_logprobs=[-0.3, -0.4],
+    )
+    cumulative = second_capture.build_prefix_record(
+        second_call,
+        prompt_token_ids=[10, 11, 12, 13],
+        generated_token_ids=[14, 15],
+        generated_logprobs=[-0.3, -0.4],
+    )
+    second_key = "__generation_cut__/checkpoint-2/r0-a1/c2"
+    worker = _worker_with_capture(_MemorySink())
+    worker._rollout_weight_version = 9
+    worker._staging_source = _MemoryPrefixSource(
+        {},
+        records={first_key: first_chunk, second_key: second_chunk},
+    )
+    admission = CaptureAdmission(
+        rollout_id="r0-a2",
+        model_call_id="c3",
+        mode="text",
+        generation_cut={
+            "source_capture_key": "r0-a1",
+            "source_model_call_id": "c2",
+            "staging_keys": [first_key, second_key],
+            "generation_token_count": 4,
+            "digest": cumulative.digest,
+        },
+    )
+
+    worker._rollout_weight_version = 8
+    with pytest.raises(RuntimeError, match="newer than the current rollout version"):
+        worker._resolve_generation_cut(admission, [])
+    worker._rollout_weight_version = 9
+    restored = worker._resolve_generation_cut(admission, [])
+
+    assert restored.weight_version == 7
+    assert restored.token_ids_delta == [10, 11, 12, 13, 14, 15]
+    assert restored.generation_log_probs_delta == [0.0, 0.0, -0.1, -0.2, -0.3, -0.4]
+
+
 def test_generation_cut_rolls_frozen_buffer_back_after_staging_failure():
     sink = _FailOncePrefixSink()
     worker = _worker_with_capture(sink)
@@ -855,6 +935,7 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
     caplog.set_level(logging.INFO)
     sink = _MemorySink()
     original_worker = _worker_with_capture(sink)
+    original_worker._rollout_weight_version = 7
     original_request = _FakeRequest(
         ng_capture={
             "rollout_id": "r0",
@@ -900,6 +981,7 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
     cut_record = sink.generation_prefix_records[-1][1]
 
     resumed_worker = _worker_with_capture(sink)
+    resumed_worker._rollout_weight_version = 9
     resumed_worker._staging_source = _MemoryPrefixSource(
         {}, records={cut_key: cut_record}
     )
@@ -972,6 +1054,8 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
     assert final_record.token_ids_delta == [10, 11, 12, 13, 14]
     assert final_record.token_mask_delta == [0.0, 0.0, 1.0, 1.0, 1.0]
     assert final_record.generation_log_probs_delta == [0.0, 0.0, -0.1, -0.2, -0.3]
+    assert final_record.weight_version == 7
+    assert content["ng_commit_coords"]["weight_version"] == 7
     assert resumed_worker._completed_capture_calls["c2"].generation_token_count == 3
     assert "generation prefix restored:" in caplog.text
     assert f"prefix_digest={cut_record.digest}" in caplog.text
