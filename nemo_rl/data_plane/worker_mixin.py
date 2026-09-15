@@ -38,6 +38,7 @@ import torch
 
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, backend_config
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
@@ -343,6 +344,10 @@ class TQWorkerMixin:
         # bootstrap=False — the driver already created the named
         # controller actor; this process attaches as a client.
         self._dp_client = build_data_plane_client(cfg, bootstrap=False)
+
+    def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
+        """Run an owner-local checkpoint command; return metadata, never payloads."""
+        return run_checkpoint_command(body)
 
     def _require_dp_client(self) -> DataPlaneClient:
         if self._dp_client is None:
