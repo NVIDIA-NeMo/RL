@@ -18,7 +18,15 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from omegaconf import OmegaConf
+from pydantic import TypeAdapter
 
+from nemo_rl.data import DataConfig
+from nemo_rl.utils.config import (
+    load_config,
+    parse_hydra_overrides,
+    register_omegaconf_resolvers,
+)
 from tests.functional._sglang_grpo_chaos import (
     Engine,
     KillReceipt,
@@ -184,4 +192,39 @@ def test_launches_real_grpo_with_canonical_config(expect: str, budget: int) -> N
     assert "grpo.max_num_steps=12" in command
     assert "logger.tensorboard_enabled=true" in command
     assert "policy.generation.use_async_rollouts=false" in command
+    assert "data.train.dataset_name=GSM8K" in command
+    assert "+data.train.subset=main" in command
+    assert "+data.train.split=train" in command
+    assert "+data.train.extract_answer=true" in command
+    assert "data.train.split_validation_size=0" in command
+    assert "~data.train.seed" in command
+    assert "policy.tokenizer.chat_template_kwargs={enable_thinking:false}" in command
     assert not any("test_fault_tolerance_real.py" in arg for arg in command)
+
+
+@pytest.mark.parametrize(
+    ("expect", "budget"), [("survival", 1), ("bounded_failure", 0)]
+)
+def test_real_grpo_command_resolves_config(expect: str, budget: int) -> None:
+    project = Path(__file__).resolve().parents[2]
+    command = training_command(project, Path("/artifacts"), expect=expect, steps=12)
+    register_omegaconf_resolvers()
+    config = parse_hydra_overrides(load_config(command[3]), command[4:])
+    resolved = OmegaConf.to_container(config, resolve=True)
+    assert isinstance(resolved, dict)
+    train = resolved["data"]["train"]
+    assert train["dataset_name"] == "GSM8K"
+    assert train["subset"] == "main"
+    assert train["split"] == "train"
+    assert train["extract_answer"] is True
+    assert train["split_validation_size"] == 0
+    assert "seed" not in train
+    # This is MasterConfig.data's actual schema, without importing the trainer.
+    TypeAdapter(DataConfig).validate_python(resolved["data"])
+    policy = resolved["policy"]
+    assert policy["tokenizer"]["chat_template_kwargs"] == {"enable_thinking": False}
+    fault_tolerance = policy["generation"]["sglang_cfg"][
+        "sglang_fault_tolerance_config"
+    ]
+    assert fault_tolerance["use_fault_tolerance"] is True
+    assert fault_tolerance["rollout_max_restart_attempts"] == budget

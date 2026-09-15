@@ -145,6 +145,15 @@ def training_command(
         "--config",
         str(project / "examples/configs/grpo_math_1B_sglang.yaml"),
         "policy.model_name=Qwen/Qwen3-0.6B",
+        # Keep this short real-training check independent of a multi-GB corpus.
+        # GSM8K uses the same math processor, reward workers, and GRPO trainer.
+        "data.train.dataset_name=GSM8K",
+        "+data.train.subset=main",
+        "+data.train.split=train",
+        "+data.train.extract_answer=true",
+        "data.train.split_validation_size=0",
+        "~data.train.seed",
+        "policy.tokenizer.chat_template_kwargs={enable_thinking:false}",
         "grpo.num_prompts_per_step=4",
         "grpo.num_generations_per_prompt=4",
         "policy.train_global_batch_size=16",
