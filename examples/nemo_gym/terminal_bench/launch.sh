@@ -27,6 +27,8 @@ for v in CONTAINER SLURM_ACCOUNT SLURM_PARTITION NUM_TRAIN_NODES NUM_GEN_NODES M
 done
 
 RL_ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
+mkdir -p "$RUN_DIR"
+export RUN_DIR=$(realpath "$RUN_DIR")  # Slurm uses the physical path as the container workdir
 EXP_NAME=${EXP_NAME:-tb-opencode-$(date +%Y%m%d-%H%M%S)}
 NUM_NODES=$((NUM_TRAIN_NODES + NUM_GEN_NODES))
 export GPUS_PER_NODE=4
@@ -54,7 +56,6 @@ cd /opt/nemo-rl && uv run --locked --extra nemo_gym examples/run_grpo_single_con
   $@
 EOF
 
-mkdir -p "$RUN_DIR"
 cd "$RUN_DIR"
 COMMAND=$COMMAND SETUP_COMMAND=$SETUP_COMMAND CONTAINER=$CONTAINER \
 MOUNTS="$RL_ROOT:/opt/nemo-rl,$MODEL:$MODEL,$DATA:$DATA,$TASK_ROOT:/terminal-bench-tasks,$RUN_DIR:$RUN_DIR${HF_HOME:+,$HF_HOME:$HF_HOME}${MOUNTS:+,$MOUNTS}" \
