@@ -602,7 +602,12 @@ class WandbLogger(LoggerInterface):
             step: Global step value
             name: Panel name
         """
-        self.run.log({name: wandb.Table(columns=columns, data=rows)}, step=step)
+        with self._log_lock:
+            self._buffer_step_metrics_locked(
+                {name: wandb.Table(columns=columns, data=rows)},
+                step=step,
+                step_finished=False,
+            )
 
     def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
         """Log a plot to wandb.
