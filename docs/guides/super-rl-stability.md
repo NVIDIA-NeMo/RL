@@ -119,6 +119,15 @@ it is never retried to seek a positive label. Math's required swapped-order
 check remains separate, with its own bounded attempts. Other exceptions are
 not retried. Final exhaustion still fails closed.
 
+The attempt count is not a transport deadline. The pinned
+`nemo_gym/openai_utils.py::NeMoGymAsyncOpenAI._request_with_retry` extends its
+retry allowance on rate-limit-class HTTP statuses, including 429 and 503, and
+the shared aiohttp client has no configured total request timeout. One wrapped
+decision can therefore remain inside the transport layer without consuming the
+next judge attempt. A per-decision deadline and bounded transport/backpressure
+policy still require separate implementation and native outage tests. The
+allocation's wall-clock limit is a resource bound, not a substitute for that fix.
+
 This reuses an answer **in memory**, not across preemption or a new job. Durable
 judge-only retry remains unimplemented. Do not interpret a healthy judge endpoint or growing rollout counts
 as evidence that optimizer updates are progressing. Diagnose repeated tagged
@@ -472,6 +481,7 @@ local collection still requires the missing Ray/Torch stack.
 | Complete pinned dependency closure | Exact Gym, Bridge, nested Megatron-LM and Automodel revisions were staged and checked in the AWS-CMH native runtime. That does not establish fresh upstream access or image compatibility everywhere. | Reproduce immutable source/image staging on each destination; preserve shallow Git boundaries when transferring partial histories. Do not replace pins or vendor mutable run copies. |
 | Kimi effort / multi-turn budget integration | Cumulative Gym budget overlays are implemented; Kimi reward shaping is not. The enabled-effort guard remains deliberate. | Port and review the typed effort schema and GRPO reward integration with end-to-end effective-request and reward tests. Ordinary-RL smoke is not Kimi certification. |
 | Judge missing-verdict / transport-failure contract | Strict verdict parsing and tagged-row rejection are implemented. Native boundary tests passed, but they are not end-to-end outage/load tests. | Preserve valid negative verdicts, bound retries and backpressure, and inject real transport/replica failures before production. Never turn service failure into reward zero. |
+| CCC compiler warnings / shared precompile cache | The pinned `resources_servers/competitive_coding_challenges/ccc_eval.py` still infers compilation success from an empty stderr and publishes a precompile cache without synchronization. A warning can be mistaken for a compile failure; concurrent first use can race in the same problem/PID directory. This is source-review evidence, not proof that a particular smoke row was affected. | Reproduce warning-only successful compilation, real compiler failure, and concurrent same-problem initialization in the actual sandbox; use process status and safely publish a complete cache. Keep policy prompts and actual test outcomes unchanged. |
 | Hosted judge outage / local HA service | The provider's auth DB exhaustion and empty 500s were external; a recovered canary did not fix service capacity. No local judge fleet is provisioned by this branch. | Prefer a dedicated self-hosted service for the requested production contract, with model/prompt/reasoning parity, independent replicas, bounded backpressure/retry, long-request load tests and replica-loss injection. Never silently change judge model or reward on failover. |
 | Policy NaN in incident 8 | Exact nonfinite field and numerical root cause were not captured in that event. Later non-reproduction is not a fix. | vLLM HTTP serialization / `vllm_worker_async.py`: add bounded, private field/request diagnostics, preserve the original exception, then reproduce with weight lineage. No `nan_to_num`. The job-bound snapshot logger is not copied. |
 | Sparse generation/learner logprob spikes | Threshold-2 filtering remained; root cause is unknown. | Fixed-input comparison of generation/logprob token alignment, masks, weight versions and routes. Keep existing filtering/penalties; do not raise the threshold to hide the issue. |
