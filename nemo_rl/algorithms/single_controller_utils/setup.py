@@ -937,6 +937,40 @@ def _load_opd_full_teacher_lm_heads(
     )
 
 
+_MINF_CAPTURE_HOOK_PROTOCOLS = ("RequestPayloadStager", "RequestPromptPreparer")
+
+
+def _require_minf_capture_hooks() -> None:
+    """Fail at setup if the pinned megatron-core lacks the MInf capture hooks.
+
+    Megatron token capture installs a ``RequestPayloadStager`` and a
+    ``RequestPromptPreparer`` on ``DynamicInferenceEngine`` (NVIDIA/Megatron-LM
+    PR #7015). Both protocols live in ``megatron.core.inference.inference_request``,
+    so their presence can be checked at config time without building an engine.
+    """
+    try:
+        # Deferred import: megatron-core is a heavy, optional dependency that the
+        # driver venv may not carry at all.
+        from megatron.core.inference import inference_request
+    except ImportError:
+        # The worker-side guard in MegatronGenerationMixin.setup_token_capture
+        # still fails loudly when the engine lacks the hooks.
+        return
+    missing = [
+        name
+        for name in _MINF_CAPTURE_HOOK_PROTOCOLS
+        if not hasattr(inference_request, name)
+    ]
+    if missing:
+        raise NotImplementedError(
+            "Megatron token capture requires the MInf capture hooks from "
+            "NVIDIA/Megatron-LM PR #7015; the pinned megatron-core lacks "
+            f"{', '.join(missing)}. Bump 3rdparty/Megatron-Bridge-workspace/"
+            "Megatron-Bridge to a revision that includes it, or use "
+            "policy.generation.backend=vllm."
+        )
+
+
 def setup_single_controller(
     master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
@@ -1090,10 +1124,11 @@ def setup_single_controller(
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
     # Token capture: validate the supported combination loudly at setup
-    # (NeMo-Gym rollout path, vLLM backend, async_engine=true). The vLLM
-    # worker venv always carries nemo_gym (see VLLM_EXECUTABLE in
-    # ray_actor_environment_registry.py), so nothing here needs to change the
-    # worker's environment.
+    # (NeMo-Gym rollout path; vLLM with async_engine=true, or Megatron with
+    # expose_http_server=true). The serving worker's venv already carries
+    # nemo_gym for both backends (see ACTOR_ENVIRONMENTS in
+    # nemo_rl/distributed/actor_environments.py), so nothing here needs to
+    # change the worker's environment.
     token_capture_cfg = master_config.token_capture
     if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
         if not master_config.checkpointing["enabled"]:
@@ -1135,22 +1170,40 @@ def setup_single_controller(
                 "(env.should_use_nemo_gym=true) — the ledger lives in Gym's "
                 "policy model server"
             )
-        if generation_config["backend"] != "vllm":
+        if generation_config["backend"] not in ("vllm", "megatron"):
             raise NotImplementedError(
-                "token_capture.enabled supports the vllm backend only; got "
+                "token_capture.enabled supports vllm or megatron; got "
                 f"{generation_config['backend']!r}"
             )
-        vllm_cfg = cast(dict[str, Any], generation_config)["vllm_cfg"]
-        if not vllm_cfg["async_engine"]:
+        generation_config_dict = cast(dict[str, Any], generation_config)
+        if (
+            generation_config["backend"] == "vllm"
+            and not generation_config_dict["vllm_cfg"]["async_engine"]
+        ):
             raise ValueError(
                 "token_capture.enabled requires "
                 "policy.generation.vllm_cfg.async_engine=true (the capture "
                 "host is the worker's in-process HTTP server)"
             )
+        if generation_config["backend"] == "megatron":
+            if not generation_config_dict["mcore_generation_config"][
+                "expose_http_server"
+            ]:
+                raise ValueError(
+                    "Megatron token capture requires policy.generation."
+                    "mcore_generation_config.expose_http_server=true"
+                )
+            if router_replay_enabled(master_config.policy):
+                raise NotImplementedError(
+                    "Megatron token capture does not yet support router replay: "
+                    "the canonical MInf stager does not yet normalize routed experts"
+                )
+            _require_minf_capture_hooks()
 
         # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
-        # per-run control-plane bearer token and the process-shared capture
-        # directory used by every Gym worker.
+        # per-run control-plane bearer token, the process-shared capture
+        # directory used by every Gym worker, and the capture-host backend.
+        token_capture_cfg.generation_backend = generation_config["backend"]
         if token_capture_cfg.control_auth_token is None:
             # Deferred import: only needed on the capture path.
             import secrets
@@ -1796,9 +1849,7 @@ def setup_single_controller(
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize", "prev_lp", "train"],
         )
-        # Host Gym's capture core in every vLLM DP leader (in-worker DP
-        # client + TQTokenSink + the single install_capture call), and give
-        # workers the initial weight version to stamp on captured calls.
+        # Both active backends stage canonical Gym rows in serving workers.
         generation.setup_token_capture(dp_config, token_capture_cfg.staging_partition)
         generation.set_rollout_weight_version(0)
 

@@ -198,11 +198,12 @@ class VllmAsyncGenerationWorkerImpl(
         # In-flight captured calls keyed by id(request): (ActiveCall, the
         # exact engine prompt ids recorded at preprocess time).
         self._capture_calls: dict[int, tuple[Any, list[int]]] = {}
-        self._staging_source: Any | None = None
-        # Guarded by _prefix_cache_lock: _fetch_chain_prefix runs on executor
-        # threads (asyncio.to_thread), so lookups/evictions can be concurrent.
-        self._prefix_cache: dict[str, list[int]] = {}
-        self._prefix_cache_lock = threading.Lock()
+        # Resolved staging-chain prefixes, shared implementation with the Megatron
+        # preparer. Installed by setup_token_capture; fetch runs on executor threads.
+        # Deferred import: tq_token_sink pulls in the data-plane stack.
+        from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache
+
+        self._chain_prefix = ChainPrefixCache()
 
         super().__init__(
             config,
@@ -486,10 +487,9 @@ class VllmAsyncGenerationWorkerImpl(
 
         dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
         sink = TQTokenSink(dp_client, staging_partition=staging_partition)
-        self._staging_source = TQTokenSource(
-            dp_client, staging_partition=staging_partition
+        self._chain_prefix.install(
+            TQTokenSource(dp_client, staging_partition=staging_partition)
         )
-        self._prefix_cache.clear()
         install_capture(
             self,
             sink=sink,
@@ -533,9 +533,9 @@ class VllmAsyncGenerationWorkerImpl(
         ``ng_capture`` context.
 
         ``prefix_token_ids`` is the prefix resolved by
-        :meth:`_resolve_admission_prefix`; Gym's ``begin_call`` checks it
-        against the admission (length == ``prev_len``, equal to an inline
-        prefix) and requires it for a ``staging_chain`` admission.
+        :meth:`_resolve_admission_prefix`. For a ``staging_chain`` admission,
+        replace the empty wire placeholder with those resolved IDs before
+        passing the admission to Gym's capture API.
         """
         capture = self.token_capture
         if capture is None:
@@ -544,53 +544,43 @@ class VllmAsyncGenerationWorkerImpl(
             admission = self._capture_admission(request)
             if admission is None:
                 return
+        if admission.mode == "token_in":
+            if prefix_token_ids is None:
+                if admission.staging_chain:
+                    # Deferred: nemo_gym is optional outside Gym capture runs.
+                    from nemo_gym.token_id_capture.staging.capture import CaptureError
+
+                    raise CaptureError(
+                        "staging_chain admission requires resolved prefix_token_ids"
+                    )
+                prefix_token_ids = list(admission.required_prefix_token_ids)
+            if len(prefix_token_ids) != admission.prev_len:
+                # Deferred: nemo_gym is optional outside Gym capture runs.
+                from nemo_gym.token_id_capture.staging.capture import CaptureError
+
+                raise CaptureError(
+                    f"resolved prefix length {len(prefix_token_ids)} does not equal "
+                    f"prev_len {admission.prev_len}"
+                )
+            admission = admission.model_copy(
+                update={"required_prefix_token_ids": list(prefix_token_ids)}
+            )
         call = capture.begin_call(
             admission,
-            prefix_token_ids=prefix_token_ids,
             stream=bool(getattr(request, "stream", False)),
         )
         self._capture_calls[id(request)] = (call, list(prompt_token_ids))
 
     def _fetch_chain_prefix(self, staging_chain: list[str]) -> list[int]:
-        """Assemble prefix token ids from staging_chain, with a worker-local LRU cache."""
-        cache = self._prefix_cache
-        with self._prefix_cache_lock:
-            cached_ids: list[int] = []
-            miss_start = 0
-            for i, key in enumerate(staging_chain):
-                if key in cache:
-                    cached_ids = cache[key]
-                    miss_start = i + 1
-            miss_keys = staging_chain[miss_start:]
-        if not miss_keys:
-            return list(cached_ids)
-        if self._staging_source is None:
-            raise RuntimeError(
-                "_staging_source not initialized; call setup_token_capture() first"
-            )
-        # TQ read stays outside the lock so concurrent fetches overlap.
-        fetched = self._staging_source.fetch_prefix_token_ids(miss_keys)
-        result = cached_ids + fetched
-        last_key = staging_chain[-1]
-        with self._prefix_cache_lock:
-            cache[last_key] = result
-            if len(cache) > 256:
-                del cache[next(iter(cache))]
-        return result
+        """Resolve a staging chain through the shared, cached TQ read."""
+        return self._chain_prefix.fetch(staging_chain)
 
     def _resolve_admission_prefix(self, admission: Any) -> list[int]:
-        """Resolve a ``CaptureAdmission`` to the flat prefix the engine prompt starts with.
+        """Resolve a ``CaptureAdmission`` to the flat prefix the engine prompt starts with."""
+        # Deferred import, matching setup_token_capture.
+        from nemo_rl.data_plane.tq_token_sink import resolve_admission_prefix
 
-        A ``staging_chain`` is fetched through the cached TransferQueue read;
-        an inline ``required_prefix_token_ids`` is used as is; a text root has
-        no prefix. Length checks are Gym's: ``begin_call`` rejects a prefix
-        that does not match ``prev_len``.
-        """
-        if admission.mode == "text":
-            return []
-        if admission.staging_chain:
-            return self._fetch_chain_prefix(list(admission.staging_chain))
-        return list(admission.required_prefix_token_ids)
+        return resolve_admission_prefix(admission, self._chain_prefix)
 
     def _enter_request_prefix(self, request: Any, prefix_token_ids: list[int]) -> None:
         """Attach the resolved prefix to the request through the capture adapter.
