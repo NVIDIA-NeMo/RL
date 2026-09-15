@@ -565,19 +565,22 @@ def setup(
         policy_config["generation"] = generation_config
     _validate_multimodal_dedup_capability(master_config)
 
-    # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
-    # path; everywhere else validation must sample exactly like training.
+    # Validation-only sampling is honored on the NeMo-Gym rollout path for the
+    # backends whose HTTP server accepts a second sampling profile; everywhere
+    # else validation must sample exactly like training.
     val_sampling_overridden = (
         generation_config["val_temperature"] != generation_config["temperature"]
         or generation_config["val_top_p"] != generation_config["top_p"]
         or generation_config["val_top_k"] != generation_config["top_k"]
     )
     if val_sampling_overridden:
-        assert generation_config["backend"] == "vllm" and should_use_nemo_gym(
-            master_config
-        ), (
+        assert generation_config["backend"] in (
+            "vllm",
+            "trtllm",
+        ) and should_use_nemo_gym(master_config), (
             "generation.val_temperature/val_top_p/val_top_k differing from the "
-            "train sampling params is only supported for vLLM NeMo-Gym rollouts."
+            "train sampling params is only supported for vLLM and TRT-LLM "
+            "NeMo-Gym rollouts."
         )
         # The NeMo-Gym path only stamps temperature/top_p onto requests and
         # rejects any top_k at rollout time, so a val_top_k override can never
@@ -2366,6 +2369,42 @@ def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int
     return num_masked
 
 
+def _apply_empty_rollout_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int:
+    """Zero loss_multiplier where the rollout produced nothing, and count it.
+
+    NemoGym stands a rollout that returned no assistant turn up as a
+    prompt-only sample so one dead rollout cannot fail the step. Such a sample
+    already contributes 0 to the loss -- it has no trainable tokens -- but
+    without zeroing loss_multiplier it still counts toward num_valid_samples,
+    which would then overstate how much of the batch actually trained.
+
+    The returned count answers "how many rollouts came back empty", which is a
+    statement about generation health, and it deliberately counts every empty
+    rollout rather than only the ones this call was first to zero. The masking
+    metrics are attribution, not a partition: with
+    env.should_mask_flagged_samples on, Gym flags an agent that timed out
+    before its first completion, so the same sample is counted here and in
+    num_mask_sample_filtered. Zeroing is idempotent so the loss is unaffected,
+    but the counts overlap and must not be summed -- num_valid_samples
+    (sample_mask.sum()) is the one authoritative figure for how much of the
+    batch trained.
+    """
+    if "empty_rollout" not in repeated_batch:
+        return 0
+
+    loss_multiplier = repeated_batch["loss_multiplier"].clone()
+    empty_rollout = repeated_batch["empty_rollout"]
+
+    if isinstance(empty_rollout, list):
+        empty_rollout = torch.tensor(empty_rollout, dtype=torch.bool)
+    empty_rollout_bool = empty_rollout.bool()
+
+    num_masked = int(empty_rollout_bool.sum().item())
+    loss_multiplier[empty_rollout_bool] = 0
+    repeated_batch["loss_multiplier"] = loss_multiplier
+    return num_masked
+
+
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     """Whether NeMo Gym is responsible for full response logging.
 
@@ -3378,6 +3417,10 @@ def _grpo_train_impl(
 
                     num_mask_sample_filtered = _apply_mask_sample_filter(repeated_batch)
                     metrics["num_mask_sample_filtered"] = num_mask_sample_filtered
+
+                    metrics["num_masked_seqs_by_empty_rollout"] = (
+                        _apply_empty_rollout_filter(repeated_batch)
+                    )
 
                     add_grpo_token_loss_masks_and_generation_logprobs(
                         repeated_batch["message_log"]
@@ -5210,6 +5253,9 @@ def async_grpo_train(
                         num_mask_sample_filtered = _apply_mask_sample_filter(
                             repeated_batch
                         )
+                        num_masked_seqs_by_empty_rollout = _apply_empty_rollout_filter(
+                            repeated_batch
+                        )
 
                     # Add loss mask to each message
                     # Only unmask assistant messages that were actually generated (have generation_logprobs),
@@ -5593,6 +5639,7 @@ def async_grpo_train(
                     "loss": train_results["loss"].numpy(),
                     "reward": rewards.numpy(),
                     "num_mask_sample_filtered": num_mask_sample_filtered,
+                    "num_masked_seqs_by_empty_rollout": num_masked_seqs_by_empty_rollout,
                     "grad_norm": train_results["grad_norm"].numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),

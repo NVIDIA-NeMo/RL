@@ -95,7 +95,9 @@ WHEEL_OUTPUT_DIR=${WHEEL_OUTPUT_DIR:-/opt/trtllm_wheels}
 mkdir -p "$WHEEL_OUTPUT_DIR"
 
 echo "Building TensorRT-LLM from:"
-echo "  TRT-LLM Git URL: $GIT_URL"
+# Redact any embedded credentials: the tekit url carries a clone token and this
+# output ends up in build logs / CI artifacts.
+echo "  TRT-LLM Git URL: $(sed -E 's#://[^/@]*@#://<redacted>@#' <<<"$GIT_URL")"
 echo "  TRT-LLM Git ref: $GIT_REF"
 
 # git-lfs is required because TRT-LLM ships its `internal_cutlass_kernels`
@@ -135,36 +137,70 @@ git lfs pull
 git submodule update --init --recursive --depth=1
 
 # requirements.txt patches:
-#   - bump modelopt pin to >=0.44.0a0 to match the runtime venv version; the
-#     venv already has 0.44.0a0 installed, so the TRT-LLM wheel build picks it
-#     up directly without a separate modelopt from-source build step.
-#   - remove `setuptools<80` ceiling. Modern setuptools (>=80) is required by
+#   - relax any `setuptools<80` ceiling. Modern setuptools (>=80) is required by
 #     several of our other dependencies (e.g. transformer-engine build deps);
-#     downgrading creates an unresolvable conflict in the venv.
-assert_patch_target requirements.txt 'nvidia-modelopt[torch]~=0.37.0'
-sed -i 's|nvidia-modelopt\[torch\]~=0\.37\.0|nvidia-modelopt[torch]>=0.44.0a0|' requirements.txt
-assert_patch_target requirements.txt 'setuptools<80'
+#     downgrading creates an unresolvable conflict in the venv. Not asserted:
+#     tekit de0cf4d8a ("Removed detailed version specification to avoid
+#     dependency misalignment") already ships `setuptools>=80`, so on current
+#     refs there is nothing left to rewrite.
 sed -i 's|^setuptools<80$|setuptools|' requirements.txt
 
-# cutlass_kernels/CMakeLists.txt invokes `setup_library.py develop --user`,
-# which (a) requires a setup.py shim and (b) the `--user` flag is invalid
-# inside a venv. Rewrite the COMMAND to copy setup_library.py to setup.py
-# (so `develop` finds a buildable target) and drop `--user`.
-assert_patch_target cpp/tensorrt_llm/kernels/cutlass_kernels/CMakeLists.txt \
-    'COMMAND ${Python3_EXECUTABLE} setup_library.py develop --user'
-sed -i 's|COMMAND \${Python3_EXECUTABLE} setup_library.py develop --user|COMMAND bash -c "cp -f setup_library.py setup.py \&\& \${Python3_EXECUTABLE} setup_library.py develop"|' \
-    cpp/tensorrt_llm/kernels/cutlass_kernels/CMakeLists.txt
+#   - drop nvidia-modelopt (preventive). build_wheel.py installs
+#     requirements-dev.txt into the already-populated nemo-rl venv, so pip can
+#     mutate the runtime environment uv built. The rubin ref pins
+#     `nvidia-modelopt[torch]~=0.39.0` (i.e. <0.40) while the root pyproject
+#     installs modelopt from a git rev reporting 0.46.0.dev*, so pip would
+#     either fail to resolve or silently downgrade a package uv owns. modelopt
+#     is a runtime dependency the wheel build does not need pinned. Not
+#     asserted: refs after rc23 dropped the line, so it may legitimately not
+#     match.
+sed -i '/^nvidia-modelopt/d' requirements.txt
+
+# cutlass_kernels/CMakeLists.txt used to invoke `setup_library.py develop
+# --user`, which needed a setup.py shim and passed a flag that is invalid
+# inside a venv. tekit de0cf4d8a dropped that execute_process entirely and now
+# puts the cutlass python dir on PYTHONPATH for generate_kernels.py instead, so
+# the rewrite below is only needed on refs predating it. Guarded rather than
+# asserted: on current refs the target is legitimately absent.
+if grep -qF 'COMMAND ${Python3_EXECUTABLE} setup_library.py develop --user' \
+        cpp/tensorrt_llm/kernels/cutlass_kernels/CMakeLists.txt; then
+    sed -i 's|COMMAND \${Python3_EXECUTABLE} setup_library.py develop --user|COMMAND bash -c "cp -f setup_library.py setup.py \&\& \${Python3_EXECUTABLE} setup_library.py develop"|' \
+        cpp/tensorrt_llm/kernels/cutlass_kernels/CMakeLists.txt
+else
+    echo "[INFO] setup_library.py develop --user not present; ref already carries the PYTHONPATH fix"
+fi
+
+# nvshmem doesn't accept the 'f' suffix CMake >= 3.31 generates for Blackwell /
+# Rubin ('100f-real', '107f-real'). Substitute bare archs for the nvshmem cmake
+# call only; DeepEP kernels keep the full arch string for FP4 support.
+#
+# The semicolons MUST stay backslash-escaped. This lands inside the
+# CMAKE_CACHE_ARGS list of an ExternalProject_Add, where ';' is CMake's list
+# separator: an unescaped '100;103;107' would split into three arguments
+# ('-D...STRING=100' plus stray '103' and '107') instead of one cache entry
+# holding a three-element list. In the sed replacement below '\\;' emits '\;'.
+#
+# Bare numbers on purpose: this mirrors _DEFAULT_ARCH in _backend.py
+# (100-real;103-real;107-real) but WITHOUT the suffixes, which nvshmem rejects.
+#
+# NOTE: this list does not track BUILD_CUSTOM_TRTLLM_ARCH -- it is hardcoded and
+# must be edited by hand to stay consistent with _DEFAULT_ARCH.
+assert_patch_target cpp/tensorrt_llm/deep_ep/CMakeLists.txt \
+    '-DCMAKE_CUDA_ARCHITECTURES:STRING=${DEEP_EP_CUDA_ARCHITECTURES}'
+sed -i 's|-DCMAKE_CUDA_ARCHITECTURES:STRING=${DEEP_EP_CUDA_ARCHITECTURES}|-DCMAKE_CUDA_ARCHITECTURES:STRING=100\\;103\\;107|' \
+    cpp/tensorrt_llm/deep_ep/CMakeLists.txt
 
 # SM arch list. Sourced from BUILD_CUSTOM_TRTLLM_ARCH so it stays in sync with
 # _backend.py, which folds the same value into the wheel cache key (a change to
 # the arch list must invalidate the cached wheel). The default below MUST match
 # _backend.py's _DEFAULT_ARCH.
-#   90-real;100-real: build Hopper (sm_90) and Blackwell (sm_100) kernels,
-#                     i.e. H100/GB200/B200 only (B200 is also sm_100) — other
-#                     SKUs (e.g. A100 sm_80, L40 sm_89, consumer Blackwell
-#                     RTX 50-series sm_120) need this list extended.
-ARCH="${BUILD_CUSTOM_TRTLLM_ARCH:-90-real;100-real}"
-JOBS="${TRTLLM_BUILD_JOBS:-24}"
+#   100-real;103-real;107-real: Blackwell (GB200/B200 sm_100), Blackwell-Ultra
+#             (GB300/B300 sm_103) and Rubin (sm_107). Other SKUs (H100 sm_90,
+#             A100 sm_80, L40 sm_89, RTX 50-series sm_120) need this list
+#             extended via BUILD_CUSTOM_TRTLLM_ARCH -- and the nvshmem arch
+#             patch above edited to match, since it does not follow this value.
+ARCH="${BUILD_CUSTOM_TRTLLM_ARCH:-100-real;103-real;107-real}"
+JOBS="${TRTLLM_BUILD_JOBS:-64}"
 NPROC=$(nproc 2>/dev/null || echo "$JOBS")
 if (( JOBS > NPROC )); then
     JOBS=$NPROC
@@ -181,6 +217,18 @@ echo "Building TensorRT-LLM wheel (arch=${ARCH}, jobs=${JOBS})..."
 show_ccache_status "before TRT-LLM build"
 ccache --zero-stats
 
+# NGC-style base images (the Rubin TRT-LLM image among them) ship
+# PIP_CONSTRAINT=/etc/pip/constraint.txt, pinning the exact versions baked into
+# the image's own Python. build_wheel.py's setup_venv() shells out to real pip
+# (`python3 -m pip install -r requirements-dev.txt`), which honours that file --
+# and those versions are vendored into the image rather than published, so they
+# are unreachable from any index. Concretely: the image pins
+# `cuda-python==13.4.0`, which does not exist on PyPI at all (latest 13.x is
+# 13.3.1, already installed here), so `cuda-python>=13` -- otherwise satisfied
+# -- becomes unresolvable. This venv is uv-managed and owes the base image's
+# site-packages nothing, so drop the constraint for the build.
+unset PIP_CONSTRAINT
+
 # Keep full output for failure diagnostics, but stream only 5% Ninja milestones.
 TRTLLM_BUILD_LOG=$(mktemp /tmp/trtllm-build.XXXXXX.log)
 set +x
@@ -193,6 +241,10 @@ TRTLLM_BUILD_CMD=(
     --nvrtc_dynamic_linking
     --job_count "$JOBS"
     -D "ENABLE_UCX=OFF"
+    # Skip cpp/tests: they are not shipped in the wheel, so compiling them only
+    # adds build time and exposes the build to test-only link failures (e.g.
+    # tests/unit_tests/executor/ against the NIXL imported target).
+    -D "BUILD_TESTS=OFF"
 )
 set +e
 NINJA_STATUS='NINJA_PROGRESS:%f:%t:%p:' \
