@@ -36,20 +36,14 @@ from nemo_rl.data_plane.gpu_token_payload import (  # noqa: E402
     BoundGpuTokenSink,
     GpuTokenPayload,
 )
-from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD  # noqa: E402
 from nemo_rl.models.generation.vllm import gpu_capture_host as hosting  # noqa: E402
 from nemo_rl.models.generation.vllm.gpu_output_capture import (  # noqa: E402
-    GpuOutputCaptureCapabilities,
     GpuOutputImportError,
     GpuOutputLease,
     GpuOutputTensors,
 )
-from nemo_rl.utils.routed_experts_codec import encode_routed_experts  # noqa: E402
 
 pytestmark = [pytest.mark.nemo_gym, pytest.mark.asyncio]
-CUDA_REQUIRED = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="requires CUDA"
-)
 
 
 class _Rpc:
@@ -88,18 +82,10 @@ class _Case:
     host: hosting.GpuCaptureHost
     imports: list[tuple[GpuOutputLease, int]]
 
-    async def bind(
-        self,
-        *,
-        count: int = 1,
-        dtype: torch.dtype = torch.int16,
-        envelope: str | None = None,
-    ) -> None:
+    async def bind(self, *, count: int = 1) -> None:
         await self.host.bind(
             self.state,
             generated_token_count=count,
-            routed_experts_dtype=dtype,
-            routed_experts_cpu=envelope,
         )
 
     def put(self, record: Any = None) -> StageResult:
@@ -175,7 +161,6 @@ def cpu_cuda(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         "invisible_device",
         "no_owner",
         "two_owners",
-        "remote_host",
         "no_device",
         "unsupported_native",
     ],
@@ -185,15 +170,13 @@ async def test_create_uses_visible_owner_or_preserves_cpu_path(
     monkeypatch: pytest.MonkeyPatch,
     topology: str,
 ) -> None:
-    owner = GpuOutputCaptureCapabilities(True, socket.gethostname(), "gpu-0", 1)
     case.rpc.responses["configure_gpu_output_capture"] = {
-        "available": [replace(owner, owner=False), owner],
-        "nondefault_device": [replace(owner, gpu_uuid="gpu-1")],
-        "invisible_device": [replace(owner, gpu_uuid="gpu-2")],
+        "available": [None, "gpu-0"],
+        "nondefault_device": ["gpu-1"],
+        "invisible_device": ["gpu-2"],
         "no_owner": [None],
-        "two_owners": [owner, owner],
-        "remote_host": [replace(owner, hostname="remote-host")],
-        "no_device": [owner],
+        "two_owners": ["gpu-0", "gpu-0"],
+        "no_device": ["gpu-0"],
         "unsupported_native": RuntimeError("unsupported native output"),
     }[topology]
     monkeypatch.setattr(
@@ -213,19 +196,18 @@ async def test_create_uses_visible_owner_or_preserves_cpu_path(
     ]
 
 
+@pytest.mark.parametrize("backfill_ranges", [(), ((0, 1),)])
 async def test_bind_preserves_tensors_coordinates_and_put_thread(
     case: _Case,
-    monkeypatch: pytest.MonkeyPatch,
     cpu_cuda: list[str],
+    backfill_ranges: tuple[tuple[int, int], ...],
 ) -> None:
     routes = torch.tensor([[[1]], [[2]], [[3]]], dtype=torch.int64)
     case.tensors = replace(case.tensors, routed_experts=routes)
-    monkeypatch.setattr(
-        hosting,
-        "decode_routed_experts",
-        lambda *_: pytest.fail("uncached request decoded CPU routes"),
+    case.lease = replace(
+        case.lease, routed_experts_prefix_backfill_ranges=backfill_ranges
     )
-    await case.bind(envelope="unused-invalid-envelope")
+    await case.bind()
     assert not case.imports and not case.state.ipc_handles_consumed
     assert case.state.prepare_payload is not None
 
@@ -238,8 +220,8 @@ async def test_bind_preserves_tensors_coordinates_and_put_thread(
     assert payload.prompt_len == 2
     assert payload.generated_token_ids is case.tensors.generated_token_ids
     assert payload.generated_logprobs is case.tensors.generation_logprobs
-    assert payload.routed_experts.dtype == torch.int16
-    assert torch.equal(payload.routed_experts, routes)
+    assert payload.routed_experts is routes
+    assert payload.routed_experts_prefix_backfill_ranges == backfill_ranges
     assert case.rpc.calls[0] == ("export_gpu_output_capture", ("call", 1, 2))
     assert cpu_cuda == ["sync"]
     case.assert_released()
@@ -280,158 +262,6 @@ async def test_invalid_export_discards_request_without_import(
     await case.host.release(case.state)
     assert case.rpc.calls[-1] == ("discard_gpu_output_capture", ("call",))
     assert not case.imports and not cpu_cuda
-
-
-@CUDA_REQUIRED
-@pytest.mark.parametrize("routing_dtype", [torch.int8, torch.int16, torch.int32])
-async def test_cached_prefix_uploads_only_missing_intervals(
-    case: _Case,
-    monkeypatch: pytest.MonkeyPatch,
-    routing_dtype: torch.dtype,
-) -> None:
-    case.state.prompt_token_ids = [11, 12, 13, 14, 15]
-    ranges = ((0, 2), (3, 4))
-    case.lease = replace(case.lease, routed_experts_prefix_backfill_ranges=ranges)
-    fresh = torch.arange(28, dtype=torch.int16).reshape(7, 2, 2)
-    case.tensors = GpuOutputTensors(
-        torch.tensor([21, 22], device="cuda"),
-        torch.tensor([-0.25, -0.5], device="cuda"),
-        fresh.to(device="cuda", dtype=torch.uint16),
-    )
-    cpu_routes = fresh + 50  # Fresh CPU rows deliberately disagree with GPU sources.
-    cpu_routes[0, 0, 0] = -1
-    expected = fresh.to(dtype=routing_dtype, copy=True)
-    for start, end in ranges:
-        expected[start:end] = cpu_routes[start:end].to(dtype=routing_dtype)
-    transfers = []
-    original_copy = torch.Tensor.copy_
-
-    def copy_with_accounting(
-        destination: torch.Tensor, source: torch.Tensor, non_blocking: bool = False
-    ) -> torch.Tensor:
-        if destination.is_cuda and source.device.type == "cpu":
-            transfers.append(
-                (
-                    destination.storage_offset(),
-                    tuple(source.shape),
-                    source.numel() * source.element_size(),
-                )
-            )
-        return original_copy(destination, source, non_blocking=non_blocking)
-
-    monkeypatch.setattr(torch.Tensor, "copy_", copy_with_accounting)
-    await case.bind(
-        count=2, dtype=routing_dtype, envelope=encode_routed_experts(cpu_routes)
-    )
-    assert (await case.finish()).ok
-    payload = case.sink.payloads["call"]
-    assert payload.generated_token_ids is case.tensors.generated_token_ids
-    assert payload.generated_logprobs is case.tensors.generation_logprobs
-    assert (
-        payload.routed_experts.is_cuda and payload.routed_experts.dtype == routing_dtype
-    )
-    assert torch.equal(payload.routed_experts.cpu(), expected)
-    assert torch.equal(case.tensors.routed_experts.cpu(), fresh.to(torch.uint16))
-    assert transfers == [
-        (0, (2, 2, 2), 8 * routing_dtype.itemsize),
-        (12, (1, 2, 2), 4 * routing_dtype.itemsize),
-    ]
-    case.assert_released()
-
-
-@CUDA_REQUIRED
-@pytest.mark.parametrize("routing_dtype", [torch.int8, torch.int16, torch.int32])
-@pytest.mark.parametrize("prev_len", [0, 3], ids=["first-turn", "continuation"])
-async def test_cached_prefix_put_fields_equal_cpu_bytes(
-    case: _Case,
-    routing_dtype: torch.dtype,
-    prev_len: int,
-) -> None:
-    case.state.prompt_token_ids = [11, 12, 13, 14, 15]
-    case.lease = replace(
-        case.lease, routed_experts_prefix_backfill_ranges=((0, 2), (3, 4))
-    )
-    routes = torch.arange(28, dtype=routing_dtype).reshape(7, 2, 2)
-    routes[0, 0, 0] = -1
-    routes[-1] = torch.tensor([[0, 1], [0, 1]], dtype=routing_dtype)
-    native_routes = routes.to(dtype=torch.uint16, device="cuda")
-    native_routes[:2] = 0
-    native_routes[3:4] = 0
-    case.tensors = GpuOutputTensors(
-        torch.tensor([21, 22], device="cuda"),
-        torch.tensor([-0.25, -0.5], device="cuda"),
-        native_routes,
-    )
-    cpu_fields = {
-        "token_ids_delta": torch.tensor([[11, 12, 13, 14, 15, 21, 22]])[:, prev_len:],
-        "token_mask_delta": torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]])[
-            :, prev_len:
-        ],
-        "generation_logprobs_delta": torch.tensor(
-            [[0.0, 0.0, 0.0, 0.0, 0.0, -0.25, -0.5]]
-        )[:, prev_len:],
-        ROUTED_EXPERTS_FIELD: routes[prev_len:].unsqueeze(0),
-    }
-    record = SimpleNamespace(
-        staging_key="call", prev_len=prev_len, delta_len=7 - prev_len, cum_len=7
-    )
-    staged_fields = {}
-
-    def put() -> StageResult:
-        result = case.put(record)
-        staged_fields.update(
-            case.sink.payloads["call"].staging_fields(record, cpu_fields)
-        )
-        return result
-
-    await case.bind(
-        count=2, dtype=routing_dtype, envelope=encode_routed_experts(routes)
-    )
-    assert (await case.host.finish(case.state, put)).ok
-    assert staged_fields.keys() == cpu_fields.keys()
-    for name, expected in cpu_fields.items():
-        actual = staged_fields[name]
-        assert (
-            actual.is_cuda
-            and actual.dtype == expected.dtype
-            and actual.shape == expected.shape
-        )
-        assert torch.equal(
-            actual.cpu().contiguous().view(torch.uint8),
-            expected.contiguous().view(torch.uint8),
-        ), name
-
-
-@pytest.mark.parametrize(
-    ("ranges", "count", "source_kind"),
-    [
-        (((0, 1),), 1, "missing"),
-        (((0, 1),), 1, "wrong_shape"),
-        (((0, 2), (1, 2)), 1, "valid"),
-        (((2, 3),), 1, "valid"),
-        (((1, 2),), 0, "valid"),
-    ],
-)
-async def test_invalid_prefix_uses_cpu_put_and_releases_lease(
-    case: _Case,
-    cpu_cuda: list[str],
-    ranges: tuple[tuple[int, int], ...],
-    count: int,
-    source_kind: str,
-) -> None:
-    case.lease = replace(case.lease, routed_experts_prefix_backfill_ranges=ranges)
-    routes = torch.arange(2 + count, dtype=torch.int16).reshape(-1, 1, 1)
-    original = routes.clone()
-    case.tensors = replace(case.tensors, routed_experts=routes)
-    envelope = {
-        "missing": None,
-        "wrong_shape": encode_routed_experts(routes[1:]),
-        "valid": encode_routed_experts(routes),
-    }[source_kind]
-    await case.bind(count=count, envelope=envelope)
-    assert (await case.finish()).ok and case.sink.payloads == {"call": None}
-    assert torch.equal(routes, original) and cpu_cuda == ["sync"]
-    case.assert_released()
 
 
 @pytest.mark.parametrize(
@@ -563,9 +393,7 @@ async def test_concurrent_calls_keep_independent_payloads(
 
     async def complete(state: hosting.CapturedModelCall) -> None:
         key = state.capture_key
-        await case.host.bind(
-            state, generated_token_count=1, routed_experts_dtype=torch.int16
-        )
+        await case.host.bind(state, generated_token_count=1)
         await case.host.finish(
             state, lambda: state.gpu_sink.stage(SimpleNamespace(staging_key=key))
         )

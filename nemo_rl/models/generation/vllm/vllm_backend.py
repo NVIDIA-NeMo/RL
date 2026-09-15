@@ -30,7 +30,6 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
 from nemo_rl.models.generation.vllm.gpu_output_capture import (
     GpuOutputCapture,
-    GpuOutputCaptureCapabilities,
     GpuOutputLease,
     configure_gpu_output_capture,
 )
@@ -349,7 +348,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         self,
         frontend_hostname: str,
         require_routed_experts: bool,
-    ) -> GpuOutputCaptureCapabilities | None:
+    ) -> str | None:
         return configure_gpu_output_capture(
             self,
             frontend_hostname=frontend_hostname,
@@ -381,10 +380,6 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     def discard_gpu_output_capture(self, capture_key: str) -> None:
         if self._gpu_output_capture is not None:
             self._gpu_output_capture.discard(capture_key)
-
-    def clear_gpu_output_capture(self) -> None:
-        if self._gpu_output_capture is not None:
-            self._gpu_output_capture.clear()
 
     # Per-PP-stage refit groups, None until init_nccl_reshard_comm_group builds them.
     # Declared rather than sprung into existence so a rebuild can release the previous

@@ -26,50 +26,13 @@ import torch
 
 from nemo_rl.data_plane.gpu_token_payload import BoundGpuTokenSink, GpuTokenPayload
 from nemo_rl.models.generation.vllm.gpu_output_capture import (
-    GpuOutputCaptureCapabilities,
     GpuOutputImportError,
     GpuOutputLease,
     import_gpu_output_lease,
 )
-from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 
 _Result = TypeVar("_Result")
 LOGGER = logging.getLogger(__name__)
-
-
-def _backfill_cached_prefix_routes(
-    routes: torch.Tensor | None,
-    ranges: tuple[tuple[int, int], ...],
-    cpu_envelope: str | None,
-    *,
-    prompt_token_count: int,
-    generated_token_count: int,
-) -> None:
-    """Fill only proven cached-prefix holes from the canonical CPU response."""
-    if not ranges:
-        return
-    total = prompt_token_count + generated_token_count
-    if routes is None or routes.ndim != 3 or routes.shape[0] != total:
-        raise ValueError("Cached-prefix backfill requires full aligned GPU routes")
-    previous_end = 0
-    prefix_end = min(prompt_token_count, max(total - 1, 0))
-    for start, end in ranges:
-        if (
-            type(start) is not int
-            or type(end) is not int
-            or not previous_end <= start < end <= prefix_end
-        ):
-            raise ValueError("GPU route backfill ranges must be ordered prompt slices")
-        previous_end = end
-    if not isinstance(cpu_envelope, str):
-        raise ValueError("Cached-prefix GPU routes require the CPU routing record")
-    cpu_routes = decode_routed_experts(cpu_envelope, routes.dtype)
-    if cpu_routes.shape != routes.shape:
-        raise ValueError("Cached-prefix CPU and GPU routing shapes do not match")
-    for start, end in ranges:
-        # Only history absent from the current GPU snapshots crosses H2D.
-        # Fresh routes and sampled outputs retain their GPU sources.
-        routes[start:end].copy_(cpu_routes[start:end])
 
 
 async def _await_completion(task: asyncio.Task[_Result]) -> _Result:
@@ -132,24 +95,16 @@ class GpuCaptureHost:
     ) -> GpuCaptureHost | None:
         """Use retained output when available; otherwise keep the existing PUT."""
         try:
-            capabilities = await rpc.collective_rpc(
+            gpu_uuids = await rpc.collective_rpc(
                 "configure_gpu_output_capture",
                 args=(socket.gethostname(), require_routed_experts),
             )
-            owners = [
-                capability
-                for capability in capabilities
-                if isinstance(capability, GpuOutputCaptureCapabilities)
-                and capability.owner
-            ]
-            if len(owners) == 1 and owners[0].hostname == socket.gethostname():
+            owners = [gpu_uuid for gpu_uuid in gpu_uuids if gpu_uuid is not None]
+            if len(owners) == 1:
                 # TP workers and the frontend can use different CUDA ordinals.
                 # TQ binds its transfer threads to this device when attaching.
                 for index in range(torch.cuda.device_count()):
-                    if (
-                        str(torch.cuda.get_device_properties(index).uuid)
-                        == owners[0].gpu_uuid
-                    ):
+                    if str(torch.cuda.get_device_properties(index).uuid) == owners[0]:
                         return cls(rpc, torch.device("cuda", index))
         except Exception as error:
             LOGGER.debug(
@@ -162,8 +117,6 @@ class GpuCaptureHost:
         state: CapturedModelCall,
         *,
         generated_token_count: int,
-        routed_experts_dtype: torch.dtype,
-        routed_experts_cpu: str | None = None,
     ) -> None:
         """Bind original device tensors to the call's completion-time sink."""
         if state.capture_key is None or state.gpu_sink is None:
@@ -202,21 +155,14 @@ class GpuCaptureHost:
                 state.ipc_handles_consumed = error.handles_consumed
                 raise
             state.ipc_handles_consumed = True
-            routes = tensors.routed_experts
-            if routes is not None:
-                routes = routes.to(dtype=routed_experts_dtype)
-            _backfill_cached_prefix_routes(
-                routes,
-                lease.routed_experts_prefix_backfill_ranges,
-                routed_experts_cpu,
-                prompt_token_count=len(state.prompt_token_ids),
-                generated_token_count=generated_token_count,
-            )
             return GpuTokenPayload(
                 prompt_len=len(state.prompt_token_ids),
                 generated_token_ids=tensors.generated_token_ids,
                 generated_logprobs=tensors.generation_logprobs,
-                routed_experts=routes,
+                routed_experts=tensors.routed_experts,
+                routed_experts_prefix_backfill_ranges=(
+                    lease.routed_experts_prefix_backfill_ranges
+                ),
             )
 
         state.prepare_payload = import_payload

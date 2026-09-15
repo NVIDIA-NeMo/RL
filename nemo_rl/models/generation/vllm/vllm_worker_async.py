@@ -1162,23 +1162,11 @@ class VllmAsyncGenerationWorkerImpl(
                             raise ValueError(
                                 "GPU token capture requires exactly one final output"
                             )
-                        routed_experts_cpu = None
                         if worker_self._return_routed_experts_enabled():
                             _validate_gpu_route_history(final_res)
-                            output_index = final_res.outputs[0].index
-                            choice = next(
-                                choice
-                                for choice in response.choices
-                                if choice.index == output_index
-                            )
-                            routed_experts_cpu = getattr(
-                                choice.message, "routed_experts", None
-                            )
                         await worker_self._gpu_capture_host.bind(
                             state,
                             generated_token_count=len(final_res.outputs[0].token_ids),
-                            routed_experts_dtype=worker_self.routed_experts_dtype,
-                            routed_experts_cpu=routed_experts_cpu,
                         )
                     except Exception as error:
                         state.gpu_sink.clear()

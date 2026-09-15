@@ -187,20 +187,44 @@ def test_concurrent_calls_have_independent_gpu_bindings() -> None:
 
 @requires_cuda
 @pytest.mark.parametrize(
-    "prev_len,prompt_len,routing_dtype",
-    [(0, 2, torch.int8), (2, 2, torch.int16), (2, 3, torch.int32)],
+    "prev_len,prompt_len,backfill_ranges",
+    [
+        (0, 2, ()),
+        (2, 2, ()),
+        (2, 3, ()),
+        (0, 5, ((0, 2), (3, 4))),
+        (1, 5, ((0, 2), (3, 4))),
+        (3, 5, ((0, 2), (3, 4))),
+        (5, 5, ((0, 2), (3, 4))),
+    ],
 )
+@pytest.mark.parametrize("routing_dtype", [torch.int8, torch.int16, torch.int32])
+@pytest.mark.parametrize("cast_routes", [False, True])
 def test_gpu_fields_match_committed_wire_without_rebuilding_generated_values(
     prev_len: int,
     prompt_len: int,
+    backfill_ranges: tuple[tuple[int, int], ...],
     routing_dtype: torch.dtype,
+    cast_routes: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    routes = torch.arange(
-        (prompt_len + 2) * 4, dtype=routing_dtype, device="cuda"
-    ).reshape(-1, 2, 2)
-    payload = _payload(prompt_len=prompt_len, routes=routes)
-    record = _record(prev_len=prev_len, prompt_len=prompt_len, routes=routes)
+    canonical_routes = torch.arange((prompt_len + 2) * 4, dtype=routing_dtype).reshape(
+        -1, 2, 2
+    )
+    if backfill_ranges:
+        canonical_routes[0, 0, 0] = -1
+    canonical_routes[-1] = torch.tensor([[0, 1], [0, 1]], dtype=routing_dtype)
+    routes = canonical_routes.to(
+        device="cuda", dtype=torch.uint16 if cast_routes else routing_dtype
+    )
+    for start, end in backfill_ranges:
+        routes[start:end] = 99  # Native snapshots lack these cached-prefix rows.
+    original_routes = routes.cpu().clone()
+    payload = replace(
+        _payload(prompt_len=prompt_len, routes=routes),
+        routed_experts_prefix_backfill_ranges=backfill_ranges,
+    )
+    record = _record(prev_len=prev_len, prompt_len=prompt_len, routes=canonical_routes)
     cpu_client, gpu_client = _PutClient(), _PutClient()
     assert TQTokenSink(cpu_client, staging_partition="staging").stage(record).ok
     h2d_sizes = []
@@ -235,12 +259,24 @@ def test_gpu_fields_match_committed_wire_without_rebuilding_generated_values(
         "routed_experts",
     ):
         assert actual[name].is_cuda
-    assert (
-        actual["routed_experts"].untyped_storage().data_ptr()
-        == routes.untyped_storage().data_ptr()
-    )
+    if cast_routes:
+        # Only the final delta needs a new allocation for the wire dtype.
+        assert actual["routed_experts"].untyped_storage().nbytes() == (
+            record.delta_len * 4 * routing_dtype.itemsize
+        )
+        assert torch.equal(routes.cpu(), original_routes)
+    else:
+        assert (
+            actual["routed_experts"].untyped_storage().data_ptr()
+            == routes.untyped_storage().data_ptr()
+        )
+        assert torch.equal(routes[:prev_len].cpu(), original_routes[:prev_len])
     carry_len = prompt_len - prev_len
-    assert h2d_sizes == ([carry_len] if carry_len else [])
+    assert h2d_sizes == ([carry_len] if carry_len else []) + [
+        (end - max(start, prev_len)) * 4
+        for start, end in backfill_ranges
+        if end > max(start, prev_len)
+    ]
     if not carry_len:
         assert (
             actual["token_ids_delta"].data_ptr()

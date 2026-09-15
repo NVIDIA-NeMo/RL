@@ -42,6 +42,8 @@ class GpuTokenPayload:
         generated_token_ids: One-dimensional generated CUDA IDs in int64 format.
         generated_logprobs: Corresponding selected-token CUDA logprobs in float32.
         routed_experts: Optional full aligned CUDA routes, including the prompt.
+        routed_experts_prefix_backfill_ranges: Cached-prefix rows missing from
+            the GPU assembly, filled from the committed CPU delta during staging.
 
     The producer must own these allocations and stop mutating them
     before binding; references alone do not protect reusable engine buffers.
@@ -51,6 +53,7 @@ class GpuTokenPayload:
     generated_token_ids: torch.Tensor
     generated_logprobs: torch.Tensor
     routed_experts: torch.Tensor | None = None
+    routed_experts_prefix_backfill_ranges: tuple[tuple[int, int], ...] = ()
 
     def device(self) -> torch.device:
         """Validate CUDA ownership and return the common source device."""
@@ -75,9 +78,9 @@ class GpuTokenPayload:
 
         This step copies CPU-origin prompt-carry IDs H2D. Generated values use
         retained CUDA storage; masks and prompt logprobs are constructed on CUDA.
-        Routes view the assembled GPU payload, which the host has already filled
-        with any missing cached-prefix rows from vLLM's CPU router history.
-        Shape and dtype checks do not transfer payloads to CPU.
+        Routes use the assembled GPU payload. Only missing cached-prefix rows
+        within this PUT's delta are copied from the existing CPU router mirror.
+        Staging does not transfer GPU payloads to CPU.
         """
         device = self.device()
         carry_len = self.prompt_len - record.prev_len
@@ -141,15 +144,22 @@ class GpuTokenPayload:
                     raise ValueError(
                         "GPU routes must cover the complete engine sequence"
                     )
-                if routes.dtype != expected_routes.dtype:
-                    raise ValueError(
-                        "GPU routes dtype does not match committed CPU mirror"
-                    )
                 delta_routes = routes.detach()[record.prev_len :]
                 if delta_routes.shape != expected_routes[0].shape:
                     raise ValueError(
                         "GPU routes shape does not match committed CPU mirror"
                     )
+                delta_routes = delta_routes.to(dtype=expected_routes.dtype)
+                for start, end in self.routed_experts_prefix_backfill_ranges:
+                    start = max(start, record.prev_len)
+                    if start < end:
+                        delta_start, delta_end = (
+                            start - record.prev_len,
+                            end - record.prev_len,
+                        )
+                        delta_routes[delta_start:delta_end].copy_(
+                            expected_routes[0, delta_start:delta_end]
+                        )
                 fields[ROUTED_EXPERTS_FIELD] = delta_routes.unsqueeze(0)
         return fields
 

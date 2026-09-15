@@ -39,14 +39,6 @@ from nemo_rl.models.generation.vllm.utils import VLLM_LOGPROB_FLOOR
 GPU_CAPTURE_KEY = "nrl_gpu_output_capture_key"
 
 
-@dataclass(frozen=True)
-class GpuOutputCaptureCapabilities:
-    owner: bool
-    hostname: str
-    gpu_uuid: str
-    device_index: int
-
-
 # PyTorch owns the CUDA sharing protocol; carry its reduction arguments unchanged.
 CudaTensorIpc = tuple[Any, ...]
 
@@ -220,8 +212,6 @@ class GpuOutputCapture:
         self._closed_keys: dict[str, str | None] = {}
         self._errors: dict[str, str] = {}
         self._lock = threading.RLock()
-        self._original_bookkeeping = runner._bookkeeping_sync
-        self._original_sample_tokens = runner.sample_tokens
         self._pending_step: tuple[_StepRequest, ...] | None = None
 
     @property
@@ -231,8 +221,8 @@ class GpuOutputCapture:
 
     def install(self) -> None:
         capture = self
-        original = self._original_bookkeeping
-        original_sample_tokens = self._original_sample_tokens
+        original = self.runner._bookkeeping_sync
+        original_sample_tokens = self.runner.sample_tokens
 
         @wraps(original)
         def bookkeeping(_runner: Any, *args: Any, **kwargs: Any) -> Any:
@@ -654,26 +644,13 @@ class GpuOutputCapture:
                 if lease.descriptor.capture_key == capture_key:
                     self.abandon_unimported(lease_id)
 
-    def clear(self) -> None:
-        """Clear unexported captures at a quiescent rollout boundary."""
-        with self._lock:
-            self._requests.clear()
-            # Outstanding imports remain valid until their PUT acknowledgement.
-            self._closed_keys = {
-                lease.descriptor.capture_key: self._closed_keys.get(
-                    lease.descriptor.capture_key
-                )
-                for lease in self._leases.values()
-            }
-            self._errors.clear()
-
 
 def configure_gpu_output_capture(
     worker: Any,
     *,
     frontend_hostname: str,
     require_routed_experts: bool,
-) -> GpuOutputCaptureCapabilities | None:
+) -> str | None:
     """Reuse native outputs when available; otherwise retain the existing CPU PUT."""
     # vLLM is optional outside the native generation-worker environment.
     from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
@@ -710,6 +687,4 @@ def configure_gpu_output_capture(
         worker._gpu_output_capture = existing
     elif existing.require_routed_experts != require_routed_experts:
         return None
-    return GpuOutputCaptureCapabilities(
-        True, existing.hostname, existing.gpu_uuid, device.index
-    )
+    return existing.gpu_uuid

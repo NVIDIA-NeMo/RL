@@ -477,10 +477,10 @@ PUT completes. A shared batch allocation stays alive until its last retained
 view is released. PUT still runs at call completion with the same fields, keys,
 and digests.
 
-Prefix caching keeps its existing behavior and CPU router history. Only cached
-prefix rows missing from the GPU snapshots are uploaded for PUT; fresh rows
-keep their GPU sources. CPU serving/digest copies, CPU-origin prompt tokens,
-and TQ's GPU staging copy remain. When the execution path or device placement
+Prefix caching keeps its existing behavior and CPU router history. Cached prefix
+rows missing from GPU snapshots are uploaded only if included in this PUT's
+delta; fresh rows keep their GPU sources. CPU serving/digest copies, CPU-origin
+prompt tokens, and TQ's GPU staging copy remain. When the execution path or device placement
 cannot provide reusable GPU outputs, or preemption invalidates retained
 history, the existing CPU-produced PUT is used. No additional configuration
 is required.

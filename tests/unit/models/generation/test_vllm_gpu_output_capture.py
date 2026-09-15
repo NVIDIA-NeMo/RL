@@ -87,6 +87,14 @@ def _runner(
     return runner
 
 
+def _capture(
+    runner: SimpleNamespace, *, require_routed_experts: bool
+) -> GpuOutputCapture:
+    capture = GpuOutputCapture(runner, require_routed_experts=require_routed_experts)
+    capture.install()
+    return capture
+
+
 def _step(
     runner: SimpleNamespace,
     capture: GpuOutputCapture,
@@ -134,8 +142,6 @@ def _step(
             else []
         ),
     )
-    if runner._bookkeeping_sync is capture._original_bookkeeping:
-        capture.install()
     runner.native_step = (scheduler, sampler, routes)
     result = runner.sample_tokens(None)
     assert result.serving_result == "original-serving-output"
@@ -213,8 +219,6 @@ def _batched_step(
         ),
     )
     runner.native_step = (scheduler, sampler, scratch)
-    if runner._bookkeeping_sync is capture._original_bookkeeping:
-        capture.install()
     output = runner.sample_tokens(None)
     assert output.serving_result == "original-serving-output"
     scratch.fill_(255)
@@ -229,8 +233,7 @@ cuda_required = pytest.mark.skipif(
 @cuda_required
 def test_native_payload_survives_scratch_reuse_and_cross_process_ipc() -> None:
     runner = _runner()
-    capture = GpuOutputCapture(runner, require_routed_experts=True)
-    capture.install()
+    capture = _capture(runner, require_routed_experts=True)
     capture_stream = torch.cuda.Stream()
     export_stream = torch.cuda.Stream()
     with torch.cuda.stream(capture_stream):
@@ -267,7 +270,6 @@ def test_native_payload_survives_scratch_reuse_and_cross_process_ipc() -> None:
     assert result[0] == [7]
     assert result[1] == pytest.approx([-0.7])
     assert result[2] == [[[10, 11]], [[12, 13]], [[14, 15]], [[0, 1]]]
-    capture.clear()
     assert lease.lease_id in capture._leases
     capture.release(lease.lease_id)
     assert not capture._requests and not capture._leases
@@ -276,13 +278,12 @@ def test_native_payload_survives_scratch_reuse_and_cross_process_ipc() -> None:
         runner, capture, start=4, count=1, token=9, logprob=-0.9, route_values=[18, 19]
     )
     assert not capture._requests and not capture._leases
-    capture.clear()
 
 
 @cuda_required
 def test_missing_routes_are_rejected_instead_of_returning_incomplete_payload() -> None:
     runner = _runner()
-    capture = GpuOutputCapture(runner, require_routed_experts=True)
+    capture = _capture(runner, require_routed_experts=True)
     _step(runner, capture, start=2, count=1, route_values=[1, 2])
     with pytest.raises(RuntimeError, match="does not cover"):
         capture.export("call", generated_token_count=1, prompt_token_count=3)
@@ -293,7 +294,7 @@ def test_missing_routes_are_rejected_instead_of_returning_incomplete_payload() -
 @cuda_required
 def test_import_rejects_wrong_host_and_physical_gpu_before_opening_ipc() -> None:
     runner = _runner()
-    capture = GpuOutputCapture(runner, require_routed_experts=False)
+    capture = _capture(runner, require_routed_experts=False)
     _step(runner, capture)
     lease = capture.export("call", generated_token_count=1, prompt_token_count=3)
     with pytest.raises(GpuOutputImportError, match="same-host") as error:
@@ -310,7 +311,7 @@ def test_import_rejects_wrong_host_and_physical_gpu_before_opening_ipc() -> None
 def test_untagged_requests_do_not_allocate_training_payloads() -> None:
     runner = _runner()
     runner.requests["native"].sampling_params.extra_args = {}
-    capture = GpuOutputCapture(runner, require_routed_experts=False)
+    capture = _capture(runner, require_routed_experts=False)
     _step(runner, capture)
     assert not capture._requests and not capture._leases
     with pytest.raises(RuntimeError, match="No retained GPU output"):
@@ -322,7 +323,7 @@ def test_reprefill_preserves_already_emitted_routes_and_logprobs() -> None:
     runner = _runner()
     # A per-request -1 becomes vocab_size at the native batch boundary.
     runner.requests["native"].sampling_params.logprobs = -1
-    capture = GpuOutputCapture(runner, require_routed_experts=True)
+    capture = _capture(runner, require_routed_experts=True)
     _step(runner, capture)
     # An overlapping prefill fragment must preserve routes already emitted.
     _step(
@@ -357,7 +358,7 @@ def test_partial_import_never_decrements_the_failed_attempt_twice(
     from nemo_rl.models.generation.vllm import gpu_output_capture as module
 
     runner = _runner()
-    capture = GpuOutputCapture(runner, require_routed_experts=True)
+    capture = _capture(runner, require_routed_experts=True)
     _step(runner, capture)
     lease = capture.export("call", generated_token_count=1, prompt_token_count=3)
     release_counter = module._release_unopened_handle
@@ -406,7 +407,7 @@ def test_gpu_logprobs_match_serving_floor_before_staging(raw_logprob: float) -> 
     from nemo_rl.models.generation.vllm.utils import VLLM_LOGPROB_FLOOR
 
     runner = _runner()
-    capture = GpuOutputCapture(runner, require_routed_experts=False)
+    capture = _capture(runner, require_routed_experts=False)
     output = _step(runner, capture, logprob=raw_logprob)
     lease = capture.export("call", generated_token_count=1, prompt_token_count=3)
     normalized = capture._leases[lease.lease_id].tensors.generation_logprobs
@@ -423,7 +424,7 @@ def test_capture_reuses_native_storage_across_uneven_request_lifetimes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = _runner()
-    capture = GpuOutputCapture(runner, require_routed_experts=True)
+    capture = _capture(runner, require_routed_experts=True)
     native_clone = torch.Tensor.clone
     cloned = []
 
@@ -478,7 +479,7 @@ def test_capture_reuses_native_storage_across_uneven_request_lifetimes(
 @cuda_required
 def test_request_mapping_is_frozen_before_native_bookkeeping_mutation() -> None:
     runner = _runner()
-    capture = GpuOutputCapture(runner, require_routed_experts=True)
+    capture = _capture(runner, require_routed_experts=True)
 
     def mutate_live_batch() -> None:
         runner.input_batch.req_ids.reverse()
@@ -506,7 +507,7 @@ def test_request_mapping_is_frozen_before_native_bookkeeping_mutation() -> None:
 @cuda_required
 def test_discard_between_bookkeeping_and_snapshot_does_not_resurrect_request() -> None:
     runner = _runner()
-    capture = GpuOutputCapture(runner, require_routed_experts=True)
+    capture = _capture(runner, require_routed_experts=True)
     runner.after_bookkeeping = lambda: capture.discard("call")
     _step(runner, capture)
     assert not capture._requests and not capture._leases
@@ -515,7 +516,7 @@ def test_discard_between_bookkeeping_and_snapshot_does_not_resurrect_request() -
 @cuda_required
 def test_native_sync_scheduler_keeps_original_sampled_outputs() -> None:
     runner = _runner(async_scheduling=False)
-    capture = GpuOutputCapture(runner, require_routed_experts=False)
+    capture = _capture(runner, require_routed_experts=False)
     output = _step(runner, capture)
     assert output._routed_experts is None
     fragment = capture._requests["call"].fragments[0]
@@ -535,7 +536,7 @@ def test_native_sync_scheduler_keeps_original_sampled_outputs() -> None:
 def test_raw_vocabulary_logprob_selection_is_deferred_to_assembly() -> None:
     runner = _runner()
     runner.input_batch.sampling_metadata = SimpleNamespace(max_num_logprobs=-1)
-    capture = GpuOutputCapture(runner, require_routed_experts=False)
+    capture = _capture(runner, require_routed_experts=False)
     output = _step(runner, capture, token=1)
     fragment = capture._requests["call"].fragments[0]
     assert fragment.logprob.shape == (2,)
@@ -551,7 +552,7 @@ def test_prefix_cached_by_untagged_request_needs_only_historical_route_backfill(
 ):
     runner = _runner()
     runner.requests["native"].sampling_params.extra_args = {}
-    capture = GpuOutputCapture(runner, require_routed_experts=True)
+    capture = _capture(runner, require_routed_experts=True)
     historical = _step(
         runner, capture, route_values=[10, 11, 12, 13, 14, 15], initial_cached_prefix=0
     )
@@ -595,7 +596,7 @@ def test_cached_prefix_length_is_frozen_before_bookkeeping_and_chunked_prefill()
 ):
     runner = _runner()
     runner.requests["native"].num_prompt_tokens = 5
-    capture = GpuOutputCapture(runner, require_routed_experts=True)
+    capture = _capture(runner, require_routed_experts=True)
 
     def mutate_admission_metadata() -> None:
         runner.native_step[0].scheduled_new_reqs[0].num_computed_tokens = 4
@@ -636,7 +637,7 @@ def test_cached_prefix_length_is_frozen_before_bookkeeping_and_chunked_prefill()
 def test_prefix_authorization_never_covers_missing_fresh_outputs(gap_kind: str) -> None:
     runner = _runner()
     runner.requests["native"].num_prompt_tokens = 5
-    capture = GpuOutputCapture(runner, require_routed_experts=True)
+    capture = _capture(runner, require_routed_experts=True)
     _step(
         runner,
         capture,
@@ -680,7 +681,7 @@ def test_invalid_admission_cache_metadata_fails_capture_only(
     cached_prefix: int,
 ) -> None:
     runner = _runner()
-    capture = GpuOutputCapture(runner, require_routed_experts=True)
+    capture = _capture(runner, require_routed_experts=True)
     _step(
         runner,
         capture,
@@ -698,7 +699,7 @@ def test_invalid_admission_cache_metadata_fails_capture_only(
 def test_later_positive_start_does_not_expand_proven_cached_prefix() -> None:
     runner = _runner()
     runner.requests["native"].num_prompt_tokens = 5
-    capture = GpuOutputCapture(runner, require_routed_experts=True)
+    capture = _capture(runner, require_routed_experts=True)
     _step(
         runner,
         capture,
@@ -723,7 +724,7 @@ def test_later_positive_start_does_not_expand_proven_cached_prefix() -> None:
 def test_native_capture_rejects_truncated_canonical_cpu_route_envelope() -> None:
     runner = _runner()
     runner.requests["native"].sampling_params.routed_experts_prompt_start = 2
-    capture = GpuOutputCapture(runner, require_routed_experts=True)
+    capture = _capture(runner, require_routed_experts=True)
     _step(
         runner,
         capture,
@@ -752,7 +753,7 @@ def test_abort_drops_native_views_and_unimported_lease(
 
     monkeypatch.setattr(module, "_release_unopened_handle", tracked_release)
     runner = _runner()
-    capture = GpuOutputCapture(runner, require_routed_experts=True)
+    capture = _capture(runner, require_routed_experts=True)
     _step(runner, capture)
     views = [
         weakref.ref(tensor)
@@ -789,8 +790,7 @@ def test_abort_drops_native_views_and_unimported_lease(
 def test_changed_bookkeeping_call_preserves_serving() -> None:
     runner = _runner()
     runner._bookkeeping_sync = lambda payload: payload
-    capture = GpuOutputCapture(runner, require_routed_experts=False)
-    capture.install()
+    capture = _capture(runner, require_routed_experts=False)
     assert (
         runner._bookkeeping_sync("original-serving-output") == "original-serving-output"
     )
@@ -805,7 +805,7 @@ def test_resumed_requests_discard_gpu_history_for_original_cpu_put(
     output_count: int,
 ) -> None:
     runner = _runner()
-    capture = GpuOutputCapture(runner, require_routed_experts=True)
+    capture = _capture(runner, require_routed_experts=True)
     _step(runner, capture, route_values=[10, 11, 20, 21, 30, 31])
     old_view = weakref.ref(capture._requests["call"].fragments[0].routes)
     result = _step(
@@ -873,13 +873,15 @@ def test_native_optimization_availability_preserves_existing_paths(
         require_routed_experts=True,
     )
     assert (capability is not None) == (path == "supported")
+    if capability is not None:
+        assert capability == str(torch.cuda.get_device_properties(runner.device).uuid)
     assert (runner.sample_tokens is not original) == (path == "supported")
 
 
 @cuda_required
 def test_export_reads_survive_source_release_on_another_stream() -> None:
     runner = _runner()
-    capture = GpuOutputCapture(runner, require_routed_experts=True)
+    capture = _capture(runner, require_routed_experts=True)
     source_stream, export_stream = torch.cuda.Stream(), torch.cuda.Stream()
     with torch.cuda.stream(source_stream):
         _step(runner, capture, route_values=[10, 11, 20, 21, 30, 31])
@@ -914,7 +916,7 @@ def test_finished_native_requests_retire_tracking_after_cleanup(
     completion: str,
 ) -> None:
     runner = _runner()
-    capture = GpuOutputCapture(runner, require_routed_experts=True)
+    capture = _capture(runner, require_routed_experts=True)
     _step(runner, capture)
     if completion == "export":
         lease = capture.export("call", generated_token_count=1, prompt_token_count=3)
@@ -952,7 +954,7 @@ def test_finished_native_requests_retire_tracking_after_cleanup(
 @cuda_required
 def test_early_abort_suppresses_later_admission_before_tracking_retires() -> None:
     runner = _runner()
-    capture = GpuOutputCapture(runner, require_routed_experts=True)
+    capture = _capture(runner, require_routed_experts=True)
     request = runner.requests.pop("native")
     capture.discard("call")
     _prepare_empty_batch(runner, capture)
