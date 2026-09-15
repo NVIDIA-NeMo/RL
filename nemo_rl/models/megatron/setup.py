@@ -1453,18 +1453,6 @@ def _validate_te_precision_config(
                 )
 
 
-def _apply_inference_mxfp8_parameter_filters(
-    model_cfg: Any, megatron_cfg: Mapping[str, Any]
-) -> None:
-    """Apply inference MXFP8 parameter selection to a model provider."""
-    for filter_name in (
-        "inference_mxfp8_include_parameters",
-        "inference_mxfp8_exclude_parameters",
-    ):
-        if filter_name in megatron_cfg:
-            setattr(model_cfg, filter_name, megatron_cfg[filter_name])
-
-
 def _apply_precision_config(
     model_cfg: Any, config: PolicyConfig, dtype: torch.dtype
 ) -> None:
@@ -1487,7 +1475,13 @@ def _apply_precision_config(
         "float16": torch.float16,
     }
     model_cfg.pipeline_dtype = dtype_map[config["megatron_cfg"]["pipeline_dtype"]]
-    _apply_inference_mxfp8_parameter_filters(model_cfg, config["megatron_cfg"])
+    for field_name in (
+        "first_last_layers_bf16",
+        "num_layers_at_start_in_bf16",
+        "num_layers_at_end_in_bf16",
+    ):
+        if field_name in config["megatron_cfg"]:
+            setattr(model_cfg, field_name, config["megatron_cfg"][field_name])
 
     te_precision_config_file = config["megatron_cfg"].get("te_precision_config_file")
     if te_precision_config_file is not None:
@@ -2015,8 +2009,10 @@ def build_inference_model(
     train_pipeline_model_parallel_size = inference_provider.pipeline_model_parallel_size
     _apply_parallelism_config(inference_provider, policy_cfg)
     _apply_moe_config(inference_provider, policy_cfg)
-    _apply_inference_mxfp8_parameter_filters(
-        inference_provider, policy_cfg["megatron_cfg"]
+    # Resolve the same per-module recipe and BF16 boundaries as a dedicated
+    # worker before MCore chooses parameter storage during construction.
+    _apply_precision_config(
+        inference_provider, policy_cfg, inference_provider.params_dtype
     )
     if "transformer_impl" in policy_cfg["megatron_cfg"]:
         inference_provider.transformer_impl = policy_cfg["megatron_cfg"][

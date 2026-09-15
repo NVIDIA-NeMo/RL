@@ -165,24 +165,21 @@ def test_inference_optimized_pins_generation_etp_to_one() -> None:
 
 
 @pytest.mark.mcore
-def test_merged_inference_config_preserves_mxfp8_parameter_filters() -> None:
+def test_merged_inference_config_inherits_selective_mxfp8_recipe() -> None:
     config = deepcopy(basic_megatron_test_config)
-    inference_cfg = config["generation"]["mcore_generation_config"]
-    inference_cfg["inference_mxfp8_include_parameters"] = (
-        r"\.mlp\.experts\.linear_fc[12]\."
+    precision_cfg = dict(
+        te_precision_config_file="/path/to/routed_experts.yaml",
+        first_last_layers_bf16=True,
+        num_layers_at_start_in_bf16=2,
+        num_layers_at_end_in_bf16=4,
+        fp8_cfg=dict(enabled=True, fp8="e4m3", fp8_recipe="mxfp8", fp8_param=True),
     )
-    inference_cfg["inference_mxfp8_exclude_parameters"] = r"\.layers\.(?:0|1)\."
+    config["megatron_cfg"].update(precision_cfg)
 
     merged = merged_inference_megatron_cfg(config)
 
-    assert (
-        merged["inference_mxfp8_include_parameters"]
-        == inference_cfg["inference_mxfp8_include_parameters"]
-    )
-    assert (
-        merged["inference_mxfp8_exclude_parameters"]
-        == inference_cfg["inference_mxfp8_exclude_parameters"]
-    )
+    for key, value in precision_cfg.items():
+        assert merged[key] == value
 
 
 @pytest.mark.mcore

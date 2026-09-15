@@ -147,10 +147,6 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # FP8/MXFP8 for the dedicated (non-colocated) inference model;
     # merged into its `megatron_cfg` by `merged_inference_megatron_cfg`.
     fp8_cfg: NotRequired[Fp8Config]
-    # Regex filters over MCore's fully qualified parameter names. Inclusion
-    # defaults to every parameter; exclusion takes precedence.
-    inference_mxfp8_include_parameters: NotRequired[str | None]
-    inference_mxfp8_exclude_parameters: NotRequired[str | None]
 
 
 class MCoreGenerationConfig(GenerationConfig):

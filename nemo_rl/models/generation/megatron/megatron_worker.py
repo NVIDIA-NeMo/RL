@@ -1665,25 +1665,11 @@ class MegatronGenerationRefitMixin:
             param_name_by_id = {
                 id(param): name for name, param in decoder.named_parameters()
             }
-            backend = _resolve_mxfp8_refit_backend(core.config)
-            include_pattern = getattr(
-                core.config, "inference_mxfp8_include_parameters", None
+            # MCore converts only parameters with MXFP8 storage; the TE recipe
+            # selected BF16 parameters already, before checkpoint loading.
+            persistent_buffers = quantize_params_to_mxfp8(
+                decoder, backend=_resolve_mxfp8_refit_backend(core.config)
             )
-            exclude_pattern = getattr(
-                core.config, "inference_mxfp8_exclude_parameters", None
-            )
-            if include_pattern is None and exclude_pattern is None:
-                # Keep compatibility with MCore revisions predating selective
-                # inference MXFP8 support when no filters are requested.
-                persistent_buffers = quantize_params_to_mxfp8(decoder, backend=backend)
-            else:
-                persistent_buffers = quantize_params_to_mxfp8(
-                    decoder,
-                    backend=backend,
-                    include_pattern=include_pattern,
-                    exclude_pattern=exclude_pattern,
-                    _filter_prefix="decoder.",
-                )
             destination_by_id.update(
                 {
                     param_id: persistent_buffers[name]

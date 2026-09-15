@@ -27,6 +27,7 @@ nemo_rl.models.megatron.setup, focusing on:
 import os
 import warnings
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, call, patch
@@ -616,9 +617,7 @@ class TestApplyModelOverrides:
 
     def test_rejects_first_class_megatron_config_conflict(self):
         """A first-class field cannot also be supplied through model_overrides."""
-        from nemo_rl.models.megatron.setup import (
-            _validate_model_override_conflicts,
-        )
+        from nemo_rl.models.megatron.setup import _validate_model_override_conflicts
 
         with pytest.raises(
             ValueError,
@@ -1176,35 +1175,41 @@ class TestApplyPrecisionConfig:
             _apply_precision_config(model_cfg, config, torch.float32)
             assert model_cfg.pipeline_dtype == expected_dtype
 
-    def test_applies_mxfp8_inference_parameter_filters(self):
-        """Dedicated inference providers receive both selection filters."""
+    def test_applies_bf16_boundary_layers(self) -> None:
+        """Training and dedicated inference use the same boundary settings."""
+        # Keep the optional Megatron/Bridge dependency out of test collection.
         from nemo_rl.models.megatron.setup import _apply_precision_config
 
         model_cfg = SimpleNamespace(bf16=False, fp16=False)
         config = {
             "megatron_cfg": {
                 "pipeline_dtype": "bfloat16",
-                "inference_mxfp8_include_parameters": (
-                    r".*mlp\.experts\.linear_fc[12]"
-                ),
-                "inference_mxfp8_exclude_parameters": r".*shared_experts.*",
+                "first_last_layers_bf16": True,
+                "num_layers_at_start_in_bf16": 2,
+                "num_layers_at_end_in_bf16": 4,
             }
         }
 
         _apply_precision_config(model_cfg, config, torch.bfloat16)
 
-        assert (
-            model_cfg.inference_mxfp8_include_parameters
-            == r".*mlp\.experts\.linear_fc[12]"
-        )
-        assert model_cfg.inference_mxfp8_exclude_parameters == r".*shared_experts.*"
+        assert model_cfg.first_last_layers_bf16 is True
+        assert model_cfg.num_layers_at_start_in_bf16 == 2
+        assert model_cfg.num_layers_at_end_in_bf16 == 4
 
-    def test_colocated_inference_model_applies_generation_filters(self, monkeypatch):
-        """Colocated inference applies generation filters before finalization."""
+    def test_colocated_inference_model_applies_precision_recipe(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Colocated inference resolves its recipe before model construction."""
+        # Keep the optional Megatron/Bridge dependency out of test collection.
         import nemo_rl.models.megatron.setup as setup
 
-        include_pattern = r".*mlp\.experts\.linear_fc[12]"
+        recipe_file = tmp_path / "te_precision.yaml"
+        recipe_file.write_text("{}")
+        recipe = self._quant_recipe({})
+        monkeypatch.setattr(setup, "load_quantization_recipe", lambda _: recipe)
         provider = SimpleNamespace(
+            params_dtype=torch.bfloat16,
+            quant_recipe=None,
             pipeline_model_parallel_size=1,
             tensor_model_parallel_size=1,
             context_parallel_size=1,
@@ -1217,8 +1222,11 @@ class TestApplyPrecisionConfig:
             transformer_impl="inference_optimized",
         )
 
-        def finalize():
-            assert provider.inference_mxfp8_include_parameters == include_pattern
+        def finalize() -> None:
+            assert provider.quant_recipe is recipe
+            assert provider.first_last_layers_bf16 is True
+            assert provider.num_layers_at_start_in_bf16 == 2
+            assert provider.num_layers_at_end_in_bf16 == 4
 
         provider.finalize = MagicMock(side_effect=finalize)
         inference_model = MagicMock()
@@ -1236,7 +1244,11 @@ class TestApplyPrecisionConfig:
             "megatron_cfg": {
                 "transformer_impl": "inference_optimized",
                 "freeze_moe_router": False,
-                "inference_mxfp8_include_parameters": include_pattern,
+                "pipeline_dtype": "bfloat16",
+                "te_precision_config_file": str(recipe_file),
+                "first_last_layers_bf16": True,
+                "num_layers_at_start_in_bf16": 2,
+                "num_layers_at_end_in_bf16": 4,
             }
         }
         megatron_cfg = SimpleNamespace(
