@@ -201,6 +201,28 @@ optimizer state again when choosing a production horizon.
 - Unvalidated CP-local route fetch, 256/256 role rebalance and W&B buffering
   candidates. They need separate correctness/performance review.
 
+## CCC compilation and grader exit status
+
+The pinned CCC evaluator inferred compilation success from empty stderr. This
+rejects valid programs with compiler warnings and accepts a failed compiler
+that produces no stderr. It also parsed partial grader stdout as a score even
+when the sandbox reported a non-successful execution.
+
+`gym_ccc_execution.patch` uses the sandbox's `process_status == "completed"`
+contract for both stages. The shell sandbox derives this status from the process
+exit code. Diagnostics retain compile/run status, stdout, and stderr; a failed
+compile never proceeds to grading, and a failed grader cannot award a score
+from partial stdout. Successful zero and fractional scores are unchanged.
+Stage a new Gym tree with `stage_gym.py`; never patch an active runtime.
+
+`tests/unit/tools/test_ccc_execution.py` applies the overlay to the pinned Gym
+source with zero fuzz and exercises its actual `run_test_case` function using
+controlled transport replies. It skips explicitly if the Gym Git object is
+unavailable. Native HTTP/sandbox known-answer controls and reasoning-on model
+generation remain separate validation gates. This change does not address
+precompile-cache races, verifier throughput, or classification/retry of sandbox
+infrastructure failures; the pinned outer verifier still catches exceptions.
+
 ## CCC metadata staging: no driver dependency on orjson
 
 **Incident 1:** a preparation driver lacked `orjson`; staging exited before
