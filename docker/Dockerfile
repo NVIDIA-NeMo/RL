@@ -119,6 +119,7 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.ru
 ARG UV_VERSION=0.11.28
 ARG PYTHON_VERSION=3.13.14
 ENV PATH="/root/.local/bin:$PATH"
+ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
     uv python install ${PYTHON_VERSION}
 
@@ -170,8 +171,8 @@ ARG TRTLLM_BUILD_JOBS=24
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
 
-# Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
-ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
+# Ensure DeepEP is built for hopper and (grace)blackwell (also mcore inference unified memory API now invokes a torch API that requires these to be set)
+ENV TORCH_CUDA_ARCH_LIST="9.0 10.0 10.3"
 
 # Build HybridEP with inter-node transport support.
 ENV HYBRID_EP_MULTINODE=1
@@ -511,6 +512,10 @@ export TRTLLM_REQUIRE_CACHED_WHEEL=1
 # and a full FQN matches only itself.
 UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py $(cut -f1 /opt/actor_venvs.tsv)
 EOF
+RUN for d in /opt/ray_venvs /opt/nemo_rl_venv; do \
+      [ -d "$d" ] || continue; \
+      find "$d" -name "ptxas-blackwell" -exec ln -sf /usr/local/cuda/bin/ptxas {} +; \
+    done
 
 # Prefetch NeMo Gym internal venvs (gym servers like code_gen, math_with_judge, etc.)
 # into the image. Gated on NEMO_GYM_PREFETCH_CONFIGS (no-op by default). Runs after the
