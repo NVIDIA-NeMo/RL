@@ -37,6 +37,7 @@ from nemo_rl.data.energon.sft_dataloader import (  # noqa: E402
     _loader_identity,
     _v2_topology,
     _worker_config,
+    build_energon_sft_loader,
 )
 from nemo_rl.data_plane import KVBatchMeta  # noqa: E402
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict  # noqa: E402
@@ -116,12 +117,103 @@ def test_v2_fingerprint_identifies_each_logical_shard() -> None:
     )
 
 
+def test_v2_loader_applies_cache_pool_and_gc_controls() -> None:
+    adapter = MagicMock(fingerprint="processor")
+    task_encoder = MagicMock()
+    task_encoder.cookers = [MagicMock(need_cache=True)]
+    dataset = object()
+    cache_pool = object()
+    raw_loader = MagicMock()
+
+    with (
+        patch(
+            "nemo_rl.data.energon.sft_dataloader.build_processor_adapter",
+            return_value=adapter,
+        ),
+        patch(
+            "nemo_rl.data.energon.sft_dataloader._task_encoder",
+            return_value=task_encoder,
+        ),
+        patch(
+            "nemo_rl.data.energon.sft_dataloader.get_train_dataset",
+            return_value=dataset,
+        ) as get_train_dataset,
+        patch(
+            "nemo_rl.data.energon.sft_dataloader.FileStoreCachePool",
+            return_value=cache_pool,
+        ) as cache_pool_type,
+        patch(
+            "nemo_rl.data.energon.sft_dataloader.get_savable_loader",
+            return_value=raw_loader,
+        ) as get_savable_loader,
+    ):
+        build_energon_sft_loader(
+            data_config={
+                "shuffle": True,
+                "energon": {
+                    "model_family": "qwen",
+                    "cache_pool_max_gbytes": 8,
+                    "cache_pool_num_workers": 3,
+                    "gc_collect_every_n_steps": 1234,
+                    "task_encoder": {
+                        "packing": {
+                            "name": "balanced_greedy_knapsack",
+                            "buffer_size": 5000,
+                            "options": {
+                                "max_sequence_length": 128,
+                                "sequence_length_pad_multiple": 8,
+                                "balanced_knapsack_delta": 5,
+                            },
+                        }
+                    },
+                },
+            },
+            source=EnergonSourceConfig(
+                path="/dataset", split="train", virtual_epoch_length=8
+            ),
+            processor=MagicMock(tokenizer=MagicMock()),
+            batch_size=2,
+            max_sequence_length=128,
+            split_role="train",
+            logical_rank=0,
+            logical_world_size=1,
+            placement_fingerprint="placement",
+            only_unmask_final=False,
+        )
+
+    cache_pool_type.assert_called_once_with(
+        method="raw", num_workers=3, max_cache_size_gbytes=8.0
+    )
+    assert get_train_dataset.call_args.kwargs["packing_buffer_size"] == 5000
+    assert get_savable_loader.call_args.kwargs["cache_pool"] is cache_pool
+    assert get_savable_loader.call_args.kwargs["gc_collect_every_n_steps"] == 1234
+
+
 def test_sft_v2_worker_uses_megatron_worker_environment() -> None:
     assert get_actor_python_env(
         "nemo_rl.data.energon.sft_worker.SFTMegatronPolicyWorker"
     ) == get_actor_python_env(
         "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
     )
+
+
+def test_sft_v2_worker_defers_processor_construction() -> None:
+    from nemo_rl.data.energon.sft_worker import SFTMegatronPolicyWorker
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker_cls = SFTMegatronPolicyWorker.__ray_metadata__.modified_class
+    with (
+        patch.object(MegatronPolicyWorkerImpl, "__init__", return_value=None),
+        patch("nemo_rl.algorithms.utils.get_tokenizer") as get_tokenizer,
+    ):
+        worker = worker_cls(
+            {"tokenizer": {"use_processor": True}}, tokenizer=MagicMock()
+        )
+
+    get_tokenizer.assert_not_called()
+    assert worker._sft_processor is None
 
 
 def test_sft_v2_worker_publishes_sequence_alignment() -> None:
@@ -135,6 +227,11 @@ def test_sft_v2_worker_publishes_sequence_alignment() -> None:
     worker._sft_logical_rank = 0
     worker._sft_logical_world_size = 2
     worker._sft_next_batch_index = 0
+    worker._ld_on = False
+    worker._ld_phase = None
+    worker._ld_t0 = 0.0
+    worker._ld_durations = {}
+    worker._ld_watchdog = None
     worker.tokenizer = MagicMock(pad_token_id=0)
     worker._dp_client = MagicMock()
 
@@ -177,3 +274,20 @@ def test_sft_v2_worker_publishes_sequence_alignment() -> None:
         {"source_id": "source-a"},
         {"source_id": "source-b"},
     ]
+    assert set(envelope.load_phase_seconds) == {
+        "iter",
+        "prepare",
+        "post-prepare",
+        "tensordict",
+        "publish",
+        "publish_setup",
+        "publish_register_partition",
+        "publish_source_tags",
+        "publish_put_samples",
+        "publish_batch_metadata",
+    }
+    assert all(value >= 0.0 for value in envelope.load_phase_seconds.values())
+    assert envelope.load_seconds >= sum(
+        envelope.load_phase_seconds[phase]
+        for phase in ("iter", "prepare", "post-prepare", "tensordict", "publish")
+    )

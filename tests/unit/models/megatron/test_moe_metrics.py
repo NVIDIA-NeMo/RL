@@ -121,6 +121,52 @@ def test_get_moe_metrics_aggregation_and_per_layer_logging(monkeypatch):
 
 
 @pytest.mark.mcore
+def test_get_moe_metrics_uses_actual_moe_layer_divisor(monkeypatch):
+    """Hybrid models must not divide by dense and Mamba tracker slots."""
+    from nemo_rl.models import megatron as megatron_module
+    from nemo_rl.models.megatron.common import get_moe_metrics
+
+    tracker = _make_fake_tracker(
+        {"seq_load_balancing_loss": torch.ones(90, dtype=torch.float32)}
+    )
+    monkeypatch.setattr(
+        megatron_module.common,
+        "reduce_aux_losses_tracker_across_ranks",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        megatron_module.common,
+        "get_moe_layer_wise_logging_tracker",
+        lambda: tracker,
+    )
+    monkeypatch.setattr(
+        megatron_module.common,
+        "clear_aux_losses_tracker",
+        lambda: None,
+    )
+
+    metrics = get_moe_metrics(loss_scale=1.0, num_moe_layers=44)
+
+    assert metrics["seq_load_balancing_loss"] == pytest.approx(90.0 / 44.0)
+
+
+@pytest.mark.mcore
+def test_count_moe_layers_uses_hybrid_pattern_and_mtp_layers(monkeypatch):
+    from megatron.core.models.hybrid import hybrid_layer_allocation
+
+    from nemo_rl.models.megatron.common import count_moe_layers
+
+    monkeypatch.setattr(
+        hybrid_layer_allocation,
+        "get_hybrid_layer_counts",
+        lambda pattern: {hybrid_layer_allocation.Symbols.MOE: 42},
+    )
+    config = SimpleNamespace(hybrid_layer_pattern="mock-pattern", mtp_num_layers=2)
+
+    assert count_moe_layers(model_config=config) == 44
+
+
+@pytest.mark.mcore
 @pytest.mark.parametrize(
     "routing_type,aux_loss_coeff,z_loss_coeff,expected",
     [
