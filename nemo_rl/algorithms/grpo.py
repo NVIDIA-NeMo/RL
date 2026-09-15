@@ -86,6 +86,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
+from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.interfaces import (
     FRONTIER_ORDINAL_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
@@ -119,6 +120,7 @@ from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.trtllm import TrtllmConfig, TrtllmGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
+    REFITTABLE_FP8_KV_CACHE_DTYPES,
     VLLM_SPARSE_REFIT_TRANSPORTS,
     normalize_vllm_refit_config,
 )
@@ -161,6 +163,7 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
+from nemo_rl.weight_sync.nccl_reshard_utils import check_nccl_reshard_refit_support
 
 # ===============================================================================
 # Configuration
@@ -490,35 +493,6 @@ def _needs_hf_refit_handshake(
     if generation_backend == "megatron":
         return False
     return not (nccl_reshard_refit_enabled and not colocated_inference)
-
-
-def shutdown_environments(
-    task_to_env: dict[str, EnvironmentInterface] | None,
-    val_task_to_env: dict[str, EnvironmentInterface] | None,
-) -> None:
-    """Shut down each unique environment actor before generation stops."""
-    seen_environment_handles: set[int] = set()
-    for environment_map in (task_to_env, val_task_to_env):
-        if environment_map is None:
-            continue
-        for task_name, environment in environment_map.items():
-            handle_id = id(environment)
-            if handle_id in seen_environment_handles:
-                continue
-            seen_environment_handles.add(handle_id)
-
-            print(f"🛑 Shutting down environment {task_name}...")
-            try:
-                ray.get(environment.shutdown.remote(), timeout=10)
-            except Exception as shutdown_error:
-                print(
-                    f"Environment {task_name} graceful shutdown failed: "
-                    f"{shutdown_error}"
-                )
-                try:
-                    ray.kill(environment)
-                except Exception as kill_error:
-                    print(f"Error stopping environment {task_name}: {kill_error}")
 
 
 def setup(
@@ -1535,13 +1509,14 @@ def setup(
             assert loss_config.use_importance_sampling_correction, (
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
             )
-        if generation_config["vllm_cfg"]["kv_cache_dtype"].startswith("fp8"):
+        kv_cache_dtype = generation_config["vllm_cfg"]["kv_cache_dtype"]
+        if kv_cache_dtype.startswith("fp8"):
             # FP8 KV cache requires FP8 model precision
             assert generation_config["vllm_cfg"]["precision"] == "fp8", (
-                f"kv_cache_dtype='{generation_config['vllm_cfg']['kv_cache_dtype']}' requires precision='fp8'. "
+                f"kv_cache_dtype='{kv_cache_dtype}' requires precision='fp8'. "
                 "FP8 KV cache can only be used together with FP8 model weights."
             )
-            # FP8 KV cache compatibility checks
+        if kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES:
             assert policy_config["dtensor_cfg"]["enabled"] == False, (
                 "DTensor backend is not supported with kv cache fp8 enabled."
             )
@@ -1729,19 +1704,18 @@ def setup(
         generation_config.get("refit_transport") == "nccl_reshard"
     )
     if nccl_reshard_refit_enabled:
-        from nemo_rl.weight_sync.nccl_reshard_utils import (
-            check_nccl_reshard_refit_support,
-        )
-
         check_nccl_reshard_refit_support(master_config)
 
-    if generation_config.get("refit_transport") is not None and backend != "vllm":
+    refit_transport = generation_config.get("refit_transport")
+    if refit_transport is not None and not (
+        backend == "vllm"
+        or (backend == "megatron" and refit_transport in ("mcore", "nccl_reshard"))
+    ):
         raise NotImplementedError(
-            "Non-default refit transports are only supported for the vLLM "
-            f"generation backend, but policy.generation.backend={backend!r}. "
-            "Set policy.generation.refit_transport=null. Support for other "
-            "generation backends is tracked in "
-            "https://github.com/NVIDIA-NeMo/RL/issues/3288."
+            f"refit_transport={refit_transport!r} is not supported for "
+            f"policy.generation.backend={backend!r}. "
+            "Set policy.generation.refit_transport=null. Megatron generation "
+            "supports refit_transport='mcore' or 'nccl_reshard'."
         )
 
     if backend == "megatron":
@@ -1848,7 +1822,9 @@ def setup(
         ) is None and _needs_hf_refit_handshake(
             backend, nccl_reshard_refit_enabled, colocated_inference
         ):
-            state_dict_info = policy.prepare_refit_info()
+            state_dict_info = policy.prepare_refit_info(
+                refit_payload_mode=policy_generation.get_refit_payload_mode()
+            )
             if policy_generation is not None:
                 policy_generation.prepare_refit_info(state_dict_info)
 
@@ -2896,8 +2872,7 @@ def _validation_early_stop_message(
     )
 
 
-@trace_fn(RLSpanGroup.JOB, "rl.grpo.job")
-def grpo_train(
+def _grpo_train_impl(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
     wrapped_dataloader: StatefulDataLoader | MultipleDataloaderWrapper,
@@ -4089,6 +4064,43 @@ def grpo_train(
     # so without this the daemon finalization thread would be killed before the
     # final tmp_step_N is renamed.
     checkpointer.shutdown()
+
+
+@trace_fn(RLSpanGroup.JOB, "rl.grpo.job")
+def grpo_train(
+    policy: ColocatablePolicyInterface,
+    policy_generation: Optional[GenerationInterface],
+    wrapped_dataloader: StatefulDataLoader | MultipleDataloaderWrapper,
+    val_dataloader: Optional[StatefulDataLoader],
+    tokenizer: TokenizerType,
+    loss_fn: LossFunction,
+    task_to_env: dict[str, EnvironmentInterface],
+    val_task_to_env: Optional[dict[str, EnvironmentInterface]],
+    logger: Logger,
+    checkpointer: CheckpointManager,
+    grpo_save_state: GRPOSaveState,
+    master_config: MasterConfig,
+    processor: Optional[AutoProcessor] = None,
+) -> None:
+    """Run GRPO training and always tear down its environments."""
+    try:
+        _grpo_train_impl(
+            policy=policy,
+            policy_generation=policy_generation,
+            wrapped_dataloader=wrapped_dataloader,
+            val_dataloader=val_dataloader,
+            tokenizer=tokenizer,
+            loss_fn=loss_fn,
+            task_to_env=task_to_env,
+            val_task_to_env=val_task_to_env,
+            logger=logger,
+            checkpointer=checkpointer,
+            grpo_save_state=grpo_save_state,
+            master_config=master_config,
+            processor=processor,
+        )
+    finally:
+        shutdown_environments(task_to_env, val_task_to_env)
 
 
 def validate(

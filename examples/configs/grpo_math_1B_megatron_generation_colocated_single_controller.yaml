@@ -2,6 +2,7 @@ defaults: grpo_math_1B_megatron_single_controller.yaml
 policy:
   generation:
     backend: megatron
+    refit_transport: mcore
     mcore_generation_config:
       cuda_graph_sizing_distribution: hybrid
       cuda_graph_max_tokens: 512
