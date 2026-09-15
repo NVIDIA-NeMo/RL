@@ -62,6 +62,15 @@ zero-fuzz patches, copies the versioned helpers, and records overlay hashes.
 Mount that tree read-only at the configured Gym source location. The dependency
 Git pin stays unchanged; overlays are reviewable in this NeMo-RL branch.
 
+When importing a staged Gym outside the image's canonical source path, set
+`NEMO_GYM_EXTRA_ROOTS` to the staged tree **before the first Gym import**.
+Gym's component search reorders `sys.path`; `PYTHONPATH` alone can leave an
+image-owned editable namespace component ahead of the staged copy. A diagnostic
+then appears to test the overlay but executes the original resource instead.
+`prepare_node.py` sets the explicit search root for each native interpreter and
+checks the imported module's resolved `__file__` against the expected staged
+`app.py`. Import success without source-path verification is not sufficient.
+
 Local budget tests cover cumulative calls, exhaustion, invalid usage, per-call
 over-return and the disabled default. Native all-route and effective-request
 tests remain required before declaring the runtime validated.

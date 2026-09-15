@@ -24,8 +24,22 @@ import subprocess
 
 from omegaconf import OmegaConf
 
+NATIVE_IMPORT_CHECK = """
+import importlib
+from pathlib import Path
+import sys
+
+module = importlib.import_module(sys.argv[1])
+actual = Path(module.__file__).resolve()
+expected = Path(sys.argv[2]).resolve()
+if actual != expected:
+    raise RuntimeError(f"Native Gym import source differs: {actual} != {expected}")
+print(f"{module.__name__}: {actual}")
+"""
+
 
 def prepare(config: Path, gym: Path, image_venvs: Path, runtime_venvs: Path) -> dict:
+    gym = gym.resolve()
     graph = OmegaConf.load(config).env.nemo_gym
     # Local model config fragments add services absent from the main recipe.
     graphs = [graph]
@@ -64,14 +78,22 @@ def prepare(config: Path, gym: Path, image_venvs: Path, runtime_venvs: Path) -> 
                     else:
                         destination.symlink_to(source, target_is_directory=True)
                     module = ".".join((*identity, "app"))
-                    command = f"import importlib; importlib.import_module({module!r}); print({module!r})"
                     env = os.environ | {
                         "PYTHONPATH": f"{gym / kind / component}:{gym}",
+                        # Gym reorders sys.path. A staged namespace component
+                        # must take precedence over the image's editable tree.
+                        "NEMO_GYM_EXTRA_ROOTS": str(gym),
                         "PYTHONDONTWRITEBYTECODE": "1",
                         "OMP_NUM_THREADS": "1",
                     }
                     subprocess.run(
-                        [str(interpreter), "-c", command],
+                        [
+                            str(interpreter),
+                            "-c",
+                            NATIVE_IMPORT_CHECK,
+                            module,
+                            str(gym / kind / component / "app.py"),
+                        ],
                         cwd=gym,
                         env=env,
                         check=True,
