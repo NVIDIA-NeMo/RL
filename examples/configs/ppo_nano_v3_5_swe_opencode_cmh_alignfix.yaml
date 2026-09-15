@@ -731,7 +731,7 @@ env:
     swe_agents_train:
       responses_api_agents:
         swe_agents:
-          agent_max_turns: 300
+          agent_max_turns: 400
           concurrency: ${mul:2, ${mul:${ppo.num_prompts_per_step}, ${ppo.num_generations_per_prompt}}}
           swebench_agent_timeout: 3600
           swebench_tests_timeout: 900
@@ -751,7 +751,7 @@ env:
     swe_agents_val:
       responses_api_agents:
         swe_agents:
-          agent_max_turns: 300
+          agent_max_turns: 400
           concurrency: ${mul:2, ${mul:${ppo.num_prompts_per_step}, ${ppo.num_generations_per_prompt}}}
           swebench_agent_timeout: 3600
           dataset_path: ${data.validation.data_path}
