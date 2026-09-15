@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
+# megatron_worker imports megatron.core at module level; skip when it is absent.
+pytest.importorskip("megatron.core")
 
 from nemo_rl.models.generation.megatron.megatron_generation import (  # noqa: E402
     MegatronGeneration,

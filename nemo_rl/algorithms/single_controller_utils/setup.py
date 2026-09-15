@@ -937,25 +937,38 @@ def _load_opd_full_teacher_lm_heads(
     )
 
 
-def _raise_missing_nemo_gym_error(error: Exception, backend: str) -> None:
-    """Raise backend-specific remediation for a missing Gym capture extra."""
-    # Worker venvs are cached by actor class name (nemo_rl/utils/venvs.py), so a
-    # venv prebuilt before token capture predates the nemo_gym extra and is reused.
-    if backend == "megatron":
-        raise RuntimeError(
-            "Megatron token capture requires nemo_gym in the "
-            "MegatronPolicyWorker environment, but the cached worker venv "
-            "predates it. Rebuild worker venvs (NRL_FORCE_REBUILD_VENVS=true) or "
-            "delete $NEMO_RL_VENV_DIR/nemo_rl.models.policy.workers."
-            "megatron_policy_worker.MegatronPolicyWorker and rerun."
-        ) from error
-    raise RuntimeError(
-        "vLLM token capture requires nemo_gym in the "
-        "VllmAsyncGenerationWorker environment, but the cached worker venv "
-        "predates it. Rebuild worker venvs (NRL_FORCE_REBUILD_VENVS=true) or "
-        "delete $NEMO_RL_VENV_DIR/nemo_rl.models.generation.vllm."
-        "vllm_worker_async.VllmAsyncGenerationWorker and rerun."
-    ) from error
+_MINF_CAPTURE_HOOK_PROTOCOLS = ("RequestPayloadStager", "RequestPromptPreparer")
+
+
+def _require_minf_capture_hooks() -> None:
+    """Fail at setup if the pinned megatron-core lacks the MInf capture hooks.
+
+    Megatron token capture installs a ``RequestPayloadStager`` and a
+    ``RequestPromptPreparer`` on ``DynamicInferenceEngine`` (NVIDIA/Megatron-LM
+    PR #7015). Both protocols live in ``megatron.core.inference.inference_request``,
+    so their presence can be checked at config time without building an engine.
+    """
+    try:
+        # Deferred import: megatron-core is a heavy, optional dependency that the
+        # driver venv may not carry at all.
+        from megatron.core.inference import inference_request
+    except ImportError:
+        # The worker-side guard in MegatronGenerationMixin.setup_token_capture
+        # still fails loudly when the engine lacks the hooks.
+        return
+    missing = [
+        name
+        for name in _MINF_CAPTURE_HOOK_PROTOCOLS
+        if not hasattr(inference_request, name)
+    ]
+    if missing:
+        raise NotImplementedError(
+            "Megatron token capture requires the MInf capture hooks from "
+            "NVIDIA/Megatron-LM PR #7015; the pinned megatron-core lacks "
+            f"{', '.join(missing)}. Bump 3rdparty/Megatron-Bridge-workspace/"
+            "Megatron-Bridge to a revision that includes it, or use "
+            "policy.generation.backend=vllm."
+        )
 
 
 def setup_single_controller(
@@ -1111,10 +1124,11 @@ def setup_single_controller(
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
     # Token capture: validate the supported combination loudly at setup
-    # (NeMo-Gym rollout path, vLLM backend, async_engine=true). The vLLM
-    # worker venv always carries nemo_gym (see VLLM_EXECUTABLE in
-    # ray_actor_environment_registry.py), so nothing here needs to change the
-    # worker's environment.
+    # (NeMo-Gym rollout path; vLLM with async_engine=true, or Megatron with
+    # expose_http_server=true). The serving worker's venv already carries
+    # nemo_gym for both backends (see ACTOR_ENVIRONMENTS in
+    # nemo_rl/distributed/actor_environments.py), so nothing here needs to
+    # change the worker's environment.
     token_capture_cfg = master_config.token_capture
     if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
         if not master_config.checkpointing["enabled"]:
@@ -1170,14 +1184,6 @@ def setup_single_controller(
                 "policy.generation.vllm_cfg.async_engine=true (the capture "
                 "host is the worker's in-process HTTP server)"
             )
-        # The capture host imports nemo_gym inside the serving worker process
-        # (TQTokenSink / TQMegatronTokenStager), so that worker's venv must
-        # carry the nemo_gym extra regardless of backend.
-        from nemo_rl.distributed.ray_actor_environment_registry import (
-            ACTOR_ENVIRONMENT_REGISTRY,
-        )
-        from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
-
         if generation_config["backend"] == "megatron":
             if not generation_config["mcore_generation_config"]["expose_http_server"]:
                 raise ValueError(
@@ -1189,13 +1195,7 @@ def setup_single_controller(
                     "Megatron token capture does not yet support router replay: "
                     "the canonical MInf stager does not yet normalize routed experts"
                 )
-            ACTOR_ENVIRONMENT_REGISTRY[
-                "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
-            ] = PY_EXECUTABLES.MCORE_GYM
-        else:
-            ACTOR_ENVIRONMENT_REGISTRY[
-                "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
-            ] = PY_EXECUTABLES.VLLM_GYM
+            _require_minf_capture_hooks()
 
         # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
         # per-run control-plane bearer token, the process-shared capture
@@ -1847,14 +1847,7 @@ def setup_single_controller(
             consumer_tasks=["finalize", "prev_lp", "train"],
         )
         # Both active backends stage canonical Gym rows in serving workers.
-        try:
-            generation.setup_token_capture(
-                dp_config, token_capture_cfg.staging_partition
-            )
-        except Exception as error:
-            if "No module named 'nemo_gym'" in str(error):
-                _raise_missing_nemo_gym_error(error, generation_config["backend"])
-            raise
+        generation.setup_token_capture(dp_config, token_capture_cfg.staging_partition)
         generation.set_rollout_weight_version(0)
 
     if weight_synchronizer is None:
