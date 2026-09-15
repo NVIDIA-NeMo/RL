@@ -216,8 +216,11 @@ mcore = [
   "mamba-ssm",
   "causal-conv1d",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
-  "flashinfer-python==0.6.18.post1",
-  "flashinfer-cubin==0.6.18.post1",
+  # flashinfer-python/-cubin are intentionally NOT pinned here: megatron-bridge's own
+  # pyproject.toml lists them as unconditional (non-extra) dependencies, so they already
+  # flow transitively on every submodule bump, same as megatron-core above. Mirroring them
+  # here previously caused uv lock to fail whenever this pin drifted from megatron-bridge's.
+  # flashinfer-jit-cache stays pinned directly: megatron-bridge does not depend on it at all.
   "flashinfer-jit-cache==0.6.18.post1",
   "flash_mla ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "nvidia-cutlass-dsl[cu13]==4.6.2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
