@@ -102,7 +102,7 @@ def test_preparation_builds_model_ready_pack_and_jagged_boundaries() -> None:
 
     assert prepared["input_ids"][0].tolist() == [1, 2, 3, 4, 5, 0, 0, 0, 1, 2, 3, 0]
     assert prepared["token_mask"][0].tolist() == [0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0]
-    assert prepared["input_lengths"].tolist() == [12, 12]
+    assert prepared["input_lengths"].tolist() == [12, 4]
     assert prepared["source_ids"] == [["s0", "s1"], ["s2"]]
     assert isinstance(prepared["cu_seqlens"], PackedTensor)
     assert isinstance(prepared["cu_seqlens_padded"], PackedTensor)
@@ -111,7 +111,7 @@ def test_preparation_builds_model_ready_pack_and_jagged_boundaries() -> None:
     assert first["cu_seqlens_padded"].as_tensor().tolist() == [0, 8, 12]
     sliced = prepared.slice(1, 2)
     assert sliced["cu_seqlens"].as_tensor().tolist() == [0, 4]
-    assert sliced["cu_seqlens_padded"].as_tensor().tolist() == [0, 12]
+    assert sliced["cu_seqlens_padded"].as_tensor().tolist() == [0, 4]
 
 
 def test_preparation_backfills_multimodal_token_fields() -> None:
@@ -129,9 +129,7 @@ def test_preparation_backfills_multimodal_token_fields() -> None:
         [packed], tokenizer=_Tokenizer(), only_unmask_final=False
     )
 
-    assert prepared["mm_token_type_ids"].tolist() == [
-        [0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0]
-    ]
+    assert prepared["mm_token_type_ids"].tolist() == [[0, 0, 0, 0, 1, 1, 1, 1]]
 
 
 def test_physical_pack_rejects_incompatible_or_over_capacity_sources() -> None:
