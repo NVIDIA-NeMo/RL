@@ -129,24 +129,16 @@ def _make_controller(
     sync.bind(monitor)
     ctrl._weight_synchronizer = sync
 
+    def _liveness(shard_idx):
+        if shard_idx in dead_shards:
+            return _failed(ray.exceptions.ActorDiedError())
+        return _completed(True)
+
     ctrl._gen = SimpleNamespace(
         requires_kv_scale_sync=False,
         invalidate_kv_cache=MagicMock(),
-        worker_group=SimpleNamespace(
-            get_dp_leader_worker_idx=lambda shard: shard,
-            workers=[
-                SimpleNamespace(
-                    is_alive=SimpleNamespace(
-                        remote=(
-                            (lambda: _failed(ray.exceptions.ActorDiedError()))
-                            if idx in dead_shards
-                            else (lambda: _completed(True))
-                        )
-                    )
-                )
-                for idx in range(shard_count)
-            ],
-        ),
+        # The probe asks by shard index; the shard-to-worker layout stays in the backend.
+        shard_liveness_ref=_liveness,
     )
     ctrl._rollout_manager = SimpleNamespace(
         set_weight_version=MagicMock(),
@@ -234,13 +226,13 @@ class TestDeathInsideTheCollective:
         it. A refit used to.
 
         The path: serving_shards() includes SUSPECT, so mark_weights_partial moves the
-        suspect survivor to STALE, and _promote_refit_shards then promotes every STALE
+        suspect survivor to STALE, and _record_refit_landed then promotes every STALE
         shard through report_refit, which zeroes the counters. Net effect, a shard
         failing real generations could never reach unhealthy_threshold for as long as
         refits kept happening.
 
         Driven through the whole recovery on purpose: asserting against
-        _promote_refit_shards alone passes even with the bug present, because it is
+        _record_refit_landed alone passes even with the bug present, because it is
         mark_weights_partial -- in the other function -- that relabels SUSPECT to STALE.
         """
         ctrl, monitor, _ = _make_controller(ABORTED, shard_count=3, dead_shards=(0,))
