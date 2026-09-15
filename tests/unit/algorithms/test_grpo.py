@@ -6236,7 +6236,7 @@ def test_grpo_train_sync_logs_data_plane_metrics_before_committing_the_step(
     policy.collect_data_plane_snapshots = MagicMock(
         return_value=[client.snapshot() for _ in range(n_snapshots)]
     )
-    policy._prev_dp_snapshot = {}
+    policy._prev_cluster_snapshot = {}
     # The real method, bound to the mock: choosing the scope is what this test
     # is about, and a MagicMock's auto-created stand-in would return a mock
     # rather than make that choice. Everything it reads is set explicitly here.

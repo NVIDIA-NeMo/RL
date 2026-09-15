@@ -856,12 +856,12 @@ def cluster_step_metrics(
         collect_ms: Wall time the caller spent gathering and merging.
     """
     n_procs = max(merged.get("n_processes", 1), 1)
-    metrics = step_metrics(merged, prev, step_time_s, collect_ms)
+    metrics = _step_metrics(merged, prev, step_time_s, collect_ms)
     metrics["now/n_processes"] = n_procs
     return metrics
 
 
-def step_metrics(
+def _step_metrics(
     snap: dict[str, Any],
     prev: dict[str, Any],
     step_time_s: float,
@@ -887,10 +887,9 @@ def step_metrics(
     # The slowest single process this step. Both forms are already scoped to
     # the step by the reset that read them, so neither is differenced:
     # ``merge_snapshots`` reduces the per-process accumulator with a max, and
-    # a single process carries its own. ``wall_ms`` is the last resort for a
-    # snapshot predating either key -- not ``wall_ms / n_procs``, which is the
-    # per-process mean this reduction replaced.
-    slowest_ms = snap.get("max_process_step_wall_ms", snap.get("step_wall_ms", wall_ms))
+    # a single process carries its own. Not ``wall_ms / n_procs``, which is
+    # the per-process mean this reduction replaced.
+    slowest_ms = snap.get("max_process_step_wall_ms", snap["step_wall_ms"])
     # step/ is a delta over this step; now/ is a level at this instant.
     # The unit alone does not distinguish them -- see README.md.
     metrics = _step_deltas(snap, prev)
@@ -1278,7 +1277,12 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 bucket.step_max_ms = 0.0
         return out
 
-    def get_step_metrics(self, step_time_s: float) -> dict[str, float]:
+    def get_step_metrics(
+        self,
+        step_time_s: float,
+        snap: dict[str, Any] | None = None,
+        collect_ms: float = 0.0,
+    ) -> dict[str, float]:
         """Per-step data-plane metrics, as a ready-to-log flat dict.
 
         Cumulative counters are differenced against the previous call, so this
@@ -1288,15 +1292,25 @@ class MetricsDataPlaneClient(DataPlaneClient):
         ``frac_of_step`` is the metric that decides whether optimising the
         data plane is worth anything: ``percent_of_dataplane`` only says where
         data-plane time went, never whether it mattered against compute.
+
+        Args:
+            step_time_s: Step wall time, for ``frac_of_step``.
+            snap: A snapshot already taken by the caller. A caller that fans
+                out has to read this client first and cannot read it twice --
+                closing the step window a second time would zero every
+                ``step/by_op/*/max_ms``. Passing it here keeps the baseline
+                in one place, this client, rather than a second copy on the
+                caller.
+            collect_ms: Wall time the caller spent gathering, if any.
         """
         # Reading the step maxima is what closes the window: the values
         # just read are this step's, and anything after belongs to the next.
-        snap = self.snapshot(reset_step_window=True)
+        if snap is None:
+            snap = self.snapshot(reset_step_window=True)
         prev = self._prev_snapshot
         self._prev_snapshot = snap
-        # One process, and no fan-out to charge for: the cluster arithmetic
-        # with n_procs=1 and collect_ms=0 is exactly this path.
-        return step_metrics(snap, prev, step_time_s)
+        # One process: the cluster arithmetic with n_procs=1 is exactly this.
+        return _step_metrics(snap, prev, step_time_s, collect_ms)
 
     def _record_put(self, partition_id: str, keys: list[str], n_bytes: int) -> None:
         """Attribute put bytes per key so a later ``clear_samples`` can subtract.
@@ -1894,14 +1908,9 @@ class MetricsDataPlaneClient(DataPlaneClient):
 def is_metrics_client(client: Any) -> TypeGuard[MetricsDataPlaneClient]:
     """Whether ``client`` is the wrapper that carries the counters.
 
-    The one answer to "is observability on here", for the four call sites
-    that used to ask it three ways -- two of them by probing for a
-    ``snapshot`` attribute, which is not on the :class:`DataPlaneClient` ABC
-    and so is carried by anything that happens to define one. Disagreement
-    between them is silent and costs a scope: the cluster view falls back to
-    the driver's own counters, which are smaller by roughly the DP degree.
-
-    ``isinstance(None, ...)`` is ``False``, so this also covers "no client at
-    all" and the callers need no separate ``None`` check.
+    The one answer to "is observability on here", replacing four call sites
+    that asked it three ways -- two by probing for a ``snapshot`` attribute,
+    which is not on the :class:`DataPlaneClient` ABC. ``isinstance(None,
+    ...)`` is ``False``, so this covers "no client at all" too.
     """
     return isinstance(client, MetricsDataPlaneClient)
