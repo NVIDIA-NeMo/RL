@@ -437,6 +437,18 @@ class _FakeGeneration:
     def get_step_metrics(self) -> dict[str, float]:
         return {}
 
+    def pause_generation_for_refit(
+        self, *, clear_cache: bool, timeout_s: float | None = None
+    ) -> bool:
+        del clear_cache, timeout_s
+        return False
+
+    def resume_generation_after_refit(self, *, timeout_s: float | None = None) -> bool:
+        return False
+
+    def invalidate_kv_cache(self) -> bool:
+        return False
+
     def wake_carries_weight_updates(self) -> bool:
         return True
 

@@ -21,7 +21,7 @@ import threading
 import types
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 import ray
@@ -32,6 +32,7 @@ from nemo_rl.algorithms.grpo import refit_policy_generation
 from nemo_rl.algorithms.loss import NLLLossFn
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.refit_watchdog import RefitAborted
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.interfaces import (
@@ -491,30 +492,75 @@ async def test_async_vllm_worker_stops_http_server_before_engine(
     assert worker.llm is None
 
 
+@pytest.mark.parametrize("timeout_s", [None, 0.25])
 def test_vllm_generation_broadcasts_native_refit_pause_and_resume(
     monkeypatch: pytest.MonkeyPatch,
+    timeout_s: float | None,
 ) -> None:
     generation = VllmGeneration.__new__(VllmGeneration)
     generation.cfg = {"vllm_cfg": {"async_engine": True}}
-    generation.worker_group = MagicMock()
-    generation.worker_group.workers = [object(), object()]
-    futures = [object(), object()]
-    generation.worker_group.run_all_workers_single_data.return_value = futures
-    ray_get = MagicMock(side_effect=[[True, True], [True, True]])
+    generation.worker_group = MagicMock(workers=[object(), object()])
+    leaders = [MagicMock(), MagicMock()]
+    pause_futures = [object(), object()]
+    resume_futures = [object(), object()]
+    for worker, pause_future, resume_future in zip(
+        leaders, pause_futures, resume_futures
+    ):
+        worker.pause_generation_async.remote.return_value = pause_future
+        worker.resume_generation_async.remote.return_value = resume_future
+    generation._refit_leader_workers = MagicMock(return_value=leaders)
+    generation._refit_membership = None
+    generation.dp_size = 2
+    generation.fleet_monitor = None
+    ray_get = MagicMock(side_effect=[[True, True], True, True])
     monkeypatch.setattr(ray, "get", ray_get)
+    ray_wait = MagicMock(return_value=(resume_futures, []))
+    monkeypatch.setattr(ray, "wait", ray_wait)
 
-    assert generation.pause_generation_for_refit(clear_cache=True)
-    assert generation.resume_generation_after_refit()
+    assert generation.pause_generation_for_refit(clear_cache=True, timeout_s=timeout_s)
+    assert generation.resume_generation_after_refit(timeout_s=timeout_s)
 
-    generation.worker_group.run_all_workers_single_data.assert_any_call(
-        "pause_generation_async",
-        clear_cache=True,
-        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-    )
-    generation.worker_group.run_all_workers_single_data.assert_any_call(
-        "resume_generation_async",
-        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-    )
+    for worker in leaders:
+        worker.pause_generation_async.remote.assert_called_once_with(clear_cache=True)
+        worker.resume_generation_async.remote.assert_called_once_with()
+    assert ray_get.call_args_list == [
+        call(pause_futures, timeout=timeout_s),
+        call(resume_futures[0]),
+        call(resume_futures[1]),
+    ]
+    ray_wait.assert_called_once_with(resume_futures, num_returns=2, timeout=timeout_s)
+
+
+@pytest.mark.parametrize("operation", ["pause", "resume"])
+def test_vllm_generation_refit_pause_and_resume_raise_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = {"vllm_cfg": {"async_engine": True}}
+    generation.worker_group = MagicMock(workers=[object()])
+    worker = MagicMock()
+    generation._refit_leader_workers = MagicMock(return_value=[worker])
+    generation._refit_membership = None
+    generation.dp_size = 1
+    ray_get = MagicMock(side_effect=ray.exceptions.GetTimeoutError("timed out"))
+    monkeypatch.setattr(ray, "get", ray_get)
+    resume_future = worker.resume_generation_async.remote.return_value
+    ray_wait = MagicMock(return_value=([], [resume_future]))
+    monkeypatch.setattr(ray, "wait", ray_wait)
+
+    with pytest.raises(RefitAborted, match=rf"{operation} did not return within 0.25s"):
+        if operation == "pause":
+            generation.pause_generation_for_refit(clear_cache=True, timeout_s=0.25)
+        else:
+            generation.resume_generation_after_refit(timeout_s=0.25)
+
+    future = getattr(worker, f"{operation}_generation_async").remote.return_value
+    if operation == "pause":
+        ray_get.assert_called_once_with([future], timeout=0.25)
+    else:
+        ray_wait.assert_called_once_with([future], num_returns=1, timeout=0.25)
+        ray_get.assert_not_called()
 
 
 def test_vllm_generation_rejects_partial_refit_pause_and_resume(
@@ -522,16 +568,16 @@ def test_vllm_generation_rejects_partial_refit_pause_and_resume(
 ) -> None:
     generation = VllmGeneration.__new__(VllmGeneration)
     generation.cfg = {"vllm_cfg": {"async_engine": True}}
-    generation.worker_group = MagicMock()
-    generation.worker_group.workers = [object(), object()]
-    generation.worker_group.run_all_workers_single_data.return_value = [
-        object(),
-        object(),
-    ]
+    generation.worker_group = MagicMock(workers=[object(), object()])
+    leaders = [MagicMock(), MagicMock()]
+    generation._refit_leader_workers = MagicMock(return_value=leaders)
+    generation._refit_membership = None
+    generation.dp_size = 2
+    monkeypatch.setattr(ray, "wait", MagicMock(return_value=([], [])))
     monkeypatch.setattr(
         ray,
         "get",
-        MagicMock(side_effect=[[True, False], [False, True]]),
+        MagicMock(side_effect=[[True, False], False, True]),
     )
 
     with pytest.raises(RuntimeError, match="pause every async vLLM engine"):
