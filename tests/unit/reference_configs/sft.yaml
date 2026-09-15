@@ -234,6 +234,23 @@ data:
     prompt_file: null
     system_prompt_file: null
     processor: "sft_processor"
+    chat_key: "messages" # Key containing the ordered conversation messages.
+    # Megatron-LM offline-packed SFT settings, used only by
+    # `dataset_name: megatron_sft_packed`. Ignored by every other dataset.
+    #
+    # `null` on the two overrides below means "derive from
+    # megatron_sft_prompt_format". The per-format defaults are:
+    #   identity            -> pad_token "<unk>",          assistant_prefix_len 0
+    #   nemotron-nano-v2    -> pad_token "<unk>",          assistant_prefix_len 3
+    #   nemotron-h-aligned  -> pad_token "<SPECIAL_233>",  assistant_prefix_len 0
+    # Set them only to override that derivation. The pad token must tokenize to
+    # an id distinct from EOS, and `identity` rejects a non-zero prefix length.
+    megatron_sft_prompt_format: "identity"
+    megatron_sft_pad_token: null
+    megatron_sft_assistant_prefix_len: null
+    # Must match policy.megatron_cfg.context_parallel_size: every packed segment
+    # is padded to a multiple of 2 * this value so mcore can zigzag-shard it.
+    megatron_sft_context_parallel_size: ${policy.megatron_cfg.context_parallel_size}
 
   # You can also use multiple datasets by using a list of datasets.
   # See `examples/configs/grpo_multiple_datasets.yaml` for a full configuration example.
