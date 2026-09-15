@@ -83,11 +83,17 @@ service startup in the native runtime before allocating training GPUs.
 After `prepare_node.py` links and checks the image-owned environments, run
 `tools/super_rl/check_gym_startup.py` with the full `--config`, mounted `--gym`,
 fresh `--runtime` output directory, and explicit `--cpus` / `--timeout` limits.
+Start required sandbox backends in the same allocation first, with the same
+shared-directory mounts and endpoint settings used for training. CCC's startup
+hook executes a sandbox readiness command before loading its metadata; it does
+not merely read a file. A missing sandbox leaves that resource waiting and then
+fails startup. Do not stub this dependency or remove CCC from the check.
 It starts the configured Gym apps on a local CPU-only Ray runtime, waits for
 their health checks, then shuts them down. This catches constructor-time asset
 errors that imports miss. Backend-model readiness is deliberately disabled only
-in this CPU test's in-memory configuration; it sends no model requests and does
-not certify sandbox execution, rewards, or training. The real training recipe
+in this CPU test's in-memory configuration. Native readiness probes may execute
+trivial sandbox commands; the check sends no policy/judge inference requests and
+does not certify task verification, rewards, or training. The real training recipe
 and its backend-readiness gate are not modified.
 
 For the three-update regular smoke, the constant-LR scheduler horizon is set to

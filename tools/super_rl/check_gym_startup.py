@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-"""CPU-only startup check for the configured Gym services, not model inference."""
+"""CPU-only Gym startup check; start required sandbox backends before running."""
 
 import argparse
 from contextlib import suppress
@@ -44,7 +44,8 @@ def startup_config(config: Path, runtime: Path) -> DictConfig:
 
 def check(config: Path, gym: Path, runtime: Path, cpus: int, timeout: int) -> dict:
     import ray
-    from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
+    from nemo_gym.cli.env import RunHelper
+    from nemo_gym.global_config import GlobalConfigDictParserConfig
 
     runtime.mkdir(parents=True, exist_ok=False)
     graph = startup_config(config, runtime)
@@ -85,7 +86,7 @@ def check(config: Path, gym: Path, runtime: Path, cpus: int, timeout: int) -> di
         "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
         "all_configured_gym_services_started": True,
         "gpus": 0,
-        "scope": "Gym constructors, local assets, service startup and health only; no model requests, sandbox execution, rewards or optimizer updates",
+        "scope": "Gym constructors, local assets, service startup and dependency readiness probes; no policy/judge inference, task verification, rewards or optimizer updates",
     }
 
 
