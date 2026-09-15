@@ -41,6 +41,7 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.weight_sync.nccl_reshard_utils import HFToLocalParamMap
@@ -1153,9 +1154,9 @@ def test_megatron_refit_bridge_tasks_export_logical_quantized_weights(
     logical_weight = torch.arange(8, dtype=torch.bfloat16).reshape(4, 2)
     bf16_source = torch.ones((2, 2), dtype=torch.bfloat16)
     dequantize = MagicMock(
-        side_effect=lambda tensor: logical_weight
-        if tensor is quantized_source
-        else tensor
+        side_effect=lambda tensor: (
+            logical_weight if tensor is quantized_source else tensor
+        )
     )
     monkeypatch.setattr(
         worker_module,
@@ -1781,6 +1782,27 @@ def test_compute_moe_grad_scale_clamps_zero_valid_tokens():
     assert torch.allclose(scale_fn(), torch.tensor(1.0))
 
 
+def test_split_train_api_rejects_direct_packed_sft_rows():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    data = BatchedDataDict(
+        {
+            "packed_cu_seqlens": torch.tensor([[0, 4]], dtype=torch.int32),
+            "target_ids": torch.ones(1, 4, dtype=torch.long),
+        }
+    )
+
+    with pytest.raises(NotImplementedError, match="split training API"):
+        MegatronPolicyWorkerImpl._train_microbatch_body(
+            worker,
+            {"loss_fn": NLLLossFn()},
+            data,
+        )
+
+
 @pytest.mark.parametrize(
     ("kwargs", "expected_param_sync"),
     [({}, False), ({"param_sync": True}, True)],
@@ -2062,13 +2084,7 @@ def create_megatron_test_config(
             },
             "attention_backend": attention_backend,
         },
-        "draft": {
-            "enabled": False,
-            "model_name": None,
-            "loss_weight": 0.1,
-            "num_layers": None,
-            "aux_layer_indices": None,
-        },
+        "draft": Eagle3DraftConfig(enabled=False),
         "make_sequence_length_divisible_by": tp,
         "optimizer": None,  # Remove default FSDP optimizer
         "scheduler": None,  # Remove default scheduler

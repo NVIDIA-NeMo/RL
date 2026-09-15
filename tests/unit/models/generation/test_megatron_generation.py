@@ -38,6 +38,7 @@ from nemo_rl.models.generation.megatron.utils import (
     build_prompt_and_multimodal_data,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.weight_sync.megatron_weight_synchronizer import (
     MegatronWeightSynchronizer,
@@ -378,8 +379,8 @@ def test_bridge_refit_finalizes_import_before_return(
     worker._generation_refit_dependency_counts = {}
     worker._generation_refit_model_chunks = [torch.nn.Module()]
     worker.megatron_bridge = MagicMock()
-    worker.megatron_bridge.finalize_hf_import.side_effect = (
-        lambda _model_chunks: events.append("finalize")
+    worker.megatron_bridge.finalize_hf_import.side_effect = lambda _model_chunks: (
+        events.append("finalize")
     )
     worker._refresh_flashinfer_mxfp8_weights = MagicMock(
         side_effect=lambda: events.append("refresh")
@@ -725,7 +726,7 @@ basic_megatron_test_config: PolicyConfig = {
             "data_parallel_sharding_strategy": "optim_grads_params",
         },
     },
-    "draft": {"enabled": False},
+    "draft": Eagle3DraftConfig(enabled=False),
     "optimizer": None,
     "scheduler": None,
     "max_grad_norm": 1.0,

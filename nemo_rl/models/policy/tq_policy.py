@@ -74,6 +74,8 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         out["moe_metrics"] = results[0]["moe_metrics"]
     if "mtp_metrics" in results[0]:
         out["mtp_metrics"] = results[0]["mtp_metrics"]
+    if "draft_grad_norm" in results[0]:
+        out["draft_grad_norm"] = results[0]["draft_grad_norm"]
     all_mb_metrics: dict[str, list[Any]] = defaultdict(list)
     for r in results:
         for k, v in r["all_mb_metrics"].items():
@@ -485,7 +487,9 @@ class TQPolicy(TQDriverMixin, Policy):
     #   finish_train_step                   — all_reduce + opt.step + sched.step
     #   abort_train_step                    — drop accumulators, no opt.step
     #
-    # ``train_from_meta`` is unchanged and remains the sync entrypoint.
+    # ``train_from_meta`` remains the ordinary sync entrypoint. Packed CP
+    # DFlash/DSpark uses this split lifecycle because the draft objective owns
+    # disjoint CP-local windows and normalizes them once at step finish.
 
     def begin_train_step(
         self,
@@ -533,6 +537,8 @@ class TQPolicy(TQDriverMixin, Policy):
             meta: Data-plane metadata for the samples in this chunk.
             timer: Optional timer for nested policy-training measurements.
             train_fields: Columns produced for this step and fetched by workers.
+                May omit columns the driver intentionally skipped, such as
+                ``prev_logprobs`` under force-on-policy training.
         """
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = self._with_route_fields(

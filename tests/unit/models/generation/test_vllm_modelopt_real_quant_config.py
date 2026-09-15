@@ -239,6 +239,13 @@ def _install_fake_vllm_reload(monkeypatch):
         "vllm.model_executor.model_loader.reload.layerwise",
         layerwise_module,
     )
+    loader_utils = types.ModuleType("vllm.model_executor.model_loader.utils")
+    loader_utils.process_weights_after_loading = lambda model, config, device: None
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.model_loader.utils",
+        loader_utils,
+    )
     modelopt_module = types.ModuleType(
         "vllm.model_executor.layers.quantization.modelopt"
     )
@@ -614,7 +621,7 @@ def _patch_real_quant_load(monkeypatch, backend, forwarded=None):
         monkeypatch.setattr(
             backend.VllmInternalWorkerExtension,
             "_load_weights",
-            lambda self, weights: forwarded.extend(weights) or "loaded",
+            lambda self, weights, coverage=None: forwarded.extend(weights) or "loaded",
         )
 
 
@@ -1386,7 +1393,7 @@ def test_real_quant_pre_ack_fence_is_device_wide_and_load_does_not_fence(
     monkeypatch.setattr(
         backend.VllmInternalWorkerExtension,
         "_load_weights",
-        lambda _self, _weights: events.append("load") or "loaded",
+        lambda _self, _weights, coverage=None: events.append("load") or "loaded",
     )
     monkeypatch.setattr(
         backend,
@@ -1700,13 +1707,88 @@ def test_real_quant_reload_keeps_vllm_config_active_during_layerwise_processing(
         # reconstructs its kernel during the yielded weight-load phase.
         assert config_mod.get_current_vllm_config() is vllm_config
         calls.append("load")
-        finish()
+        finish(False)
 
     assert config_mod.current is None
     assert calls == [
         ("initialize", model),
         "load",
         ("finalize", model, model_config),
+        "sync",
+    ]
+
+
+def test_real_quant_reload_finalizes_cotrained_draft_after_target(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+    reload_mod = sys.modules["vllm.model_executor.model_loader.reload"]
+
+    model = _mark_as_modelopt_layer(torch.nn.Linear(1, 1))
+    draft_model = object()
+    model_config = object()
+    draft_model_config = object()
+    vllm_config = types.SimpleNamespace(
+        speculative_config=types.SimpleNamespace(draft_model_config=draft_model_config)
+    )
+    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    extension.model_runner = types.SimpleNamespace(
+        model=model,
+        vllm_config=vllm_config,
+    )
+    extension.model_config = model_config
+    extension.device = torch.device("cpu")
+    extension._nrl_modelopt_reload_roots = (model,)
+    extension._model_update_manifest = types.SimpleNamespace(draft=object())
+    extension._draft_runtime_adapter = types.SimpleNamespace(
+        is_owner=True,
+        model=draft_model,
+    )
+    extension._mtp_drafter_from_disk = False
+    calls = []
+
+    monkeypatch.setattr(
+        backend.VllmQuantInternalWorkerExtension,
+        "_is_real_quant_model",
+        lambda self: True,
+    )
+    monkeypatch.setattr(
+        reload_mod,
+        "initialize_layerwise_reload",
+        lambda root: calls.append(("initialize", root)),
+    )
+    monkeypatch.setattr(
+        reload_mod,
+        "finalize_layerwise_reload",
+        lambda root, config: calls.append(("finalize_target", root, config)),
+    )
+    loader_utils = types.ModuleType("vllm.model_executor.model_loader.utils")
+    loader_utils.process_weights_after_loading = lambda draft, config, device: (
+        calls.append(("finalize_draft", draft, config, device))
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.model_loader.utils",
+        loader_utils,
+    )
+    monkeypatch.setattr(
+        backend.torch.accelerator,
+        "synchronize",
+        lambda: calls.append("sync"),
+    )
+    monkeypatch.setattr(
+        extension,
+        "_maybe_process_mtp_drafter_after_loading",
+        lambda: None,
+    )
+
+    with extension._weight_update_lifecycle("collective") as finish:
+        calls.append("load")
+        finish(True)
+
+    assert calls == [
+        ("initialize", model),
+        "load",
+        ("finalize_target", model, model_config),
+        ("finalize_draft", draft_model, draft_model_config, torch.device("cpu")),
         "sync",
     ]
 
@@ -1998,7 +2080,7 @@ def test_real_quant_ipc_rejects_invalid_key_manifest(
     extension.zmq_socket = FakeSocket()
     extension.state_dict_info = state_dict_info
     extension.maybe_init_zmq = lambda: None
-    extension._load_weights = lambda _weights: None
+    extension._load_weights = lambda _weights, coverage=None: None
     monkeypatch.setattr(
         backend.VllmQuantInternalWorkerExtension,
         "_is_real_quant_model",
@@ -2080,7 +2162,8 @@ def test_real_quant_ipc_payload_loads_weights_and_handles_gpt_oss(monkeypatch):
     }
     extension.maybe_init_zmq = lambda: None
 
-    def load_weights(weights):
+    def load_weights(weights, *, coverage=None):
+        assert coverage is None
         for name, weight in weights:
             view_refs.append(weakref.ref(weight))
             loaded.append((name, weight.clone()))

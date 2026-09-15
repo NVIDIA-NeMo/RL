@@ -53,6 +53,7 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SequencePackingArgs
 from nemo_rl.experience.route_assembly import RouteFragment, execute_route_plan
+from nemo_rl.models.policy.draft_sample_ids import stable_draft_sample_ids
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.r3_trace import trace_tq_fetch_payload
 
@@ -64,6 +65,21 @@ if TYPE_CHECKING:
     )
 
 FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
+
+
+def _attach_draft_sample_ids(
+    data: BatchedDataDict[Any],
+    sample_ids: list[str],
+) -> BatchedDataDict[Any]:
+    """Attach deterministic numeric IDs without using microbatch row order."""
+    if data["input_ids"].shape[0] != len(sample_ids):
+        raise ValueError("stable sample-ID count must match the fetched training batch")
+    data["draft_sample_ids"] = torch.tensor(
+        stable_draft_sample_ids(sample_ids),
+        dtype=torch.int64,
+        device=data["input_ids"].device,
+    )
+    return data
 
 
 def _broadcast_batched_data_dict(
@@ -898,6 +914,7 @@ class TQWorkerMixin:
         """Per-rank training entrypoint. Fetch → packing prep → delegate."""
         data = self._fetch(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
+        data = _attach_draft_sample_ids(data, meta.sample_ids)
         return self.train(  # type: ignore[attr-defined]
             data,
             loss_fn=loss_fn,
@@ -1108,6 +1125,7 @@ class TQWorkerMixin:
         """
         data = self._fetch(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
+        data = _attach_draft_sample_ids(data, meta.sample_ids)
         self.train_microbatch(  # type: ignore[attr-defined]
             data=data,
         )
