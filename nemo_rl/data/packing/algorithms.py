@@ -296,9 +296,13 @@ class SequencePacker(ABC):
 
 
 class GreedyKnapsackPacker(SequencePacker):
-    """Repeatedly take the largest remaining sequence that fits."""
+    """Fill each bin with the largest remaining sequence that fits.
+
+    Time complexity is O(n log n) for sorting and binary searches.
+    """
 
     def _pack_implementation(self, sequence_lengths: List[int]) -> List[List[int]]:
+        """Pack sequences greedily while preserving their original indices."""
         self._validate_sequence_lengths(sequence_lengths)
         remaining = sorted(
             (length, -index, index) for index, length in enumerate(sequence_lengths)
@@ -322,36 +326,19 @@ class GreedyKnapsackPacker(SequencePacker):
 
 
 class BalancedGreedyKnapsackPacker(SequencePacker):
-    """Place descending sequences into the least-full available bin."""
+    """Spread descending sequences across the smallest estimated bin count.
 
-    def __init__(
-        self,
-        bin_capacity: int,
-        collect_metrics: bool = False,
-        min_bin_count: Optional[int] = None,
-        bin_count_multiple: Optional[int] = None,
-        max_sequences_per_bin: Optional[int] = None,
-        balanced_knapsack_delta: int = 0,
-    ) -> None:
-        super().__init__(
-            bin_capacity,
-            collect_metrics,
-            min_bin_count,
-            bin_count_multiple,
-            max_sequences_per_bin,
-        )
-        if balanced_knapsack_delta < 0:
-            raise ValueError("balanced_knapsack_delta must be nonnegative")
-        self.balanced_knapsack_delta = balanced_knapsack_delta
+    Time complexity is O(n log n) for sorting plus O(n * m) for placement,
+    where m is the number of bins.
+    """
 
     def _pack_implementation(self, sequence_lengths: List[int]) -> List[List[int]]:
+        """Place each sequence into the least-full bin that can accept it."""
         self._validate_sequence_lengths(sequence_lengths)
         if not sequence_lengths:
             return []
         count = math.ceil(sum(sequence_lengths) / self.bin_capacity)
-        bins: List[List[int]] = [
-            [] for _ in range(count + self.balanced_knapsack_delta)
-        ]
+        bins: List[List[int]] = [[] for _ in range(count)]
         loads = [0] * len(bins)
         for index in sorted(
             range(len(sequence_lengths)),

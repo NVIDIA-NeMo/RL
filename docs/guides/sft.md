@@ -241,9 +241,29 @@ The processor runs inside Energon loader workers and returns the same tokenized 
 
 The v1 `SFTProcessorAdapter` and `HFMultimodalSFTProcessorAdapter` are narrow integration interfaces. They are planned to be replaced by a more comprehensive modular processor implementation; dataset loading and the policy-facing batch shape should remain stable through that change.
 
-Set `data.energon.packing_buffer_size` and enable fused
-`policy.sequence_packing` with any supported packing algorithm to let Energon
-form model-ready multimodal packs.
+To let Energon form model-ready multimodal packs, set the packing buffer and
+enable fused sequence packing:
+
+```yaml
+policy:
+  sequence_packing:
+    enabled: true
+    fuse_loss: true
+    algorithm: balanced_greedy_knapsack
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    max_sequences_per_bin: 16  # optional conversation limit per physical pack
+data:
+  energon:
+    packing_buffer_size: 64    # enables Energon-owned packing
+    max_samples_per_sequence: null  # optional shard read-order control
+```
+
+Both config blocks are required because Energon builds the packs while the
+policy block selects and configures the packer. `max_sequences_per_bin` limits
+the conversations placed in one pack. The similarly named
+`max_samples_per_sequence` controls how many consecutive samples Energon reads
+from one shard; it does not affect pack layout.
+
 Without an Energon packing buffer, SFTv2 currently requires fixed batching.
 Dynamic batching and HybridEP flex dispatch are not supported with
 Energon-owned packs.

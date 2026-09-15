@@ -32,6 +32,10 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS, PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
+from nemo_rl.models.megatron.alignment import (
+    get_fp8_token_alignment,
+    get_parallel_token_alignment,
+)
 from nemo_rl.models.megatron.common import _round_up_to_multiple
 from nemo_rl.models.megatron.hybridep import (
     get_packed_seq_padding_mask,
@@ -182,24 +186,12 @@ def make_processed_microbatch_iterator(
         )
 
 
-def _get_fp8_token_alignment(megatron_cfg: dict[str, Any]) -> int:
-    """Return the token-dimension alignment required by the FP8 recipe."""
-    fp8_cfg = megatron_cfg.get("fp8_cfg") or {}
-    if not fp8_cfg.get("enabled", False):
-        return 1
-    if fp8_cfg["fp8_recipe"] == "blockwise":
-        return 128
-    if fp8_cfg["fp8_recipe"] == "mxfp8":
-        return 32
-    return 16
-
-
 def _get_non_packed_sequence_pad_factor(cfg: dict[str, Any]) -> int:
     """Combine user, parallelism, and FP8 alignment for dense batches."""
     megatron_cfg = cfg["megatron_cfg"]
     factor = lcm(
         cfg["make_sequence_length_divisible_by"],
-        _get_fp8_token_alignment(megatron_cfg),
+        get_fp8_token_alignment(megatron_cfg),
     )
     cp_size = megatron_cfg["context_parallel_size"]
     if cp_size > 1:
@@ -1627,11 +1619,7 @@ def _get_pack_sequence_parameters_for_megatron(
     cp_size = megatron_cfg["context_parallel_size"]
 
     # individual sequence needs to be splitted to CP domain, and to TP domain when SP is enabled.
-    minimum_pad_factor = 1
-    if cp_size > 1:
-        minimum_pad_factor *= cp_size * 2
-    if tp_size > 1 and sp:
-        minimum_pad_factor *= tp_size
+    minimum_pad_factor = get_parallel_token_alignment(megatron_cfg)
     assert pad_individual_seqs_to_multiple_of % minimum_pad_factor == 0, (
         f"make_sequence_length_divisible_by ({pad_individual_seqs_to_multiple_of}) is not a multiple of minimum_pad_factor ({minimum_pad_factor}).\n"
         f"Please set policy.make_sequence_length_divisible_by to a multiple of {minimum_pad_factor}.\n"
@@ -1648,7 +1636,7 @@ def _get_pack_sequence_parameters_for_megatron(
     #   HybridEP+flex : 128  (MAX_NUM_OF_TOKENS_PER_RANK must be divisible by
     #                         NUM_OF_TOKENS_PER_CHUNK=128 in deep_ep JIT kernels)
     # When multiple constraints apply, take the max (128 is a multiple of 32/16).
-    divisor = _get_fp8_token_alignment(megatron_cfg)
+    divisor = get_fp8_token_alignment(megatron_cfg)
     if (
         megatron_cfg.get("moe_token_dispatcher_type") == "flex"
         and megatron_cfg.get("moe_flex_dispatcher_backend") == "hybridep"

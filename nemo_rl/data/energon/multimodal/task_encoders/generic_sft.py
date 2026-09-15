@@ -294,7 +294,7 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
     ) -> tuple[tuple[Any, ...], None]:
         return sample.group_key, None
 
-    @stateless
+    @stateless(restore_seeds=True)
     def select_samples_to_pack(
         self, samples: list[EncodedSFTSample]
     ) -> list[list[EncodedSFTSample]]:

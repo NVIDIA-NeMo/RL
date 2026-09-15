@@ -89,8 +89,10 @@ We have the policy backends perform the actual packing because implementations c
 #### 2. Packing Algorithms (`nemo_rl/data/packing/algorithms.py`)
 
 Six packing algorithms are implemented. Modified First Fit Decreasing is the
-default recommendation, and Energon-owned SFT packing supports all six through
-the same interface.
+default recommendation for trainer-owned packing. Energon-owned SFT supports
+all six through the same interface, and its recipes use Balanced Greedy
+Knapsack because it matched MFFD bin utilization in validation while spreading
+sequences evenly across physical packs.
 
 ##### Concatenative Packer 
 - Sequential concatenation until bin capacity is reached

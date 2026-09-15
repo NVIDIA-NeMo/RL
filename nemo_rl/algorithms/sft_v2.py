@@ -48,6 +48,10 @@ from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
     prepare_segment_topology,
 )
+from nemo_rl.models.megatron.alignment import (
+    get_fp8_token_alignment,
+    get_parallel_token_alignment,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.telemetry.config import TelemetryConfig
@@ -453,12 +457,8 @@ def setup_sft_v2(
         ):
             raise ValueError("Energon packing does not support HybridEP flex dispatch.")
 
-        cp_size = megatron_cfg["context_parallel_size"]
-        tp_size = megatron_cfg["tensor_model_parallel_size"]
         pad_multiple = master_config.policy["make_sequence_length_divisible_by"]
-        parallel_multiple = (2 * cp_size if cp_size > 1 else 1) * (
-            tp_size if tp_size > 1 and megatron_cfg["sequence_parallel"] else 1
-        )
+        parallel_multiple = get_parallel_token_alignment(megatron_cfg)
         if pad_multiple % parallel_multiple != 0:
             raise ValueError(
                 "Energon packing requires make_sequence_length_divisible_by to "
@@ -470,13 +470,8 @@ def setup_sft_v2(
                 "make_sequence_length_divisible_by."
             )
 
-        fp8_cfg = megatron_cfg.get("fp8_cfg") or {}
-        if fp8_cfg.get("enabled", False):
-            fp8_multiple = {
-                "blockwise": 128,
-                "mxfp8": 32,
-            }.get(fp8_cfg["fp8_recipe"], 16)
-            fp8_multiple *= parallel_multiple
+        fp8_multiple = get_fp8_token_alignment(megatron_cfg) * parallel_multiple
+        if fp8_multiple > parallel_multiple:
             if max_sequence_length % fp8_multiple != 0:
                 raise ValueError(
                     "Energon packing requires max_input_seq_length to be divisible "
