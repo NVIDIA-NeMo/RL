@@ -1,3 +1,6 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Offline config contracts; no Gym servers, provider requests, Ray, or GPUs.
 
 These tests intentionally stop at the NeMo RL/OmegaConf boundary. They are

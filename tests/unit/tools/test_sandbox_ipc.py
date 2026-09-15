@@ -1,3 +1,6 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Patch contract plus an opt-in actual sandbox worker/Pipe regression."""
 
 import importlib.util

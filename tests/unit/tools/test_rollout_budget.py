@@ -1,3 +1,6 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Behavioral regression tests for the pinned Gym rollout-budget overlay."""
 
 import importlib.util
