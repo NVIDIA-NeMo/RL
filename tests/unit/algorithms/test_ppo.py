@@ -29,6 +29,7 @@ from nemo_rl.algorithms.loss.loss_functions import (
     MseValueLossConfig,
     MseValueLossFn,
 )
+from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.data import DataConfig
@@ -556,6 +557,17 @@ def test_mse_value_loss_metrics():
         "vf_clipfrac",
     }
     assert expected_keys.issubset(set(metrics.keys()))
+    assert loss_fn.metric_normalizations == {
+        "loss": MetricNormalizer.TOKENS,
+        "vf_clipfrac": MetricNormalizer.TOKENS,
+        "returns_mean": MetricNormalizer.TOKENS,
+        "values_mean": MetricNormalizer.TOKENS,
+        "values_min": MetricNormalizer.NONE,
+        "values_max": MetricNormalizer.NONE,
+        "returns_sq_mean": MetricNormalizer.TOKENS,
+        "residual_sq_mean": MetricNormalizer.TOKENS,
+        "num_valid_samples": MetricNormalizer.NONE,
+    }
 
 
 def test_mse_value_loss_squeeze_trailing_dim():
