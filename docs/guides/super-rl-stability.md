@@ -129,6 +129,17 @@ it is never retried to seek a positive label. Math's required swapped-order
 check remains separate, with its own bounded attempts. Other exceptions are
 not retried. Final exhaustion still fails closed.
 
+Validate retry recovery separately from judge quality and latency. In a native
+local-judge canary, identical saved answers at temperature zero produced both
+valid positive and valid negative verdicts on an ambiguous numerical-rounding
+case. Some calls also exhausted 8K tokens without a verdict; judge-only retries
+recovered some of them but took tens of minutes end to end. A protocol-valid
+result therefore does not certify label consistency or acceptable training
+throughput. Preserve all attempts and report cap hits, retry count, total
+decision latency, and agreement on repeated fixed inputs. Do not retry valid
+negative decisions, select favorable labels, or silently change gold answers,
+reasoning settings, or output budgets to make the canary pass.
+
 The attempt count is not a transport deadline. The pinned
 `nemo_gym/openai_utils.py::NeMoGymAsyncOpenAI._request_with_retry` extends its
 retry allowance on rate-limit-class HTTP statuses, including 429 and 503, and
