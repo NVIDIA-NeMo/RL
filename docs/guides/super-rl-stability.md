@@ -135,3 +135,32 @@ Local tests cover Makefile transformation, no-clobber/source isolation, and
 ABI/read-only rejection. This refactored script has **not** been compiled in
 the native ARM/x86 images in this change; the historical ARM implementation was
 validated, which is narrower evidence. No Megatron submodule pointer is changed.
+
+## Sandbox exception IPC: retain TIR, fix the protocol
+
+**Incident 14:** `shell_worker` put an exception instance in `has_error`. In
+the production sandbox's Python 3.10.20 / requests 2.28.1 environment,
+`JSONDecodeError` failed to reconstruct across the multiprocessing Pipe. This
+is a sandbox protocol bug, not an invalid model answer or a bad GPU node.
+
+`tools/super_rl/patches/sandbox_exception_ipc.patch` changes that field to a
+boolean. Traceback/stdout/stderr, network restrictions, timeout behavior and
+session state remain unchanged. Because the affected source belongs to the
+**separate sandbox image**, this branch carries the minimal build-time patch,
+not a vendored 500-line server or a runtime monkeypatch of unrelated Gym code.
+
+Apply with zero fuzz to a fresh copy of that image's `/app/main.py`, or fix the
+corresponding upstream image source and rebuild. Validate the patch with
+`patch --dry-run --batch --forward --fuzz=0 <copied-main.py> <patch-file>` first.
+Mount the patched copy read-only at `/app/main.py` using
+`SANDBOX_EXTRA_MOUNTS`, or pin the rebuilt image. Never patch a running job's
+shared file. A different source revision requires review, not relaxed matching.
+
+Set `NRL_SANDBOX_MODULE` to the actual patched module and run
+`tests/unit/tools/test_sandbox_ipc.py` **inside the sandbox interpreter**. The
+native test invokes real `shell_worker`/Pipe, checking state creation,
+JSONDecodeError, ValueError, SyntaxError, and state after errors. The local
+patch test alone is not native validation; the native test explicitly skips
+outside that environment. All-route TIR concurrency/session smoke is still
+required. The previous CoT-only 18-step run does not certify it, and no TIR to
+CoT data converter is included here.
