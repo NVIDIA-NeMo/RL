@@ -1,4 +1,4 @@
-defaults: ../examples/configs/grpo_math_1B.yaml
+defaults: ../../grpo_math_1B.yaml
 
 grpo:
   num_prompts_per_step: 32
@@ -11,8 +11,8 @@ grpo:
   val_period: 10
   val_at_start: false
   overlong_filtering: false
-  max_val_samples: 960
-  val_batch_size: 960
+  max_val_samples: 240
+  val_batch_size: 240
   batch_multiplier: 1
   use_dynamic_sampling: false
   dynamic_sampling_max_gen_batches: 10
@@ -22,8 +22,8 @@ grpo:
     target_min: -1.0
   reward_shaping:
     enabled: false
-    overlong_buffer_length: 2048
-    max_response_length: 1024
+    overlong_buffer_length: 512
+    max_response_length: 6144
 
 loss_fn:
   reference_policy_kl_penalty: 0.0
@@ -36,9 +36,9 @@ loss_fn:
   token_level_loss: true
 checkpointing:
   enabled: true
-  checkpoint_dir: results/grpo-minimax-m3-32n8g-non-colocated
-  keep_top_k: 2
-  save_period: 5
+  checkpoint_dir: results/grpo-minimax-m3-32n8g-automodel-cp8ep128-noncolocated
+  keep_top_k: 1
+  save_period: 100
   checkpoint_must_save_by: "00:03:45:00"
   save_optimizer: true
 policy:
@@ -49,30 +49,40 @@ policy:
   train_micro_batch_size: 1
   train_global_batch_size: 512
   logprob_batch_size: 1
-  max_total_sequence_length: 2048
+  make_sequence_length_divisible_by: 1024
+  max_total_sequence_length: 8192
   logprob_chunk_size: 1024
   offload_optimizer_for_logprob: true
   optimizer:
+    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
     kwargs:
-      lr: 2.0e-06
+      lr: 1.0e-06
       weight_decay: 0.1
+      betas: [0.9, 0.999]
+      eps: 1.0e-08
+      master_weights: true
+      store_param_remainders: true
+      exp_avg_dtype: "torch.bfloat16"
+      exp_avg_sq_dtype: "torch.bfloat16"
   scheduler:
   - name: torch.optim.lr_scheduler.LinearLR
     kwargs:
       start_factor: 1.0e-08
       end_factor: 1.0
-      total_iters: 5
+      total_iters: 10
   - name: torch.optim.lr_scheduler.ConstantLR
     kwargs:
       factor: 1.0
       total_iters: 10000000000
   - milestones:
-    - 5
+    - 10
   dtensor_cfg:
+    context_parallel_size: 8
     expert_parallel_size: 128
     activation_checkpointing: true
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      NRL_REFIT_NUM_BUFFERS: "1"
     automodel_kwargs:
       backend:
         _target_: nemo_automodel.components.models.common.utils.BackendConfig
@@ -83,7 +93,7 @@ policy:
         rope_fusion: false
         enable_hf_state_dict_adapter: true
         experts: torch_mm
-        dispatcher: torch
+        dispatcher: hybridep
         enable_fsdp_optimizations: true
       freeze_config:
         freeze_vision_tower: true
@@ -92,9 +102,9 @@ policy:
   sequence_packing:
     enabled: false
   dynamic_batching:
-    enabled: true
+    enabled: false
   generation:
-    max_new_tokens: 1024
+    max_new_tokens: 6144
     vllm_kwargs:
       language_model_only: true
       block_size: 128
@@ -104,14 +114,14 @@ policy:
       expert_parallel_size: 16
       gpu_memory_utilization: 0.8
       enforce_eager: true
-      max_model_len: 2048
+      max_model_len: 8192
     colocated:
       enabled: false
       resources:
         gpus_per_node: 8
         num_nodes: 16
 data:
-  max_input_seq_length: 1024
+  max_input_seq_length: 2048
   train:
     dataset_name: DAPOMath17K
   validation:
@@ -127,7 +137,7 @@ logger:
   tensorboard_enabled: false
   wandb:
     project: nemorl-m3
-    name: grpo-minimax-m3-32n8g-non-colocated
+    name: grpo-minimax-m3-32n8g-automodel-cp8ep128-noncolocated
 cluster:
   gpus_per_node: 8
   num_nodes: 32

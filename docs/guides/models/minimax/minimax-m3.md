@@ -1,111 +1,116 @@
-# MiniMax-M3 Support
+# MiniMax-M3
 
-This guide summarizes the current MiniMax-M3 support in NeMo-RL, including the
-validated scope, a reference GRPO recipe, and known limitations.
+This guide describes GRPO training of MiniMax-M3 with the AutoModel training
+backend and BF16 vLLM generation.
 
 > [!IMPORTANT]
-> **Status: Functional Ready.** MiniMax-M3 is runnable in NeMo-RL, and short GRPO
-> training runs have been validated with a BF16 MiniMax-M3 checkpoint. Long-run
-> convergence has not been validated yet, so treat this as an early-access
-> integration.
+> **Status: Functionally Ready.** The reference recipe has been validated with
+> a short non-colocated GRPO run using CP8 and EP128 on a 32-node allocation.
+> Long-run convergence has not been established; see
+> [Known Limitations](#known-limitations) for validation coverage.
 
 ## Support Status
 
+| Model | Training backend | Validated training parallelism | Generation backend | Status |
+| --- | --- | --- | --- | --- |
+| `MiniMaxAI/MiniMax-M3` | AutoModel | CP8 + EP128 | vLLM with TP16 + EP16 | Functionally Ready |
 
-| Model                | Training backend    | Training parallelism      | Inference backend | Precision                                       | Status           |
-| -------------------- | ------------------- | ------------------------- | ----------------- | ----------------------------------------------- | ---------------- |
-| MiniMaxAI/MiniMax-M3 | AutoModel (DTensor) | Expert Parallel (EP) only | vLLM              | BF16 training weights with BF16 vLLM generation | Functional Ready |
+## Validated Scope
 
+- **Model**: `MiniMaxAI/MiniMax-M3`.
+- **Algorithm**: GRPO with `DAPOMath17K` for training and
+  `DAPOMathAIME2024` for validation.
+- **Training backend**: AutoModel with BF16 training, activation checkpointing,
+  SDPA attention, and the HybridEP expert dispatcher.
+- **Training parallelism**: CP8 and EP128.
+- **Generation backend**: vLLM with TP16, PP1, EP16, and BF16 weights.
+- **Sequence length**: Up to 2,048 prompt tokens plus up to 6,144 response
+  tokens, for a maximum total sequence length of 8,192.
+- **Reference allocation**: 32 nodes with 8 GPUs per node.
+- **Deployment**: Non-colocated training and generation, with 16 nodes
+  allocated to vLLM generation.
+- **MTP**: Disabled by setting `text_config.num_mtp_modules: 0` in the model
+  configuration overrides.
 
-Validated scope:
-
-- **Training backend**: [NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel).
-- **Training parallelism**: Expert Parallel (EP) only.
-- **Inference backend**: [vLLM](https://github.com/vllm-project/vllm).
-- **Precision**: BF16 training weights and BF16 vLLM generation.
+Recipe YAML files under `examples/configs/recipes/` are the source of truth for
+resource, parallelism, dataset, and checkpointing settings.
 
 ## How to Run
 
-### 1. Build the Environment
+### 1. Prepare the Environment
 
-MiniMax-M3 currently depends on a specific AutoModel branch and vLLM pull
-request. Clone those sources into the `3rdparty` paths used by NeMo-RL's
-editable installs.
+Use the standard NeMo-RL environment described in the
+[installation guide](../../../about/installation.md). MiniMax-M3 requires no
+additional manual compilation or custom AutoModel and vLLM source checkouts.
+For container and worker environment details, see
+[Dependency Management](../../../design-docs/dependency-management.md).
 
-Sources:
-
-- AutoModel: [https://github.com/NVIDIA-NeMo/Automodel/tree/larkz/minimax_m3](https://github.com/NVIDIA-NeMo/Automodel/tree/larkz/minimax_m3)
-- vLLM: [https://github.com/vllm-project/vllm/pull/45381](https://github.com/vllm-project/vllm/pull/45381)
-
-From the NeMo-RL repository root, run:
-
-```bash
-mkdir -p 3rdparty/Automodel-workspace 3rdparty/vLLM-workspace
-
-git clone --branch larkz/minimax_m3 --single-branch \
-  https://github.com/NVIDIA-NeMo/Automodel.git \
-  3rdparty/Automodel-workspace/Automodel
-
-git clone https://github.com/vllm-project/vllm.git \
-  3rdparty/vLLM-workspace/vllm
-
-git -C 3rdparty/vLLM-workspace/vllm fetch origin \
-  pull/45381/head:minimax-m3-pr-45381
-git -C 3rdparty/vLLM-workspace/vllm checkout minimax-m3-pr-45381
-```
-
-Published NeMo-RL containers do not yet include the full MiniMax-M3 runtime
-environment. Force a rebuild of the per-worker `uv` virtual environments at
-launch time so Ray workers pick up the local AutoModel and vLLM sources:
+The recipe uses the `MiniMaxAI/MiniMax-M3` checkpoint and the DAPO Math training
+and validation datasets from Hugging Face. Set `HF_HOME` to a cache visible
+from every node:
 
 ```bash
-export NRL_FORCE_REBUILD_VENVS=true
+export HF_HOME=<path-to-shared-huggingface-cache>
+export WANDB_API_KEY=<your-wandb-api-key>
 ```
 
-### 2. Use the Reference Recipe
+The reference recipe enables W&B logging. If W&B is not configured, pass
+`logger.wandb_enabled=false` when launching.
 
-The reference recipe is:
+### 2. Choose the Reference Recipe
 
-```text
-exp/grpo-minimax-m3-32n8g-non-colocated.yaml
-```
-
-Key settings:
-
-- AutoModel (DTensor) training with `expert_parallel_size: 128`.
-- Non-colocated vLLM generation
-(`generation.colocated.enabled: false`).
-- DAPO Math datasets (`DAPOMath17K` train / `DAPOMathAIME2024` validation).
+| Model | Algorithm | Backend | Scale | Recipe |
+| --- | --- | --- | --- | --- |
+| MiniMax-M3 | GRPO | AutoModel | 32n8g | [`grpo-minimax-m3-32n8g-automodel-cp8ep128-noncolocated.yaml`](../../../../examples/configs/recipes/llm/grpo-minimax-m3-32n8g-automodel-cp8ep128-noncolocated.yaml) |
 
 ### 3. Launch
 
-MiniMax-M3 uses the standard GRPO entrypoint:
+From the repository root in a 32-node allocation with 8 GPUs per node, launch
+the standard GRPO entry point:
 
 ```bash
-export NRL_FORCE_REBUILD_VENVS=true
-
 uv run examples/run_grpo.py \
-  --config exp/grpo-minimax-m3-32n8g-non-colocated.yaml
+  --config examples/configs/recipes/llm/grpo-minimax-m3-32n8g-automodel-cp8ep128-noncolocated.yaml
 ```
 
-### Reference Training Curve
+See the [GRPO guide](../../grpo.md) for algorithm and common configuration
+details and [Cluster Setup](../../../cluster.md) for multi-node launch setup.
+Before changing the node count, review the training and generation parallel
+dimensions and the separate generation allocation.
 
-The following curve was produced with the reference recipe above:
+## Important Recipe Settings
 
-![MiniMax-M3 GRPO training curve](../../../assets/minimax_m3_grpo_curve.png)
+- `policy.dtensor_cfg.context_parallel_size: 8` and
+  `policy.dtensor_cfg.expert_parallel_size: 128` select the training layout.
+- The AutoModel backend uses `attn: sdpa`, `linear: te`, and
+  `dispatcher: hybridep`.
+- The optimizer is Transformer Engine `FusedAdam`, with `master_weights: true`,
+  `store_param_remainders: true`, and BF16 first- and second-moment states.
+- `policy.offload_optimizer_for_logprob: true` enables optimizer offloading
+  for log-probability computation.
+- `policy.generation.colocated.enabled: false` selects non-colocated
+  generation; its `resources` block allocates 16 nodes with 8 GPUs each.
+- `policy.generation.vllm_kwargs.language_model_only: true` selects
+  language-model-only generation. The AutoModel freeze configuration freezes
+  the vision and audio towers.
+- Eager execution (`enforce_eager: true`) remains part of the validated
+  generation configuration. Sequence packing and dynamic batching are disabled.
 
-## Known Issues
+## Reference Training Curves
 
-- **Sequence length**: The validated configuration uses EP=128 and a 2k maximum
-  sequence length. Longer sequences may OOM and will likely require additional
-  parallelism such as Context Parallel (CP) or Pipeline Parallel (PP).
-- **Long-run validation**: Current validation covers short training runs only.
-  Long-run convergence has not been established.
-- **Additional parallelism**: CP, PP, TP, and sequence packing are not part of
-  the validated MiniMax-M3 training scope yet.
+The following curves were produced with the reference CP8/EP128 configuration
+on the 32-node allocation described above. They show validation accuracy,
+training reward, generation KL error, truncation rate, gradient norm, and
+approximate entropy. Validation accuracy reaches approximately 0.72 at step 100.
 
-## What's Next
+![MiniMax-M3 GRPO validation accuracy, training reward, generation KL error, truncation rate, gradient norm, and approximate entropy](../../../assets/minimax/minimax-m3-grpo-100steps.png)
 
-- Validate long-run MiniMax-M3 training.
-- Add and validate more training parallelism, especially CP and PP, to support
-  longer contexts.
+## Known Limitations
+
+- **Sequence length**: The validated configuration uses CP8 and EP128 with an
+  8,192-token maximum total sequence length. Longer sequences have not been
+  validated.
+- **Additional parallelism**: Training with PP, TP, and sequence packing is not
+  part of the validated MiniMax-M3 training scope yet.
+- MTP is disabled in the reference configuration.
+- Long-run convergence has not been established for this recipe.
