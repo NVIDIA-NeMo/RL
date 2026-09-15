@@ -1028,7 +1028,9 @@ bash -n <(printf '%s' "$worker_cmd") || { echo "[FATAL] Worker script has syntax
 # task starts the sandbox, polls its local port, and on success touches
 # SANDBOX_READY_<hostname> so the head can gate the driver on all instances.
 ########################################################
-export SLURM_MASTER_NODE=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
+# The sandbox nginx image does not inherit the training container's resolver.
+# Reuse the numeric address already resolved for Ray instead of a compute name.
+export SLURM_MASTER_NODE="$head_node_ip"
 SANDBOX_PORT="${NEMO_SKILLS_SANDBOX_PORT:-6000}"
 
 SANDBOX_BASE_PORT="${SANDBOX_BASE_PORT:-6001}"
