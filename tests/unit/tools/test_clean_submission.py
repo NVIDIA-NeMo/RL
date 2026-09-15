@@ -1,4 +1,5 @@
 import os
+import json
 import sys
 from unittest.mock import patch
 
@@ -74,3 +75,82 @@ def test_cli_is_test_only_unless_explicit(submit):
         "run.sbatch",
     ]
     assert run.call_args.kwargs["env"] == {"PATH": "/bin"}
+
+
+@pytest.mark.parametrize("submit", [False, True])
+def test_bootstrap_grace_is_an_outer_sbatch_comment(submit):
+    argv = [
+        "submit.py",
+        *(["--submit"] if submit else []),
+        "--bootstrap-grace-minutes",
+        "75",
+        "--",
+        "--account=test",
+        "run.sbatch",
+    ]
+    with (
+        patch.object(sys, "argv", argv),
+        patch("tools.super_rl.submit.subprocess.run") as run,
+    ):
+        main()
+    command = run.call_args.args[0]
+    assert command[0] == "sbatch"
+    assert ("--test-only" in command) is not submit
+    comment = next(
+        arg.removeprefix("--comment=")
+        for arg in command
+        if arg.startswith("--comment=")
+    )
+    assert json.loads(comment) == {
+        "OccupiedIdleGPUsJobReaper": {
+            "exemptIdleTimeMins": "75",
+            "reason": "other",
+            "description": "nemo-rl-run-bootstrap",
+        }
+    }
+    assert command[-2:] == ["--account=test", "run.sbatch"]
+
+
+@pytest.mark.parametrize("minutes", ["0", "-1", "not-a-number"])
+def test_invalid_grace_never_calls_sbatch(minutes):
+    argv = ["submit.py", "--bootstrap-grace-minutes", minutes, "--", "run.sbatch"]
+    with (
+        patch.object(sys, "argv", argv),
+        patch("tools.super_rl.submit.subprocess.run") as run,
+    ):
+        with pytest.raises(SystemExit) as error:
+            main()
+    assert error.value.code == 2
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize("comment", [["--comment=existing"], ["--comment", "existing"]])
+def test_conflicting_first_component_comment_fails(comment):
+    argv = [
+        "submit.py",
+        "--bootstrap-grace-minutes",
+        "75",
+        "--",
+        *comment,
+        "run.sbatch",
+    ]
+    with (
+        patch.object(sys, "argv", argv),
+        patch("tools.super_rl.submit.subprocess.run") as run,
+    ):
+        with pytest.raises(SystemExit):
+            main()
+    run.assert_not_called()
+
+
+def test_bootstrap_grace_does_not_change_service_component_comment():
+    batch_args = ["--nodes=64", ":", "--nodes=1", "--comment=service", "run.sbatch"]
+    argv = ["submit.py", "--bootstrap-grace-minutes", "75", "--", *batch_args]
+    with (
+        patch.object(sys, "argv", argv),
+        patch("tools.super_rl.submit.subprocess.run") as run,
+    ):
+        main()
+    command = run.call_args.args[0]
+    assert command[-len(batch_args) :] == batch_args
+    assert command[2].startswith("--comment=")

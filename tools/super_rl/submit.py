@@ -15,6 +15,7 @@
 """Call sbatch with a clean environment; scheduler test-only unless --submit."""
 
 import argparse
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -67,6 +68,14 @@ def main() -> None:
         "--slurm-conf", type=Path, help="Explicit site client config, if needed"
     )
     parser.add_argument(
+        "--bootstrap-grace-minutes",
+        type=int,
+        help=(
+            "Request an OccupiedIdleGPUsJobReaper startup grace for the first "
+            "Slurm component (e.g. 75); opt-in and subject to site policy"
+        ),
+    )
+    parser.add_argument(
         "sbatch_args",
         nargs=argparse.REMAINDER,
         help="-- <sbatch options> <batch script> [script args]",
@@ -83,6 +92,28 @@ def main() -> None:
     command = ["sbatch"]
     if not args.submit:
         command.append("--test-only")
+    if args.bootstrap_grace_minutes is not None:
+        if args.bootstrap_grace_minutes <= 0:
+            parser.error("--bootstrap-grace-minutes must be positive")
+        # Later heterogeneous components may have their own serving comments.
+        first_component = (
+            batch_args[: batch_args.index(":")] if ":" in batch_args else batch_args
+        )
+        if any(
+            arg == "--comment" or arg.startswith("--comment=")
+            for arg in first_component
+        ):
+            parser.error(
+                "Use either --bootstrap-grace-minutes or a first-component --comment"
+            )
+        comment = {
+            "OccupiedIdleGPUsJobReaper": {
+                "exemptIdleTimeMins": str(args.bootstrap_grace_minutes),
+                "reason": "other",
+                "description": "nemo-rl-run-bootstrap",
+            }
+        }
+        command.append("--comment=" + json.dumps(comment, separators=(",", ":")))
     # Do not log environment values or duplicate submissions on timeout/error.
     subprocess.run([*command, *batch_args], env=env, check=True)
 

@@ -42,3 +42,28 @@ flagged multi-turn trajectories in the next smoke. If extraction or parsing
 incorrectly flags valid output, fix that source rather than silently disabling
 the requested penalty. Historical reward measurements remain unchanged and
 are not measurements of the new contract.
+
+## Explicit startup idle-reaper grace
+
+Use the clean submission entrypoint with **`--bootstrap-grace-minutes 75`** for
+this baseline. It puts the same structured `OccupiedIdleGPUsJobReaper` comment
+as gold on the **outer sbatch request**, where it can be observed. Adding an
+`#SBATCH` directive to a sourced `ray.sub` would not affect the outer job.
+
+```bash
+uv run --no-sync tools/super_rl/submit.py --bootstrap-grace-minutes 75 \
+  -- --account=<your-account> --partition=batch --qos=short \
+  --nodes=64 --gpus-per-node=4 --segment=16 --time=02:00:00 <reviewed-launcher.sbatch>
+```
+
+This command is **scheduler test-only**; actual submission additionally requires
+`--submit` before `--`. Pass reviewed workload environment names via `--env` as
+needed. The grace is explicit, not applied to every site's jobs by default.
+It supersedes a batch-file comment; an additional first-component CLI comment
+is rejected rather than silently discarding it. Later heterogeneous service
+components retain their own comments and do not acquire a 75-minute or
+1440-minute exemption implicitly.
+
+The grace does not fix stalled training, extend Slurm walltime, or override site
+policy. Verify the stored outer job comment after a real submission. A scheduler
+test accepting the JSON does not prove that the reaper service honored it.
