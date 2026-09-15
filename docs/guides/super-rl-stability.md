@@ -39,6 +39,26 @@ this document. Inspect with `git show <commit>`; base is PR3941, not current mai
 | `5f6842c` | Compact valid-row Router Replay, without experimental CP-local fetch | 9 / memory and throughput |
 | `4a90f87` | Reject unimplemented effort configs rather than silently ignoring them | Configuration safety before Kimi port |
 
+## Cumulative rollout budgets
+
+The pinned Gym agents reuse the request cap on every model call. Consequently,
+setting `max_output_tokens` alone does not enforce a whole-rollout budget for
+TIR or SciCode. The reviewed `gym_rollout_budget.patch` adds an optional positive
+`max_total_output_tokens` agent setting, with shared accounting that rejects
+missing usage and responses exceeding the actual per-call allowance. It does
+not enable effort rewards or change source prompts or historical measurements.
+
+Stage a fresh runtime Gym tree with
+`uv run tools/super_rl/stage_gym.py --source <pinned-gym-repo> --output <new-directory>`.
+The tool archives commit `749432dc` (not a potentially dirty working tree), applies
+zero-fuzz patches, copies the versioned helpers, and records overlay hashes.
+Mount that tree read-only at the configured Gym source location. The dependency
+Git pin stays unchanged; overlays are reviewable in this NeMo-RL branch.
+
+Local budget tests cover cumulative calls, exhaustion, invalid usage, per-call
+over-return and the disabled default. Native all-route and effective-request
+tests remain required before declaring the runtime validated.
+
 ## What was intentionally not copied
 
 - Old job IDs, absolute user paths, submission receipts, logs, payload snapshots,
