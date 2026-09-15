@@ -35,7 +35,10 @@ from nemo_rl.utils.r3_trace import (
     r3_trace_verify_forward_enabled,
     trace_cp_routed_experts,
 )
-from nemo_rl.utils.routed_experts_ref import materialize_routed_experts_refs
+from nemo_rl.utils.routed_experts_ref import (
+    materialize_routed_experts_ref_rows,
+    materialize_routed_experts_refs,
+)
 
 
 @dataclass
@@ -125,17 +128,25 @@ def make_processed_microbatch_iterator(
 
     for data_dict in raw_iterator:
         routed_experts = data_dict.get("routed_experts")
+        routed_experts_refs_for_packing = None
         if routed_experts is not None and not isinstance(routed_experts, torch.Tensor):
             if "input_lengths" not in data_dict:
                 raise ValueError(
                     "Ray-reference routed_experts requires input_lengths for "
                     "microbatch-local materialization."
                 )
-            data_dict["routed_experts"] = materialize_routed_experts_refs(
-                routed_experts,
-                input_ids=data_dict["input_ids"],
-                input_lengths=data_dict["input_lengths"],
-            )
+            if pack_sequences and not r3_trace_verify_forward_enabled():
+                # Preserve the jagged Ray references until input_ids has supplied
+                # the exact packed boundaries. This avoids the otherwise enormous
+                # [B, max_seq, layers, topk] intermediate tensor.
+                routed_experts_refs_for_packing = routed_experts
+                del data_dict["routed_experts"]
+            else:
+                data_dict["routed_experts"] = materialize_routed_experts_refs(
+                    routed_experts,
+                    input_ids=data_dict["input_ids"],
+                    input_lengths=data_dict["input_lengths"],
+                )
 
         # Sequence packing discards the rectangular per-sample padding and then
         # selects this CP rank's tokens.  Keep routed_experts on CPU until those
@@ -169,6 +180,7 @@ def make_processed_microbatch_iterator(
                 delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
                 model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
                 straggler_timer=straggler_timer,
+                routed_experts_refs=routed_experts_refs_for_packing,
             )
         finally:
             # No forward/loss consumer reads routed_experts from data_dict; the
@@ -304,6 +316,7 @@ def process_microbatch(
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
     straggler_timer: Optional[StragglerDetector] = None,
+    routed_experts_refs: Optional[list[Any]] = None,
 ) -> ProcessedInputs:
     """Process a microbatch for Megatron model forward pass."""
     ctx = straggler_timer(bdata=True) if straggler_timer is not None else nullcontext()
@@ -315,6 +328,14 @@ def process_microbatch(
         routed_experts = (
             data_dict["routed_experts"] if "routed_experts" in data_dict else None
         )
+        if routed_experts is not None and routed_experts_refs is not None:
+            raise ValueError(
+                "Provide either dense routed_experts or routed_experts_refs, not both"
+            )
+        if routed_experts_refs is not None and not pack_sequences:
+            raise ValueError(
+                "Compact routed_experts_refs materialization requires sequence packing"
+            )
         token_identity_cp_sharded = None
         if routed_experts is not None and routed_experts.dim() != 4:
             raise ValueError(
@@ -365,7 +386,7 @@ def process_microbatch(
                 # or the double-processing produces shape mismatches downstream
                 # (GDN/RoPE/MoE). We only pad each sequence individually and
                 # hand the model [B, max_seq] + bool attention_mask + cu_seqlens.
-                if routed_experts is not None:
+                if routed_experts is not None or routed_experts_refs is not None:
                     # Router replay needs routed_experts CP-sharded into the
                     # model's local token order, but a self-packing model packs
                     # and CP-shards internally, so NeMo-RL cannot build a matching
@@ -431,6 +452,12 @@ def process_microbatch(
                     cp_rank=get_context_parallel_rank(),
                     cp_size=get_context_parallel_world_size(),
                 )
+                routed_expert_rows = None
+                if routed_experts_refs is not None:
+                    routed_expert_rows = materialize_routed_experts_ref_rows(
+                        routed_experts_refs,
+                        input_lengths=seq_lengths,
+                    )
                 if model_slices_context_parallel_inputs:
                     packed_seq_params = PackedSeqParams(
                         cu_seqlens_q=cu_seqlens,
@@ -463,21 +490,36 @@ def process_microbatch(
                 # routed_experts and the R3 trace token identity ride the SAME
                 # per-seq zigzag CP sharding as input_ids, re-derived from
                 # cu_seqlens_padded.
-                if routed_experts is not None:
-                    (
-                        routed_experts,
-                        routed_experts_cp_sharded,
-                        _token_identity_packed,
-                        token_identity_cp_sharded,
-                    ) = _shard_routed_experts_for_cp(
-                        routed_experts,
-                        token_identity,
-                        seq_lengths,
-                        cu_seqlens,
-                        cu_seqlens_padded,
-                        get_context_parallel_rank(),
-                        get_context_parallel_world_size(),
-                    )
+                if routed_experts is not None or routed_expert_rows is not None:
+                    if routed_expert_rows is not None:
+                        (
+                            routed_experts,
+                            routed_experts_cp_sharded,
+                        ) = _shard_routed_expert_rows_for_cp(
+                            routed_expert_rows,
+                            seq_lengths,
+                            cu_seqlens,
+                            cu_seqlens_padded,
+                            cp_rank=get_context_parallel_rank(),
+                            cp_size=get_context_parallel_world_size(),
+                        )
+                        _token_identity_packed = None
+                        token_identity_cp_sharded = None
+                    else:
+                        (
+                            routed_experts,
+                            routed_experts_cp_sharded,
+                            _token_identity_packed,
+                            token_identity_cp_sharded,
+                        ) = _shard_routed_experts_for_cp(
+                            routed_experts,
+                            token_identity,
+                            seq_lengths,
+                            cu_seqlens,
+                            cu_seqlens_padded,
+                            get_context_parallel_rank(),
+                            get_context_parallel_world_size(),
+                        )
                     if model_slices_context_parallel_inputs:
                         cp_partition_indices = get_packed_seq_cp_partition_indices(
                             packed_seq_params,
@@ -777,9 +819,7 @@ def _verify_r3_trace_cp_token_alignment(
 
     routed_source_rows = source_rows.to(device=source_routed_experts.device)
     routed_source_cols = source_cols.to(device=source_routed_experts.device)
-    expected_routed = source_routed_experts[
-        routed_source_rows, routed_source_cols
-    ].to(
+    expected_routed = source_routed_experts[routed_source_rows, routed_source_cols].to(
         device=flat_routed.device,
         dtype=flat_routed.dtype,
     )
@@ -1196,6 +1236,84 @@ def _pack_sequences_for_megatron(
         packed_seq_params,
         cu_seqlens,
         cu_seqlens_padded,
+    )
+
+
+def _shard_routed_expert_rows_for_cp(
+    routed_expert_rows: list[torch.Tensor],
+    seq_lengths: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_padded: Optional[torch.Tensor],
+    *,
+    cp_rank: int,
+    cp_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack valid routed-expert rows directly onto the input CP layout."""
+    batch_size = seq_lengths.shape[0]
+    if len(routed_expert_rows) != batch_size:
+        raise ValueError(
+            "Compact routed_experts rows must match the microbatch size: "
+            f"rows={len(routed_expert_rows)}, batch={batch_size}"
+        )
+
+    all_routed = []
+    cp_routed = []
+    layer_topk = None
+    for b, row in enumerate(routed_expert_rows):
+        seq_len = int(seq_lengths[b])
+        if row.ndim != 3 or row.shape[0] != seq_len:
+            raise ValueError(
+                "Each compact routed_experts row must have shape "
+                "[input_length, num_moe_layers, topk]: "
+                f"sample={b}, shape={tuple(row.shape)}, input_length={seq_len}"
+            )
+        this_layer_topk = tuple(row.shape[1:])
+        if layer_topk is None:
+            layer_topk = this_layer_topk
+        elif this_layer_topk != layer_topk:
+            raise ValueError(
+                "Compact routed_experts rows disagree on layer/top-k shape: "
+                f"expected={layer_topk}, got={this_layer_topk}"
+            )
+
+        if cu_seqlens_padded is not None:
+            padded_len = int(cu_seqlens_padded[b + 1] - cu_seqlens_padded[b])
+        else:
+            padded_len = int(cu_seqlens[b + 1] - cu_seqlens[b])
+        if padded_len < seq_len:
+            raise ValueError(
+                "Packed routed_experts boundary is shorter than the valid row: "
+                f"sample={b}, padded={padded_len}, valid={seq_len}"
+            )
+
+        if padded_len > seq_len:
+            topk = row.shape[-1]
+            default_route = torch.arange(
+                topk,
+                dtype=row.dtype,
+                device=row.device,
+            ).view(1, 1, topk)
+            row = torch.cat(
+                (
+                    row,
+                    default_route.expand(
+                        padded_len - seq_len,
+                        row.shape[1],
+                        topk,
+                    ),
+                ),
+                dim=0,
+            )
+        all_routed.append(row)
+        cp_routed.append(
+            _get_tokens_on_this_cp_rank(row, cp_rank, cp_size, seq_dim=0)
+            if cp_size > 1
+            else row
+        )
+
+    return (
+        torch.cat(all_routed, dim=0).unsqueeze(0),
+        torch.cat(cp_routed, dim=0).unsqueeze(0),
     )
 
 

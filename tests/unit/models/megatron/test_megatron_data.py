@@ -1461,9 +1461,9 @@ class TestMakeProcessedMicrobatchIterator:
 
         input_ids = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]])
         input_lengths = torch.tensor([3, 2])
-        rectangular_routes = torch.arange(
-            2 * 4 * 3 * 2, dtype=torch.int16
-        ).reshape(2, 4, 3, 2)
+        rectangular_routes = torch.arange(2 * 4 * 3 * 2, dtype=torch.int16).reshape(
+            2, 4, 3, 2
+        )
         packed_routes = rectangular_routes[:, :3].reshape(1, 6, 3, 2)
         cp_local_routes = packed_routes[:, ::2]
         data_dict = BatchedDataDict(
@@ -1512,6 +1512,65 @@ class TestMakeProcessedMicrobatchIterator:
         assert "routed_experts" not in microbatch.data_dict
         assert microbatch.routed_experts is packed_routes
         assert microbatch.routed_experts_cp_sharded is cp_local_routes
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("forward_trace", [False, True])
+def test_compact_iterator_defers_refs_until_packing(forward_trace):
+    from nemo_rl.models.megatron.data import (
+        ProcessedInputs,
+        make_processed_microbatch_iterator,
+    )
+
+    refs = [[{"opaque": "first"}], [{"opaque": "second"}]]
+    tokens = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]])
+    batch = BatchedDataDict(
+        {
+            "input_ids": tokens,
+            "input_lengths": torch.tensor([3, 2]),
+            "routed_experts": refs,
+        }
+    )
+    dense = torch.zeros(2, 4, 1, 2, dtype=torch.int16)
+    batch.to = MagicMock(return_value=batch)
+    output = ProcessedInputs(
+        input_ids=tokens,
+        input_ids_cp_sharded=tokens,
+        attention_mask=None,
+        position_ids=None,
+        packed_seq_params=None,
+        cu_seqlens_padded=None,
+    )
+    with (
+        patch(
+            "nemo_rl.models.megatron.data.r3_trace_verify_forward_enabled",
+            return_value=forward_trace,
+        ),
+        patch(
+            "nemo_rl.models.megatron.data.materialize_routed_experts_refs",
+            return_value=dense,
+        ) as materialize,
+        patch(
+            "nemo_rl.models.megatron.data.process_microbatch", return_value=output
+        ) as process,
+    ):
+        next(
+            make_processed_microbatch_iterator(
+                iter([batch]),
+                {"sequence_packing": {"enabled": True}},
+                "input_lengths",
+                4,
+                4,
+                straggler_timer=MagicMock(),
+                pad_full_seq_to=None,
+            )
+        )
+    if forward_trace:
+        materialize.assert_called_once()
+        assert process.call_args.kwargs["routed_experts_refs"] is None
+    else:
+        materialize.assert_not_called()
+        assert process.call_args.kwargs["routed_experts_refs"] == refs
 
 
 PACK_SEQUENCES_TEST_ACTOR_FQN = (
@@ -1655,6 +1714,47 @@ def test_pack_sequences_with_context_parallel(pack_sequences_setup):
                     print(f"  {test_name}: {status}")
                     if not test_result["success"]:
                         print(f"    Error: {test_result['error']}")
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("cp_size", [1, 2, 4, 16])
+def test_compact_routed_rows_match_dense_on_every_cp_rank(cp_size):
+    from nemo_rl.models.megatron.data import (
+        _pack_sequences_for_megatron,
+        _shard_routed_expert_rows_for_cp,
+        _shard_routed_experts_for_cp,
+    )
+
+    lengths = torch.tensor([3, 37, 9], dtype=torch.int32)
+    dense = torch.arange(3 * 37 * 2 * 2, dtype=torch.int16).reshape(3, 37, 2, 2)
+    rows = [dense[index, : int(length)] for index, length in enumerate(lengths)]
+    for rank in range(cp_size):
+        _, _, _, boundaries, padded = _pack_sequences_for_megatron(
+            torch.zeros(3, 37, dtype=torch.long),
+            lengths,
+            pad_individual_seqs_to_multiple_of=2 * cp_size,
+            cp_rank=rank,
+            cp_size=cp_size,
+        )
+        expected, expected_local, _, _ = _shard_routed_experts_for_cp(
+            dense,
+            None,
+            lengths,
+            boundaries,
+            padded,
+            cp_rank=rank,
+            cp_size=cp_size,
+        )
+        actual, actual_local = _shard_routed_expert_rows_for_cp(
+            rows,
+            lengths,
+            boundaries,
+            padded,
+            cp_rank=rank,
+            cp_size=cp_size,
+        )
+        assert torch.equal(actual, expected)
+        assert torch.equal(actual_local, expected_local)
 
 
 @pytest.mark.mcore

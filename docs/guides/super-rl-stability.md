@@ -228,3 +228,35 @@ data and output cap. Before adopting 32 on another cluster, check allocated
 CPU capacity and the same `shared_dir` mount inside both resource server and
 sandbox. Compare fixed answers, rewards and actual test counts at both
 concurrency values. Keep sandbox timeouts/reward semantics unchanged.
+
+## Compact Router Replay: avoid rectangular CPU materialization
+
+**Incident 9 / throughput section:** PR3941 already deferred route H2D until
+packing, but still materialized `[batch, max_sequence, layers, topk]` on CPU.
+The historical compact implementation eliminated that rectangular intermediate.
+This commit retains that working algorithm, without S25-specific function
+attributes/log markers or the unvalidated CP-local-fetch candidate.
+
+`materialize_routed_experts_ref_rows` reads valid rows (full objects or grouped
+multi-turn ranges), validates tags/shapes/dtypes, and passes jagged rows to
+Megatron packing. The existing padded token boundaries and per-sequence CP
+selection are reused, including the separate model-owned CP index path.
+Dense/inline input behavior is retained. Forward tracing intentionally retains
+the dense debug path; for the compact production path set:
+
+```bash
+export NRL_R3_TRACE=0 NRL_R3_TRACE_VERIFY_FORWARD=0
+export NRL_ROUTER_REPLAY_VALIDATE=1
+```
+
+These values must reach the **actual Megatron workers**, not just the submit
+shell. Keep profile-required MTP exclusions unchanged. Compact still fetches
+valid rows before CP slicing and constructs a full packed CPU tensor; it is
+**not** a throughput solution or a durable rollout archive.
+
+Regression tests cover multi-turn rows, range-scatter parity, wrong dtypes and
+CP1/2/4/16 equivalence to the existing dense path on every CP rank. They require
+the native Torch/Ray/Megatron environment; local collection is blocked by the
+missing dependencies. Historical native tests and three-step canaries validated
+the source algorithm, not this newly refactored branch. A new native canary
+must cover ragged inputs, model-owned CP, update/refit and checkpoint reload.
