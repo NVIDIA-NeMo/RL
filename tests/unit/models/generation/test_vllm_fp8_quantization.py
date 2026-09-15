@@ -1542,6 +1542,7 @@ def test_dsv4_module_lookup_maps_checkpoint_attention_to_fused_vllm_module(
             layer.attn.fused_wqa_wkv = torch.nn.Linear(2, 2, bias=False)
             self.model.layers = torch.nn.ModuleList([layer])
             self.hf_to_vllm_mapper = types.SimpleNamespace(
+                orig_to_new_prefix={"": "model."},
                 apply_list=lambda names: [f"model.{names[0]}"],
             )
 
@@ -1550,6 +1551,13 @@ def test_dsv4_module_lookup_maps_checkpoint_attention_to_fused_vllm_module(
     module = fp8.get_module_from_param_name(model, "layers.0.attn.wq_a.weight")
 
     assert module is model.model.layers[0].attn.fused_wqa_wkv
+
+    resolution = fp8.resolve_module_from_param_name(model, "layers.0.attn.wq_a.weight")
+    assert resolution is not None
+    assert resolution.module is module
+    # The full DeepSeek mapper already added the prefix; applying it again
+    # corrupts the mapped path even if the module walker tolerates the wrapper.
+    assert resolution.mapped_path == ("model", "layers", "0", "attn", "fused_wqa_wkv")
 
 
 def test_module_lookup_preserves_base_packed_and_mapper_handling(fp8_module):
