@@ -732,6 +732,11 @@ class GymRolloutCheckpointConfig(BaseModel, extra="forbid"):
     # Freeze active vLLM requests at snapshot time and persist their current
     # token prefixes instead of waiting for every model response to finish.
     generation_prefix_cuts_enabled: bool = False
+    # Stage an in-flight call's accumulated tokens once its unstaged segment
+    # reaches this many tokens, instead of only when a checkpoint cut fires.
+    # Bounds how much generated work a crash can lose, independently of
+    # checkpoint cadence. 0 disables periodic flushing.
+    generation_chunk_flush_tokens: Annotated[int, Field(ge=0)] = 0
     prepare_timeout_s: Annotated[float, Field(gt=0)] = 300.0
 
     @model_validator(mode="after")
@@ -743,6 +748,15 @@ class GymRolloutCheckpointConfig(BaseModel, extra="forbid"):
             raise ValueError(
                 "participant_checkpointing_enabled=true requires "
                 "capability_discovery_enabled=true"
+            )
+        if (
+            self.generation_chunk_flush_tokens
+            and not self.generation_prefix_cuts_enabled
+        ):
+            raise ValueError(
+                "generation_chunk_flush_tokens requires "
+                "generation_prefix_cuts_enabled=true; without prefix cuts a "
+                "staged chunk has no restore path"
             )
         if (
             self.generation_prefix_cuts_enabled
