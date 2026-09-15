@@ -323,7 +323,7 @@ def megatron_sft_packed_preprocessor(
         raise ValueError(
             f"max_seq_length={max_seq_length} must be a multiple of "
             f"2 * context_parallel_size ({cp_granularity}) for Megatron SFT "
-            "packed data; set data.max_total_sequence_length accordingly"
+            "packed data; set data.max_input_seq_length accordingly"
         )
 
     prompt_config = _get_prompt_config(prompt_format, pad_token, assistant_prefix_len)
