@@ -934,6 +934,7 @@ def test_batched_moe_shuffle_matches_per_expert(
 def test_process_mxfp8_linear_separates_checkpoint_and_runtime_scales(
     fp8_module, monkeypatch
 ):
+    from vllm.model_executor import parameter as vllm_parameter
     from vllm.model_executor.layers.quantization.utils import mxfp8_utils
 
     layer = torch.nn.Module()
@@ -951,6 +952,10 @@ def test_process_mxfp8_linear_separates_checkpoint_and_runtime_scales(
         mxfp8_utils,
         "swizzle_mxfp8_scale",
         lambda scale, M, K: scale + 1,
+    )
+    monkeypatch.setattr(vllm_parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        vllm_parameter, "get_tensor_model_parallel_world_size", lambda: 1
     )
     kernel_type = type("FlashInferCutlassMxfp8LinearKernel", (), {})
     method = types.SimpleNamespace(kernel=kernel_type())
