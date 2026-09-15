@@ -221,6 +221,10 @@ policy:
       fp8: "e4m3"
       fp8_recipe: "blockwise"
       fp8_param: false
+    first_last_layers_bf16: false  # Keep boundary transformer layers in BF16 for training and Megatron generation.
+    num_layers_at_start_in_bf16: 0  # Nonnegative count; used when first_last_layers_bf16 is true.
+    num_layers_at_end_in_bf16: 0  # Nonnegative count; used when first_last_layers_bf16 is true.
+
     env_vars: null
 
   dynamic_batching:

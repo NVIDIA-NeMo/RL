@@ -173,8 +173,94 @@ When both `fp8_cfg` and `te_precision_config_file` are set, matched modules use
 the recipe's per-module quantization config. NeMo RL still derives sequence
 padding and FP8 refit behavior from `fp8_cfg`, so matched FP8 recipes must use
 the same `fp8_quantization_recipe` as `fp8_cfg.fp8_recipe`. Recipe
-`training_recipe` and `evaluation_recipe` fields `fp8_param` and `fp4_param`
-are rejected; use `fp8_cfg.fp8_param` for supported FP8 parameter storage.
+`training_recipe` and `evaluation_recipe` cannot independently enable
+`fp8_param` or `fp4_param`; use `fp8_cfg.fp8_param` for FP8 parameter storage.
+
+### Selective MXFP8 for Megatron generation
+
+With [Megatron-LM #7300](https://github.com/NVIDIA/Megatron-LM/pull/7300),
+training and inference-optimized Megatron generation use the same TE per-module
+recipe to select parameter storage at model construction. BF16-selected weights
+are loaded directly in BF16, without an intermediate MXFP8 quantize/dequantize
+step. No parameter-name regex filters or checkpoint callbacks are needed.
+
+Save the following as `/path/to/routed_experts.yaml`. Matchers are ordered;
+the first enabled match wins. The catch-all explicitly disables quantization
+outside routed expert FC1/FC2, including shared experts and attention:
+
+```yaml
+configs:
+  bf16:
+    transformer_engine_config_type: TEQuantizationParams
+    training_recipe:
+      override_quantized_autocast: true
+  mxfp8:
+    transformer_engine_config_type: TEQuantizationParams
+    training_recipe:
+      fp8_quantization_recipe: mxfp8
+      override_quantized_autocast: true
+matchers:
+  mtp_bf16:
+    config: bf16
+    type: glob
+    pattern: "*mtp*"
+    enabled: true
+  routed_experts_fc1_mxfp8:
+    config: mxfp8
+    type: glob
+    pattern: "*mlp.experts.linear_fc1"
+    enabled: true
+  routed_experts_fc2_mxfp8:
+    config: mxfp8
+    type: glob
+    pattern: "*mlp.experts.linear_fc2"
+    enabled: true
+  all_other_modules_bf16:
+    config: bf16
+    type: glob
+    pattern: "*"
+    enabled: true
+```
+
+Use it for training and generation, keeping the first two and last four
+transformer layers in BF16:
+
+```yaml
+policy:
+  megatron_cfg:
+    te_precision_config_file: /path/to/routed_experts.yaml
+    fp8_cfg:
+      enabled: true
+      fp8: e4m3
+      fp8_recipe: mxfp8
+      fp8_param: true
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 2
+    num_layers_at_end_in_bf16: 4
+  generation:
+    backend: megatron
+    refit_transport: mcore
+    mcore_generation_config:
+      transformer_impl: inference_optimized
+      inference_grouped_gemm_backend: torch
+      refit_backend: nccl
+```
+
+Generation inherits the training precision config for both dedicated and
+colocated workers. Leave `fp8_param` and `inherit_model_init_context` unset in
+the per-module recipe: MCore automatically inherits the enclosing MXFP8
+parameter-init context for matching MXFP8 modules, including BF16 boundary-layer
+contexts. The BF16 catch-all instead disables MXFP8 parameter initialization.
+MTP is explicitly kept in BF16.
+
+`torch`, `vllm`, and `flashinfer` share MCore's canonical MXFP8 storage and
+refit format; BF16 destinations remain BF16. The `vllm` selection uses MCore's
+MXFP8 GEMM fallback, not a native vLLM MXFP8 kernel. FlashInfer derives its own
+packed expert weights after refit and currently requires a non-gated
+squared-ReLU MoE; use `torch` or `vllm` for SwiGLU models such as Qwen.
+Within each MoE layer, all local routed experts and both projections must use
+the same precision. This selection does not enable batch invariance or promise
+zero inference-versus-training log-probability difference.
 
 ## Compatibility Note for DeepSeek-Style FP8 Training
 
