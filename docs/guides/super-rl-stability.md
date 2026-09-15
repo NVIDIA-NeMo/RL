@@ -44,3 +44,28 @@ Validation: `tests/unit/tools/test_stage_ccc.py` covers exact problem content,
 hash failures, missing/duplicate identities, strict JSON, and no-clobber output.
 Real CCC resources-server loading and sandbox execution remain native smoke
 gates; a JSON test does not certify verifier throughput.
+
+## Container cwd and allocation identity
+
+**Incidents 3–4:** the host submit directory was not mounted at the same path
+inside Pyxis; an unrelated probe also expected `SLURM_JOB_ID` after Ray had
+intentionally removed Slurm/MPI variables.
+
+`ray.sub` now accepts `NRL_CONTAINER_WORKDIR`, an absolute directory in the
+container's mount namespace. The default remains `SLURM_SUBMIT_DIR` for existing
+launchers. Set it explicitly when a Lustre alias and its physical path differ:
+
+```bash
+export NRL_CONTAINER_WORKDIR=/run/experiment
+export MOUNTS=/physical/run:/run/experiment,/physical/code:/opt/nemo-rl:ro
+```
+
+Ray head/worker launch arguments preserve this path as one argument, and attach
+helpers use it too. The directory must actually exist in the mounted container;
+host existence is not sufficient. `NRL_SLURM_JOB_ID` and
+`NRL_SLURM_SUBMIT_DIR` preserve allocation identity for the driver and probes.
+Do not restore the entire `SLURM_*` environment inside Ray.
+
+Validation: executable shell-fragment tests in `test_ray_sub_contract.py`, plus
+`bash -n ray.sub`. Native Pyxis cwd/mount validation remains required on each
+cluster. No compute-node hardware change is involved.
