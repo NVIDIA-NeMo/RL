@@ -290,6 +290,9 @@ def get_microbatch_iterator(
         pad_factor = _get_non_packed_sequence_pad_factor(cfg)
 
     if prepacked:
+        create_packed_seq_padding_mask = bool(
+            cfg["megatron_cfg"].get("moe_router_enable_expert_bias", False)
+        )
         raw_iterator = data.make_microbatch_iterator(1)
         data_iterator_len = data.size
         micro_batch_size = 1
@@ -406,7 +409,14 @@ def _prepare_prepacked(
     data: BatchedDataDict[Any],
     *,
     model_slices_context_parallel_inputs: bool,
-) -> tuple[torch.Tensor, torch.Tensor, PackedSeqParams, torch.Tensor]:
+    create_padding_mask: bool = False,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    PackedSeqParams,
+    torch.Tensor,
+    Optional[torch.Tensor],
+]:
     input_ids = data["input_ids"]
     if not torch.is_tensor(input_ids) or input_ids.shape[0] != 1:
         raise ValueError("Prepacked input_ids must contain one physical row.")
@@ -447,6 +457,18 @@ def _prepare_prepacked(
     input_ids_cp_sharded = (
         input_ids if model_slices_context_parallel_inputs else local_input_ids
     )
+    padding_mask = None
+    if create_padding_mask:
+        full_padding_mask = get_packed_seq_padding_mask(
+            cu_seqlens=cu,
+            cu_seqlens_padded=padded,
+            total_tokens=pack_length,
+        )
+        padding_mask = (
+            full_padding_mask
+            if model_slices_context_parallel_inputs
+            else _slice_prepacked_for_cp(full_padding_mask, padded)
+        )
     # Keep physical boundaries in cu_seqlens_q as well as cu_seqlens_q_padded.
     # MTP loss rolling still has consumers that use cu_seqlens_q as the wrap
     # boundary, so logical boundaries can roll into padding or the next source.
@@ -461,7 +483,7 @@ def _prepare_prepacked(
         qkv_format="thd",
         total_tokens=input_ids_cp_sharded.shape[1],
     )
-    return input_ids, input_ids_cp_sharded, params, padded
+    return input_ids, input_ids_cp_sharded, params, padded, padding_mask
 
 
 def process_microbatch(
@@ -480,7 +502,12 @@ def process_microbatch(
     mtp_enabled: bool = False,
 ) -> ProcessedInputs:
     """Process a microbatch for Megatron model forward pass."""
-    if create_packed_seq_padding_mask and model_slices_context_parallel_inputs:
+    prepacked = "cu_seqlens" in data_dict
+    if (
+        create_packed_seq_padding_mask
+        and model_slices_context_parallel_inputs
+        and not prepacked
+    ):
         raise NotImplementedError(
             "HybridEP padding masks are not supported for models that perform "
             "context-parallel input slicing internally."
@@ -539,11 +566,13 @@ def process_microbatch(
                     input_ids_cp_sharded,
                     packed_seq_params,
                     cu_seqlens_padded,
+                    padding_mask,
                 ) = _prepare_prepacked(
                     data_dict,
                     model_slices_context_parallel_inputs=(
                         model_slices_context_parallel_inputs
                     ),
+                    create_padding_mask=create_packed_seq_padding_mask,
                 )
                 original_seq_length = input_ids.shape[1]
                 routed_experts = data_dict.get("routed_experts")
