@@ -1,0 +1,175 @@
+# DeepSeek-R1-Distill-Qwen-7B PPO, adapted from the Qwen2.5-1.5B
+# non-colocated async SingleController recipe and cross-checked against W&B
+# runs e2jm9rof, kkzc47h7, and 2yr22kkt. The successful async reference is
+# 2yr22kkt (4 training nodes + 4 inference nodes, lag 1).
+defaults: ./ppo-qwen2.5-1.5b-gsm8k-2n8g-megatron-valuetp2sp-dynbatch-noncolocated-async-single-controller.yaml
+
+logger:
+  log_dir: logs/ppo-deepseek-r1-distill-qwen-7b-8n4g-megatron-noncolocated-async-single-controller
+  wandb_enabled: true
+  wandb:
+    project: nemo-rl-single-controller-example
+    name: ppo-deepseek-r1-distill-qwen-7b-8n4g-megatron-noncolocated-async-single-controller
+
+ppo:
+  # SingleController requires the legacy async block to be null.
+  async_ppo: null
+  num_prompts_per_step: 2048
+  num_generations_per_prompt: 1
+  max_num_epochs: 100000
+  max_num_steps: 100000
+  ppo_epochs: 1
+  critic_ppo_epochs: 1
+  policy_training_start_step: 100
+  skip_reference_policy_logprobs_calculation: false
+  # Validation is not supported by the current SingleController PPO path.
+  val_period: 0
+  val_at_start: false
+  reward_shaping:
+    enabled: false
+  reward_scaling:
+    enabled: false
+  adv_estimator:
+    gae_lambda: 0.95
+    gae_lambda_value: 1.0
+    gae_lambda_policy: 1.0
+
+loss_fn:
+  reference_policy_kl_penalty: 0.001
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 5
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  ratio_clip_c: 3
+
+value_loss_fn:
+  scale: 1.0
+  cliprange: 0.5
+
+policy:
+  model_name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+  tokenizer:
+    name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+  # SingleController requires the rollout sample count to equal the policy GBS.
+  train_global_batch_size: 2048
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  generation_batch_size: 64
+  logprob_chunk_size: 2048
+  max_total_sequence_length: 18432
+  make_sequence_length_divisible_by: 1
+  offload_optimizer_for_logprob: true
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 18432
+    logprob_mb_tokens: 18432
+
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: 18432
+    logprob_mb_tokens: 18432
+
+  megatron_cfg:
+    converter_type: Qwen2ForCausalLM
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: false
+    activation_checkpointing: false
+    defer_fp32_logits: true
+    optimizer:
+      lr: 1.0e-06
+      weight_decay: 0.01
+    scheduler:
+      lr_warmup_iters: 0
+      lr_warmup_init: 0
+      start_weight_decay: 0.01
+      end_weight_decay: 0.01
+
+  generation:
+    max_new_tokens: 18432
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 4
+        gpus_per_node: 4
+    vllm_cfg:
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.8
+      max_model_len: 18432
+      async_engine: true
+      enforce_eager: false
+
+value:
+  model_name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+  tokenizer:
+    name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+  # SingleController requires the rollout sample count to equal the critic GBS.
+  train_global_batch_size: 2048
+  train_micro_batch_size: 1
+  max_total_sequence_length: 18432
+  make_sequence_length_divisible_by: 1
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 18432
+    logprob_mb_tokens: 18432
+
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: false
+    activation_checkpointing: false
+    optimizer:
+      lr: 2.0e-05
+      weight_decay: 0.01
+    scheduler:
+      lr_warmup_iters: 0
+      start_weight_decay: 0.01
+      end_weight_decay: 0.01
+
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+    system_prompt_file: null
+    processor: math_hf_data_processor
+    env_name: math
+
+env:
+  math:
+    math_verify_impl: dapo_math_verify
+
+cluster:
+  num_nodes: 8
+  gpus_per_node: 4
+
+# Current SingleController equivalent of Binguo's legacy async PPO settings:
+# max trajectory age 1, warmup trajectory age 2.
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 1
+    warmup_lookahead_versions: 2
+  recompute_kv_cache_after_weight_updates: true
+  min_groups_for_streaming_train: ${ppo.num_prompts_per_step}
+  # Capacity for one active batch plus two warmup lookahead versions.
+  max_inflight_prompts: ${mul:${ppo.num_prompts_per_step}, 3}
+  max_buffered_rollouts: ${mul:${ppo.num_prompts_per_step}, 3}
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/ppo-deepseek-r1-distill-qwen-7b-8n4g-megatron-noncolocated-async-single-controller
+  metric_name: null
+  save_period: 10
+  save_data_plane: true
