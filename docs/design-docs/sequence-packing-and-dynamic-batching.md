@@ -88,7 +88,9 @@ We have the policy backends perform the actual packing because implementations c
 
 #### 2. Packing Algorithms (`nemo_rl/data/packing/algorithms.py`)
 
-Four packing algorithms are implemented, but we recommend you just use Modified First Fit Decreasing for the best packing efficiency:
+Six packing algorithms are implemented. Modified First Fit Decreasing is the
+default recommendation, and Energon-owned SFT packing supports all six through
+the same interface.
 
 ##### Concatenative Packer 
 - Sequential concatenation until bin capacity is reached
@@ -106,6 +108,12 @@ Four packing algorithms are implemented, but we recommend you just use Modified 
   4. Add pairs of small items (backward pass)
   5. Greedy fit remaining items
   6. Apply FFD to leftovers
+
+##### Greedy Knapsack
+- Repeatedly selects the largest remaining sequence that fits in the current bin
+
+##### Balanced Greedy Knapsack
+- Places descending sequences into the least-full available bin
 
 ##### First Fit Decreasing (FFD)
 - Sort sequences by length (descending), place each in first fitting bin

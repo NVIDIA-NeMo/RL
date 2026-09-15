@@ -31,6 +31,7 @@ from nemo_rl.data.energon.sft_dataloader import (
 )
 from nemo_rl.data.energon.sft_types import StepEnvelope
 from nemo_rl.data_plane.adapters.local import local_batch_to_tensordict
+from nemo_rl.data_plane.schema import MICRO_BATCH_INDICES, MICRO_BATCH_LENGTHS
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
@@ -64,6 +65,10 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         batch_size: int,
         max_sequence_length: int,
         placement_fingerprint: str,
+        packing_algorithm: str | None,
+        max_sequences_per_bin: int | None,
+        sequence_length_pad_multiple: int,
+        only_unmask_final: bool,
         restored_state: Optional[dict[str, Any]] = None,
     ) -> bool:
         """Build the train loader on the TP0/PP0/CP0 rank of this DP replica."""
@@ -86,6 +91,10 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             logical_rank=logical_rank,
             logical_world_size=logical_world_size,
             placement_fingerprint=placement_fingerprint,
+            packing_algorithm=packing_algorithm,
+            max_sequences_per_bin=max_sequences_per_bin,
+            sequence_length_pad_multiple=sequence_length_pad_multiple,
+            only_unmask_final=only_unmask_final,
         )
         if restored_state is not None:
             self._sft_loader.load_state_dict(restored_state)
@@ -164,6 +173,11 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             (sample_mask.unsqueeze(-1) * prepared["token_mask"][:, 1:]).sum().item()
         )
         extra_info = dict(published_meta.extra_info)
+        if "cu_seqlens" in prepared:
+            extra_info[MICRO_BATCH_INDICES] = [
+                [[index, index + 1] for index in range(batch_size)]
+            ]
+            extra_info[MICRO_BATCH_LENGTHS] = [list(lengths)]
         if make_sequence_length_divisible_by > 1:
             extra_info["pad_to_multiple"] = int(make_sequence_length_divisible_by)
         envelope = StepEnvelope(

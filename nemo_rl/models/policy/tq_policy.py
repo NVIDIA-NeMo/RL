@@ -48,6 +48,8 @@ from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
     GLOBAL_FORWARD_PAD_SEQLEN,
     LP_SEED_FIELDS,
+    MICRO_BATCH_INDICES,
+    MICRO_BATCH_LENGTHS,
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
     fields_with_optional_opd_full,
@@ -576,10 +578,15 @@ class TQPolicy(TQDriverMixin, Policy):
                 f"got {len(dp_metas)} batches for dp_world={dp_world}."
             )
         spa, dba = self._packing_args("train_mb_tokens")
-        if spa is not None or dba is not None:
+        if dba is not None:
+            raise ValueError("Placed metadata does not support dynamic batching.")
+        if spa is not None and any(
+            MICRO_BATCH_INDICES not in meta.extra_info
+            or MICRO_BATCH_LENGTHS not in meta.extra_info
+            for meta in dp_metas
+        ):
             raise ValueError(
-                "Placed metadata supports fixed batches only. Disable NeMo-RL "
-                "sequence packing and dynamic batching."
+                "Placed packed metadata requires producer microbatch shapes."
             )
         train_metas = [
             replace(meta, task_name="train")
