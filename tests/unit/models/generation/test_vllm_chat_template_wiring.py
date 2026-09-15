@@ -45,6 +45,7 @@ _BUILT: dict[str, list] = {"renderer": [], "chat": [], "tokenize": [], "app": []
 class _FakeRequestOutputKind:
     FINAL_ONLY = object()
     CUMULATIVE = object()
+    DELTA = object()
 
 
 class _FakeChatCompletionRequest:
@@ -266,7 +267,7 @@ def test_absent_kwargs_render_as_empty_dict(monkeypatch):
     assert tokenization[0].kwargs["default_chat_template_kwargs"] == {}
 
 
-def test_captured_prefix_cut_request_uses_cumulative_engine_outputs(monkeypatch):
+def test_captured_prefix_cut_request_uses_delta_engine_outputs(monkeypatch):
     _build_server(monkeypatch, {}, generation_prefix_cuts_enabled=True)
     app = _BUILT["app"][0]
     handler = next(fn for path, fn in app.routes if path == "/v1/chat/completions")
@@ -278,7 +279,7 @@ def test_captured_prefix_cut_request_uses_cumulative_engine_outputs(monkeypatch)
 
     assert (
         captured_request.to_sampling_params().output_kind
-        is _FakeRequestOutputKind.CUMULATIVE
+        is _FakeRequestOutputKind.DELTA
     )
     assert (
         plain_request.to_sampling_params().output_kind

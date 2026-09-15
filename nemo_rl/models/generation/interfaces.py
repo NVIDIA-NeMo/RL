@@ -650,20 +650,6 @@ class GenerationInterface(ABC):
         _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False
 
-    def pause_generation_for_checkpoint(
-        self, *, timeout_s: Optional[float] = None
-    ) -> bool:
-        """Freeze decoding and terminal token staging for a coordinated cut.
-
-        Backends that support token-prefix checkpointing must override this
-        method. Unsupported backends fail loudly because continuing would let
-        token writes race the data-plane snapshot.
-        """
-        raise NotImplementedError(
-            "generation-prefix checkpointing is not supported for "
-            f"{type(self).__name__}"
-        )
-
     def begin_generation_checkpoint(self, *, timeout_s: Optional[float] = None) -> bool:
         """Fence terminal token writes while decoding continues.
 
@@ -673,28 +659,6 @@ class GenerationInterface(ABC):
         """
         raise NotImplementedError(
             "generation-prefix asynchronous checkpointing is not supported for "
-            f"{type(self).__name__}"
-        )
-
-    def resume_generation_after_checkpoint(
-        self, *, timeout_s: Optional[float] = None
-    ) -> bool:
-        """Release a generation freeze after snapshot publication or abort."""
-        raise NotImplementedError(
-            "generation-prefix checkpointing is not supported for "
-            f"{type(self).__name__}"
-        )
-
-    def resume_generation_after_cut(self, *, timeout_s: Optional[float] = None) -> bool:
-        """Resume decoding while terminal writes remain checkpoint-fenced.
-
-        A backend with buffer-swap support may continue filling a fresh live
-        buffer after its cut is durable. The completed response must remain
-        fenced until :meth:`finish_generation_checkpoint` publishes or aborts
-        the coordinated snapshot.
-        """
-        raise NotImplementedError(
-            "generation-prefix buffer swapping is not supported for "
             f"{type(self).__name__}"
         )
 

@@ -120,7 +120,7 @@ def _legacy_active_prefixes(manifest: dict[str, Any]) -> list[dict[str, Any]]:
                 for prefix in receipt_prefixes
                 if isinstance(prefix, dict)
                 and prefix.get("disposition") == "durable_prefix"
-                and str(prefix.get("frozen_buffer_id", "")).startswith("active/")
+                and prefix.get("cut_kind") == "active_prefix"
                 and isinstance(prefix.get("staging_keys"), list)
                 and bool(prefix["staging_keys"])
                 and isinstance(prefix.get("prefix_token_count"), int)
@@ -194,7 +194,7 @@ def _lineage_active_prefixes(
             and row.get("checkpoint_id") == gym_checkpoint["checkpoint_id"]
             and row.get("model_call_id") not in committed_calls
             and row.get("disposition") == "durable_prefix"
-            and str(row.get("frozen_buffer_id", "")).startswith("active/")
+            and row.get("cut_kind") == "active_prefix"
             and isinstance(row.get("staging_keys"), list)
             and bool(row["staging_keys"])
             and isinstance(row.get("prefix_token_count"), int)
