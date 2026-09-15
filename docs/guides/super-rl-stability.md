@@ -337,6 +337,16 @@ correctness, not acceptable throughput.
 
 ## Open issues and release blockers
 
+The maintenance branch's `GRPOConfig` now rejects an enabled or malformed
+`reasoning_effort` block before initialization. PR3941's `extra="allow"`
+would otherwise accept the block without implementing its reward shaping.
+An absent, null, or explicitly disabled block leaves non-effort runs unchanged.
+This guard is **not** the Kimi implementation: replace it with the reviewed
+typed schema and actual integrations in the implementation commit, together
+with end-to-end budget/reward tests. Do not disable effort to bypass the guard
+for an effort experiment. Native regression tests live in `test_grpo.py`;
+local collection still requires the missing Ray/Torch stack.
+
 | Item | Why not marked solved | Next code/validation boundary |
 | --- | --- | --- |
 | Complete pinned dependency closure | Local Gym, Bridge and Automodel submodules are uninitialized; the prior attempt to fetch Gym `749432dc…` from the configured origin failed. No pointer was silently replaced. | Resolve accessible, immutable upstream refs (including nested Megatron-LM), then native imports/config parsing; do not vendor mutable run copies as a substitute. |

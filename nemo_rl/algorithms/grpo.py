@@ -342,6 +342,22 @@ _REWARD_PENALTY_FLAGS = (
 
 
 class GRPOConfig(BaseModel, extra="allow"):
+    @model_validator(mode="before")
+    @classmethod
+    def reject_unimplemented_reasoning_effort(cls, values: Any) -> Any:
+        """Do not silently accept an effort experiment through extra='allow'."""
+        if isinstance(values, Mapping) and "reasoning_effort" in values:
+            effort = values["reasoning_effort"]
+            if effort is not None and (
+                not isinstance(effort, Mapping) or effort.get("enabled") is not False
+            ):
+                raise ValueError(
+                    "reasoning_effort reward/budget integration is not implemented "
+                    "on this maintenance branch. See docs/guides/super-rl-stability.md. "
+                    "Do not disable effort to bypass this gate for an effort experiment."
+                )
+        return values
+
     num_prompts_per_step: int = 32
     num_generations_per_prompt: int = 16
     max_num_epochs: int = 1

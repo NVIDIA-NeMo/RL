@@ -6201,3 +6201,19 @@ def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
 )
 def test_needs_hf_refit_handshake(backend, nccl_reshard, colocated, expected):
     assert _needs_hf_refit_handshake(backend, nccl_reshard, colocated) is expected
+
+
+@pytest.mark.parametrize("effort", [{"enabled": True, "method": "kimi"}, {}, True])
+def test_unimplemented_reasoning_effort_cannot_be_silently_ignored(effort):
+    with pytest.raises(
+        ValueError, match="reward/budget integration is not implemented"
+    ):
+        GRPOConfig(reasoning_effort=effort)
+
+
+@pytest.mark.parametrize("effort", [None, {"enabled": False}])
+def test_non_effort_config_is_unchanged(effort):
+    assert (
+        GRPOConfig(reasoning_effort=effort).num_prompts_per_step
+        == GRPOConfig().num_prompts_per_step
+    )
