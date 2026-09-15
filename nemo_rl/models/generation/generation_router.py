@@ -245,6 +245,15 @@ class GenerationRouterImpl:
 
         self._backend_error_total += 1
         self._backend_failures[backend] = self._backend_failures.get(backend, 0) + 1
+        # The transport cause, logged here because nothing else keeps it. It goes into
+        # the response body, which is Gym's to interpret, and the ledger only ever sees
+        # the aggregated "N failed request(s)" summary -- so without this line a
+        # condemned shard's record cannot say whether it refused connections, reset them,
+        # or timed out, which are three different problems.
+        print(
+            f"policy router: backend {backend} failed: {type(error).__name__}: {error}",
+            flush=True,
+        )
         if self._health_managed:
             # Reflex: stop routing here until the next membership push re-adds it.
             # Rebound, not mutated -- same reason as set_serving_backends, and this runs
