@@ -630,6 +630,37 @@ def test_cluster_frac_of_step_is_the_slowest_process():
     assert metrics["now/n_processes"] == 10
 
 
+def test_cluster_frac_of_step_follows_the_straggler_across_steps():
+    """Which rank straggles changes from step to step, so the reduction has to
+    be taken over per-step accumulators rather than differenced out of
+    cumulative ones: the difference of maxima is not the maximum of
+    differences. Rank A spends 5 x 100 ms in step one and 5 x 10 ms in step
+    two, rank B the reverse, both steps 1 s long. Each step waits on 500 ms.
+    Differencing the cumulative max reports 50 ms for step two -- the two
+    ranks' cumulative totals are equal by then, so only the second step's
+    cheap half shows."""
+    a, b = _client(register=False), _client(register=False)
+    try:
+        _emit(a, [100.0] * 5)
+        _emit(b, [10.0] * 5)
+        first = merge_snapshots(
+            [a.snapshot(reset_step_window=True), b.snapshot(reset_step_window=True)]
+        )
+        _emit(a, [10.0] * 5)
+        _emit(b, [100.0] * 5)
+        second = merge_snapshots(
+            [a.snapshot(reset_step_window=True), b.snapshot(reset_step_window=True)]
+        )
+    finally:
+        a.close()
+        b.close()
+
+    metrics = cluster_step_metrics(second, first, 1.0)
+    assert metrics["step/wall_s"] == pytest.approx(0.5, rel=0.05)
+    assert metrics["step/wall_s"] != pytest.approx(0.05, rel=0.05), "cumulative max"
+    assert metrics["step/frac_of_step"] == pytest.approx(0.5, rel=0.05)
+
+
 def test_cluster_per_op_time_is_reported_per_call():
     """``wall_ms`` sums concurrent processes, so it scales with DP degree;
     dividing by the process count trades one arbitrary denominator for another.
@@ -1044,6 +1075,43 @@ def test_a_within_row_permutation_is_the_accepted_blind_spot():
     assert fp(row.flip(0).reshape(1, 8)) == fp(row.reshape(1, 8)), (
         "a reordered row is NOT detected -- see the docstring before changing this"
     )
+    client.close()
+
+
+@pytest.mark.parametrize(
+    "seq_len, mismatches", [(6, 0), (7, 2)], ids=["even-misses", "odd-catches"]
+)
+def test_a_constant_row_of_even_length_collides_across_values(seq_len, mismatches):
+    """XOR cancels in pairs, so an all-equal row of even length folds to 0 and
+    its digest is the seed alone -- identical for every value at that dtype and
+    shape. GRPO writes ``advantages`` as one scalar expanded across the row
+    (``advantage_estimator.py``: ``advantages.expand(mask.shape)``), so at an
+    even row length two samples' advantages are indistinguishable and the
+    row-swap case the guard is advertised to catch goes unreported. Odd lengths
+    leave one unpaired element, which is why the same swap is caught there.
+
+    Pinned so the limit stays a decision rather than a surprise, the way
+    ``test_a_within_row_permutation_is_the_accepted_blind_spot`` pins the other
+    one. 0/1 columns (``token_mask``) have the same shape of exposure.
+    """
+    inner = _JaggedEcho()
+    client = _client(inner, verify_tensor_hash=True)
+    ids = _ids(4)
+    adv = torch.stack([torch.full((seq_len,), v) for v in (0.5, -0.5, 1.5, -1.5)])
+    client.put_samples(
+        sample_ids=ids,
+        partition_id="p",
+        fields=TensorDict({"advantages": adv}, batch_size=[4]),
+    )
+    a = inner.rows[("p", "u1")]["advantages"]
+    b = inner.rows[("p", "u2")]["advantages"]
+    inner.rows[("p", "u1")]["advantages"] = b
+    inner.rows[("p", "u2")]["advantages"] = a
+    client.get_samples(sample_ids=ids, partition_id="p", select_fields=["advantages"])
+
+    hv = client.snapshot()["hash_verify"]
+    assert hv["rows_checked"] == 4
+    assert hv["mismatches"] == mismatches
     client.close()
 
 

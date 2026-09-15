@@ -31,8 +31,10 @@ from nemo_rl.data_plane.observability import (
     MetricsDataPlaneClient,
     breakdown_table,
     cluster_step_metrics,
+    is_metrics_client,
     log_event,
     merge_snapshots,
+    step_metrics,
 )
 
 __all__ = [
@@ -45,7 +47,9 @@ __all__ = [
     "breakdown_table",
     "cluster_step_metrics",
     "data_plane_supports_checkpointing",
+    "is_metrics_client",
     "log_event",
     "merge_snapshots",
+    "step_metrics",
     "materialize",
 ]

@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import Counter
-from typing import TYPE_CHECKING, Any, Literal, Optional, cast
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import numpy as np
 import torch
@@ -39,6 +39,7 @@ import torch
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, backend_config
+from nemo_rl.data_plane.observability import is_metrics_client
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
     GLOBAL_FORWARD_PAD_SEQLEN,
@@ -391,17 +392,15 @@ class TQWorkerMixin:
         the driver can filter rather than special-case. The payload is
         counters only (about 1 kB), not tensors.
 
-        Closes this rank's step window (``step_max_ms``) as it reads, since
-        the driver calls this once per step. A maximum cannot be differenced
+        Closes this rank's step window (``step_wall_ms``, ``step_max_ms``) as
+        it reads, since the driver calls this once per step. Neither a sum
+        the cluster reduces with a max nor a max itself can be differenced
         out of a cumulative counter, so without the reset the cluster's
-        per-step max would latch at the worst call ever seen.
+        per-step figures would latch at the worst call ever seen.
         """
-        client = getattr(self, "_dp_client", None)
-        snapshot = getattr(client, "snapshot", None)
-        if not callable(snapshot):
+        if not is_metrics_client(self._dp_client):
             return None
-        # cast: ``snapshot`` came off getattr, so it is untyped here.
-        return cast("dict[str, Any] | None", snapshot(reset_step_window=True))
+        return self._dp_client.snapshot(reset_step_window=True)
 
     def _fetch(
         self,
