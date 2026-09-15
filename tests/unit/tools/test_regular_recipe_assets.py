@@ -59,3 +59,34 @@ def test_regular_smoke_does_not_reset_failed_stream_budget_through_gap_fill():
         assert verifier.fail_on_missing_judge_verdict is True
         assert verifier.judge_max_attempts == 4
         assert verifier.judge_responses_create_params.max_output_tokens == 8192
+
+
+def test_regular_smoke_aligns_context_and_policy_serving_with_gold():
+    register_omegaconf_resolvers()
+    root = Path(__file__).resolve().parents[3]
+    config = OmegaConf.load(
+        root / "training_configs/super_rl/experiments/regular_s120_smoke.yaml"
+    )
+    policy = config.policy
+    assert policy.max_total_sequence_length == 131072
+    assert policy.generation.vllm_cfg.max_model_len == 131072
+    for batching in (policy.sequence_packing, policy.dynamic_batching):
+        assert batching.train_mb_tokens == 131072
+        assert batching.logprob_mb_tokens == 131072
+    assert policy.generation.vllm_kwargs.max_num_seqs == 256
+    assert policy.generation.vllm_kwargs.max_num_batched_tokens == 32768
+    # Policy output and per-agent cumulative output budgets must not shrink.
+    assert policy.generation.max_new_tokens == 102400
+    components = OmegaConf.to_container(config.env.nemo_gym, resolve=False)
+    for component in components.values():
+        if isinstance(component, dict) and "responses_api_agents" in component:
+            for agent in component["responses_api_agents"].values():
+                assert agent["max_total_output_tokens"] == 102400
+    assert (
+        config.env.nemo_gym.policy_model.responses_api_models.vllm_model.chat_template_kwargs.enable_thinking
+        is True
+    )
+    # Changing policy throughput must not also increase judge token budgets.
+    for resource in ("math_with_judge", "equivalence_llm_judge"):
+        verifier = config.env.nemo_gym[resource].resources_servers[resource]
+        assert verifier.judge_responses_create_params.max_output_tokens == 8192
