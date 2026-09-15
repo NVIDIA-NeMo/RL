@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import io
 import threading
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
@@ -29,11 +29,13 @@ import nemo_rl.algorithms.async_utils.replay_buffer as _replay_buffer_module
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
     REPLAY_BUFFER_METADATA_STORAGE,
+    CheckpointMutationKind,
     DataPlaneCheckpointBarrier,
     PostWriteEnrichmentError,
     TQReplayBuffer,
     replay_manifest_digest,
 )
+from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -445,6 +447,54 @@ class TestDataPlaneCheckpointBarrier:
             # A rejected nested section must not poison later acquisitions.
             async with barrier.mutation() as cut:
                 cut.require_live()
+
+        asyncio.run(exercise())
+
+    def test_reports_mutations_blocked_by_checkpoint(self):
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+
+            async def mutate(kind: CheckpointMutationKind) -> None:
+                async with barrier.mutation(kind):
+                    pass
+
+            async with barrier.checkpoint():
+                commit_task = asyncio.create_task(mutate("group_commits"))
+                seal_task = asyncio.create_task(mutate("sibling_seals"))
+                await asyncio.sleep(0)
+                active = await barrier.drain_telemetry()
+                assert active.checkpoint_active
+                assert active.waiting_mutations == 2
+                assert active.max_waiting_mutations == 2
+                assert sum(active.blocked_by_kind.values()) == 0
+
+            await asyncio.gather(commit_task, seal_task)
+            completed = await barrier.drain_telemetry()
+            assert not completed.checkpoint_active
+            assert completed.waiting_mutations == 0
+            assert completed.max_waiting_mutations == 2
+            assert completed.blocked_by_kind["group_commits"] == 1
+            assert completed.blocked_by_kind["sibling_seals"] == 1
+            assert len(completed.wait_durations_s) == 2
+            assert all(duration >= 0 for duration in completed.wait_durations_s)
+
+            drained = await barrier.drain_telemetry()
+            assert sum(drained.blocked_by_kind.values()) == 0
+            assert drained.wait_durations_s == ()
+            assert drained.max_waiting_mutations == 0
+
+        asyncio.run(exercise())
+
+    def test_rejects_unknown_mutation_kind(self) -> None:
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+            unknown = cast(CheckpointMutationKind, "group_commit")
+
+            with pytest.raises(
+                ValueError, match="unknown checkpoint mutation kind 'group_commit'"
+            ):
+                async with barrier.mutation(unknown):
+                    pytest.fail("unknown mutation kind unexpectedly admitted")
 
         asyncio.run(exercise())
 
@@ -1135,6 +1185,69 @@ class TestReplayManifestDigest:
 
 
 class TestTQReplayBufferStateDict:
+    def test_borrow_and_repayment_remain_selectable_after_restore(self) -> None:
+        async def exercise() -> None:
+            dp = FakeDataPlaneClient()
+            original = _make_buffer(dp)
+            lender_id = original.reserve(
+                weight_version=0,
+                target_step=1,
+                group_id="lender",
+            )
+            await original.commit(
+                lender_id,
+                _make_record(),
+                start_weight_version=0,
+                end_weight_version=0,
+            )
+
+            assert original.promote_ready_group(to_target_step=0) == 1
+
+            repayment_id = original.reserve(
+                weight_version=0,
+                target_step=1,
+                group_id="repayment",
+            )
+            await original.commit(
+                repayment_id,
+                _make_record(),
+                start_weight_version=0,
+                end_weight_version=0,
+            )
+            state = original.metadata_state_dict(saved_capacity=8)
+
+            restored = _make_buffer(dp)
+            await restored.load_state_dict(
+                state,
+                max_groups=8,
+                expected_partition_id="rollout_data",
+                expected_group_size=_N_GENS,
+                expected_manifest_digest=state["manifest_digest"],
+            )
+            sampler = InOrderSampler(restored, max_lookahead_versions=1)
+            sampler.restore_dispatch_index(1)
+
+            borrowed, borrowed_count = await sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=1,
+                max_prompt_groups=1,
+            )
+            repaid, repaid_count = await sampler.select(
+                current_train_weight=1,
+                min_prompt_groups=1,
+                max_prompt_groups=1,
+            )
+
+            assert borrowed is not None
+            assert borrowed.sample_ids == ["lender_g0", "lender_g1"]
+            assert borrowed_count == 1
+            assert repaid is not None
+            assert repaid.sample_ids == ["repayment_g0", "repayment_g1"]
+            assert repaid_count == 1
+            assert restored.group_ids == ()
+
+        asyncio.run(exercise())
+
     def test_training_claim_is_reindexed_only_for_periodic_snapshot(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
