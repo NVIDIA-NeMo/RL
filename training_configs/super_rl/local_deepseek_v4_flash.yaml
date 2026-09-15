@@ -12,6 +12,7 @@ deepseek_v4_flash_judge_model:
       num_workers: 1
       chat_template_kwargs:
         thinking: true
-        reasoning_effort: medium
+        # The pinned DeepSeek V4 tokenizer maps medium to high; use its native name.
+        reasoning_effort: high
       extra_body: null
       default_headers: {}

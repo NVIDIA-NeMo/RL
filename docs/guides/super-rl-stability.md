@@ -77,6 +77,16 @@ tests remain required before declaring the runtime validated.
 
 ## Judge failures are not incorrect policy answers
 
+The validated local vLLM 0.26 DeepSeek V4 tokenizer maps `medium` to `high`;
+it does not expose a distinct medium-effort mode. The local judge fragment uses
+the explicit native name `high` with `thinking: true`. A native `/tokenize`
+comparison confirmed identical prompt tokens for the prior medium spelling and
+high on the same historical request. Earlier medium-configured local attempts
+therefore used effective high reasoning; their measurements must not be
+presented as a lower-effort experiment. This observation does not establish
+hosted-provider semantics or parity for another vLLM image. Neither reasoning
+mode nor the output budget is changed by this spelling correction.
+
 The pinned Math and equivalence judges map missing verdicts to `False`, and Gym's
 failure wrapper returns transport failures as tagged rows with placeholder reward
 zero. Neither is a valid policy-training label. `gym_judge_verdict.patch` adds

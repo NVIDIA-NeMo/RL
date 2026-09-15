@@ -8,6 +8,18 @@ from omegaconf import OmegaConf
 from nemo_rl.utils.config import register_omegaconf_resolvers
 
 
+def test_local_deepseek_uses_native_reasoning_effort_name():
+    root = Path(__file__).resolve().parents[3]
+    config = OmegaConf.load(
+        root / "training_configs/super_rl/local_deepseek_v4_flash.yaml"
+    )
+    judge = config.deepseek_v4_flash_judge_model.responses_api_models.vllm_model
+    assert judge.chat_template_kwargs == {
+        "thinking": True,
+        "reasoning_effort": "high",
+    }
+
+
 def test_equivalence_template_uses_gym_component_working_directory():
     root = Path(__file__).resolve().parents[3]
     config = OmegaConf.load(
