@@ -1891,6 +1891,7 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
                 "task_source": "workplace_assistant",
                 "responses_create_params": {},
                 "_ng_task_index": task_index,
+                "agent_ref": {"name": "agent"},
             }
         )
     original_media = [
@@ -2157,11 +2158,24 @@ def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
         task_to_env={},
         generation_config={},
         log_full_result_tables=False,
+        num_generations_per_prompt=1,
         deduplicate_multimodal_data=True,
         debug_payload_metrics=True,
     )
 
     assert actual is expected
+
+
+def test_run_nemo_gym_rollout_sync_requires_explicit_prompt_group_size():
+    with pytest.raises(ValueError, match="num_generations_per_prompt"):
+        run_nemo_gym_rollout_sync(
+            policy_generation=None,
+            input_batch=BatchedDataDict({"loss_multiplier": torch.ones(1)}),
+            tokenizer=None,
+            task_to_env={},
+            generation_config={},
+            log_full_result_tables=False,
+        )
 
 
 def test_rollout_manager_consumes_stream_and_restores_input_order():
@@ -2435,6 +2449,7 @@ def test_run_async_nemo_gym_rollout(
         generation_config=nemo_gym_vllm_generation.cfg,
         log_full_result_tables=True,
         max_rollout_turns=None,
+        num_generations_per_prompt=1,
         debug_payload_metrics=True,
     )
     for row in rows:

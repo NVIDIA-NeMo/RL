@@ -102,6 +102,7 @@ def collect_trajectories(
             log_full_result_tables=True,
             max_rollout_turns=None,
             greedy=False,
+            num_generations_per_prompt=master_config.grpo.num_generations_per_prompt,
         )
 
         rows_to_log: list[str] = []
