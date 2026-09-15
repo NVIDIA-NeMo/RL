@@ -173,7 +173,9 @@ policy:
       end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       weight_decay_incr_style: constant
       lr_decay_style: constant
-      lr_decay_iters: null
+      # Constant LR has no decay phase. Keep its horizon beyond warmup so
+      # Bridge does not shorten warmup to the three-update smoke stop target.
+      lr_decay_iters: ${add:${.lr_warmup_iters},1}
       lr_warmup_iters: 10
       lr_warmup_init: 4e-7
       override_opt_param_scheduler: true

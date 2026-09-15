@@ -90,6 +90,13 @@ in this CPU test's in-memory configuration; it sends no model requests and does
 not certify sandbox execution, rewards, or training. The real training recipe
 and its backend-readiness gate are not modified.
 
+For the three-update regular smoke, the constant-LR scheduler horizon is set to
+`lr_warmup_iters + 1`, independently of `grpo.max_num_steps`. Leaving it null
+makes Bridge infer a three-update decay horizon and silently shorten ten-update
+warmup (with a warning). The explicit horizon preserves the intended warmup;
+it does not authorize additional training updates. Review the scheduler and
+optimizer state again when choosing a production horizon.
+
 ## Excluded experimental artifacts
 
 - Old job IDs, absolute user paths, submission receipts, logs, payload snapshots,
