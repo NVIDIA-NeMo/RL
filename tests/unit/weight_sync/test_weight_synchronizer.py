@@ -261,7 +261,9 @@ def _mock_sglang_generation(
     gen.sglang_cfg = {
         "sglang_cfg": {
             "quantization": quantization,
-            "use_fault_tolerance": use_fault_tolerance,
+            "sglang_fault_tolerance_config": {
+                "use_fault_tolerance": use_fault_tolerance,
+            },
         }
     }
     gen.pause_generation_mode = pause_mode

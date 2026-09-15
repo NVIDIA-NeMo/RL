@@ -21,7 +21,7 @@ import ray
 import requests
 from ray.exceptions import RayError
 
-from nemo_rl.models.generation.sglang.config import SGLangConfig
+from nemo_rl.models.generation.sglang.config import SGLangFaultToleranceConfig
 
 logger = logging.getLogger(__name__)
 
@@ -39,42 +39,16 @@ class RolloutHealthMonitor:
     - stop(): Stop the monitor thread completely (called during dispose)
     """
 
-    def __init__(self, sglang_generation, sglang_cfg: SGLangConfig):
+    def __init__(self, sglang_generation, ft_cfg: SGLangFaultToleranceConfig) -> None:
         self._sglang_generation = sglang_generation
 
         self._thread = None
         self._stop_event = None
         self._pause_event = None  # When set, health checking is paused
-        # These knobs only matter when fault tolerance is enabled. Shipped
-        # recipes inherit them from the SGLang exemplar; name all missing keys
-        # together for hand-written configs at construction time.
-        ft_cfg = sglang_cfg["sglang_cfg"]
-        missing = [
-            key
-            for key in (
-                "rollout_health_check_interval",
-                "rollout_health_check_timeout",
-                "rollout_health_check_first_wait",
-                "rollout_max_restart_attempts",
-            )
-            if key not in ft_cfg
-        ]
-        assert not missing, (
-            f"{', '.join(missing)} must be set under policy.generation.sglang_cfg "
-            "when use_fault_tolerance is True; see examples/configs/"
-            "grpo_math_1B_sglang.yaml for the documented values."
-        )
-        self._check_interval = ft_cfg["rollout_health_check_interval"]
-        self._check_timeout = ft_cfg["rollout_health_check_timeout"]
-        self._check_first_wait = ft_cfg["rollout_health_check_first_wait"]
-        self._max_restart_attempts = ft_cfg["rollout_max_restart_attempts"]
-        if (
-            type(self._max_restart_attempts) is not int
-            or self._max_restart_attempts < 0
-        ):
-            raise ValueError(
-                "rollout_max_restart_attempts must be a nonnegative integer"
-            )
+        self._check_interval = ft_cfg.rollout_health_check_interval
+        self._check_timeout = ft_cfg.rollout_health_check_timeout
+        self._check_first_wait = ft_cfg.rollout_health_check_first_wait
+        self._max_restart_attempts = ft_cfg.rollout_max_restart_attempts
         self._restart_attempts = [0] * len(sglang_generation.engines)
         # Absolute monotonic deadline before which no probe may run, giving a
         # booting engine time to become ready. It is a DEADLINE rather than a
@@ -95,6 +69,10 @@ class RolloutHealthMonitor:
         Probe every actor, including nonzero nodes of multi-node engines. Actor
         replies check only the server process, so offloaded weights and an idle
         scheduler do not cause false failures. Each call is bounded at Ray level.
+
+        This is a liveness check, not a serving check: a hung server with a live
+        process passes here. The monitor's health_generate probe covers that case
+        during generation; this one covers the windows where the monitor is paused.
         """
         with self._check_lock:
             for index, engine in enumerate(self._sglang_generation.all_engines):
@@ -256,13 +234,9 @@ class RolloutHealthMonitor:
                     if self._stop_event.wait(remaining):
                         logger.info("Health monitor stopped during first wait.")
                         break
-                    if self._pause_event.is_set():
-                        # Paused mid-wait: go back to the pause gate rather than
-                        # probing. The deadline is unchanged, so the elapsed
-                        # time is not lost and the next resume picks up where
-                        # this left off.
-                        logger.info("Health monitor paused during first wait.")
-                        continue
+                    # Recovery may have re-armed the deadline while this thread
+                    # slept, or a pause may have arrived. Re-read both at the top.
+                    continue
                 self._first_check_after = None
 
             # Run health checks

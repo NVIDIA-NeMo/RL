@@ -22,6 +22,7 @@ so these run in the base (unmarked) unit-test shard.
 import sys
 import threading
 import time
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -34,6 +35,7 @@ from nemo_rl.models.generation.sglang import (
     sglang_generation,
     sglang_worker,
 )
+from nemo_rl.models.generation.sglang.config import SGLangFaultToleranceConfig
 from nemo_rl.models.generation.sglang.fault_tolerance import RolloutHealthMonitor
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 
@@ -127,15 +129,14 @@ class _RecordingMonitor:
 
 def _cfg(
     first_wait=0.0, interval=CHECK_INTERVAL, timeout=CHECK_TIMEOUT, max_restarts=3
-):
-    return {
-        "sglang_cfg": {
-            "rollout_health_check_interval": interval,
-            "rollout_health_check_timeout": timeout,
-            "rollout_health_check_first_wait": first_wait,
-            "rollout_max_restart_attempts": max_restarts,
-        }
-    }
+) -> SGLangFaultToleranceConfig:
+    return SGLangFaultToleranceConfig(
+        use_fault_tolerance=True,
+        rollout_health_check_interval=interval,
+        rollout_health_check_timeout=timeout,
+        rollout_health_check_first_wait=first_wait,
+        rollout_max_restart_attempts=max_restarts,
+    )
 
 
 def _wait_until(predicate, timeout=WAIT_TIMEOUT):
@@ -272,6 +273,52 @@ def test_first_wait_is_not_restarted_by_every_resume(monitor_factory):
         time.sleep(0.1)
 
     assert engine.health_check_count > 0
+
+
+def test_first_wait_honors_rearm_during_sleep(
+    monitor_factory: Callable[..., RolloutHealthMonitor],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refit can re-arm and resume before the old first-wait sleep finishes."""
+    monitor = monitor_factory(_FakeGeneration([_FakeEngine()]), first_wait=10.0)
+    monitor._stop_event = threading.Event()
+    monitor._pause_event = threading.Event()
+    now = 0.0
+    waits = []
+    probes = []
+    monkeypatch.setattr(fault_tolerance, "time", SimpleNamespace(monotonic=lambda: now))
+
+    def wait(timeout: float) -> bool:
+        nonlocal now
+        if monitor._stop_event.is_set():
+            return True
+        waits.append(timeout)
+        if len(waits) == 1:
+            assert timeout == 10.0
+            now = 5.0
+            monitor.pause()
+            monitor.arm_first_wait()
+            assert monitor._first_check_after == 15.0
+            monitor.resume()
+            now = 10.0
+        else:
+            assert waits == [10.0, 5.0]
+            now += timeout
+        return False
+
+    def probe() -> None:
+        probes.append(now)
+        monitor._stop_event.set()
+
+    monkeypatch.setattr(monitor._stop_event, "wait", wait)
+    monkeypatch.setattr(monitor, "_run_health_checks", probe)
+    monitor.arm_first_wait()
+
+    monitor._health_monitor_loop()
+
+    assert waits == [10.0, 5.0]
+    assert probes == [15.0]
+    assert monitor._first_check_after is None
 
 
 def test_stop_terminates_the_thread(monitor_factory):
@@ -515,23 +562,14 @@ def test_generation_lifecycle_is_a_noop_without_fault_tolerance():
     assert gen.shutdown() is True
 
 
-def test_monitor_names_the_missing_tuning_keys():
-    """Hand-written configs must name every tuning key when enabling FT."""
-    with pytest.raises(AssertionError) as excinfo:
-        RolloutHealthMonitor(
-            _FakeGeneration([_FakeEngine()]),
-            {"sglang_cfg": {"use_fault_tolerance": True}},
-        )
+def test_monitor_uses_config_model_defaults() -> None:
+    ft_cfg = SGLangFaultToleranceConfig(use_fault_tolerance=True)
+    monitor = RolloutHealthMonitor(_FakeGeneration([_FakeEngine()]), ft_cfg)
 
-    message = str(excinfo.value)
-    for key in (
-        "rollout_health_check_interval",
-        "rollout_health_check_timeout",
-        "rollout_health_check_first_wait",
-        "rollout_max_restart_attempts",
-    ):
-        assert key in message
-    assert "use_fault_tolerance" in message
+    assert monitor._check_interval == ft_cfg.rollout_health_check_interval
+    assert monitor.check_timeout == ft_cfg.rollout_health_check_timeout
+    assert monitor._check_first_wait == ft_cfg.rollout_health_check_first_wait
+    assert monitor._max_restart_attempts == ft_cfg.rollout_max_restart_attempts
 
 
 @pytest.mark.parametrize("failure", [False, RayActorError(), GetTimeoutError()])
@@ -670,7 +708,7 @@ def test_restart_budget_counts_logical_engines_and_is_atomic(monitor_factory):
 
 @pytest.mark.parametrize("max_restarts", [-1, 1.5, True])
 def test_restart_budget_rejects_invalid_values(max_restarts):
-    with pytest.raises(ValueError, match="nonnegative integer"):
+    with pytest.raises(ValueError, match="rollout_max_restart_attempts"):
         RolloutHealthMonitor(_FakeGeneration([]), _cfg(max_restarts=max_restarts))
 
 

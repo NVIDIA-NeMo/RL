@@ -55,6 +55,7 @@ from typing import Any, Optional
 
 import ray
 
+from nemo_rl.models.generation.sglang.config import get_sglang_fault_tolerance_config
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
@@ -127,8 +128,15 @@ class _SGLangWeightSynchronizer(WeightSynchronizer):
             )
 
     def _recover_engines(self) -> None:
-        """Recover dead engines before any refit lifecycle RPCs."""
-        if self._generation.sglang_cfg["sglang_cfg"]["use_fault_tolerance"]:
+        """Recover before refit so replacements receive current policy weights.
+
+        Replacements wait for this boundary rather than serving checkpoint
+        weights during the interrupted rollout.
+        """
+        fault_tolerance_config = get_sglang_fault_tolerance_config(
+            self._generation.sglang_cfg["sglang_cfg"]
+        )
+        if fault_tolerance_config.use_fault_tolerance:
             self._generation.recover_updatable_engines()
 
     def _refit(self, buffer_size_bytes: int) -> None:

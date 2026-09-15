@@ -36,7 +36,10 @@ from nemo_rl.models.generation.interfaces import (
     reject_unenforceable_refit_deadline,
     verify_right_padding,
 )
-from nemo_rl.models.generation.sglang.config import SGLangConfig
+from nemo_rl.models.generation.sglang.config import (
+    SGLangConfig,
+    get_sglang_fault_tolerance_config,
+)
 from nemo_rl.models.generation.sglang.fault_tolerance import RolloutHealthMonitor
 from nemo_rl.models.generation.sglang.sglang_router import _start_router
 from nemo_rl.models.generation.sglang.sglang_worker import SGLangGenerationWorker
@@ -77,6 +80,9 @@ class SGLangGeneration(GenerationInterface):
         cluster: RayVirtualCluster,
         sglang_cfg: SGLangConfig,
     ):
+        fault_tolerance_config = get_sglang_fault_tolerance_config(
+            sglang_cfg["sglang_cfg"]
+        )
         self.cluster = cluster
         self.sglang_cfg = sglang_cfg
         # GenerationInterface consumers (create_weight_synchronizer, the refit
@@ -146,8 +152,8 @@ class SGLangGeneration(GenerationInterface):
         # rank 0 in policy/utils.py; nothing on the generation side takes it.
         self.rollout_engine_lock = Lock.options(num_cpus=0, num_gpus=0).remote()
 
-        if sglang_cfg["sglang_cfg"]["use_fault_tolerance"]:
-            monitor = RolloutHealthMonitor(self, sglang_cfg)
+        if fault_tolerance_config.use_fault_tolerance:
+            monitor = RolloutHealthMonitor(self, fault_tolerance_config)
             monitor.start()
             self._health_monitor = monitor
 
