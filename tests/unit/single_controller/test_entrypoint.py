@@ -39,7 +39,11 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         logger={"log_dir": "/tmp/logs"},
         checkpointing={"enabled": False},
         async_rl=SimpleNamespace(
-            stall_watchdog=SimpleNamespace(interval_s=30.0, stall_timeout_s=600.0)
+            stall_watchdog=SimpleNamespace(interval_s=30.0, stall_timeout_s=600.0),
+            # model_construct skips validation, so nothing fills the real
+            # AsyncRLConfig defaults in here. main() reads this before init_ray() to
+            # decide on EngineCore reaping; off keeps that a no-op.
+            generation_fleet_health=SimpleNamespace(enabled=False),
         ),
         grpo=GRPOConfig(async_grpo=None),
     )
