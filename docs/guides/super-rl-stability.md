@@ -193,3 +193,19 @@ native gate. **Portable rollout persistence is not implemented:** it needs real
 tokens/logprobs/masks/rewards/routes, weight lineage/age validation, atomic group
 completion and checkpoint-aligned consumption records, plus whole-Ray-cluster
 kill/restart tests. Increasing retries or enabling replay loading is not that fix.
+
+## W&B: protect scalar updates from raw generation payloads
+
+The PR3941 profile recorded a 16.2 MB `generation_logger_metrics` payload that
+caused W&B to reject the whole update, including loss, KL and reward. This is
+distinct from the ledger's remaining GPU tick/heartbeat issues.
+
+Both GRPO loops now exclude only that raw nested key at the generic training
+logging call. Generation/performance summaries are computed first; the original
+metrics dictionary is not mutated. No rewards, logprobs, or training masks are
+changed, and no W&B data is rewritten.
+
+Tests exercise an oversized payload and preservation of every other metric,
+plus source wiring after summary generation. Actual W&B delivery still needs
+a native canary. This does **not** fix `commit=False` GPU sample merging,
+cross-resume relative time axes, or heartbeat state; those remain open.

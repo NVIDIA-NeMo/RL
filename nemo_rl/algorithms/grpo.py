@@ -67,6 +67,7 @@ from nemo_rl.algorithms.loss.loss_functions import (
 from nemo_rl.algorithms.metric_utils import (
     SetupTimingMetrics,
     print_setup_timing_summary,
+    without_generation_logger_payload,
 )
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.reward_functions import (
@@ -4390,7 +4391,11 @@ def grpo_train(
 
             if refit_metrics:
                 logger.log_metrics(refit_metrics, total_steps + 1, prefix="refit")
-            logger.log_metrics(metrics, total_steps + 1, prefix="train")
+            logger.log_metrics(
+                without_generation_logger_payload(metrics),
+                total_steps + 1,
+                prefix="train",
+            )
             logger.log_metrics(
                 performance_metrics, total_steps + 1, prefix="performance"
             )
@@ -6294,7 +6299,9 @@ def async_grpo_train(
             if refit_metrics:
                 logger.log_metrics(refit_metrics, step + 1, prefix="refit")
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")
-            logger.log_metrics(metrics, step + 1, prefix="train")
+            logger.log_metrics(
+                without_generation_logger_payload(metrics), step + 1, prefix="train"
+            )
             logger.log_metrics(efficiency_loggable, step + 1, prefix="")
             # step_finished=True here since this is the final log of our current step.
             logger.log_metrics(
