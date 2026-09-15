@@ -176,20 +176,8 @@ class _CheckpointGeneration(_FakeGeneration):
     def __init__(self, events: list[str]) -> None:
         self._events = events
 
-    def pause_generation_for_checkpoint(self, *, timeout_s=None) -> bool:
-        self._events.append("generation-pause")
-        return True
-
     def begin_generation_checkpoint(self, *, timeout_s=None) -> bool:
         self._events.append("generation-fence")
-        return True
-
-    def resume_generation_after_checkpoint(self, *, timeout_s=None) -> bool:
-        self._events.append("generation-resume")
-        return True
-
-    def resume_generation_after_cut(self, *, timeout_s=None) -> bool:
-        self._events.append("generation-resume-after-cut")
         return True
 
     def finish_generation_checkpoint(self, *, timeout_s=None) -> bool:
