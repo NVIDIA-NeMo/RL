@@ -2241,6 +2241,7 @@ class TestAsyncTrajectoryCollector:
             policy={
                 "max_total_sequence_length": 512,
                 "make_sequence_length_divisible_by": 1,
+                "generation": {},
             },
             env={"should_use_nemo_gym": False},
             logger={
