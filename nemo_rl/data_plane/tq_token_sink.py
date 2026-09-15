@@ -367,7 +367,7 @@ class ChainPrefixCache:
             self._cache.clear()
 
     def fetch(self, staging_chain: list[str]) -> list[int]:
-        """Assemble prefix token ids from staging_chain, with a worker-local LRU cache."""
+        """Assemble prefix token ids from staging_chain, with a worker-local FIFO (256-entry) cache."""
         cache = self._cache
         with self._lock:
             source = self._source
@@ -466,6 +466,8 @@ class TQMegatronPromptPreparer:
                 raise ValueError(
                     "MInf capture request carries no valid prefix boundary token"
                 )
+            # The splice relies on the endpoint's suffix starting with the
+            # boundary token; the post-condition below verifies the result.
             prompt_prefix = prefix_token_ids
             if prompt_prefix and prompt_prefix[-1] == boundary_token_id:
                 prompt_prefix = prompt_prefix[:-1]
@@ -473,10 +475,6 @@ class TQMegatronPromptPreparer:
         elif admission.staging_chain:
             raise ValueError(
                 "MInf staged-prefix request carries no prompt splice metadata"
-            )
-        elif prompt[: admission.prev_len] != prefix_token_ids:
-            raise ValueError(
-                "MInf generation prompt does not begin with the authorized token prefix"
             )
 
         if prompt[: admission.prev_len] != prefix_token_ids:
@@ -502,9 +500,27 @@ class TQMegatronTokenStager:
             # MInf passes the authoritative version explicitly for every call.
             weight_version_fn=lambda: 0,
         )
+        # Requests that straddled a refit (more than one policy_epoch boundary).
+        # Metered here because they are stamped, not masked; see _weight_version.
+        self._epoch_span_count = 0
 
-    @staticmethod
-    def _weight_version(finished_metadata: Any) -> int:
+    @property
+    def epoch_span_count(self) -> int:
+        """Number of staged calls whose generation spanned more than one policy epoch."""
+        return self._epoch_span_count
+
+    def _weight_version(self, finished_metadata: Any) -> int:
+        """Stamp the policy epoch the request was admitted under.
+
+        The engine records ``policy_epoch`` as ``(token_index, epoch)`` boundaries
+        and appends one on every ``set_generation_epoch`` while the request is
+        active, so a request that straddles a refit carries several. vLLM stamps
+        the version in effect at ``begin_call`` and never re-checks, and the
+        finalizer tags a group by the min over its calls, so the oldest epoch is
+        the matching (and conservative) choice here. Spans are counted and
+        logged rather than masked; ``_abort_stale_inflight`` is skipped on the
+        Gym path (#2625), so they are routine under async rollouts.
+        """
         policy_epoch = getattr(finished_metadata, "policy_epoch", None)
         if not isinstance(policy_epoch, list) or not policy_epoch:
             raise ValueError("MInf captured request carries no policy_epoch boundaries")
@@ -514,14 +530,19 @@ class TQMegatronTokenStager:
             raise ValueError(
                 "MInf captured request carries invalid policy_epoch metadata"
             ) from error
-        if len(versions) != 1:
-            raise ValueError(
-                f"MInf captured request spans policy epochs {sorted(versions)}"
-            )
-        (version,) = versions
+        version = min(versions)
         if version < 0:
             raise ValueError(
                 f"MInf captured request has negative policy epoch {version}"
+            )
+        if len(versions) > 1:
+            self._epoch_span_count += 1
+            logging.getLogger(__name__).warning(
+                "MInf captured request spans policy epochs %s; stamping admission "
+                "epoch %d (span count %d)",
+                sorted(versions),
+                version,
+                self._epoch_span_count,
             )
         return version
 
@@ -605,7 +626,6 @@ class TQTokenSource:
     """
 
     def __init__(self, dp_client: Any, *, staging_partition: str) -> None:
-        self._dp_client = dp_client
         self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
         self._staging_partition = staging_partition
 
@@ -665,29 +685,14 @@ class TQTokenSource:
                 # worker); fall back to the base schema so extras-free rows
                 # keep fetching.
                 try:
-                    rows = _call_dp(
-                        self._dp_client,
-                        "get_samples",
-                        sample_ids=list(staging_keys),
-                        partition_id=self._staging_partition,
+                    rows = self._store.get(
+                        staging_keys,
                         select_fields=STAGING_FIELDS + [ROUTED_EXPERTS_FIELD],
                     )
                 except Exception:  # noqa: BLE001 — field-not-present probe
-                    rows = _call_dp(
-                        self._dp_client,
-                        "get_samples",
-                        sample_ids=list(staging_keys),
-                        partition_id=self._staging_partition,
-                        select_fields=STAGING_FIELDS,
-                    )
+                    rows = self._store.get(staging_keys, select_fields=STAGING_FIELDS)
             else:
-                rows = _call_dp(
-                    self._dp_client,
-                    "get_samples",
-                    sample_ids=list(staging_keys),
-                    partition_id=self._staging_partition,
-                    select_fields=STAGING_FIELDS,
-                )
+                rows = self._store.get(staging_keys, select_fields=STAGING_FIELDS)
         except Exception as error:  # noqa: BLE001 — protocol maps misses to KeyError
             raise KeyError(
                 f"staged rows for {len(staging_keys)} keys could not be "

@@ -322,11 +322,48 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
     assert metadata["ng_capture"]["required_prefix_token_ids"] == [10, 11, 12, 99]
 
 
+def test_megatron_stager_stamps_admission_epoch_when_request_spans_refit(
+    tq_client, staging_partition, caplog
+):
+    """A request straddling a refit is stamped with its admission epoch, not masked.
+
+    Mirrors vLLM, which freezes the version at begin_call; the finalizer tags
+    a group by the min over its calls, so the oldest epoch is the right one.
+    """
+    stager = TQMegatronTokenStager(
+        TQTokenSink(tq_client, staging_partition=staging_partition)
+    )
+    admission = nemo_gym.CaptureAdmission(
+        rollout_id="minf-r0",
+        model_call_id="c1",
+        mode="text",
+    )
+    with caplog.at_level("WARNING", logger="nemo_rl.data_plane.tq_token_sink"):
+        result = stager.stage(
+            "minf-response-1",
+            SimpleNamespace(
+                prompt_token_ids=[10],
+                generated_token_ids=[11, 12],
+                generated_log_probs=[-0.1, -0.2],
+            ),
+            finished_metadata=SimpleNamespace(policy_epoch=[(0, 8), (1, 7), (2, 9)]),
+            request_metadata={"ng_capture": admission.model_dump(mode="json")},
+        )
+    assert result is not None
+    coords = result.response_metadata["ng_commit_coords"]
+    assert coords["disposition"] == "staged"
+    assert coords["weight_version"] == 7
+    assert stager.epoch_span_count == 1
+    assert any("spans policy epochs [7, 8, 9]" in r.message for r in caplog.records)
+
+
 @pytest.mark.parametrize(
     ("with_capture_metadata", "policy_epoch"),
     [
         pytest.param(False, [(0, 7)], id="missing-capture-metadata"),
-        pytest.param(True, [(0, 7), (1, 8)], id="mixed-policy-epochs"),
+        pytest.param(True, [], id="no-policy-epoch-boundaries"),
+        pytest.param(True, [(0, "x")], id="invalid-policy-epoch"),
+        pytest.param(True, [(0, -1)], id="negative-policy-epoch"),
     ],
 )
 def test_megatron_stager_declines_ineligible_requests(
