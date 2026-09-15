@@ -96,6 +96,20 @@ remains authoritative. Missing verdicts raise `JudgeError`, and NeMo-RL rejects
 tagged failed rows before token/reward processing instead of learning from zero.
 This does not add unbounded retries or change native correct/incorrect labels.
 
+The pinned `ns_tools` wrapper nested its delegated verifier's failure metadata
+inside `delegated_response`. The training adapter and rollout collector inspect
+top-level `_ng_failure_class`, so a failed Math judge could otherwise escape
+the strict boundary as an ordinary zero reward. `gym_ns_tools_failures.patch`
+preserves all delegated `_ng_failure_*` fields at the top level while retaining
+the original response, delegated payload, and tool timing metrics. Valid zero
+rewards remain ordinary negative labels. Session cleanup is unchanged.
+
+`tests/unit/tools/test_ns_tools_failures.py` applies the zero-fuzz patch and
+executes the actual verification method in isolation, checking correct,
+incorrect, judge-failed, and other tagged-failure payloads. Native response-model
+serialization and training-boundary checks are required separately; these unit
+tests do not certify real sandbox or judge behavior.
+
 Pure verdict tests and native actor-boundary regression tests are separate; real
 judge responses and retry/failure behavior still require the serving smoke.
 
