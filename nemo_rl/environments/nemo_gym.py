@@ -1200,6 +1200,13 @@ Depending on your data shape, you may want to change these values."""
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
 
+        # Gym's verifier wrapper returns tagged failures with a placeholder reward.
+        # These rows are retryable infrastructure failures, never training samples.
+        if nemo_gym_result.get("_ng_failure_class") == "judge_failed":
+            raise GymTransportError("NeMo Gym returned a tagged judge failure; reward is not valid")
+        if nemo_gym_result.get("_ng_failure_class"):
+            raise RolloutDataFailure("NeMo Gym returned a tagged failed rollout; reward is not valid")
+
         processor = getattr(self, "_processor", None)
         response = nemo_gym_result["response"]
         require_routed_experts = self.cfg.get("require_routed_experts", False)

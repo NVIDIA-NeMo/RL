@@ -61,6 +61,22 @@ tests remain required before declaring the runtime validated.
 
 ## What was intentionally not copied
 
+## Judge failures are not incorrect policy answers
+
+The pinned Math and equivalence judges map missing verdicts to `False`, and Gym's
+failure wrapper returns transport failures as tagged rows with placeholder reward
+zero. Neither is a valid policy-training label. `gym_judge_verdict.patch` adds
+`fail_on_missing_judge_verdict` (default false for backward compatibility); the
+regular baseline enables it on both resources. A first valid negative verdict
+remains authoritative. Missing verdicts raise `JudgeError`, and NeMo-RL rejects
+tagged failed rows before token/reward processing instead of learning from zero.
+This does not add unbounded retries or change native correct/incorrect labels.
+
+Pure verdict tests and native actor-boundary regression tests are separate; real
+judge responses and retry/failure behavior still require the serving smoke.
+
+## Excluded experimental artifacts
+
 - Old job IDs, absolute user paths, submission receipts, logs, payload snapshots,
   repeated `v1/v2/v3` wrappers, observer scripts and cluster allocation manifests.
 - TIR-to-CoT conversion and environment deletion scripts. All required routes

@@ -1,0 +1,79 @@
+diff --git a/resources_servers/equivalence_llm_judge/app.py b/resources_servers/equivalence_llm_judge/app.py
+index 69f6867..e91896b 100644
+--- a/resources_servers/equivalence_llm_judge/app.py
++++ b/resources_servers/equivalence_llm_judge/app.py
+@@ -38,6 +38,7 @@ from nemo_gym.base_resources_server import (
+ )
+ from nemo_gym.config_types import ModelServerRef
+ from nemo_gym.judge import JudgeError, call_judge
++from nemo_gym.judge_verdict import first_verdict
+ from nemo_gym.openai_utils import (
+     NeMoGymEasyInputMessage,
+     NeMoGymResponse,
+@@ -60,6 +61,7 @@ class LLMJudgeResourcesServerConfig(BaseResourcesServerConfig):
+     name: str = "equivalence_llm_judge"
+     judge_model_server: ModelServerRef
+     judge_responses_create_params: NeMoGymResponseCreateParamsNonStreaming
++    fail_on_missing_judge_verdict: bool = False
+ 
+     # Concurrency limit for judge endpoint requests. Set to None to disable limiting.
+     judge_endpoint_max_concurrency: Optional[int] = 64
+@@ -490,7 +492,17 @@ class LLMJudgeResourcesServer(SimpleResourcesServer):
+             verdict_label=None,
+         )
+ 
+-        # Parse the last output; fall back to not-equal if unexpected.
++        if cfg.fail_on_missing_judge_verdict:
++            try:
++                equal = first_verdict(
++                    judge_response.output_text, equal_label=equal_label, not_equal_label=not_equal_label
++                )
++            except ValueError as error:
++                raise JudgeError(str(error)) from error
++            eval_record.verdict_label = equal_label if equal else not_equal_label
++            return equal, eval_record
++
++        # Legacy behavior for configurations that do not opt into strict judging.
+         try:
+             last_output = judge_response.output[-1]
+             if getattr(last_output, "type", None) != "message":
+diff --git a/resources_servers/math_with_judge/app.py b/resources_servers/math_with_judge/app.py
+index 983cc0b..4f5ceda 100644
+--- a/resources_servers/math_with_judge/app.py
++++ b/resources_servers/math_with_judge/app.py
+@@ -34,7 +34,8 @@ from nemo_gym.base_resources_server import (
+     SimpleResourcesServer,
+ )
+ from nemo_gym.config_types import ModelServerRef
+-from nemo_gym.judge import call_judge
++from nemo_gym.judge import JudgeError, call_judge
++from nemo_gym.judge_verdict import first_verdict
+ from nemo_gym.openai_utils import (
+     NeMoGymEasyInputMessage,
+     NeMoGymResponse,
+@@ -44,6 +45,7 @@ from nemo_gym.reward_profile import compute_pass_majority_metrics, highest_k_met
+ 
+ 
+ class LibraryJudgeMathResourcesServerConfig(BaseResourcesServerConfig):
++    fail_on_missing_judge_verdict: bool = False
+     judge_model_server: ModelServerRef
+     judge_responses_create_params: NeMoGymResponseCreateParamsNonStreaming
+     should_use_judge: bool = True
+@@ -373,6 +375,17 @@ Example output: "My final verdict is different [[A!=B]]"."""
+         )
+         judge_evaluation = JudgeEvaluation(responses_create_params=responses_create_params, response=judge_response)
+ 
++        if config.fail_on_missing_judge_verdict:
++            try:
++                equal = first_verdict(
++                    judge_response.output_text,
++                    equal_label=self.JUDGE_EQUAL_LABEL,
++                    not_equal_label=self.JUDGE_NOT_EQUAL_LABEL,
++                )
++            except ValueError as error:
++                raise JudgeError(str(error)) from error
++            return equal, judge_evaluation
++
+         # Currently, for all the cases in which the response from the LLM judge
+         # does not conform to the expected format, the judge's evaluation is
+         # treated as if the answers are not equal.  This may not be ideal, but it
