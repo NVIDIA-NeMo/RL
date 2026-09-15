@@ -80,6 +80,16 @@ the Gym root instead points at a nonexistent file. Import-only checks do not
 catch this: the template is opened by the server constructor. Require actual
 service startup in the native runtime before allocating training GPUs.
 
+After `prepare_node.py` links and checks the image-owned environments, run
+`tools/super_rl/check_gym_startup.py` with the full `--config`, mounted `--gym`,
+fresh `--runtime` output directory, and explicit `--cpus` / `--timeout` limits.
+It starts the configured Gym apps on a local CPU-only Ray runtime, waits for
+their health checks, then shuts them down. This catches constructor-time asset
+errors that imports miss. Backend-model readiness is deliberately disabled only
+in this CPU test's in-memory configuration; it sends no model requests and does
+not certify sandbox execution, rewards, or training. The real training recipe
+and its backend-readiness gate are not modified.
+
 ## Excluded experimental artifacts
 
 - Old job IDs, absolute user paths, submission receipts, logs, payload snapshots,
