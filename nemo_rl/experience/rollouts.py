@@ -2827,18 +2827,48 @@ def _postprocess_single_nemo_gym_group(
                 "total_reward": r["full_result"]["reward"],
                 "assistant_tokens": sum(
                     len(m["token_ids"])
-                    for m in r["message_log"]
+                    for m in (
+                        r["gym_metrics_message_log"]
+                        if "gym_metrics_message_log" in r
+                        else r["message_log"]
+                    )
                     if m["role"] == "assistant"
                 ),
-                "total_tokens": sum(len(m["token_ids"]) for m in r["message_log"]),
-                "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
-                "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"])
+                "total_tokens": sum(
+                    len(m["token_ids"])
+                    for m in (
+                        r["gym_metrics_message_log"]
+                        if "gym_metrics_message_log" in r
+                        else r["message_log"]
+                    )
+                ),
+                "turn_count": sum(
+                    1
+                    for m in (
+                        r["gym_metrics_message_log"]
+                        if "gym_metrics_message_log" in r
+                        else r["message_log"]
+                    )
+                    if m["role"] == "user"
+                ),
+                "hit_max_tokens": sum(
+                    len(m["token_ids"])
+                    for m in (
+                        r["gym_metrics_message_log"]
+                        if "gym_metrics_message_log" in r
+                        else r["message_log"]
+                    )
+                )
                 == max_total_tokens_per_sample,
                 # max_gen_tokens_per_turn: Diagnostic for long single generations
                 "max_gen_tokens_per_turn": max(
                     (
                         len(m["token_ids"])
-                        for m in r["message_log"]
+                        for m in (
+                            r["gym_metrics_message_log"]
+                            if "gym_metrics_message_log" in r
+                            else r["message_log"]
+                        )
                         if m["role"] == "assistant"
                     ),
                     default=0,
@@ -2971,6 +3001,16 @@ def _postprocess_single_nemo_gym_group(
             ),
         }
     )
+    if any("gym_training_traces" in result for result in results):
+        if not all("gym_training_traces" in result for result in results):
+            raise ValueError("Gym batch mixes legacy and multi-trace rollout results")
+        final_batch["gym_training_traces"] = [
+            result["gym_training_traces"] for result in results
+        ]
+        final_batch["gym_rollout_id"] = [result["gym_rollout_id"] for result in results]
+        if "gym_task_group_id" in input_batch:
+            final_batch["gym_task_group_id"] = input_batch["gym_task_group_id"]
+
     # Carry the raw env/agent flag downstream; the advantage stage composes it
     # into sample_mask. env.should_mask_flagged_samples=false skips this.
     if mask_env_flagged_samples:

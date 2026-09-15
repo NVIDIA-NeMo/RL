@@ -1,5 +1,7 @@
 # GRPO Algorithm Configuration
 grpo:
+  # Opt in to Gym all_traces delivery; synchronous Megatron only.
+  gym_multi_trace: false
   num_prompts_per_step: 32
   num_generations_per_prompt: 16
   max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)

@@ -126,6 +126,7 @@ class PolicyInterface(ABC):
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
+        scheduler_step_samples: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a global batch of data.
 
@@ -135,6 +136,8 @@ class PolicyInterface(ABC):
             eval_mode: Whether to run in evaluation mode (no gradient updates)
             gbs: Global batch size override (if None, uses config default)
             mbs: Micro batch size override (if None, uses config default)
+            scheduler_step_samples: Logical sample increment for Megatron when
+                physical training rows outnumber logical rollouts. None uses gbs.
         """
         pass
 
