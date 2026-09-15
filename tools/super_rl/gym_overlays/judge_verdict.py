@@ -15,6 +15,9 @@
 # limitations under the License.
 """Parse the first valid judge verdict without treating missing output as false."""
 
+import json
+from typing import Any
+
 
 def first_verdict(text: str, *, equal_label: str, not_equal_label: str) -> bool:
     if not equal_label or not not_equal_label or equal_label == not_equal_label:
@@ -24,3 +27,23 @@ def first_verdict(text: str, *, equal_label: str, not_equal_label: str) -> bool:
     if equal < 0 and unequal < 0:
         raise ValueError("Judge response contains no valid verdict")
     return equal >= 0 and (unequal < 0 or equal < unequal)
+
+
+def response_verdict(response: Any, *, equal_label: str, not_equal_label: str) -> bool:
+    """Keep failure shape and token accounting, never the judge's full answer."""
+    try:
+        return first_verdict(
+            response.output_text,
+            equal_label=equal_label,
+            not_equal_label=not_equal_label,
+        )
+    except ValueError as error:
+        incomplete = getattr(response, "incomplete_details", None)
+        usage = getattr(response, "usage", None)
+        details = {
+            "status": getattr(response, "status", None),
+            "incomplete_reason": getattr(incomplete, "reason", None),
+            "output_tokens": getattr(usage, "output_tokens", None),
+            "output_text_chars": len(response.output_text),
+        }
+        raise ValueError(f"{error}; {json.dumps(details)}") from error

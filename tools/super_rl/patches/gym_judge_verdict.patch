@@ -6,7 +6,7 @@ index 69f6867..e91896b 100644
  )
  from nemo_gym.config_types import ModelServerRef
  from nemo_gym.judge import JudgeError, call_judge
-+from nemo_gym.judge_verdict import first_verdict
++from nemo_gym.judge_verdict import response_verdict
  from nemo_gym.openai_utils import (
      NeMoGymEasyInputMessage,
      NeMoGymResponse,
@@ -25,8 +25,8 @@ index 69f6867..e91896b 100644
 -        # Parse the last output; fall back to not-equal if unexpected.
 +        if cfg.fail_on_missing_judge_verdict:
 +            try:
-+                equal = first_verdict(
-+                    judge_response.output_text, equal_label=equal_label, not_equal_label=not_equal_label
++                equal = response_verdict(
++                    judge_response, equal_label=equal_label, not_equal_label=not_equal_label
 +                )
 +            except ValueError as error:
 +                raise JudgeError(str(error)) from error
@@ -47,7 +47,7 @@ index 983cc0b..4f5ceda 100644
  from nemo_gym.config_types import ModelServerRef
 -from nemo_gym.judge import call_judge
 +from nemo_gym.judge import JudgeError, call_judge
-+from nemo_gym.judge_verdict import first_verdict
++from nemo_gym.judge_verdict import response_verdict
  from nemo_gym.openai_utils import (
      NeMoGymEasyInputMessage,
      NeMoGymResponse,
@@ -65,8 +65,8 @@ index 983cc0b..4f5ceda 100644
  
 +        if config.fail_on_missing_judge_verdict:
 +            try:
-+                equal = first_verdict(
-+                    judge_response.output_text,
++                equal = response_verdict(
++                    judge_response,
 +                    equal_label=self.JUDGE_EQUAL_LABEL,
 +                    not_equal_label=self.JUDGE_NOT_EQUAL_LABEL,
 +                )

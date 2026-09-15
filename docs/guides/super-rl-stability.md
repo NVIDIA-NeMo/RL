@@ -86,6 +86,9 @@ stable row identity, and judge error into the typed exception. It does not log
 the full prompt, response, or Router Replay payload. Previously the generic
 exception discarded Gym's `_ng_failure_judge_error`, making an HTTP-200 tagged
 failure indistinguishable from other judge failures after collection.
+Strict-verdict errors also retain response status, incomplete reason, output
+token count, and final-text length, without printing the judge's answer. This
+separates a capped, empty final answer from an uncapped malformed verdict.
 
 The first integrated regular smoke exposed a separate recovery limitation:
 one tagged failure interrupts the batch stream, unfinished prompt groups are
