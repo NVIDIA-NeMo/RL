@@ -299,7 +299,38 @@ def test_materialize_pads_a_3d_payload_on_the_seq_dim_only() -> None:
 
     ``materialize`` builds its pad spec as ``[0, 0] * (dim - 2) + [0, pad]``,
     and ``F.pad`` reads that from the last dimension backwards -- so a 3-D
-    column only pads correctly because of the leading ``[0, 0]``.
+    column only pads correctly because of the leading ``[0, 0]``. Uses a
+    synthetic field name (not one of ``OPD_FULL_FIELDS``) since that's the
+    only real 3-D column in the wire schema and it is deliberately exempted
+    from ``pad_to_seqlen`` -- see
+    ``test_materialize_skips_pad_to_seqlen_for_opd_full_fields`` below.
+    """
+    lengths = torch.tensor([2, 4], dtype=torch.long)
+    payload = torch.randn(2, 4, 3)
+    field = "synthetic_3d_field"
+
+    td = pack_jagged_fields(
+        {field: payload},
+        lengths=lengths,
+        token_aligned_fields=frozenset({field}),
+    )
+    out = materialize(td, layout="padded", pad_to_seqlen=6)[field]
+
+    assert out.shape == (2, 6, 3)
+    assert torch.equal(out[0, :2], payload[0, :2])
+    assert torch.equal(out[1, :4], payload[1, :4])
+    assert torch.equal(out[0, 2:], torch.zeros(4, 3))
+
+
+def test_materialize_skips_pad_to_seqlen_for_opd_full_fields() -> None:
+    """opd_full's teacher payload never feeds the model forward pass, so
+    ``pad_to_seqlen`` must leave its natural (possibly shorter) width alone
+    instead of forcing it to the cross-DP forward pad target.
+
+    Regression test for the OOM this padding caused: forcing every row's
+    teacher payload to the global max sequence length regardless of its own
+    real length produced 100+ GiB allocations (see codec.py::materialize's
+    ``OPD_FULL_FIELDS`` exclusion).
     """
     lengths = torch.tensor([2, 4], dtype=torch.long)
     payload = torch.randn(2, 4, 3)
@@ -311,7 +342,5 @@ def test_materialize_pads_a_3d_payload_on_the_seq_dim_only() -> None:
     )
     out = materialize(td, layout="padded", pad_to_seqlen=6)[OPD_FULL_LOGITS_FIELD]
 
-    assert out.shape == (2, 6, 3)
-    assert torch.equal(out[0, :2], payload[0, :2])
-    assert torch.equal(out[1, :4], payload[1, :4])
-    assert torch.equal(out[0, 2:], torch.zeros(4, 3))
+    assert out.shape == (2, 4, 3)
+    assert torch.equal(out, payload)

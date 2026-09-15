@@ -23,6 +23,7 @@ from nemo_rl.data_plane.schema import (
     MICRO_BATCH_INDICES,
     MICRO_BATCH_LENGTHS,
     OPD_FULL_HIDDEN_STATES_FIELD,
+    OPD_FULL_TEACHER_INDEX_FIELD,
     TEACHER_LP_FIELDS,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -222,6 +223,8 @@ def _disable_opd_full(teacher) -> None:
     teacher._opd_full_payload = None
     teacher._opd_full_payload_dtype = "bfloat16"
     teacher._opd_full_payload_field = None
+    teacher._opd_full_teacher_index_field = None
+    teacher.teacher_index = 0
 
 
 def test_get_logprobs_from_meta_dispatches_tq_shards_to_teacher_workers():
@@ -525,6 +528,9 @@ def test_get_logprobs_from_meta_forwards_the_opd_full_payload_request():
     teacher._opd_full_payload = "hidden_states"
     teacher._opd_full_payload_dtype = "float16"
     teacher._opd_full_payload_field = OPD_FULL_HIDDEN_STATES_FIELD
+    teacher._opd_full_teacher_index_field = OPD_FULL_TEACHER_INDEX_FIELD
+    # Not 0: a hard-coded or defaulted index would still look right at 0.
+    teacher.teacher_index = 2
     teacher.alias = "teacher"
     teacher.use_sequence_packing = False
     teacher.use_dynamic_batches = False
@@ -550,6 +556,10 @@ def test_get_logprobs_from_meta_forwards_the_opd_full_payload_request():
         "opd_full_payload": "hidden_states",
         "opd_full_payload_dtype": "float16",
         "opd_full_payload_field": OPD_FULL_HIDDEN_STATES_FIELD,
+        # Multi-teacher routing: this group's own index rides every request so
+        # the student can pick the matching LM head back on the train side.
+        "opd_full_teacher_index": 2,
+        "opd_full_teacher_index_field": OPD_FULL_TEACHER_INDEX_FIELD,
     }
 
 
@@ -639,6 +649,37 @@ def test_teacher_worker_presharded_entrypoint_writes_the_full_payload_from_its_s
     assert write_meta is meta
     assert list(fields) == [OPD_FULL_HIDDEN_STATES_FIELD]
     assert torch.equal(fields[OPD_FULL_HIDDEN_STATES_FIELD], payload)
+
+
+def test_teacher_worker_presharded_entrypoint_tags_every_row_with_its_teacher():
+    """The routing column is written from the same stage as the payload.
+
+    One ``TeacherWorkerGroup`` per checkpoint, so the tag is a constant
+    broadcast over this call's batch dim -- but it has to be *this* group's
+    index, in the payload's own stage-local write, or the student projects the
+    rows through some other teacher's LM head.
+    """
+    payload = torch.randn(2, 3, 4)
+    worker = _full_payload_worker_class()(payload)
+
+    worker.get_teacher_logprobs_presharded(
+        _presharded_meta(),
+        opd_full_payload="hidden_states",
+        opd_full_payload_dtype="bfloat16",
+        opd_full_payload_field=OPD_FULL_HIDDEN_STATES_FIELD,
+        # Not 0: a defaulted or dropped index still looks right at 0.
+        opd_full_teacher_index=2,
+        opd_full_teacher_index_field=OPD_FULL_TEACHER_INDEX_FIELD,
+    )
+
+    assert len(worker.stage_local_writes) == 1
+    _, fields = worker.stage_local_writes[0]
+    assert list(fields) == [OPD_FULL_HIDDEN_STATES_FIELD, OPD_FULL_TEACHER_INDEX_FIELD]
+    tags = fields[OPD_FULL_TEACHER_INDEX_FIELD]
+    # One int per sample, not per token: [B], never [B, S].
+    assert tags.shape == (payload.shape[0],)
+    assert tags.dtype == torch.int64
+    assert torch.equal(tags, torch.tensor([2, 2]))
 
 
 def test_teacher_worker_presharded_entrypoint_skips_the_payload_off_the_last_stage():

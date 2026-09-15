@@ -1137,8 +1137,11 @@ def test_create_teacher_worker_groups_reuses_reserved_clusters(monkeypatch):
     initialized_clusters = []
 
     class FakeTeacherWorkerGroup:
-        def __init__(self, *, teacher_cfg, cluster, policy_config, tokenizer):
+        def __init__(
+            self, *, teacher_cfg, cluster, policy_config, tokenizer, teacher_index
+        ):
             initialized_clusters.append((teacher_cfg.alias, cluster))
+            self.teacher_index = teacher_index
             self.worker_group = SimpleNamespace(workers=[])
             self.use_sequence_packing = True
             self.sequence_length_pad_multiple = 1
@@ -1165,6 +1168,14 @@ def test_create_teacher_worker_groups_reuses_reserved_clusters(monkeypatch):
     ]
     assert list(worker_groups) == ["math", "code"]
     assert alias_to_group_alias == {"math": "math", "code": "code"}
+    # The teacher index is derived from the sorted alias list, not from the
+    # YAML key order this dict happens to have: it keys the student's per-
+    # teacher LM-head shards, so reordering the config must not repoint an
+    # already-tagged row at another teacher's head.
+    assert {alias: group.teacher_index for alias, group in worker_groups.items()} == {
+        "code": 0,
+        "math": 1,
+    }
 
 
 # ---------------------------------------------------------------------------
