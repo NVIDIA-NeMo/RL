@@ -158,12 +158,14 @@ from nemo_rl.models.generation.vllm.config import (
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
+    router_replay_transport,
     validate_router_replay_transport_path,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.utils.replay_checkpoint import validate_replay_restore
 from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
@@ -197,6 +199,7 @@ def _maybe_restore_async_replay_buffer_checkpoint(
     checkpoint_path: str,
     *,
     load_replay_buffer: bool | None,
+    ray_reference_transport: bool,
     num_prompts_per_step: int,
     current_training_step: int,
     max_age_steps: int,
@@ -215,6 +218,11 @@ def _maybe_restore_async_replay_buffer_checkpoint(
         The restore metadata from ``load_from_path``, or ``None`` when the
         restore was skipped or no checkpoint file exists.
     """
+    validate_replay_restore(
+        checkpoint_path=checkpoint_path,
+        ray_reference_transport=ray_reference_transport,
+        load_replay_buffer=load_replay_buffer,
+    )
     if load_replay_buffer is False:
         print(
             "📦 Skipping replay buffer restore (checkpointing.load_replay_buffer=false)"
@@ -661,6 +669,14 @@ def setup(
     # ==========================
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    validate_replay_restore(
+        checkpoint_path=last_checkpoint_path,
+        ray_reference_transport=(
+            router_replay_enabled(policy_config)
+            and router_replay_transport(policy_config) == "ray"
+        ),
+        load_replay_buffer=checkpointing_config.get("load_replay_buffer"),
+    )
     loaded_state = checkpointer.load_training_info(last_checkpoint_path)
     grpo_save_state = _get_grpo_save_state(loaded_state)
 
@@ -4913,6 +4929,10 @@ def async_grpo_train(
             replay_buffer,
             last_checkpoint_path,
             load_replay_buffer=master_config.checkpointing.get("load_replay_buffer"),
+            ray_reference_transport=(
+                router_replay_enabled(master_config.policy)
+                and router_replay_transport(master_config.policy) == "ray"
+            ),
             num_prompts_per_step=num_prompts_per_step,
             current_training_step=step,
             max_age_steps=max_trajectory_age_steps,

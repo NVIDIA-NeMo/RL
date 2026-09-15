@@ -164,3 +164,32 @@ patch test alone is not native validation; the native test explicitly skips
 outside that environment. All-route TIR concurrency/session smoke is still
 required. The previous CoT-only 18-step run does not certify it, and no TIR to
 CoT data converter is included here.
+
+## Preemption: fail early on nonportable Ray replay
+
+**Incidents 15–19:** checkpoint recovery worked, but every new allocation
+required discarding replay with old Ray route references. A requeue with the
+same Slurm job ID is still a new Ray runtime. The generic replay restore path
+did not enforce this transport constraint itself.
+
+GRPO now rejects a Ray-reference checkpoint resume unless
+`checkpointing.load_replay_buffer=false` is explicit. The guard runs during
+setup before state loading/worker allocation, and again before replay payload
+loading. Inline transport and fresh training are unchanged. This is prevention,
+not a claim that all four preemptions were caused by a replay bug.
+
+Restore model, optimizer, scheduler, dataloader and the trained frontier from
+the same complete checkpoint. Keep an ordered dataset and validate the actual
+frontier; do not infer it solely from `step * prompts_per_step` when dynamic
+sampling is enabled. Preserve unfinished sample artifacts in attempt-specific
+directories before regenerating. Keep one writer per checkpoint/W&B lineage.
+The existing PR3941 finalization/frontier machinery is retained, not replaced
+by the experiment's hardcoded recovery scripts.
+
+Validation: offline guard truth-table and source-wiring tests; existing native
+GRPO restore tests are extended but local collection is blocked by missing
+`ray` in the lightweight development environment. Full distributed reload remains a
+native gate. **Portable rollout persistence is not implemented:** it needs real
+tokens/logprobs/masks/rewards/routes, weight lineage/age validation, atomic group
+completion and checkpoint-aligned consumption records, plus whole-Ray-cluster
+kill/restart tests. Increasing retries or enabling replay loading is not that fix.

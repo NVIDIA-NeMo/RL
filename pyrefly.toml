@@ -23,6 +23,7 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "nemo_rl/utils/replay_checkpoint.py",
   "tools/super_rl/*.py",
   # TODO: enable these once we have 100 correctness
   #"nemo_rl/**/*.py",

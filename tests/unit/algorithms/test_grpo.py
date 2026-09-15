@@ -169,6 +169,7 @@ def test_restore_async_replay_buffer_checkpoint_by_default(
             replay_buffer,
             str(tmp_path),
             load_replay_buffer=load_replay_buffer,
+            ray_reference_transport=False,
             num_prompts_per_step=32,
             current_training_step=4,
             max_age_steps=1,
@@ -192,6 +193,7 @@ def test_restore_async_replay_buffer_checkpoint_can_be_disabled(tmp_path):
         replay_buffer,
         str(tmp_path),
         load_replay_buffer=False,
+        ray_reference_transport=False,
         num_prompts_per_step=32,
         current_training_step=4,
         max_age_steps=1,
@@ -209,12 +211,29 @@ def test_restore_async_replay_buffer_checkpoint_missing_file(tmp_path):
         replay_buffer,
         str(tmp_path),
         load_replay_buffer=None,
+        ray_reference_transport=False,
         num_prompts_per_step=32,
         current_training_step=4,
         max_age_steps=1,
     )
 
     assert metadata is None
+    replay_buffer.load_from_path.remote.assert_not_called()
+
+
+@pytest.mark.parametrize("load_replay_buffer", [True, None])
+def test_ray_replay_restore_rejected_before_actor_call(tmp_path, load_replay_buffer):
+    replay_buffer = MagicMock()
+    with pytest.raises(ValueError, match="load_replay_buffer=false"):
+        _maybe_restore_async_replay_buffer_checkpoint(
+            replay_buffer,
+            str(tmp_path),
+            load_replay_buffer=load_replay_buffer,
+            ray_reference_transport=True,
+            num_prompts_per_step=32,
+            current_training_step=4,
+            max_age_steps=2,
+        )
     replay_buffer.load_from_path.remote.assert_not_called()
 
 
