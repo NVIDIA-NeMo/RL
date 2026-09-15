@@ -7,6 +7,10 @@ directory, a pipeline fork, or a collection of job-specific overlays.
 Keep the existing problem-by-problem commits; do not squash them while they
 are under review. See [the fix index](super-rl-stability.md) for their scope.
 
+For the regular s120 experiment, see [the reviewed gold-alignment changes](super-rl-gold-alignment.md),
+including context/serving budgets, output penalties, explicit startup grace and
+the unvalidated CP4/EP16 topology candidate.
+
 **Current status: configuration separation and read-only checks, not a turnkey
 training release.** Kimi's reward/cumulative-budget integration and Gym's judge
 failure contract remain implementation blockers. Submodule closure and native

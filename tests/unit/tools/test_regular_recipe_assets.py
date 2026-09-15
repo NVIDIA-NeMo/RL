@@ -5,7 +5,7 @@ from pathlib import Path
 
 from omegaconf import OmegaConf
 
-from nemo_rl.utils.config import register_omegaconf_resolvers
+from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
 
 def test_local_deepseek_uses_native_reasoning_effort_name():
@@ -105,3 +105,55 @@ def test_regular_smoke_enables_all_gold_output_penalties():
     assert penalties.token_ids.unwanted == [2]
     assert penalties.token_ids.think_open == 12
     assert penalties.token_ids.think_close == 13
+
+
+def test_parallelism_candidate_changes_only_reviewed_topology_fields():
+    root = Path(__file__).resolve().parents[3]
+    experiments = root / "training_configs/super_rl/experiments"
+    control = load_config(experiments / "regular_s120_smoke.yaml")
+    candidate = load_config(experiments / "regular_s120_cp4_ep16.yaml")
+    assert candidate.policy.megatron_cfg.context_parallel_size == 4
+    assert candidate.policy.megatron_cfg.expert_model_parallel_size == 16
+    assert candidate.cluster.segment_size == 16
+    control.policy.megatron_cfg.context_parallel_size = 4
+    control.policy.megatron_cfg.expert_model_parallel_size = 16
+    control.cluster.segment_size = 16
+    # Compare without resolving private model/data/root environment variables.
+    assert OmegaConf.to_container(candidate, resolve=False) == OmegaConf.to_container(
+        control, resolve=False
+    )
+
+
+def test_parallelism_candidate_fits_static_learner_group_constraints():
+    root = Path(__file__).resolve().parents[3]
+    config = load_config(
+        root / "training_configs/super_rl/experiments/regular_s120_cp4_ep16.yaml"
+    )
+    assert config.policy.generation.colocated.enabled is False
+    generation_nodes = config.policy.generation.colocated.resources.num_nodes
+    learner_nodes = config.cluster.num_nodes - generation_nodes
+    world_size = learner_nodes * config.cluster.gpus_per_node
+    megatron = config.policy.megatron_cfg
+    attention_model_size = (
+        megatron.tensor_model_parallel_size
+        * megatron.context_parallel_size
+        * megatron.pipeline_model_parallel_size
+    )
+    expert_model_size = (
+        megatron.expert_tensor_parallel_size
+        * megatron.expert_model_parallel_size
+        * megatron.pipeline_model_parallel_size
+    )
+    assert learner_nodes == 16
+    assert world_size == 64
+    assert world_size % attention_model_size == 0
+    assert world_size % expert_model_size == 0
+    assert world_size // attention_model_size == 4
+    assert world_size // expert_model_size == 4
+    assert (
+        config.policy.train_global_batch_size
+        % (config.policy.train_micro_batch_size * (world_size // attention_model_size))
+        == 0
+    )
+    assert learner_nodes % config.cluster.segment_size == 0
+    assert config.cluster.num_nodes % config.cluster.segment_size == 0

@@ -1,0 +1,14 @@
+# Gold-aligned parallelism candidate, not a native-validated replacement.
+# Keep the CP16/EP32 regular smoke as the control. Memory and throughput must
+# be measured with identical data, output budgets and effective worker settings.
+defaults: regular_s120_smoke.yaml
+
+policy:
+  megatron_cfg:
+    context_parallel_size: 4
+    expert_model_parallel_size: 16
+
+cluster:
+  # The outer Slurm Ray component must also request --segment=16.
+  # Check actual rank/node/NVLink-domain placement after Ray initialization.
+  segment_size: 16
