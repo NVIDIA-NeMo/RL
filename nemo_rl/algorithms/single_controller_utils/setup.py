@@ -76,7 +76,7 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     resolve_latest_snapshot,
     validate_bootstrap_anchor,
 )
-from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.algorithms.utils import check_train_dataloader_not_empty, set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
@@ -1338,6 +1338,12 @@ def setup_single_controller(
         collate_fn=rl_collate_fn,
         drop_last=True,
         num_workers=data_config["num_workers"],
+    )
+    check_train_dataloader_not_empty(
+        dataloader,
+        dataset=dataset,
+        batch_size=algo_cfg.num_prompts_per_step,
+        batch_size_source="num_prompts_per_step",
     )
     if recovery_checkpoint_path is not None:
         print(

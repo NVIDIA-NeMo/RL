@@ -25,7 +25,11 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.loss import PreferenceLossFn
-from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
+from nemo_rl.algorithms.utils import (
+    check_train_dataloader_not_empty,
+    maybe_pad_last_batch,
+    set_seed,
+)
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import preference_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
@@ -196,6 +200,12 @@ def setup(
         ),
         drop_last=True,
         num_workers=data_config["num_workers"],
+    )
+    check_train_dataloader_not_empty(
+        train_dataloader,
+        dataset=train_dataset,
+        batch_size=policy_config["train_global_batch_size"],
+        batch_size_source="policy.train_global_batch_size",
     )
 
     if last_checkpoint_path is not None:

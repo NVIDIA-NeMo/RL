@@ -2446,3 +2446,30 @@ def test_load_opd_full_teacher_lm_heads_rejects_two_teacher_checkpoints(monkeypa
             },
         )
     trainer.worker_group.run_all_workers_single_data.assert_not_called()
+
+
+def test_setup_rejects_empty_train_dataloader(patched_factories):
+    """#921 guard: a dataloader that would yield zero batches fails setup
+    before any cluster or trainer construction."""
+    patched_factories["dataloader"].__len__ = MagicMock(return_value=0)
+
+    with pytest.raises(ValueError, match="zero batches") as excinfo:
+        setup_single_controller(_make_master_config(), MagicMock(pad_token_id=0))
+
+    assert "num_prompts_per_step" in str(excinfo.value)
+    patched_factories["_build_clusters"].assert_not_called()
+
+
+def test_setup_accepts_dataset_equal_to_batch_size(patched_factories):
+    """A dataset exactly num_prompts_per_step long yields one batch and passes."""
+    patched_factories["setup_response_data"].return_value = (
+        list(range(4)),  # _make_master_config() default num_prompts_per_step
+        None,
+        patched_factories["env_handles"],
+        {},
+    )
+    patched_factories["dataloader"].__len__ = MagicMock(return_value=1)
+
+    setup_single_controller(_make_master_config(), MagicMock(pad_token_id=0))
+
+    patched_factories["_build_trainer"].assert_called_once()

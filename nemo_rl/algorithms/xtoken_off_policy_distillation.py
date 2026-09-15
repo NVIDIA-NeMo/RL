@@ -48,7 +48,7 @@ from nemo_rl.algorithms.loss.loss_functions import (
     CrossTokenizerDistillationLossConfig,
     CrossTokenizerDistillationLossFn,
 )
-from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.algorithms.utils import check_train_dataloader_not_empty, set_seed
 from nemo_rl.algorithms.x_token import TokenAligner
 from nemo_rl.algorithms.x_token.utils import (
     assert_teacher_student_batch_grid,
@@ -337,6 +337,12 @@ def setup(
         # via max_num_epochs respawn+re-init all workers at every epoch
         # boundary, which dominates step time when the epoch is short.
         persistent_workers=data_config["num_workers"] > 0,
+    )
+    check_train_dataloader_not_empty(
+        train_dataloader,
+        dataset=train_dataset,
+        batch_size=distillation_config["num_prompts_per_step"],
+        batch_size_source="distillation.num_prompts_per_step",
     )
     if last_checkpoint_path:
         load_dataloader_state(train_dataloader, last_checkpoint_path, data_config)
