@@ -226,8 +226,6 @@ def test_offloaded_death_is_detected_at_recovery(
     assert len(tree.processes) > 1, "No GPU descendants captured before server death"
     if kill_actor:
         ray.kill(victim)
-        with pytest.raises(RayActorError):
-            ray.get(victim.is_alive.remote(), timeout=CHECK_TIMEOUT)
     else:
         ray.get(victim.shutdown.remote(), timeout=CHECK_TIMEOUT)
 
@@ -241,7 +239,11 @@ def test_offloaded_death_is_detected_at_recovery(
         timeout=90,
     )
     print(f"Server teardown reaped {tree.url}: processes={tree.processes}")
-    if not kill_actor:
+    if kill_actor:
+        # ray.kill() queues termination; a fresh RPC must follow the exit barrier.
+        with pytest.raises(RayActorError):
+            ray.get(victim.is_alive.remote(), timeout=CHECK_TIMEOUT)
+    else:
         # The actor remains callable after graceful server shutdown, proving
         # that checking only Ray actor death misses a dead child process.
         assert ray.get(victim.is_alive.remote(), timeout=CHECK_TIMEOUT) is False
