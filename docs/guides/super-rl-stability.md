@@ -59,8 +59,6 @@ Local budget tests cover cumulative calls, exhaustion, invalid usage, per-call
 over-return and the disabled default. Native all-route and effective-request
 tests remain required before declaring the runtime validated.
 
-## What was intentionally not copied
-
 ## Judge failures are not incorrect policy answers
 
 The pinned Math and equivalence judges map missing verdicts to `False`, and Gym's
