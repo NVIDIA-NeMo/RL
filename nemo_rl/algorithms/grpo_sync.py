@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import gc
 import os
-import time
 import warnings
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -80,10 +79,7 @@ from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.observability import (
-    MetricsDataPlaneClient,
-    cluster_step_metrics,
     log_step_metrics,
-    merge_snapshots,
     metrics_never_fail_the_step,
 )
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS, DP_TRAIN_FIELDS
@@ -405,45 +401,24 @@ def _log_data_plane_metrics_impl(
 ) -> None:
     """Log this step's data-plane cost. No-op unless observability is enabled.
 
-    Prefers the cluster view -- the driver's counters plus every policy
-    worker's, summed -- and falls back to the driver's alone when the
-    fan-out reaches only one process. Reported one way or the other, never
-    both, so there is a single answer to "what did the data plane cost"
-    rather than two that disagree by roughly the DP degree.
+    The policy computes both the metrics and the scope they cover, because
+    the baselines they are differenced against belong with the client whose
+    counters they baseline. This end owns only where they are logged.
 
     The prefix names the scope because the two differ by a lot: the driver
     issues about one op of each kind per step while the bulk traffic is the
     workers' per-DP-rank ``get_samples``. Note that even the cluster view
     omits the rollout actor, which builds its own client and is not on the
     worker group -- so ``kv_first_write`` is not in these totals.
-
-    The previous reading lives on the policy, alongside the client whose
-    counters it differences, rather than in module state: two trainers in
-    one process would otherwise interleave one ``prev`` and produce
-    negative deltas.
     """
-    client = getattr(policy, "dp_client", None)
-    if not isinstance(client, MetricsDataPlaneClient):
+    get_metrics = getattr(policy, "get_data_plane_step_metrics", None)
+    if not callable(get_metrics):
+        return  # not a data-plane policy
+    result = get_metrics(total_step_time)
+    if result is None:
         return  # observability disabled -> plain adapter
-
-    collect = getattr(policy, "collect_data_plane_snapshots", None)
-    collect_started = time.perf_counter()
-    snapshots = collect() if callable(collect) else []
-    if len(snapshots) > 1:
-        merged = merge_snapshots(snapshots)
-        # The fan-out is part of what observability costs, and the larger
-        # part: omitting it reported a twentieth of the real bill.
-        collect_ms = (time.perf_counter() - collect_started) * 1e3
-        prev = getattr(policy, "_prev_cluster_snapshot", {})
-        metrics = cluster_step_metrics(
-            merged, prev, total_step_time, collect_ms=collect_ms
-        )
-        policy._prev_cluster_snapshot = merged
-        log_step_metrics(logger, metrics, step, "cluster")
-    else:
-        # Single process, or the fan-out could not reach the workers.
-        metrics = client.get_step_metrics(total_step_time)
-        log_step_metrics(logger, metrics, step, "driver")
+    metrics, scope = result
+    log_step_metrics(logger, metrics, step, scope)
 
 
 def grpo_train_sync(

@@ -133,7 +133,7 @@ from nemo_rl.data.multimodal_utils import present_multimodal_fields
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.observability import (
-    MetricsDataPlaneClient,
+    is_metrics_client,
     log_step_metrics,
     metrics_never_fail_the_step,
 )
@@ -1776,14 +1776,15 @@ class SingleControllerActor:
         same as a data plane that cost nothing.
 
         Driver scope only, and the prefix says so. This client issues the
-        advantage stage's get plus the post-train clear; the bulk traffic is
+        advantage stage's get, the put that writes the advantages back, and
+        the post-train clear; the bulk traffic is
         the trainer and generation workers' own clients, in their own
         processes with their own counters, so ``comm_volume_mb`` here is well
         under what the job actually moved. ``grpo_sync`` gets a cluster view by
         fanning out over its policy worker group; this loop has no such group to
         fan out over, so driver scope is all there is here.
         """
-        if not isinstance(self._dp_client, MetricsDataPlaneClient):
+        if not is_metrics_client(self._dp_client):
             return  # observability disabled -> plain adapter
 
         metrics = self._dp_client.get_step_metrics(total_step_time)

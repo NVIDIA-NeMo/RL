@@ -6320,9 +6320,9 @@ def test_grpo_train_sync_logs_data_plane_metrics_before_committing_the_step(
     is reachable from the observability unit tests because those never build a
     trainer:
 
-    * ``policy.dp_client`` not being a ``MetricsDataPlaneClient`` -- the
-      isinstance guard in ``_log_data_plane_metrics`` then returns early and the
-      whole feature is a no-op that logs nothing and raises nothing;
+    * ``policy.dp_client`` not being a ``MetricsDataPlaneClient`` --
+      ``get_data_plane_step_metrics`` then returns ``None`` and the whole
+      feature is a no-op that logs nothing and raises nothing;
     * the wrong scope being chosen, so the driver's one-op-per-step counters get
       reported as if they were the cluster's bulk traffic, or vice versa;
     * the call landing after ``log_metrics(..., step_finished=True)`` -- wandb
@@ -6333,6 +6333,7 @@ def test_grpo_train_sync_logs_data_plane_metrics_before_committing_the_step(
 
     from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
     from nemo_rl.data_plane.observability import MetricsDataPlaneClient
+    from nemo_rl.models.policy.tq_policy import TQPolicy
 
     policy = mock_grpo_components["policy"]
     client = MetricsDataPlaneClient(NoOpDataPlaneClient())
@@ -6348,10 +6349,13 @@ def test_grpo_train_sync_logs_data_plane_metrics_before_committing_the_step(
     policy.collect_data_plane_snapshots = MagicMock(
         return_value=[client.snapshot() for _ in range(n_snapshots)]
     )
-    # A real policy has no such attribute on the first step, so the production
-    # ``getattr(policy, "_prev_cluster_snapshot", {})`` yields {}. A MagicMock
-    # would auto-create one and hand arithmetic a mock instead of a dict.
-    policy._prev_cluster_snapshot = {}
+    policy._prev_dp_snapshot = {}
+    # The real method, bound to the mock: choosing the scope is what this test
+    # is about, and a MagicMock's auto-created stand-in would return a mock
+    # rather than make that choice. Everything it reads is set explicitly here.
+    policy.get_data_plane_step_metrics = TQPolicy.get_data_plane_step_metrics.__get__(
+        policy
+    )
 
     master_config = mock_grpo_components["master_config"]
     master_config.data_plane = {"enabled": True}
