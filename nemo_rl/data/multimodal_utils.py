@@ -69,6 +69,7 @@ _PLACEHOLDER_STYLE_PROCESSOR_NAMES = frozenset(
     {
         "NemotronNanoVLV2Processor",
         "NemotronH_Nano_Omni_Reasoning_V3Processor",
+        "NemotronH_Omni_Reasoning_V3Processor",
     }
 )
 
@@ -165,7 +166,8 @@ def row_shapes_key(field: str) -> str:
 # Keys inside the :func:`row_shapes_key` tag value. A plain dict rather than a
 # record because ``tags`` rides TQ's own serializer.
 ROW_GEOMETRY_SHAPES = "shapes"
-ROW_GEOMETRY_PAD = "pad"
+ROW_GEOMETRY_PREPROCESS_MODE = "preprocess_mode"
+ROW_GEOMETRY_PREPROCESS_KWARGS = "preprocess_kwargs"
 
 
 # Include-list of multimodal fields every forward-running dispatch (logprob
@@ -199,7 +201,7 @@ def multimodal_row_tags(
     contents.
 
     Carries ``shapes`` (per-row, and unrecoverable once ``to_wire`` flattens)
-    and ``pad`` (the field's policy flag). Deliberately *not* a pad target: the
+    and the field's preprocessing settings. Deliberately *not* a pad target: the
     width padding lands at is scratch that the model discards -- mcore crops it
     via ``imgs_sizes`` before patchification, and the AutoModel path rejects
     mixed-resolution batches outright -- so each consumer pads to its own view
@@ -223,11 +225,11 @@ def multimodal_row_tags(
                 "sample_ids, so a disagreement here would pair one sample's "
                 "pixels with another's shapes."
             )
-        pad = value.pad_to_max_shape
         for row, row_shapes in enumerate(shapes):
             tags[row][row_shapes_key(key)] = {
                 ROW_GEOMETRY_SHAPES: row_shapes,
-                ROW_GEOMETRY_PAD: pad,
+                ROW_GEOMETRY_PREPROCESS_MODE: value.preprocess_mode,
+                ROW_GEOMETRY_PREPROCESS_KWARGS: dict(value.preprocess_kwargs),
             }
     # ``None`` rather than ``B`` empty dicts: a text-only run has no packed
     # field, and an all-empty tags list would still be pickled on every
@@ -272,14 +274,78 @@ def reassemble_packed_multimodal(
                 + ". to_wire flattens each row, so without the companion the "
                 "true per-segment shapes are unrecoverable."
             )
-        # Indexed, not ``.get``-with-default: a producer-side rename of either
-        # key must fail here rather than silently restore ``pad=False``, which
-        # changes what ``as_tensor`` hands the vision encoder.
+        # Indexed, not ``.get``-with-default: a producer-side rename of any key
+        # must fail here rather than silently change what ``as_tensor`` hands
+        # the vision encoder.
         fields[key] = PackedTensor.from_wire(
             value,
             [[] if r is None else r[ROW_GEOMETRY_SHAPES] for r in rows],  # type: ignore[union-attr]
-            pad_to_max_shape=bool(present[0][ROW_GEOMETRY_PAD]),
+            preprocess_mode=present[0][ROW_GEOMETRY_PREPROCESS_MODE],
+            preprocess_kwargs=present[0][ROW_GEOMETRY_PREPROCESS_KWARGS],
         )
+
+
+def _patchify_segments(segments: list[torch.Tensor], *, patch_dim: int) -> torch.Tensor:
+    """Cut pixel segments into vision patches and pack them into one sequence.
+
+    Each ``[N, channels, H, W]`` segment is processed at its native resolution
+    into a ``[C_i, P²]`` block, where ``C_i`` is its spatial patch count and
+    ``P²`` is the flattened patch width (``channels * patch_dim**2``). Blocks
+    are packed along dimension zero, then a batch dimension is added to produce
+    ``[1, total_C, P²]``. Already-patchified segments in that final layout are
+    accepted so repeated materialization is safe.
+    """
+    if patch_dim <= 0:
+        raise ValueError(f"patch_dim must be positive, got {patch_dim}")
+
+    flattened: list[torch.Tensor] = []
+    for segment in segments:
+        if segment.ndim == 3:
+            if segment.shape[0] != 1:
+                raise ValueError(
+                    "Pre-patchified segments must be [1, total_C, P²], "
+                    f"got shape {tuple(segment.shape)}"
+                )
+            flattened.append(segment[0])
+            continue
+        if segment.ndim != 4:
+            raise ValueError(
+                "patchify expects [N, C, H, W] pixel segments or "
+                "[1, total_C, P²] pre-patchified segments, got shape "
+                f"{tuple(segment.shape)}"
+            )
+        count, channels, height, width = segment.shape
+        if height % patch_dim or width % patch_dim:
+            raise ValueError(
+                f"Image size {(height, width)} is not divisible by "
+                f"patch_dim={patch_dim}"
+            )
+        rows = height // patch_dim
+        columns = width // patch_dim
+        flattened.append(
+            segment.reshape(count, channels, rows, patch_dim, columns, patch_dim)
+            .permute(0, 2, 4, 1, 3, 5)
+            .reshape(count * rows * columns, channels * patch_dim * patch_dim)
+        )
+
+    widths = {tensor.shape[-1] for tensor in flattened}
+    if len(widths) != 1:
+        raise ValueError(
+            f"patchify produced mismatched P² widths {sorted(widths)}; "
+            "the segments do not share a channel count"
+        )
+    return torch.cat(flattened, dim=0).unsqueeze(0).contiguous()
+
+
+def _shared_preprocess_spec(
+    from_packed_tensors: list["PackedTensor"],
+) -> dict[str, Any]:
+    """Return the preprocessing setting shared by every input."""
+    first = from_packed_tensors[0]._preprocess_spec
+    assert all(
+        packed_tensor._preprocess_spec == first for packed_tensor in from_packed_tensors
+    ), "All packed tensors must have the same preprocess setting"
+    return first
 
 
 class PackedTensor:
@@ -325,7 +391,8 @@ class PackedTensor:
         tensors: Union[torch.Tensor, list[Optional[torch.Tensor]], list[None]],
         dim_to_pack: int,
         *,
-        pad_to_max_shape: bool = False,
+        preprocess_mode: Optional[str] = None,
+        preprocess_kwargs: Optional[dict[str, Any]] = None,
         _row_offsets: Optional[list[int]] = None,
         _segment_indices: Optional[list[int]] = None,
         _segment_provenance: Optional[list[bytes]] = None,
@@ -336,8 +403,10 @@ class PackedTensor:
             tensors: A tensor or list of per-item tensors. List entries may be
                 ``None`` for items without this modality.
             dim_to_pack: Dimension along which ``as_tensor`` concatenates.
-            pad_to_max_shape: Pad every non-packing dimension to its batch-wide
-                maximum before concatenating. All tensors must have the same rank.
+            preprocess_mode: Optional preprocessing applied by ``as_tensor``.
+                Supported values are ``pad_to_max_shape`` and ``patchify``.
+            preprocess_kwargs: Extra arguments for ``preprocess_mode``. Patchify
+                accepts ``patch_dim``.
         """
         assert tensors is not None, "Input tensors to PackedTensor cannot be None"
 
@@ -354,7 +423,13 @@ class PackedTensor:
                 f"Unsupported type for input tensors to PackedTensor: {type(tensors)}"
             )
         self.dim_to_pack = dim_to_pack
-        self.pad_to_max_shape = pad_to_max_shape
+        if preprocess_mode not in (None, "pad_to_max_shape", "patchify"):
+            raise ValueError(
+                f"Unknown preprocess_mode {preprocess_mode!r}; expected None, "
+                "'pad_to_max_shape', or 'patchify'"
+            )
+        self.preprocess_mode = preprocess_mode
+        self.preprocess_kwargs: dict[str, Any] = dict(preprocess_kwargs or {})
         if (_row_offsets is None) != (_segment_indices is None):
             raise ValueError(
                 "_row_offsets and _segment_indices must either both be set or both be None"
@@ -394,6 +469,14 @@ class PackedTensor:
         self.__dict__.setdefault("_row_offsets", None)
         self.__dict__.setdefault("_segment_indices", None)
         self.__dict__.setdefault("_segment_provenance", None)
+
+    @property
+    def _preprocess_spec(self) -> dict[str, Any]:
+        """Return keyword arguments that preserve preprocessing in a copy."""
+        return {
+            "preprocess_mode": self.preprocess_mode,
+            "preprocess_kwargs": self.preprocess_kwargs,
+        }
 
     @property
     def deduplication_enabled(self) -> bool:
@@ -445,7 +528,7 @@ class PackedTensor:
             copied = PackedTensor(
                 [deepcopy(item, memo) for item in self.tensors],
                 self.dim_to_pack,
-                pad_to_max_shape=self.pad_to_max_shape,
+                **self._preprocess_spec,
             )
         else:
             copied = PackedTensor(
@@ -455,7 +538,7 @@ class PackedTensor:
                     else [deepcopy(item, memo) for item in self.tensors]
                 ),
                 self.dim_to_pack,
-                pad_to_max_shape=self.pad_to_max_shape,
+                **self._preprocess_spec,
                 _row_offsets=(
                     list(self._row_offsets) if self._row_offsets is not None else None
                 ),
@@ -488,12 +571,21 @@ class PackedTensor:
         if len(non_none_tensors) == 0:
             return None
 
+        if self.preprocess_mode == "patchify":
+            if self.dim_to_pack != 0:
+                raise ValueError(
+                    f"patchify requires dim_to_pack=0, got {self.dim_to_pack}"
+                )
+            return _patchify_segments(non_none_tensors, **self.preprocess_kwargs).to(
+                device
+            )
+
         # Some multimodal processors produce a different shape per prompt,
         # such as dynamic-resolution images, variable-frame videos, or audio
         # feature sequences. Concatenation already permits the packing
         # dimension to vary; when explicitly requested, pad every other
         # dimension to the largest size in the batch.
-        if self.pad_to_max_shape:
+        if self.preprocess_mode == "pad_to_max_shape":
             ranks = {tensor.ndim for tensor in non_none_tensors}
             if len(ranks) != 1:
                 raise ValueError(
@@ -599,7 +691,7 @@ class PackedTensor:
                 else list(self.tensors)
             ),
             self.dim_to_pack,
-            pad_to_max_shape=self.pad_to_max_shape,
+            **self._preprocess_spec,
             _row_offsets=(
                 list(self._row_offsets) if self._row_offsets is not None else None
             ),
@@ -626,7 +718,7 @@ class PackedTensor:
             return PackedTensor(
                 tensors,
                 self.dim_to_pack,
-                pad_to_max_shape=self.pad_to_max_shape,
+                **self._preprocess_spec,
             )
 
         physical_remap: dict[int, int] = {}
@@ -650,7 +742,7 @@ class PackedTensor:
         return PackedTensor(
             tensors,
             self.dim_to_pack,
-            pad_to_max_shape=self.pad_to_max_shape,
+            **self._preprocess_spec,
             _row_offsets=row_offsets,
             _segment_indices=segment_indices,
             _segment_provenance=(
@@ -672,7 +764,7 @@ class PackedTensor:
             return cls(
                 [],
                 other.dim_to_pack,
-                pad_to_max_shape=other.pad_to_max_shape,
+                **other._preprocess_spec,
                 _row_offsets=[0] * (num_rows + 1),
                 _segment_indices=[],
                 _segment_provenance=[],
@@ -681,7 +773,7 @@ class PackedTensor:
             return cls(
                 [],
                 other.dim_to_pack,
-                pad_to_max_shape=other.pad_to_max_shape,
+                **other._preprocess_spec,
                 _row_offsets=[0],
                 _segment_indices=[],
                 _segment_provenance=None,
@@ -689,7 +781,7 @@ class PackedTensor:
         return cls(
             [None] * num_rows,
             other.dim_to_pack,
-            pad_to_max_shape=other.pad_to_max_shape,
+            **other._preprocess_spec,
         )
 
     @classmethod
@@ -718,10 +810,7 @@ class PackedTensor:
         assert len(set(dim_to_packs)) == 1, (
             "All packed tensors must have the same dim_to_pack"
         )
-        pad_to_max_shapes = [batch.pad_to_max_shape for batch in from_packed_tensors]
-        assert len(set(pad_to_max_shapes)) == 1, (
-            "All packed tensors must have the same pad_to_max_shape setting"
-        )
+        preprocess_spec = _shared_preprocess_spec(from_packed_tensors)
         if any(
             packed_tensor.deduplication_enabled
             or packed_tensor._row_offsets is not None
@@ -762,7 +851,7 @@ class PackedTensor:
             return cls(
                 tensors,
                 dim_to_packs[0],
-                pad_to_max_shape=pad_to_max_shapes[0],
+                **preprocess_spec,
                 _row_offsets=row_offsets,
                 _segment_indices=segment_indices,
                 _segment_provenance=provenances,
@@ -776,7 +865,7 @@ class PackedTensor:
         return cls(
             tensors,
             dim_to_pack,
-            pad_to_max_shape=pad_to_max_shapes[0],
+            **preprocess_spec,
         )
 
     @classmethod
@@ -800,7 +889,7 @@ class PackedTensor:
         return cls(
             concatenated.tensors,
             concatenated.dim_to_pack,
-            pad_to_max_shape=concatenated.pad_to_max_shape,
+            **concatenated._preprocess_spec,
             _row_offsets=[0, len(concatenated._segment_indices)],
             _segment_indices=concatenated._segment_indices,
             _segment_provenance=concatenated._segment_provenance,
@@ -836,10 +925,7 @@ class PackedTensor:
         assert len(set(dim_to_packs)) == 1, (
             "All packed tensors must have the same dim_to_pack"
         )
-        pad_to_max_shapes = [batch.pad_to_max_shape for batch in from_packed_tensors]
-        assert len(set(pad_to_max_shapes)) == 1, (
-            "All packed tensors must have the same pad_to_max_shape setting"
-        )
+        preprocess_spec = _shared_preprocess_spec(from_packed_tensors)
         if any(
             packed_tensor.deduplication_enabled
             or packed_tensor._row_offsets is not None
@@ -854,7 +940,7 @@ class PackedTensor:
         return cls(
             tensors,
             from_packed_tensors[0].dim_to_pack,
-            pad_to_max_shape=pad_to_max_shapes[0],
+            **preprocess_spec,
         )
 
     # ── Wire encoding (data-plane roundtrip) ─────────────────────────
@@ -948,12 +1034,12 @@ class PackedTensor:
         #     storage, and TQ never falls back to the deprecated strided layout.
         #   * The per-row concat is 1-D, so it cannot raise on segments whose
         #     trailing dims differ -- which is what previously forced
-        #     ``pad_to_max_shape`` to pad *before* the concat.
+        #     preprocessing to pad *before* the concat.
         #
         # The true shapes travel beside the payload (see the returned
         # ``shapes``) because TQ derives ``per_sample_shapes`` from what it is
         # handed: give it flat rows and it records flat lengths. Padding still
-        # happens for ``pad_to_max_shape`` values, but in worker memory at use
+        # happens for values that need it, but in worker memory at use
         # time via :meth:`as_tensor`, not on the wire.
         shapes = self._shapes_of(row_segments)
         # ``reshape(-1)`` on contiguous processor output is a view, so the
@@ -990,7 +1076,8 @@ class PackedTensor:
         nested: torch.Tensor,
         shapes: list[list[list[int]]],
         *,
-        pad_to_max_shape: bool = False,
+        preprocess_mode: Optional[str] = None,
+        preprocess_kwargs: Optional[dict[str, Any]] = None,
     ) -> Optional["PackedTensor"]:
         """Reconstruct from the value produced by :meth:`to_wire`.
 
@@ -1009,10 +1096,9 @@ class PackedTensor:
         reconstructs as legacy does: ``as_tensor`` returns ``None`` and
         ``logical_segment_counts_by_row`` reports 0 rather than 1.
 
-        ``pad_to_max_shape`` is restored onto the rebuilt value as a flag, not
+        The preprocessing settings are restored onto the rebuilt value, not
         materialized. Segments come back at their true shapes and stay separate
-        via the CSR row map, so nothing is padded or concatenated here;
-        :meth:`as_tensor` pads at use time.
+        via the CSR row map; :meth:`as_tensor` preprocesses at use time.
 
         Mirrors :meth:`to_wire`; both assume ``dim_to_pack=0``.
         """
@@ -1053,7 +1139,8 @@ class PackedTensor:
         return cls(
             segments_flat,  # type: ignore[arg-type]
             dim_to_pack=0,
-            pad_to_max_shape=pad_to_max_shape,
+            preprocess_mode=preprocess_mode,
+            preprocess_kwargs=preprocess_kwargs,
             _row_offsets=row_offsets,
             _segment_indices=list(range(len(segments_flat))),
         )
@@ -1071,7 +1158,7 @@ def encode_multimodal_for_wire(
     Payload only. Per-token fields ride rectangular; packed fields ride as one
     flattened ``torch.jagged`` value. The geometry :meth:`PackedTensor.from_wire`
     needs to undo that flattening -- per-row segment shapes plus the
-    ``pad_to_max_shape`` flag -- is minted separately by
+    preprocessing settings -- is minted separately by
     :func:`multimodal_row_tags` and shipped on ``KVBatchMeta.tags``. TQ cannot
     derive it, because it reads ``per_sample_shapes`` off the flattened rows it
     is handed.
@@ -1181,9 +1268,14 @@ def get_dim_to_pack_along(processor, key: str) -> int:
     return 0
 
 
-def get_pad_to_max_shape(processor: Any, key: str) -> bool:
-    """Return whether a processor input must pad non-packing dimensions."""
-    return uses_image_placeholder(processor) and key == "pixel_values"
+def get_preprocess(processor: Any, key: str) -> dict[str, Any]:
+    """Return materialization preprocessing for one processor input."""
+    if uses_image_placeholder(processor) and key == "pixel_values":
+        return {
+            "preprocess_mode": "patchify",
+            "preprocess_kwargs": {"patch_dim": 16},
+        }
+    return {"preprocess_mode": None, "preprocess_kwargs": {}}
 
 
 def extract_multimodal_model_inputs(
@@ -1245,7 +1337,7 @@ def extract_multimodal_model_inputs(
         extracted[key] = PackedTensor(
             value,
             dim_to_pack=get_dim_to_pack_along(processor, key),
-            pad_to_max_shape=get_pad_to_max_shape(processor, key),
+            **get_preprocess(processor, key),
         )
 
     for key in ("token_type_ids", "mm_token_type_ids"):
@@ -1385,13 +1477,13 @@ def media_sources_equal(
 def _materialize_ragged_pixel_values(
     processed: dict[str, Any], processor: Any
 ) -> dict[str, Any]:
-    """Fold a ragged per-image ``pixel_values`` list into one padded tensor.
+    """Fold a ragged per-image ``pixel_values`` list into one patch sequence.
 
     Processors with dynamic per-image resolution return a list of CHW tensors
     rather than a stacked batch. ``imgs_sizes`` is derived from the *unpadded*
     shapes first, since those exact sizes are what the projector slices with;
-    padding happens afterwards so downstream sees the single tensor its
-    torch.Tensor contract expects.
+    patchification happens afterwards so downstream sees the single tensor its
+    ``torch.Tensor`` contract expects.
     """
     processed = dict(processed)
     pixel_values = processed.get("pixel_values")
@@ -1417,7 +1509,7 @@ def _materialize_ragged_pixel_values(
 def _stack_ragged_pixel_values(
     processed: dict[str, Any], tiles: list[torch.Tensor], processor: Any
 ) -> None:
-    """Derive imgs_sizes from unpadded shapes, then pad into one tensor."""
+    """Derive image sizes, then patchify native-shape tiles into one tensor."""
     if uses_image_placeholder(processor) and "imgs_sizes" not in processed:
         processed["imgs_sizes"] = torch.tensor(
             [[int(item.shape[-2]), int(item.shape[-1])] for item in tiles],
@@ -1426,7 +1518,8 @@ def _stack_ragged_pixel_values(
     stacked = PackedTensor(
         [item.unsqueeze(0) for item in tiles],
         dim_to_pack=0,
-        pad_to_max_shape=True,
+        preprocess_mode="patchify",
+        preprocess_kwargs={"patch_dim": 16},
     ).as_tensor()
     assert stacked is not None
     processed["pixel_values"] = stacked
