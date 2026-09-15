@@ -12,7 +12,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 GYM = ROOT / "3rdparty/Gym-workspace/Gym"
-BASE = "749432dc5de23b8eeb3d044c80350a7c0ae9a03f"
+BASE = "749432dc5de23b8eeb3d044c80350a7c0ae9a03f"  # pragma: allowlist secret
 RELATIVE = "resources_servers/competitive_coding_challenges/ccc_eval.py"
 
 

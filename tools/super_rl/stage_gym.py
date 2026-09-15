@@ -22,7 +22,8 @@ import shutil
 import subprocess
 import tarfile
 
-GYM_BASE = "749432dc5de23b8eeb3d044c80350a7c0ae9a03f"
+# Immutable Git object ID, not a credential.
+GYM_BASE = "749432dc5de23b8eeb3d044c80350a7c0ae9a03f"  # pragma: allowlist secret
 ASSETS = Path(__file__).resolve().parent
 
 

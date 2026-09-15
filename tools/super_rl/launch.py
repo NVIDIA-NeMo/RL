@@ -36,12 +36,13 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_ROOT = REPO_ROOT / "training_configs/super_rl"
-PR3941_BASE = "ca06137460b7e2edcaf6f1fd67ddbda5ddd6b8e2"
+# Immutable Git object IDs, not credentials.
+PR3941_BASE = "ca06137460b7e2edcaf6f1fd67ddbda5ddd6b8e2"  # pragma: allowlist secret
 PINNED_SUBMODULES = {
-    "3rdparty/Automodel-workspace/Automodel": "24b47e856263d313b942f0ed666c63fff83306b4",
-    "3rdparty/Gym-workspace/Gym": "749432dc5de23b8eeb3d044c80350a7c0ae9a03f",
-    "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge": "3961f399ef181bca689de8e984110b85c4df00fe",
-    "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM": "f2f0f7bfd88fcb1243df55275988d6af52daea35",
+    "3rdparty/Automodel-workspace/Automodel": "24b47e856263d313b942f0ed666c63fff83306b4",  # pragma: allowlist secret
+    "3rdparty/Gym-workspace/Gym": "749432dc5de23b8eeb3d044c80350a7c0ae9a03f",  # pragma: allowlist secret
+    "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge": "3961f399ef181bca689de8e984110b85c4df00fe",  # pragma: allowlist secret
+    "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM": "f2f0f7bfd88fcb1243df55275988d6af52daea35",  # pragma: allowlist secret
 }
 NATIVE_GATES = (
     "Kimi reward shaping and cumulative budgets across CoT/TIR/SciCode",
