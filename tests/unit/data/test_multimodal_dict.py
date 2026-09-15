@@ -23,8 +23,10 @@ from nemo_rl.data.multimodal_utils import (
     PER_TOKEN_MULTIMODAL_FIELDS,
     PackedTensor,
     encode_multimodal_for_wire,
+    get_preprocess,
     multimodal_row_tags,
     reassemble_packed_multimodal,
+    uses_image_placeholder,
 )
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
@@ -53,6 +55,28 @@ def test_packed_data_basic():
     # Test as_tensor
     expected_tensor = torch.cat([tensor1, tensor2], dim=0)
     assert torch.equal(batch.as_tensor(), expected_tensor)
+
+
+@pytest.mark.parametrize(
+    "processor_name",
+    [
+        "NemotronNanoVLV2Processor",
+        "NemotronH_Nano_Omni_Reasoning_V3Processor",
+        "NemotronH_Omni_Reasoning_V3Processor",
+    ],
+)
+def test_placeholder_processors_use_patchify(processor_name):
+    processor = type(processor_name, (), {})()
+
+    assert uses_image_placeholder(processor)
+    assert get_preprocess(processor, "pixel_values") == {
+        "preprocess_mode": "patchify",
+        "preprocess_kwargs": {"patch_dim": 16},
+    }
+    assert get_preprocess(processor, "imgs_sizes") == {
+        "preprocess_mode": None,
+        "preprocess_kwargs": {},
+    }
 
 
 def test_shard_by_batch_size_with_packed_data():
@@ -387,7 +411,7 @@ def test_packedtensor_pads_mixed_dynamic_resolution_images():
     second = 2 * torch.ones(1, 3, 4, 2)
 
     packed = PackedTensor(
-        [first, second], dim_to_pack=0, pad_to_max_shape=True
+        [first, second], dim_to_pack=0, preprocess_mode="pad_to_max_shape"
     ).as_tensor()
 
     assert packed.shape == (2, 3, 4, 4)
@@ -412,7 +436,7 @@ def test_dynamic_resolution_padding_is_cropped_before_radio_patchification():
     padded = PackedTensor(
         [small, large],
         dim_to_pack=0,
-        pad_to_max_shape=True,
+        preprocess_mode="pad_to_max_shape",
     ).as_tensor()
     # Use nonzero garbage so this test cannot pass merely because F.pad uses zero.
     padded[0, :, 32:, :] = 123
@@ -461,7 +485,7 @@ def test_packedtensor_pad_to_max_shape_supports_audio_and_video(
     second = 2 * torch.ones(second_shape)
 
     packed = PackedTensor(
-        [first, second], dim_to_pack=0, pad_to_max_shape=True
+        [first, second], dim_to_pack=0, preprocess_mode="pad_to_max_shape"
     ).as_tensor()
 
     assert packed.shape == expected_shape
@@ -476,7 +500,7 @@ def test_pad_to_max_shape_rejects_mismatched_ranks():
         PackedTensor(
             [torch.ones(1, 3, 4), torch.ones(1, 3)],
             dim_to_pack=0,
-            pad_to_max_shape=True,
+            preprocess_mode="pad_to_max_shape",
         ).as_tensor()
 
 
@@ -485,7 +509,7 @@ def test_pad_to_max_shape_rejects_out_of_range_dim():
         PackedTensor(
             [torch.ones(1, 3, 4), torch.ones(2, 3, 4)],
             dim_to_pack=3,
-            pad_to_max_shape=True,
+            preprocess_mode="pad_to_max_shape",
         ).as_tensor()
 
 
@@ -493,23 +517,126 @@ def test_pad_to_max_shape_supports_negative_pack_dim():
     packed = PackedTensor(
         [torch.ones(2, 3, 1), 2 * torch.ones(4, 3, 1)],
         dim_to_pack=-3,
-        pad_to_max_shape=True,
+        preprocess_mode="pad_to_max_shape",
     ).as_tensor()
 
     assert packed.shape == (6, 3, 1)
 
 
-def test_slice_preserves_pad_to_max_shape_flag():
+def test_slice_preserves_preprocess_spec():
     packed = PackedTensor(
         [torch.ones(1, 3, 2, 4), 2 * torch.ones(1, 3, 4, 2)],
         dim_to_pack=0,
-        pad_to_max_shape=True,
+        preprocess_mode="pad_to_max_shape",
+        preprocess_kwargs={},
     )
 
     sliced = packed.slice([0, 1])
 
-    assert sliced.pad_to_max_shape is True
+    assert sliced.preprocess_mode == "pad_to_max_shape"
+    assert sliced.preprocess_kwargs == {}
     assert sliced.as_tensor().shape == (2, 3, 4, 4)
+
+
+def test_packedtensor_rejects_unknown_preprocess_mode():
+    with pytest.raises(ValueError, match="Unknown preprocess_mode"):
+        PackedTensor(
+            torch.ones(1, 3, 4, 4),
+            dim_to_pack=0,
+            preprocess_mode="jagged",
+        )
+
+
+def test_patchify_packs_mixed_resolutions_without_padding():
+    packed = PackedTensor(
+        [torch.ones(1, 3, 32, 32), 2 * torch.ones(1, 3, 64, 32)],
+        dim_to_pack=0,
+        preprocess_mode="patchify",
+        preprocess_kwargs={"patch_dim": 16},
+    ).as_tensor()
+
+    assert packed.shape == (1, 12, 768)
+    assert torch.all(packed[0, :4] == 1)
+    assert torch.all(packed[0, 4:] == 2)
+
+
+def test_patchify_preserves_pixel_order_within_a_patch():
+    image = torch.arange(3 * 2 * 2, dtype=torch.float32).reshape(1, 3, 2, 2)
+
+    packed = PackedTensor(
+        [image],
+        dim_to_pack=0,
+        preprocess_mode="patchify",
+        preprocess_kwargs={"patch_dim": 2},
+    ).as_tensor()
+
+    assert packed.shape == (1, 1, 12)
+    torch.testing.assert_close(packed[0, 0], image.reshape(12))
+
+
+def test_patchify_accepts_already_patchified_segments():
+    raw = PackedTensor(
+        [torch.ones(1, 3, 32, 32)],
+        dim_to_pack=0,
+        preprocess_mode="patchify",
+        preprocess_kwargs={"patch_dim": 16},
+    )
+
+    once = raw.as_tensor()
+    assert once is not None
+    twice = PackedTensor(
+        [once],
+        dim_to_pack=0,
+        preprocess_mode="patchify",
+        preprocess_kwargs={"patch_dim": 16},
+    ).as_tensor()
+
+    torch.testing.assert_close(once, twice)
+
+
+def test_patchify_survives_flattened_concat():
+    first = PackedTensor(
+        [torch.ones(1, 3, 32, 32)],
+        dim_to_pack=0,
+        preprocess_mode="patchify",
+        preprocess_kwargs={"patch_dim": 16},
+    )
+    second = PackedTensor(
+        [2 * torch.ones(1, 3, 64, 32)],
+        dim_to_pack=0,
+        preprocess_mode="patchify",
+        preprocess_kwargs={"patch_dim": 16},
+    )
+
+    flattened = PackedTensor.flattened_concat([first, second])
+
+    assert len(flattened) == 2
+    assert flattened.as_tensor().shape == (1, 12, 768)
+    torch.testing.assert_close(
+        flattened.as_tensor(), PackedTensor.concat([first, second]).as_tensor()
+    )
+
+
+def test_patchify_rejects_indivisible_image_size():
+    with pytest.raises(ValueError, match="not divisible by patch_dim=16"):
+        PackedTensor(
+            [torch.ones(1, 3, 30, 32)],
+            dim_to_pack=0,
+            preprocess_mode="patchify",
+            preprocess_kwargs={"patch_dim": 16},
+        ).as_tensor()
+
+
+def test_concat_rejects_mixed_preprocess_settings():
+    padded = PackedTensor(
+        torch.ones(1, 3, 4, 4),
+        dim_to_pack=0,
+        preprocess_mode="pad_to_max_shape",
+    )
+    plain = PackedTensor(torch.ones(1, 3, 4, 4), dim_to_pack=0)
+
+    with pytest.raises(AssertionError, match="same preprocess setting"):
+        PackedTensor.concat([padded, plain])
 
 
 def test_packedtensor_dedup_uses_provenance_not_prompt_position():
@@ -559,12 +686,12 @@ def test_packedtensor_dedup_expands_before_dynamic_shape_padding():
     first = PackedTensor(
         torch.ones(1, 1, 2),
         dim_to_pack=0,
-        pad_to_max_shape=True,
+        preprocess_mode="pad_to_max_shape",
     ).enable_deduplication()
     second = PackedTensor(
         2 * torch.ones(1, 2, 1),
         dim_to_pack=0,
-        pad_to_max_shape=True,
+        preprocess_mode="pad_to_max_shape",
     ).enable_deduplication()
 
     packed = PackedTensor.concat([first, deepcopy(first), second])
@@ -632,25 +759,6 @@ def test_packedtensor_compact_dim_one_slice_empty_and_cloudpickle_roundtrip():
     assert empty.as_tensor() is None
 
 
-def test_packedtensor_unpickles_pre_deduplication_state():
-    tensor = torch.tensor([[1.0], [2.0]])
-    legacy = PackedTensor.__new__(PackedTensor)
-    legacy.__dict__ = {
-        "tensors": [tensor],
-        "dim_to_pack": 0,
-        "pad_to_max_shape": False,
-    }
-
-    restored = cloudpickle.loads(cloudpickle.dumps(legacy, protocol=5))
-
-    assert not restored.deduplication_enabled
-    assert len(restored) == 1
-    assert sum(restored.logical_segment_counts_by_row()) == 1
-    torch.testing.assert_close(restored.as_tensor(), tensor)
-    restored.enable_deduplication()
-    assert restored.deduplication_enabled
-
-
 def test_packedtensor_empty_legacy_rows_survive_copy_pickle_and_slice():
     legacy = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0)
     empty = PackedTensor.empty_rows_like(legacy, 0)
@@ -708,7 +816,7 @@ def test_to_wire_does_not_pad_segments_before_concat_under_dedup():
     packed = PackedTensor(
         [torch.ones(1, 3, 2, 4), 2 * torch.ones(1, 3, 4, 2)],
         dim_to_pack=0,
-        pad_to_max_shape=True,
+        preprocess_mode="pad_to_max_shape",
         _row_offsets=[0, 2],
         _segment_indices=[0, 1],
     )
@@ -721,7 +829,9 @@ def test_to_wire_does_not_pad_segments_before_concat_under_dedup():
     assert [t.numel() for t in nested.unbind()] == [48]
     assert shapes == [[[1, 3, 2, 4], [1, 3, 4, 2]]]
 
-    restored = PackedTensor.from_wire(nested, shapes, pad_to_max_shape=True).as_tensor()
+    restored = PackedTensor.from_wire(
+        nested, shapes, preprocess_mode="pad_to_max_shape"
+    ).as_tensor()
     assert torch.equal(restored, expected)
 
 
@@ -758,7 +868,9 @@ def test_to_wire_does_not_materialize_pad_to_max_shape():
     # Same rank, different trailing dims — nemotron-omni style tiles.
     first = torch.ones(1, 3, 2, 4)
     second = 2 * torch.ones(2, 3, 4, 2)
-    packed = PackedTensor([first, second], dim_to_pack=0, pad_to_max_shape=True)
+    packed = PackedTensor(
+        [first, second], dim_to_pack=0, preprocess_mode="pad_to_max_shape"
+    )
 
     nested, shapes = packed.to_wire()
     rows = list(nested.unbind())
@@ -769,7 +881,9 @@ def test_to_wire_does_not_materialize_pad_to_max_shape():
 
     # Padding is reapplied on read, reproducing the pre-wire as_tensor().
     assert torch.equal(
-        PackedTensor.from_wire(nested, shapes, pad_to_max_shape=True).as_tensor(),
+        PackedTensor.from_wire(
+            nested, shapes, preprocess_mode="pad_to_max_shape"
+        ).as_tensor(),
         packed.as_tensor(),
     )
 
@@ -836,7 +950,8 @@ def test_encode_multimodal_for_wire_packed_emits_single_nested_entry():
         [[3, 4]],
         [[1, 4]],
     ]
-    assert tags[0]["pixel_values__row_shapes"]["pad"] is False
+    assert tags[0]["pixel_values__row_shapes"]["preprocess_mode"] is None
+    assert tags[0]["pixel_values__row_shapes"]["preprocess_kwargs"] == {}
 
 
 def test_multimodal_row_tags_does_not_encode_the_payload():
@@ -882,13 +997,20 @@ def test_reassemble_packed_multimodal_raises_without_companion():
 
 
 def test_reassemble_packed_multimodal_round_trips_with_companion():
-    packed = PackedTensor([torch.ones(3, 4), torch.ones(1, 4)], dim_to_pack=0)
+    packed = PackedTensor(
+        [torch.ones(1, 3, 32, 32), torch.ones(1, 3, 16, 32)],
+        dim_to_pack=0,
+        preprocess_mode="patchify",
+        preprocess_kwargs={"patch_dim": 16},
+    )
     nested, _ = packed.to_wire()
     tags = multimodal_row_tags({"pixel_values": packed}, len(packed))
 
     fields = {"pixel_values": nested}
     reassemble_packed_multimodal(fields, tags)
 
+    assert fields["pixel_values"].preprocess_mode == "patchify"
+    assert fields["pixel_values"].preprocess_kwargs == {"patch_dim": 16}
     assert torch.equal(fields["pixel_values"].as_tensor(), packed.as_tensor())
 
 
@@ -1034,11 +1156,13 @@ def test_to_wire_carries_mixed_rank_rows():
     load-bearing. Reshaping on read restores the original ranks.
     """
     rows = [torch.ones(1, 3, 2), torch.ones(2, 3)]
-    packed = PackedTensor(list(rows), dim_to_pack=0, pad_to_max_shape=True)
+    packed = PackedTensor(list(rows), dim_to_pack=0, preprocess_mode="pad_to_max_shape")
 
     nested, shapes = packed.to_wire()
     assert [t.numel() for t in nested.unbind()] == [6, 6]
     assert shapes == [[[1, 3, 2]], [[2, 3]]]
 
-    restored = PackedTensor.from_wire(nested, shapes, pad_to_max_shape=True)
+    restored = PackedTensor.from_wire(
+        nested, shapes, preprocess_mode="pad_to_max_shape"
+    )
     assert [tuple(t.shape) for t in restored.tensors] == [(1, 3, 2), (2, 3)]
