@@ -19,7 +19,7 @@ import re
 import uuid
 from collections import defaultdict
 from collections.abc import Sequence
-from copy import deepcopy
+from copy import copy, deepcopy
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -469,6 +469,81 @@ class PackedTensor:
         self.__dict__.setdefault("_row_offsets", None)
         self.__dict__.setdefault("_segment_indices", None)
         self.__dict__.setdefault("_segment_provenance", None)
+
+    def broadcast_parts(
+        self,
+    ) -> tuple[
+        "PackedTensor",
+        list[Optional[tuple[int, ...]]],
+        str,
+        str,
+        list[torch.Tensor],
+    ]:
+        """Split semantic state from physical data for replica broadcast.
+
+        The tensor-free header retains every other instance attribute, so new
+        semantic state does not require a parallel broadcast schema update.
+        """
+        tensors = [tensor for tensor in self.tensors if tensor is not None]
+        dtype = tensors[0].dtype if tensors else torch.uint8
+        source_device = tensors[0].device if tensors else torch.device("cpu")
+        if any(tensor.dtype != dtype for tensor in tensors):
+            raise TypeError("PackedTensor segments must have one dtype for broadcast.")
+        if any(tensor.device != source_device for tensor in tensors):
+            raise TypeError(
+                "PackedTensor segments must be on one device for broadcast."
+            )
+        header = copy(self)
+        header.tensors = []
+        header.preprocess_kwargs = dict(self.preprocess_kwargs)
+        header._row_offsets = (
+            None if self._row_offsets is None else list(self._row_offsets)
+        )
+        header._segment_indices = (
+            None if self._segment_indices is None else list(self._segment_indices)
+        )
+        header._segment_provenance = (
+            None if self._segment_provenance is None else list(self._segment_provenance)
+        )
+        tensor_attributes = [
+            name
+            for name, value in header.__dict__.items()
+            if isinstance(value, torch.Tensor)
+        ]
+        if tensor_attributes:
+            raise TypeError(
+                "PackedTensor broadcast header must be tensor-free; give attributes "
+                f"{tensor_attributes} their own payload."
+            )
+        shapes = [
+            None if tensor is None else tuple(tensor.shape) for tensor in self.tensors
+        ]
+        return header, shapes, str(dtype), str(source_device), tensors
+
+    def rebuild_from_broadcast_parts(
+        self,
+        shapes: list[Optional[tuple[int, ...]]],
+        payload: torch.Tensor,
+    ) -> "PackedTensor":
+        """Attach received physical data to a header from ``broadcast_parts``."""
+        tensors: list[Optional[torch.Tensor]] = []
+        offset: int = 0
+        for shape in shapes:
+            if shape is None:
+                tensors.append(None)
+                continue
+            numel: int = 1
+            for dimension in shape:
+                numel *= dimension
+            tensors.append(payload.narrow(0, offset, numel).view(shape))
+            offset += numel
+        if offset != payload.numel():
+            raise ValueError(
+                f"PackedTensor broadcast shapes describe {offset} elements, "
+                f"but the payload has {payload.numel()}."
+            )
+        self.tensors = tensors
+        return self
 
     @property
     def _preprocess_spec(self) -> dict[str, Any]:
