@@ -660,8 +660,9 @@ class GenerationInterface(ABC):
             timeout_s: Maximum time to wait for engines to resume; None waits indefinitely.
 
         Returns:
-            True if every engine resumed; False when the backend has no native resume
-            support. Backends with native support raise when resuming fails.
+            True if every surviving engine resumed; False when the backend has no
+            native resume support. With fleet health, confirmed dead engines may be
+            excluded if enough survivors remain. Other resume failures raise.
         """
         _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False

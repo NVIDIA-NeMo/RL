@@ -3489,18 +3489,19 @@ class SingleControllerActor:
             # exhaustion check for the rest of the run.
             self._recovering_from_refit = False
 
-    async def _recover_from_failed_refit(self, failure: BaseException) -> None:
+    async def _recover_from_failed_refit(
+        self, failure: BaseException, *, refit_started: bool
+    ) -> None:
         """Drop whatever stopped participating, rebuild the communicator, allow a retry.
 
         Two failures arrive here and they are not the same event:
 
-        ``RefitAborted`` -- a rank went silent *inside* the collective and a worker's
-        watchdog broke it. Every engine that was receiving is left holding a mix of old
-        and new weights, so none of them may serve until a refit completes.
+        ``RefitAborted`` -- pausing timed out, or a rank went silent inside the
+        collective and a watchdog broke it. Only the latter leaves receiving engines
+        holding partial weights; those cannot serve until a refit completes.
 
-        ``RayActorError`` -- the collective finished and a shard died in the epilogue,
-        before its RPC returned. Nothing is partial; the survivors have complete weights.
-        Left uncaught this killed a run whose data transfer had *already succeeded*.
+        ``RayActorError`` -- a shard died before transfer, or in the epilogue after
+        the collective finished. Nothing is partial; survivors have complete weights.
 
         Both need the same repair, because both leave a communicator that no longer
         matches the fleet, and in the abort case no communicator at all.
@@ -3519,10 +3520,9 @@ class SingleControllerActor:
         # 1. Establish who is actually gone, now, rather than on the probe's clock.
         await self._probe_generation_fleet()
 
-        # 2. Only an abort leaves partial weights behind. Marking survivors stale after
-        #    a completed broadcast would pull a healthy fleet out of service over a
-        #    transfer that succeeded.
-        if isinstance(failure, RefitAborted):
+        # 2. Only an interrupted transfer leaves partial weights. A pause failure
+        #    before the transfer, like a death after it completed, does not.
+        if refit_started and isinstance(failure, RefitAborted):
             for shard_idx in self._gen_fleet.serving_shards():
                 self._gen_fleet.mark_weights_partial(shard_idx)
 
@@ -4560,6 +4560,8 @@ class SingleControllerActor:
     # and have Ray deliver it -- seconds, not minutes. If this fires first we lose their
     # diagnosis and report only "the refit never came back", which is true but less useful.
     _REFIT_UNWIND_GRACE_S = 60.0
+    # Pause/resume remain bounded even when the collective watchdog is disabled.
+    _GENERATION_CONTROL_TIMEOUT_S = 360.0
 
     def _refit_await_budget_s(self) -> Optional[float]:
         """How long to wait for the refit before giving up, or None to wait forever."""
@@ -4711,7 +4713,10 @@ class SingleControllerActor:
 
         clear_cache = self._async_cfg.recompute_kv_cache_after_weight_updates
         timeout_s = self._refit_await_budget_s()
+        if timeout_s is None:
+            timeout_s = self._GENERATION_CONTROL_TIMEOUT_S
         generation_paused_for_refit = False
+        refit_started = False
         print("⏸️ Requesting generation pause before refit", flush=True)
         try:
             generation_paused_for_refit = await asyncio.to_thread(
@@ -4724,6 +4729,7 @@ class SingleControllerActor:
                     f"   {len(self._inflight_by_group_id)} in-flight rollout group(s) paused",
                     flush=True,
                 )
+            refit_started = True
             await self._sync_weights_within(kv_scales, "first")
         except (RefitAborted, RayActorError) as failure:
             # DETECT AND FAIL FAST, because this one cannot be recovered from.
@@ -4750,7 +4756,9 @@ class SingleControllerActor:
                 )
                 raise
             with self._recovery_window():
-                await self._recover_from_failed_refit(failure)
+                await self._recover_from_failed_refit(
+                    failure, refit_started=refit_started
+                )
                 participants = self._refit_participants()
                 # A restarted engine may have joined the rebuilt membership without
                 # receiving the initial pause, even if it reuses the same shard index.

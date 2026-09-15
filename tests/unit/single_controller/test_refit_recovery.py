@@ -168,9 +168,11 @@ def test_failed_pause_recovers_and_pauses_survivors_before_refit(failure):
     ctrl, monitor, sync = _make_controller(failure)
     ctrl._async_cfg.generation_fleet_health.refit_timeout_s = 1.0
     events = []
+    serving_at_pause = []
 
     def pause(**kwargs):
         events.append("pause")
+        serving_at_pause.append(monitor.serving_shards())
         if events == ["pause"]:
             raise failure
         assert monitor.absent_shards() == [0]
@@ -182,6 +184,7 @@ def test_failed_pause_recovers_and_pauses_survivors_before_refit(failure):
     asyncio.run(ctrl._sync_weights())
 
     assert events == ["pause", "pause", "sync"]
+    assert serving_at_pause == [[0, 1], [1]]
     assert ctrl._gen.pause_generation_for_refit.call_args_list == [
         mock.call(clear_cache=False, timeout_s=61.0),
         mock.call(clear_cache=False, timeout_s=61.0),
@@ -194,7 +197,7 @@ def test_failed_pause_recovers_and_pauses_survivors_before_refit(failure):
 @pytest.mark.parametrize("failure", [ABORTED, ray.exceptions.ActorDiedError()])
 @pytest.mark.parametrize("with_monitor", [False, True])
 def test_unrecoverable_pause_stops_before_weight_transfer(failure, with_monitor):
-    ctrl, _, sync = _make_controller(failure, with_monitor=with_monitor)
+    ctrl, monitor, sync = _make_controller(failure, with_monitor=with_monitor)
     ctrl._gen.pause_generation_for_refit.side_effect = failure
 
     with pytest.raises(type(failure)):
@@ -202,11 +205,28 @@ def test_unrecoverable_pause_stops_before_weight_transfer(failure, with_monitor)
 
     assert ctrl._gen.pause_generation_for_refit.call_count == (2 if with_monitor else 1)
     assert sync.sync_calls == 0
+    if monitor is not None:
+        assert monitor.serving_shards() == [1]
+        assert monitor.snapshot()[1].weight_version == 0
     ctrl._gen.resume_generation_after_refit.assert_not_called()
     assert not ctrl._rollout_permitted.is_set()
 
 
-@pytest.mark.parametrize("failure", [ABORTED, ray.exceptions.ActorDiedError()])
+def test_retry_pause_failure_preserves_partial_weights() -> None:
+    ctrl, monitor, sync = _make_controller(ABORTED)
+    ctrl._gen.pause_generation_for_refit.side_effect = [True, ABORTED]
+
+    with pytest.raises(RefitAborted):
+        asyncio.run(ctrl._sync_weights())
+
+    assert sync.sync_calls == 1
+    assert monitor.state_of(1) is ShardState.STALE
+    assert monitor.serving_shards() == []
+    assert monitor.snapshot()[1].weight_version == 0
+    assert not ctrl._rollout_permitted.is_set()
+
+
+@pytest.mark.parametrize("failure", [ABORTED, RuntimeError("resume failed")])
 def test_failed_resume_keeps_dispatch_closed_without_retrying_refit(failure):
     ctrl, _, sync = _make_controller(failure)
     sync.sync_weights = MagicMock()
@@ -217,9 +237,9 @@ def test_failed_resume_keeps_dispatch_closed_without_retrying_refit(failure):
 
     sync.sync_weights.assert_called_once_with(kv_scales=None)
     ctrl._gen.pause_generation_for_refit.assert_called_once_with(
-        clear_cache=False, timeout_s=None
+        clear_cache=False, timeout_s=360.0
     )
-    ctrl._gen.resume_generation_after_refit.assert_called_once_with(timeout_s=None)
+    ctrl._gen.resume_generation_after_refit.assert_called_once_with(timeout_s=360.0)
     ctrl._rollout_manager.resume_request_deadlines.assert_not_called()
     assert not ctrl._rollout_permitted.is_set()
 
@@ -266,8 +286,8 @@ class TestDeathInsideTheCollective:
 
         assert sync.sync_calls == 2
         assert ctrl._gen.pause_generation_for_refit.call_args_list == [
-            mock.call(clear_cache=False, timeout_s=None),
-            mock.call(clear_cache=False, timeout_s=None),
+            mock.call(clear_cache=False, timeout_s=360.0),
+            mock.call(clear_cache=False, timeout_s=360.0),
         ]
         assert sync_calls_when_resumed == [2]
 
@@ -301,7 +321,7 @@ class TestDeathInsideTheCollective:
         assert sync.absent_at_retry == [0]
         assert monitor.state_of(2) is ShardState.HEALTHY
         assert monitor.snapshot()[2].weight_version == ctrl._trainer_version
-        ctrl._gen.resume_generation_after_refit.assert_called_once_with(timeout_s=None)
+        ctrl._gen.resume_generation_after_refit.assert_called_once_with(timeout_s=360.0)
 
     def test_survivors_are_pulled_from_service_then_given_back(self):
         """Partial weights must not serve -- and must not be stranded either.
