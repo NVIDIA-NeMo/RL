@@ -47,7 +47,9 @@ token-prefix discontinuity raises an error. When set to `true`, NeMo RL stops
 at the first trainable turn whose prompt does not preserve the tokens already
 seen, drops that turn and the remaining tail, and keeps the preceding
 contiguous prefix with the episode reward. This option cannot be used with
-`policy.router_replay.enabled: true`.
+`policy.router_replay.enabled: true` or `token_capture.enabled: true`.
+Truncation applies only to the legacy token-echo path; token-capture receipt
+mode bypasses that path and retains its own integrity checks.
 
 When `log_nemo_gym_full_result_tables` is `false`, NeMo RL does not construct
 the per-agent `full_result` Tables. This prevents those payloads from entering

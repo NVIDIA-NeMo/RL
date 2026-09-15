@@ -256,7 +256,9 @@ def setup(
 
     enable_nemo_gym = bool(env_configs) and should_use_nemo_gym(master_config)
     if enable_nemo_gym:
-        runtime_options, _ = split_nemo_gym_runtime_options(dict(env_configs["nemo_gym"]))
+        runtime_options, _ = split_nemo_gym_runtime_options(
+            dict(env_configs["nemo_gym"])
+        )
         validate_nemo_gym_runtime_options(
             runtime_options,
             enable_router_replay=router_replay_enabled(policy_config),

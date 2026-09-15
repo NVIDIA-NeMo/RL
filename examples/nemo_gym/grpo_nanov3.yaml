@@ -335,7 +335,7 @@ env:
     port_range_high: 5999
     # Opt in to keeping the contiguous prefix when a later turn's token prefix
     # diverges. The retained prefix uses the episode reward. Incompatible with
-    # policy.router_replay.enabled.
+    # policy.router_replay.enabled and token_capture.enabled.
     truncate_noncontiguous_episodes: false
     # Optional substrings/tags used to flag malformed assistant turns for advantage
     # penalties (see grpo.invalid_tool_call_advantage / malformed_thinking_advantage).
