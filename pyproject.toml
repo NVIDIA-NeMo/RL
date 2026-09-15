@@ -115,6 +115,14 @@ dependencies = [
   "mooncake-transfer-engine-cuda13==0.3.11.post1 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
 ]
 
+# vLLM loads plugins in this group via load_general_plugins() in EVERY process it
+# starts, including the spawned EngineCore subprocess where RayExecutorV2 builds the
+# inner-worker runtime_env -- which an in-process monkey-patch cannot reach. This
+# installs the deferred-capture nsight config for the inner vLLM TP workers so nsys
+# profiling produces per-rank traces on the v2 executor.
+[project.entry-points."vllm.general_plugins"]
+nemo_rl_nsight_inner = "nemo_rl.utils.vllm_nsight_plugin:register_nsight_inner_worker_profiling"
+
 
 [project.optional-dependencies]
 fsdp = [

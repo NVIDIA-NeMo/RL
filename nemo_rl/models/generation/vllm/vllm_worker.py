@@ -835,7 +835,10 @@ class BaseVllmGenerationWorker:
         tracing until start_gpu_profiling() triggers cudaProfilerStart() on each
         internal worker via collective_rpc.
         """
-        from nemo_rl.utils.nsys import NRL_NSYS_PROFILE_STEP_RANGE
+        from nemo_rl.utils.nsys import (
+            NRL_NSYS_EXTRA_OPTIONS,
+            NRL_NSYS_PROFILE_STEP_RANGE,
+        )
 
         nsight_config = {
             "t": "cuda,cudnn,cublas,nvtx",
@@ -844,9 +847,13 @@ class BaseVllmGenerationWorker:
             "s": "none",
             "capture-range": "cudaProfilerApi",
             "capture-range-end": "repeat",
-            "cuda-graph-trace": "node",
         }
+        # User-supplied flags from NRL_NSYS_EXTRA_OPTIONS override the defaults (e.g.
+        # t=cuda-sw,nvtx on platforms where the HW cuda target crashes at cudaProfilerStart).
+        if NRL_NSYS_EXTRA_OPTIONS:
+            nsight_config.update(NRL_NSYS_EXTRA_OPTIONS)
 
+        # vLLM v1 Ray executor (VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0).
         try:
             from vllm.v1.executor.ray_executor import RayDistributedExecutor
         except ImportError:
@@ -860,6 +867,12 @@ class BaseVllmGenerationWorker:
             return ray_remote_kwargs
 
         RayDistributedExecutor._configure_ray_workers_use_nsight = _patched_configure
+
+        # vLLM v2 Ray executor (default for vLLM >= 0.25) is built inside the vLLM
+        # EngineCore subprocess (spawn -> pristine vLLM import), so an in-process
+        # monkey-patch here cannot reach it. Its inner-worker nsight config is instead
+        # installed by the `vllm.general_plugins` entry point in
+        # nemo_rl.utils.vllm_nsight_plugin, which vLLM loads inside that subprocess.
 
     def _get_raw_spec_counters(self) -> dict[str, float | list[float]]:
         """Get speculative decoding metrics from the vLLM engine.
