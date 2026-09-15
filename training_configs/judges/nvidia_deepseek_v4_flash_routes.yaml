@@ -1,0 +1,29 @@
+# NeMo RL config fragment: inherit AFTER the training recipe in defaults.
+# Does not replace config_paths: append the separate provider YAML to the
+# recipe's complete existing list as documented in nemo-gym-integration.md.
+# This fragment only configures the two named resource servers, not ns_tools,
+# lc_judge, nl2bash_judge, or any other judge consumer.
+env:
+  nemo_gym:
+    math_with_judge:
+      resources_servers:
+        math_with_judge:
+          judge_model_server:
+            type: responses_api_models
+            name: deepseek_v4_flash_judge_model
+          judge_responses_create_params:
+            input: []
+            max_output_tokens: 8192
+            temperature: 0
+          should_use_judge: true
+    equivalence_llm_judge:
+      resources_servers:
+        equivalence_llm_judge:
+          judge_model_server:
+            type: responses_api_models
+            name: deepseek_v4_flash_judge_model
+          judge_responses_create_params:
+            input: []
+            max_output_tokens: 8192
+            temperature: 0
+          judge_endpoint_max_concurrency: 256

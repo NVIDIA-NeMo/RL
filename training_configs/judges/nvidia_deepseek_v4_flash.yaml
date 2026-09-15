@@ -1,0 +1,15 @@
+# Pure NeMo Gym config: load through env.nemo_gym.config_paths, NOT through
+# NeMo RL defaults. This keeps API-key resolution out of the training config.
+# See docs/design-docs/nemo-gym-integration.md#hosted-deepseek-v4-flash-judge.
+deepseek_v4_flash_judge_model:
+  responses_api_models:
+    inference_provider:
+      entrypoint: app.py
+      base_url: https://inference-api.nvidia.com/v1
+      model: nvidia/deepseek-ai/deepseek-v4-flash
+      api_key: ${oc.env:NVIDIA_API_KEY}
+      uses_reasoning_parser: true
+      num_workers: 1
+      num_concurrent_requests: 256
+      extra_body:
+        reasoning_effort: medium
