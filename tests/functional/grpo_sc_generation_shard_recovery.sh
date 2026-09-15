@@ -19,6 +19,7 @@
 #   bash tests/functional/grpo_sc_generation_shard_recovery.sh
 #   NUM_GPUS=8 bash tests/functional/grpo_sc_generation_shard_recovery.sh
 #   REFIT_TRANSPORT=nccl_reshard bash tests/functional/grpo_sc_generation_shard_recovery.sh
+#   RESTART_DEAD_SHARDS=true bash tests/functional/grpo_sc_generation_shard_recovery.sh
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 PROJECT_ROOT=$(realpath "$SCRIPT_DIR"/../..)
@@ -96,6 +97,10 @@ fi
 # those handoffs is a chance to pass on a GPU that is still being reclaimed.
 GPU_WAIT_S=${GPU_WAIT_S:-120}
 GPU_SETTLE_S=${GPU_SETTLE_S:-60}
+# Separate from GPU_SETTLE_S: this one is how long to wait after the kill before reading
+# the victim's GPU, which is a much shorter question than how long to wait for a whole
+# lane's GPUs to come free.
+REAP_SETTLE_S=${REAP_SETTLE_S:-5}
 
 # GPUs whose used memory is low enough to place a worker on.
 free_gpu_count() {
@@ -258,6 +263,11 @@ fi
 
 HOLD_FILE="$EXP_DIR/hold_refit"
 rm -f "$HOLD_FILE"
+# With restarts on, the assertion changes from "the run survived a smaller fleet" to
+# "the shard came back": the engine is recreated, re-admitted at the next refit, and
+# serves again. That is a strictly stronger claim and exercises code -- worker
+# recreation -- that no unit test can reach.
+RESTART_DEAD_SHARDS=${RESTART_DEAD_SHARDS:-false}
 
 echo "[recovery] $NUM_GPUS GPUs on host -> using $USED_GPUS: $TRAIN_GPUS train, $GEN_GPUS generation (dp_size=$GEN_GPUS), refit_transport=$REFIT_TRANSPORT"
 
@@ -290,12 +300,13 @@ uv run python "$PROJECT_ROOT"/examples/run_grpo_single_controller.py \
     logger.wandb_enabled=false \
     logger.tensorboard_enabled=true \
     logger.monitor_gpus=false \
-    ++async_rl.generation_fleet_health.enabled=true \
-    ++async_rl.generation_fleet_health.probe_interval_s=$PROBE_INTERVAL_S \
-    ++async_rl.generation_fleet_health.unhealthy_threshold=$UNHEALTHY_THRESHOLD \
-    ++async_rl.generation_fleet_health.refit_timeout_s="$REFIT_TIMEOUT_S" \
-    ++async_rl.stall_watchdog.interval_s=30.0 \
-    ++async_rl.stall_watchdog.stall_timeout_s=300.0 \
+    async_rl.generation_fleet_health.enabled=true \
+    async_rl.generation_fleet_health.restart_dead_shards="$RESTART_DEAD_SHARDS" \
+    async_rl.generation_fleet_health.probe_interval_s=$PROBE_INTERVAL_S \
+    async_rl.generation_fleet_health.unhealthy_threshold=$UNHEALTHY_THRESHOLD \
+    async_rl.generation_fleet_health.refit_timeout_s="$REFIT_TIMEOUT_S" \
+    async_rl.stall_watchdog.interval_s=30.0 \
+    async_rl.stall_watchdog.stall_timeout_s=300.0 \
     "$@" \
     > "$RUN_LOG" 2>&1 &
 TRAIN_PID=$!
@@ -474,9 +485,50 @@ fi
 rm -f "$HOLD_FILE"
 KILLED_AT=$(date +%s)
 
+# Did the victim's GPU memory actually come back?
+#
+# The worker is a Ray actor, but the thing holding the CUDA context is its EngineCore --
+# a plain multiprocessing child that SIGKILL orphans, because every cleanup path vLLM and
+# Ray provide runs inside the dying process. The consequence, measured: the victim's GPU
+# stayed pinned at a fraction of its memory free for minutes across every restart attempt,
+# so the replacement engine could not fit and re-admission failed while the survivors
+# carried on.
+#
+# Printed rather than asserted, deliberately. Only the restart variant needs the memory
+# back, so a leak is invisible to every other variant here -- but it is a leak in all of
+# them, and this line is what makes it visible instead of inferred from a pass/fail.
+if command -v nvidia-smi >/dev/null 2>&1; then
+    # Its own name, not GPU_SETTLE_S: that one is already set above for the free-GPU
+    # wait, so `${GPU_SETTLE_S:-5}` never fell back and this line reported a number it
+    # had not slept. This is the one instrument pointed at the EngineCore leak; a wrong
+    # figure here defeats it.
+    sleep "$REAP_SETTLE_S"   # give the raylet's process-group cleanup a moment to land
+    echo "[recovery] GPU free memory ${REAP_SETTLE_S}s after the kill (MiB):"
+    nvidia-smi --query-gpu=index,memory.free,memory.total --format=csv,noheader \
+        | sed 's/^/[recovery]   gpu /'
+fi
+
 echo "[recovery] waiting up to ${COMPLETION_DEADLINE_S}s for the run to finish..."
 FINISHED=0
+# Was the victim ever observed STOPPED while the run was still going?
+#
+# This used to be checked after the run exited -- "never killed, so it must still be
+# there". That stopped being true when this feature turned on per-worker process-group
+# cleanup: teardown SIGKILLs the whole group, and SIGKILL lands on a stopped process, so
+# the reaper legitimately removes the victim before anything can look for it. Job 7011909
+# failed both frozen variants on that check alone, with the abort, the attribution and the
+# exit code all correct.
+#
+# State T while the run is live is the same evidence taken at a moment when it still
+# exists, and it is strictly stronger: absence afterwards only said "something removed
+# it", whereas this says "it really was frozen, not dead". /proc/PID/status rather than
+# /proc/PID/stat because the comm field can contain spaces, which shifts stat's columns.
+VICTIM_SEEN_STOPPED=0
 for _ in $(seq 1 $((COMPLETION_DEADLINE_S / 10))); do
+    if [[ "$FREEZE_VICTIM" == "true" ]] && \
+       [[ "$(awk '/^State:/{print $2}' "/proc/$VICTIM/status" 2>/dev/null)" == "T" ]]; then
+        VICTIM_SEEN_STOPPED=1
+    fi
     if ! kill -0 $TRAIN_PID 2>/dev/null; then FINISHED=1; break; fi
     sleep 10
 done
@@ -576,10 +628,10 @@ if [[ "$KILL_DURING_REFIT" == "true" && "$REFIT_TRANSPORT" == "nccl_reshard" ]];
         echo "[recovery] exist to make this fast; something is waiting that should not be."
         exit 1
     fi
-    if [[ "$FREEZE_VICTIM" == "true" ]] && \
-       [[ "$(awk '{print $3}' "/proc/$VICTIM/stat" 2>/dev/null || echo gone)" == "gone" ]]; then
-        echo "[recovery] FAIL: the frozen victim disappeared; it was not the frozen-rank"
-        echo "[recovery] scenario that failed, so the result does not mean what it says."
+    if [[ "$FREEZE_VICTIM" == "true" && "$VICTIM_SEEN_STOPPED" != "1" ]]; then
+        echo "[recovery] FAIL: the victim was never seen stopped while the run was live, so"
+        echo "[recovery] it was not the frozen-rank scenario that failed and the result does"
+        echo "[recovery] not mean what it says."
         exit 1
     fi
     # The guard has to be REACHED, not merely consistent with the exit code. Without this
@@ -633,11 +685,12 @@ if [[ "$FREEZE_VICTIM" == "true" ]]; then
         grep -E "already suspect|identified as absent|gen_fleet: shard" "$RUN_LOG" | tail -20
         exit 1
     fi
-    # Never killed, so it must still be there -- stopped. If it is gone, something else
-    # reaped it and this was the actor-death path after all.
-    if [[ "$(awk '{print $3}' "/proc/$VICTIM/stat" 2>/dev/null || echo gone)" == "gone" ]]; then
-        echo "[recovery] FAIL: the frozen victim disappeared; it was not the frozen-rank"
-        echo "[recovery] scenario that recovered, so the result does not mean what it says."
+    # Never killed, so it must have been STOPPED while the run was going. Sampled during
+    # the wait rather than looked for afterwards -- see VICTIM_SEEN_STOPPED.
+    if [[ "$VICTIM_SEEN_STOPPED" != "1" ]]; then
+        echo "[recovery] FAIL: the victim was never seen stopped while the run was live, so"
+        echo "[recovery] it was not the frozen-rank scenario that recovered and the result"
+        echo "[recovery] does not mean what it says."
         exit 1
     fi
     echo "[recovery] abort observed:"; grep -m3 "RefitAborted" "$RUN_LOG"
@@ -655,7 +708,7 @@ fi
 
 # Completion alone is not enough: a run that never noticed the death would also exit 0.
 # These pin that the death was seen AND that the communicator was actually rebuilt.
-REBUILD_RE="rebuilding (nccl_reshard )?communicators? without shards"
+REBUILD_RE="rebuilding (nccl_reshard )?communicators? over shards"
 if ! grep -Eq "$REBUILD_RE" "$RUN_LOG"; then
     echo "[recovery] FAIL: job completed but never rebuilt the refit communicator."
     echo "[recovery] Either the death went unnoticed, or a refit was never needed after it."
@@ -676,4 +729,32 @@ uv run tests/check_metrics.py "$JSON_METRICS" \
     "len(data[\"train/reward\"]) == $MAX_STEPS" \
     'max(data["train/reward"]) > 0'
 
-echo "[recovery] PASS: survived a shard loss and completed all $MAX_STEPS steps (refit_transport=$REFIT_TRANSPORT)"
+if [[ "$RESTART_DEAD_SHARDS" == "true" ]]; then
+    # Completion plus one rebuild only proves the fleet shrank and carried on. Coming
+    # back is a different claim and needs its own evidence.
+    if ! grep -q "supervisor: restarting generation shard" "$RUN_LOG"; then
+        echo "[recovery] FAIL: restarts enabled but no restart was ever attempted"
+        grep -E "supervisor|fleet:" "$RUN_LOG" | tail -20; exit 1
+    fi
+    if ! grep -q "supervisor: shard .* back up at" "$RUN_LOG"; then
+        echo "[recovery] FAIL: the restart never produced a working engine"
+        grep -E "supervisor|fleet:" "$RUN_LOG" | tail -20; exit 1
+    fi
+    # Two rebuilds: one dropping the dead shard, one taking the replacement back.
+    REBUILDS=$(grep -Ec "$REBUILD_RE" "$RUN_LOG")
+    if (( REBUILDS < 2 )); then
+        echo "[recovery] FAIL: $REBUILDS rebuild(s); re-admission needs a second one."
+        echo "[recovery] The shard restarted but was never let back into the refit."
+        grep -E "$REBUILD_RE|supervisor|fleet:" "$RUN_LOG" | tail -20; exit 1
+    fi
+    # STALE -> HEALTHY only happens via a completed refit, so this is the end of the
+    # handover rather than just the engine being up.
+    if ! grep -q "stale -> healthy" "$RUN_LOG"; then
+        echo "[recovery] FAIL: the replacement never returned to the serving set"
+        grep -E "fleet: shard" "$RUN_LOG" | tail -20; exit 1
+    fi
+    echo "[recovery] restart + re-admission observed:"
+    grep -E "supervisor:|stale -> healthy" "$RUN_LOG" | head -6
+fi
+
+echo "[recovery] PASS: survived a shard loss and completed all $MAX_STEPS steps (refit_transport=$REFIT_TRANSPORT, restart=$RESTART_DEAD_SHARDS)"
