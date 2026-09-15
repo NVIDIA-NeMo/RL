@@ -80,6 +80,22 @@ This does not add unbounded retries or change native correct/incorrect labels.
 Pure verdict tests and native actor-boundary regression tests are separate; real
 judge responses and retry/failure behavior still require the serving smoke.
 
+Tagged failures also need diagnostic context. The actor emits a bounded
+`actor_tagged_rollout_failure` event and carries the resource-facing agent,
+stable row identity, and judge error into the typed exception. It does not log
+the full prompt, response, or Router Replay payload. Previously the generic
+exception discarded Gym's `_ng_failure_judge_error`, making an HTTP-200 tagged
+failure indistinguishable from other judge failures after collection.
+
+The first integrated regular smoke exposed a separate recovery limitation:
+one tagged failure interrupts the batch stream, unfinished prompt groups are
+regenerated, and exhausted stream retries can release groups for gap-fill.
+Thus the stream retry count is **not** an end-to-end retry bound. This branch
+does not yet implement durable judge-only retry or a total gap-fill retry
+budget. Do not interpret a healthy judge endpoint or growing rollout counts
+as evidence that optimizer updates are progressing. Diagnose repeated tagged
+failures on a small verifier workload before restarting full training.
+
 The equivalence prompt path is relative to the component's working directory,
 `resources_servers/equivalence_llm_judge`, as selected by Gym's `RunHelper`.
 The regular recipe uses `prompt_templates/equivalence_llm_judge.txt`; prepending
