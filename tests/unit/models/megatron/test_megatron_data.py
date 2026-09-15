@@ -429,6 +429,35 @@ class TestProcessMicrobatch:
 
     @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
     @patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=1
+    )
+    def test_process_microbatch_trims_prepacked_batch_padding(
+        self, mock_cp_world, mock_cp_rank
+    ):
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        data = self._prepacked_batch()
+        data["input_ids"] = torch.nn.functional.pad(data["input_ids"], (0, 4))
+        data["token_mask"] = torch.nn.functional.pad(data["token_mask"], (0, 4))
+        data["mtp_loss_mask"] = data["token_mask"].clone()
+        data["media_token_validity_mask"] = data["token_mask"].bool()
+
+        result = process_microbatch(
+            data,
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+        )
+
+        assert result.original_seq_length == 8
+        assert result.input_ids.shape == (1, 8)
+        assert data["input_ids"].shape == (1, 8)
+        assert data["token_mask"].shape == (1, 8)
+        assert result.mtp_loss_mask.shape == (1, 8)
+        assert result.media_token_validity_mask.shape == (1, 8)
+        assert result.packed_seq_params.total_tokens == 8
+
+    @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
+    @patch(
         "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=2
     )
     def test_process_microbatch_cp_slices_each_prepacked_source(

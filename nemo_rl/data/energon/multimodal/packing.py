@@ -98,7 +98,6 @@ def prepare_packed_sft_batch(
     capacities = {pack.pack_capacity for pack in packs}
     if len(capacities) != 1:
         raise ValueError("All physical packs in a batch need one capacity.")
-    capacity = capacities.pop()
     packed_logs: list[list[dict[str, Any]]] = []
     boundaries: list[torch.Tensor | None] = []
     padded_boundaries: list[torch.Tensor | None] = []
@@ -163,22 +162,6 @@ def prepare_packed_sft_batch(
                 )
                 log.append(pad_message)
             combined.extend(log)
-        tail = capacity - sum(pack.source_padded_lengths)
-        if tail:
-            tail_message = {
-                "role": "padding",
-                "token_ids": torch.full(
-                    (tail,), tokenizer.pad_token_id, dtype=token_dtype
-                ),
-                "token_loss_mask": torch.zeros(tail, dtype=torch.float32),
-            }
-            tail_message.update(
-                {
-                    key: torch.zeros((tail, *value.shape[1:]), dtype=value.dtype)
-                    for key, value in templates.items()
-                }
-            )
-            combined.append(tail_message)
         packed_logs.append(combined)
         boundaries.append(
             torch.tensor(
@@ -186,7 +169,6 @@ def prepare_packed_sft_batch(
             )
         )
         padded = [0, *torch.tensor(pack.source_padded_lengths).cumsum(0).tolist()]
-        padded[-1] = capacity
         padded_boundaries.append(torch.tensor(padded, dtype=torch.int32))
         source_ids.append([sample.sample_key for sample in pack.samples])
 

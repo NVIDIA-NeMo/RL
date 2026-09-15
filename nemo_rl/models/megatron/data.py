@@ -422,16 +422,29 @@ def _prepare_prepacked(
     padded = _prepacked_boundary(data, "cu_seqlens_padded", input_ids.device)
     source_lengths = cu[1:] - cu[:-1]
     padded_lengths = padded[1:] - padded[:-1]
+    pack_length = int(padded[-1])
     if (
         cu.shape != padded.shape
         or cu.numel() < 2
         or int(cu[0]) != 0
         or int(padded[0]) != 0
-        or int(padded[-1]) != input_ids.shape[1]
+        or pack_length > input_ids.shape[1]
         or bool((source_lengths <= 0).any())
         or bool((source_lengths > padded_lengths).any())
     ):
         raise ValueError("Invalid prepacked source boundaries.")
+    batch_size, sequence_length = input_ids.shape[:2]
+    for key, value in list(data.items()):
+        if (
+            key in {"cu_seqlens", "cu_seqlens_padded"}
+            or not torch.is_tensor(value)
+            or value.ndim < 2
+            or value.shape[0] != batch_size
+            or value.shape[1] != sequence_length
+        ):
+            continue
+        data[key] = value[:, :pack_length].contiguous()
+    input_ids = data["input_ids"]
     cp_size = get_context_parallel_world_size()
     if cp_size > 1 and bool((padded_lengths % (2 * cp_size) != 0).any()):
         raise ValueError(
@@ -540,6 +553,16 @@ def process_microbatch(
                         model_slices_context_parallel_inputs
                     ),
                 )
+                original_seq_length = input_ids.shape[1]
+                routed_experts = data_dict.get("routed_experts")
+                routed_experts_cp_sharded = routed_experts
+                if (
+                    routed_experts is not None
+                    and not model_slices_context_parallel_inputs
+                ):
+                    routed_experts_cp_sharded = _slice_prepacked_for_cp(
+                        routed_experts, cu_seqlens_padded
+                    )
                 if "mtp_loss_mask" in data_dict:
                     mtp_loss_mask = data_dict["mtp_loss_mask"]
                     if not model_slices_context_parallel_inputs:
