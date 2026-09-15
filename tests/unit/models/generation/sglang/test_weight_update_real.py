@@ -84,6 +84,7 @@ def _make_sglang_cfg(tp_size, pad_token_id=PAD_TOKEN_ID):
         "stop_strings": None,
         "_pad_token_id": pad_token_id,
         "sglang_cfg": {
+            "use_fault_tolerance": False,
             "model_path": MODEL_PATH,
             "dtype": "bfloat16",
             "random_seed": 42,
