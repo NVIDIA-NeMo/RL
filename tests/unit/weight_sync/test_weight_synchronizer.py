@@ -292,6 +292,9 @@ def test_sglang_refit_recovers_before_reading_engine_state(
 ) -> None:
     policy = _megatron_policy()
     gen = _mock_sglang_generation(use_fault_tolerance=True)
+    lifecycle = MagicMock()
+    lifecycle.attach_mock(policy, "policy")
+    lifecycle.attach_mock(gen, "generation")
     recovered_engines = [MagicMock(), MagicMock()]
 
     def recover_engines() -> None:
@@ -315,6 +318,14 @@ def test_sglang_refit_recovers_before_reading_engine_state(
     )
     gen.clear_updatable_num_new_engines.assert_called_once_with()
     if synchronizer_cls is SGLangColocatedWeightSynchronizer:
+        lifecycle.assert_has_calls(
+            [
+                call.policy.sync_params_before_refit(),
+                call.policy.offload_before_refit(),
+                call.generation.recover_updatable_engines(),
+                call.generation.prepare_for_generation(tags=["weights"]),
+            ]
+        )
         policy.connect_sglang_rollout_engines.assert_called_once_with(
             engine_gpu_counts=[1, 3], engine_gpu_offsets=[0, 1]
         )
