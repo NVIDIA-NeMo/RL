@@ -9,6 +9,7 @@ grpo:
   max_num_epochs: 2
   max_num_steps: 100
   skip_reference_policy_logprobs_calculation: true
+  seq_logprob_error_threshold: 2
 
 loss_fn:
   reference_policy_kl_penalty: 0.0
@@ -46,12 +47,14 @@ policy:
   logprob_chunk_size: 1024
   make_sequence_length_divisible_by: ${mul:${mul:${policy.megatron_cfg.tensor_model_parallel_size},${policy.megatron_cfg.context_parallel_size}},2}
   megatron_cfg:
+    empty_unused_memory_level: 2
     activation_checkpointing: true
     tensor_model_parallel_size: 4
     context_parallel_size: 4
     expert_model_parallel_size: 32
     sequence_parallel: true
     moe_router_dtype: fp32
+    moe_router_bias_update_rate: 1.0e-3
     use_fused_weighted_squared_relu: true
     bias_activation_fusion: false
     defer_fp32_logits: true
@@ -63,7 +66,11 @@ policy:
       lr_decay_iters: null
       lr_warmup_iters: 10
       lr_warmup_init: 3.0e-7
+      override_opt_param_scheduler: true
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
   generation:
+    refit_transport: nccl_reshard
     vllm_cfg:
       tensor_parallel_size: 4
       gpu_memory_utilization: 0.85
@@ -75,9 +82,21 @@ policy:
         reasoning_parser: nano_v3
         default_chat_template_kwargs:
           enable_thinking: true
+    # Generation kernels validated for Nemotron 3.5 Nano: with vLLM's defaults
+    # (FlashInfer attention, TRTLLM MoE, full CUDA graphs) generation and training
+    # logprobs disagree badly on a few tokens per step.
     vllm_kwargs:
+      attention_backend: FLASH_ATTN
+      moe_backend: triton
+      max_num_batched_tokens: 32768
+      max_num_seqs: 256
       mamba_ssm_cache_dtype: float32
       mamba_cache_mode: align
+      compilation_config:
+        cudagraph_mode: PIECEWISE
+        cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
+        pass_config:
+          fuse_allreduce_rms: false
     colocated:
       resources:
         gpus_per_node: 4
