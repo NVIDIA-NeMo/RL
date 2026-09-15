@@ -212,6 +212,76 @@ class TestProcessMicrobatch:
             }
         )
 
+    @pytest.mark.parametrize(
+        ("cu_seqlens", "cu_seqlens_padded", "input_width"),
+        [
+            ([0, 3, 6], [0, 4], 8),
+            ([0], [0], 8),
+            ([1, 3], [0, 4], 8),
+            ([0, 2], [1, 4], 8),
+            ([0, 3], [0, 9], 8),
+            ([0, 0], [0, 4], 8),
+            ([0, 5], [0, 4], 8),
+        ],
+        ids=[
+            "shape-mismatch",
+            "no-source",
+            "logical-start",
+            "padded-start",
+            "pack-too-wide",
+            "empty-source",
+            "source-exceeds-padding",
+        ],
+    )
+    def test_prepare_prepacked_rejects_invalid_boundaries(
+        self,
+        cu_seqlens: list[int],
+        cu_seqlens_padded: list[int],
+        input_width: int,
+    ) -> None:
+        from nemo_rl.models.megatron.data import _prepare_prepacked
+
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.arange(input_width).unsqueeze(0),
+                "cu_seqlens": [torch.tensor(cu_seqlens, dtype=torch.int32)],
+                "cu_seqlens_padded": [
+                    torch.tensor(cu_seqlens_padded, dtype=torch.int32)
+                ],
+            }
+        )
+        with (
+            patch(
+                "nemo_rl.models.megatron.data.get_context_parallel_rank",
+                return_value=0,
+            ),
+            patch(
+                "nemo_rl.models.megatron.data.get_context_parallel_world_size",
+                return_value=1,
+            ),
+            pytest.raises(ValueError, match="Invalid prepacked source boundaries"),
+        ):
+            _prepare_prepacked(data, model_slices_context_parallel_inputs=False)
+
+    def test_prepare_prepacked_rejects_cp_incompatible_source_lengths(self) -> None:
+        from nemo_rl.models.megatron.data import _prepare_prepacked
+
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.arange(6).unsqueeze(0),
+                "cu_seqlens": [torch.tensor([0, 3], dtype=torch.int32)],
+                "cu_seqlens_padded": [torch.tensor([0, 6], dtype=torch.int32)],
+            }
+        )
+        with (
+            patch(
+                "nemo_rl.models.megatron.data.get_context_parallel_world_size",
+                return_value=2,
+            ),
+            pytest.raises(ValueError, match="divisible by 2 \\* context_parallel_size"),
+        ):
+            _prepare_prepacked(data, model_slices_context_parallel_inputs=False)
+
     @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
     def test_process_microbatch_no_packing(self, mock_get_masks):
         """Test process_microbatch without sequence packing."""

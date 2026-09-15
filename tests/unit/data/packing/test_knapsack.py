@@ -18,6 +18,7 @@ from nemo_rl.data.packing import (
     BalancedGreedyKnapsackPacker,
     GreedyKnapsackPacker,
     PackingAlgorithm,
+    SequencePacker,
     get_packer,
 )
 
@@ -42,17 +43,19 @@ def test_greedy_knapsack_takes_largest_remaining_item_that_fits() -> None:
 
 
 def test_balanced_knapsack_spreads_equal_items_across_minimum_bins() -> None:
-    packer = BalancedGreedyKnapsackPacker(8, balanced_knapsack_delta=0)
+    packer = BalancedGreedyKnapsackPacker(8)
 
     assert packer.pack([4, 4, 4, 4]) == [[0, 2], [1, 3]]
 
 
 @pytest.mark.parametrize(
-    "packer",
-    [GreedyKnapsackPacker(10), BalancedGreedyKnapsackPacker(10)],
+    "packer_type",
+    [GreedyKnapsackPacker, BalancedGreedyKnapsackPacker],
 )
-def test_knapsack_packers_keep_common_interface_constraints(packer) -> None:
-    packer.max_sequences_per_bin = 1
+def test_knapsack_packers_keep_common_interface_constraints(
+    packer_type: type[SequencePacker],
+) -> None:
+    packer = packer_type(10, max_sequences_per_bin=1)
     assert packer.pack([4, 3, 2]) == [[0], [1], [2]]
     with pytest.raises(ValueError, match="exceeds bin capacity"):
-        packer.pack([11])
+        packer_type(10).pack([11])

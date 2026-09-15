@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import random
+
 import pytest
 import torch
 
@@ -26,6 +28,9 @@ from nemo_rl.data.energon.multimodal.packing import (  # noqa: E402
     pack_selected_samples,
     prepare_packed_sft_batch,
     select_samples_to_pack,
+)
+from nemo_rl.data.energon.multimodal.task_encoders.generic_sft import (  # noqa: E402
+    GenericSFTTaskEncoder,
 )
 from nemo_rl.data.energon.multimodal.types import EncodedSFTSample  # noqa: E402
 from nemo_rl.data.multimodal_utils import PackedTensor  # noqa: E402
@@ -114,6 +119,22 @@ def test_preparation_builds_model_ready_pack_and_jagged_boundaries() -> None:
     assert sliced["cu_seqlens_padded"].as_tensor().tolist() == [0, 4]
 
 
+def test_preparation_keeps_a_variable_length_multi_source_pack() -> None:
+    packed = pack_selected_samples(
+        [_sample("s0", 5), _sample("s1", 3)],
+        pack_capacity=16,
+        sequence_length_pad_multiple=4,
+    )
+
+    prepared = prepare_packed_sft_batch(
+        [packed], tokenizer=_Tokenizer(), only_unmask_final=False
+    )
+
+    assert prepared["input_lengths"].tolist() == [12]
+    assert prepared["cu_seqlens"].as_tensor().tolist() == [0, 5, 8]
+    assert prepared["cu_seqlens_padded"].as_tensor().tolist() == [0, 8, 12]
+
+
 def test_preparation_backfills_multimodal_token_fields() -> None:
     text_sample = _sample("text", 4)
     multimodal_sample = _sample("image", 4)
@@ -130,6 +151,59 @@ def test_preparation_backfills_multimodal_token_fields() -> None:
     )
 
     assert prepared["mm_token_type_ids"].tolist() == [[0, 0, 0, 0, 1, 1, 1, 1]]
+
+
+def test_preparation_backfills_multimodal_fields_across_packs() -> None:
+    text_pack = pack_selected_samples(
+        [_sample("text", 4)],
+        pack_capacity=8,
+        sequence_length_pad_multiple=1,
+    )
+    multimodal_sample = _sample("image", 4)
+    for message in multimodal_sample.message_log:
+        message["mm_token_type_ids"] = torch.ones_like(message["token_ids"])
+    media_pack = pack_selected_samples(
+        [multimodal_sample],
+        pack_capacity=8,
+        sequence_length_pad_multiple=1,
+    )
+
+    prepared = prepare_packed_sft_batch(
+        [text_pack, media_pack], tokenizer=_Tokenizer(), only_unmask_final=False
+    )
+
+    assert prepared["mm_token_type_ids"].tolist() == [
+        [0, 0, 0, 0],
+        [1, 1, 1, 1],
+    ]
+
+
+def test_shuffle_selection_restores_worker_seed(monkeypatch) -> None:
+    from megatron.energon.task_encoder.base import WorkerConfig
+
+    class _FakeWorkerConfig:
+        active_worker_sample_index = 7
+
+        def worker_seed(self) -> int:
+            return 42
+
+    monkeypatch.setattr(
+        WorkerConfig, "active_worker_config", _FakeWorkerConfig(), raising=False
+    )
+    encoder = object.__new__(GenericSFTTaskEncoder)
+    encoder.packer = get_packer(PackingAlgorithm.FIRST_FIT_SHUFFLE, 10)
+    encoder.sequence_length_pad_multiple = 1
+    samples = [_sample(f"s{i}", length) for i, length in enumerate([6, 5, 4, 3, 2])]
+
+    first = encoder.select_samples_to_pack(samples)
+    random.seed(999)
+    random.shuffle(samples)
+    samples.sort(key=lambda sample: sample.sample_key)
+    second = encoder.select_samples_to_pack(samples)
+
+    assert [[sample.sample_key for sample in pack] for pack in first] == [
+        [sample.sample_key for sample in pack] for pack in second
+    ]
 
 
 def test_physical_pack_rejects_incompatible_or_over_capacity_sources() -> None:
