@@ -24,6 +24,16 @@
 
 set -eoux pipefail
 
+# Preserve allocation identity before Ray's intentional SLURM_* cleanup.
+# Always take these from this allocation, never from a previous submitter.
+export NRL_SLURM_JOB_ID="${SLURM_JOB_ID:?}"
+export NRL_SLURM_SUBMIT_DIR="${SLURM_SUBMIT_DIR:?}"
+NRL_CONTAINER_WORKDIR="${NRL_CONTAINER_WORKDIR:-$SLURM_SUBMIT_DIR}"
+if [[ "$NRL_CONTAINER_WORKDIR" != /* ]]; then
+  echo "Error: NRL_CONTAINER_WORKDIR must be an absolute, container-visible path." >&2
+  exit 1
+fi
+
 # Record job-start epoch so Python can measure pre-Python overhead
 export NRL_JOB_START_EPOCH=$(date +%s.%N)
 
@@ -90,6 +100,32 @@ detect_cpus_per_node() {
     exit 1
   fi
   echo "$cpus"
+}
+
+# Check the process's effective mask, not the host's physical CPU count. This
+# uses only bash and procfs so it also runs in a minimal sandbox image.
+check_cpu_affinity() {
+  local expected="$1" key value allowed="" part count=0
+  local -a parts
+  while read -r key value; do
+    if [[ "$key" == "Cpus_allowed_list:" ]]; then allowed="$value"; break; fi
+  done < /proc/self/status
+  IFS=, read -r -a parts <<< "$allowed"
+  for part in "${parts[@]}"; do
+    if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      count=$((count + BASH_REMATCH[2] - BASH_REMATCH[1] + 1))
+    elif [[ "$part" =~ ^[0-9]+$ ]]; then
+      count=$((count + 1))
+    else
+      echo "Error: Cannot parse CPU affinity '$allowed'." >&2
+      return 1
+    fi
+  done
+  if (( count < expected )); then
+    echo "Error: Effective CPU affinity has $count CPUs; expected at least $expected ($allowed)." >&2
+    return 1
+  fi
+  echo "[INFO] Effective CPU affinity: $count CPUs ($allowed)"
 }
 
 ########################################################
@@ -247,15 +283,16 @@ else
   echo "[INFO] No GRES support detected. Running without --gres flag."
 fi
 
-COMMON_SRUN_ARGS="$GRES_ARG"
-COMMON_SRUN_ARGS+=" --no-container-mount-home"
-COMMON_SRUN_ARGS+=" --mpi=pmix"
-COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
-COMMON_SRUN_ARGS+=" --container-image=$CONTAINER"
-COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
+COMMON_SRUN_ARGS=()
+if [[ -n "$GRES_ARG" ]]; then COMMON_SRUN_ARGS+=("$GRES_ARG"); fi
+COMMON_SRUN_ARGS+=(--no-container-mount-home --mpi=pmix)
+COMMON_SRUN_ARGS+=("--container-mounts=$MOUNTS")
+COMMON_SRUN_ARGS+=("--container-image=$CONTAINER")
+COMMON_SRUN_ARGS+=("--container-workdir=$NRL_CONTAINER_WORKDIR")
 # Pass partition/account explicitly for overlapping srun calls.
-COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
-COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
+COMMON_SRUN_ARGS+=(-p "$SLURM_JOB_PARTITION" -A "$SLURM_JOB_ACCOUNT")
+# Ray and verifier sidecars intentionally share each allocated node.
+COMMON_SRUN_ARGS+=(--overlap --cpu-bind=cores)
 # Number of CPUs per worker node. If the user did not set CPUS_PER_WORKER
 # explicitly, auto-detect it from SLURM so we claim every CPU the node actually
 # has (instead of the old GPUS_PER_NODE * 16 heuristic, which under-claims on
@@ -267,6 +304,10 @@ else
   log_phase "auto-detecting CPUs per node (scontrol show node)"
   CPUS_PER_WORKER=$(detect_cpus_per_node)
   echo "[INFO] Auto-detected CPUS_PER_WORKER=$CPUS_PER_WORKER from SLURM (CPUTot of first allocated node)."
+fi
+if ! [[ "$CPUS_PER_WORKER" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Error: CPUS_PER_WORKER must be a positive integer." >&2
+  exit 1
 fi
 
 # ---------------------------------------------------------------------------
@@ -597,6 +638,8 @@ fi
 # Give the head node actual resources to make it schedulable
 
 head_cmd=$(cat <<EOF
+$(declare -f check_cpu_affinity)
+check_cpu_affinity "$CPUS_PER_WORKER" || exit 1
 if [[ "\${RAY_SUB_DEBUG_ENV:-0}" == "1" ]]; then
   env | grep -viE '(WANDB_API_KEY|HF_TOKEN|API_KEY|TOKEN|SECRET|PASSWORD)=' || true
 fi
@@ -837,6 +880,8 @@ EOF
 # Worker nodes connect to the head. They're launched with a single batched srun
 # below; each task discovers its identity at runtime via SLURM_PROCID/SLURMD_NODENAME.
 worker_cmd=$(cat <<EOF
+$(declare -f check_cpu_affinity)
+check_cpu_affinity "$CPUS_PER_WORKER" || exit 1
 if [[ "\${RAY_SUB_DEBUG_ENV:-0}" == "1" ]]; then
   env | grep -viE '(WANDB_API_KEY|HF_TOKEN|API_KEY|TOKEN|SECRET|PASSWORD)=' || true
 fi
@@ -983,7 +1028,9 @@ bash -n <(printf '%s' "$worker_cmd") || { echo "[FATAL] Worker script has syntax
 # task starts the sandbox, polls its local port, and on success touches
 # SANDBOX_READY_<hostname> so the head can gate the driver on all instances.
 ########################################################
-export SLURM_MASTER_NODE=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
+# The sandbox nginx image does not inherit the training container's resolver.
+# Reuse the numeric address already resolved for Ray instead of a compute name.
+export SLURM_MASTER_NODE="$head_node_ip"
 SANDBOX_PORT="${NEMO_SKILLS_SANDBOX_PORT:-6000}"
 
 SANDBOX_BASE_PORT="${SANDBOX_BASE_PORT:-6001}"
@@ -1011,9 +1058,12 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
     --kill-on-bad-exit=1 \
     --overlap \
     --nodes="$SLURM_JOB_NUM_NODES" \
+    --ntasks="$SLURM_JOB_NUM_NODES" \
     --ntasks-per-node=1 \
+    --cpus-per-task="$CPUS_PER_WORKER" \
+    --cpu-bind=cores \
     --export="$SANDBOX_EXPORTS" \
-    bash -xc '
+    bash -xc "$(declare -f check_cpu_affinity); check_cpu_affinity $CPUS_PER_WORKER || exit 1; "'
       ('"$SANDBOX_COMMAND"') &
       SANDBOX_PID=$!
       deadline=$((SECONDS + 300))
@@ -1040,7 +1090,7 @@ fi
 
 # Start the Ray head.
 log_phase "launching Ray head + worker sruns"
-srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
+srun "${COMMON_SRUN_ARGS[@]}" --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
 SRUN_PIDS["ray-head"]=$!
 
 # Start the Ray workers (all nodes except the head) with a single batched srun, so
@@ -1052,7 +1102,7 @@ if [[ $_num_workers -gt 0 ]]; then
   # srun -o with %t produces per-task log files; zero-pad to the worker-count
   # width so ray-worker-*.log filenames sort naturally (e.g. ray-worker-007.log).
   _task_digits=${#_num_workers}
-  srun $COMMON_SRUN_ARGS --container-name=ray-worker --exact \
+  srun "${COMMON_SRUN_ARGS[@]}" --container-name=ray-worker --exact \
     --nodes=$_num_workers \
     --ntasks=$_num_workers \
     --ntasks-per-node=1 \
@@ -1121,7 +1171,7 @@ else
   echo "[INFO][$(date '+%Y-%m-%dT%H:%M:%S%z')] All workers connected!"
 
   log_phase "generating attach helper (scontrol show job)"
-  CONTAINER_CWD=$(scontrol show job $SLURM_JOB_ID | grep -oP 'WorkDir=\K[^ ]+' | head -1)
+  CONTAINER_CWD="$NRL_CONTAINER_WORKDIR"
   echo "[INFO]: Ray Cluster is idled, run this on the slurm head node to get a shell to the head node:"
   cat <<EOF >$SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
 # No args launches on the head node (node 0)

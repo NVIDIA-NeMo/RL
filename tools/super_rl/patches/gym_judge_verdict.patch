@@ -1,0 +1,119 @@
+diff --git a/resources_servers/equivalence_llm_judge/app.py b/resources_servers/equivalence_llm_judge/app.py
+index 69f6867..1274149 100644
+--- a/resources_servers/equivalence_llm_judge/app.py
++++ b/resources_servers/equivalence_llm_judge/app.py
+@@ -27,7 +27,7 @@ from contextlib import nullcontext
+ from typing import Any, Optional
+ 
+ from fastapi import FastAPI
+-from pydantic import BaseModel, ConfigDict
++from pydantic import BaseModel, ConfigDict, Field
+ 
+ from nemo_gym.base_resources_server import (
+     BaseResourcesServerConfig,
+@@ -38,6 +38,8 @@ from nemo_gym.base_resources_server import (
+ )
+ from nemo_gym.config_types import ModelServerRef
+ from nemo_gym.judge import JudgeError, call_judge
++from nemo_gym.judge_retry import retry_judge_errors
++from nemo_gym.judge_verdict import response_verdict
+ from nemo_gym.openai_utils import (
+     NeMoGymEasyInputMessage,
+     NeMoGymResponse,
+@@ -60,6 +62,8 @@ class LLMJudgeResourcesServerConfig(BaseResourcesServerConfig):
+     name: str = "equivalence_llm_judge"
+     judge_model_server: ModelServerRef
+     judge_responses_create_params: NeMoGymResponseCreateParamsNonStreaming
++    judge_max_attempts: int = Field(default=1, ge=1, le=8)
++    fail_on_missing_judge_verdict: bool = False
+ 
+     # Concurrency limit for judge endpoint requests. Set to None to disable limiting.
+     judge_endpoint_max_concurrency: Optional[int] = 64
+@@ -447,6 +451,7 @@ class LLMJudgeResourcesServer(SimpleResourcesServer):
+         else:
+             return await self._handle_first_pass_succeeded(body, expected, question, generated, first_eval)
+ 
++    @retry_judge_errors(JudgeError)
+     async def _generate_judge_evaluation(
+         self, *, question: str, expected_answer: str, generated_answer: str
+     ) -> tuple[bool, JudgeEvaluation]:
+@@ -490,7 +495,17 @@ class LLMJudgeResourcesServer(SimpleResourcesServer):
+             verdict_label=None,
+         )
+ 
+-        # Parse the last output; fall back to not-equal if unexpected.
++        if cfg.fail_on_missing_judge_verdict:
++            try:
++                equal = response_verdict(
++                    judge_response, equal_label=equal_label, not_equal_label=not_equal_label
++                )
++            except ValueError as error:
++                raise JudgeError(str(error)) from error
++            eval_record.verdict_label = equal_label if equal else not_equal_label
++            return equal, eval_record
++
++        # Legacy behavior for configurations that do not opt into strict judging.
+         try:
+             last_output = judge_response.output[-1]
+             if getattr(last_output, "type", None) != "message":
+diff --git a/resources_servers/math_with_judge/app.py b/resources_servers/math_with_judge/app.py
+index 983cc0b..877f139 100644
+--- a/resources_servers/math_with_judge/app.py
++++ b/resources_servers/math_with_judge/app.py
+@@ -24,7 +24,7 @@ from math_verify import grader
+ from math_verify.errors import TimeoutException
+ from math_verify.metric import math_metric
+ from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
+-from pydantic import BaseModel, PositiveFloat, PositiveInt
++from pydantic import BaseModel, Field, PositiveFloat, PositiveInt
+ 
+ from nemo_gym.base_resources_server import (
+     BaseResourcesServerConfig,
+@@ -34,7 +34,9 @@ from nemo_gym.base_resources_server import (
+     SimpleResourcesServer,
+ )
+ from nemo_gym.config_types import ModelServerRef
+-from nemo_gym.judge import call_judge
++from nemo_gym.judge import JudgeError, call_judge
++from nemo_gym.judge_retry import retry_judge_errors
++from nemo_gym.judge_verdict import response_verdict
+ from nemo_gym.openai_utils import (
+     NeMoGymEasyInputMessage,
+     NeMoGymResponse,
+@@ -44,8 +46,10 @@ from nemo_gym.reward_profile import compute_pass_majority_metrics, highest_k_met
+ 
+ 
+ class LibraryJudgeMathResourcesServerConfig(BaseResourcesServerConfig):
++    fail_on_missing_judge_verdict: bool = False
+     judge_model_server: ModelServerRef
+     judge_responses_create_params: NeMoGymResponseCreateParamsNonStreaming
++    judge_max_attempts: int = Field(default=1, ge=1, le=8)
+     should_use_judge: bool = True
+     library_verifier_timeout_seconds: PositiveFloat = 10.0
+     library_verifier_max_concurrency: PositiveInt = 32
+@@ -344,6 +348,7 @@ Example output: "My final verdict is different [[A!=B]]"."""
+             reward = 0.0
+         return reward, [first_judge_evaluation, second_judge_evaluation]
+ 
++    @retry_judge_errors(JudgeError)
+     async def _generate_judge_evaluation(
+         self, question: str, first_answer: str, second_answer: str
+     ) -> tuple[bool, JudgeEvaluation]:
+@@ -373,6 +378,17 @@ Example output: "My final verdict is different [[A!=B]]"."""
+         )
+         judge_evaluation = JudgeEvaluation(responses_create_params=responses_create_params, response=judge_response)
+ 
++        if config.fail_on_missing_judge_verdict:
++            try:
++                equal = response_verdict(
++                    judge_response,
++                    equal_label=self.JUDGE_EQUAL_LABEL,
++                    not_equal_label=self.JUDGE_NOT_EQUAL_LABEL,
++                )
++            except ValueError as error:
++                raise JudgeError(str(error)) from error
++            return equal, judge_evaluation
++
+         # Currently, for all the cases in which the response from the LLM judge
+         # does not conform to the expected format, the judge's evaluation is
+         # treated as if the answers are not equal.  This may not be ideal, but it

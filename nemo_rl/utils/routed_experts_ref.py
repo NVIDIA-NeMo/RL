@@ -603,6 +603,59 @@ def _materialize_normalized_routed_experts(
     return dense
 
 
+def _materialize_normalized_routed_experts_rows(
+    batch: _NormalizedRoutedExpertsBatch,
+    *,
+    resolver: Callable[[dict[str, Any]], Any],
+) -> list[np.ndarray]:
+    """Resolve only valid per-sample rows, without rectangular batch padding."""
+    resolved: dict[tuple[str, str, tuple[int, int, int, str]], np.ndarray] = {}
+    rows: list[np.ndarray] = []
+    for sample_index, segments in enumerate(batch.refs_by_sample):
+        chunks: list[np.ndarray] = []
+        for segment in segments:
+            length = int(segment["length"])
+            if length == 0:
+                continue
+            source_key = (
+                str(segment["store"]),
+                str(segment["store_instance_id"]),
+                routed_experts_ref_lookup_key(segment),
+            )
+            source = resolved.get(source_key)
+            if source is None:
+                value = resolver(segment)
+                if isinstance(value, torch.Tensor):
+                    source = value.detach().to(device="cpu").numpy()
+                else:
+                    source = np.asarray(value)
+                resolved[source_key] = source
+            if source.dtype != np.int16 or list(source.shape) != segment["shape"]:
+                raise RuntimeError(
+                    "Resolved routed-experts object does not match its tag: "
+                    f"actual_shape={list(source.shape)}, expected_shape={segment['shape']}, "
+                    f"actual_dtype={source.dtype}, expected_dtype=int16"
+                )
+            source_offset = int(segment["offset"])
+            chunks.append(source[source_offset : source_offset + length])
+
+        expected_length = batch.input_lengths[sample_index]
+        if not chunks:
+            row = np.empty((0, *batch.layer_topk), dtype=np.int16)
+        elif len(chunks) == 1:
+            row = chunks[0]
+        else:
+            row = np.concatenate(chunks, axis=0)
+        if row.shape != (expected_length, *batch.layer_topk):
+            raise RuntimeError(
+                "Resolved routed-experts row has the wrong shape: "
+                f"sample={sample_index}, actual={list(row.shape)}, "
+                f"expected={[expected_length, *batch.layer_topk]}"
+            )
+        rows.append(row)
+    return rows
+
+
 @ray.remote(num_cpus=0)  # pragma: no cover - exercised in distributed jobs
 class RoutedExpertsObjectStore:
     """Source-local owner/index actor for full routed-experts objects."""
@@ -880,6 +933,63 @@ def _assemble_routed_experts_range_results(
     return dense
 
 
+def _assemble_routed_experts_range_rows(
+    batch: _NormalizedRoutedExpertsBatch,
+    groups: Sequence[_RoutedExpertsRangeReadGroup],
+    range_results: Sequence[Mapping[str, Any]],
+) -> list[np.ndarray]:
+    """Scatter range reads into compact valid rows instead of a padded rectangle."""
+    if len(groups) != len(range_results):
+        raise RuntimeError(
+            "Routed-experts range result count does not match the read plan: "
+            f"groups={len(groups)}, results={len(range_results)}"
+        )
+
+    rows = [
+        np.empty((length, *batch.layer_topk), dtype=np.int16)
+        for length in batch.input_lengths
+    ]
+    for group, result in zip(groups, range_results):
+        values = np.asarray(result.get("values"))
+        expected_shape = (
+            group.requested_rows,
+            batch.layer_topk[0],
+            batch.layer_topk[1],
+        )
+        if (
+            tuple(values.shape) != expected_shape
+            or values.dtype != np.int16
+            or result.get("shape") != list(expected_shape)
+            or result.get("dtype") != ROUTED_EXPERTS_REF_DTYPE
+            or result.get("nbytes") != int(values.nbytes)
+        ):
+            returned_metadata = {
+                "shape": result.get("shape"),
+                "dtype": result.get("dtype"),
+                "nbytes": result.get("nbytes"),
+            }
+            raise RuntimeError(
+                "Source actor returned an invalid routed-experts range result: "
+                f"actual_shape={list(values.shape)}, "
+                f"expected_shape={list(expected_shape)}, "
+                f"actual_dtype={values.dtype}, metadata={returned_metadata}"
+            )
+
+        source_offset = 0
+        for placement in group.placements:
+            length = int(placement.ref["length"])
+            rows[placement.sample_index][
+                placement.destination_offset : placement.destination_offset + length
+            ] = values[source_offset : source_offset + length]
+            source_offset += length
+        if source_offset != group.requested_rows:
+            raise RuntimeError(
+                "Routed-experts range scatter did not consume its full source result: "
+                f"consumed={source_offset}, available={group.requested_rows}"
+            )
+    return rows
+
+
 def _materialize_normalized_routed_experts_with_ray_ranges(
     batch: _NormalizedRoutedExpertsBatch,
 ) -> tuple[np.ndarray, dict[str, int]]:
@@ -907,6 +1017,70 @@ def _materialize_normalized_routed_experts_with_ray_transport(
         )
         return dense, {key: 0 for key in _RANGE_READ_STAT_KEYS}
     return _materialize_normalized_routed_experts_with_ray_ranges(batch)
+
+
+def _materialize_normalized_routed_experts_rows_with_ray_transport(
+    batch: _NormalizedRoutedExpertsBatch,
+) -> list[np.ndarray]:
+    if _uses_only_full_routed_experts_objects(batch):
+        return _materialize_normalized_routed_experts_rows(
+            batch, resolver=_resolve_routed_experts_ref_with_ray
+        )
+
+    groups, _ = _plan_routed_experts_range_reads(batch)
+    futures = []
+    for group in groups:
+        store = _get_routed_experts_store(group.store_name)
+        futures.append(
+            store.get_ranges.remote([placement.ref for placement in group.placements])
+        )
+    return _assemble_routed_experts_range_rows(batch, groups, ray.get(futures))
+
+
+def materialize_routed_experts_ref_rows(
+    refs_by_sample: Any,
+    *,
+    input_lengths: torch.Tensor | Sequence[int],
+    resolver: Callable[[dict[str, Any]], Any] | None = None,
+) -> list[torch.Tensor]:
+    """Resolve compact valid rows for sequence packing.
+
+    Unlike :func:`materialize_routed_experts_refs`, this path never allocates
+    ``[batch, max_sequence, layers, topk]``. The caller pads and CP-shards each
+    row directly into the packed token layout.
+    """
+    if not isinstance(refs_by_sample, list):
+        raise TypeError(
+            "Ray-reference routed_experts must be a list with one entry per sample"
+        )
+    lengths = _normalize_input_lengths(
+        input_lengths,
+        batch_size=len(refs_by_sample),
+    )
+    batch = _normalize_routed_experts_batch(
+        refs_by_sample,
+        batch_size=len(refs_by_sample),
+        padded_length=max(lengths, default=0),
+        input_lengths=lengths,
+    )
+    if resolver is None:
+        rows = _materialize_normalized_routed_experts_rows_with_ray_transport(batch)
+    else:
+        rows = _materialize_normalized_routed_experts_rows(
+            batch,
+            resolver=resolver,
+        )
+
+    result = []
+    for row in rows:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="The given NumPy array is not writable",
+                category=UserWarning,
+            )
+            result.append(torch.from_numpy(row))
+    return result
 
 
 def materialize_routed_experts_refs(

@@ -1,0 +1,28 @@
+diff --git a/resources_servers/competitive_coding_challenges/ccc_eval.py b/resources_servers/competitive_coding_challenges/ccc_eval.py
+--- a/resources_servers/competitive_coding_challenges/ccc_eval.py
++++ b/resources_servers/competitive_coding_challenges/ccc_eval.py
+@@ -397,7 +397,10 @@ def run_test_case(task_args: dict, worker_id: int) -> dict:
+             _test_loop_tls, sandbox, f"cd {unique_dir} && ./compile.sh", language="shell", timeout=120
+         )
+         result = {
+-            "compile_success": not compile_result.get("stderr"),
++            # The shell sandbox derives process_status from the exit code.
++            # Warnings may populate stderr even when compilation succeeds.
++            "compile_success": compile_result.get("process_status") == "completed",
++            "compile_status": compile_result.get("process_status"),
+             "compile_stdout": compile_result.get("stdout", ""),
+             "compile_stderr": compile_result.get("stderr", ""),
+             "run_stdout": "",
+@@ -418,8 +421,12 @@ def run_test_case(task_args: dict, worker_id: int) -> dict:
+             timeout=run_timeout,
+         )
+         result["run_time_s"] = time.monotonic() - run_start
++        result["run_status"] = run_result.get("process_status")
+         result["run_stdout"] = run_result.get("stdout", "")
+         result["run_stderr"] = run_result.get("stderr", "")
++        # Partial stdout from a failed or timed-out grader is not a score.
++        if result["run_status"] != "completed":
++            return result
+         try:
+             result["score"] = float(result["run_stdout"].strip())
+         except (ValueError, TypeError):

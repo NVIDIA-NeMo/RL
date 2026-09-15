@@ -1,0 +1,60 @@
+# Experiment DELTA, not a complete runnable GRPO recipe. See the launch guide.
+# Reward/budget integration is a release blocker on this maintenance branch.
+# Do not pass this file directly to examples/run_grpo.py.
+grpo:
+  max_num_steps: 150
+  max_num_epochs: 1
+  num_prompts_per_step: 256
+  num_generations_per_prompt: 16
+  seq_logprob_error_threshold: 2
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 2
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+  reasoning_effort:
+    enabled: true
+    method: kimi
+    effort_field: reasoning_effort
+    profile_field: reasoning_effort_profile
+    max_output_tokens: 102400
+    missing_metadata: error
+    kimi:
+      budget_multipliers:
+        low: 1.25
+        high: 2.0
+      domain_budget_multipliers: {}
+      unbounded_labels: [max]
+      over_budget_reward: -0.5
+policy:
+  train_global_batch_size: 4096
+  generation:
+    max_new_tokens: 102400
+  router_replay:
+    enabled: true
+    transport: ray
+  sequence_packing:
+    enabled: true
+  megatron_cfg:
+    env_vars:
+      NRL_ROUTER_REPLAY_EXCLUDE_MTP: '1'
+      NRL_ROUTER_REPLAY_VALIDATE: '1'
+      NRL_R3_TRACE: '0'
+      NRL_R3_TRACE_VERIFY_FORWARD: '0'
+data:
+  shuffle: false
+checkpointing:
+  save_period: 10
+  ft_save_period: 1
+  ft_keep_latest_k: 1
+  load_replay_buffer: false
+env:
+  nemo_gym:
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          chat_template_kwargs:
+            enable_thinking: true
+            truncate_history_thinking: false
+# No config_paths replacement: preserve CCC, CoT, TIR, SciCode and judging.
+# The native gate must verify these flags in worker envs and actual requests.

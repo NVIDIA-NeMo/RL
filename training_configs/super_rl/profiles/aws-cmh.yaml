@@ -1,0 +1,11 @@
+# Site adapter, not a certification of this branch on the cluster.
+name: aws-cmh
+architecture: aarch64
+gpu_model: GB300
+gpus_per_node: 4
+container_workdir: /opt/nemo-rl
+# Historical image identity hint only; the user's runtime pins the actual bytes.
+training_image_hint: nemo-rl:super35_20260902_prefetched_venvs_arm64.squashfs
+# Inspect logical AND resolved backing paths on the selected site.
+filesystem_roots_to_check: [/lustre, /scratch]
+certified: false

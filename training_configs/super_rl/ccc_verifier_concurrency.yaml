@@ -1,0 +1,9 @@
+# Optional NeMo-RL config fragment, not a complete recipe or a Gym config_path.
+# Merge after a recipe that already defines the CCC resources server.
+# Preserve verifier semantics, shared_dir, time_scale, requests and other routes.
+env:
+  nemo_gym:
+    competitive_coding_challenges_resources_server:
+      resources_servers:
+        competitive_coding_challenges:
+          test_batch_size: 32

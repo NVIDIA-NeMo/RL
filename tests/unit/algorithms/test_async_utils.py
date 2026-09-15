@@ -1299,6 +1299,7 @@ class TestAsyncTrajectoryCollector:
         next_nemo_gym_task_index: int = 0,
         max_generation_failures: int = 0,
         nemo_gym_stream_retries: int = 1,
+        nemo_gym_fail_on_retry_exhaustion: bool = False,
         pending_batch=None,
         ordinals_frontier_aligned: bool = True,
         resume_frontier_ordinal=None,
@@ -1312,6 +1313,9 @@ class TestAsyncTrajectoryCollector:
         master_config = self.create_mock_config()
         master_config.grpo.async_grpo.max_generation_failures = max_generation_failures
         master_config.grpo.async_grpo.nemo_gym_stream_retries = nemo_gym_stream_retries
+        master_config.grpo.async_grpo.nemo_gym_fail_on_retry_exhaustion = (
+            nemo_gym_fail_on_retry_exhaustion
+        )
         if replay_buffer is None:
             replay_buffer = mock.MagicMock()
             replay_buffer.get_held_task_indices.remote.return_value = []
@@ -2237,6 +2241,7 @@ class TestAsyncTrajectoryCollector:
             policy={
                 "max_total_sequence_length": 512,
                 "make_sequence_length_divisible_by": 1,
+                "generation": {},
             },
             env={"should_use_nemo_gym": False},
             logger={
@@ -3163,10 +3168,11 @@ class TestAsyncTrajectoryCollector:
 
         assert target_weight not in collector._generating_targets
 
-    def test_nemo_gym_partial_batch_exhaustion_wakes_gap_fill(
-        self, monkeypatch, capsys
+    @pytest.mark.parametrize("fail_on_exhaustion", [False, True])
+    def test_nemo_gym_partial_batch_exhaustion_policy(
+        self, monkeypatch, capsys, fail_on_exhaustion
     ):
-        """A Gym batch with useful partial progress is not a fatal failure."""
+        """Preserve completed groups, but optionally fail instead of gap-filling."""
 
         class _ReadyResult:
             def __await__(self):
@@ -3189,7 +3195,9 @@ class TestAsyncTrajectoryCollector:
 
         replay_buffer = _ReplayBuffer()
         collector = self.create_local_collector(
-            replay_buffer=replay_buffer, max_generation_failures=0
+            replay_buffer=replay_buffer,
+            max_generation_failures=0,
+            nemo_gym_fail_on_retry_exhaustion=fail_on_exhaustion,
         )
         collector.running = True
         target_weight = 16
@@ -3250,11 +3258,16 @@ class TestAsyncTrajectoryCollector:
             [8, 8],
         ]
         assert replay_buffer.add.task_indices == [7]
-        assert collector._failure_count == 0
-        assert collector._fatal_error_message is None
+        assert collector._failure_count == int(fail_on_exhaustion)
         assert collector._generation_limit_cleared.is_set()
         assert target_weight not in collector._generating_targets
-        collector.check_health()
+        if fail_on_exhaustion:
+            assert "persistent stream failure" in collector._fatal_error_message
+            with pytest.raises(RuntimeError, match="max_generation_failures=0"):
+                collector.check_health()
+        else:
+            assert collector._fatal_error_message is None
+            collector.check_health()
         output = capsys.readouterr().out
         traces = [
             json.loads(line.removeprefix("[nemo_gym_trace] "))
@@ -3262,9 +3275,17 @@ class TestAsyncTrajectoryCollector:
             if line.startswith("[nemo_gym_trace] ")
         ]
         exhaustion = next(
-            trace for trace in traces if trace["event"] == "collector_retries_exhausted"
+            trace
+            for trace in traces
+            if trace["event"]
+            == (
+                "collector_batch_failed"
+                if fail_on_exhaustion
+                else "collector_retries_exhausted"
+            )
         )
-        assert exhaustion["outcome"] == "release_for_gap_fill"
+        if not fail_on_exhaustion:
+            assert exhaustion["outcome"] == "release_for_gap_fill"
         assert exhaustion["pending_groups"]["groups"][0]["task_index"] == 8
         assert exhaustion["pending_groups"]["groups"][0]["dataset_uuid"] == "uuid-8"
         assert "persistent stream failure" in exhaustion["exception"]["error"]

@@ -1,0 +1,11 @@
+--- a/main.py
++++ b/main.py
+@@ -140,7 +140,7 @@
+                             "result_repr": repr(getattr(res, "result", None)),
+                             "stdout": stdout_buf.getvalue(),
+                             "stderr": stderr_buf.getvalue(),
+-                            "has_error": res.error_before_exec or res.error_in_exec,
++                            "has_error": bool(res.error_before_exec or res.error_in_exec),
+                         }
+                     )
+                 except KeyboardInterrupt:
