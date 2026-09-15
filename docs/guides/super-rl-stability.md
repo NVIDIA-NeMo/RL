@@ -93,9 +93,15 @@ separates a capped, empty final answer from an uncapped malformed verdict.
 The first integrated regular smoke exposed a separate recovery limitation:
 one tagged failure interrupts the batch stream, unfinished prompt groups are
 regenerated, and exhausted stream retries can release groups for gap-fill.
-Thus the stream retry count is **not** an end-to-end retry bound. This branch
-does not yet implement durable judge-only retry or a total gap-fill retry
-budget. Do not interpret a healthy judge endpoint or growing rollout counts
+Thus the stream retry count alone is **not** an end-to-end retry bound.
+`grpo.async_grpo.nemo_gym_fail_on_retry_exhaustion: true` makes an exhausted
+stream a batch-worker failure even when some groups completed. Combined with
+`max_generation_failures: 0`, the regular smoke stops on the first exhausted
+stream instead of resetting its budget through gap-fill. Completed groups are
+not discarded from the live buffer, but this is not durable persistence and
+does not repair the underlying judge failure. The default is false to preserve
+existing GRPO behavior; PPO is unchanged. Native tests cover both policies.
+Durable judge-only retry remains unimplemented. Do not interpret a healthy judge endpoint or growing rollout counts
 as evidence that optimizer updates are progressing. Diagnose repeated tagged
 failures on a small verifier workload before restarting full training.
 

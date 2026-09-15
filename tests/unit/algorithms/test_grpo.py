@@ -689,6 +689,7 @@ def test_grpo_config_nested_defaults_are_populated():
     assert first.async_grpo.enabled is False
     assert first.async_grpo.max_generation_failures == 0
     assert first.async_grpo.nemo_gym_stream_retries == 1
+    assert first.async_grpo.nemo_gym_fail_on_retry_exhaustion is False
     assert first.adv_estimator.use_leave_one_out_baseline is True
     assert first.adv_estimator.normalize_rewards is True
     assert first.adv_estimator.minus_baseline is True

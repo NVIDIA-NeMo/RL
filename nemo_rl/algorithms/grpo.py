@@ -294,6 +294,9 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     # Number of retries after the initial NeMo-Gym stream attempt. Keep this
     # small because each retry can substantially extend rollout wall time.
     nemo_gym_stream_retries: int = Field(default=1, ge=0)
+    # Count exhausted streams as worker failures even after partial progress.
+    # Otherwise gap-fill can begin a new stream retry budget indefinitely.
+    nemo_gym_fail_on_retry_exhaustion: bool = False
     # Does the weight synchronization as soon as the training is done
     # without waiting for the pending generations to finish.
     in_flight_weight_updates: bool = False

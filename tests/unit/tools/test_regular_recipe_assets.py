@@ -31,3 +31,14 @@ def test_short_smoke_preserves_ten_update_warmup():
     assert scheduler.lr_warmup_iters == 10
     assert scheduler.lr_decay_iters == 11
     assert scheduler.lr_decay_style == "constant"
+
+
+def test_regular_smoke_does_not_reset_failed_stream_budget_through_gap_fill():
+    root = Path(__file__).resolve().parents[3]
+    config = OmegaConf.load(
+        root / "training_configs/super_rl/experiments/regular_s120_smoke.yaml"
+    )
+    async_config = config.grpo.async_grpo
+    assert async_config.nemo_gym_stream_retries == 1
+    assert async_config.nemo_gym_fail_on_retry_exhaustion is True
+    assert async_config.max_generation_failures == 0

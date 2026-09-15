@@ -55,6 +55,9 @@ grpo:
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 2
+    nemo_gym_stream_retries: 1
+    nemo_gym_fail_on_retry_exhaustion: true
+    max_generation_failures: 0
     in_flight_weight_updates: true
     recompute_kv_cache_after_weight_updates: false
   use_best_at_k: false
