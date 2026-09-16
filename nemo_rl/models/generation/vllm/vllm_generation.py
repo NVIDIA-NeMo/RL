@@ -46,7 +46,9 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
+    VLLM_FP32_LM_HEAD_ENV_VAR,
     VllmConfig,
+    vllm_fp32_lm_head_enabled,
 )
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
@@ -72,6 +74,45 @@ if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_fp32_lm_head_config(master_config: "MasterConfig") -> None:
+    """Reject vLLM fp32 LM-head configs that the trainer cannot match."""
+    policy_config = master_config.policy
+    generation_config = cast(VllmConfig, policy_config["generation"])
+    vllm_cfg = generation_config.get("vllm_cfg")
+    env_vars = None if vllm_cfg is None else vllm_cfg.get("env_vars")
+    vllm_env_value = (
+        None if env_vars is None else env_vars.get(VLLM_FP32_LM_HEAD_ENV_VAR)
+    )
+    vllm_fp32 = vllm_cfg is not None and vllm_fp32_lm_head_enabled(vllm_cfg)
+
+    megatron_cfg = policy_config.get("megatron_cfg")
+    megatron_fp32_value = (
+        None if megatron_cfg is None else megatron_cfg.get("fp32_lm_head")
+    )
+    trainer_fp32 = bool(megatron_fp32_value)
+    if trainer_fp32 != vllm_fp32:
+        raise ValueError(
+            "fp32 LM head must be enabled on both engines or neither: "
+            f"policy.megatron_cfg.fp32_lm_head={megatron_fp32_value!r} but "
+            f"policy.generation.vllm_cfg.fp32_lm_head="
+            f"{None if vllm_cfg is None else vllm_cfg.get('fp32_lm_head')!r} "
+            f"({VLLM_FP32_LM_HEAD_ENV_VAR}={vllm_env_value!r}). "
+            "A one-sided fp32 head increases the generation/training logprob "
+            "mismatch instead of reducing it."
+        )
+    if (
+        trainer_fp32
+        and megatron_cfg is not None
+        and megatron_cfg.get("use_fused_linear_logprobs")
+    ):
+        raise ValueError(
+            "policy.megatron_cfg.fp32_lm_head has no effect with "
+            "use_fused_linear_logprobs=true (the fused linear+CE kernel bypasses "
+            "output_layer), which would leave the trainer in bf16 while vLLM "
+            "runs fp32. Disable one of them."
+        )
 
 
 def _record_vllm_generation_metrics(
@@ -114,6 +155,7 @@ class VllmGeneration(GenerationInterface):
         """Reject pure-config vLLM settings the SC entrypoint cannot honor."""
         generation_config = cast(VllmConfig, master_config.policy["generation"])
         assert_reload_refit_config_supported(generation_config)
+        _validate_fp32_lm_head_config(master_config)
 
     @staticmethod
     def init_cluster_placement_groups(

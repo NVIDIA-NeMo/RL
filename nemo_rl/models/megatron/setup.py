@@ -75,10 +75,6 @@ from megatron.core.utils import get_model_config
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
-from nemo_rl.models.generation.vllm.config import (
-    VLLM_FP32_LM_HEAD_ENV_VAR,
-    vllm_fp32_lm_head_enabled,
-)
 
 _HF_CONFIG_PATCHED = False
 
@@ -600,48 +596,6 @@ def _resolve_iter_dir_from_root(
     if not iter_subdirs:
         raise FileNotFoundError(not_found_msg)
     return os.path.join(path, iter_subdirs[-1])
-
-
-def validate_fp32_lm_head_config(config: PolicyConfig) -> None:
-    """Reject an fp32 LM head that is enabled on only one engine.
-
-    ``megatron_cfg.fp32_lm_head`` and ``generation.vllm_cfg.fp32_lm_head`` must
-    agree: with bf16 heads on both sides the logits round to the same grid, so
-    enabling fp32 on one side alone makes train/token_mult_prob_error worse than
-    leaving the feature off. The fused linear+CE path bypasses ``output_layer``
-    entirely, so the trainer head would silently stay bf16 there too.
-
-    Only checked when generation uses the vLLM backend; SFT/DPO have no
-    generation engine to disagree with.
-    """
-    megatron_cfg = config.get("megatron_cfg") or {}
-    trainer_fp32 = bool(megatron_cfg.get("fp32_lm_head"))
-    generation = config.get("generation") or {}
-    if generation.get("backend") != "vllm":
-        return
-    vllm_cfg = generation.get("vllm_cfg") or {}
-    env_vars = vllm_cfg.get("env_vars")
-    vllm_env_value = (
-        None if env_vars is None else env_vars.get(VLLM_FP32_LM_HEAD_ENV_VAR)
-    )
-    vllm_fp32 = vllm_fp32_lm_head_enabled(vllm_cfg)
-    if trainer_fp32 != vllm_fp32:
-        raise ValueError(
-            "fp32 LM head must be enabled on both engines or neither: "
-            f"megatron_cfg.fp32_lm_head={megatron_cfg.get('fp32_lm_head')!r} but "
-            f"generation.vllm_cfg.fp32_lm_head={vllm_cfg.get('fp32_lm_head')!r} "
-            f"({VLLM_FP32_LM_HEAD_ENV_VAR}={vllm_env_value!r}). "
-            "A one-sided fp32 head "
-            "increases the generation/training logprob mismatch instead of "
-            "reducing it."
-        )
-    if trainer_fp32 and megatron_cfg.get("use_fused_linear_logprobs"):
-        raise ValueError(
-            "megatron_cfg.fp32_lm_head has no effect with "
-            "use_fused_linear_logprobs=true (the fused linear+CE kernel bypasses "
-            "output_layer), which would leave the trainer in bf16 while vLLM "
-            "runs fp32. Disable one of them."
-        )
 
 
 def _resolve_output_layer_owner(chunk: Any) -> Any:

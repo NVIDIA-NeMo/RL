@@ -39,6 +39,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.config import VLLM_FP32_LM_HEAD_ENV_VAR
 from nemo_rl.models.generation.vllm.vllm_worker import (
     VllmGenerationWorkerImpl,
     _context_capped_max_new_tokens,
@@ -1478,6 +1479,71 @@ def test_vllm_validate_settings_accepts_missing_vllm_cfg_as_refit_disabled():
     master_config = types.SimpleNamespace(policy={"generation": vllm_config})
 
     VllmGeneration.validate_settings(master_config)
+
+
+def _fp32_master_config(
+    trainer,
+    vllm_cfg,
+    *,
+    fused=False,
+    include_megatron_cfg=True,
+):
+    generation = deepcopy(basic_vllm_test_config)
+    generation["vllm_cfg"].update(vllm_cfg)
+    policy = {"generation": generation}
+    if include_megatron_cfg:
+        megatron_cfg = {"fp32_lm_head": trainer}
+        if fused:
+            megatron_cfg["use_fused_linear_logprobs"] = True
+        policy["megatron_cfg"] = megatron_cfg
+    return types.SimpleNamespace(policy=policy)
+
+
+@pytest.mark.parametrize(
+    "trainer, vllm_cfg",
+    [
+        (False, {}),
+        ("tf32", {"fp32_lm_head": True}),
+        (True, {"fp32_lm_head": True}),
+        (True, {"env_vars": {VLLM_FP32_LM_HEAD_ENV_VAR: "1"}}),
+    ],
+)
+def test_vllm_validate_settings_accepts_matched_fp32_lm_head(trainer, vllm_cfg):
+    VllmGeneration.validate_settings(_fp32_master_config(trainer, vllm_cfg))
+
+
+@pytest.mark.parametrize(
+    "trainer, vllm_cfg",
+    [
+        ("tf32", {}),  # trainer fp32, vLLM bf16: the production misconfiguration
+        (False, {"fp32_lm_head": True}),  # vLLM fp32, trainer bf16
+        (False, {"env_vars": {VLLM_FP32_LM_HEAD_ENV_VAR: "1"}}),
+    ],
+)
+def test_vllm_validate_settings_rejects_one_sided_fp32_lm_head(trainer, vllm_cfg):
+    with pytest.raises(ValueError, match="both engines or neither"):
+        VllmGeneration.validate_settings(_fp32_master_config(trainer, vllm_cfg))
+
+
+def test_vllm_validate_settings_rejects_fp32_lm_head_with_fused_logprobs():
+    with pytest.raises(ValueError, match="use_fused_linear_logprobs"):
+        VllmGeneration.validate_settings(
+            _fp32_master_config("tf32", {"fp32_lm_head": True}, fused=True)
+        )
+
+
+def test_vllm_validate_settings_handles_missing_megatron_cfg_for_fp32_lm_head():
+    VllmGeneration.validate_settings(
+        _fp32_master_config(False, {}, include_megatron_cfg=False)
+    )
+    with pytest.raises(ValueError, match="both engines or neither"):
+        VllmGeneration.validate_settings(
+            _fp32_master_config(
+                False,
+                {"fp32_lm_head": True},
+                include_megatron_cfg=False,
+            )
+        )
 
 
 def test_vllm_policy_generation(policy, test_input_data, tokenizer):
