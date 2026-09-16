@@ -101,3 +101,145 @@ def test_workplace_restore_audit_requires_exactly_once_mutation(tmp_path: Path) 
     audit.write_text("".join(json.dumps(event) + "\n" for event in events))
     with pytest.raises(AssertionError, match="exactly once"):
         _HELPER._verify_workplace_audit(selected, audit)
+
+
+def test_genrm_restore_allows_additional_complete_phase_two_cohort(
+    tmp_path: Path,
+) -> None:
+    selected = {
+        "rollouts": [
+            {
+                "rollout_id": "restored_g0",
+                "source_attempt_index": 0,
+                "restored_attempt_index": 1,
+            },
+            {
+                "rollout_id": "restored_g1",
+                "source_attempt_index": 0,
+                "restored_attempt_index": 1,
+            },
+        ]
+    }
+    restored = ["restored_g0-a1", "restored_g1-a1"]
+    extra = ["extra_g0", "extra_g1"]
+    rollout_events = [
+        {"event": "dispatch", "rollout_ids": restored},
+        *[
+            {"event": "completion_forwarded", "rollout_id": rollout_id, "reward": 1.0}
+            for rollout_id in restored
+        ],
+    ]
+    audit_events = [
+        {"phase": "phase1", "event": "verify_entered"},
+        {"phase": "phase1", "event": "verify_waiting"},
+    ]
+    for cohort in (restored, extra):
+        audit_events.extend(
+            [
+                {
+                    "phase": "phase2",
+                    "event": "verify_entered",
+                    "capture_rollout_id": cohort[0],
+                },
+                {
+                    "phase": "phase2",
+                    "event": "verify_waiting",
+                    "cohort_size": 1,
+                    "capture_rollout_ids": [cohort[0]],
+                },
+                {
+                    "phase": "phase2",
+                    "event": "verify_entered",
+                    "capture_rollout_id": cohort[1],
+                },
+                {
+                    "phase": "phase2",
+                    "event": "reward_computed",
+                    "cohort_size": 2,
+                    "capture_rollout_ids": cohort,
+                },
+                *[
+                    {
+                        "phase": "phase2",
+                        "event": "verify_returned",
+                        "capture_rollout_id": rollout_id,
+                    }
+                    for rollout_id in cohort
+                ],
+            ]
+        )
+
+    audit = tmp_path / "audit.jsonl"
+    audit.write_text("".join(json.dumps(event) + "\n" for event in audit_events))
+
+    _HELPER._verify_genrm_restore(selected, rollout_events, audit)
+
+
+def test_genrm_restore_rejects_duplicate_reward_for_selected_cohort(
+    tmp_path: Path,
+) -> None:
+    selected = {
+        "rollouts": [
+            {
+                "rollout_id": "restored_g0",
+                "source_attempt_index": 0,
+                "restored_attempt_index": 1,
+            },
+            {
+                "rollout_id": "restored_g1",
+                "source_attempt_index": 0,
+                "restored_attempt_index": 1,
+            },
+        ]
+    }
+    restored = ["restored_g0-a1", "restored_g1-a1"]
+    rollout_events = [
+        {"event": "dispatch", "rollout_ids": restored},
+        *[
+            {"event": "completion_forwarded", "rollout_id": rollout_id, "reward": 1.0}
+            for rollout_id in restored
+        ],
+    ]
+    audit_events = [
+        {"phase": "phase1", "event": "verify_entered"},
+        {"phase": "phase1", "event": "verify_waiting"},
+        *[
+            {
+                "phase": "phase2",
+                "event": "verify_entered",
+                "capture_rollout_id": rollout_id,
+            }
+            for rollout_id in restored
+        ],
+        {
+            "phase": "phase2",
+            "event": "verify_waiting",
+            "cohort_size": 1,
+            "capture_rollout_ids": [restored[0]],
+        },
+        {
+            "phase": "phase2",
+            "event": "reward_computed",
+            "cohort_size": 2,
+            "capture_rollout_ids": restored,
+        },
+        {
+            "phase": "phase2",
+            "event": "reward_computed",
+            "cohort_size": 2,
+            "capture_rollout_ids": restored,
+        },
+        *[
+            {
+                "phase": "phase2",
+                "event": "verify_returned",
+                "capture_rollout_id": rollout_id,
+            }
+            for rollout_id in restored
+        ],
+    ]
+    audit = tmp_path / "audit.jsonl"
+    audit.write_text("".join(json.dumps(event) + "\n" for event in audit_events))
+
+    with pytest.raises(AssertionError, match="rewarded more than once"):
+        _HELPER._verify_genrm_restore(selected, rollout_events, audit)
