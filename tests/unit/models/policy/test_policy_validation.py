@@ -20,11 +20,14 @@ the world_size compatibility validation that prevents confusing reshape errors
 when the cluster size is insufficient for the specified parallelism configuration.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from nemo_rl.models.generation.vllm.config import VLLM_FP32_LM_HEAD_ENV_VAR
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
@@ -205,8 +208,13 @@ def set_vllm_generation(
     return config
 
 
-def construct_policy_with_mocks(config: PolicyConfig) -> Policy:
-    model_config = MagicMock()
+def construct_policy_with_mocks(
+    config: PolicyConfig, model_config: object | None = None
+) -> Policy:
+    if model_config is None:
+        model_config = SimpleNamespace(
+            architectures=["NemotronHForCausalLM"], model_type="nemotron_h"
+        )
     with (
         patch.dict("os.environ", {"TORCH_CUDA_ARCH_LIST": "9.0"}),
         patch("nemo_rl.models.policy.lm_policy.RayQueue"),
@@ -231,6 +239,22 @@ def test_policy_accepts_matched_vllm_and_megatron_fp32_lm_head(trainer_fp32):
     set_vllm_generation(config, {"fp32_lm_head": True})
 
     policy = construct_policy_with_mocks(config)
+
+    assert policy.worker_group is not None
+
+
+def test_policy_warns_when_vllm_fp32_lm_head_model_is_not_nemotron_h():
+    config = create_megatron_config("test-model", tp=1)
+    config["megatron_cfg"]["fp32_lm_head"] = True
+    set_vllm_generation(config, {"fp32_lm_head": True})
+
+    with pytest.warns(UserWarning, match="Nemotron-H"):
+        policy = construct_policy_with_mocks(
+            config,
+            model_config=SimpleNamespace(
+                architectures=["Qwen2ForCausalLM"], model_type="qwen2"
+            ),
+        )
 
     assert policy.worker_group is not None
 
@@ -290,7 +314,9 @@ def test_policy_accepts_vllm_fp32_lm_head_disabled_with_dtensor_trainer():
 
 def test_policy_rejects_fp32_lm_head_env_var_toggle():
     config = create_dtensor_config("test-model", tp=1)
-    set_vllm_generation(config, {"env_vars": {VLLM_FP32_LM_HEAD_ENV_VAR: "1"}})
+    set_vllm_generation(
+        config, {"env_vars": {VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR: "1"}}
+    )
 
     with (
         patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,

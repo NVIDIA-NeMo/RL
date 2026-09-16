@@ -56,8 +56,8 @@ except ImportError:
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.vllm.config import (
-    VLLM_FP32_LM_HEAD_ENV_VAR,
-    vllm_fp32_lm_head_enabled,
+    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
+    vllm_nemotron_h_fp32_lm_head_enabled,
 )
 
 if TYPE_CHECKING:
@@ -127,6 +127,9 @@ POLICY_WORKER_OVERRIDES = {
     "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2",
 }
 
+_NEMOTRON_H_MODEL_TYPES = frozenset({"nemotron_h"})
+_NEMOTRON_H_ARCHITECTURES = frozenset({"NemotronHForCausalLM"})
+
 
 def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
     """Return the quantized policy worker FQN if ``quant_cfg`` is set, else ``default_cls``.
@@ -140,8 +143,54 @@ def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
     return POLICY_WORKER_OVERRIDES.get(default_cls, default_cls)
 
 
+def _normalize_model_type(model_type: object) -> str:
+    return str(model_type).lower().replace("-", "_")
+
+
+def _get_config_model_type(model_config: object) -> object | None:
+    return getattr(model_config, "model_type", None) or getattr(
+        model_config.__class__, "model_type", None
+    )
+
+
+def _get_config_architectures(model_config: object) -> list[str]:
+    architectures = getattr(model_config, "architectures", None) or []
+    if isinstance(architectures, str):
+        return [architectures]
+    try:
+        return [str(architecture) for architecture in architectures]
+    except TypeError:
+        return []
+
+
+def _is_nemotron_h_model_config(model_config: object) -> bool:
+    model_type = _get_config_model_type(model_config)
+    if (
+        model_type is not None
+        and _normalize_model_type(model_type) in _NEMOTRON_H_MODEL_TYPES
+    ):
+        return True
+
+    return any(
+        architecture in _NEMOTRON_H_ARCHITECTURES
+        for architecture in _get_config_architectures(model_config)
+    )
+
+
+def _describe_model_config(model_config: object) -> str:
+    model_type = _get_config_model_type(model_config)
+    architectures = _get_config_architectures(model_config)
+    if architectures:
+        return f"architectures={architectures!r}, model_type={model_type!r}"
+    return f"model_type={model_type!r}"
+
+
 def validate_fp32_lm_head_config(
-    config: "PolicyConfig", *, megatron_enabled: bool, dtensor_enabled: bool
+    config: "PolicyConfig",
+    *,
+    megatron_enabled: bool,
+    dtensor_enabled: bool,
+    model_config: object | None = None,
 ) -> None:
     """Reject fp32 LM-head settings that the selected backends cannot match."""
     generation_config = config.get("generation")
@@ -176,14 +225,15 @@ def validate_fp32_lm_head_config(
         return
 
     env_vars = vllm_cfg.get("env_vars") or {}
-    if VLLM_FP32_LM_HEAD_ENV_VAR in env_vars:
+    if VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR in env_vars:
         raise ValueError(
-            f"{VLLM_FP32_LM_HEAD_ENV_VAR} is reserved for NeMo-RL internal "
-            "vLLM patch plumbing; configure fp32 LM head with "
+            f"{VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR} is reserved for "
+            "NeMo-RL internal vLLM Nemotron-H patch plumbing; configure fp32 "
+            "LM head with "
             "policy.generation.vllm_cfg.fp32_lm_head instead."
         )
 
-    vllm_fp32 = vllm_fp32_lm_head_enabled(vllm_cfg)
+    vllm_fp32 = vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg)
     if dtensor_enabled and vllm_fp32:
         raise ValueError(
             "policy.generation.vllm_cfg.fp32_lm_head=true is only supported "
@@ -199,6 +249,20 @@ def validate_fp32_lm_head_config(
             f"{vllm_cfg.get('fp32_lm_head')!r}. "
             "A one-sided fp32 head increases the generation/training logprob "
             "mismatch instead of reducing it."
+        )
+    if (
+        vllm_fp32
+        and model_config is not None
+        and not _is_nemotron_h_model_config(model_config)
+    ):
+        warnings.warn(
+            "policy.generation.vllm_cfg.fp32_lm_head=true currently only "
+            "patches vLLM's Nemotron-H model implementation "
+            "(NemotronHForCausalLM). The configured policy model does not "
+            f"look like Nemotron-H ({_describe_model_config(model_config)}), "
+            "so vLLM generation will not execute an fp32 LM-head path.",
+            UserWarning,
+            stacklevel=2,
         )
 
 

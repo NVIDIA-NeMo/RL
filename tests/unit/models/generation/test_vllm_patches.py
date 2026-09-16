@@ -41,8 +41,8 @@ import torch
 
 from nemo_rl.models.generation.vllm import patches
 from nemo_rl.models.generation.vllm.config import (
-    VLLM_FP32_LM_HEAD_ENV_VAR,
-    vllm_fp32_lm_head_enabled,
+    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
+    vllm_nemotron_h_fp32_lm_head_enabled,
 )
 from tests.unit.models.generation.vllm_patch_source_utils import (
     write_unpatched_copy,
@@ -136,7 +136,7 @@ class NemotronHForCausalLM:
 _NEMOTRON_H_LEGACY_FP32_HEAD_COMPUTE = f"""    def compute_logits(self, hidden_states):
         import os as _os
 
-        if _os.environ.get("{VLLM_FP32_LM_HEAD_ENV_VAR}", "0") == "1":
+        if _os.environ.get("{VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR}", "0") == "1":
             # NeMo-RL patch: fp32 LM head (MiniMax-M1-style). bf16 rounding of
             # the logits is the dominant gen/train logprob mismatch source.
             _fp32_head = getattr(self, "_nrl_lm_head_fp32", None)
@@ -368,12 +368,12 @@ def test_glm_decoder_sp_moe_patch_warns_on_unknown_source(
         ({}, False),
         ({"fp32_lm_head": False}, False),
         ({"fp32_lm_head": True}, True),
-        ({"env_vars": {VLLM_FP32_LM_HEAD_ENV_VAR: "1"}}, False),
-        ({"env_vars": {VLLM_FP32_LM_HEAD_ENV_VAR: "0"}}, False),
+        ({"env_vars": {VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR: "1"}}, False),
+        ({"env_vars": {VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR: "0"}}, False),
     ],
 )
-def test_vllm_fp32_lm_head_enabled(vllm_cfg, expected):
-    assert vllm_fp32_lm_head_enabled(vllm_cfg) is expected
+def test_vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg, expected):
+    assert vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg) is expected
 
 
 @pytest.mark.parametrize("env_value", [None, "0", "1"])
@@ -381,9 +381,9 @@ def test_nemotron_h_fp32_lm_head_patch_is_env_gated(
     patched_nemotron_h_source, monkeypatch, env_value
 ):
     if env_value is None:
-        monkeypatch.delenv("NRL_VLLM_FP32_LM_HEAD", raising=False)
+        monkeypatch.delenv(VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, raising=False)
     else:
-        monkeypatch.setenv("NRL_VLLM_FP32_LM_HEAD", env_value)
+        monkeypatch.setenv(VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, env_value)
 
     namespace = {}
     source = patched_nemotron_h_source.read_text()
@@ -421,7 +421,7 @@ def test_nemotron_h_fp32_lm_head_patch_is_env_gated(
 def test_nemotron_h_fp32_lm_head_patch_migrates_legacy_cached_head_source(
     patched_legacy_nemotron_h_source, monkeypatch
 ):
-    monkeypatch.setenv(VLLM_FP32_LM_HEAD_ENV_VAR, "1")
+    monkeypatch.setenv(VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, "1")
 
     source = patched_legacy_nemotron_h_source.read_text()
     namespace = {}
@@ -490,7 +490,7 @@ def _stub_non_fp32_vllm_patches(monkeypatch, captured_extra_env_vars):
 @pytest.mark.parametrize("enabled", [False, True])
 def test_apply_vllm_patches_gates_nemotron_h_fp32_lm_head(monkeypatch, enabled):
     _install_fake_vllm_modules(monkeypatch)
-    monkeypatch.delenv(patches.VLLM_FP32_LM_HEAD_ENV_VAR, raising=False)
+    monkeypatch.delenv(patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, raising=False)
     captured_extra_env_vars = []
     fp32_patch_calls = []
     _stub_non_fp32_vllm_patches(monkeypatch, captured_extra_env_vars)
@@ -500,22 +500,24 @@ def test_apply_vllm_patches_gates_nemotron_h_fp32_lm_head(monkeypatch, enabled):
         lambda _logger: fp32_patch_calls.append(True) or True,
     )
 
-    patches._apply_vllm_patches("py", extra_env_vars=["USER_VAR"], fp32_lm_head=enabled)
+    patches._apply_vllm_patches(
+        "py", extra_env_vars=["USER_VAR"], nemotron_h_fp32_lm_head=enabled
+    )
 
     assert bool(fp32_patch_calls) is enabled
     if enabled:
-        assert os.environ[patches.VLLM_FP32_LM_HEAD_ENV_VAR] == "1"
+        assert os.environ[patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR] == "1"
         assert captured_extra_env_vars == [
-            ["USER_VAR", patches.VLLM_FP32_LM_HEAD_ENV_VAR]
+            ["USER_VAR", patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR]
         ]
     else:
-        assert patches.VLLM_FP32_LM_HEAD_ENV_VAR not in os.environ
+        assert patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR not in os.environ
         assert captured_extra_env_vars == [["USER_VAR"]]
 
 
 def test_apply_vllm_patches_ignores_ambient_fp32_lm_head_env_toggle(monkeypatch):
     _install_fake_vllm_modules(monkeypatch)
-    monkeypatch.setenv(patches.VLLM_FP32_LM_HEAD_ENV_VAR, "1")
+    monkeypatch.setenv(patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, "1")
     captured_extra_env_vars = []
     fp32_patch_calls = []
     _stub_non_fp32_vllm_patches(monkeypatch, captured_extra_env_vars)
@@ -528,22 +530,27 @@ def test_apply_vllm_patches_ignores_ambient_fp32_lm_head_env_toggle(monkeypatch)
     patches._apply_vllm_patches("py")
 
     assert fp32_patch_calls == []
-    assert patches.VLLM_FP32_LM_HEAD_ENV_VAR not in os.environ
+    assert patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR not in os.environ
     assert captured_extra_env_vars == [None]
 
 
 @pytest.mark.parametrize(
-    ("vllm_cfg_overrides", "expected_fp32_lm_head"),
+    ("vllm_cfg_overrides", "expected_nemotron_h_fp32_lm_head"),
     [
         ({"env_vars": {"USER_VAR": "value"}, "fp32_lm_head": True}, True),
         (
-            {"env_vars": {"USER_VAR": "value", VLLM_FP32_LM_HEAD_ENV_VAR: "1"}},
+            {
+                "env_vars": {
+                    "USER_VAR": "value",
+                    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR: "1",
+                }
+            },
             False,
         ),
     ],
 )
-def test_vllm_worker_threads_fp32_lm_head_cfg_into_source_patches(
-    monkeypatch, vllm_cfg_overrides, expected_fp32_lm_head
+def test_vllm_worker_threads_nemotron_h_fp32_lm_head_cfg_into_source_patches(
+    monkeypatch, vllm_cfg_overrides, expected_nemotron_h_fp32_lm_head
 ):
     from nemo_rl.models.generation.vllm import vllm_worker
 
@@ -551,11 +558,11 @@ def test_vllm_worker_threads_fp32_lm_head_cfg_into_source_patches(
     monkeypatch.setattr(
         vllm_worker,
         "_apply_vllm_patches",
-        lambda py, *, extra_env_vars, fp32_lm_head: patch_calls.append(
+        lambda py, *, extra_env_vars, nemotron_h_fp32_lm_head: patch_calls.append(
             {
                 "py": py,
                 "extra_env_vars": extra_env_vars,
-                "fp32_lm_head": fp32_lm_head,
+                "nemotron_h_fp32_lm_head": nemotron_h_fp32_lm_head,
             }
         ),
     )
@@ -579,7 +586,7 @@ def test_vllm_worker_threads_fp32_lm_head_cfg_into_source_patches(
         {
             "py": sys.executable,
             "extra_env_vars": ["EXPLICIT_VAR"],
-            "fp32_lm_head": expected_fp32_lm_head,
+            "nemotron_h_fp32_lm_head": expected_nemotron_h_fp32_lm_head,
         }
     ]
 

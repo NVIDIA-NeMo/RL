@@ -16,7 +16,9 @@ import os
 from contextlib import contextmanager
 from importlib.util import find_spec
 
-from nemo_rl.models.generation.vllm.config import VLLM_FP32_LM_HEAD_ENV_VAR
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
+)
 
 
 def _get_vllm_file(relative_path: str) -> str:
@@ -666,7 +668,7 @@ from torch import nn"""
             prefix=maybe_prefix(prefix, "lm_head"),
         )"""
     previous_lm_head_snippet = f"""        self._nrl_fp32_lm_head = (
-            os.environ.get("{VLLM_FP32_LM_HEAD_ENV_VAR}", "0") == "1"
+            os.environ.get("{VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR}", "0") == "1"
         )
         if self._nrl_fp32_lm_head:
             self.lm_head = ParallelLMHead(
@@ -690,7 +692,7 @@ from torch import nn"""
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self._nrl_fp32_lm_head = (
-            os.environ.get("{VLLM_FP32_LM_HEAD_ENV_VAR}", "0") == "1"
+            os.environ.get("{VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR}", "0") == "1"
         )"""
     old_logits_processor_snippet = (
         "        self.logits_processor = LogitsProcessor(config.vocab_size)"
@@ -735,7 +737,7 @@ from torch import nn"""
     # source file that still contains the previous lazy-deepcopy patch.
     legacy_snippet = f"""        import os as _os
 
-        if _os.environ.get("{VLLM_FP32_LM_HEAD_ENV_VAR}", "0") == "1":
+        if _os.environ.get("{VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR}", "0") == "1":
             # NeMo-RL patch: fp32 LM head (MiniMax-M1-style). bf16 rounding of
             # the logits is the dominant gen/train logprob mismatch source.
             _fp32_head = getattr(self, "_nrl_lm_head_fp32", None)
@@ -861,19 +863,22 @@ def _apply_vllm_patches(
     py_executable: str,
     *,
     extra_env_vars: list[str] | None = None,
-    fp32_lm_head: bool | None = None,
+    nemotron_h_fp32_lm_head: bool | None = None,
 ) -> None:
     # Import lazily so importing the worker module does not import vLLM.
     import vllm.envs as envs
     from vllm.logger import init_logger
 
     patch_logger = init_logger("vllm_patch")
-    fp32_lm_head_enabled = bool(fp32_lm_head)
-    if fp32_lm_head_enabled:
-        os.environ[VLLM_FP32_LM_HEAD_ENV_VAR] = "1"
-        extra_env_vars = [*(extra_env_vars or []), VLLM_FP32_LM_HEAD_ENV_VAR]
+    nemotron_h_fp32_lm_head_enabled = bool(nemotron_h_fp32_lm_head)
+    if nemotron_h_fp32_lm_head_enabled:
+        os.environ[VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR] = "1"
+        extra_env_vars = [
+            *(extra_env_vars or []),
+            VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
+        ]
     else:
-        os.environ.pop(VLLM_FP32_LM_HEAD_ENV_VAR, None)
+        os.environ.pop(VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, None)
 
     # Whether the v1 patch matters at all depends on which executor vLLM will
     # select. 0.25 defaults this to "1" (RayExecutorV2), which has no
@@ -917,9 +922,13 @@ def _apply_vllm_patches(
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
-    if fp32_lm_head_enabled and not _patch_vllm_nemotron_h_fp32_lm_head(patch_logger):
+    if (
+        nemotron_h_fp32_lm_head_enabled
+        and not _patch_vllm_nemotron_h_fp32_lm_head(patch_logger)
+    ):
         raise RuntimeError(
-            "vllm_cfg.fp32_lm_head is enabled, but the Nemotron-H fp32 LM head "
-            "source patch could not be applied. Disable the flag or update the "
-            "patch anchors for this vLLM version."
+            "vllm_cfg.fp32_lm_head is enabled, but that flag currently maps to "
+            "the Nemotron-H-only vLLM fp32 LM head source patch, and the patch "
+            "could not be applied. Disable the flag or update the patch anchors "
+            "for this vLLM version."
         )

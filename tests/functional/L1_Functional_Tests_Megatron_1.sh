@@ -36,7 +36,6 @@ run_test() {
 
 run_test fast uv run --no-sync bash ./tests/functional/audio_grpo_megatron.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_megatron.sh
-run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_vllm_fp32_lm_head.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_mbridge_restore.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_eagle3_online.sh
 

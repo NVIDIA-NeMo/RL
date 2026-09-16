@@ -46,7 +46,7 @@ from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     VllmConfig,
     resolve_vllm_video_config,
-    vllm_fp32_lm_head_enabled,
+    vllm_nemotron_h_fp32_lm_head_enabled,
 )
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
@@ -443,7 +443,7 @@ class BaseVllmGenerationWorker:
         _apply_vllm_patches(
             self.py_executable,
             extra_env_vars=extra_env_vars,
-            fp32_lm_head=vllm_fp32_lm_head_enabled(vllm_cfg),
+            nemotron_h_fp32_lm_head=vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg),
         )
 
         # Skip model loading if we're not the model owner
