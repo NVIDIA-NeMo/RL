@@ -358,6 +358,51 @@ def test_megatron_stager_stamps_admission_epoch_when_request_spans_refit(
 
 
 @pytest.mark.parametrize(
+    "missing_field",
+    ["prompt_token_ids", "generated_token_ids", "generated_log_probs"],
+)
+def test_megatron_stager_poisons_malformed_payloads_with_capture_failed(
+    tq_client, staging_partition, missing_field
+):
+    """Extraction errors return ``capture_failed`` coords, not ``None``.
+
+    Gym maps returned failed coords to ``worker_capture_failed`` (as for
+    vLLM); a ``None`` result would instead surface as
+    ``worker_response_missing_commit_coordinates``.
+    """
+    stager = TQMegatronTokenStager(
+        TQTokenSink(tq_client, staging_partition=staging_partition)
+    )
+    fields = {
+        "prompt_token_ids": [10, 11],
+        "generated_token_ids": [12, 13],
+        "generated_log_probs": [-0.25, -0.5],
+    }
+    del fields[missing_field]
+    admission = nemo_gym.CaptureAdmission(
+        rollout_id="minf-r0",
+        model_call_id="c1",
+        mode="text",
+    )
+
+    result = stager.stage(
+        "minf-response-1",
+        SimpleNamespace(**fields),
+        finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
+        request_metadata={"ng_capture": admission.model_dump(mode="json")},
+    )
+
+    assert result is not None
+    coords = result.response_metadata["ng_commit_coords"]
+    assert coords["disposition"] == "capture_failed"
+    assert coords["weight_version"] == 7
+    with pytest.raises(KeyError):
+        TQTokenSource(tq_client, staging_partition=staging_partition).fetch(
+            ["minf-r0/c1"]
+        )
+
+
+@pytest.mark.parametrize(
     ("with_capture_metadata", "policy_epoch"),
     [
         pytest.param(False, [(0, 7)], id="missing-capture-metadata"),

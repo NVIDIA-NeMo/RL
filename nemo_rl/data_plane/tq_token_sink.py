@@ -493,12 +493,16 @@ class TQMegatronTokenStager:
 
     def __init__(self, sink: TQTokenSink) -> None:
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        from nemo_gym.token_id_capture.adapters.megatron import (
+            MegatronCaptureAdapter,
+        )
         from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
 
         self._capture = RolloutTokenCapture(
             sink=sink,
             # MInf passes the authoritative version explicitly for every call.
             weight_version_fn=lambda: 0,
+            adapter=MegatronCaptureAdapter(),
         )
         # Requests that straddled a refit (more than one policy_epoch boundary).
         # Metered here because they are stamped, not masked; see _weight_version.
@@ -584,26 +588,16 @@ class TQMegatronTokenStager:
         from nemo_gym.token_id_capture.staging.records import CaptureAdmission
 
         admission = CaptureAdmission.model_validate(capture_payload)
-        prompt_token_ids = getattr(payload, "prompt_token_ids", None)
-        generated_token_ids = getattr(payload, "generated_token_ids", None)
-        generated_log_probs = getattr(payload, "generated_log_probs", None)
-        if prompt_token_ids is None:
-            raise ValueError("MInf offloaded payload carries no prompt_token_ids")
-        if generated_token_ids is None:
-            raise ValueError("MInf offloaded payload carries no generated_token_ids")
-        if generated_log_probs is None:
-            raise ValueError("MInf offloaded payload carries no generated_log_probs")
-
         call = self._capture.begin_call(
             admission,
             weight_version=self._weight_version(finished_metadata),
         )
-        coords = self._capture.complete_call(
-            call,
-            prompt_token_ids=[int(token_id) for token_id in prompt_token_ids],
-            generated_token_ids=[int(token_id) for token_id in generated_token_ids],
-            generated_logprobs=[float(value) for value in generated_log_probs],
-        )
+        # Gym's MegatronCaptureAdapter reads prompt/generated ids and log
+        # probs off the offloaded payload. A malformed payload poisons the
+        # call with ``capture_failed`` coordinates (surfacing in Gym as
+        # ``worker_capture_failed``, matching vLLM) instead of raising here,
+        # which would leave Gym with no coordinates at all.
+        coords = self._capture.complete_call_from_response(call, payload)
         return MegatronPayloadStageResult(
             response_metadata={
                 "ng_commit_coords": coords.model_dump(mode="json"),
