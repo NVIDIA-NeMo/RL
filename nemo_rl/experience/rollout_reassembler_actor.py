@@ -59,6 +59,7 @@ class ReassemblyRequest:
     receipts: tuple[Optional[dict[str, Any]], ...]
     rewards: tuple[float, ...]
     fallback_weight_version: int
+    end_weight_version: int
     # Stable dataset prompt index; pack_payload stamps it on every row's tag.
     prompt_idx: int
     # Per-rollout advantage-stage flag the receipt path already knows at
@@ -173,6 +174,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             list(request.rewards),
             mask_sample=list(request.mask_sample),
             fallback_weight_version=request.fallback_weight_version,
+            latest_weight_version=request.end_weight_version,
             prompt_idx=request.prompt_idx,
             loss_multiplier=request.loss_multiplier,
             canonical_sample_ids=list(request.canonical_sample_ids),

@@ -185,6 +185,7 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
         _capture_sink=None,
         _generation_prefix_cuts_enabled=False,
         _generation_cut_control_token=None,
+        _generation_chunk_flush_tokens=0,
         _generation_checkpoint_gate=_CheckpointCaptureGate(),
         _staging_source=None,
         _prefix_cache={},
@@ -522,6 +523,8 @@ def _worker_with_capture(sink: _MemorySink):
         "_get_request_capture",
         "_pop_request_capture",
         "_remember_completed_capture",
+        "_completed_generation_cut_ack",
+        "_checkpoint_active_generation_cut",
         "_finish_request_capture_after_checkpoint_gate",
         "_finish_request_capture_with_lifecycle_owned",
     ):
@@ -741,10 +744,42 @@ def test_periodic_flush_rolls_back_and_clears_when_staging_fails():
     assert state.unstaged_token_count() == 2
     assert state.frozen_buffer is None
     assert state.generation_cut_staging_keys == []
+    assert state.periodic_flush_due is True
 
-    state.periodic_flush_due = True
     assert worker.flush_due_generation_chunks() == 1
     assert sink.generation_prefix_records[-1][1].token_ids_delta == [10, 20, 21]
+
+
+def test_periodic_flush_rearms_when_fresh_buffer_fills_during_tq_write():
+    sink = _BlockingPrefixSink()
+    worker = _capture_worker_with_periodic_flush(sink, threshold=2)
+    request = _begin_captured_request(worker, [10])
+    state = worker._capture_calls[id(request)]
+    _observe(worker, request, [20, 21], [-0.1, -0.2])
+
+    first_result: list[int] = []
+    thread = threading.Thread(
+        target=lambda: first_result.append(worker.flush_due_generation_chunks())
+    )
+    thread.start()
+    try:
+        assert sink.write_started.wait(timeout=5.0)
+        # Decoding continues into the post-swap buffer while TQ is blocked.
+        _observe(worker, request, [22, 23], [-0.3, -0.4])
+        # The frozen write owns the first flush; sealing it must rediscover
+        # that the fresh buffer independently crossed the threshold.
+        assert state.periodic_flush_due is False
+    finally:
+        sink.release_write.set()
+        thread.join(timeout=5.0)
+
+    assert not thread.is_alive()
+    assert first_result == [1]
+    assert state.periodic_flush_due is True
+    assert worker.flush_due_generation_chunks() == 1
+    assert [
+        record.token_ids_delta for _, record in sink.generation_prefix_records
+    ] == [[10, 20, 21], [22, 23]]
 
 
 def test_terminal_completion_waits_for_periodic_flush_and_clears_its_row():
@@ -968,6 +1003,113 @@ def test_generation_cut_marks_completed_race_as_terminal_completion():
     assert receipt.prefixes[0].staging_keys == ("r0/c1",)
 
 
+def test_abort_waits_for_generation_cut_before_failing_the_call():
+    sink = _BlockingPrefixSink()
+    worker = _worker_with_capture(sink)
+    request = _begin_captured_request(worker, [10])
+    _observe(worker, request, [11], [-0.1])
+    inventory = GenerationCutInventory.build(
+        checkpoint_id="checkpoint-1",
+        server_name="policy",
+        active_prefixes=[
+            GenerationCutPrefix(
+                ticket_id="ticket-1",
+                rollout_id="r0",
+                attempt_index=0,
+                model_call_id="c1",
+                admitted_at=1.0,
+            )
+        ],
+    )
+    receipt: list[GenerationCutReceipt] = []
+    cut_thread = threading.Thread(
+        target=lambda: receipt.append(
+            VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(
+                worker, inventory
+            )
+        )
+    )
+    abort_thread = threading.Thread(
+        target=lambda: VllmAsyncGenerationWorkerImpl._abort_request_capture(
+            worker, request, reason="injected abort"
+        )
+    )
+
+    cut_thread.start()
+    try:
+        assert sink.write_started.wait(timeout=5.0)
+        abort_thread.start()
+        abort_thread.join(timeout=0.05)
+        assert abort_thread.is_alive()
+    finally:
+        sink.release_write.set()
+        cut_thread.join(timeout=5.0)
+        abort_thread.join(timeout=5.0)
+
+    assert not cut_thread.is_alive()
+    assert not abort_thread.is_alive()
+    assert receipt[0].prefixes[0].disposition == "durable_prefix"
+    assert len(sink.generation_prefix_records) == 1
+    assert worker._completed_capture_calls["c1"].coords.disposition == "failed"
+
+
+def test_completed_capture_evidence_expires_by_age_not_entry_count(monkeypatch):
+    worker = _worker_with_capture(_MemorySink())
+    now = [100.0]
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.time.monotonic",
+        lambda: now[0],
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async."
+        "_COMPLETED_CAPTURE_RETENTION_S",
+        10.0,
+    )
+    coords = SimpleNamespace(rollout_id="r0", disposition="failed")
+
+    worker._remember_completed_capture("c1", coords, 0)
+    now[0] += 11.0
+    worker._remember_completed_capture("c2", coords, 0)
+
+    assert list(worker._completed_capture_calls) == ["c2"]
+
+
+def test_generation_cut_recovers_terminal_evidence_from_durable_tq_row():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    request = _begin_captured_request(worker, [10])
+    VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker,
+        request,
+        _served_content([11, 12], [-0.1, -0.2]),
+    )
+    worker._staging_source = _MemoryPrefixSource(
+        {}, records={"r0/c1": sink.records[0]}
+    )
+    worker._completed_capture_calls.clear()
+    inventory = GenerationCutInventory.build(
+        checkpoint_id="checkpoint-1",
+        server_name="policy",
+        active_prefixes=[
+            GenerationCutPrefix(
+                ticket_id="ticket-1",
+                rollout_id="r0",
+                attempt_index=0,
+                model_call_id="c1",
+                admitted_at=1.0,
+            )
+        ],
+    )
+
+    receipt = VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(
+        worker, inventory
+    )
+
+    assert receipt.prefixes[0].cut_kind == "terminal_completion"
+    assert receipt.prefixes[0].staging_keys == ("r0/c1",)
+    assert receipt.prefixes[0].prefix_token_count == 2
+
+
 def test_capture_observer_rejects_unaligned_delta_output():
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
@@ -1011,7 +1153,7 @@ def test_capture_observer_rejects_unaligned_delta_output():
 
 def test_generation_cut_swaps_buffer_before_blocking_prefix_write():
     sink = _BlockingPrefixSink()
-    worker = _worker_with_capture(sink)
+    worker = _capture_worker_with_periodic_flush(sink, threshold=2)
     request = _FakeRequest(
         ng_capture={
             "rollout_id": "r0",
@@ -1081,11 +1223,13 @@ def test_generation_cut_swaps_buffer_before_blocking_prefix_write():
                 ]
             ),
         )
+        assert worker._capture_calls[id(request)].periodic_flush_due is False
     finally:
         sink.release_write.set()
         thread.join(timeout=5.0)
     assert not thread.is_alive()
     assert len(result) == 1
+    assert worker._capture_calls[id(request)].periodic_flush_due is True
     assert sink.generation_prefix_records[0][1].token_ids_delta == [
         10,
         11,
