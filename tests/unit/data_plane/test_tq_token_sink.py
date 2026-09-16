@@ -24,6 +24,7 @@ protocol edges the kit does not cover (missing keys, stage failure shape).
 
 from __future__ import annotations
 
+import hashlib
 from types import SimpleNamespace
 
 import pytest
@@ -56,6 +57,10 @@ from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
 STAGING_PARTITION = "rollout_staging_test"
 
 pytestmark = pytest.mark.nemo_gym
+
+
+def _digest(label: str) -> str:
+    return hashlib.sha256(label.encode()).hexdigest()
 
 
 @pytest.mark.nemo_gym
@@ -294,7 +299,10 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
             "parent_chain_hash": root_coords["chain_hash"],
         }
     else:
-        admission_kwargs = {"required_prefix_token_ids": [10, 11, 12, 99]}
+        admission_kwargs = {
+            "required_prefix_token_ids": [10, 11, 12, 99],
+            "parent_chain_hash": _digest("chain:c1"),
+        }
 
     admission = nemo_gym.CaptureAdmission(
         rollout_id="minf-r0",

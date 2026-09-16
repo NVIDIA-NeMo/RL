@@ -83,7 +83,6 @@ def _manifest_record(
         "staging_key": f"r0/{call_id}",
         "mode": "text" if parent is None else "token_in",
         "response_id": response_id or f"resp-{call_id}",
-        "logical_request_id": None,
         "chain_hash": _digest(f"chain:{call_id}"),
         "cumulative_hash": cumulative_hash or _digest(f"cumulative:{call_id}"),
     }
