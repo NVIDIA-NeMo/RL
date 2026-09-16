@@ -68,6 +68,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import LoggerConfig
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 
 def has_gloo() -> bool:
@@ -213,12 +214,12 @@ def _make_master_config(
             },
             "logger": LoggerConfig(log_dir="/tmp/logger"),
             "cluster": ClusterConfig(num_nodes=1, gpus_per_node=1),
-            "checkpointing": {
+            "checkpointing": CheckpointingConfig.model_construct(**{
                 "enabled": save_enabled,
                 "checkpoint_must_save_by": None,
                 "save_period": 100,
                 "metric_name": None,
-            },
+            }),
         }
     )
 
@@ -586,10 +587,10 @@ def test_ft_save_period_triggers_periodic_saves(mock_xtoken_components):
     c = mock_xtoken_components
     c.master_config.distillation["max_num_steps"] = 5
     c.master_config.distillation["max_num_epochs"] = 1
-    c.master_config.checkpointing["enabled"] = True
-    c.master_config.checkpointing["save_period"] = 100  # only the final step saves
-    c.master_config.checkpointing["ft_save_period"] = 2
-    c.master_config.checkpointing["metric_name"] = None
+    c.master_config.checkpointing.enabled = True
+    c.master_config.checkpointing.save_period = 100  # only the final step saves
+    c.master_config.checkpointing.ft_save_period = 2
+    c.master_config.checkpointing.metric_name = None
     c.checkpointer.init_tmp_checkpoint.return_value = "/tmp/ft_ckpt_test/tmp_step"
 
     with patch(
@@ -618,8 +619,8 @@ def test_exit_on_max_epochs(mock_xtoken_components):
 
 def test_exit_on_timeout(mock_xtoken_components, capsys, tmp_path):
     mock_xtoken_components.master_config.distillation["max_num_steps"] = 100
-    mock_xtoken_components.master_config.checkpointing["enabled"] = True
-    mock_xtoken_components.master_config.checkpointing["metric_name"] = None
+    mock_xtoken_components.master_config.checkpointing.enabled = True
+    mock_xtoken_components.master_config.checkpointing.metric_name = None
     mock_xtoken_components.checkpointer.init_tmp_checkpoint.return_value = str(
         tmp_path / "tmp_step"
     )
