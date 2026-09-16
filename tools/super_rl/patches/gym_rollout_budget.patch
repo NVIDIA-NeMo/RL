@@ -135,7 +135,7 @@ index 26a3c5c..8498c89 100644
              if collect_trajectory:
                  turn_timestamp = time()
  
-@@ -157,6 +165,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
+@@ -157,5 +165,6 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                      )
                  )
  

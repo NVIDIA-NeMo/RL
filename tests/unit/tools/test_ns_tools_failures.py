@@ -4,6 +4,7 @@
 
 import ast
 import asyncio
+import os
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -25,7 +26,10 @@ def verify(tmp_path_factory):
         check=False,
     )
     if source.returncode:
-        pytest.skip("Initialize the pinned Gym submodule to test its failure overlay")
+        message = "Initialize the pinned Gym submodule to test its failure overlay"
+        if os.environ.get("NRL_REQUIRE_PINNED_GYM"):
+            pytest.fail(message)  # CI opt-in: no pin means no signal
+        pytest.skip(message)
     stage = tmp_path_factory.mktemp("ns-tools-failures")
     path = stage / RELATIVE
     path.parent.mkdir(parents=True)

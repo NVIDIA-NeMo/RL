@@ -3,6 +3,7 @@
 """Exercise the patched, pinned CCC function with controlled sandbox replies."""
 
 import importlib.util
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -24,7 +25,10 @@ def evaluator(tmp_path_factory):
         check=False,
     )
     if source.returncode:
-        pytest.skip("Initialize the pinned Gym submodule to test its execution overlay")
+        message = "Initialize the pinned Gym submodule to test its execution overlay"
+        if os.environ.get("NRL_REQUIRE_PINNED_GYM"):
+            pytest.fail(message)  # CI opt-in: no pin means no signal
+        pytest.skip(message)
     stage = tmp_path_factory.mktemp("ccc-execution")
     path = stage / RELATIVE
     path.parent.mkdir(parents=True)
