@@ -28,9 +28,30 @@ from nemo_rl.environments.nemo_gym import (
 )
 from nemo_rl.environments.gym_checkpoint import (
     GymActorExecutionRegistry,
+    GymAgentExecutionStatus,
     GymExecutionIdentity,
     GymResourcesPrepareResponse,
 )
+
+
+def test_agent_status_accepts_external_wait_frozen_boundary() -> None:
+    status = GymAgentExecutionStatus.model_validate(
+        {
+            "rollout_id": "rollout-a",
+            "attempt_index": 0,
+            "generation": 1,
+            "state": "external_wait_frozen",
+            "parked_boundary_state": "external_wait_frozen",
+            "boundary_index": 2,
+            "turn_index": 1,
+            "boundary_kind": "turn_complete",
+            "resource_state_revisions": {},
+            "age_seconds": 0.1,
+        }
+    )
+
+    assert status.state == "external_wait_frozen"
+    assert status.parked_boundary_state == "external_wait_frozen"
 
 
 def _capability(component: str, name: str, **overrides):
