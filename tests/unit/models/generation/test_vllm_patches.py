@@ -414,6 +414,7 @@ def test_nemotron_h_fp32_lm_head_patch_is_env_gated(
 
     assert "deepcopy" not in source
     assert "params_dtype=torch.float32" not in source
+    assert "NemotronH vLLM lm_head.forward casts input and weight to fp32" in source
     assert "torch.matmul(" in source
     ast.parse(source)
 

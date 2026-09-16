@@ -703,6 +703,13 @@ from torch import nn"""
             def _nrl_fp32_lm_head_forward(
                 input_, embedding_bias=None, _lm_head=self.lm_head
             ):
+                if not getattr(_lm_head, "_nrl_fp32_lm_head_forward_logged", False):
+                    print(
+                        "[fp32_lm_head] NemotronH vLLM lm_head.forward casts "
+                        "input and weight to fp32",
+                        flush=True,
+                    )
+                    _lm_head._nrl_fp32_lm_head_forward_logged = True
                 logits = torch.matmul(
                     input_.to(dtype=torch.float32),
                     _lm_head.weight.to(dtype=torch.float32).t(),
