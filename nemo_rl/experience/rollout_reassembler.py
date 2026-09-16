@@ -365,15 +365,18 @@ class RolloutReassembler:
         mask_sample: list[bool],
         fallback_weight_version: int,
         prompt_idx: int,
+        latest_weight_version: Optional[int] = None,
         loss_multiplier: float = 1.0,
         canonical_sample_ids: Optional[list[str]] = None,
     ) -> FinalizedGroup:
         """Publish exactly N canonical rows for one prompt group.
 
         Blocking (TQ round trips); run via ``asyncio.to_thread`` from the
-        dispatch task. ``fallback_weight_version`` stamps a group none of
-        whose rollouts produced a valid row (placeholder-only groups still
-        need a staleness tag). ``mask_sample`` is the per-rollout
+        dispatch task. ``fallback_weight_version`` and
+        ``latest_weight_version`` bound every policy version that could have
+        served the group, including a live refit inside one long model call.
+        Placeholder-only groups still need those staleness tags.
+        ``mask_sample`` is the per-rollout
         advantage-stage flag the native ``pack_payload`` path emits from each
         ``Completion``; it rides along unchanged so the train pump's
         environment masking reads the same field on both paths (placeholder
@@ -487,6 +490,13 @@ class RolloutReassembler:
                 count
             )
 
+        if (
+            latest_weight_version is not None
+            and latest_weight_version < fallback_weight_version
+        ):
+            raise ValueError(
+                "latest_weight_version must not precede fallback_weight_version"
+            )
         group_min_wv = min(
             (r.min_wv for r in valid_rows if r.min_wv is not None),
             default=fallback_weight_version,
@@ -495,6 +505,9 @@ class RolloutReassembler:
             (r.max_wv for r in valid_rows if r.max_wv is not None),
             default=fallback_weight_version,
         )
+        if latest_weight_version is not None:
+            group_min_wv = min(group_min_wv, fallback_weight_version)
+            group_max_wv = max(group_max_wv, latest_weight_version)
 
         _tensorize_t0 = time.perf_counter()
         # Placeholders borrow a valid sibling's prompt ids so per-prompt

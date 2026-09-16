@@ -2454,6 +2454,7 @@ class RolloutManager:
                 receipts=tuple(receipts),
                 rewards=tuple(rewards),
                 fallback_weight_version=start_version,
+                end_weight_version=self._weight_version,
                 prompt_idx=int(recovery_group.prompt_id),
                 mask_sample=tuple(mask_sample),
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
