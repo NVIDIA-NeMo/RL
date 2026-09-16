@@ -60,6 +60,15 @@ MXFP8_BLOCK_QUANT_KWARGS = {
 DEFAULT_QUANTIZATION_IGNORED_LAYERS = ("lm_head",)
 
 
+def mxfp8_batched_shuffle_enabled() -> bool:
+    value = os.environ.get("NRL_MXFP8_BATCHED_SHUFFLE", "1")
+    if value not in {"0", "1"}:
+        raise ValueError(
+            f"NRL_MXFP8_BATCHED_SHUFFLE must be '0' or '1', but received {value!r}."
+        )
+    return value == "1"
+
+
 @dataclass(frozen=True)
 class FP8Config:
     use_weight_pow2_scale: bool = False
@@ -1553,7 +1562,7 @@ def _shuffle_mxfp8_moe_per_expert(
     is_gated: bool,
     epilogue_tile_m: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Per-expert reference shuffle, kept for NRL_MXFP8_SHUFFLE_VERIFY."""
+    """Per-expert reference shuffle used by cumulative refit ablations."""
     from flashinfer import (
         reorder_rows_for_gated_act_gemm,
         shuffle_matrix_a,
@@ -1693,14 +1702,35 @@ def process_weights_after_loading_mxfp8_moe(self, layer: RoutedExperts) -> None:
         w13_weight = swap_w13_to_w31(w13_weight)
         w13_scale = swap_w13_to_w31(w13_scale)
 
-    (
-        w13_weight_shuffled,
-        w2_weight_shuffled,
-        w13_scale_shuffled,
-        w2_scale_shuffled,
-    ) = _shuffle_mxfp8_moe_batched(
-        layer, w13_weight, w2_weight, w13_scale, w2_scale, is_gated, epilogue_tile_m
-    )
+    if mxfp8_batched_shuffle_enabled():
+        (
+            w13_weight_shuffled,
+            w2_weight_shuffled,
+            w13_scale_shuffled,
+            w2_scale_shuffled,
+        ) = _shuffle_mxfp8_moe_batched(
+            layer,
+            w13_weight,
+            w2_weight,
+            w13_scale,
+            w2_scale,
+            is_gated,
+            epilogue_tile_m,
+        )
+    else:
+        (
+            w13_weight_shuffled,
+            w2_weight_shuffled,
+            w13_scale_shuffled,
+            w2_scale_shuffled,
+        ) = _shuffle_mxfp8_moe_per_expert(
+            w13_weight,
+            w2_weight,
+            w13_scale,
+            w2_scale,
+            is_gated,
+            epilogue_tile_m,
+        )
 
     if first_load:
         layer.w13_weight_scale_from_checkpoint = ModelWeightParameter(
