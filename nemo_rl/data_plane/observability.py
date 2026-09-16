@@ -887,7 +887,14 @@ def _step_metrics(
     # combines this field. Already scoped to the step by the reset that read
     # it, so it is not differenced. Not ``wall_ms / n_procs``, which is the
     # per-process mean this reduction replaced.
-    slowest_ms = snap["step_wall_ms"]
+    #
+    # Falls back to the summed wall time rather than raising. A merged
+    # snapshot is assembled key by key rather than copied, so a field that
+    # is not in one of the merge tuples is simply absent -- which is how
+    # this read once took down the whole panel, every series, for a field
+    # that only feeds two of them. Over-reporting one metric on a snapshot
+    # that predates the field beats publishing nothing.
+    slowest_ms = snap.get("step_wall_ms", wall_ms)
     # step/ is a delta over this step; now/ is a level at this instant.
     # The unit alone does not distinguish them -- see README.md.
     metrics = _step_deltas(snap, prev)

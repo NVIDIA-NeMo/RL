@@ -686,6 +686,45 @@ def test_cluster_frac_of_step_follows_the_straggler_across_steps():
     assert metrics["step/frac_of_step"] == pytest.approx(0.5, rel=0.05)
 
 
+def test_a_merged_snapshot_carries_every_field_the_step_metrics_read():
+    """``merge_snapshots`` assembles its result key by key from the merge
+    tuples rather than copying a snapshot, so a field that is not listed in
+    one of them is simply absent from the cluster view -- and the reader,
+    which cannot tell the two shapes apart, raises on it. That cost a real
+    run every one of its ``data_plane/*`` series.
+
+    Pinned as the contract it is: whatever ``_step_metrics`` reads off a
+    snapshot, the merged one has to carry."""
+    merged = merge_snapshots([_rank([10.0] * 3), _rank([20.0] * 3)])
+
+    for field in (
+        "total_wall_ms",
+        "step_wall_ms",
+        "self_ms",
+        "comm_volume_bytes",
+        "bytes_outstanding",
+        "pack_ms",
+        "unpack_ms",
+        "by_op",
+    ):
+        assert field in merged, (
+            f"{field} is read per step but does not survive the merge"
+        )
+    assert cluster_step_metrics(merged, {}, 1.0)["step/wall_s"] > 0
+
+
+def test_a_snapshot_without_the_step_window_still_reports():
+    """One absent field must cost one metric, not the panel. The reader is
+    shared by both scopes and publishes ~30 series; raising on a field that
+    feeds two of them published none at all."""
+    merged = merge_snapshots([_rank([10.0] * 4)])
+    del merged["step_wall_ms"]  # the shape a build without the field produces
+
+    metrics = cluster_step_metrics(merged, {}, 1.0)
+    assert metrics["step/comm_volume_mb"] > 0, "the other series still publish"
+    assert metrics["step/wall_s"] > 0, "falls back to the summed wall time"
+
+
 def test_cluster_per_op_time_is_reported_per_call():
     """``wall_ms`` sums concurrent processes, so it scales with DP degree;
     dividing by the process count trades one arbitrary denominator for another.
