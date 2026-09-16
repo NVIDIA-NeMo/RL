@@ -172,6 +172,13 @@ rollout_checkpointing:
     # snapshot. Requires token capture and completed-result acknowledgement in
     # the Gym agent participant.
     participant_checkpointing_enabled: false
+    # Freeze active vLLM requests at snapshot time and persist their current
+    # token prefixes instead of waiting for every model response to finish.
+    generation_prefix_cuts_enabled: false
+    # Stage an in-flight call's accumulated tokens once its unstaged segment
+    # reaches this many tokens, rather than only when a checkpoint cut fires.
+    # Bounds crash exposure independently of checkpoint cadence; 0 disables it.
+    generation_chunk_flush_tokens: 0
     prepare_timeout_s: 300
 
 policy:

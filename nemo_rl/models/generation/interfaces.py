@@ -607,6 +607,27 @@ class GenerationInterface(ABC):
         _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False
 
+    def begin_generation_checkpoint(self, *, timeout_s: Optional[float] = None) -> bool:
+        """Fence terminal token writes while decoding continues.
+
+        Buffer-swap implementations use this before Gym freezes its active-call
+        inventory. Individual cut requests then detach stable token buffers and
+        flush them while the engines continue decoding into fresh buffers.
+        """
+        raise NotImplementedError(
+            "generation-prefix asynchronous checkpointing is not supported for "
+            f"{type(self).__name__}"
+        )
+
+    def finish_generation_checkpoint(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Release terminal writes after a split cut lifecycle resolves."""
+        raise NotImplementedError(
+            "generation-prefix buffer swapping is not supported for "
+            f"{type(self).__name__}"
+        )
+
     def blocks_training(self) -> bool:
         """Whether this engine must stand down before a training step.
 

@@ -99,6 +99,63 @@ STAGING_FIELDS = [
 
 _MODE_TO_CODE = {"text": 0, "token_in": 1}
 _CODE_TO_MODE = {code: mode for mode, code in _MODE_TO_CODE.items()}
+GENERATION_CUT_STAGING_PREFIX = "__generation_cut__/"
+
+
+def generation_cut_staging_key(
+    checkpoint_id: str,
+    rollout_id: str,
+    model_call_id: str,
+    *,
+    chunk_sequence: int,
+) -> str:
+    """Return an immutable key for one checkpointed generation chunk."""
+    if not checkpoint_id or not rollout_id or not model_call_id:
+        raise ValueError("generation-cut key components must be non-empty")
+    if chunk_sequence < 0:
+        raise ValueError("generation-cut chunk sequence must be non-negative")
+    return (
+        f"{GENERATION_CUT_STAGING_PREFIX}{checkpoint_id}/{rollout_id}/"
+        f"{model_call_id}/{chunk_sequence}"
+    )
+
+
+def _staging_key_matches_snapshot(key: str, snapshot: StagedCallBaseSnapshot) -> bool:
+    """Validate a physical TQ key against the row's logical call identity.
+
+    Completed calls use their logical ``rollout_id/model_call_id`` identity as
+    the physical key. Generation cuts add a checkpoint namespace in front of
+    that same identity so multiple immutable cuts cannot collide. The staged
+    Gym snapshot intentionally contains only the logical identity, so compare
+    the suffix for checkpoint-scoped keys while retaining exact validation for
+    ordinary rows.
+    """
+    if key == snapshot.staging_key:
+        return True
+    if not key.startswith(GENERATION_CUT_STAGING_PREFIX):
+        return False
+    checkpoint_and_identity = key.removeprefix(GENERATION_CUT_STAGING_PREFIX)
+    checkpoint_id, checkpoint_separator, identity_and_sequence = (
+        checkpoint_and_identity.partition("/")
+    )
+    if (
+        checkpoint_id
+        and checkpoint_separator
+        and identity_and_sequence == snapshot.staging_key
+    ):
+        # Restore checkpoints written before generation chunks gained an
+        # explicit sequence component. New writes always use the format below.
+        return True
+    logical_key, sequence_separator, chunk_sequence = identity_and_sequence.rpartition(
+        "/"
+    )
+    return bool(
+        checkpoint_id
+        and checkpoint_separator
+        and sequence_separator
+        and chunk_sequence.isdecimal()
+        and logical_key == snapshot.staging_key
+    )
 
 
 def _bytes_tensor(value: bytes) -> torch.Tensor:
@@ -158,10 +215,30 @@ class TQTokenSink:
         self._staging_partition = staging_partition
 
     def stage(self, record: StagedCallRecord) -> StageResult:
+        return self._stage_at_key(record, record.staging_key)
+
+    def stage_generation_prefix(
+        self,
+        record: StagedCallRecord,
+        *,
+        checkpoint_id: str,
+        chunk_sequence: int,
+    ) -> StageResult:
+        """Stage an immutable active-call prefix under a checkpoint-scoped key."""
+        return self._stage_at_key(
+            record,
+            generation_cut_staging_key(
+                checkpoint_id,
+                record.rollout_id,
+                record.model_call_id,
+                chunk_sequence=chunk_sequence,
+            ),
+        )
+
+    def _stage_at_key(self, record: StagedCallRecord, key: str) -> StageResult:
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.records import StageResult
 
-        key = record.staging_key
         try:
             field_dict = {
                 "token_ids_delta": torch.tensor(
@@ -437,7 +514,7 @@ class TQTokenSource:
         for index, key in enumerate(staging_keys):
             row = _select_row(rows, index)
             snapshot = _row_to_base_snapshot(row)
-            if snapshot.staging_key != key:
+            if not _staging_key_matches_snapshot(key, snapshot):
                 raise KeyError(
                     f"staged row identity mismatch: requested {key!r}, got {snapshot.staging_key!r}"
                 )

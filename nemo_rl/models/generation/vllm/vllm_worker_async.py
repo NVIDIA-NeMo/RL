@@ -21,6 +21,8 @@ import time
 import uuid
 import warnings
 from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -47,6 +49,7 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
+    extract_selected_token_logprobs,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
@@ -58,6 +61,273 @@ from nemo_rl.models.generation.openai_server_utils import (
 from nemo_rl.telemetry.setup import shutdown_telemetry
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class _RequestCaptureBuffer:
+    """One append-only generation segment owned by an in-flight request."""
+
+    sequence: int
+    generated_token_ids: list[int] = field(default_factory=list)
+    generated_logprobs: list[float] = field(default_factory=list)
+
+
+@dataclass
+class _FrozenRequestCaptureBuffer:
+    """An active buffer detached for a checkpoint write."""
+
+    checkpoint_id: str
+    buffer: _RequestCaptureBuffer
+
+
+@dataclass
+class _RequestCaptureState:
+    """Append-only token buffers for one in-flight captured request.
+
+    vLLM publishes delta progress. ``observe`` appends each delta to the current
+    active buffer exactly once. A checkpoint swaps the active buffer under
+    ``lock`` and performs its blocking TQ write after releasing the lock, so
+    later observations can continue in a fresh buffer.
+
+    Each successful cut stages only the detached buffer. The ordered TQ keys
+    remain in Gym lineage, while the sealed token arrays are retained locally
+    only to compute the cumulative digest advertised by the latest cut.
+    """
+
+    call: Any
+    prompt_token_ids: list[int]
+    resumed_generation_token_ids: list[int] = field(default_factory=list)
+    observation_error: str | None = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    # Serializes lifecycle-changing TQ operations for this call. Token
+    # observation deliberately uses ``lock`` instead so decoding can continue
+    # while a detached generation chunk is staged.
+    lifecycle_lock: threading.Lock = field(default_factory=threading.Lock)
+    terminal_started: bool = False
+    sealed_generated_token_ids: list[int] = field(default_factory=list)
+    sealed_generated_logprobs: list[float] = field(default_factory=list)
+    generation_cut_staging_keys: list[str] = field(default_factory=list)
+    active_buffer: _RequestCaptureBuffer = field(
+        default_factory=lambda: _RequestCaptureBuffer(sequence=0)
+    )
+    frozen_buffer: _FrozenRequestCaptureBuffer | None = None
+    observed_generation_token_count: int = 0
+    next_buffer_sequence: int = 1
+    # Set by ``observe`` when the active buffer passes the periodic-flush
+    # threshold. Cleared by whichever flush actually detaches that buffer, so a
+    # request is queued at most once per unstaged segment.
+    periodic_flush_due: bool = False
+
+    def unstaged_token_count(self) -> int:
+        """Return tokens held only in memory for this call."""
+        return len(self.active_buffer.generated_token_ids)
+
+    def observe(
+        self,
+        generated_token_ids: list[int],
+        generated_logprobs: list[float],
+    ) -> None:
+        """Append one immutable vLLM output delta."""
+        if len(generated_token_ids) != len(generated_logprobs):
+            self.observation_error = (
+                "generated token IDs and log probabilities must have equal lengths"
+            )
+            return
+        self.active_buffer.generated_token_ids.extend(generated_token_ids)
+        self.active_buffer.generated_logprobs.extend(generated_logprobs)
+        self.observed_generation_token_count += len(generated_token_ids)
+        self.observation_error = None
+
+    def freeze_for_checkpoint(
+        self, checkpoint_id: str
+    ) -> tuple[str, int, list[int], list[float], list[int], list[float]]:
+        """Swap the active buffer and return its delta plus the stable prefix."""
+        if self.frozen_buffer is not None:
+            raise RuntimeError(
+                "cannot start a generation cut while another cut is in progress"
+            )
+        buffer = self.active_buffer
+        self.active_buffer = _RequestCaptureBuffer(sequence=self.next_buffer_sequence)
+        self.next_buffer_sequence += 1
+        self.frozen_buffer = _FrozenRequestCaptureBuffer(
+            checkpoint_id=checkpoint_id,
+            buffer=buffer,
+        )
+        return (
+            f"active/{checkpoint_id}/{buffer.sequence}",
+            buffer.sequence,
+            list(buffer.generated_token_ids),
+            list(buffer.generated_logprobs),
+            self.sealed_generated_token_ids + buffer.generated_token_ids,
+            self.sealed_generated_logprobs + buffer.generated_logprobs,
+        )
+
+    def seal_frozen_buffer(self, checkpoint_id: str) -> None:
+        """Adopt a successfully staged frozen buffer into the live prefix."""
+        frozen = self._require_frozen_buffer(checkpoint_id)
+        self.sealed_generated_token_ids.extend(frozen.generated_token_ids)
+        self.sealed_generated_logprobs.extend(frozen.generated_logprobs)
+        self.frozen_buffer = None
+
+    def rollback_frozen_buffer(self, checkpoint_id: str) -> None:
+        """Restore a failed cut ahead of progress collected after its swap."""
+        frozen = self._require_frozen_buffer(checkpoint_id)
+        self.active_buffer.generated_token_ids[:0] = frozen.generated_token_ids
+        self.active_buffer.generated_logprobs[:0] = frozen.generated_logprobs
+        self.frozen_buffer = None
+
+    def _require_frozen_buffer(self, checkpoint_id: str) -> _RequestCaptureBuffer:
+        frozen = self.frozen_buffer
+        if frozen is None or frozen.checkpoint_id != checkpoint_id:
+            raise RuntimeError(
+                f"generation cut {checkpoint_id!r} does not own the frozen buffer"
+            )
+        return frozen.buffer
+
+
+@dataclass(frozen=True)
+class _CompletedCaptureState:
+    """Bounded terminal evidence retained across the response/cut race."""
+
+    coords: Any
+    generation_token_count: int
+
+
+@dataclass
+class _CompletionOutputDeltaAccumulator:
+    """Linear-time accumulator for one vLLM completion index."""
+
+    template: Any | None = None
+    text_parts: list[str] = field(default_factory=list)
+    token_ids: list[int] = field(default_factory=list)
+    logprobs: list[Any] | None = None
+    routed_expert_chunks: list[Any] = field(default_factory=list)
+
+    def append(self, output: Any) -> None:
+        if self.template is None:
+            self.template = copy.copy(output)
+        else:
+            for name in (
+                "cumulative_logprob",
+                "finish_reason",
+                "stop_reason",
+                "lora_request",
+            ):
+                if hasattr(output, name):
+                    setattr(self.template, name, getattr(output, name))
+        self.text_parts.append(str(getattr(output, "text", "")))
+        self.token_ids.extend(list(getattr(output, "token_ids", ()) or ()))
+        delta_logprobs = getattr(output, "logprobs", None)
+        if delta_logprobs is not None:
+            if self.logprobs is None:
+                self.logprobs = []
+            self.logprobs.extend(list(delta_logprobs))
+        routed = getattr(output, "routed_experts", None)
+        if routed is not None:
+            self.routed_expert_chunks.append(copy.deepcopy(routed))
+
+    def build(self) -> Any:
+        if self.template is None:
+            raise RuntimeError("cannot build an empty completion output")
+        self.template.text = "".join(self.text_parts)
+        self.template.token_ids = self.token_ids
+        self.template.logprobs = self.logprobs
+        if self.routed_expert_chunks:
+            self.template.routed_experts = torch.cat(
+                [torch.as_tensor(chunk) for chunk in self.routed_expert_chunks],
+                dim=0,
+            )
+        return self.template
+
+
+@dataclass
+class _RequestOutputDeltaAccumulator:
+    """Reconstruct one final RequestOutput from immutable engine deltas."""
+
+    template: Any | None = None
+    completions: dict[int, _CompletionOutputDeltaAccumulator] = field(
+        default_factory=dict
+    )
+
+    def append(self, delta: Any) -> None:
+        if self.template is None:
+            self.template = copy.copy(delta)
+        else:
+            previous = self.template
+            self.template = copy.copy(delta)
+            for name in (
+                "prompt",
+                "prompt_token_ids",
+                "prompt_logprobs",
+                "encoder_prompt",
+                "encoder_prompt_token_ids",
+                "lora_request",
+                "num_cached_tokens",
+                "prompt_routed_experts",
+            ):
+                if getattr(self.template, name, None) is None and hasattr(
+                    previous, name
+                ):
+                    setattr(self.template, name, getattr(previous, name))
+        for output in getattr(delta, "outputs", ()):
+            self.completions.setdefault(
+                output.index, _CompletionOutputDeltaAccumulator()
+            ).append(output)
+
+    def build(self) -> Any:
+        if self.template is None:
+            raise RuntimeError("cannot build an empty request output")
+        self.template.outputs = [
+            self.completions[index].build() for index in sorted(self.completions)
+        ]
+        return self.template
+
+
+def _remaining_generation_limits_after_prefix(
+    *,
+    max_tokens: int | None,
+    min_tokens: int | None,
+    generation_token_count: int,
+) -> tuple[int | None, int | None]:
+    """Return output limits for the suffix after restoring generated tokens."""
+    if generation_token_count < 0:
+        raise ValueError("generation_token_count must be non-negative")
+    return (
+        None if max_tokens is None else max_tokens - generation_token_count,
+        None if min_tokens is None else max(0, min_tokens - generation_token_count),
+    )
+
+
+class _CheckpointCaptureGate:
+    """Drain active terminal writes and block new ones across a TQ snapshot."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._open = True
+        self._active = 0
+
+    def enter(self) -> None:
+        with self._condition:
+            while not self._open:
+                self._condition.wait()
+            self._active += 1
+
+    def exit(self) -> None:
+        with self._condition:
+            self._active -= 1
+            if self._active == 0:
+                self._condition.notify_all()
+
+    def close_and_wait(self) -> None:
+        with self._condition:
+            self._open = False
+            while self._active:
+                self._condition.wait()
+
+    def reopen(self) -> None:
+        with self._condition:
+            self._open = True
+            self._condition.notify_all()
 
 
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
@@ -195,9 +465,29 @@ class VllmAsyncGenerationWorkerImpl(
         # the set_rollout_weight_version fan-out from the SC's _sync_weights.
         self.token_capture = None
         self._rollout_weight_version = 0
-        # In-flight captured calls keyed by id(request): (ActiveCall, the
-        # exact engine prompt ids recorded at preprocess time).
-        self._capture_calls: dict[int, tuple[Any, list[int]]] = {}
+        # In-flight captured calls keyed by request and by Gym's stable call ID.
+        self._capture_calls: dict[int, _RequestCaptureState] = {}
+        self._capture_calls_by_model_call_id: dict[str, _RequestCaptureState] = {}
+        self._completed_capture_calls: dict[str, _CompletedCaptureState] = {}
+        self._generation_cut_receipts: dict[tuple[str, str], Any] = {}
+        self._capture_registry_lock = threading.Lock()
+        self._capture_sink: Any | None = None
+        self._generation_prefix_cuts_enabled = False
+        self._generation_cut_control_token: str | None = None
+        self._generation_checkpoint_gate = _CheckpointCaptureGate()
+        # Periodic chunk flushing. 0 disables it, leaving checkpoint cuts as the
+        # only thing that makes an in-flight generation durable.
+        self._generation_chunk_flush_tokens = 0
+        self._generation_chunk_flush_thread: threading.Thread | None = None
+        self._generation_chunk_flush_stop = threading.Event()
+        self._generation_chunk_flush_sequence = 0
+        # Terminal capture writes use asyncio's shared default executor. Keep
+        # checkpoint control on an isolated thread so a closed gate cannot let
+        # waiting completions consume every thread needed to create the cut.
+        self._generation_checkpoint_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="nrl-generation-checkpoint",
+        )
         self._staging_source: Any | None = None
         # Guarded by _prefix_cache_lock: _fetch_chain_prefix runs on executor
         # threads (asyncio.to_thread), so lookups/evictions can be concurrent.
@@ -465,7 +755,13 @@ class VllmAsyncGenerationWorkerImpl(
         self.token_capture = capture
 
     async def setup_token_capture(
-        self, dp_cfg: dict[str, Any], staging_partition: str
+        self,
+        dp_cfg: dict[str, Any],
+        staging_partition: str,
+        *,
+        generation_prefix_cuts_enabled: bool = False,
+        generation_cut_control_token: str | None = None,
+        generation_chunk_flush_tokens: int = 0,
     ) -> bool:
         """Host ledger-authoritative token capture in this worker.
 
@@ -486,6 +782,21 @@ class VllmAsyncGenerationWorkerImpl(
 
         dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
         sink = TQTokenSink(dp_client, staging_partition=staging_partition)
+        if generation_prefix_cuts_enabled and not generation_cut_control_token:
+            raise ValueError(
+                "generation-prefix cuts require a non-empty control bearer token"
+            )
+        if generation_chunk_flush_tokens < 0:
+            raise ValueError("generation_chunk_flush_tokens must not be negative")
+        if generation_chunk_flush_tokens and not generation_prefix_cuts_enabled:
+            raise ValueError(
+                "generation_chunk_flush_tokens requires generation-prefix cuts; "
+                "without them a staged chunk has no restore path"
+            )
+        self._capture_sink = sink
+        self._generation_prefix_cuts_enabled = generation_prefix_cuts_enabled
+        self._generation_cut_control_token = generation_cut_control_token
+        self._generation_chunk_flush_tokens = generation_chunk_flush_tokens
         self._staging_source = TQTokenSource(
             dp_client, staging_partition=staging_partition
         )
@@ -496,6 +807,7 @@ class VllmAsyncGenerationWorkerImpl(
             weight_version_fn=lambda: self._rollout_weight_version,
             adapter=VLLMCaptureAdapter(),
         )
+        self._start_generation_chunk_flusher()
         return True
 
     async def set_rollout_weight_version(self, version: int) -> None:
@@ -524,6 +836,8 @@ class VllmAsyncGenerationWorkerImpl(
         *,
         admission: Any | None = None,
         prefix_token_ids: list[int] | None = None,
+        generation_cut: Any | None = None,
+        resumed_generation_token_ids: list[int] | None = None,
     ) -> None:
         """Admit one ledger-forwarded call into the capture layer.
 
@@ -547,9 +861,102 @@ class VllmAsyncGenerationWorkerImpl(
         call = capture.begin_call(
             admission,
             prefix_token_ids=prefix_token_ids,
+            generation_cut=generation_cut,
+            generation_cut_staging_keys=(
+                admission.generation_cut.staging_keys
+                if admission.generation_cut is not None
+                else None
+            ),
             stream=bool(getattr(request, "stream", False)),
         )
-        self._capture_calls[id(request)] = (call, list(prompt_token_ids))
+        state = _RequestCaptureState(
+            call=call,
+            prompt_token_ids=list(prompt_token_ids),
+            resumed_generation_token_ids=list(resumed_generation_token_ids or ()),
+            generation_cut_staging_keys=(
+                list(admission.generation_cut.staging_keys)
+                if admission.generation_cut is not None
+                else []
+            ),
+        )
+        with self._capture_registry_lock:
+            if call.model_call_id in self._capture_calls_by_model_call_id:
+                raise RuntimeError(
+                    f"model call {call.model_call_id!r} is already active in token capture"
+                )
+            self._capture_calls[id(request)] = state
+            self._capture_calls_by_model_call_id[call.model_call_id] = state
+
+    def _observe_request_capture(self, request: Any, request_output: Any) -> None:
+        """Append one request's immutable vLLM output delta."""
+        with self._capture_registry_lock:
+            state = self._capture_calls.get(id(request))
+        if state is None:
+            return
+        outputs = getattr(request_output, "outputs", None)
+        if not outputs:
+            return
+        try:
+            generation_token_ids = list(getattr(outputs[0], "token_ids", ()) or ())
+            generation_logprobs = extract_selected_token_logprobs(outputs[0])
+        except (RuntimeError, TypeError, ValueError) as error:
+            with state.lock:
+                state.observation_error = f"{type(error).__name__}: {error}"
+            return
+        threshold = self._generation_chunk_flush_tokens
+        with state.lock:
+            state.observe(generation_token_ids, generation_logprobs)
+            # Marking is deliberately all this hook does: it runs on the event
+            # loop that drives generation, so the blocking staging write belongs
+            # on the background flush thread.
+            if (
+                threshold > 0
+                and state.observation_error is None
+                and state.frozen_buffer is None
+                and state.unstaged_token_count() >= threshold
+            ):
+                state.periodic_flush_due = True
+
+    def _restore_response_prefix(
+        self, request: Any, request_output: Any, *, tokenizer: Any
+    ) -> None:
+        """Prepend the durable assistant prefix before vLLM parses the response."""
+        state = self._get_request_capture(request)
+        if state is None or not state.resumed_generation_token_ids:
+            return
+        outputs = getattr(request_output, "outputs", None)
+        if not outputs:
+            return
+        output = outputs[0]
+        with state.lock:
+            output.text = tokenizer.decode(
+                state.resumed_generation_token_ids
+                + list(getattr(output, "token_ids", ()) or ())
+            )
+
+    def _pop_request_capture(self, request: Any) -> _RequestCaptureState | None:
+        with self._capture_registry_lock:
+            state = self._capture_calls.pop(id(request), None)
+            if state is not None:
+                self._capture_calls_by_model_call_id.pop(state.call.model_call_id, None)
+            return state
+
+    def _get_request_capture(self, request: Any) -> _RequestCaptureState | None:
+        with self._capture_registry_lock:
+            return self._capture_calls.get(id(request))
+
+    def _remember_completed_capture(
+        self, model_call_id: str, coords: Any, generation_token_count: int
+    ) -> None:
+        with self._capture_registry_lock:
+            self._completed_capture_calls[model_call_id] = _CompletedCaptureState(
+                coords=coords,
+                generation_token_count=generation_token_count,
+            )
+            if len(self._completed_capture_calls) > 100_000:
+                self._completed_capture_calls.pop(
+                    next(iter(self._completed_capture_calls))
+                )
 
     def _fetch_chain_prefix(self, staging_chain: list[str]) -> list[int]:
         """Assemble prefix token ids from staging_chain, with a worker-local LRU cache."""
@@ -591,6 +998,134 @@ class VllmAsyncGenerationWorkerImpl(
         if admission.staging_chain:
             return self._fetch_chain_prefix(list(admission.staging_chain))
         return list(admission.required_prefix_token_ids)
+
+    def _resolve_generation_cut(
+        self, admission: Any, prefix_token_ids: list[int]
+    ) -> Any | None:
+        """Fetch and rebuild the cumulative staged prefix named by an admission."""
+        continuation = admission.generation_cut
+        if continuation is None:
+            return None
+        if self._staging_source is None:
+            raise RuntimeError(
+                "_staging_source not initialized; call setup_token_capture() first"
+            )
+        staging_keys = list(continuation.staging_keys)
+        snapshots = self._staging_source.fetch(staging_keys)
+        if len(snapshots) != len(staging_keys):
+            raise RuntimeError("generation-cut fetch did not return every staged chunk")
+        if not snapshots:
+            raise RuntimeError("generation-cut continuation has no staged chunks")
+        weight_versions = [snapshot.weight_version for snapshot in snapshots]
+        if weight_versions != sorted(weight_versions):
+            raise RuntimeError(
+                "generation-cut chunk policy versions are not monotonically non-decreasing"
+            )
+        current_weight_version = self._rollout_weight_version
+        if weight_versions[-1] > current_weight_version:
+            raise RuntimeError(
+                "generation-cut prefix contains policy version "
+                f"{weight_versions[-1]}, newer than the current rollout version "
+                f"{current_weight_version}"
+            )
+        token_ids_delta = [
+            token_id for snapshot in snapshots for token_id in snapshot.token_ids_delta
+        ]
+        token_mask_delta = [
+            mask for snapshot in snapshots for mask in snapshot.token_mask_delta
+        ]
+        generation_logprobs_delta = [
+            logprob
+            for snapshot in snapshots
+            for logprob in snapshot.generation_log_probs_delta
+        ]
+        if any(
+            mask == 0.0
+            for snapshot in snapshots[1:]
+            for mask in snapshot.token_mask_delta
+        ):
+            raise RuntimeError(
+                "only the first generation-cut chunk may contain prompt tokens"
+            )
+
+        # Deferred: nemo_gym is an optional extra absent in non-Gym runs.
+        from nemo_gym.token_id_capture.staging.digest import (
+            EXTRAS_DIGEST_VERSION,
+            STAGING_DIGEST_VERSION,
+            compute_chain_hash,
+            compute_extras_digest,
+            compute_staging_digest,
+            hash_token_ids,
+        )
+        from nemo_gym.token_id_capture.staging.records import StagedCallBaseSnapshot
+
+        delta_len = len(token_ids_delta)
+        cum_len = admission.prev_len + delta_len
+        # A cut chain may span retries performed after later weight updates.
+        # Its token-level behavior logprobs remain attached to their original
+        # chunks. The cumulative snapshot uses the oldest contributing version
+        # so downstream replay-buffer staleness checks remain conservative.
+        weight_version = weight_versions[0]
+        extras_digest = compute_extras_digest(None)
+        chain_hash = compute_chain_hash(admission.parent_chain_hash, token_ids_delta)
+        cumulative_hash = hash_token_ids(prefix_token_ids + token_ids_delta)
+        digest = compute_staging_digest(
+            schema_version=admission.schema_version,
+            digest_version=STAGING_DIGEST_VERSION,
+            extras_digest_version=EXTRAS_DIGEST_VERSION,
+            rollout_id=continuation.source_capture_key,
+            model_call_id=continuation.source_model_call_id,
+            parent_call_id=admission.parent_call_id,
+            mode=admission.mode,
+            prev_len=admission.prev_len,
+            delta_len=delta_len,
+            cum_len=cum_len,
+            weight_version=weight_version,
+            token_ids_delta=token_ids_delta,
+            token_mask_delta=token_mask_delta,
+            generation_log_probs_delta=generation_logprobs_delta,
+            extras_digest=extras_digest,
+            chain_hash=chain_hash,
+            cumulative_hash=cumulative_hash,
+        )
+        generation_token_count = sum(mask == 1.0 for mask in token_mask_delta)
+        if (
+            generation_token_count != continuation.generation_token_count
+            or digest != continuation.digest
+        ):
+            raise RuntimeError(
+                "generation-cut checkpoint coordinates do not match the staged prefix"
+            )
+        snapshot = StagedCallBaseSnapshot(
+            rollout_id=continuation.source_capture_key,
+            model_call_id=continuation.source_model_call_id,
+            parent_call_id=admission.parent_call_id,
+            mode=admission.mode,
+            prev_len=admission.prev_len,
+            delta_len=delta_len,
+            cum_len=cum_len,
+            weight_version=weight_version,
+            digest=digest,
+            token_ids_delta=token_ids_delta,
+            token_mask_delta=token_mask_delta,
+            generation_log_probs_delta=generation_logprobs_delta,
+            extras_digest=extras_digest,
+            chain_hash=chain_hash,
+            cumulative_hash=cumulative_hash,
+        )
+        LOGGER.info(
+            "generation prefix restored: rollout_id=%s model_call_id=%s "
+            "source_model_call_id=%s prefix_tokens=%d prefix_digest=%s "
+            "weight_version_span=[%d,%d]",
+            admission.rollout_id,
+            admission.model_call_id,
+            continuation.source_model_call_id,
+            continuation.generation_token_count,
+            continuation.digest,
+            weight_versions[0],
+            weight_versions[-1],
+        )
+        return snapshot
 
     def _enter_request_prefix(self, request: Any, prefix_token_ids: list[int]) -> None:
         """Attach the resolved prefix to the request through the capture adapter.
@@ -650,7 +1185,172 @@ class VllmAsyncGenerationWorkerImpl(
         choice["message"] = message
         payload["choices"] = [choice]
 
+    # ── periodic generation-chunk flushing ──────────────────────────────────
+
+    def _start_generation_chunk_flusher(self) -> None:
+        """Run periodic chunk flushing on its own daemon thread."""
+        if self._generation_chunk_flush_tokens <= 0:
+            return
+        if self._generation_chunk_flush_thread is not None:
+            return
+        self._generation_chunk_flush_stop.clear()
+        thread = threading.Thread(
+            target=self._generation_chunk_flush_loop,
+            name="nemo-rl-generation-chunk-flush",
+            daemon=True,
+        )
+        self._generation_chunk_flush_thread = thread
+        thread.start()
+
+    def stop_generation_chunk_flusher(self) -> None:
+        """Stop the flush thread. Idempotent; safe before startup."""
+        self._generation_chunk_flush_stop.set()
+        thread = self._generation_chunk_flush_thread
+        self._generation_chunk_flush_thread = None
+        if thread is not None:
+            thread.join(timeout=5.0)
+
+    def _generation_chunk_flush_loop(self) -> None:
+        while not self._generation_chunk_flush_stop.wait(0.25):
+            try:
+                self.flush_due_generation_chunks()
+            except Exception:  # noqa: BLE001 — a flush failure must not end the loop
+                LOGGER.exception("periodic generation-chunk flush pass failed")
+
+    def flush_due_generation_chunks(self) -> int:
+        """Stage every in-flight call whose unstaged segment passed the bound.
+
+        Returns the number of calls staged. Mirrors the checkpoint-cut staging
+        path, minus the acknowledgement it does not have to produce: freeze the
+        active buffer, stage the detached segment, then seal it on success or
+        roll it back so the next attempt retries the same tokens.
+        """
+        if self._generation_chunk_flush_tokens <= 0:
+            return 0
+        with self._capture_registry_lock:
+            states = list(self._capture_calls.values())
+
+        staged = 0
+        for state in states:
+            with state.lock:
+                if not state.periodic_flush_due:
+                    continue
+                # A cut owns the frozen buffer, or the call regressed. Leave the
+                # mark set so the next pass reconsiders it.
+                if state.frozen_buffer is not None or state.observation_error:
+                    continue
+                if state.unstaged_token_count() < self._generation_chunk_flush_tokens:
+                    state.periodic_flush_due = False
+                    continue
+            self._generation_chunk_flush_sequence += 1
+            flush_id = f"periodic-{self._generation_chunk_flush_sequence:012d}"
+            # Ride the same gate as terminal writes so a TQ snapshot drains and
+            # then blocks periodic staging exactly as it does completions.
+            self._generation_checkpoint_gate.enter()
+            try:
+                if self._flush_generation_chunk(state, flush_id):
+                    staged += 1
+            except Exception:  # noqa: BLE001 — one bad call must not stall the rest
+                LOGGER.exception("periodic generation-chunk flush failed")
+            finally:
+                self._generation_checkpoint_gate.exit()
+        return staged
+
+    def _flush_generation_chunk(self, state: Any, flush_id: str) -> bool:
+        """Stage one call's unstaged segment. Returns whether anything staged."""
+        with state.lifecycle_lock:
+            # The registry snapshot in ``flush_due_generation_chunks`` can be
+            # stale. Once terminal processing owns the call, it will write the
+            # canonical row and this detached prefix must not be staged.
+            if state.terminal_started:
+                return False
+            return self._flush_generation_chunk_with_lifecycle_owned(state, flush_id)
+
+    def _flush_generation_chunk_with_lifecycle_owned(
+        self, state: Any, flush_id: str
+    ) -> bool:
+        """Stage one generation chunk while owning ``state.lifecycle_lock``."""
+        capture = self.token_capture
+        sink = self._capture_sink
+        if capture is None or sink is None:
+            return False
+
+        with state.lock:
+            if state.frozen_buffer is not None or state.observation_error:
+                return False
+            (
+                _frozen_buffer_id,
+                chunk_sequence,
+                chunk_token_ids,
+                chunk_logprobs,
+                generated_token_ids,
+                generated_logprobs,
+            ) = state.freeze_for_checkpoint(flush_id)
+            state.periodic_flush_due = False
+            first_chunk = not state.generation_cut_staging_keys
+
+        if not chunk_token_ids:
+            with state.lock:
+                state.rollback_frozen_buffer(flush_id)
+            return False
+
+        staged_key = None
+        try:
+            # The first staged row for a call is cumulative; later rows are
+            # deltas. A cut and a periodic flush share that numbering, so the
+            # two paths interleave without renumbering anything.
+            if first_chunk:
+                record = capture.build_prefix_record(
+                    state.call,
+                    prompt_token_ids=state.prompt_token_ids,
+                    generated_token_ids=generated_token_ids,
+                    generated_logprobs=generated_logprobs,
+                )
+            else:
+                record = capture.build_generation_chunk_record(
+                    state.call,
+                    generated_token_ids=chunk_token_ids,
+                    generated_logprobs=chunk_logprobs,
+                )
+            result = sink.stage_generation_prefix(
+                record,
+                checkpoint_id=flush_id,
+                chunk_sequence=chunk_sequence,
+            )
+            staged_key = result.staging_key
+            if not result.ok or staged_key is None:
+                raise RuntimeError(
+                    f"periodic generation-chunk staging failed: {result.error}"
+                )
+            with state.lock:
+                state.seal_frozen_buffer(flush_id)
+                state.generation_cut_staging_keys.append(staged_key)
+        except Exception:
+            with state.lock:
+                frozen = state.frozen_buffer
+                if frozen is not None and frozen.checkpoint_id == flush_id:
+                    state.rollback_frozen_buffer(flush_id)
+            if staged_key is not None:
+                try:
+                    sink.clear([staged_key])
+                except Exception:  # noqa: BLE001 — preserve the flush failure
+                    LOGGER.exception(
+                        "failed to clear rejected periodic chunk row %s", staged_key
+                    )
+            raise
+        return True
+
     def _finish_request_capture(self, request: Any, content: dict) -> dict:
+        """Run terminal token staging outside an active checkpoint cut."""
+        self._generation_checkpoint_gate.enter()
+        try:
+            return self._finish_request_capture_after_checkpoint_gate(request, content)
+        finally:
+            self._generation_checkpoint_gate.exit()
+
+    def _finish_request_capture_after_checkpoint_gate(
+        self, request: Any, content: dict
+    ) -> dict:
         """Stage the finished call and ride its coords on the response.
 
         Fail-closed: the sink write happens inside complete_call —
@@ -660,16 +1360,50 @@ class VllmAsyncGenerationWorkerImpl(
         the only token store on this path, so the worker->gate hop carries
         text + delta ids + coords only.
         """
-        state = self._capture_calls.pop(id(request), None)
+        state = self._get_request_capture(request)
         if state is None:
             return content
-        call, prompt_token_ids = state
+        with state.lifecycle_lock:
+            if state.terminal_started:
+                raise RuntimeError(
+                    f"model call {state.call.model_call_id!r} already started "
+                    "terminal token capture"
+                )
+            state.terminal_started = True
+            content, obsolete_staging_keys = (
+                self._finish_request_capture_with_lifecycle_owned(
+                    state, request, content
+                )
+            )
+
+        # The canonical terminal row now contains the complete call. Prefix
+        # chunks are no longer needed in the live staging partition. Cleanup is
+        # best-effort: a later checkpoint inventory pass also removes orphaned
+        # generation-cut rows.
+        sink = self._capture_sink
+        if obsolete_staging_keys and sink is not None:
+            try:
+                sink.clear(list(obsolete_staging_keys))
+            except Exception:  # noqa: BLE001 — do not lose a valid completion
+                LOGGER.exception(
+                    "failed to clear obsolete generation chunks for model call %s",
+                    state.call.model_call_id,
+                )
+        return content
+
+    def _finish_request_capture_with_lifecycle_owned(
+        self, state: Any, request: Any, content: dict
+    ) -> tuple[dict, tuple[str, ...]]:
+        """Stage a terminal call while owning ``state.lifecycle_lock``."""
+        call = state.call
+        prompt_token_ids = state.prompt_token_ids
         payload = dict(content)
         # vLLM's OpenAI response carries no prompt ids; the adapter reads the
         # preprocess-time engine prompt off the payload (see
         # nemo_gym.token_id_capture.adapters.vllm.extract_prompt_ids).
         payload["prompt_token_ids"] = prompt_token_ids
         adapter = self.token_capture.adapter
+        generated_token_ids: list[int] = []
         if adapter is not None:
             try:
                 generated_token_ids, _ = adapter.extract_generation(payload)
@@ -682,6 +1416,34 @@ class VllmAsyncGenerationWorkerImpl(
                 generated_len=len(generated_token_ids),
             )
         coords = self.token_capture.complete_call_from_response(call, payload)
+        total_generation_token_count = len(generated_token_ids)
+        if call.generation_cut is not None:
+            prefix_tokens = sum(
+                mask == 1.0 for mask in call.generation_cut.token_mask_delta
+            )
+            total_generation_token_count += prefix_tokens
+            LOGGER.info(
+                "generation prefix completed: rollout_id=%s model_call_id=%s "
+                "source_model_call_id=%s prefix_tokens=%d tail_tokens=%d "
+                "total_generation_tokens=%d",
+                call.rollout_id,
+                call.model_call_id,
+                call.generation_cut.model_call_id,
+                prefix_tokens,
+                len(generated_token_ids),
+                prefix_tokens + len(generated_token_ids),
+            )
+        self._remember_completed_capture(
+            call.model_call_id,
+            coords,
+            total_generation_token_count,
+        )
+        self._pop_request_capture(request)
+        obsolete_staging_keys = (
+            tuple(state.generation_cut_staging_keys)
+            if coords.disposition == "staged"
+            else ()
+        )
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
             # The delta-aligned routes were staged to TQ above; the served
@@ -690,13 +1452,219 @@ class VllmAsyncGenerationWorkerImpl(
             if isinstance(message, dict):
                 message.pop("routed_experts", None)
         content["ng_commit_coords"] = coords.model_dump()
-        return content
+        return content, obsolete_staging_keys
 
     def _abort_request_capture(self, request: Any, *, reason: str) -> None:
         """Drop the in-flight capture state for a request that errored."""
-        state = self._capture_calls.pop(id(request), None)
-        if state is not None and self.token_capture is not None:
-            self.token_capture.fail_call(state[0], reason=reason)
+        state = self._get_request_capture(request)
+        if state is None:
+            return
+        with state.lifecycle_lock:
+            if state.terminal_started:
+                return
+            state.terminal_started = True
+            popped = self._pop_request_capture(request)
+            if popped is not state or self.token_capture is None:
+                return
+            coords = self.token_capture.fail_call(state.call, reason=reason)
+            self._remember_completed_capture(state.call.model_call_id, coords, 0)
+
+    async def _run_generation_checkpoint_control(
+        self,
+        operation: Callable[..., Any],
+        *args: Any,
+    ) -> Any:
+        """Run cut control independently of blocked terminal capture writes."""
+        return await asyncio.get_running_loop().run_in_executor(
+            self._generation_checkpoint_executor,
+            operation,
+            *args,
+        )
+
+    def _checkpoint_generation_cut(self, inventory: Any) -> Any:
+        """Stage a stable prefix for every call named by Gym's frozen inventory."""
+        from nemo_gym._checkpoint.model_control_contracts import (
+            GenerationCutPrefixAck,
+            GenerationCutReceipt,
+        )
+
+        capture = self.token_capture
+        sink = self._capture_sink
+        if capture is None or sink is None:
+            raise RuntimeError("generation-prefix cuts require token capture setup")
+        receipt_key = (inventory.checkpoint_id, inventory.inventory_digest)
+        with self._capture_registry_lock:
+            cached_receipt = self._generation_cut_receipts.get(receipt_key)
+        if cached_receipt is not None:
+            return cached_receipt
+        acknowledgements = []
+        for prefix in inventory.active_prefixes:
+            with self._capture_registry_lock:
+                state = self._capture_calls_by_model_call_id.get(prefix.model_call_id)
+                completed = self._completed_capture_calls.get(prefix.model_call_id)
+            if state is None:
+                if completed is not None and completed.coords.rollout_id != (
+                    prefix.rollout_id
+                    if prefix.attempt_index == 0
+                    else f"{prefix.rollout_id}-a{prefix.attempt_index}"
+                ):
+                    raise RuntimeError(
+                        "generation-prefix inventory identity does not match the "
+                        f"completed call: model_call_id={prefix.model_call_id!r}"
+                    )
+                if completed is not None and completed.coords.disposition == "staged":
+                    acknowledgements.append(
+                        GenerationCutPrefixAck(
+                            **prefix.model_dump(mode="json"),
+                            disposition="durable_prefix",
+                            cut_kind="terminal_completion",
+                            frozen_buffer_id=f"terminal/{inventory.checkpoint_id}",
+                            staging_keys=(completed.coords.staging_key,),
+                            prefix_token_count=completed.generation_token_count,
+                            prefix_digest=completed.coords.digest,
+                        )
+                    )
+                else:
+                    acknowledgements.append(
+                        GenerationCutPrefixAck(
+                            **prefix.model_dump(mode="json"),
+                            disposition="durable_failure",
+                        )
+                    )
+                continue
+
+            expected_capture_key = (
+                prefix.rollout_id
+                if prefix.attempt_index == 0
+                else f"{prefix.rollout_id}-a{prefix.attempt_index}"
+            )
+            if state.call.rollout_id != expected_capture_key:
+                raise RuntimeError(
+                    "generation-prefix inventory identity does not match the "
+                    f"active call: model_call_id={prefix.model_call_id!r}, "
+                    f"inventory_rollout_id={prefix.rollout_id!r}, "
+                    f"worker_rollout_id={state.call.rollout_id!r}"
+                )
+
+            with state.lock:
+                observation_error = state.observation_error
+                if observation_error is None:
+                    (
+                        frozen_buffer_id,
+                        chunk_sequence,
+                        chunk_token_ids,
+                        chunk_logprobs,
+                        generated_token_ids,
+                        generated_logprobs,
+                    ) = state.freeze_for_checkpoint(inventory.checkpoint_id)
+            if observation_error is not None:
+                raise RuntimeError(
+                    f"cannot cut model call {prefix.model_call_id!r}: {observation_error}"
+                )
+            inherited_generation_token_count = (
+                state.call.admission.generation_cut.generation_token_count
+                if state.call.admission.generation_cut is not None
+                else 0
+            )
+            total_generation_token_count = inherited_generation_token_count + len(
+                generated_token_ids
+            )
+            if total_generation_token_count == 0:
+                with state.lock:
+                    state.rollback_frozen_buffer(inventory.checkpoint_id)
+                acknowledgements.append(
+                    GenerationCutPrefixAck(
+                        **prefix.model_dump(mode="json"),
+                        disposition="durable_failure",
+                    )
+                )
+                continue
+            staged_key = None
+            try:
+                cumulative_record = capture.build_prefix_record(
+                    state.call,
+                    prompt_token_ids=state.prompt_token_ids,
+                    generated_token_ids=generated_token_ids,
+                    generated_logprobs=generated_logprobs,
+                )
+                if chunk_token_ids:
+                    chunk_record = (
+                        cumulative_record
+                        if not state.generation_cut_staging_keys
+                        else capture.build_generation_chunk_record(
+                            state.call,
+                            generated_token_ids=chunk_token_ids,
+                            generated_logprobs=chunk_logprobs,
+                        )
+                    )
+                    result = sink.stage_generation_prefix(
+                        chunk_record,
+                        checkpoint_id=inventory.checkpoint_id,
+                        chunk_sequence=chunk_sequence,
+                    )
+                    staged_key = result.staging_key
+                    if not result.ok:
+                        raise RuntimeError(
+                            "generation-prefix staging failed for "
+                            f"{prefix.model_call_id!r}: {result.error}"
+                        )
+                    if staged_key is None:
+                        raise RuntimeError(
+                            "generation-prefix staging returned no staging key for "
+                            f"{prefix.model_call_id!r}"
+                        )
+                with state.lock:
+                    candidate_staging_keys = tuple(state.generation_cut_staging_keys)
+                    if staged_key is not None:
+                        candidate_staging_keys += (staged_key,)
+                    acknowledgement = GenerationCutPrefixAck(
+                        **prefix.model_dump(mode="json"),
+                        disposition="durable_prefix",
+                        cut_kind="active_prefix",
+                        frozen_buffer_id=frozen_buffer_id,
+                        staging_keys=candidate_staging_keys,
+                        prefix_token_count=total_generation_token_count,
+                        prefix_digest=cumulative_record.digest,
+                    )
+                    # Validate the complete acknowledgement before adopting the
+                    # staged chunk. A failed acknowledgement must leave the
+                    # frozen buffer available for rollback.
+                    state.seal_frozen_buffer(inventory.checkpoint_id)
+                    if staged_key is not None:
+                        state.generation_cut_staging_keys.append(staged_key)
+            except Exception:
+                with state.lock:
+                    frozen = state.frozen_buffer
+                    if (
+                        frozen is not None
+                        and frozen.checkpoint_id == inventory.checkpoint_id
+                    ):
+                        state.rollback_frozen_buffer(inventory.checkpoint_id)
+                if staged_key is not None:
+                    try:
+                        sink.clear([staged_key])
+                    except Exception:  # noqa: BLE001 — preserve the cut failure
+                        LOGGER.exception(
+                            "Failed to clear rejected generation-prefix row %s",
+                            staged_key,
+                        )
+                raise
+            acknowledgements.append(acknowledgement)
+        receipt = GenerationCutReceipt(
+            checkpoint_id=inventory.checkpoint_id,
+            cut_id=f"worker-{inventory.inventory_digest}",
+            inventory_digest=inventory.inventory_digest,
+            inventory=inventory,
+            backend_snapshot_id=f"tq-{inventory.inventory_digest}",
+            prefixes=tuple(acknowledgements),
+        )
+        with self._capture_registry_lock:
+            self._generation_cut_receipts[receipt_key] = receipt
+            if len(self._generation_cut_receipts) > 256:
+                self._generation_cut_receipts.pop(
+                    next(iter(self._generation_cut_receipts))
+                )
+        return receipt
 
     # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
@@ -706,7 +1674,7 @@ class VllmAsyncGenerationWorkerImpl(
         from logging import LogRecord
         from typing import List, Optional, Union
 
-        from fastapi import Request
+        from fastapi import Header, HTTPException, Request
         from fastapi.responses import JSONResponse, StreamingResponse
         from vllm.entrypoints.chat_utils import load_chat_template
         from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -728,6 +1696,7 @@ class VllmAsyncGenerationWorkerImpl(
             ServingTokenization,
         )
         from vllm.renderers.online_renderer import OnlineRenderer
+        from vllm.sampling_params import RequestOutputKind
         from vllm.exceptions import VLLMValidationError
         from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
         from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
@@ -878,11 +1847,52 @@ class VllmAsyncGenerationWorkerImpl(
                 # the single splice path for staged and inline prefixes.
                 admission = worker_self._capture_admission(request)
                 capture_prefix_token_ids: list[int] | None = None
-                if admission is not None and admission.mode == "token_in":
+                generation_cut = None
+                resumed_generation_token_ids: list[int] = []
+                if admission is not None:
                     capture_prefix_token_ids = await asyncio.to_thread(
                         worker_self._resolve_admission_prefix, admission
                     )
-                    worker_self._enter_request_prefix(request, capture_prefix_token_ids)
+                    generation_cut = await asyncio.to_thread(
+                        worker_self._resolve_generation_cut,
+                        admission,
+                        capture_prefix_token_ids,
+                    )
+                    engine_prefix_token_ids = list(capture_prefix_token_ids)
+                    if generation_cut is not None:
+                        engine_prefix_token_ids.extend(generation_cut.token_ids_delta)
+                        resumed_generation_token_ids = [
+                            token_id
+                            for token_id, mask in zip(
+                                generation_cut.token_ids_delta,
+                                generation_cut.token_mask_delta,
+                            )
+                            if mask == 1.0
+                        ]
+                        (
+                            remaining_output_tokens,
+                            remaining_min_tokens,
+                        ) = _remaining_generation_limits_after_prefix(
+                            max_tokens=actual_request_max_tokens,
+                            min_tokens=getattr(request, "min_tokens", None),
+                            generation_token_count=(
+                                admission.generation_cut.generation_token_count
+                            ),
+                        )
+                        if remaining_output_tokens is not None:
+                            if remaining_output_tokens <= 0:
+                                raise VLLMValidationError(
+                                    "Durable generation prefix already exhausts max_tokens.",
+                                    parameter="max_tokens",
+                                    value=actual_request_max_tokens,
+                                )
+                            actual_request_max_tokens = remaining_output_tokens
+                        if remaining_min_tokens is not None:
+                            request.min_tokens = remaining_min_tokens
+                    if engine_prefix_token_ids:
+                        worker_self._enter_request_prefix(
+                            request, engine_prefix_token_ids
+                        )
 
                 if (
                     not hasattr(request, "required_prefix_token_ids")
@@ -898,7 +1908,12 @@ class VllmAsyncGenerationWorkerImpl(
                     # Token capture, text mode: the full render is the exact
                     # engine prompt.
                     worker_self._begin_request_capture(
-                        request, res[1][0]["prompt_token_ids"], admission=admission
+                        request,
+                        res[1][0]["prompt_token_ids"],
+                        admission=admission,
+                        prefix_token_ids=capture_prefix_token_ids,
+                        generation_cut=generation_cut,
+                        resumed_generation_token_ids=resumed_generation_token_ids,
                     )
                     return res
 
@@ -942,12 +1957,15 @@ class VllmAsyncGenerationWorkerImpl(
 
                 engine_prompt = res[1][0]
 
-                final_prompt_token_ids = replace_prefix_tokens(
-                    tokenizer=self.renderer.tokenizer,
-                    model_prefix_token_ids=model_prefix_token_ids,
-                    template_prefix_token_ids=actual_corresponding_token_ids,
-                    template_token_ids=engine_prompt["prompt_token_ids"],
-                )
+                if generation_cut is not None:
+                    final_prompt_token_ids = model_prefix_token_ids
+                else:
+                    final_prompt_token_ids = replace_prefix_tokens(
+                        tokenizer=self.renderer.tokenizer,
+                        model_prefix_token_ids=model_prefix_token_ids,
+                        template_prefix_token_ids=actual_corresponding_token_ids,
+                        template_token_ids=engine_prompt["prompt_token_ids"],
+                    )
 
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
 
@@ -967,6 +1985,8 @@ class VllmAsyncGenerationWorkerImpl(
                     final_prompt_token_ids,
                     admission=admission,
                     prefix_token_ids=capture_prefix_token_ids,
+                    generation_cut=generation_cut,
+                    resumed_generation_token_ids=resumed_generation_token_ids,
                 )
 
                 return res
@@ -984,10 +2004,54 @@ class VllmAsyncGenerationWorkerImpl(
             # attaches (rollout_id, call_id, parent_call_id, prev_len, mode).
             ng_capture: Optional[dict[str, Any]] = None
 
+            def to_sampling_params(self, *args, **kwargs):
+                sampling_params = super().to_sampling_params(*args, **kwargs)
+                if (
+                    worker_self._generation_prefix_cuts_enabled
+                    and self.ng_capture is not None
+                ):
+                    # Gym's public request remains non-streaming, but prefix
+                    # cuts need vLLM to publish in-flight outputs to the
+                    # internal full-response generator. DELTA keeps that work
+                    # linear; the serving adapter reconstructs one cumulative
+                    # result before invoking vLLM's non-streaming response path.
+                    sampling_params.output_kind = RequestOutputKind.DELTA
+                return sampling_params
+
         # vLLM 0.25 routes both /v1/chat/completions and /tokenize through
         # OnlineRenderer.preprocess_chat, so the prefix-token override
         # belongs on the renderer subclass.
         worker_self = self
+
+        @app.post("/ng-control/v1/generation-cut")
+        async def checkpoint_generation_cut(
+            inventory: dict[str, Any],
+            authorization: str | None = Header(default=None),
+        ):
+            """Persist one checkpoint's frozen active-call prefixes to TQ."""
+            import secrets
+
+            from nemo_gym._checkpoint.model_control_contracts import (
+                GenerationCutInventory,
+            )
+
+            expected = worker_self._generation_cut_control_token
+            supplied = (
+                authorization.removeprefix("Bearer ")
+                if authorization is not None and authorization.startswith("Bearer ")
+                else ""
+            )
+            if not worker_self._generation_prefix_cuts_enabled or expected is None:
+                raise HTTPException(
+                    status_code=404, detail="generation-prefix cuts are disabled"
+                )
+            if not secrets.compare_digest(supplied, expected):
+                raise HTTPException(status_code=401, detail="invalid control bearer")
+            typed_inventory = GenerationCutInventory.model_validate(inventory)
+            receipt = await worker_self._run_generation_checkpoint_control(
+                worker_self._checkpoint_generation_cut, typed_inventory
+            )
+            return receipt.model_dump(mode="json")
 
         class NeMoRLOpenAIServingChatMixin:
             async def chat_completion_full_generator(
@@ -1013,13 +2077,39 @@ class VllmAsyncGenerationWorkerImpl(
                         parameter="top_logprobs",
                     )
 
+                aggregate_deltas = bool(
+                    worker_self._generation_prefix_cuts_enabled
+                    and request.ng_capture is not None
+                )
                 final_res = None
+                delta_accumulator = _RequestOutputDeltaAccumulator()
 
                 async def capture_result_generator():
                     nonlocal final_res
                     async for res in result_generator:
-                        final_res = res
-                        yield res
+                        worker_self._observe_request_capture(request, res)
+                        if not aggregate_deltas:
+                            final_res = res
+                            worker_self._restore_response_prefix(
+                                request,
+                                res,
+                                tokenizer=self.renderer.tokenizer,
+                            )
+                            yield res
+                            continue
+
+                        delta_accumulator.append(res)
+
+                    if not aggregate_deltas or delta_accumulator.template is None:
+                        return
+
+                    final_res = delta_accumulator.build()
+                    worker_self._restore_response_prefix(
+                        request,
+                        final_res,
+                        tokenizer=self.renderer.tokenizer,
+                    )
+                    yield final_res
 
                 response = await super().chat_completion_full_generator(
                     request,
@@ -2026,6 +3116,17 @@ class VllmAsyncGenerationWorkerImpl(
         await self.llm.pause_generation(mode="keep", clear_cache=clear_cache)
         return True
 
+    async def begin_generation_checkpoint_async(self) -> bool:
+        """Fence terminal staging without pausing vLLM decoding."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "begin_generation_checkpoint_async requires async_engine=True"
+            )
+        await self._run_generation_checkpoint_control(
+            self._generation_checkpoint_gate.close_and_wait
+        )
+        return True
+
     async def resume_generation_async(self) -> bool:
         """Resume vLLM generation after an in-flight weight update."""
         assert self.llm is not None, (
@@ -2038,6 +3139,15 @@ class VllmAsyncGenerationWorkerImpl(
             )
 
         await self.llm.resume_generation()
+        return True
+
+    async def finish_generation_checkpoint_async(self) -> bool:
+        """Release terminal token staging after the TQ snapshot is durable."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "finish_generation_checkpoint_async requires async_engine=True"
+            )
+        self._generation_checkpoint_gate.reopen()
         return True
 
     async def sleep_async(self):
@@ -2117,6 +3227,19 @@ class VllmAsyncGenerationWorkerImpl(
             print(f"Error during vLLM shutdown: {e}")
             return False
         finally:
+            generation_checkpoint_gate = getattr(
+                self, "_generation_checkpoint_gate", None
+            )
+            if generation_checkpoint_gate is not None:
+                generation_checkpoint_gate.reopen()
+            generation_checkpoint_executor = getattr(
+                self, "_generation_checkpoint_executor", None
+            )
+            if generation_checkpoint_executor is not None:
+                generation_checkpoint_executor.shutdown(
+                    wait=False,
+                    cancel_futures=True,
+                )
             # Flush buffered spans/metrics before the actor goes away. Off the
             # event loop: the flush blocks on a network export with a 5s
             # timeout, and this is an async actor whose other coroutines --
