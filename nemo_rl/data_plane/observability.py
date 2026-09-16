@@ -754,7 +754,15 @@ _SNAPSHOT_SUM = (
     "pack_ms",
     "unpack_ms",
 )
-_SNAPSHOT_MAX = ("max_bytes_per_key_seen", "last_put_bytes_per_key")
+_SNAPSHOT_MAX = (
+    "max_bytes_per_key_seen",
+    "last_put_bytes_per_key",
+    # These ran concurrently inside one step, so the sum is process-time and
+    # only the max is wall time the step could have waited on. Reduced here
+    # under its own name so one key means the same thing in both scopes:
+    # this step's data-plane wall time, of the process that paid the most.
+    "step_wall_ms",
+)
 _OP_SUM = (
     "calls",
     "errors",
@@ -817,16 +825,6 @@ def merge_snapshots(snapshots: "list[dict[str, Any]]") -> dict[str, Any]:
     merged["by_op"] = by_op
     merged["hash_verify"] = hashes
     merged["n_processes"] = len(snapshots)
-    # The busiest single process, kept beside the sum: these ran concurrently
-    # inside one step, so the sum is process-time and only the max is wall
-    # time the step could have waited on. Reduced over the per-step
-    # accumulator, not the cumulative total: the difference of maxima is not
-    # the maximum of differences, so differencing the cumulative one reports
-    # the straggler's step only when the cumulative leader happens to be this
-    # step's straggler, and tends to the per-process mean as ranks grow.
-    merged["max_process_step_wall_ms"] = max(
-        (s.get("step_wall_ms", 0.0) for s in snapshots), default=0.0
-    )
     _derive_op_metrics(by_op, merged["total_wall_ms"])
     merged.update(_comm_volume(by_op))
     return merged
@@ -884,19 +882,12 @@ def _step_metrics(
     """
     wall_ms = snap["total_wall_ms"] - prev.get("total_wall_ms", 0.0)
     overhead_ms = snap["self_ms"] - prev.get("self_ms", 0.0) + collect_ms
-    # The slowest single process this step. Both forms are already scoped to
-    # the step by the reset that read them, so neither is differenced:
-    # ``merge_snapshots`` reduces the per-process accumulator with a max, and
-    # a single process carries its own. Not ``wall_ms / n_procs``, which is
-    # the per-process mean this reduction replaced.
-    # Membership, not ``.get``'s default: a default argument is evaluated
-    # eagerly, so the single-process key would be looked up on a merged
-    # snapshot that never carries it and raise on every cluster step.
-    slowest_ms = (
-        snap["max_process_step_wall_ms"]
-        if "max_process_step_wall_ms" in snap
-        else snap["step_wall_ms"]
-    )
+    # The slowest single process this step -- one process's own accumulator,
+    # or the max over every process's, which is how ``merge_snapshots``
+    # combines this field. Already scoped to the step by the reset that read
+    # it, so it is not differenced. Not ``wall_ms / n_procs``, which is the
+    # per-process mean this reduction replaced.
+    slowest_ms = snap["step_wall_ms"]
     # step/ is a delta over this step; now/ is a level at this instant.
     # The unit alone does not distinguish them -- see README.md.
     metrics = _step_deltas(snap, prev)
