@@ -1394,6 +1394,62 @@ class TestAsyncTrajectoryCollector:
         assert metrics["payload_bytes/nemo_gym_return/logical_media"] == 150
         assert metrics["payload_ratio/nemo_gym_return/physical_to_logical"] == 0.2
 
+    def test_collection_loop_drains_final_prompt_group_after_eof(self) -> None:
+        """EOF must not disable enqueue while the final rollout is outstanding."""
+        replay_buffer = mock.MagicMock()
+        replay_buffer.add.remote = mock.AsyncMock(return_value="success")
+        collector = self.create_local_collector(replay_buffer=replay_buffer)
+        self._prime_collection_loop(collector)
+        collector.dataloader = [{"batch": 0}]
+        collector._process_batch = lambda batch: None
+        buffered = set()
+        result = SimpleNamespace(
+            final_batch=BatchedDataDict({"total_reward": torch.tensor([1.0])}),
+            rollout_metrics={},
+            group_index=0,
+            task_index=0,
+        )
+
+        def finish_pending_rollout() -> None:
+            assert collector.data_exhausted
+            assert collector.running
+            asyncio.run(
+                collector._enqueue_rollout_group(
+                    rollout_result=result,
+                    generation_weight_version=0,
+                    target_weight_version=0,
+                    expected_prompt_groups=1,
+                    buffered_group_indices=buffered,
+                    collection_started_at=time.perf_counter(),
+                )
+            )
+
+        with mock.patch.object(
+            collector,
+            "wait_for_pending_generations",
+            side_effect=finish_pending_rollout,
+        ) as drain:
+            collector._collection_loop()
+
+        drain.assert_called_once_with()
+        replay_buffer.add.remote.assert_awaited_once()
+        assert buffered == {0}
+        assert not collector.running
+        assert collector.data_exhausted
+
+    def test_collection_loop_stops_even_if_drain_raises(self) -> None:
+        collector = self.create_local_collector()
+        self._prime_collection_loop(collector)
+        collector.dataloader = []
+        with mock.patch.object(
+            collector,
+            "wait_for_pending_generations",
+            side_effect=RuntimeError("drain interrupted"),
+        ):
+            with pytest.raises(RuntimeError, match="drain interrupted"):
+                collector._collection_loop()
+        assert not collector.running
+
     def test_collection_loop_marks_errored_on_crash(self):
         """A crash sets errored (not data_exhausted) so driver guards fail fast."""
         collector = self.create_local_collector()

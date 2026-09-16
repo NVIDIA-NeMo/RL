@@ -686,16 +686,17 @@ class AsyncTrajectoryCollector:
             traceback.print_exc()
             self._mark_collection_failed(e)
         finally:
-            self.running = False
-            if dataloader_exhausted:
-                self.data_exhausted = True
-                print(
-                    "❌ Trajectory collection stopped: dataloader exhausted "
-                    "(max_num_epochs reached). No more data available for generation. "
-                    "Increase max_num_epochs or use a larger dataset."
-                )
-            else:
-                print("🛑 Trajectory collection stopped")
+            try:
+                if dataloader_exhausted:
+                    self.data_exhausted = True
+                    print("Dataloader exhausted; draining in-flight rollouts")
+                    # EOF ends admission, not collection. Workers still need
+                    # running=True to enqueue the final batch's prompt groups.
+                    self.wait_for_pending_generations()
+                else:
+                    print("🛑 Trajectory collection stopped")
+            finally:
+                self.running = False
 
     def _stamp_task_indices(self, batch: BatchedDataDict[DatumSpec]) -> bool:
         """Assign one stable, monotonic task index to every prompt in a batch.

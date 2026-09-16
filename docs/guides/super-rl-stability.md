@@ -46,6 +46,23 @@ this document. Inspect with `git show <commit>`; base is PR3941, not current mai
 | `06176b1`, `f1e5560` | CPU service startup check and real sandbox prerequisites | Preflight dependency coverage |
 | `373e99c` | Independent scheduler horizon for a short smoke | Preserve intended warmup |
 
+## Drain the final asynchronous batch at end of data
+
+The fixed base closes `AsyncTrajectoryCollector.running` when its dataloader
+reaches EOF, even if batch workers still have outstanding rollouts. Those
+workers require `running=True` to enqueue completed prompt groups. A one-batch
+smoke therefore can finish generation while leaving its replay buffer empty;
+larger finite runs can lose their final in-flight groups at the same boundary.
+
+The collection loop now marks the data exhausted, drains its existing workers,
+and only then closes `running`. EOF stops new admission; it does not cancel
+already-issued work. The running flag is still closed if draining raises.
+No epoch count, data order, reward, generation budget, or retry limit changes.
+
+The collector unit tests exercise EOF followed by the actual enqueue path with
+a fake asynchronous buffer, and finalization after a drain error. These tests
+do not replace a finite-dataset training smoke or certify judge throughput.
+
 ## Cumulative rollout budgets
 
 The pinned Gym agents reuse the request cap on every model call. Consequently,
