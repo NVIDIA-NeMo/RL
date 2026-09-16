@@ -2433,16 +2433,6 @@ def _prepare_nemo_gym_rows(
         else:
             row[NEMO_GYM_TARGET_WEIGHT_VERSION_KEY] = target_weight_version
 
-        task_index = row.get(NEMO_GYM_TASK_INDEX_KEY)
-        if task_index is not None:
-            row[NEMO_GYM_ROLLOUT_INDEX_KEY] = next_rollout_index_by_task[task_index]
-            next_rollout_index_by_task[task_index] += 1
-
-        if target_weight_version is None:
-            row.pop(NEMO_GYM_TARGET_WEIGHT_VERSION_KEY, None)
-        else:
-            row[NEMO_GYM_TARGET_WEIGHT_VERSION_KEY] = target_weight_version
-
 
 def _tensorize_nemo_gym_result(result: dict) -> None:
     """Convert token fields returned by the Gym actor back to tensors."""
