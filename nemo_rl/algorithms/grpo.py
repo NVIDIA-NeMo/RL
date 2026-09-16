@@ -3287,7 +3287,7 @@ def _grpo_train_impl(
                         print("Computing advantages on GPU!")
                         # Just fix the device id for now
                         device_id = 0
-                        baseline, std = calculate_baseline_and_std_per_prompt(
+                        baseline, std, _ = calculate_baseline_and_std_per_prompt(
                             input_ids.cuda(device_id),
                             rewards.cuda(device_id),
                             torch.ones_like(rewards).cuda(device_id),
@@ -3301,7 +3301,7 @@ def _grpo_train_impl(
                         baseline = baseline.cpu()
                         std = std.cpu()
                     else:
-                        baseline, std = calculate_baseline_and_std_per_prompt(
+                        baseline, std, _ = calculate_baseline_and_std_per_prompt(
                             input_ids,
                             rewards,
                             torch.ones_like(rewards),

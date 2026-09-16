@@ -2772,7 +2772,7 @@ def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping(
     # call site.
     input_ids = torch.stack([m[0]["token_ids"] for m in repeated_batch["message_log"]])
     rewards = repeated_batch["total_reward"]
-    baseline, raw_std = calculate_baseline_and_std_per_prompt(
+    baseline, raw_std, _ = calculate_baseline_and_std_per_prompt(
         input_ids,
         rewards,
         torch.ones_like(rewards),
@@ -5196,6 +5196,26 @@ def test_grpo_advantage_estimator_zero_std_and_zero_advantage():
     # All advantages should be exactly 0
     expected = torch.zeros(4, 3)
     assert torch.allclose(result, expected, rtol=1e-5)
+
+
+def test_grpo_advantage_estimator_skips_trivial_leave_one_out_normalization():
+    """Do not amplify FP32 variance noise from an identical leave-one-out set."""
+    estimator_config = AdvEstimatorConfig.model_construct(
+        use_leave_one_out_baseline=True,
+        normalize_rewards=True,
+    )
+    estimator = GRPOAdvantageEstimator(estimator_config, ClippedPGLossConfig())
+    prompt_ids = torch.zeros(8, 1, dtype=torch.long)
+    rewards = torch.tensor([0.0] + [0.95] * 7)
+
+    result = estimator.compute_advantage(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=torch.ones(8, 3),
+    )
+
+    torch.testing.assert_close(result[0], torch.full((3,), -0.95))
+    assert torch.isfinite(result).all()
 
 
 def test_grpo_advantage_estimator_small_nonzero_std():
