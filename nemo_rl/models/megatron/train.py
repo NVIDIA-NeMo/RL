@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 import torch
 from megatron.core import tensor_parallel
 from megatron.core.models.gpt import GPTModel
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, TreePackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_context_parallel_world_size,
@@ -45,19 +45,23 @@ from nemo_rl.algorithms.loss import (
     DraftLossWrapper,
     SequencePackingFusionLossWrapper,
     SequencePackingLossWrapper,
+    TreePackingLossWrapper,
     prepare_loss_input,
     prepare_packed_loss_input,
+    prepare_tree_loss_input,
     wrap_loss_fn_with_input_preparation,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.utils import _pack_input_ids
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
+from nemo_rl.data.packed_rollouts import TREE_ATTENTION_EDGE_TARGET_IDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
+    from_parallel_tree_logits_to_logprobs,
 )
 from nemo_rl.models.megatron.config import MegatronModule
 from nemo_rl.models.megatron.data import ProcessedMicrobatch
@@ -434,6 +438,7 @@ def forward_with_post_processing_fn(
             input_ids=input_ids,
             cu_seqlens_padded=cu_seqlens_padded,
             original_seq_length=original_seq_length,
+            packed_seq_params=packed_seq_params,
         )
     elif isinstance(post_processing_fn, TeacherFullPayloadPostProcessor):
         assert original_seq_length is not None
@@ -631,8 +636,24 @@ class LossPostProcessor:
         # wrap loss function with loss input preparation
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
         if pack_sequences and packed_seq_params is not None:
-            fuse_loss = self.cfg.get("sequence_packing", {}).get("fuse_loss", False)
-            if fuse_loss:
+            if isinstance(packed_seq_params, TreePackedSeqParams):
+                if self.prepare_fn is not None or self.d2t is not None:
+                    raise NotImplementedError(
+                        "tree attention does not support custom or draft loss preparation"
+                    )
+                loss_fn_wrapped = TreePackingLossWrapper(
+                    loss_fn=self.loss_fn,
+                    prepare_fn=partial(
+                        prepare_tree_loss_input,
+                        sampling_params=self.sampling_params,
+                        chunk_size=logprob_chunk_size,
+                    ),
+                    packed_seq_params=packed_seq_params,
+                    vocab_parallel_rank=get_tensor_model_parallel_rank(),
+                    vocab_parallel_group=get_tensor_model_parallel_group(),
+                    context_parallel_group=get_context_parallel_group(),
+                )
+            elif self.cfg.get("sequence_packing", {}).get("fuse_loss", False):
                 # The fused path prepares loss via prepare_packed_loss_input and
                 # cannot honor a custom prepare_fn (e.g. the value model's); guard
                 # rather than silently bypass it.
@@ -641,26 +662,34 @@ class LossPostProcessor:
                     "prepare_fn (e.g. the value model's value-specific prep). "
                     "Disable fuse_loss for the value model."
                 )
-                wrapper_cls = SequencePackingFusionLossWrapper
-                prepare_fn = partial(
-                    prepare_packed_loss_input,
-                    sampling_params=self.sampling_params,
-                    chunk_size=logprob_chunk_size,
+                loss_fn_wrapped = SequencePackingFusionLossWrapper(
+                    loss_fn=self.loss_fn,
+                    prepare_fn=partial(
+                        prepare_packed_loss_input,
+                        sampling_params=self.sampling_params,
+                        chunk_size=logprob_chunk_size,
+                    ),
+                    cu_seqlens_q=packed_seq_params.cu_seqlens_q,
+                    cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
+                    vocab_parallel_rank=get_tensor_model_parallel_rank(),
+                    vocab_parallel_group=get_tensor_model_parallel_group(),
+                    context_parallel_group=get_context_parallel_group(),
                 )
             else:
-                wrapper_cls = SequencePackingLossWrapper
-                prepare_fn = prepare_loss_input_wrapped
-
-            loss_fn_wrapped = wrapper_cls(
-                loss_fn=self.loss_fn,
-                prepare_fn=prepare_fn,
-                cu_seqlens_q=packed_seq_params.cu_seqlens_q,
-                cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
-                vocab_parallel_rank=get_tensor_model_parallel_rank(),
-                vocab_parallel_group=get_tensor_model_parallel_group(),
-                context_parallel_group=get_context_parallel_group(),
-            )
+                loss_fn_wrapped = SequencePackingLossWrapper(
+                    loss_fn=self.loss_fn,
+                    prepare_fn=prepare_loss_input_wrapped,
+                    cu_seqlens_q=packed_seq_params.cu_seqlens_q,
+                    cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
+                    vocab_parallel_rank=get_tensor_model_parallel_rank(),
+                    vocab_parallel_group=get_tensor_model_parallel_group(),
+                    context_parallel_group=get_context_parallel_group(),
+                )
             if "student_logits" in data_dict:
+                if isinstance(packed_seq_params, TreePackedSeqParams):
+                    raise NotImplementedError(
+                        "tree attention does not support draft logits"
+                    )
                 # draft + use_fused_linear_logprobs is rejected at setup in
                 # lm_policy.py (the fused path never materializes the full
                 # next-token logits the teacher needs), so no check here.
@@ -749,6 +778,7 @@ class LogprobsPostProcessor:
         input_ids: torch.Tensor,
         cu_seqlens_padded: torch.Tensor,
         original_seq_length: int,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes token log probabilities.
 
@@ -767,7 +797,22 @@ class LogprobsPostProcessor:
         unpacked_input_ids = data_dict["input_ids"]
 
         def processor_fn_inner(output_tensor):
-            if self.use_fused_linear_logprobs:
+            if isinstance(packed_seq_params, TreePackedSeqParams):
+                tp_grp = get_tensor_model_parallel_group()
+                tp_rank = get_tensor_model_parallel_rank()
+                token_logprobs = from_parallel_tree_logits_to_logprobs(
+                    output_tensor,
+                    data_dict[TREE_ATTENTION_EDGE_TARGET_IDS],
+                    packed_seq_params,
+                    vocab_start_index=tp_rank * output_tensor.shape[-1],
+                    vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],
+                    tp_group=tp_grp,
+                    cp_group=get_context_parallel_group(),
+                    inference_only=True,
+                    chunk_size=self.cfg.get("logprob_chunk_size", None),
+                    sampling_params=self.sampling_params,
+                )
+            elif self.use_fused_linear_logprobs:
                 token_logprobs = output_tensor.to(torch.float32)
                 token_logprobs = token_logprobs[:, : original_seq_length - 1]
             elif self.cfg["sequence_packing"]["enabled"]:

@@ -40,6 +40,9 @@ from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
 from megatron.core.distributed import DistributedDataParallel
+from megatron.core.distributed.finalize_model_grads import (
+    reset_model_temporary_tensors,
+)
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallelV1,
     FullyShardedDataParallelV2,
@@ -196,6 +199,14 @@ def _model_self_packs_mtp_loss_mask(model: Any) -> bool:
     return any(
         bool(getattr(chunk, "model_owns_mtp_loss_mask_packing", False))
         for chunk in chunks
+    )
+
+
+def _mtp_loss_enabled(model_config: Any) -> bool:
+    """Whether the model should execute and optimize its MTP objective."""
+    mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
+    return bool(mtp_num_layers) and not bool(
+        getattr(model_config, "disable_mtp_loss", False)
     )
 
 
@@ -769,17 +780,17 @@ class MegatronPolicyWorkerImpl(
         # (mbridge VLM wrappers like Qwen3VL). If so, NeMo-RL must hand it an
         # unpacked [B, S] batch rather than pre-packing + CP-sharding itself.
         self.delegate_pack_to_model = _model_self_packs_for_cp(self.model)
-        self.delegate_mtp_loss_mask_to_model = _model_self_packs_mtp_loss_mask(
-            self.model
-        )
+        model_config = self._get_model_config()
+        self.delegate_mtp_loss_mask_to_model = _mtp_loss_enabled(
+            model_config
+        ) and _model_self_packs_mtp_loss_mask(self.model)
         assert (
             not self.delegate_mtp_loss_mask_to_model or self.delegate_pack_to_model
         ), "A model cannot own MTP-mask packing without owning sequence packing"
         self.model_slices_context_parallel_inputs = (
             _model_slices_context_parallel_inputs(self.model)
         )
-        mtp_num_layers = self._get_model_config().mtp_num_layers
-        self.mtp_enabled = mtp_num_layers is not None and mtp_num_layers > 0
+        self.mtp_enabled = _mtp_loss_enabled(model_config)
         # A media placeholder is an ordinary vocabulary entry, so text that
         # legitimately contains it must not be read as an anchor demanding a
         # projected feature. Only models that accept the mask are sent one.
@@ -958,6 +969,7 @@ class MegatronPolicyWorkerImpl(
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         check_dim_skip_keys: Optional[Iterable[str]] = None,
+        scheduler_step_increment: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function.
 
@@ -965,6 +977,9 @@ class MegatronPolicyWorkerImpl(
         workers (cross-tokenizer ride-along tensors whose dim 1 is not the
         student sequence axis). Megatron doesn't run cross-tokenizer, so it
         must be None.
+
+        ``scheduler_step_increment`` can preserve episode-based scheduler
+        semantics when one logical rollout batch is expanded into model-call rows.
         """
         assert check_dim_skip_keys is None, (
             "check_dim_skip_keys is only supported by the v2 DTensor worker; "
@@ -1099,8 +1114,9 @@ class MegatronPolicyWorkerImpl(
                         self._compute_moe_grad_scale(global_valid_toks)
                     )
                     # Set mtp_grad_scale_func for MTP loss scaling (scales by valid tokens)
-                    mtp_scale = 1.0 / global_valid_toks.clamp(min=1).float()
-                    self._set_mtp_grad_scale_func(lambda: mtp_scale)
+                    if self.mtp_enabled:
+                        mtp_scale = 1.0 / global_valid_toks.clamp(min=1).float()
+                        self._set_mtp_grad_scale_func(lambda: mtp_scale)
 
                     # Forward pass.
                     draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
@@ -1251,7 +1267,13 @@ class MegatronPolicyWorkerImpl(
             # samples: NeMo init scales lr_warmup_steps by gbs internally, so
             # passing increment=gbs cancels that scaling and one tick == one
             # train() call regardless of batch size.
-            self.scheduler.step(increment=gbs)
+            self.scheduler.step(
+                increment=(
+                    gbs
+                    if scheduler_step_increment is None
+                    else scheduler_step_increment
+                )
+            )
 
         # Aggregate metrics across all microbatches
         mb_metrics, global_loss = aggregate_training_statistics(
@@ -1362,7 +1384,7 @@ class MegatronPolicyWorkerImpl(
     #
     # SC drives one ``begin / train_microbatch×N / finish`` cycle per
     # optimizer step. The worker exposes:
-    #   begin_train_step      — open the step (zero grads, null mcore sync hooks)
+    #   begin_train_step      — open the step (zero grads, defer mcore finalization)
     #   train_microbatch      — one DP slice of fwd/bwd, grads accumulate locally
     #   finish_train_step     — all_reduce + opt.step + scheduler.step
     #   abort_train_step      — drop partial state (no opt.step)
@@ -1389,7 +1411,7 @@ class MegatronPolicyWorkerImpl(
     # 3. Grad clip is bundled inside ``MegatronOptimizer.step()``; the 1/N
     #    rescale via ``self.model.scale_gradients(1/N)`` must run before
     #    ``optimizer.step()`` so the clip operates on the rescaled grad.
-    # 4. With ``calculate_per_token_loss=True`` + ``average_in_collective=
+    # 5. With ``calculate_per_token_loss=True`` + ``average_in_collective=
     #    False``, mcore's DDP sums (does not average) grads across DP, so
     #    no FSDP-style ``loss *= dp_size*cp_size`` cancellation is needed
     #    per microbatch.
@@ -1589,11 +1611,11 @@ class MegatronPolicyWorkerImpl(
                 model_config, "grad_sync_func", None
             )
             state["saved_no_sync_func"] = getattr(model_config, "no_sync_func", None)
-            model_config.grad_sync_func = None
-            model_config.no_sync_func = nullcontext
             state["saved_finalize_model_grads_func"] = getattr(
                 model_config, "finalize_model_grads_func", None
             )
+            model_config.grad_sync_func = None
+            model_config.no_sync_func = nullcontext
             model_config.finalize_model_grads_func = None
         else:
             state["saved_grad_sync_func"] = None
@@ -2091,6 +2113,7 @@ class MegatronPolicyWorkerImpl(
             mtp_grad_norm,
         )
 
+        self._release_preserved_grad_host_buffers()
         self._train_step_state = None
         return metrics
 
@@ -2105,9 +2128,21 @@ class MegatronPolicyWorkerImpl(
             self._set_mtp_grad_scale_func(None)
         finally:
             self._restore_saved_mcore_hooks(state)
+            model_config = getattr(self.model, "config", None)
+            if model_config is not None:
+                reset_model_temporary_tensors(model_config, [self.model])
             self.model.zero_grad_buffer()
             self.optimizer.zero_grad()
+            self._release_preserved_grad_host_buffers()
             self._train_step_state = None
+
+    def _release_preserved_grad_host_buffers(self) -> None:
+        """Release split-step host gradients once the step is closed."""
+        if not isinstance(self.model, DistributedDataParallel):
+            return
+        for buffers in [self.model.buffers, self.model.expert_parallel_buffers]:
+            for buffer in buffers:
+                buffer.release_grad_data_cpu()
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
     def get_logprobs(
@@ -3375,6 +3410,27 @@ class MegatronPolicyWorkerImpl(
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
     ) -> None:
+        """Broadcast the weights for collective communication."""
+        # A split train step can release its final optimizer/metric temporaries
+        # only after finish_train_step returns, which is later than that method's
+        # own empty_cache call. Refit conversion immediately allocates EP gather
+        # buffers, so make the train -> refit boundary explicit before starting
+        # the weight iterator.
+        if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
+            allocated_before = torch.cuda.memory_allocated()
+            reserved_before = torch.cuda.memory_reserved()
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+            if self.rank == 0:
+                gib = 1024**3
+                print(
+                    "[weight_sync_memory] "
+                    f"allocated={allocated_before / gib:.2f}GiB "
+                    f"reserved_before={reserved_before / gib:.2f}GiB "
+                    f"reserved_after={torch.cuda.memory_reserved() / gib:.2f}GiB",
+                    flush=True,
+                )
         # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
             iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),
@@ -3943,42 +3999,17 @@ class MegatronPolicyWorkerImpl(
         )
 
     def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
-        """Put the model in eval mode for logprob inference.
+        """Prepare logprob inference, optionally retaining train buffers on CUDA.
 
-        Args:
-            keep_train_buffers: Leave the grad buffers and the optimizer state on
-                CUDA. Set this when a train step is already open. mcore's
-                ``_ParamAndGradBuffer.offload_to_cpu(move_grads=True)`` does not
-                copy gradients anywhere — it calls
-                ``grad_data.storage().resize_(0)``, freeing them — and the
-                matching ``reload_from_cpu`` resizes the storage back and
-                ``zero_()``s it. ``param.main_grad`` stays a valid view of that
-                storage throughout, so nothing raises: the gradients accumulated
-                by earlier streaming chunks of this step are simply gone, leaving
-                only the last chunk's contribution against a 1/N normalizer
-                computed over all of them. Keeping the buffers resident also
-                avoids round-tripping tens of GiB per chunk.
+        With keep_train_buffers=False, an open split step offloads and preserves
+        accumulated gradients for the next training chunk. Between steps, gradient
+        storage can be discarded. Keeping buffers resident avoids that transfer.
 
-                Suppressing the offload here is sufficient only because of an
-                mcore invariant on the other side of the detour:
-                ``prepare_for_training`` runs before every chunk and reloads with
-                ``move_grads=True``, and ``reload_from_cpu`` resizes and
-                ``zero_()``s the grad buffer only ``if grad_data_size > 0``, a
-                counter set only by a matching ``offload_to_cpu``. With the
-                offload suppressed it stays 0, so the reload is a no-op and
-                the accumulated gradients survive. An mcore change that dropped
-                that guard, or that zeroed unconditionally, would silently
-                reinstate this bug.
-
-            MXFP8 overlap aliases the parameter all-gather buffer to grad
-            storage. That allocation remains resident even when
-            ``keep_train_buffers`` is false because logprob forward pre-hooks
-            may need it for parameter all-gather.
+        MXFP8 overlap aliases the parameter all-gather buffer to grad storage.
+        That allocation remains resident even when keep_train_buffers is false
+        because logprob forward pre-hooks may need it for parameter all-gather.
         """
-        # First worker call after the controller's select() wait returns, so this
-        # is also the "idle wait end" marker. Whether the offload was suppressed
-        # is the difference between accumulating gradients across chunks and
-        # discarding all but the last, so it is worth a line.
+        # First worker call after the controller's select() wait returns.
         log.debug(
             "[lp_prep] rank=%d keep_train_buffers=%s",
             self.rank,
@@ -4002,8 +4033,12 @@ class MegatronPolicyWorkerImpl(
         if not keep_train_buffers and not uses_mxfp8_shared_buffer:
             # offload grads to cpu
             self.model = self.move_model(
-                self.model, "cpu", move_params=False, move_grads=True
-            )  # get rid of grad buffers
+                self.model,
+                "cpu",
+                move_params=False,
+                move_grads=True,
+                preserve_grads=self._train_step_state is not None,
+            )
 
         # offload optimizer to cpu
         torch.randn(1).cuda()  # wake up torch allocator
@@ -4304,6 +4339,7 @@ class MegatronPolicyWorkerImpl(
         device: str,
         move_params: bool = True,
         move_grads: bool = True,
+        preserve_grads: bool = False,
     ) -> torch.nn.Module:
         # move all param and grad buffers to the device
         if isinstance(model, DistributedDataParallel):
@@ -4312,7 +4348,9 @@ class MegatronPolicyWorkerImpl(
                 for buffer_idx in range(len(buffers)):
                     if device == "cpu":
                         buffers[buffer_idx].offload_to_cpu(
-                            move_params=move_params, move_grads=move_grads
+                            move_params=move_params,
+                            move_grads=move_grads,
+                            preserve_grad_data=preserve_grads,
                         )
                     elif device == "cuda":
                         buffers[buffer_idx].reload_from_cpu(
@@ -4325,6 +4363,11 @@ class MegatronPolicyWorkerImpl(
         elif isinstance(
             model, (FullyShardedDataParallelV1, FullyShardedDataParallelV2)
         ):
+            if preserve_grads:
+                raise NotImplementedError(
+                    "Preserving open split-step gradients across inference "
+                    "is not implemented for Megatron FSDP"
+                )
             if device == "cpu":
                 model.param_and_grad_buffer.offload_to_cpu(move_params, move_grads)
             elif device == "cuda":
@@ -4383,6 +4426,12 @@ class MegatronPolicyWorkerImpl(
             weights_path: The specific directory path where the checkpoint will be saved.
             optimizer_path: If not None, optimizer and scheduler states are saved if they exist.
         """
+        if self._train_step_state is not None:
+            raise RuntimeError(
+                "cannot save a checkpoint while a split train step is open; "
+                "finish or abort the step first"
+            )
+
         if not torch.distributed.is_initialized():
             raise RuntimeError(
                 "Distributed process group is not initialized. Cannot save checkpoint."

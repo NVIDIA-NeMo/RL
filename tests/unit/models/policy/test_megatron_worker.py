@@ -4813,3 +4813,103 @@ def test_megatron_policy_flops_range_check(tiny_llama_model_path):
     finally:
         policy.shutdown()
         cluster.shutdown()
+
+
+@pytest.mark.parametrize(
+    "mtp_num_layers,disable_mtp_loss,expected",
+    [(None, False, False), (0, False, False), (1, False, True), (1, True, False)],
+)
+def test_mtp_loss_enabled_requires_layers_and_enabled_loss(
+    mtp_num_layers: Optional[int], disable_mtp_loss: bool, expected: bool
+):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _mtp_loss_enabled,
+    )
+
+    config = SimpleNamespace(
+        mtp_num_layers=mtp_num_layers,
+        disable_mtp_loss=disable_mtp_loss,
+    )
+
+    assert _mtp_loss_enabled(config) is expected
+
+
+@pytest.mark.parametrize(
+    "step_state,expected_preserve_grads", [(None, False), ({}, True)]
+)
+def test_megatron_prepare_for_lp_inference_preserves_open_step_grads(
+    monkeypatch, step_state, expected_preserve_grads
+):
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = _FakeTrainableModel()
+    worker.optimizer = None
+    worker.optimizer_cpu_offload = False
+    worker.offload_optimizer_for_logprob = False
+    worker._train_step_state = step_state
+    move_calls = []
+    worker.move_model = lambda model, device, **kwargs: (
+        move_calls.append((device, kwargs)) or model
+    )
+
+    allocator_wakeup = MagicMock()
+    monkeypatch.setattr(worker_module.torch, "randn", lambda *_: allocator_wakeup)
+    monkeypatch.setattr(worker_module.gc, "collect", lambda: None)
+    monkeypatch.setattr(worker_module.torch.cuda, "empty_cache", lambda: None)
+
+    MegatronPolicyWorkerImpl.prepare_for_lp_inference(worker)
+
+    allocator_wakeup.cuda.assert_called_once_with()
+    assert worker.model.eval_called
+    assert move_calls == [
+        ("cuda", {"move_grads": False}),
+        (
+            "cpu",
+            {
+                "move_params": False,
+                "move_grads": True,
+                "preserve_grads": expected_preserve_grads,
+            },
+        ),
+    ]
+
+
+def test_megatron_releases_preserved_grad_host_buffers(monkeypatch):
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    class FakeDistributedDataParallel:
+        def __init__(self):
+            self.buffers = [MagicMock()]
+            self.expert_parallel_buffers = [MagicMock()]
+
+    monkeypatch.setattr(
+        worker_module,
+        "DistributedDataParallel",
+        FakeDistributedDataParallel,
+    )
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = FakeDistributedDataParallel()
+
+    MegatronPolicyWorkerImpl._release_preserved_grad_host_buffers(worker)
+
+    for buffer in worker.model.buffers + worker.model.expert_parallel_buffers:
+        buffer.release_grad_data_cpu.assert_called_once_with()
+
+
+def test_megatron_save_checkpoint_rejects_open_split_step():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker._train_step_state = {}
+
+    with pytest.raises(RuntimeError, match="split train step is open"):
+        MegatronPolicyWorkerImpl.save_checkpoint(worker, weights_path="unused")

@@ -1420,6 +1420,7 @@ class TestLogprobsPostProcessor:
         mock_data_dict.__getitem__ = MagicMock(
             return_value=torch.tensor([[1, 2, 3, 4, 5, 0, 0, 0]])
         )
+        mock_data_dict.get.return_value = None
 
         mock_logprobs = torch.randn(1, 7)  # One less than padded input length
         mock_from_logits.return_value = mock_logprobs
@@ -1469,6 +1470,7 @@ class TestLogprobsPostProcessor:
         mock_data_dict.__getitem__ = MagicMock(
             return_value=torch.tensor([[1, 2, 3, 4, 5]])
         )
+        mock_data_dict.get.return_value = None
 
         mock_logprobs = torch.randn(1, 4)
         mock_from_logits_packed.return_value = mock_logprobs

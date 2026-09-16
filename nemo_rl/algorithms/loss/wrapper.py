@@ -65,7 +65,6 @@ class SequencePackingLossWrapper:
             vocab_parallel_rank: Vocab parallel rank.
             vocab_parallel_group: Vocab parallel group.
             context_parallel_group: Context parallel group.
-
             vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
 
         Returns:
@@ -183,6 +182,49 @@ class SequencePackingLossWrapper:
                     metrics_accum[k] += val
 
         return loss_accum, metrics_accum
+
+
+class TreePackingLossWrapper:
+    """Prepare and apply one batched loss over sampled edges of a packed tree."""
+
+    def __init__(
+        self,
+        loss_fn: LossFunction,
+        prepare_fn: Callable[..., Any],
+        packed_seq_params: Any,
+        vocab_parallel_rank: int,
+        vocab_parallel_group: torch.distributed.ProcessGroup,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
+        self.loss_fn = loss_fn
+        self.prepare_fn = prepare_fn
+        self.packed_seq_params = packed_seq_params
+        self.vocab_parallel_rank = vocab_parallel_rank
+        self.vocab_parallel_group = vocab_parallel_group
+        self.context_parallel_group = context_parallel_group
+
+    def __call__(
+        self,
+        next_token_logits: Tensor,
+        data: BatchedDataDict[Any],
+        global_valid_seqs: Tensor | None,
+        global_valid_toks: Tensor | None,
+    ) -> tuple[Tensor, dict[str, Any]]:
+        loss_input, prepared_data = self.prepare_fn(
+            logits=next_token_logits,
+            data=data,
+            loss_fn=self.loss_fn,
+            packed_seq_params=self.packed_seq_params,
+            vocab_parallel_rank=self.vocab_parallel_rank,
+            vocab_parallel_group=self.vocab_parallel_group,
+            context_parallel_group=self.context_parallel_group,
+        )
+        return self.loss_fn(
+            data=prepared_data,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            **loss_input,
+        )
 
 
 class SequencePackingFusionLossWrapper:

@@ -21,8 +21,13 @@ import torch
 from megatron.bridge.training.utils.packed_seq_utils import (
     get_packed_seq_cp_partition_indices,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    TreePackedSeqParams,
+    TreeQueryRun,
+)
 from megatron.core.parallel_state import (
+    get_context_parallel_group,
     get_context_parallel_rank,
     get_context_parallel_world_size,
 )
@@ -30,6 +35,15 @@ from megatron.core.utils import StragglerDetector
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
+from nemo_rl.data.packed_rollouts import (
+    TREE_ATTENTION_EDGE_LENGTHS,
+    TREE_ATTENTION_EDGE_SOURCE_INDICES,
+    TREE_ATTENTION_LAYOUTS,
+    TREE_EDGE_ALIGNED_FIELDS,
+    TREE_EDGE_SHIFTED_FIELDS,
+    TREE_EDGE_UNSHIFTED_FIELDS,
+    TreeAttentionLayout,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.common import _round_up_to_multiple
@@ -424,7 +438,6 @@ def process_microbatch(
 
             # Get sequence lengths and context parallel size
             seq_lengths = data_dict[seq_length_key]
-
             if delegate_pack_to_model:
                 has_mtp_loss_mask = "mtp_loss_mask" in data_dict
                 assert not has_mtp_loss_mask or delegate_mtp_loss_mask_to_model, (
@@ -513,6 +526,25 @@ def process_microbatch(
                     cp_rank=get_context_parallel_rank(),
                     cp_size=get_context_parallel_world_size(),
                 )
+                if TREE_ATTENTION_LAYOUTS in data_dict:
+                    if model_slices_context_parallel_inputs:
+                        raise NotImplementedError(
+                            "tree attention is not supported by models that slice "
+                            "context-parallel inputs internally"
+                        )
+                    packed_seq_params = _build_tree_packed_seq_params(
+                        packed_seq_params,
+                        layouts=data_dict[TREE_ATTENTION_LAYOUTS],
+                        edge_source_indices=data_dict[
+                            TREE_ATTENTION_EDGE_SOURCE_INDICES
+                        ],
+                        edge_lengths=data_dict[TREE_ATTENTION_EDGE_LENGTHS],
+                        seq_lengths=seq_lengths,
+                        cu_seqlens_padded=cu_seqlens_padded,
+                        total_tokens=input_ids.shape[1],
+                        cp_rank=get_context_parallel_rank(),
+                        cp_size=get_context_parallel_world_size(),
+                    )
                 if model_slices_context_parallel_inputs:
                     packed_seq_params = PackedSeqParams(
                         cu_seqlens_q=cu_seqlens,
@@ -1340,6 +1372,205 @@ def _pack_sequences_for_megatron(
     )
 
 
+def _gather_cp_partition_indices(
+    local_global_indices: torch.Tensor,
+    *,
+    cp_size: int,
+) -> torch.Tensor:
+    """Gather rank-local CP ownership in context-parallel rank order."""
+    if cp_size == 1:
+        return local_global_indices
+
+    gathered = [torch.empty_like(local_global_indices) for _ in range(cp_size)]
+    torch.distributed.all_gather(
+        gathered,
+        local_global_indices,
+        group=get_context_parallel_group(),
+    )
+    return torch.cat(gathered)
+
+
+def _build_tree_packed_seq_params(
+    base: PackedSeqParams,
+    *,
+    layouts: list[TreeAttentionLayout],
+    edge_source_indices: torch.Tensor,
+    edge_lengths: torch.Tensor,
+    seq_lengths: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    total_tokens: int,
+    cp_rank: int,
+    cp_size: int,
+) -> TreePackedSeqParams:
+    """Attach logical tree paths and CP ownership to a physical DFS pack."""
+    if len(layouts) != int(seq_lengths.shape[0]):
+        raise ValueError("tree layouts must align with packed rollout rows")
+    if total_tokens % cp_size != 0:
+        raise ValueError("tree packed token count must be divisible by CP size")
+
+    local_global_indices = get_packed_seq_cp_partition_indices(
+        base,
+        total_tokens=total_tokens,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        device=cu_seqlens_padded.device,
+    ).to(torch.long)
+    gathered_global_indices = _gather_cp_partition_indices(
+        local_global_indices,
+        cp_size=cp_size,
+    )
+    cp_gather_inverse = torch.argsort(gathered_global_indices)
+    global_to_local = torch.full(
+        (total_tokens,),
+        -1,
+        dtype=torch.long,
+        device=cu_seqlens_padded.device,
+    )
+    global_to_local[local_global_indices] = torch.arange(
+        local_global_indices.numel(),
+        dtype=torch.long,
+        device=cu_seqlens_padded.device,
+    )
+
+    segment_starts: list[int] = []
+    segment_lengths: list[int] = []
+    segment_parents: list[int] = []
+    segment_depths: list[int] = []
+    global_position_ids = torch.zeros(
+        total_tokens, dtype=torch.long, device=cu_seqlens_padded.device
+    )
+    max_logical_path_length = 1
+
+    for row, layout in enumerate(layouts):
+        layout.validate()
+        max_logical_path_length = max(max_logical_path_length, layout.max_path_length)
+        actual_length = int(seq_lengths[row].item())
+        if layout.unique_token_count != actual_length:
+            raise ValueError(
+                "tree layout does not cover its physical input row: "
+                f"row={row}, layout={layout.unique_token_count}, input={actual_length}"
+            )
+        row_start = int(cu_seqlens_padded[row].item())
+        row_end = int(cu_seqlens_padded[row + 1].item())
+        segment_index_offset = len(segment_starts)
+        offset = 0
+        for length, parent, depth in zip(
+            layout.segment_lengths,
+            layout.segment_parents,
+            layout.segment_depths,
+        ):
+            start = row_start + offset
+            segment_starts.append(start)
+            segment_lengths.append(length)
+            segment_parents.append(
+                -1 if parent == -1 else segment_index_offset + parent
+            )
+            segment_depths.append(depth)
+            global_position_ids[start : start + length] = torch.arange(
+                depth,
+                depth + length,
+                device=global_position_ids.device,
+            )
+            offset += length
+
+        padding_length = row_end - row_start - actual_length
+        if padding_length > 0:
+            padding_start = row_start + actual_length
+            segment_starts.append(padding_start)
+            segment_lengths.append(padding_length)
+            segment_parents.append(-1)
+            segment_depths.append(0)
+            # Padding is an isolated, unsupervised root. Reusing position zero
+            # keeps RoPE allocation bounded by valid logical paths rather than
+            # by physical pack padding.
+            global_position_ids[padding_start:row_end] = 0
+
+    query_runs: list[TreeQueryRun] = []
+    for segment_index, (start, length) in enumerate(
+        zip(segment_starts, segment_lengths)
+    ):
+        local_positions = global_to_local[start : start + length]
+        owned_offsets = torch.nonzero(local_positions >= 0, as_tuple=False).flatten()
+        if owned_offsets.numel() == 0:
+            continue
+        split_points = torch.nonzero(
+            owned_offsets[1:] != owned_offsets[:-1] + 1,
+            as_tuple=False,
+        ).flatten()
+        run_boundaries = [
+            0,
+            *(int(i.item()) + 1 for i in split_points),
+            int(owned_offsets.numel()),
+        ]
+        for run_start, run_end in zip(run_boundaries, run_boundaries[1:]):
+            run_offsets = owned_offsets[run_start:run_end]
+            global_start = start + int(run_offsets[0].item())
+            global_end = start + int(run_offsets[-1].item()) + 1
+            query_runs.append(
+                TreeQueryRun(
+                    segment_index=segment_index,
+                    global_start=global_start,
+                    global_end=global_end,
+                    local_indices=local_positions.index_select(0, run_offsets),
+                )
+            )
+
+    edge_local_indices: list[torch.Tensor] = []
+    edge_output_indices: list[torch.Tensor] = []
+    edge_width = int(edge_source_indices.shape[1])
+    for row, edge_length_tensor in enumerate(edge_lengths):
+        edge_length = int(edge_length_tensor.item())
+        if edge_length == 0:
+            continue
+        row_sources = edge_source_indices[row, :edge_length]
+        row_global_sources = row_sources + cu_seqlens_padded[row].to(torch.long)
+        row_local_sources = global_to_local.index_select(0, row_global_sources)
+        owned = row_local_sources >= 0
+        edge_local_indices.append(row_local_sources[owned])
+        row_output = row * edge_width + torch.arange(
+            edge_length, device=edge_source_indices.device
+        )
+        edge_output_indices.append(row_output[owned])
+
+    empty_index = torch.empty(0, dtype=torch.long, device=cu_seqlens_padded.device)
+    return TreePackedSeqParams(
+        qkv_format=base.qkv_format,
+        cu_seqlens_q=base.cu_seqlens_q,
+        cu_seqlens_kv=base.cu_seqlens_kv,
+        cu_seqlens_q_padded=base.cu_seqlens_q_padded,
+        cu_seqlens_kv_padded=base.cu_seqlens_kv_padded,
+        max_seqlen_q=max_logical_path_length,
+        max_seqlen_kv=max_logical_path_length,
+        local_cp_size=base.local_cp_size,
+        cp_group=base.cp_group,
+        total_tokens=base.total_tokens,
+        tokens_per_sample=base.tokens_per_sample,
+        pad_between_seqs=base.pad_between_seqs,
+        tree_segment_starts=tuple(segment_starts),
+        tree_segment_lengths=tuple(segment_lengths),
+        tree_segment_parents=tuple(segment_parents),
+        tree_segment_depths=tuple(segment_depths),
+        tree_local_position_ids=global_position_ids.index_select(
+            0, local_global_indices
+        ),
+        tree_cp_gather_inverse=cp_gather_inverse,
+        tree_query_runs=tuple(query_runs),
+        tree_cp_local_token_count=int(local_global_indices.numel()),
+        # Keep a single unused projection row on CP ranks that own no sampled
+        # edges; zero-row TE GEMMs are not supported consistently.
+        tree_edge_local_indices=(
+            torch.cat(edge_local_indices)
+            if edge_local_indices
+            else torch.zeros(1, dtype=torch.long, device=empty_index.device)
+        ),
+        tree_edge_output_indices=(
+            torch.cat(edge_output_indices) if edge_output_indices else empty_index
+        ),
+        tree_edge_count=int(edge_lengths.sum().item()),
+        tree_edge_padded_width=edge_width,
+    )
+
+
 def _shard_routed_experts_for_cp(
     routed_experts: Optional[torch.Tensor],  # [B, S, L, K] or None
     token_identity: Optional[
@@ -1600,11 +1831,91 @@ def get_and_validate_seqlen(data: BatchedDataDict[Any]):
     # seqlen.
     sequence_dim = 1
     seq_dim_size = data["input_ids"].shape[sequence_dim]
+    tree_edge_fields: frozenset[str] = frozenset()
+    if TREE_ATTENTION_LAYOUTS in data:
+        _validate_tree_attention_seqlens(data)
+        tree_edge_fields = TREE_EDGE_ALIGNED_FIELDS
     for k, v in data.items():
         if k in PACKED_MULTIMODAL_FIELDS:
             continue
-        if torch.is_tensor(v) and len(v.shape) > 1:
+        if torch.is_tensor(v) and len(v.shape) > 1 and k not in tree_edge_fields:
             assert v.shape[sequence_dim] == seq_dim_size, (
                 f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape} for key {k}"
             )
     return sequence_dim, seq_dim_size
+
+
+def _validate_tree_attention_seqlens(data: BatchedDataDict[Any]) -> None:
+    """Validate physical-node and sampled-edge dimensions independently."""
+    input_ids = data["input_ids"]
+    layouts = data[TREE_ATTENTION_LAYOUTS]
+    batch_size = int(input_ids.shape[0])
+    if len(layouts) != batch_size:
+        raise ValueError(
+            "tree attention layouts must align with the input batch: "
+            f"layouts={len(layouts)}, batch={batch_size}"
+        )
+
+    required_fields = (
+        "input_lengths",
+        TREE_ATTENTION_EDGE_LENGTHS,
+        *TREE_EDGE_UNSHIFTED_FIELDS,
+    )
+    missing_fields = [field for field in required_fields if field not in data]
+    if missing_fields:
+        raise ValueError(
+            f"tree attention batch is missing required fields: {missing_fields}"
+        )
+
+    input_lengths = data["input_lengths"]
+    edge_lengths = data[TREE_ATTENTION_EDGE_LENGTHS]
+    if tuple(input_lengths.shape) != (batch_size,):
+        raise ValueError(
+            "tree attention input_lengths must have shape [batch], got "
+            f"{tuple(input_lengths.shape)}"
+        )
+    if tuple(edge_lengths.shape) != (batch_size,):
+        raise ValueError(
+            "tree attention edge lengths must have shape [batch], got "
+            f"{tuple(edge_lengths.shape)}"
+        )
+
+    expected_input_lengths: list[int] = []
+    expected_edge_lengths: list[int] = []
+    for layout in layouts:
+        layout.validate()
+        expected_input_lengths.append(layout.unique_token_count)
+        expected_edge_lengths.append(len(layout.edge_source_indices))
+
+    actual_input_lengths = [int(length) for length in input_lengths.tolist()]
+    actual_edge_lengths = [int(length) for length in edge_lengths.tolist()]
+    if actual_input_lengths != expected_input_lengths:
+        raise ValueError(
+            "tree attention physical input lengths do not match layouts: "
+            f"actual={actual_input_lengths}, expected={expected_input_lengths}"
+        )
+    if actual_edge_lengths != expected_edge_lengths:
+        raise ValueError(
+            "tree attention sampled-edge lengths do not match layouts: "
+            f"actual={actual_edge_lengths}, expected={expected_edge_lengths}"
+        )
+
+    max_edges = max(expected_edge_lengths, default=0)
+    expected_widths = {
+        **{field: max_edges + 1 for field in TREE_EDGE_SHIFTED_FIELDS},
+        **{field: max_edges for field in TREE_EDGE_UNSHIFTED_FIELDS},
+    }
+    for field, expected_width in expected_widths.items():
+        if field not in data:
+            continue
+        value = data[field]
+        if not torch.is_tensor(value) or value.ndim < 2:
+            raise ValueError(
+                f"tree attention field {field} must be a tensor with shape "
+                f"[batch, edge], got {type(value).__name__}"
+            )
+        if value.shape[0] != batch_size or value.shape[1] != expected_width:
+            raise ValueError(
+                f"tree attention field {field} has shape {tuple(value.shape)}; "
+                f"expected batch={batch_size}, edge_width={expected_width}"
+            )

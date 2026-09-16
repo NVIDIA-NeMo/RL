@@ -112,6 +112,57 @@ def test_build_router_replay_tensors_maps_global_moe_layer_order():
 
 
 @pytest.mark.mcore
+def test_build_router_replay_tensors_excludes_auxiliary_mtp_routers():
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    from nemo_rl.models.megatron.router_replay import build_router_replay_assignments
+
+    RouterReplay.clear_global_router_replay_instances()
+
+    class DummyRouter(torch.nn.Module):
+        def __init__(self, layer_number):
+            super().__init__()
+            self.router_replay = RouterReplay()
+            self.layer_number = layer_number
+
+    class DummyMTP(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            # MTP layer numbering restarts independently from the policy stack.
+            self.router = DummyRouter(layer_number=2)
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(num_layers=4, moe_layer_freq=[0, 1, 0, 1])
+            self.router_2 = DummyRouter(layer_number=2)
+            self.router_4 = DummyRouter(layer_number=4)
+            self.mtp = DummyMTP()
+
+    try:
+        model = DummyModel()
+        routed_experts = torch.tensor(
+            [
+                [[10, 11], [40, 41]],
+                [[12, 13], [42, 43]],
+            ],
+            dtype=torch.int32,
+        )
+
+        assignments = build_router_replay_assignments(model, routed_experts)
+
+        assert [replay for replay, _ in assignments] == [
+            model.router_2.router_replay,
+            model.router_4.router_replay,
+        ]
+        assert model.mtp.router.router_replay not in [
+            replay for replay, _ in assignments
+        ]
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
 def test_build_router_replay_tensors_maps_full_layer_payload_to_moe_layers():
     from megatron.core.transformer.moe.router_replay import RouterReplay
 
@@ -809,6 +860,75 @@ def test_r3_trace_forward_verifier_records_actual_replayed_topk(tmp_path, monkey
         assert verify_records[0]["action"] == "replay_forward"
         assert verify_records[0]["layer_number"] == 7
         assert verify_records[0]["matches_expected"] is True
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
+def test_r3_trace_compares_natural_and_replayed_topk(tmp_path, monkeypatch):
+    import json
+
+    from megatron.core.transformer.moe.moe_utils import topk_routing_with_score_function
+    from megatron.core.transformer.moe.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
+
+    from nemo_rl.utils.r3_trace import r3_trace_stage
+
+    monkeypatch.setenv("NRL_R3_TRACE", "1")
+    monkeypatch.setenv("NRL_R3_TRACE_VERIFY_FORWARD", "1")
+    monkeypatch.setenv("NRL_R3_TRACE_COMPARE_NATURAL", "1")
+    monkeypatch.setenv("NRL_R3_TRACE_DIR", str(tmp_path))
+    RouterReplay.clear_global_router_replay_instances()
+
+    try:
+        replay = RouterReplay()
+        target = torch.tensor([[0, 1], [2, 3]], dtype=torch.long)
+        replay.set_target_indices(target)
+        replay.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+
+        logits = torch.tensor(
+            [[9.0, 8.0, 1.0, 0.0], [9.0, 8.0, 1.0, 0.0]],
+            requires_grad=True,
+        )
+        observed_natural_call = {}
+
+        original_topk = torch.topk
+
+        def inspect_topk(input, *args, **kwargs):
+            observed_natural_call["requires_grad"] = input.requires_grad
+            observed_natural_call["grad_enabled"] = torch.is_grad_enabled()
+            return original_topk(input, *args, **kwargs)
+
+        monkeypatch.setattr(torch, "topk", inspect_topk)
+        with r3_trace_stage("unit-forward"):
+            _, top_indices = topk_routing_with_score_function(
+                logits=logits,
+                topk=2,
+                use_pre_softmax=True,
+                router_replay=replay,
+                score_function="softmax",
+                dense_output=True,
+            )
+
+        assert torch.equal(top_indices, target)
+        assert observed_natural_call == {
+            "requires_grad": False,
+            "grad_enabled": True,
+        }
+        records = [
+            json.loads(line)
+            for path in tmp_path.glob("*.jsonl")
+            for line in path.read_text(encoding="utf-8").splitlines()
+        ]
+        comparison = records[0]["natural_route_comparison"]
+        assert comparison == {
+            "comparable_rows": 2,
+            "exact_order_row_matches": 1,
+            "expert_set_row_matches": 1,
+            "mean_expert_overlap_fraction": 0.5,
+        }
     finally:
         RouterReplay.clear_global_router_replay_instances()
 

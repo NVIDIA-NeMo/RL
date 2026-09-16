@@ -23,7 +23,14 @@ import torch
 from ray.util.queue import Queue as RayQueue
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
+from nemo_rl.data.packed_rollouts import (
+    TREE_ATTENTION_LAYOUTS,
+    expand_batched_data_for_packed_attention,
+    expand_batched_data_for_tree_attention,
+    reassemble_packed_attention_segments,
+    reassemble_tree_attention_edge_values,
+)
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
@@ -560,6 +567,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     def _shard_for_logprob(
         self,
         data: BatchedDataDict[Any],
+        allow_uneven_shards: bool = False,
     ) -> tuple[list["SlicedDataDict"], Optional[list[int]]]:
         """Shard inputs for ``get_logprobs`` / ``get_reference_policy_logprobs``.
 
@@ -568,6 +576,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         is the inverse permutation needed to undo seqpack/dynbatch reorder
         (``None`` when neither is enabled).
         """
+        if TREE_ATTENTION_LAYOUTS in data and not self.use_sequence_packing:
+            raise ValueError(
+                "tree rollouts require policy.sequence_packing.enabled=true"
+            )
         dp_size = self.data_parallel_size
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
@@ -579,14 +591,31 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 dynamic_batching_args=self.dynamic_batching_args,
             )
         elif self.use_sequence_packing:
-            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+            sequence_packing_args = dict(self.sequence_packing_args)
+            sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
                 "sequence_packing"
             ]["logprob_mb_tokens"]
+            if TREE_ATTENTION_LAYOUTS in data:
+                configured_context = self.cfg["max_total_sequence_length"]
+                for layout in data[TREE_ATTENTION_LAYOUTS]:
+                    if layout.max_path_length > configured_context:
+                        raise ValueError(
+                            "tree rollout logical path exceeds logprob context: "
+                            f"{layout.max_path_length} > {configured_context}"
+                        )
+                physical_tokens = int(data["input_lengths"].max().item())
+                if physical_tokens > sequence_packing_args["max_tokens_per_microbatch"]:
+                    raise ValueError(
+                        "tree rollout was not fragmented to the logprob token budget: "
+                        f"{physical_tokens} > "
+                        f"{sequence_packing_args['max_tokens_per_microbatch']}"
+                    )
             # we just shard into DP shards here as Sequence packing allows for CP.
             sharded_data, unsorted_data_indices = data.shard_by_batch_size(
                 dp_size,
                 batch_size=None,
-                sequence_packing_args=self.sequence_packing_args,
+                allow_uneven_shards=allow_uneven_shards,
+                sequence_packing_args=sequence_packing_args,
             )
         else:
             sharded_data = data.shard_by_batch_size(  # type: ignore
@@ -599,7 +628,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     def _shard_for_train(
         self,
         data: BatchedDataDict[Any],
-        batch_size: int,
+        batch_size: Optional[int],
+        allow_uneven_shards: bool = False,
     ) -> list["SlicedDataDict"]:
         """Shard inputs for ``train``.
 
@@ -609,6 +639,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         does not return ``unsorted_data_indices`` because train returns
         scalar metrics (no per-row outputs to reorder).
         """
+        if TREE_ATTENTION_LAYOUTS in data and not self.use_sequence_packing:
+            raise ValueError(
+                "tree rollouts require policy.sequence_packing.enabled=true"
+            )
         dp_size = self.data_parallel_size
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
@@ -620,13 +654,30 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 dynamic_batching_args=self.dynamic_batching_args,
             )
         elif self.use_sequence_packing:
-            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+            sequence_packing_args = dict(self.sequence_packing_args)
+            sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
                 "sequence_packing"
             ]["train_mb_tokens"]
+            if TREE_ATTENTION_LAYOUTS in data:
+                configured_context = self.cfg["max_total_sequence_length"]
+                for layout in data[TREE_ATTENTION_LAYOUTS]:
+                    if layout.max_path_length > configured_context:
+                        raise ValueError(
+                            "tree rollout logical path exceeds training context: "
+                            f"{layout.max_path_length} > {configured_context}"
+                        )
+                physical_tokens = int(data["input_lengths"].max().item())
+                if physical_tokens > sequence_packing_args["max_tokens_per_microbatch"]:
+                    raise ValueError(
+                        "tree rollout was not fragmented to the training token budget: "
+                        f"{physical_tokens} > "
+                        f"{sequence_packing_args['max_tokens_per_microbatch']}"
+                    )
             sharded_data, _ = data.shard_by_batch_size(
                 dp_size,
                 batch_size=batch_size,
-                sequence_packing_args=self.sequence_packing_args,
+                allow_uneven_shards=allow_uneven_shards,
+                sequence_packing_args=sequence_packing_args,
             )
         else:
             sharded_data = data.shard_by_batch_size(
@@ -651,6 +702,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
         )
 
+    def _validate_tree_execution(self) -> None:
+        """Reject workers that cannot honor tree ancestry or sampled-edge projection."""
+        if not self.cfg.get("megatron_cfg", {}).get("enabled", False):
+            raise ValueError("tree rollouts require the Megatron training backend")
+        if not self.cfg.get("sequence_packing", {}).get("enabled", False):
+            raise ValueError(
+                "tree rollouts require policy.sequence_packing.enabled=true"
+            )
+        if (self.cfg.get("draft") or {}).get("enabled", False):
+            raise ValueError("tree rollouts do not support policy.draft.enabled=true")
+
     def get_logprobs(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
@@ -664,7 +726,27 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
         with timer.time("get_logprobs/shard_data") if timer else nullcontext():
-            sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
+            if TREE_ATTENTION_LAYOUTS in data:
+                self._validate_tree_execution()
+                packing_cfg: Any = self.cfg["sequence_packing"]
+                tree_data, tree_fragment_layout = (
+                    expand_batched_data_for_tree_attention(
+                        data,
+                        max_physical_tokens=int(packing_cfg["logprob_mb_tokens"]),
+                        fragment_count_multiple=self.data_parallel_size,
+                    )
+                )
+            else:
+                tree_data, tree_fragment_layout = data, None
+            expanded_data, packed_layout = expand_batched_data_for_packed_attention(
+                tree_data
+            )
+            sharded_data, unsorted_data_indices = self._shard_for_logprob(
+                expanded_data,
+                allow_uneven_shards=(
+                    packed_layout is not None or tree_fragment_layout is not None
+                ),
+            )
         self._report_sharded_payload(sharded_data, "policy_get_logprobs")
 
         with (
@@ -695,6 +777,16 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # so change it back here
         if unsorted_data_indices is not None:
             logprobs.reorder_data(unsorted_data_indices)
+        if packed_layout is not None:
+            logprobs["logprobs"] = reassemble_packed_attention_segments(
+                logprobs["logprobs"],
+                packed_layout.segment_lengths,
+                packed_layout.output_sequence_length,
+            )
+        if tree_fragment_layout is not None:
+            logprobs["logprobs"] = reassemble_tree_attention_edge_values(
+                logprobs["logprobs"], tree_fragment_layout
+            )
 
         return logprobs
 
@@ -713,7 +805,27 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             if timer
             else nullcontext()
         ):
-            sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
+            if TREE_ATTENTION_LAYOUTS in data:
+                self._validate_tree_execution()
+                packing_cfg: Any = self.cfg["sequence_packing"]
+                tree_data, tree_fragment_layout = (
+                    expand_batched_data_for_tree_attention(
+                        data,
+                        max_physical_tokens=int(packing_cfg["logprob_mb_tokens"]),
+                        fragment_count_multiple=self.data_parallel_size,
+                    )
+                )
+            else:
+                tree_data, tree_fragment_layout = data, None
+            expanded_data, packed_layout = expand_batched_data_for_packed_attention(
+                tree_data
+            )
+            sharded_data, unsorted_data_indices = self._shard_for_logprob(
+                expanded_data,
+                allow_uneven_shards=(
+                    packed_layout is not None or tree_fragment_layout is not None
+                ),
+            )
         self._report_sharded_payload(sharded_data, "policy_get_reference_logprobs")
 
         with (
@@ -749,6 +861,16 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # so change it back here
         if unsorted_data_indices is not None:
             logprobs.reorder_data(unsorted_data_indices)
+        if packed_layout is not None:
+            logprobs["reference_logprobs"] = reassemble_packed_attention_segments(
+                logprobs["reference_logprobs"],
+                packed_layout.segment_lengths,
+                packed_layout.output_sequence_length,
+            )
+        if tree_fragment_layout is not None:
+            logprobs["reference_logprobs"] = reassemble_tree_attention_edge_values(
+                logprobs["reference_logprobs"], tree_fragment_layout
+            )
 
         return logprobs
 
@@ -761,7 +883,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     ) -> BatchedDataDict[TopkLogitsOutputSpec]:
         """Dispatch get_topk_logits to workers (no CP/packed support initially)."""
         with timer.time("get_topk_logits/shard_data") if timer else nullcontext():
-            sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
+            expanded_data, packed_layout = expand_batched_data_for_packed_attention(
+                data
+            )
+            sharded_data, unsorted_data_indices = self._shard_for_logprob(
+                expanded_data,
+                allow_uneven_shards=packed_layout is not None,
+            )
 
         with (
             timer.time("get_topk_logits/submit_topk_logits_futures")
@@ -796,6 +924,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         if unsorted_data_indices is not None:
             stacked.reorder_data(unsorted_data_indices)
+        if packed_layout is not None:
+            for key in ("topk_logits", "topk_indices"):
+                stacked[key] = reassemble_packed_attention_segments(
+                    stacked[key],
+                    packed_layout.segment_lengths,
+                    packed_layout.output_sequence_length,
+                )
 
         return stacked
 
@@ -880,7 +1015,38 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
         # Shard and replicate the batch
         with timer.time("policy_training/sharding_data") if timer else nullcontext():
-            sharded_data = self._shard_for_train(data, batch_size)
+            if TREE_ATTENTION_LAYOUTS in data:
+                self._validate_tree_execution()
+                packing_cfg: Any = self.cfg["sequence_packing"]
+                tree_data, tree_fragment_layout = (
+                    expand_batched_data_for_tree_attention(
+                        data,
+                        max_physical_tokens=int(packing_cfg["train_mb_tokens"]),
+                        fragment_count_multiple=self.data_parallel_size,
+                    )
+                )
+            else:
+                tree_data, tree_fragment_layout = data, None
+            if (
+                tree_fragment_layout is not None
+                and loss_fn.loss_type != LossType.TOKEN_LEVEL
+            ):
+                raise ValueError(
+                    "bounded tree fragmentation currently supports token-level "
+                    "losses only"
+                )
+            expanded_data, packed_layout = expand_batched_data_for_packed_attention(
+                tree_data
+            )
+            has_virtual_rows = (
+                packed_layout is not None or tree_fragment_layout is not None
+            )
+            worker_batch_size = expanded_data.size if has_virtual_rows else batch_size
+            sharded_data = self._shard_for_train(
+                expanded_data,
+                None if has_virtual_rows else worker_batch_size,
+                allow_uneven_shards=has_virtual_rows,
+            )
         self._report_sharded_payload(sharded_data, "policy_train")
 
         if self.flops_tracker is not None:
@@ -895,6 +1061,20 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             if timer
             else nullcontext()
         ):
+            common_kwargs = {
+                "loss_fn": loss_fn,
+                "eval_mode": eval_mode,
+                "gbs": worker_batch_size,
+                "mbs": micro_batch_size,
+                "check_dim_skip_keys": check_dim_skip_keys,
+            }
+            if has_virtual_rows:
+                if not self.cfg.get("megatron_cfg", {}).get("enabled", False):
+                    raise NotImplementedError(
+                        "virtual packed rows currently require the Megatron policy "
+                        "backend"
+                    )
+                common_kwargs["scheduler_step_increment"] = batch_size
             futures = self.worker_group.run_all_workers_sharded_data(
                 "train",
                 data=sharded_data,
@@ -909,13 +1089,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
-                common_kwargs={
-                    "loss_fn": loss_fn,
-                    "eval_mode": eval_mode,
-                    "gbs": batch_size,
-                    "mbs": micro_batch_size,
-                    "check_dim_skip_keys": check_dim_skip_keys,
-                },
+                common_kwargs=common_kwargs,
             )
         results = self.worker_group.get_all_worker_results(futures)
 
@@ -1116,30 +1290,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         distributed reduction, returning results merged across ranks. Therefore, we shard the
         input by DP and call in parallel, then take the result from the first worker.
         """
-        dp_size = self.data_parallel_size
-        if self.use_dynamic_batches:
-            self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
-                "dynamic_batching"
-            ]["logprob_mb_tokens"]
-            sharded_data, _ = data.shard_by_batch_size(  # type: ignore
-                dp_size,
-                batch_size=None,
-                dynamic_batching_args=self.dynamic_batching_args,
-            )
-        elif self.use_sequence_packing:
-            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
-                "sequence_packing"
-            ]["logprob_mb_tokens"]
-            sharded_data, _ = data.shard_by_batch_size(
-                dp_size,
-                batch_size=None,
-                sequence_packing_args=self.sequence_packing_args,
-            )
-        else:
-            sharded_data = data.shard_by_batch_size(  # type: ignore
-                dp_size,
-                batch_size=None,
-            )
+        expanded_data, packed_layout = expand_batched_data_for_packed_attention(data)
+        sharded_data, _ = self._shard_for_logprob(
+            expanded_data,
+            allow_uneven_shards=packed_layout is not None,
+        )
         self._report_sharded_payload(sharded_data, "policy_kv_calibration")
 
         futures = self.worker_group.run_all_workers_sharded_data(
