@@ -869,9 +869,10 @@ Depending on your data shape, you may want to change these values."""
         Such rows are structurally off-chain and do not poison; if the
         *terminal* request itself died this way, the missing-terminal-row
         check below still masks the rollout. Every other failure reason
-        (``worker_capture_failed``, ``invalid_worker_commit_coordinates``)
-        marks a call whose completion WAS served — a hole in the chain —
-        and poisons.
+        (for example ``worker_capture_failed``,
+        ``invalid_worker_commit_coordinates``, or ``unresolved_parent``; a
+        reason-less failure row poisons as ``capture_failed``) marks a call
+        whose completion WAS served — a hole in the chain — and poisons.
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
