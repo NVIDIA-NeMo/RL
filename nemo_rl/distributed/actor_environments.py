@@ -62,8 +62,12 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
     "nemo_rl.models.value.workers.dtensor_value_worker_v2.DTensorValueWorkerV2": [
         "automodel"
     ],
+    # nemo_gym: token_capture.defer_routed_experts_to_policy assembles routed-experts
+    # rows on the policy workers from Gym's staged fragments (route_assembly imports
+    # nemo_gym.token_id_capture.staging.routes).
     "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": [
-        "mcore"
+        "mcore",
+        "nemo_gym",
     ],
     "nemo_rl.models.value.workers.megatron_value_worker.MegatronValueWorker": ["mcore"],
     "nemo_rl.data.energon.sft_worker.SFTMegatronPolicyWorker": ["mcore"],
