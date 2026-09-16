@@ -48,6 +48,11 @@ from nemo_rl.algorithms.utils import (
     masked_var,
 )
 
+# Minimum per-prompt reward std for advantage normalization. Below this the group is
+# treated as zero-variance (advantage = reward - baseline, unnormalized). Guards against
+# fp32 cancellation residue in calculate_baseline_and_std_per_prompt; rewards are O(1).
+STD_FLOOR = 1e-3
+
 
 class AdvEstimatorConfig(BaseModel, extra="allow"):
     """Configuration for advantage estimator (GRPO, GDPO, OPD, or Reinforce++)."""
@@ -117,7 +122,13 @@ class GRPOAdvantageEstimator:
         if self.normalize_rewards:
             # don't sharpen the ones with no variation
             epsilon = 1e-6
-            non_zero_std_mask = std > 0
+            # std > 0 is not a sufficient guard: calculate_baseline_and_std_per_prompt
+            # computes std via E[x^2]-E[x]^2 in fp32 matmuls, so a leave-one-out set of
+            # identical rewards yields ~1e-4 cancellation residue (not exact zero)
+            # whenever the reward is not exactly representable (e.g. 0.35), producing
+            # O(1000x) advantages (wireup job 1973369 step 5: advantages/max 7428).
+            # Threshold at a reward-scale-meaningful floor.
+            non_zero_std_mask = std > STD_FLOOR
             advantages[non_zero_std_mask] = advantages[non_zero_std_mask] / (
                 std.unsqueeze(-1)[non_zero_std_mask] + epsilon
             )
@@ -204,7 +215,8 @@ class GDPOAdvantageEstimator:
             adv_k = (r - base).unsqueeze(-1)
             if self.normalize_rewards:
                 epsilon = 1e-6
-                non_zero_std_mask = std_k > 0
+                # Same fp32-cancellation hazard as above: require a meaningful std.
+                non_zero_std_mask = std_k > STD_FLOOR
                 adv_k[non_zero_std_mask] = adv_k[non_zero_std_mask] / (
                     std_k.unsqueeze(-1)[non_zero_std_mask] + epsilon
                 )
