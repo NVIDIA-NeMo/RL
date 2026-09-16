@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,9 @@ nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 # megatron_worker imports megatron.core at module level; skip when it is absent.
 pytest.importorskip("megatron.core")
 
+from nemo_rl.algorithms.single_controller_utils.setup import (  # noqa: E402
+    _require_minf_capture_hooks,
+)
 from nemo_rl.models.generation.megatron.megatron_generation import (  # noqa: E402
     MegatronGeneration,
 )
@@ -49,6 +53,42 @@ def test_generation_setup_token_capture_fans_tq_config_to_workers(monkeypatch):
             {"dp_cfg": dp_cfg, "staging_partition": "rollout_staging"},
         )
     ]
+
+
+def test_generation_setup_token_capture_requires_exposed_http_server() -> None:
+    generation = object.__new__(MegatronGeneration)
+    generation.cfg = {"mcore_generation_config": {"expose_http_server": False}}
+    worker_group = _WorkerGroup()
+    generation._policy = SimpleNamespace(worker_group=worker_group)
+
+    with pytest.raises(ValueError, match="expose_http_server=true"):
+        generation.setup_token_capture({"backend": "simple"}, "rollout_staging")
+
+    # The driver-side guard fires before any worker is asked to install hooks.
+    assert worker_group.calls == []
+
+
+@pytest.mark.parametrize("version", [-1, 1.0, "7", True], ids=repr)
+def test_worker_rejects_invalid_rollout_weight_versions(monkeypatch, version) -> None:
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.megatron.megatron_worker.torch.distributed.get_rank",
+        lambda: 0,
+    )
+    worker = object.__new__(MegatronGenerationMixin)
+    worker._token_capture_enabled = True
+    epochs = []
+    worker.inference_client = SimpleNamespace(
+        set_generation_epoch=lambda version: epochs.append(version)
+    )
+
+    # The check is `type(version) is not int`, so bool (an int subclass) is
+    # rejected alongside negative ints, floats, and numeric strings.
+    with pytest.raises(
+        ValueError, match="rollout weight version must be a non-negative int"
+    ):
+        worker.set_rollout_weight_version(version)
+
+    assert epochs == []
 
 
 def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
@@ -127,6 +167,8 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
     follower._request_payload_stager = None
     follower._request_prompt_preparer = None
     assert not follower.setup_token_capture({}, "rollout_staging")
+    # Followers accept weight-version stamps even though they host no hooks.
+    assert follower._token_capture_enabled is True
     assert follower.dynamic_inference_engine.payload_stager is None
     assert follower.dynamic_inference_engine.prompt_preparer is None
     assert installed_sinks == [("dp", "rollout_staging")]
@@ -139,3 +181,35 @@ def test_worker_requires_minf_payload_stager_protocol() -> None:
 
     with pytest.raises(RuntimeError, match="RequestPayloadStager"):
         worker.setup_token_capture({}, "rollout_staging")
+
+
+def test_setup_capture_hook_gate_matches_pinned_dynamic_engine() -> None:
+    """The driver-side #7015 gate must agree with the pinned engine's hooks.
+
+    The pinned megatron-core may or may not carry the MInf capture hooks
+    (NVIDIA/Megatron-LM PR #7015). This does not assert either way; it asserts
+    that ``_require_minf_capture_hooks`` reaches the same verdict as inspecting
+    ``DynamicInferenceEngine`` itself, so it fails only when the detection logic
+    and reality diverge, and stays green across the pin bump.
+    """
+    dynamic_engine = pytest.importorskip(
+        "megatron.core.inference.engines.dynamic_engine"
+    )
+    engine_cls = dynamic_engine.DynamicInferenceEngine
+    init_source = inspect.getsource(engine_cls.__init__)
+    has_hooks = all(
+        hasattr(engine_cls, name)
+        or name in getattr(engine_cls, "__annotations__", {})
+        or name in init_source
+        for name in ("payload_stager", "prompt_preparer")
+    )
+
+    try:
+        _require_minf_capture_hooks()
+    except NotImplementedError as exc:
+        assert "7015" in str(exc)
+        gate_passes = False
+    else:
+        gate_passes = True
+
+    assert gate_passes == has_hooks
