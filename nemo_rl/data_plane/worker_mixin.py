@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import Counter
+from collections.abc import Collection, Iterator
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import numpy as np
@@ -38,7 +39,21 @@ import torch
 
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.packed_rollouts import (
+    PACKED_ATTENTION_SEGMENT_LENGTHS,
+    PACKED_ATTENTION_SELECTED_SEGMENTS,
+    TREE_ATTENTION_FRAGMENT_SELECTIONS,
+    TREE_ATTENTION_LAYOUTS,
+    TREE_EDGE_ALIGNED_FIELDS,
+    expand_selected_packed_attention_segments,
+    materialize_tree_attention_fragments,
+)
+from nemo_rl.data_plane.column_io import round_up
 from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, backend_config
+from nemo_rl.data_plane.preshard import (
+    split_packed_attention_microbatch_metas,
+    split_tree_attention_microbatch_metas,
+)
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
     GLOBAL_FORWARD_PAD_SEQLEN,
@@ -250,6 +265,7 @@ def _materialize_fetched(
     pad_value_dict: dict[str, int | float] | None,
     pad_to_seqlen: int,
     tags: list[dict[str, Any]] | None = None,
+    exclude_pad_to_seqlen_fields: Collection[str] = (),
 ) -> BatchedDataDict[Any]:
     """Materialize a fetched TensorDict with the reader that matches the writer.
 
@@ -284,6 +300,7 @@ def _materialize_fetched(
             layout=layout,
             pad_value_dict=pad_value_dict,
             pad_to_seqlen=pad_to_seqlen,
+            exclude_pad_to_seqlen_fields=exclude_pad_to_seqlen_fields,
         )
     return materialize(
         td,
@@ -291,6 +308,7 @@ def _materialize_fetched(
         pad_value_dict=pad_value_dict,
         pad_to_seqlen=pad_to_seqlen,
         tags=tags,
+        exclude_pad_to_seqlen_fields=exclude_pad_to_seqlen_fields,
     )
 
 
@@ -406,8 +424,10 @@ class TQWorkerMixin:
                 fetch (cheapest for TP=CP=PP=1). ``"independent"`` forces
                 every sibling to fetch. ``"leader_broadcast"`` forces the
                 broadcast path and asserts a replica group exists.
-            preprocess: Optional ``(worker, td) -> td`` applied between
-                materialize and return.
+            preprocess: Optional ``(worker, data) -> data`` applied by the
+                fetch leader after materialization and before replica
+                broadcast. Independent fetches apply it locally at the same
+                boundary.
             dp_aligned_seq_len: When True (default), right-pad the seq
                 dim for the forward pass. Disabled in tests that want
                 to observe per-rank local-pad behavior.
@@ -434,6 +454,11 @@ class TQWorkerMixin:
 
         pad_to_seqlen = self._forward_pad_seqlen(meta) if dp_aligned_seq_len else 0
         local_batch = is_local_batch_meta(meta)
+        excluded_fields = (
+            TREE_EDGE_ALIGNED_FIELDS
+            if TREE_ATTENTION_LAYOUTS in (meta.extra_info or {})
+            else ()
+        )
 
         if replica_group is not None and replica_group.size() > 1:
             is_leader = self._is_replica_leader()
@@ -458,8 +483,11 @@ class TQWorkerMixin:
                     pad_value_dict=pad_value_dict,
                     pad_to_seqlen=pad_to_seqlen,
                     tags=meta.tags,
+                    exclude_pad_to_seqlen_fields=excluded_fields,
                 )
                 data = self._maybe_assemble_routed_experts(meta, data)
+                if preprocess is not None:
+                    data = preprocess(self, data)
             else:
                 data = None
             data = _broadcast_batched_data_dict(
@@ -476,8 +504,6 @@ class TQWorkerMixin:
                 keys=meta.sample_ids,
                 data=data,
             )
-            if preprocess is not None:
-                data = preprocess(self, data)
             return data
 
         dp_client = self._require_dp_client()
@@ -499,16 +525,17 @@ class TQWorkerMixin:
             pad_value_dict=pad_value_dict,
             pad_to_seqlen=pad_to_seqlen,
             tags=meta.tags,
+            exclude_pad_to_seqlen_fields=excluded_fields,
         )
         data = self._maybe_assemble_routed_experts(meta, data)
+        if preprocess is not None:
+            data = preprocess(self, data)
         attach_message_log_view(data)
         trace_tq_fetch_payload(
             stage=meta.task_name or "unknown",
             keys=meta.sample_ids,
             data=data,
         )
-        if preprocess is not None:
-            data = preprocess(self, data)
         return data
 
     def _fetch_route_fragments(
@@ -704,6 +731,21 @@ class TQWorkerMixin:
                 ],
                 "max_tokens_per_microbatch": seqpack["train_mb_tokens"],
             }
+            if TREE_ATTENTION_LAYOUTS in data:
+                configured_context = cfg["max_total_sequence_length"]
+                for layout in data[TREE_ATTENTION_LAYOUTS]:
+                    if layout.max_path_length > configured_context:
+                        raise ValueError(
+                            "tree rollout logical path exceeds worker context: "
+                            f"{layout.max_path_length} > {configured_context}"
+                        )
+                spa["max_tokens_per_microbatch"] = max(
+                    spa["max_tokens_per_microbatch"],
+                    round_up(
+                        int(data["input_lengths"].max().item()),
+                        int(spa["sequence_length_pad_multiple"]),
+                    ),
+                )
             microbatch_order = seqpack.get("microbatch_order")
             if microbatch_order is not None:
                 spa["microbatch_order"] = microbatch_order
@@ -753,6 +795,299 @@ class TQWorkerMixin:
                 data.elem_counts_per_gb = extra[ELEM_COUNTS_PER_GB]
             return data
         return self._apply_packing_prep(data)
+
+    def _expand_packed_attention_from_meta(
+        self,
+        data: BatchedDataDict[Any],
+        meta: "KVBatchMeta",
+    ) -> BatchedDataDict[Any]:
+        """Expand fetched logical rollouts into calls selected for this DP rank."""
+        extra = meta.extra_info or {}
+        segment_lengths = extra.get(PACKED_ATTENTION_SEGMENT_LENGTHS)
+        selected_segments = extra.get(PACKED_ATTENTION_SELECTED_SEGMENTS)
+        if segment_lengths is None and selected_segments is None:
+            return data
+        if segment_lengths is None or selected_segments is None:
+            raise ValueError(
+                "packed attention preshard metadata requires both segment lengths "
+                "and selected segments"
+            )
+        return expand_selected_packed_attention_segments(
+            data,
+            segment_lengths=segment_lengths,
+            selected_segments=selected_segments,
+            output_sequence_length=self._forward_pad_seqlen(meta) or None,
+        )
+
+    def _fetch_presharded(self, meta: "KVBatchMeta") -> BatchedDataDict[Any]:
+        """Fetch a DP slice, expanding packed calls before replica broadcast.
+
+        ``shard_meta_for_dp`` has already assigned physical calls to this DP
+        rank. The TQ rows remain logical rollouts, so the fetch leader pulls
+        only the parent rows referenced by that assignment, materializes the
+        selected calls, and broadcasts the physical-call batch. This mirrors
+        legacy's expand-before-DP preparation without constructing a global
+        expanded batch on the driver.
+        """
+        extra = meta.extra_info or {}
+        has_segments = PACKED_ATTENTION_SEGMENT_LENGTHS in extra
+        has_selection = PACKED_ATTENTION_SELECTED_SEGMENTS in extra
+        if has_segments != has_selection:
+            raise ValueError(
+                "packed attention preshard metadata requires both segment lengths "
+                "and selected segments"
+            )
+        fragment_selections = extra.get(TREE_ATTENTION_FRAGMENT_SELECTIONS)
+        if fragment_selections is not None:
+            selected_fragments = list(fragment_selections)
+            if has_segments:
+                raise ValueError(
+                    "tree fragment and independent-call selections are mutually "
+                    "exclusive"
+                )
+
+            def materialize_fragments(
+                _worker: TQWorkerMixin, data: BatchedDataDict[Any]
+            ) -> BatchedDataDict[Any]:
+                data = materialize_tree_attention_fragments(
+                    data,
+                    fragments=[fragment for _, fragment in selected_fragments],
+                    parent_indices=[parent for parent, _ in selected_fragments],
+                )
+                # Layouts already travel in replica metadata, not the tensor wire.
+                data.pop(TREE_ATTENTION_LAYOUTS)
+                return data
+
+            data = self._fetch(
+                meta,
+                layout="jagged",
+                dp_aligned_seq_len=False,
+                preprocess=materialize_fragments,
+            )
+            data[TREE_ATTENTION_LAYOUTS] = [
+                fragment.layout for _, fragment in selected_fragments
+            ]
+            return data
+        if not has_segments:
+            data = self._fetch(meta)
+            tree_layouts = extra.get(TREE_ATTENTION_LAYOUTS)
+            if tree_layouts is not None:
+                data[TREE_ATTENTION_LAYOUTS] = tree_layouts
+            return data
+        return self._fetch(
+            meta,
+            # Logical parent rows can be longer than the physical call width.
+            # Expand first, then pad the selected calls to the global width.
+            dp_aligned_seq_len=False,
+            preprocess=lambda worker, data: worker._expand_packed_attention_from_meta(
+                data, meta
+            ),
+        )
+
+    def _iter_fetch_presharded_microbatches(
+        self,
+        meta: "KVBatchMeta",
+    ) -> Iterator[tuple[BatchedDataDict[Any], "KVBatchMeta"]]:
+        """Yield bounded packed bins without materializing a full expanded shard.
+
+        A packed rollout row concatenates every independent model call.  The
+        preshard metadata already assigns those calls to packed microbatches;
+        expanding the whole assignment before replica broadcast creates a
+        potentially enormous ``[calls, longest_call, ...]`` tensor. Tree rows
+        are fetched by planned bin because PyTorch nested tensors cannot be
+        fancy-indexed; each row belongs to exactly one bin, so this does not
+        duplicate payload bytes. Each bin is materialized and broadcast
+        immediately before it is consumed.
+
+        Unpacked data and packed data without sequence-packing metadata retain
+        the existing single-fetch behavior.
+        """
+        extra = meta.extra_info or {}
+        if (
+            TREE_ATTENTION_LAYOUTS in extra
+            and MICRO_BATCH_INDICES in extra
+            and MICRO_BATCH_LENGTHS in extra
+        ):
+            from nemo_rl.data_plane import materialize
+
+            micro_metas = split_tree_attention_microbatch_metas(meta)
+            replica_group = self._get_replica_group()
+            use_replica_broadcast = (
+                replica_group is not None and replica_group.size() > 1
+            )
+            is_leader = not use_replica_broadcast or self._is_replica_leader()
+            leader = (
+                torch.distributed.get_global_rank(replica_group, 0)
+                if use_replica_broadcast
+                else 0
+            )
+
+            fragment_selections = extra.get(TREE_ATTENTION_FRAGMENT_SELECTIONS)
+            if fragment_selections is not None:
+                logical_data: Optional[BatchedDataDict[Any]] = None
+                if is_leader:
+                    wire_data = self._require_dp_client().get_samples(
+                        sample_ids=meta.sample_ids,
+                        partition_id=meta.partition_id,
+                        select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
+                    )
+                    logical_data = materialize(
+                        wire_data,
+                        layout="jagged",
+                        pad_value_dict=self._pad_value_dict(),
+                    )
+                source_parent = {
+                    sample_id: index for index, sample_id in enumerate(meta.sample_ids)
+                }
+                for micro_meta in micro_metas:
+                    micro_data: Optional[BatchedDataDict[Any]] = None
+                    selected = micro_meta.extra_info[TREE_ATTENTION_FRAGMENT_SELECTIONS]
+                    if is_leader:
+                        assert logical_data is not None
+                        fragments = [fragment for _, fragment in selected]
+                        parents = [
+                            source_parent[micro_meta.sample_ids[local_parent]]
+                            for local_parent, _ in selected
+                        ]
+                        micro_data = materialize_tree_attention_fragments(
+                            logical_data,
+                            fragments=fragments,
+                            parent_indices=parents,
+                        )
+                        micro_data.pop(TREE_ATTENTION_LAYOUTS)
+
+                    if use_replica_broadcast:
+                        micro_data = _broadcast_batched_data_dict(
+                            micro_data,
+                            is_leader=is_leader,
+                            src=leader,
+                            group=replica_group,
+                        )
+                    assert micro_data is not None
+                    # Every replica already owns the selected layouts in metadata.
+                    micro_data[TREE_ATTENTION_LAYOUTS] = [
+                        fragment.layout for _, fragment in selected
+                    ]
+                    attach_message_log_view(micro_data)
+                    trace_tq_fetch_payload(
+                        stage=meta.task_name or "unknown",
+                        keys=micro_meta.sample_ids,
+                        data=micro_data,
+                    )
+                    yield micro_data, micro_meta
+                return
+
+            dp_client = self._require_dp_client() if is_leader else None
+            for micro_meta in micro_metas:
+                micro_data: Optional[BatchedDataDict[Any]] = None
+                if is_leader:
+                    assert dp_client is not None
+                    wire_data = dp_client.get_samples(
+                        sample_ids=micro_meta.sample_ids,
+                        partition_id=meta.partition_id,
+                        select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
+                    )
+                    micro_data = materialize(
+                        wire_data,
+                        layout="padded",
+                        pad_value_dict=self._pad_value_dict(),
+                        pad_to_seqlen=self._forward_pad_seqlen(micro_meta),
+                        exclude_pad_to_seqlen_fields=TREE_EDGE_ALIGNED_FIELDS,
+                    )
+                if use_replica_broadcast:
+                    micro_data = _broadcast_batched_data_dict(
+                        micro_data,
+                        is_leader=is_leader,
+                        src=leader,
+                        group=replica_group,
+                    )
+                assert micro_data is not None
+                micro_data[TREE_ATTENTION_LAYOUTS] = micro_meta.extra_info[
+                    TREE_ATTENTION_LAYOUTS
+                ]
+                attach_message_log_view(micro_data)
+                trace_tq_fetch_payload(
+                    stage=meta.task_name or "unknown",
+                    keys=micro_meta.sample_ids,
+                    data=micro_data,
+                )
+                yield micro_data, micro_meta
+            return
+
+        if not (
+            PACKED_ATTENTION_SEGMENT_LENGTHS in extra
+            and PACKED_ATTENTION_SELECTED_SEGMENTS in extra
+            and MICRO_BATCH_INDICES in extra
+            and MICRO_BATCH_LENGTHS in extra
+        ):
+            yield self._fetch_presharded(meta), meta
+            return
+
+        from nemo_rl.data_plane import materialize
+
+        micro_metas = split_packed_attention_microbatch_metas(meta)
+        replica_group = self._get_replica_group()
+        use_replica_broadcast = replica_group is not None and replica_group.size() > 1
+        is_leader = not use_replica_broadcast or self._is_replica_leader()
+        leader = (
+            torch.distributed.get_global_rank(replica_group, 0)
+            if use_replica_broadcast
+            else 0
+        )
+
+        logical_data: Optional[BatchedDataDict[Any]] = None
+        if is_leader:
+            td = self._require_dp_client().get_samples(
+                sample_ids=meta.sample_ids,
+                partition_id=meta.partition_id,
+                select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
+            )
+            logical_data = materialize(
+                td,
+                layout="jagged",
+                pad_value_dict=self._pad_value_dict(),
+            )
+
+        source_parent = {
+            sample_id: index for index, sample_id in enumerate(meta.sample_ids)
+        }
+        source_segment_lengths = extra[PACKED_ATTENTION_SEGMENT_LENGTHS]
+        for micro_meta in micro_metas:
+            micro_data: Optional[BatchedDataDict[Any]] = None
+            if is_leader:
+                assert logical_data is not None
+                micro_selected = micro_meta.extra_info[
+                    PACKED_ATTENTION_SELECTED_SEGMENTS
+                ]
+                selected_in_source = [
+                    (
+                        source_parent[micro_meta.sample_ids[local_parent]],
+                        int(segment),
+                    )
+                    for local_parent, segment in micro_selected
+                ]
+                micro_data = expand_selected_packed_attention_segments(
+                    logical_data,
+                    segment_lengths=source_segment_lengths,
+                    selected_segments=selected_in_source,
+                    output_sequence_length=self._forward_pad_seqlen(micro_meta),
+                )
+
+            if use_replica_broadcast:
+                micro_data = _broadcast_batched_data_dict(
+                    micro_data,
+                    is_leader=is_leader,
+                    src=leader,
+                    group=replica_group,
+                )
+            assert micro_data is not None
+            attach_message_log_view(micro_data)
+            trace_tq_fetch_payload(
+                stage=meta.task_name or "unknown",
+                keys=micro_meta.sample_ids,
+                data=micro_data,
+            )
+            yield micro_data, micro_meta
 
     def _local_coords(self) -> dict[str, int]:
         """This worker's (axis -> local-rank) mapping.
@@ -894,16 +1229,22 @@ class TQWorkerMixin:
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        scheduler_step_increment: Optional[int] = None,
     ) -> dict[str, Any]:
         """Per-rank training entrypoint. Fetch → packing prep → delegate."""
-        data = self._fetch(meta)
+        data = self._fetch_presharded(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
+        train_kwargs: dict[str, Any] = {
+            "loss_fn": loss_fn,
+            "eval_mode": eval_mode,
+            "gbs": gbs,
+            "mbs": mbs,
+        }
+        if scheduler_step_increment is not None:
+            train_kwargs["scheduler_step_increment"] = scheduler_step_increment
         return self.train(  # type: ignore[attr-defined]
             data,
-            loss_fn=loss_fn,
-            eval_mode=eval_mode,
-            gbs=gbs,
-            mbs=mbs,
+            **train_kwargs,
         )
 
     @wrap_with_nvtx_name("policy_worker/get_logprobs_presharded")
@@ -911,22 +1252,31 @@ class TQWorkerMixin:
         self,
         meta: "KVBatchMeta",
         micro_batch_size: Optional[int] = None,
-    ) -> None:
+    ) -> Optional[BatchedDataDict[Any]]:
         """Per-rank logprob entrypoint. Fetch → packing prep → run → write back.
 
-        Returns ``None`` — the per-token tensor is committed to TQ via
-        :meth:`_write_back_result_field` under ``prev_logprobs``.
-        Callers fetch it through :meth:`TQPolicy.read_from_dataplane` —
-        skipping the Ray plasma roundtrip on the (B, S) tensor.
-        ``del result`` drops the local reference before returning so the
-        worker doesn't carry the tensor into the next dispatch.
+        Unpacked results are committed directly to TQ and return ``None``.
+        Packed results return physical call rows to the driver, which restores
+        their logical rollout rows before the single TQ write.
         """
-        data = self._fetch(meta)
-        data = self._attach_or_repack_pack_metadata(data, meta)
-        result: BatchedDataDict[Any] = self.get_logprobs(  # type: ignore[attr-defined]
-            data=data,
-            micro_batch_size=micro_batch_size,
+        packed = PACKED_ATTENTION_SELECTED_SEGMENTS in (meta.extra_info or {})
+        fragmented_tree = TREE_ATTENTION_FRAGMENT_SELECTIONS in (meta.extra_info or {})
+        results: list[BatchedDataDict[Any]] = []
+        for data, micro_meta in self._iter_fetch_presharded_microbatches(meta):
+            data = self._attach_or_repack_pack_metadata(data, micro_meta)
+            results.append(
+                self.get_logprobs(  # type: ignore[attr-defined]
+                    data=data,
+                    micro_batch_size=micro_batch_size,
+                )
+            )
+        if not results:
+            raise RuntimeError("get_logprobs_presharded produced no microbatches")
+        result = (
+            BatchedDataDict.from_batches(results) if len(results) > 1 else results[0]
         )
+        if packed or fragmented_tree:
+            return result.to("cpu")
         self._write_back_result_field(
             meta,
             result,
@@ -934,24 +1284,33 @@ class TQWorkerMixin:
             tq_field="prev_logprobs",
         )
         del result
+        return None
 
     @wrap_with_nvtx_name("policy_worker/get_reference_policy_logprobs_presharded")
     def get_reference_policy_logprobs_presharded(
         self,
         meta: "KVBatchMeta",
         micro_batch_size: Optional[int] = None,
-    ) -> None:
+    ) -> Optional[BatchedDataDict[Any]]:
         """Per-rank reference-policy logprob entrypoint.
 
         See :meth:`get_logprobs_presharded` for the contract. Tensor
         lives in TQ under ``reference_policy_logprobs``.
         """
-        data = self._fetch(meta)
+        packed = PACKED_ATTENTION_SELECTED_SEGMENTS in (meta.extra_info or {})
+        fragmented_tree = TREE_ATTENTION_FRAGMENT_SELECTIONS in (meta.extra_info or {})
+        data = self._fetch_presharded(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
+        # Keep reference evaluation in one call so MCore swaps the reference
+        # weights exactly once. Unlike policy logprob/train, this fetch excludes
+        # routed-expert replay, so rank-local fragment materialization remains
+        # bounded to token and edge fields.
         result: BatchedDataDict[Any] = self.get_reference_policy_logprobs(  # type: ignore[attr-defined]
             data=data,
             micro_batch_size=micro_batch_size,
         )
+        if packed or fragmented_tree:
+            return result.to("cpu")
         self._write_back_result_field(
             meta,
             result,
@@ -959,6 +1318,7 @@ class TQWorkerMixin:
             tq_field="reference_policy_logprobs",
         )
         del result
+        return None
 
     @wrap_with_nvtx_name("policy_worker/get_teacher_logprobs_presharded")
     def get_teacher_logprobs_presharded(
@@ -1106,11 +1466,11 @@ class TQWorkerMixin:
         accumulate in the backend's open-step state and surface once via
         ``finish_train_step_presharded``.
         """
-        data = self._fetch(meta)
-        data = self._attach_or_repack_pack_metadata(data, meta)
-        self.train_microbatch(  # type: ignore[attr-defined]
-            data=data,
-        )
+        for data, micro_meta in self._iter_fetch_presharded_microbatches(meta):
+            data = self._attach_or_repack_pack_metadata(data, micro_meta)
+            self.train_microbatch(  # type: ignore[attr-defined]
+                data=data,
+            )
 
     @wrap_with_nvtx_name("policy_worker/finish_train_step_presharded")
     def finish_train_step_presharded(self) -> dict[str, Any]:

@@ -20,13 +20,39 @@ Runs on CPU (gloo) so it stays in the no-GPU Tier 1 lane.
 from __future__ import annotations
 
 import os
+import sys
+from collections import deque
+from copy import deepcopy
+from functools import partial
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import patch
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from tensordict import TensorDict
 
 from nemo_rl.data.multimodal_utils import PackedTensor
-from nemo_rl.data_plane.worker_mixin import _broadcast_batched_data_dict
+from nemo_rl.data.packed_rollouts import (
+    TREE_ATTENTION_EDGE_LENGTHS,
+    TREE_ATTENTION_EDGE_SOURCE_INDICES,
+    TREE_ATTENTION_EDGE_TARGET_IDS,
+    TREE_ATTENTION_FRAGMENT_SELECTIONS,
+    TREE_ATTENTION_LAYOUTS,
+    TreeAttentionLayout,
+    materialize_tree_attention_fragments,
+)
+from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+from nemo_rl.data_plane.preshard import shard_meta_for_dp
+from nemo_rl.data_plane.schema import MICRO_BATCH_INDICES, MICRO_BATCH_LENGTHS
+from nemo_rl.data_plane.worker_mixin import (
+    TQWorkerMixin,
+    _broadcast_batched_data_dict,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -214,3 +240,177 @@ def test_get_replica_group_default_is_none():
         pass
 
     assert _Stub()._get_replica_group() is None
+
+
+def _tree_fetch_body(rank: int, *, mode: str) -> None:
+    class Client(NoOpDataPlaneClient):
+        fetch_count = 0
+
+        def get_samples(self, *args: Any, **kwargs: Any) -> TensorDict:
+            assert rank == 0, "only the replica leader may fetch tree payloads"
+            self.fetch_count += 1
+            return super().get_samples(*args, **kwargs)
+
+    class Worker(TQWorkerMixin):
+        def __init__(self, client: Client) -> None:
+            self._dp_client = client
+
+        def _get_replica_group(self) -> dist.ProcessGroup:
+            return dist.group.WORLD
+
+        def _is_replica_leader(self) -> bool:
+            return rank == 0
+
+    layouts = [
+        TreeAttentionLayout((3, 2, 2), (-1, 0, 0), (0, 3, 3), (1, 3, 5), 9),
+        TreeAttentionLayout((4,), (-1,), (0,), (1, 2), 4),
+    ]
+    logical = BatchedDataDict(
+        {
+            "input_ids": torch.tensor(
+                [[10, 11, 12, 20, 21, 30, 31], [40, 41, 42, 43, 0, 0, 0]]
+            ),
+            "input_lengths": torch.tensor([7, 4]),
+            "routed_experts": torch.arange(28).reshape(2, 7, 2, 1),
+            "generation_logprobs": torch.tensor(
+                [[0.0, 1.0, 2.0, 3.0], [0.0, 4.0, 5.0, 0.0]]
+            ),
+            "token_mask": torch.tensor([[0, 1, 1, 1], [0, 1, 1, 0]]),
+            TREE_ATTENTION_EDGE_SOURCE_INDICES: torch.tensor([[1, 3, 5], [1, 2, -1]]),
+            TREE_ATTENTION_EDGE_TARGET_IDS: torch.tensor(
+                [[101, 102, 103], [201, 202, 0]]
+            ),
+            TREE_ATTENTION_EDGE_LENGTHS: torch.tensor([3, 2]),
+        }
+    )
+    meta = KVBatchMeta(
+        partition_id="trees",
+        task_name="prev_lp",
+        sample_ids=["s0", "s1"],
+        fields=list(logical),
+        sequence_lengths=[7, 4],
+        extra_info={TREE_ATTENTION_LAYOUTS: layouts},
+    )
+    client = Client()
+    if rank == 0:
+        client.register_partition(
+            partition_id="trees",
+            fields=list(logical),
+            num_samples=2,
+            consumer_tasks=["prev_lp"],
+        )
+        client.put_samples(
+            sample_ids=meta.sample_ids,
+            partition_id="trees",
+            fields=TensorDict(dict(logical), batch_size=(2,)),
+        )
+
+    fragmented = mode != "unfragmented"
+    if fragmented:
+        rank_metas, _ = shard_meta_for_dp(
+            meta,
+            dp_world=1,
+            sequence_packing_args={
+                "algorithm": "modified_first_fit_decreasing",
+                "input_key": "input_ids",
+                "input_lengths_key": "input_lengths",
+                "max_tokens_per_microbatch": 5,
+                "sequence_length_pad_multiple": 1,
+            },
+        )
+        meta = rank_metas[0]
+    else:
+        meta.extra_info.update(
+            {MICRO_BATCH_INDICES: [[[0, 1], [1, 2]]], MICRO_BATCH_LENGTHS: [[7, 4]]}
+        )
+
+    worker = Worker(client)
+    seen_targets = []
+
+    def tensor_only_broadcast(
+        data: BatchedDataDict[Any] | None, **kwargs: Any
+    ) -> BatchedDataDict[Any]:
+        if data is not None:
+            assert TREE_ATTENTION_LAYOUTS not in data
+        return _broadcast_batched_data_dict(data, **kwargs)
+
+    with patch(
+        "nemo_rl.data_plane.worker_mixin._broadcast_batched_data_dict",
+        side_effect=tensor_only_broadcast,
+    ) as broadcast:
+        batches = (
+            [(worker._fetch_presharded(meta), meta)]
+            if mode == "fallback"
+            else worker._iter_fetch_presharded_microbatches(meta)
+        )
+        for data, micro_meta in batches:
+            parents = [int(sample_id[1:]) for sample_id in micro_meta.sample_ids]
+            if fragmented:
+                selected = micro_meta.extra_info[TREE_ATTENTION_FRAGMENT_SELECTIONS]
+                expected = materialize_tree_attention_fragments(
+                    logical,
+                    fragments=[fragment for _, fragment in selected],
+                    parent_indices=[parents[parent] for parent, _ in selected],
+                )
+                assert data[TREE_ATTENTION_LAYOUTS] == expected[TREE_ATTENTION_LAYOUTS]
+                if mode != "fallback":
+                    assert data["input_lengths"].sum().item() <= 5
+            else:
+                expected = BatchedDataDict(
+                    {key: value[parents] for key, value in logical.items()}
+                )
+                assert data[TREE_ATTENTION_LAYOUTS] == [
+                    layouts[parent] for parent in parents
+                ]
+            for key in logical:
+                # Unfragmented source rows may contain trailing padding.
+                want = expected[key]
+                if want.ndim > 1:
+                    want = want[:, : data[key].shape[1]]
+                torch.testing.assert_close(data[key], want)
+            for row, length in zip(
+                data[TREE_ATTENTION_EDGE_TARGET_IDS],
+                data[TREE_ATTENTION_EDGE_LENGTHS],
+                strict=True,
+            ):
+                seen_targets.extend(row[:length].tolist())
+        assert broadcast.call_count > 0
+
+    assert sorted(seen_targets) == [101, 102, 103, 201, 202]
+    assert client.fetch_count == ((1 if fragmented else 2) if rank == 0 else 0)
+
+
+@pytest.mark.parametrize("mode", ["unfragmented", "fragmented", "fallback"])
+def test_tree_fetch_restores_layouts_on_all_replicas(tmp_path: Path, mode: str) -> None:
+    _run_two_ranks(partial(_tree_fetch_body, mode=mode), str(tmp_path / "init_tree"))
+
+
+@pytest.mark.parametrize("mode", ["unfragmented", "fragmented", "fallback"])
+def test_tree_fetch_metadata_flow_without_collectives(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """Check both replica branches independently of distributed startup."""
+    payloads: deque[BatchedDataDict[Any]] = deque()
+    group = SimpleNamespace(size=lambda: 2)
+    monkeypatch.setattr(dist, "group", SimpleNamespace(WORLD=group))
+    monkeypatch.setattr(dist, "get_global_rank", lambda _group, rank: rank)
+
+    def record_or_receive(
+        data: BatchedDataDict[Any] | None, *, is_leader: bool, src: int, group: Any
+    ) -> BatchedDataDict[Any]:
+        if is_leader:
+            assert data is not None
+            assert TREE_ATTENTION_LAYOUTS not in data
+            payloads.append(deepcopy(data))
+            return data
+        assert data is None
+        return payloads.popleft()
+
+    # _tree_fetch_body wraps the actual mixin boundary and compares both ranks'
+    # materialized fields against the original logical rows.
+    monkeypatch.setattr(
+        sys.modules[__name__], "_broadcast_batched_data_dict", record_or_receive
+    )
+    _tree_fetch_body(0, mode=mode)
+    _tree_fetch_body(1, mode=mode)
+    assert not payloads
