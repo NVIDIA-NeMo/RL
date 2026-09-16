@@ -29,13 +29,27 @@ from contextvars import ContextVar
 from enum import Enum
 from typing import Any, Iterator, Mapping, Optional
 
-from nemo.lens import (
-    is_span_group_enabled,
-    span_cm,
-)
-from nemo.lens import (
-    managed_span as _managed_span,
-)
+try:
+    from nemo.lens import (
+        is_span_group_enabled,
+        span_cm,
+    )
+    from nemo.lens import (
+        managed_span as _managed_span,
+    )
+except ImportError:  # nemo-lens is optional on this branch; every span is a no-op.
+
+    def is_span_group_enabled(*_args: Any, **_kwargs: Any) -> bool:
+        return False
+
+    @contextmanager
+    def span_cm(*_args: Any, **_kwargs: Any) -> Iterator[None]:
+        yield None
+
+    @contextmanager
+    def _managed_span(*_args: Any, **_kwargs: Any) -> Iterator[None]:
+        yield None
+
 
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 

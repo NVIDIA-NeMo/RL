@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import asdict
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import torch
 from packaging.version import Version as PkgVersion
@@ -24,19 +24,86 @@ from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from nemo_rl.utils.flops_formulas import FLOPSConfig, deepseekv3, llama, qwen2, qwen3
+from nemo_rl.utils.flops_formulas import (
+    FLOPSConfig,
+    deepseekv3,
+    glm_moe_dsa,
+    llama,
+    qwen2,
+    qwen3,
+)
 
 
-def get_default_hf_config(model_name: str) -> PretrainedConfig:
-    """Get the default Hugging Face config for a model.
+def get_hf_config(model_name: str, **overrides: Any) -> PretrainedConfig:
+    """Get the effective Hugging Face config for a model.
 
-    Both the DTensor and MCore paths use the same default config, we initialize the model config
-    here to allow computation of theoretical flops which is agnostic to the backend.
+    Both the DTensor and MCore paths use the same config, which allows backend-agnostic
+    theoretical FLOPs computation. Policy overrides must be included so the tracker describes
+    the model that is actually trained.
     """
     return AutoConfig.from_pretrained(
         model_name,
         torch_dtype=torch.float32,
         trust_remote_code=True,
+        **overrides,
+    )
+
+
+def _get_glm_moe_layer_pattern(config: PretrainedConfig) -> list[int]:
+    """Return the GLM dense/MoE layer pattern from the model config."""
+    mlp_layer_types = getattr(config, "mlp_layer_types", None)
+    if mlp_layer_types is None:
+        first_k_dense = config.first_k_dense_replace
+        if not 0 <= first_k_dense <= config.num_hidden_layers:
+            raise ValueError(
+                "GLM first_k_dense_replace must be between zero and the number "
+                f"of hidden layers, got {first_k_dense}"
+            )
+        return [0] * first_k_dense + [1] * (config.num_hidden_layers - first_k_dense)
+
+    if len(mlp_layer_types) != config.num_hidden_layers:
+        raise ValueError(
+            "GLM mlp_layer_types must contain one entry per hidden layer, got "
+            f"{len(mlp_layer_types)} entries for {config.num_hidden_layers} layers"
+        )
+
+    valid_layer_types = {"dense", "sparse"}
+    invalid_layer_types = set(mlp_layer_types) - valid_layer_types
+    if invalid_layer_types:
+        raise ValueError(f"Unsupported GLM MLP layer types: {invalid_layer_types}")
+    return [0 if layer_type == "dense" else 1 for layer_type in mlp_layer_types]
+
+
+def _get_glm_index_compute_layers(config: PretrainedConfig) -> int:
+    """Return how many GLM layers compute, rather than reuse, DSA indices."""
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is not None:
+        if len(indexer_types) != config.num_hidden_layers:
+            raise ValueError(
+                "GLM indexer_types must contain one entry per hidden layer, got "
+                f"{len(indexer_types)} entries for {config.num_hidden_layers} layers"
+            )
+
+        valid_indexer_types = {"full", "shared"}
+        invalid_indexer_types = set(indexer_types) - valid_indexer_types
+        if invalid_indexer_types:
+            raise ValueError(
+                f"Unsupported GLM DSA indexer types: {invalid_indexer_types}"
+            )
+        return sum(indexer_type == "full" for indexer_type in indexer_types)
+
+    topk_freq = getattr(config, "index_topk_freq", 1) or 1
+    skip_topk_offset = getattr(config, "index_skip_topk_offset", 0) or 0
+    if topk_freq < 1:
+        raise ValueError(f"GLM index_topk_freq must be positive, got {topk_freq}")
+    if skip_topk_offset < 0:
+        raise ValueError(
+            f"GLM index_skip_topk_offset must be non-negative, got {skip_topk_offset}"
+        )
+    skip_topk_offset = max(skip_topk_offset, 1)
+    return sum(
+        max(layer_number - skip_topk_offset, 0) % topk_freq == 0
+        for layer_number in range(1, config.num_hidden_layers + 1)
     )
 
 
@@ -99,6 +166,35 @@ def convert_config_to_flops_config(
             mtp_num_layers=0,
             causal_self_attn=True,
         ), deepseekv3
+    elif config.__class__.model_type == "glm_moe_dsa":
+        return FLOPSConfig(
+            gbs=0,
+            hs=config.hidden_size,
+            layers=config.num_hidden_layers,
+            ffn_hs=config.intermediate_size,
+            attention_heads=config.num_attention_heads,
+            moe_router_topk=config.num_experts_per_tok,
+            query_groups=config.num_key_value_heads,
+            vocab_size=config.vocab_size,
+            q_lora_rank=config.q_lora_rank,
+            kv_lora_rank=config.kv_lora_rank,
+            qk_head_dim=config.qk_nope_head_dim,
+            qk_pos_emb_head_dim=config.qk_rope_head_dim,
+            v_head_dim=config.v_head_dim,
+            moe_layer_freq=_get_glm_moe_layer_pattern(config),
+            moe_shared_expert_intermediate_size=(
+                config.moe_intermediate_size * config.n_shared_experts
+            ),
+            moe_ffn_hidden_size=config.moe_intermediate_size,
+            # GLM-5 HF config may expose next-token-prediction heads, but the
+            # MCore Bridge path used by these runs disables MTP mappings.
+            mtp_num_layers=None,
+            causal_self_attn=True,
+            dsa_indexer_n_heads=config.index_n_heads,
+            dsa_indexer_head_dim=config.index_head_dim,
+            dsa_indexer_topk=config.index_topk,
+            dsa_indexer_compute_layers=_get_glm_index_compute_layers(config),
+        ), glm_moe_dsa
     else:
         raise ValueError(f"Unsupported config type: {type(config)}")
 

@@ -16,7 +16,23 @@
 
 from typing import ClassVar, Final
 
-from nemo.lens.groups import SpanGroup
+try:
+    from nemo.lens.groups import SpanGroup
+except ImportError:  # nemo-lens is optional on this branch; telemetry stays disabled.
+
+    class SpanGroup(str):
+        """Minimal stand-in for ``nemo.lens.groups.SpanGroup`` when nemo-lens is absent."""
+
+        JOB = "job"
+        STEP = "step"
+        CHECKPOINT = "checkpoint"
+        EVALUATE = "evaluate"
+        MODEL_INIT = "model_init"
+        FORWARD_BACKWARD = "forward_backward"
+        LOAD_CHECKPOINT = "load_checkpoint"
+        OPTIMIZER = "optimizer"
+        ALL_GROUPS = frozenset([JOB, STEP, CHECKPOINT, EVALUATE, MODEL_INIT, CHECKPOINT, EVALUATE, FORWARD_BACKWARD, JOB, LOAD_CHECKPOINT, MODEL_INIT, OPTIMIZER, STEP])
+
 
 
 class RLSpanGroup(SpanGroup):

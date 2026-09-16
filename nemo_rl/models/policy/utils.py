@@ -14,6 +14,8 @@
 
 import gc
 import os
+import time
+import requests
 import traceback
 import warnings
 from datetime import timedelta
@@ -1163,3 +1165,234 @@ def broadcast_hf_buckets_via_distributed_impl(
             ray.get(refs)
         finally:
             ray.get(rollout_engine_lock.release.remote())
+
+
+# --- retained from super-v3.5-posttraining for dtensor_policy_worker_v2 (branch version) ---
+def _ensure_ipc_topology(
+    num_engines: int,
+    num_gpus_per_engine: int,
+    worker_state: dict,
+) -> None:
+    """Lazily create a per-engine Gloo subgroup and cache rank-only routing state.
+
+    Every FSDP rank must call ``dist.new_group`` for every engine's rank range
+    (collective). Only the ranks inside a given range stash ``gather_src`` and
+    ``gather_group`` into ``worker_state``. The engine handle itself is resolved
+    at call time from the caller-provided ``rollout_engines`` list so that
+    post-recover actor swaps are picked up without cache invalidation.
+
+    Note: callers must have already applied ``monkey_patch_torch_reductions``
+    once during worker setup; this function no longer applies it.
+    """
+    if worker_state.get("ready"):
+        return
+
+    my_rank = dist.get_rank()
+    for i in range(num_engines):
+        start = i * num_gpus_per_engine
+        group_ranks = list(range(start, start + num_gpus_per_engine))
+        grp = dist.new_group(ranks=group_ranks, backend="gloo")
+        if my_rank in group_ranks:
+            worker_state["gather_src"] = start
+            worker_state["gather_group"] = grp
+
+    worker_state.setdefault("weight_version", 0)
+    worker_state["ready"] = True
+
+
+def _flush_bucket(
+    named_tensors,
+    gather_src: int,
+    gather_group,
+    engine_url: str,
+    weight_version: int,
+    flattened_tensor_bucket_cls,
+    multiprocessing_serializer_cls,
+) -> None:
+    """Flatten ``named_tensors`` per dtype, gather to ``gather_src``, and POST to the engine."""
+    # Wait on any async DTensor redistributes.
+    named_tensors = [
+        (n, (t.wait() if hasattr(t, "wait") else t)) for n, t in named_tensors
+    ]
+
+    by_dtype: dict = {}
+    for n, t in named_tensors:
+        by_dtype.setdefault(t.dtype, []).append((n, t))
+
+    serialized: list[str] = []
+    for _dtype, tensors in by_dtype.items():
+        bkt = flattened_tensor_bucket_cls(named_tensors=tensors)
+        payload = {
+            "flattened_tensor": bkt.get_flattened_tensor(),
+            "metadata": bkt.get_metadata(),
+        }
+        serialized.append(
+            multiprocessing_serializer_cls.serialize(payload, output_str=True)
+        )
+
+    my_rank = dist.get_rank()
+    group_world = dist.get_world_size(gather_group)
+    gathered = [None] * group_world if my_rank == gather_src else None
+    dist.gather_object(
+        serialized,
+        object_gather_list=gathered,
+        dst=gather_src,
+        group=gather_group,
+    )
+
+    if my_rank != gather_src:
+        return
+
+    assert gathered is not None
+    gathered_payloads: list[list[str]] = []
+    for item in gathered:
+        assert item is not None
+        gathered_payloads.append(item)
+
+    num_dtypes = len(gathered_payloads[0])
+    assert num_dtypes > 0
+    for i in range(num_dtypes):
+        body = {
+            "serialized_named_tensors": [g[i] for g in gathered_payloads],
+            "load_format": "flattened_bucket",
+            "flush_cache": False,
+            "weight_version": str(weight_version),
+        }
+        response = requests.post(f"{engine_url}/update_weights_from_tensor", json=body)
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            e.add_note(f"{response.text=}")
+            raise
+        result = response.json()
+        success = result.get("success", True)
+        error_msg = result.get("error_message") or result.get(
+            "message", "unknown error"
+        )
+        if not success:
+            raise RuntimeError(
+                f"Weight sync failed on rollout engine: {error_msg}. "
+                f"Check SGLang version compatibility."
+            )
+
+
+def stream_weights_via_http_impl(
+    params_generator: Iterable[tuple[str, torch.Tensor]],
+    rollout_engine_urls: Iterable[str],
+    num_gpus_per_engine: int,
+    rank: int,
+    world_size: int,
+    worker_name: str,
+    buffer_size_bytes: int,
+    worker_state: dict,
+) -> None:
+    """Stream FSDP weights to colocated SGLang engines via CUDA IPC over HTTP.
+
+    Args:
+        params_generator: Iterable yielding ``(name, tensor)`` pairs to stream.
+            Caller is responsible for any pre-processing (LoRA merge, HF
+            adaptation, dtype cast).
+        rollout_engine_urls: ``http://host:port`` base URLs of each engine's
+            ``node_rank=0`` SGLang HTTP server. One entry per engine, in TP
+            rank-range order: engine ``i`` owns global ranks
+            ``[i * num_gpus_per_engine, (i + 1) * num_gpus_per_engine)``.
+        num_gpus_per_engine: TP size per SGLang engine.
+        rank: Global FSDP rank.
+        world_size: Global FSDP world size.
+        worker_name: Human label for logs.
+        buffer_size_bytes: Max bucket size in bytes.
+        worker_state: Mutable dict on the worker used to cache topology and
+            weight version across refits.
+    """
+    from nemo_rl.models.generation.sglang.utils.train_utils import (
+        FlattenedTensorBucket,
+        MultiprocessingSerializer,
+    )
+
+    rollout_engine_urls = list(rollout_engine_urls)
+
+    _ensure_ipc_topology(
+        num_engines=len(rollout_engine_urls),
+        num_gpus_per_engine=num_gpus_per_engine,
+        worker_state=worker_state,
+    )
+
+    worker_state["weight_version"] = worker_state.get("weight_version", 0) + 1
+    weight_version = worker_state["weight_version"]
+    gather_src = worker_state["gather_src"]
+    gather_group = worker_state["gather_group"]
+
+    engine_url = None
+    for i, candidate in enumerate(rollout_engine_urls):
+        start = i * num_gpus_per_engine
+        end = start + num_gpus_per_engine
+        if start <= rank < end:
+            engine_url = candidate
+            break
+    if engine_url is None:
+        raise RuntimeError(
+            f"No rollout engine matched rank={rank} with "
+            f"num_gpus_per_engine={num_gpus_per_engine} and "
+            f"{len(rollout_engine_urls)} engine URL(s); "
+            f"rank must fall within [0, {num_gpus_per_engine * len(rollout_engine_urls)})."
+        )
+
+    try:
+        bucket: list = []
+        bucket_size = 0
+        for name, param in params_generator:
+            param_size = param.numel() * param.element_size()
+            if bucket and bucket_size + param_size >= buffer_size_bytes:
+                _flush_bucket(
+                    bucket,
+                    gather_src=gather_src,
+                    gather_group=gather_group,
+                    engine_url=engine_url,
+                    weight_version=weight_version,
+                    flattened_tensor_bucket_cls=FlattenedTensorBucket,
+                    multiprocessing_serializer_cls=MultiprocessingSerializer,
+                )
+                bucket = []
+                bucket_size = 0
+
+            param = param.cuda()
+            bucket.append((name, param))
+            bucket_size += param_size
+
+        if bucket:
+            _flush_bucket(
+                bucket,
+                gather_src=gather_src,
+                gather_group=gather_group,
+                engine_url=engine_url,
+                weight_version=weight_version,
+                flattened_tensor_bucket_cls=FlattenedTensorBucket,
+                multiprocessing_serializer_cls=MultiprocessingSerializer,
+            )
+
+        if dist.get_rank() == gather_src:
+            # Mirror SGLangGenerationWorker.invalidate_kv_cache: the endpoint
+            # returns non-200 while requests are still pending, so retry up to 60s.
+            import time
+
+            for _ in range(60):
+                try:
+                    response = requests.get(f"{engine_url}/flush_cache")
+                    if response.status_code == 200:
+                        break
+                except requests.RequestException:
+                    pass
+                time.sleep(1)
+            else:
+                raise TimeoutError(f"Timeout while flushing cache at {engine_url}.")
+
+    except Exception as e:
+        print(
+            f"{worker_name} (rank {rank}): Error during HTTP weight streaming: {e}.\n"
+            f"{traceback.format_exc()}"
+        )
+        raise
+    finally:
+        gc.collect()
+        torch.cuda.empty_cache()
+
