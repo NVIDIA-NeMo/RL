@@ -40,10 +40,6 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     RefitPayloadMode,
 )
-from nemo_rl.models.generation.vllm.config import (
-    VLLM_FP32_LM_HEAD_ENV_VAR,
-    vllm_fp32_lm_head_enabled,
-)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
@@ -55,6 +51,7 @@ from nemo_rl.models.policy.interfaces import (
 from nemo_rl.models.policy.utils import (
     aggregate_per_sample_handles,
     resolve_policy_worker_cls,
+    validate_fp32_lm_head_config,
 )
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.flops_tracker import (
@@ -91,68 +88,6 @@ def _aggregate_megatron_flops_metrics(
     except Exception as e:
         warnings.warn(f"Error getting theoretical flops: {e}")
     return aggregated
-
-
-def _validate_fp32_lm_head_config(
-    config: PolicyConfig, *, megatron_enabled: bool, dtensor_enabled: bool
-) -> None:
-    """Reject fp32 LM-head settings that the selected backends cannot match."""
-    generation_config = config.get("generation")
-    if generation_config is None:
-        return
-
-    generation_backend = generation_config["backend"]
-    megatron_cfg = config.get("megatron_cfg")
-    megatron_fp32_value = (
-        megatron_cfg.get("fp32_lm_head")
-        if megatron_enabled and megatron_cfg is not None
-        else None
-    )
-    megatron_fp32 = bool(megatron_fp32_value)
-
-    if (
-        megatron_fp32
-        and megatron_cfg is not None
-        and megatron_cfg.get("use_fused_linear_logprobs")
-    ):
-        raise ValueError(
-            "policy.megatron_cfg.fp32_lm_head has no effect with "
-            "use_fused_linear_logprobs=true (the fused linear+CE kernel bypasses "
-            "output_layer). Disable one of them."
-        )
-
-    if generation_backend != "vllm":
-        return
-
-    vllm_cfg = generation_config.get("vllm_cfg")
-    if vllm_cfg is None:
-        return
-
-    env_vars = vllm_cfg.get("env_vars") or {}
-    if VLLM_FP32_LM_HEAD_ENV_VAR in env_vars:
-        raise ValueError(
-            f"{VLLM_FP32_LM_HEAD_ENV_VAR} is reserved for NeMo-RL internal "
-            "vLLM patch plumbing; configure fp32 LM head with "
-            "policy.generation.vllm_cfg.fp32_lm_head instead."
-        )
-
-    vllm_fp32 = vllm_fp32_lm_head_enabled(vllm_cfg)
-    if dtensor_enabled and vllm_fp32:
-        raise ValueError(
-            "policy.generation.vllm_cfg.fp32_lm_head=true is only supported "
-            "with the Megatron trainer because DTensor has no matching "
-            "policy.dtensor_cfg fp32 LM-head implementation."
-        )
-    if megatron_enabled and megatron_fp32 != vllm_fp32:
-        raise ValueError(
-            "fp32 LM head must be enabled on both Megatron training and vLLM "
-            "generation or neither: "
-            f"policy.megatron_cfg.fp32_lm_head={megatron_fp32_value!r} but "
-            f"policy.generation.vllm_cfg.fp32_lm_head="
-            f"{vllm_cfg.get('fp32_lm_head')!r}. "
-            "A one-sided fp32 head increases the generation/training logprob "
-            "mismatch instead of reducing it."
-        )
 
 
 class Policy(ColocatablePolicyInterface, GenerationInterface):
@@ -222,7 +157,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
             )
-        _validate_fp32_lm_head_config(
+        validate_fp32_lm_head_config(
             config, megatron_enabled=megatron_enable, dtensor_enabled=dtensor_enable
         )
         if reserved_http_server_ports is not None and not megatron_enable:
