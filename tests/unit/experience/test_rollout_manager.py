@@ -45,6 +45,7 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.experience.failures import GenerationUnavailable
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
@@ -101,7 +102,7 @@ def _with_cut(buffer, callback):
     return _run(apply())
 
 
-def test_generate_response_forwards_message_log_media_to_generation() -> None:
+def test_generate_response_forwards_all_vllm_media_to_generation() -> None:
     captured: dict[str, BatchedDataDict] = {}
 
     class _Generation:
@@ -131,6 +132,7 @@ def test_generate_response_forwards_message_log_media_to_generation() -> None:
     manager._deadline_registry = None
     pixel_values = PackedTensor(torch.ones(2, 3, 4, 4), dim_to_pack=0)
     imgs_sizes = PackedTensor(torch.tensor([[4, 4], [4, 4]]), dim_to_pack=0)
+    native_image = object()
     message_log = [
         {
             "role": "user",
@@ -147,13 +149,22 @@ def test_generate_response_forwards_message_log_media_to_generation() -> None:
     ]
 
     assistant_message, input_lengths, _ = _run(
-        manager._generate_response(message_log, ["<stop>"])
+        manager._generate_response(
+            message_log,
+            ["<stop>"],
+            native_generation_data={
+                "vllm_content": "rendered prompt",
+                "vllm_images": [native_image],
+            },
+        )
     )
 
     generation_data = captured["data"]
     assert generation_data["input_ids"].tolist() == [[1, 2, 3, 4, 5]]
     assert generation_data["input_lengths"].tolist() == [5]
     assert generation_data["stop_strings"] == [["<stop>"]]
+    assert generation_data["vllm_content"] == ["rendered prompt"]
+    assert generation_data["vllm_images"] == [[native_image]]
     assert isinstance(generation_data["pixel_values"], PackedTensor)
     assert isinstance(generation_data["imgs_sizes"], PackedTensor)
     assert torch.equal(
@@ -165,6 +176,89 @@ def test_generate_response_forwards_message_log_media_to_generation() -> None:
     assert input_lengths.tolist() == [5]
     assert assistant_message["content"] == "answer"
     assert assistant_message["token_ids"].tolist() == [42]
+
+
+def test_run_single_rollout_preserves_native_media_across_turns(monkeypatch) -> None:
+    calls: list[dict] = []
+    image = object()
+    audio = object()
+    video = object()
+
+    async def generate_response(
+        _message_log,
+        _stop_strings,
+        *,
+        native_generation_data=None,
+    ):
+        calls.append(dict(native_generation_data or {}))
+        return (
+            {
+                "role": "assistant",
+                "content": "answer",
+                "token_ids": torch.tensor([42]),
+                "generation_logprobs": torch.tensor([0.0]),
+            },
+            torch.tensor(1),
+            {},
+        )
+
+    def calculate_rewards(_batch, _task_to_env):
+        return EnvironmentReturn(
+            observations=[{"role": "user", "content": "next"}],
+            metadata=[None],
+            next_stop_strings=[None],
+            rewards=torch.tensor([0.0]),
+            terminateds=torch.tensor([len(calls) == 2]),
+            answers=[None],
+        )
+
+    class _Tokenizer:
+        def __call__(self, *_args, **_kwargs):
+            return SimpleNamespace(input_ids=torch.tensor([[7]]))
+
+    monkeypatch.setattr(
+        "nemo_rl.experience.rollout_manager.calculate_rewards", calculate_rewards
+    )
+    manager = object.__new__(AsyncRolloutImpl)
+    manager._generate_response = generate_response
+    manager._tokenizer = _Tokenizer()
+    manager._task_to_env = {}
+    manager._max_seq_len = 32
+    manager._max_rollout_turns = 2
+    manager._timeouts = SimpleNamespace(env_s=10.0)
+
+    _run(
+        manager._run_single_rollout(
+            {
+                "idx": 0,
+                "message_log": [
+                    {
+                        "role": "user",
+                        "content": "",
+                        "token_ids": torch.tensor([1]),
+                    }
+                ],
+                "extra_env_info": None,
+                "task_name": "vlm",
+                "vllm_content": "<image><audio><video>",
+                "vllm_images": [image],
+                "vllm_audios": [audio],
+                "vllm_videos": [video],
+            },
+            traj_idx=0,
+        )
+    )
+
+    assert len(calls) == 2
+    assert calls[0]["vllm_content"] == "<image><audio><video>"
+    assert calls[1]["vllm_content"] is None
+    for key, expected in (
+        ("vllm_images", image),
+        ("vllm_audios", audio),
+        ("vllm_videos", video),
+    ):
+        assert calls[0][key][0] is expected
+        assert calls[1][key][0] is expected
 
 
 class _FakeBuffer:
