@@ -8,6 +8,7 @@ bash "${script_dir}/repair_container_python.sh"
 python - <<'PY'
 import torch
 import nemo_rl
+import nemo_rl.distributed.ray_actor_environment_registry
 
 assert torch.cuda.is_available()
 assert torch.cuda.device_count() == 4

@@ -43,6 +43,7 @@ if [[ ! -f ${source_archive} ]]; then
     --format=tar \
     --output="${source_archive_tmp}" \
     "${branch_sha}" \
+    pyproject.toml \
     nemo_rl \
     examples \
     research/qwen30_refit_cumulative_ablation
@@ -104,9 +105,9 @@ EOF
   export HF_DATASETS_CACHE="${hf_home}/datasets"
   export NRL_MXFP8_BATCHED_SHUFFLE="${batched_shuffle}"
   export RAY_LOG_SYNC_FREQUENCY=300
-  export SETUP_COMMAND="stage_root=/raid/scratch/nemo-rl-source-\${SLURM_JOB_ID}; rm -rf \"\${stage_root}\"; mkdir -p \"\${stage_root}\"; tar -xf ${source_archive} -C \"\${stage_root}\"; bash \"\${stage_root}/research/qwen30_refit_cumulative_ablation/repair_container_python.sh\""
+  export SETUP_COMMAND="stage_root=/raid/scratch/nemo-rl-source-${branch_sha}; rm -rf \"\${stage_root}\"; mkdir -p \"\${stage_root}\"; tar -xf ${source_archive} -C \"\${stage_root}\"; bash \"\${stage_root}/research/qwen30_refit_cumulative_ablation/repair_container_python.sh\""
   export MOUNTS="/lustre:/lustre,/raid/scratch:/raid/scratch"
-  export COMMAND="stage_root=/raid/scratch/nemo-rl-source-\${SLURM_JOB_ID}; export PYTHONPATH=\${stage_root}\${PYTHONPATH:+:\${PYTHONPATH}}; cd /opt/nemo-rl && if [[ -f 3rdparty/vllm/nemo-rl.env ]]; then source 3rdparty/vllm/nemo-rl.env; fi && uv run --no-sync \${stage_root}/examples/run_grpo.py --config \${stage_root}/${recipe} grpo.max_num_steps=20 policy.generation.refit_transport=${transport} policy.generation.vllm_cfg.refit_prequantize=false policy.generation.vllm_cfg.refit_cache_loader_routes=${route_cache} policy.refit_persistent_ipc_buffers=false checkpointing.enabled=false logger.log_dir=${output_dir}/logs logger.wandb_enabled=true logger.wandb.project=${wandb_project} logger.wandb.name=${run_name}"
+  export COMMAND="stage_root=/raid/scratch/nemo-rl-source-${branch_sha}; export PYTHONPATH=\${stage_root}\${PYTHONPATH:+:\${PYTHONPATH}}; cd /opt/nemo-rl && if [[ -f 3rdparty/vllm/nemo-rl.env ]]; then source 3rdparty/vllm/nemo-rl.env; fi && uv run --no-sync \${stage_root}/examples/run_grpo.py --config \${stage_root}/${recipe} grpo.max_num_steps=20 policy.generation.refit_transport=${transport} policy.generation.vllm_cfg.refit_prequantize=false policy.generation.vllm_cfg.refit_cache_loader_routes=${route_cache} policy.refit_persistent_ipc_buffers=false checkpointing.enabled=false logger.log_dir=${output_dir}/logs logger.wandb_enabled=true logger.wandb.project=${wandb_project} logger.wandb.name=${run_name}"
 
   local sbatch_args=(
     --nodes=4
