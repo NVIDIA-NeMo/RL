@@ -889,7 +889,14 @@ def _step_metrics(
     # ``merge_snapshots`` reduces the per-process accumulator with a max, and
     # a single process carries its own. Not ``wall_ms / n_procs``, which is
     # the per-process mean this reduction replaced.
-    slowest_ms = snap.get("max_process_step_wall_ms", snap["step_wall_ms"])
+    # Membership, not ``.get``'s default: a default argument is evaluated
+    # eagerly, so the single-process key would be looked up on a merged
+    # snapshot that never carries it and raise on every cluster step.
+    slowest_ms = (
+        snap["max_process_step_wall_ms"]
+        if "max_process_step_wall_ms" in snap
+        else snap["step_wall_ms"]
+    )
     # step/ is a delta over this step; now/ is a level at this instant.
     # The unit alone does not distinguish them -- see README.md.
     metrics = _step_deltas(snap, prev)
