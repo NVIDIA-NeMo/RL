@@ -1,53 +1,33 @@
 defaults: ../../grpo_math_1B.yaml
-
 grpo:
-  num_prompts_per_step: 32
-  num_generations_per_prompt: 16
-  max_rollout_turns: 1
   max_num_epochs: 10
   max_num_steps: 10000
-  normalize_rewards: true
   use_leave_one_out_baseline: false
-  val_period: 10
-  val_at_start: false
-  overlong_filtering: false
   max_val_samples: 240
   val_batch_size: 240
-  batch_multiplier: 1
-  use_dynamic_sampling: false
-  dynamic_sampling_max_gen_batches: 10
-  seed: 42
   reward_scaling:
-    enabled: false
     target_min: -1.0
   reward_shaping:
-    enabled: false
     overlong_buffer_length: 512
     max_response_length: 6144
-
 loss_fn:
   reference_policy_kl_penalty: 0.0
   use_importance_sampling_correction: true
   truncated_importance_sampling_ratio: 2
   truncated_importance_sampling_type: tis
-  ratio_clip_min: 0.2
   ratio_clip_max: 0.28
   ratio_clip_c: 10
-  token_level_loss: true
 checkpointing:
-  enabled: true
   checkpoint_dir: results/grpo-minimax-m3-32n8g-automodel-cp8ep128-noncolocated
   keep_top_k: 1
   save_period: 100
-  checkpoint_must_save_by: "00:03:45:00"
-  save_optimizer: true
+  checkpoint_must_save_by: 00:03:45:00
 policy:
   model_name: MiniMaxAI/MiniMax-M3
   hf_config_overrides:
     text_config:
       num_mtp_modules: 0
   train_micro_batch_size: 1
-  train_global_batch_size: 512
   logprob_batch_size: 1
   make_sequence_length_divisible_by: 1024
   max_total_sequence_length: 8192
@@ -58,12 +38,10 @@ policy:
     kwargs:
       lr: 1.0e-06
       weight_decay: 0.1
-      betas: [0.9, 0.999]
-      eps: 1.0e-08
       master_weights: true
       store_param_remainders: true
-      exp_avg_dtype: "torch.bfloat16"
-      exp_avg_sq_dtype: "torch.bfloat16"
+      exp_avg_dtype: torch.bfloat16
+      exp_avg_sq_dtype: torch.bfloat16
   scheduler:
   - name: torch.optim.lr_scheduler.LinearLR
     kwargs:
@@ -82,7 +60,7 @@ policy:
     activation_checkpointing: true
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
-      NRL_REFIT_NUM_BUFFERS: "1"
+      NRL_REFIT_NUM_BUFFERS: '1'
     automodel_kwargs:
       backend:
         _target_: nemo_automodel.components.models.common.utils.BackendConfig
@@ -101,8 +79,6 @@ policy:
         freeze_language_model: false
   sequence_packing:
     enabled: false
-  dynamic_batching:
-    enabled: false
   generation:
     max_new_tokens: 6144
     vllm_kwargs:
@@ -110,7 +86,6 @@ policy:
       block_size: 128
     vllm_cfg:
       tensor_parallel_size: 16
-      pipeline_parallel_size: 1
       expert_parallel_size: 16
       gpu_memory_utilization: 0.8
       enforce_eager: true
@@ -131,10 +106,9 @@ data:
 env:
   math:
     num_workers: 16
-    math_verify_impl: "dapo_math_verify"
+    math_verify_impl: dapo_math_verify
 logger:
   wandb_enabled: true
-  tensorboard_enabled: false
   wandb:
     project: nemorl-m3
     name: grpo-minimax-m3-32n8g-automodel-cp8ep128-noncolocated
