@@ -658,6 +658,8 @@ def apply_fp32_lm_head(model_chunks: list, use_tf32: bool = False) -> None:
             continue
         if getattr(output_layer.forward, _FP32_LM_HEAD_PATCHED_ATTR, False):
             continue
+        if getattr(output_layer.forward, _FP32_LM_HEAD_PATCHED_ATTR, False):
+            continue
         original_forward = output_layer.forward
 
         def _fp32_forward(
@@ -679,6 +681,8 @@ def apply_fp32_lm_head(model_chunks: list, use_tf32: bool = False) -> None:
             finally:
                 torch.backends.cuda.matmul.allow_tf32 = prev
 
+        setattr(_fp32_forward, _FP32_LM_HEAD_PATCHED_ATTR, True)
+        setattr(_fp32_forward, _FP32_LM_HEAD_USE_TF32_ATTR, use_tf32)
         setattr(_fp32_forward, _FP32_LM_HEAD_PATCHED_ATTR, True)
         setattr(_fp32_forward, _FP32_LM_HEAD_USE_TF32_ATTR, use_tf32)
         output_layer.forward = _fp32_forward
