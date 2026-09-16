@@ -42,6 +42,7 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from tests.unit.models.policy.test_megatron_worker import create_megatron_test_config
 from tests.unit.single_controller._dp_fakes import _PARTITION_ID
 from tests.unit.test_utils import SimpleLossFn
@@ -351,16 +352,18 @@ def test_train_pump_drives_mcore_training_step(
             },
             # Actor __init__ builds a CheckpointManager + TimeoutChecker from
             # this block; enabled=False keeps the run write-free.
-            checkpointing={
-                "enabled": False,
-                "checkpoint_dir": str(tmp_path / "checkpoints"),
-                "metric_name": None,
-                "higher_is_better": False,
-                "keep_top_k": None,
-                "save_period": 10_000,
-                "save_optimizer": False,
-                "checkpoint_must_save_by": None,
-            },
+            checkpointing=CheckpointingConfig.model_construct(
+                **{
+                    "enabled": False,
+                    "checkpoint_dir": str(tmp_path / "checkpoints"),
+                    "metric_name": None,
+                    "higher_is_better": False,
+                    "keep_top_k": None,
+                    "save_period": 10_000,
+                    "save_optimizer": False,
+                    "checkpoint_must_save_by": None,
+                }
+            ),
         )
 
         actor_args = SingleControllerActorArgs(

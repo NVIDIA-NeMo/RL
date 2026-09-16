@@ -43,6 +43,7 @@ from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
     DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
 )
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 
 def _all_sampler_names() -> list[str]:
@@ -78,7 +79,9 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
             force_on_policy_ratio=False,
         ),
         env={"should_use_nemo_gym": True},
-        checkpointing={"enabled": False, "metric_name": None},
+        checkpointing=CheckpointingConfig.model_construct(
+            **{"enabled": False, "metric_name": None}
+        ),
     )
 
 
@@ -436,7 +439,9 @@ class TestWrongPathFaultToleranceIsRejected:
             env={"should_use_nemo_gym": use_nemo_gym},
             # Read by the metric_name check upstream #3429 added to this same
             # validator, which runs before the wrong-path check under test.
-            checkpointing={"enabled": False, "metric_name": None},
+            checkpointing=CheckpointingConfig.model_construct(
+                **{"enabled": False, "metric_name": None}
+            ),
         )
 
     def test_gym_only_knobs_on_a_native_run_are_rejected(self):

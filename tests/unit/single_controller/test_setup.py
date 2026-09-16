@@ -78,6 +78,7 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 # Captured at import, before the patched_factories fixture swaps it for a mock.
 _REAL_BUILD_GENERATION = sc_setup_mod._build_generation
@@ -176,15 +177,17 @@ def _make_master_config(
         # Full block: setup builds a CheckpointManager unconditionally (resume
         # lookup), which indexes these keys directly. Nothing is written while
         # enabled=False and the dir doesn't exist.
-        checkpointing={
-            "enabled": False,
-            "checkpoint_dir": "results/_sc_setup_test_ckpt",
-            "metric_name": None,
-            "higher_is_better": False,
-            "keep_top_k": None,
-            "save_period": 10,
-            "save_optimizer": False,
-        },
+        checkpointing=CheckpointingConfig.model_construct(
+            **{
+                "enabled": False,
+                "checkpoint_dir": "results/_sc_setup_test_ckpt",
+                "metric_name": None,
+                "higher_is_better": False,
+                "keep_top_k": None,
+                "save_period": 10,
+                "save_optimizer": False,
+            }
+        ),
         logger={"wandb_enabled": False, "wandb": {}},
         cluster={"num_nodes": 2, "gpus_per_node": 8, "segment_size": None},
         loss_fn=loss_cfg if loss_cfg is not None else ClippedPGLossConfig(),
@@ -576,8 +579,8 @@ def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
     assert isinstance(resolved, dict)
     master_config = MasterConfig.model_validate(resolved)
     validate_single_controller_config(master_config)
-    assert master_config.checkpointing["metric_name"] is None
-    assert master_config.checkpointing["save_data_plane"] is True
+    assert master_config.checkpointing.metric_name is None
+    assert master_config.checkpointing.save_data_plane is True
     assert master_config.token_capture.enabled is True
     assert (
         master_config.rollout_recovery.default_granularity
@@ -729,14 +732,14 @@ class TestSetup:
     def test_rejects_mooncake_data_plane_checkpointing(self):
         mc = _make_master_config()
         mc.data_plane["backend"] = "mooncake_cpu"
-        mc.checkpointing["save_data_plane"] = True
+        mc.checkpointing.save_data_plane = True
         with pytest.raises(NotImplementedError, match="backend='mooncake_cpu'"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     def test_periodic_checkpointing_requires_trainer_checkpointing(self):
         mc = _make_master_config()
-        mc.checkpointing["enabled"] = False
-        mc.checkpointing["save_data_plane"] = True
+        mc.checkpointing.enabled = False
+        mc.checkpointing.save_data_plane = True
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
         )
@@ -750,8 +753,8 @@ class TestSetup:
                 target=f"{__name__}:_NonCheckpointingCustomSampler"
             )
         )
-        mc.checkpointing["enabled"] = True
-        mc.checkpointing["save_data_plane"] = False
+        mc.checkpointing.enabled = True
+        mc.checkpointing.save_data_plane = False
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
         )
@@ -766,8 +769,8 @@ class TestSetup:
 
     def test_periodic_checkpointing_requires_token_capture(self):
         mc = _make_master_config()
-        mc.checkpointing["enabled"] = True
-        mc.checkpointing["save_data_plane"] = True
+        mc.checkpointing.enabled = True
+        mc.checkpointing.save_data_plane = True
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
         )
@@ -781,8 +784,8 @@ class TestSetup:
                 target=f"{__name__}:_NonCheckpointingCustomSampler"
             )
         )
-        mc.checkpointing["enabled"] = True
-        mc.checkpointing["save_data_plane"] = True
+        mc.checkpointing.enabled = True
+        mc.checkpointing.save_data_plane = True
         mc.token_capture = TokenCaptureConfig(enabled=True)
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
@@ -800,8 +803,8 @@ class TestSetup:
                 target=(f"{__name__}:_CheckpointingNonClaimingCustomSampler")
             )
         )
-        mc.checkpointing["enabled"] = True
-        mc.checkpointing["save_data_plane"] = True
+        mc.checkpointing.enabled = True
+        mc.checkpointing.save_data_plane = True
         mc.token_capture = TokenCaptureConfig(enabled=True)
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
@@ -871,7 +874,7 @@ class TestSetup:
     ):
         mc = _make_master_config()
         checkpoint_dir = tmp_path / "checkpoints"
-        mc.checkpointing["checkpoint_dir"] = str(checkpoint_dir)
+        mc.checkpointing.checkpoint_dir = str(checkpoint_dir)
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=None,
             restore_mode="latest",
@@ -949,8 +952,8 @@ class TestSetup:
 
     def test_rejects_windowed_checkpointing_without_native_tq(self):
         mc = _make_master_config()
-        mc.checkpointing["enabled"] = True
-        mc.checkpointing["save_data_plane"] = False
+        mc.checkpointing.enabled = True
+        mc.checkpointing.save_data_plane = False
         mc.async_rl.sampler = WindowedSamplerConfig(max_staleness_versions=1)
         mc.data_plane["backend"] = "simple"
 
@@ -965,8 +968,8 @@ class TestSetup:
 
     def test_checkpointing_error_explains_mooncake_incompatibility(self):
         mc = _make_master_config()
-        mc.checkpointing["enabled"] = True
-        mc.checkpointing["save_data_plane"] = False
+        mc.checkpointing.enabled = True
+        mc.checkpointing.save_data_plane = False
         mc.async_rl.sampler = WindowedSamplerConfig(max_staleness_versions=1)
         mc.data_plane["backend"] = "mooncake_cpu"
 
@@ -980,8 +983,8 @@ class TestSetup:
 
     def test_rejects_checkpointing_custom_sampler_without_native_tq(self):
         mc = _make_master_config()
-        mc.checkpointing["enabled"] = True
-        mc.checkpointing["save_data_plane"] = False
+        mc.checkpointing.enabled = True
+        mc.checkpointing.save_data_plane = False
         mc.async_rl.sampler = CustomSamplerConfig(
             target=f"{__name__}:_CheckpointingCustomSampler"
         )
@@ -1000,8 +1003,8 @@ class TestSetup:
         self, patched_factories
     ):
         mc = _make_master_config()
-        mc.checkpointing["enabled"] = True
-        mc.checkpointing["save_data_plane"] = False
+        mc.checkpointing.enabled = True
+        mc.checkpointing.save_data_plane = False
         mc.async_rl.sampler = CustomSamplerConfig(
             target=f"{__name__}:_NonCheckpointingCustomSampler"
         )

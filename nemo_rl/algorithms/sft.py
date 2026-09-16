@@ -152,9 +152,11 @@ def setup(
         processor = tokenizer
         tokenizer = processor.tokenizer
 
-    checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
+    checkpointing_pretrained = checkpointing_config.pretrained_checkpoint
     if checkpointing_pretrained is not None:
-        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
+        # PolicyConfig is still TypedDict-shaped; hand off a plain dict so the
+        # Megatron setup path keeps its key-style access.
+        policy_config["pretrained_checkpoint"] = checkpointing_pretrained.model_dump()
 
     # ==========================
     #         Logger
@@ -522,7 +524,7 @@ def sft_train(
     _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
-        timeout=master_config.checkpointing["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing.checkpoint_must_save_by,
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -559,7 +561,7 @@ def sft_train(
 
     policy.prepare_for_training()
 
-    ft_save_period = master_config.checkpointing.get("ft_save_period")
+    ft_save_period = master_config.checkpointing.ft_save_period
 
     while (
         current_epoch < max_num_epochs and total_steps < master_config.sft.max_num_steps
@@ -666,8 +668,7 @@ def sft_train(
                 timeout.mark_iteration()
                 should_save_by_step = (
                     is_last_step
-                    or (total_steps + 1) % master_config.checkpointing["save_period"]
-                    == 0
+                    or (total_steps + 1) % master_config.checkpointing.save_period == 0
                     or (
                         ft_save_period is not None
                         and (total_steps + 1) % ft_save_period == 0
@@ -677,7 +678,7 @@ def sft_train(
                 # Check if timeout-based checkpointing is enabled in config.
                 should_save_by_timeout = timeout.check_save()
 
-                if master_config.checkpointing["enabled"] and (
+                if master_config.checkpointing.enabled and (
                     should_save_by_step or should_save_by_timeout
                 ):
                     sft_save_state.step = (current_step + 1) % len(train_dataloader)
@@ -685,7 +686,7 @@ def sft_train(
                     sft_save_state.epoch = current_epoch
                     sft_save_state.total_valid_tokens = total_valid_tokens
 
-                    full_metric_name = master_config.checkpointing["metric_name"]
+                    full_metric_name = master_config.checkpointing.metric_name
                     if full_metric_name is not None:
                         assert full_metric_name.startswith(
                             "train:"

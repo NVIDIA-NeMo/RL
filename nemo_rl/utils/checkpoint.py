@@ -32,9 +32,7 @@ from typing import (
     Callable,
     Literal,
     Mapping,
-    NotRequired,
     Optional,
-    TypedDict,
     Union,
 )
 
@@ -114,7 +112,7 @@ def validate_warm_start_checkpoint(
         )
 
 
-class PretrainedCheckpointConfig(TypedDict):
+class PretrainedCheckpointConfig(BaseModel, extra="allow"):
     """Configuration for restoring initial weights from a pre-existing Megatron checkpoint.
 
     When set, the policy will restore its initial weights from this checkpoint
@@ -148,7 +146,7 @@ class PretrainedCheckpointConfig(TypedDict):
     format: Literal["megatron_bridge", "megatron_lm"]
 
 
-class CheckpointingConfig(TypedDict):
+class CheckpointingConfig(BaseModel, extra="allow"):
     """Configuration for checkpoint management.
 
     Attributes:
@@ -184,22 +182,28 @@ class CheckpointingConfig(TypedDict):
     metric_name: str | None
     higher_is_better: bool
     save_period: int
-    keep_top_k: NotRequired[int | None]
-    ft_keep_latest_k: NotRequired[int | None]
-    ft_save_period: NotRequired[int]
-    checkpoint_must_save_by: NotRequired[str | None]
-    pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
-    save_optimizer: NotRequired[bool]  # Default: True
-    save_data_plane: NotRequired[bool]
-    load_replay_buffer: NotRequired[bool]  # Default: True (async GRPO only)
-    # New nemo-automodel integration fields
-    model_save_format: NotRequired[str | None]  # Default: "safetensors"
-    save_consolidated: NotRequired[bool]  # Default: False
-    model_cache_dir: NotRequired[str]  # Default: ""
-    model_repo_id: NotRequired[str]  # Default: ""
-    is_peft: NotRequired[bool]  # Default: False
-    peft_config: NotRequired[Any]  # Default: None
-    is_async: NotRequired[bool]  # Default: False
+    keep_top_k: Optional[int] = None
+    ft_keep_latest_k: Optional[int] = None
+    ft_save_period: Optional[int] = None
+    checkpoint_must_save_by: Optional[str] = None
+    pretrained_checkpoint: Optional[PretrainedCheckpointConfig] = None
+    save_optimizer: bool = True
+    save_data_plane: bool = False
+    # Tri-state on purpose: the async-GRPO restore path treats None the same as
+    # True (restore) and only `False` opts out, so an omitted key must stay
+    # distinguishable from an explicit `true`.
+    load_replay_buffer: Optional[bool] = None
+    # New nemo-automodel integration fields.
+    # None is load-bearing for model_save_format: the DTensor v1 worker rejects
+    # any non-None value, and the automodel layers apply their own
+    # "safetensors" fallback. Do not default it to "safetensors" here.
+    model_save_format: Optional[str] = None
+    save_consolidated: bool = False
+    model_cache_dir: str = ""
+    model_repo_id: str = ""
+    is_peft: bool = False
+    peft_config: Optional[Any] = None
+    is_async: bool = False
 
 
 class CheckpointManager:
@@ -229,20 +233,26 @@ class CheckpointManager:
         Args:
             config (CheckpointingConfig)
         """
-        self.checkpoint_dir = Path(config["checkpoint_dir"])
-        self.metric_name: str | None = config["metric_name"]
-        self.higher_is_better = config["higher_is_better"]
-        self.keep_top_k = config["keep_top_k"]
-        self.save_period: int = config["save_period"]
-        self.ft_keep_latest_k: int | None = config.get("ft_keep_latest_k", None)
-        self.save_optimizer = config["save_optimizer"]
+        self.checkpoint_dir = Path(config.checkpoint_dir)
+        self.metric_name: str | None = config.metric_name
+        self.higher_is_better = config.higher_is_better
+        self.keep_top_k = config.keep_top_k
+        self.save_period: int = config.save_period
+        self.ft_keep_latest_k: int | None = config.ft_keep_latest_k
+        self.save_optimizer = config.save_optimizer
 
-        # Store nemo-automodel specific config options
-        self.model_save_format = config.get("model_save_format", "safetensors")
-        self.save_consolidated = config.get("save_consolidated", False)
-        self.model_cache_dir = config.get("model_cache_dir", "")
-        self.model_repo_id = config.get("model_repo_id", "")
-        self.is_peft = config.get("is_peft", False)
+        # Store nemo-automodel specific config options. model_save_format stays
+        # None on the schema (the DTensor v1 worker requires that); the manager
+        # is an automodel-side consumer, so it resolves the automodel default.
+        self.model_save_format = (
+            config.model_save_format
+            if config.model_save_format is not None
+            else "safetensors"
+        )
+        self.save_consolidated = config.save_consolidated
+        self.model_cache_dir = config.model_cache_dir
+        self.model_repo_id = config.model_repo_id
+        self.is_peft = config.is_peft
 
         # Async finalization state
         self._finalize_thread: Optional[threading.Thread] = None

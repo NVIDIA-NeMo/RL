@@ -153,7 +153,7 @@ class SFTSingleControllerActor:
         # wall clock in __init__, so a driver-built one would count the
         # cluster and policy setup against the training budget.
         self._timeout = TimeoutChecker(
-            timeout=master_config.checkpointing.get("checkpoint_must_save_by"),
+            timeout=master_config.checkpointing.checkpoint_must_save_by,
             fit_last_save_time=True,
         )
         self._timeout.start_iterations()
@@ -319,12 +319,12 @@ class SFTSingleControllerActor:
 
     def _should_save(self, *, save_by_timeout: bool) -> bool:
         config = self._master_config.checkpointing
-        ft_save_period = config.get("ft_save_period")
+        ft_save_period = config.ft_save_period
         steps = self._save_state.total_steps
-        return bool(config["enabled"]) and (
+        return bool(config.enabled) and (
             save_by_timeout
             or steps == self._max_steps
-            or steps % config["save_period"] == 0
+            or steps % config.save_period == 0
             or (ft_save_period is not None and steps % ft_save_period == 0)
         )
 
@@ -334,7 +334,7 @@ class SFTSingleControllerActor:
         Called every step rather than only on a save so a name that no step
         produces fails on step 1 instead of at the first checkpoint.
         """
-        metric_name = self._master_config.checkpointing["metric_name"]
+        metric_name = self._master_config.checkpointing.metric_name
         if metric_name is None:
             return {}
         # setup_sft_v2 already rejected anything but a train: name.
@@ -408,7 +408,7 @@ def setup_sft_v2(
         raise ValueError("SFTv2 reads no validation source. Set data.validation=null.")
     # Same reason: only train metrics exist here, so a val: name would leave
     # keep_top_k ranking every checkpoint on a metric that is never written.
-    metric_name = master_config.checkpointing["metric_name"]
+    metric_name = master_config.checkpointing.metric_name
     if metric_name is not None and not metric_name.startswith("train:"):
         raise ValueError(
             "SFTv2 can rank checkpoints on training metrics only. Set "

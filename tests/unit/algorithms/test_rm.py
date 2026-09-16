@@ -27,6 +27,7 @@ from nemo_rl.algorithms.rm import (
     rm_train,
     setup,
 )
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 
 def test_get_rm_save_state_handles_legacy_checkpoint_and_filters_metrics():
@@ -131,11 +132,13 @@ def mock_components():
                 },
                 "train_micro_batch_size": 1,
             },
-            "checkpointing": {
-                "enabled": False,
-                "checkpoint_must_save_by": None,
-                "save_period": 10,
-            },
+            "checkpointing": CheckpointingConfig.model_construct(
+                **{
+                    "enabled": False,
+                    "checkpoint_must_save_by": None,
+                    "save_period": 10,
+                }
+            ),
             "cluster": {
                 "num_nodes": 1,
                 "gpus_per_node": 2,
@@ -176,7 +179,7 @@ def test_context_parallel_rejected_for_dtensor_rm():
             "data": {},
             "logger": {},
             "cluster": {},
-            "checkpointing": {},
+            "checkpointing": CheckpointingConfig.model_construct(),
         }
     )
     with pytest.raises(
@@ -210,7 +213,7 @@ def test_context_parallel_allowed_when_one():
             "data": {},
             "logger": {},
             "cluster": {},
-            "checkpointing": {},
+            "checkpointing": CheckpointingConfig.model_construct(),
         }
     )
     with pytest.raises(Exception) as excinfo:
@@ -332,10 +335,10 @@ def test_ft_save_period_triggers_periodic_saves(mock_components):
     cfg.rm.val_period = 0
     cfg.rm.max_num_steps = 5
     cfg.rm.max_num_epochs = 1
-    cfg.checkpointing["enabled"] = True
-    cfg.checkpointing["save_period"] = 100  # only the final step would save
-    cfg.checkpointing["ft_save_period"] = 2
-    cfg.checkpointing["metric_name"] = None
+    cfg.checkpointing.enabled = True
+    cfg.checkpointing.save_period = 100  # only the final step would save
+    cfg.checkpointing.ft_save_period = 2
+    cfg.checkpointing.metric_name = None
 
     checkpointer = mock_components["checkpointer"]
     checkpointer.init_tmp_checkpoint.return_value = "/tmp/ft_ckpt_test/tmp_step"

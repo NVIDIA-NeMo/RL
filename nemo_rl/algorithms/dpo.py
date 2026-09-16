@@ -183,9 +183,11 @@ def setup(
     checkpointing_config = master_config.checkpointing
     _validate_stop_after_step(dpo_config, algorithm_config_name)
 
-    checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
+    checkpointing_pretrained = checkpointing_config.pretrained_checkpoint
     if checkpointing_pretrained is not None:
-        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
+        # PolicyConfig is still TypedDict-shaped; hand off a plain dict so the
+        # Megatron setup path keeps its key-style access.
+        policy_config["pretrained_checkpoint"] = checkpointing_pretrained.model_dump()
 
     # Make sure we are not using dynamic batching or sequence packing.
     # Anything that changes the order of data within a batch is currently incompatible with DPO.
@@ -593,7 +595,7 @@ def dpo_train(
     _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
-        timeout=master_config.checkpointing["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing.checkpoint_must_save_by,
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -643,7 +645,7 @@ def dpo_train(
 
     policy.prepare_for_training()
 
-    ft_save_period = master_config.checkpointing.get("ft_save_period")
+    ft_save_period = master_config.checkpointing.ft_save_period
 
     while (
         current_epoch < max_num_epochs and total_steps < master_config.dpo.max_num_steps
@@ -743,8 +745,7 @@ def dpo_train(
                 should_save_by_step = (
                     is_last_step
                     or reached_configured_stop
-                    or (total_steps + 1) % master_config.checkpointing["save_period"]
-                    == 0
+                    or (total_steps + 1) % master_config.checkpointing.save_period == 0
                     or (
                         ft_save_period is not None
                         and (total_steps + 1) % ft_save_period == 0
@@ -754,7 +755,7 @@ def dpo_train(
                 # Check if timeout-based checkpointing is enabled in config.
                 should_save_by_timeout = timeout.check_save()
 
-                if master_config.checkpointing["enabled"] and (
+                if master_config.checkpointing.enabled and (
                     should_save_by_step or should_save_by_timeout
                 ):
                     dpo_save_state.step = (current_step + 1) % len(train_dataloader)
@@ -781,7 +782,7 @@ def dpo_train(
                         for key, val in val_metrics.items():
                             setattr(dpo_save_state, key, val)
 
-                    full_metric_name = master_config.checkpointing["metric_name"]
+                    full_metric_name = master_config.checkpointing.metric_name
                     if full_metric_name is not None:
                         assert full_metric_name.startswith(
                             "train:"

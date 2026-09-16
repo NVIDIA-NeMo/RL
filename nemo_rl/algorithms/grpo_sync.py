@@ -423,7 +423,7 @@ def grpo_train_sync(
     """
     timer = Timer()
     timeout = TimeoutChecker(
-        timeout=master_config.checkpointing["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing.checkpoint_must_save_by,
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -560,7 +560,7 @@ def grpo_train_sync(
             "As a result, grpo.max_num_epochs will be ignored, and only grpo.max_num_steps will be used."
         )
 
-    ft_save_period = master_config.checkpointing.get("ft_save_period")
+    ft_save_period = master_config.checkpointing.ft_save_period
 
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
@@ -1157,8 +1157,7 @@ def grpo_train_sync(
                     is_last_step
                     # Early stop saves the final state like a last step.
                     or early_stop_message is not None
-                    or (total_steps + 1) % master_config.checkpointing["save_period"]
-                    == 0
+                    or (total_steps + 1) % master_config.checkpointing.save_period == 0
                     or (
                         ft_save_period is not None
                         and (total_steps + 1) % ft_save_period == 0
@@ -1167,7 +1166,7 @@ def grpo_train_sync(
                 should_save_by_timeout = timeout.check_save()
 
                 memory_tracker.snapshot_start_of_stage("Checkpointing", dir())
-                if master_config.checkpointing["enabled"] and (
+                if master_config.checkpointing.enabled and (
                     should_save_by_step or should_save_by_timeout
                 ):
                     policy.prepare_for_training()
@@ -1182,7 +1181,7 @@ def grpo_train_sync(
                         delattr(grpo_save_state, "val_reward")
                     grpo_save_state.consumed_samples = consumed_samples
 
-                    full_metric_name = master_config.checkpointing["metric_name"]
+                    full_metric_name = master_config.checkpointing.metric_name
                     if full_metric_name is not None:
                         assert full_metric_name.startswith(
                             "train:"

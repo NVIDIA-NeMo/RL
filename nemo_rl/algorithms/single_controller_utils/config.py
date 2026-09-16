@@ -1235,8 +1235,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     policy_megatron_cfg = master_config.policy.get("megatron_cfg", {})  # type: ignore
     if (
         getattr(algo_cfg, "policy_training_start_step", 0) > 0
-        and master_config.checkpointing["enabled"]
-        and master_config.checkpointing["save_optimizer"]
+        and master_config.checkpointing.enabled
+        and master_config.checkpointing.save_optimizer
         and policy_megatron_cfg.get("enabled")
         and policy_megatron_cfg.get("checkpoint", {}).get(
             "ckpt_assume_constant_structure"
@@ -1333,9 +1333,9 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     # Top-k retention keys off checkpointing.metric_name, but SC has no
     # validation loop yet (see _save_checkpoint), so a "val:" metric would
     # never be collected and top-k would silently degrade to a no-op.
-    metric_name = master_config.checkpointing["metric_name"]
+    metric_name = master_config.checkpointing.metric_name
     if (
-        master_config.checkpointing["enabled"]
+        master_config.checkpointing.enabled
         and metric_name is not None
         and not metric_name.startswith("train:")
     ):

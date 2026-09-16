@@ -27,6 +27,7 @@ from nemo_rl.algorithms.sft_v2 import (
 )
 from nemo_rl.data.energon.sft_types import StepEnvelope
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 _ACTOR_CLS = SFTSingleControllerActor.__ray_metadata__.modified_class
 
@@ -99,7 +100,9 @@ def _valid_setup_config(
         sft=SimpleNamespace(**sft),
         data=data,
         policy=policy,
-        checkpointing={"metric_name": metric_name},
+        checkpointing=CheckpointingConfig.model_construct(
+            **{"metric_name": metric_name}
+        ),
     )
 
 

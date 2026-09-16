@@ -231,9 +231,11 @@ def setup(
     cluster_config = master_config.cluster
     checkpointing_config = master_config.checkpointing
 
-    checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
+    checkpointing_pretrained = checkpointing_config.pretrained_checkpoint
     if checkpointing_pretrained is not None:
-        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
+        # PolicyConfig is still TypedDict-shaped; hand off a plain dict so the
+        # Megatron setup path keeps its key-style access.
+        policy_config["pretrained_checkpoint"] = checkpointing_pretrained.model_dump()
 
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for distillation"
@@ -661,7 +663,7 @@ def _distillation_train_impl(
     _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
-        timeout=master_config.checkpointing["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing.checkpoint_must_save_by,
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -724,7 +726,7 @@ def _distillation_train_impl(
     # Run distillation training (multi-epoch until reaching max_num_steps or max_num_epochs)
     batch: BatchedDataDict[DatumSpec]
 
-    ft_save_period = master_config.checkpointing.get("ft_save_period")
+    ft_save_period = master_config.checkpointing.ft_save_period
 
     while total_steps < max_steps and current_epoch < max_epochs:
         print(
@@ -995,8 +997,7 @@ def _distillation_train_impl(
 
                 should_save_by_step = (
                     is_last_step
-                    or (total_steps + 1) % master_config.checkpointing["save_period"]
-                    == 0
+                    or (total_steps + 1) % master_config.checkpointing.save_period == 0
                     or (
                         ft_save_period is not None
                         and (total_steps + 1) % ft_save_period == 0
@@ -1006,7 +1007,7 @@ def _distillation_train_impl(
                 # Check if timeout-based checkpointing is enabled in config.
                 should_save_by_timeout = timeout.check_save()
 
-                if master_config.checkpointing["enabled"] and (
+                if master_config.checkpointing.enabled and (
                     should_save_by_step or should_save_by_timeout
                 ):
                     student_policy.prepare_for_training()
@@ -1021,7 +1022,7 @@ def _distillation_train_impl(
                         delattr(distillation_save_state, "val_reward")
                     distillation_save_state.consumed_samples = consumed_samples
 
-                    full_metric_name = master_config.checkpointing["metric_name"]
+                    full_metric_name = master_config.checkpointing.metric_name
                     if full_metric_name is not None:
                         assert full_metric_name.startswith(
                             "train:"

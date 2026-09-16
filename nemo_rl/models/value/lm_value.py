@@ -448,7 +448,13 @@ class Value(ValueInterface):
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
                 tokenizer_path=tokenizer_path,
-                checkpointing_cfg=checkpointing_cfg,
+                # Workers consume this dict-style (automodel checkpoint layer);
+                # dump until the worker-side config migration lands.
+                checkpointing_cfg=(
+                    checkpointing_cfg.model_dump()
+                    if checkpointing_cfg is not None
+                    else None
+                ),
             )
         ray.get(futures)
 

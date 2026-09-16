@@ -22,6 +22,7 @@ from examples import run_grpo_single_controller
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 
 @pytest.fixture
@@ -37,7 +38,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         env={},
         data_plane={"enabled": True, "impl": "transfer_queue", "backend": "simple"},
         logger={"log_dir": "/tmp/logs"},
-        checkpointing={"enabled": False},
+        checkpointing=CheckpointingConfig.model_construct(**{"enabled": False}),
         async_rl=SimpleNamespace(
             stall_watchdog=SimpleNamespace(interval_s=30.0, stall_timeout_s=600.0),
             # model_construct skips validation, so nothing fills the real

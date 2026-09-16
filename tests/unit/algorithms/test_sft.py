@@ -28,6 +28,7 @@ from nemo_rl.algorithms.sft import (
     sft_train,
 )
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 
 def test_get_sft_save_state_handles_legacy_checkpoint_and_filters_metrics():
@@ -141,11 +142,13 @@ def mock_components():
             "train_global_batch_size": 1,
             "make_sequence_length_divisible_by": 8,
         },
-        checkpointing={
-            "enabled": False,
-            "checkpoint_must_save_by": None,
-            "save_period": 10,
-        },
+        checkpointing=CheckpointingConfig.model_construct(
+            **{
+                "enabled": False,
+                "checkpoint_must_save_by": None,
+                "save_period": 10,
+            }
+        ),
         cluster={
             "num_nodes": 1,
             "gpus_per_node": 2,
@@ -324,10 +327,10 @@ def test_ft_save_period_triggers_periodic_saves(mock_components):
     cfg.sft.val_period = 0
     cfg.sft.max_num_steps = 5
     cfg.sft.max_num_epochs = 1
-    cfg.checkpointing["enabled"] = True
-    cfg.checkpointing["save_period"] = 100  # only the final step would save
-    cfg.checkpointing["ft_save_period"] = 2
-    cfg.checkpointing["metric_name"] = None
+    cfg.checkpointing.enabled = True
+    cfg.checkpointing.save_period = 100  # only the final step would save
+    cfg.checkpointing.ft_save_period = 2
+    cfg.checkpointing.metric_name = None
 
     checkpointer = mock_components["checkpointer"]
     checkpointer.init_tmp_checkpoint.return_value = "/tmp/ft_ckpt_test/tmp_step"

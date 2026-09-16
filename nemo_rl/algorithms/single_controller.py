@@ -425,7 +425,7 @@ class SingleControllerActor:
         # (save_state, last_checkpoint_path).
         self._checkpointer = CheckpointManager(master_config.checkpointing)
         self._timeout = TimeoutChecker(
-            timeout=master_config.checkpointing["checkpoint_must_save_by"],
+            timeout=master_config.checkpointing.checkpoint_must_save_by,
             fit_last_save_time=True,
         )
         self._timeout.start_iterations()
@@ -466,9 +466,9 @@ class SingleControllerActor:
         else:
             self._sampler.restore_dispatch_index(restored_dispatch_index)
         if (
-            self._master_config.checkpointing["enabled"]
+            self._master_config.checkpointing.enabled
             and self._sampler.supports_buffer_checkpoint
-            and not self._master_config.checkpointing.get("save_data_plane")
+            and not self._master_config.checkpointing.save_data_plane
         ):
             raise ValueError(
                 "SingleController checkpointing with a replay-checkpoint-capable "
@@ -485,8 +485,8 @@ class SingleControllerActor:
         self._rollout_recovery_enabled = bool(
             restoring_rollout_recovery
             or (
-                self._master_config.checkpointing["enabled"]
-                and self._master_config.checkpointing.get("save_data_plane")
+                self._master_config.checkpointing.enabled
+                and self._master_config.checkpointing.save_data_plane
                 and self._sampler.supports_buffer_checkpoint
             )
         )
@@ -2943,13 +2943,12 @@ class SingleControllerActor:
                 is_last_step = self._train_steps >= self._algo_cfg.max_num_steps or (
                     self._rollout_exhausted.is_set() and len(self._buffer) == 0
                 )
-                ft_save_period = self._master_config.checkpointing.get("ft_save_period")
+                ft_save_period = self._master_config.checkpointing.ft_save_period
                 # _train_steps was already incremented above, so it equals
                 # the legacy loop's 1-indexed `step + 1`.
                 should_save_by_step = (
                     is_last_step
-                    or self._train_steps
-                    % self._master_config.checkpointing["save_period"]
+                    or self._train_steps % self._master_config.checkpointing.save_period
                     == 0
                     or (
                         ft_save_period is not None
@@ -2958,9 +2957,9 @@ class SingleControllerActor:
                 )
                 # Call once per step and reuse the bool.
                 should_save_by_timeout = self._timeout.check_save()
-                will_save_checkpoint = self._master_config.checkpointing[
-                    "enabled"
-                ] and (should_save_by_step or should_save_by_timeout)
+                will_save_checkpoint = self._master_config.checkpointing.enabled and (
+                    should_save_by_step or should_save_by_timeout
+                )
                 # A colocated Megatron wake is itself the refit (prepare_for_generation reshards or
                 # shares the trainer's tensors), so a save-bound step skips _sync_weights and
                 # splits it: offload before the save, wake after it.
@@ -4360,7 +4359,7 @@ class SingleControllerActor:
 
         # validate_single_controller_config already rejected anything but a
         # "train:" prefix, so step_metrics is the only source to consult.
-        full_metric_name = self._master_config.checkpointing["metric_name"]
+        full_metric_name = self._master_config.checkpointing.metric_name
         if full_metric_name is not None:
             metric_name = full_metric_name.split(":", 1)[1]
             if not is_policy_training_step:
@@ -4413,7 +4412,7 @@ class SingleControllerActor:
                 self._master_config,
             )
 
-            if self._master_config.checkpointing.get("save_data_plane"):
+            if self._master_config.checkpointing.save_data_plane:
                 training_owned_groups = self._buffer.training_owned_replay_groups()
                 if training_owned_groups:
                     raise RuntimeError(
