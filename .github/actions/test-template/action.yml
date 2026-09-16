@@ -243,6 +243,16 @@ runs:
           exit 1
         fi
 
+    - name: Upload MCore reproduction diagnostics
+      uses: actions/upload-artifact@v6
+      if: ${{ always() && inputs.script == 'L1_Functional_Tests_Megatron_4' }}
+      with:
+        name: mcore-repro-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.uuid.outputs.id }}
+        path: |
+          ${{ github.workspace }}/${{ github.run_id }}/${{ steps.uuid.outputs.id }}/nemo-rl/tests/functional/grpo_megatron_generation_colocated/
+        if-no-files-found: warn
+        retention-days: 7
+
     - name: Upload artifacts
       uses: actions/upload-artifact@v6
       if: ${{ steps.check.outputs.coverage_report != 'none' }}
