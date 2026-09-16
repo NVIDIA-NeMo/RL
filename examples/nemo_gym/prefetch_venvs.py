@@ -35,10 +35,10 @@ from nemo_rl.environments.nemo_gym import (
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
 )
-from nemo_rl.utils.config import load_config
+from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
-OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
+register_omegaconf_resolvers()  # add/mul/div/max, same set the training entrypoints register
 
 
 def prefetch_nemo_gym_venvs(config_paths: list[str]) -> None:
