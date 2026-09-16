@@ -177,7 +177,7 @@ def test_gae_fractional_sample_weights_preserve_recurrence(
 
 
 @pytest.mark.parametrize("configured_lambda,override", [(1.0, None), (0.95, 1.0)])
-def test_gae_fast_path_logs_activation_once(
+def test_gae_fast_path_logs_activation_every_call(
     capsys: pytest.CaptureFixture[str],
     configured_lambda: float,
     override: float | None,
@@ -196,7 +196,9 @@ def test_gae_fast_path_logs_activation_once(
     )
 
     estimator._compute_gae(rewards, values, mask, gae_lambda=override)
-    assert capsys.readouterr().out == ""
+    assert capsys.readouterr().out == (
+        "Fast GAE compute activated for lambda=1.0, gamma=1.0\n"
+    )
 
 
 @pytest.mark.parametrize("fallback", ["gamma", "lambda", "tensor_lambda", "fractional"])
@@ -223,7 +225,7 @@ def test_gae_fallback_does_not_log_fast_path_activation(
     estimator._compute_gae(rewards, values, mask, gae_lambda=override)
     assert capsys.readouterr().out == ""
 
-    # A fallback call must not suppress the first subsequent fast-path message.
+    # A subsequent fast-path call still logs after a silent fallback call.
     estimator.gae_gamma = 1.0
     estimator._compute_gae(rewards, values, torch.ones_like(mask), gae_lambda=1.0)
     assert capsys.readouterr().out == (
