@@ -33,9 +33,16 @@ from typing import Any, Sequence
 
 import numpy as np
 import torch
+from tensordict import TensorDict
 
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data.multimodal_utils import PER_TOKEN_MULTIMODAL_FIELDS
+from nemo_rl.data.packed_rollouts import (
+    TREE_ATTENTION_LAYOUTS,
+    TREE_EDGE_ALIGNED_FIELDS,
+    TREE_EDGE_SHIFTED_FIELDS,
+    TREE_EDGE_UNSHIFTED_FIELDS,
+)
 from nemo_rl.data_plane.codec import materialize, pack_jagged_fields
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.data_plane.schema import (
@@ -74,6 +81,25 @@ _TEXT_TOKEN_ALIGNED_FIELDS = frozenset(
 # same way. Unioned from the registry rather than re-listed, so a new
 # per-token modality cannot be added there and silently forgotten here.
 TOKEN_ALIGNED_FIELDS = _TEXT_TOKEN_ALIGNED_FIELDS | PER_TOKEN_MULTIMODAL_FIELDS
+
+
+def _tree_lengths_by_field(extra_info: dict[str, Any]) -> dict[str, torch.Tensor]:
+    layouts = extra_info.get(TREE_ATTENTION_LAYOUTS)
+    if layouts is None:
+        return {}
+    edge_lengths = torch.tensor(
+        [len(layout.edge_source_indices) for layout in layouts], dtype=torch.long
+    )
+    return {
+        **{field: edge_lengths + 1 for field in TREE_EDGE_SHIFTED_FIELDS},
+        **{field: edge_lengths for field in TREE_EDGE_UNSHIFTED_FIELDS},
+    }
+
+
+def _token_aligned_fields_for_meta(meta: KVBatchMeta) -> frozenset[str]:
+    if TREE_ATTENTION_LAYOUTS in (meta.extra_info or {}):
+        return TOKEN_ALIGNED_FIELDS - TREE_EDGE_ALIGNED_FIELDS
+    return TOKEN_ALIGNED_FIELDS
 
 
 def round_up(value: int, multiple: int) -> int:
@@ -121,6 +147,11 @@ def read_columns(
         pad_value_dict=pad_value_dict,
         pad_to_seqlen=pad_to_seqlen,
         tags=meta.tags,
+        exclude_pad_to_seqlen_fields=(
+            TREE_EDGE_ALIGNED_FIELDS
+            if TREE_ATTENTION_LAYOUTS in (meta.extra_info or {})
+            else ()
+        ),
     )
     attach_message_log_view(data)
     return data
@@ -146,17 +177,42 @@ def write_columns(
     if not fields:
         return
 
-    seq_lens = meta.sequence_lengths
-    lengths = torch.tensor(seq_lens, dtype=torch.long) if seq_lens is not None else None
-    td = pack_jagged_fields(
-        fields,
-        lengths=lengths,
-        token_aligned_fields=TOKEN_ALIGNED_FIELDS,
-    )
+    td = pack_columns_for_meta(meta, fields)
     dp_client.put_samples(
         sample_ids=meta.sample_ids,
         partition_id=meta.partition_id,
         fields=td,
+    )
+
+
+def pack_columns_for_meta(
+    meta: KVBatchMeta,
+    fields: "dict[str, torch.Tensor | np.ndarray]",
+) -> TensorDict:
+    """Pack DataPlane columns using the row lengths described by ``meta``.
+
+    Tree-attention batches have separate physical-node and sampled-edge axes.
+    This helper keeps all write sites on the same per-field length contract.
+
+    Args:
+        meta: Batch metadata describing physical rows and any tree layouts.
+        fields: Columns to pack.
+
+    Returns:
+        Columns packed for ``DataPlaneClient.put_samples``.
+    """
+    seq_lens = meta.sequence_lengths
+    lengths = torch.tensor(seq_lens, dtype=torch.long) if seq_lens is not None else None
+    batch_lengths = (
+        lengths if lengths is not None else torch.zeros(meta.size, dtype=torch.long)
+    )
+    return pack_jagged_fields(
+        fields,
+        lengths=batch_lengths,
+        token_aligned_fields=(
+            _token_aligned_fields_for_meta(meta) if lengths is not None else frozenset()
+        ),
+        lengths_by_field=_tree_lengths_by_field(meta.extra_info or {}),
     )
 
 
@@ -170,6 +226,7 @@ def kv_first_write(
     task_name: str = "train",
     pad_to_multiple: int = 1,
     tags: list[dict[str, Any]] | None = None,
+    token_aligned_fields: frozenset[str] = TOKEN_ALIGNED_FIELDS,
 ) -> KVBatchMeta:
     """Single flat ``put_samples`` of every tensor field in ``final_batch_cpu``.
 
@@ -210,6 +267,7 @@ def kv_first_write(
             f"kv_first_write: tags ({len(tags)}) must match batch size ({n})"
         )
     lengths = final_batch_cpu["input_lengths"]
+    extras = dict(extra_info or {})
     # Binary wire dispatch: only ``torch.Tensor`` (including
     # ``torch.nested``) and ``np.ndarray[object]`` cross the codec.
     # Raise loudly on anything else instead of silently dropping —
@@ -233,7 +291,8 @@ def kv_first_write(
     td = pack_jagged_fields(
         fields,
         lengths=lengths,
-        token_aligned_fields=TOKEN_ALIGNED_FIELDS,
+        token_aligned_fields=token_aligned_fields,
+        lengths_by_field=_tree_lengths_by_field(extras),
     )
     dp_client.put_samples(
         sample_ids=list(sample_ids),
@@ -242,7 +301,6 @@ def kv_first_write(
         tags=tags,
     )
 
-    extras = dict(extra_info or {})
     if pad_to_multiple > 1:
         extras["pad_to_multiple"] = int(pad_to_multiple)
     return KVBatchMeta(
