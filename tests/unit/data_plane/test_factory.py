@@ -126,11 +126,9 @@ def _is_wrapped(client) -> bool:
     return isinstance(client, MetricsDataPlaneClient)
 
 
-def _logs_events(client) -> bool:
-    """Whether the wrapper's event sink is the logger rather than a no-op."""
-    from nemo_rl.data_plane.observability import log_event
-
-    return client._on_event is log_event
+def _has_event_sink(client) -> bool:
+    """Whether the wrapper got a per-op sink at all, rather than spans only."""
+    return client._on_event is not None
 
 
 def test_telemetry_alone_installs_the_metrics_wrapper(monkeypatch, stub_tq_adapter):
@@ -147,15 +145,21 @@ def test_telemetry_alone_installs_the_metrics_wrapper(monkeypatch, stub_tq_adapt
         {"enabled": True, "impl": "transfer_queue"}, bootstrap=False
     )
     assert _is_wrapped(client)
-    # Event logging stays off: only spans were asked for, and attaching the
-    # log sink would add a per-op log line nobody enabled.
-    assert not _logs_events(client)
+    # Event logging stays off: only spans were asked for, and attaching a sink
+    # would add a per-op callback nobody enabled.
+    assert not _has_event_sink(client)
     client.close()
 
 
-def test_observability_alone_still_installs_the_event_callback(
+def test_observability_alone_installs_the_wrapper_without_a_default_sink(
     monkeypatch, stub_tq_adapter
 ):
+    """Observability alone gets the wrapper, but no per-op sink by default.
+
+    The metrics surface is ``get_step_metrics``, which the trainer logs once a
+    step; a sink here fires on every single transfer, so ``log_event`` is opt-in
+    via ``observability.callback``.
+    """
     import nemo_rl.data_plane.factory as factory_mod
 
     monkeypatch.setattr(factory_mod, "telemetry_enabled_in_env", lambda: False)
@@ -169,7 +173,66 @@ def test_observability_alone_still_installs_the_event_callback(
         bootstrap=False,
     )
     assert _is_wrapped(client)
-    assert _logs_events(client)
+    assert not _has_event_sink(client)
+    client.close()
+
+
+def test_observability_callback_is_the_opt_in_path_to_per_op_events(
+    monkeypatch, stub_tq_adapter
+):
+    """An explicitly configured callback is wired straight through."""
+    import nemo_rl.data_plane.factory as factory_mod
+
+    monkeypatch.setattr(factory_mod, "telemetry_enabled_in_env", lambda: False)
+
+    def sink(event):
+        pass
+
+    client = build_data_plane_client(
+        {
+            "enabled": True,
+            "impl": "transfer_queue",
+            "observability": {"enabled": True, "callback": sink},
+        },
+        bootstrap=False,
+    )
+    assert _is_wrapped(client)
+    assert client._on_event is sink
+    client.close()
+
+
+def test_disabled_observability_block_is_not_armed_by_telemetry(
+    monkeypatch, stub_tq_adapter
+):
+    """A telemetry-only run must not honour a disabled observability block.
+
+    Telemetry installs the wrapper for its spans, which puts the ``callback``
+    and ``verify_tensor_hash`` fields of an ``enabled: false`` block back in
+    reach. Acting on them would start a per-op sink and re-read every tensor
+    element on both put and get for a feature the user switched off.
+    """
+    import nemo_rl.data_plane.factory as factory_mod
+
+    monkeypatch.setattr(factory_mod, "telemetry_enabled_in_env", lambda: True)
+
+    def sink(event):
+        pass
+
+    client = build_data_plane_client(
+        {
+            "enabled": True,
+            "impl": "transfer_queue",
+            "observability": {
+                "enabled": False,
+                "callback": sink,
+                "verify_tensor_hash": True,
+            },
+        },
+        bootstrap=False,
+    )
+    assert _is_wrapped(client)
+    assert not _has_event_sink(client)
+    assert not client._verify_tensor_hash
     client.close()
 
 

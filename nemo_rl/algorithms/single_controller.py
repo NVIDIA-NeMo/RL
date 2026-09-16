@@ -182,7 +182,6 @@ from nemo_rl.telemetry.instrumentation import (
     umbrella_span,
 )
 from nemo_rl.telemetry.setup import (
-    get_telemetry_handle,
     init_telemetry_worker,
     shutdown_telemetry,
 )
@@ -348,12 +347,11 @@ class SingleControllerActor:
         # NRL_WORKER_GROUP for it. Without the name it reports rank 0 of 1 with
         # no rl.worker_group, which is exactly what the launcher driver reports
         # -- leaving every rl.sc.* span indistinguishable from the driver's.
-        init_telemetry_worker(
+        _telemetry = init_telemetry_worker(
             rank=0,
             world_size=1,
             resource_attributes={"rl.worker_group": "single_controller"},
         )
-        _telemetry = get_telemetry_handle()
         self._tracer = _telemetry.tracer if _telemetry is not None else None
 
         self._advantage_cfg = AdvantageConfig()
