@@ -172,34 +172,17 @@ class TokenAligner:
             their training device via
             :func:`nemo_rl.algorithms.x_token.loss_utils.get_sparse_projection_matrix`
             or :func:`nemo_rl.algorithms.x_token.loss_utils.get_topk_projection`.
-        alignment_method: Alignment strategy the chat path uses.
-            ``"offset_cluster_decode_fix"`` (default) pairs tokens by char
-            offsets; ``"same_tokenizer_identity"`` asserts a 1-1 identity
-            pairing (student and teacher share a tokenizer). The raw-text
-            :meth:`align` path always uses offset-cluster.
     """
-
-    _SUPPORTED_ALIGNMENT_METHODS = (
-        "offset_cluster_decode_fix",
-        "same_tokenizer_identity",
-    )
 
     def __init__(
         self,
         student_tokenizer,
         teacher_tokenizer,
         projection_matrix_path: str,
-        alignment_method: str = "offset_cluster_decode_fix",
     ):
-        if alignment_method not in self._SUPPORTED_ALIGNMENT_METHODS:
-            raise ValueError(
-                f"alignment_method must be one of "
-                f"{self._SUPPORTED_ALIGNMENT_METHODS!r}, got {alignment_method!r}"
-            )
         self.student_tokenizer = student_tokenizer
         self.teacher_tokenizer = teacher_tokenizer
         self.projection_matrix_path = projection_matrix_path
-        self.alignment_method = alignment_method
 
     def align(
         self,
@@ -421,7 +404,7 @@ class TokenAligner:
     # These return raw 7-tuples (s_tokens, t_tokens, s_start, s_end, t_start,
     # t_end, is_correct); the chat collator converts them to AlignmentPair.
     # ------------------------------------------------------------------ #
-    def align_one_offset(
+    def _align_one_offset(
         self,
         student_ids: List[int],
         teacher_ids: List[int],
@@ -430,10 +413,11 @@ class TokenAligner:
     ) -> List[Tuple[Any, ...]]:
         """Single-sample offset-cluster alignment with the decode-fix mask.
 
-        Returns the raw 7-tuple pair list. Used by the chat collator for
-        per-document alignment inside a packed row. ``is_correct`` starts from
-        the canonical-text match; pairs that fail are re-checked against their
-        NFC-decoded text (catches CJK / whitespace-split asymmetry).
+        Returns the raw 7-tuple pair list. Used by
+        :meth:`align_one_offset_per_asst` for each independently rebased
+        assistant region. ``is_correct`` starts from the canonical-text match;
+        pairs that fail are re-checked against their NFC-decoded text (catches
+        CJK / whitespace-split asymmetry).
         """
         pairs = align_by_offsets_cluster(
             student_ids,
@@ -474,7 +458,7 @@ class TokenAligner:
         drop_first_content_pair: bool = False,
         included_regions: Collection[str] | None = None,
     ) -> List[Tuple[Any, ...]]:
-        """Per-assistant-message offset (or strict-identity) alignment.
+        """Per-assistant-message offset-cluster alignment.
 
         Used by the chat collator where each side has its own rendered text,
         so full-sequence offsets are in different coordinate systems. For each
@@ -485,7 +469,7 @@ class TokenAligner:
            native-thinking mode supplies reasoning, close, and answer regions.
         2. Rebase each paired region independently so both token slices share
            the same coordinate system.
-        3. Run :func:`align_by_offsets_cluster` on the slices.
+        3. Run :meth:`_align_one_offset` on the slices.
         4. Translate slice-local positions back to full-sequence positions.
 
         Scaffold and user-content tokens are not aligned; the caller's
@@ -587,14 +571,6 @@ class TokenAligner:
                     and ce > cs
                     and (teacher_asst_mask is None or teacher_asst_mask[j] == 1)
                 ]
-                if self.alignment_method == "same_tokenizer_identity" and (
-                    bool(s_idx) != bool(t_idx)
-                ):
-                    raise ValueError(
-                        "same_tokenizer_identity supervised-region presence "
-                        f"mismatch at assistant turn {turn_i}: "
-                        f"student_tokens={len(s_idx)}, teacher_tokens={len(t_idx)}"
-                    )
                 if not s_idx or not t_idx:
                     continue
 
@@ -615,71 +591,12 @@ class TokenAligner:
                     for j in t_idx
                 ]
 
-                if self.alignment_method == "same_tokenizer_identity":
-                    if len(s_slice_ids) != len(t_slice_ids):
-                        raise ValueError(
-                            "same_tokenizer_identity supervised token-count "
-                            f"mismatch at assistant turn {turn_i}: "
-                            f"student={len(s_slice_ids)}, teacher={len(t_slice_ids)}"
-                        )
-                    slice_pairs = []
-                    for position, (
-                        student_id,
-                        teacher_id,
-                        student_offset,
-                        teacher_offset,
-                    ) in enumerate(
-                        zip(s_slice_ids, t_slice_ids, s_slice_off, t_slice_off)
-                    ):
-                        if student_id != teacher_id:
-                            raise ValueError(
-                                "same_tokenizer_identity token mismatch at "
-                                f"assistant turn {turn_i}, region position "
-                                f"{position}: student={student_id}, "
-                                f"teacher={teacher_id}"
-                            )
-                        if student_offset != teacher_offset:
-                            raise ValueError(
-                                "same_tokenizer_identity offset mismatch at "
-                                f"assistant turn {turn_i}, region position "
-                                f"{position}: student={student_offset}, "
-                                f"teacher={teacher_offset}"
-                            )
-                        slice_pairs.append(
-                            (
-                                [student_id],
-                                [teacher_id],
-                                position,
-                                position + 1,
-                                position,
-                                position + 1,
-                                True,
-                            )
-                        )
-                else:
-                    slice_pairs = align_by_offsets_cluster(
-                        s_slice_ids,
-                        s_slice_off,
-                        self.student_tokenizer,
-                        t_slice_ids,
-                        t_slice_off,
-                        self.teacher_tokenizer,
-                    )
-                if slice_pairs and self.alignment_method != "same_tokenizer_identity":
-                    pairs_6 = [
-                        (p[0], p[1], p[2], p[3], p[4], p[5]) for p in slice_pairs
-                    ]
-                    correct_mask = _decode_fix_correct_mask(
-                        pairs_6,
-                        student_ids_seq=s_slice_ids,
-                        teacher_ids_seq=t_slice_ids,
-                        student_tokenizer=self.student_tokenizer,
-                        teacher_tokenizer=self.teacher_tokenizer,
-                    )
-                    slice_pairs = [
-                        (p[0], p[1], p[2], p[3], p[4], p[5], is_correct)
-                        for p, is_correct in zip(pairs_6, correct_mask)
-                    ]
+                slice_pairs = self._align_one_offset(
+                    student_ids=s_slice_ids,
+                    teacher_ids=t_slice_ids,
+                    student_offsets=s_slice_off,
+                    teacher_offsets=t_slice_off,
+                )
 
                 for s_toks, t_toks, s0, s1, t0, t1, ok in slice_pairs:
                     full_s0 = s_idx[s0] if s0 != -1 else -1
@@ -725,26 +642,8 @@ class TokenAligner:
                     ),
                     None,
                 )
-            if self.alignment_method == "same_tokenizer_identity" and (
-                (s_eot_idx is None) != (t_eot_idx is None)
-            ):
-                raise ValueError(
-                    "same_tokenizer_identity EOT presence mismatch at "
-                    f"assistant turn {turn_i}: student={s_eot_idx}, "
-                    f"teacher={t_eot_idx}"
-                )
             include_eot = included_region_set is None or "eot" in included_region_set
             if include_eot and s_eot_idx is not None and t_eot_idx is not None:
-                if (
-                    self.alignment_method == "same_tokenizer_identity"
-                    and student_ids[s_eot_idx] != teacher_ids[t_eot_idx]
-                ):
-                    raise ValueError(
-                        "same_tokenizer_identity EOT token mismatch at "
-                        f"assistant turn {turn_i}: "
-                        f"student={student_ids[s_eot_idx]}, "
-                        f"teacher={teacher_ids[t_eot_idx]}"
-                    )
                 combined.append(
                     (
                         [student_ids[s_eot_idx]],
