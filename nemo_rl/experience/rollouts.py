@@ -81,6 +81,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     print_multimodal_payload_metrics,
 )
 from nemo_rl.utils.timer import Timer
+from nemo_rl.utils.trace import Tracer
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -1209,6 +1210,9 @@ async def async_generate_response_for_sample_turn(
     *,
     sample_multimodal_data: dict[str, Any] | None = None,
     deduplicate_multimodal_data: bool = False,
+    tracer: Optional[Tracer] = None,
+    trace_sample_id: Optional[str] = None,
+    turn: int = 0,
 ) -> tuple[list[dict], torch.Tensor, torch.Tensor, dict[str, float]]:
     """Generate a response for a single sample's turn using async generation.
 
@@ -1222,6 +1226,9 @@ async def async_generate_response_for_sample_turn(
         sample_multimodal_data: vLLM-ready media fields for this sample.
         deduplicate_multimodal_data: Avoid sending both vLLM-ready and policy-ready
             media through the async generation boundary.
+        tracer: Optional Perfetto tracer for per-sample rollout spans.
+        trace_sample_id: Unique trace identity for the parent sample.
+        turn: Zero-based rollout turn index.
 
     Returns:
         Tuple of (updated_message_log, generated_tokens, input_lengths, generation_metrics)
@@ -1264,15 +1271,28 @@ async def async_generate_response_for_sample_turn(
     )
 
     # Generate response using the async version
-    updated_batch, generated_ids, gen_metrics = await generate_responses_async(
-        policy_generation,
-        generation_input_data,
-        dummy_batch,
-        tokenizer,
-        input_lengths=input_lengths,
-        include_logprobs=True,
-        greedy=greedy,
-    )
+    generation_span_id = f"{trace_sample_id}:turn:{turn}:generation"
+    if tracer is not None and trace_sample_id is not None:
+        tracer.start_async_span(
+            "generate_responses_async",
+            generation_span_id,
+            track_name=trace_sample_id,
+            category="rollout",
+            args={"turn": turn, "input_tokens": int(input_lengths)},
+        )
+    try:
+        updated_batch, generated_ids, gen_metrics = await generate_responses_async(
+            policy_generation,
+            generation_input_data,
+            dummy_batch,
+            tokenizer,
+            input_lengths=input_lengths,
+            include_logprobs=True,
+            greedy=greedy,
+        )
+    finally:
+        if tracer is not None and trace_sample_id is not None:
+            tracer.end_async_span(generation_span_id)
 
     # Extract results for the single sample
     updated_message_log = updated_batch["message_log"][0]
@@ -1291,6 +1311,8 @@ async def run_sample_multi_turn_rollout(
     max_rollout_turns: int = 999999,
     greedy: bool = False,
     deduplicate_multimodal_data: bool = False,
+    tracer: Optional[Tracer] = None,
+    trace_prefix: str = "rollout",
 ) -> tuple[dict, dict[str, Any]]:
     """Run a multi-turn rollout for a single sample.
 
@@ -1308,6 +1330,8 @@ async def run_sample_multi_turn_rollout(
         greedy: Whether to use greedy decoding
         deduplicate_multimodal_data: Avoid redundant media at generation
             boundaries while preserving compact policy media in the trajectory.
+        tracer: Optional Perfetto tracer for per-sample rollout spans.
+        trace_prefix: Unique prefix identifying this rollout batch in the trace.
 
     Returns:
         Tuple of (final_sample_state, sample_metrics)
@@ -1317,6 +1341,22 @@ async def run_sample_multi_turn_rollout(
     current_extra_env_info = copy.deepcopy(initial_sample_state["extra_env_info"])
     current_stop_strings = initial_sample_state.get("stop_strings", None)
     task_name = initial_sample_state["task_name"]
+    trace_sample_id = f"{trace_prefix} / sample {sample_idx}"
+    if tracer is not None:
+        initial_input_tokens = sum(
+            len(message.get("token_ids", [])) for message in current_message_log
+        )
+        tracer.start_async_span(
+            "sample_rollout",
+            f"{trace_sample_id}:rollout",
+            track_name=trace_sample_id,
+            category="sample",
+            args={
+                "sample_idx": sample_idx,
+                "task_name": task_name,
+                "initial_input_tokens": initial_input_tokens,
+            },
+        )
     sample_multimodal_data = {
         key: initial_sample_state[key]
         for key in VLLM_PROMPT_KEYS
@@ -1347,6 +1387,15 @@ async def run_sample_multi_turn_rollout(
             break
 
         turn_count += 1
+        turn_span_id = f"{trace_sample_id}:turn:{turn}"
+        if tracer is not None:
+            tracer.start_async_span(
+                "rollout_turn",
+                turn_span_id,
+                track_name=trace_sample_id,
+                category="turn",
+                args={"turn": turn},
+            )
 
         # Generate response for this sample using async generation
         try:
@@ -1355,21 +1404,37 @@ async def run_sample_multi_turn_rollout(
                 turn_multimodal_data = dict(sample_multimodal_data)
                 turn_multimodal_data["vllm_content"] = None
 
+            if tracer is None:
+                generation_result = await async_generate_response_for_sample_turn(
+                    policy_generation,
+                    current_message_log,
+                    current_stop_strings,
+                    tokenizer,
+                    max_seq_len,
+                    greedy=greedy,
+                    sample_multimodal_data=turn_multimodal_data,
+                    deduplicate_multimodal_data=deduplicate_multimodal_data,
+                )
+            else:
+                generation_result = await async_generate_response_for_sample_turn(
+                    policy_generation,
+                    current_message_log,
+                    current_stop_strings,
+                    tokenizer,
+                    max_seq_len,
+                    greedy=greedy,
+                    sample_multimodal_data=turn_multimodal_data,
+                    deduplicate_multimodal_data=deduplicate_multimodal_data,
+                    tracer=tracer,
+                    trace_sample_id=trace_sample_id,
+                    turn=turn,
+                )
             (
                 updated_message_log,
                 generated_tokens,
                 input_lengths,
                 gen_metrics,
-            ) = await async_generate_response_for_sample_turn(
-                policy_generation,
-                current_message_log,
-                current_stop_strings,
-                tokenizer,
-                max_seq_len,
-                greedy=greedy,
-                sample_multimodal_data=turn_multimodal_data,
-                deduplicate_multimodal_data=deduplicate_multimodal_data,
-            )
+            ) = generation_result
             current_message_log = updated_message_log
 
             # Check if response was truncated (hit max_tokens without stop token)
@@ -1392,6 +1457,11 @@ async def run_sample_multi_turn_rollout(
                 )
 
         except Exception as e:
+            if tracer is not None:
+                tracer.end_async_span(
+                    turn_span_id,
+                    args={"error": f"{type(e).__name__}: {e}"},
+                )
             print(f"Error generating response for sample {sample_idx}: {e}")
             break
 
@@ -1410,9 +1480,22 @@ async def run_sample_multi_turn_rollout(
         # blocks every other in-flight rollout coroutine for the entire env
         # step. In this case, need to wrap with asyncio.to_thread to make
         # this function yieldable.
-        env_output = await asyncio.to_thread(
-            calculate_rewards, sample_batch, task_to_env
-        )
+        reward_span_id = f"{trace_sample_id}:turn:{turn}:reward"
+        if tracer is not None:
+            tracer.start_async_span(
+                "env_calculate_rewards",
+                reward_span_id,
+                track_name=trace_sample_id,
+                category="env",
+                args={"turn": turn},
+            )
+        try:
+            env_output = await asyncio.to_thread(
+                calculate_rewards, sample_batch, task_to_env
+            )
+        finally:
+            if tracer is not None:
+                tracer.end_async_span(reward_span_id)
         # Update total reward and optional per-component reward signals.
         if isinstance(env_output.rewards, dict):
             multi_reward_seen = True
@@ -1426,6 +1509,15 @@ async def run_sample_multi_turn_rollout(
         # Check termination
         terminated = env_output.terminateds[0].item()
         env_obs_content = env_output.observations[0]["content"]
+        tokenize_span_id = f"{trace_sample_id}:turn:{turn}:tokenize"
+        if tracer is not None:
+            tracer.start_async_span(
+                "env_tokenize_and_append",
+                tokenize_span_id,
+                track_name=trace_sample_id,
+                category="env",
+                args={"turn": turn},
+            )
         # Tokenize environment response
         tokenized_obs = tokenizer(
             env_obs_content, return_tensors="pt", add_special_tokens=False
@@ -1452,6 +1544,10 @@ async def run_sample_multi_turn_rollout(
                 tokenized_obs, routed_template
             )
         current_message_log.append(env_message)
+        if tracer is not None:
+            tracer.end_async_span(
+                tokenize_span_id, args={"env_tokens": len(tokenized_obs)}
+            )
 
         # Update token counts
         env_token_count += len(tokenized_obs)
@@ -1463,6 +1559,17 @@ async def run_sample_multi_turn_rollout(
                 current_stop_strings = env_output.next_stop_strings[0]
             if env_output.metadata[0] is not None:
                 current_extra_env_info = env_output.metadata[0]
+
+        if tracer is not None:
+            tracer.end_async_span(
+                turn_span_id,
+                args={
+                    "generated_tokens": gen_token_count,
+                    "env_tokens": len(tokenized_obs),
+                    "terminated": bool(terminated),
+                    "truncated": bool(truncated),
+                },
+            )
 
     # Check if max turns reached
     if turn_count >= max_rollout_turns:
@@ -1501,6 +1608,21 @@ async def run_sample_multi_turn_rollout(
         # Pass-through per-worker per-turn accounting for aggregation at batch level
         "per_worker_token_counts": per_worker_token_counts,
     }
+
+    if tracer is not None:
+        tracer.end_async_span(
+            f"{trace_sample_id}:rollout",
+            args={
+                "num_turns": turn_count,
+                "output_tokens": assistant_token_count,
+                "env_tokens": env_token_count,
+                "total_tokens": initial_input_tokens + token_count,
+                "truncated": bool(truncated),
+                "terminated": bool(terminated),
+                "max_turns_reached": bool(max_turns_reached),
+                "total_reward": total_reward,
+            },
+        )
 
     return final_sample_state, sample_metrics
 
@@ -1606,6 +1728,8 @@ async def _run_multi_turn_rollout_async(
     max_rollout_turns: int = 999999,
     greedy: bool = False,
     deduplicate_multimodal_data: bool = False,
+    tracer: Optional[Tracer] = None,
+    trace_prefix: str = "rollout",
 ) -> tuple[BatchedDataDict[DatumSpec], list[dict[str, Any]]]:
     """Run one native rollout batch and retain metrics at sample granularity."""
     batch_size = len(input_batch["message_log"])
@@ -1636,6 +1760,8 @@ async def _run_multi_turn_rollout_async(
                 max_rollout_turns=max_rollout_turns,
                 greedy=greedy,
                 deduplicate_multimodal_data=deduplicate_multimodal_data,
+                tracer=tracer,
+                trace_prefix=trace_prefix,
             )
         except Exception as error:
             raise RuntimeError(f"Error in sample {i} rollout: {error}") from error
@@ -1703,6 +1829,8 @@ def run_async_multi_turn_rollout(
     max_rollout_turns: int = 999999,
     greedy: bool = False,
     deduplicate_multimodal_data: bool = False,
+    tracer: Optional[Tracer] = None,
+    trace_prefix: str = "rollout",
 ) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
     """Run a complete native rollout batch from a synchronous call site.
 
@@ -1736,6 +1864,8 @@ def run_async_multi_turn_rollout(
             max_rollout_turns=max_rollout_turns,
             greedy=greedy,
             deduplicate_multimodal_data=deduplicate_multimodal_data,
+            tracer=tracer,
+            trace_prefix=trace_prefix,
         )
     )
     return final_batch, _aggregate_multi_turn_rollout_metrics(sample_metrics)
@@ -1751,6 +1881,8 @@ async def run_async_multi_turn_rollout_groups(
     max_rollout_turns: int = 999999,
     greedy: bool = False,
     deduplicate_multimodal_data: bool = False,
+    tracer: Optional[Tracer] = None,
+    trace_prefix: str = "rollout",
 ) -> AsyncGenerator[RolloutGroupResult, None]:
     """Run one native batch, then yield prompt groups with group-local metrics.
 
@@ -1794,6 +1926,8 @@ async def run_async_multi_turn_rollout_groups(
         max_rollout_turns=max_rollout_turns,
         greedy=greedy,
         deduplicate_multimodal_data=deduplicate_multimodal_data,
+        tracer=tracer,
+        trace_prefix=trace_prefix,
     )
     for group_index, start in enumerate(range(0, final_batch.size, num_generations)):
         end = start + num_generations
