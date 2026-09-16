@@ -138,13 +138,21 @@ def validate_fused_expert_layout(
 
 
 def configure_fp8_llm_kwargs(
-    llm_kwargs: dict[str, Any], *, model_type: str, is_mx: bool = False
+    llm_kwargs: dict[str, Any],
+    *,
+    model_type: str,
+    is_mx: bool = False,
+    llm_args_type: type[Any] | None = None,
 ) -> None:
     """Apply the experts-only block-FP8 / MXFP8 contract to TRT-LLM args.
 
     Existing Qwen3.5 ``model_kwargs`` entries are preserved. Conflicting
     quantization or load-format overrides fail at setup instead of silently
     creating a runtime whose refit schema differs from this converter.
+
+    ``llm_args_type`` is the installed TRT-LLM's ``LlmArgs`` class, used only
+    to detect optional-field support (e.g. ``use_cute_dsl_blockscaling_mm``);
+    pass ``None`` to skip every such optional field.
     """
     if model_type != "qwen3_5_moe":
         raise ValueError(
@@ -181,10 +189,16 @@ def configure_fp8_llm_kwargs(
     llm_kwargs["model_kwargs"] = model_kwargs
     llm_kwargs["load_format"] = "dummy"
     llm_kwargs["dtype"] = "bfloat16"
-    # This keeps any block-FP8 Linear fallback on the FP32-scale path. Routed
-    # experts additionally require MoeConfig(backend="TRTLLM"), configured by
-    # the worker.
-    # llm_kwargs["use_cute_dsl_blockscaling_mm"] = True
+    # Routed experts additionally require MoeConfig(backend="TRTLLM"),
+    # configured by the worker.
+    if llm_args_type is not None and "use_cute_dsl_blockscaling_mm" in getattr(
+        llm_args_type, "model_fields", {}
+    ):
+        # Keeps the block-FP8 Linear fallback on the FP32-scale path (vs.
+        # DeepGEMM's E8M0 resmoothing). Only set when the installed TRT-LLM's
+        # LlmArgs actually declares the field -- older builds reject unknown
+        # llm_kwargs keys.
+        llm_kwargs["use_cute_dsl_blockscaling_mm"] = True
 
 
 def configure_fp8_moe_backend(
