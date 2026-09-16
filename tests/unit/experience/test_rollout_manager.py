@@ -2023,7 +2023,7 @@ class TestGenerateForFinalizationFlow:
         buf = _FakeCaptureBuffer()
         mgr = _make_capture_manager(buf)
         pending_acknowledgement_history: list[
-            list[tuple[str, int, str, int, str, str]]
+            list[tuple[str, int, str, int, str, str, str | None, str | None]]
         ] = []
 
         request = _run(
@@ -2066,6 +2066,8 @@ class TestGenerateForFinalizationFlow:
                     1,
                     f"result-{canonical_ids[0]}-0",
                     f"{1:064x}",
+                    None,
+                    None,
                 )
             ],
             [
@@ -2076,6 +2078,8 @@ class TestGenerateForFinalizationFlow:
                     1,
                     f"result-{canonical_ids[0]}-0",
                     f"{1:064x}",
+                    None,
+                    None,
                 ),
                 (
                     canonical_ids[1],
@@ -2084,6 +2088,8 @@ class TestGenerateForFinalizationFlow:
                     1,
                     f"result-{canonical_ids[1]}-0",
                     f"{1:064x}",
+                    None,
+                    None,
                 ),
             ],
         ]
@@ -2287,7 +2293,7 @@ class TestGenerateForFinalizationFlow:
         impl = _PartialCaptureImpl()
         mgr._impl = impl
         pending_acknowledgement_history: list[
-            list[tuple[str, int, str, int, str, str]]
+            list[tuple[str, int, str, int, str, str, str | None, str | None]]
         ] = []
 
         request = _run(
@@ -2322,6 +2328,8 @@ class TestGenerateForFinalizationFlow:
                     2,
                     f"result-{request.group_id}_g0-1",
                     f"{2:064x}",
+                    None,
+                    None,
                 ),
                 (
                     f"{request.group_id}_g1",
@@ -2330,6 +2338,8 @@ class TestGenerateForFinalizationFlow:
                     2,
                     f"result-{request.group_id}_g1-1",
                     f"{2:064x}",
+                    None,
+                    None,
                 ),
             ]
         ]

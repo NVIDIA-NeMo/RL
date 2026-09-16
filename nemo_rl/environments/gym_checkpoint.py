@@ -199,6 +199,21 @@ class GymCompletionReceipt(GymExecutionIdentity):
     execution_generation: PositiveInt
     result_identity: str = Field(min_length=1, max_length=512)
     result_digest: Sha256Digest
+    manifest_capture_key: str | None = Field(
+        default=None,
+        min_length=1,
+        pattern=_IDENTITY_PATTERN,
+    )
+    terminal_model_call_id: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def validate_model_lineage_coordinate(self) -> "GymCompletionReceipt":
+        if (self.manifest_capture_key is None) != (self.terminal_model_call_id is None):
+            raise ValueError(
+                "completion receipt model-lineage capture key and terminal call "
+                "id must be supplied together"
+            )
+        return self
 
 
 def gym_capture_key(logical_rollout_id: str, attempt_index: int) -> str:
@@ -854,11 +869,23 @@ class GymAgentContinuationRoot(_StrictWireModel):
 
     @model_validator(mode="after")
     def validate_capture_key(self) -> "GymAgentContinuationRoot":
-        expected = gym_capture_key(self.rollout_id, self.attempt_index)
-        if self.capture_key != expected:
+        if self.capture_key == self.rollout_id:
+            source_attempt_index = 0
+        else:
+            prefix = f"{self.rollout_id}-a"
+            suffix = self.capture_key.removeprefix(prefix)
+            if not self.capture_key.startswith(prefix) or not suffix.isdigit():
+                raise ValueError(
+                    "Gym continuation capture key does not belong to its logical "
+                    f"rollout: rollout_id={self.rollout_id!r}, "
+                    f"capture_key={self.capture_key!r}"
+                )
+            source_attempt_index = int(suffix)
+        if source_attempt_index > self.attempt_index:
             raise ValueError(
-                "Gym continuation capture key does not match its execution: "
-                f"expected={expected!r}, actual={self.capture_key!r}"
+                "Gym continuation capture key cannot name a future rollout "
+                f"attempt: source_attempt={source_attempt_index}, "
+                f"boundary_attempt={self.attempt_index}"
             )
         return self
 

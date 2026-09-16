@@ -942,8 +942,8 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
     state = ledger.state_dict()
     restored = RolloutRecoveryLedger.from_state_dict(state)
     assert restored.completed_execution_acknowledgements("g7") == [
-        ("g7_g0", 0, "test-agent", 1, "result-g7_g0-0", f"{1:064x}"),
-        ("g7_g1", 0, "test-agent", 1, "result-g7_g1-0", f"{1:064x}"),
+        ("g7_g0", 0, "test-agent", 1, "result-g7_g0-0", f"{1:064x}", None, None),
+        ("g7_g1", 0, "test-agent", 1, "result-g7_g1-0", f"{1:064x}", None, None),
     ]
     physical_ids, _, restored_receipts, rewards, mask_sample = (
         restored.finalization_inputs("g7")
@@ -957,8 +957,8 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
 
     recorded = restored.pending_completed_execution_acknowledgements()
     assert recorded == [
-        ("g7_g0", 0, "test-agent", 1, "result-g7_g0-0", f"{1:064x}"),
-        ("g7_g1", 0, "test-agent", 1, "result-g7_g1-0", f"{1:064x}"),
+        ("g7_g0", 0, "test-agent", 1, "result-g7_g0-0", f"{1:064x}", None, None),
+        ("g7_g1", 0, "test-agent", 1, "result-g7_g1-0", f"{1:064x}", None, None),
     ]
     _mutate(lambda cut: restored.discard_group(cut, "g7"))
     restored = RolloutRecoveryLedger.from_state_dict(restored.state_dict())

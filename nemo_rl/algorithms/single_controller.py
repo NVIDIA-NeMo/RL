@@ -1835,6 +1835,8 @@ class SingleControllerActor:
                         "execution_generation": execution_generation,
                         "result_identity": result_identity,
                         "result_digest": result_digest,
+                        "manifest_capture_key": manifest_capture_key,
+                        "terminal_model_call_id": terminal_model_call_id,
                     },
                     agent_name=agent_name,
                 ).model_dump(mode="json")
@@ -1845,6 +1847,8 @@ class SingleControllerActor:
                     execution_generation,
                     result_identity,
                     result_digest,
+                    manifest_capture_key,
+                    terminal_model_call_id,
                 ) in pending
             ]
             await self._nemo_gym_checkpoint_actor().acknowledge_completed_executions.remote(

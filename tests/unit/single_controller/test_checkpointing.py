@@ -1930,6 +1930,8 @@ class TestPeriodicRolloutCheckpoint:
                 1,
                 "result-group-7_g0-0",
                 "1" * 64,
+                None,
+                None,
             )
         ]
         state = {
