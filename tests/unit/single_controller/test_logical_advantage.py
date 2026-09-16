@@ -131,7 +131,7 @@ def _controller(meta, data, *, grpo=None, loss=None):
 
 @pytest.mark.parametrize("population", ["valid_owners", "all_owners"])
 @pytest.mark.parametrize("reorder", [False, True])
-def test_deduplicates_unequal_segments_and_pools_same_prompt_across_groups(
+def test_deduplicates_unequal_segments_without_pooling_identical_prompts_across_groups(
     population, reorder
 ):
     meta, data = _batch(
@@ -147,19 +147,40 @@ def test_deduplicates_unequal_segments_and_pools_same_prompt_across_groups(
     assert len(ctrl._dp_client.puts) == 1
     assert sorted(ctrl._step_log_dict["rewards"][0].tolist()) == [0, 0, 1, 1]
     assert ctrl._step_log_dict["sample_masks"][0].tolist() == [1, 1, 1, 1]
-    for row, sample_id in enumerate(meta.sample_ids):
+    assert data["advantages"].count_nonzero() == 0
+
+
+@pytest.mark.parametrize("population", ["valid_owners", "all_owners"])
+@pytest.mark.parametrize("reorder", [False, True])
+@pytest.mark.parametrize("leave_one_out", [False, True])
+def test_sibling_rollouts_with_distinct_prompts_share_baseline(
+    population: str, reorder: bool, leave_one_out: bool
+) -> None:
+    meta, data = _batch([("a", [(0.0, 3), (1.0, 2)])], padding=True)
+    data["prompt_ids_for_adv"][3:5] = torch.tensor([42, 17])
+    if reorder:
+        order = [4, 1, 5, 0, 3, 2]
+        meta, data = meta.subset(order), data[order]
+    ctrl = _controller(
+        meta,
+        data,
+        grpo={
+            "baseline_population": population,
+            "adv_estimator": {
+                "normalize_rewards": False,
+                "use_leave_one_out_baseline": leave_one_out,
+            },
+        },
+    )
+    asyncio.run(ctrl._advantage_stage(meta))
+    magnitude = 1.0 if leave_one_out else 0.5
+    for row, tag in enumerate(meta.tags):
         expected = (
-            0.0 if "_pad" in sample_id else (-0.5 if sample_id.startswith("a") else 0.5)
+            0.0
+            if tag["is_execution_padding"]
+            else (-magnitude if tag["logical_slot"] == 0 else magnitude)
         )
         torch.testing.assert_close(data["advantages"][row], torch.full((3,), expected))
-
-
-def test_distinct_original_prompt_tokens_do_not_pool():
-    meta, data = _batch([("a", [(0.0, 2), (0.0, 1)]), ("b", [(1.0, 3), (1.0, 1)])])
-    data["prompt_ids_for_adv"][3:] = torch.tensor([42, 17])
-    ctrl = _controller(meta, data)
-    asyncio.run(ctrl._advantage_stage(meta))
-    assert data["advantages"].count_nonzero() == 0
 
 
 @pytest.mark.nemo_gym
@@ -234,22 +255,16 @@ def test_real_capture_finalizer_rows_feed_sc_at_actual_segment_lengths(
         asyncio.run(harness.ledger.close())
 
 
-def test_original_prompt_lengths_prevent_padding_aliases_without_splitting_equal_prompts():
-    meta, data = _batch(
-        [
-            ("a", [(0.0, 2), (0.0, 1)]),
-            ("b", [(1.0, 1), (1.0, 2)]),
-            ("c", [(9.0, 1), (9.0, 1)]),
-        ]
-    )
+def test_sibling_prompt_lengths_do_not_split_the_sampling_group():
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1)])])
     data["prompt_ids_for_adv"] = torch.nested.as_nested_tensor(
-        [torch.tensor([17, 42])] * 6 + [torch.tensor([17, 42, 0])] * 2,
+        [torch.tensor([17, 42])] * 2 + [torch.tensor([17, 42, 0])],
         layout=torch.jagged,
     )
     ctrl = _controller(meta, data)
     asyncio.run(ctrl._advantage_stage(meta))
     torch.testing.assert_close(
-        data["advantages"][:, 0], torch.tensor([-0.5] * 3 + [0.5] * 3 + [0.0] * 2)
+        data["advantages"][:, 0], torch.tensor([-0.5, -0.5, 0.5])
     )
 
 

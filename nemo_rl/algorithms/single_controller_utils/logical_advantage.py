@@ -42,6 +42,7 @@ class LogicalOwnerBatch:
     """Indices into physical rows; padding has row_owner=-1 and no reward vote."""
 
     representative_rows: torch.Tensor
+    group_ids: torch.Tensor
     row_owner: torch.Tensor
     valid_mask: torch.Tensor
 
@@ -60,8 +61,8 @@ def build_logical_owner_batch(
 ) -> LogicalOwnerBatch:
     """Check complete groups, deduplicate owner rows, and combine their validity.
 
-    Original prompt tokens determine the estimator's grouping. Dispatch IDs
-    only establish completeness; separate groups may share a GRPO baseline.
+    Dispatch IDs determine the estimator's grouping, independently of prompt
+    tokens. Each logical owner contributes once, regardless of segment count.
     """
     if (
         meta.tags is None
@@ -122,9 +123,9 @@ def build_logical_owner_batch(
             raise ValueError("CC owner/segment identity is invalid")
         slots.setdefault(slot, []).append(row)
 
-    representatives, validity = [], []
+    representatives, validity, group_ids = [], [], []
     row_owner = torch.full((meta.size,), -1, dtype=torch.long, device=rewards.device)
-    for slots in groups.values():
+    for group_index, slots in enumerate(groups.values()):
         if set(slots) != set(range(expected_group_size)):
             raise ValueError("CC estimator requires every logical slot in each group")
         for rows in slots.values():
@@ -141,6 +142,7 @@ def build_logical_owner_batch(
                 raise ValueError("CC owner rows disagree on reward or original prompt")
             row_owner[rows] = len(representatives)
             representatives.append(first)
+            group_ids.append(group_index)
             validity.append(sample_mask[rows].amin())
     if not representatives:
         raise ValueError("CC estimator requires logical owners, not padding alone")
@@ -148,6 +150,9 @@ def build_logical_owner_batch(
         representative_rows=torch.tensor(
             representatives, dtype=torch.long, device=rewards.device
         ),
+        group_ids=torch.tensor(group_ids, dtype=torch.long, device=rewards.device)[
+            :, None
+        ],
         row_owner=row_owner,
         valid_mask=torch.stack(validity),
     )

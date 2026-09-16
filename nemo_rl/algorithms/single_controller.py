@@ -4392,7 +4392,7 @@ class SingleControllerActor:
         if has_valid_training_tokens and owner_batch is not None:
             rows = owner_batch.representative_rows
             owner_advantages = self._advantage_estimator.compute_advantage(
-                prompt_ids=prompt_ids[rows],
+                prompt_ids=owner_batch.group_ids,
                 rewards=rewards[rows],
                 mask=owner_batch.valid_mask.unsqueeze(-1),
                 valid_mask=baseline_mask[rows],
