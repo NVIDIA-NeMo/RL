@@ -876,6 +876,19 @@ def test_quantize_mxfp8_weight_restores_grouped_expert_shape(fp8_module, monkeyp
     )
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, True), ("1", True), ("0", False)],
+)
+def test_mxfp8_batched_shuffle_env_gate(fp8_module, monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("NRL_MXFP8_BATCHED_SHUFFLE", raising=False)
+    else:
+        monkeypatch.setenv("NRL_MXFP8_BATCHED_SHUFFLE", value)
+
+    assert fp8.mxfp8_batched_shuffle_enabled() is expected
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("is_gated", "intermediate_size", "hidden_size"),
