@@ -689,14 +689,18 @@ def setup(
     # ==========================
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    validate_replay_restore(
-        checkpoint_path=last_checkpoint_path,
-        ray_reference_transport=(
-            router_replay_enabled(policy_config)
-            and router_replay_transport(policy_config) == "ray"
-        ),
-        load_replay_buffer=checkpointing_config.get("load_replay_buffer"),
-    )
+    # Only async GRPO persists a replay buffer whose routed-expert rows can hold
+    # Ray references. Synchronous GRPO consumes them within a step, so resuming
+    # it with transport=ray needs no replay discard.
+    if grpo_config.async_grpo and grpo_config.async_grpo.enabled:
+        validate_replay_restore(
+            checkpoint_path=last_checkpoint_path,
+            ray_reference_transport=(
+                router_replay_enabled(policy_config)
+                and router_replay_transport(policy_config) == "ray"
+            ),
+            load_replay_buffer=checkpointing_config.get("load_replay_buffer"),
+        )
     loaded_state = checkpointer.load_training_info(last_checkpoint_path)
     grpo_save_state = _get_grpo_save_state(loaded_state)
 

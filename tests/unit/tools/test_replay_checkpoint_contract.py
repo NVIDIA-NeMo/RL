@@ -61,3 +61,28 @@ def test_guard_is_wired_before_state_and_payload_loading():
         )
         loads = [node for node in calls if load_name in ast.unparse(node.func)]
         assert loads and guard.lineno < min(node.lineno for node in loads)
+
+
+def test_setup_guard_applies_only_to_async_grpo():
+    """Sync GRPO has no replay buffer, so a Ray-transport resume must not be blocked."""
+    tree = ast.parse(
+        (Path(__file__).resolve().parents[3] / "nemo_rl/algorithms/grpo.py").read_text()
+    )
+    setup = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "setup"
+    )
+    guards = [
+        node
+        for node in ast.walk(setup)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "validate_replay_restore"
+            for call in ast.walk(node)
+        )
+    ]
+    assert guards, "validate_replay_restore is not conditional in setup()"
+    assert all("async_grpo.enabled" in ast.unparse(node.test) for node in guards)
