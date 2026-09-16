@@ -46,8 +46,6 @@ from nemo_rl.data.chat_templates import find_rendered_message_content_span
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
-_CHAT_ALIGNMENT_METHODS = {"offset_cluster_decode_fix", "same_tokenizer_identity"}
-
 
 class CrossTokenizerCollator:
     """Tokenize the student once, tokenize+align each teacher, return a flat batch.
@@ -104,12 +102,6 @@ class CrossTokenizerCollator:
             for i, aligner in enumerate(aligners):
                 if aligner is None:
                     continue
-                if aligner.alignment_method not in _CHAT_ALIGNMENT_METHODS:
-                    raise ValueError(
-                        f"mode='chat' requires an offset-aware alignment method; "
-                        f"teacher {i} has {aligner.alignment_method!r}, expected "
-                        f"one of {sorted(_CHAT_ALIGNMENT_METHODS)!r}."
-                    )
                 if not getattr(student_tokenizer, "is_fast", False) or not getattr(
                     teacher_tokenizers[i], "is_fast", False
                 ):
