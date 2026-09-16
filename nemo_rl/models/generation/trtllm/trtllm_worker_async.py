@@ -225,7 +225,7 @@ class TrtllmAsyncGenerationWorkerImpl:
         if trtllm_cfg["precision"] == "fp8":
             # Import only in TRT-LLM actors so the base NeMo-RL environment
             # does not need the optional TRT-LLM dependency.
-            from tensorrt_llm.llmapi.llm_args import MoeConfig
+            from tensorrt_llm.llmapi.llm_args import LlmArgs, MoeConfig
             from transformers import AutoConfig
 
             from nemo_rl.models.generation.trtllm.quantization.fp8 import (
@@ -241,6 +241,7 @@ class TrtllmAsyncGenerationWorkerImpl:
                 llm_kwargs,
                 model_type=hf_config.model_type,
                 is_mx=is_mx,
+                llm_args_type=LlmArgs,
             )
 
             # Block-FP8: DeepGEMM resmooths 128x128 FP32 block scales to E8M0

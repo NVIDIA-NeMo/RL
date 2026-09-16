@@ -72,9 +72,40 @@ def test_fp8_config_preserves_overrides():
 
     assert llm_kwargs["dtype"] == "bfloat16"
     assert llm_kwargs["load_format"] == "dummy"
-    assert llm_kwargs["use_cute_dsl_blockscaling_mm"] is True
+    # No llm_args_type given -> unknown whether the installed TRT-LLM has the
+    # field, so it must stay unset rather than risk an unknown-kwarg error.
+    assert "use_cute_dsl_blockscaling_mm" not in llm_kwargs
     assert llm_kwargs["model_kwargs"]["pretrained_config"] == {"num_hidden_layers": 4}
     assert llm_kwargs["model_kwargs"]["quantization_config"] == FP8_BLOCK_QUANT_KWARGS
+
+
+class _LlmArgsWithCuteDsl:
+    model_fields = {"use_cute_dsl_blockscaling_mm": object()}
+
+
+class _LlmArgsWithoutCuteDsl:
+    model_fields = {}
+
+
+def test_fp8_config_enables_cute_dsl_blockscaling_mm_when_supported():
+    """e.g. a TRT-LLM build carrying the CuTe DSL blockscaling mm field."""
+    llm_kwargs = {}
+
+    configure_fp8_llm_kwargs(
+        llm_kwargs, model_type="qwen3_5_moe", llm_args_type=_LlmArgsWithCuteDsl
+    )
+
+    assert llm_kwargs["use_cute_dsl_blockscaling_mm"] is True
+
+
+def test_fp8_config_skips_cute_dsl_blockscaling_mm_when_unsupported():
+    llm_kwargs = {}
+
+    configure_fp8_llm_kwargs(
+        llm_kwargs, model_type="qwen3_5_moe", llm_args_type=_LlmArgsWithoutCuteDsl
+    )
+
+    assert "use_cute_dsl_blockscaling_mm" not in llm_kwargs
 
 
 @pytest.mark.parametrize(
