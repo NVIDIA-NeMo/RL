@@ -698,7 +698,12 @@ class VllmAsyncGenerationWorkerImpl(
 
     @staticmethod
     def _delta_align_routed_experts(
-        payload: dict[str, Any], *, prev_len: int, prompt_len: int, generated_len: int
+        payload: dict[str, Any],
+        *,
+        prev_len: int,
+        prompt_len: int,
+        generated_len: int,
+        routed_experts_start: int = 0,
     ) -> None:
         """Normalize optional vLLM routes to the exact staged token delta."""
         choices = payload.get("choices") or []
@@ -727,13 +732,15 @@ class VllmAsyncGenerationWorkerImpl(
             else:
                 dtype = torch.int16
             experts = decode_routed_experts(routed, dtype)
-            expected_full_len = prompt_len + generated_len
+            expected_full_len = prompt_len + generated_len - routed_experts_start
             if experts.dim() != 3 or experts.shape[0] != expected_full_len:
                 raise ValueError(
                     f"route length {experts.shape[0]} does not match engine sequence "
                     f"length {expected_full_len}"
                 )
-            message["routed_experts"] = encode_routed_experts(experts[prev_len:])
+            message["routed_experts"] = encode_routed_experts(
+                experts[prev_len - routed_experts_start :]
+            )
         except (IndexError, TypeError, ValueError) as error:
             LOGGER.warning(
                 "dropping invalid routed_experts from staged capture: %s", error
@@ -742,7 +749,9 @@ class VllmAsyncGenerationWorkerImpl(
         choice["message"] = message
         payload["choices"] = [choice]
 
-    def _finish_request_capture(self, request: Any, content: dict) -> dict:
+    def _finish_request_capture(
+        self, request: Any, content: dict, *, routed_experts_start: int = 0
+    ) -> dict:
         """Stage the finished call and ride its coords on the response.
 
         Fail-closed: the sink write happens inside complete_call —
@@ -772,26 +781,39 @@ class VllmAsyncGenerationWorkerImpl(
                 prev_len=call.admission.prev_len,
                 prompt_len=len(prompt_token_ids),
                 generated_len=len(generated_token_ids),
+                routed_experts_start=routed_experts_start,
             )
         coords = state.capture.complete_call_from_response(call, payload)
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
-            # The delta-aligned routes were staged to TQ above; the served
-            # full-length copy is dead weight the gate strips on arrival.
+            # The routes were staged to TQ above; the gate does not need
+            # another copy in the response.
             message = choice.get("message")
             if isinstance(message, dict):
                 message.pop("routed_experts", None)
         content["ng_commit_coords"] = coords.model_dump()
         return content
 
-    async def _complete_request_capture(self, request: Any, content: dict) -> dict:
+    async def _complete_request_capture(
+        self,
+        request: Any,
+        content: dict,
+        *,
+        finalize: Callable[[dict], Any] | None = None,
+    ) -> Any:
         """Keep the original device allocations alive through the blocking PUT."""
         state = self._capture_calls.get(id(request))
-        operation = lambda: self._finish_request_capture(request, content)
+        routed_experts_start = state.call.admission.prev_len if state is not None else 0
+        operation = lambda: self._finish_request_capture(
+            request, content, routed_experts_start=routed_experts_start
+        )
         if state is not None and state.gpu_sink is not None:
             assert self._gpu_capture_host is not None
-            return await self._gpu_capture_host.finish(state, operation)
-        return await asyncio.to_thread(operation)
+            return await self._gpu_capture_host.finish(
+                state, operation, finalize=finalize
+            )
+        result = await asyncio.to_thread(operation)
+        return finalize(result) if finalize is not None else result
 
     async def _abort_request_capture(self, request: Any, *, reason: str) -> None:
         """Drop the in-flight capture state for a request that errored."""
@@ -1125,6 +1147,25 @@ class VllmAsyncGenerationWorkerImpl(
                     nonlocal final_res
                     async for res in result_generator:
                         final_res = res
+                        state = worker_self._capture_calls.get(id(request))
+                        if (
+                            res.finished
+                            and len(res.outputs) == 1
+                            and state is not None
+                            and state.gpu_sink is not None
+                        ):
+                            assert worker_self._gpu_capture_host is not None
+                            try:
+                                worker_self._gpu_capture_host.start_export(
+                                    state,
+                                    generated_token_count=len(res.outputs[0].token_ids),
+                                )
+                            except Exception as error:
+                                LOGGER.warning(
+                                    "Early GPU export unavailable for %s: %s",
+                                    state.capture_key,
+                                    error,
+                                )
                         yield res
 
                 response = await super().chat_completion_full_generator(
@@ -1145,6 +1186,7 @@ class VllmAsyncGenerationWorkerImpl(
                         final_res,
                     )
 
+                state = worker_self._capture_calls.get(id(request))
                 if worker_self._return_routed_experts_enabled():
                     response = attach_routed_experts_to_chat_response_choices(
                         response,
@@ -1152,9 +1194,13 @@ class VllmAsyncGenerationWorkerImpl(
                         device=torch.device("cpu"),
                         logger=LOGGER,
                         routed_experts_dtype=worker_self.routed_experts_dtype,
+                        # Capture stages only this suffix. Trim before encoding
+                        # so completion never decodes the unused prefix again.
+                        routed_experts_start=(
+                            state.call.admission.prev_len if state is not None else 0
+                        ),
                     )
 
-                state = worker_self._capture_calls.get(id(request))
                 if state is not None and state.gpu_sink is not None:
                     assert worker_self._gpu_capture_host is not None
                     try:
@@ -1319,10 +1365,11 @@ class VllmAsyncGenerationWorkerImpl(
                     # Complete the blocking PUT off-loop before returning coords.
                     # Serialization is also inside the abort boundary: it can
                     # fail after the generator has imported a GPU payload lease.
-                    content = await worker_self._complete_request_capture(
-                        request, content
+                    return await worker_self._complete_request_capture(
+                        request,
+                        content,
+                        finalize=lambda result: JSONResponse(content=result),
                     )
-                    return JSONResponse(content=content)
 
                 await worker_self._abort_request_capture(
                     request, reason="streaming_response"

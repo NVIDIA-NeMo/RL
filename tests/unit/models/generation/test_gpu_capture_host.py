@@ -20,6 +20,7 @@ import asyncio
 import inspect
 import socket
 import threading
+from concurrent.futures import Future
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
@@ -38,6 +39,7 @@ from nemo_rl.data_plane.gpu_token_payload import (  # noqa: E402
 )
 from nemo_rl.models.generation.vllm import gpu_capture_host as hosting  # noqa: E402
 from nemo_rl.models.generation.vllm.gpu_output_capture import (  # noqa: E402
+    GpuCaptureOwner,
     GpuOutputImportError,
     GpuOutputLease,
     GpuOutputTensors,
@@ -46,12 +48,77 @@ from nemo_rl.models.generation.vllm.gpu_output_capture import (  # noqa: E402
 pytestmark = [pytest.mark.nemo_gym, pytest.mark.asyncio]
 
 
+class FakeObjectRef:
+    """Ray-shaped handle: submission precedes future registration and awaiting."""
+
+    def __init__(
+        self, awaitable: Any = None, *, future: Future[Any] | None = None
+    ) -> None:
+        self.future_calls = 0
+        self._future: Future[Any] = future if future is not None else Future()
+        self._task = (
+            asyncio.create_task(self._resolve(awaitable))
+            if awaitable is not None
+            else None
+        )
+
+    async def _resolve(self, awaitable: Any) -> None:
+        try:
+            result = await awaitable
+        except Exception as error:
+            if not self._future.done():
+                self._future.set_exception(error)
+        else:
+            if not self._future.done():
+                self._future.set_result(result)
+
+    def future(self) -> Future[Any]:
+        self.future_calls += 1
+        return self._future
+
+    def __await__(self) -> Any:
+        return asyncio.wrap_future(self.future()).__await__()
+
+    def set_result(self, value: Any) -> None:
+        self._future.set_result(value)
+
+    def set_exception(self, error: BaseException) -> None:
+        self._future.set_exception(error)
+
+    def cancelled(self) -> bool:
+        return self._future.cancelled()
+
+
 class _Rpc:
     def __init__(self) -> None:
         self.responses: dict[str, Any] = {}
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.collective_calls: list[str] = []
+        self.direct_calls: list[str] = []
+        self.execute_method = SimpleNamespace(remote=self._execute_method)
+        self.loop: asyncio.AbstractEventLoop | None = None
 
     async def collective_rpc(self, method: str, *, args: tuple[Any, ...]) -> Any:
+        self.collective_calls.append(method)
+        return await self._response(method, args)
+
+    def _execute_method(self, method: str, *args: Any) -> FakeObjectRef:
+        self.direct_calls.append(method)
+        if self.loop is None:
+            self.loop = asyncio.get_running_loop()
+        future = asyncio.run_coroutine_threadsafe(
+            self._execute_response(method, args), self.loop
+        )
+        return FakeObjectRef(future=future)
+
+    async def _execute_response(self, method: str, args: tuple[Any, ...]) -> Any:
+        result = await self._response(method, args)
+        if isinstance(result, list):
+            owners = [item for item in result if item is not None]
+            return owners[0] if len(owners) == 1 else owners
+        return result
+
+    async def _response(self, method: str, args: tuple[Any, ...]) -> Any:
         self.calls.append((method, args))
         response = self.responses.get(method)
         if isinstance(response, Exception):
@@ -109,12 +176,12 @@ class _Case:
         assert not self.state.ipc_handles_consumed
 
 
-@pytest.fixture
-def case(monkeypatch: pytest.MonkeyPatch) -> _Case:
+@pytest.fixture(params=["ray", "uni"])
+def case(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> _Case:
     rpc, sink = _Rpc(), _Sink()
     state = hosting.CapturedModelCall(
         capture=None,
-        call=None,
+        call=SimpleNamespace(admission=SimpleNamespace(prev_len=0)),
         prompt_token_ids=[11, 12],
         gpu_sink=BoundGpuTokenSink(sink),
         capture_key="call",
@@ -129,7 +196,11 @@ def case(monkeypatch: pytest.MonkeyPatch) -> _Case:
         state,
         lease,
         GpuOutputTensors(torch.tensor([21]), torch.tensor([-0.25]), None),
-        hosting.GpuCaptureHost(rpc, torch.device("cuda:0")),
+        hosting.GpuCaptureHost(
+            rpc,
+            torch.device("cuda:0"),
+            worker=rpc if request.param == "ray" else None,
+        ),
         [],
     )
     rpc.responses["export_gpu_output_capture"] = lambda *_: [None, result.lease]
@@ -167,16 +238,20 @@ def cpu_cuda(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 )
 async def test_create_uses_visible_owner_or_preserves_cpu_path(
     case: _Case,
+    cpu_cuda: list[str],
     monkeypatch: pytest.MonkeyPatch,
     topology: str,
 ) -> None:
+    def owner(index: int) -> GpuCaptureOwner:
+        return GpuCaptureOwner(f"gpu-{index}", case.host._worker)
+
     case.rpc.responses["configure_gpu_output_capture"] = {
-        "available": [None, "gpu-0"],
-        "nondefault_device": ["gpu-1"],
-        "invisible_device": ["gpu-2"],
+        "available": [None, owner(0)],
+        "nondefault_device": [owner(1)],
+        "invisible_device": [owner(2)],
         "no_owner": [None],
-        "two_owners": ["gpu-0", "gpu-0"],
-        "no_device": ["gpu-0"],
+        "two_owners": [owner(0), owner(0)],
+        "no_device": [owner(0)],
         "unsupported_native": RuntimeError("unsupported native output"),
     }[topology]
     monkeypatch.setattr(
@@ -194,15 +269,29 @@ async def test_create_uses_visible_owner_or_preserves_cpu_path(
     assert case.rpc.calls == [
         ("configure_gpu_output_capture", (socket.gethostname(), True))
     ]
+    if host is not None:
+        await host.bind(case.state, generated_token_count=1)
+        await host.release(case.state)
+        if case.host._worker is not None:
+            assert case.rpc.collective_calls == ["configure_gpu_output_capture"]
+            assert case.rpc.direct_calls == [
+                "export_gpu_output_capture",
+                "abandon_unimported_gpu_output_capture",
+            ]
+        else:
+            assert not case.rpc.direct_calls
 
 
 @pytest.mark.parametrize("backfill_ranges", [(), ((0, 1),)])
+@pytest.mark.parametrize("prev_len", [0, 1, 2])
 async def test_bind_preserves_tensors_coordinates_and_put_thread(
     case: _Case,
     cpu_cuda: list[str],
     backfill_ranges: tuple[tuple[int, int], ...],
+    prev_len: int,
 ) -> None:
-    routes = torch.tensor([[[1]], [[2]], [[3]]], dtype=torch.int64)
+    case.state.call.admission.prev_len = prev_len
+    routes = torch.tensor([[[1]], [[2]], [[3]]], dtype=torch.int64)[prev_len:]
     case.tensors = replace(case.tensors, routed_experts=routes)
     case.lease = replace(
         case.lease, routed_experts_prefix_backfill_ranges=backfill_ranges
@@ -221,8 +310,12 @@ async def test_bind_preserves_tensors_coordinates_and_put_thread(
     assert payload.generated_token_ids is case.tensors.generated_token_ids
     assert payload.generated_logprobs is case.tensors.generation_logprobs
     assert payload.routed_experts is routes
+    assert payload.routed_experts_start == prev_len
     assert payload.routed_experts_prefix_backfill_ranges == backfill_ranges
-    assert case.rpc.calls[0] == ("export_gpu_output_capture", ("call", 1, 2))
+    assert case.rpc.calls[0] == (
+        "export_gpu_output_capture",
+        ("call", 1, 2, prev_len),
+    )
     assert cpu_cuda == ["sync"]
     case.assert_released()
 

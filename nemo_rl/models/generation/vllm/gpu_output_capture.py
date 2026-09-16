@@ -31,7 +31,9 @@ from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any
 
+import ray
 import torch
+from ray.actor import ActorHandle
 from torch.multiprocessing.reductions import rebuild_cuda_tensor, reduce_tensor
 
 from nemo_rl.models.generation.vllm.utils import VLLM_LOGPROB_FLOOR
@@ -41,6 +43,14 @@ GPU_CAPTURE_KEY = "nrl_gpu_output_capture_key"
 
 # PyTorch owns the CUDA sharing protocol; carry its reduction arguments unchanged.
 CudaTensorIpc = tuple[Any, ...]
+
+
+@dataclass(frozen=True)
+class GpuCaptureOwner:
+    """Locate retained outputs without redispatching through the engine core."""
+
+    gpu_uuid: str
+    worker: ActorHandle | None = None
 
 
 @dataclass(frozen=True)
@@ -412,8 +422,11 @@ class GpuOutputCapture:
                 raise RuntimeError(
                     "Native async output lacks its GPU routed-expert snapshot"
                 )
-        ready = torch.cuda.Event()
-        ready.record(torch.cuda.current_stream(self.device))
+        # Native async D2H already records an event covering these same sources.
+        # Sync bookkeeping has materialized IDs/logprobs before returning here.
+        ready = (
+            output.async_copy_ready_event if self.runner.use_async_scheduling else None
+        )
         with self._lock:
             for entry in entries:
                 if entry.key in self._closed_keys:
@@ -468,10 +481,17 @@ class GpuOutputCapture:
                     self.fail_keys(((entry.key, entry.native_request_id),), error)
 
     def export(
-        self, capture_key: str, *, generated_token_count: int, prompt_token_count: int
+        self,
+        capture_key: str,
+        *,
+        generated_token_count: int,
+        prompt_token_count: int,
+        start: int = 0,
     ) -> GpuOutputLease:
         if generated_token_count < 0 or prompt_token_count < 0:
             raise ValueError("GPU output lengths must be nonnegative")
+        if not 0 <= start <= prompt_token_count:
+            raise ValueError("GPU route export start must lie within the prompt")
         with self._lock, torch.cuda.device(self.device):
             if capture_key in self._errors:
                 raise RuntimeError(
@@ -496,12 +516,6 @@ class GpuOutputCapture:
                 route_shape = tuple(route_fragments[0].routes.shape[1:])
                 if len(route_shape) != 2:
                     raise RuntimeError("Expected [tokens, layers, topk] GPU routes")
-            ids = torch.empty(
-                generated_token_count, dtype=torch.int64, device=self.device
-            )
-            logprobs = torch.empty(
-                generated_token_count, dtype=torch.float32, device=self.device
-            )
             assembled_routes = None
             if route_shape is not None:
                 source = route_fragments[0].routes
@@ -509,14 +523,21 @@ class GpuOutputCapture:
                     torch.arange(route_shape[1], device=self.device)
                     .to(source.dtype)
                     .view(1, 1, -1)
-                    .expand(total, *route_shape)
+                    .expand(total - start, *route_shape)
                     .clone()
                 )
-            token_coverage = [False] * generated_token_count
-            route_coverage = [False] * expected_routes
+            sampled_ids: dict[int, torch.Tensor] = {}
+            sampled_logprobs: dict[int, torch.Tensor] = {}
+            route_coverage = bytearray(expected_routes)
+            route_runs: list[tuple[int, list[torch.Tensor]]] = []
+            route_end = -1
+            export_stream = torch.cuda.current_stream(self.device)
+            # Native events share one copy stream and fragments append in step
+            # order, so the last event covers every earlier retained source.
+            ready = state.fragments[-1].ready if state.fragments else None
+            if ready is not None:
+                export_stream.wait_event(ready)
             for fragment in state.fragments:
-                export_stream = torch.cuda.current_stream(self.device)
-                export_stream.wait_event(fragment.ready)
                 # Fragments were allocated on the capture stream. The request
                 # drops its references below, before export-stream copies may
                 # finish, so the caching allocator must track these reads.
@@ -533,26 +554,39 @@ class GpuOutputCapture:
                         raise RuntimeError(
                             "Generated GPU fragment lacks sampled IDs/logprobs"
                         )
-                    ids[pos : pos + 1].copy_(fragment.token_id)
-                    selected_logprob = (
+                    sampled_ids[pos] = fragment.token_id
+                    sampled_logprobs[pos] = (
                         fragment.logprob.gather(0, fragment.token_id.to(torch.int64))
                         if fragment.logprob_by_token
                         else fragment.logprob
                     )
-                    logprobs[pos : pos + 1].copy_(selected_logprob)
-                    token_coverage[pos] = True
                 if assembled_routes is not None and fragment.routes is not None:
                     end = min(
                         fragment.start + fragment.routes.shape[0], expected_routes
                     )
                     if end > fragment.start:
-                        assembled_routes[fragment.start : end].copy_(
-                            fragment.routes[: end - fragment.start]
-                        )
-                        route_coverage[fragment.start : end] = [True] * (
+                        # Validate the full history even when staging needs only
+                        # its suffix. Prefix-cache authorization is unchanged.
+                        route_coverage[fragment.start : end] = b"\x01" * (
                             end - fragment.start
                         )
-            if not all(token_coverage):
+                    copy_start = max(fragment.start, start)
+                    if end > copy_start:
+                        # Batch adjacent rows without changing chronological
+                        # overwrite order for overlapping prefill fragments.
+                        if copy_start != route_end:
+                            route_runs.append((copy_start, []))
+                        route_view = fragment.routes
+                        if (
+                            copy_start != fragment.start
+                            or end - fragment.start != route_view.shape[0]
+                        ):
+                            route_view = route_view[
+                                copy_start - fragment.start : end - fragment.start
+                            ]
+                        route_runs[-1][1].append(route_view)
+                        route_end = end
+            if any(pos not in sampled_ids for pos in range(generated_token_count)):
                 raise RuntimeError(
                     "GPU output does not cover the final accepted token/route positions"
                 )
@@ -561,20 +595,38 @@ class GpuOutputCapture:
                 # Only proven admission prefix-cache hits may
                 # lack GPU history. Report exact holes and preserve every
                 # fresh GPU row from the current computation history.
-                index = 0
-                while index < len(route_coverage):
-                    if route_coverage[index]:
-                        index += 1
-                        continue
-                    missing_start = index
-                    while index < len(route_coverage) and not route_coverage[index]:
-                        index += 1
+                missing_start = route_coverage.find(b"\x00")
+                while missing_start != -1:
+                    index = route_coverage.find(b"\x01", missing_start)
+                    if index == -1:
+                        index = expected_routes
                     if index > state.proven_cached_prefix_tokens:
                         raise RuntimeError(
                             "GPU output does not cover the final accepted token/route "
                             "positions outside the proven cached prefix"
                         )
                     prefix_backfill_ranges.append((missing_start, index))
+                    missing_start = route_coverage.find(b"\x00", index)
+            if generated_token_count:
+                # Convert after concatenation so differing native/wire dtypes
+                # do not make cat fall back to one copy per sampled token.
+                ids = torch.cat(
+                    [sampled_ids[pos] for pos in range(generated_token_count)]
+                ).to(torch.int64)
+                logprobs = torch.cat(
+                    [sampled_logprobs[pos] for pos in range(generated_token_count)]
+                ).to(torch.float32)
+            else:
+                ids = torch.empty(0, dtype=torch.int64, device=self.device)
+                logprobs = torch.empty(0, dtype=torch.float32, device=self.device)
+            if assembled_routes is not None:
+                for run_start, sources in route_runs:
+                    end = run_start + sum(source.shape[0] for source in sources)
+                    destination = assembled_routes[run_start - start : end - start]
+                    if len(sources) == 1:
+                        destination.copy_(sources[0])
+                    else:
+                        torch.cat(sources, out=destination)
             # The OpenAI serving adapter applies max(raw, VLLM_LOGPROB_FLOOR).
             # Match that normalization on device to preserve committed bytes.
             logprobs.clamp_min_(VLLM_LOGPROB_FLOOR)
@@ -650,7 +702,7 @@ def configure_gpu_output_capture(
     *,
     frontend_hostname: str,
     require_routed_experts: bool,
-) -> str | None:
+) -> GpuCaptureOwner | None:
     """Reuse native outputs when available; otherwise retain the existing CPU PUT."""
     # vLLM is optional outside the native generation-worker environment.
     from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
@@ -687,4 +739,7 @@ def configure_gpu_output_capture(
         worker._gpu_output_capture = existing
     elif existing.require_routed_experts != require_routed_experts:
         return None
-    return existing.gpu_uuid
+    owner = None
+    if parallel.distributed_executor_backend == "ray":
+        owner = ray.get_runtime_context().current_actor
+    return GpuCaptureOwner(existing.gpu_uuid, owner)

@@ -200,12 +200,14 @@ def test_concurrent_calls_have_independent_gpu_bindings() -> None:
 )
 @pytest.mark.parametrize("routing_dtype", [torch.int8, torch.int16, torch.int32])
 @pytest.mark.parametrize("cast_routes", [False, True])
+@pytest.mark.parametrize("export_delta", [False, True])
 def test_gpu_fields_match_committed_wire_without_rebuilding_generated_values(
     prev_len: int,
     prompt_len: int,
     backfill_ranges: tuple[tuple[int, int], ...],
     routing_dtype: torch.dtype,
     cast_routes: bool,
+    export_delta: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     canonical_routes = torch.arange((prompt_len + 2) * 4, dtype=routing_dtype).reshape(
@@ -214,14 +216,19 @@ def test_gpu_fields_match_committed_wire_without_rebuilding_generated_values(
     if backfill_ranges:
         canonical_routes[0, 0, 0] = -1
     canonical_routes[-1] = torch.tensor([[0, 1], [0, 1]], dtype=routing_dtype)
-    routes = canonical_routes.to(
+    routed_experts_start = prev_len if export_delta else 0
+    routes = canonical_routes[routed_experts_start:].to(
         device="cuda", dtype=torch.uint16 if cast_routes else routing_dtype
     )
     for start, end in backfill_ranges:
-        routes[start:end] = 99  # Native snapshots lack these cached-prefix rows.
+        start = max(start, routed_experts_start)
+        if start < end:
+            # Native snapshots lack these cached-prefix rows.
+            routes[start - routed_experts_start : end - routed_experts_start] = 99
     original_routes = routes.cpu().clone()
     payload = replace(
         _payload(prompt_len=prompt_len, routes=routes),
+        routed_experts_start=routed_experts_start,
         routed_experts_prefix_backfill_ranges=backfill_ranges,
     )
     record = _record(prev_len=prev_len, prompt_len=prompt_len, routes=canonical_routes)
@@ -255,10 +262,10 @@ def test_gpu_fields_match_committed_wire_without_rebuilding_generated_values(
     for name in (
         "token_ids_delta",
         "generation_logprobs_delta",
-        "token_mask_delta",
         "routed_experts",
     ):
         assert actual[name].is_cuda
+    assert actual["token_mask_delta"].device.type == "cpu"
     if cast_routes:
         # Only the final delta needs a new allocation for the wire dtype.
         assert actual["routed_experts"].untyped_storage().nbytes() == (
@@ -270,7 +277,10 @@ def test_gpu_fields_match_committed_wire_without_rebuilding_generated_values(
             actual["routed_experts"].untyped_storage().data_ptr()
             == routes.untyped_storage().data_ptr()
         )
-        assert torch.equal(routes[:prev_len].cpu(), original_routes[:prev_len])
+        retained_prefix = prev_len - routed_experts_start
+        assert torch.equal(
+            routes[:retained_prefix].cpu(), original_routes[:retained_prefix]
+        )
     carry_len = prompt_len - prev_len
     assert h2d_sizes == ([carry_len] if carry_len else []) + [
         (end - max(start, prev_len)) * 4
@@ -298,8 +308,40 @@ def test_gpu_fields_match_committed_wire_without_rebuilding_generated_values(
 
 
 @requires_cuda
+@pytest.mark.parametrize("mask_values", [[-0.0, 0.0, 1.0, 1.0], [0.0, 1.0, 1.0, 1.0]])
+def test_staging_fields_preserves_cpu_mask_identity_and_bits(
+    mask_values: list[float],
+) -> None:
+    record = _record()
+    client = _PutClient()
+    assert TQTokenSink(client, staging_partition="staging").stage(record).ok
+    cpu_fields = dict(client.puts[0]["fields"].items())
+    # Test helper input preservation independently of Gym's record validation:
+    # neither signed zero nor a different mask pattern may be reconstructed.
+    mask = torch.tensor([mask_values], dtype=torch.float32)
+    cpu_fields["token_mask_delta"] = mask
+    mask_bits = mask.view(torch.int32).clone()
+
+    fields = _payload().staging_fields(record, cpu_fields)
+
+    assert fields["token_mask_delta"] is mask
+    assert not fields["token_mask_delta"].is_cuda
+    assert torch.equal(mask.view(torch.int32), mask_bits)
+    assert fields["token_ids_delta"].is_cuda
+    assert fields["generation_logprobs_delta"].is_cuda
+
+
+@requires_cuda
 @pytest.mark.parametrize(
-    "invalid", ["cpu", "ids_dtype", "logprobs_dtype", "routes_shape", "prompt_len"]
+    "invalid",
+    [
+        "cpu",
+        "ids_dtype",
+        "logprobs_dtype",
+        "routes_shape",
+        "routes_start",
+        "prompt_len",
+    ],
 )
 def test_invalid_gpu_optimization_preserves_one_cpu_put(invalid: str) -> None:
     routes = torch.arange(16, dtype=torch.int16, device="cuda").reshape(4, 2, 2)
@@ -315,6 +357,8 @@ def test_invalid_gpu_optimization_preserves_one_cpu_put(invalid: str) -> None:
         payload = replace(payload, generated_logprobs=payload.generated_logprobs.half())
     elif invalid == "routes_shape":
         payload = replace(payload, routed_experts=routes[:1])
+    elif invalid == "routes_start":
+        payload = replace(payload, routed_experts=routes[1:], routed_experts_start=1)
     else:
         payload = replace(payload, prompt_len=3)
     original, fallback = _PutClient(), _PutClient()
@@ -346,7 +390,7 @@ def test_failed_gpu_put_is_not_retried_as_cpu() -> None:
 def test_gpu_fields_are_ready_for_backend_executor_on_another_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    record = _record(prev_len=2)
+    record = _record()
     payload = _payload()
     torch.cuda.synchronize()
     caller_thread = threading.get_ident()
@@ -356,7 +400,7 @@ def test_gpu_fields_are_ready_for_backend_executor_on_another_stream(
 
     def delayed_zeros(*args: Any, **kwargs: Any) -> torch.Tensor:
         assert torch.cuda.current_stream() == caller_stream
-        # Delay the mask producer so a missing stream fence is observable before
+        # Delay the carry-logprob producer so a missing stream fence is observable before
         # the executor attempts its own GPU read and any implicit synchronization.
         torch.cuda._sleep(100_000_000)
         result = original_zeros(*args, **kwargs)
@@ -373,8 +417,12 @@ def test_gpu_fields_are_ready_for_backend_executor_on_another_stream(
             assert torch.cuda.current_stream() == torch.cuda.default_stream()
             assert len(ready_events) == 1
             assert ready_events[0].query(), "backend observed unfinished field writes"
-            assert fields["token_mask_delta"].cpu().tolist() == [[1.0, 1.0]]
-            assert fields["token_ids_delta"].cpu().tolist() == [[31, 32]]
+            assert not fields["token_mask_delta"].is_cuda
+            assert fields["token_mask_delta"].tolist() == [[0.0, 0.0, 1.0, 1.0]]
+            assert fields["token_ids_delta"].cpu().tolist() == [[20, 21, 31, 32]]
+            assert fields["generation_logprobs_delta"].cpu().tolist() == [
+                [0.0, 0.0, -0.125, -0.0]
+            ]
 
     with ThreadPoolExecutor(max_workers=1) as executor:
 

@@ -41,7 +41,8 @@ class GpuTokenPayload:
         prompt_len: Full engine prompt length, including a continuation prefix.
         generated_token_ids: One-dimensional generated CUDA IDs in int64 format.
         generated_logprobs: Corresponding selected-token CUDA logprobs in float32.
-        routed_experts: Optional full aligned CUDA routes, including the prompt.
+        routed_experts: Optional aligned CUDA routes through the final token.
+        routed_experts_start: Sequence offset of the first retained router row.
         routed_experts_prefix_backfill_ranges: Cached-prefix rows missing from
             the GPU assembly, filled from the committed CPU delta during staging.
 
@@ -53,6 +54,7 @@ class GpuTokenPayload:
     generated_token_ids: torch.Tensor
     generated_logprobs: torch.Tensor
     routed_experts: torch.Tensor | None = None
+    routed_experts_start: int = 0
     routed_experts_prefix_backfill_ranges: tuple[tuple[int, int], ...] = ()
 
     def device(self) -> torch.device:
@@ -77,7 +79,8 @@ class GpuTokenPayload:
         """Build device fields with the same layout as Gym's committed mirror.
 
         This step copies CPU-origin prompt-carry IDs H2D. Generated values use
-        retained CUDA storage; masks and prompt logprobs are constructed on CUDA.
+        retained CUDA storage; prompt logprobs are constructed on CUDA. The
+        synthetic mask remains the existing committed CPU tensor.
         Routes use the assembled GPU payload. Only missing cached-prefix rows
         within this PUT's delta are copied from the existing CPU router mirror.
         Staging does not transfer GPU payloads to CPU.
@@ -87,14 +90,6 @@ class GpuTokenPayload:
         generated_len = record.delta_len - carry_len
         if carry_len < 0 or generated_len < 0:
             raise ValueError("GPU payload prompt length does not match staged delta")
-        expected_mask = [0.0] * carry_len + [1.0] * generated_len
-        if not torch.equal(
-            cpu_fields["token_mask_delta"][0].view(torch.int32),
-            torch.tensor(expected_mask, dtype=torch.float32).view(torch.int32),
-        ):
-            raise ValueError(
-                "GPU payload prompt/generation split does not match staged mask"
-            )
         if torch.count_nonzero(
             cpu_fields["generation_logprobs_delta"][0, :carry_len].view(torch.int32)
         ).item():
@@ -127,11 +122,9 @@ class GpuTokenPayload:
                 full_logprobs[carry_len:].copy_(logprobs)
             else:
                 full_ids, full_logprobs = ids, logprobs
-            mask = torch.zeros(record.delta_len, dtype=torch.float32, device=device)
-            mask[carry_len:] = 1.0
             fields = {
                 "token_ids_delta": full_ids.unsqueeze(0),
-                "token_mask_delta": mask.unsqueeze(0),
+                "token_mask_delta": cpu_fields["token_mask_delta"],
                 "generation_logprobs_delta": full_logprobs.unsqueeze(0),
             }
 
@@ -140,11 +133,20 @@ class GpuTokenPayload:
                 expected_routes = cpu_fields.get(ROUTED_EXPERTS_FIELD)
                 if expected_routes is None:
                     raise ValueError("GPU routes have no committed CPU extras mirror")
-                if routes.ndim != 3 or routes.shape[0] != record.cum_len:
+                if not 0 <= self.routed_experts_start <= record.prev_len:
                     raise ValueError(
-                        "GPU routes must cover the complete engine sequence"
+                        "GPU routes start must lie within the admitted prefix"
                     )
-                delta_routes = routes.detach()[record.prev_len :]
+                if (
+                    routes.ndim != 3
+                    or routes.shape[0] != record.cum_len - self.routed_experts_start
+                ):
+                    raise ValueError(
+                        "GPU routes must cover the retained engine sequence suffix"
+                    )
+                delta_routes = routes.detach()[
+                    record.prev_len - self.routed_experts_start :
+                ]
                 if delta_routes.shape != expected_routes[0].shape:
                     raise ValueError(
                         "GPU routes shape does not match committed CPU mirror"

@@ -29,6 +29,7 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 )
 from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
 from nemo_rl.models.generation.vllm.gpu_output_capture import (
+    GpuCaptureOwner,
     GpuOutputCapture,
     GpuOutputLease,
     configure_gpu_output_capture,
@@ -348,7 +349,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         self,
         frontend_hostname: str,
         require_routed_experts: bool,
-    ) -> str | None:
+    ) -> GpuCaptureOwner | None:
         return configure_gpu_output_capture(
             self,
             frontend_hostname=frontend_hostname,
@@ -360,6 +361,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         capture_key: str,
         generated_token_count: int,
         prompt_token_count: int,
+        start: int = 0,
     ) -> GpuOutputLease | None:
         if self._gpu_output_capture is None:
             return None
@@ -367,6 +369,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             capture_key,
             generated_token_count=generated_token_count,
             prompt_token_count=prompt_token_count,
+            start=start,
         )
 
     def release_gpu_output_capture(self, lease_id: str) -> None:

@@ -333,8 +333,9 @@ def attach_routed_experts_to_chat_response_choices(
     device: torch.device,
     logger: Any = None,
     routed_experts_dtype: torch.dtype = ROUTED_EXPERTS_FALLBACK_DTYPE,
+    routed_experts_start: int = 0,
 ) -> Any:
-    """Attach aligned routed experts to OpenAI chat response choices."""
+    """Attach aligned routed experts, beginning at the requested token offset."""
     outputs_by_index = {
         output.index: output for output in getattr(final_request_output, "outputs", [])
     }
@@ -390,7 +391,7 @@ def attach_routed_experts_to_chat_response_choices(
         # re-validated at every gym HTTP hop; a single string passes through
         # the gym chain opaquely.
         choice.message.routed_experts = encode_routed_experts(
-            routed_experts.to(dtype=routed_experts_dtype)
+            routed_experts[routed_experts_start:].to(dtype=routed_experts_dtype)
         )
 
     if len(attached_choice_indices) != len(choices):

@@ -23,6 +23,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+import ray
 import torch
 
 from nemo_rl.models.generation.vllm.gpu_output_capture import (
@@ -49,6 +50,10 @@ def _runner(
         hidden_states: torch.Tensor | None,
         num_scheduled_tokens: int,
     ) -> str:
+        if not async_scheduling:
+            # Native sync bookkeeping materializes both before returning.
+            runner.sampled_token_ids_cpu = sampler_output.sampled_token_ids.cpu()
+            runner.logprobs_cpu = sampler_output.logprobs_tensors.logprobs.cpu()
         return "original-serving-output"
 
     def sample_tokens(grammar_output: Any) -> SimpleNamespace:
@@ -65,16 +70,38 @@ def _runner(
             if async_scheduling and routes
             else None
         )
-        return SimpleNamespace(
+        output = SimpleNamespace(
             _routed_experts=snapshot,
             _sampled_token_ids=sampler.sampled_token_ids,
             _logprobs_tensors=sampler.logprobs_tensors,
             serving_result=serving_result,
         )
+        if async_scheduling:
+            # Match AsyncGPUModelRunnerOutput's existing stream/event ordering.
+            output.async_copy_ready_event = torch.cuda.Event(blocking=True)
+            producing_stream = torch.cuda.current_stream()
+            with torch.cuda.stream(runner.async_output_copy_stream):
+                runner.async_output_copy_stream.wait_stream(producing_stream)
+                output.sampled_token_ids_cpu = sampler.sampled_token_ids.to(
+                    "cpu", non_blocking=True
+                )
+                output.logprobs_cpu = sampler.logprobs_tensors.logprobs.to(
+                    "cpu", non_blocking=True
+                )
+                output.routes_cpu = (
+                    snapshot.routing_data.to("cpu", non_blocking=True)
+                    if snapshot is not None
+                    else None
+                )
+                output.async_copy_ready_event.record()
+        return output
 
     runner = SimpleNamespace(
         sample_tokens=sample_tokens,
         use_async_scheduling=async_scheduling,
+        async_output_copy_stream=torch.cuda.Stream() if async_scheduling else None,
+        sampled_token_ids_cpu=None,
+        logprobs_cpu=None,
         device=torch.device("cuda", 0),
         _bookkeeping_sync=bookkeeping,
         input_batch=SimpleNamespace(
@@ -231,7 +258,159 @@ cuda_required = pytest.mark.skipif(
 
 
 @cuda_required
-def test_native_payload_survives_scratch_reuse_and_cross_process_ipc() -> None:
+@pytest.mark.parametrize("routes", [False, True])
+def test_capture_reuses_native_async_event_without_recording_another(
+    monkeypatch: pytest.MonkeyPatch, routes: bool
+) -> None:
+    runner = _runner(routes=routes)
+    capture = _capture(runner, require_routed_experts=routes)
+    native_event = torch.cuda.Event
+    events = []
+
+    def track_event(*args: Any, **kwargs: Any) -> torch.cuda.Event:
+        event = native_event(*args, **kwargs)
+        events.append(event)
+        return event
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.cuda, "Event", track_event)
+        output = _step(runner, capture)
+    assert events == [output.async_copy_ready_event]
+    fragment = capture._requests["call"].fragments[0]
+    assert fragment.ready is output.async_copy_ready_event
+    capture.discard("call")
+
+
+@cuda_required
+def test_native_copy_event_orders_export_before_cpu_materialization() -> None:
+    runner = _runner()
+    capture = _capture(runner, require_routed_experts=True)
+    producing_stream, export_stream = torch.cuda.Stream(), torch.cuda.Stream()
+
+    def delay_producing_writes() -> None:
+        # The inputs already exist; delaying before their creation would let a
+        # blocking H2D initialization accidentally synchronize this test.
+        _, sampler, scratch = runner.native_step
+        torch.cuda._sleep(200_000_000)
+        sampler.sampled_token_ids.fill_(23)
+        sampler.logprobs_tensors.logprobs.fill_(-1.25)
+        scratch.fill_(42)
+
+    runner.after_bookkeeping = delay_producing_writes
+    with torch.cuda.stream(producing_stream):
+        output = _step(runner, capture)
+    ready = output.async_copy_ready_event
+    assert not ready.query()
+    assert capture._requests["call"].fragments[0].ready is ready
+    # Do not perform native get_output's CPU event synchronization. Also drop
+    # its GPU references; only capture owns the views used by this export.
+    del output._routed_experts, output._sampled_token_ids, output._logprobs_tensors
+    del runner.native_step
+    with torch.cuda.stream(export_stream):
+        lease = capture.export("call", generated_token_count=1, prompt_token_count=3)
+    export_stream.synchronize()
+    tensors = capture._leases[lease.lease_id].tensors
+    assert tensors.generated_token_ids.tolist() == [23]
+    assert tensors.generation_logprobs.tolist() == [-1.25]
+    assert tensors.routed_experts.tolist() == [
+        [[42, 42]],
+        [[42, 42]],
+        [[42, 42]],
+        [[0, 1]],
+    ]
+    del tensors
+    capture.abandon_unimported(lease.lease_id)
+
+
+@cuda_required
+@pytest.mark.parametrize("export_start", [0, 2])
+def test_last_copy_event_covers_all_steps_without_full_extent_slices(
+    monkeypatch: pytest.MonkeyPatch, export_start: int
+) -> None:
+    runner = _runner()
+    capture = _capture(runner, require_routed_experts=True)
+    # Allocate before delaying the producer: no blocking input H2D may complete
+    # an earlier step while the subsequent native outputs are being assembled.
+    steps = [
+        (
+            SimpleNamespace(
+                num_scheduled_tokens={"native": count},
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=SimpleNamespace(resumed_req_ids=set()),
+            ),
+            SimpleNamespace(
+                sampled_token_ids=torch.zeros((1, 1), dtype=torch.int32, device="cuda"),
+                logprobs_tensors=SimpleNamespace(
+                    logprobs=torch.zeros((1, 1), device="cuda")
+                ),
+            ),
+            torch.zeros((count, 1, 2), dtype=torch.uint16, device="cuda"),
+        )
+        for count in (3, 1, 1)
+    ]
+    torch.cuda.synchronize()
+    producing_stream, export_stream = torch.cuda.Stream(), torch.cuda.Stream()
+    outputs = []
+    runner.discard_request_mask.np[0] = False
+    with torch.cuda.stream(producing_stream):
+        torch.cuda._sleep(200_000_000)
+        for index, (step, position) in enumerate(zip(steps, (0, 3, 4), strict=True)):
+            runner.input_batch.num_computed_tokens_cpu[0] = position
+            runner.native_step = step
+            _, sampler, scratch = step
+            sampler.sampled_token_ids.fill_(25 + index)
+            sampler.logprobs_tensors.logprobs.fill_(-0.25 * (index + 1))
+            scratch.fill_(100 + index)
+            outputs.append(runner.sample_tokens(None))
+            scratch.fill_(255)
+    assert not outputs[0].async_copy_ready_event.query()
+    assert not outputs[-1].async_copy_ready_event.query()
+    fragments = capture._requests["call"].fragments
+    route_ids = {id(fragment.routes) for fragment in fragments}
+    waits, slices = [], []
+    original_wait, original_getitem = (
+        torch.cuda.Stream.wait_event,
+        torch.Tensor.__getitem__,
+    )
+
+    def track_wait(stream: torch.cuda.Stream, event: torch.cuda.Event) -> None:
+        waits.append(event)
+        original_wait(stream, event)
+
+    def track_slice(tensor: torch.Tensor, key: Any) -> torch.Tensor:
+        if id(tensor) in route_ids:
+            slices.append(key)
+        return original_getitem(tensor, key)
+
+    with monkeypatch.context() as patch, torch.cuda.stream(export_stream):
+        patch.setattr(torch.cuda.Stream, "wait_event", track_wait)
+        patch.setattr(torch.Tensor, "__getitem__", track_slice)
+        # The third step is already queued but excluded by the final stop.
+        lease = capture.export(
+            "call", generated_token_count=2, prompt_token_count=3, start=export_start
+        )
+    export_stream.synchronize()
+    try:
+        assert waits == [outputs[-1].async_copy_ready_event]
+        assert slices == ([] if export_start == 0 else [slice(2, 3)])
+        tensors = capture._leases[lease.lease_id].tensors
+        assert tensors.generated_token_ids.tolist() == [25, 26]
+        assert tensors.generation_logprobs.tolist() == [-0.25, -0.5]
+        assert (
+            tensors.routed_experts.tolist()
+            == [[[100, 100]], [[100, 100]], [[100, 100]], [[101, 101]], [[0, 1]]][
+                export_start:
+            ]
+        )
+    finally:
+        capture.abandon_unimported(lease.lease_id)
+
+
+@cuda_required
+@pytest.mark.parametrize("export_start", [0, 2])
+def test_native_payload_survives_scratch_reuse_and_cross_process_ipc(
+    export_start: int,
+) -> None:
     runner = _runner()
     capture = _capture(runner, require_routed_experts=True)
     capture_stream = torch.cuda.Stream()
@@ -258,7 +437,12 @@ def test_native_payload_survives_scratch_reuse_and_cross_process_ipc() -> None:
             route_values=[16, 17],
         )
     with torch.cuda.stream(export_stream):
-        lease = capture.export("call", generated_token_count=1, prompt_token_count=3)
+        lease = capture.export(
+            "call",
+            generated_token_count=1,
+            prompt_token_count=3,
+            start=export_start,
+        )
     context = multiprocessing.get_context("spawn")
     queue = context.Queue()
     child = context.Process(target=_ipc_child, args=(lease, queue))
@@ -269,7 +453,7 @@ def test_native_payload_survives_scratch_reuse_and_cross_process_ipc() -> None:
     assert child.exitcode == 0
     assert result[0] == [7]
     assert result[1] == pytest.approx([-0.7])
-    assert result[2] == [[[10, 11]], [[12, 13]], [[14, 15]], [[0, 1]]]
+    assert result[2] == [[[10, 11]], [[12, 13]], [[14, 15]], [[0, 1]]][export_start:]
     assert lease.lease_id in capture._leases
     capture.release(lease.lease_id)
     assert not capture._requests and not capture._leases
@@ -348,6 +532,131 @@ def test_reprefill_preserves_already_emitted_routes_and_logprobs() -> None:
     del tensors
     capture.abandon_unimported(lease.lease_id)
     assert not capture._requests and not capture._leases
+
+
+@cuda_required
+@pytest.mark.parametrize("export_start", [0, 1, 3, 5, 8])
+def test_export_batches_fragments_without_changing_overlap_or_cached_holes(
+    export_start: int,
+) -> None:
+    runner = _runner()
+    runner.requests["native"].num_prompt_tokens = 8
+    capture = _capture(runner, require_routed_experts=True)
+    _step(
+        runner,
+        capture,
+        start=2,
+        count=3,
+        route_values=[20, 21, 30, 31, 40, 41],
+        discard=True,
+        initial_cached_prefix=2,
+    )
+    # Uncommitted prefill rows may be recomputed; the latest values must win.
+    _step(
+        runner,
+        capture,
+        start=3,
+        count=3,
+        route_values=[130, 131, 140, 141, 150, 151],
+        discard=True,
+    )
+    _step(runner, capture, start=6, count=2, route_values=[60, 61, 70, 71])
+    # Repeating a sampled position replaces its ID/logprob but preserves the
+    # routes committed when the earlier sampled output was emitted.
+    _step(
+        runner,
+        capture,
+        start=5,
+        count=3,
+        token=9,
+        logprob=-0.9,
+        route_values=[250, 251, 260, 261, 270, 271],
+    )
+    _step(
+        runner,
+        capture,
+        start=8,
+        count=1,
+        token=10,
+        logprob=-1.0,
+        route_values=[80, 81],
+    )
+    _step(
+        runner,
+        capture,
+        start=9,
+        count=1,
+        token=11,
+        logprob=-1.1,
+        route_values=[90, 91],
+    )
+    lease = capture.export(
+        "call", generated_token_count=3, prompt_token_count=8, start=export_start
+    )
+    tensors = capture._leases[lease.lease_id].tensors
+    assert tensors.generated_token_ids.dtype == torch.int64
+    assert tensors.generation_logprobs.dtype == torch.float32
+    assert tensors.generated_token_ids.tolist() == [9, 10, 11]
+    assert tensors.generation_logprobs.tolist() == pytest.approx([-0.9, -1.0, -1.1])
+    assert lease.routed_experts_prefix_backfill_ranges == ((0, 2),)
+    assert (
+        tensors.routed_experts[:, 0].tolist()
+        == [
+            [0, 1],
+            [0, 1],
+            [20, 21],
+            [130, 131],
+            [140, 141],
+            [150, 151],
+            [60, 61],
+            [70, 71],
+            [80, 81],
+            [90, 91],
+            [0, 1],
+        ][export_start:]
+    )
+    assert tensors.routed_experts.untyped_storage().nbytes() == (11 - export_start) * 4
+    del tensors
+    capture.abandon_unimported(lease.lease_id)
+
+
+@cuda_required
+@pytest.mark.parametrize("export_start", [0, 2, 3])
+def test_export_with_no_accepted_tokens_keeps_empty_wire_arrays(
+    export_start: int,
+) -> None:
+    runner = _runner()
+    capture = _capture(runner, require_routed_experts=True)
+    _step(runner, capture)
+    lease = capture.export(
+        "call", generated_token_count=0, prompt_token_count=3, start=export_start
+    )
+    tensors = capture._leases[lease.lease_id].tensors
+    assert tensors.generated_token_ids.shape == (0,)
+    assert tensors.generated_token_ids.dtype == torch.int64
+    assert tensors.generation_logprobs.shape == (0,)
+    assert tensors.generation_logprobs.dtype == torch.float32
+    assert (
+        tensors.routed_experts.tolist() == [[[1, 2]], [[3, 4]], [[0, 1]]][export_start:]
+    )
+    del tensors
+    capture.abandon_unimported(lease.lease_id)
+
+
+@cuda_required
+@pytest.mark.parametrize("export_start", [-1, 4])
+def test_export_rejects_start_outside_prompt_without_consuming_capture(
+    export_start: int,
+) -> None:
+    runner = _runner()
+    capture = _capture(runner, require_routed_experts=True)
+    _step(runner, capture)
+    with pytest.raises(ValueError, match="start must lie within the prompt"):
+        capture.export(
+            "call", generated_token_count=1, prompt_token_count=3, start=export_start
+        )
+    assert "call" in capture._requests and not capture._leases
+    capture.discard("call")
 
 
 @cuda_required
@@ -514,12 +823,23 @@ def test_discard_between_bookkeeping_and_snapshot_does_not_resurrect_request() -
 
 
 @cuda_required
-def test_native_sync_scheduler_keeps_original_sampled_outputs() -> None:
+def test_native_sync_scheduler_keeps_original_sampled_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     runner = _runner(async_scheduling=False)
     capture = _capture(runner, require_routed_experts=False)
+
+    def unexpected_event(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("Sync CPU materialization needs no capture readiness event")
+
+    monkeypatch.setattr(torch.cuda, "Event", unexpected_event)
+    monkeypatch.setattr(torch.cuda.Stream, "wait_event", unexpected_event)
     output = _step(runner, capture)
     assert output._routed_experts is None
     fragment = capture._requests["call"].fragments[0]
+    assert fragment.ready is None
+    assert runner.sampled_token_ids_cpu.tolist() == [[7]]
+    assert runner.logprobs_cpu.tolist()[0] == pytest.approx([-0.7, -9.0])
     assert fragment.token_id.data_ptr() == output._sampled_token_ids.data_ptr()
     assert fragment.logprob.data_ptr() == output._logprobs_tensors.logprobs.data_ptr()
     lease = capture.export("call", generated_token_count=1, prompt_token_count=3)
@@ -631,10 +951,58 @@ def test_cached_prefix_length_is_frozen_before_bookkeeping_and_chunked_prefill()
 
 
 @cuda_required
+@pytest.mark.parametrize("export_start", [0, 4, 8])
+def test_disjoint_cached_prefix_holes_remain_absolute_after_delta_export(
+    export_start: int,
+) -> None:
+    runner = _runner()
+    runner.requests["native"].num_prompt_tokens = 8
+    capture = _capture(runner, require_routed_experts=True)
+    _step(
+        runner,
+        capture,
+        start=6,
+        count=1,
+        route_values=[60, 61],
+        discard=True,
+        initial_cached_prefix=6,
+    )
+    # Uncommitted recomputed rows split the proven historical prefix into holes.
+    _step(
+        runner, capture, start=1, count=2, route_values=[10, 11, 20, 21], discard=True
+    )
+    _step(runner, capture, start=7, count=1, route_values=[70, 71])
+    lease = capture.export(
+        "call", generated_token_count=1, prompt_token_count=8, start=export_start
+    )
+    try:
+        assert lease.routed_experts_prefix_backfill_ranges == ((0, 1), (3, 6))
+        assert (
+            capture._leases[lease.lease_id].tensors.routed_experts.tolist()
+            == [
+                [[0, 1]],
+                [[10, 11]],
+                [[20, 21]],
+                [[0, 1]],
+                [[0, 1]],
+                [[0, 1]],
+                [[60, 61]],
+                [[70, 71]],
+                [[0, 1]],
+            ][export_start:]
+        )
+    finally:
+        capture.abandon_unimported(lease.lease_id)
+
+
+@cuda_required
 @pytest.mark.parametrize(
     "gap_kind", ["uncached_prompt", "generated_route", "generated_id"]
 )
-def test_prefix_authorization_never_covers_missing_fresh_outputs(gap_kind: str) -> None:
+@pytest.mark.parametrize("export_start", [0, 5])
+def test_prefix_authorization_never_covers_missing_fresh_outputs(
+    gap_kind: str, export_start: int
+) -> None:
     runner = _runner()
     runner.requests["native"].num_prompt_tokens = 5
     capture = _capture(runner, require_routed_experts=True)
@@ -669,7 +1037,12 @@ def test_prefix_authorization_never_covers_missing_fresh_outputs(gap_kind: str) 
     else:
         generated = 2
     with pytest.raises(RuntimeError, match="does not cover"):
-        capture.export("call", generated_token_count=generated, prompt_token_count=5)
+        capture.export(
+            "call",
+            generated_token_count=generated,
+            prompt_token_count=5,
+            start=export_start,
+        )
     capture.discard("call")
     torch.cuda.synchronize()
     assert not capture._requests and not capture._leases
@@ -836,6 +1209,7 @@ def test_resumed_requests_discard_gpu_history_for_original_cpu_put(
     "path",
     [
         "supported",
+        "ray",
         "sync_routes",
         "speculative",
         "pipeline",
@@ -853,6 +1227,7 @@ def test_native_optimization_availability_preserves_existing_paths(
     runner.vllm_config = SimpleNamespace(
         speculative_config=object() if path == "speculative" else None,
         parallel_config=SimpleNamespace(
+            distributed_executor_backend="ray" if path == "ray" else "uni",
             pipeline_parallel_size=2 if path == "pipeline" else 1,
             decode_context_parallel_size=2 if path == "context" else 1,
         ),
@@ -867,15 +1242,23 @@ def test_native_optimization_availability_preserves_existing_paths(
         ),
     )
     worker = SimpleNamespace(model_runner=runner)
+    actor = object()
+    if path == "ray":
+        monkeypatch.setattr(
+            ray, "get_runtime_context", lambda: SimpleNamespace(current_actor=actor)
+        )
     capability = configure_gpu_output_capture(
         worker,
         frontend_hostname="other-host" if path == "remote" else socket.gethostname(),
         require_routed_experts=True,
     )
-    assert (capability is not None) == (path == "supported")
+    assert (capability is not None) == (path in ("supported", "ray"))
     if capability is not None:
-        assert capability == str(torch.cuda.get_device_properties(runner.device).uuid)
-    assert (runner.sample_tokens is not original) == (path == "supported")
+        assert capability.gpu_uuid == str(
+            torch.cuda.get_device_properties(runner.device).uuid
+        )
+        assert capability.worker is (actor if path == "ray" else None)
+    assert (runner.sample_tokens is not original) == (path in ("supported", "ray"))
 
 
 @cuda_required
