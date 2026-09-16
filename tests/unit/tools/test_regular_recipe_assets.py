@@ -92,6 +92,25 @@ def test_regular_smoke_aligns_context_and_policy_serving_with_gold():
         assert verifier.judge_responses_create_params.max_output_tokens == 8192
 
 
+def test_regular_smoke_declares_only_consumed_safety_and_checkpoint_keys():
+    root = Path(__file__).resolve().parents[3]
+    config = OmegaConf.load(
+        root / "training_configs/super_rl/experiments/regular_s120_smoke.yaml"
+    )
+    checkpoint = config.policy.megatron_cfg.checkpoint
+    # nemo_rl/models/megatron/setup.py forwards only the ckpt_-prefixed Bridge
+    # names; the unprefixed spelling is silently dropped.
+    assert checkpoint.ckpt_fully_parallel_save_process_group == "ep_dp"
+    assert checkpoint.ckpt_fully_parallel_load_process_group == "ep_dp"
+    assert checkpoint.ckpt_fully_parallel_load_exchange_algo == "broadcast"
+    assert not any(key.startswith("fully_parallel") for key in checkpoint)
+    # The legacy async trainer selected by grpo.async_grpo.enabled reads neither
+    # async_rl.* nor megatron_cfg.distributed_timeout_minutes; declaring them
+    # would imply deadlines and timeouts that do not exist on this path.
+    assert "async_rl" not in config
+    assert "distributed_timeout_minutes" not in config.policy.megatron_cfg
+
+
 def test_regular_smoke_enables_all_gold_output_penalties():
     root = Path(__file__).resolve().parents[3]
     config = OmegaConf.load(

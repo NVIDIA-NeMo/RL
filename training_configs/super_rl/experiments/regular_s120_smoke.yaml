@@ -203,15 +203,15 @@ policy:
     checkpoint:
       async_save: false
       ckpt_assume_constant_structure: true
-      fully_parallel_save_process_group: ep_dp
-      fully_parallel_load_process_group: ep_dp
-      fully_parallel_load_exchange_algo: broadcast
+      # Bridge CheckpointConfig names; nemo_rl forwards only the ckpt_ prefix.
+      ckpt_fully_parallel_save_process_group: ep_dp
+      ckpt_fully_parallel_load_process_group: ep_dp
+      ckpt_fully_parallel_load_exchange_algo: broadcast
     env_vars:
       NRL_ROUTER_REPLAY_EXCLUDE_MTP: '1'
       NRL_ROUTER_REPLAY_VALIDATE: '1'
       NRL_R3_TRACE: '0'
       NRL_R3_TRACE_VERIFY_FORWARD: '0'
-    distributed_timeout_minutes: 45
     force_reconvert_from_hf: false
   router_replay:
     enabled: true
@@ -538,10 +538,3 @@ reward_penalties:
     - 2
     think_open: 12
     think_close: 13
-async_rl:
-  rollout_failure:
-    nemo_gym:
-      rollout_timeout_s: 7200
-      max_row_attempts: 3
-  stall_watchdog:
-    stall_timeout_s: 7500
