@@ -25,7 +25,10 @@ The Sep 16 nightly contains prebuilt main and actor virtual environments whose
 Python symlinks refer to uv-managed interpreters omitted from the squashfs.
 `repair_container_python.sh` installs the matching Python 3.13 interpreter and
 repoints those existing environments without reinstalling their packages. The
-launcher runs it once on every node through `SETUP_COMMAND`.
+launcher stores the exact committed source as one tar artifact on Lustre, then
+extracts it to node-local `/raid/scratch` and repairs Python once per node
+through `SETUP_COMMAND`. It does not bind-mount the login node's `/home`, which
+is not shared with OCI-HSG compute nodes.
 
 The experiment reports means over steps 2-19:
 
