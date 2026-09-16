@@ -115,6 +115,13 @@ class _BlockingPrefixSink(_MemorySink):
         )
 
 
+class _FailClearSink(_MemorySink):
+    """Fail prefix cleanup after accepting a canonical terminal row."""
+
+    def clear(self, staging_keys: list[str]) -> None:
+        raise RuntimeError("injected cleanup failure")
+
+
 class _FailOncePrefixSink(_MemorySink):
     """Reject the first prefix write and accept its retry."""
 
@@ -516,6 +523,7 @@ def _worker_with_capture(sink: _MemorySink):
         "_pop_request_capture",
         "_remember_completed_capture",
         "_finish_request_capture_after_checkpoint_gate",
+        "_finish_request_capture_with_lifecycle_owned",
     ):
         setattr(
             worker, name, getattr(VllmAsyncGenerationWorkerImpl, name).__get__(worker)
@@ -633,6 +641,7 @@ def _capture_worker_with_periodic_flush(sink, threshold):
     for name in (
         "flush_due_generation_chunks",
         "_flush_generation_chunk",
+        "_flush_generation_chunk_with_lifecycle_owned",
         "_observe_request_capture",
     ):
         setattr(
@@ -736,6 +745,87 @@ def test_periodic_flush_rolls_back_and_clears_when_staging_fails():
     state.periodic_flush_due = True
     assert worker.flush_due_generation_chunks() == 1
     assert sink.generation_prefix_records[-1][1].token_ids_delta == [10, 20, 21]
+
+
+def test_terminal_completion_waits_for_periodic_flush_and_clears_its_row():
+    sink = _BlockingPrefixSink()
+    worker = _capture_worker_with_periodic_flush(sink, threshold=2)
+    request = _begin_captured_request(worker, [10])
+    state = worker._capture_calls[id(request)]
+    _observe(worker, request, [20, 21], [-0.1, -0.2])
+
+    flush_result: list[int] = []
+    terminal_result: list[dict] = []
+    flush_thread = threading.Thread(
+        target=lambda: flush_result.append(worker.flush_due_generation_chunks())
+    )
+    terminal_thread = threading.Thread(
+        target=lambda: terminal_result.append(
+            VllmAsyncGenerationWorkerImpl._finish_request_capture(
+                worker,
+                request,
+                _served_content([20, 21, 22], [-0.1, -0.2, -0.3]),
+            )
+        )
+    )
+
+    flush_thread.start()
+    try:
+        assert sink.write_started.wait(timeout=5.0)
+        terminal_thread.start()
+        terminal_thread.join(timeout=0.05)
+        assert terminal_thread.is_alive()
+        assert sink.records == []
+    finally:
+        sink.release_write.set()
+        flush_thread.join(timeout=5.0)
+        terminal_thread.join(timeout=5.0)
+
+    assert not flush_thread.is_alive()
+    assert not terminal_thread.is_alive()
+    assert flush_result == [1]
+    assert terminal_result[0]["ng_commit_coords"]["disposition"] == "staged"
+    assert len(sink.records) == 1
+    assert sink.cleared_generation_prefix_keys == sink.generation_prefix_keys
+    assert state.terminal_started is True
+    assert worker._capture_calls == {}
+
+
+def test_stale_periodic_snapshot_skips_after_terminal_completion():
+    sink = _MemorySink()
+    worker = _capture_worker_with_periodic_flush(sink, threshold=2)
+    request = _begin_captured_request(worker, [10])
+    state = worker._capture_calls[id(request)]
+    _observe(worker, request, [20, 21], [-0.1, -0.2])
+
+    VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker,
+        request,
+        _served_content([20, 21], [-0.1, -0.2]),
+    )
+
+    assert worker._flush_generation_chunk(state, "stale-periodic") is False
+    assert sink.generation_prefix_keys == []
+
+
+def test_terminal_prefix_cleanup_failure_preserves_completion(caplog):
+    sink = _FailClearSink()
+    worker = _capture_worker_with_periodic_flush(sink, threshold=2)
+    request = _begin_captured_request(worker, [10])
+    state = worker._capture_calls[id(request)]
+    _observe(worker, request, [20, 21], [-0.1, -0.2])
+    assert worker.flush_due_generation_chunks() == 1
+
+    with caplog.at_level(logging.ERROR):
+        content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+            worker,
+            request,
+            _served_content([20, 21, 22], [-0.1, -0.2, -0.3]),
+        )
+
+    assert content["ng_commit_coords"]["disposition"] == "staged"
+    assert worker._capture_calls == {}
+    assert "failed to clear obsolete generation chunks" in caplog.text
 
 
 def test_periodic_flush_skips_a_call_a_checkpoint_cut_already_froze():
