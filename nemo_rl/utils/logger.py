@@ -1557,6 +1557,391 @@ class Logger(LoggerInterface):
 
         plt.close(fig)
 
+    def log_token_logprob_diagnostics(
+        self,
+        data: dict[str, Any],
+        tokenizer: Any,
+        step: int,
+        *,
+        per_sequence_mult_prob_error: torch.Tensor,
+        sample_metadata: Optional[list[dict[str, Any]]] = None,
+        max_sequences: int = 32,
+        top_k_tokens_per_sequence: int = 32,
+        min_abs_logprob_diff: float = 0.25,
+        min_sequence_mult_prob_error: float = 1.05,
+        context_tokens: int = 8,
+        relative_position_bins: int = 10,
+        top_token_ids_by_total_abs_diff: int = 32,
+    ) -> None:
+        """Persist compact token-level logprob mismatch diagnostics as JSONL.
+
+        Token positions refer to the unshifted input sequence. The records retain
+        attention-segment and generated-span boundaries so multi-call rollouts can
+        be distinguished from decode/re-encode tokenization changes.
+        """
+        input_ids = data["input_ids"].detach().cpu()
+        input_lengths = data["input_lengths"].detach().cpu()
+        token_mask = data["token_mask"][:, 1:].detach().cpu().bool()
+        sample_mask = data["sample_mask"].detach().cpu().bool()
+        generation_logprobs = data["generation_logprobs"][:, 1:].detach().cpu()
+        prev_logprobs = data["prev_logprobs"][:, 1:].detach().cpu()
+        sequence_errors = per_sequence_mult_prob_error.detach().cpu()
+        attention_segment_lengths = data.get("attention_segment_lengths")
+
+        valid_indices = [
+            index
+            for index in range(input_ids.shape[0])
+            if sample_mask[index]
+            and token_mask[index].any()
+            and sequence_errors[index] >= min_sequence_mult_prob_error
+        ]
+        valid_indices.sort(
+            key=lambda index: float(sequence_errors[index]), reverse=True
+        )
+        selected_indices = valid_indices[:max_sequences]
+        if not selected_indices:
+            return
+
+        def finite_float(value: torch.Tensor) -> Optional[float]:
+            scalar = float(value)
+            return scalar if np.isfinite(scalar) else None
+
+        def decode(token_ids: list[int]) -> str:
+            return tokenizer.decode(
+                token_ids,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+
+        def summarize_signed_diffs(signed_diffs: torch.Tensor) -> dict[str, Any]:
+            finite_mask = torch.isfinite(signed_diffs)
+            finite_diffs = signed_diffs[finite_mask].float()
+            token_count = int(signed_diffs.numel())
+            finite_count = int(finite_mask.sum())
+            if finite_count == 0:
+                return {
+                    "token_count": token_count,
+                    "finite_token_count": 0,
+                    "non_finite_token_count": token_count,
+                    "positive_signed_diff_count": 0,
+                    "zero_signed_diff_count": 0,
+                    "negative_signed_diff_count": 0,
+                    "mean_signed_logprob_diff": None,
+                    "mean_abs_logprob_diff": None,
+                    "rms_logprob_diff": None,
+                    "mean_mult_prob_error": None,
+                    "mult_prob_error_overflow_count": 0,
+                    "abs_logprob_diff_quantiles": {},
+                }
+
+            abs_diffs = finite_diffs.abs()
+            mult_errors = torch.exp(abs_diffs)
+            finite_mult_error_count = int(torch.isfinite(mult_errors).sum())
+            quantiles = torch.quantile(
+                abs_diffs,
+                torch.tensor([0.5, 0.9, 0.99], dtype=abs_diffs.dtype),
+            )
+            return {
+                "token_count": token_count,
+                "finite_token_count": finite_count,
+                "non_finite_token_count": token_count - finite_count,
+                "positive_signed_diff_count": int((finite_diffs > 0).sum()),
+                "zero_signed_diff_count": int((finite_diffs == 0).sum()),
+                "negative_signed_diff_count": int((finite_diffs < 0).sum()),
+                "mean_signed_logprob_diff": finite_float(finite_diffs.mean()),
+                "mean_abs_logprob_diff": finite_float(abs_diffs.mean()),
+                "rms_logprob_diff": finite_float(
+                    torch.sqrt(torch.mean(finite_diffs.square()))
+                ),
+                "mean_mult_prob_error": finite_float(mult_errors.mean()),
+                "mult_prob_error_overflow_count": finite_count
+                - finite_mult_error_count,
+                "abs_logprob_diff_quantiles": {
+                    "p50": finite_float(quantiles[0]),
+                    "p90": finite_float(quantiles[1]),
+                    "p99": finite_float(quantiles[2]),
+                    "max": finite_float(abs_diffs.max()),
+                },
+            }
+
+        records = []
+        for diagnostic_rank, sample_index in enumerate(selected_indices):
+            full_length = int(input_lengths[sample_index])
+            sample_token_mask = token_mask[sample_index, : max(full_length - 1, 0)]
+            valid_token_positions = torch.nonzero(
+                sample_token_mask, as_tuple=False
+            ).flatten()
+            token_diffs = torch.abs(
+                generation_logprobs[sample_index, valid_token_positions]
+                - prev_logprobs[sample_index, valid_token_positions]
+            )
+            signed_token_diffs = (
+                generation_logprobs[sample_index, valid_token_positions]
+                - prev_logprobs[sample_index, valid_token_positions]
+            )
+            token_count = min(top_k_tokens_per_sequence, token_diffs.numel())
+            _, top_offsets = torch.topk(token_diffs, k=token_count)
+
+            loss_spans = []
+            span_start = None
+            for shifted_position, enabled in enumerate(sample_token_mask.tolist()):
+                if enabled and span_start is None:
+                    span_start = shifted_position
+                elif not enabled and span_start is not None:
+                    loss_spans.append((span_start, shifted_position))
+                    span_start = None
+            if span_start is not None:
+                loss_spans.append((span_start, len(sample_token_mask)))
+
+            segment_lengths = (
+                attention_segment_lengths[sample_index]
+                if attention_segment_lengths is not None
+                else [full_length]
+            )
+            attention_spans = []
+            segment_start = 0
+            for segment_length in segment_lengths:
+                segment_end = segment_start + int(segment_length)
+                attention_spans.append((segment_start, segment_end))
+                segment_start = segment_end
+
+            call_summaries = []
+            position_bin_diffs: list[list[torch.Tensor]] = [
+                [] for _ in range(relative_position_bins)
+            ]
+            for loss_span_index, loss_span in enumerate(loss_spans):
+                loss_start, loss_end = loss_span
+                call_signed_diffs = (
+                    generation_logprobs[sample_index, loss_start:loss_end]
+                    - prev_logprobs[sample_index, loss_start:loss_end]
+                )
+                token_start = loss_start + 1
+                attention_segment_index, attention_span = next(
+                    (
+                        (span_index, span)
+                        for span_index, span in enumerate(attention_spans)
+                        if span[0] <= token_start < span[1]
+                    ),
+                    (-1, (0, full_length)),
+                )
+                generation_length = loss_end - loss_start
+                prompt_length = token_start - attention_span[0]
+                segment_length = attention_span[1] - attention_span[0]
+                call_summaries.append(
+                    {
+                        "loss_span_index": loss_span_index,
+                        "attention_segment_index": attention_segment_index,
+                        "attention_segment_start": attention_span[0],
+                        "attention_segment_end": attention_span[1],
+                        "attention_segment_length": segment_length,
+                        "prompt_token_count": prompt_length,
+                        "generation_token_count": generation_length,
+                        "prompt_plus_generation_matches_segment": (
+                            prompt_length + generation_length == segment_length
+                        ),
+                        **summarize_signed_diffs(call_signed_diffs),
+                    }
+                )
+                for bin_index in range(relative_position_bins):
+                    # Offsets belong to floor(offset * bins / generation_length).
+                    # Ceil the inverse bounds so short calls begin in bin zero
+                    # instead of being assigned to the last bins.
+                    bin_start = (
+                        generation_length * bin_index + relative_position_bins - 1
+                    ) // relative_position_bins
+                    bin_end = (
+                        generation_length * (bin_index + 1) + relative_position_bins - 1
+                    )
+                    bin_end //= relative_position_bins
+                    if bin_end > bin_start:
+                        position_bin_diffs[bin_index].append(
+                            call_signed_diffs[bin_start:bin_end]
+                        )
+
+            relative_position_summaries = []
+            for bin_index, diff_parts in enumerate(position_bin_diffs):
+                bin_diffs = (
+                    torch.cat(diff_parts)
+                    if diff_parts
+                    else torch.empty(0, dtype=generation_logprobs.dtype)
+                )
+                relative_position_summaries.append(
+                    {
+                        "bin_index": bin_index,
+                        "relative_start": bin_index / relative_position_bins,
+                        "relative_end": (bin_index + 1) / relative_position_bins,
+                        **summarize_signed_diffs(bin_diffs),
+                    }
+                )
+
+            finite_qualified = torch.isfinite(token_diffs) & (
+                token_diffs >= min_abs_logprob_diff
+            )
+            qualified_token_ids = input_ids[
+                sample_index, valid_token_positions[finite_qualified] + 1
+            ]
+            qualified_abs_diffs = token_diffs[finite_qualified].double()
+            qualified_signed_diffs = signed_token_diffs[finite_qualified].double()
+            token_id_summaries = []
+            if qualified_token_ids.numel():
+                unique_ids, inverse, counts = torch.unique(
+                    qualified_token_ids,
+                    return_inverse=True,
+                    return_counts=True,
+                )
+                total_abs_diff = torch.zeros(unique_ids.numel(), dtype=torch.float64)
+                total_signed_diff = torch.zeros(unique_ids.numel(), dtype=torch.float64)
+                total_abs_diff.scatter_add_(0, inverse, qualified_abs_diffs)
+                total_signed_diff.scatter_add_(0, inverse, qualified_signed_diffs)
+                top_id_indices = torch.argsort(total_abs_diff, descending=True)[
+                    :top_token_ids_by_total_abs_diff
+                ]
+                for unique_index in top_id_indices.tolist():
+                    token_id = int(unique_ids[unique_index])
+                    count = int(counts[unique_index])
+                    token_id_summaries.append(
+                        {
+                            "token_id": token_id,
+                            "token_text": decode([token_id]),
+                            "count_above_abs_diff_threshold": count,
+                            "total_abs_logprob_diff": float(
+                                total_abs_diff[unique_index]
+                            ),
+                            "mean_abs_logprob_diff": float(
+                                total_abs_diff[unique_index] / count
+                            ),
+                            "mean_signed_logprob_diff": float(
+                                total_signed_diff[unique_index] / count
+                            ),
+                        }
+                    )
+
+            token_records = []
+            for top_offset in top_offsets.tolist():
+                shifted_position = int(valid_token_positions[top_offset])
+                token_position = shifted_position + 1
+                token_id = int(input_ids[sample_index, token_position])
+                abs_diff = token_diffs[top_offset]
+
+                loss_span_index, loss_span = next(
+                    (
+                        (span_index, span)
+                        for span_index, span in enumerate(loss_spans)
+                        if span[0] <= shifted_position < span[1]
+                    ),
+                    (-1, (shifted_position, shifted_position + 1)),
+                )
+                attention_segment_index, attention_span = next(
+                    (
+                        (span_index, span)
+                        for span_index, span in enumerate(attention_spans)
+                        if span[0] <= token_position < span[1]
+                    ),
+                    (-1, (0, full_length)),
+                )
+
+                context_start = max(attention_span[0], token_position - context_tokens)
+                context_end = min(
+                    attention_span[1], token_position + context_tokens + 1
+                )
+                context_ids = input_ids[
+                    sample_index, context_start:context_end
+                ].tolist()
+                context_text = decode(context_ids)
+                try:
+                    roundtrip_ids = tokenizer.encode(
+                        context_text, add_special_tokens=False
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    roundtrip_ids = None
+                roundtrip_matches = (
+                    roundtrip_ids == context_ids if roundtrip_ids is not None else None
+                )
+
+                distance_from_loss_start = shifted_position - loss_span[0]
+                heuristic_flags = []
+                if roundtrip_matches is False:
+                    heuristic_flags.append("decode_reencode_tokenization_change")
+                if distance_from_loss_start == 0:
+                    heuristic_flags.append("model_call_generation_boundary")
+                elif distance_from_loss_start <= 2:
+                    heuristic_flags.append("near_model_call_generation_boundary")
+                generation_logprob = generation_logprobs[sample_index, shifted_position]
+                prev_logprob = prev_logprobs[sample_index, shifted_position]
+                if not torch.isfinite(generation_logprob) or not torch.isfinite(
+                    prev_logprob
+                ):
+                    heuristic_flags.append("non_finite_logprob")
+
+                token_records.append(
+                    {
+                        "token_position": token_position,
+                        "token_id": token_id,
+                        "token_text": decode([token_id]),
+                        "generation_logprob": finite_float(generation_logprob),
+                        "recomputed_logprob": finite_float(prev_logprob),
+                        "signed_logprob_diff": finite_float(
+                            generation_logprob - prev_logprob
+                        ),
+                        "abs_logprob_diff": finite_float(abs_diff),
+                        "exceeds_abs_diff_threshold": bool(
+                            abs_diff >= min_abs_logprob_diff
+                        ),
+                        "attention_segment_index": attention_segment_index,
+                        "attention_segment_start": attention_span[0],
+                        "attention_segment_end": attention_span[1],
+                        "loss_span_index": loss_span_index,
+                        "distance_from_loss_span_start": distance_from_loss_start,
+                        "distance_to_loss_span_end": loss_span[1]
+                        - shifted_position
+                        - 1,
+                        "context_start": context_start,
+                        "context_token_ids": context_ids,
+                        "context_text": context_text,
+                        "decode_reencode_token_ids": roundtrip_ids,
+                        "decode_reencode_matches": roundtrip_matches,
+                        "heuristic_flags": heuristic_flags,
+                    }
+                )
+
+            metadata = (
+                sample_metadata[sample_index]
+                if sample_metadata is not None and sample_index < len(sample_metadata)
+                else {}
+            )
+            records.append(
+                {
+                    "step": step,
+                    "diagnostic_rank": diagnostic_rank,
+                    "sample_index": sample_index,
+                    "sequence_mult_prob_error": finite_float(
+                        sequence_errors[sample_index]
+                    ),
+                    "trainable_token_count": int(sample_token_mask.sum()),
+                    "full_length": full_length,
+                    "metadata": metadata,
+                    "all_token_summary": {
+                        **summarize_signed_diffs(signed_token_diffs),
+                        "attention_segment_count": len(attention_spans),
+                        "loss_span_count": len(loss_spans),
+                        "attention_segments_cover_full_length": (
+                            segment_start == full_length
+                        ),
+                        "relative_generation_position_bins": relative_position_summaries,
+                        "calls": call_summaries,
+                        "token_ids_by_total_abs_diff": token_id_summaries,
+                    },
+                    "top_tokens": token_records,
+                }
+            )
+
+        filename = os.path.join(
+            "logprob_diagnostics", f"token_logprob_outliers_step_{step:06d}.jsonl"
+        )
+        self.log_string_list_as_jsonl(
+            [json.dumps(record, ensure_ascii=True) for record in records], filename
+        )
+
     def __del__(self) -> None:
         """Clean up resources when the logger is destroyed."""
         if self.gpu_monitor:

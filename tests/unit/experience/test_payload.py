@@ -16,7 +16,14 @@ from __future__ import annotations
 
 import torch
 
+from nemo_rl.algorithms.grpo import _compact_exact_nemo_gym_call_sequences
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.packed_rollouts import (
+    TREE_ATTENTION_EDGE_LENGTHS,
+    TREE_ATTENTION_EDGE_SOURCE_INDICES,
+    TREE_ATTENTION_EDGE_TARGET_IDS,
+    TREE_ATTENTION_LAYOUTS,
+)
 from nemo_rl.data_plane.codec import materialize
 from nemo_rl.data_plane.schema import (
     INVALID_TOOL_CALL_MASK,
@@ -157,8 +164,14 @@ def test_record_to_train_batch_preserves_routed_experts_in_tq_payload() -> None:
         "num_routed_experts_backfilled": 0,
     }
     assert tags == [
-        {"weight_version": 3, "prompt_idx": 17, **no_violations},
-        {"weight_version": 3, "prompt_idx": 17, **no_violations},
+        {
+            "weight_version": 3,
+            "prompt_idx": 17,
+            "group_id": "group",
+            "rollout_index": i,
+            **no_violations,
+        }
+        for i in range(2)
     ]
 
 
@@ -300,8 +313,18 @@ def test_per_token_multimodal_field_is_packed_with_sequence_lengths() -> None:
         [0, 1],
     ]
     assert tags == [
-        {"weight_version": 3, "prompt_idx": 17},
-        {"weight_version": 3, "prompt_idx": 17},
+        {
+            "weight_version": 3,
+            "prompt_idx": 17,
+            "group_id": "group",
+            "rollout_index": 0,
+        },
+        {
+            "weight_version": 3,
+            "prompt_idx": 17,
+            "group_id": "group",
+            "rollout_index": 1,
+        },
     ]
 
 
@@ -449,6 +472,8 @@ def test_pack_payload_stamps_violation_counts_on_tags() -> None:
         {
             "weight_version": 7,
             "prompt_idx": 17,
+            "group_id": "g",
+            "rollout_index": 0,
             "num_invalid_tool_calls": 1,
             "num_malformed_thinking": 0,
             "num_assistant_messages": 1,
@@ -457,6 +482,8 @@ def test_pack_payload_stamps_violation_counts_on_tags() -> None:
         {
             "weight_version": 7,
             "prompt_idx": 17,
+            "group_id": "g",
+            "rollout_index": 1,
             "num_invalid_tool_calls": 0,
             "num_malformed_thinking": 1,
             "num_assistant_messages": 1,
@@ -465,6 +492,8 @@ def test_pack_payload_stamps_violation_counts_on_tags() -> None:
         {
             "weight_version": 7,
             "prompt_idx": 17,
+            "group_id": "g",
+            "rollout_index": 2,
             "num_invalid_tool_calls": 0,
             "num_malformed_thinking": 0,
             "num_assistant_messages": 0,
@@ -474,3 +503,132 @@ def test_pack_payload_stamps_violation_counts_on_tags() -> None:
             "num_routed_experts_backfilled": 1,
         },
     ]
+
+
+def test_record_to_train_batch_builds_tree_nodes_and_sampled_edges() -> None:
+    call_1 = [
+        {"role": "user", "content": "p", "token_ids": torch.tensor([10, 11])},
+        {
+            "role": "assistant",
+            "content": "a1",
+            "token_ids": torch.tensor([20, 21]),
+            "generation_logprobs": torch.tensor([-0.1, -0.2]),
+        },
+    ]
+    call_2 = [
+        {
+            "role": "user",
+            "content": "p+a1+tool",
+            "token_ids": torch.tensor([30, 31, 32]),
+        },
+        {
+            "role": "assistant",
+            "content": "a2",
+            "token_ids": torch.tensor([40, 41]),
+            "generation_logprobs": torch.tensor([-0.3, -0.4]),
+        },
+    ]
+    completion = Completion(
+        message_log=call_2,
+        env_extras=None,
+        truncated=False,
+        reward=1.0,
+        training_message_logs=[call_1, call_2],
+    )
+
+    train_batch = record_to_train_batch(
+        _record([completion]),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
+    )
+
+    layout = train_batch[TREE_ATTENTION_LAYOUTS][0]
+    assert layout.segment_lengths == (4, 5)
+    assert layout.segment_parents == (-1, -1)
+    assert train_batch["input_lengths"].tolist() == [9]
+    assert train_batch["input_ids"][0, :9].tolist() == [
+        10,
+        11,
+        20,
+        21,
+        30,
+        31,
+        32,
+        40,
+        41,
+    ]
+    assert train_batch["prompt_ids_for_adv"][0, :3].tolist() == [30, 31, 32]
+    assert train_batch[TREE_ATTENTION_EDGE_LENGTHS].tolist() == [4]
+    assert train_batch[TREE_ATTENTION_EDGE_SOURCE_INDICES][0, :4].tolist() == [
+        1,
+        2,
+        6,
+        7,
+    ]
+    assert train_batch[TREE_ATTENTION_EDGE_TARGET_IDS][0, :4].tolist() == [
+        20,
+        21,
+        40,
+        41,
+    ]
+    assert int(train_batch["token_mask"].sum().item()) == 4
+
+    _, fields, _ = pack_payload(
+        train_batch, weight_version=0, group_id="group", prompt_idx=17
+    )
+    assert TREE_ATTENTION_LAYOUTS not in fields
+    assert [row.shape[0] for row in fields["input_ids"].unbind()] == [9]
+    assert [row.shape[0] for row in fields["generation_logprobs"].unbind()] == [5]
+    assert [
+        row.shape[0] for row in fields[TREE_ATTENTION_EDGE_SOURCE_INDICES].unbind()
+    ] == [4]
+
+
+def test_record_to_train_batch_accepts_precompacted_exact_calls() -> None:
+    call_1 = [
+        {"role": "user", "content": "p", "token_ids": torch.tensor([10, 11])},
+        {
+            "role": "assistant",
+            "content": "a1",
+            "token_ids": torch.tensor([20, 21]),
+            "generation_logprobs": torch.tensor([-0.1, -0.2]),
+            "routed_experts": _routes(10, 2),
+        },
+    ]
+    call_2 = [
+        {
+            "role": "user",
+            "content": "p+a1+tool",
+            "token_ids": torch.tensor([30, 31, 32]),
+            "routed_experts": _routes(20, 3),
+        },
+        {
+            "role": "assistant",
+            "content": "a2",
+            "token_ids": torch.tensor([40, 41]),
+            "generation_logprobs": torch.tensor([-0.3, -0.4]),
+            "routed_experts": _routes(30, 2),
+        },
+    ]
+    tree = _compact_exact_nemo_gym_call_sequences(
+        [call_1, call_2],
+        materialize_storage=True,
+    )
+    completion = Completion(
+        message_log=call_2,
+        env_extras=None,
+        truncated=False,
+        reward=1.0,
+        exact_call_tree=tree,
+    )
+
+    train_batch = record_to_train_batch(
+        _record([completion]),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
+    )
+
+    assert train_batch[TREE_ATTENTION_LAYOUTS] == [tree.layout]
+    assert train_batch["input_lengths"].tolist() == [tree.layout.unique_token_count]
+    assert train_batch[TREE_ATTENTION_EDGE_LENGTHS].tolist() == [4]
+    assert int(train_batch["token_mask"].sum().item()) == 4

@@ -33,13 +33,16 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     StatefulDataLoader,
     TokenizerType,
-    grpo_train,
     refit_policy_generation,
     setup,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
-from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
+from nemo_rl.data_plane.factory import (
+    make_policy_factory,
+    maybe_configure_data_plane_env,
+    select_sync_trainer,
+)
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import (
     setup_nemo_gym_config,
@@ -176,6 +179,7 @@ def main() -> None:
             "megatron_cfg" in config.policy
             and config.policy["megatron_cfg"]["enabled"]
             and bool(config.policy["megatron_cfg"].get("mtp_num_layers"))
+            and not bool(config.policy["megatron_cfg"].get("disable_mtp_loss"))
         )
         config.policy["generation"] = configure_generation_config(
             config.policy["generation"],
@@ -257,6 +261,7 @@ The validation set you pass in will directly be used for validation with no addi
             train_dataset,
             val_dataset,
             processor=processor,
+            policy_factory=make_policy_factory(config.data_plane),
         )
 
     rl_init_timer.record("total", time.perf_counter() - main_start)
@@ -332,25 +337,24 @@ The validation set you pass in will directly be used for validation with no addi
                 processor=processor,
             )
         else:
-            print("🚀 Running synchronous GRPO training")
-
-            # Run standard GRPO training
-            trainer_owns_environment_shutdown = True
-            grpo_train(
-                policy,
-                policy_generation,
-                dataloader,
-                val_dataloader,
-                tokenizer,
-                loss_fn,
-                task_to_env,
-                val_task_to_env,
-                logger,
-                checkpointer,
-                grpo_state,
-                master_config,
-                processor=processor,
-            )
+            trainer = select_sync_trainer(master_config)
+            with checkpointer:
+                trainer_owns_environment_shutdown = True
+                trainer(
+                    policy,
+                    policy_generation,
+                    dataloader,
+                    val_dataloader,
+                    tokenizer,
+                    loss_fn,
+                    task_to_env,
+                    val_task_to_env,
+                    logger,
+                    checkpointer,
+                    grpo_state,
+                    master_config,
+                    processor=processor,
+                )
     finally:
         if not trainer_owns_environment_shutdown:
             shutdown_environments(task_to_env, val_task_to_env)

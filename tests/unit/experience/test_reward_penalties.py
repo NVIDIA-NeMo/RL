@@ -80,6 +80,27 @@ def _msg(role, token_ids, **extra):
     return msg
 
 
+@pytest.mark.parametrize("violation", ["unwanted", "thinking"])
+def test_token_penalties_include_earlier_exact_calls(violation):
+    first = [
+        _msg("user", [1]),
+        _msg("assistant", [99], has_malformed_thinking=violation == "thinking"),
+    ]
+    last = [_msg("user", [2]), _msg("assistant", [3])]
+    result = _make_result(message_log=last)
+    result["training_message_logs"] = [first, last]
+    config = (
+        {"penalize_unwanted_tokens": True, "token_ids": {"unwanted": [99]}}
+        if violation == "unwanted"
+        else {"penalize_malformed_think_tag": True}
+    )
+
+    counts = apply_reward_penalties([result], config)
+
+    assert result["full_result"]["reward"] == 0.0
+    assert sum(counts.values()) == 1
+
+
 class _FakeTokenizer:
     def __init__(self, eos_token_id=2, token_map=None):
         self.eos_token_id = eos_token_id
@@ -93,6 +114,7 @@ class _FakeTokenizer:
 
 class TestMaskSampleFlags:
     def test_reads_mask_sample_from_instance_config(self):
+        """An agent that judges its own rollout unusable sets it in the instance config."""
         results = [
             {"full_result": {"instance_config": {"mask_sample": True}}},
             {"full_result": {"instance_config": {"mask_sample": False}}},
@@ -107,6 +129,21 @@ class TestMaskSampleFlags:
         assert torch.equal(
             mask_sample, torch.tensor([True, False, False, False, False])
         )
+
+    def test_reads_mask_sample_from_the_top_of_the_record(self):
+        """Gym's token capture puts it there: rollout collection does not own the agent's
+        instance config, and a consumer should not have to know the feature exists to find it."""
+        results = [
+            {"full_result": {"mask_sample": True}},
+            {"full_result": {"mask_sample": False}},
+            # Either location masks, so a rollout flagged by the agent still counts.
+            {"full_result": {"instance_config": {"mask_sample": True}}},
+            {"full_result": {}},
+        ]
+
+        mask_sample = _mask_sample_flags(r["full_result"] for r in results)
+
+        assert torch.equal(mask_sample, torch.tensor([True, False, True, False]))
 
 
 class TestShouldMaskFlaggedSamples:

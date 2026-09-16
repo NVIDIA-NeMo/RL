@@ -2234,6 +2234,83 @@ class TestLogger:
         assert any("Max abs error" in text for text in legend_texts)
         assert any("Max rel error (prob)" in text for text in legend_texts)
 
+    def test_log_token_logprob_diagnostics_preserves_shift_and_boundaries(
+        self, temp_dir
+    ):
+        """Outlier JSONL identifies the predicted token and call boundaries."""
+
+        class TestTokenizer:
+            def decode(self, token_ids, **_kwargs):
+                return ",".join(str(token_id) for token_id in token_ids)
+
+            def encode(self, text, **_kwargs):
+                return [int(token_id) for token_id in text.split(",")]
+
+        cfg = {
+            "wandb_enabled": False,
+            "tensorboard_enabled": False,
+            "mlflow_enabled": False,
+            "swanlab_enabled": False,
+            "monitor_gpus": False,
+            "wandb": {},
+            "log_dir": temp_dir,
+        }
+        logger = Logger(cfg)
+        data = {
+            "input_ids": torch.tensor([[10, 11, 12, 13, 0]]),
+            "input_lengths": torch.tensor([4]),
+            "token_mask": torch.tensor([[0, 1, 1, 0, 0]]),
+            "sample_mask": torch.ones(1),
+            "generation_logprobs": torch.tensor([[0.0, -3.0, -1.0, 0.0, 0.0]]),
+            "prev_logprobs": torch.tensor([[0.0, -1.0, -1.5, 0.0, 0.0]]),
+            "attention_segment_lengths": [[4]],
+        }
+
+        logger.log_token_logprob_diagnostics(
+            data,
+            TestTokenizer(),
+            3,
+            per_sequence_mult_prob_error=torch.tensor([4.0]),
+            sample_metadata=[{"task_name": "task-a", "_ng_rollout_index": 1}],
+            max_sequences=1,
+            top_k_tokens_per_sequence=2,
+            min_abs_logprob_diff=0.25,
+            min_sequence_mult_prob_error=1.05,
+            context_tokens=1,
+        )
+
+        output = (
+            Path(temp_dir)
+            / "logprob_diagnostics"
+            / "token_logprob_outliers_step_000003.jsonl"
+        )
+        record = json.loads(output.read_text(encoding="utf-8"))
+        assert record["metadata"]["task_name"] == "task-a"
+        assert record["top_tokens"][0]["token_position"] == 1
+        assert record["top_tokens"][0]["token_id"] == 11
+        assert (
+            "model_call_generation_boundary"
+            in record["top_tokens"][0]["heuristic_flags"]
+        )
+        assert record["top_tokens"][0]["decode_reencode_matches"] is True
+        summary = record["all_token_summary"]
+        assert summary["token_count"] == 2
+        assert summary["positive_signed_diff_count"] == 1
+        assert summary["negative_signed_diff_count"] == 1
+        assert summary["calls"][0]["prompt_token_count"] == 1
+        assert summary["calls"][0]["generation_token_count"] == 2
+        assert summary["calls"][0]["prompt_plus_generation_matches_segment"] is False
+        assert summary["attention_segments_cover_full_length"] is True
+        assert (
+            sum(
+                item["token_count"]
+                for item in summary["relative_generation_position_bins"]
+            )
+            == 2
+        )
+        assert summary["relative_generation_position_bins"][0]["token_count"] == 1
+        assert summary["token_ids_by_total_abs_diff"][0]["token_id"] == 11
+
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
     @patch("nemo_rl.utils.logger.MLflowLogger")

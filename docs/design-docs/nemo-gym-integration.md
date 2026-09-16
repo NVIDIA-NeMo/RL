@@ -53,6 +53,119 @@ For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/n
 
 NeMo Gym runs as a Ray actor within NeMo RL's Ray cluster, so the same Ray and Python versions must be used in both environments.
 
+## Harbor and Exact-Call Training
+
+Harbor integration uses Gym's `responses_api_agents/harbor_agent_general`.
+Its `harbor_agent`, `harbor_environment`, `harbor_dataset`, and `harbor_verifier`
+fields use Harbor's typed configurations. Policy and verifier harnesses can be
+configured independently. Direct-provider evaluation does not require an RL
+model server. For training, configure the agent's `model_server`,
+`model_api_key`, and `token_id_capture: true` so policy requests traverse Gym's
+capture endpoint before reaching the NeMo RL vLLM workers.
+
+Dataset JSONL records must name the registered agent in `agent_ref`; updating
+the config path alone does not migrate an existing manifest. Datasets, model
+weights, provider credentials, and deployment-specific mounts remain external
+inputs. See Gym's `responses_api_agents/harbor_agent_general/TRAINING.md` for
+OpenSandbox and migration details.
+
+### Representation and Ownership
+
+Harbor's ATIF trajectory describes the interaction, but the training source of
+truth is the token record captured for each inference call. A harness may
+retokenize history, compact it, or invoke a subagent. The trainer must not
+replace any of those exact contexts with a textually equivalent concatenation.
+
+| Layer | Contract |
+|-------|----------|
+| Gym capture | Preserve prompt IDs, sampled IDs, sampled logprobs, optional expert routes, and replica/cache/weight-version metadata per call. |
+| Exact-call preparation | Build a route-compatible prefix tree from exact token IDs; incompatible contexts remain separate branches. |
+| Physical model input | Store unique token runs with parent/depth metadata. A node attends only to its own causal ancestry. |
+| Policy loss | Maintain a separate sampled-edge stream containing targets, logprobs, masks, and advantages. Each sampled occurrence contributes once, even if its context is shared. |
+| Bounded fragments | Repeat ancestor context as needed to fit a microbatch, but assign each sampled edge to exactly one fragment. |
+| Reassembly | Return edge values to the original logical rollout order before policy-loss bookkeeping. |
+
+The final generated token may lack an executed routing row because no next
+token was decoded from it. If a later request executes that same context, its
+known route can materialize the node. After that, another continuation with a
+different known route must branch; the original missing row is not a wildcard
+that permits incompatible continuations to share a hidden state. Replica,
+weight-version, and cache metadata further constrain route-prefix reuse.
+
+The pure construction algorithms live in `nemo_rl/data/exact_calls.py`.
+`nemo_rl/data/packed_rollouts.py` defines layouts, ancestor-closed fragmentation,
+and sampled-edge reassembly. GRPO attaches episode rewards and advantages;
+these representations do not introduce a separate reward or normalization rule.
+
+Select Gym's `token_id_capture.builder: independent_calls` for this contract.
+The upstream default, `prefix_merging`, projects a verified terminal chain and
+does not preserve the whole episode for training. Native external-staging
+receipts currently support that single-chain contract only; combining them
+with `independent_calls` is rejected before Gym servers start. Whole-episode
+trees use the ordinary Gym payload with either legacy or TQ ingestion instead.
+
+### Capture Lifetime
+
+Freezing a capture does not delete it. The Gym actor returns a small frozen
+snapshot identity alongside the token payload, without retaining a second
+copy of the token or routing arrays. Successful acceptance permits retirement:
+
+- Async TQ: after the canonical replay-buffer commit succeeds.
+- Legacy async: after the replay-buffer actor accepts the complete prompt group.
+- Sync TQ: after the first data-plane write succeeds.
+- Sync without TQ: after the caller has assembled and validated the complete
+  returned batch; this path has no replay buffer.
+
+Retirement is conditional on the same snapshot ID and version. Unknown,
+changed, failed, or capture-masked snapshots are not deleted. Cleanup failure
+does not retry or discard an already accepted rollout. Set Gym's
+`token_id_capture.retain_consumed: true` to keep successful captures for offline
+inspection. The Gym actor closes only sources it created, never a borrowed
+framework-installed source. This handoff is not a per-rollout disk checkpoint;
+durability across a full job failure still depends on the training checkpoint.
+
+### Legacy and Transfer Queue
+
+Legacy delivery and the Transfer Queue (TQ) must preserve the same logical
+rollout, exact-call metadata, sampled-edge ownership, and row order. Tree model
+inputs are node-aligned; loss tensors are edge-aligned and need not have the
+same sequence length. Treating both as ordinary token-aligned tensors would
+silently change the objective or create unnecessarily large padded broadcasts.
+
+For oversized TQ trees, dispatch carries fragment selections and row metadata.
+The worker materializes bounded physical microbatches before model-parallel
+broadcast rather than broadcasting the whole padded logical group. The legacy
+path uses the same fragment planner and edge reassembly contracts.
+
+SingleController resumes the current upstream native TQ checkpoint format.
+Historical `replay_buffer.pt` and `replay_buffer/manifest.json` checkpoints are
+rejected when native replay metadata is absent, rather than silently losing
+buffered rollouts. Resume those using their original implementation or make
+an explicit decision to restart without the old buffer; there is no automatic
+format migration in this patch.
+
+### Backend Requirements
+
+Shared-prefix execution requires the matching Megatron-Core tree attention,
+Mamba state propagation, and sampled-edge projection support, as well as
+`policy.sequence_packing.enabled: true`. Physical microbatch budgets are
+`policy.sequence_packing.train_mb_tokens` and `logprob_mb_tokens`; a logical
+root-to-leaf path must still fit the context and fragment budget. Fragmenting a
+wide tree does not truncate a long path. Multimodal tree fragmentation is not
+supported, and unsupported loss/backend combinations fail explicitly.
+
+Whole-episode independent-call training is currently a GRPO feature. PPO and
+teacher/distillation consumers reject explicit independent-call requests rather
+than training only the compatibility transcript. Their ordinary native-agent
+and upstream prefix-merging paths retain upstream behavior. A synchronous
+consumer must opt in with `allow_independent_calls=True` only after implementing
+the exact-call contract; returning a token-bearing transcript is not sufficient.
+
+CPU layout tests establish token/route alignment and single ownership. They do
+not establish numerical kernel parity. Changes to backend execution also need
+forward and gradient comparisons against independent paths for the configured
+CP/TP topology and model family, including Mamba models.
+
 ## Architecture Overview
 
 ```mermaid

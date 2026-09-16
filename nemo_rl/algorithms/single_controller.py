@@ -121,6 +121,7 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.algorithms.single_controller_utils.utils import (
+    advantage_group_ids_from_meta,
     aggregate_step_metrics,
     apply_message_level_advantage_penalties,
     fields_for_put,
@@ -389,7 +390,9 @@ class SingleControllerActor:
             hparams["token_capture"]["control_auth_token"] = "<redacted>"
         self._logger.log_hyperparams(hparams)
         self._logger.log_metrics(
-            setup_timing_metrics.to_metrics_dict(), step=0, prefix="timing/setup"
+            setup_timing_metrics.to_metrics_dict(),
+            step=actor_args.save_state.current_step,
+            prefix="timing/setup",
         )
         self._timer = Timer()
         self._throughput_sample_time: Optional[float] = None
@@ -4714,7 +4717,10 @@ class SingleControllerActor:
             select_fields=self._advantage_input_fields(),
         )
 
-        prompt_ids = tensor_field(data, adv_cfg.prompt_ids_field)
+        advantage_group_ids = advantage_group_ids_from_meta(
+            meta,
+            expected_group_size=self._algo_cfg.num_generations_per_prompt,
+        )
         rewards = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.reward_field)
         ).float()
@@ -4815,7 +4821,7 @@ class SingleControllerActor:
         returns: Optional[torch.Tensor] = None
         if has_valid_training_tokens:
             result = self._advantage_estimator.compute_advantage(
-                prompt_ids=prompt_ids,
+                prompt_ids=advantage_group_ids,
                 rewards=rewards,
                 mask=mask,
                 repeated_batch=repeated_batch,
@@ -4903,7 +4909,6 @@ class SingleControllerActor:
     def _advantage_input_fields(self) -> list[str]:
         adv_cfg = self._advantage_cfg
         fields = [
-            adv_cfg.prompt_ids_field,
             adv_cfg.reward_field,
             adv_cfg.token_mask_field,
             adv_cfg.sample_mask_field,
