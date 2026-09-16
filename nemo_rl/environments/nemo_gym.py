@@ -1691,6 +1691,7 @@ def build_nemo_gym_config(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
+    routed_experts_dtype: Optional[str] = None,
 ) -> NemoGymConfig:
     """Build the ``NemoGymConfig`` for a NeMo-Gym actor.
 
@@ -1740,11 +1741,14 @@ def build_nemo_gym_config(
     if uv_venv_dir is not None:
         nemo_gym_dict.setdefault("uv_venv_dir", uv_venv_dir)
 
-    routed_experts_dtype = (
-        resolve_routed_experts_dtype_name_for_model(model_name)
-        if enable_router_replay
-        else "int16"
-    )
+    if routed_experts_dtype is None:
+        # Caller-resolved dtype wins (the legacy grpo.py path on super-v3.5
+        # passes it explicitly); otherwise derive it from the model here.
+        routed_experts_dtype = (
+            resolve_routed_experts_dtype_name_for_model(model_name)
+            if enable_router_replay
+            else "int16"
+        )
 
     return NemoGymConfig(
         model_name=model_name,
@@ -1771,6 +1775,7 @@ def spinup_nemo_gym_actor(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
+    routed_experts_dtype: Optional[str] = None,
 ) -> Any:
     """Spin up the NeMo-Gym actor against the given generation server URLs.
 
@@ -1797,6 +1802,7 @@ def spinup_nemo_gym_actor(
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
         token_capture=token_capture,
+        routed_experts_dtype=routed_experts_dtype,
     )
 
     nemo_gym_opts: dict[str, Any] = {
