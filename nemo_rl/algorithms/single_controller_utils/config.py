@@ -1280,7 +1280,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     validate_router_replay_transport_path(
         master_config.policy,
-        data_plane_enabled=bool((master_config.data_plane or {}).get("enabled", False)),
+        data_plane_enabled=bool((getattr(master_config, "data_plane", None) or {}).get("enabled", False)),
         async_grpo_enabled=True,
         nemo_gym_enabled=bool(master_config.env.get("should_use_nemo_gym", False)),
         load_replay_buffer=master_config.checkpointing.get("load_replay_buffer"),
