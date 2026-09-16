@@ -66,6 +66,7 @@ recipe=${recipe}
 arm=${arm}
 refit_transport=${transport}
 nrl_mxfp8_batched_shuffle=${batched_shuffle}
+container_python_setup=research/qwen30_refit_cumulative_ablation/repair_container_python.sh
 steps=20
 steady_window=2-19
 account=${account}
@@ -81,7 +82,8 @@ EOF
   export HF_DATASETS_CACHE="${hf_home}/datasets"
   export NRL_MXFP8_BATCHED_SHUFFLE="${batched_shuffle}"
   export RAY_LOG_SYNC_FREQUENCY=300
-  export MOUNTS="/lustre:/lustre,${repo_root}/nemo_rl:/opt/nemo-rl/nemo_rl,${repo_root}/examples:/opt/nemo-rl/examples,${repo_root}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
+  export SETUP_COMMAND="bash /opt/nemo-rl/research/qwen30_refit_cumulative_ablation/repair_container_python.sh"
+  export MOUNTS="/lustre:/lustre,${repo_root}/nemo_rl:/opt/nemo-rl/nemo_rl,${repo_root}/examples:/opt/nemo-rl/examples,${repo_root}/research/qwen30_refit_cumulative_ablation:/opt/nemo-rl/research/qwen30_refit_cumulative_ablation,${repo_root}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
   export COMMAND="cd /opt/nemo-rl && if [[ -f 3rdparty/vllm/nemo-rl.env ]]; then source 3rdparty/vllm/nemo-rl.env; fi && uv run --no-sync examples/run_grpo.py --config ${recipe} grpo.max_num_steps=20 policy.generation.refit_transport=${transport} checkpointing.enabled=false logger.log_dir=${output_dir}/logs logger.wandb_enabled=true logger.wandb.project=${wandb_project} logger.wandb.name=${run_name}"
 
   local sbatch_args=(
