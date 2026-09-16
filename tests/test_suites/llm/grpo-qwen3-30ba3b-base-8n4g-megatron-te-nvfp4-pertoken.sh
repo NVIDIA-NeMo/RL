@@ -4,6 +4,8 @@
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source "$SCRIPT_DIR/common.env"
 
+export NRL_ROUTER_REPLAY_VALIDATE=1
+
 # ===== BEGIN CONFIG =====
 NUM_NODES=8
 GPUS_PER_NODE=4
@@ -35,8 +37,8 @@ uv run --no-sync tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METR
 
 grep -q "\[nvfp4_pertoken\] per-token NVFP4 activation scaling active" "$RUN_LOG"
 REFIT_COUNT=$(grep -F -c "[nvfp4_pertoken] refit: quantized" "$RUN_LOG" || true)
-if [[ $REFIT_COUNT -lt 2 ]]; then
-    echo "[ERROR] Expected at least two quantized refits, found $REFIT_COUNT"
+if [[ $REFIT_COUNT -lt $MAX_STEPS ]]; then
+    echo "[ERROR] Expected at least $MAX_STEPS quantized refits, found $REFIT_COUNT"
     exit 1
 fi
 

@@ -125,6 +125,9 @@ def resolve_boundary_ignore_patterns(
         indices.update(
             range(num_hidden_layers - num_layers_at_end_in_bf16, num_hidden_layers)
         )
+    # Routed-expert containers use mlp.experts (Qwen3-MoE / LLaMA-MoE naming).
+    # Supporting block_sparse_moe.experts (Mixtral) or ffn.experts (DBRX)
+    # requires updating both these patterns and _FULL_EXPERT_LAYER_IGNORE_RE.
     resolved = [f"*.layers.{index}.mlp.experts*" for index in sorted(indices)]
 
     if expected_additional_ignore is not None:

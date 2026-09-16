@@ -411,7 +411,7 @@ def test_rejects_swizzled_scale_shape(nvfp4_module, monkeypatch):
         scale_shape_fn=lambda m, n: (((m + 127) // 128) * 128, n // 16),
     )
     quantizer = _quantizer_with_layer_quantized(M, True)
-    with pytest.raises(AssertionError, match="linear"):
+    with pytest.raises(RuntimeError, match="linear"):
         quantizer.process(
             [
                 (

@@ -435,11 +435,12 @@ class NvFp4PerTokenQuantizer:
             weight, global_scale, is_sf_swizzled_layout=False, backend="none"
         )
         expected_scale_shape = (weight.shape[0], weight.shape[1] // 16)
-        assert scale.shape == expected_scale_shape, (
-            f"[nvfp4_pertoken] expected linear (non-swizzled) NVFP4 block-scale "
-            f"shape {expected_scale_shape}, got {tuple(scale.shape)} — "
-            "scaled_fp4_quant's default swizzled layout may have changed."
-        )
+        if scale.shape != expected_scale_shape:
+            raise RuntimeError(
+                f"[nvfp4_pertoken] expected linear (non-swizzled) NVFP4 block-scale "
+                f"shape {expected_scale_shape}, got {tuple(scale.shape)} — "
+                "scaled_fp4_quant's default swizzled layout may have changed."
+            )
         return packed, scale
 
     @staticmethod
