@@ -203,14 +203,17 @@ def _maybe_restore_native_data_plane_checkpoint(
     checkpoint_path = Path(last_checkpoint_path)
     replay_metadata_path = checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME
     if not replay_metadata_path.is_file():
-        legacy_replay_path = checkpoint_path / LEGACY_REPLAY_BUFFER_FILENAME
-        if legacy_replay_path.is_file():
-            raise RuntimeError(
-                "Checkpoint contains legacy replay_buffer.pt state, which "
-                "predates authoritative native TQ replay recovery. Resume it "
-                "with the older implementation or explicitly start without "
-                "restoring buffered rollouts."
-            )
+        for legacy_name in (
+            LEGACY_REPLAY_BUFFER_FILENAME,
+            "replay_buffer/manifest.json",
+        ):
+            if (checkpoint_path / legacy_name).is_file():
+                raise RuntimeError(
+                    f"Checkpoint contains legacy {legacy_name} state, which "
+                    "predates authoritative native TQ replay recovery. Resume it "
+                    "with the older implementation or explicitly start without "
+                    "restoring buffered rollouts."
+                )
         print(
             f"⚠️ No {REPLAY_BUFFER_METADATA_FILENAME} found in checkpoint "
             f"{checkpoint_path}. The matching TQ checkpoint will not be loaded, "
@@ -962,6 +965,19 @@ def setup_single_controller(
         tokenizer,
         thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
     )
+
+    # Match the legacy GRPO setup: a zero KL coefficient means no reference
+    # state is loaded, so the train pump must not schedule reference logprobs.
+    if (
+        master_config.loss_fn.reference_policy_kl_penalty == 0
+        and not master_config.grpo.skip_reference_policy_logprobs_calculation
+    ):
+        master_config.grpo.skip_reference_policy_logprobs_calculation = True
+        print(
+            "Auto-enabling `grpo.skip_reference_policy_logprobs_calculation=True` "
+            "because `loss_fn.reference_policy_kl_penalty == 0` "
+            "(reference model is not loaded)."
+        )
 
     # short names for config sections
     algo_cfg = algo_config(master_config)
@@ -1845,6 +1861,9 @@ def setup_single_controller(
         staging_partition_id=(
             token_capture_cfg.staging_partition if token_capture_cfg.enabled else None
         ),
+        packing_memory_diagnostics=bool(
+            (dp_config.get("observability") or {}).get("packing_memory_enabled")
+        ),
     )
     finalizer_actors: list[Any] = []
     if token_capture_cfg.enabled:
@@ -1881,6 +1900,11 @@ def setup_single_controller(
             wandb_config=master_config.logger["wandb"],
         ),
         reward_penalty_config=resolved_reward_penalty_config,
+        native_exact_call_tree=master_config.async_rl.native_exact_call_tree,
+        allow_independent_calls=(
+            not is_ppo_run(master_config)
+            and not opd_module.is_opd_enabled(master_config)
+        ),
         tq_buffer=tq_buffer,
         timeouts=RolloutTimeouts(
             rollout_s=master_config.async_rl.rollout_failure.nemo_gym.rollout_timeout_s,

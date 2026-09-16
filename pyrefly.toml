@@ -24,6 +24,7 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "nemo_rl/environments/nemo_gym_capture.py",
   # TODO: enable these once we have 100 correctness
   #"nemo_rl/**/*.py",
   #"examples/**/*.py",
@@ -134,6 +135,8 @@ project-includes = [
   "nemo_rl/data/energon/sft_worker.py",
   "nemo_rl/data/energon/topology.py",
   "nemo_rl/data/interfaces.py",
+  "nemo_rl/data/exact_calls.py",
+  "nemo_rl/data/packed_rollouts.py",
   "nemo_rl/data/multimodal_utils.py",
   "nemo_rl/data/packing/__init__.py",
   "nemo_rl/data/processors.py",

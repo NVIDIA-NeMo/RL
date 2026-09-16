@@ -31,11 +31,27 @@ from nemo_rl.environments.nemo_gym import (
     NEMO_GYM_ACTOR_FQN,
     NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S,
     _detect_invalid_tool_call_and_malformed_thinking,
+    _validate_capture_delivery_mode,
     build_nemo_gym_config,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
     spinup_nemo_gym_actor,
 )
+
+
+@pytest.mark.parametrize(
+    "external_staging,builder",
+    [(False, "independent_calls"), (False, "prefix_merging"), (True, "prefix_merging")],
+)
+def test_capture_delivery_mode_keeps_supported_paths(external_staging, builder):
+    _validate_capture_delivery_mode(external_staging=external_staging, builder=builder)
+
+
+def test_capture_delivery_mode_rejects_terminal_receipts_for_all_calls():
+    with pytest.raises(ValueError, match="cannot deliver independent_calls"):
+        _validate_capture_delivery_mode(
+            external_staging=True, builder="independent_calls"
+        )
 
 
 @pytest.mark.parametrize(

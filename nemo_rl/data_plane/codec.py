@@ -35,6 +35,7 @@ to ``np.ndarray(dtype=object)`` for the trainer.
 
 from __future__ import annotations
 
+from collections.abc import Collection, Mapping
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -135,6 +136,7 @@ def pack_jagged_fields(
     *,
     lengths: torch.Tensor | None,
     token_aligned_fields: set[str] | frozenset[str] | None = None,
+    lengths_by_field: Mapping[str, torch.Tensor] | None = None,
 ) -> TensorDict:
     """Pack a column dict into the wire layout expected by ``put_samples``.
 
@@ -154,6 +156,8 @@ def pack_jagged_fields(
         token_aligned_fields: Field names known to be per-token. These use
             :func:`pack_per_token_field`, which tolerates extra padded columns
             and slices each row to ``lengths``.
+        lengths_by_field: Optional per-field length overrides for tensors whose
+            ragged axis is not the physical token axis.
 
     Returns:
         ``TensorDict`` with ``batch_size=[N]`` (N from ``lengths`` if
@@ -161,6 +165,7 @@ def pack_jagged_fields(
     """
     n = int(lengths.shape[0]) if lengths is not None else 0
     token_aligned_fields = token_aligned_fields or frozenset()
+    lengths_by_field = lengths_by_field or {}
     packed: dict[str, Any] = {}
     for k, v in fields.items():
         if isinstance(v, np.ndarray) and v.dtype == object:
@@ -170,7 +175,10 @@ def pack_jagged_fields(
             # round-trips intact.
             packed[k] = v
         elif isinstance(v, torch.Tensor):
-            if lengths is not None and k in token_aligned_fields:
+            field_lengths = lengths_by_field.get(k)
+            if field_lengths is not None:
+                packed[k] = pack_per_token_field(v, field_lengths)
+            elif lengths is not None and k in token_aligned_fields:
                 packed[k] = pack_per_token_field(v, lengths)
             else:
                 packed[k] = v.detach().contiguous()
@@ -256,6 +264,7 @@ def materialize(
     pad_value_dict: dict[str, int | float] | None = None,
     pad_to_seqlen: int = 0,
     tags: list[dict[str, Any]] | None = None,
+    exclude_pad_to_seqlen_fields: Collection[str] = (),
 ) -> "BatchedDataDict[Any]":
     """Convert a wire TensorDict to a BatchedDataDict.
 
@@ -282,6 +291,8 @@ def materialize(
             to ``sequence_length_round`` for Megatron's microbatch
             iterator); driver-side ``read_columns`` leaves it 0 and
             consumes the natural-padded shape. Default 0 disables.
+        exclude_pad_to_seqlen_fields: Tensor fields whose second dimension is
+            not the physical token axis. They retain their natural width.
 
     Returns:
         ``BatchedDataDict`` with rectangular tensors for padded layout,
@@ -353,6 +364,7 @@ def materialize(
         # extending it to a token seqlen inflates pixel_values ~40x.
         if (
             pad_to_seqlen > 0
+            and key not in exclude_pad_to_seqlen_fields
             and isinstance(padded, torch.Tensor)
             and not padded.is_nested
             and padded.dim() >= 2

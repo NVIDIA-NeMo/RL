@@ -36,6 +36,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     replay_manifest_digest,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
+from nemo_rl.data.packed_rollouts import PACKED_ATTENTION_SEGMENT_LENGTHS
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -688,7 +689,15 @@ class TestTQReplayBufferReserveCommit:
         assert buf.ready_list == [True]
         assert buf.meta_list[0].sample_ids == meta.sample_ids
         # TQ tags preserve both dispatch-time weight and dataset identity.
-        assert meta.tags == [{"weight_version": 3, "prompt_idx": 418}] * _N_GENS
+        assert meta.tags == [
+            {
+                "weight_version": 3,
+                "prompt_idx": 418,
+                "group_id": group_id,
+                "rollout_index": i,
+            }
+            for i in range(_N_GENS)
+        ]
         assert len(dp.put_calls) == 1
         assert len(trace_calls) == 1
         assert trace_calls[0]["keys"] == meta.sample_ids
@@ -715,6 +724,42 @@ class TestTQReplayBufferReserveCommit:
         assert dp.put_calls == []
         assert dp.depth() == 0
         assert buf.ready_list == [False]
+
+    def test_commit_carries_exact_call_layout_in_meta(self, monkeypatch):
+        def _packed_train_batch(
+            record: PromptGroupRecord,
+            *,
+            pad_value_dict: Any,
+            include_message_violation_fields: bool,
+        ) -> BatchedDataDict[Any]:
+            batch = _stub_record_to_train_batch(
+                record,
+                pad_value_dict=pad_value_dict,
+                include_message_violation_fields=include_message_violation_fields,
+            )
+            batch[PACKED_ATTENTION_SEGMENT_LENGTHS] = [[1, 2], [3]]
+            return batch
+
+        monkeypatch.setattr(
+            _replay_buffer_module,
+            "record_to_train_batch",
+            _packed_train_batch,
+        )
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        group_id = buf.reserve(weight_version=3)
+
+        meta = _run(
+            buf.commit(
+                group_id,
+                _make_record(),
+                start_weight_version=3,
+                end_weight_version=3,
+            )
+        )
+
+        assert meta.extra_info[PACKED_ATTENTION_SEGMENT_LENGTHS] == [[1, 2], [3]]
+        assert PACKED_ATTENTION_SEGMENT_LENGTHS not in dp.put_calls[0]["fields"]
 
     def test_commit_raises_for_unknown_group_id(self):
         dp = FakeDataPlaneClient()

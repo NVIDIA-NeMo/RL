@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pickle
 import shutil
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -170,6 +170,7 @@ def materialize_local(
     layout: Layout = "padded",
     pad_value_dict: dict[str, int | float] | None = None,
     pad_to_seqlen: int = 0,
+    exclude_pad_to_seqlen_fields: Collection[str] = (),
 ) -> BatchedDataDict[Any]:
     """Materialize local tensors and restore exact non-tensor field values.
 
@@ -193,6 +194,7 @@ def materialize_local(
         layout=layout,
         pad_value_dict=pad_value_dict,
         pad_to_seqlen=pad_to_seqlen,
+        exclude_pad_to_seqlen_fields=exclude_pad_to_seqlen_fields,
     )
     result.update(local_fields)
     return result

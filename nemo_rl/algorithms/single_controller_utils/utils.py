@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from numbers import Integral
 from typing import Any
 
 import numpy as np
@@ -23,6 +24,7 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.column_io import pack_columns_for_meta
 
 # Reduction rules for all_mb_metrics. Mirror grpo.py / grpo_sync.py.
 _MB_METRIC_MIN: frozenset[str] = frozenset(
@@ -351,25 +353,55 @@ def fields_for_put(meta: KVBatchMeta, fields: dict[str, torch.Tensor]) -> Tensor
     Returns:
         TensorDict shaped for dp_client.put_samples.
     """
-    packed: dict[str, torch.Tensor] = {}
-    if meta.sequence_lengths is None:
-        for field_name, value in fields.items():
-            packed[field_name] = value.detach().contiguous()
-        # pyrefly: ignore[bad-argument-type]
-        return TensorDict(packed, batch_size=[meta.size])
+    return pack_columns_for_meta(meta, fields)
 
-    lengths = torch.tensor(meta.sequence_lengths, dtype=torch.long)
-    for field_name, value in fields.items():
-        if value.dim() >= 2 and value.shape[1] == int(lengths.max().item()):
-            rows = [
-                value[i, : int(lengths[i].item())].detach().contiguous()
-                for i in range(meta.size)
-            ]
-            packed[field_name] = torch.nested.as_nested_tensor(
-                rows,
-                layout=torch.jagged,
+
+def advantage_group_ids_from_meta(
+    meta: KVBatchMeta,
+    *,
+    expected_group_size: int,
+) -> torch.Tensor:
+    """Build dense advantage-group labels from explicit rollout metadata.
+
+    Args:
+        meta: Selected rollout batch with one tag per completion.
+        expected_group_size: Required number of rollout indices per group.
+
+    Returns:
+        Integer group labels of shape ``[batch_size, 1]``.
+
+    Raises:
+        ValueError: If tags are absent, malformed, or do not contain complete
+            groups with rollout indices ``0..expected_group_size - 1``.
+    """
+    if expected_group_size < 1:
+        raise ValueError(
+            f"expected_group_size must be positive; got {expected_group_size}"
+        )
+    if meta.tags is None:
+        raise ValueError("advantage grouping requires explicit rollout metadata tags")
+
+    labels_by_group: dict[str, int] = {}
+    indices_by_group: dict[str, list[int]] = {}
+    labels: list[int] = []
+    for row, tag in enumerate(meta.tags):
+        group_id = tag.get("group_id")
+        rollout_index = tag.get("rollout_index")
+        if not isinstance(group_id, str) or not group_id:
+            raise ValueError(f"invalid advantage group_id at row {row}: {group_id!r}")
+        if isinstance(rollout_index, bool) or not isinstance(rollout_index, Integral):
+            raise ValueError(f"invalid rollout_index at row {row}: {rollout_index!r}")
+
+        label = labels_by_group.setdefault(group_id, len(labels_by_group))
+        labels.append(label)
+        indices_by_group.setdefault(group_id, []).append(int(rollout_index))
+
+    expected_indices = list(range(expected_group_size))
+    for group_id, rollout_indices in indices_by_group.items():
+        if sorted(rollout_indices) != expected_indices:
+            raise ValueError(
+                f"advantage group {group_id!r} must contain rollout indices "
+                f"{expected_indices}; got {sorted(rollout_indices)}"
             )
-        else:
-            packed[field_name] = value.detach().contiguous()
-    # pyrefly: ignore[bad-argument-type]
-    return TensorDict(packed, batch_size=[meta.size])
+
+    return torch.tensor(labels, dtype=torch.long).unsqueeze(-1)

@@ -504,6 +504,35 @@ def attach_token_information_to_chat_response_choices(
     return response
 
 
+def attach_generation_metadata_to_chat_response_choices(
+    response: Any,
+    *,
+    replica_id: str,
+    weight_version: int,
+    end_weight_version: int,
+    kv_cache_block_metadata: dict[str, int],
+    num_cached_tokens: int | None = None,
+) -> Any:
+    """Attach request-scoped execution identity for exact-call reconstruction.
+
+    ``ng_generation_weight_version`` remains the request-start version for
+    compatibility. The end version identifies requests that overlapped a refit.
+    """
+    for choice in getattr(response, "choices", []):
+        choice.message.ng_generation_replica_id = replica_id
+        choice.message.ng_generation_weight_version = weight_version
+        choice.message.ng_generation_weight_version_end = end_weight_version
+        choice.message.ng_kv_cache_scheduler_block_size = kv_cache_block_metadata[
+            "scheduler_block_size"
+        ]
+        choice.message.ng_kv_cache_hash_block_size = kv_cache_block_metadata[
+            "hash_block_size"
+        ]
+        if num_cached_tokens is not None:
+            choice.message.ng_kv_cache_num_cached_tokens = num_cached_tokens
+    return response
+
+
 def model_dump_chat_response_with_dynamic_message_fields(
     response: Any,
 ) -> dict[str, Any]:
@@ -516,6 +545,12 @@ def model_dump_chat_response_with_dynamic_message_fields(
         for field_name in (
             "routed_experts",
             "prompt_token_ids",
+            "ng_generation_replica_id",
+            "ng_generation_weight_version",
+            "ng_generation_weight_version_end",
+            "ng_kv_cache_scheduler_block_size",
+            "ng_kv_cache_hash_block_size",
+            "ng_kv_cache_num_cached_tokens",
             "generation_token_ids",
             "generation_log_probs",
         ):

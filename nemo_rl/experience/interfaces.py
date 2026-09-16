@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
+from nemo_rl.data.packed_rollouts import TreeAttentionLayout
+from nemo_rl.environments.nemo_gym_capture import CaptureSnapshotRef
 
 NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
 NEMO_GYM_GROUP_ID_KEY = "_ng_group_id"
@@ -41,6 +43,33 @@ RETAINED_TASK_INDICES_KEY = "retained_task_indices"
 TRAINED_TASK_INDICES_KEY = "trained_task_indices"
 
 
+@dataclass(frozen=True)
+class ExactCallTreeDiagnostics:
+    """Small counters retained after one rollout's exact calls are compacted."""
+
+    input_call_count: int
+    input_token_count: int
+    page_fork_count: int
+    page_shared_token_count: int
+    cross_replica_rollout: int
+    replica_count: int
+    baseline_attention_pairs: int
+    max_call_token_count: int
+    max_call_generation_tokens: int
+    min_generation_weight_version: int | None = None
+    max_generation_weight_version: int | None = None
+
+
+@dataclass(frozen=True)
+class ExactCallTreePayload:
+    """Owned compact representation of one rollout's captured model calls."""
+
+    edge_message_log: LLMMessageLogType | VLMMessageLogType
+    unique_message_log: LLMMessageLogType | VLMMessageLogType
+    layout: TreeAttentionLayout
+    diagnostics: ExactCallTreeDiagnostics
+
+
 @dataclass
 class Completion:
     """A single generated completion for one prompt."""
@@ -49,6 +78,9 @@ class Completion:
     env_extras: Optional[dict[str, Any]]
     truncated: bool
     reward: float
+    training_message_logs: Optional[list[LLMMessageLogType | VLMMessageLogType]] = None
+    exact_call_tree: Optional[ExactCallTreePayload] = None
+    token_capture_snapshot: Optional[CaptureSnapshotRef] = None
 
 
 @dataclass

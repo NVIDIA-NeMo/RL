@@ -22,7 +22,7 @@ import statistics
 import uuid
 import warnings
 from collections import defaultdict
-from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -59,7 +59,12 @@ from nemo_rl.environments.interfaces import (
 )
 from nemo_rl.environments.nemo_gym import (
     DEFAULT_THINKING_TAGS,
+    NemoGymRolloutFailure,
     get_pad_dynamic_image_shapes,
+)
+from nemo_rl.environments.nemo_gym_capture import (
+    CaptureSnapshotRef,
+    acknowledge_gym_captures,
 )
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
@@ -298,7 +303,10 @@ def _mask_sample_flags(extras: Iterable[dict[str, Any] | None]) -> torch.Tensor:
     """Return True for samples the environment asks GRPO to mask from loss."""
     return torch.tensor(
         [
-            bool(((extra or {}).get("instance_config") or {}).get(MASK_SAMPLE, False))
+            bool(
+                (extra or {}).get(MASK_SAMPLE)
+                or ((extra or {}).get("instance_config") or {}).get(MASK_SAMPLE)
+            )
             for extra in extras
         ],
         dtype=torch.bool,
@@ -1512,6 +1520,7 @@ class RolloutGroupResult:
     final_batch: BatchedDataDict[DatumSpec]
     rollout_metrics: dict[str, Any]
     task_index: Optional[int] = None
+    token_capture_snapshots: tuple[CaptureSnapshotRef, ...] = ()
 
 
 def _aggregate_multi_turn_rollout_metrics(
@@ -1605,6 +1614,7 @@ async def _run_multi_turn_rollout_async(
     max_rollout_turns: int = 999999,
     greedy: bool = False,
     deduplicate_multimodal_data: bool = False,
+    on_dispatched: Callable[[], None] | None = None,
 ) -> tuple[BatchedDataDict[DatumSpec], list[dict[str, Any]]]:
     """Run one native rollout batch and retain metrics at sample granularity."""
     batch_size = len(input_batch["message_log"])
@@ -1639,13 +1649,16 @@ async def _run_multi_turn_rollout_async(
         except Exception as error:
             raise RuntimeError(f"Error in sample {i} rollout: {error}") from error
 
-    sample_results = await asyncio.gather(
+    pending_results = asyncio.gather(
         *(
             run_single_sample_with_error_handling(i, sample_state)
             for i, sample_state in enumerate(sample_initial_states)
         ),
         return_exceptions=False,
     )
+    if on_dispatched is not None:
+        on_dispatched()
+    sample_results = await pending_results
     final_sample_states = [result[0] for result in sample_results]
     all_sample_metrics = [result[1] for result in sample_results]
 
@@ -1750,6 +1763,7 @@ async def run_async_multi_turn_rollout_groups(
     max_rollout_turns: int = 999999,
     greedy: bool = False,
     deduplicate_multimodal_data: bool = False,
+    on_dispatched: Callable[[], None] | None = None,
 ) -> AsyncGenerator[RolloutGroupResult, None]:
     """Run one native batch, then yield prompt groups with group-local metrics.
 
@@ -1793,6 +1807,7 @@ async def run_async_multi_turn_rollout_groups(
         max_rollout_turns=max_rollout_turns,
         greedy=greedy,
         deduplicate_multimodal_data=deduplicate_multimodal_data,
+        on_dispatched=on_dispatched,
     )
     for group_index, start in enumerate(range(0, final_batch.size, num_generations)):
         end = start + num_generations
@@ -1810,7 +1825,8 @@ def _tensorize_by_key(message_logs: list, key: str):
         return
 
     for m in message_logs:
-        m[key] = torch.tensor(m[key])
+        if not torch.is_tensor(m[key]):
+            m[key] = torch.tensor(m[key])
 
 
 @dataclass
@@ -1822,6 +1838,8 @@ class NemoGymRolloutResult:
     rollout_metrics: dict[str, Any]
     # Stable prompt identity used by the async collector; absent for sync callers.
     task_index: Optional[int]
+    token_capture_snapshots: tuple[CaptureSnapshotRef, ...] = ()
+    requires_exact_call_training: bool = False
 
 
 @dataclass(frozen=True)
@@ -1852,18 +1870,17 @@ class _NemoGymStreamAccumulator:
         self._allow_mixed_agents = allow_mixed_agents
         self._received_row_indices: set[int] = set()
         self._pending_results: dict[int, dict[int, dict]] = defaultdict(dict)
+        self._failed_group_indices: set[int] = set()
 
     @property
     def is_complete(self) -> bool:
         return len(self._received_row_indices) == len(self._rows)
 
-    def add(
-        self,
-        row_index: int,
-        result: dict,
-        resolved_agent_ref: dict,
-    ) -> _CompletedNemoGymGroup | None:
-        """Add one streamed row and return its group when that group is complete."""
+    @property
+    def has_failures(self) -> bool:
+        return bool(self._failed_group_indices)
+
+    def _register_row(self, row_index: int) -> int:
         if not isinstance(row_index, int):
             raise TypeError(
                 f"NeMo-Gym row index must be an int, got {type(row_index).__name__}"
@@ -1876,9 +1893,18 @@ class _NemoGymStreamAccumulator:
         if row_index in self._received_row_indices:
             raise ValueError(f"NeMo-Gym returned duplicate row index {row_index}")
 
-        self._rows[row_index]["agent_ref"] = resolved_agent_ref
         self._received_row_indices.add(row_index)
-        group_index = row_index // self._num_generations
+        return row_index // self._num_generations
+
+    def add(
+        self, row_index: int, result: dict, *, resolved_agent_ref: dict
+    ) -> _CompletedNemoGymGroup | None:
+        """Add one streamed row and return its group when that group is complete."""
+        group_index = self._register_row(row_index)
+        self._rows[row_index]["agent_ref"] = resolved_agent_ref
+        if group_index in self._failed_group_indices:
+            return None
+
         group_results = self._pending_results[group_index]
         group_results[row_index] = result
         if len(group_results) < self._num_generations:
@@ -1911,6 +1937,12 @@ class _NemoGymStreamAccumulator:
             rows=rows,
             results=ordered_results,
         )
+
+    def add_failure(self, row_index: int) -> None:
+        """Invalidate only the prompt group containing a failed rollout row."""
+        group_index = self._register_row(row_index)
+        self._failed_group_indices.add(group_index)
+        self._pending_results.pop(group_index, None)
 
     def finish(self) -> None:
         """Raise when the stream ended before every expected row arrived."""
@@ -2103,6 +2135,15 @@ def resolve_reward_penalty_config(
     return resolved
 
 
+def _nemo_gym_training_messages(result: dict) -> list[dict]:
+    """Visit each captured call once; do not add its compatibility alias again."""
+    return [
+        message
+        for call in (result.get("training_message_logs") or [result["message_log"]])
+        for message in call
+    ]
+
+
 def apply_reward_penalties(
     results: list[dict], reward_penalty_config: dict[str, Any] | BaseModel | None
 ) -> dict[str, int]:
@@ -2179,7 +2220,7 @@ def apply_reward_penalties(
     )
     if any_penalty_enabled:
         for result in results:
-            roles = {msg.get("role") for msg in result["message_log"]}
+            roles = {msg.get("role") for msg in _nemo_gym_training_messages(result)}
             assert roles <= {"user", "assistant"}, (
                 f"apply_reward_penalties requires Gym-path message_log with only 'user' and 'assistant' roles, "
                 f"but found roles: {roles}. These penalties are not supported for non-Gym rollout paths."
@@ -2250,7 +2291,7 @@ def apply_reward_penalties(
         )
         for result in results:
             has_unwanted_token = False
-            for msg in result["message_log"]:
+            for msg in _nemo_gym_training_messages(result):
                 if msg["role"] != "assistant":
                     continue
                 # Penalize any configured unwanted token in the assistant generation,
@@ -2282,14 +2323,14 @@ def apply_reward_penalties(
             has_violation = any(
                 msg.get("role") == "assistant"
                 and msg.get("has_malformed_thinking", False)
-                for msg in result["message_log"]
+                for msg in _nemo_gym_training_messages(result)
             )
 
             # 4a) Token ID check per (user, assistant) turn pair.
             # Infer thinking mode from prompt token counts:
             #   enable_thinking=True:  prompt has open=close+1 (trailing <think>), expect asst: 0 open, 1 close
             #   enable_thinking=False: prompt has open=close (balanced), expect asst: 0 open, 0 close
-            msgs = result["message_log"]
+            msgs = _nemo_gym_training_messages(result)
             if (
                 not has_violation
                 and think_open_token_id is not None
@@ -2331,9 +2372,14 @@ def apply_reward_penalties(
                         "reward_penalties.thinking_tags must contain open and close tags"
                     )
                 think_open_text, think_close_text = thinking_tags[:2]
-                output_items = (
-                    result["full_result"].get("response", {}).get("output", [])
-                )
+                responses = result["full_result"].get("_ng_training_responses") or [
+                    result["full_result"].get("response") or {}
+                ]
+                output_items = [
+                    item
+                    for response in responses
+                    for item in (response.get("output") or [])
+                ]
                 for item in output_items:
                     gen_str = item.get("generation_str", "")
                     if not gen_str:
@@ -2436,6 +2482,12 @@ def _tensorize_nemo_gym_result(result: dict) -> None:
         ],
         "generation_logprobs",
     )
+    for message_log in result.get("training_message_logs") or []:
+        _tensorize_by_key(message_log, "token_ids")
+        _tensorize_by_key(
+            [message for message in message_log if message["role"] == "assistant"],
+            "generation_logprobs",
+        )
 
 
 async def run_async_nemo_gym_rollout(
@@ -2457,6 +2509,8 @@ async def run_async_nemo_gym_rollout(
     sampling_params: Optional[GenerationSamplingParams] = None,
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
+    on_dispatched: Callable[[], None] | None = None,
+    max_row_retries: int = 0,
 ) -> AsyncGenerator[NemoGymRolloutResult, None]:
     """Stream complete NeMo-Gym prompt groups in group-completion order.
 
@@ -2495,11 +2549,16 @@ async def run_async_nemo_gym_rollout(
             remote Gym return and restore the exact original payload locally.
         debug_payload_metrics: Emit logical, physical, and serialized media
             payload metrics at the Gym Ray boundary.
+        max_row_retries: Number of times to redispatch a failed or missing row.
+            Each retry receives a fresh Gym rollout ID and therefore a fresh
+            harness sandbox; successful siblings are retained.
 
     Yields:
         ``NemoGymRolloutResult`` objects in prompt-group completion order. Rows
         inside each result are restored to input order. The final result also
-        carries actor-wide and rollout-wide timing metrics.
+        carries actor-wide and rollout-wide timing metrics. A structured Gym
+        failure is retried row-by-row when ``max_row_retries`` is nonzero;
+        successful siblings remain in the accumulator.
 
     Raises:
         AssertionError: If an unsupported generation option is requested.
@@ -2555,6 +2614,8 @@ async def run_async_nemo_gym_rollout(
     )
     if num_generations <= 0:
         raise ValueError("num_generations must be greater than zero")
+    if max_row_retries < 0:
+        raise ValueError("max_row_retries must be non-negative")
     if not nemo_gym_rows:
         raise ValueError("NeMo-Gym rollout batch must not be empty")
     if len(nemo_gym_rows) % num_generations != 0:
@@ -2594,39 +2655,40 @@ async def run_async_nemo_gym_rollout(
         final_rollout_result: NemoGymRolloutResult | None = None
         actor_timing_metrics: dict[str, Any] = {}
         nemo_gym_environment = task_to_env["nemo_gym"]
-        with timer.time(run_rollouts_timer_label):
-            ray_arguments = (
-                nemo_gym_rows,
-                timer_prefix,
-                deduplicate_multimodal_data,
-            )
-            print_multimodal_payload_metrics(
-                collect_multimodal_payload_metrics(
-                    ray_arguments,
-                    "nemo_gym_request",
-                    enabled=debug_payload_metrics,
-                )
-            )
-            rollout_gen = nemo_gym_environment.run_rollouts.options(
-                num_returns="streaming"
-            ).remote(*ray_arguments)
-        rollout_iterator = rollout_gen.__aiter__()
+        event_queue: asyncio.Queue[tuple[str, int, Any]] = asyncio.Queue()
+        attempt_tasks: set[asyncio.Task[None]] = set()
+        active_attempts = 0
+        next_attempt_id = 0
+        retries_by_row = [0] * len(nemo_gym_rows)
+        retries_launched = 0
+        retries_exhausted = 0
+        last_stream_error: Exception | None = None
 
-    while True:
-        stream_finished = False
-        group_to_yield: NemoGymRolloutResult | None = None
-        with timer.time(total_timer_label):
-            with timer.time(run_rollouts_timer_label):
-                try:
-                    future = await anext(rollout_iterator)
-                except StopAsyncIteration:
-                    stream_finished = True
-                else:
+        async def pump_attempt(
+            attempt_id: int,
+            row_indices: tuple[int, ...],
+            delay_seconds: float,
+            notify_dispatched: bool,
+        ) -> None:
+            received: set[int] = set()
+            try:
+                if delay_seconds:
+                    await asyncio.sleep(delay_seconds)
+                rows = [copy.deepcopy(nemo_gym_rows[index]) for index in row_indices]
+                ray_arguments = (rows, timer_prefix, deduplicate_multimodal_data)
+                print_multimodal_payload_metrics(
+                    collect_multimodal_payload_metrics(
+                        ray_arguments,
+                        "nemo_gym_request",
+                        enabled=debug_payload_metrics,
+                    )
+                )
+                rollout_gen = nemo_gym_environment.run_rollouts.options(
+                    num_returns="streaming"
+                ).remote(*ray_arguments)
+                dispatch_notified = False
+                async for future in rollout_gen:
                     rowidx, resolved_agent_ref, result, timing_metrics = await future
-                    # Measure the received streaming Ray value in the caller. In
-                    # async training this runs in the collector actor; validation
-                    # runs in the driver, so the two phases cannot share a metric
-                    # accumulator even when they share the NeMo-Gym actor.
                     print_multimodal_payload_metrics(
                         collect_multimodal_payload_metrics(
                             (rowidx, resolved_agent_ref, result, timing_metrics),
@@ -2634,10 +2696,125 @@ async def run_async_nemo_gym_rollout(
                             enabled=debug_payload_metrics,
                         )
                     )
+                    if (
+                        notify_dispatched
+                        and not dispatch_notified
+                        and on_dispatched is not None
+                    ):
+                        # The actor materializes the entire request set before it
+                        # can return a row. Releasing the FIFO gate here prevents
+                        # a later target from racing ahead during Gym admission
+                        # while still allowing both target batches to execute in
+                        # parallel after the first completion.
+                        on_dispatched()
+                        dispatch_notified = True
+                    if rowidx not in row_indices:
+                        raise ValueError(
+                            f"NeMo-Gym retry attempt {attempt_id} returned unexpected "
+                            f"row index {rowidx}; expected one of {list(row_indices)}"
+                        )
+                    if rowidx in received:
+                        raise ValueError(
+                            f"NeMo-Gym retry attempt {attempt_id} returned duplicate row index {rowidx}"
+                        )
+                    received.add(rowidx)
+                    await event_queue.put(
+                        (
+                            "row",
+                            attempt_id,
+                            (rowidx, resolved_agent_ref, result, timing_metrics),
+                        )
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - missing rows are retried below
+                missing = tuple(index for index in row_indices if index not in received)
+                await event_queue.put(("error", attempt_id, (error, missing)))
+            finally:
+                await event_queue.put(("done", attempt_id, None))
 
-            if not stream_finished:
+        def schedule_attempt(
+            row_indices: Sequence[int],
+            *,
+            delay_seconds: float = 0.0,
+            notify_dispatched: bool = False,
+        ) -> None:
+            nonlocal active_attempts, next_attempt_id
+            attempt_id = next_attempt_id
+            next_attempt_id += 1
+            active_attempts += 1
+            task = asyncio.create_task(
+                pump_attempt(
+                    attempt_id,
+                    tuple(row_indices),
+                    delay_seconds,
+                    notify_dispatched,
+                )
+            )
+            attempt_tasks.add(task)
+            task.add_done_callback(attempt_tasks.discard)
+
+        def mark_terminal_failure(rowidx: int) -> None:
+            nonlocal retries_exhausted
+            retries_exhausted += 1
+            accumulator.add_failure(rowidx)
+
+        def retry_or_fail(rowidx: int, reason: str) -> None:
+            nonlocal retries_launched
+            if retries_by_row[rowidx] >= max_row_retries:
+                print(
+                    "NeMo-Gym rollout row exhausted fresh-sandbox retries: "
+                    f"rowidx={rowidx} attempts={retries_by_row[rowidx] + 1} "
+                    f"reason={reason}",
+                    flush=True,
+                )
+                mark_terminal_failure(rowidx)
+                return
+            retries_by_row[rowidx] += 1
+            retries_launched += 1
+            delay_seconds = 2 ** (retries_by_row[rowidx] - 1)
+            print(
+                "NeMo-Gym rollout row failed; redispatching it with a fresh rollout ID "
+                f"in {delay_seconds}s (rowidx={rowidx}, retry "
+                f"{retries_by_row[rowidx]}/{max_row_retries}, reason={reason})",
+                flush=True,
+            )
+            schedule_attempt([rowidx], delay_seconds=delay_seconds)
+
+        schedule_attempt(range(len(nemo_gym_rows)), notify_dispatched=True)
+
+    try:
+        while active_attempts:
+            group_to_yield: NemoGymRolloutResult | None = None
+            with timer.time(total_timer_label):
+                with timer.time(run_rollouts_timer_label):
+                    event_type, _attempt_id, payload = await event_queue.get()
+
+                if event_type == "done":
+                    active_attempts -= 1
+                    continue
+                if event_type == "error":
+                    error, missing_row_indices = payload
+                    last_stream_error = error
+                    for rowidx in missing_row_indices:
+                        retry_or_fail(
+                            rowidx,
+                            f"{type(error).__name__}: {error}",
+                        )
+                    continue
+                if event_type != "row":
+                    raise RuntimeError(f"Unknown NeMo-Gym stream event {event_type!r}")
+
+                rowidx, resolved_agent_ref, result, timing_metrics = payload
                 if timing_metrics is not None:
-                    actor_timing_metrics = timing_metrics
+                    actor_timing_metrics.update(timing_metrics)
+
+                if isinstance(result, NemoGymRolloutFailure):
+                    retry_or_fail(
+                        rowidx,
+                        f"{result.failure_class}: {result.error or '<no error>'}",
+                    )
+                    continue
 
                 _tensorize_nemo_gym_result(result)
                 completed_group = accumulator.add(
@@ -2667,25 +2844,39 @@ async def run_async_nemo_gym_rollout(
                         thinking_tags=thinking_tags,
                         mask_env_flagged_samples=mask_env_flagged_samples,
                     )
+                if completed_group is not None:
                     if accumulator.is_complete:
                         final_rollout_result = rollout_result
                     else:
                         group_to_yield = rollout_result
 
-        if stream_finished:
-            break
-        if group_to_yield is not None:
-            yield group_to_yield
+            if group_to_yield is not None:
+                yield group_to_yield
+    finally:
+        for task in attempt_tasks:
+            task.cancel()
+        if attempt_tasks:
+            await asyncio.gather(*attempt_tasks, return_exceptions=True)
 
     with timer.time(total_timer_label):
         accumulator.finish()
         if final_rollout_result is None:
+            if accumulator.has_failures:
+                return
             raise RuntimeError(
                 "NeMo-Gym completed without producing a final prompt group"
             )
 
     final_rollout_result.rollout_metrics.update(actor_timing_metrics)
     final_rollout_result.rollout_metrics.update(timer.get_timing_metrics("sum"))
+    final_rollout_result.rollout_metrics["nemo_gym/row_retries_launched"] = float(
+        retries_launched
+    )
+    final_rollout_result.rollout_metrics["nemo_gym/row_retries_exhausted"] = float(
+        retries_exhausted
+    )
+    if last_stream_error is not None:
+        final_rollout_result.rollout_metrics["nemo_gym/stream_errors"] = 1.0
     yield final_rollout_result
 
 
@@ -2706,6 +2897,8 @@ def run_nemo_gym_rollout_sync(
     mask_env_flagged_samples: bool = True,
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
+    defer_capture_ack: bool = False,
+    allow_independent_calls: bool = False,
 ) -> NemoGymRolloutResult:
     """Run and return one complete NeMo-Gym batch synchronously.
 
@@ -2737,6 +2930,11 @@ def run_nemo_gym_rollout_sync(
         deduplicate_multimodal_data: Omit initial policy-ready media from the
             remote Gym return and restore it from the input batch.
         debug_payload_metrics: Emit exact Gym Ray-boundary media payload metrics.
+        defer_capture_ack: Leave capture retirement to a downstream TQ writer.
+            Otherwise, successful assembly into this caller's returned batch is
+            the acceptance boundary; no replay buffer exists on the sync path.
+        allow_independent_calls: The caller consumes all exact-call metadata.
+            Unsupported callers must not fall back to the compatibility log.
 
     Returns:
         The fully postprocessed NeMo-Gym rollout batch in input-row order.
@@ -2775,6 +2973,15 @@ def run_nemo_gym_rollout_sync(
             pass
         if rollout_result is None:
             raise RuntimeError("NeMo-Gym did not return any rollouts")
+        if rollout_result.requires_exact_call_training and not allow_independent_calls:
+            raise NotImplementedError(
+                "Gym independent_calls requires an exact-call-aware training "
+                "consumer; this PPO/distillation/sync caller has not opted in."
+            )
+        if not defer_capture_ack and rollout_result.token_capture_snapshots:
+            await acknowledge_gym_captures(
+                task_to_env["nemo_gym"], rollout_result.token_capture_snapshots
+            )
         return rollout_result
 
     return asyncio.run(_consume_rollout())
@@ -2827,18 +3034,25 @@ def _postprocess_single_nemo_gym_group(
                 "total_reward": r["full_result"]["reward"],
                 "assistant_tokens": sum(
                     len(m["token_ids"])
-                    for m in r["message_log"]
+                    for m in _nemo_gym_training_messages(r)
                     if m["role"] == "assistant"
                 ),
-                "total_tokens": sum(len(m["token_ids"]) for m in r["message_log"]),
-                "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
-                "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"])
-                == max_total_tokens_per_sample,
+                "total_tokens": sum(
+                    len(m["token_ids"]) for m in _nemo_gym_training_messages(r)
+                ),
+                "turn_count": sum(
+                    1 for m in _nemo_gym_training_messages(r) if m["role"] == "user"
+                ),
+                "hit_max_tokens": any(
+                    sum(len(m["token_ids"]) for m in call)
+                    >= max_total_tokens_per_sample
+                    for call in (r.get("training_message_logs") or [r["message_log"]])
+                ),
                 # max_gen_tokens_per_turn: Diagnostic for long single generations
                 "max_gen_tokens_per_turn": max(
                     (
                         len(m["token_ids"])
-                        for m in r["message_log"]
+                        for m in _nemo_gym_training_messages(r)
                         if m["role"] == "assistant"
                     ),
                     default=0,
@@ -2953,6 +3167,12 @@ def _postprocess_single_nemo_gym_group(
         {
             "agent_ref": [r["agent_ref"] for r in results],
             "message_log": [r["message_log"] for r in results],
+            # One list of exact model-call sequences per logical rollout. GRPO
+            # keeps the outer rollout row for reward/advantage grouping and only
+            # concatenates these calls when constructing policy inputs.
+            "training_message_logs": [
+                r.get("training_message_logs") or [r["message_log"]] for r in results
+            ],
             # length is used downstream for mean_prompt_length
             "length": torch.tensor(
                 [len(r["input_message_log"][0]["token_ids"]) for r in results]
@@ -3027,4 +3247,13 @@ def _postprocess_single_nemo_gym_group(
         final_batch=final_batch,
         rollout_metrics=rollout_metrics,
         task_index=group_task_index,
+        token_capture_snapshots=tuple(
+            result["token_capture_snapshot"]
+            for result in results
+            if result.get("token_capture_snapshot") is not None
+        ),
+        requires_exact_call_training=any(
+            bool(result["full_result"].get("_ng_training_responses"))
+            for result in results
+        ),
     )

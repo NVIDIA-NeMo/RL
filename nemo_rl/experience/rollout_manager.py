@@ -42,6 +42,8 @@ from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import NemoGymRolloutFailure
+from nemo_rl.environments.nemo_gym_capture import acknowledge_gym_captures
 from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
@@ -56,6 +58,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
     Completion,
     PromptGroupRecord,
 )
@@ -477,6 +480,21 @@ class _Deadline:
         self._remaining = None
 
 
+def _snapshot_exact_call_message_log(
+    message_log: LLMMessageLogType,
+) -> LLMMessageLogType:
+    """Own tensor storage for a model call before later turns mutate the log."""
+    return [
+        {
+            key: value.clone()
+            if isinstance(value, torch.Tensor)
+            else copy.deepcopy(value)
+            for key, value in message.items()
+        }
+        for message in message_log
+    ]
+
+
 class AsyncRolloutImpl:
     """Manages per-prompt multi-turn rollouts, producing a PromptGroupRecord per call.
 
@@ -494,6 +512,7 @@ class AsyncRolloutImpl:
         policy_generation: GenerationInterface,
         timeouts: RolloutTimeouts = RolloutTimeouts(),
         deadline_registry: Optional[RequestDeadlineRegistry] = None,
+        native_exact_call_tree: bool = False,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -504,6 +523,7 @@ class AsyncRolloutImpl:
         self._policy_generation = policy_generation
         self._timeouts = timeouts
         self._deadline_registry = deadline_registry
+        self._native_exact_call_tree = native_exact_call_tree
 
     async def run_rollout(
         self,
@@ -593,6 +613,7 @@ class AsyncRolloutImpl:
         turn_total_tokens = []
         # Track per-turn per-worker token accounting if available
         per_worker_token_counts = {}  # worker_idx -> token_count
+        training_message_logs = [] if self._native_exact_call_tree else None
 
         for _ in range(self._max_rollout_turns):
             if terminated or truncated:
@@ -619,6 +640,10 @@ class AsyncRolloutImpl:
                 ) from e
 
             current_message_log.append(assistant_message)
+            if training_message_logs is not None:
+                training_message_logs.append(
+                    _snapshot_exact_call_message_log(current_message_log)
+                )
 
             # Check if response was truncated (hit max_tokens without stop token)
             response_truncated = gen_metrics.pop("_response_truncated", None)
@@ -714,11 +739,17 @@ class AsyncRolloutImpl:
             # Reached max turns without termination or truncation.
             max_turns_reached = True
 
+        if training_message_logs is not None and not training_message_logs:
+            training_message_logs.append(
+                _snapshot_exact_call_message_log(current_message_log)
+            )
+
         completion = Completion(
             message_log=current_message_log,
             env_extras=current_extra_env_info,
             truncated=truncated,
             reward=total_reward,
+            training_message_logs=training_message_logs,
         )
         sample_metrics = {
             "turn_count": turn_count,
@@ -919,6 +950,7 @@ class AsyncNemoGymRolloutImpl:
         # Length-based reward shaping for low-effort prompts; None disables it.
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
+        allow_independent_calls: bool = True,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -929,6 +961,7 @@ class AsyncNemoGymRolloutImpl:
         self._generation_config = generation_config
         self._mask_env_flagged_samples = mask_env_flagged_samples
         self._log_full_result_tables = log_full_result_tables
+        self._allow_independent_calls = allow_independent_calls
         self._reward_penalty_config = reward_penalty_config
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
         self._deadline_registry = deadline_registry
@@ -939,6 +972,7 @@ class AsyncNemoGymRolloutImpl:
         ).max_gym_row_attempts
         self._stats = stats
         self._effort_config = effort_config
+        self._next_nemo_gym_task_index = 0
 
         self._validate_init_params()
 
@@ -1059,6 +1093,11 @@ class AsyncNemoGymRolloutImpl:
             else self._generation_config["max_new_tokens"]
         )
 
+        # Match the legacy collector's Gym identifiers: one task index per
+        # dispatched prompt and one rollout index per completion in its group.
+        task_index = self._next_nemo_gym_task_index
+        self._next_nemo_gym_task_index += 1
+
         # Build N rows with distinct rowidxs so run_rollouts can sort them correctly.
         if rollout_ids is not None:
             assert len(rollout_ids) == self._num_generations_per_prompt, (
@@ -1089,6 +1128,7 @@ class AsyncNemoGymRolloutImpl:
         for i in indices:
             row = copy.deepcopy(template_row)
             row["_rowidx"] = i
+            row[NEMO_GYM_TASK_INDEX_KEY] = task_index
             row[NEMO_GYM_GROUP_ID_KEY] = group_id
             row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempt
             row[NEMO_GYM_ROLLOUT_INDEX_KEY] = i
@@ -1128,6 +1168,7 @@ class AsyncNemoGymRolloutImpl:
         inputs_by_rowidx = {row["_rowidx"]: row for row in pending}
         received: set[int] = set()
         env_timing_metrics: Optional[dict[str, Any]] = None
+        row_failures: list[RolloutFailure] = []
 
         async for result_ref in nemo_gym_env.run_rollouts.options(
             num_returns="streaming"
@@ -1149,6 +1190,19 @@ class AsyncNemoGymRolloutImpl:
                 raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
             received.add(rowidx)
             inputs_by_rowidx[rowidx]["agent_ref"] = resolved_agent_ref
+            if isinstance(result, NemoGymRolloutFailure):
+                detail = (
+                    f"NeMo-Gym row {rowidx} failed: "
+                    f"{result.failure_class}: {result.error}"
+                )
+                failure_type = (
+                    GymTransportError
+                    if result.failure_class
+                    in {"sandbox_lifecycle_reset", "sandbox_backend_unreachable"}
+                    else RolloutDataFailure
+                )
+                row_failures.append(failure_type(detail))
+                continue
             # A streamed completion may become durable recovery ownership before
             # the rest of its prompt group finishes. Shape its reward first so a
             # checkpoint never preserves a raw reward that finalization will later
@@ -1170,6 +1224,17 @@ class AsyncNemoGymRolloutImpl:
             if timing_metrics is not None:
                 env_timing_metrics = timing_metrics
 
+        if row_failures:
+            # Drain successful siblings before retrying; unknown/data failures
+            # must not be hidden behind an unrelated transient infra failure.
+            raise next(
+                (
+                    failure
+                    for failure in row_failures
+                    if isinstance(failure, RolloutDataFailure)
+                ),
+                row_failures[0],
+            )
         return env_timing_metrics
 
     async def _run_rollouts(
@@ -1205,7 +1270,7 @@ class AsyncNemoGymRolloutImpl:
         if len(expected_indices) != len(set(expected_indices)):
             raise ValueError("NeMo-Gym input rows contain duplicate _rowidx values")
 
-        # Run generation and restore input order as results stream back.
+        # Preserve successful siblings when retrying missing or failed rows.
         with timer.time(f"{timer_prefix}/run_rollouts"):
             results: list[dict | None] = [None for _ in range(total_rows)]
             shaping_by_rowidx: list[Optional[_EffortShapingMetrics]] = [
@@ -1350,13 +1415,25 @@ class AsyncNemoGymRolloutImpl:
         reward penalties; the receipt and rollout id ride env_extras for the
         finalize step.
         """
+        if not self._allow_independent_calls and any(
+            r["full_result"].get("_ng_training_responses") for r in results
+        ):
+            raise NotImplementedError(
+                "Gym independent_calls is not supported by PPO or teacher "
+                "distillation consumers; refusing to train only the last call."
+            )
         token_results = [r for r in results if "receipt" not in r]
         for result in token_results:
-            _tensorize_by_key(result["message_log"], "token_ids")
-            _tensorize_by_key(
-                [m for m in result["message_log"] if m["role"] == "assistant"],
-                "generation_logprobs",
-            )
+            message_logs = [
+                result["message_log"],
+                *(result.get("training_message_logs") or []),
+            ]
+            for message_log in message_logs:
+                _tensorize_by_key(message_log, "token_ids")
+                _tensorize_by_key(
+                    [m for m in message_log if m["role"] == "assistant"],
+                    "generation_logprobs",
+                )
 
         # Same gate as the batched path: when masking is off, drop the env mask
         # flag so later batch building never sees it. Receipt rollouts take the
@@ -1389,9 +1466,29 @@ class AsyncNemoGymRolloutImpl:
                     )
                 )
                 continue
+            exact_call_tree = None
+            training_message_logs = result.pop("training_message_logs", None)
+            if not self._allow_independent_calls:
+                # Preserve upstream transcript semantics for native/prefix-merging
+                # agents. Explicit independent-call requests were rejected above.
+                training_message_logs = None
+            if training_message_logs:
+                # GRPO imports RolloutManager; defer this import to avoid the cycle.
+                from nemo_rl.algorithms.grpo import (
+                    _compact_exact_nemo_gym_call_sequences,
+                )
+
+                exact_call_tree = _compact_exact_nemo_gym_call_sequences(
+                    training_message_logs,
+                    materialize_storage=True,
+                )
+                for message in result["message_log"]:
+                    message.pop("routed_experts", None)
             truncated = (
-                sum(len(m["token_ids"]) for m in result["message_log"])
-                == self._max_seq_len
+                exact_call_tree.diagnostics.max_call_token_count >= self._max_seq_len
+                if exact_call_tree is not None
+                else sum(len(m["token_ids"]) for m in result["message_log"])
+                >= self._max_seq_len
             )
             completions.append(
                 Completion(
@@ -1399,6 +1496,8 @@ class AsyncNemoGymRolloutImpl:
                     env_extras=result["full_result"],
                     truncated=truncated,
                     reward=float(result["full_result"]["reward"]),
+                    exact_call_tree=exact_call_tree,
+                    token_capture_snapshot=result.get("token_capture_snapshot"),
                 )
             )
         return completions, penalty_counts
@@ -1450,15 +1549,22 @@ class AsyncNemoGymRolloutImpl:
             ]
         else:
             turn_count = [
-                sum(1 for m in c.message_log if m["role"] == "user")
+                c.exact_call_tree.diagnostics.input_call_count
+                if c.exact_call_tree is not None
+                else sum(1 for m in c.message_log if m["role"] == "user")
                 for c in completions
             ]
             # token metrics
             total_tokens = [
-                sum(len(m["token_ids"]) for m in c.message_log) for c in completions
+                c.exact_call_tree.diagnostics.input_token_count
+                if c.exact_call_tree is not None
+                else sum(len(m["token_ids"]) for m in c.message_log)
+                for c in completions
             ]
             assistant_tokens = [
-                sum(
+                len(c.exact_call_tree.layout.edge_source_indices)
+                if c.exact_call_tree is not None
+                else sum(
                     len(m["token_ids"])
                     for m in c.message_log
                     if m["role"] == "assistant"
@@ -1467,7 +1573,9 @@ class AsyncNemoGymRolloutImpl:
             ]
             # max_gen_tokens_per_turn: Diagnostic for long single generations
             max_gen_tokens_per_turn = [
-                max(
+                c.exact_call_tree.diagnostics.max_call_generation_tokens
+                if c.exact_call_tree is not None
+                else max(
                     (
                         len(m["token_ids"])
                         for m in c.message_log
@@ -1546,6 +1654,8 @@ class RolloutManager:
         mask_env_flagged_samples: bool = True,
         reward_penalty_config: Optional[dict[str, Any]] = None,
         tq_buffer: Optional[TQReplayBuffer] = None,
+        native_exact_call_tree: bool = False,
+        allow_independent_calls: bool = True,
         timeouts: Optional[RolloutTimeouts] = None,
         retry_policy: Optional[RolloutRetryPolicy] = None,
         effort_config: Optional[EffortLevelsConfig] = None,
@@ -1554,6 +1664,10 @@ class RolloutManager:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
         )
+        if native_exact_call_tree and not allow_independent_calls:
+            raise NotImplementedError(
+                "native_exact_call_tree is not supported by this PPO/distillation consumer"
+            )
         # Resolved before the impl is built: the NeMo-Gym impl reads its row-retry
         # budget out of it at construction time, and shares the counters so its
         # row-level re-dispatches land in the same place as everything else.
@@ -1573,6 +1687,10 @@ class RolloutManager:
                 "policy_generation is required for the native async path"
             )
         else:
+            if native_exact_call_tree:
+                raise ValueError(
+                    "native_exact_call_tree cannot be enabled for NeMo-Gym rollouts"
+                )
             rollout_cls = AsyncNemoGymRolloutImpl
             assert generation_config is not None, (
                 "generation_config is required for the NeMo-Gym path"
@@ -1589,6 +1707,7 @@ class RolloutManager:
             # Only used by AsyncNemoGymRolloutImpl; AsyncRolloutImpl ignores these.
             mask_env_flagged_samples=mask_env_flagged_samples,
             log_full_result_tables=log_full_result_tables,
+            allow_independent_calls=allow_independent_calls,
             reward_penalty_config=reward_penalty_config,
             # None means "no deadlines", which is what async_rl's own defaults resolve
             # to; callers that have a config pass the resolved values in.
@@ -1598,6 +1717,7 @@ class RolloutManager:
             retry_policy=self._retry_policy,
             stats=self._stats,
             effort_config=effort_config,
+            native_exact_call_tree=native_exact_call_tree,
         )
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
@@ -2016,6 +2136,15 @@ class RolloutManager:
                     "group_removals"
                 ) as cut:
                     self._recovery_ledger.discard_group(cut, lineage_group_id)
+            if "nemo_gym" in self._env_handles:
+                capture_refs = tuple(
+                    c.token_capture_snapshot
+                    for c in record.completions
+                    if c.token_capture_snapshot is not None
+                )
+                await acknowledge_gym_captures(
+                    self._env_handles["nemo_gym"], capture_refs
+                )
             return RolloutOutcome.COMMITTED
 
         # The infrastructure budget ran out. The same failure followed the prompt across

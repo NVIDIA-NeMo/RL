@@ -384,6 +384,10 @@ class MegatronConfig(TypedDict):
     freeze_sound_encoder: NotRequired[bool]
     freeze_sound_projection: NotRequired[bool]
     pipeline_dtype: str
+    # Dtype for materialized inter-chunk Mamba SSM states during training.
+    # Valid values are "float32", "bfloat16", and "float16"; null follows
+    # the model activation dtype.
+    mamba_training_ssm_states_dtype: NotRequired[str | None]
     sequence_parallel: bool
     freeze_moe_router: bool
     # Optional multimodal provider controls. These map legacy Omni recipe
@@ -506,6 +510,8 @@ class MegatronConfig(TypedDict):
     mtp_loss_scaling_factor: NotRequired[float]
     # Populated by the algorithm before Megatron setup to size the LR scheduler.
     train_iters: NotRequired[int]
+    # When True, retain MTP checkpoint parameters but skip and freeze the MTP training loss path.
+    disable_mtp_loss: NotRequired[bool]
     # When True, repeat a single MTP layer mtp_num_layers times instead of using distinct layers.
     mtp_use_repeated_layer: NotRequired[bool]
     # When True, detach MTP heads from the main model so MTP loss does not affect main-model gradients.

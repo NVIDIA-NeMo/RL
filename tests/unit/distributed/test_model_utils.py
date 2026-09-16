@@ -18,7 +18,10 @@ import pytest
 import ray
 import torch
 
-from nemo_rl.algorithms.logits_sampling_utils import apply_top_k_top_p
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    apply_top_k_top_p,
+)
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedCrossEntropyToFixedLogits,
     ChunkedDistributedEntropy,
@@ -35,6 +38,7 @@ from nemo_rl.distributed.model_utils import (
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
+    from_parallel_tree_logits_to_logprobs,
     gather_logits_at_global_indices,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -292,6 +296,55 @@ def virtual_cluster_4_gpus():
 
 
 import numpy as np
+
+
+@pytest.mark.parametrize(
+    "chunk_size,kernel",
+    [
+        (None, DistributedLogprobWithSampling),
+        (2048, ChunkedDistributedLogprobWithSampling),
+    ],
+)
+def test_tree_sampled_logprobs_pad_selected_edges_to_tp(
+    monkeypatch, chunk_size, kernel
+):
+    captured = {}
+
+    def fake_apply(logits, targets, *_args):
+        captured["logits_shape"] = tuple(logits.shape)
+        captured["targets_shape"] = tuple(targets.shape)
+        return logits.sum(dim=-1)
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda _group: 8)
+    monkeypatch.setattr(kernel, "apply", fake_apply)
+
+    packed_seq_params = type(
+        "TreeParams",
+        (),
+        {"tree_edge_output_indices": torch.arange(6)},
+    )()
+    logits = torch.arange(24, dtype=torch.float32).reshape(1, 6, 4)
+    logits.requires_grad_(True)
+    result = from_parallel_tree_logits_to_logprobs(
+        logits,
+        torch.arange(8).unsqueeze(0),
+        packed_seq_params,
+        vocab_start_index=0,
+        vocab_end_index=4,
+        tp_group=object(),
+        chunk_size=chunk_size,
+        sampling_params=TrainingSamplingParams(top_p=0.95),
+    )
+
+    assert captured == {
+        "logits_shape": (1, 8, 4),
+        "targets_shape": (1, 8),
+    }
+    torch.testing.assert_close(
+        result, torch.tensor([[6.0, 22.0, 38.0, 54.0, 70.0, 86.0, 0.0, 0.0]])
+    )
+    result.sum().backward()
+    torch.testing.assert_close(logits.grad, torch.ones_like(logits))
 
 
 @pytest.mark.parametrize(

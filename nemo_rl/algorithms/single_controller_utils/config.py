@@ -494,6 +494,8 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     max_buffered_rollouts: int = 64
     # Enable per-rollout diagnostic prints (prompt content / completion previews).
     diagnostics: bool = False
+    # Capture native model invocations as exact-call trees for tree attention.
+    native_exact_call_tree: bool = False
 
     @model_validator(mode="after")
     def _reject_renamed_blocks(self) -> "AsyncRLConfig":
@@ -1554,7 +1556,6 @@ class AdvantageConfig:
     """Internal DataPlane field mapping for advantage calculation."""
 
     output_field: str = "advantages"
-    prompt_ids_field: str = "prompt_ids_for_adv"
     reward_field: str = "total_reward"
     token_mask_field: str = "token_mask"
     sample_mask_field: str = "sample_mask"

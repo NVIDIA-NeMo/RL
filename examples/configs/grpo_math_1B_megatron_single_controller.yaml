@@ -36,6 +36,8 @@ async_rl:
   max_buffered_rollouts: 64
   # Enable per-rollout diagnostic prints (prompt content / completion previews).
   diagnostics: false
+  # Capture native model invocations as exact-call trees for tree attention.
+  native_exact_call_tree: false
 
   # ── Resiliency ─────────────────────────────────────────────────────────────
   # What happens to a prompt whose rollout fails. Infrastructure failures are

@@ -29,33 +29,89 @@ no key minting). Workers fetch their slice from TQ via
 
 from __future__ import annotations
 
+import json
 import warnings
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional
 
 import ray
+import torch
 
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
+from nemo_rl.data.packed_rollouts import (
+    PACKED_ATTENTION_SEGMENT_LENGTHS,
+    PACKED_ATTENTION_SELECTED_SEGMENTS,
+    TREE_ATTENTION_EDGE_LENGTHS,
+    TREE_ATTENTION_EDGE_SOURCE_INDICES,
+    TREE_ATTENTION_EDGE_TARGET_IDS,
+    TREE_ATTENTION_LAYOUTS,
+    TreeAttentionFragmentBatchLayout,
+    reassemble_packed_attention_segments,
+    reassemble_tree_attention_edge_values,
+)
 from nemo_rl.data_plane import KVBatchMeta, build_data_plane_client
 from nemo_rl.data_plane.column_io import round_up
 from nemo_rl.data_plane.driver_mixin import TQDriverMixin
 from nemo_rl.data_plane.interfaces import DataPlaneRuntimeConfig
-from nemo_rl.data_plane.preshard import shard_meta_for_dp
+from nemo_rl.data_plane.preshard import (
+    expand_meta_for_tree_attention,
+    shard_meta_for_dp,
+)
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
+    ELEM_COUNTS_PER_GB,
     GLOBAL_FORWARD_PAD_SEQLEN,
     LP_SEED_FIELDS,
+    MICRO_BATCH_INDICES,
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
     fields_with_optional_opd_full,
     fields_with_optional_routed_experts,
 )
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.flops_tracker import get_theoretical_tflops
 from nemo_rl.utils.timer import Timer
+
+TREE_ATTENTION_TENSOR_FIELDS = (
+    TREE_ATTENTION_EDGE_SOURCE_INDICES,
+    TREE_ATTENTION_EDGE_TARGET_IDS,
+    TREE_ATTENTION_EDGE_LENGTHS,
+)
+
+
+def _with_tree_attention_fields(
+    fields: tuple[str, ...] | list[str], meta: KVBatchMeta
+) -> list[str]:
+    out = list(fields)
+    if TREE_ATTENTION_LAYOUTS in (meta.extra_info or {}):
+        out.extend(field for field in TREE_ATTENTION_TENSOR_FIELDS if field not in out)
+    return out
+
+
+def _validate_tree_rows(
+    meta: KVBatchMeta,
+    sequence_packing_args: Optional[dict[str, Any]],
+    *,
+    max_context_length: int,
+) -> None:
+    if TREE_ATTENTION_LAYOUTS not in (meta.extra_info or {}):
+        return
+    if sequence_packing_args is None:
+        raise ValueError("tree rollouts require policy.sequence_packing.enabled=true")
+    if not meta.sequence_lengths:
+        raise ValueError("tree rollout metadata requires physical sequence lengths")
+    for layout in meta.extra_info[TREE_ATTENTION_LAYOUTS]:
+        if layout.max_path_length > max_context_length:
+            raise ValueError(
+                "tree rollout logical path exceeds configured context: "
+                f"{layout.max_path_length} > {max_context_length}"
+            )
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Per-stage aggregators that assemble per-rank worker results into the
@@ -91,10 +147,89 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     return out
 
 
-# Logprob results land in TQ directly via the worker-side
-# ``_write_back_result_field`` leader path; the per-rank Ray return is
-# always None (see :meth:`TQWorkerMixin.get_logprobs_presharded`). The
-# dispatcher only waits for completion — no aggregation needed.
+def _model_sequence_lengths(meta: KVBatchMeta) -> list[int]:
+    """Return physical model-call lengths, or logical lengths when unpacked."""
+    segment_lengths = (meta.extra_info or {}).get(PACKED_ATTENTION_SEGMENT_LENGTHS)
+    if segment_lengths is not None:
+        return [length for row in segment_lengths for length in row]
+    return list(meta.sequence_lengths or [])
+
+
+def _streamed_packed_broadcast_slots(meta: KVBatchMeta) -> list[int]:
+    """Dense token slots per streamed packed bin for one DP-rank meta."""
+    extra = meta.extra_info or {}
+    segment_lengths = extra.get(PACKED_ATTENTION_SEGMENT_LENGTHS)
+    selected_segments = extra.get(PACKED_ATTENTION_SELECTED_SEGMENTS)
+    micro_batch_indices = extra.get(MICRO_BATCH_INDICES)
+    elem_counts = extra.get(ELEM_COUNTS_PER_GB)
+    if (
+        segment_lengths is None
+        or selected_segments is None
+        or micro_batch_indices is None
+    ):
+        return []
+
+    slots: list[int] = []
+    chunk_offset = 0
+    for chunk_index, chunk_ranges in enumerate(micro_batch_indices):
+        chunk_count = (
+            int(elem_counts[chunk_index])
+            if elem_counts is not None
+            else (int(chunk_ranges[-1][1]) if chunk_ranges else 0)
+        )
+        for start, stop in chunk_ranges:
+            calls = selected_segments[
+                chunk_offset + int(start) : chunk_offset + int(stop)
+            ]
+            if not calls:
+                continue
+            width = max(
+                int(segment_lengths[parent][segment]) for parent, segment in calls
+            )
+            slots.append(len(calls) * width)
+        chunk_offset += chunk_count
+    return slots
+
+
+def _concatenate_packed_logprob_results(
+    results: list[Any],
+    *,
+    result_key: str,
+) -> BatchedDataDict[Any]:
+    """Pad rank-local call rows to one width and concatenate in dispatch order."""
+    tensors: list[torch.Tensor] = []
+    for result in results:
+        if not isinstance(result, Mapping) or result_key not in result:
+            raise RuntimeError(
+                "packed logprob worker result must contain "
+                f"{result_key!r}, got {type(result).__name__}"
+            )
+        tensor = result[result_key]
+        if not isinstance(tensor, torch.Tensor) or tensor.ndim < 2:
+            raise TypeError(
+                f"packed logprob result {result_key!r} must be a rank-2+ tensor"
+            )
+        tensors.append(tensor)
+    if not tensors:
+        raise RuntimeError("packed logprob dispatch returned no worker results")
+
+    max_sequence_length = max(tensor.shape[1] for tensor in tensors)
+    padded: list[torch.Tensor] = []
+    for tensor in tensors:
+        if tensor.shape[1] == max_sequence_length:
+            padded.append(tensor)
+            continue
+        output = tensor.new_zeros(
+            (tensor.shape[0], max_sequence_length, *tensor.shape[2:])
+        )
+        output[:, : tensor.shape[1]] = tensor
+        padded.append(output)
+    return BatchedDataDict[Any]({result_key: torch.cat(padded, dim=0)})
+
+
+# Unpacked logprob results land in TQ directly from each worker leader. Packed
+# results return per-call tensors to the driver so calls split across DP ranks
+# can be reassembled into one logical rollout row before the TQ write.
 
 
 class TQPolicy(TQDriverMixin, Policy):
@@ -143,6 +278,7 @@ class TQPolicy(TQDriverMixin, Policy):
         self._opd_full_field: Optional[str] = (
             self.cfg.get("on_policy_distillation_full") or {}
         ).get("payload_field")
+        self._open_train_loss_type: LossType | None = None
 
         # Forward to workers (replaces ``Policy.setup_data_plane`` call
         # site in the trainer — TQPolicy bundles bootstrap + worker
@@ -188,7 +324,8 @@ class TQPolicy(TQDriverMixin, Policy):
             partition_id=self.tq_partition_id,
             fields=fields_with_optional_opd_full(
                 fields_with_optional_routed_experts(
-                    DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                    [*DP_TRAIN_FIELDS, *TREE_ATTENTION_TENSOR_FIELDS],
+                    enabled=self._router_replay_enabled,
                 ),
                 field=self._opd_full_field,
             ),
@@ -210,7 +347,8 @@ class TQPolicy(TQDriverMixin, Policy):
             partition_id=partition_id,
             fields=fields_with_optional_opd_full(
                 fields_with_optional_routed_experts(
-                    DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                    [*DP_TRAIN_FIELDS, *TREE_ATTENTION_TENSOR_FIELDS],
+                    enabled=self._router_replay_enabled,
                 ),
                 field=self._opd_full_field,
             ),
@@ -231,12 +369,159 @@ class TQPolicy(TQDriverMixin, Policy):
         """Drop this step's bulk from TQ. Mirror of :meth:`prepare_step`."""
         self.discard_samples(meta.sample_ids, meta.partition_id)
 
+    def _stamp_pad_seqlen(self, meta: KVBatchMeta) -> None:
+        """Mint ``GLOBAL_FORWARD_PAD_SEQLEN`` onto ``meta.extra_info`` (idempotent).
+
+        Cross-DP forward pad target. Packed rollouts use the longest physical
+        call, matching legacy's expand-before-shard batch width; unpacked
+        batches use the longest logical row. Preshard shards inherit it via
+        ``dict(meta.extra_info)`` propagation.
+        """
+        if not meta.sequence_lengths:
+            return
+        if GLOBAL_FORWARD_PAD_SEQLEN in meta.extra_info:
+            return
+        _, dba = self._packing_args("train_mb_tokens")
+        seq_round = int(dba["sequence_length_round"]) if dba is not None else 1
+        pad_mult = int(meta.extra_info.get("pad_to_multiple", 1))
+        model_sequence_lengths = _model_sequence_lengths(meta)
+        segment_lengths = (meta.extra_info or {}).get(PACKED_ATTENTION_SEGMENT_LENGTHS)
+        meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] = (
+            max(model_sequence_lengths)
+            if segment_lengths is not None
+            else round_up(max(model_sequence_lengths), max(pad_mult, seq_round))
+        )
+
+    def read_from_dataplane(
+        self,
+        meta: KVBatchMeta,
+        *,
+        select_fields: list[str],
+        pad_value_dict: Optional[dict[str, Any]] = None,
+    ) -> BatchedDataDict[Any]:
+        """Materialize columns with their packed-call or tree layout."""
+        data = super().read_from_dataplane(
+            meta, select_fields=select_fields, pad_value_dict=pad_value_dict
+        )
+        for key in (PACKED_ATTENTION_SEGMENT_LENGTHS, TREE_ATTENTION_LAYOUTS):
+            if key in meta.extra_info:
+                data[key] = meta.extra_info[key]
+        return data
+
+    def _emit_packed_padding_comparison(
+        self,
+        *,
+        stage: str,
+        meta: KVBatchMeta,
+        dp_metas: list[KVBatchMeta],
+    ) -> None:
+        """Report old logical-row vs expanded-call replica-broadcast padding."""
+        observability = (getattr(self, "dp_cfg", {}) or {}).get("observability") or {}
+        if not observability.get("packing_memory_enabled", False):
+            return
+        segment_lengths = (meta.extra_info or {}).get(PACKED_ATTENTION_SEGMENT_LENGTHS)
+        if segment_lengths is None or not meta.sequence_lengths:
+            return
+
+        _, dba = self._packing_args("train_mb_tokens")
+        seq_round = int(dba["sequence_length_round"]) if dba is not None else 1
+        pad_mult = int(meta.extra_info.get("pad_to_multiple", 1))
+        logical_pad = round_up(max(meta.sequence_lengths), max(pad_mult, seq_round))
+        physical_pad = int(meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN])
+        previous_logical_slots = sum(
+            len(rank_meta.sample_ids) * logical_pad for rank_meta in dp_metas
+        )
+        expanded_call_slots = sum(
+            len(rank_meta.extra_info.get(PACKED_ATTENTION_SELECTED_SEGMENTS, []))
+            * physical_pad
+            for rank_meta in dp_metas
+        )
+        valid_call_tokens = sum(
+            length for row_lengths in segment_lengths for length in row_lengths
+        )
+        streamed_slots_by_microbatch = [
+            slots
+            for rank_meta in dp_metas
+            for slots in _streamed_packed_broadcast_slots(rank_meta)
+        ]
+        streamed_call_slots = sum(streamed_slots_by_microbatch)
+        event = {
+            "stage": stage,
+            "logical_rows": len(meta.sample_ids),
+            "physical_calls": sum(len(row) for row in segment_lengths),
+            "valid_call_tokens": valid_call_tokens,
+            "previous_logical_broadcast_slots": previous_logical_slots,
+            "expanded_call_broadcast_slots": expanded_call_slots,
+            "previous_padding_fraction": (
+                1.0 - valid_call_tokens / previous_logical_slots
+                if previous_logical_slots
+                else 0.0
+            ),
+            "expanded_padding_fraction": (
+                1.0 - valid_call_tokens / expanded_call_slots
+                if expanded_call_slots
+                else 0.0
+            ),
+            "streamed_microbatch_broadcast_slots": streamed_call_slots,
+            "streamed_padding_fraction": (
+                1.0 - valid_call_tokens / streamed_call_slots
+                if streamed_call_slots
+                else 0.0
+            ),
+            "peak_streamed_microbatch_broadcast_slots": max(
+                streamed_slots_by_microbatch, default=0
+            ),
+            "broadcast_slot_reduction_fraction": (
+                1.0 - expanded_call_slots / previous_logical_slots
+                if previous_logical_slots
+                else 0.0
+            ),
+        }
+        print(f"tq_packed_padding: {json.dumps(event, sort_keys=True)}", flush=True)
+
+    def _emit_tree_fragmentation(
+        self,
+        *,
+        stage: str,
+        meta: KVBatchMeta,
+        layout: TreeAttentionFragmentBatchLayout | None,
+    ) -> None:
+        """Report the physical-token cost and bound of a fragmented tree batch."""
+        if layout is None:
+            return
+        original_layouts = meta.extra_info[TREE_ATTENTION_LAYOUTS]
+        real_fragments = [
+            fragment for fragment in layout.fragments if not fragment.is_padding
+        ]
+        event = {
+            "stage": stage,
+            "logical_rows": layout.original_batch_size,
+            "fragments": len(real_fragments),
+            "padding_fragments": len(layout.fragments) - len(real_fragments),
+            "original_physical_tokens": sum(
+                item.unique_token_count for item in original_layouts
+            ),
+            "fragment_physical_tokens": sum(
+                fragment.layout.unique_token_count for fragment in real_fragments
+            ),
+            "max_original_physical_tokens": max(
+                item.unique_token_count for item in original_layouts
+            ),
+            "max_fragment_physical_tokens": max(
+                fragment.layout.unique_token_count for fragment in real_fragments
+            ),
+            "owned_edges": sum(
+                len(fragment.edge_indices) for fragment in real_fragments
+            ),
+        }
+        print(f"tq_tree_fragmentation: {json.dumps(event, sort_keys=True)}", flush=True)
+
     # ── 1-hop entrypoints (KVBatchMeta in, no re-fan-out) ──────────────────
 
     def _with_route_fields(
         self,
         meta: KVBatchMeta,
-        base_fields: tuple[str, ...],
+        base_fields: tuple[str, ...] | list[str],
         *,
         task_name: str,
         want_routes: bool,
@@ -278,6 +563,8 @@ class TQPolicy(TQDriverMixin, Policy):
         timer: Optional[Timer],
         common_kwargs: dict[str, Any],
         include_router_replay: bool = False,
+        result_key: str,
+        tq_field: str,
     ) -> None:
         """Shared body of get_logprobs_from_meta / get_reference_policy_logprobs_from_meta.
 
@@ -293,24 +580,50 @@ class TQPolicy(TQDriverMixin, Policy):
         completion.
         """
         spa, dba = self._packing_args("logprob_mb_tokens")
+        if TREE_ATTENTION_LAYOUTS in (meta.extra_info or {}):
+            self._validate_tree_execution()
+            _validate_tree_rows(
+                meta, spa, max_context_length=self.cfg["max_total_sequence_length"]
+            )
+        tree_fragment_layout = (
+            expand_meta_for_tree_attention(
+                meta,
+                max_physical_tokens=int(spa["max_tokens_per_microbatch"]),
+                fragment_count_multiple=self.sharding_annotations.get_axis_size(
+                    "data_parallel"
+                ),
+            )
+            if spa is not None
+            else None
+        )
+        self._emit_tree_fragmentation(
+            stage=task_name,
+            meta=meta,
+            layout=tree_fragment_layout,
+        )
         # Narrow the fetch to LP_SEED_FIELDS + optional routed_experts under
         # R3 replay. ``_isolated_meta`` unions in the multimodal columns the
         # rollout wrote, for this dispatch and the training one alike, so the
         # prev/ref logprobs and the training forward see identical model inputs.
         lp_meta = self._with_route_fields(
             meta,
-            LP_SEED_FIELDS,
+            _with_tree_attention_fields(LP_SEED_FIELDS, meta),
             task_name=task_name,
             want_routes=include_router_replay,
         )
         with timer.time(f"{timer_prefix}/shard_meta") if timer else nullcontext():
-            metas, _ = shard_meta_for_dp(
+            metas, unsorted_indices = shard_meta_for_dp(
                 lp_meta,
                 dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
                 batch_size=None,
                 sequence_packing_args=spa,
                 dynamic_batching_args=dba,
             )
+        self._emit_packed_padding_comparison(
+            stage=task_name,
+            meta=lp_meta,
+            dp_metas=metas,
+        )
         with timer.time(f"{timer_prefix}/submit_futures") if timer else nullcontext():
             futures = self.worker_group.run_all_workers_sharded_data(
                 worker_method,
@@ -328,8 +641,32 @@ class TQPolicy(TQDriverMixin, Policy):
                 ],
                 common_kwargs=common_kwargs,
             )
-        # Wait for completion; per-rank returns are None.
-        self.worker_group.get_all_worker_results(futures)
+        worker_results = self.worker_group.get_all_worker_results(futures)
+        segment_lengths = (meta.extra_info or {}).get(PACKED_ATTENTION_SEGMENT_LENGTHS)
+        if segment_lengths is None and tree_fragment_layout is None:
+            return
+
+        packed_results = _concatenate_packed_logprob_results(
+            worker_results,
+            result_key=result_key,
+        )
+        if unsorted_indices is not None:
+            packed_results.reorder_data(unsorted_indices)
+        if tree_fragment_layout is not None:
+            reassembled = reassemble_tree_attention_edge_values(
+                packed_results[result_key], tree_fragment_layout
+            )
+        else:
+            if not meta.sequence_lengths:
+                raise ValueError(
+                    "packed attention logprob dispatch requires sequence_lengths"
+                )
+            reassembled = reassemble_packed_attention_segments(
+                packed_results[result_key],
+                segment_lengths,
+                output_sequence_length=max(meta.sequence_lengths),
+            )
+        self.write_to_dataplane(meta, fields={tq_field: reassembled})
 
     def get_logprobs_from_meta(
         self,
@@ -345,6 +682,8 @@ class TQPolicy(TQDriverMixin, Policy):
             timer=timer,
             common_kwargs={"micro_batch_size": micro_batch_size},
             include_router_replay=True,
+            result_key="logprobs",
+            tq_field="prev_logprobs",
         )
 
     def get_reference_policy_logprobs_from_meta(
@@ -360,6 +699,8 @@ class TQPolicy(TQDriverMixin, Policy):
             timer_prefix="get_reference_policy_logprobs",
             timer=timer,
             common_kwargs={"micro_batch_size": micro_batch_size},
+            result_key="reference_logprobs",
+            tq_field="reference_policy_logprobs",
         )
 
     def train_from_meta(
@@ -396,8 +737,42 @@ class TQPolicy(TQDriverMixin, Policy):
         """
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
+        segment_lengths = (meta.extra_info or {}).get(PACKED_ATTENTION_SEGMENT_LENGTHS)
+        worker_batch_size = (
+            sum(len(row) for row in segment_lengths)
+            if segment_lengths is not None
+            else batch_size
+        )
+        if segment_lengths is not None and not self.cfg.get("megatron_cfg", {}).get(
+            "enabled", False
+        ):
+            raise NotImplementedError(
+                "independent model-call packing currently requires the Megatron "
+                "policy backend"
+            )
 
         spa, dba = self._packing_args("train_mb_tokens")
+        if TREE_ATTENTION_LAYOUTS in (meta.extra_info or {}):
+            self._validate_tree_execution()
+            _validate_tree_rows(
+                meta, spa, max_context_length=self.cfg["max_total_sequence_length"]
+            )
+        if (
+            spa is not None
+            and expand_meta_for_tree_attention(
+                meta,
+                max_physical_tokens=int(spa["max_tokens_per_microbatch"]),
+                fragment_count_multiple=self.sharding_annotations.get_axis_size(
+                    "data_parallel"
+                ),
+            )
+            is not None
+        ):
+            raise NotImplementedError(
+                "bounded tree fragmentation is supported by the async split TQ "
+                "training path; train_from_meta cannot preserve one optimizer step "
+                "across streamed fragments"
+            )
         # ``train_fields`` (rollout + logprob deltas + advantages + sample_mask;
         # default ``DP_TRAIN_FIELDS``) must be in TQ before this call — written
         # by workers + driver delta-writes. Caller may narrow to drop columns
@@ -408,7 +783,10 @@ class TQPolicy(TQDriverMixin, Policy):
         train_meta = self._with_route_fields(
             meta,
             tuple(
-                fields_with_optional_opd_full(train_fields, field=self._opd_full_field)
+                fields_with_optional_opd_full(
+                    _with_tree_attention_fields(train_fields, meta),
+                    field=self._opd_full_field,
+                )
             ),
             task_name="train",
             want_routes=True,
@@ -421,11 +799,15 @@ class TQPolicy(TQDriverMixin, Policy):
                 sequence_packing_args=spa,
                 dynamic_batching_args=dba,
             )
+        self._emit_packed_padding_comparison(
+            stage="train",
+            meta=train_meta,
+            dp_metas=dp_metas,
+        )
 
         if self.flops_tracker is not None:
             self.flops_tracker.reset()
-            for m in dp_metas:
-                self.flops_tracker.track_batch(list(m.sequence_lengths or []))
+            self.flops_tracker.track_batch(_model_sequence_lengths(meta))
 
         with (
             timer.time("policy_training/submit_training_futures")
@@ -449,8 +831,11 @@ class TQPolicy(TQDriverMixin, Policy):
                 common_kwargs={
                     "loss_fn": loss_fn,
                     "eval_mode": eval_mode,
-                    "gbs": batch_size,
+                    "gbs": worker_batch_size,
                     "mbs": micro_batch_size,
+                    "scheduler_step_increment": batch_size
+                    if segment_lengths is not None
+                    else None,
                 },
             )
         results = self.worker_group.get_all_worker_results(futures)
@@ -508,6 +893,7 @@ class TQPolicy(TQDriverMixin, Policy):
             mbs=micro_batch_size,
         )
         ray.get(futures)
+        self._open_train_loss_type = loss_fn.loss_type
 
     def train_microbatches_from_meta(
         self,
@@ -534,7 +920,44 @@ class TQPolicy(TQDriverMixin, Policy):
             timer: Optional timer for nested policy-training measurements.
             train_fields: Columns produced for this step and fetched by workers.
         """
+        segment_lengths = (meta.extra_info or {}).get(PACKED_ATTENTION_SEGMENT_LENGTHS)
+        if segment_lengths is not None and not self.cfg.get("megatron_cfg", {}).get(
+            "enabled", False
+        ):
+            raise NotImplementedError(
+                "independent model-call packing currently requires the Megatron "
+                "policy backend"
+            )
+        self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("train_mb_tokens")
+        if TREE_ATTENTION_LAYOUTS in (meta.extra_info or {}):
+            self._validate_tree_execution()
+            _validate_tree_rows(
+                meta, spa, max_context_length=self.cfg["max_total_sequence_length"]
+            )
+        tree_fragment_layout = (
+            expand_meta_for_tree_attention(
+                meta,
+                max_physical_tokens=int(spa["max_tokens_per_microbatch"]),
+                fragment_count_multiple=self.sharding_annotations.get_axis_size(
+                    "data_parallel"
+                ),
+            )
+            if spa is not None
+            else None
+        )
+        if (
+            tree_fragment_layout is not None
+            and self._open_train_loss_type != LossType.TOKEN_LEVEL
+        ):
+            raise ValueError(
+                "bounded tree fragmentation currently supports token-level losses only"
+            )
+        self._emit_tree_fragmentation(
+            stage="train_microbatch",
+            meta=meta,
+            layout=tree_fragment_layout,
+        )
         train_meta = self._with_route_fields(
             meta,
             # Raw fields, not pre-wrapped in fields_with_optional_routed_experts:
@@ -542,7 +965,10 @@ class TQPolicy(TQDriverMixin, Policy):
             # router replay and route-plan passthrough. The opd_full payload
             # column has no such gate, so it is appended here.
             tuple(
-                fields_with_optional_opd_full(train_fields, field=self._opd_full_field)
+                fields_with_optional_opd_full(
+                    _with_tree_attention_fields(train_fields, meta),
+                    field=self._opd_full_field,
+                )
             ),
             task_name="train",
             want_routes=True,
@@ -555,6 +981,11 @@ class TQPolicy(TQDriverMixin, Policy):
                 sequence_packing_args=spa,
                 dynamic_batching_args=dba,
             )
+        self._emit_packed_padding_comparison(
+            stage="train_microbatch",
+            meta=train_meta,
+            dp_metas=dp_metas,
+        )
 
         self._dispatch_train_microbatches(dp_metas, timer=timer)
 
@@ -628,8 +1059,8 @@ class TQPolicy(TQDriverMixin, Policy):
     ) -> None:
         """Send prepared per-DP metadata into an open train step."""
         if self.flops_tracker is not None:
-            for m in dp_metas:
-                self.flops_tracker.track_batch(list(m.sequence_lengths or []))
+            for rank_meta in dp_metas:
+                self.flops_tracker.track_batch(list(rank_meta.sequence_lengths or []))
 
         with (
             timer.time("policy_training/submit_microbatch_futures")
@@ -680,6 +1111,7 @@ class TQPolicy(TQDriverMixin, Policy):
             aggregated_results["total_flops"] = self.flops_tracker.total_flops
             aggregated_results["num_ranks"] = self.worker_group.cluster.world_size()
 
+        self._open_train_loss_type = None
         return aggregated_results
 
     def abort_train_step(self) -> None:
@@ -688,6 +1120,7 @@ class TQPolicy(TQDriverMixin, Policy):
             "abort_train_step_presharded",
         )
         ray.get(futures)
+        self._open_train_loss_type = None
 
         if self.flops_tracker is not None:
             self.flops_tracker.reset()

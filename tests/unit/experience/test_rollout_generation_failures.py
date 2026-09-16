@@ -150,6 +150,7 @@ def _make_impl(
     impl._max_seq_len = 128
     impl._max_rollout_turns = max_turns
     impl._policy_generation = generation
+    impl._native_exact_call_tree = False
     impl._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
     impl._deadline_registry = None
     return impl
@@ -553,6 +554,7 @@ def _make_gym_impl(
     impl._stats = stats if stats is not None else RolloutStats()
     # Upstream default; this fixture is about re-dispatch, not sample masking.
     impl._mask_env_flagged_samples = True
+    impl._allow_independent_calls = True
     # Full-result tables are likewise opt-in in the real constructor.
     impl._log_full_result_tables = False
     # Reward penalties are off; direct construction must still satisfy the impl contract.
@@ -610,6 +612,48 @@ class TestPartialGymRedispatch:
     At num_generations_per_prompt=16, one bad row killing the stream costs 16
     regenerations if the whole group is redone. It should cost the rows that were lost.
     """
+
+    @pytest.mark.parametrize(
+        "failure_class",
+        ["sandbox_lifecycle_reset", "sandbox_backend_unreachable", "unknown_failure"],
+    )
+    def test_structured_failure_preserves_successful_siblings(self, failure_class):
+        from nemo_rl.environments.nemo_gym import NemoGymRolloutFailure
+
+        class StructuredMethod(_PartialGymMethod):
+            async def _stream(self, inputs, attempt):
+                for row in inputs:
+                    if attempt == 0 and row["_rowidx"] == 0:
+
+                        async def failed_result():
+                            return (
+                                0,
+                                {"name": "agent"},
+                                NemoGymRolloutFailure(
+                                    failure_class=failure_class,
+                                    error="injected failure",
+                                    full_result={},
+                                ),
+                                None,
+                            )
+
+                        yield failed_result()
+                    else:
+                        yield _row_result(row["_rowidx"])
+
+        method = StructuredMethod(fail_after_rows=0, failures_before_success=1)
+        impl = _make_gym_impl(method, num_generations=2, row_attempts=3)
+        if failure_class == "unknown_failure":
+            with pytest.raises(RolloutDataFailure, match="unknown_failure"):
+                asyncio.run(impl._run_rollouts(_gym_rows(2), Timer(), "timing/rollout"))
+            assert method.dispatched == [[0, 1]]
+        else:
+            completions, _, _ = asyncio.run(
+                impl._run_rollouts(_gym_rows(2), Timer(), "timing/rollout")
+            )
+            assert method.dispatched == [[0, 1], [0]]
+            assert len(completions) == 2
+            assert [c.reward for c in completions] == [1.0, 1.0]
 
     def test_only_the_missing_rows_are_re_dispatched(self):
         # Rows 0-1 land, then the stream dies; the retry should carry rows 2-3 only.

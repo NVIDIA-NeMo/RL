@@ -43,6 +43,11 @@ from typing import Annotated, Any, Callable, Literal, NotRequired, Sequence, Typ
 from pydantic import BaseModel, Field, PositiveInt
 from tensordict import TensorDict
 
+from nemo_rl.data.packed_rollouts import (
+    PACKED_ATTENTION_SEGMENT_LENGTHS,
+    TREE_ATTENTION_LAYOUTS,
+)
+
 DATA_PLANE_CHECKPOINT_SCHEMA_VERSION = 2
 
 
@@ -187,6 +192,7 @@ class ObservabilityConfig(TypedDict):
 
     enabled: bool
     callback: NotRequired[Callable[[dict[str, Any]], None]]
+    packing_memory_enabled: NotRequired[bool]
 
 
 class LocalDataPlaneConfig(BaseModel, extra="allow"):
@@ -296,7 +302,7 @@ class KVBatchMeta:
 
     def subset(self, indices: "Sequence[int]") -> "KVBatchMeta":
         """Return a new meta with only the rows at ``indices`` (any order)."""
-        return self._replace(
+        out = self._replace(
             sample_ids=[self.sample_ids[i] for i in indices],
             sequence_lengths=(
                 [self.sequence_lengths[i] for i in indices]
@@ -305,18 +311,29 @@ class KVBatchMeta:
             ),
             tags=([self.tags[i] for i in indices] if self.tags is not None else None),
         )
+        segment_lengths = self.extra_info.get(PACKED_ATTENTION_SEGMENT_LENGTHS)
+        if segment_lengths is not None:
+            if len(segment_lengths) != self.size:
+                raise ValueError(
+                    f"{PACKED_ATTENTION_SEGMENT_LENGTHS} must align with "
+                    f"sample_ids: {len(segment_lengths)} != {self.size}"
+                )
+            out.extra_info[PACKED_ATTENTION_SEGMENT_LENGTHS] = [
+                segment_lengths[i] for i in indices
+            ]
+        tree_layouts = self.extra_info.get(TREE_ATTENTION_LAYOUTS)
+        if tree_layouts is not None:
+            if len(tree_layouts) != self.size:
+                raise ValueError(
+                    f"{TREE_ATTENTION_LAYOUTS} must align with sample_ids: "
+                    f"{len(tree_layouts)} != {self.size}"
+                )
+            out.extra_info[TREE_ATTENTION_LAYOUTS] = [tree_layouts[i] for i in indices]
+        return out
 
     def slice(self, start: int, stop: int) -> "KVBatchMeta":
         """Return a new meta with rows in the contiguous range ``[start, stop)``."""
-        return self._replace(
-            sample_ids=self.sample_ids[start:stop],
-            sequence_lengths=(
-                self.sequence_lengths[start:stop]
-                if self.sequence_lengths is not None
-                else None
-            ),
-            tags=self.tags[start:stop] if self.tags is not None else None,
-        )
+        return self.subset(range(start, stop))
 
     def concat(self, *others: "KVBatchMeta") -> "KVBatchMeta":
         """Append metadata from the same partition.
@@ -337,7 +354,7 @@ class KVBatchMeta:
         """
         if any(o.partition_id != self.partition_id for o in others):
             raise ValueError("KVBatchMeta.concat: partition_ids must match")
-        all_m = (self, *others)
+        all_m: tuple[KVBatchMeta, ...] = (self, *others)
         sample_ids = [k for m in all_m for k in m.sample_ids]
         all_have_lens = all(m.sequence_lengths is not None for m in all_m)
         seq_lens = (
@@ -350,11 +367,43 @@ class KVBatchMeta:
         merged_fields = list(
             dict.fromkeys(field for meta in all_m for field in (meta.fields or []))
         )
-        result = self._replace(
-            sample_ids=sample_ids, sequence_lengths=seq_lens, tags=tags
-        )
-        result.fields = merged_fields or None
-        return result
+        out = self._replace(sample_ids=sample_ids, sequence_lengths=seq_lens, tags=tags)
+        out.fields = merged_fields or None
+        packed_layouts = [
+            m.extra_info.get(PACKED_ATTENTION_SEGMENT_LENGTHS) for m in all_m
+        ]
+        if any(layout is not None for layout in packed_layouts):
+            merged_layout = []
+            for index, m in enumerate(all_m):
+                layout: Any = packed_layouts[index]
+                if layout is None:
+                    sequence_lengths = m.sequence_lengths
+                    if sequence_lengths is None:
+                        raise ValueError(
+                            "cannot merge packed attention metadata with a meta "
+                            "that has no sequence_lengths"
+                        )
+                    layout = [[int(length)] for length in sequence_lengths]
+                if len(layout) != m.size:
+                    raise ValueError(
+                        f"{PACKED_ATTENTION_SEGMENT_LENGTHS} must align with "
+                        f"sample_ids: {len(layout)} != {m.size}"
+                    )
+                merged_layout.extend(layout)
+            out.extra_info[PACKED_ATTENTION_SEGMENT_LENGTHS] = merged_layout
+        tree_layouts = [m.extra_info.get(TREE_ATTENTION_LAYOUTS) for m in all_m]
+        if any(layout is not None for layout in tree_layouts):
+            if not all(layout is not None for layout in tree_layouts):
+                raise ValueError("cannot merge tree and non-tree attention metadata")
+            merged_trees = []
+            for m, layouts in zip(all_m, tree_layouts):
+                if len(layouts) != m.size:
+                    raise ValueError(
+                        f"{TREE_ATTENTION_LAYOUTS} must align with sample_ids"
+                    )
+                merged_trees.extend(layouts)
+            out.extra_info[TREE_ATTENTION_LAYOUTS] = merged_trees
+        return out
 
     def drop(self, indices: "Sequence[int]") -> "KVBatchMeta | None":
         """Complement of :meth:`subset`. Returns ``None`` when all rows are dropped."""

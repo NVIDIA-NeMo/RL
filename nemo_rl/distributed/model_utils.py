@@ -1223,6 +1223,113 @@ def from_parallel_logits_to_logprobs(
     return logprobs[:, :-1]
 
 
+def from_parallel_tree_logits_to_logprobs(
+    vocab_parallel_logits: torch.Tensor,
+    target_ids: torch.Tensor,
+    packed_seq_params: Any,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    tp_group: torch.distributed.ProcessGroup,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    inference_only: bool = False,
+    chunk_size: Optional[int] = None,
+    sampling_params: Optional[TrainingSamplingParams] = None,
+) -> torch.Tensor:
+    """Compute sampled-edge logprobs from tree-selected output logits."""
+    output_indices = packed_seq_params.tree_edge_output_indices
+    local_edge_count = int(output_indices.numel())
+    local_logits = vocab_parallel_logits[:, :local_edge_count]
+    flat_targets = target_ids.reshape(-1)
+    local_targets = flat_targets.index_select(0, output_indices).unsqueeze(0)
+
+    if local_edge_count:
+        if need_top_k_or_top_p_filtering(sampling_params):
+            # Tree edges are selected after the model-forward padding has been
+            # removed, so their count is not constrained by the configured
+            # sequence-length multiple. The sampled-logprob all-to-all shards
+            # this dimension across TP ranks and therefore needs its own local
+            # padding. These dummy rows are discarded before edge writeback.
+            tp_size = torch.distributed.get_world_size(tp_group)
+            sampling_pad = (-local_edge_count) % tp_size
+            if sampling_pad:
+                local_logits = torch.cat(
+                    [
+                        local_logits,
+                        local_logits.new_zeros(
+                            local_logits.shape[0],
+                            sampling_pad,
+                            local_logits.shape[2],
+                        ),
+                    ],
+                    dim=1,
+                )
+                local_targets = torch.cat(
+                    [
+                        local_targets,
+                        local_targets.new_zeros(local_targets.shape[0], sampling_pad),
+                    ],
+                    dim=1,
+                )
+            if chunk_size is not None:
+                local_logprobs = ChunkedDistributedLogprobWithSampling.apply(  # type: ignore
+                    local_logits,
+                    local_targets,
+                    tp_group,
+                    sampling_params.top_k,
+                    sampling_params.top_p,
+                    chunk_size,
+                    inference_only,
+                )
+            else:
+                local_logprobs = DistributedLogprobWithSampling.apply(  # type: ignore
+                    local_logits,
+                    local_targets,
+                    tp_group,
+                    sampling_params.top_k,
+                    sampling_params.top_p,
+                    inference_only,
+                )
+            local_logprobs = local_logprobs[:, :local_edge_count]
+        elif chunk_size is not None:
+            local_logprobs = ChunkedDistributedLogprob.apply(  # type: ignore
+                local_logits,
+                local_targets,
+                vocab_start_index,
+                vocab_end_index,
+                chunk_size,
+                tp_group,
+                inference_only,
+            )
+        else:
+            local_logprobs = DistributedLogprob.apply(  # type: ignore
+                local_logits,
+                local_targets,
+                vocab_start_index,
+                vocab_end_index,
+                tp_group,
+                inference_only,
+            )
+        local_logprobs = local_logprobs.reshape(-1)
+    else:
+        local_logprobs = vocab_parallel_logits.new_empty(0, dtype=torch.float32)
+
+    flat_logprobs = vocab_parallel_logits.new_zeros(
+        target_ids.numel(), dtype=torch.float32
+    )
+    flat_logprobs = flat_logprobs.index_copy(
+        0, output_indices, local_logprobs.to(torch.float32)
+    )
+    # Keep the dummy projection on edge-empty CP ranks in the autograd graph.
+    flat_logprobs = flat_logprobs + vocab_parallel_logits.sum() * 0.0
+    if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1:
+        flat_logprobs = torch.distributed.nn.functional.all_reduce(
+            flat_logprobs,
+            op=torch.distributed.ReduceOp.SUM,
+            group=cp_group,
+        )
+    return flat_logprobs.view_as(target_ids)
+
+
 def from_parallel_logits_to_logprobs_packed_sequences(
     vocab_parallel_logits: torch.Tensor,
     target: torch.Tensor,
