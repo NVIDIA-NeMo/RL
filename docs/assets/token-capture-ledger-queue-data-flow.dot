@@ -77,7 +77,7 @@ digraph token_capture_flow {
     group="right",
     color="#ea580c",
     fillcolor="#ffedd5",
-    label="Megatron — canonicalize and stage\nDynamicInferenceEngine._serialize_finished_request_record()\nTQMegatronTokenStager.stage() → RolloutTokenCapture.complete_call()\n→ TQTokenSink.stage()"
+    label="Megatron — canonicalize and stage\nDynamicInferenceEngine._serialize_finished_request()\nTQMegatronTokenStager.stage() → RolloutTokenCapture.complete_call()\n→ TQTokenSink.stage()"
   ];
 
   tq_staging [
