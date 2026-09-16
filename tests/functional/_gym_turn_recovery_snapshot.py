@@ -22,6 +22,7 @@ import json
 import os
 import tarfile
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -724,26 +725,106 @@ def _verify_genrm_restore(
         json.loads(line) for line in audit_path.read_text().splitlines() if line.strip()
     ]
 
-    def count(phase: str, event: str) -> int:
-        return sum(
-            item.get("phase") == phase and item.get("event") == event for item in audit
-        )
-
-    expected_counts = {
+    expected_phase1_counts = {
         ("phase1", "verify_entered"): 1,
         ("phase1", "verify_waiting"): 1,
         ("phase1", "reward_computed"): 0,
         ("phase1", "verify_returned"): 0,
-        ("phase2", "verify_entered"): 2,
-        ("phase2", "verify_waiting"): 1,
-        ("phase2", "reward_computed"): 1,
-        ("phase2", "verify_returned"): 2,
     }
-    actual_counts = {key: count(*key) for key in expected_counts}
-    if actual_counts != expected_counts:
+    actual_phase1_counts = {
+        key: sum(
+            item.get("phase") == key[0] and item.get("event") == key[1]
+            for item in audit
+        )
+        for key in expected_phase1_counts
+    }
+    if actual_phase1_counts != expected_phase1_counts:
         raise AssertionError(
-            "GenRM cohort did not freeze, replay, and resolve exactly once: "
-            f"expected={expected_counts!r}, actual={actual_counts!r}, audit={audit!r}"
+            "GenRM cohort did not freeze exactly once before the crash: "
+            f"expected={expected_phase1_counts!r}, "
+            f"actual={actual_phase1_counts!r}, audit={audit!r}"
+        )
+
+    phase2 = [item for item in audit if item.get("phase") == "phase2"]
+    entered = [item for item in phase2 if item.get("event") == "verify_entered"]
+    returned = [item for item in phase2 if item.get("event") == "verify_returned"]
+
+    def capture_id(item: dict[str, Any]) -> str:
+        value = item.get("capture_rollout_id")
+        if not isinstance(value, str) or not value:
+            raise AssertionError(
+                f"GenRM audit event has no capture rollout identity: event={item!r}"
+            )
+        return value
+
+    entered_counts = Counter(capture_id(item) for item in entered)
+    returned_counts = Counter(capture_id(item) for item in returned)
+    if entered_counts != returned_counts or any(count != 1 for count in entered_counts.values()):
+        raise AssertionError(
+            "a phase-two GenRM verification was duplicated or left unfinished: "
+            f"entered={entered_counts!r}, returned={returned_counts!r}, audit={audit!r}"
+        )
+
+    cohort_size = len(expected_capture_keys)
+
+    def cohort_members(item: dict[str, Any]) -> frozenset[str]:
+        raw_members = item.get("capture_rollout_ids")
+        if not isinstance(raw_members, list) or any(
+            not isinstance(member, str) or not member for member in raw_members
+        ):
+            raise AssertionError(
+                f"GenRM cohort audit event has no member identities: event={item!r}"
+            )
+        members = frozenset(raw_members)
+        if len(members) != len(raw_members):
+            raise AssertionError(
+                f"GenRM cohort audit event repeats a member identity: event={item!r}"
+            )
+        return members
+
+    reward_events = [item for item in phase2 if item.get("event") == "reward_computed"]
+    reward_cohorts = [cohort_members(item) for item in reward_events]
+    if any(
+        len(members) != cohort_size or event.get("cohort_size") != cohort_size
+        for members, event in zip(reward_cohorts, reward_events, strict=True)
+    ):
+        raise AssertionError(
+            f"phase-two GenRM reward used an incomplete cohort: events={reward_events!r}"
+        )
+    if len(set(reward_cohorts)) != len(reward_cohorts):
+        raise AssertionError(
+            f"a phase-two GenRM cohort was rewarded more than once: events={reward_events!r}"
+        )
+
+    rewarded_counts = Counter(member for cohort in reward_cohorts for member in cohort)
+    if rewarded_counts != entered_counts:
+        raise AssertionError(
+            "phase-two GenRM requests and rewarded cohort membership disagree: "
+            f"entered={entered_counts!r}, rewarded={rewarded_counts!r}, audit={audit!r}"
+        )
+
+    waiting_events = [item for item in phase2 if item.get("event") == "verify_waiting"]
+    waiting_cohorts = [cohort_members(item) for item in waiting_events]
+    if any(
+        len(members) != cohort_size - 1 or event.get("cohort_size") != cohort_size - 1
+        for members, event in zip(waiting_cohorts, waiting_events, strict=True)
+    ):
+        raise AssertionError(
+            f"phase-two GenRM wait has invalid cohort membership: events={waiting_events!r}"
+        )
+    for rewarded in reward_cohorts:
+        matching_waits = [waiting for waiting in waiting_cohorts if waiting < rewarded]
+        if len(matching_waits) != 1:
+            raise AssertionError(
+                "phase-two GenRM cohort did not wait and resolve exactly once: "
+                f"rewarded={sorted(rewarded)!r}, waits={matching_waits!r}, audit={audit!r}"
+            )
+
+    selected_cohort = frozenset(expected_capture_keys)
+    if selected_cohort not in reward_cohorts:
+        raise AssertionError(
+            "the selected restored GenRM siblings were not rewarded as one cohort: "
+            f"selected={sorted(selected_cohort)!r}, rewarded={reward_cohorts!r}"
         )
 
 
