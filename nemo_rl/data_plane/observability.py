@@ -1034,6 +1034,9 @@ def breakdown_table(
     return ["op", *_BREAKDOWN_COLUMNS], rows
 
 
+_panel_failures = 0
+
+
 @contextmanager
 def metrics_never_fail_the_step(step: int) -> Iterator[None]:
     """Swallow anything the metrics panel raises, and say so.
@@ -1041,18 +1044,45 @@ def metrics_never_fail_the_step(step: int) -> Iterator[None]:
     Observability is on by default, so a fault here would otherwise take
     down every step of every recipe -- a panel must never fail training.
 
+    Swallowing is why this has to be loud. A panel that raises every step
+    logs nothing else, and no ``data_plane/*`` series reaches the dashboard
+    at all: the symptom is an empty panel, which looks exactly like a data
+    plane that cost nothing. So the first failure carries its traceback at
+    ERROR -- a bare ``KeyError: 'step_wall_ms'`` names the key but not the
+    line that asked for it -- and later ones carry a running count, which
+    is what distinguishes "broken since step 1" from "flaked once".
+
+    The nightly gate is the backstop: with the panel down, the suites'
+    ``rows_checked > 0`` check reads an absent series and fails.
+
     Args:
-        step: Step number, for the warning.
+        step: Step number, for the log line.
     """
+    global _panel_failures
     try:
         yield
     except Exception as exc:  # noqa: BLE001 - a panel must never fail a step
-        logging.getLogger(__name__).warning(
-            "data-plane metrics failed at step %d (%s: %s); training continues",
-            step,
-            type(exc).__name__,
-            exc,
-        )
+        _panel_failures += 1
+        log = logging.getLogger(__name__)
+        if _panel_failures == 1:
+            log.error(
+                "data-plane metrics failed at step %d (%s: %s); training "
+                "continues and no data_plane/* series will be logged for this "
+                "step. Traceback follows -- this is the only one printed.",
+                step,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+        else:
+            log.warning(
+                "data-plane metrics failed at step %d (%s: %s); %d failures so "
+                "far, training continues",
+                step,
+                type(exc).__name__,
+                exc,
+                _panel_failures,
+            )
 
 
 def log_step_metrics(
