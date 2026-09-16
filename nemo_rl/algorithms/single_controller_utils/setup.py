@@ -1822,10 +1822,16 @@ def setup_single_controller(
     # Setup Algorithm + Rollout Wiring
     # ==========================
     advantage_estimator = _build_advantage_estimator(master_config)
-    loss_fn: LossFunction = ClippedPGLossFn(
-        master_config.loss_fn,
-        opd_full=opd_module.get_opd_full_config(master_config),
-    )
+    # super-v3.5 branch: the loss module predates full-vocabulary OPD, so the
+    # opd_full kwarg only exists on main. Refuse loudly instead of silently
+    # dropping the teacher payload when a recipe asks for it.
+    _opd_full_cfg = opd_module.get_opd_full_config(master_config)
+    if _opd_full_cfg is not None:
+        raise NotImplementedError(
+            "on_policy_distillation.full is not available on this branch's "
+            "ClippedPGLossFn (no opd_full support in nemo_rl/algorithms/loss)."
+        )
+    loss_fn: LossFunction = ClippedPGLossFn(master_config.loss_fn)
     value_loss_fn: Optional[LossFunction] = (
         MseValueLossFn(master_config.value_loss_fn)  # type: ignore
         if is_ppo_run(master_config)

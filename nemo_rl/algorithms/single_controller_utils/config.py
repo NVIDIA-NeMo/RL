@@ -1282,7 +1282,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         master_config.policy,
         data_plane_enabled=bool((getattr(master_config, "data_plane", None) or {}).get("enabled", False)),
         async_grpo_enabled=True,
-        nemo_gym_enabled=bool(master_config.env.get("should_use_nemo_gym", False)),
+        nemo_gym_enabled=bool((getattr(master_config, "env", None) or {}).get("should_use_nemo_gym", False)),
         load_replay_buffer=master_config.checkpointing.get("load_replay_buffer"),
     )
     _validate_algo_settings(master_config)
@@ -1293,7 +1293,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     reward_penalties_enabled = any(
         getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS
     )
-    if reward_penalties_enabled and not master_config.env.get("should_use_nemo_gym"):
+    if reward_penalties_enabled and not (getattr(master_config, "env", None) or {}).get("should_use_nemo_gym"):
         raise ValueError(
             "reward_penalties require the NeMo-Gym rollout path "
             "(env.should_use_nemo_gym=true) on SingleController"
