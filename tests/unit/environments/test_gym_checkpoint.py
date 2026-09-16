@@ -22,6 +22,7 @@ from pydantic import ValidationError
 
 from nemo_rl.environments.gym_checkpoint import (
     GYM_CHECKPOINT_SCHEMA_VERSION,
+    GymAgentContinuationRoot,
     GymAgentCheckpointDirectoryRequest,
     GymAgentCommitResponse,
     GymAgentRestoreResponse,
@@ -72,6 +73,30 @@ def test_gym_execution_identity_separates_logical_id_from_capture_key() -> None:
     assert first.capture_key == "group-7_g0"
     assert retry.capture_key == "group-7_g0-a2"
     assert gym_capture_key("group-7_g0", 2) == retry.capture_key
+
+
+def test_continuation_can_reference_model_lineage_from_an_earlier_attempt() -> None:
+    continuation = GymAgentContinuationRoot(
+        rollout_id="group-7_g0",
+        attempt_index=2,
+        capture_key="group-7_g0-a1",
+        last_committed_model_call_id="call-1",
+    )
+
+    assert continuation.capture_key == "group-7_g0-a1"
+
+
+@pytest.mark.parametrize("capture_key", ["other-rollout", "group-7_g0-a3"])
+def test_continuation_rejects_foreign_or_future_model_lineage(
+    capture_key: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        GymAgentContinuationRoot(
+            rollout_id="group-7_g0",
+            attempt_index=2,
+            capture_key=capture_key,
+            last_committed_model_call_id="call-1",
+        )
 
 
 def test_checkpoint_requests_use_required_new_only_artifact_contract() -> None:

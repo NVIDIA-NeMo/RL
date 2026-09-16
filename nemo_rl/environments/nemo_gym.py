@@ -1763,13 +1763,22 @@ Depending on your data shape, you may want to change these values."""
                 self._gym_execution_registry.mark_terminal(execution)
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
+                completion_receipt = None
+                if self._gym_checkpoint_participants:
+                    assert execution is not None
+                    completion_receipt = await self._completion_receipt_for(
+                        execution,
+                        agent_name=nemo_gym_row["agent_ref"]["name"],
+                    )
                 if self._token_capture_enabled:
                     # Receipt mode: fetch the ledger manifest and assemble the
                     # receipt locally; token-free result. The canonical row is
                     # rebuilt by the finalizer, so no message_log walk (and no
                     # NaN check) applies here.
                     nemo_rl_result = await self._postprocess_receipt_mode(
-                        nemo_gym_row, nemo_gym_result
+                        nemo_gym_row,
+                        nemo_gym_result,
+                        completion_receipt=completion_receipt,
                     )
                 else:
                     nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
@@ -1781,11 +1790,7 @@ Depending on your data shape, you may want to change these values."""
                     if _has_nan_generation_logprobs(nemo_rl_result):
                         raise RuntimeError("Generation logprobs contain NaN")
                 if self._gym_checkpoint_participants:
-                    assert execution is not None
-                    completion_receipt = await self._completion_receipt_for(
-                        execution,
-                        agent_name=nemo_gym_row["agent_ref"]["name"],
-                    )
+                    assert completion_receipt is not None
                     nemo_rl_result["gym_completion_receipt"] = (
                         completion_receipt.model_dump(mode="json")
                     )
@@ -1832,7 +1837,11 @@ Depending on your data shape, you may want to change these values."""
                     self._gym_execution_registry.release(execution)
 
     async def _postprocess_receipt_mode(
-        self, nemo_gym_row: dict, nemo_gym_result: dict
+        self,
+        nemo_gym_row: dict,
+        nemo_gym_result: dict,
+        *,
+        completion_receipt: GymCompletionReceipt | None = None,
     ) -> dict:
         """Fetch the ledger manifest and assemble the receipt locally.
 
@@ -1852,6 +1861,17 @@ Depending on your data shape, you may want to change these values."""
             attempt_index=attempt_index,
         )
         rollout_id = execution.capture_key
+        manifest_capture_key = (
+            completion_receipt.manifest_capture_key
+            if completion_receipt is not None
+            and completion_receipt.manifest_capture_key is not None
+            else rollout_id
+        )
+        terminal_model_call_id = (
+            completion_receipt.terminal_model_call_id
+            if completion_receipt is not None
+            else None
+        )
         # Gym's TERMINAL_RESPONSE_ID_KEY: the served response envelope id the
         # harness kept (``response.id``), not the logical-request header.
         terminal_response_id = nemo_gym_result.get("terminal_response_id")
@@ -1867,12 +1887,20 @@ Depending on your data shape, you may want to change these values."""
         try:
             manifest = await self._control(
                 "GET",
-                f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/{rollout_id}/manifest",
+                f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/"
+                f"{manifest_capture_key}/manifest",
             )
+            if manifest.get("rollout_id") != manifest_capture_key:
+                raise ValueError(
+                    "Gym model manifest identity mismatch: "
+                    f"expected={manifest_capture_key!r}, "
+                    f"actual={manifest.get('rollout_id')!r}"
+                )
             receipt = self._assemble_receipt(
                 rollout_id,
                 manifest,
                 terminal_response_id=terminal_response_id,
+                terminal_model_call_id=terminal_model_call_id,
                 scored_response=scored_response,
                 reward=float(nemo_gym_result.get("reward") or 0.0),
             )
@@ -1893,6 +1921,7 @@ Depending on your data shape, you may want to change these values."""
         manifest: dict,
         *,
         terminal_response_id: Optional[str],
+        terminal_model_call_id: Optional[str] = None,
         scored_response: Optional[dict] = None,
         reward: float,
     ) -> dict:
@@ -1960,7 +1989,13 @@ Depending on your data shape, you may want to change these values."""
             ]
         except ValueError:
             selection_reason = "invalid_manifest_row"
-        if parsed_records is not None:
+        if parsed_records is not None and terminal_model_call_id is not None:
+            terminal_selection = "declared"
+            attribution_reason = "agent_boundary_model_call_id"
+            terminal_record = deduped.get(terminal_model_call_id)
+            if terminal_record is None:
+                selection_reason = "missing_declared_terminal_row"
+        elif parsed_records is not None:
             attribution = resolve_terminal(
                 parsed_records,
                 scored_response,
