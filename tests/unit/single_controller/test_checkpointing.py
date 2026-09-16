@@ -114,7 +114,7 @@ from nemo_rl.experience.route_plan import (
     encode_route_plan,
 )
 from nemo_rl.telemetry.vocabulary import TELEMETRY_WALL_TIME_METRIC
-from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import LoggerConfig
 from tests.unit.experience.test_rollout_recovery import _forest_sealed_ledger
 
@@ -849,7 +849,7 @@ def _actor_master_config(
         ),
         logger=LoggerConfig(log_dir=str(tmp_path / "logs"), monitor_gpus=False),
         cluster=ClusterConfig(num_nodes=1, gpus_per_node=1),
-        checkpointing={
+        checkpointing=CheckpointingConfig.model_construct(**{
             "enabled": enabled,
             "checkpoint_dir": str(tmp_path / "checkpoints"),
             "metric_name": metric_name,
@@ -861,7 +861,7 @@ def _actor_master_config(
             "load_replay_buffer": load_replay_buffer,
             "checkpoint_must_save_by": checkpoint_must_save_by,
             "ft_save_period": ft_save_period,
-        },
+        }),
         data_plane={
             "enabled": True,
             "impl": "transfer_queue",
@@ -3156,7 +3156,7 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     )
     actor._sampler = _FakeSampler()
     actor._master_config = SimpleNamespace(
-        checkpointing={"metric_name": None, "save_data_plane": False},
+        checkpointing=CheckpointingConfig.model_construct(**{"metric_name": None, "save_data_plane": False}),
         data_plane={},
     )
     actor._dataloader = SimpleNamespace(state_dict=lambda: {})
@@ -3246,7 +3246,7 @@ class TestPPOWarmupCheckpoint:
 
     def test_warmup_step_skips_the_top_k_metric(self, actor):
         """No policy metrics exist yet, so the checkpoint just is not a candidate."""
-        actor._master_config.checkpointing["metric_name"] = "train:loss"
+        actor._master_config.checkpointing.metric_name = "train:loss"
         # Seed it so the delattr in the warmup branch is observable; the bare
         # namespace never had the attribute, so the assertion would be vacuous.
         setattr(actor._save_state, "train:loss", 1.23)
@@ -3262,7 +3262,7 @@ class TestPPOWarmupCheckpoint:
 
     def test_a_training_step_still_raises_on_a_missing_metric(self, actor):
         """The warmup branch must not soften the misconfiguration error."""
-        actor._master_config.checkpointing["metric_name"] = "train:loss"
+        actor._master_config.checkpointing.metric_name = "train:loss"
 
         with pytest.raises(ValueError, match="not found in train metrics"):
             asyncio.run(
@@ -3474,7 +3474,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             min_groups_for_streaming_train=4,
             max_buffered_rollouts=8,
         ),
-        checkpointing={
+        checkpointing=CheckpointingConfig.model_construct(**{
             "enabled": True,
             "checkpoint_dir": checkpoint_dir,
             "metric_name": None,
@@ -3484,7 +3484,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             "save_optimizer": True,
             "save_data_plane": True,
             "checkpoint_must_save_by": None,
-        },
+        }),
     )
 
 
@@ -3554,7 +3554,7 @@ class TestSetupResumeWiring:
     ):
         ckpt_dir = tmp_path / "ckpts"
         mc = _setup_master_config(str(ckpt_dir))
-        mc.checkpointing["save_period"] = 1
+        mc.checkpointing.save_period = 1
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=120.0
         )
@@ -3693,7 +3693,7 @@ class TestSetupResumeWiring:
     ):
         mc = _setup_master_config(str(tmp_path / "ckpts"))
         pretrained = {"path": "/some/ckpt", "format": "megatron_bridge"}
-        mc.checkpointing["pretrained_checkpoint"] = pretrained
+        mc.checkpointing.pretrained_checkpoint = pretrained
 
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 

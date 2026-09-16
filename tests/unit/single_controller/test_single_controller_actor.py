@@ -96,6 +96,7 @@ from nemo_rl.weight_sync.sglang_weight_synchronizer import (
     SGLangColocatedWeightSynchronizer,
     SGLangDisaggregatedWeightSynchronizer,
 )
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 
 class FakeWeightSynchronizer:
@@ -352,8 +353,8 @@ def test_fresh_mooncake_init_registers_partition(
     dp_client = MagicMock(name="dp_client")
     master_config = _grpo_master_config(tmp_path)
     master_config.data_plane = _data_plane_config("mooncake_cpu")
-    master_config.checkpointing["enabled"] = checkpoint_enabled
-    master_config.checkpointing["save_data_plane"] = save_data_plane
+    master_config.checkpointing.enabled = checkpoint_enabled
+    master_config.checkpointing.save_data_plane = save_data_plane
     actor_args = _actor_args_for_init(dp_client=dp_client)
     if not checkpoint_enabled:
         actor_args.trainer_handle = None
@@ -2278,7 +2279,7 @@ def _train_pump_controller(*, sampler) -> object:
         ),
         # The pump's step epilogue reads the save triggers even when saving
         # is disabled.
-        checkpointing={"enabled": False, "save_period": 10},
+        checkpointing=CheckpointingConfig.model_construct(**{"enabled": False, "save_period": 10}),
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
