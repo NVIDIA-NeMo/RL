@@ -174,6 +174,11 @@ class TeacherWorkerGroup:
         # TQ fetch does not carry routed_experts, so replay must stay off.
         if "router_replay" in cfg:
             cfg["router_replay"]["enabled"] = False
+        # A student `pretrained_checkpoint` rides along on the copied config and
+        # would be loaded as the teacher's own weights. Resume keeps student
+        # weights out of the config for the same reason (`weights_path=None`
+        # below); this key has to be dropped explicitly.
+        cfg.pop("pretrained_checkpoint", None)
         # The teacher uses the plain Megatron worker, so a student-side quant_cfg
         # would be silently ignored. Drop it explicitly and warn instead.
         if cfg.get("quant_cfg") is not None:
@@ -235,6 +240,19 @@ class TeacherWorkerGroup:
 
         self.cfg = cfg
         self._micro_batch_size = teacher_cfg.micro_batch_size
+
+        # Resolved by the driver in setup and carried on the deep-copied policy
+        # config; absent means full-vocabulary MOPD is off for this run.
+        opd_full_cfg = cfg.get("on_policy_distillation_full")
+        self._opd_full_payload: Optional[str] = (
+            opd_full_cfg["teacher_payload"] if opd_full_cfg else None
+        )
+        self._opd_full_payload_dtype: Optional[str] = (
+            opd_full_cfg["payload_dtype"] if opd_full_cfg else None
+        )
+        self._opd_full_payload_field: Optional[str] = (
+            opd_full_cfg["payload_field"] if opd_full_cfg else None
+        )
 
         # Set up sequence packing / dynamic batching (mirrors lm_policy.py)
         self.use_sequence_packing = cfg["sequence_packing"]["enabled"]
@@ -332,7 +350,12 @@ class TeacherWorkerGroup:
                 "tensor_parallel",
                 "pipeline_parallel",
             ],
-            common_kwargs={"micro_batch_size": self._micro_batch_size},
+            common_kwargs={
+                "micro_batch_size": self._micro_batch_size,
+                "opd_full_payload": self._opd_full_payload,
+                "opd_full_payload_dtype": self._opd_full_payload_dtype,
+                "opd_full_payload_field": self._opd_full_payload_field,
+            },
         )
         self.worker_group.get_all_worker_results(futures)
 

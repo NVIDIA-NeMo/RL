@@ -48,6 +48,7 @@ The bugs these catch:
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -149,6 +150,10 @@ def _make_worker(loss_type):
             },
         },
     }
+    w.megatron_cfg = SimpleNamespace(
+        optimizer=SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=False),
+        ddp=SimpleNamespace(overlap_param_gather=False),
+    )
     w.dp_size = 2
     w.cp_size = 1
     w.sampling_params = None
@@ -157,14 +162,20 @@ def _make_worker(loss_type):
     w.dtype = torch.float32
     w._is_reward_model = False
     w._router_replay_enabled = False
+    # opd_full off, mirroring __init__ when the config block is absent.
+    w._opd_full_enabled = False
+    w._opd_full_lm_head_lifecycle = None
+    w._opd_full_teacher_lm_head = None
+    w._opd_full_teacher_checkpoint_path = None
     w.media_placeholder_token_id = None
     # Model-capability flags __init__ derives from self.model, which
-    # object.__new__ skips. train_microbatch passes all three straight through
+    # object.__new__ skips. train_microbatch passes all four straight through
     # to get_microbatch_iterator, so the plain-model defaults (NeMo-RL owns
-    # packing and CP sharding) have to be spelled out here.
+    # packing and CP sharding, no MTP) have to be spelled out here.
     w.delegate_pack_to_model = False
     w.delegate_mtp_loss_mask_to_model = False
     w.model_slices_context_parallel_inputs = False
+    w.mtp_enabled = False
     w._first_train_step_forward_pre_hook_disabled = False
     w._first_train_step_param_sync_func = None
     # Normally set from get_rank_safe() in __init__, which object.__new__ skips.
@@ -334,11 +345,12 @@ class TestBegin:
         assert w._train_step_state["gbs"] == w.cfg["train_global_batch_size"]
         assert w._train_step_state["mbs"] == w.cfg["train_micro_batch_size"]
 
-    def test_records_mtp_enabled_from_model_config(self, mock_module_symbols):
+    def test_records_mtp_enabled_in_step_state(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         w.model.config.mtp_num_layers = 2
+        w.mtp_enabled = True
         w.begin_train_step(loss_fn=w._test_loss_fn)
         assert w._train_step_state["mtp_enabled"] is True
 
@@ -347,6 +359,7 @@ class TestBegin:
 
         w = _make_worker(LossType.SEQUENCE_LEVEL)
         w.model.config.mtp_num_layers = 2
+        w.mtp_enabled = True
         with pytest.raises(ValueError, match="mtp_detach_heads"):
             w.begin_train_step(loss_fn=w._test_loss_fn)
         assert getattr(w, "_train_step_state", None) is None
@@ -356,6 +369,7 @@ class TestBegin:
 
         w = _make_worker(LossType.SEQUENCE_LEVEL)
         w.model.config.mtp_num_layers = 2
+        w.mtp_enabled = True
         w.model.config.mtp_detach_heads = True
         w.begin_train_step(loss_fn=w._test_loss_fn)
         assert w._train_step_state["mtp_detach_heads"] is True
@@ -365,6 +379,7 @@ class TestBegin:
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         w.model.config.mtp_num_layers = 2
+        w.mtp_enabled = True
         w.begin_train_step(loss_fn=w._test_loss_fn)
         assert w._train_step_state["mtp_detach_heads"] is False
 
@@ -375,6 +390,7 @@ class TestBegin:
 
         w = _make_worker(LossType.SEQUENCE_LEVEL)
         w.model.config.mtp_num_layers = 2
+        w.mtp_enabled = True
         w.model.config.mtp_loss_scaling_factor = 0.0
         w.begin_train_step(loss_fn=w._test_loss_fn)
         assert w._train_step_state["mtp_detach_heads"] is False
@@ -410,6 +426,27 @@ class TestAssertStepOpen:
 
 
 class TestTrainMicrobatch:
+    def test_forwards_multimodal_iterator_capabilities(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.media_placeholder_token_id = 42
+        w.delegate_pack_to_model = True
+        w.delegate_mtp_loss_mask_to_model = True
+        batch = _fake_batch()
+
+        with patch(
+            f"{WORKER_MOD}.attach_media_token_validity_mask"
+        ) as attach_validity_mask:
+            w.begin_train_step(loss_fn=w._test_loss_fn)
+            w.train_microbatch(batch)
+
+        attach_validity_mask.assert_called_once_with(batch, 42)
+        iterator_kwargs = mock_module_symbols["gmi"].call_args.kwargs
+        assert iterator_kwargs["delegate_pack_to_model"] is True
+        assert iterator_kwargs["delegate_mtp_loss_mask_to_model"] is True
+        assert iterator_kwargs["model_slices_context_parallel_inputs"] is False
+
     def test_wraps_forward_backward_in_no_sync(self, mock_module_symbols):
         """The single most important assertion in this file. Without the
         no_sync wrap, mcore DDP dispatches a per-call cross-DP reduce on
@@ -455,6 +492,7 @@ class TestTrainMicrobatch:
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         w.model.config.mtp_num_layers = 1
+        w.mtp_enabled = True
         w.delegate_pack_to_model = delegate_pack_to_model
         w.delegate_mtp_loss_mask_to_model = delegate_mtp_loss_mask_to_model
         w.model_slices_context_parallel_inputs = model_slices_context_parallel_inputs
@@ -469,6 +507,14 @@ class TestTrainMicrobatch:
         )
         assert (
             kwargs["model_slices_context_parallel_inputs"]
+            is model_slices_context_parallel_inputs
+        )
+        assert kwargs["mtp_enabled"] is True
+        # model_forward needs the same flag to keep position_ids on multimodal
+        # batches for caller-packed models, so it must reach the forward too.
+        mfb_kwargs = mock_module_symbols["mfb"].call_args.kwargs
+        assert (
+            mfb_kwargs["model_slices_context_parallel_inputs"]
             is model_slices_context_parallel_inputs
         )
 
@@ -538,6 +584,7 @@ class TestTrainMicrobatch:
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         w.model.config.mtp_num_layers = 2
+        w.mtp_enabled = True
         batch = _fake_batch()
         batch["token_mask"][0, 5] = 0
         batch["sample_mask"][3] = 0
@@ -721,6 +768,7 @@ class TestFinish:
 
         w = _make_worker(LossType.SEQUENCE_LEVEL)
         w.model.config.mtp_num_layers = 2
+        w.mtp_enabled = True
         w.model.config.mtp_detach_heads = True
         mtp_param, other_param = self._mtp_params()
         w.model.parameters = MagicMock(return_value=[mtp_param, other_param])
@@ -748,6 +796,7 @@ class TestFinish:
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         w.model.config.mtp_num_layers = 2
+        w.mtp_enabled = True
         w.model.config.mtp_detach_heads = True
         mtp_param, _ = self._mtp_params()
         w.model.parameters = MagicMock(return_value=[mtp_param])
@@ -855,6 +904,7 @@ class TestFinish:
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         w.model.config.mtp_num_layers = 2
+        w.mtp_enabled = True
         w.optimizer.grad_norms_by_group = {"mtp": 1.25}
 
         def _collect(
@@ -1038,6 +1088,7 @@ class TestAbort:
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         w.model.config.mtp_num_layers = 1
+        w.mtp_enabled = True
         w.model.config.mtp_grad_scale_func = lambda: torch.tensor(7.0)
         w.begin_train_step(loss_fn=w._test_loss_fn)
         assert w.model.config.mtp_grad_scale_func is None

@@ -23,6 +23,7 @@ import torch
 
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup, RolloutReassembler
+from nemo_rl.utils.venvs import make_actor_runtime_env
 
 # Field names whose values are per-token and therefore large, but whose Python
 # type is indistinguishable from metadata -- a list[int] of token ids looks just
@@ -53,6 +54,7 @@ class ReassemblyRequest:
 
     group_id: str
     rollout_ids: tuple[str, ...]
+    canonical_sample_ids: tuple[str, ...]
     receipts: tuple[Optional[dict[str, Any]], ...]
     rewards: tuple[float, ...]
     fallback_weight_version: int
@@ -63,6 +65,8 @@ class ReassemblyRequest:
     # train pump reads the same ``mask_sample`` field as the native path
     # (SingleController reads it unconditionally).
     mask_sample: tuple[bool, ...]
+    # Dataset-level loss weight shared by every completion in this prompt group.
+    loss_multiplier: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -131,18 +135,31 @@ class RolloutReassemblerActor:  # pragma: no cover
             max_seq_len=config.max_seq_len,
         )
 
+    def check_dependencies(self) -> None:
+        """Import the finalization API before the controller starts rollouts."""
+        # Deferred: only the actor's environment needs the optional Gym extra.
+        from nemo_gym.token_id_capture.staging.rebuild import (  # noqa: F401
+            RebuildError,
+            ReceiptVerificationError,
+            verify_and_linearize,
+        )
+        from nemo_gym.token_id_capture.staging.records import (
+            RolloutReceipt,  # noqa: F401
+        )
+
     def finalize(self, request: ReassemblyRequest) -> FinalizedGroup:
         """Finalize one request without allowing tensor payloads across Ray RPC."""
         assert_metadata_only(request)
         if not (
             len(request.rollout_ids)
+            == len(request.canonical_sample_ids)
             == len(request.receipts)
             == len(request.rewards)
             == len(request.mask_sample)
         ):
             raise ValueError(
-                "finalizer request rollout_ids, receipts, rewards, and "
-                "mask_sample must be parallel"
+                "finalizer request rollout_ids, canonical_sample_ids, receipts, "
+                "rewards, and mask_sample must be parallel"
             )
         result = self._finalizer.finalize_group(
             request.group_id,
@@ -152,6 +169,8 @@ class RolloutReassemblerActor:  # pragma: no cover
             mask_sample=list(request.mask_sample),
             fallback_weight_version=request.fallback_weight_version,
             prompt_idx=request.prompt_idx,
+            loss_multiplier=request.loss_multiplier,
+            canonical_sample_ids=list(request.canonical_sample_ids),
         )
         assert_metadata_only(result)
         return result
@@ -163,9 +182,26 @@ def create_rollout_reassembler_actors(
     *,
     num_workers: int,
 ) -> list[Any]:
-    """Construct the fixed validation pool after TQ partitions are registered."""
+    """Construct and validate the pool after TQ partitions are registered."""
     if num_workers <= 0:
         raise ValueError(f"num_reassembler_workers must be positive, got {num_workers}")
-    return [
-        RolloutReassemblerActor.remote(dp_config, config) for _ in range(num_workers)
+    runtime_env = make_actor_runtime_env(
+        "nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor"
+    )
+    actors = [
+        RolloutReassemblerActor.options(runtime_env=runtime_env).remote(
+            dp_config, config
+        )
+        for _ in range(num_workers)
     ]
+    try:
+        ray.get([actor.check_dependencies.remote() for actor in actors])
+    except ray.exceptions.RayError:
+        # Cleanup errors must not hide the startup failure or skip other actors.
+        for actor in actors:
+            try:
+                ray.kill(actor)
+            except Exception as error:
+                print(f"finalizer actor termination failed: {error}", flush=True)
+        raise
+    return actors

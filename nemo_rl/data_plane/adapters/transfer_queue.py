@@ -27,6 +27,7 @@ import glob
 import importlib
 import ipaddress
 import json
+import logging
 import os
 import resource
 import socket
@@ -34,6 +35,7 @@ import threading
 import time
 import warnings
 import weakref
+from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
 from queue import Empty, SimpleQueue
@@ -54,6 +56,9 @@ from nemo_rl.data_plane.interfaces import (
     backend_config,
     data_plane_supports_checkpointing,
 )
+from nemo_rl.distributed.virtual_cluster import _reserve_data_plane_ports
+
+LOGGER = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────
 # Backend init — lifted from rl-arena/arena/backends.py.
@@ -479,6 +484,12 @@ def _patch_scalar_field_schema() -> None:
     _md._nrl_scalar_schema_patched = True
 
 
+# Installed at import, not from the constructor: a process can unpickle a client
+# without ever running __init__, so import is the earliest point that covers
+# every user of this module.
+_patch_scalar_field_schema()
+
+
 def _patch_mooncake_staging_buffers(max_bytes: int) -> None:
     """Reuse RDMA-registered host buffers for mooncake tensor GETs and PUTs.
 
@@ -588,6 +599,127 @@ def _patch_mooncake_staging_buffers(max_bytes: int) -> None:
     cls._nrl_staging_patched = True
 
 
+class _MooncakeMasterArgv:
+    """Stand-in for the mooncake bootstrap module's ``subprocess`` reference.
+
+    Overrides ``Popen``, and only for ``mooncake_master``'s argv; everything
+    else the bootstrap reaches for (``STDOUT``, the offload client's launch)
+    delegates to the real module untouched.
+    """
+
+    def __init__(self, wrapped: Any, metrics_port: int) -> None:
+        self._wrapped = wrapped
+        self.metrics_port = metrics_port
+        self.master_launched = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped, name)
+
+    def Popen(self, args: Any, *rest: Any, **kwargs: Any) -> Any:
+        """Append ``--metrics_port`` when this is the master being launched."""
+        if (
+            isinstance(args, (list, tuple))
+            and args
+            and os.path.basename(str(args[0])) == "mooncake_master"
+        ):
+            args = [*args, f"--metrics_port={self.metrics_port}"]
+            self.master_launched = True
+        return self._wrapped.Popen(args, *rest, **kwargs)
+
+
+_METRICS_PORT_DRIFT_CONSEQUENCE = (
+    "the --metrics_port TQ omits cannot be applied, leaving mooncake_master's "
+    "metrics server on its 9003 default inside this node's ephemeral range"
+)
+
+
+def _patch_mooncake_master_metrics_port(port: int) -> None:
+    """Move mooncake_master's metrics server onto a reserved *port*.
+
+    ``MasterAdminServer::Start`` binds the metrics socket before it consults
+    ``enable_metric_reporting``, and the master exits non-zero if that bind
+    fails, so the ``metrics_port`` gflag default (9003) is a port the job
+    depends on whether or not anything scrapes it — and it sits inside the
+    ephemeral range these nodes hand out as source ports. TQ forwards no
+    ``--metrics_port``, nor a ``--config_path`` file that could carry one, so
+    without this the metrics server is the one data-plane port that cannot
+    move into ray.sub's band and the master can still lose a startup race it
+    has no reason to be in.
+
+    TQ does build the master's argv in this process, though: ``tq.init`` ->
+    ``_maybe_create_tq_storage`` -> ``initialize_mooncake_storage`` all run on
+    the driver, so appending the flag to the ``subprocess.Popen`` the bootstrap
+    calls is enough. gflags takes the last occurrence of a repeated flag, so
+    this stays correct if a future TQ revision starts passing its own.
+
+    The provider registry holds a ``functools.wraps`` wrapper closed over the
+    original bootstrap function, so rebinding the module attribute alone would
+    never be called — the same trap ``extract_field_schema`` has. Re-registering
+    is also where the drift check lives: if the bootstrap ever launches the
+    master by some other route the flag stops landing silently, putting the
+    metrics server back on 9003, so the bootstrap is required to have gone
+    through the wrapped ``Popen``.
+    """
+    # Imported here, not at module top, so a TQ that has moved these
+    # submodules reports the drift below instead of failing this file's import.
+    try:
+        from transfer_queue.storage.bootstrap import mooncake_bootstrap as _bs
+        from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
+    except ImportError as e:
+        raise _tq_shape_drift_error(
+            "storage.bootstrap is no longer importable",
+            _METRICS_PORT_DRIFT_CONSEQUENCE,
+            "import",
+        ) from e
+
+    installed = getattr(_bs, "subprocess", None)
+    if isinstance(installed, _MooncakeMasterArgv):
+        # The installed proxy is its own idempotence marker, rather than a
+        # separate _nrl_*_patched flag like the sibling patches use: it is the
+        # object that lets a re-init in the same process keep one wrapper and
+        # repoint it to the port this call reserved.
+        installed.metrics_port = port
+        return
+    if installed is None:
+        raise _tq_shape_drift_error(
+            "the mooncake bootstrap no longer launches the master via subprocess",
+            _METRICS_PORT_DRIFT_CONSEQUENCE,
+            "launch site",
+        )
+
+    bootstrap = StorageBootstrapProvider.get_provider("MooncakeStore")
+    if bootstrap is None:
+        raise _tq_shape_drift_error(
+            "MooncakeStore is no longer a registered bootstrap provider",
+            _METRICS_PORT_DRIFT_CONSEQUENCE,
+            "registry key",
+        )
+    # Rebound under a typed name because the None check above does not narrow
+    # ``get_provider``'s ``Callable | None`` inside the closure that calls it.
+    registered_bootstrap: Callable[..., Any] = bootstrap
+
+    argv = _MooncakeMasterArgv(installed, port)
+
+    def _bootstrap_with_metrics_port(conf: Any) -> Any:
+        argv.master_launched = False
+        result = registered_bootstrap(conf)
+        if not argv.master_launched:
+            raise _tq_shape_drift_error(
+                "the mooncake bootstrap ran without launching mooncake_master "
+                "through its subprocess.Popen",
+                _METRICS_PORT_DRIFT_CONSEQUENCE,
+                "launch site",
+            )
+        return result
+
+    # pyrefly: ignore[bad-assignment]  the proxy stands in for the module on purpose
+    _bs.subprocess = argv
+    # Upstream's own decorator, so the entry is stored exactly as TQ stores it.
+    StorageBootstrapProvider.register_provider("MooncakeStore")(
+        _bootstrap_with_metrics_port
+    )
+
+
 def _connect_existing() -> None:
     """Worker-process path: connect this process's client to the Ray cluster.
 
@@ -652,16 +784,22 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
         _existing_path = os.environ.get("PATH", "")
         if _moon_pkg not in _existing_path.split(os.pathsep):
             os.environ["PATH"] = _moon_pkg + os.pathsep + _existing_path
-        # Per-process MC_TCP_BIND_ADDRESS / KV-path promotion already
-        # set by TQDataPlaneClient.__init__ (runs on every process,
-        # including this driver). _init_tq only needs local_ip below
-        # for the metadata/master server URLs (driver-bound).
+        # Per-process MC_TCP_BIND_ADDRESS already set by
+        # TQDataPlaneClient.__init__; the scalar schema patch is installed
+        # at module import. _init_tq only needs local_ip below for the
+        # metadata/master server URLs (driver-bound).
         local_ip = _get_local_node_ip()
         if not local_ip:
             raise RuntimeError(
                 "Mooncake backend requires a local node IP; "
                 "_get_local_node_ip() returned empty."
             )
+        # All three of the master's listening ports come from one band below
+        # the ephemeral floor. The metrics port reaches the master through a
+        # patched argv rather than the config below, because TQ forwards no
+        # --metrics_port — see _patch_mooncake_master_metrics_port.
+        metadata_port, master_port, metrics_port = _reserve_data_plane_ports(3)
+        _patch_mooncake_master_metrics_port(metrics_port)
         # Sizes are per client process and RDMA-pinned — see MooncakeCpuConfig
         # in nemo_rl/data_plane/interfaces.py for the per-node arithmetic.
         mooncake_cfg = backend_config(cfg)
@@ -675,9 +813,11 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
                     # _init_tq runs on the driver only — driver IS the
                     # head, so local_ip here is also the head's IP that
                     # mooncake_master + the metadata server bind to.
-                    "metadata_server": f"{local_ip}:50050",
-                    "master_server_address": f"{local_ip}:50051",
+                    "metadata_server": f"{local_ip}:{metadata_port}",
+                    "master_server_address": f"{local_ip}:{master_port}",
                     **_mooncake_transport_config(),
+                    "use_gdr": bool(mooncake_cfg.use_gdr),
+                    "gdr_staging_buffer_mb": int(mooncake_cfg.gdr_staging_buffer_mb),
                 },
             },
         }
@@ -765,6 +905,12 @@ def _from_wire(td: TensorDict) -> TensorDict:
 class TQDataPlaneClient(DataPlaneClient):
     """Adapter façade — maps NeMo-RL calls onto TransferQueue's public API."""
 
+    # Class-level so ``put_samples`` stays readable on an instance built
+    # without ``__init__`` — ``object.__new__`` in tests, or a process that
+    # unpickles a client without running the constructor.
+    _gdr_requested: bool = False
+    _gdr_put_confirmed: bool = False
+
     def __init__(self, cfg: DataPlaneConfig, *, bootstrap: bool = True) -> None:
         """Construct a TQ-backed client.
 
@@ -778,15 +924,12 @@ class TQDataPlaneClient(DataPlaneClient):
         """
         # mooncake_cpu setup must run BEFORE _init_tq / _connect_existing
         # — once tq.init/connect runs, Mooncake's engine.so reads the
-        # env vars and they can't be changed. Two per-process knobs are
+        # env vars and they can't be changed. MC_TCP_BIND_ADDRESS is
         # needed in EVERY process that builds a TQ client (driver,
-        # SyncRolloutActor, every MegatronPolicyWorker rank):
-        #   1. MC_TCP_BIND_ADDRESS — Mooncake engine.so writes this into
-        #      desc.ip_or_host_name, the address peers receive from the
-        #      metadata service. Without it, getifaddrs()[0] picks usb0
-        #      (169.254.x APIPA) and peers fail to connect.
-        #   2. KV-path 1D promotion — works around TQ's
-        #      extract_field_schema schema/data mismatch for 1D fields.
+        # SyncRolloutActor, every MegatronPolicyWorker rank): Mooncake
+        # engine.so writes it into desc.ip_or_host_name, the address peers
+        # receive from the metadata service. Without it, getifaddrs()[0]
+        # picks usb0 (169.254.x APIPA) and peers fail to connect.
         # The cluster-wide MC_* knobs are NOT among them; they are set
         # once on the driver, before this module is importable — see
         # nemo_rl.data_plane.adapters.transfer_queue_env.
@@ -814,13 +957,12 @@ class TQDataPlaneClient(DataPlaneClient):
 
         self._backend = cfg["backend"]
         self._supports_checkpointing = data_plane_supports_checkpointing(cfg)
-        # Fix TQ's 1-D field schema at the source rather than reshaping the
-        # payload around it: the schema now reports the ``()`` sample shape
-        # the stored rows actually have. Applied on every backend and in
-        # every process that builds a client, before ``_init_tq`` /
-        # ``_connect_existing``, so no put can land under the old schema.
-        # Self-verifying — see :func:`_assert_tq_stores_scalar_rows_0d`.
-        _patch_scalar_field_schema()
+        # GDR is a mooncake_cpu-only transport knob, so key it off the backend
+        # directly rather than off any incidental per-backend flag.
+        self._gdr_requested = self._backend == "mooncake_cpu" and bool(
+            backend_config(cfg).use_gdr
+        )
+        self._gdr_put_confirmed = False
 
         if bootstrap:
             _init_tq(cfg)
@@ -1036,6 +1178,31 @@ class TQDataPlaneClient(DataPlaneClient):
             wire_fields = detached_fields
             field_names = [str(key) for key in detached_fields.keys()]
 
+        confirm_gdr_put = bool(
+            self._gdr_requested
+            and not self._gdr_put_confirmed
+            and torch.cuda.is_initialized()
+            and wire_fields is not None
+            and any(
+                isinstance(wire_fields.get(key), torch.Tensor)
+                for key in wire_fields.keys()
+            )
+        )
+        if confirm_gdr_put:
+            # Checked before the put, not after: TQ fixes GDR eligibility when
+            # the client attaches, so this is decidable up front — and once
+            # `kv_batch_put` returns, the rows are already durable and the
+            # controller has been notified, so raising then would strand them.
+            tq_client = tq.get_client()
+            storage_manager = getattr(tq_client, "storage_manager", None)
+            storage_client = getattr(storage_manager, "storage_client", None)
+            gdr_staging = getattr(storage_client, "_gdr_staging", None)
+            if not getattr(storage_client, "use_gdr", False) or gdr_staging is None:
+                raise RuntimeError(
+                    "GDR was requested for a CUDA-initialized TransferQueue "
+                    "client, but TransferQueue selected CPU RDMA for tensor PUTs"
+                )
+
         self._mark_data_operation_started()
         # TQ's wire vocabulary is `keys=` — translation point.
         tq.kv_batch_put(
@@ -1044,6 +1211,11 @@ class TQDataPlaneClient(DataPlaneClient):
             fields=wire_fields,
             tags=user_tags,
         )
+        if confirm_gdr_put:
+            LOGGER.info(
+                "TransferQueue GDR tensor PUT active (partition=%s)", partition_id
+            )
+            self._gdr_put_confirmed = True
 
         return KVBatchMeta(
             partition_id=partition_id,

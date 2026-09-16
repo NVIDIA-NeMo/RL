@@ -35,6 +35,9 @@ rather than as silent nested scalars in production.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import pytest
 import torch
 
@@ -45,13 +48,6 @@ tq_metadata = pytest.importorskip(
     reason="transfer_queue not installed",
 )
 TensorDict = pytest.importorskip("tensordict").TensorDict
-
-
-@pytest.fixture(autouse=True)
-def _patched():
-    """Apply the patch for each test; it is idempotent and process-global."""
-    tq_adapter._patch_scalar_field_schema()
-    yield
 
 
 def _schema(fields: dict, n: int) -> dict:
@@ -124,8 +120,8 @@ def test_probe_confirms_tq_stores_scalar_rows_as_0d() -> None:
 
 
 def test_patch_is_idempotent() -> None:
-    """Every process that builds a client calls it; double-application must
-    not stack wrappers (which would still be correct but unboundedly deep)."""
+    """Installed once at import; a redundant call must not stack wrappers
+    (which would still be correct but unboundedly deep)."""
     first = tq_metadata.extract_field_schema
     tq_adapter._patch_scalar_field_schema()
     assert tq_metadata.extract_field_schema is first
@@ -153,3 +149,24 @@ def test_scalar_rows_round_trip_as_a_dense_column() -> None:
     rebuilt = [row.reshape(tuple(shape)) for row in src]
     assert all(r.dim() == 0 for r in rebuilt)
     assert torch.equal(torch.stack(rebuilt), src)
+
+
+def test_patch_is_installed_by_import_alone() -> None:
+    """Importing the adapter must arm the process — no client required.
+
+    This is the property the KV path depends on: ``SingleControllerActor``
+    receives its client by cloudpickle, so ``TQDataPlaneClient.__init__``
+    never runs there, and unpickling imports this module as its only side
+    effect. Every other test here passes with the call back inside the
+    constructor, so a fresh interpreter that *only* imports is the one thing
+    that detects the scope regressing.
+    """
+    subprocess.check_call(
+        [
+            sys.executable,
+            "-c",
+            "import nemo_rl.data_plane.adapters.transfer_queue;"
+            "from transfer_queue import metadata;"
+            "assert metadata._nrl_scalar_schema_patched",
+        ]
+    )

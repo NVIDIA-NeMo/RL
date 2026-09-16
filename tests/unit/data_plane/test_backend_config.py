@@ -61,12 +61,19 @@ def test_checkpointing_capability_defaults_to_unsupported(
 def test_nested_block_is_used() -> None:
     cfg = _cfg(
         "mooncake_cpu",
-        mooncake_cpu={"global_segment_size": 111, "reuse_registered_buffers": False},
+        mooncake_cpu={
+            "global_segment_size": 111,
+            "reuse_registered_buffers": False,
+            "use_gdr": True,
+            "gdr_staging_buffer_mb": 512,
+        },
     )
     resolved = backend_config(cfg)
     assert isinstance(resolved, MooncakeCpuConfig)
     assert resolved.global_segment_size == 111
     assert resolved.reuse_registered_buffers is False
+    assert resolved.use_gdr is True
+    assert resolved.gdr_staging_buffer_mb == 512
 
 
 def test_absent_block_falls_back_to_model_defaults() -> None:
@@ -81,6 +88,16 @@ def test_absent_block_falls_back_to_model_defaults() -> None:
     assert resolved.local_buffer_size == 4294967296  # 4 GiB per client process
     # The opt-out flag defaults on, so omitting it must not disable the pool.
     assert resolved.reuse_registered_buffers is True
+    assert resolved.use_gdr is False
+    assert resolved.gdr_staging_buffer_mb == 1024
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_gdr_staging_size_rejects_non_positive_values(value: int) -> None:
+    with pytest.raises(pydantic.ValidationError):
+        backend_config(
+            _cfg("mooncake_cpu", mooncake_cpu={"gdr_staging_buffer_mb": value})
+        )
 
 
 def test_accepts_an_already_coerced_model() -> None:

@@ -15,9 +15,8 @@
 import math
 import random
 import warnings
-from copy import deepcopy
 from functools import partial, wraps
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 import torch
@@ -28,10 +27,16 @@ from transformers import (
 )
 
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
-from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.deepseek_v4_tokenizer import (
+    get_deepseek_v4_tokenizer,
+    should_use_deepseek_v4_chat_template,
+)
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.fastokens import maybe_patch_fastokens
 from nemo_rl.utils.logger import Logger
+
+if TYPE_CHECKING:
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
 def get_gdpo_reward_component_keys(batch) -> list[str]:
@@ -385,7 +390,18 @@ def get_tokenizer(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    if "chat_template" in tokenizer_config:
+    use_deepseek_v4_tokenizer = should_use_deepseek_v4_chat_template(tokenizer_config)
+    chat_template_kwargs = tokenizer_config.get("chat_template_kwargs")
+    if chat_template_kwargs is not None:
+        assert isinstance(chat_template_kwargs, dict), (
+            "chat_template_kwargs should be a dictionary"
+        )
+    if use_deepseek_v4_tokenizer:
+        print("Using vLLM 0.25.1's DeepSeek V4 chat renderer")
+        tokenizer = get_deepseek_v4_tokenizer(tokenizer, chat_template_kwargs)
+        if processor is not None:
+            processor.tokenizer = tokenizer
+    elif "chat_template" in tokenizer_config:
         if tokenizer_config["chat_template"] is None:
             print("Using passthrough chat template")
             tokenizer.chat_template = COMMON_CHAT_TEMPLATES.passthrough_prompt_response
@@ -403,15 +419,9 @@ def get_tokenizer(
     else:
         print("No chat template provided, using tokenizer's default")
 
-    if (
-        "chat_template_kwargs" in tokenizer_config
-        and tokenizer_config["chat_template_kwargs"] is not None
-    ):
-        assert isinstance(tokenizer_config["chat_template_kwargs"], dict), (
-            "chat_template_kwargs should be a dictionary"
-        )
+    if chat_template_kwargs is not None and not use_deepseek_v4_tokenizer:
         tokenizer.apply_chat_template = partial(
-            tokenizer.apply_chat_template, **tokenizer_config["chat_template_kwargs"]
+            tokenizer.apply_chat_template, **chat_template_kwargs
         )
 
     # The "tokenizer" is passed to the policy workers only to use the pad/eos/bos tokens for extra padding and processing of the tokenized messages. That is the only reason it is needed.
@@ -469,7 +479,9 @@ def get_tokenizer(
     return tokenizer if processor is None else processor
 
 
-def maybe_pad_last_batch(batch: dict, dp_size: int, mbs: int) -> dict:
+def maybe_pad_last_batch(
+    batch: "BatchedDataDict[Any]", dp_size: int, mbs: int
+) -> "BatchedDataDict[Any]":
     """Pads the given batch so that its size is divisible by (mbs * dp_size).
 
     Args:
@@ -483,27 +495,39 @@ def maybe_pad_last_batch(batch: dict, dp_size: int, mbs: int) -> dict:
     min_padding = (math.ceil(batch.size / (mbs * dp_size)) * mbs * dp_size) - batch.size
     if min_padding > 0:
         print(f"Padding last validation batch with {min_padding} padding samples")
-        original_size = batch.size
-        for key, value in list(batch.items()):
-            if isinstance(value, torch.Tensor):
-                if key == "sample_mask":
-                    padding = torch.zeros_like(value[-1:]).repeat(
-                        (min_padding,) + (1,) * (value.ndim - 1)
-                    )
-                else:
-                    padding = value[-1:].repeat(
-                        (min_padding,) + (1,) * (value.ndim - 1)
-                    )
-                batch[key] = torch.cat([value, padding], dim=0)
-            elif isinstance(value, PackedTensor):
-                padding = value.slice([original_size - 1] * min_padding)
-                batch[key] = PackedTensor.concat([value, padding])
-            elif isinstance(value, list):
-                batch[key] = value + [deepcopy(value[-1]) for _ in range(min_padding)]
-            else:
-                raise TypeError(
-                    f"Cannot pad batch field {key!r} with type {type(value).__name__}."
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+        if "pair_index" in batch and "is_chosen" in batch:
+            if min_padding % 2 != 0:
+                raise ValueError(
+                    "Preference validation batches must be padded by complete pairs."
                 )
+            # Padding runs before sequence packing, while preference rows are
+            # still interleaved. Duplicate complete media-bearing pairs so all
+            # batch-aligned fields remain consistent.
+            pair_repeats = min_padding // 2
+            padding_indices = [batch.size - 2, batch.size - 1] * pair_repeats
+        else:
+            padding_indices = [batch.size - 1] * min_padding
+
+        padding_batch = batch.select_indices(padding_indices)
+        padding_batch["sample_mask"] = torch.zeros_like(padding_batch["sample_mask"])
+
+        if "pair_index" in padding_batch and "is_chosen" in padding_batch:
+            first_padding_pair = int(batch["pair_index"].max().item()) + 1
+            padding_batch["pair_index"] = torch.arange(
+                first_padding_pair,
+                first_padding_pair + min_padding // 2,
+                dtype=batch["pair_index"].dtype,
+                device=batch["pair_index"].device,
+            ).repeat_interleave(2)
+            padding_batch["is_chosen"] = torch.tensor(
+                [True, False],
+                dtype=batch["is_chosen"].dtype,
+                device=batch["is_chosen"].device,
+            ).repeat(min_padding // 2)
+
+        batch = BatchedDataDict.from_batches([batch, padding_batch])
     return batch
 
 

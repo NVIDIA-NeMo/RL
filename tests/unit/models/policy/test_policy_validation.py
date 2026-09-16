@@ -196,6 +196,129 @@ def test_policy_flops_tracker_uses_hf_config_overrides() -> None:
 
 
 @pytest.mark.parametrize(
+    ("configured_extension_fqn", "explicit_extension_fqn"),
+    [
+        ("tests.extensions.CustomPolicyWorker", None),
+        (None, "tests.extensions.CustomPolicyWorker"),
+        (
+            "tests.extensions.CustomPolicyWorker",
+            "tests.extensions.CustomPolicyWorker",
+        ),
+    ],
+)
+def test_policy_selects_worker_extension_from_config_or_constructor(
+    configured_extension_fqn: str | None,
+    explicit_extension_fqn: str | None,
+) -> None:
+    config = create_dtensor_config("test-model", tp=1)
+    if configured_extension_fqn is not None:
+        config["worker_extension_cls_fqn"] = configured_extension_fqn
+    with (
+        patch("nemo_rl.models.policy.lm_policy.get_hf_config"),
+        patch("nemo_rl.models.policy.lm_policy.FLOPTracker"),
+        patch("nemo_rl.models.policy.lm_policy.RayQueue"),
+        patch.dict(
+            "nemo_rl.distributed.ray_actor_environment_registry.ACTOR_ENVIRONMENT_REGISTRY",
+            {"tests.extensions.CustomPolicyWorker": "python"},
+        ),
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerBuilder") as worker_builder,
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup"),
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+            worker_extension_cls_fqn=explicit_extension_fqn,
+        )
+
+    assert worker_builder.call_args.args[0] == "tests.extensions.CustomPolicyWorker"
+
+
+def test_policy_constructor_worker_extension_allows_quantization() -> None:
+    """The constructor argument may extend the quant-resolved worker; the config field may not."""
+    config = create_dtensor_config("test-model", tp=1)
+    config["quant_cfg"] = "NVFP4"
+
+    with (
+        patch("nemo_rl.models.policy.lm_policy.RayQueue"),
+        patch.dict(
+            "nemo_rl.distributed.ray_actor_environment_registry.ACTOR_ENVIRONMENT_REGISTRY",
+            {"tests.extensions.CustomPolicyWorker": "python"},
+        ),
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerBuilder") as worker_builder,
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup"),
+        patch("nemo_rl.models.policy.lm_policy.get_hf_config"),
+        patch("nemo_rl.models.policy.lm_policy.FLOPTracker"),
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+            worker_extension_cls_fqn="tests.extensions.CustomPolicyWorker",
+        )
+
+    assert worker_builder.call_args.args[0] == "tests.extensions.CustomPolicyWorker"
+
+
+@pytest.mark.parametrize(
+    ("config_updates", "explicit_extension_fqn", "error_match"),
+    [
+        (
+            {
+                "worker_extension_cls_fqn": "tests.extensions.CustomPolicyWorker",
+                "quant_cfg": "NVFP4",
+            },
+            None,
+            "worker_extension_cls_fqn and quant_cfg are mutually exclusive",
+        ),
+        (
+            {"worker_extension_cls_fqn": "tests.extensions.ConfigWorker"},
+            "tests.extensions.ArgumentWorker",
+            "different values",
+        ),
+    ],
+)
+def test_policy_rejects_invalid_worker_extension_config(
+    config_updates,
+    explicit_extension_fqn,
+    error_match,
+) -> None:
+    config = create_dtensor_config("test-model", tp=1)
+    config.update(config_updates)
+
+    with pytest.raises(ValueError, match=error_match):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+            worker_extension_cls_fqn=explicit_extension_fqn,
+        )
+
+
+@pytest.mark.parametrize("from_config", [False, True])
+def test_policy_rejects_unregistered_worker_extension(from_config: bool) -> None:
+    extension_fqn = "tests.extensions.UnregisteredPolicyWorker"
+    config = create_dtensor_config("test-model", tp=1)
+    if from_config:
+        config["worker_extension_cls_fqn"] = extension_fqn
+    cluster = create_mock_cluster(world_size=1)
+
+    with (
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
+        pytest.raises(ValueError, match="No actor environment registered"),
+    ):
+        Policy(
+            cluster=cluster,
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+            worker_extension_cls_fqn=None if from_config else extension_fqn,
+        )
+
+    worker_group.assert_not_called()
+    cluster._init_placement_groups.assert_not_called()
+
+
+@pytest.mark.parametrize(
     "world_size,tp,cp,should_pass,expected_error_type,description",
     [
         # Valid cases - DTensor backend (PP is always 1 for DTensor)
