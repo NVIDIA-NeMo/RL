@@ -20,6 +20,7 @@ from typing import Any, Iterable
 import torch
 
 from nemo_rl.algorithms.loss.draft import DraftLossStats
+from nemo_rl.models.megatron.draft.utils import DRAFT_GRAD_NORM_GROUP
 
 DRAFT_STEP_PAYLOAD_KEY = "_draft_step_payload"
 DRAFT_LOSS_METRIC_KEY = "draft_loss"
@@ -147,7 +148,7 @@ class DraftStepState:
         draft_scale = self._normalization_scale()
         correction = policy_count * draft_scale if policy_count > 0 else 0.0
         for param in parameters:
-            if getattr(param, "grad_norm_group", None) != "draft":
+            if getattr(param, "grad_norm_group", None) != DRAFT_GRAD_NORM_GROUP:
                 continue
             main_grad = getattr(param, "main_grad", None)
             if main_grad is not None:

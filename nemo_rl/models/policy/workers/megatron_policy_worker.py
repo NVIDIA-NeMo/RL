@@ -1847,6 +1847,12 @@ class MegatronPolicyWorkerImpl(
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         # Recover policy and draft counts with one existing DP collective.
+        # The draft slice is length-1 while the step is active and empty
+        # otherwise, so every rank in the DP group has to agree on
+        # ``active`` or this all_reduce sees mismatched shapes. It does:
+        # the payload comes from the draft loss wrapper, which is built
+        # from the same policy config on every DP rank, and Megatron runs
+        # the same microbatch count on all of them.
         draft_step_state: DraftStepState = state["draft_step_state"]
         policy_counts = torch.stack(
             [state["local_valid_seqs"], state["local_valid_toks"]]
