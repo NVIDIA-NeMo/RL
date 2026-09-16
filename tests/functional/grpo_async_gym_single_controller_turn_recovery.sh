@@ -15,7 +15,7 @@ BASE_RUN_LOG=$SCRIPT_DIR/grpo_async_gym_single_controller/run.log
 RECOVERY_HOOK=$SCRIPT_DIR/_single_controller_sibling_recovery_hook.py
 SNAPSHOT_HELPER=$SCRIPT_DIR/_gym_turn_recovery_snapshot.py
 PROFILE=${SC_GYM_TURN_RECOVERY_PROFILE:-counter}
-if [[ "$PROFILE" != "counter" && "$PROFILE" != "workplace" ]]; then
+if [[ "$PROFILE" != "counter" && "$PROFILE" != "workplace" && "$PROFILE" != "genrm" ]]; then
     echo "[ERROR] Unsupported SC_GYM_TURN_RECOVERY_PROFILE=$PROFILE"
     exit 2
 fi
@@ -38,8 +38,15 @@ GYM_ROOT=${NEMO_GYM_SOURCE_DIR:-$PROJECT_ROOT/3rdparty/Gym-workspace/Gym}
 SNAPSHOT_INTERVAL_S=${SC_GYM_TURN_RECOVERY_INTERVAL_S:-5}
 SNAPSHOT_TIMEOUT_S=${SC_GYM_TURN_RECOVERY_TIMEOUT_S:-2400}
 PHASE2_TIMEOUT_S=${SC_GYM_TURN_RECOVERY_PHASE2_TIMEOUT_S:-2400}
-MAX_STEPS=${SC_GYM_TURN_RECOVERY_MAX_STEPS:-2}
-NUM_PROMPTS=${SC_GYM_TURN_RECOVERY_NUM_PROMPTS:-4}
+if [[ "$PROFILE" == "genrm" ]]; then
+    DEFAULT_MAX_STEPS=1
+    DEFAULT_NUM_PROMPTS=1
+else
+    DEFAULT_MAX_STEPS=2
+    DEFAULT_NUM_PROMPTS=4
+fi
+MAX_STEPS=${SC_GYM_TURN_RECOVERY_MAX_STEPS:-$DEFAULT_MAX_STEPS}
+NUM_PROMPTS=${SC_GYM_TURN_RECOVERY_NUM_PROMPTS:-$DEFAULT_NUM_PROMPTS}
 NUM_GENERATIONS=${SC_GYM_TURN_RECOVERY_NUM_GENERATIONS:-2}
 TRAIN_GLOBAL_BATCH_SIZE=$((NUM_PROMPTS * NUM_GENERATIONS))
 
@@ -55,6 +62,8 @@ export NEMO_GYM_CHECKPOINT_CONTROL_TOKEN=${NEMO_GYM_CHECKPOINT_CONTROL_TOKEN:-fu
 rm -rf "$TEST_DIR"
 mkdir -p "$TEST_DIR"
 
+EXPECTED_GYM_COMPONENTS=resources_servers,responses_api_agents,responses_api_models
+PHASE1_BOUNDARY_HOOK=NEMO_GYM_TEST_HOLD_FIRST_MUTATED_BOUNDARY=1
 if [[ "$PROFILE" == "counter" ]]; then
     # A restored rollout receives reward 1 only when its saved counter is
     # continued exactly once.
@@ -63,7 +72,7 @@ if [[ "$PROFILE" == "counter" ]]; then
         "$GYM_ROOT/resources_servers/example_session_state_mgmt/data/example.jsonl" \
         > "$TEST_DATA"
     GYM_CONFIG_PATHS='[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,responses_api_agents/checkpoint_test_agent/configs/example_session_state_mgmt.yaml]'
-else
+elif [[ "$PROFILE" == "workplace" ]]; then
     # Force one real Workplace mutation. max_steps=1 in the test agent makes
     # the post-restore continuation terminal without issuing another model call.
     jq -c -s --argjson count "$NUM_PROMPTS" '
@@ -96,6 +105,24 @@ else
     ' "$GYM_ROOT/resources_servers/workplace_assistant/data/example.jsonl" \
         > "$TEST_DATA"
     GYM_CONFIG_PATHS='[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,responses_api_agents/checkpoint_test_agent/configs/workplace_assistant.yaml]'
+else
+    # One sibling waits in the stateless cohort verifier while the second is
+    # parked at its terminal boundary. Recovery must replay both /verify calls
+    # and compute the cohort reward exactly once.
+    jq -c -s '
+        limit(1; .[])
+        | .task_source = "genrm_checkpoint_test_agent"
+        | .responses_create_params.input = [{
+            "role": "user",
+            "content": "Reply with exactly one word: ready"
+          }]
+        | .responses_create_params.tools = []
+        | .responses_create_params.parallel_tool_calls = false
+    ' "$GYM_ROOT/resources_servers/genrm_compare/data/example.jsonl" \
+        > "$TEST_DATA"
+    GYM_CONFIG_PATHS='[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,responses_api_agents/checkpoint_test_agent/configs/genrm_compare.yaml]'
+    EXPECTED_GYM_COMPONENTS=responses_api_agents,responses_api_models
+    PHASE1_BOUNDARY_HOOK=NEMO_GYM_TEST_HOLD_SECOND_TERMINAL_BOUNDARY=1
 fi
 export NEMO_GYM_TRAIN_DATA_PATH=$TEST_DATA
 export NEMO_GYM_VALIDATION_DATA_PATH=$TEST_DATA
@@ -160,7 +187,8 @@ command -v setsid >/dev/null
 setsid env \
     SC_TEST_ENTRYPOINT="$RECOVERY_HOOK" \
     SC_SIBLING_RECOVERY_TEST_EVENTS="$PHASE1_EVENTS" \
-    NEMO_GYM_TEST_HOLD_FIRST_MUTATED_BOUNDARY=1 \
+    "$PHASE1_BOUNDARY_HOOK" \
+    NEMO_GYM_CHECKPOINT_TEST_PHASE=phase1 \
     NEMO_GYM_CHECKPOINT_TEST_EVENTS="$AUDIT_EVENTS" \
     RUN_CONVERGENCE_CHECKS=0 \
     NEMO_GYM_SOURCE_DIR="$GYM_ROOT" \
@@ -208,13 +236,14 @@ timeout --signal=TERM --kill-after=30s "${PHASE2_TIMEOUT_S}s" \
         NEMO_GYM_SOURCE_DIR="$GYM_ROOT" \
         NEMO_GYM_CHECKPOINT_CONTROL_TOKEN="$NEMO_GYM_CHECKPOINT_CONTROL_TOKEN" \
         NEMO_GYM_CHECKPOINT_TEST_EVENTS="$AUDIT_EVENTS" \
+        NEMO_GYM_CHECKPOINT_TEST_PHASE=phase2 \
         bash "$BASE_TEST" "${COMMON_OVERRIDES[@]}" "$@"
 cp "$BASE_RUN_LOG" "$PHASE2_LOG"
 
 grep -Fq "Selected rollout recovery snapshot: $SNAPSHOT_DIR" "$PHASE2_LOG"
 grep -q "Native TQ checkpoint restored and validated" "$PHASE2_LOG"
 grep -q \
-    "Gym participant checkpoint restored and validated: .*components=resources_servers,responses_api_agents,responses_api_models" \
+    "Gym participant checkpoint restored and validated: .*components=$EXPECTED_GYM_COMPONENTS" \
     "$PHASE2_LOG"
 grep -q "train step $MAX_STEPS/$MAX_STEPS" "$PHASE2_LOG"
 

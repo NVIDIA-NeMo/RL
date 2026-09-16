@@ -1106,7 +1106,7 @@ Depending on your data shape, you may want to change these values."""
             deadline_ts=deadline_ts,
         ).model_dump(mode="json")
         results: list[GymParticipantPrepareResult] = []
-        touched: list[GymDiscoveredParticipant] = []
+        prepare_attempted: list[GymDiscoveredParticipant] = []
         try:
             for discovered in self._ordered_checkpoint_participants():
                 participant = discovered.participant
@@ -1123,7 +1123,10 @@ Depending on your data shape, you may want to change these values."""
                         raise RuntimeError(
                             f"Gym policy model {participant.server_name!r} cannot pause"
                         )
-                    touched.append(discovered)
+                    # Record before the RPC. A participant may apply the pause
+                    # and lose its response, so rollback must safely resume an
+                    # attempted participant even when the caller saw failure.
+                    prepare_attempted.append(discovered)
                     payload = GymModelPrepareResponse.model_validate(
                         await self._control(
                             "POST",
@@ -1141,7 +1144,7 @@ Depending on your data shape, you may want to change these values."""
                 elif participant.component == "responses_api_agents":
                     if capabilities.checkpoint_mode != "export_restore":
                         continue
-                    touched.append(discovered)
+                    prepare_attempted.append(discovered)
                     payload = await self._prepare_agent_checkpoint(
                         discovered,
                         request=request,
@@ -1151,7 +1154,7 @@ Depending on your data shape, you may want to change these values."""
                 else:
                     if capabilities.checkpoint_mode != "export_restore":
                         continue
-                    touched.append(discovered)
+                    prepare_attempted.append(discovered)
                     payload = GymResourcesPrepareResponse.model_validate(
                         await self._control(
                             "POST",
@@ -1177,7 +1180,9 @@ Depending on your data shape, you may want to change these values."""
                 ):
                     continue
                 discovered = next(
-                    item for item in touched if item.participant == result.participant
+                    item
+                    for item in prepare_attempted
+                    if item.participant == result.participant
                 )
                 payload = await self._wait_for_policy_model_pause(
                     discovered,
@@ -1203,7 +1208,7 @@ Depending on your data shape, you may want to change these values."""
                 await self._resume_checkpoint_participants(
                     checkpoint_id,
                     abort_deadline_ts,
-                    tuple(touched),
+                    tuple(prepare_attempted),
                 )
             except (Exception, asyncio.CancelledError) as abort_error:
                 raise BaseExceptionGroup(
