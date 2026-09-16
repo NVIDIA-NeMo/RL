@@ -30,6 +30,14 @@ extracts it to node-local `/raid/scratch` and repairs Python once per node
 through `SETUP_COMMAND`. It does not bind-mount the login node's `/home`, which
 is not shared with OCI-HSG compute nodes.
 
+NCCL M2N is distributed separately from `nvidia-nccl-cu13` in the
+`nccl-extensions` wheel. `ensure_nccl_m2n.sh` installs version 0.1.0 into the
+main, Megatron policy, and synchronous/asynchronous vLLM environments using a
+node-local uv cache. It then imports `nccl.m2n.reshard` in every environment.
+All three arms run this preflight so their package environments are identical;
+an unavailable native M2N binding stops the job instead of silently measuring
+the Python fallback.
+
 The experiment reports means over steps 2-19:
 
 - refit transfer and update time

@@ -22,7 +22,7 @@ import sys
 
 print(f"executable={sys.executable}")
 print(f"prefix={sys.prefix}")
-for distribution in ("nvidia-nccl-cu13", "nvidia-nccl-cu12"):
+for distribution in ("nvidia-nccl-cu13", "nvidia-nccl-cu12", "nccl-extensions"):
     try:
         print(f"{distribution}={importlib.metadata.version(distribution)}")
     except importlib.metadata.PackageNotFoundError:
