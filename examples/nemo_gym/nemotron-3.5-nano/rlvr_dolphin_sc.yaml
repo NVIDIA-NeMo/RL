@@ -85,6 +85,10 @@ grpo:
   async_grpo: null
 
 policy:
+  # Prefix recovery does not yet preserve router-replay traces.
+  router_replay:
+    enabled: false
+
   # ---------------------------------------------------------------------------
   # Speculative-decoding draft head. run_grpo_single_controller.py reads
   # config.policy["draft"]["enabled"] unconditionally, so omitting this block is
@@ -284,15 +288,34 @@ env:
     # Without this, the outer /run error hides which dependency failed and why.
     global_aiohttp_client_request_debug: true
 
+    genrm_model:
+      responses_api_models:
+        genrm_model:
+          instance_role: auxiliary
+
+    nl2bash_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          instance_role: auxiliary
+
+    safety_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          instance_role: auxiliary
+
     # Pinned literals for what student_rlvr1.yaml interpolated off
     # grpo.async_grpo.max_trajectory_age_steps, which is null on this path.
     policy_model:
       responses_api_models:
         vllm_model:
+          # Gym participant checkpointing currently requires one managed
+          # process per participant.
+          num_workers: 1
           num_groups_nemo_rl: 2
     policy_model_reasoning_off:
       responses_api_models:
         vllm_model:
+          num_workers: 1
           num_groups_nemo_rl: 2
 
 # =============================================================================
@@ -339,10 +362,18 @@ token_capture:
 # Periodic data-plane/ledger snapshots. The launcher exposes both intervals as
 # environment variables and forwards them as Hydra overrides.
 rollout_checkpointing:
-  snapshot_attempt_interval_s: 300
+  # Keep this short enough for a small-scale run to capture an unfinished
+  # generation prefix before the run completes.
+  snapshot_attempt_interval_s: 60
   telemetry_interval_s: 120
   keep_latest_k: 2
   restore_mode: latest
+  gym:
+    capability_discovery_enabled: true
+    participant_checkpointing_enabled: true
+    generation_prefix_cuts_enabled: true
+    generation_chunk_flush_tokens: 0  # good first scale run
+    prepare_timeout_s: 60
 
 # Recovery policy for unfinished token-capture prompt groups. The agent-level
 # override takes precedence over task_name when both match.
