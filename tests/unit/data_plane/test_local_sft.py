@@ -47,7 +47,7 @@ def _put_multimodal_batch(
     pixels = PackedTensor(
         [torch.full((1, 2), 1.0), torch.full((2, 2), 2.0)],
         dim_to_pack=0,
-        pad_to_max_shape=True,
+        preprocess_mode="pad_to_max_shape",
     ).enable_deduplication()
     fields = local_batch_to_tensordict(
         {
@@ -80,7 +80,7 @@ def test_local_round_trip_preserves_tensor_and_packed_tensor_fields() -> None:
     pixels = batch["pixel_values"]
     assert isinstance(pixels, PackedTensor)
     assert pixels.dim_to_pack == 0
-    assert pixels.pad_to_max_shape
+    assert pixels.preprocess_mode == "pad_to_max_shape"
     assert pixels.deduplication_enabled
     assert pixels.logical_segment_counts_by_row() == [1, 1]
     assert torch.equal(pixels.tensors[0], torch.full((1, 2), 1.0))
