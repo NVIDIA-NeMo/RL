@@ -12,8 +12,8 @@ For the full list of supported models, see
 
 - **[DeepSeek](deepseek/index.md)** — DeepSeek V4 Flash GRPO with AutoModel
   training and block-FP8 vLLM generation.
-- **[GLM](glm/index.md)** — GLM-5.1 and GLM-5.2 GRPO recipes on the Megatron
-  backend, colocated and non-colocated with vLLM.
+- **[GLM](glm/index.md)** — GLM-5.3-Flash GRPO with AutoModel and FP8 vLLM,
+  plus GLM-5.1 and GLM-5.2 recipes on the Megatron backend.
 - **[Gemma](gemma/index.md)** — Gemma 4 text-only DAPO and VLM GRPO recipes on
   AutoModel, including Context Parallel layouts for the text-only variants.
 - **[Nemotron](nemotron/index.md)** — post-training recipes for Nemotron 3

@@ -9,6 +9,8 @@ For the full list of supported GLM models, see
 
 ## Version Guides
 
+- **[GLM-5.3-Flash](glm5-3-flash.md)** — Text-only GRPO with AutoModel,
+  HybridEP training, FP8 vLLM generation, and reference training curves.
 - **[GLM-5](glm5.md)** — GLM-5.1 and GLM-5.2 GRPO recipes on the Megatron
   backend, including 131K-token training capacity, colocated and non-colocated
   vLLM, and cuDNN or TileLang DSA kernels.
@@ -20,5 +22,6 @@ YAML files remain the source of truth for other supported GLM models.
 ```{toctree}
 :hidden:
 
+glm5-3-flash.md
 glm5.md
 ```

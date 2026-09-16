@@ -90,6 +90,9 @@ Run a fixed Dynamo vLLM fleet with NCCL refit and W&B telemetry inside a Slurm R
 
 ## Guides and Examples
 
+See the [GLM-5.3-Flash guide](guides/models/glm/glm5-3-flash.md) for text-only
+GRPO with AutoModel, FP8 vLLM generation, and reference training curves.
+
 ::::{grid} 1 1 2 2
 :gutter: 3
 
