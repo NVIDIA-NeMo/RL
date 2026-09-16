@@ -96,6 +96,9 @@ apt-get clean
 rm -rf /var/lib/apt/lists/*
 EOF
 
+# Grafana Alloy (Apache-2.0), started by ray.sub when RAY_ALLOY_ENABLED=1.
+COPY --from=grafana/alloy:v1.18.0 /bin/alloy /usr/local/bin/alloy
+
 # CMake (for CUDA extension builds: transformer-engine, mamba-ssm, etc.)
 RUN GITHUB_ARTIFACTORY=github.com \
     && CMAKE_VERSION=4.0.3 \
