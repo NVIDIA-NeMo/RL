@@ -39,7 +39,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
-from nemo_rl.data.multimodal_utils import NATIVE_MULTIMODAL_KEYS
+from nemo_rl.data.multimodal_utils import VLLM_PROMPT_KEYS
 from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -576,7 +576,7 @@ class AsyncRolloutImpl:
         input_sample_data: Mapping[str, Any] = input_sample
         native_generation_data = {
             key: input_sample_data[key]
-            for key in NATIVE_MULTIMODAL_KEYS
+            for key in VLLM_PROMPT_KEYS
             if key in input_sample_data
         }
         current_extra_env_info = copy.deepcopy(input_sample["extra_env_info"])
