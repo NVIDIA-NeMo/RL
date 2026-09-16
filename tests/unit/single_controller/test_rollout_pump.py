@@ -57,6 +57,7 @@ from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryState,
 )
 from nemo_rl.utils.logger import LoggerConfig
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 # Reuse fixtures from the experience tests; same shape as test_async_rollout_manager.
 from tests.unit.experience.test_rollout_manager import (
@@ -1390,7 +1391,7 @@ def test_rollout_pump_writes_expected_tq_data(
         logger=LoggerConfig(log_dir=str(tmp_path / "logs"), monitor_gpus=False),
         # Actor __init__ builds a CheckpointManager + TimeoutChecker from
         # this block; enabled=False keeps the run write-free.
-        checkpointing={
+        checkpointing=CheckpointingConfig.model_construct(**{
             "enabled": False,
             "checkpoint_dir": str(tmp_path / "checkpoints"),
             "metric_name": None,
@@ -1399,7 +1400,7 @@ def test_rollout_pump_writes_expected_tq_data(
             "save_period": 10_000,
             "save_optimizer": False,
             "checkpoint_must_save_by": None,
-        },
+        }),
     )
     # Wrap each value in a single-element list so size==1 and v[0] returns the original field.
     batched_sample = BatchedDataDict({k: [v] for k, v in input_sample.items()})

@@ -56,6 +56,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import LoggerConfig
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 _NUM_PROMPTS_PER_STEP = 4
 _NUM_GENERATIONS_PER_PROMPT = 2
@@ -130,7 +131,7 @@ def _make_master_config(
                 "colocated": {"enabled": False, "resources": {}},
             },
         },
-        checkpointing={
+        checkpointing=CheckpointingConfig.model_construct(**{
             "enabled": False,
             "checkpoint_dir": "results/_sc_ppo_setup_test_ckpt",
             "metric_name": None,
@@ -138,7 +139,7 @@ def _make_master_config(
             "keep_top_k": None,
             "save_period": 10,
             "save_optimizer": False,
-        },
+        }),
         logger=LoggerConfig.model_construct(),
         loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
         env={},
@@ -201,7 +202,7 @@ class TestAlgorithmBlockValidator:
     )
     def test_the_exemplars_still_validate(self, name):
         config = MasterConfig(**self._resolved(name))
-        assert config.checkpointing["save_period"] == 1
+        assert config.checkpointing.save_period == 1
 
     def test_rejects_a_config_with_no_algorithm_block(self):
         resolved = self._resolved("grpo_math_1B_megatron_single_controller.yaml")
@@ -367,8 +368,8 @@ class TestPPOValidation:
         mc.policy["megatron_cfg"]["checkpoint"] = {
             "ckpt_assume_constant_structure": constant_structure
         }
-        mc.checkpointing["enabled"] = True
-        mc.checkpointing["save_optimizer"] = True
+        mc.checkpointing.enabled = True
+        mc.checkpointing.save_optimizer = True
         return mc
 
     def test_rejects_constant_ckpt_structure_with_warmup(self):
@@ -718,7 +719,7 @@ class TestValueWarmStart:
                 **_STEP_CONFIG,
             )
         )
-        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+        mc.checkpointing.checkpoint_dir = str(tmp_path / "run")
 
         setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
 
@@ -731,7 +732,7 @@ class TestValueWarmStart:
 
     def test_unset_leaves_the_critic_cold(self, patched_ppo_factories, tmp_path):
         mc = _ppo_master_config()
-        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+        mc.checkpointing.checkpoint_dir = str(tmp_path / "run")
 
         setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
 
@@ -760,7 +761,7 @@ class TestValueWarmStart:
                 **_STEP_CONFIG,
             )
         )
-        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+        mc.checkpointing.checkpoint_dir = str(tmp_path / "run")
 
         with pytest.raises(ValueError, match=message):
             setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
@@ -785,7 +786,7 @@ class TestValueWarmStart:
                 **_STEP_CONFIG,
             )
         )
-        mc.checkpointing["checkpoint_dir"] = str(tmp_path / "run")
+        mc.checkpointing.checkpoint_dir = str(tmp_path / "run")
 
         with patch.object(sc_setup_mod, "load_dataloader_state"):
             setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
