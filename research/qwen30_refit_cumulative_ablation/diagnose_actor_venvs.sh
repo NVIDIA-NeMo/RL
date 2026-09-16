@@ -16,12 +16,26 @@ for actor_venv in /opt/ray_venvs/*; do
     continue
   fi
   "${actor_python}" - <<'PY'
+import importlib.metadata
 import importlib.util
 import sys
 
 print(f"executable={sys.executable}")
 print(f"prefix={sys.prefix}")
-for module in ("pytest", "vllm", "transformer_engine", "megatron"):
+for distribution in ("nvidia-nccl-cu13", "nvidia-nccl-cu12"):
+    try:
+        print(f"{distribution}={importlib.metadata.version(distribution)}")
+    except importlib.metadata.PackageNotFoundError:
+        print(f"{distribution}=missing")
+
+for module in ("pytest", "vllm", "transformer_engine", "megatron", "nccl"):
     print(f"{module}={importlib.util.find_spec(module)}")
+
+try:
+    from nccl.m2n import reshard
+except Exception as error:
+    print(f"nccl.m2n.reshard=unavailable:{type(error).__name__}:{error}")
+else:
+    print(f"nccl.m2n.reshard={reshard}")
 PY
 done
