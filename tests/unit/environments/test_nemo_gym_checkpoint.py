@@ -474,6 +474,45 @@ def test_checkpoint_prepare_timeout_resumes_touched_participants() -> None:
     assert resume_order == ["tools", "agent", "policy"]
 
 
+def test_checkpoint_prepare_lost_response_resumes_attempted_participant() -> None:
+    env = _checkpoint_env()
+    capabilities = {
+        "policy": _capability(
+            "responses_api_models",
+            "policy",
+            admission_states=["accepting", "draining", "paused"],
+            concurrency_contract="stateless",
+            instance_role="policy",
+        ),
+    }
+
+    async def discover_control(_method, _path, *, server_name, **_kwargs):
+        return capabilities[server_name]
+
+    env._control = AsyncMock(side_effect=discover_control)
+    asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
+    calls: list[str] = []
+
+    async def prepare_control(_method, path, *, server_name, **_kwargs):
+        assert server_name == "policy"
+        if path.endswith("/pause"):
+            calls.append("pause")
+            raise OSError("response lost after pause may have applied")
+        calls.append("resume")
+        return {
+            "state": "accepting",
+            "workers": {"acknowledged": 1, "expected": 1},
+            "released_waiters": 0,
+        }
+
+    env._control = AsyncMock(side_effect=prepare_control)
+
+    with pytest.raises(OSError, match="response lost"):
+        asyncio.run(env.prepare_checkpoint("snapshot-lost", time.time() + 10.0))
+
+    assert calls == ["pause", "resume"]
+
+
 def test_checkpoint_commit_restore_and_resume_fan_out() -> None:
     continuation_index = {
         "schema_version": 1,

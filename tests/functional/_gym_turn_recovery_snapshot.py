@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 
-_PROFILES = ("counter", "workplace")
+_PROFILES = ("counter", "workplace", "genrm")
 _WORKPLACE_EVENT = {
     "event_name": "NeMo RL checkpoint recovery sentinel",
     "participant_email": "checkpoint-recovery@example.com",
@@ -199,6 +199,125 @@ def _matching_recovery_attempt(
     return matches[0]
 
 
+def _inspect_genrm_snapshot(
+    snapshot: Path,
+    dataset_rows: list[dict[str, Any]],
+    gym_checkpoint: dict[str, Any],
+    model: dict[str, Any],
+    agent: dict[str, Any],
+    agent_manifest_path: Path,
+) -> dict[str, Any]:
+    """Select a complete two-sibling GenRM cohort parked before verification."""
+    import torch
+
+    if model["payload"]["rows"] < 2:
+        raise AssertionError(
+            "GenRM checkpoint has fewer than two committed policy calls"
+        )
+    if agent["payload"]["records"] < 2:
+        raise AssertionError("GenRM checkpoint has fewer than two parked siblings")
+
+    continuation_rows = _read_artifact(
+        snapshot,
+        agent["payload"]["continuation_index"],
+    )
+    storage_reference_rows = _read_artifact(
+        snapshot,
+        model["payload"]["storage_reference_index"],
+    )
+    agent_records = _read_agent_records(snapshot, agent_manifest_path)
+    recovery = torch.load(snapshot / "rollout_recovery.pt", weights_only=True)
+    replay = torch.load(snapshot / "replay_buffer_metadata.pt", weights_only=False)
+    if not isinstance(recovery, dict) or not isinstance(replay, dict):
+        raise TypeError("GenRM rollout checkpoint sidecars must be mappings")
+    if recovery.get("pending_completed_execution_acknowledgements"):
+        raise AssertionError(
+            "completed Gym executions were not acknowledged before checkpoint commit"
+        )
+
+    candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for record in agent_records:
+        if (
+            record.get("boundary_kind") != "turn_complete"
+            or record.get("boundary_index", 0) < 1
+            or not record.get("last_committed_model_call_id")
+            or record.get("pending_model") is not None
+        ):
+            continue
+        group, attempt = _matching_recovery_attempt(recovery, record["rollout_id"])
+        if attempt["attempt_index"] != record["attempt_index"]:
+            raise AssertionError(
+                "GenRM agent boundary and RL ledger disagree about the attempt"
+            )
+        if attempt["status"] != "dispatched":
+            raise AssertionError("a parked GenRM sibling must remain dispatched")
+        candidates.append((record, group))
+
+    group_ids = {group["group_id"] for _, group in candidates}
+    if len(group_ids) != 1:
+        raise AssertionError(
+            "GenRM checkpoint must contain one fully parked sibling cohort"
+        )
+    group = candidates[0][1]
+    expected_rollout_ids = {
+        f"{group['group_id']}_g{sibling['generation_index']}"
+        for sibling in group["siblings"]
+    }
+    selected_records = {
+        record["rollout_id"]: record
+        for record, candidate_group in candidates
+        if candidate_group["group_id"] == group["group_id"]
+    }
+    if len(expected_rollout_ids) != 2 or set(selected_records) != expected_rollout_ids:
+        raise AssertionError(
+            "GenRM checkpoint must park both siblings from one two-member cohort"
+        )
+
+    continuation_capture_keys = {row["capture_key"] for row in continuation_rows}
+    expected_capture_keys = {
+        (
+            rollout_id
+            if record["attempt_index"] == 0
+            else f"{rollout_id}-a{record['attempt_index']}"
+        )
+        for rollout_id, record in selected_records.items()
+    }
+    if not expected_capture_keys.issubset(continuation_capture_keys):
+        raise AssertionError("GenRM checkpoint is missing a sibling continuation root")
+    storage_capture_keys = {row["capture_key"] for row in storage_reference_rows}
+    if not storage_capture_keys.issubset(continuation_capture_keys):
+        raise AssertionError(
+            "GenRM storage references contain a rollout without a continuation"
+        )
+
+    try:
+        prompt_index = int(group["prompt_ref"]["sample_id"])
+        dataset_rows[prompt_index]
+    except (IndexError, KeyError, TypeError, ValueError) as error:
+        raise AssertionError(
+            "selected GenRM cohort does not resolve to its dataset row"
+        ) from error
+
+    return {
+        "snapshot_path": str(snapshot.resolve()),
+        "checkpoint_id": gym_checkpoint["checkpoint_id"],
+        "profile": "genrm",
+        "group_id": group["group_id"],
+        "prompt_index": prompt_index,
+        "completed_group_ids": sorted(item["group_id"] for item in replay["groups"]),
+        "rollouts": [
+            {
+                "rollout_id": rollout_id,
+                "source_attempt_index": record["attempt_index"],
+                "restored_attempt_index": record["attempt_index"] + 1,
+                "boundary_index": record["boundary_index"],
+                "last_committed_model_call_id": record["last_committed_model_call_id"],
+            }
+            for rollout_id, record in sorted(selected_records.items())
+        ],
+    }
+
+
 def inspect_snapshot(
     snapshot: Path,
     dataset_rows: list[dict[str, Any]],
@@ -228,9 +347,19 @@ def inspect_snapshot(
 
     model = _participant(gym_checkpoint, "responses_api_models")
     agent = _participant(gym_checkpoint, "responses_api_agents")
-    resources = _participant(gym_checkpoint, "resources_servers")
     _validate_participant_manifest(snapshot, model)
     agent_manifest_path = _validate_participant_manifest(snapshot, agent)
+    if profile == "genrm":
+        return _inspect_genrm_snapshot(
+            snapshot,
+            dataset_rows,
+            gym_checkpoint,
+            model,
+            agent,
+            agent_manifest_path,
+        )
+
+    resources = _participant(gym_checkpoint, "resources_servers")
     resources_manifest_path = _validate_participant_manifest(snapshot, resources)
 
     if model["payload"]["rows"] < 1:
@@ -485,6 +614,9 @@ def verify_restore(args: argparse.Namespace) -> None:
         for line in args.events.read_text().splitlines()
         if line.strip()
     ]
+    if args.profile == "genrm":
+        _verify_genrm_restore(selected, events, args.audit_events)
+        return
     expected_capture_key = (
         f"{selected['rollout_id']}-a{selected['restored_attempt_index']}"
     )
@@ -541,6 +673,78 @@ def verify_restore(args: argparse.Namespace) -> None:
         )
     if args.profile == "workplace":
         _verify_workplace_audit(selected, args.audit_events)
+
+
+def _verify_genrm_restore(
+    selected: dict[str, Any],
+    events: list[dict[str, Any]],
+    audit_path: Path | None,
+) -> None:
+    expected_capture_keys = {
+        f"{rollout['rollout_id']}-a{rollout['restored_attempt_index']}"
+        for rollout in selected["rollouts"]
+    }
+    matching_dispatches = [
+        event
+        for event in events
+        if event.get("event") == "dispatch"
+        and expected_capture_keys.issubset(set(event.get("rollout_ids", [])))
+    ]
+    if len(matching_dispatches) != 1:
+        raise AssertionError(
+            "restored GenRM cohort was not redispatched exactly once: "
+            f"matches={matching_dispatches!r}"
+        )
+    stale_rollout_ids = {rollout["rollout_id"] for rollout in selected["rollouts"]}
+    stale_dispatches = [
+        event
+        for event in events
+        if event.get("event") == "dispatch"
+        and stale_rollout_ids.intersection(event.get("rollout_ids", []))
+    ]
+    if stale_dispatches:
+        raise AssertionError("GenRM recovery reused a tombstoned source attempt")
+
+    for capture_key in expected_capture_keys:
+        completions = [
+            event
+            for event in events
+            if event.get("event") == "completion_forwarded"
+            and event.get("rollout_id") == capture_key
+        ]
+        if len(completions) != 1 or completions[0].get("reward") != 1.0:
+            raise AssertionError(
+                "restored GenRM sibling did not complete exactly once with its "
+                f"cohort reward: capture_key={capture_key!r}, events={completions!r}"
+            )
+
+    if audit_path is None or not audit_path.is_file():
+        raise AssertionError("GenRM recovery produced no durable verifier audit")
+    audit = [
+        json.loads(line) for line in audit_path.read_text().splitlines() if line.strip()
+    ]
+
+    def count(phase: str, event: str) -> int:
+        return sum(
+            item.get("phase") == phase and item.get("event") == event for item in audit
+        )
+
+    expected_counts = {
+        ("phase1", "verify_entered"): 1,
+        ("phase1", "verify_waiting"): 1,
+        ("phase1", "reward_computed"): 0,
+        ("phase1", "verify_returned"): 0,
+        ("phase2", "verify_entered"): 2,
+        ("phase2", "verify_waiting"): 1,
+        ("phase2", "reward_computed"): 1,
+        ("phase2", "verify_returned"): 2,
+    }
+    actual_counts = {key: count(*key) for key in expected_counts}
+    if actual_counts != expected_counts:
+        raise AssertionError(
+            "GenRM cohort did not freeze, replay, and resolve exactly once: "
+            f"expected={expected_counts!r}, actual={actual_counts!r}, audit={audit!r}"
+        )
 
 
 def _verify_workplace_audit(
