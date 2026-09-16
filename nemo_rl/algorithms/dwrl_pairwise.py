@@ -699,6 +699,9 @@ def dwrl_train_pairwise(
                 )
                 #force_on_policy_ratio = master_config["loss_fn"].get("force_on_policy_ratio", False)
                 skip_prev_logprobs = False
+                print("▶ Preparing for logprob inference...", flush=True)
+                with timer.time("logprob_inference_prep"):
+                    policy.prepare_for_lp_inference()
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
