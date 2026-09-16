@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import fields as dc_fields
 from dataclasses import is_dataclass
+from unittest.mock import patch
 
 import torch
 
@@ -295,9 +296,7 @@ def test_module_exposes_alignment_kernel():
 
 
 def _chat_aligner(student_vocab, teacher_vocab):
-    aligner = _make_aligner(student_vocab, teacher_vocab)
-    aligner.alignment_method = "offset_cluster_decode_fix"
-    return aligner
+    return _make_aligner(student_vocab, teacher_vocab)
 
 
 def test_per_asst_whole_message_plus_eot():
@@ -321,6 +320,39 @@ def test_per_asst_whole_message_plus_eot():
     positions = [(p[2], p[3], p[4], p[5]) for p in pairs]
     assert positions == [(1, 2, 1, 2), (2, 3, 2, 3), (3, 4, 3, 4)], positions
     assert pairs[-1][6] is True  # EOT pair is correct
+
+
+def test_per_asst_calls_private_offset_helper_with_rebased_decode_fix():
+    """The production per-assistant path owns slicing/rebasing and delegates
+    each region's offset alignment plus decode-fix mask to the private helper.
+    """
+    aligner = _chat_aligner(
+        {10: "student_surface", 99: "<eot>"},
+        {20: "teacher_surface", 98: "<eot>"},
+    )
+    aligner.student_tokenizer.decode = lambda *_args, **_kwargs: "e\u0301"
+    aligner.teacher_tokenizer.decode = lambda *_args, **_kwargs: "\u00e9"
+
+    with patch.object(
+        aligner, "_align_one_offset", wraps=aligner._align_one_offset
+    ) as helper:
+        pairs = aligner.align_one_offset_per_asst(
+            [10, 99],
+            [(10, 11), (11, 12)],
+            [(10, 11)],
+            [20, 98],
+            [(20, 21), (21, 22)],
+            [(20, 21)],
+        )
+
+    helper.assert_called_once_with(
+        student_ids=[10],
+        teacher_ids=[20],
+        student_offsets=[(0, 1)],
+        teacher_offsets=[(0, 1)],
+    )
+    assert pairs[0][2:6] == (0, 1, 0, 1)
+    assert pairs[0][6] is True
 
 
 def test_per_asst_drop_first_content_pair():

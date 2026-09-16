@@ -369,7 +369,6 @@ def _chat_aligner(student_tok, teacher_tok) -> TokenAligner:
     aligner = TokenAligner.__new__(TokenAligner)
     aligner.student_tokenizer = student_tok
     aligner.teacher_tokenizer = teacher_tok
-    aligner.alignment_method = "offset_cluster_decode_fix"
     return aligner
 
 
@@ -411,6 +410,33 @@ class TestCollatorChatMode:
         s_chunk = out["alignment_0_student_chunk_id"][0].tolist()
         assert all(s_chunk[p] != -1 for p in range(8, 20)), s_chunk
         assert all(s_chunk[p] == -1 for p in list(range(0, 8)) + [20, 21]), s_chunk
+
+    def test_same_tokenizer_teacher_bypasses_alignment(self):
+        tok = FakeChatTokenizer({"user": ("[U]", ""), "assistant": ("[A]", "[E]")})
+        collator = CrossTokenizerCollator(
+            student_tokenizer=tok,
+            teacher_tokenizers=[tok],
+            aligners=[None],
+            ctx_length_student=32,
+            ctx_length_teachers=[32],
+            mode="chat",
+        )
+        out = collator(
+            [
+                {
+                    "loss_multiplier": 1.0,
+                    "idx": 0,
+                    "message_log": [
+                        {"role": "user", "content": "hi"},
+                        {"role": "assistant", "content": "ok"},
+                    ],
+                }
+            ]
+        )
+
+        assert not any(
+            key.startswith(("teacher_0_", "alignment_0_")) for key in out.keys()
+        )
 
     def test_native_thinking_alignment_not_implemented(self):
         tok = FakeChatTokenizer({"assistant": ("", "")})
