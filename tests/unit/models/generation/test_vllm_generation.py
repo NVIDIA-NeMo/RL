@@ -1505,7 +1505,6 @@ def _fp32_master_config(
         (False, {}),
         ("tf32", {"fp32_lm_head": True}),
         (True, {"fp32_lm_head": True}),
-        (True, {"env_vars": {VLLM_FP32_LM_HEAD_ENV_VAR: "1"}}),
     ],
 )
 def test_vllm_validate_settings_accepts_matched_fp32_lm_head(trainer, vllm_cfg):
@@ -1517,12 +1516,18 @@ def test_vllm_validate_settings_accepts_matched_fp32_lm_head(trainer, vllm_cfg):
     [
         ("tf32", {}),  # trainer fp32, vLLM bf16: the production misconfiguration
         (False, {"fp32_lm_head": True}),  # vLLM fp32, trainer bf16
-        (False, {"env_vars": {VLLM_FP32_LM_HEAD_ENV_VAR: "1"}}),
     ],
 )
 def test_vllm_validate_settings_rejects_one_sided_fp32_lm_head(trainer, vllm_cfg):
     with pytest.raises(ValueError, match="both engines or neither"):
         VllmGeneration.validate_settings(_fp32_master_config(trainer, vllm_cfg))
+
+
+def test_vllm_validate_settings_rejects_fp32_lm_head_env_var_toggle():
+    with pytest.raises(ValueError, match="policy.generation.vllm_cfg.fp32_lm_head"):
+        VllmGeneration.validate_settings(
+            _fp32_master_config(False, {"env_vars": {VLLM_FP32_LM_HEAD_ENV_VAR: "1"}})
+        )
 
 
 def test_vllm_validate_settings_rejects_fp32_lm_head_with_fused_logprobs():

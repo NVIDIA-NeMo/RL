@@ -118,10 +118,7 @@ class VllmSpecificArgs(TypedDict):
 
 def vllm_fp32_lm_head_enabled(vllm_cfg: VllmSpecificArgs | dict[str, Any]) -> bool:
     """Return whether vLLM should run Nemotron-H logits with an fp32 head."""
-    if vllm_cfg.get("fp32_lm_head"):
-        return True
-    env_vars = vllm_cfg.get("env_vars")
-    return env_vars is not None and str(env_vars.get(VLLM_FP32_LM_HEAD_ENV_VAR)) == "1"
+    return bool(vllm_cfg.get("fp32_lm_head"))
 
 
 class VllmDeltaCompressionConfig(BaseModel, extra="allow"):

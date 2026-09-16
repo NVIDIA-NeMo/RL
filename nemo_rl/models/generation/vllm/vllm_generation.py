@@ -81,10 +81,13 @@ def _validate_fp32_lm_head_config(master_config: "MasterConfig") -> None:
     policy_config = master_config.policy
     generation_config = cast(VllmConfig, policy_config["generation"])
     vllm_cfg = generation_config.get("vllm_cfg")
-    env_vars = None if vllm_cfg is None else vllm_cfg.get("env_vars")
-    vllm_env_value = (
-        None if env_vars is None else env_vars.get(VLLM_FP32_LM_HEAD_ENV_VAR)
-    )
+    env_vars = {} if vllm_cfg is None else vllm_cfg.get("env_vars") or {}
+    if VLLM_FP32_LM_HEAD_ENV_VAR in env_vars:
+        raise ValueError(
+            f"{VLLM_FP32_LM_HEAD_ENV_VAR} is reserved for NeMo-RL internal "
+            "vLLM patch plumbing; configure fp32 LM head with "
+            "policy.generation.vllm_cfg.fp32_lm_head instead."
+        )
     vllm_fp32 = vllm_cfg is not None and vllm_fp32_lm_head_enabled(vllm_cfg)
 
     megatron_cfg = policy_config.get("megatron_cfg")
@@ -97,8 +100,7 @@ def _validate_fp32_lm_head_config(master_config: "MasterConfig") -> None:
             "fp32 LM head must be enabled on both engines or neither: "
             f"policy.megatron_cfg.fp32_lm_head={megatron_fp32_value!r} but "
             f"policy.generation.vllm_cfg.fp32_lm_head="
-            f"{None if vllm_cfg is None else vllm_cfg.get('fp32_lm_head')!r} "
-            f"({VLLM_FP32_LM_HEAD_ENV_VAR}={vllm_env_value!r}). "
+            f"{None if vllm_cfg is None else vllm_cfg.get('fp32_lm_head')!r}. "
             "A one-sided fp32 head increases the generation/training logprob "
             "mismatch instead of reducing it."
         )

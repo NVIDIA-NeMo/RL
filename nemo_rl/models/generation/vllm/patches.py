@@ -634,8 +634,9 @@ def _patch_vllm_nemotron_h_fp32_lm_head(logger) -> bool:
 
     This must be a source patch (not a monkeypatch): the model executes in
     vLLM's EngineCore worker subprocesses, which import vllm independently of
-    this process. The patched code is opt-in at runtime via
-    NRL_VLLM_FP32_LM_HEAD=1 (set by policy.generation.vllm_cfg.fp32_lm_head).
+    this process. The patched code is opt-in at runtime via an internal
+    NRL_VLLM_FP32_LM_HEAD=1 environment variable set from
+    policy.generation.vllm_cfg.fp32_lm_head.
     When enabled, the live ParallelLMHead keeps its original parameter dtype
     and quantization config; only the projection path casts hidden states,
     weights, and optional bias to fp32 at runtime.
@@ -867,12 +868,12 @@ def _apply_vllm_patches(
     from vllm.logger import init_logger
 
     patch_logger = init_logger("vllm_patch")
-    fp32_lm_head_enabled = (
-        fp32_lm_head or os.environ.get(VLLM_FP32_LM_HEAD_ENV_VAR) == "1"
-    )
+    fp32_lm_head_enabled = bool(fp32_lm_head)
     if fp32_lm_head_enabled:
         os.environ[VLLM_FP32_LM_HEAD_ENV_VAR] = "1"
         extra_env_vars = [*(extra_env_vars or []), VLLM_FP32_LM_HEAD_ENV_VAR]
+    else:
+        os.environ.pop(VLLM_FP32_LM_HEAD_ENV_VAR, None)
 
     # Whether the v1 patch matters at all depends on which executor vLLM will
     # select. 0.25 defaults this to "1" (RayExecutorV2), which has no

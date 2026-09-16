@@ -368,7 +368,7 @@ def test_glm_decoder_sp_moe_patch_warns_on_unknown_source(
         ({}, False),
         ({"fp32_lm_head": False}, False),
         ({"fp32_lm_head": True}, True),
-        ({"env_vars": {VLLM_FP32_LM_HEAD_ENV_VAR: "1"}}, True),
+        ({"env_vars": {VLLM_FP32_LM_HEAD_ENV_VAR: "1"}}, False),
         ({"env_vars": {VLLM_FP32_LM_HEAD_ENV_VAR: "0"}}, False),
     ],
 )
@@ -513,7 +513,7 @@ def test_apply_vllm_patches_gates_nemotron_h_fp32_lm_head(monkeypatch, enabled):
         assert captured_extra_env_vars == [["USER_VAR"]]
 
 
-def test_apply_vllm_patches_accepts_legacy_fp32_lm_head_env_toggle(monkeypatch):
+def test_apply_vllm_patches_ignores_ambient_fp32_lm_head_env_toggle(monkeypatch):
     _install_fake_vllm_modules(monkeypatch)
     monkeypatch.setenv(patches.VLLM_FP32_LM_HEAD_ENV_VAR, "1")
     captured_extra_env_vars = []
@@ -527,19 +527,23 @@ def test_apply_vllm_patches_accepts_legacy_fp32_lm_head_env_toggle(monkeypatch):
 
     patches._apply_vllm_patches("py")
 
-    assert fp32_patch_calls == [True]
-    assert captured_extra_env_vars == [[patches.VLLM_FP32_LM_HEAD_ENV_VAR]]
+    assert fp32_patch_calls == []
+    assert patches.VLLM_FP32_LM_HEAD_ENV_VAR not in os.environ
+    assert captured_extra_env_vars == [None]
 
 
 @pytest.mark.parametrize(
-    "vllm_cfg_overrides",
+    ("vllm_cfg_overrides", "expected_fp32_lm_head"),
     [
-        {"env_vars": {"USER_VAR": "value"}, "fp32_lm_head": True},
-        {"env_vars": {"USER_VAR": "value", VLLM_FP32_LM_HEAD_ENV_VAR: "1"}},
+        ({"env_vars": {"USER_VAR": "value"}, "fp32_lm_head": True}, True),
+        (
+            {"env_vars": {"USER_VAR": "value", VLLM_FP32_LM_HEAD_ENV_VAR: "1"}},
+            False,
+        ),
     ],
 )
 def test_vllm_worker_threads_fp32_lm_head_cfg_into_source_patches(
-    monkeypatch, vllm_cfg_overrides
+    monkeypatch, vllm_cfg_overrides, expected_fp32_lm_head
 ):
     from nemo_rl.models.generation.vllm import vllm_worker
 
@@ -575,7 +579,7 @@ def test_vllm_worker_threads_fp32_lm_head_cfg_into_source_patches(
         {
             "py": sys.executable,
             "extra_env_vars": ["EXPLICIT_VAR"],
-            "fp32_lm_head": True,
+            "fp32_lm_head": expected_fp32_lm_head,
         }
     ]
 
