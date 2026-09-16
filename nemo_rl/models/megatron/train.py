@@ -160,6 +160,7 @@ def model_forward(
     straggler_timer: Optional[StragglerDetector] = None,
     use_fused_linear_logprobs: bool = False,
     media_token_validity_mask: Optional[torch.Tensor] = None,
+    model_slices_context_parallel_inputs: bool = False,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
@@ -180,6 +181,7 @@ def model_forward(
         media_token_validity_mask: Which media-token positions actually anchor a
             projected feature, already in this model's token layout. Only passed
             when the model accepts it; otherwise the model derives its own.
+        model_slices_context_parallel_inputs: Whether the model CP-slices its own inputs.
 
     Returns:
         torch.Tensor: Output tensor from the model (logits)
@@ -187,7 +189,11 @@ def model_forward(
     multimodal_data = data_dict.get_multimodal_dict(
         as_tensors=True, device=input_ids_cp_sharded.device
     )
-    if len(multimodal_data) > 0:
+    # VLM wrappers normally derive their own positions or expand the token sequence,
+    # so position_ids are dropped for multimodal batches.
+    # A model that consumes caller-packed THD inputs keeps them:
+    # it CP-slices them with the tokens and its MTP block asserts they are present.
+    if len(multimodal_data) > 0 and not model_slices_context_parallel_inputs:
         position_ids = None
 
     additional_kwargs = {}
@@ -268,6 +274,7 @@ def forward_with_post_processing_fn(
     use_fused_linear_logprobs: bool = False,
     use_router_replay: bool = False,
     router_replay_train: bool = False,
+    model_slices_context_parallel_inputs: bool = False,
 ) -> Tuple[torch.Tensor, Callable]:
     """Perform forward pass with pre-processed microbatch and return output tensor and post-processing function.
 
@@ -288,6 +295,7 @@ def forward_with_post_processing_fn(
         enable_hidden_capture: Whether to enable hidden state capture for draft model training
         enable_opd_full_capture: Whether to capture pre-LM-head hidden states for
             the full-vocabulary MOPD teacher payload
+        model_slices_context_parallel_inputs: Whether the model CP-slices its own inputs.
 
     Returns:
         tuple: (output_tensor, post_processing_fn_wrapped)
@@ -345,6 +353,7 @@ def forward_with_post_processing_fn(
                 straggler_timer=straggler_timer,
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
                 media_token_validity_mask=media_token_validity_mask,
+                model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
             )
     except Exception:
         # The forward above armed the router-replay action (set_router_replay_forward);
@@ -474,6 +483,7 @@ def megatron_forward_backward(
     use_fused_linear_logprobs: bool = False,
     use_router_replay: bool = False,
     router_replay_train: bool = False,
+    model_slices_context_parallel_inputs: bool = False,
 ) -> Any:
     """Execute forward and backward passes using Megatron's utilities.
 
@@ -498,6 +508,7 @@ def megatron_forward_backward(
         enable_hidden_capture: Whether to enable hidden state capture for draft model training
         enable_opd_full_capture: Whether to capture pre-LM-head hidden states for
             the full-vocabulary MOPD teacher payload
+        model_slices_context_parallel_inputs: Whether the model CP-slices its own inputs.
 
     Returns:
         Results from the forward/backward execution
@@ -516,6 +527,7 @@ def megatron_forward_backward(
         use_fused_linear_logprobs=use_fused_linear_logprobs,
         use_router_replay=use_router_replay,
         router_replay_train=router_replay_train,
+        model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
     )
     forward_backward_func = get_forward_backward_func()
     if use_router_replay:
@@ -664,7 +676,7 @@ class LossPostProcessor:
                     loss_fn=loss_fn_wrapped,
                     prepare_fn=None,
                     data_dict=data_dict,
-                    loss_weight=float(self.cfg["draft"]["loss_weight"]),
+                    loss_weight=float(self.cfg["draft"].loss_weight),
                     vocab_parallel_rank=get_tensor_model_parallel_rank(),
                     vocab_parallel_group=get_tensor_model_parallel_group(),
                     context_parallel_group=get_context_parallel_group(),
@@ -673,8 +685,10 @@ class LossPostProcessor:
                     d2t=self.d2t,
                     student_logits=student_logits,
                     token_chunk_size=int(
-                        self.cfg["draft"].get(
-                            "token_chunk_size", DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
+                        getattr(
+                            self.cfg["draft"],
+                            "token_chunk_size",
+                            DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
                         )
                     ),
                     defer_normalization=self.defer_draft_normalization,
@@ -693,13 +707,15 @@ class LossPostProcessor:
                     loss_fn=loss_fn_wrapped,
                     prepare_fn=prepare_loss_input_wrapped,
                     data_dict=data_dict,
-                    loss_weight=float(self.cfg["draft"]["loss_weight"]),
+                    loss_weight=float(self.cfg["draft"].loss_weight),
                     vocab_parallel_rank=get_tensor_model_parallel_rank(),
                     vocab_parallel_group=get_tensor_model_parallel_group(),
                     context_parallel_group=get_context_parallel_group(),
                     token_chunk_size=int(
-                        self.cfg["draft"].get(
-                            "token_chunk_size", DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
+                        getattr(
+                            self.cfg["draft"],
+                            "token_chunk_size",
+                            DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
                         )
                     ),
                     defer_normalization=self.defer_draft_normalization,

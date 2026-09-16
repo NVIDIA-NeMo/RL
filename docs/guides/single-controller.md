@@ -58,6 +58,24 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
             gpus_per_node: 1  # inference GPUs; remainder go to training
     ```
 
+    For default non-colocated vLLM refit, the SingleController entrypoint uses the
+    same vLLM generation path as legacy GRPO/PPO, so you can opt into vLLM's
+    native reload API with:
+
+    ```yaml
+    policy:
+      generation:
+        backend: "vllm"
+        refit_transport: null
+        colocated:
+          enabled: false
+        vllm_cfg:
+          async_engine: true
+          refit_with_reload_api: true
+    ```
+
+    This reload API path has the same limitations described in [Weight Refit](./refit.md#vllm-reload-api).
+
 3. **One RL step = one training batch.** The batch a step trains on is the whole step (see `validate_single_controller_config` in [nemo_rl/algorithms/single_controller_utils/config.py](../../nemo_rl/algorithms/single_controller_utils/config.py)). A GRPO step is also one optimizer step. A PPO step applies `ppo.ppo_epochs` actor updates and `ppo.critic_ppo_epochs` critic updates over that same batch. Both counts must be at least 1 and can be configured independently; the exemplar defaults the critic count to `${ppo.ppo_epochs}`.
 
     ```python
@@ -119,6 +137,8 @@ checkpointing:
 
 rollout_checkpointing:
   snapshot_attempt_interval_s: 120
+  telemetry_interval_s: null
+  max_consecutive_failures: 3
   keep_latest_k: 2
   restore_mode: latest
   extra_fingerprint_excluded_paths: []
@@ -135,6 +155,17 @@ recommended for continuous post-step coverage; with a larger value, attempts
 are skipped until the matching trainer checkpoint exists. Before the first
 training step, snapshots are anchored to the initial model and a fingerprint of
 the rollout-semantic configuration.
+
+`telemetry_interval_s` controls an independent wall-clock sampler for rollout
+throughput and checkpoint pressure. It is `null` (disabled) by default; set it
+to a positive number such as `30` to emit one sample every 30 seconds. This does
+not change the checkpoint cadence. See the
+[Single-Controller rollout recovery metrics](../observability/metrics.md#single-controller-rollout-recovery-metrics)
+for the emitted fields.
+
+`max_consecutive_failures` is the number of consecutive retryable periodic-save
+failures tolerated before training aborts. A successful or skipped checkpoint
+attempt resets the count; checkpoint invariant failures still fail immediately.
 
 The bootstrap fingerprint is fail-closed: every configuration value affects
 compatibility unless NeMo-RL's built-in denylist identifies it as operational,
