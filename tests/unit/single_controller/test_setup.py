@@ -2164,13 +2164,19 @@ class TestNativeTQRecoverySetup:
 
         assert restored == metadata
 
-    def test_legacy_replay_checkpoint_is_rejected(self, tmp_path):
+    @pytest.mark.parametrize(
+        "legacy_name",
+        [LEGACY_REPLAY_BUFFER_FILENAME, "replay_buffer/manifest.json"],
+    )
+    def test_legacy_replay_checkpoint_is_rejected(self, tmp_path, legacy_name):
         checkpoint_path = tmp_path / "step_3"
         checkpoint_path.mkdir()
-        (checkpoint_path / LEGACY_REPLAY_BUFFER_FILENAME).touch()
+        legacy_path = checkpoint_path / legacy_name
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.touch()
         policy = MagicMock()
 
-        with pytest.raises(RuntimeError, match="legacy replay_buffer.pt"):
+        with pytest.raises(RuntimeError, match=f"legacy {legacy_name}"):
             sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
                 policy,
                 last_checkpoint_path=str(checkpoint_path),

@@ -16,8 +16,10 @@ import math
 import os
 import subprocess
 import sys
+import uuid
 from collections import Counter
 from collections.abc import AsyncGenerator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, Optional, Protocol, TypedDict
 
@@ -39,6 +41,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym_capture import CaptureSnapshotRef, GymCaptureReader
 from nemo_rl.environments.nemo_gym_multimodal import (
     _index_per_turn_images,
     _is_trainable_output_item,
@@ -86,6 +89,16 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+DEFAULT_MAX_ROLLOUT_RETRIES = 3
+
+
+@dataclass(frozen=True, kw_only=True)
+class NemoGymRolloutFailure:
+    """A row-level Gym failure that must not terminate the rollout stream."""
+
+    failure_class: str
+    error: str | None
+    full_result: dict[str, Any]
 
 
 class NemoGymCompatibleConfig(Protocol):
@@ -138,11 +151,23 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
 
 def _has_nan_generation_logprobs(result: dict) -> bool:
     """Return whether a postprocessed rollout contains NaN policy logprobs."""
+    message_logs = result.get("training_message_logs") or [result["message_log"]]
     return any(
         message.get("generation_logprobs") is not None
         and torch.isnan(message["generation_logprobs"]).any()
-        for message in result["message_log"]
+        for message_log in message_logs
+        for message in message_log
     )
+
+
+def _validate_capture_delivery_mode(*, external_staging: bool, builder: str) -> None:
+    if external_staging and builder == "independent_calls":
+        raise ValueError(
+            "The external-staging receipt path selects one terminal chain and "
+            "cannot deliver independent_calls. Disable token_capture.enabled "
+            "and configure Gym token_id_capture for the ordinary legacy or TQ "
+            "rollout payload path for exact-call tree training."
+        )
 
 
 def _typed_gym_failure(error: Exception) -> Optional[Exception]:
@@ -226,6 +251,7 @@ class NemoGymConfig(TypedDict):
     # Forwarded from policy.tokenizer.use_fastokens so rollout actors patch their
     # tokenizer consistently with the driver. Defaults to off when absent.
     use_fastokens: NotRequired[bool]
+    max_rollout_retries: NotRequired[int]
     # Multimodal fields (populated by `setup_nemo_gym_config` when VLM is enabled).
     tokenizer_config: NotRequired[
         Optional[TokenizerConfig]
@@ -294,7 +320,7 @@ def _detect_invalid_tool_call_and_malformed_thinking(
     is_invalid_tool_call = False
     has_malformed_thinking = False
     if is_output_message:
-        assistant_message_content = output_item_dict["content"][0]["text"]
+        assistant_message_content = content[0]["text"]
         if any(
             pattern in assistant_message_content
             for pattern in invalid_tool_call_patterns
@@ -303,7 +329,7 @@ def _detect_invalid_tool_call_and_malformed_thinking(
         if any(tag in assistant_message_content for tag in thinking_tags):
             has_malformed_thinking = True
     elif is_reasoning_message:
-        assistant_message_content = output_item_dict["summary"][0]["text"]
+        assistant_message_content = summary[0]["text"]
         if any(
             pattern in assistant_message_content
             for pattern in invalid_tool_call_patterns
@@ -333,6 +359,74 @@ def get_pad_dynamic_image_shapes(env_config: Mapping[str, Any]) -> bool:
     return bool(nemo_gym_config.get("pad_dynamic_image_shapes"))
 
 
+def _token_capture_metrics(
+    per_rollout: list[dict[str, Any]], rebuilt: int, unbuilt: int, masked: int = 0
+) -> dict[str, float]:
+    """Summarize a batch's token capture for the training metrics.
+
+    These are the numbers that make silent training loss visible. The failure they
+    exist to catch is a rollout that looks healthy, with a green run and a moving
+    reward, while the chain broke partway and only part of it was trained on.
+    Measured causes so far: a tool-call parser truncating the assistant turn at
+    the tool call and discarding whatever the model generated after it, and a
+    chat template re-tokenizing an assistant turn differently than it was
+    sampled.
+
+    Read ``delivered_fraction`` first. Well below 1.0 means the trainer is seeing
+    a fraction of each rollout. ``calls_per_rollout_mean`` at exactly 1.0 is the
+    other one worth stopping on: it usually means the tool parser is not
+    configured, so the harness never called a tool and the agentic path was never
+    exercised.
+    """
+    if not per_rollout and not rebuilt and not unbuilt:
+        return {}
+
+    def mean(key: str) -> float:
+        values = [
+            float(m[key]) for m in per_rollout if isinstance(m.get(key), (int, float))
+        ]
+        return sum(values) / len(values) if values else 0.0
+
+    def total(key: str) -> float:
+        return float(sum(int(m.get(key) or 0) for m in per_rollout))
+
+    total_rollouts = rebuilt + unbuilt
+    return {
+        "token_capture/rollouts_rebuilt": float(rebuilt),
+        "token_capture/rollouts_unbuilt": float(unbuilt),
+        "token_capture/rebuilt_fraction": (rebuilt / total_rollouts)
+        if total_rollouts
+        else 0.0,
+        "token_capture/delivered_fraction_mean": mean("delivered_fraction"),
+        "token_capture/quarantined_fraction_mean": mean("quarantined_fraction"),
+        "token_capture/calls_per_rollout_mean": mean("n_calls"),
+        "token_capture/chains_per_rollout_mean": mean("chains"),
+        # Calls the model returned with no generated tokens. Non-zero usually means the output
+        # budget or a content filter is truncating generations before the first token.
+        "token_capture/empty_generation_calls": total("empty_generation_calls"),
+        "token_capture/rejected_without_generation_calls": total(
+            "rejected_without_generation_calls"
+        ),
+        "token_capture/retokenized_boundaries": total("retokenized_boundaries"),
+        "token_capture/retokenized_tokens_masked": total("retokenized_tokens_masked"),
+        # How often a recorded parent link could not be used, so the builder inferred the parent
+        # from token prefixes instead. Inference is correct but cannot disambiguate a retry.
+        "token_capture/parent_link_fallbacks": float(
+            sum(
+                sum((m.get("parent_link_fallbacks") or {}).values())
+                for m in per_rollout
+            )
+        ),
+        # Counted from the build rather than the metrics dict: Gym puts the verdict at the top of
+        # the rollout record, so a consumer reads one field to decide, and the metrics dict below
+        # carries only the reasons.
+        "token_capture/masked_rollouts": float(masked),
+        "token_capture/incomplete_rollouts": float(
+            sum(1 for m in per_rollout if m.get("capture_incomplete"))
+        ),
+    }
+
+
 # Fail fast rather than restart. The servers this actor owns are started in
 # _spinup, which Ray does not re-run after a restart, so a restarted actor is
 # permanently broken: _require_spinup() rejects every later rollout call, and
@@ -358,6 +452,9 @@ class NemoGym(EnvironmentInterface):
         # _spinup replaces this from cfg. Keep restarted/unspun actors internally
         # complete so diagnostics and focused tests do not fail with AttributeError.
         self._token_capture_enabled = False
+        self._rollout_seq = 0
+        self._rollout_id_base = uuid.uuid4().hex
+        self._capture_reader: GymCaptureReader | None = None
         self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
@@ -415,8 +512,10 @@ class NemoGym(EnvironmentInterface):
         self.head_server_port = _get_free_port_local(_gym_port_low, _gym_port_high)
 
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
+        from nemo_gym.global_config import get_global_config_dict
         from nemo_gym.rollout_collection import RolloutCollectionHelper
         from nemo_gym.server_utils import HEAD_SERVER_KEY_NAME, BaseServerConfig
+        from nemo_gym.token_id_capture import TokenIdCaptureConfig
         from omegaconf import DictConfig
 
         RELATIVE_PATH = "nemo_rl/environments/nemo_gym.py"
@@ -492,6 +591,13 @@ Depending on your data shape, you may want to change these values."""
         self._control_headers: Dict[str, str] = {}
         self._control_timeout_s = 60.0
         if self._token_capture_enabled:
+            # Do not erase an explicitly requested all-call projection below.
+            _validate_capture_delivery_mode(
+                external_staging=True,
+                builder=(initial_global_config_dict.get("token_id_capture") or {}).get(
+                    "builder", "prefix_merging"
+                ),
+            )
             policy_overrides = (
                 initial_global_config_dict.setdefault("policy_model", {})
                 .setdefault("responses_api_models", {})
@@ -524,15 +630,27 @@ Depending on your data shape, you may want to change these values."""
                 token_capture.get("control_timeout_s") or 60.0
             )
 
-        self.rh = RunHelper()
-        self.rh.start(
-            global_config_dict_parser_config=GlobalConfigDictParserConfig(
-                dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute()
-                / "nemo_gym_env.yaml",
-                initial_global_config_dict=DictConfig(initial_global_config_dict),
-                skip_load_from_cli=True,
-            )
+        parser_config = GlobalConfigDictParserConfig(
+            dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute()
+            / "nemo_gym_env.yaml",
+            initial_global_config_dict=DictConfig(initial_global_config_dict),
+            skip_load_from_cli=True,
         )
+        # RunHelper uses this same cached config. Check YAML overlays before
+        # starting any Gym servers, not after the first rollout is admitted.
+        resolved_config = get_global_config_dict(
+            global_config_dict_parser_config=parser_config
+        )
+        _validate_capture_delivery_mode(
+            external_staging=self._token_capture_enabled,
+            builder=TokenIdCaptureConfig.model_validate(
+                resolved_config
+            ).token_id_capture.builder,
+        )
+        if not self._token_capture_enabled:
+            self._capture_reader = GymCaptureReader.from_config(resolved_config)
+        self.rh = RunHelper()
+        self.rh.start(global_config_dict_parser_config=parser_config)
 
         # Setup for rollout collection
         self.head_server_config = BaseServerConfig(
@@ -652,7 +770,9 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_examples: list[dict],
         timer_prefix: str,
         deduplicate_multimodal_data: bool = False,
-    ) -> AsyncGenerator[tuple[int, dict, dict, dict | None], None]:
+    ) -> AsyncGenerator[
+        tuple[int, dict, dict | NemoGymRolloutFailure, dict | None], None
+    ]:
         """Stream postprocessed rollouts as NeMo-Gym tasks complete."""
         self._require_spinup()
         if not nemo_gym_examples:
@@ -674,12 +794,67 @@ Depending on your data shape, you may want to change these values."""
 
         timer = Timer()
         timer.start("_run_rollouts_total")
+
+        # Correlate each rollout so the Gym model server captures its model calls under a stable
+        # id, and resolve the token-capture dirs so a token-bearing response can be rebuilt for
+        # training. NeMo Gym's low-level run_examples (unlike its rollout_collection) does not
+        # stamp the correlation id; without one an external harness's model calls reach the model
+        # server uncorrelated (no /ng-rollout prefix) and nothing is captured.
+        from nemo_gym.global_config import ROLLOUT_ID_KEY_NAME
+        from nemo_gym.rollout_collection import NG_FAILURE_CLASS_KEY
+        from nemo_gym.token_id_capture import (
+            TokenIdCaptureConfig,
+        )
+        from nemo_gym.token_id_capture.config import token_id_capture_enabled_for_agent
+        from nemo_gym.token_id_capture.delivery import finalize_rollout_token_capture
+
+        # Read the resolved config, including the agent's YAML overlays.
+        global_config_dict = self.rch.setup_server_client(
+            self.head_server_config
+        ).global_config_dict
+        token_capture_config = TokenIdCaptureConfig.model_validate(
+            global_config_dict
+        ).token_id_capture
+        _validate_capture_delivery_mode(
+            external_staging=self._token_capture_enabled,
+            builder=token_capture_config.builder,
+        )
+        capture_reader = self._capture_reader
+
+        # A monotonic counter gives each rollout an id unique across steps; the per-step ``_rowidx``
+        # resets every step and would collide token files. The counter is per ACTOR, so under
+        # sharding K actors would each start at 0 and collide across shards -- harmless while the
+        # capture dir is node-local, silently corrupting the moment it is not. A per-actor random
+        # base makes the id unique regardless.
+        #
+        # This goes in Gym's dedicated correlation key rather than its task/rollout indices. Those
+        # mean "which dataset row", which is not what this is, and Gym derives an id from them only
+        # as a fallback for callers that have nothing better.
+        for row in nemo_gym_examples:
+            # TQ uses its sample ID as the capture identity. Never replace an
+            # explicit ID with an actor-local counter.
+            if ROLLOUT_ID_KEY_NAME not in row:
+                row[ROLLOUT_ID_KEY_NAME] = (
+                    f"s{self._rollout_id_base}-{self._rollout_seq}"
+                )
+                self._rollout_seq += 1
+
         nemo_gym_result_iterator = self.rch.run_examples(
-            examples=nemo_gym_examples, head_server_config=self.head_server_config
+            examples=nemo_gym_examples,
+            head_server_config=self.head_server_config,
+            route_failures_to_sidecar=True,
         )
         # Gym resolves task_source to agent_ref synchronously in run_examples().
         # Build the counter afterward so completion rows use the resolved identity.
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
+
+        # Token-capture health, accumulated across this batch and emitted with the timing metrics
+        # on the final result (this is a streaming generator, so there is no end-of-loop).
+        capture_metrics: list[dict[str, Any]] = []
+        rebuilt_rollouts = 0
+        unbuilt_rollouts = 0
+        masked_rollouts = 0
+        failure_counts: Counter[str] = Counter()
 
         num_results = 0
         for task in nemo_gym_result_iterator:
@@ -701,12 +876,58 @@ Depending on your data shape, you may want to change these values."""
                         raise typed from None
                     raise
 
+            # A rollout whose returned output has no token ids gets them attached from what was
+            # recorded for it; one that already carries them is left alone. Gym decides that from
+            # the rollout itself, so a batch can mix native agents and external harnesses, and this
+            # call does not need to know which this is.
+            capture_snapshot = None
+            if (
+                capture_reader is not None
+                and not self._token_capture_enabled
+                and nemo_gym_result.get(NG_FAILURE_CLASS_KEY) is None
+                and token_id_capture_enabled_for_agent(
+                    global_config_dict, nemo_gym_row["agent_ref"]["name"]
+                )
+            ):
+                # run_examples returns the harness result without the correlation key, which the
+                # lookup needs. Gym's rollout collection copies it onto the result for the same
+                # reason; this is that copy for the low-level path.
+                nemo_gym_result[ROLLOUT_ID_KEY_NAME] = nemo_gym_row[ROLLOUT_ID_KEY_NAME]
+                built = await finalize_rollout_token_capture(
+                    nemo_gym_result,
+                    capture_reader.source,
+                    builder=token_capture_config.builder,
+                )
+                capture_snapshot = capture_reader.register(
+                    nemo_gym_row[ROLLOUT_ID_KEY_NAME], built
+                )
+                if built is not None:
+                    capture_metrics.append(built.get("metrics") or {})
+                    masked_rollouts += bool(built.get("mask_sample"))
+                    if built.get("rebuilt_response") is not None:
+                        rebuilt_rollouts += 1
+                    else:
+                        unbuilt_rollouts += 1
+
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                if self._token_capture_enabled:
-                    # Receipt mode: fetch the ledger manifest and assemble the
-                    # receipt locally; token-free result. The canonical row is
-                    # rebuilt by the finalizer, so no message_log walk (and no
-                    # NaN check) applies here.
+                failure_class = nemo_gym_result.get(NG_FAILURE_CLASS_KEY)
+                if failure_class is not None:
+                    failure_counts[str(failure_class)] += 1
+                    nemo_rl_result: dict | NemoGymRolloutFailure = (
+                        NemoGymRolloutFailure(
+                            failure_class=str(failure_class),
+                            error=nemo_gym_result.get("error"),
+                            full_result=nemo_gym_result,
+                        )
+                    )
+                    print(
+                        "NeMo-Gym rollout row failed: "
+                        f"rowidx={nemo_gym_row['_rowidx']} "
+                        f"failure_class={failure_class!r} "
+                        f"error={nemo_gym_result.get('error')!r}",
+                        file=sys.stderr,
+                    )
+                elif self._token_capture_enabled:
                     nemo_rl_result = await self._postprocess_receipt_mode(
                         nemo_gym_row, nemo_gym_result
                     )
@@ -719,6 +940,9 @@ Depending on your data shape, you may want to change these values."""
                     )
                     if _has_nan_generation_logprobs(nemo_rl_result):
                         raise RuntimeError("Generation logprobs contain NaN")
+                    if capture_snapshot is not None:
+                        nemo_rl_result["token_capture_snapshot"] = capture_snapshot
+
             num_results += 1
             timing_metrics = None
             if num_results == len(nemo_gym_examples):
@@ -730,6 +954,21 @@ Depending on your data shape, you may want to change these values."""
                     * timing_metrics[f"{timer_prefix}/postprocess_results"]
                     / total_time
                 )
+                timing_metrics.update(
+                    _token_capture_metrics(
+                        capture_metrics,
+                        rebuilt_rollouts,
+                        unbuilt_rollouts,
+                        masked_rollouts,
+                    )
+                )
+                timing_metrics[f"{timer_prefix}/failed_rows"] = float(
+                    sum(failure_counts.values())
+                )
+                for failure_class, count in failure_counts.items():
+                    timing_metrics[f"{timer_prefix}/failure_class/{failure_class}"] = (
+                        float(count)
+                    )
 
             agent_name = nemo_gym_row["agent_ref"]["name"]
             counts_left[agent_name] -= 1
@@ -940,6 +1179,46 @@ Depending on your data shape, you may want to change these values."""
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
 
+        # Token capture preserves every model invocation as an exact, independent
+        # Responses payload. Convert those calls separately; concatenating their
+        # message logs happens later, together with explicit attention boundaries.
+        training_message_logs = []
+        if (
+            nemo_gym_result.get("_ng_training_responses")
+            and self._processor is not None
+        ):
+            raise NotImplementedError(
+                "Independent captured calls require per-call multimodal inputs; "
+                "the text-only tree adapter cannot infer them from a final transcript."
+            )
+        for training_response in nemo_gym_result.get("_ng_training_responses", []):
+            call_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                nemo_gym_row,
+                {
+                    "response": training_response,
+                    "responses_create_params": nemo_gym_result.get(
+                        "responses_create_params", {"input": []}
+                    ),
+                },
+                tokenizer,
+                include_initial_multimodal_data=include_initial_multimodal_data,
+            )
+            training_message_logs.append(call_result["message_log"])
+        if training_message_logs:
+            # All calls are the training payload. The final call is only the
+            # compatibility message log used by ordinary trajectory consumers.
+            # Do not process response.output again: the projected response may
+            # share its output objects with one of the exact calls above.
+            result = {
+                "message_log": training_message_logs[-1],
+                "training_message_logs": training_message_logs,
+                "input_message_log": training_message_logs[0][:1],
+                "full_result": nemo_gym_result,
+            }
+            if not include_initial_multimodal_data:
+                result["_initial_multimodal_data_omitted"] = False
+            return result
+
         processor = getattr(self, "_processor", None)
         response = nemo_gym_result["response"]
         result_input = nemo_gym_result["responses_create_params"].get("input", [])
@@ -1004,6 +1283,7 @@ Depending on your data shape, you may want to change these values."""
         turn_idx = 0
 
         nemo_rl_message_log = []
+        direct_training_message_logs = []
         seen_token_ids: List[int] = []
         batch_decode_items = []
         for output_item_dict in nemo_gym_result["response"]["output"]:
@@ -1029,6 +1309,18 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             generation_token_ids = output_item_dict.pop("generation_token_ids")
             generation_log_probs = output_item_dict.pop("generation_log_probs")
             routed_experts_raw = output_item_dict.pop("routed_experts", None)
+            execution_metadata = {
+                field: output_item_dict.pop(field)
+                for field in (
+                    "ng_generation_replica_id",
+                    "ng_generation_weight_version",
+                    "ng_generation_weight_version_end",
+                    "ng_kv_cache_scheduler_block_size",
+                    "ng_kv_cache_hash_block_size",
+                    "ng_kv_cache_num_cached_tokens",
+                )
+                if field in output_item_dict
+            }
             new_prompt_token_ids = prompt_token_ids[len(seen_token_ids) :]
 
             routed_experts = None
@@ -1093,6 +1385,14 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 user_message["routed_experts"] = routed_experts[prompt_start:prompt_end]
             nemo_rl_message_log.append(user_message)
 
+            direct_user_message = {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.tensor(prompt_token_ids),
+            }
+            if routed_experts is not None:
+                direct_user_message["routed_experts"] = routed_experts[:prompt_end]
+
             if processor is not None:
                 images_this_turn = (
                     per_turn_images[turn_idx] if turn_idx < len(per_turn_images) else []
@@ -1129,12 +1429,34 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 "generation_logprobs": torch.tensor(generation_log_probs),
                 "is_invalid_tool_call": is_invalid_tool_call,
                 "has_malformed_thinking": has_malformed_thinking,
+                **execution_metadata,
             }
             if routed_experts is not None:
                 assistant_message["routed_experts"] = routed_experts[
                     generation_start:generation_end
                 ]
             nemo_rl_message_log.append(assistant_message)
+            direct_training_message_logs.append(
+                [
+                    direct_user_message,
+                    {
+                        **assistant_message,
+                        "token_ids": assistant_message["token_ids"].clone(),
+                        "generation_logprobs": assistant_message[
+                            "generation_logprobs"
+                        ].clone(),
+                        **(
+                            {
+                                "routed_experts": assistant_message[
+                                    "routed_experts"
+                                ].clone()
+                            }
+                            if "routed_experts" in assistant_message
+                            else {}
+                        ),
+                    },
+                ]
+            )
 
             seen_token_ids.extend(new_prompt_token_ids)
             seen_token_ids.extend(generation_token_ids)
@@ -1196,8 +1518,12 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                         container[key], raw_initial_sources
                     )
 
+        if not training_message_logs and processor is None:
+            training_message_logs = direct_training_message_logs
+
         result = {
             "message_log": nemo_rl_message_log,
+            "training_message_logs": training_message_logs,
             "input_message_log": nemo_rl_message_log[:1],
             "full_result": nemo_gym_result,
         }
@@ -1205,17 +1531,25 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             result["_initial_multimodal_data_omitted"] = initial_multimodal_data_omitted
         return result
 
-    def shutdown(self) -> None:
-        """Stop the Gym servers. Safe to call more than once, and before spinup.
+    async def acknowledge_token_captures(
+        self, refs: tuple[CaptureSnapshotRef, ...]
+    ) -> int:
+        """Retire frozen local captures only after downstream acceptance."""
+        if self._capture_reader is None:
+            return 0
+        return await self._capture_reader.acknowledge(refs)
 
-        Teardown runs in a finally block and may be requested more than once.
-        RunHelper.shutdown() is not idempotent, so the handle is cleared before
-        it is used. A failure therefore cannot leave a live handle that a later
-        cleanup attempt invokes again.
-        """
-        rh, self.rh = self.rh, None
-        if rh is not None:
-            rh.shutdown()
+    async def shutdown(self) -> None:
+        # Teardown runs in a finally block, so it must not turn a real training error
+        # into a confusing AttributeError from a never-spun-up (e.g. restarted) actor.
+        run_helper = self.rh
+        self.rh = None
+        try:
+            if run_helper is not None:
+                run_helper.shutdown()
+        finally:
+            if self._capture_reader is not None:
+                await self._capture_reader.close()
 
     def step(self, message_log_batch, metadata):
         # This is not used since NeMo-Gym will handle the rollouts entirely.
@@ -1325,6 +1659,16 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     if config.policy.get("is_vlm"):
         env_cfg = config.env.setdefault("nemo_gym", {})
         env_cfg.setdefault("tokenizer_config", dict(config.policy["tokenizer"]))
+
+    # Publish this trainer's sampling params to NeMo Gym through generic config keys so the Gym
+    # model server can force on-policy sampling regardless of what an external harness requests.
+    # Gym holds no NeMo-RL-specific knowledge; it only reads these keys (see the model server's
+    # sampling_overrides). The vLLM generation worker asserts requests match this config, so
+    # pinning here is required, not optional, for captured rollouts to stay on-policy.
+    nemo_gym_cfg = config.env["nemo_gym"]
+    nemo_gym_cfg.setdefault("max_rollout_retries", DEFAULT_MAX_ROLLOUT_RETRIES)
+    nemo_gym_cfg["policy_generation_temperature"] = generation_config["temperature"]
+    nemo_gym_cfg["policy_generation_top_p"] = generation_config["top_p"]
 
 
 def build_nemo_gym_config(

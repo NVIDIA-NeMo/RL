@@ -42,6 +42,7 @@ from nemo_rl.algorithms.grpo import (
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
+    _build_exact_call_tree,
     _get_grpo_save_state,
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
@@ -52,8 +53,10 @@ from nemo_rl.algorithms.grpo import (
     _resolve_message_level_advantage_penalties,
     _save_async_replay_buffer_checkpoint,
     _startup_pipeline_ready,
+    _use_exact_nemo_gym_call_sequences,
     _validate_multimodal_dedup_capability,
     _validate_use_kl_in_reward_compat,
+    add_grpo_token_loss_masks_and_generation_logprobs,
     aggregate_rollout_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
@@ -73,6 +76,10 @@ from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data.dataloader import CyclingDataLoader
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.packed_rollouts import (
+    TREE_ATTENTION_LAYOUTS,
+    TREE_ATTENTION_UNIQUE_MESSAGE_LOGS,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
@@ -190,6 +197,531 @@ def test_restore_async_replay_buffer_checkpoint_missing_file(tmp_path):
 
     assert metadata is None
     replay_buffer.load_from_path.remote.assert_not_called()
+
+
+def test_use_exact_nemo_gym_call_sequences_preserves_rollout_rows() -> None:
+    calls = [
+        [
+            [
+                {"role": "user", "token_ids": torch.tensor([10, 11])},
+                {
+                    "role": "assistant",
+                    "token_ids": torch.tensor([12]),
+                    "generation_logprobs": torch.tensor([-1.0]),
+                },
+            ],
+            [
+                {"role": "user", "token_ids": torch.tensor([20])},
+                {
+                    "role": "assistant",
+                    "token_ids": torch.tensor([21, 22]),
+                    "generation_logprobs": torch.tensor([-2.0, -2.1]),
+                },
+            ],
+        ],
+        [
+            [
+                {"role": "user", "token_ids": torch.tensor([30])},
+                {
+                    "role": "assistant",
+                    "token_ids": torch.tensor([31]),
+                    "generation_logprobs": torch.tensor([-3.0]),
+                },
+            ]
+        ],
+    ]
+    batch = BatchedDataDict(
+        {
+            "message_log": [[{"role": "user", "token_ids": [0]}]] * 2,
+            "training_message_logs": calls,
+            "rewards": torch.tensor([1.0, 0.0]),
+        }
+    )
+
+    _use_exact_nemo_gym_call_sequences(batch)
+
+    assert [layout.segment_lengths for layout in batch[TREE_ATTENTION_LAYOUTS]] == [
+        (3, 3),
+        (2,),
+    ]
+    assert [
+        [message["token_ids"].tolist() for message in message_log]
+        for message_log in batch[TREE_ATTENTION_UNIQUE_MESSAGE_LOGS]
+    ] == [[[10, 11], [12], [20], [21, 22]], [[30], [31]]]
+    assert [
+        torch.cat([message["token_ids"] for message in message_log]).tolist()
+        for message_log in batch["message_log"]
+    ] == [[10, 12, 21, 22], [30, 31]]
+    assert torch.equal(batch["rewards"], torch.tensor([1.0, 0.0]))
+
+
+def test_exact_call_tree_shares_branches_and_keeps_edge_predecessors() -> None:
+    result = _build_exact_call_tree(
+        [
+            [
+                {"role": "user", "token_ids": torch.tensor([10])},
+                {
+                    "role": "assistant",
+                    "token_ids": torch.tensor([11, 12]),
+                    "generation_logprobs": torch.tensor([-1.1, -1.2]),
+                },
+            ],
+            [
+                {"role": "user", "token_ids": torch.tensor([10, 11])},
+                {
+                    "role": "assistant",
+                    "token_ids": torch.tensor([13]),
+                    "generation_logprobs": torch.tensor([-2.1]),
+                },
+            ],
+        ]
+    )
+
+    assert result.layout.segment_lengths == (2, 1, 1)
+    assert result.layout.segment_parents == (-1, 0, 0)
+    assert result.layout.segment_depths == (0, 2, 2)
+    assert result.layout.edge_source_indices == (0, 1, 1)
+    assert result.layout.original_token_count == 6
+    assert result.layout.unique_token_count == 4
+    assert result.layout.valid_attention_pairs == 9
+    assert torch.equal(
+        torch.cat([message["token_ids"] for message in result.unique_message_log]),
+        torch.tensor([10, 11, 12, 13]),
+    )
+    assert torch.equal(
+        torch.cat([message["token_ids"] for message in result.edge_message_log]),
+        torch.tensor([10, 11, 12, 13]),
+    )
+
+
+def test_exact_call_tree_preserves_duplicate_sampled_edges() -> None:
+    duplicate_call = [
+        {"role": "user", "token_ids": torch.tensor([10])},
+        {
+            "role": "assistant",
+            "token_ids": torch.tensor([11]),
+            "generation_logprobs": torch.tensor([-1.1]),
+        },
+    ]
+
+    result = _build_exact_call_tree([duplicate_call, duplicate_call])
+
+    assert result.layout.segment_lengths == (2,)
+    assert result.layout.unique_token_count == 2
+    assert result.layout.edge_source_indices == (0, 0)
+    assert torch.equal(
+        torch.cat([message["token_ids"] for message in result.edge_message_log]),
+        torch.tensor([10, 11, 11]),
+    )
+
+
+def test_exact_calls_compact_strict_prefix_and_train_each_token_once() -> None:
+    batch = BatchedDataDict(
+        {
+            "message_log": [[{"role": "user", "token_ids": torch.tensor([0])}]],
+            "training_message_logs": [
+                [
+                    [
+                        {"role": "user", "token_ids": torch.tensor([10])},
+                        {
+                            "role": "assistant",
+                            "token_ids": torch.tensor([11, 12]),
+                            "generation_logprobs": torch.tensor([-1.1, -1.2]),
+                        },
+                    ],
+                    [
+                        {
+                            "role": "user",
+                            # The second call replays turn 1 plus new context.
+                            "token_ids": torch.tensor([10, 11, 12, 20]),
+                        },
+                        {
+                            "role": "assistant",
+                            "token_ids": torch.tensor([21, 22]),
+                            "generation_logprobs": torch.tensor([-2.1, -2.2]),
+                        },
+                    ],
+                ]
+            ],
+        }
+    )
+
+    _use_exact_nemo_gym_call_sequences(batch)
+    add_grpo_token_loss_masks_and_generation_logprobs(batch["message_log"])
+    layout = batch[TREE_ATTENTION_LAYOUTS][0]
+    assert layout.segment_lengths == (6,)
+    assert layout.edge_source_indices == (0, 1, 3, 4)
+    assert torch.equal(
+        torch.cat(
+            [
+                message["token_ids"]
+                for message in batch[TREE_ATTENTION_UNIQUE_MESSAGE_LOGS][0]
+            ]
+        ),
+        torch.tensor([10, 11, 12, 20, 21, 22]),
+    )
+    # The edge stream contains one dummy predecessor plus every sampled token
+    # exactly once, so the shifted policy loss counts four tokens.
+    assert (
+        sum(
+            int(message["token_loss_mask"].sum()) for message in batch["message_log"][0]
+        )
+        == 4
+    )
+
+
+def test_exact_calls_branch_when_retokenization_changes_context() -> None:
+    batch = BatchedDataDict(
+        {
+            "message_log": [[{"role": "user", "token_ids": torch.tensor([0])}]],
+            "training_message_logs": [
+                [
+                    [
+                        {"role": "user", "token_ids": torch.tensor([10])},
+                        {
+                            "role": "assistant",
+                            "token_ids": torch.tensor([11, 12]),
+                            "generation_logprobs": torch.tensor([-1.1, -1.2]),
+                        },
+                    ],
+                    [
+                        # OpenCode text round-tripping merged the old 11, 12 pair.
+                        {"role": "user", "token_ids": torch.tensor([10, 99, 20])},
+                        {
+                            "role": "assistant",
+                            "token_ids": torch.tensor([21]),
+                            "generation_logprobs": torch.tensor([-2.1]),
+                        },
+                    ],
+                ]
+            ],
+        }
+    )
+
+    _use_exact_nemo_gym_call_sequences(batch)
+
+    layout = batch[TREE_ATTENTION_LAYOUTS][0]
+    assert layout.segment_lengths == (1, 2, 3)
+    assert layout.segment_parents == (-1, 0, 0)
+
+
+def test_exact_calls_branch_when_router_replay_prefix_differs() -> None:
+    def routes(values: list[int]) -> torch.Tensor:
+        return torch.tensor(values, dtype=torch.int16).view(-1, 1, 1)
+
+    batch = BatchedDataDict(
+        {
+            "message_log": [[{"role": "user", "token_ids": torch.tensor([0])}]],
+            "training_message_logs": [
+                [
+                    [
+                        {
+                            "role": "user",
+                            "token_ids": torch.tensor([10]),
+                            "routed_experts": routes([1]),
+                        },
+                        {
+                            "role": "assistant",
+                            "token_ids": torch.tensor([11, 12]),
+                            "generation_logprobs": torch.tensor([-1.1, -1.2]),
+                            # Route 7 is real; route 99 is the terminal placeholder.
+                            "routed_experts": routes([7, 99]),
+                        },
+                    ],
+                    [
+                        {
+                            "role": "user",
+                            "token_ids": torch.tensor([10, 11, 12, 20]),
+                            # Token IDs match call 1, but non-terminal token 11
+                            # took route 8 instead of route 7.
+                            "routed_experts": routes([1, 8, 9, 3]),
+                        },
+                        {
+                            "role": "assistant",
+                            "token_ids": torch.tensor([21]),
+                            "generation_logprobs": torch.tensor([-2.1]),
+                            "routed_experts": routes([4]),
+                        },
+                    ],
+                ]
+            ],
+        }
+    )
+
+    _use_exact_nemo_gym_call_sequences(batch)
+
+    layout = batch[TREE_ATTENTION_LAYOUTS][0]
+    assert layout.segment_lengths == (1, 2, 4)
+    assert layout.segment_parents == (-1, 0, 0)
+
+
+def test_exact_calls_classify_runtime_page_aligned_route_fork(capsys) -> None:
+    def routes(values: list[int]) -> torch.Tensor:
+        return torch.tensor(values, dtype=torch.int16).view(-1, 1, 1)
+
+    metadata = {
+        "ng_generation_replica_id": "vllm-3",
+        "ng_generation_weight_version": 2,
+        "ng_kv_cache_scheduler_block_size": 4,
+        "ng_kv_cache_hash_block_size": 4,
+        "ng_kv_cache_num_cached_tokens": 4,
+    }
+    batch = BatchedDataDict(
+        {
+            "message_log": [[{"role": "user", "token_ids": torch.tensor([0])}]],
+            "training_message_logs": [
+                [
+                    [
+                        {
+                            "role": "user",
+                            "token_ids": torch.tensor([10]),
+                            "routed_experts": routes([1]),
+                            **metadata,
+                        },
+                        {
+                            "role": "assistant",
+                            "token_ids": torch.tensor([11, 12, 13, 14, 15]),
+                            "generation_logprobs": torch.tensor(
+                                [-1.1, -1.2, -1.3, -1.4, -1.5]
+                            ),
+                            "routed_experts": routes([2, 3, 4, 9, 99]),
+                            **metadata,
+                        },
+                    ],
+                    [
+                        {
+                            "role": "user",
+                            "token_ids": torch.tensor([10]),
+                            "routed_experts": routes([1]),
+                            **metadata,
+                        },
+                        {
+                            "role": "assistant",
+                            "token_ids": torch.tensor([11, 12, 13, 14, 15, 16]),
+                            "generation_logprobs": torch.tensor(
+                                [-2.1, -2.2, -2.3, -2.4, -2.5, -2.6]
+                            ),
+                            "routed_experts": routes([2, 3, 4, 8, 10, 99]),
+                            **metadata,
+                        },
+                    ],
+                ]
+            ],
+        }
+    )
+
+    _use_exact_nemo_gym_call_sequences(batch)
+
+    # The trailing partial cache page remains two independent training paths.
+    layout = batch[TREE_ATTENTION_LAYOUTS][0]
+    assert layout.segment_lengths == (4, 2, 3)
+    assert layout.segment_parents == (-1, 0, 0)
+    diagnostics = capsys.readouterr().out
+    assert "page_forks=1" in diagnostics
+    assert "page_shared_tokens=4" in diagnostics
+    assert "cross_replica_rollouts=0" in diagnostics
+
+
+def test_exact_calls_share_observed_cached_prefix_across_weight_versions() -> None:
+    def routes(values: list[int]) -> torch.Tensor:
+        return torch.tensor(values, dtype=torch.int16).view(-1, 1, 1)
+
+    cache_metadata = {
+        "ng_generation_replica_id": "vllm-3",
+        "ng_kv_cache_scheduler_block_size": 2,
+        "ng_kv_cache_hash_block_size": 2,
+    }
+    first_call = [
+        {
+            "role": "user",
+            "token_ids": torch.tensor([10]),
+            "routed_experts": routes([1]),
+            "ng_generation_weight_version": 1,
+            **cache_metadata,
+        },
+        {
+            "role": "assistant",
+            "token_ids": torch.tensor([11]),
+            "generation_logprobs": torch.tensor([-1.1]),
+            "routed_experts": routes([99]),
+            "ng_generation_weight_version": 1,
+            **cache_metadata,
+        },
+    ]
+    second_call = [
+        {
+            "role": "user",
+            "token_ids": torch.tensor([10, 11, 20]),
+            "routed_experts": routes([1, 2, 3]),
+            "ng_generation_weight_version": 2,
+            "ng_kv_cache_num_cached_tokens": 2,
+            **cache_metadata,
+        },
+        {
+            "role": "assistant",
+            "token_ids": torch.tensor([21]),
+            "generation_logprobs": torch.tensor([-2.1]),
+            "routed_experts": routes([99]),
+            "ng_generation_weight_version": 2,
+            "ng_kv_cache_num_cached_tokens": 2,
+            **cache_metadata,
+        },
+    ]
+
+    cached_tree = _build_exact_call_tree([first_call, second_call])
+    assert cached_tree.layout.unique_token_count == 4
+    assert cached_tree.layout.segment_lengths == (4,)
+
+    uncached_second_call = [
+        {
+            key: value
+            for key, value in message.items()
+            if key != "ng_kv_cache_num_cached_tokens"
+        }
+        for message in second_call
+    ]
+    uncached_tree = _build_exact_call_tree([first_call, uncached_second_call])
+    assert uncached_tree.layout.unique_token_count == 6
+    assert uncached_tree.layout.segment_parents == (-1, -1)
+
+
+def test_exact_calls_compact_when_router_replay_prefix_matches() -> None:
+    def routes(values: list[int]) -> torch.Tensor:
+        return torch.tensor(values, dtype=torch.int16).view(-1, 1, 1)
+
+    batch = BatchedDataDict(
+        {
+            "message_log": [[{"role": "user", "token_ids": torch.tensor([0])}]],
+            "training_message_logs": [
+                [
+                    [
+                        {
+                            "role": "user",
+                            "token_ids": torch.tensor([10]),
+                            "routed_experts": routes([1]),
+                        },
+                        {
+                            "role": "assistant",
+                            "token_ids": torch.tensor([11]),
+                            "generation_logprobs": torch.tensor([-1.1]),
+                            # This row was never executed by the first call.
+                            "routed_experts": routes([99]),
+                        },
+                    ],
+                    [
+                        {
+                            "role": "user",
+                            "token_ids": torch.tensor([10, 11, 20]),
+                            "routed_experts": routes([1, 2, 3]),
+                        },
+                        {
+                            "role": "assistant",
+                            "token_ids": torch.tensor([21]),
+                            "generation_logprobs": torch.tensor([-2.1]),
+                            "routed_experts": routes([4]),
+                        },
+                    ],
+                ]
+            ],
+        }
+    )
+
+    _use_exact_nemo_gym_call_sequences(batch)
+
+    assert batch[TREE_ATTENTION_LAYOUTS][0].segment_lengths == (4,)
+    materialized_routes = torch.cat(
+        [
+            message["routed_experts"]
+            for message in batch[TREE_ATTENTION_UNIQUE_MESSAGE_LOGS][0]
+            if "routed_experts" in message
+        ]
+    )
+    # The compacted path retains the descendant's real route for token 11,
+    # rather than the first call's terminal placeholder 99.
+    assert torch.equal(materialized_routes, routes([1, 2, 3, 4]))
+
+
+def test_exact_calls_branch_on_internal_missing_route() -> None:
+    def routes(values: list[int]) -> torch.Tensor:
+        return torch.tensor(values, dtype=torch.int16).view(-1, 1, 1)
+
+    batch = BatchedDataDict(
+        {
+            "message_log": [[{"role": "user", "token_ids": torch.tensor([0])}]],
+            "training_message_logs": [
+                [
+                    [
+                        {
+                            "role": "user",
+                            "token_ids": torch.tensor([10]),
+                            "routed_experts": routes([1]),
+                        },
+                        {
+                            "role": "assistant",
+                            "token_ids": torch.tensor([11, 12]),
+                            "generation_logprobs": torch.tensor([-1.1, -1.2]),
+                            "routed_experts": routes([-1, 99]),
+                        },
+                    ],
+                    [
+                        {
+                            "role": "user",
+                            "token_ids": torch.tensor([10, 11, 12, 20]),
+                            "routed_experts": routes([1, -1, 9, 3]),
+                        },
+                        {
+                            "role": "assistant",
+                            "token_ids": torch.tensor([21]),
+                            "generation_logprobs": torch.tensor([-2.1]),
+                            "routed_experts": routes([4]),
+                        },
+                    ],
+                ]
+            ],
+        }
+    )
+
+    _use_exact_nemo_gym_call_sequences(batch)
+
+    layout = batch[TREE_ATTENTION_LAYOUTS][0]
+    assert layout.segment_lengths == (1, 2, 4)
+    assert layout.segment_parents == (-1, 0, 0)
+
+
+def test_exact_calls_preserve_duplicate_sample_multiplicity() -> None:
+    duplicate = [
+        {"role": "user", "token_ids": torch.tensor([10])},
+        {
+            "role": "assistant",
+            "token_ids": torch.tensor([11]),
+            "generation_logprobs": torch.tensor([-1.1]),
+        },
+    ]
+    descendant = [
+        {"role": "user", "token_ids": torch.tensor([10, 11, 20])},
+        {
+            "role": "assistant",
+            "token_ids": torch.tensor([21]),
+            "generation_logprobs": torch.tensor([-2.1]),
+        },
+    ]
+    batch = BatchedDataDict(
+        {
+            "message_log": [[{"role": "user", "token_ids": torch.tensor([0])}]],
+            "training_message_logs": [[duplicate, duplicate, descendant]],
+        }
+    )
+
+    _use_exact_nemo_gym_call_sequences(batch)
+    add_grpo_token_loss_masks_and_generation_logprobs(batch["message_log"])
+
+    assert batch[TREE_ATTENTION_LAYOUTS][0].segment_lengths == (4,)
+    assert (
+        sum(
+            int(message["token_loss_mask"].sum()) for message in batch["message_log"][0]
+        )
+        == 3
+    )
 
 
 @patch("nemo_rl.algorithms.grpo.ray")

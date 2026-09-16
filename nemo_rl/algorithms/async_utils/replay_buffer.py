@@ -18,6 +18,8 @@ import gc
 import hashlib
 import json
 import math
+import os
+import resource
 import statistics
 import threading as _threading
 import time
@@ -40,10 +42,15 @@ from typing import (
     get_args,
 )
 
+import numpy as np
 import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
+from nemo_rl.data.packed_rollouts import (
+    PACKED_ATTENTION_SEGMENT_LENGTHS,
+    TREE_ATTENTION_LAYOUTS,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import (
@@ -1105,6 +1112,7 @@ class TQReplayBuffer:
         include_message_violation_fields: bool,
         staging_partition_id: Optional[str] = None,
         require_routed_experts: bool = False,
+        packing_memory_diagnostics: bool = False,
     ):
         self._dp_client = dp_client
         self._partition_id = partition_id
@@ -1115,6 +1123,7 @@ class TQReplayBuffer:
         # legacy path.
         self._staging_partition_id = staging_partition_id
         self._require_routed_experts = require_routed_experts
+        self._packing_memory_diagnostics = packing_memory_diagnostics
         self.meta_list: list[Optional[KVBatchMeta]] = []
         self.start_weight_list: list[int] = []
         self.end_weight_list: list[int] = []
@@ -1166,6 +1175,45 @@ class TQReplayBuffer:
     def group_ids(self) -> tuple[str, ...]:
         """Return a stable snapshot of controller-local replay ownership."""
         return tuple(self._group_ids)
+
+    @staticmethod
+    def _current_rss_bytes() -> int:
+        """Return this process's current RSS on Linux."""
+        try:
+            with open("/proc/self/statm", encoding="ascii") as statm:
+                resident_pages = int(statm.read().split()[1])
+            return resident_pages * os.sysconf("SC_PAGE_SIZE")
+        except (OSError, ValueError, IndexError):
+            return 0
+
+    @staticmethod
+    def _peak_rss_bytes() -> int:
+        """Return this process's lifetime peak RSS on Linux."""
+        return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
+
+    @staticmethod
+    def _tensor_field_bytes(data: Mapping[str, Any]) -> dict[str, int]:
+        """Return logical tensor bytes by top-level field."""
+        field_bytes: dict[str, int] = {}
+        for name, value in data.items():
+            if isinstance(value, torch.Tensor):
+                tensor = value.values() if value.is_nested else value
+                field_bytes[str(name)] = tensor.numel() * tensor.element_size()
+            elif isinstance(value, np.ndarray) and value.dtype != object:
+                field_bytes[str(name)] = int(value.nbytes)
+        return field_bytes
+
+    def _emit_packing_memory(self, stage: str, group_id: str, **metrics: Any) -> None:
+        if not self._packing_memory_diagnostics:
+            return
+        event = {
+            "stage": stage,
+            "group_id": group_id,
+            "rss_bytes": self._current_rss_bytes(),
+            "peak_rss_bytes": self._peak_rss_bytes(),
+            **metrics,
+        }
+        print(f"tq_packing_memory: {json.dumps(event, sort_keys=True)}", flush=True)
 
     def reserve(
         self,
@@ -1241,6 +1289,7 @@ class TQReplayBuffer:
                 "TQReplayBuffer must be bound to the controller data-plane "
                 "checkpoint barrier before committing samples"
             )
+        started_at = time.perf_counter()
         train_batch = record_to_train_batch(
             record,
             pad_value_dict=self._pad_value_dict,
@@ -1252,6 +1301,25 @@ class TQReplayBuffer:
             group_id=group_id,
             prompt_idx=record.prompt_idx,
         )
+        attention_extra_info = {
+            key: train_batch[key]
+            for key in (PACKED_ATTENTION_SEGMENT_LENGTHS, TREE_ATTENTION_LAYOUTS)
+            if key in train_batch
+        }
+        if len(attention_extra_info) > 1:
+            raise ValueError(
+                "Rollout payload cannot contain both packed and tree attention layouts"
+            )
+        if self._packing_memory_diagnostics:
+            self._emit_packing_memory(
+                "packed",
+                group_id,
+                wall_ms=(time.perf_counter() - started_at) * 1000.0,
+                dense_field_bytes=self._tensor_field_bytes(train_batch),
+                packed_field_bytes=self._tensor_field_bytes(fields),
+                valid_tokens=int(train_batch["input_lengths"].sum().item()),
+                padded_tokens=train_batch["input_ids"].numel(),
+            )
         if self._require_routed_experts and ROUTED_EXPERTS_FIELD not in fields:
             raise RuntimeError(
                 "policy.router_replay.enabled=true requires routed_experts in "
@@ -1279,7 +1347,10 @@ class TQReplayBuffer:
                     sample_ids=list(sample_ids),
                     fields=list(fields.keys()),
                     sequence_lengths=[int(s) for s in lengths.tolist()],
-                    extra_info={ROLLOUT_METRICS: [dict(record.rollout_metrics)]},
+                    extra_info={
+                        ROLLOUT_METRICS: [dict(record.rollout_metrics)],
+                        **attention_extra_info,
+                    },
                     tags=[dict(t) for t in tags],
                 )
 
@@ -1303,6 +1374,11 @@ class TQReplayBuffer:
                 self.meta_list[idx] = meta
                 self.end_weight_list[idx] = end_weight_version
                 self.ready_list[idx] = True
+                self._emit_packing_memory(
+                    "committed",
+                    group_id,
+                    wall_ms=(time.perf_counter() - started_at) * 1000.0,
+                )
                 return meta
             except BaseException as commit_error:
                 # put_samples may have written rows before raising. Roll back by the

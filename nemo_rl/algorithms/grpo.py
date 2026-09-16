@@ -19,7 +19,7 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, fields
-from typing import Any, Callable, Optional, TypeVar, cast
+from typing import Any, Callable, NotRequired, Optional, TypeVar, cast
 
 import numpy as np
 import ray
@@ -69,10 +69,29 @@ from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.dataloader import CyclingDataLoader, MultipleDataloaderWrapper
 from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data.exact_calls import (
+    _build_exact_call_tree as _build_exact_call_tree,
+)
+from nemo_rl.data.exact_calls import (
+    _compact_exact_call_sequences as _compact_exact_call_sequences,
+)
+from nemo_rl.data.exact_calls import (
+    _exact_call_trie_diagnostics,
+    _flatten_exact_call,
+)
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType, VLMMessageLogType
 from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
+)
+from nemo_rl.data.packed_rollouts import (
+    PACKED_ATTENTION_SEGMENT_LENGTHS,
+    TREE_ATTENTION_EDGE_LENGTHS,
+    TREE_ATTENTION_EDGE_SOURCE_INDICES,
+    TREE_ATTENTION_EDGE_TARGET_IDS,
+    TREE_ATTENTION_LAYOUTS,
+    TREE_ATTENTION_UNIQUE_MESSAGE_LOGS,
+    validate_packed_attention_segment_lengths,
 )
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
@@ -89,12 +108,15 @@ from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_a
 from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.interfaces import (
     FRONTIER_ORDINAL_KEY,
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
     PENDING_PROMPTS_KEY,
     RESUME_BASE_ORDINAL_KEY,
     RETAINED_TASK_INDICES_KEY,
     TRAINED_TASK_INDICES_KEY,
+    ExactCallTreeDiagnostics,
+    ExactCallTreePayload,
 )
 from nemo_rl.experience.metric_utils import is_histogram_metric
 from nemo_rl.experience.rollouts import (
@@ -428,8 +450,33 @@ def _get_grpo_save_state(
     return GRPOSaveState(**state_values)
 
 
+class TokenLogprobDiagnosticsConfig(BaseModel, extra="allow"):
+    """Configure compact per-token generation/recompute logprob diagnostics."""
+
+    enabled: bool = False
+    max_sequences: int = Field(default=32, gt=0)
+    top_k_tokens_per_sequence: int = Field(default=32, gt=0)
+    min_abs_logprob_diff: float = Field(default=0.25, ge=0)
+    min_sequence_mult_prob_error: float = Field(default=1.05, ge=1)
+    context_tokens: int = Field(default=8, ge=0)
+    relative_position_bins: int = Field(default=10, gt=0, le=100)
+    top_token_ids_by_total_abs_diff: int = Field(default=32, gt=0)
+
+
 class GRPOLoggerConfig(LoggerConfig):
     num_val_samples_to_print: int  # number of val samples to print to stdout
+    token_logprob_diagnostics: NotRequired[TokenLogprobDiagnosticsConfig]
+
+
+def _resolve_token_logprob_diagnostics_config(
+    logger_config: GRPOLoggerConfig,
+) -> TokenLogprobDiagnosticsConfig:
+    raw_config = logger_config.get("token_logprob_diagnostics")
+    if raw_config is None:
+        return TokenLogprobDiagnosticsConfig()
+    if isinstance(raw_config, TokenLogprobDiagnosticsConfig):
+        return raw_config
+    return TokenLogprobDiagnosticsConfig.model_validate(raw_config)
 
 
 class MasterConfig(BaseModel, extra="allow"):
@@ -2323,29 +2370,245 @@ def _policy_dtype(policy_config: PolicyConfig) -> torch.dtype:
     return getattr(torch, policy_config["precision"])
 
 
+def _flatten_tree_model_inputs(
+    repeated_batch: BatchedDataDict,
+    edge_flat_messages: BatchedDataDict,
+    edge_input_lengths: torch.Tensor,
+    *,
+    pad_token_id: int,
+    make_sequence_length_divisible_by: int,
+) -> tuple[BatchedDataDict, torch.Tensor]:
+    """Flatten the physical DFS nodes separately from sampled loss edges."""
+    if TREE_ATTENTION_LAYOUTS not in repeated_batch:
+        return edge_flat_messages, edge_input_lengths
+
+    layouts = repeated_batch[TREE_ATTENTION_LAYOUTS]
+    unique_message_logs = repeated_batch.get(TREE_ATTENTION_UNIQUE_MESSAGE_LOGS)
+    if unique_message_logs is None or len(unique_message_logs) != len(layouts):
+        raise ValueError(
+            "tree attention requires one unique-node message log per layout"
+        )
+
+    # Model inputs deliberately exclude edge-only fields such as rollout
+    # logprobs and loss masks. Routes remain aligned with the physical nodes.
+    model_message_logs = [
+        get_keys_from_message_log(
+            message_log, ["role", "content", "token_ids", "routed_experts"]
+        )
+        for message_log in unique_message_logs
+    ]
+    backfill_missing_routed_experts(model_message_logs)
+    model_flat_messages, model_input_lengths = batched_message_log_to_flat_message(
+        model_message_logs,
+        pad_value_dict={"token_ids": pad_token_id},
+        make_sequence_length_divisible_by=make_sequence_length_divisible_by,
+    )
+
+    for row, (layout, input_length) in enumerate(zip(layouts, model_input_lengths)):
+        layout.validate()
+        if layout.unique_token_count != int(input_length):
+            raise ValueError(
+                "tree attention unique-node log does not match its layout: "
+                f"row={row}, tokens={int(input_length)}, "
+                f"layout_tokens={layout.unique_token_count}"
+            )
+    return model_flat_messages, model_input_lengths
+
+
 def _build_async_grpo_train_data(
     flat_messages: BatchedDataDict,
     input_lengths: torch.Tensor,
     repeated_batch: BatchedDataDict,
     policy_config: PolicyConfig,
+    *,
+    model_flat_messages: BatchedDataDict | None = None,
 ) -> BatchedDataDict[ClippedPGLossDataDict]:
     """Build the async no-TQ policy train batch from flattened rollout messages."""
+    model_flat_messages = (
+        flat_messages if model_flat_messages is None else model_flat_messages
+    )
     train_data = BatchedDataDict[ClippedPGLossDataDict](
         {
-            "input_ids": flat_messages["token_ids"],
+            "input_ids": model_flat_messages["token_ids"],
             "input_lengths": input_lengths,
             "generation_logprobs": flat_messages["generation_logprobs"],
             "token_mask": flat_messages["token_loss_mask"],
             "sample_mask": repeated_batch["loss_multiplier"],
         }
     )
-    _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
+    _preserve_router_replay_routed_experts(
+        train_data, model_flat_messages, policy_config
+    )
+    if TREE_ATTENTION_LAYOUTS in repeated_batch:
+        layouts = repeated_batch[TREE_ATTENTION_LAYOUTS]
+        edge_lengths = torch.tensor(
+            [len(layout.edge_source_indices) for layout in layouts],
+            dtype=torch.long,
+        )
+        max_edges = flat_messages["token_ids"].shape[1] - 1
+        edge_sources = torch.full(
+            (len(layouts), max_edges),
+            -1,
+            dtype=torch.long,
+        )
+        for row, layout in enumerate(layouts):
+            layout.validate()
+            if layout.edge_source_indices:
+                edge_sources[row, : len(layout.edge_source_indices)] = torch.tensor(
+                    layout.edge_source_indices,
+                    dtype=torch.long,
+                )
+            if len(layout.edge_source_indices) > max_edges:
+                raise ValueError("tree attention edge metadata exceeds its padded row")
+        train_data[TREE_ATTENTION_LAYOUTS] = layouts
+        train_data[TREE_ATTENTION_EDGE_SOURCE_INDICES] = edge_sources
+        train_data[TREE_ATTENTION_EDGE_TARGET_IDS] = flat_messages["token_ids"][:, 1:]
+        train_data[TREE_ATTENTION_EDGE_LENGTHS] = edge_lengths
+    if PACKED_ATTENTION_SEGMENT_LENGTHS in repeated_batch:
+        segment_lengths = repeated_batch[PACKED_ATTENTION_SEGMENT_LENGTHS]
+        validate_packed_attention_segment_lengths(segment_lengths, input_lengths)
+        train_data[PACKED_ATTENTION_SEGMENT_LENGTHS] = segment_lengths
     # update multimodal data unconditionally
     extra_multimodal_data = flat_messages.get_multimodal_dict(
         as_tensors=False, pixel_dtype=_policy_dtype(policy_config)
     )
     train_data.update(extra_multimodal_data)
     return train_data
+
+
+def _use_exact_nemo_gym_call_sequences(repeated_batch: BatchedDataDict) -> None:
+    """Compact exact calls into unique tree nodes and sampled loss edges."""
+    training_message_logs = repeated_batch.get("training_message_logs")
+    if training_message_logs is None:
+        return
+
+    trees = [
+        _compact_exact_nemo_gym_call_sequences(
+            rollout_calls,
+            materialize_storage=False,
+        )
+        for rollout_calls in training_message_logs
+    ]
+    _apply_exact_nemo_gym_call_trees(repeated_batch, trees)
+
+
+def _clone_message_log_tensors(
+    message_log: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Copy tensor leaves so compact messages do not pin raw-call storages."""
+    return [
+        {
+            key: value.clone() if isinstance(value, torch.Tensor) else value
+            for key, value in message.items()
+        }
+        for message in message_log
+    ]
+
+
+def _compact_exact_nemo_gym_call_sequences(
+    rollout_calls: list[list[dict[str, Any]]],
+    *,
+    materialize_storage: bool,
+) -> ExactCallTreePayload:
+    """Compact one rollout independently of its prompt-group siblings."""
+    if not rollout_calls:
+        raise ValueError("NeMo-Gym produced no exact training calls for a rollout")
+
+    flattened_calls = [
+        _flatten_exact_call(call, call_index)
+        for call_index, call in enumerate(rollout_calls)
+    ]
+    generation_weight_versions = [
+        version
+        for call in flattened_calls
+        for version in (
+            call.generation_weight_version,
+            call.generation_weight_version_end,
+        )
+        if version is not None
+    ]
+    input_token_count = sum(call.length for call in flattened_calls)
+    baseline_attention_pairs = sum(
+        call.length * (call.length + 1) // 2 for call in flattened_calls
+    )
+    page_forks, page_shared_tokens, replicas = _exact_call_trie_diagnostics(
+        flattened_calls
+    )
+    tree = _build_exact_call_tree(rollout_calls)
+    edge_message_log = tree.edge_message_log
+    unique_message_log = tree.unique_message_log
+    if materialize_storage:
+        edge_message_log = _clone_message_log_tensors(edge_message_log)
+        unique_message_log = _clone_message_log_tensors(unique_message_log)
+
+    return ExactCallTreePayload(
+        edge_message_log=edge_message_log,
+        unique_message_log=unique_message_log,
+        layout=tree.layout,
+        diagnostics=ExactCallTreeDiagnostics(
+            input_call_count=len(rollout_calls),
+            input_token_count=input_token_count,
+            page_fork_count=page_forks,
+            page_shared_token_count=page_shared_tokens,
+            cross_replica_rollout=int(len(replicas) > 1),
+            replica_count=len(replicas),
+            baseline_attention_pairs=baseline_attention_pairs,
+            max_call_token_count=max(call.length for call in flattened_calls),
+            max_call_generation_tokens=max(
+                sum(span.end - span.start for span in call.generated_spans)
+                for call in flattened_calls
+            ),
+            min_generation_weight_version=(
+                min(generation_weight_versions) if generation_weight_versions else None
+            ),
+            max_generation_weight_version=(
+                max(generation_weight_versions) if generation_weight_versions else None
+            ),
+        ),
+    )
+
+
+def _apply_exact_nemo_gym_call_trees(
+    repeated_batch: BatchedDataDict,
+    trees: list[ExactCallTreePayload],
+) -> None:
+    """Install precompacted rollout trees and emit aggregate diagnostics."""
+    if not trees:
+        raise ValueError("NeMo-Gym produced no exact-call trees")
+
+    edge_message_logs = [tree.edge_message_log for tree in trees]
+    unique_message_logs = [tree.unique_message_log for tree in trees]
+    tree_layouts = [tree.layout for tree in trees]
+    diagnostics = [tree.diagnostics for tree in trees]
+
+    repeated_batch["message_log"] = edge_message_logs
+    repeated_batch[TREE_ATTENTION_UNIQUE_MESSAGE_LOGS] = unique_message_logs
+    repeated_batch[TREE_ATTENTION_LAYOUTS] = tree_layouts
+    repeated_batch.pop(PACKED_ATTENTION_SEGMENT_LENGTHS, None)
+    output_segment_count = sum(len(layout.segment_lengths) for layout in tree_layouts)
+    output_token_count = sum(layout.unique_token_count for layout in tree_layouts)
+    tree_attention_pairs = sum(layout.valid_attention_pairs for layout in tree_layouts)
+    input_call_count = sum(item.input_call_count for item in diagnostics)
+    input_token_count = sum(item.input_token_count for item in diagnostics)
+    baseline_attention_pairs = sum(
+        item.baseline_attention_pairs for item in diagnostics
+    )
+    print(
+        "NeMo-Gym exact-call trie: "
+        f"calls={input_call_count}, segments={output_segment_count}, "
+        f"tokens_before={input_token_count}, tokens_after={output_token_count}, "
+        f"token_reduction={1 - output_token_count / input_token_count:.4f}, "
+        f"attention_pair_reduction="
+        f"{1 - tree_attention_pairs / baseline_attention_pairs:.4f}, "
+        f"page_forks={sum(item.page_fork_count for item in diagnostics)}, "
+        f"page_shared_tokens="
+        f"{sum(item.page_shared_token_count for item in diagnostics)}, "
+        f"cross_replica_rollouts="
+        f"{sum(item.cross_replica_rollout for item in diagnostics)}, "
+        f"max_replicas_per_rollout="
+        f"{max(item.replica_count for item in diagnostics)}",
+        flush=True,
+    )
 
 
 def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int:
@@ -2707,6 +2970,8 @@ def compute_and_apply_seq_logprob_error_masking(
     train_data: BatchedDataDict,
     rewards: torch.Tensor,
     seq_logprob_error_threshold: Optional[float],
+    *,
+    include_per_sequence_errors: bool = False,
 ) -> dict:
     """Compute sequence-level logprob error metrics and optionally mask high-error sequences.
 
@@ -2821,7 +3086,7 @@ def compute_and_apply_seq_logprob_error_masking(
                 flush=True,
             )
 
-    return {
+    result = {
         "max_seq_mult_prob_error": max_seq_mult_prob_error,
         "mean_seq_mult_prob_error": mean_seq_mult_prob_error,
         "min_seq_mult_prob_error": min_seq_mult_prob_error,
@@ -2831,6 +3096,93 @@ def compute_and_apply_seq_logprob_error_masking(
         "num_masked_seqs": num_masked_seqs,
         "masked_correct_pct": masked_correct_pct,
     }
+    if include_per_sequence_errors:
+        result["_per_sequence_mult_prob_error"] = seq_mult_prob_error.detach().cpu()
+    return result
+
+
+def _logprob_sample_metadata(
+    repeated_batch: BatchedDataDict, num_generations_per_prompt: int
+) -> list[dict[str, Any]]:
+    """Build stable identifiers for correlating logprob records with Gym jobs."""
+    task_names = repeated_batch.get("task_name")
+    extra_env_info = repeated_batch.get("extra_env_info")
+    metadata = []
+    for sample_index in range(repeated_batch.size):
+        sample = {
+            "prompt_group_index": sample_index // num_generations_per_prompt,
+            "rollout_index_within_group": sample_index % num_generations_per_prompt,
+        }
+        if isinstance(task_names, list) and sample_index < len(task_names):
+            sample["task_name"] = task_names[sample_index]
+        if isinstance(extra_env_info, list) and sample_index < len(extra_env_info):
+            info = extra_env_info[sample_index]
+            if isinstance(info, dict):
+                for key in (
+                    NEMO_GYM_TASK_INDEX_KEY,
+                    NEMO_GYM_ROLLOUT_INDEX_KEY,
+                ):
+                    if info.get(key) is not None:
+                        sample[key] = info[key]
+        metadata.append(sample)
+    return metadata
+
+
+def _maybe_log_token_logprob_diagnostics(
+    *,
+    logger: Logger,
+    tokenizer: TokenizerType,
+    train_data: BatchedDataDict,
+    repeated_batch: BatchedDataDict,
+    original_sample_mask: torch.Tensor,
+    per_sequence_mult_prob_error: Optional[torch.Tensor],
+    config: TokenLogprobDiagnosticsConfig,
+    step: int,
+    num_generations_per_prompt: int,
+) -> None:
+    if not config.enabled or per_sequence_mult_prob_error is None:
+        return
+
+    diagnostic_input_ids = train_data["input_ids"]
+    diagnostic_input_lengths = train_data["input_lengths"]
+    if TREE_ATTENTION_LAYOUTS in train_data:
+        # Tree logits are aligned to sampled edges, not to physical DFS nodes.
+        # Preserve the logger's conventional one-token shift while ensuring
+        # every reported token ID is the target whose logprob was compared.
+        edge_targets = train_data[TREE_ATTENTION_EDGE_TARGET_IDS]
+        diagnostic_input_ids = torch.cat(
+            [edge_targets.new_zeros((edge_targets.shape[0], 1)), edge_targets], dim=1
+        )
+        diagnostic_input_lengths = train_data[TREE_ATTENTION_EDGE_LENGTHS] + 1
+
+    diagnostic_data = {
+        "input_ids": diagnostic_input_ids,
+        "input_lengths": diagnostic_input_lengths,
+        "generation_logprobs": train_data["generation_logprobs"],
+        "prev_logprobs": train_data["prev_logprobs"],
+        "token_mask": train_data["token_mask"],
+        "sample_mask": original_sample_mask,
+    }
+    if PACKED_ATTENTION_SEGMENT_LENGTHS in train_data:
+        diagnostic_data["attention_segment_lengths"] = train_data[
+            PACKED_ATTENTION_SEGMENT_LENGTHS
+        ]
+    logger.log_token_logprob_diagnostics(
+        diagnostic_data,
+        tokenizer,
+        step,
+        per_sequence_mult_prob_error=per_sequence_mult_prob_error,
+        sample_metadata=_logprob_sample_metadata(
+            repeated_batch, num_generations_per_prompt
+        ),
+        max_sequences=config.max_sequences,
+        top_k_tokens_per_sequence=config.top_k_tokens_per_sequence,
+        min_abs_logprob_diff=config.min_abs_logprob_diff,
+        min_sequence_mult_prob_error=config.min_sequence_mult_prob_error,
+        context_tokens=config.context_tokens,
+        relative_position_bins=config.relative_position_bins,
+        top_token_ids_by_total_abs_diff=config.top_token_ids_by_total_abs_diff,
+    )
 
 
 # ===============================================================================
@@ -3162,6 +3514,7 @@ def _grpo_train_impl(
                             "stop_strings": None,
                         }
                         nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
+                            allow_independent_calls=True,
                             policy_generation=policy_generation,
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,
@@ -3365,6 +3718,7 @@ def _grpo_train_impl(
                         tracer=_tracer,
                     ),
                 ):
+                    _use_exact_nemo_gym_call_sequences(repeated_batch)
                     use_overlong_filtering = master_config.grpo.overlong_filtering
                     if use_overlong_filtering:
                         loss_multiplier = repeated_batch["loss_multiplier"].clone()
@@ -3392,19 +3746,27 @@ def _grpo_train_impl(
                         ],
                     )
 
+                    model_flat_messages, model_input_lengths = (
+                        _flatten_tree_model_inputs(
+                            repeated_batch,
+                            flat_messages,
+                            input_lengths,
+                            pad_token_id=tokenizer.pad_token_id,
+                            make_sequence_length_divisible_by=master_config.policy[
+                                "make_sequence_length_divisible_by"
+                            ],
+                        )
+                    )
+
                     # Create training data from flattened messages
                     # Note: advantages will be computed and added after logprobs are available
-                    train_data = BatchedDataDict[ClippedPGLossDataDict](
-                        {
-                            "input_ids": flat_messages["token_ids"],
-                            "input_lengths": input_lengths,
-                            "generation_logprobs": flat_messages["generation_logprobs"],
-                            "token_mask": flat_messages["token_loss_mask"],
-                            "sample_mask": repeated_batch["loss_multiplier"],
-                        }
+                    train_data = _build_async_grpo_train_data(
+                        flat_messages,
+                        model_input_lengths,
+                        repeated_batch,
+                        master_config.policy,
+                        model_flat_messages=model_flat_messages,
                     )
-                    # this will be mini-batched inside the policy, so maintain the packed multimodal structure
-                    # This is also used to populate part of the downstream logprob calculation data
                     extra_multimodal_data = flat_messages.get_multimodal_dict(
                         as_tensors=False,
                         pixel_dtype=_policy_dtype(master_config.policy),
@@ -3416,16 +3778,6 @@ def _grpo_train_impl(
                             "rollout_to_policy",
                             enabled=master_config.grpo.debug_payload_metrics,
                         )
-                    )
-                    # Router replay (R3) on the legacy data_plane.enabled=false
-                    # driver path: routed_experts already rides flat_messages
-                    # (attached to message_log during rollout, then batched into
-                    # a [B, S, L, K] tensor by batched_message_log_to_flat_message),
-                    # but the train_data whitelist above drops it. Copy it back so
-                    # the Megatron worker's train-stage router-replay guard finds
-                    # it. Mirrors the TQ producer (sync_rollout_actor.py).
-                    _preserve_router_replay_routed_experts(
-                        train_data, flat_messages, master_config.policy
                     )
                     train_data.to("cpu")
 
@@ -3458,8 +3810,8 @@ def _grpo_train_impl(
                         {
                             "input_ids": train_data["input_ids"],
                             "input_lengths": train_data["input_lengths"],
-                            "token_mask": flat_messages["token_loss_mask"],
-                            "sample_mask": repeated_batch["loss_multiplier"],
+                            "token_mask": train_data["token_mask"],
+                            "sample_mask": train_data["sample_mask"],
                             **extra_multimodal_data,
                         }
                     )
@@ -3470,9 +3822,15 @@ def _grpo_train_impl(
                     # intentionally ignores routed_experts (require_router_replay
                     # =False short-circuits before the field is read), so a
                     # present-but-unused field here is safe.
-                    _preserve_router_replay_routed_experts(
-                        logprob_data, flat_messages, master_config.policy
-                    )
+                    for key in (
+                        "routed_experts",
+                        TREE_ATTENTION_LAYOUTS,
+                        TREE_ATTENTION_EDGE_SOURCE_INDICES,
+                        TREE_ATTENTION_EDGE_TARGET_IDS,
+                        TREE_ATTENTION_EDGE_LENGTHS,
+                    ):
+                        if key in train_data:
+                            logprob_data[key] = train_data[key]
 
                     if not skip_prev_logprobs:
                         train_data["prev_logprobs"] = policy.get_logprobs(
@@ -3507,6 +3865,10 @@ def _grpo_train_impl(
                     del extra_multimodal_data
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
+                token_logprob_diagnostics_config = (
+                    _resolve_token_logprob_diagnostics_config(master_config.logger)
+                )
+                pre_logprob_error_sample_mask = train_data["sample_mask"].clone()
                 if skip_prev_logprobs:
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
                     seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
@@ -3515,6 +3877,21 @@ def _grpo_train_impl(
                         train_data=train_data,
                         rewards=rewards,
                         seq_logprob_error_threshold=seq_logprob_error_threshold,
+                        include_per_sequence_errors=token_logprob_diagnostics_config.enabled,
+                    )
+                    per_sequence_mult_prob_error = seq_error_result.pop(
+                        "_per_sequence_mult_prob_error", None
+                    )
+                    _maybe_log_token_logprob_diagnostics(
+                        logger=logger,
+                        tokenizer=tokenizer,
+                        train_data=train_data,
+                        repeated_batch=repeated_batch,
+                        original_sample_mask=pre_logprob_error_sample_mask,
+                        per_sequence_mult_prob_error=per_sequence_mult_prob_error,
+                        config=token_logprob_diagnostics_config,
+                        step=total_steps + 1,
+                        num_generations_per_prompt=master_config.grpo.num_generations_per_prompt,
                     )
                     seq_logprob_error_metrics = seq_error_result
                     if "num_masked_seqs" in seq_logprob_error_metrics:
@@ -3927,7 +4304,7 @@ def _grpo_train_impl(
                         "generation_logprobs": train_data["generation_logprobs"],
                         "prev_logprobs": train_data["prev_logprobs"],
                         "token_mask": train_data["token_mask"],
-                        "sample_mask": train_data["sample_mask"],
+                        "sample_mask": pre_logprob_error_sample_mask,
                     },
                     total_steps + 1,
                     name="train/token_mult_prob_error_plot_sample",
@@ -4183,6 +4560,7 @@ def validate(
                     top_k=generation_config["val_top_k"],
                 )
                 nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
+                    allow_independent_calls=True,
                     policy_generation=policy_generation,
                     input_batch=val_batch,
                     tokenizer=tokenizer,
@@ -5193,6 +5571,7 @@ def async_grpo_train(
                         tracer=_tracer,
                     ),
                 ):
+                    _use_exact_nemo_gym_call_sequences(repeated_batch)
                     # Apply overlong filtering - mask out truncated sequences from loss computation
                     with timer.time("overlong_filter"):
                         use_overlong_filtering = master_config.grpo.overlong_filtering
@@ -5227,12 +5606,25 @@ def async_grpo_train(
                         ],
                     )
 
+                    model_flat_messages, model_input_lengths = (
+                        _flatten_tree_model_inputs(
+                            repeated_batch,
+                            flat_messages,
+                            input_lengths,
+                            pad_token_id=tokenizer.pad_token_id,
+                            make_sequence_length_divisible_by=master_config.policy[
+                                "make_sequence_length_divisible_by"
+                            ],
+                        )
+                    )
+
                     # Create training data. Advantages are added after logprobs.
                     train_data = _build_async_grpo_train_data(
                         flat_messages,
-                        input_lengths,
+                        model_input_lengths,
                         repeated_batch,
                         master_config.policy,
+                        model_flat_messages=model_flat_messages,
                     )
                     print_multimodal_payload_metrics(
                         collect_multimodal_payload_metrics(
@@ -5299,6 +5691,10 @@ def async_grpo_train(
                         )
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
+                token_logprob_diagnostics_config = (
+                    _resolve_token_logprob_diagnostics_config(master_config.logger)
+                )
+                pre_logprob_error_sample_mask = train_data["sample_mask"].clone()
                 if skip_prev_logprobs:
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
                     seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
@@ -5307,6 +5703,21 @@ def async_grpo_train(
                         train_data=train_data,
                         rewards=rewards,
                         seq_logprob_error_threshold=seq_logprob_error_threshold,
+                        include_per_sequence_errors=token_logprob_diagnostics_config.enabled,
+                    )
+                    per_sequence_mult_prob_error = seq_error_result.pop(
+                        "_per_sequence_mult_prob_error", None
+                    )
+                    _maybe_log_token_logprob_diagnostics(
+                        logger=logger,
+                        tokenizer=tokenizer,
+                        train_data=train_data,
+                        repeated_batch=repeated_batch,
+                        original_sample_mask=pre_logprob_error_sample_mask,
+                        per_sequence_mult_prob_error=per_sequence_mult_prob_error,
+                        config=token_logprob_diagnostics_config,
+                        step=step + 1,
+                        num_generations_per_prompt=master_config.grpo.num_generations_per_prompt,
                     )
                     seq_logprob_error_metrics = seq_error_result
                     if "num_masked_seqs" in seq_logprob_error_metrics:
@@ -5316,6 +5727,11 @@ def async_grpo_train(
 
                 # Pad teacher logprobs to match train_data sequence length.
                 if trajectory_teacher_logprobs is not None:
+                    if TREE_ATTENTION_LAYOUTS in train_data:
+                        raise NotImplementedError(
+                            "OPD teacher logprobs are linear-sequence aligned and "
+                            "cannot supervise sampled tree edges"
+                        )
                     trajectory_teacher_logprobs = _pad_teacher_logprobs(
                         trajectory_teacher_logprobs, train_data["input_ids"].shape[1]
                     )

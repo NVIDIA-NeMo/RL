@@ -25,9 +25,16 @@ mixin subclass that fakes ``_is_replica_leader``.
 from __future__ import annotations
 
 import torch
+from tensordict import TensorDict
 
+from nemo_rl.data.packed_rollouts import TREE_ATTENTION_LAYOUTS, TreeAttentionLayout
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+from nemo_rl.data_plane.schema import (
+    ELEM_COUNTS_PER_GB,
+    MICRO_BATCH_INDICES,
+    MICRO_BATCH_LENGTHS,
+)
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -127,3 +134,75 @@ def test_writeback_single_worker_default_is_leader():
         select_fields=["prev_logprobs"],
     )
     assert torch.allclose(fetched["prev_logprobs"], torch.full((1, 4), 7.5))
+
+
+def test_tree_microbatches_fetch_jagged_rows_by_bin():
+    """Tree streaming must not fancy-index TQ's nested tensor leaves."""
+
+    class _RecordingClient(NoOpDataPlaneClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fetches: list[list[str]] = []
+
+        def get_samples(
+            self,
+            sample_ids: list[str],
+            partition_id: str,
+            select_fields: list[str],
+        ) -> TensorDict:
+            self.fetches.append(list(sample_ids))
+            return super().get_samples(sample_ids, partition_id, select_fields)
+
+    class _TreeWorker(TQWorkerMixin):
+        def __init__(self, client: NoOpDataPlaneClient) -> None:
+            self._dp_client = client
+
+    client = _RecordingClient()
+    client.register_partition(
+        partition_id="train",
+        fields=["input_ids", "input_lengths"],
+        num_samples=3,
+        consumer_tasks=["prev_lp"],
+    )
+    client.put_samples(
+        sample_ids=["s0", "s1", "s2"],
+        partition_id="train",
+        fields=TensorDict(
+            {
+                "input_ids": torch.nested.nested_tensor(
+                    [torch.arange(3), torch.arange(2), torch.arange(4)],
+                    layout=torch.jagged,
+                ),
+                "input_lengths": torch.tensor([3, 2, 4]),
+            },
+            batch_size=(3,),
+        ),
+    )
+    layouts = [
+        TreeAttentionLayout(
+            segment_lengths=(length,),
+            segment_parents=(-1,),
+            segment_depths=(0,),
+            edge_source_indices=(),
+            original_token_count=length,
+        )
+        for length in (3, 2, 4)
+    ]
+    meta = KVBatchMeta(
+        partition_id="train",
+        task_name="prev_lp",
+        sample_ids=["s0", "s1", "s2"],
+        fields=["input_ids", "input_lengths"],
+        sequence_lengths=[3, 2, 4],
+        extra_info={
+            TREE_ATTENTION_LAYOUTS: layouts,
+            MICRO_BATCH_INDICES: [[[0, 2], [2, 3]]],
+            MICRO_BATCH_LENGTHS: [[5, 4]],
+            ELEM_COUNTS_PER_GB: [3],
+        },
+    )
+
+    batches = list(_TreeWorker(client)._iter_fetch_presharded_microbatches(meta))
+
+    assert client.fetches == [["s0", "s1"], ["s2"]]
+    assert [data["input_ids"].shape for data, _ in batches] == [(2, 3), (1, 4)]

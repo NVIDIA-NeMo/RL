@@ -41,6 +41,8 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
+    NemoGymRolloutFailure,
+    _token_capture_metrics,
     build_reward_component_columns,
     extract_reward_components,
     setup_nemo_gym_config,
@@ -77,6 +79,22 @@ from tests.unit.models.generation.test_vllm_generation import (
 )
 
 
+class _NoCaptureCollectionHelper:
+    def setup_server_client(self, head_server_config):
+        return SimpleNamespace(global_config_dict={})
+
+
+class _CaptureDisabledActor:
+    _token_capture_enabled = False
+    _tokenizer = object()
+    _rollout_id_base = "test"
+    _rollout_seq = 0
+    _capture_reader = None
+
+    def _require_spinup(self):
+        pass
+
+
 def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
     capsys,
 ) -> None:
@@ -90,8 +108,10 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
             for index in range(11)
         ]
 
-        class _RolloutCollectionHelper:
-            def run_examples(self, examples, head_server_config):
+        class _RolloutCollectionHelper(_NoCaptureCollectionHelper):
+            def run_examples(
+                self, examples, head_server_config, *, route_failures_to_sidecar
+            ):
                 del head_server_config
                 for row in examples:
                     row["agent_ref"] = {"name": "resolved_agent"}
@@ -101,7 +121,7 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
 
                 return [_completed_result(row) for row in examples]
 
-        class _MockSelf:
+        class _MockSelf(_CaptureDisabledActor):
             cfg = {}
             rch = _RolloutCollectionHelper()
             head_server_config = object()
@@ -1020,6 +1040,52 @@ def test_extract_reward_components():
     assert all(isinstance(v, float) for v in components.values())
 
 
+def test_run_rollouts_streams_structured_gym_failure_without_postprocessing():
+    row = {
+        "agent_ref": {"name": "agent"},
+        "responses_create_params": {"input": []},
+        "_rowidx": 0,
+    }
+    failure_result = {
+        "_ng_failure_class": "harbor_failed",
+        "error": "sandbox upload failed",
+        "reward": 0.0,
+    }
+
+    class _RolloutCollection(_NoCaptureCollectionHelper):
+        def run_examples(
+            self, examples, head_server_config, *, route_failures_to_sidecar
+        ):
+            assert examples == [row]
+            assert head_server_config is None
+
+            async def _result():
+                return row, failure_result
+
+            return [_result()]
+
+    class _Actor(_CaptureDisabledActor):
+        cfg = {"initial_global_config_dict": {}}
+        head_server_config = None
+        rch = _RolloutCollection()
+
+    async def _collect():
+        method = NemoGym.__ray_metadata__.modified_class.run_rollouts
+        return [result async for result in method(_Actor(), [row], "timing/rollout")]
+
+    outputs = asyncio.run(_collect())
+
+    assert len(outputs) == 1
+    row_index, agent_ref, result, timing_metrics = outputs[0]
+    assert row_index == 0
+    assert agent_ref == row["agent_ref"]
+    assert isinstance(result, NemoGymRolloutFailure)
+    assert result.failure_class == "harbor_failed"
+    assert result.error == "sandbox upload failed"
+    assert result.full_result == failure_result
+    assert timing_metrics is not None
+
+
 def test_build_reward_component_columns():
     """The bridge emission helper: reward/<name> keys, 0.0-fill, deterministic order.
 
@@ -1286,6 +1352,15 @@ def test_nemo_gym_postprocess_uses_batch_decode():
     assert result["message_log"][1]["token_ids"].tolist() == [3]
     assert result["message_log"][2]["token_ids"].tolist() == [4, 5]
     assert result["message_log"][3]["token_ids"].tolist() == [6, 7]
+    assert len(result["training_message_logs"]) == 2
+    assert result["training_message_logs"][0][0]["token_ids"].tolist() == [1, 2]
+    assert result["training_message_logs"][1][0]["token_ids"].tolist() == [
+        1,
+        2,
+        3,
+        4,
+        5,
+    ]
     assert nemo_gym_result["response"]["output"][0]["prompt_str"] == "1 2"
     assert nemo_gym_result["response"]["output"][0]["generation_str"] == "3"
     assert nemo_gym_result["response"]["output"][1]["prompt_str"] == "1 2 3 4 5"
@@ -1611,8 +1686,10 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
         tokenizer = object()
         postprocess_calls = []
 
-        class _RolloutCollectionHelper:
-            def run_examples(self, examples, head_server_config):
+        class _RolloutCollectionHelper(_NoCaptureCollectionHelper):
+            def run_examples(
+                self, examples, head_server_config, *, route_failures_to_sidecar
+            ):
                 del head_server_config
                 content = examples[0]["responses_create_params"]["input"][0]["content"]
                 assert content[0]["video_url"].startswith("data:video/mp4;base64,")
@@ -1623,7 +1700,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
 
                 return [_completed_result()]
 
-        class _MockSelf:
+        class _MockSelf(_CaptureDisabledActor):
             cfg = {}
             rch = _RolloutCollectionHelper()
             head_server_config = object()
@@ -1704,8 +1781,10 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
             def batch_decode(self, batches):
                 return [" ".join(map(str, token_ids)) for token_ids in batches]
 
-        class _RolloutCollectionHelper:
-            def run_examples(self, examples, head_server_config):
+        class _RolloutCollectionHelper(_NoCaptureCollectionHelper):
+            def run_examples(
+                self, examples, head_server_config, *, route_failures_to_sidecar
+            ):
                 assert head_server_config.backend == "megatron"
                 dispatched_row = examples[0]
                 dispatched_part = dispatched_row["responses_create_params"]["input"][0][
@@ -1740,7 +1819,7 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
 
                 return [_completed_result()]
 
-        class _MockSelf:
+        class _MockSelf(_CaptureDisabledActor):
             cfg = {}
             rch = _RolloutCollectionHelper()
             head_server_config = SimpleNamespace(backend="megatron")
@@ -1995,3 +2074,85 @@ def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
             f"expected null top_logprobs accepted-with-None or rejected as 4xx, "
             f"got {null_resp.status_code}: {null_resp.text}"
         )
+
+
+class TestTokenCaptureMetrics:
+    """The numbers that make silent training loss visible.
+
+    The failure they exist to catch is a rollout that looks healthy -- green
+    run, moving reward -- while most of its calls were quarantined because the
+    chat template dropped earlier reasoning and the prompts stopped chaining.
+    """
+
+    def test_summarizes_a_healthy_batch(self):
+        per_rollout = [
+            {
+                "delivered_fraction": 1.0,
+                "quarantined_fraction": 0.0,
+                "n_calls": 4,
+                "chains": 1,
+            },
+            {
+                "delivered_fraction": 1.0,
+                "quarantined_fraction": 0.0,
+                "n_calls": 6,
+                "chains": 1,
+            },
+        ]
+        got = _token_capture_metrics(per_rollout, rebuilt=2, unbuilt=0)
+        assert got["token_capture/rebuilt_fraction"] == 1.0
+        assert got["token_capture/delivered_fraction_mean"] == 1.0
+        assert got["token_capture/calls_per_rollout_mean"] == 5.0
+        assert got["token_capture/retokenized_boundaries"] == 0.0
+        assert got["token_capture/retokenized_tokens_masked"] == 0.0
+        assert got["token_capture/masked_rollouts"] == 0.0
+
+    def test_surfaces_partial_delivery(self):
+        """A reasoning model whose history is stripped: the chain breaks, most of
+        the rollout is quarantined, and the run would otherwise look fine."""
+        per_rollout = [
+            {
+                "delivered_fraction": 0.2,
+                "quarantined_fraction": 0.75,
+                "n_calls": 8,
+                "chains": 4,
+            },
+            {
+                "delivered_fraction": 0.25,
+                "quarantined_fraction": 0.7,
+                "n_calls": 8,
+                "chains": 3,
+            },
+        ]
+        got = _token_capture_metrics(per_rollout, rebuilt=2, unbuilt=0)
+        assert got["token_capture/delivered_fraction_mean"] < 0.3
+        assert got["token_capture/quarantined_fraction_mean"] > 0.7
+        assert got["token_capture/chains_per_rollout_mean"] == 3.5
+
+    def test_counts_masked_incomplete_and_unbuilt(self):
+        per_rollout = [
+            {
+                "capture_incomplete": True,
+                "empty_generation_calls": 1,
+                "parent_link_fallbacks": {"parent_digest_mismatch": 2},
+            },
+            {
+                "empty_generation_calls": 2,
+                "parent_link_fallbacks": {},
+                "rejected_without_generation_calls": 3,
+            },
+        ]
+        # The mask verdict is counted from the build, not read out of the metrics dict, because
+        # Gym now puts it at the top of the rollout record and leaves only reasons in the dict.
+        got = _token_capture_metrics(per_rollout, rebuilt=1, unbuilt=1, masked=1)
+        assert got["token_capture/masked_rollouts"] == 1.0
+        assert got["token_capture/incomplete_rollouts"] == 1.0
+        assert got["token_capture/empty_generation_calls"] == 3.0
+        assert got["token_capture/rejected_without_generation_calls"] == 3.0
+        # Fallback reasons are counted per reason, then summed across the batch.
+        assert got["token_capture/parent_link_fallbacks"] == 2.0
+        assert got["token_capture/rollouts_unbuilt"] == 1.0
+        assert got["token_capture/rebuilt_fraction"] == 0.5
+
+    def test_emits_nothing_when_capture_is_off(self):
+        assert _token_capture_metrics([], rebuilt=0, unbuilt=0) == {}

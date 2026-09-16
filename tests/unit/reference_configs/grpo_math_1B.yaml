@@ -240,6 +240,8 @@ policy:
     mtp_num_layers: 0
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
     mtp_loss_scaling_factor: 0.0
+    # Retain MTP checkpoint parameters but skip and freeze the MTP training loss path.
+    disable_mtp_loss: false
     # When true, repeat one MTP layer mtp_num_layers times instead of using distinct layers.
     mtp_use_repeated_layer: false
     # When true, detach MTP heads so MTP loss does not affect main-model gradients.

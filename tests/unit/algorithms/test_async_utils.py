@@ -56,6 +56,7 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
+from nemo_rl.environments.nemo_gym_capture import CaptureSnapshotRef
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
@@ -1311,6 +1312,25 @@ class TestReplayBuffer:
 
 class TestAsyncTrajectoryCollector:
     """Test cases for AsyncTrajectoryCollector."""
+
+    def test_observed_generation_version_uses_all_exact_calls(self):
+        batch = BatchedDataDict(
+            {
+                "training_message_logs": [
+                    [
+                        [{"ng_generation_weight_version": 3}],
+                        [{"ng_generation_weight_version": 4}],
+                    ],
+                    [[{"ng_generation_weight_version": 2}]],
+                ]
+            }
+        )
+
+        assert trajectory_collector_mod._observed_generation_weight_versions(batch) == [
+            3,
+            4,
+            2,
+        ]
 
     def create_local_collector(
         self,
@@ -2920,16 +2940,6 @@ class TestAsyncTrajectoryCollector:
             def __init__(self):
                 self.get_trajectories_needed = RemoteMethod(1)
 
-        class FakeBatch:
-            size = 1
-
-            def slice(self, start, end):
-                return self
-
-            def repeat_interleave(self, repeats, *, share_immutable_media=False):
-                assert not share_immutable_media
-                return self
-
         class FailingThread:
             def __init__(self, *args, **kwargs):
                 pass
@@ -2956,9 +2966,118 @@ class TestAsyncTrajectoryCollector:
             FailingThread,
         )
 
-        collector._process_batch(FakeBatch())
+        collector._process_batch(self.create_mock_batch(size=1))
 
         assert target_weight not in collector._generating_targets
+
+        assert collector._next_dispatch_sequence == 1
+        assert not collector._finished_dispatch_sequences
+
+    @pytest.mark.parametrize("use_nemo_gym", [False, True])
+    def test_batch_dispatch_is_fifo_without_serializing_completion(
+        self, monkeypatch, use_nemo_gym
+    ):
+        collector = self.create_local_collector()
+        collector.running = True
+        collector.replay_buffer.get_trajectories_needed.remote.return_value = 3
+        targets = iter(range(3))
+
+        def reserve_target(version):
+            target = next(targets)
+            collector._generating_targets.add(target)
+            return target
+
+        real_thread = threading.Thread
+        queued = []
+
+        class DeferredThread:
+            def __init__(self, *, target, daemon, name):
+                self.target = target
+
+            def start(self):
+                queued.append(self.target)
+
+            def is_alive(self):
+                return True
+
+        submitted = []
+        all_submitted = threading.Event()
+        allow_completion = threading.Event()
+
+        async def collect(**kwargs):
+            assert kwargs["use_nemo_gym"] is use_nemo_gym
+            submitted.append(kwargs["target_weight_version"])
+            kwargs["on_dispatched"]()
+            # A duplicate notification must not advance the next ticket twice.
+            kwargs["on_dispatched"]()
+            if len(submitted) == 3:
+                all_submitted.set()
+            assert allow_completion.wait(timeout=10)
+
+        monkeypatch.setattr(
+            collector, "_get_next_target_for_generation", reserve_target
+        )
+        monkeypatch.setattr(collector, "_collect_rollout_batch", collect)
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        monkeypatch.setattr(
+            trajectory_collector_mod, "should_use_nemo_gym", lambda config: use_nemo_gym
+        )
+        monkeypatch.setattr(
+            trajectory_collector_mod._threading, "Thread", DeferredThread
+        )
+
+        for _ in range(3):
+            batch = self.create_mock_batch(size=1)
+            collector._stamp_task_indices(batch)
+            assert collector._process_batch(batch) is None
+
+        workers = [real_thread(target=callback) for callback in reversed(queued)]
+        try:
+            for worker in workers:
+                worker.start()
+            assert all_submitted.wait(timeout=10)
+            assert submitted == [0, 1, 2]
+            assert all(worker.is_alive() for worker in workers)
+            assert collector._next_dispatch_sequence == 3
+        finally:
+            allow_completion.set()
+            for worker in workers:
+                worker.join(timeout=10)
+        assert not any(worker.is_alive() for worker in workers)
+        assert not collector._generating_targets
+        assert not collector._finished_dispatch_sequences
+
+    @pytest.mark.parametrize("cancelled", [False, True])
+    def test_failed_dispatch_releases_following_tickets(self, monkeypatch, cancelled):
+        collector = self.create_local_collector()
+        collector.running = True
+        collector._generating_targets.add(0)
+        collector._finish_dispatch_sequence(1)
+        assert collector._next_dispatch_sequence == 0
+
+        async def fail_before_dispatch(**kwargs):
+            if cancelled:
+                raise asyncio.CancelledError
+            raise RuntimeError("submission failed")
+
+        monkeypatch.setattr(collector, "_collect_rollout_batch", fail_before_dispatch)
+        worker = collector._run_rollout_batch_worker(
+            repeated_batch=None,
+            generation_weight_version=0,
+            target_weight_version=0,
+            num_generations=1,
+            use_nemo_gym=True,
+            dispatch_sequence=0,
+        )
+        if cancelled:
+            with pytest.raises(asyncio.CancelledError):
+                asyncio.run(worker)
+        else:
+            asyncio.run(worker)
+
+        assert collector._next_dispatch_sequence == 2
+        assert not collector._finished_dispatch_sequences
+        assert not collector._generating_targets
 
     def test_process_batch_gap_fill_spawns_only_needed(self, monkeypatch):
         """Gap-fill sends only the needed prompt groups to one batch worker."""
@@ -3154,6 +3273,45 @@ class TestAsyncTrajectoryCollector:
         )
         assert collector.get_rollouts_state() == {"next_ng_task_index": 0}
         assert target_weight not in collector._generating_targets
+
+    @pytest.mark.parametrize("status", ["success", "unexpected"])
+    def test_capture_ack_waits_for_legacy_buffer_acceptance(self, monkeypatch, status):
+        replay_buffer = mock.MagicMock()
+        replay_buffer.add.remote = mock.AsyncMock(side_effect=["full", status])
+        collector = self.create_local_collector(replay_buffer=replay_buffer)
+        collector.running = True
+        actor = object()
+        collector.task_to_env = {"nemo_gym": actor}
+        ref = CaptureSnapshotRef("rollout", "snapshot", 1)
+        result = trajectory_collector_mod.RolloutGroupResult(
+            group_index=0,
+            final_batch=BatchedDataDict({"value": torch.tensor([1])}),
+            rollout_metrics={},
+            token_capture_snapshots=(ref,),
+        )
+        buffered = set()
+
+        async def acknowledge(env, refs):
+            assert env is actor
+            assert refs == (ref,)
+            assert buffered == {0}
+            assert replay_buffer.add.remote.await_count == 2
+
+        ack = mock.AsyncMock(side_effect=acknowledge)
+        monkeypatch.setattr(trajectory_collector_mod, "acknowledge_gym_captures", ack)
+
+        async def enqueue():
+            await collector._enqueue_rollout_group(
+                result, 0, 0, 1, buffered, time.perf_counter()
+            )
+
+        if status == "success":
+            asyncio.run(enqueue())
+            ack.assert_awaited_once()
+        else:
+            with pytest.raises(RuntimeError, match="unexpected add status"):
+                asyncio.run(enqueue())
+            ack.assert_not_called()
 
     def test_native_batch_worker_enqueues_each_group(self, monkeypatch):
         """The common worker enqueues every native group without Gym metadata."""
@@ -3353,9 +3511,16 @@ class TestAsyncTrajectoryCollector:
                 low_string="{reasoning effort: efficient}",
             )
             rollout_calls += 1
-            yield _rollout_result(7)
+            task_indices = {
+                row["_ng_task_index"] for row in kwargs["input_batch"]["extra_env_info"]
+            }
             if rollout_calls == 1:
+                assert task_indices == {7, 8}
+                yield _rollout_result(7)
                 raise RuntimeError("transient stream failure")
+
+            assert task_indices == {8}
+            assert kwargs["input_batch"].size == 2
             yield _rollout_result(8)
 
         async def no_sleep(delay):

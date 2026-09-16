@@ -116,7 +116,9 @@ def main() -> None:
             )
             has_refit_draft_weights = bool(config.policy["draft"]["enabled"])
             megatron_cfg = config.policy.get("megatron_cfg") or {}
-            trains_mtp = bool(megatron_cfg.get("mtp_num_layers"))
+            trains_mtp = bool(megatron_cfg.get("mtp_num_layers")) and not bool(
+                megatron_cfg.get("disable_mtp_loss")
+            )
             config.policy["generation"] = configure_generation_config(
                 config.policy["generation"],
                 tokenizer,

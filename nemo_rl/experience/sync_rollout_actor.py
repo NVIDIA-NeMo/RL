@@ -47,11 +47,22 @@ from nemo_rl.data.multimodal_utils import (
     encode_multimodal_for_wire,
     multimodal_row_tags,
 )
-from nemo_rl.data_plane.column_io import kv_first_write
+from nemo_rl.data.packed_rollouts import (
+    TREE_ATTENTION_EDGE_LENGTHS,
+    TREE_ATTENTION_EDGE_SOURCE_INDICES,
+    TREE_ATTENTION_EDGE_TARGET_IDS,
+    TREE_ATTENTION_LAYOUTS,
+)
+from nemo_rl.data_plane.column_io import (
+    TOKEN_ALIGNED_FIELDS,
+    TREE_EDGE_ALIGNED_FIELDS,
+    kv_first_write,
+)
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym_capture import acknowledge_gym_captures_sync
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     get_nemo_gym_thinking_tags,
@@ -75,6 +86,7 @@ def _flatten_rollout_message_log_for_tq(
     message_logs: list[Any],
     prompt_lengths: torch.Tensor,
     *,
+    prompt_source_message_logs: Optional[list[Any]] = None,
     pad_token_id: int,
     make_sequence_length_divisible_by: int,
 ) -> tuple[BatchedDataDict[Any], torch.Tensor, BatchedDataDict[Any]]:
@@ -89,9 +101,10 @@ def _flatten_rollout_message_log_for_tq(
     pad = {"pad_value_dict": {"token_ids": pad_token_id}}
     # Must precede the prompt extraction: it reuses the same message dicts, so
     # backfilling here also covers the prompt flatten below.
-    backfill_missing_routed_experts(message_logs)
+    prompt_source_message_logs = prompt_source_message_logs or message_logs
+    backfill_missing_routed_experts(prompt_source_message_logs)
     prompt_message_logs = extract_initial_prompt_messages(
-        message_logs,
+        prompt_source_message_logs,
         prompt_lengths,
     )
     prompt_flat, _ = batched_message_log_to_flat_message(
@@ -99,6 +112,7 @@ def _flatten_rollout_message_log_for_tq(
         **pad,
     )
 
+    backfill_missing_routed_experts(message_logs)
     add_grpo_token_loss_masks_and_generation_logprobs(message_logs)
     flat, input_lengths = batched_message_log_to_flat_message(
         message_logs,
@@ -216,7 +230,10 @@ class SyncRolloutActor:
         """
         # Lazy imports keep rollout-specific dependencies off the actor startup path.
         # ``_policy_dtype`` sizes the VLM pixel tensors below.
-        from nemo_rl.algorithms.grpo import _policy_dtype
+        from nemo_rl.algorithms.grpo import (
+            _policy_dtype,
+            _use_exact_nemo_gym_call_sequences,
+        )
         from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
         from nemo_rl.data.llm_message_utils import (
             MESSAGE_LOG_BULK_FIELDS,
@@ -249,6 +266,7 @@ class SyncRolloutActor:
         )
 
         # Rollout dispatch (mirrors grpo_sync.py:294-349).
+        capture_refs = ()
         if should_use_nemo_gym(cfg):
             r = run_nemo_gym_rollout_sync(
                 **common,
@@ -269,8 +287,11 @@ class SyncRolloutActor:
                 thinking_tags=get_nemo_gym_thinking_tags(cfg.env),
                 deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
                 debug_payload_metrics=cfg.grpo.debug_payload_metrics,
+                defer_capture_ack=True,
+                allow_independent_calls=True,
             )
             final_batch, rollout_metrics = r.final_batch, r.rollout_metrics
+            capture_refs = r.token_capture_snapshots
         else:
             runner = (
                 run_async_multi_turn_rollout
@@ -289,19 +310,46 @@ class SyncRolloutActor:
         # Flatten message_log → bulk tensors + extract original prompt ids.
         # GRPO masks only generated assistant turns, even if the dataset
         # prompt itself contains assistant messages as conversation history.
+        message_logs_for_training = fb["message_log"]
+        exact_batch = None
+        if partition_id == "train" and "training_message_logs" in fb:
+            exact_batch = BatchedDataDict[Any](
+                {
+                    "message_log": list(fb["message_log"]),
+                    "training_message_logs": fb["training_message_logs"],
+                }
+            )
+            _use_exact_nemo_gym_call_sequences(exact_batch)
+            message_logs_for_training = exact_batch["message_log"]
         flat, input_lengths, prompt_flat = _flatten_rollout_message_log_for_tq(
-            fb["message_log"],
+            message_logs_for_training,
             fb["length"],
+            prompt_source_message_logs=fb["message_log"],
             pad_token_id=self.tokenizer.pad_token_id,
             make_sequence_length_divisible_by=cfg.policy[
                 "make_sequence_length_divisible_by"
             ],
         )
 
+        model_flat = flat
+        model_input_lengths = input_lengths
+        if exact_batch is not None and TREE_ATTENTION_LAYOUTS in exact_batch:
+            from nemo_rl.algorithms.grpo import _flatten_tree_model_inputs
+
+            model_flat, model_input_lengths = _flatten_tree_model_inputs(
+                exact_batch,
+                flat,
+                input_lengths,
+                pad_token_id=self.tokenizer.pad_token_id,
+                make_sequence_length_divisible_by=cfg.policy[
+                    "make_sequence_length_divisible_by"
+                ],
+            )
+
         router_replay_enabled = bool(
             (cfg.policy.get("router_replay") or {}).get("enabled", False)
         )
-        if router_replay_enabled and ROUTED_EXPERTS_FIELD not in flat:
+        if router_replay_enabled and ROUTED_EXPERTS_FIELD not in model_flat:
             raise RuntimeError(
                 "policy.router_replay.enabled=true requires routed_experts in "
                 "the rollout bulk payload, but rollout flattening did not "
@@ -312,15 +360,31 @@ class SyncRolloutActor:
         # TQ bulk payload — DP_TRAIN_FIELDS + multimodal extras.
         bulk_batch = BatchedDataDict[Any](
             {
-                "input_ids": flat["token_ids"],
-                "input_lengths": input_lengths,
+                "input_ids": model_flat["token_ids"],
+                "input_lengths": model_input_lengths,
                 "generation_logprobs": flat["generation_logprobs"],
                 "token_mask": flat["token_loss_mask"],
                 "sample_mask": fb["loss_multiplier"],
             }
         )
-        if ROUTED_EXPERTS_FIELD in flat:
-            bulk_batch[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
+        if ROUTED_EXPERTS_FIELD in model_flat:
+            bulk_batch[ROUTED_EXPERTS_FIELD] = model_flat[ROUTED_EXPERTS_FIELD]
+        if exact_batch is not None and TREE_ATTENTION_LAYOUTS in exact_batch:
+            from nemo_rl.algorithms.grpo import _build_async_grpo_train_data
+
+            tree_data = _build_async_grpo_train_data(
+                flat,
+                model_input_lengths,
+                exact_batch,
+                cfg.policy,
+                model_flat_messages=model_flat,
+            )
+            for key in (
+                TREE_ATTENTION_EDGE_SOURCE_INDICES,
+                TREE_ATTENTION_EDGE_TARGET_IDS,
+                TREE_ATTENTION_EDGE_LENGTHS,
+            ):
+                bulk_batch[key] = tree_data[key]
         # ``pixel_dtype`` mirrors the legacy analogs (``grpo._build_async_grpo_train_data``
         # and the sync train-data builders): cast pixels to the policy precision
         # once here, at the same point they'd be cast in-memory. No worker
@@ -352,7 +416,11 @@ class SyncRolloutActor:
         # decomposed fields above (per-row pickle of dict-with-tensors
         # would smuggle aliased views into the wire).
         for k, v in fb.items():
-            if isinstance(v, torch.Tensor) or k in bulk_batch or k == "message_log":
+            if (
+                isinstance(v, torch.Tensor)
+                or k in bulk_batch
+                or k in {"message_log", "training_message_logs"}
+            ):
                 continue
             bulk_batch[k] = (
                 v
@@ -367,7 +435,7 @@ class SyncRolloutActor:
         truncated = fb["truncated"]
         if not isinstance(truncated, torch.Tensor):
             truncated = torch.tensor(truncated, dtype=torch.bool)
-        length = fb.get("length", input_lengths)
+        length = fb.get("length", model_input_lengths)
         if not isinstance(length, torch.Tensor):
             length = torch.tensor(length)
         driver_carry = {
@@ -375,7 +443,7 @@ class SyncRolloutActor:
             "loss_multiplier": fb["loss_multiplier"],
             "truncated": truncated,
             "length": length,
-            "input_lengths": input_lengths,
+            "input_lengths": model_input_lengths,
             "prompt_ids_for_adv": prompt_flat["token_ids"],
             # Computed by decompose_message_log above; feeds
             # apply_reward_shaping on the driver without a TQ fetch.
@@ -414,12 +482,17 @@ class SyncRolloutActor:
         uids = [str(uuid.uuid4()) for _ in range(n_prompts)]
         sample_ids = [f"{uid}_g{i}" for uid in uids for i in range(n_per_prompt)]
         trace_rollout_payload(keys=sample_ids, data=bulk_batch)
+        extra_info = {"rollout_metrics": rollout_metrics}
+        token_aligned_fields = TOKEN_ALIGNED_FIELDS
+        if exact_batch is not None and TREE_ATTENTION_LAYOUTS in exact_batch:
+            extra_info[TREE_ATTENTION_LAYOUTS] = exact_batch[TREE_ATTENTION_LAYOUTS]
+            token_aligned_fields = TOKEN_ALIGNED_FIELDS - TREE_EDGE_ALIGNED_FIELDS
         meta = kv_first_write(
             bulk_batch,
             sample_ids=sample_ids,
             dp_client=self._dp_client,
             partition_id=partition_id,
-            extra_info={"rollout_metrics": rollout_metrics},
+            extra_info=extra_info,
             # Per-row shapes the flattening removes from the payload. ``tags``
             # is the transport's per-sample channel and is projected with the
             # rows, so no consumer re-keys them.
@@ -428,7 +501,10 @@ class SyncRolloutActor:
             pad_to_multiple=int(
                 cfg.policy.get("make_sequence_length_divisible_by") or 1
             ),
+            token_aligned_fields=token_aligned_fields,
         )
+        if capture_refs:
+            acknowledge_gym_captures_sync(task_to_env["nemo_gym"], capture_refs)
 
         if self.policy_generation is not None:
             if finish_generation:
