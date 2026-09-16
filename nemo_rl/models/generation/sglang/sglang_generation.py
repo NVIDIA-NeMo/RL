@@ -80,6 +80,17 @@ class SGLangGeneration(GenerationInterface):
         cluster: RayVirtualCluster,
         sglang_cfg: SGLangConfig,
     ):
+        # __del__ also runs when validation or resource allocation fails.
+        # Establish inert cleanup state before either can raise.
+        self._health_monitor: RolloutHealthMonitor | None = None
+        # Set by ``grpo.setup``; ``refit_policy_generation`` dispatches on it.
+        self.weight_synchronizer: WeightSynchronizer | None = None
+        self._async_loop: AsyncLoopThread | None = None
+        self._http_client: HttpClient | None = None
+        self.all_engines: list = []
+        self._router_actor: ray.actor.ActorHandle | None = None
+        self.rollout_engine_lock: ray.actor.ActorHandle | None = None
+
         fault_tolerance_config = get_sglang_fault_tolerance_config(
             sglang_cfg["sglang_cfg"]
         )
@@ -88,10 +99,7 @@ class SGLangGeneration(GenerationInterface):
         # GenerationInterface consumers (create_weight_synchronizer, the refit
         # transports) read ``cfg``; keep the sglang-specific name as the alias.
         self.cfg = sglang_cfg
-        # Set by ``grpo.setup``; ``refit_policy_generation`` dispatches on it.
-        self.weight_synchronizer: WeightSynchronizer | None = None
-        self._async_loop: AsyncLoopThread | None = AsyncLoopThread()
-        self._http_client: HttpClient | None = None
+        self._async_loop = AsyncLoopThread()
 
         pgs = cluster._init_placement_groups(
             strategy="PACK",
@@ -112,7 +120,7 @@ class SGLangGeneration(GenerationInterface):
 
         self.num_gpus_per_engine: int = gpus_per_engine
         self.num_gpus_per_node: int = num_gpus_per_node
-        self.all_engines: list = [None] * num_engines
+        self.all_engines = [None] * num_engines
         # Keep endpoints outside actors so a dead or wedged actor can still be
         # removed from the router. Entries follow all_engines, including peers.
         self._engine_urls: list[str | None] = [None] * num_engines
@@ -127,7 +135,6 @@ class SGLangGeneration(GenerationInterface):
         # call that the refit dispatch has not connected yet.
         self.num_new_engines: int = 0
         self.pause_generation_mode: str = sglang_server_cfg["pause_generation_mode"]
-        self._health_monitor: RolloutHealthMonitor | None = None
 
         # --- Router bootstrap --------------------------------------------
         # Resolved router endpoint is held only on the instance; we don't
@@ -141,7 +148,7 @@ class SGLangGeneration(GenerationInterface):
         # Only set when ``_start_router`` actually spawned the router (i.e.
         # sglang_router_ip was not already configured). Kept so ``shutdown``
         # can terminate it cleanly.
-        self._router_actor: ray.actor.ActorHandle | None = router_actor
+        self._router_actor = router_actor
 
         # --- Start engines -----------------------------------------------
         init_handles, _ = self._start_engines({})

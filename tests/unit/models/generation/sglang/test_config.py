@@ -14,6 +14,9 @@
 
 """CPU-only validation of driver-owned SGLang runtime settings."""
 
+import gc
+import sys
+import weakref
 from copy import deepcopy
 from unittest.mock import MagicMock
 
@@ -120,8 +123,13 @@ def test_fault_tolerance_rejects_invalid_values_in_both_spellings(nested, key, v
         get_sglang_fault_tolerance_config(config)
 
 
-def test_invalid_fault_tolerance_fails_before_cluster_allocation():
+def test_invalid_fault_tolerance_fails_before_cluster_allocation(monkeypatch):
     cluster = MagicMock()
+    loop_factory = MagicMock()
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.sglang.sglang_generation.AsyncLoopThread",
+        loop_factory,
+    )
     with pytest.raises(ValidationError, match="rollout_max_restart_attempts"):
         SGLangGeneration(
             cluster,
@@ -134,6 +142,79 @@ def test_invalid_fault_tolerance_fails_before_cluster_allocation():
             },
         )
     cluster._init_placement_groups.assert_not_called()
+    loop_factory.assert_not_called()
+
+
+@pytest.mark.parametrize("invalid_config", [True, False])
+def test_failed_constructor_cleanup_is_repeatable_and_destructor_safe(
+    monkeypatch, invalid_config
+):
+    cluster = MagicMock()
+
+    def fail_placement(**kwargs):
+        # A stored exception instance would retain the failed constructor's
+        # traceback and keep the generation object alive during gc.collect().
+        raise RuntimeError("placement failed")
+
+    cluster._init_placement_groups.side_effect = fail_placement
+    loop = MagicMock()
+    loop_factory = MagicMock(return_value=loop)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.sglang.sglang_generation.AsyncLoopThread",
+        loop_factory,
+    )
+    http_factory = MagicMock()
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.sglang.sglang_generation.HttpClient",
+        http_factory,
+    )
+    unraisable_errors = []
+    monkeypatch.setattr(sys, "unraisablehook", unraisable_errors.append)
+    destructor_calls = []
+    original_destructor = SGLangGeneration.__del__
+
+    def record_destructor(instance):
+        destructor_calls.append(True)
+        original_destructor(instance)
+
+    monkeypatch.setattr(SGLangGeneration, "__del__", record_destructor)
+    config = {"sglang_cfg": {}}
+    if invalid_config:
+        config["sglang_cfg"]["sglang_fault_tolerance_config"] = {
+            "rollout_max_restart_attempts": -1
+        }
+    expected_error = ValidationError if invalid_config else RuntimeError
+    expected_message = (
+        "rollout_max_restart_attempts" if invalid_config else "placement failed"
+    )
+    # Keep the failed instance reachable so cleanup is checked synchronously,
+    # then let real garbage collection invoke its actual destructor too.
+    generation = object.__new__(SGLangGeneration)
+    with pytest.raises(expected_error, match=expected_message):
+        generation.__init__(cluster, config)
+
+    assert generation.shutdown()
+    assert generation.shutdown()
+    http_factory.assert_not_called()
+    if invalid_config:
+        cluster._init_placement_groups.assert_not_called()
+        loop_factory.assert_not_called()
+        loop.close.assert_not_called()
+    else:
+        cluster._init_placement_groups.assert_called_once_with(
+            strategy="PACK", use_unified_pg=True
+        )
+        loop_factory.assert_called_once_with()
+        loop.close.assert_called_once_with()
+
+    reference = weakref.ref(generation)
+    del generation
+    gc.collect()
+    assert reference() is None
+    assert destructor_calls == [True]
+    assert unraisable_errors == []
+    if not invalid_config:
+        loop.close.assert_called_once_with()
 
 
 def test_http_client_default_counts_total_attempts():
