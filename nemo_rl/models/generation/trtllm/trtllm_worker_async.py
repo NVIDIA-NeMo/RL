@@ -222,6 +222,9 @@ class TrtllmAsyncGenerationWorkerImpl:
         # they can override anything above for advanced tuning.
         llm_kwargs.update(extra_trtllm_kwargs)
 
+        if trtllm_cfg.get("is_mx") and trtllm_cfg["precision"] != "fp8":
+            raise ValueError("trtllm_cfg.is_mx=True requires precision='fp8'")
+
         if trtllm_cfg["precision"] == "fp8":
             # Import only in TRT-LLM actors so the base NeMo-RL environment
             # does not need the optional TRT-LLM dependency.
@@ -236,7 +239,7 @@ class TrtllmAsyncGenerationWorkerImpl:
             hf_config = AutoConfig.from_pretrained(
                 self.model_name, trust_remote_code=True
             )
-            is_mx = bool(trtllm_cfg.get("is_mx", False))
+            is_mx = bool(trtllm_cfg.get("is_mx"))
             configure_fp8_llm_kwargs(
                 llm_kwargs,
                 model_type=hf_config.model_type,

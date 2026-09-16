@@ -16,8 +16,13 @@ import pytest
 import torch
 
 from nemo_rl.models.generation.trtllm.quantization.fp8 import (
+    E4M3_MAX,
     FP8_BLOCK_QUANT_KWARGS,
+    MXFP8_BLOCK_QUANT_KWARGS,
+    MXFP8_BLOCK_SIZE,
+    UE8M0_BIAS,
     cast_tensor_to_fp8_blockwise,
+    cast_tensor_to_mxfp8_blockwise,
     configure_fp8_llm_kwargs,
     configure_fp8_moe_backend,
     load_weights,
@@ -159,6 +164,49 @@ def test_configure_fp8_moe_backend_rejects_non_trtllm(moe_config):
         configure_fp8_moe_backend({"moe_config": moe_config}, _MoeConfig)
 
 
+def test_mxfp8_scale_is_ue8m0_exponent_and_round_trips():
+    torch.manual_seed(0)
+    source = (torch.randn(4, 64, dtype=torch.float32) * 100.0).to(torch.bfloat16)
+
+    quantized, scale_ue8m0 = cast_tensor_to_mxfp8_blockwise(source)
+
+    assert quantized.dtype == torch.float8_e4m3fn
+    assert scale_ue8m0.dtype == torch.uint8
+    assert scale_ue8m0.shape == (4, 64 // MXFP8_BLOCK_SIZE)
+
+    blocked = source.float().reshape(4, -1, MXFP8_BLOCK_SIZE)
+    expected_exponent = torch.ceil(torch.log2(blocked.abs().amax(-1) / E4M3_MAX))
+    assert torch.equal(scale_ue8m0, (expected_exponent + UE8M0_BIAS).to(torch.uint8))
+
+    scale = torch.exp2(scale_ue8m0.float() - UE8M0_BIAS).repeat_interleave(
+        MXFP8_BLOCK_SIZE, dim=-1
+    )
+    assert torch.allclose(quantized.float() * scale, source.float(), rtol=1.0 / 16, atol=1e-3)
+    assert quantized.float().abs().max() <= E4M3_MAX
+
+
+def test_mxfp8_moe_backend_requires_cutlass_and_rejects_trtllm():
+    llm_kwargs = {}
+    configure_fp8_moe_backend(llm_kwargs, _MoeConfig, is_mx=True)
+    assert llm_kwargs["moe_config"].backend == "CUTLASS"
+
+    with pytest.raises(ValueError, match="backend='CUTLASS'"):
+        configure_fp8_moe_backend(
+            {"moe_config": {"backend": "TRTLLM"}}, _MoeConfig, is_mx=True
+        )
+
+
+def test_mxfp8_llm_kwargs_use_the_mx_quant_contract():
+    llm_kwargs = {}
+
+    configure_fp8_llm_kwargs(llm_kwargs, model_type="qwen3_5_moe", is_mx=True)
+
+    quant = llm_kwargs["model_kwargs"]["quantization_config"]
+    assert quant["quant_method"] == "mxfp8"
+    assert quant["weight_block_size"] == [1, MXFP8_BLOCK_SIZE]
+    assert quant == MXFP8_BLOCK_QUANT_KWARGS
+
+
 def test_block_fp8_scale_orientation_is_out_block_by_in_block():
     source = _block_matrix([[1.0, 2.0], [3.0, 4.0]])
 
@@ -196,6 +244,31 @@ def test_block_fp8_handles_batched_non_aligned_zero_weights():
     assert scale_inv.shape == (2, 2, 3)
     assert torch.count_nonzero(fp8_data.float()) == 0
     assert torch.equal(scale_inv, torch.ones_like(scale_inv))
+
+
+def test_block_fp8_round_trip_preserves_intra_block_element_order():
+    """Every element in the tests above is constant within its 128x128 block,
+    so a dropped/wrong inverse permute at the reshape back to [rows, cols]
+    would still pass them silently. Random (not periodic -- a ramp's
+    symmetry can coincidentally survive a scramble) values make intra-block
+    position matter."""
+    torch.manual_seed(0)
+    source = (torch.randn(256, 256, dtype=torch.float32) * 10.0).to(torch.bfloat16)
+
+    fp8_data, scale_inv = cast_tensor_to_fp8_blockwise(source)
+
+    for row_block in range(2):
+        for column_block in range(2):
+            block = fp8_data[
+                row_block * 128 : (row_block + 1) * 128,
+                column_block * 128 : (column_block + 1) * 128,
+            ]
+            dequantized = block.float() * scale_inv[row_block, column_block]
+            expected = source[
+                row_block * 128 : (row_block + 1) * 128,
+                column_block * 128 : (column_block + 1) * 128,
+            ].float()
+            assert torch.allclose(dequantized, expected, rtol=1.0 / 8, atol=1.0)
 
 
 def test_routed_expert_conversion():
