@@ -2189,8 +2189,17 @@ class MegatronPolicyWorkerImpl(
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
-    def prepare_refit_info(self) -> None:
-        """Prepare state dict metadata for weight refitting and IPC streaming."""
+    def prepare_refit_info(self, *, refit_payload_mode: str = "hf_export") -> None:
+        """Prepare state dict metadata for weight refitting and IPC streaming.
+
+        ``refit_payload_mode`` is accepted for call compatibility with the
+        policy layer from main; this branch's worker only exports HF weights.
+        """
+        if refit_payload_mode != "hf_export":
+            raise NotImplementedError(
+                f"refit_payload_mode={refit_payload_mode!r} is not supported by the "
+                "super-v3.5 Megatron worker (hf_export only)."
+            )
         self.refit_param_info_mcore = self._calculate_refit_param_info()
 
         # Collect tensor metadata for refit / hf side info.
@@ -2707,6 +2716,7 @@ class MegatronPolicyWorkerImpl(
         gen_parallelism,
         train_world_size,
         gen_world_size,
+        *, refit_payload_mode: str = "hf_export",
     ):
         """Prepare per-layer parameter metadata for nccl_reshard-based refit.
 
