@@ -103,11 +103,13 @@ def _make_recovery_cfg(pad_token_id):
                 "sglang_router_ip": None,
                 "sglang_router_port": None,
             },
-            "use_fault_tolerance": True,
-            "rollout_health_check_interval": CHECK_INTERVAL,
-            "rollout_health_check_timeout": CHECK_TIMEOUT,
-            "rollout_health_check_first_wait": 0,
-            "rollout_max_restart_attempts": 3,
+            "sglang_fault_tolerance_config": {
+                "use_fault_tolerance": True,
+                "rollout_health_check_interval": CHECK_INTERVAL,
+                "rollout_health_check_timeout": CHECK_TIMEOUT,
+                "rollout_health_check_first_wait": 0,
+                "rollout_max_restart_attempts": 3,
+            },
         },
         "sglang_kwargs": {},
     }

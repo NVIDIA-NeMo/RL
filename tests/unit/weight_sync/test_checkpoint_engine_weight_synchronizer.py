@@ -47,9 +47,8 @@ def _mock_policy(**overrides):
 def _mock_generation(**overrides):
     gen = MagicMock()
     gen.cfg = {}
-    # Set the required fault-tolerance flag explicitly so a bare MagicMock
-    # cannot accidentally enable recovery.
-    gen.sglang_cfg = {"sglang_cfg": {"use_fault_tolerance": False}}
+    # A real config uses the model's disabled default, not a truthy MagicMock.
+    gen.sglang_cfg = {"sglang_cfg": {}}
     gen.prepare_for_generation.return_value = True
     gen.finish_generation.return_value = True
     gen.prepare_refit_info.return_value = None
@@ -433,13 +432,19 @@ class TestCheckpointEngineWeightSynchronizer:
         sync._ensure_ready_and_consume_count()
         sync._generation.clear_updatable_num_new_engines.assert_not_called()
 
+    @pytest.mark.parametrize("nested", [False, True])
     @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
-    def test_sglang_recovery_rebinds_without_destroying_engines(self, mock_ray):
+    def test_sglang_recovery_rebinds_without_destroying_engines(self, mock_ray, nested):
         """recover -> mark not-ready -> reinit -> clear count -> transfer."""
         policy = _mock_policy()
         policy.worker_group = _CheckpointWorkerGroup()
         generation = _mock_generation(cfg={"backend": SGLANG_BACKEND})
-        generation.sglang_cfg = {"sglang_cfg": {"use_fault_tolerance": True}}
+        ft_config = {"use_fault_tolerance": True}
+        generation.sglang_cfg = {
+            "sglang_cfg": (
+                {"sglang_fault_tolerance_config": ft_config} if nested else ft_config
+            )
+        }
         generation.run_checkpoint_engine_method.return_value = ["generation-update"]
         generation.prepare_for_generation.return_value = None
         generation.pause_generation_mode = "retract"
@@ -528,6 +533,24 @@ class TestCheckpointEngineWeightSynchronizer:
         sync.sync_weights()
 
         generation.recover_updatable_engines.assert_not_called()
+
+    def test_sglang_mixed_fault_tolerance_config_fails_before_recovery(self):
+        generation = _mock_generation(cfg={"backend": SGLANG_BACKEND})
+        generation.sglang_cfg = {
+            "sglang_cfg": {
+                "use_fault_tolerance": False,
+                "sglang_fault_tolerance_config": {"use_fault_tolerance": True},
+            }
+        }
+        sync = CheckpointEngineWeightSynchronizer(
+            _mock_policy(), generation, _checkpoint_engine_cfg()
+        )
+
+        with pytest.raises(ValueError, match="Do not mix"):
+            sync.sync_weights()
+
+        generation.recover_updatable_engines.assert_not_called()
+        generation.prepare_for_generation.assert_not_called()
 
     @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
     def test_sglang_recovery_failure_is_retryable_but_rollback_failure_is_not(
@@ -917,6 +940,20 @@ class TestCheckpointEngineWeightSynchronizer:
 
 
 class TestCheckpointEngineFactory:
+    def test_sglang_fault_tolerance_defaults_to_disabled(self):
+        generation = _mock_generation(cfg=_sglang_refit_cfg())
+        del generation.cfg["sglang_cfg"]["use_fault_tolerance"]
+        generation.pause_generation_mode = "retract"
+
+        sync = create_weight_synchronizer(
+            policy=_mock_policy(cfg={}),
+            generation=generation,
+            generation_backend=SGLANG_BACKEND,
+            colocated=False,
+        )
+
+        assert isinstance(sync, CheckpointEngineWeightSynchronizer)
+
     @pytest.mark.parametrize(
         ("backend", "colocated", "expected"),
         [
@@ -1037,8 +1074,10 @@ class TestCheckpointEngineFactory:
                 colocated=False,
             )
 
+    @pytest.mark.parametrize("nested", [False, True])
     def test_checkpoint_engine_rejects_sglang_fault_tolerance_on_custom_backend(
         self,
+        nested,
     ):
         """Recovery rebinds through the built-in NIXL disconnect-before-connect
         path; a plugin engine has no reconnect contract, so FT must refuse it
@@ -1051,6 +1090,10 @@ class TestCheckpointEngineFactory:
         gen.cfg["refit_transport"] = plugin
         gen.cfg["refit_cfg"] = {plugin: {"device": "cpu", "release_after_refit": False}}
         gen.cfg["sglang_cfg"]["use_fault_tolerance"] = True
+        if nested:
+            gen.cfg["sglang_cfg"]["sglang_fault_tolerance_config"] = {
+                "use_fault_tolerance": gen.cfg["sglang_cfg"].pop("use_fault_tolerance")
+            }
 
         with pytest.raises(NotImplementedError, match="built-in 'nixl' backend"):
             create_weight_synchronizer(
