@@ -24,12 +24,12 @@ found_vllm=0
 found_mcore=0
 for actor_venv in /opt/ray_venvs/*; do
   actor_python="${actor_venv}/bin/python"
-  if [[ ${found_vllm} -eq 0 ]] && "${actor_python}" -c 'import pytest, vllm' 2>/dev/null; then
+  if [[ ${found_vllm} -eq 0 ]] && "${actor_python}" -c 'import vllm' 2>/dev/null; then
     echo "vllm_venv=${actor_venv}"
     "${actor_python}" -c 'import vllm; print(vllm.__version__)'
     found_vllm=1
   fi
-  if [[ ${found_mcore} -eq 0 ]] && "${actor_python}" -c 'import megatron.core, pytest, transformer_engine.pytorch' 2>/dev/null; then
+  if [[ ${found_mcore} -eq 0 ]] && "${actor_python}" -c 'import megatron.core, transformer_engine.pytorch' 2>/dev/null; then
     echo "mcore_venv=${actor_venv}"
     found_mcore=1
   fi

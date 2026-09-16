@@ -21,7 +21,7 @@ import sys
 
 print(f"executable={sys.executable}")
 print(f"prefix={sys.prefix}")
-for module in ("pytest", "vllm", "transformer_engine", "megatron.core"):
+for module in ("pytest", "vllm", "transformer_engine", "megatron"):
     print(f"{module}={importlib.util.find_spec(module)}")
 PY
 done
