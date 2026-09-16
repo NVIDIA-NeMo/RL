@@ -617,6 +617,34 @@ external_service_readiness_override+='}'
 COMMAND+=" ++env.nemo_gym.external_service_readiness='${external_service_readiness_override}'"
 export COMMAND
 
+# ---------------------------------------------------------------------------
+# Sandbox sidecar hosts file. The nemo-skills sandbox's head nginx lists every
+# Ray node's workers as "<short-hostname>:<port>" upstreams and runs `nginx -t`,
+# which resolves each name once; a single transient DNS miss ("host not found in
+# upstream nvl72045-T18:6133") aborts the sidecar and therefore ray.sub. Resolve
+# every hetgroup-0 node here on the head (with retries) into a hosts file and
+# bind-mount it over /etc/hosts in the sandbox containers so nginx never asks DNS.
+# ---------------------------------------------------------------------------
+sandbox_hosts_file="${LOG_DIR}/sandbox_hosts"
+{
+  cat /etc/hosts
+  for node in "${ray_nodes[@]}"; do
+    entry=""
+    for attempt in 1 2 3 4 5; do
+      entry="$(getent hosts "${node}" 2>/dev/null | head -n1)" && [[ -n "${entry}" ]] && break
+      sleep 2
+    done
+    if [[ -n "${entry}" ]]; then
+      ip="${entry%% *}"; fqdn="$(echo "${entry}" | awk '{print $2}')"
+      echo "${ip} ${node} ${fqdn}"
+    else
+      echo "[WARN] sandbox_hosts: could not resolve ${node}; nginx will fall back to DNS for it" >&2
+    fi
+  done
+} > "${sandbox_hosts_file}"
+export SANDBOX_EXTRA_MOUNTS="${SANDBOX_EXTRA_MOUNTS:+${SANDBOX_EXTRA_MOUNTS},}${sandbox_hosts_file}:/etc/hosts"
+echo "[INFO] Sandbox hosts file: ${sandbox_hosts_file} ($(grep -c "" "${sandbox_hosts_file}") lines) mounted over /etc/hosts in the sidecars"
+
 echo "[INFO] Starting NeMo RL while external vLLM pools load"
 # ray.sub predates hetjobs and consumes the unsuffixed allocation variables.
 # Restrict those variables to component 0; srun also defaults to hetgroup 0.
