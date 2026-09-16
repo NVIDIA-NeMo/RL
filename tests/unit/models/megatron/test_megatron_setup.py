@@ -3992,6 +3992,7 @@ class _FakeOutputLayer(torch.nn.Module):
 
 
 def _assert_fp32_wrapped(output_layer: _FakeOutputLayer) -> None:
+    assert getattr(output_layer.forward, "_nrl_fp32_lm_head_patched") is True
     out = output_layer.forward(torch.ones(3, 2, dtype=torch.bfloat16))
     assert out.dtype == torch.float32
     assert output_layer.seen_dtypes == [(torch.float32, torch.float32)]
@@ -4017,6 +4018,24 @@ def test_apply_fp32_lm_head_tf32_path_produces_fp32_output():
         module=SimpleNamespace(output_layer=layer, post_process=True)
     )
     apply_fp32_lm_head([chunk], use_tf32=True)
+    assert getattr(layer.forward, "_nrl_fp32_lm_head_use_tf32") is True
+    _assert_fp32_wrapped(layer)
+
+
+def test_apply_fp32_lm_head_is_idempotent():
+    from nemo_rl.models.megatron.setup import apply_fp32_lm_head
+
+    layer = _FakeOutputLayer()
+    chunk = SimpleNamespace(
+        module=SimpleNamespace(output_layer=layer, post_process=True)
+    )
+    apply_fp32_lm_head([chunk])
+    first_forward = layer.forward
+
+    apply_fp32_lm_head([chunk])
+
+    assert layer.forward is first_forward
+    assert getattr(layer.forward, "_nrl_fp32_lm_head_use_tf32") is False
     _assert_fp32_wrapped(layer)
 
 

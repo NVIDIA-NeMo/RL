@@ -79,6 +79,8 @@ from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_c
 _HF_CONFIG_PATCHED = False
 
 _NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT = "expanded_sequence_v1"
+_FP32_LM_HEAD_PATCHED_ATTR = "_nrl_fp32_lm_head_patched"
+_FP32_LM_HEAD_USE_TF32_ATTR = "_nrl_fp32_lm_head_use_tf32"
 
 
 def _patch_hf_config_double_instantiation():
@@ -654,6 +656,8 @@ def apply_fp32_lm_head(model_chunks: list, use_tf32: bool = False) -> None:
                     "worse than disabling both."
                 )
             continue
+        if getattr(output_layer.forward, _FP32_LM_HEAD_PATCHED_ATTR, False):
+            continue
         original_forward = output_layer.forward
 
         def _fp32_forward(
@@ -675,6 +679,8 @@ def apply_fp32_lm_head(model_chunks: list, use_tf32: bool = False) -> None:
             finally:
                 torch.backends.cuda.matmul.allow_tf32 = prev
 
+        setattr(_fp32_forward, _FP32_LM_HEAD_PATCHED_ATTR, True)
+        setattr(_fp32_forward, _FP32_LM_HEAD_USE_TF32_ATTR, use_tf32)
         output_layer.forward = _fp32_forward
         print(
             "[fp32_lm_head] output layer will compute logits in fp32"
