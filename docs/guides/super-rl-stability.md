@@ -108,10 +108,26 @@ The pinned Math and equivalence judges map missing verdicts to `False`, and Gym'
 failure wrapper returns transport failures as tagged rows with placeholder reward
 zero. Neither is a valid policy-training label. `gym_judge_verdict.patch` adds
 `fail_on_missing_judge_verdict` (default false for backward compatibility); the
-regular baseline enables it on both resources. A first valid negative verdict
-remains authoritative. Missing verdicts raise `JudgeError`, and NeMo-RL rejects
+regular baseline enables it on both resources. A complete, unambiguous negative
+verdict remains authoritative. Missing verdicts raise `JudgeError`, and NeMo-RL rejects
 tagged failed rows before token/reward processing instead of learning from zero.
 This does not add unbounded retries or change native correct/incorrect labels.
+
+Strict parsing also rejects responses whose status is not `completed`, responses
+with incomplete details, and text containing both verdict labels. The earlier
+helper only rejected missing labels: it could accept the first label in
+`Need final with [[A=B]] or [[A!=B]]` even when that response reached its output
+cap. The chat-to-Responses converter already preserves `length` as
+`status=incomplete`; `tools/super_rl/gym_overlays/judge_verdict.py` must enforce
+that state before parsing. Repeating the same verdict kind is not a conflict.
+These failures use the existing bounded judge retry, never reward zero or a
+heuristic choice between contradictory labels.
+
+`tests/unit/tools/test_judge_verdict.py` covers conflicting label order,
+unfinished responses with apparently valid labels, contradictory completion
+metadata, and privacy-safe error details. Stage a new Gym overlay after changing
+the helper; do not patch a live runtime tree. Validate real converted captures
+through the native ARM Gym interpreter before promoting the runtime to training.
 
 The pinned `ns_tools` wrapper nested its delegated verifier's failure metadata
 inside `delegated_response`. The training adapter and rollout collector inspect
