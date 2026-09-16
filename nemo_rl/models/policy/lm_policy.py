@@ -1097,7 +1097,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     def prepare_refit_info(
         self,
         *,
-        refit_payload_mode: RefitPayloadMode,
+        refit_payload_mode: RefitPayloadMode = "hf_export",
     ) -> Optional[dict[str, Any]]:
         """Prepare the info for refit.
 
