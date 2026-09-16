@@ -477,9 +477,9 @@ def _prepare_prepacked(
         for physical_start, source_length in zip(padded[:-1], source_lengths):
             source_length = int(source_length)
             physical_start = int(physical_start)
-            full_position_ids[
-                :, physical_start : physical_start + source_length
-            ] = torch.arange(source_length, device=input_ids.device)
+            full_position_ids[:, physical_start : physical_start + source_length] = (
+                torch.arange(source_length, device=input_ids.device)
+            )
         position_ids = (
             full_position_ids
             if model_slices_context_parallel_inputs
