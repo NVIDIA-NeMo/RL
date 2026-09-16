@@ -104,6 +104,11 @@ class _RequestCaptureState:
     resumed_generation_token_ids: list[int] = field(default_factory=list)
     observation_error: str | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
+    # Serializes lifecycle-changing TQ operations for this call. Token
+    # observation deliberately uses ``lock`` instead so decoding can continue
+    # while a detached generation chunk is staged.
+    lifecycle_lock: threading.Lock = field(default_factory=threading.Lock)
+    terminal_started: bool = False
     sealed_generated_token_ids: list[int] = field(default_factory=list)
     sealed_generated_logprobs: list[float] = field(default_factory=list)
     generation_cut_staging_keys: list[str] = field(default_factory=list)
@@ -1273,6 +1278,18 @@ class VllmAsyncGenerationWorkerImpl(
 
     def _flush_generation_chunk(self, state: Any, flush_id: str) -> bool:
         """Stage one call's unstaged segment. Returns whether anything staged."""
+        with state.lifecycle_lock:
+            # The registry snapshot in ``flush_due_generation_chunks`` can be
+            # stale. Once terminal processing owns the call, it will write the
+            # canonical row and this detached prefix must not be staged.
+            if state.terminal_started:
+                return False
+            return self._flush_generation_chunk_with_lifecycle_owned(state, flush_id)
+
+    def _flush_generation_chunk_with_lifecycle_owned(
+        self, state: Any, flush_id: str
+    ) -> bool:
+        """Stage one generation chunk while owning ``state.lifecycle_lock``."""
         capture = self.token_capture
         sink = self._capture_sink
         if capture is None or sink is None:
@@ -1366,6 +1383,38 @@ class VllmAsyncGenerationWorkerImpl(
         state = self._get_request_capture(request)
         if state is None:
             return content
+        with state.lifecycle_lock:
+            if state.terminal_started:
+                raise RuntimeError(
+                    f"model call {state.call.model_call_id!r} already started "
+                    "terminal token capture"
+                )
+            state.terminal_started = True
+            content, obsolete_staging_keys = (
+                self._finish_request_capture_with_lifecycle_owned(
+                    state, request, content
+                )
+            )
+
+        # The canonical terminal row now contains the complete call. Prefix
+        # chunks are no longer needed in the live staging partition. Cleanup is
+        # best-effort: a later checkpoint inventory pass also removes orphaned
+        # generation-cut rows.
+        sink = self._capture_sink
+        if obsolete_staging_keys and sink is not None:
+            try:
+                sink.clear(list(obsolete_staging_keys))
+            except Exception:  # noqa: BLE001 — do not lose a valid completion
+                LOGGER.exception(
+                    "failed to clear obsolete generation chunks for model call %s",
+                    state.call.model_call_id,
+                )
+        return content
+
+    def _finish_request_capture_with_lifecycle_owned(
+        self, state: Any, request: Any, content: dict
+    ) -> tuple[dict, tuple[str, ...]]:
+        """Stage a terminal call while owning ``state.lifecycle_lock``."""
         call = state.call
         prompt_token_ids = state.prompt_token_ids
         payload = dict(content)
@@ -1410,6 +1459,11 @@ class VllmAsyncGenerationWorkerImpl(
             total_generation_token_count,
         )
         self._pop_request_capture(request)
+        obsolete_staging_keys = (
+            tuple(state.generation_cut_staging_keys)
+            if coords.disposition == "staged"
+            else ()
+        )
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
             # Token arrays and delta-aligned routes were staged to TQ above;
@@ -1424,12 +1478,20 @@ class VllmAsyncGenerationWorkerImpl(
                 ):
                     message.pop(field, None)
         content["ng_commit_coords"] = coords.model_dump()
-        return content
+        return content, obsolete_staging_keys
 
     def _abort_request_capture(self, request: Any, *, reason: str) -> None:
         """Drop the in-flight capture state for a request that errored."""
-        state = self._pop_request_capture(request)
-        if state is not None and self.token_capture is not None:
+        state = self._get_request_capture(request)
+        if state is None:
+            return
+        with state.lifecycle_lock:
+            if state.terminal_started:
+                return
+            state.terminal_started = True
+            popped = self._pop_request_capture(request)
+            if popped is not state or self.token_capture is None:
+                return
             coords = self.token_capture.fail_call(state.call, reason=reason)
             self._remember_completed_capture(state.call.model_call_id, coords, 0)
 
