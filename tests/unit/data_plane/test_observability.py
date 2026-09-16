@@ -41,6 +41,7 @@ from nemo_rl.data_plane.observability import (
     cluster_step_metrics,
     headline_series,
     merge_snapshots,
+    metrics_never_fail_the_step,
 )
 
 # ── helpers ────────────────────────────────────────────────────────────
@@ -628,6 +629,30 @@ def test_cluster_frac_of_step_is_the_slowest_process():
     assert metrics["step/frac_of_step"] != pytest.approx(0.19, rel=0.05), "sum"
     assert metrics["step/wall_s"] == pytest.approx(0.5, rel=0.05)
     assert metrics["now/n_processes"] == 10
+
+
+def test_a_failing_panel_is_loud_once_then_counts(caplog, monkeypatch):
+    """The guard swallows, so it has to say enough to act on.
+
+    A panel that raises every step logs nothing else and publishes no
+    ``data_plane/*`` series, and an empty panel looks exactly like a data
+    plane that cost nothing -- that is how a ``KeyError`` on every step of a
+    real run went unnoticed until the series were looked for. The first
+    failure therefore carries a traceback (the exception message names a key,
+    not the line that asked for it) and later ones carry a count, which is
+    what separates "broken since step 1" from "flaked once". Neither raises.
+    """
+    monkeypatch.setattr(observability, "_panel_failures", 0)
+    with caplog.at_level(logging.WARNING, logger=observability.__name__):
+        for step in (1, 2, 3):
+            with metrics_never_fail_the_step(step):
+                raise KeyError("step_wall_ms")
+
+    first, *rest = caplog.records
+    assert first.levelno == logging.ERROR
+    assert first.exc_info is not None, "the first failure must carry a traceback"
+    assert [r.levelno for r in rest] == [logging.WARNING, logging.WARNING]
+    assert "3 failures so far" in rest[-1].getMessage()
 
 
 def test_cluster_frac_of_step_follows_the_straggler_across_steps():
