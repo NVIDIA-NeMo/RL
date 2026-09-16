@@ -1785,17 +1785,17 @@ def test_generation_prepare_refit_info_allows_prequantized_mxfp8_grouped_moe(
             "refit_prequantize": True,
         }
     }
-    generation.worker_group = SimpleNamespace(
-        run_all_workers_single_data=MagicMock(return_value=["future"])
-    )
+    leader = MagicMock()
+    leader.prepare_refit_info.remote.return_value = "future"
+    generation.worker_group = SimpleNamespace(workers=[leader])
+    generation.dp_size = 1
+    generation._refit_membership = None
     monkeypatch.setattr(vllm_generation.ray, "get", MagicMock(return_value=[None]))
     state_dict_info = {"model.layers.0.mlp.experts.gate_up_proj": object()}
 
     assert generation.prepare_refit_info(state_dict_info) is None
-    generation.worker_group.run_all_workers_single_data.assert_called_once_with(
-        "prepare_refit_info",
-        state_dict_info=state_dict_info,
-        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    leader.prepare_refit_info.remote.assert_called_once_with(
+        state_dict_info=state_dict_info
     )
 
 
