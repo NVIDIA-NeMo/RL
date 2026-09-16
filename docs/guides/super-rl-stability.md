@@ -94,6 +94,11 @@ zero. Neither is a valid policy-training label. `gym_judge_verdict.patch` adds
 regular baseline enables it on both resources. A first valid negative verdict
 remains authoritative. Missing verdicts raise `JudgeError`, and NeMo-RL rejects
 tagged failed rows before token/reward processing instead of learning from zero.
+NeMo-RL follows Gym's own retry contract when classifying them: every tagged
+row is an infrastructure failure eligible for re-dispatch unless Gym flagged it
+`_ng_failure_terminal`, which marks a prompt-specific data failure. Gym uses
+the same tag for remote-endpoint, timeout and malformed-reply failures, so the
+class name alone does not identify a data failure.
 This does not add unbounded retries or change native correct/incorrect labels.
 
 The pinned `ns_tools` wrapper nested its delegated verifier's failure metadata
@@ -162,6 +167,10 @@ decision can therefore remain inside the transport layer without consuming the
 next judge attempt. A per-decision deadline and bounded transport/backpressure
 policy still require separate implementation and native outage tests. The
 allocation's wall-clock limit is a resource bound, not a substitute for that fix.
+The `async_rl.rollout_failure` deadlines and `async_rl.stall_watchdog` exist
+only on the single-controller path; the legacy async trainer selected by
+`grpo.async_grpo.enabled` never reads them, so the regular recipe does not
+declare them.
 
 This reuses an answer **in memory**, not across preemption or a new job. Durable
 judge-only retry remains unimplemented. Do not interpret a healthy judge endpoint or growing rollout counts
@@ -578,7 +587,7 @@ modules are included in its allow-list for native development/CI checking.
 
 Follow-up AWS-CMH ARM validation used training source `373e99c` and startup
 checker `f1e5560`, with receipts in
-[SCI2-118](https://linear.app/nvidia/issue/SCI2-118). Exact-worker helper ABI and
+internal tracker issue SCI2-118. Exact-worker helper ABI and
 read-only `make` verification passed, along with eight configured component
 imports, all twelve real Gym service health checks, complete CCC metadata
 loading, native recipe parsing and two tagged-judge-failure boundary tests.

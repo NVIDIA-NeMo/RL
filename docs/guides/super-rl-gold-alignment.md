@@ -52,7 +52,7 @@ as gold on the **outer sbatch request**, where it can be observed. Adding an
 
 ```bash
 uv run --no-sync tools/super_rl/submit.py --bootstrap-grace-minutes 75 \
-  -- --account=<your-account> --partition=batch --qos=short \
+  -- --account=<account> --partition=<partition> --qos=<qos> \
   --nodes=64 --gpus-per-node=4 --segment=16 --time=02:00:00 <reviewed-launcher.sbatch>
 ```
 
@@ -111,9 +111,8 @@ segment8 blocks; verify the actual rank-to-node/NVLink-domain map after startup.
 Topology discovery can fall back, so setting a number is not placement proof.
 
 On 2026-09-15, CMH accepted **both segment8 and segment16** in read-only
-`sbatch --test-only` requests for 64 nodes, four GPUs/node, account
-`nemotron_n4_post`, partition `batch`, QoS `short`, two hours, with the structured
-75-minute comment. No GPU job was submitted. Acceptance and estimated start
+`sbatch --test-only` requests for 64 nodes, four GPUs/node, with the team's
+account, partition and QoS, two hours, and the structured 75-minute comment. No GPU job was submitted. Acceptance and estimated start
 times are neither reservations nor guarantees about runtime placement.
 The earlier 20-node smoke shape is not divisible by 8 or 16; do not blindly
 reuse it with these segment sizes. Judge allocation components remain separate.

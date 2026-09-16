@@ -1,7 +1,7 @@
 # Super RL maintenance branch and launch contract
 
-The deliverable is **this NeMo-RL repository**, on
-`jcxu/pr3941-stable-super-rl`, based on the fixed PR3941 commit
+The deliverable is **this NeMo-RL repository**, on the PR 4136 maintenance
+branch, based on the fixed PR3941 commit
 `ca06137460b7e2edcaf6f1fd67ddbda5ddd6b8e2`. It is not a Research Factory run
 directory, a pipeline fork, or a collection of job-specific overlays.
 Keep the existing problem-by-problem commits; do not squash them while they
@@ -88,10 +88,58 @@ uv run --no-sync tools/super_rl/launch.py \
 
 The `--check` flag is optional: this is always a read-only check. Use `oci-hsg`
 or `h100` to select the corresponding profile. `--experiment` can select
-another Kimi delta; the default is `experiments/kimi_s25.yaml`. Start from
-`training_configs/super_rl/user.example.yaml`; unresolved `???` values fail.
-Only the example belongs in Git. Resolve cluster paths on the cluster, not by
-pretending a workstation can inspect remote Lustre.
+another Kimi delta; the default is `experiments/kimi_s25.yaml`. `--user`
+defaults to the Git-ignored `super-rl.local.yaml` at the repository root. Start
+from `training_configs/super_rl/user.example.yaml`; unresolved `???` values
+fail. Only the example belongs in Git. Resolve cluster paths on the cluster, not
+by pretending a workstation can inspect remote Lustre.
+
+**Scope of the experiment check.** `experiment_errors` validates Kimi effort
+deltas only, and `read_yaml` rejects every `${...}` interpolation so that no
+secret is ever resolved. The regular recipe
+`experiments/regular_s120_smoke.yaml` is built from `${oc.env:SUPER_RL_*}`
+interpolations and carries no effort block, so passing it to `--experiment`
+fails by design. That recipe is validated by
+`tests/unit/tools/test_regular_recipe_assets.py` and, at startup, by the
+trainer's configuration schema. Conversely, `kimi_s25.yaml` passes this checker
+but `GRPOConfig` rejects it at startup until the effort port lands; the checker
+confirms the delta's internal consistency, not that it can run today.
+
+## Regular smoke environment contract
+
+`regular_s120_smoke.yaml` and `local_deepseek_v4_flash.yaml` read every private
+or site-specific input from the environment of the process that loads the
+config (the driver inside the training container). Nothing under
+`tools/super_rl/` exports these yet; `submit.py` only forwards the names it is
+given with `--env`. Set all required variables before launch, or OmegaConf fails
+at load with a missing-variable error.
+
+| Variable | Read by | Default |
+| --- | --- | --- |
+| `SUPER_RL_ROOT` | `checkpointing.checkpoint_dir`, `logger.log_dir`, Gym log/cache/results dirs (`<root>/smoke/...`) | required |
+| `SUPER_RL_MODEL` | `policy.model_name`, `policy.tokenizer.name` | required |
+| `SUPER_RL_DATA` | `data.train.data_path`, `data.validation.data_path` | required |
+| `SUPER_RL_PARSER` | `policy.generation.vllm_cfg.reasoning_parser_plugin` | required |
+| `SUPER_RL_SCICODE_HDF5` | `scicode` resource `test_data_fpath` | required |
+| `SUPER_RL_CCC_METADATA` | `competitive_coding_challenges` resource `test_file` | required |
+| `CCC_SHARED_TEMP_DIR` | `competitive_coding_challenges` resource `shared_dir`; must be visible to every sandbox node | required |
+| `SUPER_RL_RUN_NAME` | `logger.wandb.name` | required |
+| `SUPER_RL_JUDGE_URL` | `deepseek_v4_flash_judge_model` `base_url` in `local_deepseek_v4_flash.yaml` | required |
+| `NEMO_SKILLS_SANDBOX_HOST` | `ns_tools` resource `sandbox_host` | `127.0.0.1` |
+| `NEMO_SKILLS_SANDBOX_PORT` | `ns_tools` resource `sandbox_port` | `6000` |
+
+The same fields appear under different names in `user.example.yaml`
+(`model`, `train_data`, `ccc_metadata`, `scicode_hdf5`, `work_root`) because the
+launcher does not compose recipes yet; keep the two consistent by hand until
+step 4 of the acceptance order below wires them together.
+
+The smoke also fixes the cluster shape and container layout of the two
+four-GPU profiles: `cluster.gpus_per_node: 4`, 48 generation nodes, 64 nodes in
+total, `segment_size: 4`, the judge fragment at
+`/opt/nemo-rl/training_configs/super_rl/local_deepseek_v4_flash.yaml` (the
+profiles' `container_workdir`), and `uv_venv_dir: /opt/train_gym_venvs`. Those
+values belong to the site/profile layer; an `h100` run needs its own experiment
+file with an eight-GPU topology rather than edits to this one.
 
 The checker validates source ancestry and pinned submodule checkouts, literal
 configuration, scalar budget/batch consistency, declared image architecture,

@@ -1,5 +1,8 @@
 # Copy outside the checkout, or to ignored super-rl.local.yaml at repo root.
 # No account, node count, image digest or private path is guessed for you.
+# The regular smoke recipe reads its inputs from SUPER_RL_* environment variables
+# (table in docs/guides/super-rl-launch.md); this file is not yet wired to export
+# them. Keep both consistent by hand until the launcher composes recipes.
 site: ???  # Actual site name; required even when using the generic H100 adapter.
 account: ???
 partition: ???
