@@ -209,9 +209,16 @@ def test_build_nemo_gym_config_uv_dirs(detected_uv_dirs, configured, expected):
     assert (global_config["uv_cache_dir"], global_config["uv_venv_dir"]) == expected
 
 
-def test_build_nemo_gym_config_moves_port_range_to_actor_fields(detected_uv_dirs):
+@pytest.mark.parametrize("truncate_noncontiguous_episodes", [False, True])
+def test_build_nemo_gym_config_moves_port_range_to_actor_fields(
+    detected_uv_dirs, truncate_noncontiguous_episodes
+):
     cfg = build_nemo_gym_config(
-        _env_configs(port_range_low=6000, port_range_high=6999),
+        _env_configs(
+            port_range_low=6000,
+            port_range_high=6999,
+            truncate_noncontiguous_episodes=truncate_noncontiguous_episodes,
+        ),
         base_urls=[],
         model_name="test-model",
         enable_router_replay=False,
@@ -221,6 +228,43 @@ def test_build_nemo_gym_config_moves_port_range_to_actor_fields(detected_uv_dirs
     assert (cfg["port_range_low"], cfg["port_range_high"]) == (6000, 6999)
     assert "port_range_low" not in cfg["initial_global_config_dict"]
     assert "port_range_high" not in cfg["initial_global_config_dict"]
+    assert cfg["truncate_noncontiguous_episodes"] is truncate_noncontiguous_episodes
+    assert "truncate_noncontiguous_episodes" not in cfg["initial_global_config_dict"]
+
+
+@pytest.mark.parametrize("truncate_noncontiguous_episodes", [False, True])
+@pytest.mark.parametrize("valid_shards", [False, True])
+def test_truncation_preserves_shard_setup_validation(
+    detected_uv_dirs, truncate_noncontiguous_episodes, valid_shards
+):
+    env_configs = _env_configs(
+        truncate_noncontiguous_episodes=truncate_noncontiguous_episodes,
+        shards=[{"name": "math", "config_paths": ["math.yaml"]}],
+    )
+    if valid_shards:
+        env_configs["nemo_gym"].pop("config_paths")
+    original = copy.deepcopy(env_configs)
+    error = (
+        "multi-actor creation is not wired up yet"
+        if valid_shards
+        else "cannot be combined with 'shards'"
+    )
+    with (
+        patch.object(nemo_gym_mod, "NemoGym") as mock_actor,
+        patch.object(nemo_gym_mod, "make_actor_runtime_env") as mock_runtime_env,
+        pytest.raises(nemo_gym_mod.ShardConfigError, match=error),
+    ):
+        spinup_nemo_gym_actor(
+            env_configs,
+            base_urls=[],
+            model_name="test-model",
+            tokenizer=MagicMock(),
+            enable_router_replay=False,
+            use_fastokens=False,
+        )
+    mock_actor.options.assert_not_called()
+    mock_runtime_env.assert_not_called()
+    assert env_configs == original
 
 
 @pytest.mark.parametrize("token_capture", [None, {"enabled": True}])
