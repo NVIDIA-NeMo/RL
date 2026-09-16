@@ -19,6 +19,9 @@ def test_collective_refit_always_resets_prefix_cache():
     engine = MagicMock()
     engine.model_engine = SimpleNamespace(model=model, model_loader=model_loader)
     engine.control_action.return_value = nullcontext()
+    # Force the reset_prefix_cache fallback: a bare MagicMock auto-creates
+    # recompute_active_requests, which would mask it entirely.
+    del engine.recompute_active_requests
 
     extension.engine = engine
     extension.device_id = 0

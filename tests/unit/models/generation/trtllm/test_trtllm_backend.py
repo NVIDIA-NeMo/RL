@@ -127,6 +127,13 @@ def test_collective_refit_runs_at_async_engine_boundary(
     from nemo_rl.models.generation.trtllm import trtllm_backend as backend
 
     extension, module, model, model_loader, engine = _extension(backend)
+    # Force the manual finalize fallback so the asserted call order is
+    # deterministic. On an installed TRT-LLM that actually has
+    # WorkerExtension.finalize_weight_update, _finalize_weight_update takes
+    # that fast path instead and never drives process/post individually.
+    monkeypatch.setattr(
+        backend.WorkerExtension, "finalize_weight_update", None, raising=False
+    )
     call_order = []
     incoming = [("model.weight", torch.tensor([1.0]))]
     converted = {"converted.weight": torch.tensor([2.0])}
