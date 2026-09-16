@@ -4526,7 +4526,7 @@ vllm = [
     { name = "nvidia-cutlass-dsl", version = "4.5.2", source = { registry = "https://pypi.org/simple" }, extra = ["cu13"], marker = "extra == 'extra-7-nemo-rl-vllm' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-8-nemo-gym-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-8-nemo-gym-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-8-nemo-gym-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-8-nemo-gym-vllm')" },
     { name = "tilelang", version = "0.1.9", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64'" },
     { name = "transformers", version = "5.12.1", source = { registry = "https://pypi.org/simple" } },
-    { name = "vllm", version = "0.25.1", source = { git = "https://github.com/TomerBN-Nvidia/vllm.git?rev=6f11a9c5f95e1259a21c4d416b421fcb598b37bf#6f11a9c5f95e1259a21c4d416b421fcb598b37bf" } },
+    { name = "vllm", version = "0.25.1", source = { git = "https://github.com/TomerBN-Nvidia/vllm.git?rev=33484aad0a7c97fdc7103cbf9f4d52d79a3f47f6#33484aad0a7c97fdc7103cbf9f4d52d79a3f47f6" } },
 ]
 
 [package.dev-dependencies]
@@ -4681,7 +4681,7 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'trtllm'", specifier = "==5.5.4" },
     { name = "transformers", marker = "extra == 'vllm'", specifier = "==5.12.1" },
     { name = "triton", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "vllm", marker = "extra == 'vllm'", git = "https://github.com/TomerBN-Nvidia/vllm.git?rev=6f11a9c5f95e1259a21c4d416b421fcb598b37bf" },
+    { name = "vllm", marker = "extra == 'vllm'", git = "https://github.com/TomerBN-Nvidia/vllm.git?rev=33484aad0a7c97fdc7103cbf9f4d52d79a3f47f6" },
     { name = "wandb", specifier = ">=0.28.0" },
     { name = "zstandard" },
 ]
@@ -8770,7 +8770,7 @@ wheels = [
 [[package]]
 name = "vllm"
 version = "0.25.1"
-source = { git = "https://github.com/TomerBN-Nvidia/vllm.git?rev=6f11a9c5f95e1259a21c4d416b421fcb598b37bf#6f11a9c5f95e1259a21c4d416b421fcb598b37bf" }
+source = { git = "https://github.com/TomerBN-Nvidia/vllm.git?rev=33484aad0a7c97fdc7103cbf9f4d52d79a3f47f6#33484aad0a7c97fdc7103cbf9f4d52d79a3f47f6" }
 resolution-markers = [
     "platform_machine == 'x86_64' and sys_platform == 'linux'",
     "platform_machine == 'aarch64' and sys_platform == 'linux'",

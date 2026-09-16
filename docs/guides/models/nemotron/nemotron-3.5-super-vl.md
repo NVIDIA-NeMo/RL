@@ -59,7 +59,7 @@ Both AutoModel and vLLM come from pinned sources in this branch.
   `transformers==5.15.1`.
 - **vLLM** — `pyproject.toml` installs the `vllm` extra from the
   [`super_vl_rl_v0.25.1`](https://github.com/TomerBN-Nvidia/vllm/tree/super_vl_rl_v0.25.1)
-  fork at `6f11a9c5` as a direct git requirement. The fork only changes the
+  fork at `33484aad` as a direct git requirement. The fork only changes the
   Python layer (architecture registration, transformers-native RADIO checkpoint
   layout, Mamba prefix-cache fixes), so the build reuses the upstream v0.25.1
   precompiled wheel (`VLLM_USE_PRECOMPILED=1`,

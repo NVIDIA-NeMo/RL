@@ -165,7 +165,7 @@ vllm = [
   # and static metadata ([tool.uv.dependency-metadata]) keeps `uv lock` build-free.
   # Declared as a direct git requirement (not a [tool.uv.sources] entry) so the
   # nemo-gym[vllm] workspace extra keeps resolving its own vllm==0.24.0 from PyPI.
-  "vllm @ git+https://github.com/TomerBN-Nvidia/vllm.git@6f11a9c5f95e1259a21c4d416b421fcb598b37bf",
+  "vllm @ git+https://github.com/TomerBN-Nvidia/vllm.git@33484aad0a7c97fdc7103cbf9f4d52d79a3f47f6",
   "num2words>=0.5.14",
   "flashinfer-python==0.6.13",
   "flashinfer-cubin==0.6.13",
