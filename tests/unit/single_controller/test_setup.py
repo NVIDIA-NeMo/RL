@@ -2100,6 +2100,114 @@ class TestSetup:
             assert metrics.generation_init_reserve_time_s is None
             assert metrics.weight_sync_time_s is None
 
+    def _make_megatron_token_capture_config(self) -> MasterConfig:
+        """Gym-on Megatron config with token capture enabled (expose_http_server=true)."""
+        mc = self._make_gym_megatron_config()
+        # Extend, don't replace: setup_single_controller also indexes the
+        # wandb keys that _make_master_config populates.
+        mc.logger = {**mc.logger, "log_dir": "/tmp/test-megatron-token-capture"}
+        mc.token_capture.enabled = True
+        return mc
+
+    def test_megatron_token_capture_propagates_backend(self, patched_factories):
+        """Megatron token capture derives generation_backend and rides into Gym.
+
+        The #7015 gate is stubbed to pass so the happy path is deterministic
+        regardless of the pinned megatron-core; the gate itself is covered by
+        test_megatron_token_capture_requires_minf_capture_hooks.
+        """
+        mc = self._make_megatron_token_capture_config()
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            None,
+        )
+        fake_gym_actor = MagicMock(name="nemo_gym_actor")
+        reserved_urls = ["http://10.0.0.1:5555/v1"]
+        port_holders = [MagicMock(name="port_holder_rank_0")]
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "spinup_nemo_gym_actor", return_value=fake_gym_actor
+            ) as mock_spinup,
+            patch.object(sc_setup_mod, "_require_minf_capture_hooks") as mock_gate,
+            patch.object(sc_setup_mod, "MegatronGeneration") as mock_megatron,
+            patch.object(sc_setup_mod, "ray"),
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+                return_value=[MagicMock(name="finalizer_0")],
+            ) as mock_create_finalizer_actors,
+        ):
+            mock_megatron.reserve_http_server_addresses.return_value = (
+                reserved_urls,
+                {0: 5555},
+                port_holders,
+            )
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        mock_gate.assert_called_once_with()
+        assert mc.token_capture.generation_backend == "megatron"
+        assert mock_spinup.call_args.kwargs["token_capture"]["generation_backend"] == (
+            "megatron"
+        )
+        mock_create_finalizer_actors.assert_called_once()
+        assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
+
+    def test_megatron_token_capture_requires_exposed_http_server(
+        self, patched_factories
+    ):
+        mc = self._make_megatron_token_capture_config()
+        mc.policy["generation"]["mcore_generation_config"]["expose_http_server"] = False
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(sc_setup_mod, "_require_minf_capture_hooks") as mock_gate,
+            pytest.raises(ValueError, match="expose_http_server=true"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        mock_gate.assert_not_called()
+        assert mc.token_capture.generation_backend is None
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
+    def test_megatron_token_capture_rejects_router_replay(self, patched_factories):
+        mc = self._make_megatron_token_capture_config()
+        # The real router_replay_enabled predicate reads policy.router_replay.enabled.
+        mc.policy["router_replay"] = {"enabled": True}
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(sc_setup_mod, "_require_minf_capture_hooks") as mock_gate,
+            pytest.raises(NotImplementedError, match="router replay"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        # Router replay is rejected before the megatron-core pin is consulted.
+        mock_gate.assert_not_called()
+        assert mc.token_capture.generation_backend is None
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
+    def test_megatron_token_capture_requires_minf_capture_hooks(
+        self, patched_factories, monkeypatch
+    ):
+        """A pinned megatron-core without PR #7015 fails before any factory runs."""
+        mc = self._make_megatron_token_capture_config()
+        _stub_megatron_inference_request(
+            monkeypatch, types.SimpleNamespace(RequestPayloadStager=object)
+        )
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            pytest.raises(NotImplementedError, match="7015"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert mc.token_capture.generation_backend is None
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
     @pytest.mark.parametrize("backend", ["sglang"])
     def test_nemo_gym_rejects_non_vllm_backend(self, patched_factories, backend):
         """SC nemo-gym wiring supports vllm and megatron; every other backend must raise."""
