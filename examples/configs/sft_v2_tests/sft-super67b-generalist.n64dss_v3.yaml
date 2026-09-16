@@ -1,0 +1,16 @@
+defaults: sft-super67b-generalist.n64dss_v2.yaml
+
+policy:
+  megatron_cfg:
+    scheduler:
+      lr_warmup_iters: 3
+
+logger:
+  log_dir: logs/sft-super67b-n64-dss-generalist-v3
+  wandb:
+    name: sft-super67b-n64-dss-generalist-v3
+  tensorboard:
+    log_dir: logs/sft-super67b-n64-dss-generalist-v3
+
+checkpointing:
+  checkpoint_dir: /data/nemorl-runs/sft-super67b-n64-dss-generalist-v3

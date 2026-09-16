@@ -1,0 +1,14 @@
+defaults: sft-super67b-generalist.n32dss.yaml
+policy:
+  train_global_batch_size: 32
+cluster:
+  gpus_per_node: 4
+  num_nodes: 64
+logger:
+  log_dir: logs/sft-super67b-n64-dss-generalist
+  wandb:
+    name: sft-super67b-n64-dss-generalist
+  tensorboard:
+    log_dir: logs/sft-super67b-n64-dss-generalist
+checkpointing:
+  checkpoint_dir: /data/nemorl-runs/sft-super67b-n64-dss-generalist
