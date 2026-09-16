@@ -1565,6 +1565,15 @@ class VllmGeneration(GenerationInterface):
             raise RuntimeError("Failed to resume every async vLLM engine")
         return True
 
+    def set_generation_weight_version(self, version: int) -> None:
+        """Publish an absolute controller weight version to every vLLM replica."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "set_generation_weight_version",
+            version=version,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
+
     @property
     def requires_kv_scale_sync(self) -> bool:
         """Check if KV cache scales should be synchronized during refit.

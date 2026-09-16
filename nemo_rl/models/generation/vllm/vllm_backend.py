@@ -593,6 +593,23 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         """Return the host shared by worker processes on this node."""
         return socket.gethostname()
 
+    def report_kv_cache_block_metadata(self) -> dict[str, int]:
+        """Report vLLM's runtime cache alignment, after cache initialization."""
+        # vLLM is an optional backend and is intentionally imported only inside
+        # its worker process.
+        from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+
+        kv_cache_config = getattr(self.model_runner, "kv_cache_config", None)
+        if kv_cache_config is None:
+            raise RuntimeError("vLLM KV cache is not initialized")
+        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+            kv_cache_config, self.model_runner.vllm_config
+        )
+        return {
+            "scheduler_block_size": int(scheduler_block_size),
+            "hash_block_size": int(hash_block_size),
+        }
+
     def get_zmq_address(self):
         """Get the ZMQ address for the current device."""
         return f"ipc:///tmp/{self.report_device_id()}.sock"
