@@ -5,10 +5,16 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 bash "${script_dir}/repair_container_python.sh"
 
+repo_root=$(cd -- "${script_dir}/../.." && pwd)
+mbridge_root=/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
+mcore_root=${mbridge_root}/3rdparty/Megatron-LM
+export PYTHONPATH="${repo_root}:${mbridge_root}:${mcore_root}${PYTHONPATH:+:${PYTHONPATH}}"
+
 python - <<'PY'
 import torch
 import nemo_rl
 import nemo_rl.distributed.ray_actor_environment_registry
+import megatron.core
 
 assert torch.cuda.is_available()
 assert torch.cuda.device_count() == 4
