@@ -104,6 +104,7 @@ def test_internal_worker_owns_profiler_lifecycle_with_dense_rank():
         events.append(("worker_init", kwargs["rank"]))
 
     with (
+        patch.dict("os.environ"),
         patch(
             "nemo_rl.models.generation.vllm.vllm_backend.load_rollout_profiler",
             return_value=profiler,
