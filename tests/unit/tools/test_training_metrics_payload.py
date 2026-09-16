@@ -5,6 +5,8 @@ import ast
 import json
 from pathlib import Path
 
+import pytest
+
 from nemo_rl.algorithms.metric_utils import without_generation_logger_payload
 
 
@@ -33,8 +35,14 @@ def test_no_payload_and_empty_metrics():
     assert without_generation_logger_payload({"loss": 1}) == {"loss": 1}
 
 
-def test_both_grpo_loops_filter_only_after_performance_summary():
-    source = Path(__file__).resolve().parents[3] / "nemo_rl/algorithms/grpo.py"
+@pytest.mark.parametrize(
+    "module,expected_filters",
+    [("grpo.py", 2), ("grpo_sync.py", 1), ("ppo.py", 2)],
+)
+def test_every_train_loop_filters_only_after_performance_summary(
+    module, expected_filters
+):
+    source = Path(__file__).resolve().parents[3] / "nemo_rl/algorithms" / module
     tree = ast.parse(source.read_text())
     checked = 0
     for function in tree.body:
@@ -56,4 +64,4 @@ def test_both_grpo_loops_filter_only_after_performance_summary():
             ]
             assert any(node.lineno < filtered.lineno for node in summaries)
             checked += 1
-    assert checked == 2
+    assert checked == expected_filters
