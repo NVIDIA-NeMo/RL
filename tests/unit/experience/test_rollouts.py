@@ -2168,6 +2168,52 @@ def test_run_nemo_gym_rollout_sync_separates_collection_and_identity_groups(
     assert actual is expected
 
 
+@pytest.mark.parametrize(
+    ("row_count", "identity_num_generations", "error"),
+    [
+        (2, 0, "identity_num_generations must be greater than zero"),
+        (
+            3,
+            2,
+            "NeMo-Gym rollout batch size must be divisible by identity_num_generations",
+        ),
+    ],
+)
+def test_run_async_nemo_gym_rollout_validates_identity_group_size(
+    row_count,
+    identity_num_generations,
+    error,
+):
+    input_batch = BatchedDataDict(
+        {"extra_env_info": [{"responses_create_params": {}} for _ in range(row_count)]}
+    )
+
+    async def collect():
+        return [
+            result
+            async for result in run_async_nemo_gym_rollout(
+                policy_generation=SimpleNamespace(
+                    cfg={"max_total_sequence_length": 128}
+                ),
+                input_batch=input_batch,
+                tokenizer=None,
+                task_to_env={},
+                generation_config={
+                    "max_new_tokens": 16,
+                    "stop_strings": [],
+                    "stop_token_ids": [],
+                },
+                num_generations=row_count,
+                identity_num_generations=identity_num_generations,
+                log_full_result_tables=False,
+                sampling_params=SimpleNamespace(top_k=0),
+            )
+        ]
+
+    with pytest.raises(ValueError, match=error):
+        asyncio.run(collect())
+
+
 def test_rollout_manager_consumes_stream_and_restores_input_order():
     class _ReadyRef:
         def __init__(self, value):
