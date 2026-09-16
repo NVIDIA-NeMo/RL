@@ -38,6 +38,7 @@ again on both sides, so it is a debugging tool, not a metric. See
 
 from __future__ import annotations
 
+import itertools
 import logging
 import zlib
 from bisect import bisect_left
@@ -894,7 +895,8 @@ def _step_metrics(
     # this read once took down the whole panel, every series, for a field
     # that only feeds two of them. Over-reporting one metric on a snapshot
     # that predates the field beats publishing nothing.
-    slowest_ms = snap.get("step_wall_ms", wall_ms)
+    step_window = snap.get("step_wall_ms")
+    slowest_ms = wall_ms if step_window is None else step_window
     # step/ is a delta over this step; now/ is a level at this instant.
     # The unit alone does not distinguish them -- see README.md.
     metrics = _step_deltas(snap, prev)
@@ -1041,7 +1043,9 @@ def breakdown_table(
     return ["op", *_BREAKDOWN_COLUMNS], rows
 
 
-_panel_failures = 0
+# A running count of panel failures, as a counter rather than a module global
+# mutated through ``global``: the only operation needed is "next number".
+_panel_failures = itertools.count(1)
 
 
 @contextmanager
@@ -1065,13 +1069,12 @@ def metrics_never_fail_the_step(step: int) -> Iterator[None]:
     Args:
         step: Step number, for the log line.
     """
-    global _panel_failures
     try:
         yield
     except Exception as exc:  # noqa: BLE001 - a panel must never fail a step
-        _panel_failures += 1
+        failures = next(_panel_failures)
         log = logging.getLogger(__name__)
-        if _panel_failures == 1:
+        if failures == 1:
             log.error(
                 "data-plane metrics failed at step %d (%s: %s); training "
                 "continues and no data_plane/* series will be logged for this "
@@ -1088,7 +1091,7 @@ def metrics_never_fail_the_step(step: int) -> Iterator[None]:
                 step,
                 type(exc).__name__,
                 exc,
-                _panel_failures,
+                failures,
             )
 
 

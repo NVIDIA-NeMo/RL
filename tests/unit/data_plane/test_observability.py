@@ -21,6 +21,7 @@ built-in sinks.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import random
 from time import monotonic
@@ -642,7 +643,7 @@ def test_a_failing_panel_is_loud_once_then_counts(caplog, monkeypatch):
     not the line that asked for it) and later ones carry a count, which is
     what separates "broken since step 1" from "flaked once". Neither raises.
     """
-    monkeypatch.setattr(observability, "_panel_failures", 0)
+    monkeypatch.setattr(observability, "_panel_failures", itertools.count(1))
     with caplog.at_level(logging.WARNING, logger=observability.__name__):
         for step in (1, 2, 3):
             with metrics_never_fail_the_step(step):
