@@ -394,6 +394,7 @@ class BaseVllmGenerationWorker:
         self._init_config(
             config, bundle_indices, fraction_of_gpus, seed, extra_env_vars
         )
+        self._generation_weight_version = 0
         self._sparse_refit_receiver: Any = None
         if (
             self.is_model_owner
@@ -411,6 +412,10 @@ class BaseVllmGenerationWorker:
 
         if not defer_model_load:
             self._load_model(bundle_indices, seed)
+
+    def set_generation_weight_version(self, version: int) -> None:
+        """Set the controller-global version reported with generated outputs."""
+        self._generation_weight_version = int(version)
 
     def _init_config(
         self,

@@ -25,6 +25,7 @@ from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.algorithms.x_token.loss_utils import (
     prepare_xtoken_cross_tokenizer_loss_input,
 )
+from nemo_rl.data.packed_rollouts import TREE_ATTENTION_EDGE_TARGET_IDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedCrossEntropyToFixedLogits,
@@ -33,6 +34,7 @@ from nemo_rl.distributed.model_utils import (
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
     from_parallel_logits_to_logprobs_packed_sequences,
+    from_parallel_tree_logits_to_logprobs,
     get_cp_sharded_next_token_logprobs,
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
@@ -368,6 +370,51 @@ def prepare_opd_full_loss_input(
             chunk_size=chunk_size,
         )
     return loss_input
+
+
+def prepare_tree_loss_input(
+    logits: torch.Tensor,
+    data: BatchedDataDict[Any],
+    loss_fn: LossFunction,
+    packed_seq_params: Any,
+    vocab_parallel_rank: int,
+    vocab_parallel_group: torch.distributed.ProcessGroup,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    sampling_params: Optional[TrainingSamplingParams] = None,
+    chunk_size: Optional[int] = None,
+) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
+    """Prepare policy loss from logits projected only at sampled tree edges."""
+    if loss_fn.input_type != LossInputType.LOGPROB:
+        raise ValueError("tree attention currently supports logprob losses only")
+    logprobs = from_parallel_tree_logits_to_logprobs(
+        logits,
+        data[TREE_ATTENTION_EDGE_TARGET_IDS],
+        packed_seq_params,
+        vocab_start_index=vocab_parallel_rank * logits.shape[-1],
+        vocab_end_index=(vocab_parallel_rank + 1) * logits.shape[-1],
+        tp_group=vocab_parallel_group,
+        cp_group=context_parallel_group,
+        inference_only=False,
+        chunk_size=chunk_size,
+        sampling_params=sampling_params,
+    )
+    if need_top_k_or_top_p_filtering(sampling_params):
+        mask = data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)
+        logprobs = mask_out_neg_inf_logprobs(logprobs, mask, "curr_logprobs")
+        if getattr(loss_fn, "reference_policy_kl_penalty", 0) != 0:
+            data["curr_logprobs_unfiltered"] = from_parallel_tree_logits_to_logprobs(
+                logits,
+                data[TREE_ATTENTION_EDGE_TARGET_IDS],
+                packed_seq_params,
+                vocab_start_index=vocab_parallel_rank * logits.shape[-1],
+                vocab_end_index=(vocab_parallel_rank + 1) * logits.shape[-1],
+                tp_group=vocab_parallel_group,
+                cp_group=context_parallel_group,
+                inference_only=False,
+                chunk_size=chunk_size,
+                sampling_params=None,
+            )
+    return {"next_token_logprobs": logprobs}, data
 
 
 def prepare_loss_input(

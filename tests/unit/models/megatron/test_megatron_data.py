@@ -194,10 +194,158 @@ class TestGetAndValidateSeqlen:
 
         assert "Dim 1 must be the sequence dim" in str(exc_info.value)
 
+    def test_get_and_validate_seqlen_accepts_tree_edge_dimensions(self):
+        """Tree supervision is edge-aligned, not physical-token-aligned."""
+        from nemo_rl.data.packed_rollouts import (
+            TREE_ATTENTION_EDGE_LENGTHS,
+            TREE_ATTENTION_EDGE_SOURCE_INDICES,
+            TREE_ATTENTION_EDGE_TARGET_IDS,
+            TREE_ATTENTION_LAYOUTS,
+            TreeAttentionLayout,
+        )
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+        from nemo_rl.models.megatron.data import get_and_validate_seqlen
+
+        layout = TreeAttentionLayout(
+            segment_lengths=(6, 4),
+            segment_parents=(-1, 0),
+            segment_depths=(0, 6),
+            edge_source_indices=(5, 6, 7),
+            original_token_count=14,
+        )
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.zeros(1, 10, dtype=torch.long),
+                "input_lengths": torch.tensor([10]),
+                "routed_experts": torch.zeros(1, 10, 2, 2, dtype=torch.long),
+                "token_mask": torch.ones(1, 4),
+                "generation_logprobs": torch.zeros(1, 4),
+                TREE_ATTENTION_EDGE_SOURCE_INDICES: torch.tensor([[5, 6, 7]]),
+                TREE_ATTENTION_EDGE_TARGET_IDS: torch.tensor([[11, 12, 13]]),
+                TREE_ATTENTION_EDGE_LENGTHS: torch.tensor([3]),
+                TREE_ATTENTION_LAYOUTS: [layout],
+            }
+        )
+        assert get_and_validate_seqlen(data) == 10
+
+    def test_get_and_validate_seqlen_rejects_bad_tree_edge_width(self):
+        from nemo_rl.data.packed_rollouts import (
+            TREE_ATTENTION_EDGE_LENGTHS,
+            TREE_ATTENTION_EDGE_SOURCE_INDICES,
+            TREE_ATTENTION_EDGE_TARGET_IDS,
+            TREE_ATTENTION_LAYOUTS,
+            TreeAttentionLayout,
+        )
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+        from nemo_rl.models.megatron.data import get_and_validate_seqlen
+
+        layout = TreeAttentionLayout(
+            segment_lengths=(10,),
+            segment_parents=(-1,),
+            segment_depths=(0,),
+            edge_source_indices=(5, 6, 7),
+            original_token_count=10,
+        )
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.zeros(1, 10, dtype=torch.long),
+                "input_lengths": torch.tensor([10]),
+                "token_mask": torch.ones(1, 3),
+                TREE_ATTENTION_EDGE_SOURCE_INDICES: torch.tensor([[5, 6, 7]]),
+                TREE_ATTENTION_EDGE_TARGET_IDS: torch.tensor([[11, 12, 13]]),
+                TREE_ATTENTION_EDGE_LENGTHS: torch.tensor([3]),
+                TREE_ATTENTION_LAYOUTS: [layout],
+            }
+        )
+
+        with pytest.raises(ValueError, match="token_mask.*edge_width=4"):
+            get_and_validate_seqlen(data)
+
 
 @pytest.mark.mcore
 class TestProcessMicrobatch:
     """Tests for process_microbatch function."""
+
+    @patch("nemo_rl.models.megatron.data.get_context_parallel_group")
+    @patch("nemo_rl.models.megatron.data.torch.distributed.all_gather")
+    def test_gather_cp_partition_indices_uses_cp_rank_order(
+        self, mock_all_gather, mock_cp_group
+    ):
+        from nemo_rl.models.megatron.data import _gather_cp_partition_indices
+
+        group = MagicMock()
+        mock_cp_group.return_value = group
+
+        def populate_rank_partitions(outputs, local, *, group):
+            assert torch.equal(local, torch.tensor([0, 3, 4, 7]))
+            assert group is mock_cp_group.return_value
+            outputs[0].copy_(torch.tensor([0, 3, 4, 7]))
+            outputs[1].copy_(torch.tensor([1, 2, 5, 6]))
+
+        mock_all_gather.side_effect = populate_rank_partitions
+
+        result = _gather_cp_partition_indices(
+            torch.tensor([0, 3, 4, 7]),
+            cp_size=2,
+        )
+
+        assert torch.equal(result, torch.tensor([0, 3, 4, 7, 1, 2, 5, 6]))
+        mock_all_gather.assert_called_once()
+
+    @patch("nemo_rl.models.megatron.data.TreePackedSeqParams")
+    @patch("nemo_rl.models.megatron.data._gather_cp_partition_indices")
+    @patch("nemo_rl.models.megatron.data.get_packed_seq_cp_partition_indices")
+    def test_tree_packed_params_gather_real_cp_rank_partitions(
+        self, mock_partition, mock_gather, mock_tree_params
+    ):
+        """Tree CP metadata gathers ownership instead of impersonating CP ranks."""
+        from nemo_rl.data.packed_rollouts import TreeAttentionLayout
+        from nemo_rl.models.megatron.data import _build_tree_packed_seq_params
+
+        local_indices = torch.tensor([0, 3, 4, 7])
+        rank_order_indices = torch.tensor([0, 3, 4, 7, 1, 2, 5, 6])
+        mock_partition.return_value = local_indices
+        mock_gather.return_value = rank_order_indices
+        base = MagicMock()
+        base.qkv_format = "thd"
+        base.cu_seqlens_q = torch.tensor([0, 8], dtype=torch.int32)
+        base.cu_seqlens_kv = base.cu_seqlens_q
+        base.cu_seqlens_q_padded = base.cu_seqlens_q
+        base.cu_seqlens_kv_padded = base.cu_seqlens_q
+        base.local_cp_size = None
+        base.cp_group = None
+        base.total_tokens = 8
+        base.tokens_per_sample = None
+        base.pad_between_seqs = False
+
+        _build_tree_packed_seq_params(
+            base,
+            layouts=[
+                TreeAttentionLayout(
+                    segment_lengths=(8,),
+                    segment_parents=(-1,),
+                    segment_depths=(0,),
+                    edge_source_indices=(),
+                    original_token_count=8,
+                )
+            ],
+            edge_source_indices=torch.empty((1, 0), dtype=torch.long),
+            edge_lengths=torch.tensor([0]),
+            seq_lengths=torch.tensor([8]),
+            cu_seqlens_padded=torch.tensor([0, 8], dtype=torch.int32),
+            total_tokens=8,
+            cp_rank=0,
+            cp_size=2,
+        )
+
+        mock_partition.assert_called_once()
+        assert mock_partition.call_args.kwargs["cp_rank"] == 0
+        mock_gather.assert_called_once_with(local_indices, cp_size=2)
+        kwargs = mock_tree_params.call_args.kwargs
+        assert torch.equal(
+            kwargs["tree_cp_gather_inverse"],
+            torch.tensor([0, 4, 5, 1, 2, 6, 7, 3]),
+        )
 
     @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
     def test_process_microbatch_no_packing(self, mock_get_masks):

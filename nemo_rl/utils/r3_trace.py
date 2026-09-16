@@ -34,6 +34,7 @@ _TRACE_SAMPLES_ENV = "NRL_R3_TRACE_SAMPLES"
 _TRACE_DIR_ENV = "NRL_R3_TRACE_DIR"
 _TRACE_MICROBATCHES_ENV = "NRL_R3_TRACE_MICROBATCHES"
 _TRACE_VERIFY_FORWARD_ENV = "NRL_R3_TRACE_VERIFY_FORWARD"
+_TRACE_COMPARE_NATURAL_ENV = "NRL_R3_TRACE_COMPARE_NATURAL"
 
 _DEFAULT_TRACE_DIR = "logs/r3_trace"
 _DEFAULT_TRACE_STEPS = 1
@@ -57,6 +58,17 @@ def r3_trace_enabled() -> bool:
 
 def r3_trace_verify_forward_enabled() -> bool:
     return r3_trace_enabled() and os.getenv(_TRACE_VERIFY_FORWARD_ENV, "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def r3_trace_compare_natural_enabled() -> bool:
+    return r3_trace_verify_forward_enabled() and os.getenv(
+        _TRACE_COMPARE_NATURAL_ENV, "0"
+    ).lower() in {
         "1",
         "true",
         "yes",
@@ -240,6 +252,7 @@ def _trace_router_replay_topk_use(
     topk: int,
     expected: Optional[Any],
     actual: Any,
+    natural: Optional[Any],
     backward_list_len_before: Optional[int],
     backward_list_len_after: Optional[int],
 ) -> None:
@@ -272,6 +285,43 @@ def _trace_router_replay_topk_use(
         record["replay_backward_list_len_after"] = int(backward_list_len_after)
     if expected is not None:
         record["expected"] = _tensor_record(expected)
+    if natural is not None and expected_for_match is not None:
+        natural = natural.to(device=actual.device, dtype=actual.dtype)
+        expected = expected.to(device=actual.device, dtype=actual.dtype)
+        expected_for_match = expected_for_match.to(
+            device=actual.device, dtype=actual.dtype
+        )
+        comparable_rows = ~expected.eq(-1).all(dim=-1)
+        exact_row_matches = natural.eq(expected_for_match).all(dim=-1)
+        set_row_matches = (
+            natural.sort(dim=-1)
+            .values.eq(expected_for_match.sort(dim=-1).values)
+            .all(dim=-1)
+        )
+        expert_overlap = (
+            natural.unsqueeze(-1)
+            .eq(expected_for_match.unsqueeze(-2))
+            .any(dim=-1)
+            .sum(dim=-1)
+        )
+        comparable_count = int(comparable_rows.sum().item())
+        record["natural"] = _tensor_record(natural)
+        record["natural_route_comparison"] = {
+            "comparable_rows": comparable_count,
+            "exact_order_row_matches": int(
+                exact_row_matches[comparable_rows].sum().item()
+            ),
+            "expert_set_row_matches": int(
+                set_row_matches[comparable_rows].sum().item()
+            ),
+            "mean_expert_overlap_fraction": (
+                float(
+                    expert_overlap[comparable_rows].float().div(int(topk)).mean().item()
+                )
+                if comparable_count
+                else None
+            ),
+        }
     _write_record(record)
 
     if not matches:
@@ -315,8 +365,23 @@ def _verify_router_replay_forward_context() -> Iterator[None]:
                 backward_list = getattr(replay_instance, "replay_backward_list", [])
                 backward_len_before = len(backward_list)
                 expected = None
+                natural = None
                 if action == RouterReplayAction.REPLAY_FORWARD:
                     expected = getattr(replay_instance, "target_topk_idx", None)
+                    if (
+                        r3_trace_compare_natural_enabled()
+                        and default_compute_topk is not None
+                    ):
+                        # Keep the caller's grad-mode because MCore uses it to
+                        # select sorted training top-k, but do not attach this
+                        # diagnostic-only branch to the training graph.
+                        _, natural = default_compute_topk(
+                            scores.detach(),
+                            topk,
+                            num_groups=num_groups,
+                            group_topk=group_topk,
+                        )
+                        natural = natural.detach()
                 elif action == RouterReplayAction.REPLAY_BACKWARD:
                     expected = backward_list[0] if backward_list else None
 
@@ -341,6 +406,7 @@ def _verify_router_replay_forward_context() -> Iterator[None]:
                         topk=topk,
                         expected=expected,
                         actual=top_indices,
+                        natural=natural,
                         backward_list_len_before=backward_len_before,
                         backward_list_len_after=len(
                             getattr(replay_instance, "replay_backward_list", [])

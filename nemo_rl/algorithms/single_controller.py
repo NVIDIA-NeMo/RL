@@ -4761,7 +4761,13 @@ class SingleControllerActor:
             # the loop this is a blocking Ray call, and a wedged generation worker would
             # freeze the event loop itself -- taking the watchdog, which is an asyncio
             # task on that same loop, down with it.
-            await asyncio.to_thread(self._gen.invalidate_kv_cache)
+            if not await asyncio.to_thread(self._gen.invalidate_kv_cache):
+                raise RuntimeError(
+                    "Generation KV-cache invalidation failed after a weight update"
+                )
+        await asyncio.to_thread(
+            self._gen.set_generation_weight_version, self._trainer_version
+        )
         elapsed = time.monotonic() - t0
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)

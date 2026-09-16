@@ -1379,6 +1379,8 @@ def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
         model_cfg.mtp_num_layers = megatron_cfg["mtp_num_layers"]
     if "mtp_loss_scaling_factor" in megatron_cfg:
         model_cfg.mtp_loss_scaling_factor = megatron_cfg["mtp_loss_scaling_factor"]
+    if "disable_mtp_loss" in megatron_cfg:
+        model_cfg.disable_mtp_loss = megatron_cfg["disable_mtp_loss"]
     if "mtp_use_repeated_layer" in megatron_cfg:
         model_cfg.mtp_use_repeated_layer = megatron_cfg["mtp_use_repeated_layer"]
     if "mtp_detach_heads" in megatron_cfg:
@@ -1474,6 +1476,11 @@ def _apply_precision_config(
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
     }
+    if "mamba_training_ssm_states_dtype" in config["megatron_cfg"]:
+        mamba_state_dtype = config["megatron_cfg"]["mamba_training_ssm_states_dtype"]
+        model_cfg.mamba_training_ssm_states_dtype = (
+            dtype_map[mamba_state_dtype] if mamba_state_dtype is not None else None
+        )
     model_cfg.pipeline_dtype = dtype_map[config["megatron_cfg"]["pipeline_dtype"]]
 
     te_precision_config_file = config["megatron_cfg"].get("te_precision_config_file")
