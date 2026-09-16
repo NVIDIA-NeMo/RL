@@ -35,6 +35,11 @@ def _extension(backend):
     engine = MagicMock()
     engine.model_engine = model_engine
     engine.control_action.side_effect = lambda **_: contextlib.nullcontext()
+    # Absent by default, matching every released TRT-LLM today (the method is
+    # only on NVIDIA/TensorRT-LLM#17937, not yet merged). A bare MagicMock
+    # would auto-create this attribute and mask the fallback path entirely;
+    # tests for the "available" branch re-add it explicitly.
+    del engine.recompute_active_requests
     extension.engine = engine
     extension.device_id = 0
     extension.model_update_group = object()
@@ -182,7 +187,31 @@ def test_collective_refit_runs_at_async_engine_boundary(
         "stream_sync",
     ]
     model_loader.abort_update_weights.assert_not_called()
+    # recompute_active_requests is absent (the fixture default), so the
+    # collective path must fall back to reset_prefix_cache.
     engine.reset_prefix_cache.assert_called_once_with()
+
+
+def test_collective_refit_uses_recompute_active_requests_when_available(monkeypatch):
+    """On TRT-LLM builds carrying NVIDIA/TensorRT-LLM#17937 (e.g. tekit_tmp),
+    prefer the precise in-flight-KV recompute over a blanket cache reset."""
+    from nemo_rl.models.generation.trtllm import trtllm_backend as backend
+
+    extension, _, model, model_loader, engine = _extension(backend)
+    engine.recompute_active_requests = MagicMock()
+    model.model_config = SimpleNamespace(quant_config=object())
+
+    def packed_consumer(*, post_unpack_func, **_):
+        post_unpack_func([("model.weight", torch.tensor([1.0]))])
+
+    monkeypatch.setattr(backend, "packed_broadcast_consumer", packed_consumer)
+    monkeypatch.setattr(backend.fp8_quantization, "is_fp8_model", lambda _: False)
+    monkeypatch.setattr(backend.torch.cuda, "synchronize", lambda: None)
+
+    assert extension.update_weights_from_collective() is True
+
+    engine.recompute_active_requests.assert_called_once_with()
+    engine.reset_prefix_cache.assert_not_called()
 
 
 def test_collective_refit_requires_metadata():
