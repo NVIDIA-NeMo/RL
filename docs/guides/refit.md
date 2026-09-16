@@ -91,9 +91,28 @@ policy:
 
 This path currently accepts only checkpoints whose Transformers `model_type`
 is `qwen3_5_moe`. NeMo RL initializes the TRT-LLM model with `load_format` set
-to `dummy`, then populates it from the first BF16 policy refit. The TRTLLM MoE
-backend is required to preserve FP32 block scales; MXFP8/E8M0 scales are not
-used.
+to `dummy`, then populates it from the first BF16 policy refit. By default
+(`is_mx: false`), the TRTLLM MoE backend is required to preserve FP32 block
+scales; MXFP8/E8M0 scales are not used.
+
+#### MXFP8 variant
+
+Set `is_mx: true` to quantize routed experts to MXFP8 (E4M3 weights with
+UE8M0 1x32 block scales) instead of 128x128 block-FP8 with FP32 scales:
+
+```yaml
+policy:
+  generation:
+    trtllm_cfg:
+      precision: fp8
+      is_mx: true
+```
+
+This selects the CUTLASS MoE backend instead of TRTLLM -- CUTLASS is the only
+backend implementing `MXFP8CutlassFusedMoEMethod`. MXFP8 also constrains
+which GPUs it can run on: TRT-LLM's CUTLASS MoE gates `QuantAlgo.MXFP8` on
+`sm_constraint in {100, 103}`, so it does not run everywhere the default
+block-FP8 path does.
 
 The installed TRT-LLM must provide the incremental-refit lifecycle APIs
 `begin_update_weights`, `finalize_update_weights`, `abort_update_weights`, and
