@@ -15,6 +15,7 @@
 from typing import Any, Literal, NotRequired, TypedDict, Union
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 
 
@@ -527,26 +528,6 @@ class MegatronConfig(TypedDict):
     freeze_config: NotRequired[dict[str, Any]]
 
 
-class DraftConfigDisabled(TypedDict):
-    """Configuration shape for the disabled draft-model training path."""
-
-    enabled: Literal[False]
-
-
-class DraftConfig(TypedDict):
-    """Configuration for Eagle draft-model training alongside the policy model."""
-
-    enabled: Literal[True]
-    model_name: NotRequired[str | None]
-    loss_weight: NotRequired[float]
-    num_layers: NotRequired[int | None]
-    aux_layer_indices: NotRequired[list[int] | None]
-    # Tokens per FP32 vocab tile in the streaming draft soft-CE. Trades peak
-    # activation memory against kernel-launch count; see
-    # DEFAULT_DRAFT_TOKEN_CHUNK_SIZE in nemo_rl/algorithms/loss/draft.py.
-    token_chunk_size: NotRequired[int]
-
-
 class TokenizerConfig(TypedDict):
     name: str
     # None selects NeMo-RL's passthrough prompt/response template.
@@ -643,7 +624,7 @@ class PolicyConfig(TypedDict):
     reward_model_cfg: NotRequired[RewardModelConfig]
     dtensor_cfg: DTensorConfig | DTensorConfigDisabled
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
-    draft: NotRequired[DraftConfig | DraftConfigDisabled]
+    draft: NotRequired[Eagle3DraftConfig]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
     # Resolved once by the driver and carried to the student workers and (via
     # deepcopy) to the teacher group. Absent means full-vocabulary MOPD is off.
