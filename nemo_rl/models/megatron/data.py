@@ -105,6 +105,9 @@ class ProcessedMicrobatch:
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
     original_seq_length: Optional[int] = None
     media_token_validity_mask: Optional[torch.Tensor] = None
+    dynamic_cp_group_start: bool = False
+    dynamic_cp_group_index: Optional[int] = None
+    dynamic_cp_task_index: Optional[int] = None
 
 
 def make_processed_microbatch_iterator(

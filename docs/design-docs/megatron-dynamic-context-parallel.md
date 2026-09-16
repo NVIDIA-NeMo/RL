@@ -16,8 +16,7 @@ policy:
       enabled: true
       min_size: 1
       max_size: 8
-      train_tokens_per_rank: 1024
-      logprob_tokens_per_rank: 1024
+      tokens_per_rank: 4096
   sequence_packing:
     enabled: true
   dynamic_batching:
@@ -30,6 +29,20 @@ than static CP. `max_size: null` uses the complete domain. The domain and CP
 bounds must be powers of two. Budgets count padded tokens per CP rank, before
 tensor sequence parallelism. A sequence that cannot fit at the maximum size is
 rejected before dispatch.
+
+There is one `tokens_per_rank` budget for scoring and training. Training usually
+has the tighter memory limit because it retains activations, so this is the safe
+schedule to share. The first policy or reference-logprob call builds the
+immutable schedule. Later score calls with the same ordered lengths reuse it,
+and training consumes it while recomputing its own valid-token and
+valid-sequence denominators. The payload is still rebuilt at each stage because
+score and train carry different fields, but `plan_cp_phases` runs only once.
+
+Set `tokens_per_rank` to the largest packed token count that one rank can safely
+train. Setting it lower than the ordinary sequence-packing budget forces extra
+CP groups and smaller model calls even when memory does not require them. The
+scheduler can still increase CP for work in a partially occupied phase so idle
+lanes contribute, matching the balanced hybrid-CP behavior.
 
 This path currently supports PP=1 and the standard Ray policy data path.
 TransferQueue, split execution, model-owned multimodal packing, atomic preference
@@ -51,16 +64,33 @@ initialized DP × CP group and resolves the active attention group using MCore's
 hybrid-group API. TP ranks receive the same task payload. EP is a constraint on
 group placement, not another data-sharding axis.
 
-Each phase covers the entire DP × CP domain. Unoccupied lanes execute a small
-zero-mask placeholder, so every rank performs the same number of
-forward/backward calls and reaches gradient synchronization together. A barrier
-between phases keeps changes of active group coordinated, including MCore
-reruns. This conservative scheduler introduces more synchronization and padding
-than Megatron's balanced scheduler; it is not a throughput-equivalent port of
-that scheduler.
+Before finalizing an initial placement, the driver repeatedly expands the smallest real task
+to the next CP power of two while unused lanes remain. Its padding factor and
+padded-token count are recalculated at the larger CP size. This mirrors MCore's
+`fill_empty_gpus` policy and turns idle lanes into useful attention work. If an
+explicit `max_size` prevents another expansion, the remaining lanes execute a
+small zero-mask placeholder.
+
+Adjacent placements with the same lane partition are merged into one
+synchronization group. Packed tasks are redistributed between equal-size CP
+subgroups using longest-processing-time placement with
+`sum(sequence_length²) / active_CP` as the estimated attention cost. A subgroup
+may consequently execute more packed tasks than another subgroup. Every packed
+task still has its own checked token budget; merging never combines their
+activations or padding allocations.
+
+Every lane executes at least one task per synchronization group. A zero-mask
+placeholder is used only when a lane has no real task, which lets all DDP ranks
+participate in the final gradient synchronization. The standard MCore PP=1
+executor runs every lane's local tasks except its last under `no_sync`; the last
+local backward starts gradient synchronization. A domain-wide barrier occurs
+only before the first task of each synchronization group. Faster subgroups wait
+there after completing their shorter task lists, before any rank changes its CP
+topology. The boundary marker is part of `ProcessedMicrobatch`, so an MCore
+rerun repeats the barrier.
 
 MCore creates hybrid groups during Bridge initialization. NeMo-RL then selects
-the standard no-pipeline executor for these driver-planned phases. Optimizer
+the standard no-pipeline executor for these driver-planned groups. Optimizer
 and DDP groups remain fixed. `PackedSeqParams.local_cp_size` and `cp_group`
 carry the active attention topology; size one explicitly uses `cp_group=None`.
 The NeMo-RL runtime also initializes the TE CP stream when a model built with
@@ -73,11 +103,22 @@ collection. The model receives a shallow copy of packed metadata with a real
 singleton group for CP=1, because RoPE interprets `None` as a static-group
 fallback. Loss and logprob code retain the explicit size-one/None convention.
 
-Dynamic-CP workers register a Ray serializer for CPU tensor results. It uses
-NumPy byte arrays and preserves tensor dtype and shape, including BF16. This
-keeps the driver independent of MCore even when MCore replaces PyTorch's tensor
-storage loader with a backend-specific function. MCore's checkpoint loader is
-left intact.
+During worker setup, dynamic-CP Megatron actors register a Ray serializer for
+CPU tensor results. Importing MCore in the worker replaces
+`torch.storage._load_from_bytes` with MCore's safe loader. A tensor does not
+store a Megatron object, but PyTorch's normal storage pickle records that loader
+function by module name; deserializing such a result would therefore make the
+lightweight Ray driver import `megatron`.
+
+The serializer runs when Ray materializes an actor method's return value, after
+the worker has copied result tensors to CPU and before the driver's
+`get_all_worker_results` completes. It applies once to every tensor nested in
+that return value. In the GRPO recipe this includes the full policy-logprob and
+reference-logprob result rounds and the small loss/gradient metric tensors from
+each training step. It encodes contiguous bytes, dtype, and shape in a NumPy
+payload, including BF16 and empty tensors, then reconstructs an independent,
+writable CPU tensor in the driver. It does not modify MCore's checkpoint loader
+or serialize model parameters and GPU activations.
 
 ## Packing, outputs, and normalization
 
@@ -97,13 +138,14 @@ discard valid results.
 The driver computes valid sequence and token denominators from the unique
 global batch before replication, separately for every optimizer step. The
 differentiable CP logprob gather replicates the loss over the active CP group.
-For this gathered loss, NeMo-RL multiplies by
+For this gathered loss, each lane's task is multiplied by
 
 ```text
-number_of_phases / (static_CP * active_CP)
+number_of_local_tasks / (static_CP * active_CP)
 ```
 
-This cancels the pinned no-pipeline executor's `static_CP / number_of_phases`
+This cancels the pinned no-pipeline executor's
+`static_CP / number_of_local_tasks`
 scaling and compensates the active-CP gather's backward SUM. DDP sums gradients
 over the fixed DP × CP domain. Metrics are retained only on task owners before
 global aggregation. `tests/unit/models/megatron/test_dynamic_cp_scaling.py`
@@ -150,8 +192,34 @@ all ten steps with `PROFILE_STEP_RANGE=1:11`. Use
 `PROFILE_STEP_RANGE=3:6` for a smaller steady-state-only report. The launcher
 is a dry run unless `DRY_RUN=0` is explicitly supplied.
 
-Each runtime phase has an NVTX label such as
-`dynamic_cp/phase_7/cp_4/lane_2/data`. The post-run check requires ten dynamic
-training plans, transitions between CP=1 and CP>1, valid training metrics, and
-at least one completed policy `.nsys-rep` file on the head node. `ray.sub` also
-copies reports from all nodes into `<job-id>-logs/ray/**/nsight/`.
+Each runtime packed task has an NVTX label such as
+`dynamic_cp/group_2/task_1/cp_4/lane_2/data`. Within a group, different lanes
+may have different maximum task indices. The post-run check requires ten
+dynamic training plans, at least two active CP sizes, at least one group with
+multiple sequential packed tasks, valid training metrics, and at least one
+completed policy `.nsys-rep` file on the head node. It reports how many groups
+had uneven per-lane task counts and also requires every training
+dispatch to report `schedule=reused`. `ray.sub` copies reports from all nodes
+into `<job-id>-logs/ray/**/nsight/`.
+
+### Ten-step dynamic/static comparison
+
+`perf_runs/run_gb200_cp_comparison.sh` runs matched ten-step jobs with the same
+model, batch, TP=2, PP=1, base CP=1, generation setup, container, and W&B
+project. Set `CP_MODE=dynamic` to allow active CP sizes 1–8, or
+`CP_MODE=static` to keep CP=1. Use different `CP_RUN_NAME` values so the W&B
+runs and local logs remain distinct.
+
+The launcher accepts `CP_MAX_TOTAL_SEQUENCE_LENGTH`, `CP_TOKENS_PER_RANK`,
+`CP_MAX_SIZE`, and `STATIC_CP_SIZE`. A fair capacity-matched comparison uses the
+smallest fixed CP that can accommodate the configured maximum at the same
+per-rank token budget. For example, compare dynamic CP1–2 against static CP2
+with an 8192-token maximum and a 4096-token per-rank budget. Static CP1 remains
+useful as an unconstrained throughput reference when it fits in memory; static
+CP8 is a capacity-matched baseline only when the workload actually requires
+CP8.
+
+After each run, `perf_runs/analyze_cp_sequence_lengths.py` writes
+`sequence_length_distribution.json` beside the driver log. It reports length
+percentiles, how many samples stopped exactly at the configured ceiling, and
+the CP size each sample required before optional idle-lane expansion.

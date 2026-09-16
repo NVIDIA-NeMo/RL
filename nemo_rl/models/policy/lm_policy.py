@@ -42,8 +42,10 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.dynamic_cp import (
+    CPBatchSchedule,
     build_cp_dispatch,
     collect_cp_outputs,
+    cp_schedule_matches,
     dynamic_cp_config,
     validate_dynamic_cp,
 )
@@ -339,6 +341,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
 
         self.dynamic_cp = dynamic_cp_config(config) is not None
+        self._dynamic_cp_schedule: Optional[CPBatchSchedule] = None
         if self.dynamic_cp:
             if not self.supports_dynamic_cp_dispatch:
                 raise ValueError(
@@ -670,9 +673,22 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     def _get_dynamic_cp_outputs(
         self, method: str, data: BatchedDataDict, **kwargs: Any
     ) -> BatchedDataDict:
+        schedule_batch_size = self.cfg["train_global_batch_size"]
+        if data.size != schedule_batch_size:
+            # The score worker currently consumes one CPRankStep. Standalone
+            # scoring can therefore use dynamic CP as one schedule batch, but
+            # it will not reuse a multi-global-batch training schedule.
+            schedule_batch_size = data.size
+        schedule = self._matching_dynamic_cp_schedule(data, schedule_batch_size)
         dispatch = build_cp_dispatch(
-            data, self.cfg, self.sharding_annotations, batch_size=None, training=False
+            data,
+            self.cfg,
+            self.sharding_annotations,
+            batch_size=schedule_batch_size,
+            training=False,
+            schedule=schedule,
         )
+        self._dynamic_cp_schedule = dispatch.schedule
         futures = self.worker_group.run_all_workers_sharded_data(
             method,
             data=dispatch.data,
@@ -685,6 +701,22 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return collect_cp_outputs(
             self.worker_group.get_all_worker_results(futures), dispatch, data.size
         )
+
+    def _matching_dynamic_cp_schedule(
+        self, data: BatchedDataDict, batch_size: int
+    ) -> Optional[CPBatchSchedule]:
+        schedule = self._dynamic_cp_schedule
+        if schedule is None:
+            return None
+        if cp_schedule_matches(
+            schedule,
+            data,
+            self.cfg,
+            self.sharding_annotations,
+            batch_size=batch_size,
+        ):
+            return schedule
+        return None
 
     def get_logprobs(
         self,
@@ -934,10 +966,16 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     self.sharding_annotations,
                     batch_size=batch_size,
                     training=True,
+                    schedule=self._matching_dynamic_cp_schedule(data, batch_size),
                 )
                 if self.dynamic_cp
                 else None
             )
+            if dispatch is not None:
+                # A schedule is step-local. Training is the final consumer, so
+                # release it even though the immutable topology is also stored
+                # in dispatch for the duration of this call.
+                self._dynamic_cp_schedule = None
             sharded_data = (
                 dispatch.data
                 if dispatch is not None

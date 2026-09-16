@@ -2121,9 +2121,11 @@ def setup_model_and_optimizer(
         and megatron_cfg.model.hybrid_context_parallel
     ):
         initialize_dynamic_cp_runtime()
-        # The Ray driver supplies already scheduled, uniform phases. Use MCore's
-        # standard no-pipeline executor, not its TP0 dataloader/redistribution loop.
-        # Hybrid process groups remain initialized; PackedSeqParams selects them.
+        # The Ray driver supplies packed-task synchronization groups and each
+        # lane's possibly uneven task list. Use MCore's standard PP=1 executor,
+        # whose no_sync handling covers every local task except the last, rather
+        # than its TP0 dataloader/redistribution path. Hybrid process groups stay
+        # initialized; PackedSeqParams selects the active attention group.
         megatron_cfg.model.hybrid_context_parallel = False
 
     if megatron_cfg.ft and megatron_cfg.ft.enable_ft_package:

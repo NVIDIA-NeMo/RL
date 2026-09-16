@@ -91,7 +91,7 @@ def bind_attention_cp_group(model: torch.nn.Module, packed_seq_params: Any) -> A
 def planned_microbatches(
     data: Any, plan: CPRankPlan, step: CPRankStep, straggler_timer: Any
 ) -> Iterator[Any]:
-    """Yield exactly the driver's phases, binding and validating active groups."""
+    """Yield the lane's uneven task list with explicit group boundaries."""
     # Avoid a cycle: data.py dispatches to this iterator.
     from nemo_rl.models.megatron.data import ProcessedMicrobatch, process_microbatch
 
@@ -103,70 +103,79 @@ def planned_microbatches(
         or domain.rank() != plan.lane
     ):
         raise ValueError("Ray's DP*CP lane map disagrees with initialized MCore groups")
-    for phase_index, assignment in enumerate(step.assignments):
-        size = assignment.cp_size
-        group = (
-            parallel_state.get_hybrid_data_context_parallel_groups(group_size=size)
-            if size > 1
-            else None
-        )
-        rank = plan.lane - assignment.lane_start
-        if group is not None:
-            members = expected[assignment.lane_start : assignment.lane_start + size]
-            if (
-                group.size() != size
-                or group.rank() != rank
-                or torch.distributed.get_process_group_ranks(group) != members
-            ):
+    for group_index, rank_group in enumerate(step.groups):
+        if not rank_group.assignments:
+            raise ValueError("Every CP synchronization group needs one local task")
+        for task_index, assignment in enumerate(rank_group.assignments):
+            size = assignment.cp_size
+            group = (
+                parallel_state.get_hybrid_data_context_parallel_groups(group_size=size)
+                if size > 1
+                else None
+            )
+            rank = plan.lane - assignment.lane_start
+            if group is not None:
+                members = expected[assignment.lane_start : assignment.lane_start + size]
+                if (
+                    group.size() != size
+                    or group.rank() != rank
+                    or torch.distributed.get_process_group_ranks(group) != members
+                ):
+                    raise ValueError(
+                        "Active CP group disagrees with the driver's assignment"
+                    )
+            expert_group = parallel_state.get_expert_model_parallel_group()
+            tp_size = parallel_state.get_tensor_model_parallel_world_size()
+            task_ranks = {
+                base + offset
+                for base in plan.lane_ranks[
+                    assignment.lane_start : assignment.lane_start + size
+                ]
+                for offset in range(tp_size)
+            }
+            if not set(
+                torch.distributed.get_process_group_ranks(expert_group)
+            ).issubset(task_ranks):
                 raise ValueError(
-                    "Active CP group disagrees with the driver's assignment"
+                    "Expert communication group crosses dynamic CP task boundaries"
                 )
-        expert_group = parallel_state.get_expert_model_parallel_group()
-        tp_size = parallel_state.get_tensor_model_parallel_world_size()
-        task_ranks = {
-            base + offset
-            for base in plan.lane_ranks[
-                assignment.lane_start : assignment.lane_start + size
-            ]
-            for offset in range(tp_size)
-        }
-        if not set(torch.distributed.get_process_group_ranks(expert_group)).issubset(
-            task_ranks
-        ):
-            raise ValueError(
-                "Expert communication group crosses dynamic CP task boundaries"
+            context = RuntimeCPContext(size=size, rank=rank, group=group)
+            if assignment.sample_indices:
+                batch = data.select_indices(list(assignment.sample_indices)).to("cuda")
+            else:
+                batch = data.select_indices([0]).to("cuda")
+                # A real attention invocation keeps collective counts aligned, but
+                # none of this placeholder's targets or metrics belong to the batch.
+                for key, value in list(batch.items()):
+                    if isinstance(value, torch.Tensor):
+                        batch[key] = torch.zeros_like(value)
+                batch["input_lengths"].fill_(2)
+            inputs = process_microbatch(
+                batch,
+                seq_length_key="input_lengths",
+                pack_sequences=True,
+                pad_individual_seqs_to_multiple_of=assignment.pad_multiple,
+                straggler_timer=straggler_timer,
+                cp_context=context,
             )
-        context = RuntimeCPContext(size=size, rank=rank, group=group)
-        if assignment.sample_indices:
-            batch = data.select_indices(list(assignment.sample_indices)).to("cuda")
-        else:
-            batch = data.select_indices([0]).to("cuda")
-            # A real attention invocation keeps collective counts aligned, but
-            # none of this placeholder's targets or metrics belong to the batch.
-            for key, value in list(batch.items()):
-                if isinstance(value, torch.Tensor):
-                    batch[key] = torch.zeros_like(value)
-            batch["input_lengths"].fill_(2)
-        inputs = process_microbatch(
-            batch,
-            seq_length_key="input_lengths",
-            pack_sequences=True,
-            pad_individual_seqs_to_multiple_of=assignment.pad_multiple,
-            straggler_timer=straggler_timer,
-            cp_context=context,
-        )
-        if inputs.input_ids_cp_sharded.shape[1] * size != assignment.padded_tokens:
-            raise ValueError(
-                "Packed worker token count disagrees with the driver's plan"
-            )
-        payload_kind = "data" if assignment.sample_indices else "padding"
-        # The generator stays paused inside this range while MCore consumes the
-        # microbatch, so an Nsight trace shows the active CP size for the whole
-        # forward/backward phase.
-        with torch.cuda.nvtx.range(
-            f"dynamic_cp/phase_{phase_index}/cp_{size}/lane_{plan.lane}/{payload_kind}"
-        ):
-            yield ProcessedMicrobatch(data_dict=batch, **vars(inputs))
+            if inputs.input_ids_cp_sharded.shape[1] * size != assignment.padded_tokens:
+                raise ValueError(
+                    "Packed worker token count disagrees with the driver's plan"
+                )
+            payload_kind = "data" if assignment.sample_indices else "padding"
+            # The generator stays paused inside this range while MCore consumes
+            # the microbatch, making uneven task counts visible in Nsight.
+            with torch.cuda.nvtx.range(
+                f"dynamic_cp/group_{group_index}/task_{task_index}/cp_{size}/"
+                f"lane_{plan.lane}/{payload_kind}"
+            ):
+                yield ProcessedMicrobatch(
+                    data_dict=batch,
+                    dynamic_cp_group_start=task_index == 0,
+                    dynamic_cp_group_index=group_index,
+                    dynamic_cp_task_index=task_index,
+                    **vars(inputs),
+                )
 
 
 def runtime_cp_from_packed(packed_seq_params: Any) -> RuntimeCPContext:

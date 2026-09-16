@@ -11,14 +11,22 @@
 
 import unittest
 from random import Random
+from unittest.mock import patch
 
 import numpy as np
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.dynamic_context_parallel import cp_loss_multiplier
+from nemo_rl.distributed.dynamic_context_parallel import (
+    cp_loss_multiplier,
+    plan_cp_phases,
+)
 from nemo_rl.distributed.named_sharding import NamedSharding
-from nemo_rl.models.policy.dynamic_cp import build_cp_dispatch, collect_cp_outputs
+from nemo_rl.models.policy.dynamic_cp import (
+    build_cp_dispatch,
+    collect_cp_outputs,
+    cp_schedule_matches,
+)
 
 
 class TestDynamicCPDispatch(unittest.TestCase):
@@ -40,8 +48,7 @@ class TestDynamicCPDispatch(unittest.TestCase):
                 "sequence_parallel": False,
                 "dynamic_context_parallel": {
                     "enabled": True,
-                    "train_tokens_per_rank": 8,
-                    "logprob_tokens_per_rank": 8,
+                    "tokens_per_rank": 8,
                     "max_size": 4,
                 },
             },
@@ -169,6 +176,144 @@ class TestDynamicCPDispatch(unittest.TestCase):
             for plan in dp:
                 self.assertGreater(plan.steps[0].valid_tokens, 0)
                 self.assertEqual(plan.steps[1].valid_tokens, 0)
+
+    def test_dispatch_preserves_uneven_packed_task_lists(self):
+        data = BatchedDataDict(
+            input_ids=torch.arange(5 * 12).reshape(5, 12),
+            input_lengths=torch.tensor([10, 10, 10, 10, 10]),
+            sample_ids=torch.arange(5),
+        )
+        data["sample_mask"] = torch.ones(5, dtype=torch.long)
+        data["token_mask"] = torch.ones(5, 12, dtype=torch.long)
+        cfg = {**self.cfg, "megatron_cfg": dict(self.cfg["megatron_cfg"])}
+        cfg["megatron_cfg"]["dynamic_context_parallel"] = {
+            "enabled": True,
+            "tokens_per_rank": 10,
+            "max_size": 1,
+        }
+        dispatch = build_cp_dispatch(data, cfg, self.mesh, batch_size=5, training=True)
+        local_counts = [
+            len(plan.steps[0].assignments)
+            for dp_plans in dispatch.plans
+            for plan in dp_plans
+        ]
+        self.assertEqual(sorted(local_counts), [1, 1, 1, 2])
+        self.assertTrue(
+            all(
+                len(plan.steps[0].groups) == 1
+                for dp_plans in dispatch.plans
+                for plan in dp_plans
+            )
+        )
+        worker_outputs = []
+        for payloads, plans in zip(dispatch.data, dispatch.plans):
+            for payload, plan in zip(payloads, plans):
+                values = []
+                for task in plan.steps[0].assignments:
+                    values.extend(
+                        payload["sample_ids"][list(task.sample_indices)].tolist()
+                        if task.sample_indices
+                        else [-1]
+                    )
+                worker_outputs.append(
+                    BatchedDataDict(logprobs=torch.tensor(values)[:, None])
+                )
+        restored = collect_cp_outputs(worker_outputs, dispatch, data.size)
+        torch.testing.assert_close(restored["logprobs"].flatten(), torch.arange(5))
+
+        baseline_weight = torch.tensor(0.3, dtype=torch.float64, requires_grad=True)
+        inputs = data["input_ids"][:, 1:].double() / 100
+        baseline = torch.nn.functional.softplus(inputs * baseline_weight).sum() / 55
+        baseline.backward()
+
+        uneven_weight = baseline_weight.detach().clone().requires_grad_()
+        uneven_loss = uneven_weight * 0
+        for payloads, plans in zip(dispatch.data, dispatch.plans):
+            for payload, plan in zip(payloads, plans):
+                step = plan.steps[0]
+                num_local_tasks = len(step.assignments)
+                for task in step.assignments:
+                    if not task.sample_indices:
+                        continue
+                    local = payload.select_indices(list(task.sample_indices))
+                    local_loss = (
+                        torch.nn.functional.softplus(
+                            local["input_ids"][:, 1:].double() / 100 * uneven_weight
+                        ).sum()
+                        / step.valid_tokens
+                    )
+                    multiplier = cp_loss_multiplier(
+                        active_cp_size=task.cp_size,
+                        schedule_cp_size=2,
+                        num_microbatches=num_local_tasks,
+                        replicated_cp_loss=True,
+                    )
+                    # MCore PP=1 applies static_CP / local_microbatch_count.
+                    uneven_loss = (
+                        uneven_loss + local_loss * multiplier * 2 / num_local_tasks
+                    )
+        uneven_loss.backward()
+        torch.testing.assert_close(uneven_loss, baseline)
+        torch.testing.assert_close(uneven_weight.grad, baseline_weight.grad)
+
+    def test_score_and_train_reuse_one_schedule(self):
+        with patch(
+            "nemo_rl.models.policy.dynamic_cp.plan_cp_phases",
+            wraps=plan_cp_phases,
+        ) as planner:
+            score = build_cp_dispatch(
+                self.data,
+                self.cfg,
+                self.mesh,
+                batch_size=5,
+                training=False,
+            )
+            train = build_cp_dispatch(
+                self.data,
+                self.cfg,
+                self.mesh,
+                batch_size=5,
+                training=True,
+                schedule=score.schedule,
+            )
+
+        self.assertEqual(planner.call_count, 1)
+        self.assertIs(train.schedule, score.schedule)
+        self.assertTrue(
+            cp_schedule_matches(
+                score.schedule,
+                self.data,
+                self.cfg,
+                self.mesh,
+                batch_size=5,
+            )
+        )
+        for score_dp, train_dp in zip(score.plans, train.plans):
+            for score_plan, train_plan in zip(score_dp, train_dp):
+                self.assertEqual(
+                    score_plan.steps[0].assignments,
+                    train_plan.steps[0].assignments,
+                )
+                self.assertEqual(score_plan.steps[0].valid_tokens, 0)
+                self.assertGreater(train_plan.steps[0].valid_tokens, 0)
+
+    def test_schedule_reuse_rejects_different_batch_boundaries(self):
+        score = build_cp_dispatch(
+            self.data,
+            self.cfg,
+            self.mesh,
+            batch_size=5,
+            training=False,
+        )
+        self.assertFalse(
+            cp_schedule_matches(
+                score.schedule,
+                self.data,
+                self.cfg,
+                self.mesh,
+                batch_size=1,
+            )
+        )
 
 
 if __name__ == "__main__":

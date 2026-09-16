@@ -336,11 +336,10 @@ def forward_with_post_processing_fn(
         and isinstance(getattr(packed_seq_params, "local_cp_size", None), int)
         else None
     )
-    if packed_seq_params is not None and isinstance(
-        getattr(packed_seq_params, "local_cp_size", None), int
-    ):
-        # Every phase has one forward/backward per lane. Keep the barrier here,
-        # rather than in the iterator, so MCore reruns replay it as well.
+    if processed_mb.dynamic_cp_group_start:
+        # Lanes may run different numbers of packed tasks in a fixed CP
+        # partition. They meet only before changing to the next partition.
+        # Keep this in the forward path so MCore reruns replay the barrier.
         torch.distributed.barrier(
             group=parallel_state.get_data_parallel_group(with_context_parallel=True)
         )

@@ -66,8 +66,7 @@ def main() -> None:
             "sequence_parallel": False,
             "dynamic_context_parallel": {
                 "enabled": True,
-                "train_tokens_per_rank": 32,
-                "logprob_tokens_per_rank": 32,
+                "tokens_per_rank": 32,
                 "max_size": 4,
             },
         },
@@ -108,10 +107,13 @@ def main() -> None:
         )
         reported = torch.zeros((), device="cuda")
         sizes = []
+        group_boundaries = 0
         for task, batch in zip(
             step.assignments, planned_microbatches(payload, plan, step, None)
         ):
-            dist.barrier()
+            if batch.dynamic_cp_group_start:
+                group_boundaries += 1
+                dist.barrier()
             sizes.append(task.cp_size)
             callback = processor(
                 batch.data_dict,
@@ -123,6 +125,7 @@ def main() -> None:
             (loss * base_cp / len(step.assignments)).backward()
             if task.sample_indices and rank == task.lane_start:
                 reported += metrics["loss"]
+        assert group_boundaries == len(step.groups)
         dist.all_reduce(weight.grad)
         dist.all_reduce(reported)
         torch.testing.assert_close(reported, reference_loss, rtol=3e-5, atol=3e-6)

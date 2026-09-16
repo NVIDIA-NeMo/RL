@@ -24,8 +24,10 @@ policy:
       enabled: true
       min_size: 1
       max_size: 8
-      train_tokens_per_rank: 1024
-      logprob_tokens_per_rank: 1024
+      # Match the normal packed-microbatch budget. Smaller values force long
+      # sequences into CP even when they fit on one GB200 rank, fragmenting one
+      # step into many poorly utilized model calls.
+      tokens_per_rank: 4096
     fp8_cfg:
       enabled: false
   sequence_packing:

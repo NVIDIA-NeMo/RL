@@ -37,7 +37,12 @@ def tensor_from_payload(payload: TensorPayload) -> torch.Tensor:
 
 
 def register_policy_tensor_serializer() -> None:
-    """Register the policy worker's Ray serializer, retaining MCore's loader."""
+    """Register serialization for actor return tensors in this worker process.
+
+    Ray invokes this after an actor method returns and before the result enters
+    the object store. Registration is process-local and does not change the
+    driver's serializer or MCore's checkpoint loading behavior.
+    """
     # Ray is optional in tensor packing/round-trip unit tests.
     import ray.util
 

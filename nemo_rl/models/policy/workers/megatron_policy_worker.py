@@ -789,8 +789,12 @@ class MegatronPolicyWorkerImpl(
             if _model_accepts_media_token_validity_mask(self.model)
             else None
         )
+        # MCore installs a Megatron-specific torch storage loader process-wide.
+        # Every Megatron policy result therefore needs the portable CPU-tensor
+        # serializer, even when dynamic context parallelism is disabled; the
+        # Ray driver intentionally does not have Megatron on its import path.
+        register_policy_tensor_serializer()
         if dynamic_cp_config(self.cfg) is not None:
-            register_policy_tensor_serializer()
             if self.delegate_pack_to_model or self.model_slices_context_parallel_inputs:
                 raise ValueError("Dynamic CP requires NeMo-owned text-model packing")
             if getattr(self._get_model_config(), "mtp_num_layers", None):

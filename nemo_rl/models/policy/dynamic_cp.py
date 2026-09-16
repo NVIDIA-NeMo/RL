@@ -17,10 +17,12 @@ from typing import Any
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.dynamic_context_parallel import (
+    CPRankGroup,
     CPRankPlan,
     CPRankStep,
+    CPSyncGroup,
     DynamicContextParallelConfig,
-    assignment_for_lane,
+    assignments_for_lane,
     plan_cp_phases,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -70,7 +72,7 @@ def validate_dynamic_cp(cfg: dict[str, Any], *, lanes: int) -> None:
         lanes=lanes,
         min_size=minimum,
         max_size=dynamic.max_size or lanes,
-        tokens_per_rank=dynamic.train_tokens_per_rank,
+        tokens_per_rank=dynamic.tokens_per_rank,
         sequence_parallel_size=tp if mc["sequence_parallel"] else 1,
         user_pad_multiple=cfg["make_sequence_length_divisible_by"],
     )
@@ -83,6 +85,146 @@ class CPDispatch:
     data: list[list[BatchedDataDict]]
     plans: list[list[CPRankPlan]]
     output_rows: list[tuple[list[int], list[int]]]
+    schedule: "CPBatchSchedule"
+
+
+@dataclass(frozen=True)
+class CPBatchSchedule:
+    """Immutable sample grouping shared by score and train dispatches."""
+
+    input_lengths: tuple[int, ...]
+    batch_size: int
+    lanes: int
+    min_size: int
+    max_size: int
+    tokens_per_rank: int
+    sequence_parallel_size: int
+    user_pad_multiple: int
+    token_alignment: int
+    groups_by_batch: tuple[tuple[CPSyncGroup, ...], ...]
+
+
+def _schedule_parameters(
+    cfg: dict[str, Any], sharding: NamedSharding
+) -> tuple[int, int, int, int, int, int, int]:
+    dynamic = dynamic_cp_config(cfg)
+    if dynamic is None:
+        raise ValueError("Dynamic CP scheduling requires enabled configuration")
+    mc = cfg["megatron_cfg"]
+    cp = sharding.shape["context_parallel"]
+    lanes = sharding.shape["data_parallel"] * cp
+    tp = mc["tensor_model_parallel_size"]
+    minimum = dynamic.min_size
+    while minimum * tp < mc["expert_model_parallel_size"]:
+        minimum *= 2
+    fp8 = mc.get("fp8_cfg") or {}
+    alignment = 1
+    if fp8.get("enabled"):
+        alignment = {"blockwise": 128, "mxfp8": 32}.get(fp8["fp8_recipe"], 16)
+    if (
+        mc.get("moe_token_dispatcher_type") == "flex"
+        and mc.get("moe_flex_dispatcher_backend") == "hybridep"
+    ):
+        alignment = max(alignment, 128)
+    return (
+        lanes,
+        minimum,
+        dynamic.max_size or lanes,
+        dynamic.tokens_per_rank,
+        tp if mc["sequence_parallel"] else 1,
+        cfg["make_sequence_length_divisible_by"],
+        alignment,
+    )
+
+
+def _schedule_batch_size(data: BatchedDataDict, batch_size: int | None) -> int:
+    gbs = batch_size if batch_size is not None else data.size
+    if gbs < 1 or data.size % gbs:
+        raise ValueError("Dynamic CP data must contain complete schedule batches")
+    return gbs
+
+
+def _input_lengths(data: BatchedDataDict) -> tuple[int, ...]:
+    values = data["input_lengths"]
+    if hasattr(values, "tolist"):
+        values = values.tolist()
+    return tuple(int(value) for value in values)
+
+
+def build_cp_schedule(
+    data: BatchedDataDict,
+    cfg: dict[str, Any],
+    sharding: NamedSharding,
+    *,
+    batch_size: int | None,
+) -> CPBatchSchedule:
+    """Plan sample groups once, using the training-safe token budget."""
+    gbs = _schedule_batch_size(data, batch_size)
+    lengths = _input_lengths(data)
+    (
+        lanes,
+        minimum,
+        maximum,
+        tokens_per_rank,
+        sequence_parallel_size,
+        user_pad_multiple,
+        alignment,
+    ) = _schedule_parameters(cfg, sharding)
+    groups_by_batch = tuple(
+        plan_cp_phases(
+            list(lengths[start : start + gbs]),
+            lanes=lanes,
+            min_size=minimum,
+            max_size=maximum,
+            tokens_per_rank=tokens_per_rank,
+            sequence_parallel_size=sequence_parallel_size,
+            user_pad_multiple=user_pad_multiple,
+            token_alignment=alignment,
+        )
+        for start in range(0, len(lengths), gbs)
+    )
+    return CPBatchSchedule(
+        lengths,
+        gbs,
+        lanes,
+        minimum,
+        maximum,
+        tokens_per_rank,
+        sequence_parallel_size,
+        user_pad_multiple,
+        alignment,
+        groups_by_batch,
+    )
+
+
+def cp_schedule_matches(
+    schedule: CPBatchSchedule,
+    data: BatchedDataDict,
+    cfg: dict[str, Any],
+    sharding: NamedSharding,
+    *,
+    batch_size: int | None,
+) -> bool:
+    """Return whether a cached schedule is valid for this ordered batch."""
+    try:
+        gbs = _schedule_batch_size(data, batch_size)
+        parameters = _schedule_parameters(cfg, sharding)
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (
+        schedule.input_lengths == _input_lengths(data)
+        and schedule.batch_size == gbs
+        and (
+            schedule.lanes,
+            schedule.min_size,
+            schedule.max_size,
+            schedule.tokens_per_rank,
+            schedule.sequence_parallel_size,
+            schedule.user_pad_multiple,
+            schedule.token_alignment,
+        )
+        == parameters
+    )
 
 
 def build_cp_dispatch(
@@ -92,6 +234,7 @@ def build_cp_dispatch(
     *,
     batch_size: int | None,
     training: bool,
+    schedule: CPBatchSchedule | None = None,
 ) -> CPDispatch:
     """Plan before replication; count each original training target once."""
     dynamic = dynamic_cp_config(cfg)
@@ -102,11 +245,6 @@ def build_cp_dispatch(
     cp = sharding.shape["context_parallel"]
     dp = sharding.shape["data_parallel"]
     lanes = cp * dp
-    mc = cfg["megatron_cfg"]
-    tp = mc["tensor_model_parallel_size"]
-    minimum = dynamic.min_size
-    while minimum * tp < mc["expert_model_parallel_size"]:
-        minimum *= 2
     group_ranks = tuple(
         sharding.get_ranks_by_coord(
             pipeline_parallel=0,
@@ -116,36 +254,16 @@ def build_cp_dispatch(
         )[0]
         for i in range(lanes)
     )
-    budget = (
-        dynamic.train_tokens_per_rank if training else dynamic.logprob_tokens_per_rank
-    )
-    fp8 = mc.get("fp8_cfg") or {}
-    alignment = 1
-    if fp8.get("enabled"):
-        alignment = {"blockwise": 128, "mxfp8": 32}.get(fp8["fp8_recipe"], 16)
-    if (
-        mc.get("moe_token_dispatcher_type") == "flex"
-        and mc.get("moe_flex_dispatcher_backend") == "hybridep"
-    ):
-        alignment = max(alignment, 128)
-    gbs = batch_size if batch_size is not None else data.size
-    if gbs < 1 or data.size % gbs:
-        raise ValueError(
-            "Dynamic CP training data must contain complete global batches"
-        )
+    gbs = _schedule_batch_size(data, batch_size)
+    reused_schedule = schedule is not None
+    if schedule is None:
+        schedule = build_cp_schedule(data, cfg, sharding, batch_size=batch_size)
+    elif not cp_schedule_matches(schedule, data, cfg, sharding, batch_size=batch_size):
+        raise ValueError("Cached dynamic CP schedule does not match this ordered batch")
     rank_steps: list[list[CPRankStep]] = [[] for _ in range(lanes)]
-    for start in range(0, data.size, gbs):
+    for batch_index, start in enumerate(range(0, data.size, gbs)):
         batch = data.select_indices(list(range(start, start + gbs)))
-        phases = plan_cp_phases(
-            batch["input_lengths"].tolist(),
-            lanes=lanes,
-            min_size=minimum,
-            max_size=dynamic.max_size or lanes,
-            tokens_per_rank=budget,
-            sequence_parallel_size=tp if mc["sequence_parallel"] else 1,
-            user_pad_multiple=cfg["make_sequence_length_divisible_by"],
-            token_alignment=alignment,
-        )
+        groups = schedule.groups_by_batch[batch_index]
         if training:
             if "sample_mask" not in batch or "token_mask" not in batch:
                 raise ValueError(
@@ -160,31 +278,55 @@ def build_cp_dispatch(
         else:
             valid_sequences = valid_tokens = 0.0
         samples_by_cp = Counter()
-        for phase in phases:
-            for task in phase:
+        for group in groups:
+            for task in group.assignments:
                 samples_by_cp[task.cp_size] += len(task.sample_indices)
+        group_task_ranges = [
+            (
+                min(len(assignments_for_lane(group, lane)) for lane in range(lanes)),
+                max(len(assignments_for_lane(group, lane)) for lane in range(lanes)),
+            )
+            for group in groups
+        ]
         logger.info(
-            "Dynamic CP %s: samples=%d phases=%d samples_by_cp=%s valid_sequences=%s valid_tokens=%s",
+            "Dynamic CP %s: samples=%d groups=%d uneven_groups=%d "
+            "local_tasks=[%d,%d] "
+            "samples_by_cp=%s "
+            "valid_sequences=%s valid_tokens=%s schedule=%s",
             "train" if training else "score",
             gbs,
-            len(phases),
+            len(groups),
+            sum(low < high for low, high in group_task_ranges),
+            min(
+                sum(len(assignments_for_lane(group, lane)) for group in groups)
+                for lane in range(lanes)
+            ),
+            max(
+                sum(len(assignments_for_lane(group, lane)) for group in groups)
+                for lane in range(lanes)
+            ),
             dict(sorted(samples_by_cp.items())),
             valid_sequences,
             valid_tokens,
+            "reused" if reused_schedule else "new",
         )
         for lane in range(lanes):
-            assignments = tuple(
-                replace(
-                    assignment_for_lane(phase, lane),
-                    sample_indices=tuple(
-                        i + start
-                        for i in assignment_for_lane(phase, lane).sample_indices
-                    ),
+            rank_groups = tuple(
+                CPRankGroup(
+                    tuple(
+                        replace(
+                            assignment,
+                            sample_indices=tuple(
+                                i + start for i in assignment.sample_indices
+                            ),
+                        )
+                        for assignment in assignments_for_lane(group, lane)
+                    )
                 )
-                for phase in phases
+                for group in groups
             )
             rank_steps[lane].append(
-                CPRankStep(assignments, valid_sequences, valid_tokens)
+                CPRankStep(rank_groups, valid_sequences, valid_tokens)
             )
 
     payloads, plans, output_rows = [], [], []
@@ -204,14 +346,19 @@ def build_cp_dispatch(
         remapped_steps = tuple(
             replace(
                 step,
-                assignments=tuple(
-                    replace(
-                        task,
-                        sample_indices=tuple(
-                            local_indices[i] for i in task.sample_indices
-                        ),
+                groups=tuple(
+                    CPRankGroup(
+                        tuple(
+                            replace(
+                                task,
+                                sample_indices=tuple(
+                                    local_indices[i] for i in task.sample_indices
+                                ),
+                            )
+                            for task in group.assignments
+                        )
                     )
-                    for task in step.assignments
+                    for group in step.groups
                 ),
             )
             for step in steps
@@ -230,6 +377,7 @@ def build_cp_dispatch(
         data=[payloads[i : i + cp] for i in range(0, lanes, cp)],
         plans=[plans[i : i + cp] for i in range(0, lanes, cp)],
         output_rows=output_rows,
+        schedule=schedule,
     )
 
 

@@ -14,7 +14,9 @@ import random
 import pytest
 
 from nemo_rl.distributed.dynamic_context_parallel import (
+    DynamicContextParallelConfig,
     assignment_for_lane,
+    assignments_for_lane,
     cp_loss_multiplier,
     plan_cp_phases,
 )
@@ -33,15 +35,28 @@ def make_plan(lengths, *, lanes=8, minimum=1, maximum=None, budget=128, sp=2):
     )
 
 
+def test_one_token_budget_is_shared_by_score_and_train():
+    config = DynamicContextParallelConfig(enabled=True, tokens_per_rank=64)
+    assert config.tokens_per_rank == 64
+    with pytest.raises(ValueError):
+        DynamicContextParallelConfig(
+            enabled=True,
+            train_tokens_per_rank=64,
+            logprob_tokens_per_rank=128,
+        )
+
+
 def check_plan(phases, lengths, lanes, budget, sp):
     owners = []
     for phase in phases:
         for lane in range(lanes):
-            task = assignment_for_lane(phase, lane)
-            assert task.lane_start % task.cp_size == 0
-            assert task.padded_tokens % (task.cp_size * sp) == 0
-            assert task.padded_tokens // task.cp_size <= budget
-        for task in phase:
+            tasks = assignments_for_lane(phase, lane)
+            assert len({(task.lane_start, task.cp_size) for task in tasks}) == 1
+            for task in tasks:
+                assert task.lane_start % task.cp_size == 0
+                assert task.padded_tokens % (task.cp_size * sp) == 0
+                assert task.padded_tokens // task.cp_size <= budget
+        for task in phase.assignments:
             if not task.sample_indices:
                 continue
             owners.extend(task.sample_indices)
@@ -75,8 +90,10 @@ def test_mixed_cp_and_cross_dp_groups():
     lengths = [400, 200, 90, 70, 9, 3, 1000]
     phases = make_plan(lengths)
     check_plan(phases, lengths, 8, 128, 2)
-    assert {a.cp_size for p in phases for a in p if a.sample_indices} == {1, 2, 4, 8}
-    assert any(a.cp_size == 8 for p in phases for a in p)
+    assert (
+        len({a.cp_size for p in phases for a in p.assignments if a.sample_indices}) > 1
+    )
+    assert any(a.cp_size == 8 for p in phases for a in p.assignments)
 
 
 @pytest.mark.parametrize("lanes", [1, 2, 4, 8, 16])
@@ -90,16 +107,64 @@ def test_randomized_coverage_and_alignment(lanes):
 
 
 def test_padding_drives_cp_selection():
-    phases = make_plan([127], budget=127)
-    task = next(a for p in phases for a in p if a.sample_indices)
+    phases = make_plan([127], lanes=2, budget=127)
+    task = next(a for p in phases for a in p.assignments if a.sample_indices)
     assert task.cp_size == 2
 
 
-def test_moe_minimum_and_padding_only_lanes():
+def test_moe_minimum_expands_real_work_to_fill_lanes():
     phases = make_plan([3, 7], minimum=4)
-    assert all(a.cp_size >= 4 for p in phases for a in p)
-    assert any(not a.sample_indices for p in phases for a in p)
+    assert all(a.cp_size >= 4 for p in phases for a in p.assignments)
+    assert not any(not a.sample_indices for p in phases for a in p.assignments)
+    assert [a.cp_size for p in phases for a in p.assignments] == [8]
     check_plan(phases, [3, 7], 8, 128, 2)
+
+
+def test_idle_lanes_expand_real_assignment_and_recompute_padding():
+    phases = make_plan([3])
+    task = phases[0].assignments[0]
+    assert task.sample_indices == (0,)
+    assert task.cp_size == 8
+    assert task.pad_multiple == 32
+    assert task.padded_tokens == 32
+    assert not any(
+        not assignment.sample_indices for assignment in phases[0].assignments
+    )
+    check_plan(phases, [3], 8, 128, 2)
+
+
+def test_maximum_cp_keeps_placeholders_when_real_work_cannot_fill_lanes():
+    phases = make_plan([3], maximum=4)
+    real = [
+        assignment for assignment in phases[0].assignments if assignment.sample_indices
+    ]
+    placeholders = [
+        assignment
+        for assignment in phases[0].assignments
+        if not assignment.sample_indices
+    ]
+    assert [assignment.cp_size for assignment in real] == [4]
+    assert sum(assignment.cp_size for assignment in placeholders) == 4
+    check_plan(phases, [3], 8, 128, 2)
+
+
+def test_equal_topologies_merge_into_uneven_sequential_task_lists():
+    phases = make_plan([40, 40, 40, 40, 40], lanes=2, maximum=1, budget=64, sp=1)
+    assert len(phases) == 1
+    lane_zero = assignments_for_lane(phases[0], 0)
+    lane_one = assignments_for_lane(phases[0], 1)
+    assert sorted((len(lane_zero), len(lane_one))) == [2, 3]
+    assert {
+        index for task in lane_zero + lane_one for index in task.sample_indices
+    } == {
+        0,
+        1,
+        2,
+        3,
+        4,
+    }
+    with pytest.raises(ValueError, match="sequential assignments"):
+        assignment_for_lane(phases[0], 0)
 
 
 @pytest.mark.parametrize(
