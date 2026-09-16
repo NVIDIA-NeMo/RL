@@ -243,7 +243,7 @@ def test_ipc_zmq_streams_chunk_and_reloads_with_aligned_offsets(monkeypatch, fp8
     extension, model_loader, engine = _ipc_extension(backend)
     model = extension.engine.model_engine.model
     model.model_config = SimpleNamespace(quant_config=object())
-    convert = MagicMock(side_effect=lambda weights: dict(weights))
+    convert = MagicMock(side_effect=lambda weights, **kwargs: dict(weights))
 
     buffer = torch.zeros(1024, dtype=torch.uint8)
     monkeypatch.setattr(backend, "rebuild_cuda_tensor_from_ipc", lambda h, d: buffer)
