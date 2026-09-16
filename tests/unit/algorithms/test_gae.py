@@ -176,6 +176,61 @@ def test_gae_fractional_sample_weights_preserve_recurrence(
         torch.testing.assert_close(actual_tensor, expected_tensor)
 
 
+@pytest.mark.parametrize("configured_lambda,override", [(1.0, None), (0.95, 1.0)])
+def test_gae_fast_path_logs_activation_once(
+    capsys: pytest.CaptureFixture[str],
+    configured_lambda: float,
+    override: float | None,
+) -> None:
+    estimator = GeneralizedAdvantageEstimator(
+        GAEConfig(gae_gamma=1.0, gae_lambda=configured_lambda), ClippedPGLossConfig()
+    )
+    rewards = torch.tensor([[0.0, 1.0]])
+    values = torch.tensor([[0.2, 0.5]])
+    mask = torch.ones_like(rewards)
+    assert capsys.readouterr().out == ""
+
+    estimator._compute_gae(rewards, values, mask, gae_lambda=override)
+    assert capsys.readouterr().out == (
+        "Fast GAE compute activated for lambda=1.0, gamma=1.0\n"
+    )
+
+    estimator._compute_gae(rewards, values, mask, gae_lambda=override)
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("fallback", ["gamma", "lambda", "tensor_lambda", "fractional"])
+def test_gae_fallback_does_not_log_fast_path_activation(
+    capsys: pytest.CaptureFixture[str],
+    fallback: str,
+) -> None:
+    estimator = GeneralizedAdvantageEstimator(
+        GAEConfig(
+            gae_gamma=0.99 if fallback == "gamma" else 1.0,
+            gae_lambda=0.95 if fallback == "lambda" else 1.0,
+        ),
+        ClippedPGLossConfig(),
+    )
+    rewards = torch.tensor([[0.0, 1.0]])
+    values = torch.tensor([[0.2, 0.5]])
+    mask = (
+        torch.full_like(rewards, 0.5)
+        if fallback == "fractional"
+        else torch.ones_like(rewards)
+    )
+    override = torch.ones(1) if fallback == "tensor_lambda" else None
+
+    estimator._compute_gae(rewards, values, mask, gae_lambda=override)
+    assert capsys.readouterr().out == ""
+
+    # A fallback call must not suppress the first subsequent fast-path message.
+    estimator.gae_gamma = 1.0
+    estimator._compute_gae(rewards, values, torch.ones_like(mask), gae_lambda=1.0)
+    assert capsys.readouterr().out == (
+        "Fast GAE compute activated for lambda=1.0, gamma=1.0\n"
+    )
+
+
 @pytest.mark.parametrize("normalize", [False, True])
 @pytest.mark.parametrize("use_kl", [False, True])
 @pytest.mark.parametrize("decoupling", ["none", "fixed", "adaptive"])

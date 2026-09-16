@@ -371,6 +371,7 @@ class GeneralizedAdvantageEstimator:
         self.gae_lambda = estimator_config.gae_lambda
         self.gae_gamma = estimator_config.gae_gamma
         self.normalize_advantages = estimator_config.normalize_advantages
+        self._fast_gae_activation_logged = False
 
         # VAPO decoupled GAE: separate λ for value returns vs policy advantages.
         # None for both = standard GAE (use gae_lambda everywhere, no decoupling).
@@ -571,6 +572,13 @@ class GeneralizedAdvantageEstimator:
             and lam == 1.0
             and bool(((mask == 0) | (mask == 1)).all())
         ):
+            if not self._fast_gae_activation_logged:
+                print(
+                    f"Fast GAE compute activated for lambda={lam}, gamma={self.gae_gamma}",
+                    flush=True,
+                )
+                self._fast_gae_activation_logged = True
+
             # With zero terminal bootstrap, the TD value terms telescope:
             # A_t = sum_{k=t}^T r_k - V_t. Scan rewards instead of running
             # one Python/PyTorch iteration per token. Keep tensor-valued lambda
