@@ -335,8 +335,8 @@ def test_megatron_stager_stamps_admission_epoch_when_request_spans_refit(
 ):
     """A request straddling a refit is stamped with its admission epoch, not masked.
 
-    Mirrors vLLM, which freezes the version at begin_call; the finalizer tags
-    a group by the min over its calls, so the oldest epoch is the right one.
+    Mirrors vLLM, which freezes the version at begin_call. The engine stamps the
+    admission epoch first and appends a boundary per refit, so epochs only grow.
     """
     stager = TQMegatronTokenStager(
         TQTokenSink(tq_client, staging_partition=staging_partition)
@@ -354,7 +354,7 @@ def test_megatron_stager_stamps_admission_epoch_when_request_spans_refit(
                 generated_token_ids=[11, 12],
                 generated_log_probs=[-0.1, -0.2],
             ),
-            finished_metadata=SimpleNamespace(policy_epoch=[(0, 8), (1, 7), (2, 9)]),
+            finished_metadata=SimpleNamespace(policy_epoch=[(0, 7), (1, 8), (2, 9)]),
             request_metadata={"ng_capture": admission.model_dump(mode="json")},
         )
     assert result is not None

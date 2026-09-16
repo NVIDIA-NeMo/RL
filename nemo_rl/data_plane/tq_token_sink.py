@@ -516,14 +516,14 @@ class TQMegatronTokenStager:
     def _weight_version(self, finished_metadata: Any) -> int:
         """Stamp the policy epoch the request was admitted under.
 
-        The engine records ``policy_epoch`` as ``(token_index, epoch)`` boundaries
-        and appends one on every ``set_generation_epoch`` while the request is
-        active, so a request that straddles a refit carries several. vLLM stamps
-        the version in effect at ``begin_call`` and never re-checks, and the
-        finalizer tags a group by the min over its calls, so the oldest epoch is
-        the matching (and conservative) choice here. Spans are counted and
-        logged rather than masked; ``_abort_stale_inflight`` is skipped on the
-        Gym path (#2625), so they are routine under async rollouts.
+        The engine records ``policy_epoch`` as ``(token_index, epoch)`` boundaries:
+        one at admission, plus one appended on every ``set_generation_epoch``
+        while the request is active, so a request that straddles a refit carries
+        several. vLLM stamps the version in effect at ``begin_call`` and never
+        re-checks, so the admission epoch (first boundary) is the matching choice
+        here. Spans are counted and logged rather than masked;
+        ``_abort_stale_inflight`` is skipped on the Gym path (#2625), so they are
+        routine under async rollouts.
         """
         policy_epoch = getattr(finished_metadata, "policy_epoch", None)
         if not isinstance(policy_epoch, list) or not policy_epoch:
@@ -534,7 +534,8 @@ class TQMegatronTokenStager:
             raise ValueError(
                 "MInf captured request carries invalid policy_epoch metadata"
             ) from error
-        version = min(versions)
+        # Admission epoch (first boundary); later boundaries only mark refits.
+        version = int(policy_epoch[0][1])
         if version < 0:
             raise ValueError(
                 f"MInf captured request has negative policy epoch {version}"
