@@ -45,6 +45,7 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmAsyncCheckpointEngineRpcMixin,
 )
 from nemo_rl.models.generation.vllm.utils import (
+    attach_generation_metadata_to_chat_response_choices,
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
     format_prompt_for_vllm_generation,
@@ -203,6 +204,7 @@ class VllmAsyncGenerationWorkerImpl(
         # threads (asyncio.to_thread), so lookups/evictions can be concurrent.
         self._prefix_cache: dict[str, list[int]] = {}
         self._prefix_cache_lock = threading.Lock()
+        self._kv_cache_block_metadata: dict[str, int] | None = None
 
         super().__init__(
             config,
@@ -432,6 +434,21 @@ class VllmAsyncGenerationWorkerImpl(
             self._sparse_refit_receiver.set_async_loop(self._engine_loop)
         if self.llm is not None:
             await self.llm.collective_rpc("bind_numa", args=tuple())
+            cache_metadata = await self.llm.collective_rpc(
+                "report_kv_cache_block_metadata", args=tuple()
+            )
+            if not cache_metadata or any(
+                item != cache_metadata[0] for item in cache_metadata[1:]
+            ):
+                raise RuntimeError(
+                    "vLLM ranks reported inconsistent KV-cache block metadata: "
+                    f"{cache_metadata}"
+                )
+            self._kv_cache_block_metadata = dict(cache_metadata[0])
+            LOGGER.info(
+                "vLLM runtime KV-cache block metadata: %s",
+                self._kv_cache_block_metadata,
+            )
         self.vllm_device_ids = await self.report_device_id_async()
         if self._mtp_speculative_enabled:
             await self.llm.collective_rpc(
@@ -1013,6 +1030,7 @@ class VllmAsyncGenerationWorkerImpl(
                         parameter="top_logprobs",
                     )
 
+                request_start_weight_version = worker_self._generation_weight_version
                 final_res = None
 
                 async def capture_result_generator():
@@ -1027,11 +1045,16 @@ class VllmAsyncGenerationWorkerImpl(
                     *args,
                     **kwargs,
                 )
-                if (
-                    not isinstance(response, ChatCompletionResponse)
-                    or final_res is None
-                ):
+                if not isinstance(response, ChatCompletionResponse):
                     return response
+                if final_res is None:
+                    raise RuntimeError(
+                        "vLLM completed a chat request without a final engine output"
+                    )
+                if worker_self._kv_cache_block_metadata is None:
+                    raise RuntimeError(
+                        "vLLM served a request before runtime KV-cache metadata was collected"
+                    )
 
                 if request.logprobs and return_as_token_id:
                     response = attach_token_information_to_chat_response_choices(
@@ -1047,8 +1070,18 @@ class VllmAsyncGenerationWorkerImpl(
                         logger=LOGGER,
                         routed_experts_dtype=worker_self.routed_experts_dtype,
                     )
-
-                return response
+                return attach_generation_metadata_to_chat_response_choices(
+                    response,
+                    replica_id=str(worker_self.base_url),
+                    weight_version=request_start_weight_version,
+                    end_weight_version=worker_self._generation_weight_version,
+                    kv_cache_block_metadata=worker_self._kv_cache_block_metadata,
+                    num_cached_tokens=(
+                        getattr(final_res, "num_cached_tokens", None)
+                        if final_res is not None
+                        else None
+                    ),
+                )
 
         class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingChatMixin, OpenAIServingChat):
             pass
@@ -1861,6 +1894,7 @@ class VllmAsyncGenerationWorkerImpl(
                 )
                 return False
             await self._reset_encoder_cache_after_weight_update()
+            self._generation_weight_version += 1
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
@@ -1901,6 +1935,7 @@ class VllmAsyncGenerationWorkerImpl(
                 )
                 return False
             await self._reset_encoder_cache_after_weight_update()
+            self._generation_weight_version += 1
             return True
         except Exception as e:
             # Propagate a deliberate abort instead of folding it into `return False`. It
@@ -1976,6 +2011,7 @@ class VllmAsyncGenerationWorkerImpl(
                 )
                 return False
             await self._reset_encoder_cache_after_weight_update()
+            self._generation_weight_version += 1
             return True
         except Exception as e:
             # Propagate a deliberate abort instead of folding it into `return False`. It

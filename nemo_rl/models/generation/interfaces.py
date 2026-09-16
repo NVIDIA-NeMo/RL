@@ -670,6 +670,15 @@ class GenerationInterface(ABC):
         """
         return False
 
+    def set_generation_weight_version(self, version: int) -> None:
+        """Publish the controller-global weight version to generation workers.
+
+        Backends that expose execution metadata should override this hook. The
+        default is a no-op so generation backends without versioned request
+        metadata do not need transport-specific plumbing.
+        """
+        pass
+
     def clear_logger_metrics(self) -> None:
         """Clear logger metrics for performance reporting.
 

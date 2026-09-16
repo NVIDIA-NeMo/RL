@@ -586,6 +586,32 @@ def test_vllm_latest_metric_drain_prunes_worker_histories():
     assert latest["generation_tokens"] is not worker.generation_tokens
 
 
+def test_worker_accepts_absolute_generation_weight_version():
+    worker = object.__new__(VllmGenerationWorkerImpl)
+    worker._generation_weight_version = 1
+
+    worker.set_generation_weight_version(59)
+
+    assert worker._generation_weight_version == 59
+
+
+def test_generation_publishes_weight_version_to_replica_leaders(monkeypatch):
+    generation = types.SimpleNamespace(worker_group=MagicMock())
+    futures = [object(), object()]
+    generation.worker_group.run_all_workers_single_data.return_value = futures
+    ray_get = MagicMock()
+    monkeypatch.setattr(ray, "get", ray_get)
+
+    VllmGeneration.set_generation_weight_version(generation, 59)
+
+    generation.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "set_generation_weight_version",
+        version=59,
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
+    ray_get.assert_called_once_with(futures)
+
+
 def test_resolve_enable_prefix_caching_respects_explicit_config(monkeypatch):
     def raise_if_called():
         raise AssertionError("CUDA capability should not be queried")
@@ -795,7 +821,9 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
         },
     }
     worker.llm = MagicMock(model_config="model-config", renderer="renderer")
-    worker._http_engine_client = worker.llm
+    worker._http_engine_client = MagicMock(
+        model_config="http-model-config", renderer="http-renderer"
+    )
     model_config = MagicMock(served_model_name="served-model", model="model-path")
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = model_config
@@ -810,6 +838,10 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
         "/plugins/reasoning_parser.py"
     )
     assert openai_serving_chat.instances[0].kwargs["reasoning_parser"] == "nano_v3"
+    assert (
+        openai_serving_chat.instances[0].kwargs["engine_client"]
+        is worker._http_engine_client
+    )
     # make sure that the config attribute does not leak into `http_server_serving_chat_kwargs`
     assert "reasoning_parser_plugin" not in openai_serving_chat.instances[0].kwargs
 

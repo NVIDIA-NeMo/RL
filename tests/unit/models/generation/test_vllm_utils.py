@@ -29,6 +29,7 @@ from nemo_rl.models.generation.vllm import utils as vllm_utils
 from nemo_rl.models.generation.vllm.utils import (
     R3_MISSING_ROUTE_SENTINEL,
     aggregate_spec_decode_counters,
+    attach_generation_metadata_to_chat_response_choices,
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
     compute_spec_decode_metrics,
@@ -811,6 +812,37 @@ def test_model_dump_chat_response_with_dynamic_message_fields_preserves_all_fiel
     assert message["prompt_token_ids"] == [101, 102]
     assert message["generation_token_ids"] == [201]
     assert message["generation_log_probs"] == [-0.1]
+
+
+def test_attach_and_dump_generation_metadata():
+    response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace())])
+
+    attach_generation_metadata_to_chat_response_choices(
+        response,
+        replica_id="http://10.0.0.3:8123/v1",
+        weight_version=3,
+        end_weight_version=4,
+        kv_cache_block_metadata={
+            "scheduler_block_size": 1056,
+            "hash_block_size": 1056,
+        },
+        num_cached_tokens=2112,
+    )
+
+    class DumpableResponse:
+        choices = response.choices
+
+        def model_dump(self):
+            return {"choices": [{"message": {"role": "assistant"}}]}
+
+    dumped = model_dump_chat_response_with_dynamic_message_fields(DumpableResponse())
+    message = dumped["choices"][0]["message"]
+    assert message["ng_generation_replica_id"] == "http://10.0.0.3:8123/v1"
+    assert message["ng_generation_weight_version"] == 3
+    assert message["ng_generation_weight_version_end"] == 4
+    assert message["ng_kv_cache_scheduler_block_size"] == 1056
+    assert message["ng_kv_cache_hash_block_size"] == 1056
+    assert message["ng_kv_cache_num_cached_tokens"] == 2112
 
 
 @pytest.mark.vllm
