@@ -10,14 +10,23 @@ from nemo_rl.experience.failures import GymTransportError, RolloutDataFailure
 
 
 @pytest.mark.parametrize(
-    "failure,exception",
-    [("judge_failed", GymTransportError), ("unknown", RolloutDataFailure)],
+    "result,exception",
+    [
+        ({"_ng_failure_class": "judge_failed"}, GymTransportError),
+        # Gym tags remote-endpoint, timeout and malformed-reply failures the same
+        # way and retries them; they are not prompt-specific data failures.
+        ({"_ng_failure_class": "remote_endpoint_unavailable"}, GymTransportError),
+        (
+            {"_ng_failure_class": "verify_error", "_ng_failure_terminal": True},
+            RolloutDataFailure,
+        ),
+    ],
 )
-def test_tagged_failures_never_reach_token_or_reward_processing(failure, exception):
+def test_tagged_failures_never_reach_token_or_reward_processing(result, exception):
     # No response/tokenizer/self state: rejection must precede all processing.
     with pytest.raises(exception, match="reward is not valid"):
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
-            None, {}, {"_ng_failure_class": failure, "reward": 0.0}, None
+            None, {}, {**result, "reward": 0.0}, None
         )
 
 
