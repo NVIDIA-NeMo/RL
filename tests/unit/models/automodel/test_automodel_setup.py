@@ -15,6 +15,7 @@
 """Unit tests for automodel setup utilities."""
 
 import os
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, create_autospec, patch
 
@@ -914,6 +915,31 @@ class TestSetupModelAndOptimizer:
         tokenizer.pad_token_id = 0
         return tokenizer
 
+    @pytest.mark.parametrize(
+        "use_te, optimizer_kwargs, expected_dtype",
+        [
+            (False, {}, torch.float32),
+            (True, {"master_weights": False}, torch.float32),
+            (True, {"master_weights": True}, torch.bfloat16),
+            (
+                True,
+                {"master_weights": True, "master_weight_dtype": "torch.float32"},
+                torch.bfloat16,
+            ),
+            (
+                True,
+                {"master_weights": True, "master_weight_dtype": "torch.float16"},
+                torch.float32,
+            ),
+        ],
+        ids=[
+            "adamw",
+            "te-no-master",
+            "te-default-master",
+            "te-fp32-master",
+            "te-fp16-master",
+        ],
+    )
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
     @patch("nemo_rl.models.automodel.setup.get_class")
@@ -927,8 +953,12 @@ class TestSetupModelAndOptimizer:
         mock_distributed_context,
         mock_checkpoint_manager,
         mock_tokenizer,
+        monkeypatch,
+        use_te,
+        optimizer_kwargs,
+        expected_dtype,
     ):
-        """Test basic model and optimizer setup."""
+        """Test model setup and the load dtype selected for optimizer precision."""
         mock_get_rank.return_value = 0
         mock_lambda_lr.return_value = MagicMock()
 
@@ -943,6 +973,17 @@ class TestSetupModelAndOptimizer:
         # Setup mock optimizer
         mock_optimizer = MagicMock()
         mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
+
+        mock_config["optimizer"]["kwargs"] = optimizer_kwargs
+        if use_te:
+            mock_config["optimizer"]["name"] = (
+                "transformer_engine.pytorch.optimizers.FusedAdam"
+            )
+        monkeypatch.setitem(
+            sys.modules,
+            "transformer_engine.pytorch.optimizers",
+            SimpleNamespace(FusedAdam=mock_get_class.return_value) if use_te else None,
+        )
 
         result = setup_model_and_optimizer(
             config=mock_config,
@@ -959,6 +1000,7 @@ class TestSetupModelAndOptimizer:
         # single DistributedSetup; the separate kwargs are rejected with a TypeError.
         mock_runtime_config.model_class.from_pretrained.assert_called_once()
         call_kwargs = mock_runtime_config.model_class.from_pretrained.call_args[1]
+        assert call_kwargs["torch_dtype"] == expected_dtype
         for legacy_kwarg in (
             "device_mesh",
             "moe_mesh",
@@ -1265,6 +1307,8 @@ class TestSetupModelAndOptimizer:
 
         assert result.optimizer is None
         assert result.scheduler is None
+        call_kwargs = mock_runtime_config.model_class.from_pretrained.call_args[1]
+        assert call_kwargs["torch_dtype"] == mock_runtime_config.dtype
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")

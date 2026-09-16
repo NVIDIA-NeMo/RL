@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Guards for the vLLM source patches that had no coverage.
+"""Guards for vLLM source patches that need installed-source coverage.
 
-The two port patches ship their own suites. These cover the remaining patches:
+The two port patches ship their own suites. This module covers the other
+source-sensitive compatibility patches:
 
 * ``_patch_vllm_tool_parser_namespace_tool`` is the most load-bearing patch in
   the repo -- it is the only thing that makes vLLM 0.25.1 importable against
@@ -28,16 +29,21 @@ The two port patches ship their own suites. These cover the remaining patches:
   ``RAY_ENABLE_UV_RUN_RUNTIME_ENV`` and every user ``extra_env_vars`` to the
   Ray workers. Being additive rather than clobbering is the whole point of the
   rewrite, and it is pure string handling, so it is cheap to pin.
+* the MiniMax-M3 top-k patch must update both the indexer writer and sparse
+  attention reader together. Its tests pin both vLLM 0.25.1 source anchors and
+  ensure an unknown source cannot leave a half-applied layout change.
 """
 
 import ast
 import logging
 import os
+from pathlib import Path
 
 import pytest
 
 from nemo_rl.models.generation.vllm import patches
 from tests.unit.models.generation.vllm_patch_source_utils import (
+    patch_snippets,
     write_unpatched_copy,
 )
 
@@ -50,6 +56,19 @@ _RADIO_MARKER = "initializer_factor = self.config.initializer_factor"
 _GLM_DSA_SOURCE = "model_executor/models/deepseek_v2.py"
 _GLM_DSA_PATCH_FN = "_patch_vllm_glm_decoder_sequence_parallel_moe"
 _GLM_DSA_MARKER = 'getattr(config, "model_type", None) != "glm_moe_dsa"'
+_MINIMAX_M3_PATCH_FN = "_patch_vllm_minimax_m3_topk_buffer_layout"
+_MINIMAX_M3_SOURCES = {
+    "models/minimax_m3/common/indexer.py": (
+        "indexer_old_snippet",
+        "indexer_new_snippet",
+    ),
+    "models/minimax_m3/common/sparse_attention.py": (
+        "sparse_attention_old_snippet",
+        "sparse_attention_new_snippet",
+    ),
+}
+_MINIMAX_M3_INDEXER_MARKER = "buf_htk = ("
+_MINIMAX_M3_SPARSE_ATTN_MARKER = "else topk_buffer[:num_tokens].transpose(0, 1)"
 
 
 @pytest.fixture
@@ -79,6 +98,37 @@ def patched_glm_dsa_source(tmp_path, monkeypatch):
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
     patches._patch_vllm_glm_decoder_sequence_parallel_moe(logging.getLogger(__name__))
     return copied
+
+
+@pytest.fixture
+def patched_minimax_m3_sources(tmp_path, monkeypatch):
+    """Installed MiniMax-M3 sources, restored to 0.25.1 then patched in tmp."""
+    copied_sources = {}
+    for relative_source, (old_name, new_name) in _MINIMAX_M3_SOURCES.items():
+        old_snippet, new_snippet = patch_snippets(
+            _MINIMAX_M3_PATCH_FN,
+            old_name,
+            new_name,
+        )
+        content = Path(patches._get_vllm_file(relative_source)).read_text()
+        if new_snippet in content:
+            content = content.replace(new_snippet, old_snippet, 1)
+        assert old_snippet in content, (
+            f"{relative_source} contains neither the vLLM 0.25.1 nor the fixed "
+            "MiniMax-M3 top-k layout anchor"
+        )
+
+        copied = tmp_path / Path(relative_source).name
+        copied.write_text(content)
+        copied_sources[relative_source] = copied
+
+    monkeypatch.setattr(
+        patches,
+        "_get_vllm_file",
+        lambda relative: str(copied_sources[relative]),
+    )
+    patches._patch_vllm_minimax_m3_topk_buffer_layout(logging.getLogger(__name__))
+    return copied_sources
 
 
 @pytest.mark.vllm
@@ -210,6 +260,70 @@ def test_glm_decoder_sp_moe_patch_warns_on_unknown_source(
 
     assert model_source.read_text() == "class DeepseekV2DecoderLayer:\n    pass\n"
     assert "vLLM 0.25.1 source shape was not found" in caplog.text
+
+
+@pytest.mark.vllm
+def test_minimax_m3_topk_patch_applies_to_installed_vllm_and_is_idempotent(
+    patched_minimax_m3_sources,
+):
+    indexer = patched_minimax_m3_sources[
+        "models/minimax_m3/common/indexer.py"
+    ].read_text()
+    sparse_attention = patched_minimax_m3_sources[
+        "models/minimax_m3/common/sparse_attention.py"
+    ].read_text()
+
+    assert _MINIMAX_M3_INDEXER_MARKER in indexer
+    assert "out=buf_htk," in indexer
+    assert "out=buf_htk[:, nd:, :] if buf_htk is not None else None" in indexer
+    assert _MINIMAX_M3_SPARSE_ATTN_MARKER in sparse_attention
+    ast.parse(indexer)
+    ast.parse(sparse_attention)
+
+    before = {
+        source: copied.read_text()
+        for source, copied in patched_minimax_m3_sources.items()
+    }
+
+    patches._patch_vllm_minimax_m3_topk_buffer_layout(logging.getLogger(__name__))
+
+    assert {
+        source: copied.read_text()
+        for source, copied in patched_minimax_m3_sources.items()
+    } == before
+
+
+def test_minimax_m3_topk_patch_does_not_partially_patch_unknown_source(
+    monkeypatch,
+    tmp_path,
+    caplog,
+):
+    indexer_source = "models/minimax_m3/common/indexer.py"
+    sparse_source = "models/minimax_m3/common/sparse_attention.py"
+    indexer_old, _ = patch_snippets(
+        _MINIMAX_M3_PATCH_FN,
+        *_MINIMAX_M3_SOURCES[indexer_source],
+    )
+    indexer_file = tmp_path / "indexer.py"
+    sparse_file = tmp_path / "sparse_attention.py"
+    indexer_file.write_text(indexer_old)
+    sparse_file.write_text("class UnknownSparseAttention:\n    pass\n")
+    sources = {
+        indexer_source: indexer_file,
+        sparse_source: sparse_file,
+    }
+    monkeypatch.setattr(
+        patches,
+        "_get_vllm_file",
+        lambda relative: str(sources[relative]),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        patches._patch_vllm_minimax_m3_topk_buffer_layout(logging.getLogger(__name__))
+
+    assert indexer_file.read_text() == indexer_old
+    assert sparse_file.read_text() == "class UnknownSparseAttention:\n    pass\n"
+    assert "indexer=True, sparse_attention=False" in caplog.text
 
 
 @pytest.mark.parametrize(

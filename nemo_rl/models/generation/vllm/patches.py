@@ -622,6 +622,195 @@ def _patch_vllm_glm_decoder_sequence_parallel_moe(logger) -> None:
     logger.info("Successfully disabled decoder-level SP-MoE for GLM DSA models.")
 
 
+def _patch_vllm_minimax_m3_topk_buffer_layout(logger) -> None:
+    """Backport the MiniMax-M3 token-major top-k buffer fix to vLLM 0.25.1.
+
+    vLLM 0.25.1 allocates ``topk_indices_buffer`` as token-major ``[T, H, K]``
+    for the NVIDIA MSA path, while its common Triton indexer and sparse-attention
+    paths read and write it as head-major ``[H, T, K]``. The wrong shape and
+    strides can make ``_topk_index_kernel`` access memory out of bounds and fail
+    with ``CUDA illegal memory access``.
+
+    Remove this patch after upgrading to vLLM >= 0.27.0, which contains the
+    upstream fix. See https://github.com/vllm-project/vllm/issues/48603 and
+    https://github.com/vllm-project/vllm/commit/d1a8ba63d9d2bb51ebf60dd5ea1463cf61c70cea.
+    """
+    try:
+        indexer_file = _get_vllm_file("models/minimax_m3/common/indexer.py")
+        sparse_attention_file = _get_vllm_file(
+            "models/minimax_m3/common/sparse_attention.py"
+        )
+    except RuntimeError as error:
+        logger.warning("Could not locate MiniMax-M3 sources for top-k patch: %s", error)
+        return
+
+    indexer_old_snippet = """        # Both sides write into the single shared persistent topk_indices_buffer
+        # (decode at [:, :nd], prefill at [:, nd:]) and return views into it; the
+        # kernels' out= writes out[:, :total_q]. None -> allocate fresh.
+        buf = self.topk_indices_buffer
+        decode_topk: torch.Tensor | None = None
+        prefill_topk: torch.Tensor | None = None
+        if index_md.num_decodes > 0:
+            d = index_md.decode
+            assert d is not None
+            decode_topk = minimax_m3_index_decode(
+                iq[:nd],
+                kv,
+                d.block_table,
+                d.seq_lens,
+                d.max_seq_len,
+                self.topk_blocks,
+                self.init_blocks,
+                self.local_blocks,
+                self.num_kv_heads,
+                d.decode_query_len,
+                d.max_decode_query_len,
+                out=buf,
+            )
+        if index_md.num_prefills > 0:
+            p = index_md.prefill
+            assert p is not None
+            score = minimax_m3_index_score(
+                iq[nd:],
+                kv,
+                p.block_table,
+                p.cu_seqlens_q,
+                p.seq_lens,
+                p.context_lens,
+                p.max_query_len,
+                p.max_seq_len,
+                self.num_kv_heads,
+            )
+            prefill_topk = minimax_m3_index_topk(
+                score,
+                p.cu_seqlens_q,
+                p.context_lens,
+                p.max_query_len,
+                self.topk_blocks,
+                self.init_blocks,
+                self.local_blocks,
+                out=buf[:, nd:, :] if buf is not None else None,
+            )
+        return decode_topk, prefill_topk
+"""
+    indexer_new_snippet = """        # Both sides write into the single shared persistent topk_indices_buffer
+        # (decode at [:, :nd], prefill at [:, nd:]) and return views into it; the
+        # kernels' out= writes out[:, :total_q]. None -> allocate fresh.
+        buf = self.topk_indices_buffer
+        buf_htk = (
+            buf if buf is None or current_platform.is_rocm() else buf.transpose(0, 1)
+        )
+        decode_topk: torch.Tensor | None = None
+        prefill_topk: torch.Tensor | None = None
+        if index_md.num_decodes > 0:
+            d = index_md.decode
+            assert d is not None
+            decode_topk = minimax_m3_index_decode(
+                iq[:nd],
+                kv,
+                d.block_table,
+                d.seq_lens,
+                d.max_seq_len,
+                self.topk_blocks,
+                self.init_blocks,
+                self.local_blocks,
+                self.num_kv_heads,
+                d.decode_query_len,
+                d.max_decode_query_len,
+                out=buf_htk,
+            )
+        if index_md.num_prefills > 0:
+            p = index_md.prefill
+            assert p is not None
+            score = minimax_m3_index_score(
+                iq[nd:],
+                kv,
+                p.block_table,
+                p.cu_seqlens_q,
+                p.seq_lens,
+                p.context_lens,
+                p.max_query_len,
+                p.max_seq_len,
+                self.num_kv_heads,
+            )
+            prefill_topk = minimax_m3_index_topk(
+                score,
+                p.cu_seqlens_q,
+                p.context_lens,
+                p.max_query_len,
+                self.topk_blocks,
+                self.init_blocks,
+                self.local_blocks,
+                out=buf_htk[:, nd:, :] if buf_htk is not None else None,
+            )
+        return decode_topk, prefill_topk
+"""
+    sparse_attention_old_snippet = """        # Indexer top-k from the shared buffer: decode [:, :nd], prefill [:, nd:].
+        topk = layer.topk_indices_buffer  # type: ignore[attr-defined]
+        assert topk is not None
+"""
+    sparse_attention_new_snippet = """        # Indexer top-k from the shared buffer: decode [:, :nd], prefill [:, nd:].
+        topk_buffer = layer.topk_indices_buffer  # type: ignore[attr-defined]
+        assert topk_buffer is not None
+
+        topk = (
+            topk_buffer
+            if current_platform.is_rocm()
+            else topk_buffer[:num_tokens].transpose(0, 1)
+        )
+        assert topk is not None
+"""
+
+    # Lock both files in a fixed order and validate both anchors before writing
+    # either one. This prevents an unexpected vLLM source shape from leaving the
+    # indexer and sparse-attention sides with incompatible buffer layouts.
+    with _locked_file_patch(indexer_file) as (indexer_content, write_indexer):
+        with _locked_file_patch(sparse_attention_file) as (
+            sparse_attention_content,
+            write_sparse_attention,
+        ):
+            indexer_known = (
+                indexer_old_snippet in indexer_content
+                or indexer_new_snippet in indexer_content
+            )
+            sparse_attention_known = (
+                sparse_attention_old_snippet in sparse_attention_content
+                or sparse_attention_new_snippet in sparse_attention_content
+            )
+            if not indexer_known or not sparse_attention_known:
+                logger.warning(
+                    "Could not apply MiniMax-M3 top-k buffer patch: expected "
+                    "vLLM 0.25.1 source shape was not found (indexer=%s, "
+                    "sparse_attention=%s).",
+                    indexer_known,
+                    sparse_attention_known,
+                )
+                return
+
+            indexer_patched = indexer_new_snippet in indexer_content
+            sparse_attention_patched = (
+                sparse_attention_new_snippet in sparse_attention_content
+            )
+            if indexer_patched and sparse_attention_patched:
+                logger.info("vLLM MiniMax-M3 top-k buffer patch already applied.")
+                return
+
+            if not indexer_patched:
+                write_indexer(
+                    indexer_content.replace(indexer_old_snippet, indexer_new_snippet, 1)
+                )
+            if not sparse_attention_patched:
+                write_sparse_attention(
+                    sparse_attention_content.replace(
+                        sparse_attention_old_snippet,
+                        sparse_attention_new_snippet,
+                        1,
+                    )
+                )
+
+    logger.info("Successfully patched vLLM MiniMax-M3 top-k buffer layout.")
+
+
 def ensure_vllm_source_compat() -> None:
     """Apply interpreter-independent vLLM source-compat patches.
 
@@ -637,6 +826,7 @@ def ensure_vllm_source_compat() -> None:
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
+    _patch_vllm_minimax_m3_topk_buffer_layout(patch_logger)
 
 
 def _apply_vllm_patches(
@@ -692,3 +882,4 @@ def _apply_vllm_patches(
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
+    _patch_vllm_minimax_m3_topk_buffer_layout(patch_logger)

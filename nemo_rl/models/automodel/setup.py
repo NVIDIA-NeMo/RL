@@ -79,6 +79,26 @@ STRING_TO_DTYPE = {
 }
 
 
+def _has_optimizer_fp32_master(
+    optimizer_cls: type[torch.optim.Optimizer], optimizer_kwargs: dict[str, Any]
+) -> bool:
+    """Whether the resolved optimizer and kwargs provide FP32 master weights."""
+    if optimizer_kwargs.get("master_weights") is not True:
+        return False
+
+    # TE is optional; only import it when checking an optimizer with master weights.
+    try:
+        from transformer_engine.pytorch.optimizers import FusedAdam
+    except ImportError:
+        return False
+
+    # FusedAdam defaults to FP32 masters when master_weight_dtype is omitted.
+    return optimizer_cls is FusedAdam and (
+        "master_weight_dtype" not in optimizer_kwargs
+        or optimizer_kwargs["master_weight_dtype"] == torch.float32
+    )
+
+
 def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
     """Validate and maybe auto-set force_hf based on adapter compatibility.
 
@@ -343,7 +363,7 @@ def validate_and_prepare_config(
     # Load model config
     model_config = AutoConfig.from_pretrained(
         model_name,
-        torch_dtype=torch.float32,  # Always load in float32 for master weights
+        torch_dtype=dtype,
         trust_remote_code=True,
         attn_implementation="flash_attention_2" if enable_seq_packing else None,
         **hf_config_overrides,
@@ -732,6 +752,20 @@ def setup_model_and_optimizer(
 
     model_name = config["model_name"]
 
+    load_dtype = runtime_config.dtype
+    if init_optimizer:
+        optimizer_cfg = config.get("optimizer")
+        if not optimizer_cfg:
+            raise ValueError("optimizer config is required when init_optimizer=True")
+        optimizer_cls = get_class(optimizer_cfg["name"])
+        optimizer_kwargs = dict(optimizer_cfg["kwargs"])
+        # Normalize once for both load-dtype selection and optimizer construction.
+        for key, value in optimizer_kwargs.items():
+            if isinstance(value, str) and value.startswith("torch."):
+                optimizer_kwargs[key] = getattr(torch, value.removeprefix("torch."))
+        if not _has_optimizer_fp32_master(optimizer_cls, optimizer_kwargs):
+            load_dtype = torch.float32
+
     # Validate CP configuration with model type before from_pretrained
     if cp_size > 1:
         if model_config.model_type == "gemma3":
@@ -887,7 +921,7 @@ def setup_model_and_optimizer(
         distributed_setup=distributed_setup,
         peft_config=peft_config,
         attn_implementation=attn_impl,
-        torch_dtype=str(model_config.torch_dtype),
+        torch_dtype=load_dtype,
         trust_remote_code=True,
         sdpa_method=sdpa_method,
         **from_pretrained_kwargs,
@@ -927,12 +961,6 @@ def setup_model_and_optimizer(
     # Initialize optimizer
     optimizer = None
     if init_optimizer:
-        optimizer_cls = get_class(config["optimizer"]["name"])
-        optimizer_kwargs = dict(config["optimizer"]["kwargs"])
-        # Resolve string-valued torch dtypes (e.g. "torch.bfloat16" -> torch.bfloat16)
-        for key, value in optimizer_kwargs.items():
-            if isinstance(value, str) and value.startswith("torch."):
-                optimizer_kwargs[key] = getattr(torch, value.removeprefix("torch."))
         # Only pass trainable params to the optimizer. TE FusedAdam's step()
         # allocates per-param state (exp_avg/exp_avg_sq/master_param) before the
         # p.grad-is-None check, so passing frozen params (e.g. the visual
