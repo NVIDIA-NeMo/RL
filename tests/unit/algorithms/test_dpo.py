@@ -31,6 +31,7 @@ from nemo_rl.algorithms.loss import PreferenceLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 
 def test_get_dpo_save_state_handles_legacy_checkpoint_and_filters_metrics():
@@ -260,11 +261,11 @@ def mock_dpo_components():
                 },
                 "train_micro_batch_size": 1,
             },
-            "checkpointing": {
+            "checkpointing": CheckpointingConfig.model_construct(**{
                 "enabled": False,
                 "checkpoint_must_save_by": None,
                 "save_period": 10,
-            },
+            }),
             "cluster": ClusterConfig(num_nodes=1, gpus_per_node=1),
         }
     )
@@ -323,9 +324,9 @@ def test_configured_stop_forces_checkpoint_without_shortening_run(
             "stop_after_step": 3,
         }
     )
-    cfg.checkpointing["enabled"] = True
-    cfg.checkpointing["save_period"] = 100
-    cfg.checkpointing["metric_name"] = None
+    cfg.checkpointing.enabled = True
+    cfg.checkpointing.save_period = 100
+    cfg.checkpointing.metric_name = None
 
     checkpointer = mock_dpo_components["checkpointer"]
     checkpointer.init_tmp_checkpoint.return_value = "/tmp/segment_ckpt/tmp_step"
@@ -412,8 +413,8 @@ def test_exit_on_timeout(mock_dpo_components, capsys, tmp_path):
     # Set max steps and epochs to large numbers
     mock_dpo_components["master_config"].dpo.max_num_steps = 100
     mock_dpo_components["master_config"].dpo.max_num_epochs = 10
-    mock_dpo_components["master_config"].checkpointing["enabled"] = True
-    mock_dpo_components["master_config"].checkpointing["metric_name"] = None
+    mock_dpo_components["master_config"].checkpointing.enabled = True
+    mock_dpo_components["master_config"].checkpointing.metric_name = None
     mock_dpo_components["checkpointer"].init_tmp_checkpoint.return_value = str(
         tmp_path / "tmp_step"
     )
@@ -480,10 +481,10 @@ def test_ft_save_period_triggers_periodic_saves(mock_dpo_components):
     cfg.dpo.val_period = 0
     cfg.dpo.max_num_steps = 5
     cfg.dpo.max_num_epochs = 1
-    cfg.checkpointing["enabled"] = True
-    cfg.checkpointing["save_period"] = 100  # only the final step would save
-    cfg.checkpointing["ft_save_period"] = 2
-    cfg.checkpointing["metric_name"] = None
+    cfg.checkpointing.enabled = True
+    cfg.checkpointing.save_period = 100  # only the final step would save
+    cfg.checkpointing.ft_save_period = 2
+    cfg.checkpointing.metric_name = None
 
     checkpointer = mock_dpo_components["checkpointer"]
     checkpointer.init_tmp_checkpoint.return_value = "/tmp/ft_ckpt_test/tmp_step"
