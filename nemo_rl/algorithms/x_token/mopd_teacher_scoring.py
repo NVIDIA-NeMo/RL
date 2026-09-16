@@ -43,9 +43,9 @@ from nemo_rl.algorithms.x_token.mopd import (
     normalize_alignment_method,
     parse_qwen_chat_token_stream,
     proven_template_only_teacher_token_indices,
-    qwen_chat_boundaries_present,
     qwen3_assistant_content_transform,
     qwen3_leading_think_prefix_len,
+    qwen_chat_boundaries_present,
     render_teacher_open_thinking_prefix,
     sampled_im_end_token_id,
     split_sampled_assistant_eot,
@@ -62,7 +62,6 @@ from nemo_rl.data.deepseek_v4_tokenizer import (
     should_use_deepseek_v4_chat_template,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-
 
 _PLAIN_TOKENIZER_LOAD_LOCK = threading.Lock()
 

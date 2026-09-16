@@ -294,8 +294,8 @@ def preflight_cross_tokenizer_mopd(master_config: Any) -> None:
         return
 
     from nemo_rl.algorithms.x_token.mopd_teacher_scoring import (
-        validate_mopd_student_alignment_preflight,
         validate_cross_tokenizer_preflight,
+        validate_mopd_student_alignment_preflight,
     )
     from nemo_rl.models.policy.teacher_worker_group import (
         create_teacher_configs_from_opd_config,

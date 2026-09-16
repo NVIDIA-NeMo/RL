@@ -36,16 +36,16 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig as GRPOMasterConfig,
 )
 from nemo_rl.algorithms.opd import resolve_reference_aliases, teacher_seq_pad_multiple
-from nemo_rl.algorithms.x_token.mopd_teacher_scoring import (
-    MOPDTeacherScoreResult,
-    build_mopd_teacher_scorer,
-)
 from nemo_rl.algorithms.ppo import (
     AsyncPPOConfig,
     PPOConfig,
 )
 from nemo_rl.algorithms.ppo import (
     MasterConfig as PPOMasterConfig,
+)
+from nemo_rl.algorithms.x_token.mopd_teacher_scoring import (
+    MOPDTeacherScoreResult,
+    build_mopd_teacher_scorer,
 )
 from nemo_rl.data.dataloader import CyclingDataLoader
 from nemo_rl.data.interfaces import DatumSpec

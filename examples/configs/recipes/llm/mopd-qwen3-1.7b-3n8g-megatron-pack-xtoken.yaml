@@ -1,12 +1,5 @@
-# Cross-tokenizer MOPD parity recipe. Replace every /path/to placeholder before
-# launching. The internal reproduction manifest pins the exact checkpoint and
-# tokenizer revisions, chat-template hashes, dataset SHA, container digest, and
-# NeMo Gym commit plus patch-state hash; those private artifacts are not shipped.
-
 defaults: ../../grpo_math_1B.yaml
-
 grpo:
-  seed: 42
   num_prompts_per_step: 256
   num_generations_per_prompt: 1
   max_num_steps: 5
@@ -15,34 +8,25 @@ grpo:
   advantage_clip_low: -50.0
   advantage_clip_high: 50.0
   max_val_samples: null
-  val_batch_size: 256
   invalid_tool_call_advantage: -5.0
   malformed_thinking_advantage: -5.0
   async_grpo:
     enabled: true
   adv_estimator:
     name: opd
-    # Optional TOP-D scalar reward shaping is deliberately off for parity.
-    proximal_reward_alpha: null
-    proximal_reward_scale: 1.0
   seq_logprob_error_threshold: 2.0
-
 loss_fn:
   reference_policy_kl_penalty: 0.0
   kl_input_clamp_value: null
   kl_output_clamp_value: null
-  ratio_clip_min: 0.2
   ratio_clip_max: 0.28
   use_on_policy_kl_approximation: true
-  # This setting takes precedence over the ratio clips and is required to
-  # reproduce the recorded numeric loss.
   force_on_policy_ratio: true
   disable_ppo_ratio: true
   use_importance_sampling_correction: true
   truncated_importance_sampling_ratio: 5.0
   truncated_importance_sampling_ratio_min: 0.2
   truncated_importance_sampling_type: icepop
-
 checkpointing:
   enabled: false
   checkpoint_dir: results/mopd-qwen3-1.7b-3n8g-megatron-pack-xtoken
@@ -51,14 +35,10 @@ checkpointing:
   save_period: 1000
   checkpoint_must_save_by: 00:03:40:00
   save_optimizer: false
-
 policy:
   model_name: /path/to/student-checkpoint-at-pinned-revision
   tokenizer:
     name: /path/to/student-tokenizer-at-pinned-revision
-    chat_template_kwargs: {}
-    tokenizer_kwargs: {}
-    # Matches the recorded runtime; alignment offsets come from a plain-HF copy.
     use_fastokens: true
   train_global_batch_size: 256
   train_micro_batch_size: 1
@@ -104,7 +84,6 @@ policy:
       resources:
         gpus_per_node: 8
         num_nodes: 1
-
 data:
   max_input_seq_length: null
   train:
@@ -118,7 +97,6 @@ data:
     env_name: nemo_gym
     prompt_file: null
     processor: nemo_gym_data_processor
-
 env:
   should_use_nemo_gym: true
   nemo_gym:
@@ -142,7 +120,6 @@ env:
           num_processes: 1024
           unit_test_timeout_secs: 10
           debug: false
-
 logger:
   tensorboard_enabled: true
   wandb:
@@ -151,11 +128,9 @@ logger:
   mlflow:
     experiment_name: mopd
     run_name: mopd-qwen3-1.7b-3n8g-megatron-pack-xtoken
-
 cluster:
   gpus_per_node: 8
   num_nodes: 3
-
 on_policy_distillation:
   enabled: true
   teacher_model_by_agent_name:
@@ -173,7 +148,6 @@ on_policy_distillation:
       gpus_per_node: 8
       precision: bf16
       micro_batch_size: 1
-      # Resolve this per teacher; do not inherit the student setting implicitly.
       use_fused_linear_logprobs: false
       cross_tokenizer:
         tokenizer:
