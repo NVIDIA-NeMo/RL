@@ -32,6 +32,7 @@ from nemo_rl.models.generation.constants import (
     SGLANG_BACKEND,
     VLLM_BACKEND,
 )
+from nemo_rl.models.generation.sglang.config import get_sglang_fault_tolerance_config
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
@@ -131,7 +132,7 @@ def create_weight_synchronizer(
                     "shard_expert_weights=true; use full-weight MoE refit instead."
                 )
             if (
-                sglang_cfg["use_fault_tolerance"]
+                get_sglang_fault_tolerance_config(sglang_cfg).use_fault_tolerance
                 and checkpoint_engine_config["backend"] != "nixl"
             ):
                 # Engine recovery rebinds receivers through the built-in NIXL
