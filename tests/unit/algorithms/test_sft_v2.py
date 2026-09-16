@@ -33,6 +33,7 @@ from nemo_rl.data.energon.sft_types import StepEnvelope
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.instrumentation import TRACE_CARRIER_KWARG
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 _ACTOR_CLS = SFTSingleControllerActor.__ray_metadata__.modified_class
 
@@ -113,7 +114,7 @@ def _valid_setup_config(
         sft=SimpleNamespace(**sft),
         data=data,
         policy=policy,
-        checkpointing={"metric_name": metric_name},
+        checkpointing=CheckpointingConfig.model_construct(**{"metric_name": metric_name}),
     )
 
 
@@ -152,12 +153,12 @@ def test_train_step_aborts_policy_and_loader_on_training_failure() -> None:
 
 def _save_controller(**checkpointing: Any) -> object:
     controller = _controller()
-    controller._master_config.checkpointing = {
+    controller._master_config.checkpointing = CheckpointingConfig.model_construct(**{
         "enabled": True,
         "save_period": 10,
         "metric_name": None,
         **checkpointing,
-    }
+    })
     controller._max_steps = 25
     return controller
 
