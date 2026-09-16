@@ -53,10 +53,15 @@ def validate_release_grads_before_refit(
         raise ValueError(
             "release_grads_before_refit requires the Megatron policy backend."
         )
-    if colocated or generation_backend != VLLM_BACKEND or refit_transport is not None:
+    if colocated or generation_backend != VLLM_BACKEND:
         raise ValueError(
-            "release_grads_before_refit is supported only by the default "
-            "non-colocated vLLM collective refit transport."
+            "release_grads_before_refit is supported only by non-colocated vLLM "
+            "collective or nccl_reshard refit transports."
+        )
+    if refit_transport not in (None, "nccl_reshard"):
+        raise ValueError(
+            "release_grads_before_refit is supported only by non-colocated vLLM "
+            "collective or nccl_reshard refit transports."
         )
 
 
@@ -215,6 +220,7 @@ def create_weight_synchronizer(
                 train_cluster=train_cluster,
                 inference_cluster=inference_cluster,
                 refit_timeout_s=refit_timeout_s,
+                release_grads_before_refit=release_grads_before_refit,
             )
 
         from nemo_rl.weight_sync.collective_weight_synchronizer import (

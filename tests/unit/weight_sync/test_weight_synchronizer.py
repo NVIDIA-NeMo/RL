@@ -789,6 +789,38 @@ class TestNcclReshardWeightSynchronizer:
 
         assert sync._generation is None
 
+    @pytest.mark.parametrize(
+        ("release_grads_before_refit", "expected_events"),
+        [
+            (False, ["nccl_reshard_refit"]),
+            (True, ["offload_before_refit", "nccl_reshard_refit"]),
+        ],
+    )
+    @patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray")
+    def test_sync_weights_propagates_refit_memory_release(
+        self, mock_ray, release_grads_before_refit, expected_events
+    ):
+        mock_ray.get.return_value = [True]
+        events = []
+        policy = _mock_policy()
+        policy.offload_before_refit.side_effect = lambda: events.append(
+            "offload_before_refit"
+        )
+        policy.nccl_reshard_refit.side_effect = lambda **_: (
+            events.append("nccl_reshard_refit") or [MagicMock()]
+        )
+        sync = NcclReshardWeightSynchronizer(
+            policy,
+            _mock_generation(cfg={"backend": "vllm"}),
+            _mock_cluster(),
+            _mock_cluster(),
+            release_grads_before_refit=release_grads_before_refit,
+        )
+
+        sync.sync_weights()
+
+        assert events == expected_events
+
 
 # ---------------------------------------------------------------------------
 # Factory
@@ -1221,7 +1253,7 @@ class TestFactory:
         ("generation_backend", "colocated", "refit_transport"),
         [
             (VLLM_BACKEND, True, None),
-            (VLLM_BACKEND, False, "nccl_reshard"),
+            (VLLM_BACKEND, False, "http"),
             (MEGATRON_BACKEND, False, None),
         ],
     )
@@ -1243,6 +1275,30 @@ class TestFactory:
                 train_cluster=_mock_cluster(),
                 inference_cluster=_mock_cluster(),
             )
+
+    @patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray")
+    def test_non_colocated_vllm_nccl_reshard_propagates_refit_memory_release(
+        self, mock_ray
+    ):
+        mock_ray.get.return_value = [True]
+        policy = _mock_policy()
+        policy.cfg["megatron_cfg"]["enabled"] = True
+        policy.cfg["release_grads_before_refit"] = True
+        generation = _mock_generation()
+        generation.cfg["refit_transport"] = "nccl_reshard"
+
+        sync = create_weight_synchronizer(
+            policy=policy,
+            generation=generation,
+            generation_backend=VLLM_BACKEND,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+        )
+
+        assert isinstance(sync, NcclReshardWeightSynchronizer)
+        sync.sync_weights()
+        policy.offload_before_refit.assert_called_once_with()
 
     def test_non_colocated_dynamo_returns_collective(self):
         sync = create_weight_synchronizer(
