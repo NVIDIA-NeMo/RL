@@ -38,6 +38,28 @@ print(f"{module.__name__}: {actual}")
 """
 
 
+def link_environment(destination: Path, source: Path) -> None:
+    """Create the link once; nodes racing on a shared filesystem tolerate losing."""
+    try:
+        destination.symlink_to(source, target_is_directory=True)
+    except FileExistsError:
+        pass
+    if destination.resolve() != source.resolve():
+        raise ValueError(f"Existing environment differs: {destination}")
+
+
+def write_receipt(path: Path, receipt: dict) -> None:
+    """Write once; an identical rerun is a no-op and a different one is an error."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(receipt, indent=2)
+    try:
+        with path.open("x") as stream:
+            stream.write(encoded)
+    except FileExistsError:
+        if path.read_text() != encoded:
+            raise FileExistsError(f"Receipt differs from this run: {path}") from None
+
+
 def prepare(config: Path, gym: Path, image_venvs: Path, runtime_venvs: Path) -> dict:
     gym = gym.resolve()
     graph = OmegaConf.load(config).env.nemo_gym
@@ -70,13 +92,7 @@ def prepare(config: Path, gym: Path, image_venvs: Path, runtime_venvs: Path) -> 
                     if not interpreter.is_file():
                         raise FileNotFoundError(interpreter)
                     destination.parent.mkdir(parents=True, exist_ok=True)
-                    if destination.is_symlink() or destination.exists():
-                        if destination.resolve() != source.resolve():
-                            raise ValueError(
-                                f"Existing environment differs: {destination}"
-                            )
-                    else:
-                        destination.symlink_to(source, target_is_directory=True)
+                    link_environment(destination, source)
                     module = ".".join((*identity, "app"))
                     env = os.environ | {
                         "PYTHONPATH": f"{gym / kind / component}:{gym}",
@@ -117,9 +133,7 @@ def main() -> None:
     parser.add_argument("--receipt", type=Path, required=True)
     args = parser.parse_args()
     receipt = prepare(args.config, args.gym, args.image_venvs, args.runtime_venvs)
-    args.receipt.parent.mkdir(parents=True, exist_ok=True)
-    with args.receipt.open("x") as stream:
-        json.dump(receipt, stream, indent=2)
+    write_receipt(args.receipt, receipt)
     print(json.dumps(receipt))
 
 

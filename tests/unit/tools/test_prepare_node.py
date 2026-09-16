@@ -9,7 +9,12 @@ from unittest.mock import patch
 
 import pytest
 
-from tools.super_rl.prepare_node import NATIVE_IMPORT_CHECK, prepare
+from tools.super_rl.prepare_node import (
+    NATIVE_IMPORT_CHECK,
+    link_environment,
+    prepare,
+    write_receipt,
+)
 
 
 @pytest.mark.parametrize("matching_source", [True, False])
@@ -56,3 +61,23 @@ def test_prepare_selects_staged_component_root(tmp_path: Path):
     assert run.call_args.kwargs["env"]["NEMO_GYM_EXTRA_ROOTS"] == str(gym)
     assert receipt["complete"] is True
     assert receipt["components"] == ["resources_servers.example.app"]
+
+
+def test_rerun_tolerates_existing_link_and_identical_receipt(tmp_path: Path):
+    source = tmp_path / "image" / ".venv"
+    source.mkdir(parents=True)
+    destination = tmp_path / "runtime" / ".venv"
+    destination.parent.mkdir()
+    link_environment(destination, source)
+    link_environment(destination, source)  # second node, or a rerun
+    assert destination.resolve() == source.resolve()
+    other = tmp_path / "other" / ".venv"
+    other.mkdir(parents=True)
+    with pytest.raises(ValueError, match="differs"):
+        link_environment(destination, other)
+
+    receipt = tmp_path / "receipts" / "node.json"
+    write_receipt(receipt, {"complete": True, "components": ["a"]})
+    write_receipt(receipt, {"complete": True, "components": ["a"]})
+    with pytest.raises(FileExistsError, match="differs"):
+        write_receipt(receipt, {"complete": True, "components": ["b"]})

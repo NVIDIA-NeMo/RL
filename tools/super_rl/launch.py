@@ -298,7 +298,12 @@ def main() -> None:
     parser.add_argument(
         "--profile", choices=["aws-cmh", "oci-hsg", "h100"], required=True
     )
-    parser.add_argument("--user", type=Path, required=True)
+    parser.add_argument(
+        "--user",
+        type=Path,
+        default=REPO_ROOT / "super-rl.local.yaml",
+        help="Private launch inputs; defaults to the ignored super-rl.local.yaml",
+    )
     parser.add_argument(
         "--experiment",
         type=Path,
