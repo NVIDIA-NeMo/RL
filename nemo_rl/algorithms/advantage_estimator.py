@@ -565,6 +565,37 @@ class GeneralizedAdvantageEstimator:
         lam = gae_lambda if gae_lambda is not None else self.gae_lambda
 
         gen_len = token_level_rewards.shape[-1]
+        if (
+            self.gae_gamma == 1.0
+            and not isinstance(lam, torch.Tensor)
+            and lam == 1.0
+            and bool(((mask == 0) | (mask == 1)).all())
+        ):
+            # With zero terminal bootstrap, the TD value terms telescope:
+            # A_t = sum_{k=t}^T r_k - V_t. Scan rewards instead of running
+            # one Python/PyTorch iteration per token. Keep tensor-valued lambda
+            # and fractional sample weights on the general path. Only binary
+            # masks allow gathering the next valid value below.
+            masked_rewards = token_level_rewards * mask
+            reward_to_go = (
+                masked_rewards.to(
+                    torch.promote_types(masked_rewards.dtype, values.dtype)
+                )
+                .flip(-1)
+                .cumsum(-1)
+                .flip(-1)
+            )
+
+            # At masked positions, the loop carries the next valid token's
+            # advantage. Gather that token's value to preserve this behavior
+            # for both advantages and returns, including fully masked rows.
+            indices = torch.arange(gen_len, device=values.device)
+            next_valid = torch.where(mask.bool(), indices, gen_len)
+            next_valid = next_valid.flip(-1).cummin(-1).values.flip(-1)
+            padded_values = torch.nn.functional.pad(values, (0, 1))
+            advantages = reward_to_go - padded_values.gather(-1, next_valid)
+            return advantages, advantages + values
+
         next_values: torch.Tensor = torch.zeros(
             values.shape[0], device=values.device, dtype=values.dtype
         )
