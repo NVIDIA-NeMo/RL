@@ -19,7 +19,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from nemo_rl.models.generation.constants import (
-    MEGATRON_BACKEND,
     SGLANG_BACKEND,
     VLLM_BACKEND,
 )
@@ -37,7 +36,6 @@ def _mock_policy(**overrides):
     policy.offload_after_refit.return_value = None
     policy.prepare_refit_info.return_value = {"layer_0": {"shape": [4096, 4096]}}
     policy.stream_weights_via_ipc_zmq.return_value = [MagicMock()]
-    policy.stream_weights_via_http.return_value = [MagicMock()]
     policy.broadcast_weights_for_collective.return_value = [MagicMock()]
     policy.init_collective.return_value = [MagicMock()]
     policy.get_free_memory_bytes.return_value = 1024**3  # 1 GB
@@ -54,8 +52,8 @@ def _mock_generation(**overrides):
     gen.prepare_refit_info.return_value = None
     gen.update_weights_via_ipc_zmq.return_value = [MagicMock()]
     gen.update_weights_from_collective.return_value = [MagicMock()]
-    gen.get_rollout_engine_urls.return_value = ["http://localhost:30000"]
     gen.init_collective.return_value = [MagicMock()]
+    gen.get_refit_payload_mode.return_value = "hf_export"
     for k, v in overrides.items():
         setattr(gen, k, v)
     return gen
@@ -230,7 +228,9 @@ class TestCheckpointEngineWeightSynchronizer:
         sync.sync_weights(kv_scales={"kv": 1.0})
 
         assert not sync.is_stale
-        sync._policy.prepare_refit_info.assert_called_once()
+        sync._policy.prepare_refit_info.assert_called_once_with(
+            refit_payload_mode="hf_export"
+        )
         sync._generation.prepare_refit_info.assert_called_once()
         assert (
             "checkpoint_engine_rpc",
@@ -323,7 +323,6 @@ class TestCheckpointEngineFactory:
             (VLLM_BACKEND, False, CheckpointEngineWeightSynchronizer),
             (VLLM_BACKEND, True, ValueError),
             (SGLANG_BACKEND, False, NotImplementedError),
-            (MEGATRON_BACKEND, False, NotImplementedError),
         ],
     )
     def test_checkpoint_engine_factory_routing(self, backend, colocated, expected):

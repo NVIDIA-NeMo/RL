@@ -349,6 +349,48 @@ def test_build_router_replay_tensors_maps_full_layer_payload_to_moe_layers():
 
 
 @pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("env_value", "expected"),
+    [
+        (None, True),
+        ("1", True),
+        (" true ", True),
+        ("YES", True),
+        ("on", True),
+        ("0", False),
+        (" false ", False),
+        ("NO", False),
+        ("off", False),
+    ],
+)
+def test_router_replay_exclude_mtp_env_parses_explicit_values(
+    monkeypatch, env_value, expected
+):
+    from nemo_rl.models.megatron.router_replay import (
+        _router_replay_exclude_mtp_enabled,
+    )
+
+    if env_value is None:
+        monkeypatch.delenv("NRL_ROUTER_REPLAY_EXCLUDE_MTP", raising=False)
+    else:
+        monkeypatch.setenv("NRL_ROUTER_REPLAY_EXCLUDE_MTP", env_value)
+
+    assert _router_replay_exclude_mtp_enabled() is expected
+
+
+@pytest.mark.mcore
+def test_router_replay_exclude_mtp_env_rejects_invalid_values(monkeypatch):
+    from nemo_rl.models.megatron.router_replay import (
+        _router_replay_exclude_mtp_enabled,
+    )
+
+    monkeypatch.setenv("NRL_ROUTER_REPLAY_EXCLUDE_MTP", "ture")
+
+    with pytest.raises(ValueError, match="Invalid NRL_ROUTER_REPLAY_EXCLUDE_MTP"):
+        _router_replay_exclude_mtp_enabled()
+
+
+@pytest.mark.mcore
 def test_router_replay_excludes_mtp_subtrees_by_default(monkeypatch):
     from megatron.core.transformer.moe.router_replay import (
         RouterReplay,

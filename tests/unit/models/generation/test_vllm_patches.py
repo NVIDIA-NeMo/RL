@@ -14,13 +14,15 @@
 
 """Guards for the vLLM source patches that had no coverage.
 
-The two port patches ship their own suites. These cover the remaining two:
+The two port patches ship their own suites. These cover the remaining patches:
 
 * ``_patch_vllm_tool_parser_namespace_tool`` is the most load-bearing patch in
   the repo -- it is the only thing that makes vLLM 0.25.1 importable against
   the pinned ``openai==2.6.1``. If upstream reorders that import block the
   patch logs a warning and returns, and every engine then dies on
   ``import vllm.tool_parsers``. So the anchor needs pinning.
+* ``_patch_vllm_glm_decoder_sequence_parallel_moe`` restores the vLLM 0.24
+  decoder boundary for GLM-5.1/5.2 while leaving MoE-local SP enabled.
 * the ``VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`` merge replaced the old
   ``ADDITIONAL_ENV_VARS`` file patch and is what now carries
   ``RAY_ENABLE_UV_RUN_RUNTIME_ENV`` and every user ``extra_env_vars`` to the
@@ -125,6 +127,9 @@ def test_apply_vllm_patches_allows_compact_routed_experts_patch_failure(monkeypa
     patches._apply_vllm_patches("/path/to/python")
 
     assert calls == ["compact", "refit"]
+_GLM_DSA_SOURCE = "model_executor/models/deepseek_v2.py"
+_GLM_DSA_PATCH_FN = "_patch_vllm_glm_decoder_sequence_parallel_moe"
+_GLM_DSA_MARKER = 'getattr(config, "model_type", None) != "glm_moe_dsa"'
 
 
 @pytest.fixture
@@ -142,6 +147,17 @@ def patched_radio_source(tmp_path, monkeypatch):
     copied = write_unpatched_copy(_RADIO_SOURCE, _RADIO_PATCH_FN, tmp_path / "radio.py")
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
     patches._patch_vllm_radio_layerscale_loader(logging.getLogger(__name__))
+    return copied
+
+
+@pytest.fixture
+def patched_glm_dsa_source(tmp_path, monkeypatch):
+    """The installed GLM/DeepSeek model source, unpatched then patched in tmp."""
+    copied = write_unpatched_copy(
+        _GLM_DSA_SOURCE, _GLM_DSA_PATCH_FN, tmp_path / "deepseek_v2.py"
+    )
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+    patches._patch_vllm_glm_decoder_sequence_parallel_moe(logging.getLogger(__name__))
     return copied
 
 
@@ -270,6 +286,13 @@ def test_routed_experts_compact_source_patch_matches_pinned_result(
     assert _ROUTED_EXPERTS_MARKER in content
     assert "routed_layers=%d" in content
     assert "self.layer_id_to_capture_index" in content
+@pytest.mark.vllm
+def test_glm_decoder_sp_moe_patch_anchor_still_matches_installed_vllm(
+    patched_glm_dsa_source,
+):
+    """Pin the vLLM 0.25.1 decoder-level SP-MoE source shape."""
+    content = patched_glm_dsa_source.read_text()
+    assert _GLM_DSA_MARKER in content
     ast.parse(content)
 
 
@@ -334,6 +357,31 @@ def test_routed_experts_compact_source_patch_rejects_unknown_source(
 
     assert unknown_source.read_text() == "class RoutedExpertsCapturer:\n    pass\n"
     assert "Refusing to patch unknown vLLM routed-experts capturer" in caplog.text
+def test_glm_decoder_sp_moe_patch_is_idempotent(patched_glm_dsa_source, monkeypatch):
+    before = patched_glm_dsa_source.read_text()
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(patched_glm_dsa_source)
+    )
+
+    patches._patch_vllm_glm_decoder_sequence_parallel_moe(logging.getLogger(__name__))
+
+    assert patched_glm_dsa_source.read_text() == before
+
+
+def test_glm_decoder_sp_moe_patch_warns_on_unknown_source(
+    monkeypatch, tmp_path, caplog
+):
+    model_source = tmp_path / "deepseek_v2.py"
+    model_source.write_text("class DeepseekV2DecoderLayer:\n    pass\n")
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(model_source))
+
+    with caplog.at_level(logging.WARNING):
+        patches._patch_vllm_glm_decoder_sequence_parallel_moe(
+            logging.getLogger(__name__)
+        )
+
+    assert model_source.read_text() == "class DeepseekV2DecoderLayer:\n    pass\n"
+    assert "vLLM 0.25.1 source shape was not found" in caplog.text
 
 
 @pytest.mark.parametrize(

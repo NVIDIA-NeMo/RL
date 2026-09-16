@@ -148,17 +148,38 @@ def validate_router_replay_config(config: PolicyConfig) -> None:
     _install_missing_route_fallback_patch()
 
 
-def _iter_model_modules(model: Any) -> Iterable[Any]:
+def _iter_model_modules_with_mtp_ancestry(
+    model: Any, *, beneath_mtp: bool = False
+) -> Iterable[tuple[Any, bool]]:
+    """Yield modules and whether MCore identifies them as part of an MTP layer."""
     if isinstance(model, (list, tuple)):
         for item in model:
-            yield from _iter_model_modules(item)
+            yield from _iter_model_modules_with_mtp_ancestry(
+                item, beneath_mtp=beneath_mtp
+            )
         return
 
-    modules = getattr(model, "modules", None)
-    if callable(modules):
-        yield from modules()
-    else:
-        yield model
+    beneath_mtp = beneath_mtp or bool(getattr(model, "is_mtp_layer", False))
+    yield model, beneath_mtp
+
+    children = getattr(model, "children", None)
+    if callable(children):
+        for child in children():
+            yield from _iter_model_modules_with_mtp_ancestry(
+                child, beneath_mtp=beneath_mtp
+            )
+
+
+def _router_replay_exclude_mtp_enabled() -> bool:
+    value = os.getenv(_ROUTER_REPLAY_EXCLUDE_MTP_ENV, "1").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"Invalid {_ROUTER_REPLAY_EXCLUDE_MTP_ENV}={value!r}; expected one of "
+        "{'1','true','yes','on','0','false','no','off'}."
+    )
 
 
 def _iter_model_modules_with_mtp_ancestry(
@@ -252,6 +273,18 @@ def _global_moe_layer_numbers(model_config: Any) -> list[int]:
         raise ValueError(f"Unsupported moe_layer_freq: {moe_layer_freq!r}")
 
     return [layer_idx + 1 for layer_idx, is_moe in enumerate(pattern) if is_moe]
+
+
+def router_replay_dimensions(model_config: Any) -> tuple[int, int]:
+    """Return model-owned ``(num_moe_layers, top_k)`` route dimensions."""
+    num_moe_layers = len(_global_moe_layer_numbers(model_config))
+    top_k = int(getattr(model_config, "moe_router_topk"))
+    if num_moe_layers <= 0 or top_k <= 0:
+        raise ValueError(
+            "router replay requires positive route dimensions, got "
+            f"num_moe_layers={num_moe_layers}, top_k={top_k}"
+        )
+    return num_moe_layers, top_k
 
 
 def _router_replay_instances_for_model(model: Any) -> list[tuple[Any, int]]:

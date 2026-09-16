@@ -28,6 +28,7 @@ No offload/restore steps are needed since policy and generation run on
 separate GPUs with dedicated memory.
 """
 
+from collections.abc import Sequence
 from contextlib import nullcontext
 from typing import Any, Optional
 
@@ -35,6 +36,47 @@ import ray
 
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.membership import (
+    RefitMembership,
+    desired_membership,
+    should_rebuild,
+)
+
+
+def _settle_before_propagating(futures, budget_s, what: str) -> None:
+    """Let every rank finish unwinding before a refit failure reaches the caller.
+
+    ``ray.get`` raises on the FIRST future that fails and leaves the rest running. That is
+    fine when the caller is going to stop, and wrong when it is going to rebuild: a
+    communicator rebuild is itself a collective, so dispatching ``init_collective`` while
+    some ranks are still inside the old refit means they join late or not at all, and the
+    rendezvous times out instead of coming up.
+
+    Job 6512153 measured exactly that on the reshard kill variant. Rank 0 gave up on its
+    own deadline, the controller went straight into the recovery, and the rebuild began --
+    line 963 of the log -- two lines BEFORE rank 1's watchdog fired at all. The surviving
+    generation worker then spent 300s twice failing to reach a store that never came up,
+    and the run died at 690s having done everything else right.
+
+    Bounded, and swallowing whatever the stragglers raise: they are unwinding from the same
+    failure the caller is already holding, and replacing it with a straggler's version
+    would lose the diagnosis. If the budget runs out, propagate anyway -- a caller stuck
+    here would be a worse wedge than the one being recovered from.
+    """
+    if not futures:
+        return
+    try:
+        ready, pending = ray.wait(
+            list(futures), num_returns=len(futures), timeout=budget_s
+        )
+        if pending:
+            print(
+                f"  refit: {len(pending)} of {len(futures)} {what} rank(s) had not "
+                f"unwound after {budget_s}s; rebuilding anyway",
+                flush=True,
+            )
+    except Exception:  # noqa: BLE001 - the caller's failure is the one that matters
+        pass
 
 
 class CollectiveWeightSynchronizer(WeightSynchronizer):
@@ -49,6 +91,10 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         train_cluster: RayVirtualCluster for the training workers, used to
             obtain the master address/port and world size for collective init.
         inference_cluster: RayVirtualCluster for the inference workers.
+        refit_timeout_s: Deadline for one refit collective. Each participating worker
+            arms a watchdog and aborts its own communicator when it expires, which is
+            what lets the controller rebuild over the survivors instead of blocking in
+            NCCL forever. ``None`` disarms it entirely, so the hang protection is lost.
     """
 
     def __init__(
@@ -57,12 +103,18 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         generation: Any,
         train_cluster: Any,
         inference_cluster: Any,
+        refit_timeout_s: Optional[float] = None,
     ):
+        # None disarms the abort watchdog in every worker, which is the default and
+        # reproduces the pre-existing behaviour exactly.
+        self._refit_timeout_s = refit_timeout_s
         self._policy = policy
         self._generation = generation
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
         self._stale = True
+        # What the communicator was last built over. None until init_communicator.
+        self._built_membership: Optional[RefitMembership] = None
 
     def sync_weights(
         self,
@@ -79,12 +131,30 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             sender_spec = self._generation.get_collective_sender_spec()
             futures_train = self._policy.broadcast_weights_for_collective(
                 kv_scales=kv_scales,
+                refit_timeout_s=self._refit_timeout_s,
                 buffer_size_bytes=sender_spec.buffer_size_bytes,
                 num_buffers=sender_spec.num_buffers,
             )
-            futures_inference = self._generation.update_weights_from_collective()
+            futures_inference = self._generation.update_weights_from_collective(
+                refit_timeout_s=self._refit_timeout_s
+            )
 
-            ray.get(futures_train)
+            try:
+                ray.get(futures_train)
+            except BaseException:
+                # Every rank must be out of the old refit before the caller can rebuild
+                # over the survivors; see _settle_before_propagating. BOTH sides: the
+                # rebuild dispatches init_collective to the generation ranks too, and
+                # ray.get(futures_train) raising leaves futures_inference running. Settling
+                # only the train half is the same half-applied fix as the widened
+                # signatures in design_vllm_fault_tolerance.md section 8.5.5.
+                _settle_before_propagating(
+                    futures_train, self._settle_budget_s(), "train"
+                )
+                _settle_before_propagating(
+                    futures_inference, self._settle_budget_s(), "generation"
+                )
+                raise
             results = ray.get(futures_inference)
             update_success = all(result for result in results if result is not None)
 
@@ -101,11 +171,48 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
     def is_stale(self) -> bool:
         return self._stale
 
+    def _desired_membership(
+        self, absent_shards: Sequence[int], train_world_size: int
+    ) -> Optional[RefitMembership]:
+        """The membership to track, or None for a backend that owns no DP worker group.
+
+        NOT every GenerationInterface has one. vLLM and TRT-LLM do; Dynamo, Megatron and
+        SGLang do not, and the interface declares nothing either way -- so reading
+        ``self._generation.worker_group`` assumes a vLLM shape that this synchronizer is
+        not entitled to assume. It holds a GenerationInterface, and Dynamo reaches it
+        through the ordinary non-colocated branch of the factory.
+
+        That assumption broke L1_Functional_Tests_Dynamo on the plain grpo.py path:
+
+            grpo.py:1747  policy_generation.weight_synchronizer.init_communicator()
+            AttributeError: 'DynamoGeneration' object has no attribute 'worker_group'
+
+        None means "this backend has no shards to track", which is the same thing an
+        unrecorded membership already meant: every reconcile falls through to "nothing to
+        do", exactly as it behaved before membership tracking existed. Re-admission is only
+        meaningful where shards exist.
+
+        Deliberately NOT mirrored on the reshard synchronizer. nccl_reshard is a vLLM-only
+        transport that REQUIRES a worker group, so a missing one there is a
+        misconfiguration that should fail loudly rather than silently degrade.
+        """
+        worker_group = getattr(self._generation, "worker_group", None)
+        if worker_group is None:
+            return None
+        return desired_membership(
+            absent_shards=absent_shards,
+            dp_size=worker_group.dp_size,
+            total_gen_workers=len(worker_group.workers),
+            train_world_size=train_world_size,
+        )
+
     def init_communicator(self) -> None:
         # prepare_refit_info is called before init_collective. This matches
         # distillation.py ordering. Neither call depends on the other today,
         # but we document this as the canonical ordering for future reference.
-        state_dict_info = self._policy.prepare_refit_info()
+        state_dict_info = self._policy.prepare_refit_info(
+            refit_payload_mode=self._generation.get_refit_payload_mode()
+        )
         self._generation.prepare_refit_info(state_dict_info)
 
         ip, port = self._train_cluster.get_master_address_and_port()
@@ -127,6 +234,120 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             ip, port, world_size, train_world_size=train_world_size
         )
         ray.get(futures_train + futures_inference)
+        # Recorded so the first reconcile can tell "unchanged" from "never built".
+        self._built_membership = self._desired_membership([], train_world_size)
+
+    def _settle_budget_s(self) -> float:
+        """How long to let stragglers unwind: their own deadline, plus a little.
+
+        A rank that has not given up yet will do so when its watchdog fires, which is the
+        same ``refit_timeout_s`` every rank was armed with. Without a configured deadline
+        there is nothing bounding them, so fall back to a fixed wait rather than blocking
+        the recovery indefinitely.
+        """
+        return (self._refit_timeout_s or 60.0) + 30.0
+
+    def reconcile_communicator(
+        self, absent_shards: Sequence[int], force: bool = False
+    ) -> bool:
+        """Rebuild the refit communicator over the surviving generation shards.
+
+        ``model_update_group`` spans every train and inference rank and was built once,
+        at setup, over the full fleet. The refit is a broadcast on that group, so a
+        missing rank blocks it forever -- inside NCCL, where it produces no error and no
+        progress while Ray still reports every actor healthy. Rebuilding without the dead
+        ranks is what lets the run continue.
+
+        Safe for the broadcast because rank 0 is a trainer and trainers are never
+        excluded, so the root is stable across a rebuild and each receiver still slices
+        the same byte stream locally.
+
+        Rebuild rather than ``shrink``/``grow``. The pinned NCCL exports both -- checked
+        against ``nccl.core.communicator.Communicator``, which also exports ``revoke``,
+        ``suspend``, ``resume`` and ``split`` (2.28.9 exported only ``shrink``; uv.lock
+        pins 2.30.7 and 2.30.4 in the dev image already has them). So this is a choice
+        rather than a limitation: the
+        nccl_reshard transport has to regenerate its refit plan on any membership change
+        whatever NCCL supports, restore is dominated by the minutes an engine takes to
+        reload, and one path shared with ``init_communicator`` is exercised by every
+        normal run instead of only after a failure.
+        """
+        membership = self._desired_membership(
+            absent_shards, self._train_cluster.world_size()
+        )
+        # A backend with no DP worker group has no membership to reconcile, and never had
+        # one to lose: nothing can be absent, so there is nothing to rebuild over. Returning
+        # False here is what this method did for every backend before membership tracking
+        # existed. See _desired_membership.
+        if membership is None:
+            return False
+        # An unrecorded membership means the full fleet -- see should_rebuild's docstring,
+        # which owns the rest of this rule for both hardened transports.
+        built = self._built_membership
+        if built is None:
+            # Not Optional in practice: _desired_membership only returns None for a
+            # backend with no worker group, and the check above already ruled that out
+            # for this same call. `or membership` rather than an assert so a future
+            # change to that invariant degrades to "assume the current membership was
+            # built", which is what an unrecorded membership already means.
+            built = (
+                self._desired_membership([], membership.train_world_size) or membership
+            )
+            self._built_membership = built
+        if not should_rebuild(
+            desired=membership,
+            built=built,
+            absent_shards=absent_shards,
+            force=force,
+        ):
+            return False
+
+        # A fresh port every time: the rendezvous store for the previous world may still
+        # be bound, and the cluster hands out a unique port per call for exactly this.
+        ip, port = self._train_cluster.get_master_address_and_port()
+        print(
+            f"  refit: rebuilding communicator over shards "
+            f"{membership.surviving_shards}; world_size {membership.world_size}, "
+            f"port {port}",
+            flush=True,
+        )
+
+        # RECORDED BEFORE THE FIRST DISPATCH, not merely before the last one. Every refit
+        # dispatch resolves its targets through _refit_leader_workers, which falls back to
+        # the whole fleet while no membership is recorded -- so a dispatch that runs before
+        # this line addresses the shard the reconcile is in the middle of removing.
+        #
+        # It sat 21 lines lower, after prepare_refit_info, and that ordering raised
+        # ActorDiedError out of reconcile_communicator after the rebuild had already
+        # succeeded. Every collective-transport recovery variant failed and every
+        # nccl_reshard one passed, because _build on that side records it first.
+        self._generation.set_refit_membership(membership)
+
+        # Re-run for the whole fleet, not just for new shards. A restarted engine has no
+        # state_dict_info at all -- update_weights_from_collective asserts on it -- and
+        # this is metadata rather than weights, so redistributing it to shards that
+        # already have it is cheap and removes the need to track who is new.
+        state_dict_info = self._policy.prepare_refit_info()
+        self._generation.prepare_refit_info(state_dict_info)
+
+        # nccl_peer, exactly as init_communicator passes it. The receiver's bootstrap is
+        # not negotiable: "nemo" publishes a raw unique ID and warms up with a rank-0
+        # broadcast, "vllm" adds a pickled ID key and warms up with an all-reduce. Omitting
+        # it here silently rebuilt with the "nemo" default, and mismatched warmups on one
+        # communicator HANG rather than error -- the exact failure this path exists to
+        # remove, reappearing inside the recovery.
+        sender_spec = self._generation.get_collective_sender_spec()
+        futures_train = self._policy.init_collective(
+            ip,
+            port,
+            membership.world_size,
+            train_world_size=membership.train_world_size,
+            nccl_peer=sender_spec.nccl_peer,
+        )
+        futures_inference = self._generation.rebuild_collective(membership, ip, port)
+        ray.get(futures_train + futures_inference)
+        self._built_membership = membership
+        return True
 
     def shutdown(self) -> None:
         # The NCCL process group lifecycle is managed by Ray actor teardown.

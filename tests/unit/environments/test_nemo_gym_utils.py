@@ -17,13 +17,24 @@ These run in the default L0 suite. Keep this module free of heavy imports
 (e.g. vllm) so the fast detector tests are not gated behind the nemo_gym extra.
 """
 
+import copy
+import sys
+import types
+from contextlib import contextmanager
+from unittest.mock import MagicMock, call, patch
+
 import pytest
+from omegaconf import DictConfig
 
 from nemo_rl.environments import nemo_gym as nemo_gym_mod
 from nemo_rl.environments.nemo_gym import (
+    NEMO_GYM_ACTOR_FQN,
+    NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S,
     _detect_invalid_tool_call_and_malformed_thinking,
+    build_nemo_gym_config,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
+    spinup_nemo_gym_actor,
 )
 
 
@@ -60,6 +71,18 @@ from nemo_rl.environments.nemo_gym import (
         ({"content": [None]}, False, False),
         ({"content": [{"text": None}]}, False, False),
         ({"type": "reasoning", "summary": None}, False, False),
+        # A tool-call-only assistant item carries content: None — a structured
+        # (executed) call, never a penalty (regression: jobs 6342333/6358268).
+        (
+            {"content": None, "tool_calls": [{"function": {"name": "bash"}}]},
+            False,
+            False,
+        ),
+        (
+            {},
+            False,
+            False,
+        ),
     ],
 )
 def test_detect_invalid_tool_call_and_malformed_thinking(
@@ -102,3 +125,409 @@ def test_get_nemo_gym_uv_cache_dir_uses_uv_inside_container(monkeypatch):
         lambda *args, **kwargs: b"  /root/.cache/uv\n",
     )
     assert get_nemo_gym_uv_cache_dir() == "/root/.cache/uv"
+
+
+def _env_configs(**overrides):
+    nemo_gym = {
+        "num_gpu_nodes": 1,
+        "invalid_tool_call_patterns": ["bad_call"],
+        "thinking_tags": ["<think>"],
+        "tokenizer_config": {"name": "test-tokenizer"},
+        "pad_dynamic_image_shapes": True,
+        "config_paths": ["gym.yaml"],
+    }
+    nemo_gym.update(overrides)
+    return {"nemo_gym": nemo_gym}
+
+
+@pytest.fixture
+def detected_uv_dirs(monkeypatch):
+    """Pretend we are in a container with image-baked uv cache + venv dirs."""
+    monkeypatch.setattr(
+        nemo_gym_mod, "get_nemo_gym_uv_cache_dir", lambda: "/opt/nemo-gym/.uv-cache"
+    )
+    monkeypatch.setattr(
+        nemo_gym_mod, "get_nemo_gym_venv_dir", lambda: "/opt/nemo-gym/venvs"
+    )
+
+
+def test_build_nemo_gym_config_splits_nemo_rl_keys(detected_uv_dirs):
+    """NeMo-RL-only knobs become top-level fields; the rest is Gym's global config."""
+    env_configs = _env_configs()
+    env_configs_before = copy.deepcopy(env_configs)
+
+    cfg = build_nemo_gym_config(
+        env_configs,
+        base_urls=["http://vllm-0"],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+    )
+
+    assert cfg["model_name"] == "test-model"
+    assert cfg["base_urls"] == ["http://vllm-0"]
+    assert cfg["invalid_tool_call_patterns"] == ["bad_call"]
+    assert cfg["thinking_tags"] == ["<think>"]
+    assert cfg["tokenizer_config"] == {"name": "test-tokenizer"}
+    assert cfg["pad_dynamic_image_shapes"] is True
+    assert cfg["initial_global_config_dict"] == {
+        "num_gpu_nodes": 1,
+        "config_paths": ["gym.yaml"],
+        "uv_cache_dir": "/opt/nemo-gym/.uv-cache",
+        "uv_venv_dir": "/opt/nemo-gym/venvs",
+    }
+    # The caller's master_config.env must survive untouched.
+    assert env_configs == env_configs_before
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        ({}, ("/opt/nemo-gym/.uv-cache", "/opt/nemo-gym/venvs")),
+        (
+            {"uv_cache_dir": "/custom/cache", "uv_venv_dir": "/custom/venvs"},
+            ("/custom/cache", "/custom/venvs"),
+        ),
+    ],
+    ids=["detected", "explicit-wins"],
+)
+def test_build_nemo_gym_config_uv_dirs(detected_uv_dirs, configured, expected):
+    cfg = build_nemo_gym_config(
+        _env_configs(**configured),
+        base_urls=[],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+    )
+    global_config = cfg["initial_global_config_dict"]
+    assert (global_config["uv_cache_dir"], global_config["uv_venv_dir"]) == expected
+
+
+def test_build_nemo_gym_config_router_replay_off_uses_default_dtype(detected_uv_dirs):
+    cfg = build_nemo_gym_config(
+        _env_configs(),
+        base_urls=[],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+    )
+    assert cfg["require_routed_experts"] is False
+    assert cfg["routed_experts_dtype"] == "int16"
+
+
+def test_build_nemo_gym_config_router_replay_resolves_dtype(detected_uv_dirs):
+    with patch.object(
+        nemo_gym_mod,
+        "resolve_routed_experts_dtype_name_for_model",
+        return_value="int8",
+    ) as mock_resolve:
+        cfg = build_nemo_gym_config(
+            _env_configs(),
+            base_urls=[],
+            model_name="test-model",
+            enable_router_replay=True,
+            use_fastokens=False,
+        )
+
+    mock_resolve.assert_called_once_with("test-model")
+    assert cfg["require_routed_experts"] is True
+    assert cfg["routed_experts_dtype"] == "int8"
+
+
+@pytest.mark.parametrize("num_gpu_nodes", [0, 1], ids=["no-gpus", "colocated-gpus"])
+def test_spinup_nemo_gym_actor(detected_uv_dirs, num_gpu_nodes):
+    """The actor gets the registry runtime_env, and node affinity only when it
+    has colocated GPUs to land next to."""
+    actor = MagicMock()
+    actor._spinup.remote.return_value = "spinup-ref"
+    actor.set_tokenizer.remote.return_value = "tokenizer-ref"
+    tokenizer = MagicMock()
+    runtime_env = {"py_executable": "/venv/bin/python"}
+    token_capture = {"enabled": True, "capture_dir": "/tmp/cap"}
+
+    with (
+        patch.object(
+            nemo_gym_mod, "make_actor_runtime_env", return_value=runtime_env
+        ) as mock_runtime_env,
+        patch.object(nemo_gym_mod, "NemoGym") as mock_cls,
+        patch.object(nemo_gym_mod, "ray") as mock_ray,
+    ):
+        mock_cls.options.return_value.remote.return_value = actor
+        mock_ray.get_runtime_context.return_value.get_node_id.return_value = "a" * 56
+
+        result = spinup_nemo_gym_actor(
+            _env_configs(num_gpu_nodes=num_gpu_nodes),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=tokenizer,
+            enable_router_replay=False,
+            use_fastokens=True,
+            token_capture=token_capture,
+        )
+
+    assert result is actor
+    mock_runtime_env.assert_called_once_with(NEMO_GYM_ACTOR_FQN)
+
+    options_kwargs = mock_cls.options.call_args.kwargs
+    assert options_kwargs["runtime_env"] is runtime_env
+    if num_gpu_nodes:
+        assert isinstance(
+            options_kwargs["scheduling_strategy"],
+            nemo_gym_mod.NodeAffinitySchedulingStrategy,
+        )
+        assert options_kwargs["scheduling_strategy"].node_id == "a" * 56
+    else:
+        assert "scheduling_strategy" not in options_kwargs
+
+    cfg = mock_cls.options.return_value.remote.call_args.args[0]
+    assert cfg["use_fastokens"] is True
+    # The ledger config must ride through to the actor; a refactor of this
+    # wrapper once dropped it without any type or test catching it.
+    assert cfg["token_capture"] == token_capture
+
+    # Spinup is deferred from __init__, so the factory must await it.
+    actor._spinup.remote.assert_called_once_with()
+    actor.set_tokenizer.remote.assert_called_once_with(tokenizer)
+    assert mock_ray.get.call_args_list == [call("spinup-ref"), call("tokenizer-ref")]
+
+
+@pytest.mark.parametrize("failed_ref", ["spinup-ref", "tokenizer-ref"])
+def test_spinup_nemo_gym_actor_cleans_up_after_startup_failure(
+    detected_uv_dirs, failed_ref
+):
+    actor = MagicMock()
+    actor._spinup.remote.return_value = "spinup-ref"
+    actor.set_tokenizer.remote.return_value = "tokenizer-ref"
+    actor.shutdown.remote.return_value = "shutdown-ref"
+
+    def get_or_fail(ref, **_kwargs):
+        if ref == failed_ref:
+            raise RuntimeError("startup failed")
+        return None
+
+    with (
+        patch.object(nemo_gym_mod, "make_actor_runtime_env", return_value={}),
+        patch.object(nemo_gym_mod, "NemoGym") as mock_cls,
+        patch.object(nemo_gym_mod, "ray") as mock_ray,
+    ):
+        mock_cls.options.return_value.remote.return_value = actor
+        mock_ray.get.side_effect = get_or_fail
+
+        with pytest.raises(RuntimeError, match="startup failed"):
+            spinup_nemo_gym_actor(
+                _env_configs(num_gpu_nodes=0),
+                base_urls=["http://vllm-0"],
+                model_name="test-model",
+                tokenizer=MagicMock(),
+                enable_router_replay=False,
+                use_fastokens=False,
+            )
+
+    actor.shutdown.remote.assert_called_once_with()
+    mock_ray.kill.assert_called_once_with(actor)
+    assert (
+        call("shutdown-ref", timeout=NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S)
+        in mock_ray.get.call_args_list
+    )
+
+
+@pytest.mark.parametrize("cleanup_failure", ["shutdown-remote", "shutdown-get", "kill"])
+def test_spinup_nemo_gym_actor_preserves_startup_error_when_cleanup_fails(
+    detected_uv_dirs, cleanup_failure
+):
+    actor = MagicMock()
+    actor._spinup.remote.return_value = "spinup-ref"
+    actor.shutdown.remote.return_value = "shutdown-ref"
+    startup_error = RuntimeError("startup failed")
+    cleanup_error = RuntimeError("cleanup failed")
+
+    if cleanup_failure == "shutdown-remote":
+        actor.shutdown.remote.side_effect = cleanup_error
+
+    def get_or_fail(ref, **_kwargs):
+        if ref == "spinup-ref":
+            raise startup_error
+        if ref == "shutdown-ref" and cleanup_failure == "shutdown-get":
+            raise cleanup_error
+        return None
+
+    with (
+        patch.object(nemo_gym_mod, "make_actor_runtime_env", return_value={}),
+        patch.object(nemo_gym_mod, "NemoGym") as mock_cls,
+        patch.object(nemo_gym_mod, "ray") as mock_ray,
+    ):
+        mock_cls.options.return_value.remote.return_value = actor
+        mock_ray.get.side_effect = get_or_fail
+        if cleanup_failure == "kill":
+            mock_ray.kill.side_effect = cleanup_error
+
+        with pytest.raises(RuntimeError) as exc_info:
+            spinup_nemo_gym_actor(
+                _env_configs(num_gpu_nodes=0),
+                base_urls=["http://vllm-0"],
+                model_name="test-model",
+                tokenizer=MagicMock(),
+                enable_router_replay=False,
+                use_fastokens=False,
+            )
+
+    assert exc_info.value is startup_error
+    actor.shutdown.remote.assert_called_once_with()
+    mock_ray.kill.assert_called_once_with(actor)
+
+
+def test_nemo_gym_fails_fast_instead_of_restarting():
+    """A restarted actor would be permanently broken.
+
+    __init__ only stores cfg; the Gym servers are created in _spinup, which Ray
+    does not re-run after a restart. _require_spinup() would reject every later
+    call instead of surfacing RayActorError to the caller.
+    """
+    metadata = nemo_gym_mod.NemoGym.__ray_metadata__
+    assert metadata.max_restarts == 0
+    assert metadata.max_task_retries == 0
+
+
+def test_nemo_gym_shutdown_is_idempotent():
+    actor = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class.__new__(
+        nemo_gym_mod.NemoGym.__ray_metadata__.modified_class
+    )
+    actor.rh = MagicMock()
+    run_helper = actor.rh
+
+    actor.shutdown()
+    actor.shutdown()
+
+    run_helper.shutdown.assert_called_once_with()
+
+
+def test_nemo_gym_shutdown_before_spinup_is_a_noop():
+    cls = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class
+    actor = cls.__new__(cls)
+    actor.__init__({})
+
+    actor.shutdown()  # must not raise
+
+
+@contextmanager
+def _stub_gym_resolved_config(resolved):
+    """Stand in for nemo_gym.global_config, which lives in the actor's venv."""
+    package = types.ModuleType("nemo_gym")
+    module = types.ModuleType("nemo_gym.global_config")
+    module.get_global_config_dict = lambda: resolved
+    with patch.dict(
+        sys.modules, {"nemo_gym": package, "nemo_gym.global_config": module}
+    ):
+        yield
+
+
+def _spun_up_actor():
+    cls = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class
+    actor = cls.__new__(cls)
+    actor.__init__({})
+    actor.rh = MagicMock()
+    return actor
+
+
+def test_list_entries_reports_entry_names_and_server_types():
+    resolved = DictConfig(
+        {
+            "math_agent": {
+                "responses_api_agents": {"simple_agent": {"entrypoint": "app.py"}}
+            },
+            "math_env": {"resources_servers": {"math": {"entrypoint": "app.py"}}},
+            # An entry can carry more than one server type.
+            "judge": {
+                "responses_api_models": {"local_vllm_model": {"entrypoint": "app.py"}},
+                "resources_servers": {"judge_tools": {"entrypoint": "app.py"}},
+            },
+            # Plain Gym settings are not entries.
+            "port_range_low": 5000,
+            "default_host": "10.0.0.1",
+            "config_paths": ["a.yaml"],
+        }
+    )
+
+    with _stub_gym_resolved_config(resolved):
+        entries = _spun_up_actor().list_entries()
+
+    assert entries == {
+        "math_agent": ["responses_api_agents"],
+        "math_env": ["resources_servers"],
+        "judge": ["responses_api_models", "resources_servers"],
+    }
+
+
+def test_list_entries_skips_dicts_that_hold_no_server_type():
+    """A dict-shaped setting is not an entry unless it nests a server type."""
+    resolved = DictConfig(
+        {
+            "real_entry": {"resources_servers": {"env": {"entrypoint": "app.py"}}},
+            "some_setting": {"nested": "value"},
+        }
+    )
+
+    with _stub_gym_resolved_config(resolved):
+        entries = _spun_up_actor().list_entries()
+
+    assert entries == {"real_entry": ["resources_servers"]}
+
+
+def test_list_entries_skips_an_entry_that_starts_no_server():
+    resolved = DictConfig(
+        {
+            "math_env": {"resources_servers": {"math": {"entrypoint": "app.py"}}},
+            "code_gen": {"resources_servers": {"code": {"host": "10.0.0.1"}}},
+        }
+    )
+
+    with _stub_gym_resolved_config(resolved):
+        entries = _spun_up_actor().list_entries()
+
+    assert entries == {"math_env": ["resources_servers"]}
+
+
+def test_list_entries_before_spinup_raises():
+    cls = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class
+    actor = cls.__new__(cls)
+    actor.__init__({})
+
+    with pytest.raises(RuntimeError, match="call _spinup"):
+        actor.list_entries()
+
+
+class TestUnresolvedAgentRefsAreDiagnosable:
+    """A Gym older than the checkout that prepared the data must say so.
+
+    ``task_source`` routing is new. A current Gym strips ``agent_ref`` from collated rows
+    and stamps ``task_source`` instead, then resolves it back inside ``run_examples``. An
+    older Gym has no resolver, so the same dataset arrives unroutable -- and the first
+    thing that touched it was an unguarded ``row["agent_ref"]``, which surfaced as a bare
+    KeyError inside a Ray TaskError inside an ExceptionGroup.
+    """
+
+    def test_resolved_rows_pass_through(self):
+        rows = [{"agent_ref": {"name": "a"}}, {"agent_ref": {"name": "b"}}]
+        nemo_gym_mod._require_resolved_agent_refs(rows)  # must not raise
+
+    def test_a_stale_gym_is_named_along_with_the_remedy(self):
+        rows = [
+            {"agent_ref": {"name": "a"}},
+            {"task_source": "workplace_assistant_simple_agent"},
+        ]
+        with pytest.raises(RuntimeError) as excinfo:
+            nemo_gym_mod._require_resolved_agent_refs(rows)
+        message = str(excinfo.value)
+        assert "1 of 2" in message
+        assert "workplace_assistant_simple_agent" in message
+        assert "NRL_FORCE_REBUILD_VENVS" in message
+
+    def test_a_row_with_no_routing_at_all_says_that_instead(self):
+        """Different cause, different fix: rebuilding venvs would not help here."""
+        with pytest.raises(RuntimeError, match="no task_source either"):
+            nemo_gym_mod._require_resolved_agent_refs([{"id": "x"}])
+
+    def test_an_empty_agent_ref_counts_as_unresolved(self):
+        """Gym writes {"name": ...}; a bare {} routes nowhere."""
+        with pytest.raises(RuntimeError):
+            nemo_gym_mod._require_resolved_agent_refs([{"agent_ref": {}}])

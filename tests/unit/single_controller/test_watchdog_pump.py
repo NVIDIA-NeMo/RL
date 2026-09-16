@@ -44,10 +44,14 @@ from nemo_rl.models.generation.fleet_health import (
 class _RecordingLogger:
     def __init__(self) -> None:
         self.metrics: list[dict] = []
+        self.step_metrics: list[str | None] = []
 
-    def log_metrics(self, metrics, step=0, prefix="", **kwargs) -> None:
+    def log_metrics(
+        self, metrics, step=0, prefix="", step_metric=None, **kwargs
+    ) -> None:
         del step, prefix, kwargs
         self.metrics.append(dict(metrics))
+        self.step_metrics.append(step_metric)
 
 
 def _make_controller(
@@ -81,6 +85,7 @@ def _make_controller(
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig.model_construct(max_num_steps=max_num_steps)
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._rollout_manager = SimpleNamespace(stats=stats)
     ctrl._inflight_rollouts = inflight
     ctrl._train_steps = train_steps
@@ -89,6 +94,8 @@ def _make_controller(
     # These tests cover stall detection, not fleet health or gym routing.
     ctrl._gen_fleet = None
     ctrl._generation_router = None
+    # No fleet health, so nothing ever reaches DEAD and there is nothing to restart.
+    ctrl._engine_supervisor = None
     return ctrl
 
 
@@ -225,6 +232,19 @@ class TestMetrics:
         # The leading indicator: idle time rises before a wedge becomes a stall.
         assert "rollout/idle_s" in published
 
+    def test_ticks_never_name_the_committed_step(self):
+        """A tick naming _train_steps is dropped: _train_pump already committed it."""
+        ctrl = _make_controller(
+            stats=RolloutStats(), inflight=0, stall_timeout_s=1000.0
+        )
+
+        asyncio.run(_run_ticks(ctrl, 2))
+
+        assert ctrl._logger.step_metrics, "the watchdog never ticked"
+        assert set(ctrl._logger.step_metrics) == {"rollout/train_steps"}
+        # The no-step branch needs the key in the payload too, not just the argument.
+        assert all("rollout/train_steps" in m for m in ctrl._logger.metrics)
+
 
 class TestGenerationFleetProbe:
     """The probe is the proactive half; the routing adapters supply the reactive half.
@@ -240,21 +260,33 @@ class TestGenerationFleetProbe:
             stats=RolloutStats(), inflight=0, stall_timeout_s=1000.0, **kwargs
         )
         ctrl._gen_fleet = monitor
-        ctrl._gen = SimpleNamespace(
+        ctrl._engine_supervisor = None
+        # A confirmed death stands the trainers' refit deadline down, so the fixture has to
+        # carry the trainer handle it fans out over. Without it the probe's except clause
+        # would swallow an AttributeError and the feature would silently no-op -- which is
+        # how a wrong attribute name survived until a test looked for the calls.
+        ctrl._stood_down = []
+        ctrl._trainer = SimpleNamespace(
             worker_group=SimpleNamespace(
-                get_dp_leader_worker_idx=lambda shard: shard,
                 workers=[
                     SimpleNamespace(
-                        is_alive=SimpleNamespace(
-                            remote=(lambda alive=alive: _completed())
-                            if alive
-                            else (lambda: _failed(ray.exceptions.ActorDiedError()))
+                        stand_down_refit_watchdog=SimpleNamespace(
+                            remote=(lambda i=i: ctrl._stood_down.append(i))
                         )
                     )
-                    for alive in worker_alive
-                ],
+                    for i in range(2)
+                ]
             )
         )
+
+        # One stub, not four nested namespaces: the probe asks the backend by shard index
+        # and the shard-to-worker layout stays the backend's business.
+        def _liveness(shard_idx):
+            if worker_alive[shard_idx]:
+                return _completed()
+            return _failed(ray.exceptions.ActorDiedError())
+
+        ctrl._gen = SimpleNamespace(shard_liveness_ref=_liveness)
         return ctrl
 
     def test_a_live_fleet_stays_serving(self):
@@ -273,6 +305,79 @@ class TestGenerationFleetProbe:
         asyncio.run(_run_probe_ticks(ctrl, 3))
         assert monitor.state_of(1) is ShardState.DEAD
         assert monitor.serving_shards() == [0]
+
+    def test_a_dead_actor_is_conclusive_on_the_first_round(self):
+        """A RayActorError is proof, not another ambiguous data point.
+
+        A probe timeout cannot tell a slow shard from a dead one, which is what the
+        counters are for. Ray reporting the actor dead can, so waiting for
+        unhealthy_threshold rounds only delays the verdict -- and the refit deadline can
+        expire inside that delay, which is exactly how job 5925668 aborted a hung refit
+        while the corpse was still SUSPECT. A threshold of 99 makes counting impossible.
+        """
+        monitor = GenerationFleetHealth(
+            shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=99)
+        )
+        ctrl = self._with_fleet(monitor, worker_alive=[True, False])
+        asyncio.run(_run_probe_ticks(ctrl, 2))
+        assert monitor.state_of(1) is ShardState.DEAD
+        assert monitor.absent_shards() == [1]
+
+    def test_a_confirmed_death_stands_the_trainers_deadline_down(self):
+        """A dead peer needs NCCL's own error path, not the refit deadline.
+
+        Job 6405953 recovered the reshard kill variant with RefitAborted appearing zero
+        times, before any deadline existed. Once it existed it started winning that race:
+        it aborts, sync_stream_within orphans kernels on the trainers' streams, and the
+        rebuild that would have worked cannot. recovery-reshard-refit has failed
+        continuously since job 6512153 for exactly that reason.
+        """
+        monitor = GenerationFleetHealth(
+            shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=99)
+        )
+        ctrl = self._with_fleet(monitor, worker_alive=[True, False])
+        asyncio.run(ctrl._probe_generation_fleet())
+        assert ctrl._stood_down == [0, 1], (
+            "every policy worker must be told to stand its refit deadline down once a "
+            f"generation shard is confirmed gone; saw {ctrl._stood_down}"
+        )
+
+    def test_a_timeout_leaves_the_deadline_armed(self):
+        """The frozen case, and the reason this is keyed on DEATH rather than silence.
+
+        A frozen rank is alive and simply stops answering. No death is ever recorded, the
+        deadline still fires, and the run still ends attributably -- which is the only
+        outcome available on the reshard transport once the bulk transfer has aborted.
+        """
+        monitor = GenerationFleetHealth(
+            shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=99)
+        )
+        ctrl = self._with_fleet(monitor, worker_alive=[True, True])
+        ctrl._async_cfg.generation_fleet_health.probe_timeout_s = 0.001
+        ctrl._gen.shard_liveness_ref = lambda shard_idx: (
+            asyncio.sleep(10.0) if shard_idx == 1 else _completed()
+        )
+        asyncio.run(_run_probe_ticks(ctrl, 2))
+        assert ctrl._stood_down == [], (
+            "a probe timeout is not proof of death; standing the deadline down on one "
+            "would leave a frozen rank able to wedge the run forever"
+        )
+
+    def test_a_timeout_is_still_counted_rather_than_trusted(self):
+        """The other half: an ambiguous failure must keep its benefit of the doubt.
+
+        A shard busy inside a refit stops answering probes without being dead. Treating
+        that like proof of death would condemn a healthy fleet on one slow round.
+        """
+        monitor = GenerationFleetHealth(
+            shard_count=1, policy=FleetHealthPolicy(unhealthy_threshold=99)
+        )
+        ctrl = self._with_fleet(monitor, worker_alive=[True])
+        ctrl._async_cfg.generation_fleet_health.probe_timeout_s = 0.001
+        ctrl._gen.shard_liveness_ref = lambda shard_idx: asyncio.sleep(10.0)
+        asyncio.run(_run_probe_ticks(ctrl, 3))
+        assert monitor.state_of(0) is ShardState.SUSPECT
+        assert monitor.absent_shards() == []
 
     def test_fleet_state_is_published(self):
         monitor = GenerationFleetHealth(
@@ -297,6 +402,54 @@ class TestGenerationFleetProbe:
             policy=FleetHealthPolicy(unhealthy_threshold=1, min_healthy_shards=1),
         )
         ctrl = self._with_fleet(monitor, worker_alive=[False])
+
+        async def _main():
+            await _run_probe_ticks(ctrl, 3)
+            await ctrl._stall_watchdog_pump()
+
+        with pytest.raises(GenerationFleetExhausted):
+            asyncio.run(_main())
+
+    def test_a_tick_inside_a_recovery_does_not_end_the_run(self):
+        """Regression: the exhaustion check killed the recovery that was about to succeed.
+
+        _recover_from_failed_refit marks every serving shard partial, so the serving set
+        is empty by construction until the retry refit promotes them back -- across two
+        awaits that yield this loop. A watchdog tick landing in that window used to see
+        zero serving shards, raise GenerationFleetExhausted, and end the run while the
+        retry was still in flight, blaming an exhausted fleet for a recovery in progress.
+
+        The default tick is 30s and a rebuild plus a full refit can easily outlast it.
+        """
+        monitor = GenerationFleetHealth(
+            shard_count=1,
+            policy=FleetHealthPolicy(unhealthy_threshold=1, min_healthy_shards=1),
+        )
+        ctrl = self._with_fleet(monitor, worker_alive=[False])
+
+        async def _main():
+            await _run_probe_ticks(ctrl, 3)
+            with ctrl._recovery_window():
+                # _run_ticks, not the raw pump: the pump is `while True` and only ever
+                # returns by raising, so awaiting it directly here would hang forever --
+                # which is precisely what the fix makes it do, since the exhaustion check
+                # it used to raise from is now skipped inside this window.
+                await _run_ticks(ctrl, 3)
+
+        asyncio.run(_main())  # must not raise
+
+    def test_the_window_reopens_the_check_even_if_the_retry_raises(self):
+        """A leaked flag would disable the exhaustion check for the rest of the run."""
+        monitor = GenerationFleetHealth(
+            shard_count=1,
+            policy=FleetHealthPolicy(unhealthy_threshold=1, min_healthy_shards=1),
+        )
+        ctrl = self._with_fleet(monitor, worker_alive=[False])
+
+        with pytest.raises(RuntimeError, match="retry blew up"):
+            with ctrl._recovery_window():
+                raise RuntimeError("retry blew up")
+        assert ctrl._recovering_from_refit is False
 
         async def _main():
             await _run_probe_ticks(ctrl, 3)
@@ -378,10 +531,7 @@ class TestGenerationFleetProbe:
                 concurrent -= 1
 
         ctrl = self._with_fleet(monitor, worker_alive=[True] * 4)
-        ctrl._gen.worker_group.workers = [
-            SimpleNamespace(is_alive=SimpleNamespace(remote=lambda: _slow()))
-            for _ in range(4)
-        ]
+        ctrl._gen.shard_liveness_ref = lambda shard_idx: _slow()
 
         async def _main():
             task = asyncio.ensure_future(ctrl._probe_generation_fleet())
@@ -392,6 +542,36 @@ class TestGenerationFleetProbe:
             return observed
 
         assert asyncio.run(_main()) == 4
+
+
+class TestABackendThatCannotBeProbed:
+    """An unprobeable backend must not read as a dead fleet.
+
+    The probe asks the backend for liveness by shard index. A backend that does not
+    implement it raises NotImplementedError, which the generic handler below would record
+    as a failed probe -- condemning every shard within unhealthy_threshold ticks and ending
+    the run as GenerationFleetExhausted. A healthy fleet reported as a dead one, with the
+    real cause (fleet health enabled on a backend that cannot support it) nowhere in sight.
+    """
+
+    def test_it_raises_naming_the_backend_instead_of_condemning_shards(self):
+        class _Unprobeable:
+            def shard_liveness_ref(self, shard_idx):
+                raise NotImplementedError
+
+        monitor = GenerationFleetHealth(
+            shard_count=2, policy=FleetHealthPolicy(unhealthy_threshold=1)
+        )
+        ctrl = _make_controller(stats=RolloutStats(), inflight=0, stall_timeout_s=600.0)
+        ctrl._gen_fleet = monitor
+        ctrl._gen = _Unprobeable()
+
+        with pytest.raises(RuntimeError, match="does not implement shard_liveness_ref"):
+            asyncio.run(ctrl._probe_generation_fleet())
+
+        assert monitor.serving_shards() == [0, 1], (
+            "no shard may be condemned for the backend's inability to be probed"
+        )
 
 
 class TestEnvHealthCheck:

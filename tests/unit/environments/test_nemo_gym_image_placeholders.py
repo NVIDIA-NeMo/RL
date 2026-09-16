@@ -16,10 +16,10 @@ import pytest
 import torch
 from PIL import Image
 
-from nemo_rl.environments.nemo_gym import _attach_multimodal_data_to_user_message
+from nemo_rl.data.multimodal_utils import attach_image_model_inputs_to_message
 
 # --------------------------------------------------------------------------
-# ragged pixel_values path in _attach_multimodal_data_to_user_message
+# ragged pixel_values path in attach_image_model_inputs_to_message
 # --------------------------------------------------------------------------
 
 
@@ -72,7 +72,7 @@ def test_ragged_output_requested_only_for_multi_image_turns():
     """The ragged switch needs both the flag and more than one image."""
     for count, flag, expected in [(2, True, None), (1, True, "pt"), (2, False, "pt")]:
         processor = NemotronNanoVLV2Processor(torch.zeros(count, 3, 4, 4))
-        _attach_multimodal_data_to_user_message(
+        attach_image_model_inputs_to_message(
             {},
             images=_images(count),
             processor=processor,
@@ -87,7 +87,7 @@ def test_ragged_pixel_values_are_padded_to_one_tensor():
     """Heterogeneous CHW tensors become a single padded tensor for the message."""
     processor = _ragged((3, 2, 4), (3, 6, 4))
     user_message: dict = {}
-    _attach_multimodal_data_to_user_message(
+    attach_image_model_inputs_to_message(
         user_message,
         images=_images(2),
         processor=processor,
@@ -103,7 +103,7 @@ def test_ragged_pixel_values_are_padded_to_one_tensor():
 def test_ragged_pixel_values_reject_non_chw_entries():
     processor = _ragged((3, 2, 4), (2, 4))
     with pytest.raises(ValueError, match="one CHW tensor per image"):
-        _attach_multimodal_data_to_user_message(
+        attach_image_model_inputs_to_message(
             {},
             images=_images(2),
             processor=processor,
@@ -114,7 +114,7 @@ def test_ragged_pixel_values_reject_non_chw_entries():
 def test_ragged_pixel_values_reject_mixed_channel_counts():
     processor = _ragged((3, 2, 4), (1, 2, 4))
     with pytest.raises(ValueError, match="same channel count"):
-        _attach_multimodal_data_to_user_message(
+        attach_image_model_inputs_to_message(
             {},
             images=_images(2),
             processor=processor,
@@ -124,10 +124,10 @@ def test_ragged_pixel_values_reject_mixed_channel_counts():
 
 def test_attach_is_a_noop_without_images_or_processor():
     user_message: dict = {}
-    _attach_multimodal_data_to_user_message(
+    attach_image_model_inputs_to_message(
         user_message, images=[], processor=NemotronNanoVLV2Processor(None)
     )
-    _attach_multimodal_data_to_user_message(
+    attach_image_model_inputs_to_message(
         user_message, images=_images(1), processor=None
     )
     assert user_message == {}

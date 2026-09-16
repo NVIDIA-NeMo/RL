@@ -89,6 +89,22 @@ def test_register_and_clear_recorded(wrapped_client):
     assert ops.count("clear") == 1
 
 
+def test_list_sample_ids_is_forwarded_and_recorded(wrapped_client):
+    client, events = wrapped_client
+    client.register_partition(
+        partition_id="p", fields=["x"], num_samples=2, consumer_tasks=["r"]
+    )
+    client.put_samples(
+        sample_ids=["b", "a"],
+        partition_id="p",
+        fields=TensorDict({"x": torch.ones(2)}, batch_size=[2]),
+    )
+
+    assert client.list_sample_ids("p") == ["a", "b"]
+    assert events[-1]["op"] == "list_sample_ids"
+    assert events[-1]["status"] == "ok"
+
+
 def test_error_status_recorded_and_reraised(wrapped_client):
     """Decorator does NOT swallow errors — re-raise after recording."""
     client, events = wrapped_client
@@ -129,6 +145,42 @@ def test_close_propagates(wrapped_client):
     client.close()
     # Second close must not raise — NoOp is idempotent.
     client.close()
+
+
+def test_checkpoint_lifecycle_is_forwarded_and_recorded(tmp_path) -> None:
+    checkpoint_dir = tmp_path / "data-plane"
+    source_events: list[dict] = []
+    source = MetricsDataPlaneClient(
+        NoOpDataPlaneClient(),
+        on_event=source_events.append,
+    )
+    source.register_partition(
+        partition_id="p",
+        fields=["x"],
+        num_samples=1,
+        consumer_tasks=["train"],
+    )
+    source.put_samples(
+        sample_ids=["a"],
+        partition_id="p",
+        fields=TensorDict({"x": torch.tensor([1])}, batch_size=[1]),
+    )
+    source.save_checkpoint(checkpoint_dir, metadata={"step": 3})
+
+    restore_events: list[dict] = []
+    restored = MetricsDataPlaneClient(
+        NoOpDataPlaneClient(),
+        on_event=restore_events.append,
+    )
+    metadata = restored.load_checkpoint(checkpoint_dir)
+
+    assert metadata == {"step": 3}
+    assert [event["op"] for event in source_events][-1] == "save_checkpoint"
+    assert source_events[-1]["status"] == "ok"
+    assert [event["op"] for event in restore_events] == ["load_checkpoint"]
+    assert restore_events[-1]["status"] == "ok"
+    source.close()
+    restored.close()
 
 
 def test_factory_wraps_when_observability_enabled():

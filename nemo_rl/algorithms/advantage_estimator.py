@@ -21,6 +21,12 @@ This module provides different advantage estimation strategies:
 - RawRewardAdvantageEstimator: Raw reward as advantage with optional batch normalization (no baseline, no value model)
 - GeneralizedAdvantageEstimator: Generalized Advantage Estimation (GAE) with temporal bootstrapping
 - OPDAdvantageEstimator: Multi-Teacher On-Policy Distillation (MOPD) token-level distillation advantages
+
+Every group-relative estimator (GRPO, GDPO, Reinforce++) accepts ``valid_mask``
+and must honor it: the SingleController always passes ``final_sample_mask`` as
+``valid_mask`` so token-capture placeholder rows (and sequence-logprob-error
+masked rows) do not vote in their siblings' baselines.
+
 Reference papers:
 - ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
 - Reinforce++: https://arxiv.org/abs/2501.03262
@@ -30,6 +36,7 @@ Reference papers:
 
 import math
 from typing import Annotated
+from typing import Literal, Optional
 
 import torch
 from pydantic import BaseModel, Field
@@ -45,9 +52,9 @@ from nemo_rl.algorithms.utils import (
 
 
 class AdvEstimatorConfig(BaseModel, extra="allow"):
-    """Configuration for advantage estimator (GRPO, GDPO, or Reinforce++)."""
+    """Configuration for advantage estimator (GRPO, GDPO, OPD, or Reinforce++)."""
 
-    name: str = "grpo"  # "grpo", "gdpo", or "reinforce_plus_plus"
+    name: Literal["grpo", "gdpo", "opd", "reinforce_plus_plus"] = "grpo"
     # GRPO specific
     normalize_rewards: bool = True
     use_leave_one_out_baseline: bool = True
@@ -58,6 +65,20 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
     # OPD specific
     proximal_teacher_alpha: Annotated[float, Field(gt=0.0, le=1.0)] = 1.0
     subtract_global_baseline: bool = False
+
+
+class GAEConfig(BaseModel, extra="allow"):
+    """Configuration for the value-model advantage estimators (PPO)."""
+
+    name: Literal["gae", "raw_reward"] = "gae"
+    gae_lambda: float = 0.95
+    gae_gamma: float = 1.0
+    normalize_advantages: bool = True
+    # VAPO decoupled GAE (None = standard GAE, no decoupling)
+    gae_lambda_value: Optional[float] = None
+    gae_lambda_policy: Optional[float] = None
+    # Length-adaptive λ_policy = 1 - 1/(α·l). 0 = disabled.
+    length_adaptive_alpha: float = 0.0
 
 
 class GRPOAdvantageEstimator:
@@ -72,7 +93,7 @@ class GRPOAdvantageEstimator:
         self.use_leave_one_out_baseline = estimator_config.use_leave_one_out_baseline
         self.normalize_rewards = estimator_config.normalize_rewards
 
-    def compute_advantage(self, prompt_ids, rewards, mask, **kwargs):
+    def compute_advantage(self, prompt_ids, rewards, mask, valid_mask=None, **kwargs):
         """Compute GRPO advantages.
 
         Args:
@@ -80,6 +101,11 @@ class GRPOAdvantageEstimator:
             rewards: Tensor of shape [batch_size] containing reward for each sample.
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
                   Used only for expanding advantages to token-level shape.
+            valid_mask: Optional tensor of shape [batch_size], 1.0 for samples whose
+                  reward should participate in the per-prompt baseline/std. Token-capture
+                  placeholder rows carry 0.0 (their sample_mask already excludes them
+                  from the loss; excluding them here keeps siblings' baselines unbiased).
+                  None keeps the legacy all-valid behavior.
             **kwargs: Additional arguments (unused).
 
         Returns:
@@ -88,7 +114,7 @@ class GRPOAdvantageEstimator:
         baseline, std = calculate_baseline_and_std_per_prompt(
             prompt_ids,
             rewards,
-            torch.ones_like(rewards),
+            torch.ones_like(rewards) if valid_mask is None else valid_mask.float(),
             leave_one_out_baseline=self.use_leave_one_out_baseline,
         )
         advantages = (rewards - baseline).unsqueeze(-1)
@@ -125,6 +151,7 @@ class GDPOAdvantageEstimator:
         rewards,
         mask,
         repeated_batch,
+        valid_mask=None,
         **kwargs,
     ):
         """Compute GDPO advantages.
@@ -134,6 +161,11 @@ class GDPOAdvantageEstimator:
             rewards: Unused; for interface consistency.
             repeated_batch: Batch containing named reward component keys (e.g. reward/correctness, reward/format).
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
+            valid_mask: Optional tensor of shape [batch_size], 1.0 for samples whose
+                  reward components should participate in the per-prompt baseline/std.
+                  Token-capture placeholder rows carry 0.0 (their sample_mask already
+                  excludes them from the loss; excluding them here keeps siblings'
+                  baselines unbiased). None keeps the legacy all-valid behavior.
             **kwargs: Additional arguments (unused).
 
         Returns:
@@ -158,7 +190,8 @@ class GDPOAdvantageEstimator:
                 "Provide exactly one weight per component, ordered alphabetically by "
                 "component name (matching the sorted reward/<name> keys)."
             )
-        valid = torch.ones_like(repeated_batch[reward_component_keys[0]])
+        reference = repeated_batch[reward_component_keys[0]]
+        valid = torch.ones_like(reference) if valid_mask is None else valid_mask.float()
         leave_one_out = self.use_leave_one_out_baseline
         assert prompt_ids.shape[0] == valid.shape[0], (
             "prompt_ids must match reward batch size; "
@@ -217,8 +250,10 @@ class ReinforcePlusPlusAdvantageEstimator:
         prompt_ids,
         rewards,
         mask,
+        *,
         logprobs_policy=None,
         logprobs_reference=None,
+        valid_mask=None,
         **kwargs,
     ):
         """Compute Reinforce++ advantages with optional KL penalty.
@@ -231,6 +266,11 @@ class ReinforcePlusPlusAdvantageEstimator:
                   that only considers valid tokens.
             logprobs_policy: Policy log probabilities of shape [batch_size, seq_len], required if use_kl_in_reward.
             logprobs_reference: Reference policy log probabilities of shape [batch_size, seq_len], required if use_kl_in_reward.
+            valid_mask: Optional tensor of shape [batch_size], 1.0 for samples whose
+                  reward should participate in the per-prompt mean baseline. Token-capture
+                  placeholder rows carry 0.0 (their sample_mask already excludes them from
+                  the loss; excluding them here keeps siblings' baselines unbiased).
+                  None keeps the legacy all-valid behavior.
             **kwargs: Additional arguments (unused).
 
         Returns:
@@ -241,7 +281,7 @@ class ReinforcePlusPlusAdvantageEstimator:
             mean, _ = calculate_baseline_and_std_per_prompt(
                 prompt_ids,
                 rewards,
-                torch.ones_like(rewards),
+                torch.ones_like(rewards) if valid_mask is None else valid_mask.float(),
                 leave_one_out_baseline=False,
             )
             adv = rewards - mean
@@ -279,8 +319,8 @@ class RawRewardAdvantageEstimator:
     No value model, no baselines. Optionally normalizes across the batch.
     """
 
-    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
-        self.normalize_advantages = estimator_config["normalize_advantages"]
+    def __init__(self, estimator_config: GAEConfig, loss_config: ClippedPGLossConfig):
+        self.normalize_advantages = estimator_config.normalize_advantages
 
     def compute_advantage(self, prompt_ids, rewards, mask, **kwargs):
         """Compute advantages as raw rewards expanded to token-level shape.
@@ -332,17 +372,17 @@ class GeneralizedAdvantageEstimator:
         normalize_advantages: If True, normalize advantages globally across batch
     """
 
-    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
-        self.gae_lambda = estimator_config["gae_lambda"]
-        self.gae_gamma = estimator_config["gae_gamma"]
-        self.normalize_advantages = estimator_config["normalize_advantages"]
+    def __init__(self, estimator_config: GAEConfig, loss_config: ClippedPGLossConfig):
+        self.gae_lambda = estimator_config.gae_lambda
+        self.gae_gamma = estimator_config.gae_gamma
+        self.normalize_advantages = estimator_config.normalize_advantages
 
         # VAPO decoupled GAE: separate λ for value returns vs policy advantages.
         # None for both = standard GAE (use gae_lambda everywhere, no decoupling).
-        self.gae_lambda_value = estimator_config["gae_lambda_value"]
-        self.gae_lambda_policy = estimator_config["gae_lambda_policy"]
+        self.gae_lambda_value = estimator_config.gae_lambda_value
+        self.gae_lambda_policy = estimator_config.gae_lambda_policy
         # Length-adaptive λ_policy = 1 - 1/(α·l). 0 = disabled (use fixed λ).
-        self.length_adaptive_alpha = estimator_config["length_adaptive_alpha"]
+        self.length_adaptive_alpha = estimator_config.length_adaptive_alpha
 
         self.use_kl_in_reward = loss_config.use_kl_in_reward
         self.kl_coef = loss_config.reference_policy_kl_penalty
@@ -367,8 +407,8 @@ class GeneralizedAdvantageEstimator:
         self,
         rewards: torch.Tensor,
         mask: torch.Tensor,
-        logprobs: torch.Tensor | None = None,
-        reference_logprobs: torch.Tensor | None = None,
+        logprobs_policy: torch.Tensor | None = None,
+        logprobs_reference: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Build per-token reward tensor with optional KL penalty.
 
@@ -378,8 +418,8 @@ class GeneralizedAdvantageEstimator:
         Args:
             rewards: Scalar reward per sample, shape [batch_size].
             mask: Response token mask, shape [batch_size, seq_len].
-            logprobs: Current policy log probs, shape [batch_size, seq_len].
-            reference_logprobs: Reference policy log probs, shape [batch_size, seq_len].
+            logprobs_policy: Current policy log probs, shape [batch_size, seq_len].
+            logprobs_reference: Reference policy log probs, shape [batch_size, seq_len].
 
         Returns:
             token_level_rewards: shape [batch_size, seq_len].
@@ -393,10 +433,10 @@ class GeneralizedAdvantageEstimator:
         if (
             self.use_kl_in_reward
             and self.kl_coef > 0
-            and logprobs is not None
-            and reference_logprobs is not None
+            and logprobs_policy is not None
+            and logprobs_reference is not None
         ):
-            kl = calculate_kl(logprobs, reference_logprobs, self.kl_type)
+            kl = calculate_kl(logprobs_policy, logprobs_reference, self.kl_type)
             token_level_rewards = token_level_rewards - self.kl_coef * kl
 
         # Place terminal reward at the last response token (last mask=1
@@ -443,8 +483,9 @@ class GeneralizedAdvantageEstimator:
         rewards,
         mask,
         values,
-        reference_logprobs=None,
-        logprobs=None,
+        *,
+        logprobs_policy=None,
+        logprobs_reference=None,
         **kwargs,
     ):
         """Compute GAE advantages with temporal bootstrapping.
@@ -462,8 +503,8 @@ class GeneralizedAdvantageEstimator:
         token_level_rewards = self._build_token_level_rewards(
             rewards,
             mask,
-            logprobs,
-            reference_logprobs,
+            logprobs_policy,
+            logprobs_reference,
         )
 
         lam_value = self._resolve_lambda_value()

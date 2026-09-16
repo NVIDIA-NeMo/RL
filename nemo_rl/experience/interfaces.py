@@ -32,6 +32,8 @@ NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY = "_nemo_rl_empty_response_output"
 # Trainer version/step for which an async rollout was reserved. This is internal
 # replay metadata and is deliberately not sent to Gym or the generation backend.
 TARGET_WEIGHT_VERSION_KEY = "target_weight_version"
+NEMO_GYM_GROUP_ID_KEY = "_ng_group_id"
+NEMO_GYM_GROUP_ATTEMPT_KEY = "_ng_group_attempt"
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
 # Unconsumed suffix of a gap-fill dataloader batch, carried in the async
 # collector's rollouts state so a checkpoint cannot strand yielded prompts.
@@ -72,3 +74,4 @@ class PromptGroupRecord:
     metadata: dict[str, Any]
     completions: list["Completion"]
     rollout_metrics: dict[str, Any]
+    loss_multiplier: float = 1.0
