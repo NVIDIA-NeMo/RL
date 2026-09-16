@@ -372,13 +372,13 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             start=start,
         )
 
-    def release_gpu_output_capture(self, lease_id: str) -> None:
+    def release_gpu_output_capture(self, capture_key: str) -> None:
         if self._gpu_output_capture is not None:
-            self._gpu_output_capture.release(lease_id)
+            self._gpu_output_capture.release(capture_key)
 
-    def abandon_unimported_gpu_output_capture(self, lease_id: str) -> None:
+    def abandon_unimported_gpu_output_capture(self, capture_key: str) -> None:
         if self._gpu_output_capture is not None:
-            self._gpu_output_capture.abandon_unimported(lease_id)
+            self._gpu_output_capture.abandon_unimported(capture_key)
 
     def discard_gpu_output_capture(self, capture_key: str) -> None:
         if self._gpu_output_capture is not None:

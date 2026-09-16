@@ -41,10 +41,9 @@ class GpuTokenPayload:
         prompt_len: Full engine prompt length, including a continuation prefix.
         generated_token_ids: One-dimensional generated CUDA IDs in int64 format.
         generated_logprobs: Corresponding selected-token CUDA logprobs in float32.
-        routed_experts: Optional aligned CUDA routes through the final token.
-        routed_experts_start: Sequence offset of the first retained router row.
-        routed_experts_prefix_backfill_ranges: Cached-prefix rows missing from
-            the GPU assembly, filled from the committed CPU delta during staging.
+        routed_experts: Optional aligned CUDA routes for the staged token delta.
+        routed_experts_prefix_backfill_ranges: Absolute cached-prefix ranges
+            missing from the GPU delta, filled from the CPU mirror during staging.
 
     The producer must own these allocations and stop mutating them
     before binding; references alone do not protect reusable engine buffers.
@@ -54,7 +53,6 @@ class GpuTokenPayload:
     generated_token_ids: torch.Tensor
     generated_logprobs: torch.Tensor
     routed_experts: torch.Tensor | None = None
-    routed_experts_start: int = 0
     routed_experts_prefix_backfill_ranges: tuple[tuple[int, int], ...] = ()
 
     def device(self) -> torch.device:
@@ -129,25 +127,14 @@ class GpuTokenPayload:
             }
 
             if self.routed_experts is not None:
-                routes = self.routed_experts
+                delta_routes = self.routed_experts.detach()
                 expected_routes = cpu_fields.get(ROUTED_EXPERTS_FIELD)
                 if expected_routes is None:
                     raise ValueError("GPU routes have no committed CPU extras mirror")
-                if not 0 <= self.routed_experts_start <= record.prev_len:
-                    raise ValueError(
-                        "GPU routes start must lie within the admitted prefix"
-                    )
                 if (
-                    routes.ndim != 3
-                    or routes.shape[0] != record.cum_len - self.routed_experts_start
+                    delta_routes.ndim != 3
+                    or delta_routes.shape != expected_routes[0].shape
                 ):
-                    raise ValueError(
-                        "GPU routes must cover the retained engine sequence suffix"
-                    )
-                delta_routes = routes.detach()[
-                    record.prev_len - self.routed_experts_start :
-                ]
-                if delta_routes.shape != expected_routes[0].shape:
                     raise ValueError(
                         "GPU routes shape does not match committed CPU mirror"
                     )

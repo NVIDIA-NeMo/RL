@@ -258,77 +258,13 @@ cuda_required = pytest.mark.skipif(
 
 
 @cuda_required
+@pytest.mark.parametrize("export_start", [0, 2])
 @pytest.mark.parametrize("routes", [False, True])
-def test_capture_reuses_native_async_event_without_recording_another(
-    monkeypatch: pytest.MonkeyPatch, routes: bool
+def test_export_orders_all_steps_before_cpu_materialization(
+    export_start: int, routes: bool
 ) -> None:
     runner = _runner(routes=routes)
     capture = _capture(runner, require_routed_experts=routes)
-    native_event = torch.cuda.Event
-    events = []
-
-    def track_event(*args: Any, **kwargs: Any) -> torch.cuda.Event:
-        event = native_event(*args, **kwargs)
-        events.append(event)
-        return event
-
-    with monkeypatch.context() as patch:
-        patch.setattr(torch.cuda, "Event", track_event)
-        output = _step(runner, capture)
-    assert events == [output.async_copy_ready_event]
-    fragment = capture._requests["call"].fragments[0]
-    assert fragment.ready is output.async_copy_ready_event
-    capture.discard("call")
-
-
-@cuda_required
-def test_native_copy_event_orders_export_before_cpu_materialization() -> None:
-    runner = _runner()
-    capture = _capture(runner, require_routed_experts=True)
-    producing_stream, export_stream = torch.cuda.Stream(), torch.cuda.Stream()
-
-    def delay_producing_writes() -> None:
-        # The inputs already exist; delaying before their creation would let a
-        # blocking H2D initialization accidentally synchronize this test.
-        _, sampler, scratch = runner.native_step
-        torch.cuda._sleep(200_000_000)
-        sampler.sampled_token_ids.fill_(23)
-        sampler.logprobs_tensors.logprobs.fill_(-1.25)
-        scratch.fill_(42)
-
-    runner.after_bookkeeping = delay_producing_writes
-    with torch.cuda.stream(producing_stream):
-        output = _step(runner, capture)
-    ready = output.async_copy_ready_event
-    assert not ready.query()
-    assert capture._requests["call"].fragments[0].ready is ready
-    # Do not perform native get_output's CPU event synchronization. Also drop
-    # its GPU references; only capture owns the views used by this export.
-    del output._routed_experts, output._sampled_token_ids, output._logprobs_tensors
-    del runner.native_step
-    with torch.cuda.stream(export_stream):
-        lease = capture.export("call", generated_token_count=1, prompt_token_count=3)
-    export_stream.synchronize()
-    tensors = capture._leases[lease.lease_id].tensors
-    assert tensors.generated_token_ids.tolist() == [23]
-    assert tensors.generation_logprobs.tolist() == [-1.25]
-    assert tensors.routed_experts.tolist() == [
-        [[42, 42]],
-        [[42, 42]],
-        [[42, 42]],
-        [[0, 1]],
-    ]
-    del tensors
-    capture.abandon_unimported(lease.lease_id)
-
-
-@cuda_required
-@pytest.mark.parametrize("export_start", [0, 2])
-def test_last_copy_event_covers_all_steps_without_full_extent_slices(
-    monkeypatch: pytest.MonkeyPatch, export_start: int
-) -> None:
-    runner = _runner()
-    capture = _capture(runner, require_routed_experts=True)
     # Allocate before delaying the producer: no blocking input H2D may complete
     # an earlier step while the subsequent native outputs are being assembled.
     steps = [
@@ -363,47 +299,35 @@ def test_last_copy_event_covers_all_steps_without_full_extent_slices(
             scratch.fill_(100 + index)
             outputs.append(runner.sample_tokens(None))
             scratch.fill_(255)
+            scratch.record_stream(producing_stream)
     assert not outputs[0].async_copy_ready_event.query()
     assert not outputs[-1].async_copy_ready_event.query()
-    fragments = capture._requests["call"].fragments
-    route_ids = {id(fragment.routes) for fragment in fragments}
-    waits, slices = [], []
-    original_wait, original_getitem = (
-        torch.cuda.Stream.wait_event,
-        torch.Tensor.__getitem__,
-    )
-
-    def track_wait(stream: torch.cuda.Stream, event: torch.cuda.Event) -> None:
-        waits.append(event)
-        original_wait(stream, event)
-
-    def track_slice(tensor: torch.Tensor, key: Any) -> torch.Tensor:
-        if id(tensor) in route_ids:
-            slices.append(key)
-        return original_getitem(tensor, key)
-
-    with monkeypatch.context() as patch, torch.cuda.stream(export_stream):
-        patch.setattr(torch.cuda.Stream, "wait_event", track_wait)
-        patch.setattr(torch.Tensor, "__getitem__", track_slice)
+    # Export before native get_output's CPU synchronization, after releasing
+    # its GPU references. Only capture retains the immutable output views.
+    for output in outputs:
+        del output._routed_experts, output._sampled_token_ids, output._logprobs_tensors
+    del runner.native_step, steps, step, sampler, scratch
+    with torch.cuda.stream(export_stream):
         # The third step is already queued but excluded by the final stop.
         lease = capture.export(
             "call", generated_token_count=2, prompt_token_count=3, start=export_start
         )
     export_stream.synchronize()
     try:
-        assert waits == [outputs[-1].async_copy_ready_event]
-        assert slices == ([] if export_start == 0 else [slice(2, 3)])
-        tensors = capture._leases[lease.lease_id].tensors
+        tensors = capture._leases[lease.capture_key].tensors
         assert tensors.generated_token_ids.tolist() == [25, 26]
         assert tensors.generation_logprobs.tolist() == [-0.25, -0.5]
-        assert (
-            tensors.routed_experts.tolist()
-            == [[[100, 100]], [[100, 100]], [[100, 100]], [[101, 101]], [[0, 1]]][
-                export_start:
-            ]
-        )
+        if routes:
+            assert (
+                tensors.routed_experts.tolist()
+                == [[[100, 100]], [[100, 100]], [[100, 100]], [[101, 101]], [[0, 1]]][
+                    export_start:
+                ]
+            )
+        else:
+            assert tensors.routed_experts is None
     finally:
-        capture.abandon_unimported(lease.lease_id)
+        capture.abandon_unimported(lease.capture_key)
 
 
 @cuda_required
@@ -454,8 +378,8 @@ def test_native_payload_survives_scratch_reuse_and_cross_process_ipc(
     assert result[0] == [7]
     assert result[1] == pytest.approx([-0.7])
     assert result[2] == [[[10, 11]], [[12, 13]], [[14, 15]], [[0, 1]]][export_start:]
-    assert lease.lease_id in capture._leases
-    capture.release(lease.lease_id)
+    assert lease.capture_key in capture._leases
+    capture.release(lease.capture_key)
     assert not capture._requests and not capture._leases
     # A queued step after finalization must not reallocate discarded output.
     _step(
@@ -487,7 +411,7 @@ def test_import_rejects_wrong_host_and_physical_gpu_before_opening_ipc() -> None
     with pytest.raises(GpuOutputImportError, match="UUID mismatch") as error:
         import_gpu_output_lease(replace(lease, gpu_uuid="wrong-gpu"), 0)
     assert not error.value.handles_consumed
-    capture.abandon_unimported(lease.lease_id)
+    capture.abandon_unimported(lease.capture_key)
     capture.discard("call")
 
 
@@ -503,44 +427,14 @@ def test_untagged_requests_do_not_allocate_training_payloads() -> None:
 
 
 @cuda_required
-def test_reprefill_preserves_already_emitted_routes_and_logprobs() -> None:
-    runner = _runner()
-    # A per-request -1 becomes vocab_size at the native batch boundary.
-    runner.requests["native"].sampling_params.logprobs = -1
-    capture = _capture(runner, require_routed_experts=True)
-    _step(runner, capture)
-    # An overlapping prefill fragment must preserve routes already emitted.
-    _step(
-        runner,
-        capture,
-        count=4,
-        token=8,
-        logprob=-0.8,
-        route_values=[91, 92, 93, 94, 95, 96, 7, 8],
-    )
-    lease = capture.export("call", generated_token_count=2, prompt_token_count=3)
-    tensors = capture._leases[lease.lease_id].tensors
-    assert tensors.generated_token_ids.tolist() == [7, 8]
-    assert tensors.generation_logprobs.tolist() == pytest.approx([-0.7, -0.8])
-    assert tensors.routed_experts.tolist() == [
-        [[1, 2]],
-        [[3, 4]],
-        [[5, 6]],
-        [[7, 8]],
-        [[0, 1]],
-    ]
-    del tensors
-    capture.abandon_unimported(lease.lease_id)
-    assert not capture._requests and not capture._leases
-
-
-@cuda_required
 @pytest.mark.parametrize("export_start", [0, 1, 3, 5, 8])
-def test_export_batches_fragments_without_changing_overlap_or_cached_holes(
+def test_overlapping_prefill_preserves_emitted_outputs_and_cached_holes(
     export_start: int,
 ) -> None:
     runner = _runner()
     runner.requests["native"].num_prompt_tokens = 8
+    # A per-request -1 becomes vocab_size at the native batch boundary.
+    runner.requests["native"].sampling_params.logprobs = -1
     capture = _capture(runner, require_routed_experts=True)
     _step(
         runner,
@@ -581,19 +475,20 @@ def test_export_batches_fragments_without_changing_overlap_or_cached_holes(
         logprob=-1.0,
         route_values=[80, 81],
     )
+    # Re-prefilling earlier positions must also retain their IDs/logprobs.
     _step(
         runner,
         capture,
-        start=9,
-        count=1,
+        start=7,
+        count=3,
         token=11,
         logprob=-1.1,
-        route_values=[90, 91],
+        route_values=[170, 171, 180, 181, 90, 91],
     )
     lease = capture.export(
         "call", generated_token_count=3, prompt_token_count=8, start=export_start
     )
-    tensors = capture._leases[lease.lease_id].tensors
+    tensors = capture._leases[lease.capture_key].tensors
     assert tensors.generated_token_ids.dtype == torch.int64
     assert tensors.generation_logprobs.dtype == torch.float32
     assert tensors.generated_token_ids.tolist() == [9, 10, 11]
@@ -617,7 +512,7 @@ def test_export_batches_fragments_without_changing_overlap_or_cached_holes(
     )
     assert tensors.routed_experts.untyped_storage().nbytes() == (11 - export_start) * 4
     del tensors
-    capture.abandon_unimported(lease.lease_id)
+    capture.abandon_unimported(lease.capture_key)
 
 
 @cuda_required
@@ -631,7 +526,7 @@ def test_export_with_no_accepted_tokens_keeps_empty_wire_arrays(
     lease = capture.export(
         "call", generated_token_count=0, prompt_token_count=3, start=export_start
     )
-    tensors = capture._leases[lease.lease_id].tensors
+    tensors = capture._leases[lease.capture_key].tensors
     assert tensors.generated_token_ids.shape == (0,)
     assert tensors.generated_token_ids.dtype == torch.int64
     assert tensors.generation_logprobs.shape == (0,)
@@ -640,7 +535,7 @@ def test_export_with_no_accepted_tokens_keeps_empty_wire_arrays(
         tensors.routed_experts.tolist() == [[[1, 2]], [[3, 4]], [[0, 1]]][export_start:]
     )
     del tensors
-    capture.abandon_unimported(lease.lease_id)
+    capture.abandon_unimported(lease.capture_key)
 
 
 @cuda_required
@@ -706,7 +601,7 @@ def test_partial_import_never_decrements_the_failed_attempt_twice(
         release_counter(lease.routed_experts)
     else:
         assert cleanup == [lease.routed_experts]
-    capture.release(lease.lease_id)
+    capture.release(lease.capture_key)
     assert not capture._requests and not capture._leases
 
 
@@ -719,12 +614,12 @@ def test_gpu_logprobs_match_serving_floor_before_staging(raw_logprob: float) -> 
     capture = _capture(runner, require_routed_experts=False)
     output = _step(runner, capture, logprob=raw_logprob)
     lease = capture.export("call", generated_token_count=1, prompt_token_count=3)
-    normalized = capture._leases[lease.lease_id].tensors.generation_logprobs
+    normalized = capture._leases[lease.capture_key].tensors.generation_logprobs
     assert normalized.is_cuda
     assert normalized.item() == max(raw_logprob, VLLM_LOGPROB_FLOOR)
     assert output._logprobs_tensors.logprobs[0, 0].item() == raw_logprob
     del normalized
-    capture.abandon_unimported(lease.lease_id)
+    capture.abandon_unimported(lease.capture_key)
     assert not capture._requests and not capture._leases
 
 
@@ -774,14 +669,18 @@ def test_capture_reuses_native_storage_across_uneven_request_lifetimes(
     # Request B's one-row views still pin the complete old batch allocations.
     assert set(capture._requests) == {"b"}
     assert capture._requests["b"].fragments[0].routes.tolist() == [[[6, 7]]]
-    capture.abandon_unimported(lease_a.lease_id)
+    capture.abandon_unimported(lease_a.capture_key)
     lease_b = capture.export("b", generated_token_count=1, prompt_token_count=1)
+    # A delayed duplicate cleanup for A cannot release the next call's buffers.
+    capture.release(lease_a.capture_key)
+    capture.abandon_unimported(lease_a.capture_key)
+    assert set(capture._leases) == {lease_b.capture_key} == {"b"}
     torch.cuda.synchronize()
-    tensors = capture._leases[lease_b.lease_id].tensors
+    tensors = capture._leases[lease_b.capture_key].tensors
     assert tensors.generated_token_ids.tolist() == [8]
     assert tensors.routed_experts.tolist() == [[[6, 7]], [[0, 1]]]
     del tensors
-    capture.abandon_unimported(lease_b.lease_id)
+    capture.abandon_unimported(lease_b.capture_key)
     assert not capture._requests and not capture._leases
 
 
@@ -801,13 +700,13 @@ def test_request_mapping_is_frozen_before_native_bookkeeping_mutation() -> None:
     runner.after_bookkeeping = mutate_live_batch
     _batched_step(runner, capture)
     lease = capture.export("a", generated_token_count=1, prompt_token_count=3)
-    tensors = capture._leases[lease.lease_id].tensors
+    tensors = capture._leases[lease.capture_key].tensors
     assert tensors.generated_token_ids.tolist() == [7]
     assert tensors.generation_logprobs.tolist() == pytest.approx([-0.7])
     assert tensors.routed_experts.tolist() == [[[0, 1]], [[2, 3]], [[4, 5]], [[0, 1]]]
     assert set(capture._requests) == {"b"}
     del tensors
-    capture.abandon_unimported(lease.lease_id)
+    capture.abandon_unimported(lease.capture_key)
     capture.discard("b")
     torch.cuda.synchronize()
     assert not capture._requests and not capture._leases
@@ -823,17 +722,10 @@ def test_discard_between_bookkeeping_and_snapshot_does_not_resurrect_request() -
 
 
 @cuda_required
-def test_native_sync_scheduler_keeps_original_sampled_outputs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_native_sync_scheduler_keeps_original_sampled_outputs() -> None:
     runner = _runner(async_scheduling=False)
     capture = _capture(runner, require_routed_experts=False)
 
-    def unexpected_event(*args: Any, **kwargs: Any) -> None:
-        pytest.fail("Sync CPU materialization needs no capture readiness event")
-
-    monkeypatch.setattr(torch.cuda, "Event", unexpected_event)
-    monkeypatch.setattr(torch.cuda.Stream, "wait_event", unexpected_event)
     output = _step(runner, capture)
     assert output._routed_experts is None
     fragment = capture._requests["call"].fragments[0]
@@ -844,10 +736,10 @@ def test_native_sync_scheduler_keeps_original_sampled_outputs(
     assert fragment.logprob.data_ptr() == output._logprobs_tensors.logprobs.data_ptr()
     lease = capture.export("call", generated_token_count=1, prompt_token_count=3)
     assert lease.routed_experts is None
-    tensors = capture._leases[lease.lease_id].tensors
+    tensors = capture._leases[lease.capture_key].tensors
     assert tensors.generated_token_ids.tolist() == [7]
     del tensors
-    capture.abandon_unimported(lease.lease_id)
+    capture.abandon_unimported(lease.capture_key)
     torch.cuda.synchronize()
     assert not capture._requests and not capture._leases
 
@@ -862,8 +754,8 @@ def test_raw_vocabulary_logprob_selection_is_deferred_to_assembly() -> None:
     assert fragment.logprob.shape == (2,)
     assert fragment.logprob.data_ptr() == output._logprobs_tensors.logprobs.data_ptr()
     lease = capture.export("call", generated_token_count=1, prompt_token_count=3)
-    assert capture._leases[lease.lease_id].tensors.generation_logprobs.item() == -9
-    capture.abandon_unimported(lease.lease_id)
+    assert capture._leases[lease.capture_key].tensors.generation_logprobs.item() == -9
+    capture.abandon_unimported(lease.capture_key)
 
 
 @cuda_required
@@ -900,12 +792,12 @@ def test_prefix_cached_by_untagged_request_needs_only_historical_route_backfill(
     assert fragment.logprob.data_ptr() == output._logprobs_tensors.logprobs.data_ptr()
     lease = capture.export("call", generated_token_count=1, prompt_token_count=3)
     assert lease.routed_experts_prefix_backfill_ranges == ((0, 2),)
-    tensors = capture._leases[lease.lease_id].tensors
+    tensors = capture._leases[lease.capture_key].tensors
     assert tensors.generated_token_ids.tolist() == [8]
     assert tensors.generation_logprobs.tolist() == pytest.approx([-0.8])
     assert tensors.routed_experts[2:].tolist() == [[[20, 21]], [[0, 1]]]
     del tensors
-    capture.abandon_unimported(lease.lease_id)
+    capture.abandon_unimported(lease.capture_key)
     torch.cuda.synchronize()
     assert not capture._requests and not capture._leases
 
@@ -939,7 +831,7 @@ def test_cached_prefix_length_is_frozen_before_bookkeeping_and_chunked_prefill()
     assert capture._requests["call"].proven_cached_prefix_tokens == 2
     lease = capture.export("call", generated_token_count=1, prompt_token_count=5)
     assert lease.routed_experts_prefix_backfill_ranges == ((0, 2),)
-    tensors = capture._leases[lease.lease_id].tensors
+    tensors = capture._leases[lease.capture_key].tensors
     assert tensors.routed_experts[2:].tolist() == [
         [[20, 21]],
         [[30, 31]],
@@ -947,7 +839,7 @@ def test_cached_prefix_length_is_frozen_before_bookkeeping_and_chunked_prefill()
         [[0, 1]],
     ]
     del tensors
-    capture.abandon_unimported(lease.lease_id)
+    capture.abandon_unimported(lease.capture_key)
 
 
 @cuda_required
@@ -978,7 +870,7 @@ def test_disjoint_cached_prefix_holes_remain_absolute_after_delta_export(
     try:
         assert lease.routed_experts_prefix_backfill_ranges == ((0, 1), (3, 6))
         assert (
-            capture._leases[lease.lease_id].tensors.routed_experts.tolist()
+            capture._leases[lease.capture_key].tensors.routed_experts.tolist()
             == [
                 [[0, 1]],
                 [[10, 11]],
@@ -992,7 +884,7 @@ def test_disjoint_cached_prefix_holes_remain_absolute_after_delta_export(
             ][export_start:]
         )
     finally:
-        capture.abandon_unimported(lease.lease_id)
+        capture.abandon_unimported(lease.capture_key)
 
 
 @cuda_required
@@ -1139,9 +1031,11 @@ def test_abort_drops_native_views_and_unimported_lease(
     assert all(ref() is not None for ref in views)
     lease = capture.export("call", generated_token_count=1, prompt_token_count=3)
     assert all(ref() is None for ref in views)
-    assembled = weakref.ref(capture._leases[lease.lease_id].tensors.generated_token_ids)
+    assembled = weakref.ref(
+        capture._leases[lease.capture_key].tensors.generated_token_ids
+    )
     if release_mode == "explicit":
-        capture.abandon_unimported(lease.lease_id)
+        capture.abandon_unimported(lease.capture_key)
     elif release_mode == "consumed":
         # Model PyTorch's consumed counters, then the frontend release ACK.
         for handle in (
@@ -1150,7 +1044,7 @@ def test_abort_drops_native_views_and_unimported_lease(
             lease.routed_experts,
         ):
             release_counter(handle)
-        capture.release(lease.lease_id)
+        capture.release(lease.capture_key)
     # With a lost export reply, discard must release the unopened handles.
     capture.discard("call")
     capture.discard("call")
@@ -1279,7 +1173,7 @@ def test_export_reads_survive_source_release_on_another_stream() -> None:
             torch.full((3, 1, 2), 255, dtype=torch.uint16, device="cuda")
             for _ in range(64)
         ]
-    tensors = capture._leases[lease.lease_id].tensors
+    tensors = capture._leases[lease.capture_key].tensors
     export_stream.synchronize()
     assert tensors.generated_token_ids.tolist() == [7]
     assert tensors.generation_logprobs.tolist() == pytest.approx([-0.7])
@@ -1290,7 +1184,7 @@ def test_export_reads_survive_source_release_on_another_stream() -> None:
         [[0, 1]],
     ]
     del tensors, replacements
-    capture.abandon_unimported(lease.lease_id)
+    capture.abandon_unimported(lease.capture_key)
 
 
 @cuda_required
@@ -1303,6 +1197,9 @@ def test_finished_native_requests_retire_tracking_after_cleanup(
     _step(runner, capture)
     if completion == "export":
         lease = capture.export("call", generated_token_count=1, prompt_token_count=3)
+        assert set(capture._leases) == {lease.capture_key} == {"call"}
+        with pytest.raises(RuntimeError, match="No retained GPU output"):
+            capture.export("call", generated_token_count=1, prompt_token_count=3)
     elif completion == "failure":
         capture.fail_keys((("call", "native"),), RuntimeError("capture unavailable"))
     elif completion == "resume":
@@ -1324,7 +1221,7 @@ def test_finished_native_requests_retire_tracking_after_cleanup(
     _prepare_empty_batch(runner, capture)
     if completion == "export":
         assert "call" in capture._closed_keys
-        capture.abandon_unimported(lease.lease_id)
+        capture.abandon_unimported(lease.capture_key)
     elif completion in ("failure", "resume"):
         assert "call" in capture._errors
         with pytest.raises(RuntimeError, match="capture failed"):

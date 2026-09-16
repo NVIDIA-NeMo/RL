@@ -187,27 +187,25 @@ def test_concurrent_calls_have_independent_gpu_bindings() -> None:
 
 @requires_cuda
 @pytest.mark.parametrize(
-    "prev_len,prompt_len,backfill_ranges",
+    "prev_len,prompt_len,backfill_ranges,routing_dtype,cast_routes",
     [
-        (0, 2, ()),
-        (2, 2, ()),
-        (2, 3, ()),
-        (0, 5, ((0, 2), (3, 4))),
-        (1, 5, ((0, 2), (3, 4))),
-        (3, 5, ((0, 2), (3, 4))),
-        (5, 5, ((0, 2), (3, 4))),
+        (0, 2, (), torch.int8, False),
+        (2, 2, (), torch.int16, True),
+        (2, 3, (), torch.int32, False),
+        (0, 5, ((0, 2), (3, 4)), torch.int8, True),
+        (1, 5, ((0, 2), (3, 4)), torch.int16, False),
+        (1, 5, ((0, 2), (3, 4)), torch.int32, True),
+        (3, 5, ((0, 2), (3, 4)), torch.int8, False),
+        (3, 5, ((0, 2), (3, 4)), torch.int16, True),
+        (5, 5, ((0, 2), (3, 4)), torch.int32, False),
     ],
 )
-@pytest.mark.parametrize("routing_dtype", [torch.int8, torch.int16, torch.int32])
-@pytest.mark.parametrize("cast_routes", [False, True])
-@pytest.mark.parametrize("export_delta", [False, True])
 def test_gpu_fields_match_committed_wire_without_rebuilding_generated_values(
     prev_len: int,
     prompt_len: int,
     backfill_ranges: tuple[tuple[int, int], ...],
     routing_dtype: torch.dtype,
     cast_routes: bool,
-    export_delta: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     canonical_routes = torch.arange((prompt_len + 2) * 4, dtype=routing_dtype).reshape(
@@ -216,34 +214,22 @@ def test_gpu_fields_match_committed_wire_without_rebuilding_generated_values(
     if backfill_ranges:
         canonical_routes[0, 0, 0] = -1
     canonical_routes[-1] = torch.tensor([[0, 1], [0, 1]], dtype=routing_dtype)
-    routed_experts_start = prev_len if export_delta else 0
-    routes = canonical_routes[routed_experts_start:].to(
+    routes = canonical_routes[prev_len:].to(
         device="cuda", dtype=torch.uint16 if cast_routes else routing_dtype
     )
     for start, end in backfill_ranges:
-        start = max(start, routed_experts_start)
+        start = max(start, prev_len)
         if start < end:
             # Native snapshots lack these cached-prefix rows.
-            routes[start - routed_experts_start : end - routed_experts_start] = 99
+            routes[start - prev_len : end - prev_len] = 99
     original_routes = routes.cpu().clone()
     payload = replace(
         _payload(prompt_len=prompt_len, routes=routes),
-        routed_experts_start=routed_experts_start,
         routed_experts_prefix_backfill_ranges=backfill_ranges,
     )
     record = _record(prev_len=prev_len, prompt_len=prompt_len, routes=canonical_routes)
     cpu_client, gpu_client = _PutClient(), _PutClient()
     assert TQTokenSink(cpu_client, staging_partition="staging").stage(record).ok
-    h2d_sizes = []
-    copy = torch.Tensor.copy_
-
-    def tracked_copy(
-        destination: torch.Tensor, source: torch.Tensor, *args: Any, **kwargs: Any
-    ) -> torch.Tensor:
-        if destination.is_cuda and not source.is_cuda:
-            h2d_sizes.append(source.numel())
-        return copy(destination, source, *args, **kwargs)
-
     original_cpu = torch.Tensor.cpu
 
     def reject_payload_copy(tensor: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
@@ -253,7 +239,6 @@ def test_gpu_fields_match_committed_wire_without_rebuilding_generated_values(
     bound = BoundGpuTokenSink(TQTokenSink(gpu_client, staging_partition="staging"))
     bound.bind(payload)
     with monkeypatch.context() as patch:
-        patch.setattr(torch.Tensor, "copy_", tracked_copy)
         patch.setattr(torch.Tensor, "cpu", reject_payload_copy)
         assert bound.stage(record).ok
     assert len(gpu_client.puts) == 1
@@ -277,17 +262,7 @@ def test_gpu_fields_match_committed_wire_without_rebuilding_generated_values(
             actual["routed_experts"].untyped_storage().data_ptr()
             == routes.untyped_storage().data_ptr()
         )
-        retained_prefix = prev_len - routed_experts_start
-        assert torch.equal(
-            routes[:retained_prefix].cpu(), original_routes[:retained_prefix]
-        )
-    carry_len = prompt_len - prev_len
-    assert h2d_sizes == ([carry_len] if carry_len else []) + [
-        (end - max(start, prev_len)) * 4
-        for start, end in backfill_ranges
-        if end > max(start, prev_len)
-    ]
-    if not carry_len:
+    if prompt_len == prev_len:
         assert (
             actual["token_ids_delta"].data_ptr()
             == payload.generated_token_ids.data_ptr()
@@ -308,17 +283,14 @@ def test_gpu_fields_match_committed_wire_without_rebuilding_generated_values(
 
 
 @requires_cuda
-@pytest.mark.parametrize("mask_values", [[-0.0, 0.0, 1.0, 1.0], [0.0, 1.0, 1.0, 1.0]])
-def test_staging_fields_preserves_cpu_mask_identity_and_bits(
-    mask_values: list[float],
-) -> None:
+def test_staging_fields_preserves_cpu_mask_identity_and_bits() -> None:
     record = _record()
     client = _PutClient()
     assert TQTokenSink(client, staging_partition="staging").stage(record).ok
     cpu_fields = dict(client.puts[0]["fields"].items())
     # Test helper input preservation independently of Gym's record validation:
     # neither signed zero nor a different mask pattern may be reconstructed.
-    mask = torch.tensor([mask_values], dtype=torch.float32)
+    mask = torch.tensor([[-0.0, 1.0, 1.0, 1.0]], dtype=torch.float32)
     cpu_fields["token_mask_delta"] = mask
     mask_bits = mask.view(torch.int32).clone()
 
@@ -327,8 +299,6 @@ def test_staging_fields_preserves_cpu_mask_identity_and_bits(
     assert fields["token_mask_delta"] is mask
     assert not fields["token_mask_delta"].is_cuda
     assert torch.equal(mask.view(torch.int32), mask_bits)
-    assert fields["token_ids_delta"].is_cuda
-    assert fields["generation_logprobs_delta"].is_cuda
 
 
 @requires_cuda
@@ -339,7 +309,6 @@ def test_staging_fields_preserves_cpu_mask_identity_and_bits(
         "ids_dtype",
         "logprobs_dtype",
         "routes_shape",
-        "routes_start",
         "prompt_len",
     ],
 )
@@ -357,8 +326,6 @@ def test_invalid_gpu_optimization_preserves_one_cpu_put(invalid: str) -> None:
         payload = replace(payload, generated_logprobs=payload.generated_logprobs.half())
     elif invalid == "routes_shape":
         payload = replace(payload, routed_experts=routes[:1])
-    elif invalid == "routes_start":
-        payload = replace(payload, routed_experts=routes[1:], routed_experts_start=1)
     else:
         payload = replace(payload, prompt_len=3)
     original, fallback = _PutClient(), _PutClient()

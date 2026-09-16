@@ -25,7 +25,6 @@ from __future__ import annotations
 import socket
 import threading
 import types
-import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from functools import wraps
@@ -55,7 +54,6 @@ class GpuCaptureOwner:
 
 @dataclass(frozen=True)
 class GpuOutputLease:
-    lease_id: str
     capture_key: str
     hostname: str
     gpu_uuid: str
@@ -306,9 +304,6 @@ class GpuOutputCapture:
         }
         resumed_requests = scheduler_output.scheduled_cached_reqs.resumed_req_ids
         with self._lock:
-            leased_keys = {
-                lease.descriptor.capture_key for lease in self._leases.values()
-            }
             # Native requests survive preemption and disappear only on finish.
             # Keep unobserved admissions and metadata awaiting frontend cleanup.
             self._closed_keys = {
@@ -317,7 +312,7 @@ class GpuOutputCapture:
                 if request_id is None
                 or request_id in runner.requests
                 or key in self._errors
-                or key in leased_keys
+                or key in self._leases
             }
             for index, request_id in enumerate(batch.req_ids):
                 count = int(scheduler_output.num_scheduled_tokens[request_id])
@@ -631,14 +626,12 @@ class GpuOutputCapture:
             # Match that normalization on device to preserve committed bytes.
             logprobs.clamp_min_(VLLM_LOGPROB_FLOOR)
             tensors = GpuOutputTensors(ids, logprobs, assembled_routes)
-            lease_id = uuid.uuid4().hex
             handles: list[CudaTensorIpc] = []
             try:
                 for tensor in (ids, logprobs, assembled_routes):
                     if tensor is not None:
                         handles.append(_export_tensor(tensor))
                 descriptor = GpuOutputLease(
-                    lease_id,
                     capture_key,
                     self.hostname,
                     self.gpu_uuid,
@@ -652,29 +645,29 @@ class GpuOutputCapture:
                 for handle in handles:
                     _release_unopened_handle(handle)
                 raise
-            self._leases[lease_id] = _OwnedLease(descriptor, tensors)
+            self._leases[capture_key] = _OwnedLease(descriptor, tensors)
             del self._requests[capture_key]
             self._closed_keys[capture_key] = state.native_request_id
             self._errors.pop(capture_key, None)
             return descriptor
 
-    def release(self, lease_id: str) -> None:
+    def release(self, capture_key: str) -> None:
         """Release only after the frontend has finished PUT and dropped imports."""
         with self._lock:
-            self._leases.pop(lease_id, None)
+            self._leases.pop(capture_key, None)
 
-    def abandon_unimported(self, lease_id: str) -> None:
+    def abandon_unimported(self, capture_key: str) -> None:
         """Release descriptors the frontend guarantees it never attempted.
 
         Never call this if any receiver may still import these descriptors or
         has already consumed their IPC refcounters.
         """
         with self._lock:
-            lease = self._leases.get(lease_id)
+            lease = self._leases.get(capture_key)
             if lease is not None:
                 for handle in _lease_handles(lease.descriptor):
                     _release_unopened_handle(handle)
-                self.release(lease_id)
+                self.release(capture_key)
 
     def discard(
         self, capture_key: str, *, native_request_id: str | None = None
@@ -692,9 +685,7 @@ class GpuOutputCapture:
                 else native_request_id or self._closed_keys.get(capture_key)
             )
             self._errors.pop(capture_key, None)
-            for lease_id, lease in list(self._leases.items()):
-                if lease.descriptor.capture_key == capture_key:
-                    self.abandon_unimported(lease_id)
+            self.abandon_unimported(capture_key)
 
 
 def configure_gpu_output_capture(

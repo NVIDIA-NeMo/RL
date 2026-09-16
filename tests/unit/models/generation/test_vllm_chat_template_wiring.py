@@ -27,6 +27,8 @@ module tree and inspect what each consumer was constructed with.
 
 import sys
 import types
+from collections.abc import Callable
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -183,6 +185,35 @@ def _build_server(monkeypatch, serving_chat_kwargs):
     worker._setup_vllm_openai_api_server(_FakeApp())
     assert _BUILT["chat"][0].kwargs["engine_client"] is worker._http_engine_client
     return _BUILT["renderer"], _BUILT["chat"], _BUILT["tokenize"]
+
+
+def build_serving(
+    worker: Any, request: Any, formatter: Callable, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Any, Callable]:
+    """Wire the real chat endpoint around an existing capture worker and formatter."""
+    _install_fake_vllm(monkeypatch)
+    worker.cfg = {
+        "temperature": request.temperature,
+        "top_p": request.top_p,
+        "val_temperature": request.temperature,
+        "val_top_p": request.top_p,
+        "vllm_cfg": {},
+    }
+    worker._http_engine_client = types.SimpleNamespace(
+        model_config="model", renderer="renderer"
+    )
+    worker.llm_async_engine_args = types.SimpleNamespace(
+        enable_return_routed_experts=False,
+        create_model_config=lambda: types.SimpleNamespace(
+            served_model_name="model", model="model"
+        ),
+    )
+    monkeypatch.setattr(
+        _OpenAIServingChat, "chat_completion_full_generator", formatter, raising=False
+    )
+    app = _FakeApp()
+    VllmAsyncGenerationWorkerImpl._setup_vllm_openai_api_server(worker, app)
+    return _BUILT["chat"][0], dict(app.routes)["/v1/chat/completions"]
 
 
 @pytest.mark.parametrize(

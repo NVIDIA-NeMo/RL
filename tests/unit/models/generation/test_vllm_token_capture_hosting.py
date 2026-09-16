@@ -23,9 +23,12 @@ a mock worker group.
 from __future__ import annotations
 
 import asyncio
+import json
+import sys
 import threading
 from collections.abc import AsyncGenerator
 from contextlib import nullcontext
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -45,6 +48,7 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     StageResult,
 )
 
+from nemo_rl.data_plane.gpu_token_payload import BoundGpuTokenSink  # noqa: E402
 from nemo_rl.models.generation.vllm.gpu_capture_host import GpuCaptureHost  # noqa: E402
 from nemo_rl.models.generation.vllm.gpu_output_capture import (
     GPU_CAPTURE_KEY,  # noqa: E402
@@ -55,6 +59,8 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     _AsyncLLMHTTPClient,
     _validate_gpu_route_history,
 )
+from nemo_rl.utils.routed_experts_codec import encode_routed_experts  # noqa: E402
+from tests.unit.models.generation import test_vllm_chat_template_wiring as wiring  # noqa: E402
 
 pytestmark = pytest.mark.nemo_gym
 
@@ -337,14 +343,17 @@ def _worker_with_capture(sink: _MemorySink):
     worker._prefix_cache_lock = threading.Lock()
     worker._staging_source = None
     worker._token_sink = sink
-    worker._delta_align_routed_experts = (
-        VllmAsyncGenerationWorkerImpl._delta_align_routed_experts
+    worker._normalize_routed_experts = (
+        VllmAsyncGenerationWorkerImpl._normalize_routed_experts
     )
     for name in (
         "_fetch_chain_prefix",
         "_capture_admission",
         "_resolve_admission_prefix",
         "_enter_request_prefix",
+        "_finish_request_capture",
+        "_complete_request_capture",
+        "_abort_request_capture",
     ):
         setattr(
             worker, name, getattr(VllmAsyncGenerationWorkerImpl, name).__get__(worker)
@@ -676,3 +685,185 @@ def test_request_capture_abort_fails_the_call_and_drains_state():
         worker, request, _served_content([3], [-0.1])
     )
     assert "ng_commit_coords" not in out
+
+
+def _route_capture(prev_len: int) -> tuple[Any, Any, _MemorySink]:
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    admission = {"rollout_id": "r0", "model_call_id": "c1", "mode": "text"}
+    if prev_len:
+        admission.update(
+            mode="token_in",
+            prev_len=prev_len,
+            parent_call_id="parent",
+            parent_chain_hash="a" * 64,
+            required_prefix_token_ids=list(range(prev_len)),
+        )
+    request = _FakeRequest(
+        ng_capture=admission,
+        stream=False,
+        top_k=None,
+        top_p=1.0,
+        temperature=1.0,
+        return_tokens_as_token_ids=True,
+        logprobs=True,
+        top_logprobs=0,
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        worker, request, list(range(5))
+    )
+    return worker, request, sink
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prev_len", "dtype", "mode"),
+    [
+        (0, torch.int8, "captured"),
+        (2, torch.int16, "captured"),
+        (5, torch.int32, "captured"),
+        (2, torch.int16, "cpu_fallback"),
+        (2, torch.int16, "uncaptured"),
+    ],
+)
+@pytest.mark.parametrize("missing", [0, 2])
+async def test_endpoint_route_suffix_preserves_record_and_response(
+    monkeypatch: pytest.MonkeyPatch,
+    prev_len: int,
+    dtype: torch.dtype,
+    mode: str,
+    missing: int,
+) -> None:
+    routes = torch.arange((7 - missing) * 6, dtype=dtype).reshape(-1, 2, 3)
+    full_routes = torch.cat(
+        [
+            routes,
+            torch.full((missing, 2, 3), -1, dtype=dtype),
+            torch.arange(3, dtype=dtype).expand(1, 2, 3),
+        ]
+    )
+    raw = _served_content([20, 21, 22], [-0.25] * 3)
+    raw["choices"][0]["routed_experts"] = "unchanged-choice-level-NPY"
+    reference = deepcopy(raw)
+    reference["choices"][0]["message"].update(
+        prompt_token_ids=list(range(5)),
+        generation_token_ids=[20, 21, 22],
+        generation_log_probs=[-0.25] * 3,
+        routed_experts=encode_routed_experts(
+            full_routes if mode == "uncaptured" else full_routes[prev_len:]
+        ),
+    )
+    reference_worker, reference_request, reference_sink = _route_capture(prev_len)
+    if mode != "uncaptured":
+        reference = reference_worker._finish_request_capture(
+            reference_request, reference
+        )
+
+    worker, request, sink = _route_capture(prev_len)
+    worker.routed_experts_dtype = dtype
+    worker._return_routed_experts_enabled = lambda: True
+    if mode == "uncaptured":
+        worker._capture_calls.clear()
+    elif mode == "cpu_fallback":
+        state = worker._capture_calls[id(request)]
+        state.gpu_sink = BoundGpuTokenSink(sink)
+        state.capture = RolloutTokenCapture(
+            sink=state.gpu_sink,
+            weight_version_fn=lambda: 0,
+            adapter=state.capture.adapter,
+        )
+
+        async def bind(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("GPU preparation unavailable")
+
+        async def finish(state: Any, operation: Any, *, finalize: Any) -> Any:
+            return finalize(await asyncio.to_thread(operation))
+
+        worker._gpu_capture_host = SimpleNamespace(
+            start_export=lambda *args, **kwargs: None, bind=bind, finish=finish
+        )
+
+    async def outputs() -> Any:
+        yield SimpleNamespace(
+            finished=True,
+            prompt_token_ids=list(range(5)),
+            num_cached_tokens=4,
+            prompt_routed_experts=None,
+            outputs=[
+                SimpleNamespace(
+                    index=0,
+                    token_ids=[20, 21, 22],
+                    logprobs=[
+                        {token: SimpleNamespace(logprob=-0.25)}
+                        for token in [20, 21, 22]
+                    ],
+                    routed_experts=routes,
+                )
+            ],
+        )
+
+    async def formatter(
+        self: Any, req: Any, results: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        async for _ in results:
+            pass
+        response = sys.modules[
+            "vllm.entrypoints.openai.chat_completion.protocol"
+        ].ChatCompletionResponse()
+        response.choices = [SimpleNamespace(index=0, message=SimpleNamespace())]
+        response.model_dump = lambda: deepcopy(raw)
+        return response
+
+    serving, endpoint = wiring.build_serving(worker, request, formatter, monkeypatch)
+
+    async def create(req: Any, raw: Any) -> Any:
+        return await serving.chat_completion_full_generator(req, outputs())
+
+    monkeypatch.setattr(serving, "create_chat_completion", create, raising=False)
+    result = await endpoint(request, None)
+    content = json.loads(result.body)
+    assert content == reference
+    assert [record.model_dump() for record in sink.records] == [
+        record.model_dump() for record in reference_sink.records
+    ]
+    assert not worker._capture_calls
+    if mode != "uncaptured":
+        assert content["ng_commit_coords"]["disposition"] == "staged"
+        assert sink.records[0].extras == {
+            "routed_experts": encode_routed_experts(full_routes[prev_len:])
+        }
+
+
+@pytest.mark.parametrize(
+    "form,prev_len",
+    [(form, 2) for form in ("legacy", "noncanonical", "length", "base64", "generation")]
+    + [("legacy", 0), ("noncanonical", 0)],
+)
+def test_route_suffix_preserves_canonicalization_and_failure(
+    form: str, prev_len: int
+) -> None:
+    routes = torch.arange(48, dtype=torch.int16).reshape(8, 2, 3)[prev_len:]
+    worker, request, sink = _route_capture(prev_len)
+    content = _served_content([20, 21, 22], [-0.25] * 3)
+    message = content["choices"][0]["message"]
+    message.update(generation_token_ids=[20, 21, 22], generation_log_probs=[-0.25] * 3)
+    encoded = encode_routed_experts(routes)
+    message["routed_experts"] = (
+        routes.tolist() if form == "legacy" else encoded.replace("x2x3:", "x02x03:")
+    )
+    if form == "length":
+        worker._capture_calls[id(request)].prompt_token_ids.append(99)
+    elif form == "base64":
+        message["routed_experts"] = encoded.rsplit(":", 1)[0] + ":invalid!"
+    elif form == "generation":
+        message["generation_log_probs"] = []
+    result = worker._finish_request_capture(request, content)
+    assert not worker._capture_calls
+    disposition = "capture_failed" if form == "generation" else "staged"
+    assert result["ng_commit_coords"]["disposition"] == disposition
+    if form == "generation":
+        assert not sink.records
+    else:
+        assert sink.records[0].extras == (
+            None if form in ("length", "base64") else {"routed_experts": encoded}
+        )

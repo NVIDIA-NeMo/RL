@@ -697,15 +697,12 @@ class VllmAsyncGenerationWorkerImpl(
             setattr(request, field_name, value)
 
     @staticmethod
-    def _delta_align_routed_experts(
+    def _normalize_routed_experts(
         payload: dict[str, Any],
         *,
-        prev_len: int,
-        prompt_len: int,
-        generated_len: int,
-        routed_experts_start: int = 0,
+        delta_len: int,
     ) -> None:
-        """Normalize optional vLLM routes to the exact staged token delta."""
+        """Validate and canonicalize routes already aligned to the staged delta."""
         choices = payload.get("choices") or []
         if len(choices) != 1 or not isinstance(choices[0], dict):
             return
@@ -732,15 +729,12 @@ class VllmAsyncGenerationWorkerImpl(
             else:
                 dtype = torch.int16
             experts = decode_routed_experts(routed, dtype)
-            expected_full_len = prompt_len + generated_len - routed_experts_start
-            if experts.dim() != 3 or experts.shape[0] != expected_full_len:
+            if experts.dim() != 3 or experts.shape[0] != delta_len:
                 raise ValueError(
-                    f"route length {experts.shape[0]} does not match engine sequence "
-                    f"length {expected_full_len}"
+                    f"route length {experts.shape[0]} does not match staged delta "
+                    f"length {delta_len}"
                 )
-            message["routed_experts"] = encode_routed_experts(
-                experts[prev_len - routed_experts_start :]
-            )
+            message["routed_experts"] = encode_routed_experts(experts)
         except (IndexError, TypeError, ValueError) as error:
             LOGGER.warning(
                 "dropping invalid routed_experts from staged capture: %s", error
@@ -749,9 +743,7 @@ class VllmAsyncGenerationWorkerImpl(
         choice["message"] = message
         payload["choices"] = [choice]
 
-    def _finish_request_capture(
-        self, request: Any, content: dict, *, routed_experts_start: int = 0
-    ) -> dict:
+    def _finish_request_capture(self, request: Any, content: dict) -> dict:
         """Stage the finished call and ride its coords on the response.
 
         Fail-closed: the sink write happens inside complete_call —
@@ -776,12 +768,13 @@ class VllmAsyncGenerationWorkerImpl(
                 generated_token_ids, _ = adapter.extract_generation(payload)
             except Exception:  # capture core will report the authoritative failure
                 generated_token_ids = []
-            self._delta_align_routed_experts(
+            self._normalize_routed_experts(
                 payload,
-                prev_len=call.admission.prev_len,
-                prompt_len=len(prompt_token_ids),
-                generated_len=len(generated_token_ids),
-                routed_experts_start=routed_experts_start,
+                delta_len=(
+                    len(prompt_token_ids)
+                    + len(generated_token_ids)
+                    - call.admission.prev_len
+                ),
             )
         coords = state.capture.complete_call_from_response(call, payload)
         for choice in content.get("choices") or []:
@@ -803,10 +796,7 @@ class VllmAsyncGenerationWorkerImpl(
     ) -> Any:
         """Keep the original device allocations alive through the blocking PUT."""
         state = self._capture_calls.get(id(request))
-        routed_experts_start = state.call.admission.prev_len if state is not None else 0
-        operation = lambda: self._finish_request_capture(
-            request, content, routed_experts_start=routed_experts_start
-        )
+        operation = lambda: self._finish_request_capture(request, content)
         if state is not None and state.gpu_sink is not None:
             assert self._gpu_capture_host is not None
             return await self._gpu_capture_host.finish(

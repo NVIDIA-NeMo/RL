@@ -205,7 +205,6 @@ class GpuCaptureHost:
         if adopted_lease is None:
             raise RuntimeError("GPU output capture has no adopted payload lease")
         lease: GpuOutputLease = adopted_lease
-        routed_experts_start = state.call.admission.prev_len
 
         # Defer import until the existing completion executor performs PUT.
         # This avoids handing CUDA work between two frontend worker threads.
@@ -221,7 +220,6 @@ class GpuCaptureHost:
                 generated_token_ids=tensors.generated_token_ids,
                 generated_logprobs=tensors.generation_logprobs,
                 routed_experts=tensors.routed_experts,
-                routed_experts_start=routed_experts_start,
                 routed_experts_prefix_backfill_ranges=(
                     lease.routed_experts_prefix_backfill_ranges
                 ),
@@ -287,7 +285,7 @@ class GpuCaptureHost:
                 else "abandon_unimported_gpu_output_capture"
             )
             state.release_reply = self._worker.execute_method.remote(
-                method, state.lease.lease_id
+                method, state.lease.capture_key
             ).future()
         except Exception as error:
             # Preserve release()'s warning-only error policy and producer lease.
@@ -329,7 +327,7 @@ class GpuCaptureHost:
                     if state.ipc_handles_consumed
                     else "abandon_unimported_gpu_output_capture"
                 )
-                await self._call_worker(release_method, args=(state.lease.lease_id,))
+                await self._call_worker(release_method, args=(state.lease.capture_key,))
             state.lease = None
             state.capture_key = None
             state.ipc_handles_consumed = False
