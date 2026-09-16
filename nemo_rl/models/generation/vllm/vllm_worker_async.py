@@ -62,6 +62,12 @@ from nemo_rl.telemetry.setup import shutdown_telemetry
 
 LOGGER = logging.getLogger(__name__)
 
+# Completion evidence only bridges the short race between a terminal response
+# and Gym freezing its admitted-call inventory. Time-based retention avoids
+# evicting fresh evidence merely because a large deployment completed more
+# than 100k calls, while still bounding idle-job memory growth.
+_COMPLETED_CAPTURE_RETENTION_S = 60.0 * 60.0
+
 
 @dataclass
 class _RequestCaptureBuffer:
@@ -138,6 +144,15 @@ class _RequestCaptureState:
         self.observed_generation_token_count += len(generated_token_ids)
         self.observation_error = None
 
+    def refresh_periodic_flush_due(self, threshold: int) -> None:
+        """Recompute whether the current active buffer needs a flush."""
+        self.periodic_flush_due = bool(
+            threshold > 0
+            and self.observation_error is None
+            and self.frozen_buffer is None
+            and self.unstaged_token_count() >= threshold
+        )
+
     def freeze_for_checkpoint(
         self, checkpoint_id: str
     ) -> tuple[str, int, list[int], list[float], list[int], list[float]]:
@@ -187,10 +202,11 @@ class _RequestCaptureState:
 
 @dataclass(frozen=True)
 class _CompletedCaptureState:
-    """Bounded terminal evidence retained across the response/cut race."""
+    """Time-bounded terminal evidence retained across the response/cut race."""
 
     coords: Any
     generation_token_count: int
+    completed_at_monotonic: float
 
 
 @dataclass
@@ -909,13 +925,7 @@ class VllmAsyncGenerationWorkerImpl(
             # Marking is deliberately all this hook does: it runs on the event
             # loop that drives generation, so the blocking staging write belongs
             # on the background flush thread.
-            if (
-                threshold > 0
-                and state.observation_error is None
-                and state.frozen_buffer is None
-                and state.unstaged_token_count() >= threshold
-            ):
-                state.periodic_flush_due = True
+            state.refresh_periodic_flush_due(threshold)
 
     def _restore_response_prefix(
         self, request: Any, request_output: Any, *, tokenizer: Any
@@ -948,15 +958,27 @@ class VllmAsyncGenerationWorkerImpl(
     def _remember_completed_capture(
         self, model_call_id: str, coords: Any, generation_token_count: int
     ) -> None:
+        now = time.monotonic()
         with self._capture_registry_lock:
+            # Dict insertion order is completion order. Remove only entries old
+            # enough that the response/inventory race has certainly elapsed;
+            # never discard fresh evidence because the deployment crossed an
+            # arbitrary call-count threshold.
+            while self._completed_capture_calls:
+                oldest_id = next(iter(self._completed_capture_calls))
+                oldest = self._completed_capture_calls[oldest_id]
+                if (
+                    now - oldest.completed_at_monotonic
+                    <= _COMPLETED_CAPTURE_RETENTION_S
+                ):
+                    break
+                self._completed_capture_calls.pop(oldest_id)
+            self._completed_capture_calls.pop(model_call_id, None)
             self._completed_capture_calls[model_call_id] = _CompletedCaptureState(
                 coords=coords,
                 generation_token_count=generation_token_count,
+                completed_at_monotonic=now,
             )
-            if len(self._completed_capture_calls) > 100_000:
-                self._completed_capture_calls.pop(
-                    next(iter(self._completed_capture_calls))
-                )
 
     def _fetch_chain_prefix(self, staging_chain: list[str]) -> list[int]:
         """Assemble prefix token ids from staging_chain, with a worker-local LRU cache."""
@@ -1292,6 +1314,9 @@ class VllmAsyncGenerationWorkerImpl(
         if not chunk_token_ids:
             with state.lock:
                 state.rollback_frozen_buffer(flush_id)
+                state.refresh_periodic_flush_due(
+                    self._generation_chunk_flush_tokens
+                )
             return False
 
         staged_key = None
@@ -1325,11 +1350,17 @@ class VllmAsyncGenerationWorkerImpl(
             with state.lock:
                 state.seal_frozen_buffer(flush_id)
                 state.generation_cut_staging_keys.append(staged_key)
+                state.refresh_periodic_flush_due(
+                    self._generation_chunk_flush_tokens
+                )
         except Exception:
             with state.lock:
                 frozen = state.frozen_buffer
                 if frozen is not None and frozen.checkpoint_id == flush_id:
                     state.rollback_frozen_buffer(flush_id)
+                    state.refresh_periodic_flush_due(
+                        self._generation_chunk_flush_tokens
+                    )
             if staged_key is not None:
                 try:
                     sink.clear([staged_key])
@@ -1481,57 +1512,103 @@ class VllmAsyncGenerationWorkerImpl(
             *args,
         )
 
-    def _checkpoint_generation_cut(self, inventory: Any) -> Any:
-        """Stage a stable prefix for every call named by Gym's frozen inventory."""
+    def _completed_generation_cut_ack(self, prefix: Any, checkpoint_id: str) -> Any:
+        """Describe a call whose terminal path won the cut/abort race."""
         from nemo_gym._checkpoint.model_control_contracts import (
             GenerationCutPrefixAck,
-            GenerationCutReceipt,
+        )
+        from nemo_gym.token_id_capture.staging.records import staging_key
+
+        with self._capture_registry_lock:
+            completed = self._completed_capture_calls.get(prefix.model_call_id)
+        expected_capture_key = (
+            prefix.rollout_id
+            if prefix.attempt_index == 0
+            else f"{prefix.rollout_id}-a{prefix.attempt_index}"
+        )
+        if (
+            completed is not None
+            and completed.coords.rollout_id != expected_capture_key
+        ):
+            raise RuntimeError(
+                "generation-prefix inventory identity does not match the "
+                f"completed call: model_call_id={prefix.model_call_id!r}"
+            )
+        if completed is not None and completed.coords.disposition == "staged":
+            return GenerationCutPrefixAck(
+                **prefix.model_dump(mode="json"),
+                disposition="durable_prefix",
+                cut_kind="terminal_completion",
+                frozen_buffer_id=f"terminal/{checkpoint_id}",
+                staging_keys=(completed.coords.staging_key,),
+                prefix_token_count=completed.generation_token_count,
+                prefix_digest=completed.coords.digest,
+            )
+        # The in-memory cache is only an optimization. Its durable canonical
+        # row remains authoritative if the race evidence aged out before a
+        # delayed checkpoint inventory arrived.
+        if completed is None and self._staging_source is not None:
+            canonical_key = staging_key(expected_capture_key, prefix.model_call_id)
+            try:
+                snapshots = self._staging_source.fetch([canonical_key])
+            except KeyError:
+                snapshots = []
+            if snapshots:
+                if len(snapshots) != 1:
+                    raise RuntimeError(
+                        "terminal completion lookup returned an unexpected row count"
+                    )
+                snapshot = snapshots[0]
+                if (
+                    snapshot.rollout_id != expected_capture_key
+                    or snapshot.model_call_id != prefix.model_call_id
+                ):
+                    raise RuntimeError(
+                        "generation-prefix inventory identity does not match the "
+                        f"durable terminal row: model_call_id={prefix.model_call_id!r}"
+                    )
+                return GenerationCutPrefixAck(
+                    **prefix.model_dump(mode="json"),
+                    disposition="durable_prefix",
+                    cut_kind="terminal_completion",
+                    frozen_buffer_id=f"terminal/{checkpoint_id}",
+                    staging_keys=(canonical_key,),
+                    prefix_token_count=sum(
+                        mask == 1.0 for mask in snapshot.token_mask_delta
+                    ),
+                    prefix_digest=snapshot.digest,
+                )
+        return GenerationCutPrefixAck(
+            **prefix.model_dump(mode="json"),
+            disposition="durable_failure",
+        )
+
+    def _checkpoint_active_generation_cut(
+        self,
+        prefix: Any,
+        state: _RequestCaptureState,
+        checkpoint_id: str,
+    ) -> Any | None:
+        """Cut one live call, or return ``None`` if abort won the race."""
+        from nemo_gym._checkpoint.model_control_contracts import (
+            GenerationCutPrefixAck,
         )
 
         capture = self.token_capture
         sink = self._capture_sink
         if capture is None or sink is None:
             raise RuntimeError("generation-prefix cuts require token capture setup")
-        receipt_key = (inventory.checkpoint_id, inventory.inventory_digest)
-        with self._capture_registry_lock:
-            cached_receipt = self._generation_cut_receipts.get(receipt_key)
-        if cached_receipt is not None:
-            return cached_receipt
-        acknowledgements = []
-        for prefix in inventory.active_prefixes:
+
+        # Abort and terminal completion use the same lifecycle lock. Once the
+        # cut owns it, the call cannot be removed until its detached buffer is
+        # staged or rolled back. If abort won first, use its terminal evidence.
+        with state.lifecycle_lock:
             with self._capture_registry_lock:
-                state = self._capture_calls_by_model_call_id.get(prefix.model_call_id)
-                completed = self._completed_capture_calls.get(prefix.model_call_id)
-            if state is None:
-                if completed is not None and completed.coords.rollout_id != (
-                    prefix.rollout_id
-                    if prefix.attempt_index == 0
-                    else f"{prefix.rollout_id}-a{prefix.attempt_index}"
-                ):
-                    raise RuntimeError(
-                        "generation-prefix inventory identity does not match the "
-                        f"completed call: model_call_id={prefix.model_call_id!r}"
-                    )
-                if completed is not None and completed.coords.disposition == "staged":
-                    acknowledgements.append(
-                        GenerationCutPrefixAck(
-                            **prefix.model_dump(mode="json"),
-                            disposition="durable_prefix",
-                            cut_kind="terminal_completion",
-                            frozen_buffer_id=f"terminal/{inventory.checkpoint_id}",
-                            staging_keys=(completed.coords.staging_key,),
-                            prefix_token_count=completed.generation_token_count,
-                            prefix_digest=completed.coords.digest,
-                        )
-                    )
-                else:
-                    acknowledgements.append(
-                        GenerationCutPrefixAck(
-                            **prefix.model_dump(mode="json"),
-                            disposition="durable_failure",
-                        )
-                    )
-                continue
+                current = self._capture_calls_by_model_call_id.get(
+                    prefix.model_call_id
+                )
+            if current is not state or state.terminal_started:
+                return None
 
             expected_capture_key = (
                 prefix.rollout_id
@@ -1556,10 +1633,11 @@ class VllmAsyncGenerationWorkerImpl(
                         chunk_logprobs,
                         generated_token_ids,
                         generated_logprobs,
-                    ) = state.freeze_for_checkpoint(inventory.checkpoint_id)
+                    ) = state.freeze_for_checkpoint(checkpoint_id)
             if observation_error is not None:
                 raise RuntimeError(
-                    f"cannot cut model call {prefix.model_call_id!r}: {observation_error}"
+                    f"cannot cut model call {prefix.model_call_id!r}: "
+                    f"{observation_error}"
                 )
             inherited_generation_token_count = (
                 state.call.admission.generation_cut.generation_token_count
@@ -1571,14 +1649,15 @@ class VllmAsyncGenerationWorkerImpl(
             )
             if total_generation_token_count == 0:
                 with state.lock:
-                    state.rollback_frozen_buffer(inventory.checkpoint_id)
-                acknowledgements.append(
-                    GenerationCutPrefixAck(
-                        **prefix.model_dump(mode="json"),
-                        disposition="durable_failure",
+                    state.rollback_frozen_buffer(checkpoint_id)
+                    state.refresh_periodic_flush_due(
+                        self._generation_chunk_flush_tokens
                     )
+                return GenerationCutPrefixAck(
+                    **prefix.model_dump(mode="json"),
+                    disposition="durable_failure",
                 )
-                continue
+
             staged_key = None
             try:
                 cumulative_record = capture.build_prefix_record(
@@ -1599,7 +1678,7 @@ class VllmAsyncGenerationWorkerImpl(
                     )
                     result = sink.stage_generation_prefix(
                         chunk_record,
-                        checkpoint_id=inventory.checkpoint_id,
+                        checkpoint_id=checkpoint_id,
                         chunk_sequence=chunk_sequence,
                     )
                     staged_key = result.staging_key
@@ -1629,17 +1708,20 @@ class VllmAsyncGenerationWorkerImpl(
                     # Validate the complete acknowledgement before adopting the
                     # staged chunk. A failed acknowledgement must leave the
                     # frozen buffer available for rollback.
-                    state.seal_frozen_buffer(inventory.checkpoint_id)
+                    state.seal_frozen_buffer(checkpoint_id)
                     if staged_key is not None:
                         state.generation_cut_staging_keys.append(staged_key)
+                    state.refresh_periodic_flush_due(
+                        self._generation_chunk_flush_tokens
+                    )
             except Exception:
                 with state.lock:
                     frozen = state.frozen_buffer
-                    if (
-                        frozen is not None
-                        and frozen.checkpoint_id == inventory.checkpoint_id
-                    ):
-                        state.rollback_frozen_buffer(inventory.checkpoint_id)
+                    if frozen is not None and frozen.checkpoint_id == checkpoint_id:
+                        state.rollback_frozen_buffer(checkpoint_id)
+                        state.refresh_periodic_flush_due(
+                            self._generation_chunk_flush_tokens
+                        )
                 if staged_key is not None:
                     try:
                         sink.clear([staged_key])
@@ -1649,6 +1731,41 @@ class VllmAsyncGenerationWorkerImpl(
                             staged_key,
                         )
                 raise
+            return acknowledgement
+
+    def _checkpoint_generation_cut(self, inventory: Any) -> Any:
+        """Stage a stable prefix for every call named by Gym's frozen inventory."""
+        from nemo_gym._checkpoint.model_control_contracts import (
+            GenerationCutReceipt,
+        )
+
+        capture = self.token_capture
+        sink = self._capture_sink
+        if capture is None or sink is None:
+            raise RuntimeError("generation-prefix cuts require token capture setup")
+        receipt_key = (inventory.checkpoint_id, inventory.inventory_digest)
+        with self._capture_registry_lock:
+            cached_receipt = self._generation_cut_receipts.get(receipt_key)
+        if cached_receipt is not None:
+            return cached_receipt
+        acknowledgements = []
+        for prefix in inventory.active_prefixes:
+            with self._capture_registry_lock:
+                state = self._capture_calls_by_model_call_id.get(prefix.model_call_id)
+            if state is None:
+                acknowledgements.append(
+                    self._completed_generation_cut_ack(
+                        prefix, inventory.checkpoint_id
+                    )
+                )
+                continue
+            acknowledgement = self._checkpoint_active_generation_cut(
+                prefix, state, inventory.checkpoint_id
+            )
+            if acknowledgement is None:
+                acknowledgement = self._completed_generation_cut_ack(
+                    prefix, inventory.checkpoint_id
+                )
             acknowledgements.append(acknowledgement)
         receipt = GenerationCutReceipt(
             checkpoint_id=inventory.checkpoint_id,
