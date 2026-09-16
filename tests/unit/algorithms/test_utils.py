@@ -717,7 +717,9 @@ def test_calculate_baseline_and_std_per_prompt_basic():
     )
     valid_mask = torch.ones(6)
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, _ = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     expected_baseline = torch.tensor([2.5, 2.0, 1.5, 5.5, 5.0, 4.5])
     expected_std = torch.tensor(
@@ -740,7 +742,9 @@ def test_calculate_baseline_and_std_per_prompt_single_generation_per_prompt():
     )
     valid_mask = torch.ones(2)
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, _ = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     # When num_valid <= 1 (single generation per prompt), baseline equals reward
     expected_baseline = torch.tensor([2.5, 4.0])
@@ -766,13 +770,30 @@ def test_calculate_baseline_and_std_per_prompt_identical_rewards():
     )
     valid_mask = torch.ones(6)
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, is_trivial = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     expected_baseline = torch.tensor([3.0, 3.0, 3.0, 7.0, 7.0, 7.0])
     expected_std = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
     assert torch.allclose(baseline, expected_baseline, rtol=1e-5)
     assert torch.allclose(std, expected_std, rtol=1e-5)
+    assert is_trivial.all()
+
+
+def test_calculate_baseline_and_std_per_prompt_marks_trivial_leave_one_out_set():
+    """A sample's leave-one-out peers may be identical even when the full group is not."""
+    rewards = torch.tensor([0.0] + [0.95] * 7)
+    prompts = torch.zeros(8, 1, dtype=torch.long)
+    valid_mask = torch.ones(8)
+
+    baseline, _, is_trivial = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
+
+    torch.testing.assert_close(baseline[0], torch.tensor(0.95))
+    assert is_trivial.tolist() == [True] + [False] * 7
 
 
 def test_calculate_baseline_and_std_per_prompt_mixed_prompt_sizes():
@@ -790,7 +811,9 @@ def test_calculate_baseline_and_std_per_prompt_mixed_prompt_sizes():
     )
     valid_mask = torch.ones(5)
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, _ = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     expected_baseline = torch.tensor([2.0, 1.0, 5.5, 5.0, 4.5])
     expected_std = torch.tensor([0.0, 0.0, 0.707107, 1.414214, 0.707107])
@@ -805,10 +828,13 @@ def test_calculate_baseline_and_std_per_prompt_empty_input():
     prompts = torch.empty(0, 3, dtype=torch.long)
     valid_mask = torch.tensor([])
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, is_trivial = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     assert baseline.shape == torch.Size([0])
     assert std.shape == torch.Size([0])
+    assert is_trivial.shape == torch.Size([0])
     assert torch.equal(baseline, torch.tensor([]))
     assert torch.equal(std, torch.tensor([]))
 
@@ -831,7 +857,9 @@ def test_calculate_baseline_and_std_per_prompt_nan_handling():
     # Mark the second sample as invalid
     valid_mask = torch.tensor([1.0, 0.0, 1.0, 1.0, 1.0, 1.0])
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, _ = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     expected_baseline = torch.tensor([3.0, 4.0, 1.0, 5.5, 5.0, 4.5])
     expected_std = torch.tensor([0.0, 0.0, 0.0, 0.707107, 1.414214, 0.707107])
@@ -856,11 +884,14 @@ def test_calculate_baseline_and_std_per_prompt_cuda_compatibility():
     ).cuda()
     valid_mask = torch.ones(4).cuda()
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, is_trivial = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     # Verify results are on CUDA and have expected values
     assert baseline.device.type == "cuda"
     assert std.device.type == "cuda"
+    assert is_trivial.device.type == "cuda"
 
     expected_baseline = torch.tensor([2.0, 1.0, 4.0, 3.0]).cuda()
     expected_std = torch.tensor([0.0, 0.0, 0.0, 0.0]).cuda()
@@ -885,7 +916,9 @@ def test_calculate_baseline_and_std_per_prompt_numerical_precision():
     )
     valid_mask = torch.ones(6)
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, _ = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     expected_baseline = torch.tensor([2.5e-8, 2e-8, 1.5e-8, 2.5e8, 2e8, 1.5e8])
 

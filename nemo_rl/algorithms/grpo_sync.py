@@ -771,13 +771,15 @@ def grpo_train_sync(
                             driver_carry,
                             master_config.grpo.reward_shaping,
                         )
-                    driver_carry["baseline"], driver_carry["std"] = (
-                        calculate_baseline_and_std_per_prompt(
-                            driver_carry["prompt_ids_for_adv"],
-                            driver_carry["total_reward"],
-                            torch.ones_like(driver_carry["total_reward"]),
-                            leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
-                        )
+                    (
+                        driver_carry["baseline"],
+                        driver_carry["std"],
+                        _,
+                    ) = calculate_baseline_and_std_per_prompt(
+                        driver_carry["prompt_ids_for_adv"],
+                        driver_carry["total_reward"],
+                        torch.ones_like(driver_carry["total_reward"]),
+                        leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
                     )
                     # Mirror std onto meta so dynamic_sampling can filter
                     # without fetching tensor data.
