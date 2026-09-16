@@ -46,6 +46,7 @@ from nemo_rl.telemetry.instrumentation import (
 from nemo_rl.telemetry.setup import get_telemetry_handle
 
 if TYPE_CHECKING:
+    from nemo.lens.instruments import MetricSpec
     from opentelemetry.metrics import Meter
 
 logger = logging.getLogger(__name__)
@@ -316,7 +317,7 @@ def warn_once(key: str, message: str) -> None:
     logger.warning(message, exc_info=True)
 
 
-def _metric_specs() -> list[Any]:
+def _metric_specs() -> list[MetricSpec]:
     """Build the full ``MetricSpec`` list for the ``rl`` group."""
     from nemo.lens.instruments import MetricSpec
 

@@ -1752,7 +1752,10 @@ class MetricsDataPlaneClient(DataPlaneClient):
             span_ctx: Any = _NO_SPAN
         else:
             name = f"rl.data_plane.{op}"
-            attributes = {_OP_ATTR: op, _PARTITION_ATTR: partition_id}
+            # Annotated rather than inferred as dict[str, str]: these are span
+            # attributes, whose values are heterogeneous, and the helpers below
+            # take a typed ``tracer`` ahead of their ``**attributes``.
+            attributes: dict[str, Any] = {_OP_ATTR: op, _PARTITION_ATTR: partition_id}
             if per_prompt:
                 span_ctx = umbrella_span(RLSpanGroup.U_PER_PROMPT, name, **attributes)
             else:

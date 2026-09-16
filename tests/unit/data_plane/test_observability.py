@@ -45,6 +45,8 @@ from nemo_rl.data_plane.observability import (
     merge_snapshots,
     metrics_never_fail_the_step,
 )
+from nemo_rl.telemetry.instrumentation import is_span_group_enabled
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 
 # ── helpers ────────────────────────────────────────────────────────────
 
@@ -189,6 +191,7 @@ class _JaggedEcho(NoOpDataPlaneClient):
                 else torch.nested.nested_tensor(rows, layout=torch.jagged)
             )
         return TensorDict(out, batch_size=[len(sample_ids)])
+
 
 try:
     from nemo.lens import NemoLensConfig, setup_telemetry
@@ -1701,9 +1704,28 @@ def test_spans_are_emitted_without_the_event_callback(finished_spans):
 
 def test_spans_cost_nothing_when_telemetry_is_off():
     """The wrapper is installed on every data-plane client, so the disabled
-    path is the one that actually runs in production today."""
+    path is the one that actually runs in production today.
+
+    Deliberately the one test here without ``@requires_lens``: it is the only
+    coverage of the ``_NO_SPAN`` short-circuit, which is the branch every
+    data-plane op takes on a run that never enabled telemetry.
+    """
+    # The assertions below only describe the disabled path while the gate is
+    # actually closed, and nothing in this test would fail if it were open.
+    # No ``_exporting`` fixture runs here, and the ones that use it clear the
+    # groups again in ``_reset_otel_globals``.
+    assert not is_span_group_enabled(RLSpanGroup.DATA_PLANE)
+
     inner = NoOpDataPlaneClient()
     client = MetricsDataPlaneClient(inner, on_event=None)
     _put_one(client)
     client.close()
     inner.close()
+
+    # Short-circuiting the span must not short-circuit the op: the put still
+    # reaches the inner client and the byte accounting still runs.
+    snap = client.snapshot()
+    assert snap["total_ops"] >= 2  # register + put
+    assert snap["total_bytes"] >= 8  # 2 x float32
+    # Written only on a put, so the register alone cannot satisfy this.
+    assert snap["last_put_bytes_per_key"] == 4  # float32

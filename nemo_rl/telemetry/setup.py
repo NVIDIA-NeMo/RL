@@ -587,5 +587,5 @@ def shutdown_telemetry(timeout_ms: int = 5000) -> None:
         from nemo.lens.state import set_enabled_span_groups
 
         set_enabled_span_groups(frozenset())
-    except Exception:
-        logger.debug("nemo-lens: could not clear enabled span groups", exc_info=True)
+    except (ImportError, AttributeError):
+        logger.warning("nemo-lens: could not clear enabled span groups", exc_info=True)
