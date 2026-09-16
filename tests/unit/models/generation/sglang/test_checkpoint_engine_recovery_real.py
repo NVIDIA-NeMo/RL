@@ -192,6 +192,12 @@ def tokenizer():
 @pytest.fixture(scope="module")
 def recovery_stack(ray_cluster, tokenizer):
     """2 sender actors + 2 real SGLang engines + the real synchronizer."""
+    gpu_count = ray.cluster_resources().get("GPU", 0)
+    assert gpu_count >= 4, (
+        "Checkpoint-engine recovery requires four GPUs (two policy senders "
+        f"and two SGLang engines); Ray reports {gpu_count}. "
+        "Run this fixture on a four-GPU-or-larger runner."
+    )
     senders = [_CheckpointSenderWorker.remote(rank, MODEL_PATH) for rank in range(2)]
     cluster = RayVirtualCluster(
         bundle_ct_per_node_list=[2],
