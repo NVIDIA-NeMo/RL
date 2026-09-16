@@ -92,8 +92,8 @@ from nemo_rl.models.megatron.setup import (
     setup_distributed,
     setup_model_and_optimizer,
     setup_reference_model_state,
-    validate_fp32_lm_head_config,
     validate_and_set_config,
+    validate_fp32_lm_head_config,
     validate_megatron_config,
     validate_model_paths,
 )

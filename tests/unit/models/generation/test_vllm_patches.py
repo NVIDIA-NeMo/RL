@@ -40,6 +40,10 @@ import pytest
 import torch
 
 from nemo_rl.models.generation.vllm import patches
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_FP32_LM_HEAD_ENV_VAR,
+    vllm_fp32_lm_head_enabled,
+)
 from tests.unit.models.generation.vllm_patch_source_utils import (
     write_unpatched_copy,
 )
@@ -129,6 +133,55 @@ class NemotronHForCausalLM:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 """
+_NEMOTRON_H_LEGACY_FP32_HEAD_COMPUTE = f"""    def compute_logits(self, hidden_states):
+        import os as _os
+
+        if _os.environ.get("{VLLM_FP32_LM_HEAD_ENV_VAR}", "0") == "1":
+            # NeMo-RL patch: fp32 LM head (MiniMax-M1-style). bf16 rounding of
+            # the logits is the dominant gen/train logprob mismatch source.
+            _fp32_head = getattr(self, "_nrl_lm_head_fp32", None)
+            if _fp32_head is None and not torch.cuda.is_current_stream_capturing():
+                # Skipped under graph capture: an allocation there lives in the
+                # graph's memory pool and is not valid for later eager replays.
+                # Capture output is discarded anyway, so bf16 is fine for it.
+                import copy as _copy
+
+                _fp32_head = _copy.deepcopy(self.lm_head).float()
+                # object.__setattr__ bypasses nn.Module.__setattr__: registering
+                # this as a submodule would add a vocab-sized parameter to
+                # named_parameters(), which the refit weight mapping is built from.
+                object.__setattr__(self, "_nrl_lm_head_fp32", _fp32_head)
+                self._nrl_lm_head_fp32_dirty = False
+                print(
+                    "[fp32_lm_head] built fp32 head in forward shape=%s"
+                    % (tuple(_fp32_head.weight.shape),),
+                    flush=True,
+                )
+            elif _fp32_head is not None and getattr(
+                self, "_nrl_lm_head_fp32_dirty", False
+            ):
+                # Refreshed in place: replacing the module would leave any
+                # captured CUDA graph pointing at the old storage.
+                _fp32_head.weight.data.copy_(self.lm_head.weight)
+                if getattr(_fp32_head, "bias", None) is not None:
+                    _fp32_head.bias.data.copy_(self.lm_head.bias)
+                self._nrl_lm_head_fp32_dirty = False
+                print("[fp32_lm_head] refreshed cached head in forward", flush=True)
+            if _fp32_head is not None:
+                return self.logits_processor(_fp32_head, hidden_states.float())
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        return logits
+"""
+_NEMOTRON_H_LEGACY_FP32_HEAD_SOURCE = _NEMOTRON_H_SOURCE.replace(
+    "import torch\nfrom torch import nn",
+    "import os\n\nimport torch\nfrom torch import nn",
+).replace(
+    """    def compute_logits(self, hidden_states):
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        return logits
+""",
+    _NEMOTRON_H_LEGACY_FP32_HEAD_COMPUTE,
+)
 
 
 @pytest.fixture
@@ -164,6 +217,15 @@ def patched_glm_dsa_source(tmp_path, monkeypatch):
 def patched_nemotron_h_source(tmp_path, monkeypatch):
     source = tmp_path / "nemotron_h.py"
     source.write_text(_NEMOTRON_H_SOURCE)
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
+    patches._patch_vllm_nemotron_h_fp32_lm_head(logging.getLogger(__name__))
+    return source
+
+
+@pytest.fixture
+def patched_legacy_nemotron_h_source(tmp_path, monkeypatch):
+    source = tmp_path / "nemotron_h.py"
+    source.write_text(_NEMOTRON_H_LEGACY_FP32_HEAD_SOURCE)
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
     patches._patch_vllm_nemotron_h_fp32_lm_head(logging.getLogger(__name__))
     return source
@@ -300,6 +362,20 @@ def test_glm_decoder_sp_moe_patch_warns_on_unknown_source(
     assert "vLLM 0.25.1 source shape was not found" in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("vllm_cfg", "expected"),
+    [
+        ({}, False),
+        ({"fp32_lm_head": False}, False),
+        ({"fp32_lm_head": True}, True),
+        ({"env_vars": {VLLM_FP32_LM_HEAD_ENV_VAR: "1"}}, True),
+        ({"env_vars": {VLLM_FP32_LM_HEAD_ENV_VAR: "0"}}, False),
+    ],
+)
+def test_vllm_fp32_lm_head_enabled(vllm_cfg, expected):
+    assert vllm_fp32_lm_head_enabled(vllm_cfg) is expected
+
+
 @pytest.mark.parametrize("env_value", [None, "0", "1"])
 def test_nemotron_h_fp32_lm_head_patch_is_env_gated(
     patched_nemotron_h_source, monkeypatch, env_value
@@ -336,6 +412,32 @@ def test_nemotron_h_fp32_lm_head_patch_is_env_gated(
             (torch.bfloat16, torch.bfloat16, None)
         ]
 
+    assert "deepcopy" not in source
+    assert "params_dtype=torch.float32" not in source
+    assert "torch.matmul(" in source
+    ast.parse(source)
+
+
+def test_nemotron_h_fp32_lm_head_patch_migrates_legacy_cached_head_source(
+    patched_legacy_nemotron_h_source, monkeypatch
+):
+    monkeypatch.setenv(VLLM_FP32_LM_HEAD_ENV_VAR, "1")
+
+    source = patched_legacy_nemotron_h_source.read_text()
+    namespace = {}
+    exec(compile(source, str(patched_legacy_nemotron_h_source), "exec"), namespace)
+    config = types.SimpleNamespace(vocab_size=16, hidden_size=8)
+    model = namespace["NemotronHForCausalLM"](config, "model")
+    hidden_states = torch.ones(2, 8, dtype=torch.bfloat16)
+
+    logits = model.compute_logits(hidden_states)
+
+    assert model._nrl_fp32_lm_head is True
+    assert model.lm_head.params_dtype is None
+    assert model.lm_head.quant_config is model.quant_config
+    assert model.lm_head.weight.dtype is torch.bfloat16
+    assert logits.dtype is torch.float32
+    assert "_nrl_lm_head_fp32" not in source
     assert "deepcopy" not in source
     assert "params_dtype=torch.float32" not in source
     assert "torch.matmul(" in source

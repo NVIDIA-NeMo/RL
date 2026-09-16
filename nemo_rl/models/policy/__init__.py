@@ -507,10 +507,10 @@ class MegatronConfig(TypedDict):
     # makes the multiplicative error worse, since both otherwise round to the
     # same grid.
     #   False   - bf16 head (default)
-    #   True    - full fp32 head (~2x cost on the logprob pass)
-    #   "tf32"  - fp32 head on TF32 tensor cores; numerically identical here
-    #             because the inputs are already exact bf16 values, at ~baseline
-    #             speed. Prefer this.
+    #   True    - full fp32 head with regular fp32 matmul
+    #   "tf32"  - fp32 head with CUDA TF32 matmul enabled where available;
+    #             generally faster than regular fp32 on supported GPUs, but
+    #             validate throughput and tolerance for the target workload
     # No effect when use_fused_linear_logprobs is set, which bypasses the
     # output layer's standalone forward.
     fp32_lm_head: NotRequired[bool | Literal["tf32"]]

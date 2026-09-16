@@ -4009,6 +4009,17 @@ def test_apply_fp32_lm_head_wraps_plain_last_stage_chunk():
     _assert_fp32_wrapped(layer)
 
 
+def test_apply_fp32_lm_head_tf32_path_produces_fp32_output():
+    from nemo_rl.models.megatron.setup import apply_fp32_lm_head
+
+    layer = _FakeOutputLayer()
+    chunk = SimpleNamespace(
+        module=SimpleNamespace(output_layer=layer, post_process=True)
+    )
+    apply_fp32_lm_head([chunk], use_tf32=True)
+    _assert_fp32_wrapped(layer)
+
+
 @pytest.mark.parametrize(
     "build",
     [
@@ -4120,6 +4131,21 @@ def test_validate_fp32_lm_head_config_ignores_non_vllm_generation():
     # SFT/DPO-style configs have no vLLM engine to disagree with.
     validate_fp32_lm_head_config({"megatron_cfg": {"fp32_lm_head": "tf32"}})
     validate_fp32_lm_head_config(_fp32_policy_cfg("tf32", {}, backend="megatron"))
+
+
+def test_validate_fp32_lm_head_config_handles_missing_megatron_cfg():
+    from nemo_rl.models.megatron.setup import validate_fp32_lm_head_config
+
+    validate_fp32_lm_head_config({"generation": {"backend": "vllm", "vllm_cfg": {}}})
+    with pytest.raises(ValueError, match="both engines or neither"):
+        validate_fp32_lm_head_config(
+            {
+                "generation": {
+                    "backend": "vllm",
+                    "vllm_cfg": {"fp32_lm_head": True},
+                },
+            }
+        )
 
 
 @pytest.mark.mcore
