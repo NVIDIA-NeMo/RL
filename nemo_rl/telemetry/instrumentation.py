@@ -31,7 +31,16 @@ import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import Enum
-from typing import Any, Callable, Iterator, Mapping, Optional, TypeVar, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterator,
+    Mapping,
+    Optional,
+    TypeVar,
+    cast,
+)
 
 from nemo.lens import (
     is_span_group_enabled,
@@ -45,6 +54,9 @@ from nemo.lens import (
 )
 
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+
+if TYPE_CHECKING:
+    from opentelemetry.trace import Tracer
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +97,7 @@ __all__ = [
 ]
 
 
-def safe_set_span_attributes(span: Optional[Any], attributes: dict) -> None:
+def safe_set_span_attributes(span: Optional[Any], attributes: dict[str, Any]) -> None:
     """Like the lens helper, but a no-op when *span* is None.
 
     Every span helper in this module yields None for a disabled group, and lens's
@@ -583,7 +595,7 @@ def accepts_trace_context(method: _F) -> _F:
 
 @contextmanager
 def managed_span(
-    group: str, name: str, tracer=None, **attributes: Any
+    group: str, name: str, tracer: Optional[Tracer] = None, **attributes: Any
 ) -> Iterator[Any]:
     """Like lens ``managed_span``, but injects ``rl.bucket`` for leaf groups.
 
@@ -634,7 +646,7 @@ def _warn_leaf_group_at_umbrella_call(group: str, name: str) -> None:
 
 @contextmanager
 def umbrella_span(
-    group: str, name: str, tracer=None, **attributes: Any
+    group: str, name: str, tracer: Optional[Tracer] = None, **attributes: Any
 ) -> Iterator[Any]:
     """Span for an umbrella group: timed and nested, never bucketed.
 
@@ -664,7 +676,9 @@ def umbrella_span(
 
 
 @contextmanager
-def efficiency_span(category: str, tracer=None, **attributes: Any) -> Iterator[Any]:
+def efficiency_span(
+    category: str, tracer: Optional[Tracer] = None, **attributes: Any
+) -> Iterator[Any]:
     """Span for one efficiency category, tagged with that category's bucket.
 
     ``category`` is the same label the ``Timer`` uses (``"idle/refit_bubble"``,
@@ -700,7 +714,7 @@ def efficiency_span(category: str, tracer=None, **attributes: Any) -> Iterator[A
 
 
 @contextmanager
-def startup_span(tracer=None, **attributes: Any) -> Iterator[Any]:
+def startup_span(tracer: Optional[Tracer] = None, **attributes: Any) -> Iterator[Any]:
     """Umbrella over everything between process start and the first step.
 
     Open this in the entrypoint, around both ``init_ray()`` and the algorithm's
@@ -708,12 +722,16 @@ def startup_span(tracer=None, **attributes: Any) -> Iterator[Any]:
     spanning them the startup phases arrive as unrelated root traces rather than
     one waterfall.
     """
-    with _managed_span(RLSpanGroup.SETUP, "rl.startup", tracer=tracer, **attributes):
-        yield
+    with _managed_span(
+        RLSpanGroup.SETUP, "rl.startup", tracer=tracer, **attributes
+    ) as span:
+        yield span
 
 
 @contextmanager
-def setup_span(phase: str, tracer=None, **attributes: Any) -> Iterator[Any]:
+def setup_span(
+    phase: str, tracer: Optional[Tracer] = None, **attributes: Any
+) -> Iterator[Any]:
     """One startup phase, named ``rl.setup.<phase>``.
 
     Unbucketed and freely nestable — see :data:`UMBRELLA_GROUPS` for why the
@@ -730,33 +748,37 @@ def setup_span(phase: str, tracer=None, **attributes: Any) -> Iterator[Any]:
         yield span
 
 
-def trace_fn(group: str, name: str, tracer=None):
+def trace_fn(
+    group: str, name: str, tracer: Optional[Tracer] = None
+) -> Callable[[_F], _F]:
     """Decorator that wraps a function in a bucket-tagged ``managed_span``."""
 
-    def decorator(func):
+    def decorator(func: _F) -> _F:
         @functools.wraps(func)
-        def wrapper(*args, **kwargs):
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
             with managed_span(group, name, tracer=tracer):
                 return func(*args, **kwargs)
 
-        return wrapper
+        return cast(_F, wrapper)
 
     return decorator
 
 
-def umbrella_trace_fn(group: str, name: str, tracer=None):
+def umbrella_trace_fn(
+    group: str, name: str, tracer: Optional[Tracer] = None
+) -> Callable[[_F], _F]:
     """Decorator form of :func:`umbrella_span`, for whole-function umbrellas.
 
     The ``rl.<algo>.job`` spans are all of this shape: one span over one call,
     covering everything the run does.
     """
 
-    def decorator(func):
+    def decorator(func: _F) -> _F:
         @functools.wraps(func)
-        def wrapper(*args, **kwargs):
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
             with umbrella_span(group, name, tracer=tracer):
                 return func(*args, **kwargs)
 
-        return wrapper
+        return cast(_F, wrapper)
 
     return decorator
