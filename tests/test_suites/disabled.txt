@@ -80,3 +80,8 @@ tests/test_suites/llm/grpo-nanov3-30BA3B-4n4g-megatron_generation-colocated-resh
 
 # Enable after the first Nano MMPR MPO CP=1 functional qualification.
 tests/test_suites/vlm/vlm_mpo-nemotron-omni-30ba3b-mmpr-1n8g-megatron-tp8.v1.sh
+
+# Cross-tokenizer MOPD requires pinned private parity inputs and a 3n8g
+# heterogeneous allocation. Keep it manual/L2-only until maintainers approve
+# an exact public smoke command and allocation; it is not part of a nightly.
+tests/test_suites/llm/mopd-qwen3-1.7b-3n8g-megatron-pack-xtoken.sh

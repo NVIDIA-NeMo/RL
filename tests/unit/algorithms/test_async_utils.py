@@ -492,6 +492,65 @@ class TestReplayBufferImplCheckpointing:
             torch.tensor([[1.0, 2.0], [1.0, 2.0]]),
         )
 
+    def test_same_token_mopd_restore_backfills_legacy_teacher_mask(self):
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
+        score = torch.tensor([[0.1, 0.2, 0.3]])
+        state = {
+            "trajectories": [{"batch": {"teacher_reference_logprobs": score.clone()}}],
+            "trajectory_versions": [0],
+            "target_weight_versions": [1],
+            "last_target_weight_already_generated": -1,
+        }
+
+        buffer.load_state_dict(state, teacher_mask_mode="same_token")
+
+        restored_batch = buffer.state_dict()["trajectories"][0]["batch"]
+        torch.testing.assert_close(restored_batch["teacher_reference_logprobs"], score)
+        assert torch.equal(
+            restored_batch["teacher_reference_logprobs_mask"],
+            torch.ones_like(score, dtype=torch.bool),
+        )
+
+    def test_cross_token_mopd_restore_rejects_legacy_entry_without_mask(self):
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
+        state = {
+            "trajectories": [
+                {"batch": {"teacher_reference_logprobs": torch.tensor([[0.1, 0.2]])}}
+            ],
+            "trajectory_versions": [0],
+            "target_weight_versions": [1],
+            "last_target_weight_already_generated": -1,
+        }
+
+        with pytest.raises(
+            ValueError, match="alignment validity cannot be reconstructed"
+        ):
+            buffer.load_state_dict(state, teacher_mask_mode="cross_token")
+
+    def test_cross_token_mopd_restore_round_trips_nontrivial_score_and_mask(self):
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
+        score = torch.tensor([[0.25, -1.5, 0.0]])
+        mask = torch.tensor([[True, False, True]])
+        state = {
+            "trajectories": [
+                {
+                    "batch": {
+                        "teacher_reference_logprobs": score.clone(),
+                        "teacher_reference_logprobs_mask": mask.clone(),
+                    }
+                }
+            ],
+            "trajectory_versions": [0],
+            "target_weight_versions": [1],
+            "last_target_weight_already_generated": -1,
+        }
+
+        buffer.load_state_dict(state, teacher_mask_mode="cross_token")
+
+        restored_batch = buffer.state_dict()["trajectories"][0]["batch"]
+        torch.testing.assert_close(restored_batch["teacher_reference_logprobs"], score)
+        assert torch.equal(restored_batch["teacher_reference_logprobs_mask"], mask)
+
 
 class TestReplayBuffer:
     """Test cases for ReplayBuffer."""
@@ -1911,6 +1970,202 @@ class TestAsyncTrajectoryCollector:
                 )
 
         return fake_rollouts
+
+    def test_current_nemo_gym_final_batch_stores_teacher_score_and_mask(self):
+        from nemo_rl.algorithms.x_token.mopd_teacher_scoring import (
+            MOPDTeacherScoreResult,
+        )
+        from nemo_rl.experience.rollouts import (
+            NemoGymRolloutResult,
+            RolloutGroupResult,
+        )
+
+        class _RecordingAdd:
+            def __init__(self, outer):
+                self.outer = outer
+                self.calls = []
+
+            def remote(self, *args):
+                self.calls.append(args)
+                return self.outer._AwaitableStatus()
+
+        class _ReplayBuffer:
+            def __init__(self, outer):
+                self.add = _RecordingAdd(outer)
+
+        replay_buffer = _ReplayBuffer(self)
+        collector = self.create_local_collector(replay_buffer=replay_buffer)
+        collector.running = True
+        collector._has_distillation_teachers = True
+        collector.tokenizer.pad_token_id = 0
+        captured = {}
+
+        def score(input_ids, agent_refs, **kwargs):
+            captured.update(
+                input_ids=input_ids,
+                agent_refs=agent_refs,
+                input_lengths=kwargs["input_lengths"],
+                message_logs=kwargs["message_log_batched"],
+            )
+            return MOPDTeacherScoreResult(
+                logprobs=torch.tensor([[0.0, -0.5, -0.75]]),
+                valid_mask=torch.tensor([[False, True, False]]),
+                elapsed_seconds=0.25,
+                metrics={"mopd/valid_tokens": 1.0},
+            )
+
+        collector._compute_teacher_logprobs = score
+        final_batch = BatchedDataDict(
+            {
+                "agent_ref": [{"name": "math"}],
+                "message_log": [
+                    [
+                        {
+                            "role": "user",
+                            "content": "q",
+                            "token_ids": torch.tensor([11]),
+                        },
+                        {
+                            "role": "assistant",
+                            "content": "ok",
+                            "token_ids": torch.tensor([12, 13]),
+                            "generation_logprobs": torch.zeros(2),
+                        },
+                    ]
+                ],
+            }
+        )
+        current_result = NemoGymRolloutResult(
+            input_ids=torch.tensor([[11, 12, 13]]),
+            final_batch=final_batch,
+            rollout_metrics={"reward": 1.0},
+            task_index=7,
+        )
+        rollout_group = RolloutGroupResult(
+            group_index=0,
+            final_batch=current_result.final_batch,
+            rollout_metrics=current_result.rollout_metrics,
+            task_index=current_result.task_index,
+        )
+        buffered = set()
+
+        asyncio.run(
+            collector._enqueue_rollout_group(
+                rollout_group,
+                generation_weight_version=2,
+                target_weight_version=3,
+                expected_prompt_groups=1,
+                buffered_group_indices=buffered,
+                collection_started_at=time.perf_counter(),
+            )
+        )
+
+        assert captured["input_ids"].tolist() == [[11, 12, 13]]
+        assert captured["input_lengths"].tolist() == [3]
+        assert captured["agent_refs"] == [{"name": "math"}]
+        assert captured["message_logs"] is final_batch["message_log"]
+        assert buffered == {0}
+        assert len(replay_buffer.add.calls) == 1
+        trajectory = replay_buffer.add.calls[0][0]
+        torch.testing.assert_close(
+            trajectory["batch"]["teacher_reference_logprobs"],
+            torch.tensor([[0.0, -0.5, -0.75]]),
+        )
+        assert torch.equal(
+            trajectory["batch"]["teacher_reference_logprobs_mask"],
+            torch.tensor([[False, True, False]]),
+        )
+        assert trajectory["rollout_metrics"]["teacher_logprob_time"] == 0.25
+        assert trajectory["rollout_metrics"]["mopd/valid_tokens"] == 1.0
+
+    @pytest.mark.parametrize(
+        ("failure", "match"),
+        [
+            ("missing_agent_ref", "missing required agent_ref"),
+            ("scorer_error", "teacher unavailable"),
+            ("bad_shape", "score shape does not match"),
+            ("partial_result", "incomplete result"),
+        ],
+    )
+    def test_teacher_scoring_failure_latches_unhealthy_without_replay(
+        self, failure, match
+    ):
+        from nemo_rl.algorithms.x_token.mopd_teacher_scoring import (
+            MOPDTeacherScoreResult,
+        )
+        from nemo_rl.experience.rollouts import RolloutGroupResult
+
+        class _RecordingAdd:
+            calls = []
+
+            @classmethod
+            def remote(cls, *args):
+                cls.calls.append(args)
+                return self._AwaitableStatus()
+
+        class _ReplayBuffer:
+            add = _RecordingAdd()
+
+        collector = self.create_local_collector(replay_buffer=_ReplayBuffer())
+        collector.running = True
+        collector._has_distillation_teachers = True
+        collector.tokenizer.pad_token_id = 0
+        fields = {
+            "agent_ref": [{"name": "math"}],
+            "message_log": [
+                [
+                    {"role": "user", "content": "q", "token_ids": torch.tensor([1])},
+                    {
+                        "role": "assistant",
+                        "content": "a",
+                        "token_ids": torch.tensor([2]),
+                        "generation_logprobs": torch.zeros(1),
+                    },
+                ]
+            ],
+        }
+        if failure == "missing_agent_ref":
+            fields.pop("agent_ref")
+
+        def score(*args, **kwargs):
+            if failure == "scorer_error":
+                raise RuntimeError("teacher unavailable")
+            if failure == "partial_result":
+                return SimpleNamespace(logprobs=torch.zeros(1, 2))
+            return MOPDTeacherScoreResult(
+                logprobs=torch.zeros(1, 1),
+                valid_mask=torch.ones(1, 1, dtype=torch.bool),
+                elapsed_seconds=0.0,
+                metrics={},
+            )
+
+        collector._compute_teacher_logprobs = score
+        rollout_group = RolloutGroupResult(
+            group_index=0,
+            final_batch=BatchedDataDict(fields),
+            rollout_metrics={},
+            task_index=9,
+        )
+
+        with pytest.raises(
+            (AttributeError, RuntimeError, TypeError, ValueError), match=match
+        ):
+            asyncio.run(
+                collector._enqueue_rollout_group(
+                    rollout_group,
+                    generation_weight_version=2,
+                    target_weight_version=3,
+                    expected_prompt_groups=1,
+                    buffered_group_indices=set(),
+                    collection_started_at=time.perf_counter(),
+                )
+            )
+
+        assert _RecordingAdd.calls == []
+        assert collector.collection_failed is True
+        assert collector._fatal_error_message is not None
+        with pytest.raises(RuntimeError, match="teacher scoring failed"):
+            collector.check_health()
 
     def test_buffered_groups_clear_outstanding_before_worker_exit(self, monkeypatch):
         """The window where every group has buffered but the worker has not

@@ -43,6 +43,10 @@ from nemo_rl.algorithms.ppo import (
 from nemo_rl.algorithms.ppo import (
     MasterConfig as PPOMasterConfig,
 )
+from nemo_rl.algorithms.x_token.mopd_teacher_scoring import (
+    MOPDTeacherScoreResult,
+    build_mopd_teacher_scorer,
+)
 from nemo_rl.data.dataloader import CyclingDataLoader
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
@@ -207,6 +211,19 @@ class AsyncTrajectoryCollector:
         # in parallel since they use separate NCCL groups on separate nodes.
         self._teacher_locks: dict[str, _threading.Lock] = {
             k: _threading.Lock() for k in self.teacher_worker_groups
+        }
+        # Alignment tokenizers are deliberately built inside this collector
+        # actor with plain Transformers. They are distinct from the model
+        # workers' tokenizers and are cached once per physical teacher group.
+        self._cross_token_teacher_scorers = {
+            group_key: build_mopd_teacher_scorer(
+                student_tokenizer=self.tokenizer,
+                student_tokenizer_config=self.master_config.policy["tokenizer"],
+                teacher_group=teacher_group,
+                cross_tokenizer_config=teacher_group.cross_tokenizer,
+            )
+            for group_key, teacher_group in self.teacher_worker_groups.items()
+            if getattr(teacher_group, "cross_tokenizer", None) is not None
         }
         self.running = False
         self.data_exhausted = False
@@ -478,6 +495,19 @@ class AsyncTrajectoryCollector:
             if not self.collection_failed:
                 self.collection_failed = True
                 self.collection_error = f"{type(error).__name__}: {error}"
+
+    def _latch_teacher_scoring_failure(self, error: Exception) -> None:
+        """Make a teacher-scoring invariant failure immediately fatal."""
+        message = (
+            "AsyncTrajectoryCollector aborting before replay insertion because "
+            f"teacher scoring failed: {type(error).__name__}: {error}"
+        )
+        with self._failure_lock:
+            self.collection_failed = True
+            if self.collection_error is None:
+                self.collection_error = message
+            if self._fatal_error_message is None:
+                self._fatal_error_message = message
 
     def _collection_loop(self):
         """Run the collection loop in background thread.
@@ -1371,22 +1401,57 @@ class AsyncTrajectoryCollector:
         input_ids: torch.Tensor,
         agent_refs: list[dict[str, Any]],
         input_lengths: Optional[torch.Tensor] = None,
+        message_log_batched: Optional[list[list[dict[str, Any]]]] = None,
         multimodal_data: Optional[dict[str, Any]] = None,
-    ) -> tuple[torch.Tensor, float]:
+    ) -> MOPDTeacherScoreResult:
         """Compute teacher logprobs for non-colocated teachers.
 
-        Groups samples by teacher, fans out in parallel, stitches results.
+        Route rows, score each physical teacher once, and stitch scores/masks.
+        Same-token teachers retain the existing padded multimodal path. Cross-
+        token teachers use their collector-cached transcript scorer.
 
         Args:
             input_ids: [B, S] tokenized input tensor
             agent_refs: list of B agent reference dicts
-            input_lengths: [B] per-sample lengths (required for sequence packing)
+            input_lengths: [B] per-sample lengths. Missing lengths are
+                synthesized as the padded sequence width.
+            message_log_batched: original per-sample transcript logs, required
+                for cross-token scoring
             multimodal_data: batch-level multimodal inputs, row-aligned with
-                ``input_ids`` and sliced per teacher
+                ``input_ids`` and sliced per same-token teacher
 
         Returns:
-            ([B, S] teacher logprobs tensor, total_time_seconds)
+            Teacher scores, a boolean alignment-validity mask, elapsed time,
+            and scorer diagnostics on the student token grid.
         """
+        if input_ids.ndim != 2:
+            raise ValueError(f"Teacher input_ids must be [B, S], got {input_ids.shape}")
+        batch_size, sequence_length = input_ids.shape
+        if len(agent_refs) != batch_size:
+            raise ValueError(
+                "Teacher agent_ref count differs from input batch size: "
+                f"{len(agent_refs)} vs {batch_size}"
+            )
+        if input_lengths is None:
+            input_lengths = torch.full(
+                (batch_size,),
+                sequence_length,
+                dtype=torch.long,
+                device=input_ids.device,
+            )
+        elif input_lengths.ndim != 1 or input_lengths.shape[0] != batch_size:
+            raise ValueError(
+                "Teacher input_lengths must be [B] and match input_ids; got "
+                f"{input_lengths.shape} for B={batch_size}"
+            )
+        if bool(((input_lengths < 0) | (input_lengths > sequence_length)).any()):
+            raise ValueError("Teacher input_lengths entries must lie in [0, S]")
+        if message_log_batched is not None and len(message_log_batched) != batch_size:
+            raise ValueError(
+                "Teacher message_log count differs from input batch size: "
+                f"{len(message_log_batched)} vs {batch_size}"
+            )
+
         opd_cfg = self.on_policy_distillation_cfg
         teacher_model_by_agent_name = opd_cfg.get("teacher_model_by_agent_name", {})
         default_teacher_alias = opd_cfg.get("default_teacher_alias")
@@ -1409,19 +1474,73 @@ class AsyncTrajectoryCollector:
         # Group sample indices by teacher group
         group_to_indices: dict[str, list[int]] = defaultdict(list)
         for i, gk in enumerate(group_keys):
+            if gk not in self.teacher_worker_groups:
+                raise KeyError(f"No physical teacher worker group for alias {gk!r}")
             group_to_indices[gk].append(i)
 
-        B, S = input_ids.shape
-        result = torch.zeros(B, S, dtype=torch.float32)
-        if (
-            not group_to_indices
-        ):  # 0-sample batch: nothing to route (avoid max_workers=0)
-            return result, 0.0
+        result = torch.zeros(batch_size, sequence_length, dtype=torch.float32)
+        result_mask = torch.zeros(batch_size, sequence_length, dtype=torch.bool)
+        if not group_to_indices:
+            return MOPDTeacherScoreResult(
+                logprobs=result,
+                valid_mask=result_mask,
+                elapsed_seconds=0.0,
+                metrics={"mopd/teacher_groups": 0.0},
+            )
 
-        def _get_logprobs_for_group(group_key, indices):
+        def _select_multimodal_rows(row_indices: list[int]) -> dict[str, Any]:
+            if not multimodal_data:
+                return {}
+            selected = BatchedDataDict(multimodal_data).select_indices(row_indices)
+            return {
+                key: value
+                for key, value in selected.items()
+                if value is not None
+                and not (
+                    isinstance(value, PackedTensor)
+                    and not any(value.logical_segment_counts_by_row())
+                )
+            }
+
+        def _get_logprobs_for_group(
+            group_key: str,
+            indices: list[int],
+        ) -> tuple[list[int], MOPDTeacherScoreResult]:
             twg = self.teacher_worker_groups[group_key]
             sub_input_ids = input_ids[indices]
-            sub_lengths = input_lengths[indices] if input_lengths is not None else None
+            sub_lengths = input_lengths[indices]
+
+            scorer = self._cross_token_teacher_scorers.get(group_key)
+            if scorer is not None:
+                if message_log_batched is None:
+                    raise ValueError(
+                        f"Cross-token teacher {group_key!r} requires message_log"
+                    )
+                selected_multimodal = _select_multimodal_rows(indices)
+                if selected_multimodal:
+                    raise ValueError(
+                        "Cross-tokenizer MOPD v1 supports text-only rollouts; "
+                        f"teacher {group_key!r} received multimodal fields "
+                        f"{sorted(selected_multimodal)}"
+                    )
+                sub_message_logs = [message_log_batched[index] for index in indices]
+                lock_started_at = time.perf_counter()
+                with self._teacher_locks[group_key]:
+                    lock_wait = time.perf_counter() - lock_started_at
+                    score_result = scorer.score(
+                        input_ids=sub_input_ids,
+                        input_lengths=sub_lengths,
+                        message_logs=sub_message_logs,
+                    )
+                metrics = dict(score_result.metrics)
+                metrics["mopd/teacher_lock_wait_seconds"] = lock_wait
+                return indices, MOPDTeacherScoreResult(
+                    logprobs=score_result.logprobs,
+                    valid_mask=score_result.valid_mask,
+                    elapsed_seconds=score_result.elapsed_seconds + lock_wait,
+                    metrics=metrics,
+                )
+
             row_indices = list(indices)
 
             # Pad batch to multiple of dp_size (required for DP sharding)
@@ -1434,37 +1553,22 @@ class AsyncTrajectoryCollector:
                 # actual_batch_size < pad_count (e.g., 1 sample, dp_size=4)
                 pad_rows = sub_input_ids[-1:].expand(pad_count, -1)
                 sub_input_ids = torch.cat([sub_input_ids, pad_rows], dim=0)
-                if sub_lengths is not None:
-                    sub_lengths = torch.cat(
-                        [sub_lengths, sub_lengths[-1:].expand(pad_count)], dim=0
-                    )
+                sub_lengths = torch.cat(
+                    [sub_lengths, sub_lengths[-1:].expand(pad_count)], dim=0
+                )
                 row_indices.extend([row_indices[-1]] * pad_count)
 
-            sub_data = BatchedDataDict({"input_ids": sub_input_ids})
-            if sub_lengths is not None:
-                sub_data["input_lengths"] = sub_lengths
-            if multimodal_data:
-                selected_multimodal = BatchedDataDict(multimodal_data).select_indices(
-                    row_indices
-                )
-                sub_data.update(
-                    {
-                        key: value
-                        for key, value in selected_multimodal.items()
-                        if value is not None
-                        and not (
-                            isinstance(value, PackedTensor)
-                            and not any(value.logical_segment_counts_by_row())
-                        )
-                    }
-                )
+            sub_data = BatchedDataDict(
+                {"input_ids": sub_input_ids, "input_lengths": sub_lengths}
+            )
+            sub_data.update(_select_multimodal_rows(row_indices))
 
             # Serialize calls per teacher to prevent NCCL collective desync
-            t_lock_start = time.time()
+            t_lock_start = time.perf_counter()
             with self._teacher_locks[group_key]:
-                t_inference_start = time.time()
+                t_inference_start = time.perf_counter()
                 logprobs_result = twg.get_logprobs(sub_data)
-            t_done = time.time()
+            t_done = time.perf_counter()
             lock_wait = t_inference_start - t_lock_start
             inference_time = t_done - t_inference_start
             print(
@@ -1472,14 +1576,34 @@ class AsyncTrajectoryCollector:
                 f"lock_wait={lock_wait:.2f}s inference={inference_time:.2f}s"
             )
             logprobs = logprobs_result["reference_logprobs"]
+            if not isinstance(logprobs, torch.Tensor):
+                raise TypeError("Teacher reference_logprobs must be a tensor")
 
             # Trim DP padding
-            logprobs = logprobs[:actual_batch_size]
+            logprobs = (
+                logprobs[:actual_batch_size]
+                .detach()
+                .to(device="cpu", dtype=torch.float32)
+            )
 
-            return indices, logprobs
+            return indices, MOPDTeacherScoreResult(
+                logprobs=logprobs,
+                valid_mask=torch.ones_like(logprobs, dtype=torch.bool),
+                elapsed_seconds=lock_wait + inference_time,
+                metrics={
+                    "mopd/samples": float(actual_batch_size),
+                    "mopd/teacher_calls": 1.0,
+                    "mopd/dp_padding_rows": float(
+                        sub_input_ids.shape[0] - actual_batch_size
+                    ),
+                    "mopd/teacher_lock_wait_seconds": lock_wait,
+                    "mopd/teacher_inference_seconds": inference_time,
+                },
+            )
 
         # Fan out to teachers in parallel
-        t_total_start = time.time()
+        t_total_start = time.perf_counter()
+        group_results: list[tuple[str, list[int], MOPDTeacherScoreResult]] = []
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=len(group_to_indices)
         ) as executor:
@@ -1488,14 +1612,47 @@ class AsyncTrajectoryCollector:
                 for gk, idxs in group_to_indices.items()
             }
             for future in concurrent.futures.as_completed(futures):
-                indices, logprobs = future.result()
-                result[indices] = logprobs
-        total_time = time.time() - t_total_start
+                group_key = futures[future]
+                indices, score_result = future.result()
+                expected_shape = (len(indices), sequence_length)
+                if tuple(score_result.logprobs.shape) != expected_shape:
+                    raise ValueError(
+                        f"Teacher {group_key!r} returned score shape "
+                        f"{tuple(score_result.logprobs.shape)}; expected "
+                        f"{expected_shape}"
+                    )
+                if tuple(score_result.valid_mask.shape) != expected_shape:
+                    raise ValueError(
+                        f"Teacher {group_key!r} returned mask shape "
+                        f"{tuple(score_result.valid_mask.shape)}; expected "
+                        f"{expected_shape}"
+                    )
+                result[indices] = score_result.logprobs
+                result_mask[indices] = score_result.valid_mask
+                group_results.append((group_key, indices, score_result))
+        total_time = time.perf_counter() - t_total_start
         print(
-            f"[teacher_logprob] total={total_time:.2f}s for {B} samples across {len(group_to_indices)} teacher(s)"
+            f"[teacher_logprob] total={total_time:.2f}s for {batch_size} "
+            f"samples across {len(group_to_indices)} teacher(s)"
         )
 
-        return result, total_time
+        metrics: dict[str, float] = {
+            "mopd/teacher_groups": float(len(group_to_indices))
+        }
+        for group_key, _, score_result in group_results:
+            for metric_name, metric_value in score_result.metrics.items():
+                value = float(metric_value)
+                metrics[metric_name] = metrics.get(metric_name, 0.0) + value
+                if metric_name.startswith("mopd/"):
+                    suffix = metric_name.removeprefix("mopd/")
+                    metrics[f"mopd/{group_key}/{suffix}"] = value
+
+        return MOPDTeacherScoreResult(
+            logprobs=result,
+            valid_mask=result_mask,
+            elapsed_seconds=total_time,
+            metrics=metrics,
+        )
 
     async def _iter_rollout_groups(
         self,
@@ -1699,34 +1856,88 @@ class AsyncTrajectoryCollector:
 
         # Teacher inference is blocking. Keep it off this worker's event loop so
         # other completed prompt groups can continue moving toward the buffer.
-        if self._has_distillation_teachers and "agent_ref" in final_batch_cpu:
-            agent_refs = final_batch_cpu["agent_ref"]
-            if isinstance(agent_refs, list):
+        # A teacher-configured row may enter replay only with a complete,
+        # shape-consistent score+mask pair.
+        if self._has_distillation_teachers:
+            try:
+                if "agent_ref" not in final_batch_cpu:
+                    raise ValueError(
+                        "Teacher-configured rollout is missing required agent_ref"
+                    )
+                if "message_log" not in final_batch_cpu:
+                    raise ValueError(
+                        "Teacher-configured rollout is missing required message_log"
+                    )
+                agent_refs = final_batch_cpu["agent_ref"]
+                if not isinstance(agent_refs, list):
+                    raise TypeError(
+                        "Teacher-configured rollout agent_ref must be a list"
+                    )
+                message_logs = final_batch_cpu["message_log"]
+                if not isinstance(message_logs, list):
+                    raise TypeError(
+                        "Teacher-configured rollout message_log must be a list"
+                    )
                 from nemo_rl.data.llm_message_utils import (
                     batched_message_log_to_flat_message,
                 )
 
                 flat_for_teacher, teacher_input_lengths = (
                     batched_message_log_to_flat_message(
-                        final_batch_cpu["message_log"],
+                        message_logs,
                         pad_value_dict={"token_ids": self.tokenizer.pad_token_id},
                         make_sequence_length_divisible_by=self._teacher_seq_pad_multiple,
                     )
                 )
-                teacher_logprobs, teacher_logprob_time = await asyncio.to_thread(
+                score_result = await asyncio.to_thread(
                     self._compute_teacher_logprobs,
                     flat_for_teacher["token_ids"],
                     agent_refs,
                     input_lengths=teacher_input_lengths,
+                    message_log_batched=message_logs,
                     multimodal_data=flat_for_teacher.get_multimodal_dict(
                         as_tensors=False
                     ),
                 )
+                if not isinstance(score_result, MOPDTeacherScoreResult):
+                    raise TypeError(
+                        "Teacher scorer returned an incomplete result; expected "
+                        "MOPDTeacherScoreResult with score and mask fields"
+                    )
+                expected_shape = tuple(flat_for_teacher["token_ids"].shape)
+                if tuple(score_result.logprobs.shape) != expected_shape:
+                    raise ValueError(
+                        "Teacher score shape does not match the flattened rollout: "
+                        f"{tuple(score_result.logprobs.shape)} vs {expected_shape}"
+                    )
+                if tuple(score_result.valid_mask.shape) != expected_shape:
+                    raise ValueError(
+                        "Teacher mask shape does not match the flattened rollout: "
+                        f"{tuple(score_result.valid_mask.shape)} vs {expected_shape}"
+                    )
+                if score_result.valid_mask.dtype is not torch.bool:
+                    raise TypeError("Teacher validity mask must have dtype torch.bool")
                 # Keep the tensor inside the batch so replay-buffer collation can
                 # pad variable-length prompt groups correctly.
-                final_batch_cpu["teacher_reference_logprobs"] = teacher_logprobs
+                final_batch_cpu["teacher_reference_logprobs"] = score_result.logprobs
+                final_batch_cpu["teacher_reference_logprobs_mask"] = (
+                    score_result.valid_mask
+                )
+                required_fields = {
+                    "teacher_reference_logprobs",
+                    "teacher_reference_logprobs_mask",
+                }
+                if not required_fields.issubset(final_batch_cpu):
+                    missing = sorted(required_fields.difference(final_batch_cpu))
+                    raise RuntimeError(
+                        f"Teacher scoring produced incomplete replay fields: {missing}"
+                    )
                 rollout_metrics = dict(rollout_metrics)
-                rollout_metrics["teacher_logprob_time"] = teacher_logprob_time
+                rollout_metrics["teacher_logprob_time"] = score_result.elapsed_seconds
+                rollout_metrics.update(score_result.metrics)
+            except Exception as error:
+                self._latch_teacher_scoring_failure(error)
+                raise
 
         rollout_metrics = dict(rollout_metrics)
         rollout_metrics["trajectory_duration_s"] = (

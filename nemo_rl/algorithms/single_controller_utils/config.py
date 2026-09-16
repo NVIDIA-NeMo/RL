@@ -1484,6 +1484,12 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     if opd_enabled:
         opd_config = master_config.on_policy_distillation
         assert opd_config is not None
+        if opd_module.is_cross_tokenizer_mopd_enabled(master_config):
+            raise NotImplementedError(
+                "cross-tokenizer MOPD is not supported by SingleController. "
+                "Use the legacy async NeMo-Gym GRPO entrypoint "
+                "examples/nemo_gym/run_grpo_nemo_gym.py."
+            )
         if algo_cfg.adv_estimator.name != "opd":
             raise ValueError(
                 "on_policy_distillation.enabled=true requires "
