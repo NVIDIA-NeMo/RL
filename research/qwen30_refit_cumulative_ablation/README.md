@@ -3,16 +3,23 @@
 This experiment measures three ordered refit configurations on the same source,
 container, model recipe, seed, and hardware:
 
-| Arm | Transport | MXFP8 MoE conversion |
-|---|---|---|
-| `legacy` | Legacy collective | Per expert, reusable scratch disabled |
-| `nccl_only` | NCCL Reshard | Per expert, reusable scratch disabled |
-| `nccl_full` | NCCL Reshard | Batched conversion with reusable scratch |
+| Arm | Transport | Batched expert shuffle | Loader-route cache |
+|---|---|---|---|
+| `legacy` | Legacy collective | Disabled | Disabled |
+| `nccl_only` | NCCL Reshard | Disabled | Disabled |
+| `nccl_full` | NCCL Reshard | Enabled with reusable scratch | Enabled |
 
 All arms use
 `examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g-async-1off-mxfp8-rollout.yaml`
 for 20 steps. The inherited global batch size, policy and generation node split,
 parallelism, logprob work, and seed are unchanged.
+
+Trainer-side prequantization is explicitly disabled in all arms because NCCL
+Reshard does not support that path. Persistent IPC source buffers are also
+disabled because this is a non-colocated NCCL experiment. This source does not
+reuse NCCL receive buffers across refits, so the full arm measures every
+additional optimization currently applicable to this Async path: batched
+expert shuffle, reusable shuffle scratch, and loader-route caching.
 
 The Sep 16 nightly contains prebuilt main and actor virtual environments whose
 Python symlinks refer to uv-managed interpreters omitted from the squashfs.
