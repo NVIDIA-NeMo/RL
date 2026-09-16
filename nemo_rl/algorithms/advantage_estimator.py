@@ -621,6 +621,7 @@ class OPDAdvantageEstimator:
         rewards,
         mask,
         teacher_logprobs=None,
+        teacher_logprobs_mask=None,
         prev_logprobs=None,
         **kwargs,
     ):
@@ -631,6 +632,7 @@ class OPDAdvantageEstimator:
             rewards: [B] rewards (unused for pure distillation)
             mask: [B, S] token mask
             teacher_logprobs: [B, S] teacher model logprobs (required)
+            teacher_logprobs_mask: optional [B, S] boolean alignment-validity mask
             prev_logprobs: [B, S] student training-engine logprobs (required)
 
         Returns:
@@ -640,22 +642,51 @@ class OPDAdvantageEstimator:
             raise ValueError("OPD requires teacher_logprobs")
         if prev_logprobs is None:
             raise ValueError("OPD requires prev_logprobs")
+        if teacher_logprobs.shape != prev_logprobs.shape:
+            raise ValueError(
+                "OPD teacher/student logprob shape mismatch: "
+                f"{tuple(teacher_logprobs.shape)} vs {tuple(prev_logprobs.shape)}"
+            )
+        if mask.shape != prev_logprobs.shape:
+            raise ValueError(
+                "OPD training mask shape mismatch: "
+                f"{tuple(mask.shape)} vs {tuple(prev_logprobs.shape)}"
+            )
+
+        effective_mask = mask.to(device=prev_logprobs.device).bool()
+        if teacher_logprobs_mask is not None:
+            if teacher_logprobs_mask.shape != prev_logprobs.shape:
+                raise ValueError(
+                    "OPD teacher validity-mask shape mismatch: "
+                    f"{tuple(teacher_logprobs_mask.shape)} vs "
+                    f"{tuple(prev_logprobs.shape)}"
+                )
+            effective_mask &= teacher_logprobs_mask.to(
+                device=prev_logprobs.device
+            ).bool()
 
         # Â_MOPD,t = sg[log π_teacher - log π_student]  (Equation 8)
-        distill_advantages = (teacher_logprobs - prev_logprobs).detach()
+        teacher_student_gap = (teacher_logprobs - prev_logprobs).detach()
+        distill_advantages = teacher_student_gap
 
-        # Apply mask
-        advantages = distill_advantages * mask
+        # Avoid ``0 * inf`` and ``0 * nan`` contamination on invalid aligned
+        # positions. Keep the caller's training mask unchanged: this mask is
+        # local to OPD advantages and must not change the loss denominator.
+        advantages = torch.where(
+            effective_mask,
+            distill_advantages,
+            torch.zeros_like(distill_advantages),
+        )
 
         # Metrics
-        self._compute_metrics(distill_advantages, advantages, mask)
+        self._compute_metrics(teacher_student_gap, advantages, effective_mask)
 
         return advantages
 
-    def _compute_metrics(self, distill_advantages, advantages, mask):
+    def _compute_metrics(self, teacher_student_gap, advantages, mask):
         """Compute OPD logging metrics and store in self.last_metrics."""
         valid_bool = mask.bool()
-        distill_valid = torch.masked_select(distill_advantages, valid_bool)
+        distill_valid = torch.masked_select(teacher_student_gap, valid_bool)
         adv_valid = torch.masked_select(advantages, valid_bool)
 
         distill_mean = distill_valid.mean().item() if distill_valid.numel() > 0 else 0.0

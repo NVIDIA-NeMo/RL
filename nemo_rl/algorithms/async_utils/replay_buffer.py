@@ -726,6 +726,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         num_prompts_per_step: int | None = None,
         current_training_step: int | None = None,
         max_age_steps: int | None = None,
+        teacher_mask_mode: str | None = None,
     ) -> dict[str, Any]:
         """Restore inside the actor and return only compact coordination metadata.
 
@@ -753,6 +754,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             num_prompts_per_step=num_prompts_per_step,
             current_training_step=current_training_step,
             max_age_steps=max_age_steps,
+            teacher_mask_mode=teacher_mask_mode,
         )
         del state
         gc.collect()
@@ -775,6 +777,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         num_prompts_per_step: int | None = None,
         current_training_step: int | None = None,
         max_age_steps: int | None = None,
+        teacher_mask_mode: str | None = None,
     ) -> None:
         """Restore replay buffer state from a checkpoint.
 
@@ -788,6 +791,9 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 incomplete current/future target steps are kept for gap filling.
             max_age_steps: Maximum allowed age for restored trajectories. When
                 provided, stale trajectories are removed during restore.
+            teacher_mask_mode: ``"same_token"`` backfills an all-valid mask in
+                legacy MOPD entries; ``"cross_token"`` rejects such entries
+                because alignment validity cannot be reconstructed.
 
         Raises:
             ValueError: If the checkpoint is missing required fields or has
@@ -805,6 +811,68 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 raise ValueError(f"Checkpoint missing required keys: {missing_keys}")
 
             trajectories = list(state["trajectories"])
+            if teacher_mask_mode not in {None, "same_token", "cross_token"}:
+                raise ValueError(
+                    "teacher_mask_mode must be None, 'same_token', or "
+                    f"'cross_token', got {teacher_mask_mode!r}"
+                )
+            if teacher_mask_mode is not None:
+                for trajectory_index, trajectory in enumerate(trajectories):
+                    batch = (
+                        trajectory.get("batch")
+                        if isinstance(trajectory, dict)
+                        else None
+                    )
+                    if batch is None:
+                        raise ValueError(
+                            "MOPD replay trajectory is missing its batch at index "
+                            f"{trajectory_index}"
+                        )
+                    has_score = "teacher_reference_logprobs" in batch
+                    has_mask = "teacher_reference_logprobs_mask" in batch
+                    if not has_score:
+                        raise ValueError(
+                            "MOPD replay entry is missing teacher_reference_logprobs "
+                            f"at index {trajectory_index}; start fresh or disable replay loading."
+                        )
+                    score = batch["teacher_reference_logprobs"]
+                    if (
+                        not isinstance(score, torch.Tensor)
+                        or score.ndim != 2
+                        or not score.is_floating_point()
+                    ):
+                        raise ValueError(
+                            "MOPD replay teacher_reference_logprobs must be a "
+                            f"floating [B, S] tensor at index {trajectory_index}"
+                        )
+                    if not has_mask:
+                        if teacher_mask_mode == "cross_token":
+                            raise ValueError(
+                                "Cross-token MOPD replay entry is missing "
+                                "teacher_reference_logprobs_mask; alignment validity "
+                                "cannot be reconstructed. Start fresh or disable replay loading."
+                            )
+                        batch["teacher_reference_logprobs_mask"] = torch.ones_like(
+                            score, dtype=torch.bool
+                        )
+                    else:
+                        teacher_mask = batch["teacher_reference_logprobs_mask"]
+                        if not isinstance(teacher_mask, torch.Tensor):
+                            raise ValueError(
+                                "MOPD replay teacher_reference_logprobs_mask must "
+                                f"be a tensor at index {trajectory_index}"
+                            )
+                        if teacher_mask.shape != score.shape:
+                            raise ValueError(
+                                "MOPD replay score/mask shape mismatch at index "
+                                f"{trajectory_index}: {tuple(score.shape)} vs "
+                                f"{tuple(teacher_mask.shape)}"
+                            )
+                        if teacher_mask.dtype is not torch.bool:
+                            raise ValueError(
+                                "MOPD replay teacher_reference_logprobs_mask must "
+                                f"be bool at index {trajectory_index}"
+                            )
             trajectory_versions = list(state["trajectory_versions"])
             target_weight_versions = list(state["target_weight_versions"])
             if not (

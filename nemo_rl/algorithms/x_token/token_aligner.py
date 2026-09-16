@@ -167,7 +167,7 @@ class TokenAligner:
         student_tokenizer: HF tokenizer for the student model. Must be a fast
             tokenizer so the collator can emit ``offset_mapping``.
         teacher_tokenizer: HF tokenizer for the teacher model.
-        projection_matrix_path: Path retained on the aligner for downstream
+        projection_matrix_path: Optional path retained on the aligner for downstream
             callers (e.g. the loss fn) that materialize the projection on
             their training device via
             :func:`nemo_rl.algorithms.x_token.loss_utils.get_sparse_projection_matrix`
@@ -178,7 +178,7 @@ class TokenAligner:
         self,
         student_tokenizer,
         teacher_tokenizer,
-        projection_matrix_path: str,
+        projection_matrix_path: str | None = None,
     ):
         self.student_tokenizer = student_tokenizer
         self.teacher_tokenizer = teacher_tokenizer
@@ -440,6 +440,46 @@ class TokenAligner:
                 (p[0], p[1], p[2], p[3], p[4], p[5], m) for p, m in zip(pairs_6, mask)
             ]
         return pairs
+
+    def align_one_offset_pairs(
+        self,
+        student_ids: List[int],
+        teacher_ids: List[int],
+        student_offsets: List[Tuple[int, int]],
+        teacher_offsets: List[Tuple[int, int]],
+    ) -> List[AlignmentPair]:
+        """Align one offset-annotated sample and return typed span records.
+
+        This alignment-only API is used by online cross-tokenizer MOPD.  It
+        deliberately performs no projection-matrix I/O and no chat-boundary or
+        end-of-turn inference; callers must supply only the exact sampled spans
+        they intend to supervise.
+        """
+        return [
+            AlignmentPair(
+                s_tokens=s_tokens,
+                t_tokens=t_tokens,
+                s_start=s_start,
+                s_end=s_end,
+                t_start=t_start,
+                t_end=t_end,
+                is_correct=is_correct,
+            )
+            for (
+                s_tokens,
+                t_tokens,
+                s_start,
+                s_end,
+                t_start,
+                t_end,
+                is_correct,
+            ) in self._align_one_offset(
+                student_ids,
+                teacher_ids,
+                student_offsets,
+                teacher_offsets,
+            )
+        ]
 
     def align_one_offset_per_asst(
         self,

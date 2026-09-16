@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
 
 from nemo_rl.algorithms.advantage_estimator import OPDAdvantageEstimator
 
 
-def _make_estimator():
-    return OPDAdvantageEstimator({"name": "opd"}, {})
+def _make_estimator(**config):
+    return OPDAdvantageEstimator({"name": "opd", **config}, {})
 
 
 def test_opd_basic_positive_distill_advantage():
@@ -107,3 +108,35 @@ def test_opd_metrics_returned():
     )
     assert abs(estimator.last_metrics["on_policy_distillation/adv_mean"] - 1.0) < 1e-5
     assert abs(estimator.last_metrics["on_policy_distillation/adv_std"]) < 1e-5
+
+
+@pytest.mark.parametrize("all_invalid", [False, True])
+def test_opd_teacher_mask_is_nonfinite_safe_and_drives_metrics(all_invalid):
+    """Only the token/sample/teacher-mask intersection contributes."""
+    estimator = _make_estimator()
+    teacher_lp = torch.tensor([[1.0, float("nan"), float("inf"), -3.0]])
+    student_lp = torch.zeros_like(teacher_lp)
+    # This represents the token-mask/sample-mask intersection supplied by GRPO.
+    mask = torch.tensor([[1.0, 1.0, 0.0, 1.0]])
+    teacher_mask = torch.zeros_like(mask)
+    if not all_invalid:
+        teacher_mask[0, 0] = 1.0
+
+    advantages = estimator.compute_advantage(
+        torch.arange(1),
+        torch.zeros(1),
+        mask,
+        teacher_logprobs=teacher_lp,
+        teacher_logprobs_mask=teacher_mask,
+        prev_logprobs=student_lp,
+    )
+
+    expected = torch.tensor([[0.0 if all_invalid else 1.0, 0.0, 0.0, 0.0]])
+    torch.testing.assert_close(advantages, expected)
+    assert torch.isfinite(advantages).all()
+    assert estimator.last_metrics[
+        "on_policy_distillation/teacher_student_logprob_gap_mean"
+    ] == pytest.approx(0.0 if all_invalid else 1.0)
+    assert estimator.last_metrics["on_policy_distillation/adv_mean"] == pytest.approx(
+        0.0 if all_invalid else 1.0
+    )

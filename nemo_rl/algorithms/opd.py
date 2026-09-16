@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from collections.abc import Mapping
 from typing import Any, Literal, Optional
 
 import ray
@@ -48,6 +49,33 @@ from nemo_rl.experience.interfaces import PromptGroupRecord
 # ---------------------------------------------------------------------------
 
 
+class CrossTokenizerSpec(BaseModel, extra="forbid"):
+    """Tokenizer used only to render and align cross-token MOPD transcripts."""
+
+    name: str
+    chat_template: str | None = "default"
+    chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
+    tokenizer_kwargs: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def resolve_tokenizer_kwargs(self) -> "CrossTokenizerSpec":
+        """Materialize loader defaults before resource deduplication."""
+        resolved = dict(self.tokenizer_kwargs)
+        resolved.setdefault("trust_remote_code", True)
+        self.tokenizer_kwargs = resolved
+        return self
+
+
+class CrossTokenizerMOPDConfig(BaseModel, extra="forbid"):
+    """Strict cross-tokenizer scoring configuration for one MOPD teacher."""
+
+    tokenizer: CrossTokenizerSpec
+    alignment_method: Literal["offset_cluster_decode_fix"] = "offset_cluster_decode_fix"
+    mask_first_teacher_prefix_chunk: bool = False
+    exclude_proven_template_only_teacher_tokens: bool = False
+    missing_think_close_policy: Literal["mask", "preserve_open_if_proven"] = "mask"
+
+
 class TeacherResourceConfig(BaseModel, extra="allow"):
     """Per-teacher resourcing for a non-colocated teacher worker group.
 
@@ -63,7 +91,30 @@ class TeacherResourceConfig(BaseModel, extra="allow"):
     gpus_per_node: int = 8
     precision: str = "bf16"
     micro_batch_size: int = 4
+    # Resolve this independently for each teacher instead of inheriting the
+    # student's fused sampled-logprob implementation through the copied policy.
+    use_fused_linear_logprobs: bool = False
     megatron_cfg_overrides: dict[str, Any] = Field(default_factory=dict)
+    cross_tokenizer: CrossTokenizerMOPDConfig | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_cross_tokenizer_keys(cls, value: Any) -> Any:
+        """Reject old flat keys before ``extra='allow'`` treats them as MCore knobs."""
+        if not isinstance(value, dict):
+            return value
+        legacy = sorted(
+            {"tokenizer_name", "alignment_method", "chunk_size"}.intersection(value)
+        )
+        if legacy:
+            joined = ", ".join(legacy)
+            raise ValueError(
+                "Legacy flat cross-token MOPD key(s) "
+                f"{joined} are not supported. Move tokenizer/alignment/masking "
+                "settings under teacher resource `cross_tokenizer`; `chunk_size` "
+                "has no replacement because only offset_cluster_decode_fix is supported."
+            )
+        return value
 
 
 class NonColocatedTeachersConfig(BaseModel, extra="allow"):
@@ -73,7 +124,11 @@ class NonColocatedTeachersConfig(BaseModel, extra="allow"):
     default_teacher_cfg: TeacherResourceConfig = Field(
         default_factory=TeacherResourceConfig
     )
-    teacher_overrides: dict[str, TeacherResourceConfig] = Field(default_factory=dict)
+    # Overrides are sparse patches. They are recursively merged into the
+    # validated default resource and the fully resolved result is then
+    # validated as ``TeacherResourceConfig``. Keeping the raw mapping here
+    # preserves explicit nulls and permits nested one-field patches.
+    teacher_overrides: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class OnPolicyDistillationFullConfig(BaseModel, extra="allow"):
@@ -152,7 +207,23 @@ def _opd_cfg(master_config: Any) -> dict[str, Any]:
     if cfg is None:
         return {}
     if isinstance(cfg, BaseModel):
-        return cfg.model_dump(exclude_none=True)
+        dumped = cfg.model_dump(exclude_none=True)
+        # Per-alias resource overrides are patches, not complete resources.
+        # Preserve only fields the user explicitly set so defaults from a
+        # sparse override cannot erase values in default_teacher_cfg.
+        non_colocated = getattr(cfg, "non_colocated_teachers", None)
+        if non_colocated is not None:
+            # The default resource is a complete resolved config. Preserve its
+            # nested explicit nulls, notably ``chat_template: null`` which
+            # selects passthrough rendering rather than the model default.
+            dumped["non_colocated_teachers"]["default_teacher_cfg"] = (
+                non_colocated.default_teacher_cfg.model_dump()
+            )
+            dumped["non_colocated_teachers"]["teacher_overrides"] = {
+                alias: dict(override)
+                for alias, override in non_colocated.teacher_overrides.items()
+            }
+        return dumped
     return cfg
 
 
@@ -168,6 +239,78 @@ def is_non_colocated_teachers_enabled(master_config: Any) -> bool:
     return bool(
         _opd_cfg(master_config).get("non_colocated_teachers", {}).get("enabled", False)
     )
+
+
+def is_cross_tokenizer_mopd_enabled(master_config: Any) -> bool:
+    """Whether any fully resolved non-colocated teacher is cross-tokenized."""
+    if not is_non_colocated_teachers_enabled(master_config):
+        return False
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    return any(
+        teacher.cross_tokenizer is not None
+        for teacher in create_teacher_configs_from_opd_config(_opd_cfg(master_config))
+    )
+
+
+def validate_cross_tokenizer_mopd(master_config: Any) -> None:
+    """Validate the supported v1 runtime before reserving teacher resources."""
+    if not is_cross_tokenizer_mopd_enabled(master_config):
+        return
+
+    if not is_opd_enabled(master_config):
+        raise ValueError(
+            "cross-tokenizer MOPD requires on_policy_distillation.enabled=true"
+        )
+    if not is_non_colocated_teachers_enabled(master_config):
+        raise ValueError(
+            "cross-tokenizer MOPD requires non_colocated_teachers.enabled=true"
+        )
+    grpo_cfg = getattr(master_config, "grpo", None)
+    async_cfg = getattr(grpo_cfg, "async_grpo", None)
+    if async_cfg is None or not bool(getattr(async_cfg, "enabled", False)):
+        raise ValueError(
+            "cross-tokenizer MOPD requires legacy async GRPO "
+            "(grpo.async_grpo.enabled=true)"
+        )
+    adv_cfg = getattr(grpo_cfg, "adv_estimator", None)
+    if getattr(adv_cfg, "name", None) != "opd":
+        raise ValueError("cross-tokenizer MOPD requires grpo.adv_estimator.name='opd'")
+    env_cfg = getattr(master_config, "env", {})
+    if not bool(env_cfg.get("should_use_nemo_gym", False)):
+        raise ValueError("cross-tokenizer MOPD requires env.should_use_nemo_gym=true")
+    if get_opd_full_config(master_config) is not None:
+        raise ValueError(
+            "cross-tokenizer MOPD does not support full-vocabulary MOPD; "
+            "disable on_policy_distillation.full"
+        )
+
+
+def preflight_cross_tokenizer_mopd(master_config: Any) -> None:
+    """Validate resolved tokenizer capabilities before reserving GPU workers."""
+    if not is_cross_tokenizer_mopd_enabled(master_config):
+        return
+
+    from nemo_rl.algorithms.x_token.mopd_teacher_scoring import (
+        validate_mopd_student_alignment_preflight,
+        validate_cross_tokenizer_preflight,
+    )
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    policy_config = getattr(master_config, "policy", None)
+    if not isinstance(policy_config, Mapping):
+        raise TypeError("cross-tokenizer MOPD requires a mapping policy config")
+    validate_mopd_student_alignment_preflight(policy_config["tokenizer"])
+
+    for teacher_config in create_teacher_configs_from_opd_config(
+        _opd_cfg(master_config)
+    ):
+        if teacher_config.cross_tokenizer is not None:
+            validate_cross_tokenizer_preflight(teacher_config.cross_tokenizer)
 
 
 def get_opd_full_config(master_config: Any) -> Optional[OnPolicyDistillationFullConfig]:
@@ -775,10 +918,15 @@ def create_teacher_worker_groups(
 
     # Build alias -> group_alias mapping for deduplication
     alias_to_group_alias: dict[str, str] = {}
-    model_to_primary: dict[str, str] = {}
-    for teacher_config in teacher_configs:
-        model_to_primary[teacher_config.model_name] = teacher_config.alias
-    for alias, model_name in teacher_model_by_agent_name.items():
-        alias_to_group_alias[alias] = model_to_primary.get(model_name, alias)
+    deduplicate = bool(opd_cfg.get("deduplicate_shared_teacher_checkpoints", True))
+    if deduplicate:
+        model_to_primary = {
+            teacher_config.model_name: teacher_config.alias
+            for teacher_config in teacher_configs
+        }
+        for alias, model_name in teacher_model_by_agent_name.items():
+            alias_to_group_alias[alias] = model_to_primary[model_name]
+    else:
+        alias_to_group_alias = {alias: alias for alias in teacher_model_by_agent_name}
 
     return teacher_worker_groups, alias_to_group_alias

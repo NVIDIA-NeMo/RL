@@ -70,6 +70,7 @@ class ReplayBufferProtocol(Protocol):  # pragma: no cover
         num_prompts_per_step: int | None = None,
         current_training_step: int | None = None,
         max_age_steps: int | None = None,
+        teacher_mask_mode: str | None = None,
     ) -> None:
         """Restore state produced by ``state_dict``."""
         ...
@@ -84,7 +85,8 @@ class ReplayBufferProtocol(Protocol):  # pragma: no cover
         num_prompts_per_step: int | None = None,
         current_training_step: int | None = None,
         max_age_steps: int | None = None,
-    ) -> dict[str, int]:
+        teacher_mask_mode: str | None = None,
+    ) -> dict[str, Any]:
         """Restore state directly in the replay actor."""
         ...
 

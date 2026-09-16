@@ -43,6 +43,7 @@ class _MockTeacherWorkerGroup:
         self.sequence_length_pad_multiple = 1
 
     def get_logprobs(self, data):
+        self.received = data
         input_ids = data["input_ids"]
         B, S = input_ids.shape
         # Verify the caller already padded to dp_size
@@ -68,6 +69,7 @@ def _make_collector(**overrides):
         "alias_to_group_alias": {},
         "on_policy_distillation_cfg": {},
         "_has_distillation_teachers": False,
+        "_cross_token_teacher_scorers": {},
     }
     defaults.update(overrides)
     obj = object.__new__(real_cls)
@@ -109,10 +111,13 @@ def test_compute_teacher_logprobs_dp_padding(batch_size, dp_size):
     input_ids = torch.randint(0, 100, (batch_size, S))
     agent_refs = [{"name": "math_agent"}] * batch_size
 
-    result, _ = collector._compute_teacher_logprobs(input_ids, agent_refs)
+    score_result = collector._compute_teacher_logprobs(input_ids, agent_refs)
 
-    assert result.shape == (batch_size, S)
-    assert torch.allclose(result, torch.tensor(2.0))
+    assert score_result.logprobs.shape == (batch_size, S)
+    assert torch.allclose(score_result.logprobs, torch.tensor(2.0))
+    assert score_result.valid_mask.dtype is torch.bool
+    assert score_result.valid_mask.all()
+    assert twg.received["input_lengths"].tolist() == [S] * twg.received.size
 
 
 class _RecordingTeacherWorkerGroup(_MockTeacherWorkerGroup):
@@ -196,7 +201,7 @@ def test_compute_teacher_logprobs_dp_padding_repeats_multimodal_row():
         _has_distillation_teachers=True,
     )
 
-    result, _ = collector._compute_teacher_logprobs(
+    score_result = collector._compute_teacher_logprobs(
         torch.randint(0, 100, (1, 8)),
         [{"name": "vision_agent"}],
         multimodal_data={
@@ -209,7 +214,8 @@ def test_compute_teacher_logprobs_dp_padding_repeats_multimodal_row():
     assert twg.received["input_ids"].shape[0] == 4
     assert _received_row_markers(twg.received["pixel_values"]) == [7.0] * 4
     assert _received_row_markers(twg.received["num_frames"]) == [1.0] * 4
-    assert result.shape == (1, 8)
+    assert score_result.logprobs.shape == (1, 8)
+    assert score_result.valid_mask.all()
 
 
 def test_compute_teacher_logprobs_mixed_media_and_text_rows_per_teacher():
@@ -224,7 +230,7 @@ def test_compute_teacher_logprobs_mixed_media_and_text_rows_per_teacher():
         _has_distillation_teachers=True,
     )
 
-    result, _ = collector._compute_teacher_logprobs(
+    score_result = collector._compute_teacher_logprobs(
         torch.randint(0, 100, (3, 8)),
         [{"name": "mixed_agent"}] * 3,
         multimodal_data={
@@ -237,7 +243,8 @@ def test_compute_teacher_logprobs_mixed_media_and_text_rows_per_teacher():
     # The text-only row keeps its slot so media rows stay paired with token rows.
     assert _received_row_markers(twg.received["pixel_values"]) == [5.0, None, 6.0]
     assert _received_row_markers(twg.received["imgs_sizes"]) == [15.0, None, 16.0]
-    assert result.shape == (3, 8)
+    assert score_result.logprobs.shape == (3, 8)
+    assert score_result.valid_mask.all()
 
 
 def test_compute_teacher_logprobs_routes_to_correct_teacher():
@@ -266,13 +273,14 @@ def test_compute_teacher_logprobs_routes_to_correct_teacher():
         {"name": "code_agent"},
     ]
 
-    result, _ = collector._compute_teacher_logprobs(input_ids, agent_refs)
+    score_result = collector._compute_teacher_logprobs(input_ids, agent_refs)
 
-    assert result.shape == (B, S)
-    assert torch.allclose(result[0], torch.tensor(1.0))
-    assert torch.allclose(result[1], torch.tensor(2.0))
-    assert torch.allclose(result[2], torch.tensor(1.0))
-    assert torch.allclose(result[3], torch.tensor(2.0))
+    assert score_result.logprobs.shape == (B, S)
+    assert torch.allclose(score_result.logprobs[0], torch.tensor(1.0))
+    assert torch.allclose(score_result.logprobs[1], torch.tensor(2.0))
+    assert torch.allclose(score_result.logprobs[2], torch.tensor(1.0))
+    assert torch.allclose(score_result.logprobs[3], torch.tensor(2.0))
+    assert score_result.valid_mask.all()
 
 
 def test_compute_teacher_logprobs_deduplication():
@@ -295,9 +303,10 @@ def test_compute_teacher_logprobs_deduplication():
     input_ids = torch.randint(0, 100, (B, S))
     agent_refs = [{"name": "mcqa"}, {"name": "terminal"}]
 
-    result, _ = collector._compute_teacher_logprobs(input_ids, agent_refs)
-    assert result.shape == (B, S)
-    assert torch.allclose(result, torch.tensor(3.0))
+    score_result = collector._compute_teacher_logprobs(input_ids, agent_refs)
+    assert score_result.logprobs.shape == (B, S)
+    assert torch.allclose(score_result.logprobs, torch.tensor(3.0))
+    assert score_result.valid_mask.all()
 
 
 def test_compute_teacher_logprobs_default_alias_fallback_routes():
@@ -316,9 +325,10 @@ def test_compute_teacher_logprobs_default_alias_fallback_routes():
     input_ids = torch.randint(0, 100, (B, S))
     # second agent ("surprise_agent") is unmapped -> must fall back to math_agent
     agent_refs = [{"name": "math_agent"}, {"name": "surprise_agent"}]
-    result, _ = collector._compute_teacher_logprobs(input_ids, agent_refs)
-    assert result.shape == (B, S)
-    assert torch.allclose(result, torch.tensor(7.0))
+    score_result = collector._compute_teacher_logprobs(input_ids, agent_refs)
+    assert score_result.logprobs.shape == (B, S)
+    assert torch.allclose(score_result.logprobs, torch.tensor(7.0))
+    assert score_result.valid_mask.all()
 
 
 # ---------------------------------------------------------------------------
@@ -891,6 +901,105 @@ def test_is_opd_enabled_object_config():
     )
     assert not is_opd_enabled(SimpleNamespace())
     assert not is_opd_enabled(SimpleNamespace(on_policy_distillation=None))
+
+
+def test_opd_cfg_preserves_sparse_teacher_overrides():
+    """An unrelated alias override must not replace shared cross-token settings."""
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig, _opd_cfg
+
+    config = OnPolicyDistillationConfig(
+        enabled=True,
+        teacher_model_by_agent_name={"code": "/models/code"},
+        non_colocated_teachers={
+            "enabled": True,
+            "default_teacher_cfg": {
+                "cross_tokenizer": {
+                    "tokenizer": {
+                        "name": "/tokenizers/teacher",
+                        "chat_template": None,
+                    },
+                    "missing_think_close_policy": "preserve_open_if_proven",
+                }
+            },
+            "teacher_overrides": {
+                "code": {"tensor_model_parallel_size": 4},
+            },
+        },
+    )
+
+    dumped = _opd_cfg(SimpleNamespace(on_policy_distillation=config))
+
+    assert dumped["non_colocated_teachers"]["teacher_overrides"]["code"] == {
+        "tensor_model_parallel_size": 4
+    }
+    assert (
+        dumped["non_colocated_teachers"]["default_teacher_cfg"]["cross_tokenizer"][
+            "missing_think_close_policy"
+        ]
+        == "preserve_open_if_proven"
+    )
+    assert (
+        dumped["non_colocated_teachers"]["default_teacher_cfg"]["cross_tokenizer"][
+            "tokenizer"
+        ]["chat_template"]
+        is None
+    )
+
+
+def _cross_token_master_config(**overrides):
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
+
+    full = overrides.get("full")
+    return SimpleNamespace(
+        on_policy_distillation=OnPolicyDistillationConfig(
+            enabled=True,
+            teacher_model_by_agent_name={"code": "/models/code"},
+            non_colocated_teachers={
+                "enabled": True,
+                "default_teacher_cfg": {
+                    "cross_tokenizer": {"tokenizer": {"name": "/tokenizers/teacher"}}
+                },
+            },
+            full=full,
+        ),
+        grpo=SimpleNamespace(
+            async_grpo=SimpleNamespace(enabled=overrides.get("async_enabled", True)),
+            adv_estimator=SimpleNamespace(name=overrides.get("adv_name", "opd")),
+            deduplicate_multimodal_data=overrides.get("deduplicate_multimodal", False),
+        ),
+        env={"should_use_nemo_gym": overrides.get("nemo_gym", True)},
+    )
+
+
+def test_cross_tokenizer_mopd_runtime_guard_accepts_supported_v1():
+    from nemo_rl.algorithms.opd import validate_cross_tokenizer_mopd
+
+    validate_cross_tokenizer_mopd(_cross_token_master_config())
+    # This transport optimization is legal for text-only rows. Actual
+    # multimodal payloads are rejected at collection time.
+    validate_cross_tokenizer_mopd(
+        _cross_token_master_config(deduplicate_multimodal=True)
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"async_enabled": False}, "legacy async GRPO"),
+        ({"adv_name": "grpo"}, "adv_estimator.name='opd'"),
+        ({"nemo_gym": False}, "should_use_nemo_gym=true"),
+        ({"full": {"enabled": True}}, "does not support full-vocabulary"),
+    ],
+)
+def test_cross_tokenizer_mopd_runtime_guard_rejects_unsupported_modes(overrides, match):
+    from nemo_rl.algorithms.opd import validate_cross_tokenizer_mopd
+
+    with pytest.raises(ValueError, match=match):
+        validate_cross_tokenizer_mopd(_cross_token_master_config(**overrides))
 
 
 def test_is_non_colocated_teachers_enabled():
