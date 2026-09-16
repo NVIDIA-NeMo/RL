@@ -531,7 +531,16 @@ def test_apply_vllm_patches_accepts_legacy_fp32_lm_head_env_toggle(monkeypatch):
     assert captured_extra_env_vars == [[patches.VLLM_FP32_LM_HEAD_ENV_VAR]]
 
 
-def test_vllm_worker_threads_fp32_lm_head_cfg_into_source_patches(monkeypatch):
+@pytest.mark.parametrize(
+    "vllm_cfg_overrides",
+    [
+        {"env_vars": {"USER_VAR": "value"}, "fp32_lm_head": True},
+        {"env_vars": {"USER_VAR": "value", VLLM_FP32_LM_HEAD_ENV_VAR: "1"}},
+    ],
+)
+def test_vllm_worker_threads_fp32_lm_head_cfg_into_source_patches(
+    monkeypatch, vllm_cfg_overrides
+):
     from nemo_rl.models.generation.vllm import vllm_worker
 
     patch_calls = []
@@ -556,8 +565,7 @@ def test_vllm_worker_threads_fp32_lm_head_cfg_into_source_patches(monkeypatch):
                 "expert_parallel_size": 1,
                 "gpu_memory_utilization": 0.6,
                 "precision": "bfloat16",
-                "env_vars": {"USER_VAR": "value"},
-                "fp32_lm_head": True,
+                **vllm_cfg_overrides,
             },
         },
         extra_env_vars=["EXPLICIT_VAR"],
@@ -566,7 +574,7 @@ def test_vllm_worker_threads_fp32_lm_head_cfg_into_source_patches(monkeypatch):
     assert patch_calls == [
         {
             "py": sys.executable,
-            "extra_env_vars": ["EXPLICIT_VAR", "USER_VAR"],
+            "extra_env_vars": ["EXPLICIT_VAR"],
             "fp32_lm_head": True,
         }
     ]
