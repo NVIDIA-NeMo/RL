@@ -34,6 +34,7 @@ from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 
 def _make_loss_config(
@@ -993,12 +994,14 @@ def _run_mock_ppo_train(
             "make_sequence_length_divisible_by": 1,
         },
         loss_fn=_make_loss_config(),
-        checkpointing={
-            "enabled": checkpoint_path is not None,
-            "checkpoint_must_save_by": None,
-            "save_period": 100,
-            "metric_name": None,
-        },
+        checkpointing=CheckpointingConfig.model_construct(
+            **{
+                "enabled": checkpoint_path is not None,
+                "checkpoint_must_save_by": None,
+                "save_period": 100,
+                "metric_name": None,
+            }
+        ),
         cluster={"num_nodes": 1, "gpus_per_node": 2},
     )
 
@@ -1571,10 +1574,12 @@ def _make_noncolocated_setup_config(
             "gpus_per_node": total_gpus_per_node,
             "segment_size": segment_size,
         },
-        checkpointing={
-            "enabled": False,
-            "save_optimizer": False,
-        },
+        checkpointing=CheckpointingConfig.model_construct(
+            **{
+                "enabled": False,
+                "save_optimizer": False,
+            }
+        ),
     )
 
 
@@ -2368,7 +2373,9 @@ def _make_async_ppo_config() -> SimpleNamespace:
         ),
         data={"use_multiple_dataloader": False},
         env={},
-        checkpointing={"checkpoint_must_save_by": None},
+        checkpointing=CheckpointingConfig.model_construct(
+            **{"checkpoint_must_save_by": None}
+        ),
     )
 
 

@@ -32,9 +32,7 @@ from typing import (
     Callable,
     Literal,
     Mapping,
-    NotRequired,
     Optional,
-    TypedDict,
     Union,
 )
 
@@ -114,7 +112,7 @@ def validate_warm_start_checkpoint(
         )
 
 
-class PretrainedCheckpointConfig(TypedDict):
+class PretrainedCheckpointConfig(BaseModel, extra="allow"):
     """Configuration for restoring initial weights from a pre-existing Megatron checkpoint.
 
     When set, the policy will restore its initial weights from this checkpoint
@@ -148,7 +146,7 @@ class PretrainedCheckpointConfig(TypedDict):
     format: Literal["megatron_bridge", "megatron_lm"]
 
 
-class CheckpointingConfig(TypedDict):
+class CheckpointingConfig(BaseModel, extra="allow"):
     """Configuration for checkpoint management.
 
     Attributes:
@@ -179,14 +177,17 @@ class CheckpointingConfig(TypedDict):
     metric_name: str | None
     higher_is_better: bool
     save_period: int
-    keep_top_k: NotRequired[int | None]
-    ft_keep_latest_k: NotRequired[int | None]
-    ft_save_period: NotRequired[int]
-    checkpoint_must_save_by: NotRequired[str | None]
-    pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
-    save_optimizer: NotRequired[bool]  # Default: True
-    save_data_plane: NotRequired[bool]
-    load_replay_buffer: NotRequired[bool]  # Default: True (async GRPO only)
+    keep_top_k: Optional[int] = None
+    ft_keep_latest_k: Optional[int] = None
+    ft_save_period: Optional[int] = None
+    checkpoint_must_save_by: Optional[str] = None
+    pretrained_checkpoint: Optional[PretrainedCheckpointConfig] = None
+    save_optimizer: bool = True
+    save_data_plane: bool = False
+    # Tri-state on purpose: the async-GRPO restore path treats None the same as
+    # True (restore) and only `False` opts out, so an omitted key must stay
+    # distinguishable from an explicit `true`.
+    load_replay_buffer: Optional[bool] = None
 
 
 _AUTOMODEL_ONLY_CHECKPOINT_FIELDS = frozenset(
@@ -231,8 +232,10 @@ class CheckpointManager:
         Args:
             config (CheckpointingConfig)
         """
+        # These fields no longer exist on the schema, so legacy keys arrive via
+        # extra="allow" — check model_extra rather than the field set.
         automodel_only_fields = sorted(
-            _AUTOMODEL_ONLY_CHECKPOINT_FIELDS.intersection(config)
+            _AUTOMODEL_ONLY_CHECKPOINT_FIELDS.intersection(config.model_extra or {})
         )
         if automodel_only_fields:
             raise ValueError(
@@ -245,13 +248,13 @@ class CheckpointManager:
                 "internally."
             )
 
-        self.checkpoint_dir = Path(config["checkpoint_dir"])
-        self.metric_name: str | None = config["metric_name"]
-        self.higher_is_better = config["higher_is_better"]
-        self.keep_top_k = config["keep_top_k"]
-        self.save_period: int = config["save_period"]
-        self.ft_keep_latest_k: int | None = config.get("ft_keep_latest_k", None)
-        self.save_optimizer = config["save_optimizer"]
+        self.checkpoint_dir = Path(config.checkpoint_dir)
+        self.metric_name: str | None = config.metric_name
+        self.higher_is_better = config.higher_is_better
+        self.keep_top_k = config.keep_top_k
+        self.save_period: int = config.save_period
+        self.ft_keep_latest_k: int | None = config.ft_keep_latest_k
+        self.save_optimizer = config.save_optimizer
 
         # Async finalization state
         self._finalize_thread: Optional[threading.Thread] = None

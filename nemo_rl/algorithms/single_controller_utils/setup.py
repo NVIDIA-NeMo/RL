@@ -1083,16 +1083,16 @@ def setup_single_controller(
     data_plane_checkpointing_supported = data_plane_supports_checkpointing(dp_config)
     rollout_checkpoint_cfg = master_config.rollout_checkpointing
     if (
-        master_config.checkpointing.get("save_data_plane")
+        master_config.checkpointing.save_data_plane
         or rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
     ) and not data_plane_checkpointing_supported:
         raise NotImplementedError(
             "SingleController data-plane checkpointing is not supported for "
             f"data_plane.backend={dp_config['backend']!r}."
         )
-    if master_config.checkpointing["enabled"]:
+    if master_config.checkpointing.enabled:
         if (
-            master_config.checkpointing.get("save_data_plane")
+            master_config.checkpointing.save_data_plane
             and dp_config["backend"] == "mooncake_cpu"
             and master_config.async_rl.generation_fleet_health.restart_dead_shards
         ):
@@ -1109,8 +1109,9 @@ def setup_single_controller(
         sampler_supports_replay_recovery = sampler_supports_buffer_checkpoint(
             master_config.async_rl.sampler
         )
-        if sampler_supports_replay_recovery and not master_config.checkpointing.get(
-            "save_data_plane"
+        if (
+            sampler_supports_replay_recovery
+            and not master_config.checkpointing.save_data_plane
         ):
             error_message = (
                 "SingleController checkpointing with a replay-checkpoint-capable "
@@ -1181,9 +1182,11 @@ def setup_single_controller(
             "Use the legacy controller for multimodal MOPD."
         )
 
-    checkpointing_pretrained = master_config.checkpointing.get("pretrained_checkpoint")
+    checkpointing_pretrained = master_config.checkpointing.pretrained_checkpoint
     if checkpointing_pretrained is not None:
-        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
+        # PolicyConfig is still TypedDict-shaped; hand off a plain dict so the
+        # Megatron setup path keeps its key-style access.
+        policy_config["pretrained_checkpoint"] = checkpointing_pretrained.model_dump()
 
     # Token capture: validate the supported combination loudly at setup
     # (NeMo-Gym rollout path, vLLM backend, async_engine=true). The vLLM
@@ -1192,11 +1195,11 @@ def setup_single_controller(
     # worker's environment.
     token_capture_cfg = master_config.token_capture
     if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
-        if not master_config.checkpointing["enabled"]:
+        if not master_config.checkpointing.enabled:
             raise ValueError(
                 "rollout checkpointing requires checkpointing.enabled=true"
             )
-        if not master_config.checkpointing.get("save_data_plane"):
+        if not master_config.checkpointing.save_data_plane:
             raise ValueError(
                 "rollout checkpointing requires checkpointing.save_data_plane=true"
             )
@@ -1214,10 +1217,10 @@ def setup_single_controller(
                 "rollout checkpointing requires a sampler that explicitly "
                 "supports training-claim ownership"
             )
-        if master_config.checkpointing["save_period"] != 1:
+        if master_config.checkpointing.save_period != 1:
             warnings.warn(
                 "rollout checkpointing is enabled with "
-                f"checkpointing.save_period={master_config.checkpointing['save_period']}; "
+                f"checkpointing.save_period={master_config.checkpointing.save_period}; "
                 "periodic rollout snapshots can only be saved while a matching "
                 "trainer checkpoint exists. Set checkpointing.save_period=1 for "
                 "continuous post-step coverage.",

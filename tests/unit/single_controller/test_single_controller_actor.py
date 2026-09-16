@@ -59,6 +59,7 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 
 class FakeWeightSynchronizer:
@@ -1591,7 +1592,9 @@ def _train_pump_controller(*, sampler) -> object:
         ),
         # The pump's step epilogue reads the save triggers even when saving
         # is disabled.
-        checkpointing={"enabled": False, "save_period": 10},
+        checkpointing=CheckpointingConfig.model_construct(
+            **{"enabled": False, "save_period": 10}
+        ),
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
