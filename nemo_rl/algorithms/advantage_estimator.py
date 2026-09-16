@@ -34,10 +34,11 @@ Reference papers:
 - MOPD: https://arxiv.org/abs/2601.02780
 """
 
+import math
 from typing import Literal, Optional
 
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.utils import (
@@ -60,6 +61,40 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
     reward_weights: list[float] | None = None
     # Reinforce++ specific
     minus_baseline: bool = True
+    # OPD-specific bounded scalar reward transform from TOP-D. ``None`` keeps
+    # the raw teacher-minus-student log-probability gap.
+    proximal_reward_alpha: float | None = None
+    proximal_reward_scale: float = 1.0
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_proximal_reward_config(cls, value: object) -> object:
+        """Validate TOP-D scalar shaping only when its alpha enables it."""
+        if not isinstance(value, dict):
+            return value
+        alpha = value.get("proximal_reward_alpha")
+        if alpha is None:
+            return value
+        if (
+            isinstance(alpha, bool)
+            or not isinstance(alpha, (int, float))
+            or not math.isfinite(alpha)
+            or not 0 < alpha <= 1
+        ):
+            raise ValueError(
+                f"proximal_reward_alpha must be finite and in (0, 1], got {alpha!r}"
+            )
+        scale = value.get("proximal_reward_scale", 1.0)
+        if (
+            isinstance(scale, bool)
+            or not isinstance(scale, (int, float))
+            or not math.isfinite(scale)
+            or scale <= 0
+        ):
+            raise ValueError(
+                f"proximal_reward_scale must be finite and positive, got {scale!r}"
+            )
+        return value
 
 
 class GAEConfig(BaseModel, extra="allow"):
@@ -596,6 +631,13 @@ class OPDAdvantageEstimator:
     Computes token-level distillation advantages:
         Â_MOPD,t = sg[log π_teacher - log π_student]
 
+    Optionally applies TOP-D's scalar proximal-teacher reward shaping to that
+    sampled-token gap:
+        Â_prox,t = scale * log(alpha * exp(Â_MOPD,t) + 1 - alpha)
+
+    This opt-in transform is not full TOP-D: it does not implement future
+    returns, group normalization, or PPO minibatch reuse.
+
     This is Equation 8 from the MOPD paper. The IS truncation (w_t, the
     hard gate on the training-to-inference ratio) is handled separately by
     ICE-POP mode in ClippedPGLoss — not here.
@@ -614,6 +656,31 @@ class OPDAdvantageEstimator:
 
     def __init__(self, estimator_config: dict, loss_config: dict):
         self.last_metrics: dict[str, float] = {}
+        validated_config = AdvEstimatorConfig.model_validate(estimator_config)
+        self.proximal_reward_alpha = validated_config.proximal_reward_alpha
+        self.proximal_reward_scale = validated_config.proximal_reward_scale
+
+    def _transform_gap(self, gap: torch.Tensor) -> torch.Tensor:
+        """Apply the optional stable scalar proximal-reward transformation."""
+        alpha = self.proximal_reward_alpha
+        scale = self.proximal_reward_scale
+        if alpha is None:
+            return gap
+
+        # alpha=1, scale=1 is exactly ordinary OPD. Keep it bit-for-bit
+        # identical and avoid evaluating log1p(-1).
+        if alpha == 1.0:
+            return gap if scale == 1.0 else gap * scale
+
+        gap_fp32 = gap.float()
+        teacher_component = gap_fp32 + math.log(alpha)
+        student_component = torch.tensor(
+            math.log1p(-alpha),
+            device=gap_fp32.device,
+            dtype=gap_fp32.dtype,
+        )
+        transformed = torch.logaddexp(teacher_component, student_component)
+        return transformed if scale == 1.0 else transformed * scale
 
     def compute_advantage(
         self,
@@ -667,7 +734,7 @@ class OPDAdvantageEstimator:
 
         # Â_MOPD,t = sg[log π_teacher - log π_student]  (Equation 8)
         teacher_student_gap = (teacher_logprobs - prev_logprobs).detach()
-        distill_advantages = teacher_student_gap
+        distill_advantages = self._transform_gap(teacher_student_gap)
 
         # Avoid ``0 * inf`` and ``0 * nan`` contamination on invalid aligned
         # positions. Keep the caller's training mask unchanged: this mask is
@@ -698,3 +765,17 @@ class OPDAdvantageEstimator:
             "on_policy_distillation/adv_mean": adv_mean,
             "on_policy_distillation/adv_std": adv_std,
         }
+        if self.proximal_reward_alpha is not None:
+            self.last_metrics.update(
+                {
+                    "on_policy_distillation/proximal_reward_enabled": 1.0,
+                    "on_policy_distillation/proximal_reward_alpha": self.proximal_reward_alpha,
+                    "on_policy_distillation/proximal_reward_scale": self.proximal_reward_scale,
+                    "on_policy_distillation/proximal_reward_min": (
+                        adv_valid.min().item() if adv_valid.numel() > 0 else 0.0
+                    ),
+                    "on_policy_distillation/proximal_reward_max": (
+                        adv_valid.max().item() if adv_valid.numel() > 0 else 0.0
+                    ),
+                }
+            )
