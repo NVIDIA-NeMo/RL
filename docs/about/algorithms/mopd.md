@@ -36,6 +36,20 @@ tool / environment tokens contribute zero. Because the advantage subtracts a
 real `prev_logprobs`, MOPD requires the student log-probabilities to actually be
 computed — see [Configuration](#configuration).
 
+When student and teacher tokenizers differ, the teacher scores its own rendered
+transcript and the resulting log-probabilities are projected onto student token
+positions. For each valid alignment pair `(s0, s1, t0, t1)`, every student token
+in `[s0, s1)` receives:
+
+```
+sum(teacher_logprobs[t0:t1]) / (s1 - s0)
+```
+
+The projected student-span sum therefore equals the joint teacher
+log-probability for the aligned teacher span. Invalid or structurally ambiguous
+positions are zeroed in the advantage through a separate teacher-validity mask;
+the training loss mask and its denominator are not changed.
+
 ## Configuration
 
 Enable MOPD in two places: select the advantage estimator and add the
@@ -48,6 +62,9 @@ grpo:
     enabled: true
   adv_estimator:
     name: opd
+    # Optional TOP-D scalar reward shaping; null preserves ordinary MOPD.
+    proximal_reward_alpha: null
+    proximal_reward_scale: 1.0
   # OPD subtracts a real prev_logprobs, so it must not be skipped.
   seq_logprob_error_threshold: 2.0
 
@@ -84,6 +101,8 @@ on_policy_distillation:
       gpus_per_node: 8
       precision: bf16
       micro_batch_size: 1
+      # This is resolved for each teacher rather than inherited from the policy.
+      use_fused_linear_logprobs: false
     # Optional per-alias overrides on top of default_teacher_cfg.
     teacher_overrides: {}
 ```
@@ -99,6 +118,119 @@ on_policy_distillation:
 > `prev_logprobs` (`loss_fn.force_on_policy_ratio: true` with no
 > `grpo.seq_logprob_error_threshold`), because the advantage would silently
 > degrade to `teacher_logprobs − 0`.
+
+### Cross-tokenizer configuration
+
+Add `cross_tokenizer` to a teacher resource when that teacher does not share the
+student tokenizer. A null or omitted block preserves same-token MOPD behavior.
+
+```yaml
+on_policy_distillation:
+  non_colocated_teachers:
+    default_teacher_cfg:
+      cross_tokenizer:
+        tokenizer:
+          name: /path/to/teacher-tokenizer
+          chat_template: default
+          chat_template_kwargs: {}
+          tokenizer_kwargs: {}
+        alignment_method: offset_cluster_decode_fix
+        mask_first_teacher_prefix_chunk: false
+        exclude_proven_template_only_teacher_tokens: true
+        missing_think_close_policy: preserve_open_if_proven
+```
+
+`offset_cluster_decode_fix` is the only supported alignment method. The schema
+defaults `mask_first_teacher_prefix_chunk` and
+`exclude_proven_template_only_teacher_tokens` to `false`, and defaults
+`missing_think_close_policy` to `mask`. The corrected parity recipe explicitly
+enables template-only exclusion and uses `preserve_open_if_proven`.
+
+Old flat teacher-resource keys are rejected instead of being forwarded as
+Megatron overrides:
+
+| Rejected key | Migration |
+|---|---|
+| `tokenizer_name` | Set `cross_tokenizer.tokenizer.name`. |
+| `alignment_method` | Set `cross_tokenizer.alignment_method`. |
+| `chunk_size` | Remove it; the supported offset aligner has no replacement setting. |
+
+The collector loads independent, plain Hugging Face copies of both the student
+and teacher alignment tokenizers. The runtime student tokenizer remains
+authoritative for sampled IDs, while its plain copy supplies canonical character
+offsets even when Fastokens is enabled; the teacher copy is separate from the
+model worker's tokenizer. Tokenizer paths, revisions, chat templates, template
+arguments, and tokenizer arguments must therefore be pinned for reproducibility.
+`use_fused_linear_logprobs` is likewise resolved explicitly for each teacher;
+set it in the teacher resource rather than relying on the student policy value.
+
+### Cross-token transcript semantics
+
+Cross-token scoring reconstructs the exact sampled student token stream from
+`message_log`, then renders the full multi-turn transcript with the teacher's
+native chat template. This includes developer/system normalization and tool
+loops. Only generated assistant messages that carry generation log-probabilities
+are aligned and trained; user, tool, environment, and template-only regions do
+not become distillation targets.
+
+The scorer preserves native or proven-open Qwen thinking state. An ambiguous
+thinking/tool structure fails closed by masking the causally affected suffix.
+`missing_think_close_policy: preserve_open_if_proven` preserves an open thinking
+turn only when the reconstructed transcript proves that state; otherwise it is
+masked. When template provenance can be proved,
+`exclude_proven_template_only_teacher_tokens: true` excludes teacher tokens made
+entirely from template text while retaining tokens that mix template and model
+content. The scorer pairs a sampled end-of-turn token only when it is present in
+the sampled stream and never synthesizes an EOS token. It also supports manual
+offset recovery for noncanonical generated token streams.
+
+Alignment errors, orphan spans, configured teacher-prefix chunks, sequence
+overflow, out-of-bounds spans, and structurally unsafe regions are invalidated.
+Every scored rollout entering replay contains both
+`teacher_reference_logprobs` and `teacher_reference_logprobs_mask`; same-token
+teachers produce an all-valid mask. At advantage time the effective mask is the
+intersection of token, sample, and teacher masks, and masked selection is used
+so invalid `NaN` or infinite scores cannot leak through `0 * value` arithmetic.
+The mask affects only OPD advantages, not the training token mask, loss
+denominator, or global valid-token count.
+
+Older same-token replay entries without the mask are loaded with an all-ones
+mask. A cross-token run rejects an older replay entry that lacks the mask; start
+with a fresh replay buffer or disable replay loading rather than guessing which
+alignments were valid. Both the score and mask are saved for new checkpoints.
+
+### Optional TOP-D scalar reward shaping
+
+MOPD can optionally transform the teacher/student log-probability gap `g` with:
+
+```
+proximal_reward_scale * log(
+    proximal_reward_alpha * exp(g) + 1 - proximal_reward_alpha
+)
+```
+
+Set `grpo.adv_estimator.proximal_reward_alpha` in `(0, 1]` and a finite positive
+`proximal_reward_scale` to enable it. `proximal_reward_alpha: null` and
+`proximal_reward_scale: 1.0` preserve ordinary MOPD and are used by the parity
+recipe. The numerically stable transform runs after teacher-to-student
+projection and before the effective alignment mask; malformed-thinking and
+invalid-tool-call overrides are then applied, followed by advantage clipping.
+
+This option is only **TOP-D scalar reward shaping**. It does not implement full
+TOP-D future returns, group normalization, or PPO minibatch reuse, and it is
+unrelated to [Full-vocabulary MOPD](#full-vocabulary-mopd).
+
+### Observability
+
+Cross-token scoring reports per-teacher latency and alignment coverage together
+with counters for incorrect alignments, orphans, template-only and prefix masks,
+structural failures, overflow, and out-of-bounds spans. The advantage stage
+continues to report the raw
+`on_policy_distillation/teacher_student_logprob_gap_mean` plus advantage
+statistics; when scalar shaping is enabled it also reports transformed-reward
+statistics. Treat falling coverage or rising structural/overflow counters as a
+data or template regression rather than silently accepting a smaller training
+signal.
 
 ### Teacher routing
 
@@ -123,6 +255,26 @@ For example, the reference 3-node recipe lays out: 1 node policy (student,
 trainable) + 1 node vLLM generation (frozen) + 1 node teacher (frozen). Ten
 distinct teachers at 1 node each would instead add 10 nodes on top of the
 policy and generation nodes.
+
+### Runtime support matrix
+
+Cross-tokenizer support is deliberately narrower than same-token MOPD v1.
+Unsupported combinations fail during setup, before teacher workers are
+allocated.
+
+| Mode | Legacy async GRPO + NeMo Gym | Single-Controller |
+|---|---:|---:|
+| Sampled-token, same tokenizer | Supported | Supported (text only) |
+| Sampled-token, cross tokenizer, text | **Supported** | Rejected; use legacy async GRPO |
+| Full-vocabulary, same tokenizer | Rejected | Supported with the restrictions below |
+| Full-vocabulary, cross tokenizer | Rejected | Rejected |
+| Multimodal, cross tokenizer (v1) | Rejected | Rejected |
+
+Cross-token MOPD requires `on_policy_distillation.enabled: true`, non-colocated
+teachers, `grpo.adv_estimator.name: opd`, `grpo.async_grpo.enabled: true`, and
+`env.should_use_nemo_gym: true`. The existing same-token teacher batching and
+multimodal path are unchanged; cross-token v1 does not add cross-prompt teacher
+batching.
 
 ## Full-vocabulary MOPD
 
@@ -203,9 +355,10 @@ Rejected at construction rather than silently ignored:
 
 ## Running MOPD
 
-MOPD collects rollouts through NeMo Gym and supports both the legacy async GRPO
-runtime and the Single-Controller runtime. The checked-in recipes use
-placeholder dataset paths; override them for your local data.
+MOPD collects rollouts through NeMo Gym. Same-token sampled MOPD supports the
+legacy async GRPO and Single-Controller runtimes; cross-tokenizer MOPD uses only
+the legacy async entrypoint. The checked-in recipes use placeholder dataset and
+checkpoint paths; replace them before launching.
 
 ### Single-Controller text path
 
@@ -236,10 +389,30 @@ uv run examples/nemo_gym/run_grpo_nemo_gym.py \
   data.validation.data_path=/path/to/val.jsonl
 ```
 
-Both reference recipes self-distill `Qwen/Qwen3-1.7B` (student == teacher)
-across 3 nodes (1 policy + 1 vLLM + 1 teacher) with sequence packing enabled.
-Because student and teacher are identical, the OPD loss stays near zero — it is
-a correctness smoke test, not a demonstration of distillation gains.
+For a cross-token run, start from the corrected parity recipe and replace its
+checkpoint, tokenizer, and public/synthetic dataset placeholders:
+
+```sh
+uv run examples/nemo_gym/run_grpo_nemo_gym.py \
+  --config examples/configs/recipes/llm/mopd-qwen3-1.7b-3n8g-megatron-pack-xtoken.yaml
+```
+
+That recipe pins seed 42, one generation per prompt, 256 prompts/global batch,
+65,536 total tokens, 32,768 generated tokens, constant `1e-6` learning rate,
+the recorded clipping and ICE-POP bounds, and `force_on_policy_ratio: true`.
+The forced on-policy ratio takes precedence over ratio clipping and is required
+to reproduce the recorded numeric loss. TOP-D scalar reward shaping remains
+disabled. The corresponding internal reproduction manifest—not the public
+recipe—pins exact checkpoint/tokenizer revisions, chat-template hashes, dataset
+SHA, container digest, and NeMo Gym patch state. Private prompts, tool traces,
+and the 192-record differential corpus are not included.
+
+The two same-token reference recipes self-distill `Qwen/Qwen3-1.7B`
+(student == teacher) across 3 nodes (1 policy + 1 vLLM + 1 teacher) with
+sequence packing enabled. Because student and teacher are identical, the OPD
+loss stays near zero — it is a correctness smoke test, not a demonstration of
+distillation gains. The cross-token recipe instead contains explicit model and
+tokenizer placeholders and is not runnable until they are replaced.
 
 ## References
 
