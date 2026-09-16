@@ -886,7 +886,14 @@ def test_mxfp8_batched_shuffle_env_gate(fp8_module, monkeypatch, value, expected
     else:
         monkeypatch.setenv("NRL_MXFP8_BATCHED_SHUFFLE", value)
 
-    assert fp8.mxfp8_batched_shuffle_enabled() is expected
+    assert fp8_module.mxfp8_batched_shuffle_enabled() is expected
+
+
+def test_mxfp8_batched_shuffle_env_gate_rejects_invalid_value(fp8_module, monkeypatch):
+    monkeypatch.setenv("NRL_MXFP8_BATCHED_SHUFFLE", "invalid")
+
+    with pytest.raises(ValueError, match="NRL_MXFP8_BATCHED_SHUFFLE"):
+        fp8_module.mxfp8_batched_shuffle_enabled()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
