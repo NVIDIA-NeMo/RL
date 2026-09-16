@@ -14,8 +14,15 @@
 
 """CPU checks for the real-GRPO chaos harness's acceptance conditions."""
 
+import argparse
+import builtins
+import json
+import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import Mock
 
 import pytest
 from omegaconf import OmegaConf
@@ -27,6 +34,7 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
+from tests.functional import _sglang_grpo_chaos as chaos
 from tests.functional._sglang_grpo_chaos import (
     Engine,
     KillReceipt,
@@ -228,3 +236,187 @@ def test_real_grpo_command_resolves_config(expect: str, budget: int) -> None:
     ]
     assert fault_tolerance["use_fault_tolerance"] is True
     assert fault_tolerance["rollout_max_restart_attempts"] == budget
+
+
+@pytest.mark.parametrize("expect", ["survival", "bounded_failure"])
+@pytest.mark.parametrize("observation_error", [False, True])
+def test_run_detaches_observer_before_waiting_for_driver(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    expect: str,
+    observation_error: bool,
+) -> None:
+    """Run the real loop/oracles without a Ray cluster or training subprocess."""
+    events = []
+    artifacts = tmp_path / "artifacts"
+    terminal_receipt = artifacts / (
+        "replacement.json" if expect == "survival" else "kill.json"
+    )
+    victim = Engine(10, 1.0, "http://host:3001")
+    survivor = Engine(11, 1.1, "http://host:3002")
+    replacement = Engine(20, 2.0, "http://host:3003")
+    connected = False
+
+    def connect(**kwargs: Any) -> None:
+        nonlocal connected
+        assert not terminal_receipt.exists(), "Observer reconnected after receipt"
+        assert kwargs["address"] == "127.0.0.1:12345"
+        connected = True
+        events.append("connect")
+
+    def disconnect() -> None:
+        nonlocal connected
+        connected = False
+        events.append("disconnect")
+
+    fake_ray = SimpleNamespace(
+        init=Mock(side_effect=connect),
+        shutdown=Mock(side_effect=disconnect),
+        is_initialized=lambda: connected,
+    )
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setattr(chaos, "_address_from_session", lambda _: "127.0.0.1:12345")
+    monkeypatch.setattr(chaos.tempfile, "mkdtemp", lambda **_: str(tmp_path / "ray"))
+    monkeypatch.setattr(
+        chaos,
+        "time",
+        SimpleNamespace(monotonic=lambda: 0.0, time=lambda: 10.0, sleep=lambda _: None),
+    )
+
+    def training_log(steps: int) -> str:
+        log = ""
+        for step in range(1, steps + 1):
+            log += f"===== Step {step}/5 =====\n📊 Training Results:\n"
+            if step == 1 and steps > 1:
+                log += "Restarting SGLang engine 0 (attempt 1/1)\n"
+        return log
+
+    exhaustion = (
+        "SGLang engines [0] exhausted rollout_max_restart_attempts=0; aborting refit."
+    )
+    driver = Mock(pid=100)
+    driver.returncode = None
+    progress = iter(
+        [(1, None), (2, None), (3, None), (5, 0)]
+        if expect == "survival"
+        else [(1, None), (1, None), (1, 1)]
+    )
+
+    def poll() -> int | None:
+        if driver.returncode is not None:
+            return driver.returncode
+        if terminal_receipt.exists() and not observation_error:
+            assert not connected, "Observer remained attached after terminal receipt"
+            events.append("poll_after_receipt")
+        steps, driver.returncode = next(progress)
+        log = training_log(steps)
+        if expect == "bounded_failure" and (artifacts / "kill.json").exists():
+            log += exhaustion
+        (artifacts / "run.log").write_text(log)
+        if driver.returncode is not None:
+            events.append("driver_exit")
+        return driver.returncode
+
+    def wait(timeout: int | None = None) -> int:
+        events.append("driver_wait")
+        if timeout is not None:
+            assert timeout == 10
+            return 1
+        assert driver.returncode is not None
+        assert not connected
+        return driver.returncode
+
+    driver.poll.side_effect = poll
+    driver.wait.side_effect = wait
+    monkeypatch.setattr(chaos.subprocess, "Popen", Mock(return_value=driver))
+    captured = Mock(name="captured_training_process")
+
+    def capture(processes: dict[tuple[int, float], Mock], pid: int) -> None:
+        processes[(100, 1.0)] = captured
+
+    def clean(processes: dict[tuple[int, float], Mock]) -> None:
+        assert processes == {(100, 1.0): captured}
+        events.append("cleanup")
+
+    monkeypatch.setattr(chaos, "capture_children", capture)
+    monkeypatch.setattr(chaos, "cleanup", clean)
+    actor = Mock()
+    actor.create_time.return_value = victim.actor_created
+    monkeypatch.setattr(chaos.psutil, "Process", Mock(return_value=actor))
+    http = Mock()
+    http.close.side_effect = lambda: events.append("http_close")
+    monkeypatch.setattr(chaos.requests, "Session", Mock(return_value=http))
+
+    def engines(log: str) -> list[Engine]:
+        assert connected
+        assert not terminal_receipt.exists(), "Actor query after terminal receipt"
+        events.append("actor_query")
+        if observation_error:
+            raise RuntimeError("observer failed before receipt")
+        if (artifacts / "kill.json").exists():
+            return [survivor, replacement]
+        return [victim, survivor]
+
+    monkeypatch.setattr(chaos, "live_engines", engines)
+    monkeypatch.setattr(
+        chaos, "serving_state", lambda _, engine: (3 if engine == replacement else 2, 4)
+    )
+
+    def extract_metrics(command: list[str], **kwargs: Any) -> None:
+        assert not connected
+        assert driver.returncode == 0
+        assert kwargs["check"] is True
+        assert command[1] == "tests/json_dump_tb_logs.py"
+        events.append("metrics")
+        Path(command[-1]).write_text(json.dumps(survival_case()["metrics"]))
+
+    metrics_call = Mock(side_effect=extract_metrics)
+    monkeypatch.setattr(chaos.subprocess, "run", metrics_call)
+    args = argparse.Namespace(
+        artifact_dir=artifacts,
+        expect=expect,
+        max_steps=5,
+        startup_timeout=10,
+        fault_timeout=10,
+        completion_timeout=10,
+    )
+    # Ray caches this flag during import; changing it only before ray.init is late.
+    monkeypatch.setenv("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "1")
+    original_import = builtins.__import__
+
+    def import_module(module_name: str, *args: Any, **kwargs: Any) -> Any:
+        if module_name == "ray":
+            assert chaos.os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] == "0"
+            events.append("ray_import")
+        return original_import(module_name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_module)
+    if observation_error:
+        with pytest.raises(RuntimeError, match="observer failed before receipt"):
+            chaos.run(args)
+        assert not (artifacts / "result.json").exists()
+        assert events[-4:] == ["disconnect", "http_close", "cleanup", "driver_wait"]
+        metrics_call.assert_not_called()
+        return
+
+    chaos.run(args)
+
+    result = json.loads((artifacts / "result.json").read_text())
+    assert result["expect"] == expect
+    assert result["returncode"] == (0 if expect == "survival" else 1)
+    assert result["kill"]["engine"]["actor_pid"] == victim.actor_pid
+    actor.kill.assert_called_once_with()
+    fake_ray.init.assert_called_once()
+    assert events.count("actor_query") == (2 if expect == "survival" else 1)
+    assert events.index("disconnect") < events.index("poll_after_receipt")
+    assert events.index("poll_after_receipt") < events.index("driver_exit")
+    assert events.index("driver_exit") < events.index("driver_wait")
+    assert events[-3:] == ["disconnect", "http_close", "cleanup"]
+    if expect == "survival":
+        assert result["replacement"]["engine"]["actor_pid"] == replacement.actor_pid
+        assert result["completed_steps"] == [1, 2, 3, 4, 5]
+        assert events.index("driver_wait") < events.index("metrics")
+        metrics_call.assert_called_once()
+    else:
+        assert result["replacement"] is None
+        metrics_call.assert_not_called()

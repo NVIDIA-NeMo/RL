@@ -90,6 +90,14 @@ def engine_endpoints(log: str) -> dict[int, str]:
     }
 
 
+def needs_actor_observation(
+    expect: str,
+    kill: KillReceipt | None,
+    replacement: ReplacementReceipt | None,
+) -> bool:
+    return kill is None or (expect == "survival" and replacement is None)
+
+
 def validate_outcome(
     *,
     expect: str,
@@ -262,6 +270,9 @@ def cleanup(processes: dict[tuple[int, float], psutil.Process]) -> None:
 
 
 def run(args: argparse.Namespace) -> None:
+    # Match nemo_rl's driver setup before Ray caches this flag at import time.
+    # The observer needs no remote runtime environment or repository upload.
+    os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
     # Ray is optional in CPU-only parser/oracle tests.
     import ray
 
@@ -311,6 +322,11 @@ def run(args: argparse.Namespace) -> None:
                 steps = completed_steps(log)
                 if not steps:
                     time.sleep(0.2)
+                    continue
+                if not needs_actor_observation(args.expect, kill, replacement):
+                    # The driver owns the GCS and may shut it down before it
+                    # exits. After the last receipt, observe only its log/PID.
+                    time.sleep(0.1)
                     continue
                 if not ray.is_initialized():
                     address = _address_from_session(str(Path(ray_tmp) / "ray"))
@@ -377,8 +393,13 @@ def run(args: argparse.Namespace) -> None:
                             flush=True,
                         )
                         break
+                if not needs_actor_observation(args.expect, kill, replacement):
+                    # Disconnect while the driver is still serving, before its
+                    # teardown can terminate an attached observer's core worker.
+                    ray.shutdown()
                 time.sleep(0.1)
             returncode = training.wait()
+            ray.shutdown()
             log = log_path.read_text(errors="replace")
             assert kill is not None, "Training exited before fault injection"
             metrics = {}
