@@ -679,28 +679,48 @@ def test_repeat_interleave_shares_only_flagged_multimodal_segments():
     assert flag_on["message_log"][0] is not flag_on["message_log"][1]
 
 
-def test_repeat_interleave_shares_native_image_video_and_audio_leaves():
+def test_repeat_interleave_shares_vllm_multimodal_data_leaves():
     image = torch.ones(1, 2)
     video = np.ones((2, 2), dtype=np.float32)
     audio = np.ones(16, dtype=np.float32)
     batch = BatchedDataDict(
         {
-            "vllm_images": [[image]],
-            "vllm_videos": [[video]],
-            "vllm_audios": [[(audio, 16_000)]],
+            "vllm_multi_modal_data": [
+                {"image": image, "video": video, "audio": (audio, 16_000)}
+            ],
         }
     )
 
     flag_off = batch.repeat_interleave(2)
-    assert flag_off["vllm_images"][0][0] is not flag_off["vllm_images"][1][0]
-    assert flag_off["vllm_videos"][0][0] is not flag_off["vllm_videos"][1][0]
-    assert flag_off["vllm_audios"][0][0][0] is not flag_off["vllm_audios"][1][0][0]
+    assert (
+        flag_off["vllm_multi_modal_data"][0]["image"]
+        is not flag_off["vllm_multi_modal_data"][1]["image"]
+    )
+    assert (
+        flag_off["vllm_multi_modal_data"][0]["video"]
+        is not flag_off["vllm_multi_modal_data"][1]["video"]
+    )
+    assert (
+        flag_off["vllm_multi_modal_data"][0]["audio"][0]
+        is not flag_off["vllm_multi_modal_data"][1]["audio"][0]
+    )
 
     flag_on = batch.repeat_interleave(2, share_immutable_media=True)
-    assert flag_on["vllm_images"][0] is not flag_on["vllm_images"][1]
-    assert flag_on["vllm_images"][0][0] is flag_on["vllm_images"][1][0]
-    assert flag_on["vllm_videos"][0][0] is flag_on["vllm_videos"][1][0]
-    assert flag_on["vllm_audios"][0][0][0] is flag_on["vllm_audios"][1][0][0]
+    assert (
+        flag_on["vllm_multi_modal_data"][0] is not flag_on["vllm_multi_modal_data"][1]
+    )
+    assert (
+        flag_on["vllm_multi_modal_data"][0]["image"]
+        is flag_on["vllm_multi_modal_data"][1]["image"]
+    )
+    assert (
+        flag_on["vllm_multi_modal_data"][0]["video"]
+        is flag_on["vllm_multi_modal_data"][1]["video"]
+    )
+    assert (
+        flag_on["vllm_multi_modal_data"][0]["audio"][0]
+        is flag_on["vllm_multi_modal_data"][1]["audio"][0]
+    )
 
 
 @pytest.mark.parametrize("share_immutable_media", [False, True])

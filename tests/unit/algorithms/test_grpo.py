@@ -219,21 +219,73 @@ def test_refit_policy_generation_forwards_kv_scales_on_colocated_ipc(
     )
 
 
-def test_megatron_m2n_refit_delegates_entirely_to_the_synchronizer() -> None:
-    """MegatronWeightSynchronizer owns the engine lifecycle; the caller must not duplicate it.
-
-    ``refit_policy_generation`` returns as soon as a weight synchronizer is
-    present, so suspend/offload/prepare/resume must NOT be driven here — they
-    live inside ``MegatronWeightSynchronizer.sync_weights`` and are asserted in
-    ``tests/unit/weight_sync/test_weight_synchronizer.py``.
-    """
+@patch("nemo_rl.algorithms.grpo.ray")
+def test_legacy_noncolocated_refit_syncs_policy_params_first(
+    mock_ray: MagicMock,
+) -> None:
+    mock_ray.get.return_value = [True]
+    events = []
     policy = MagicMock()
+    policy.sync_params_before_refit.side_effect = lambda: events.append("sync")
+    policy.broadcast_weights_for_collective.side_effect = lambda **_: (
+        events.append("broadcast") or [MagicMock()]
+    )
+    policy_generation = MagicMock()
+    policy_generation.weight_synchronizer = None
+    policy_generation.update_weights_from_collective.return_value = [MagicMock()]
+
+    refit_policy_generation(
+        policy,
+        policy_generation,
+        colocated_inference=False,
+    )
+
+    assert events == ["sync", "broadcast"]
+
+
+@patch("nemo_rl.algorithms.grpo.ray")
+def test_legacy_colocated_refit_syncs_policy_params_before_offload(
+    mock_ray: MagicMock,
+) -> None:
+    mock_ray.get.return_value = [True]
+    events = []
+    policy = MagicMock()
+    policy.sync_params_before_refit.side_effect = lambda: events.append("sync")
+    policy.offload_before_refit.side_effect = lambda: events.append("offload")
+    policy.get_free_memory_bytes.return_value = 1 << 30
+    policy.stream_weights_via_ipc_zmq.side_effect = lambda **_: (
+        events.append("stream") or [MagicMock()]
+    )
+    policy_generation = MagicMock()
+    policy_generation.weight_synchronizer = None
+    policy_generation.update_weights_via_ipc_zmq.return_value = [MagicMock()]
+
+    refit_policy_generation(
+        policy,
+        policy_generation,
+        colocated_inference=True,
+    )
+
+    assert events == ["sync", "offload", "stream"]
+
+
+def test_megatron_m2n_refit_syncs_params_then_delegates_to_synchronizer() -> None:
+    """The caller syncs params; MegatronWeightSynchronizer owns engine lifecycle.
+
+    Suspend/offload/prepare/resume live inside the synchronizer and are asserted
+    in ``tests/unit/weight_sync/test_weight_synchronizer.py``.
+    """
+    events = []
+    policy = MagicMock()
+    policy.sync_params_before_refit.side_effect = lambda: events.append("sync")
     generation = object.__new__(MegatronGeneration)
     generation.suspend_for_refit = MagicMock()
     generation.prepare_for_generation = MagicMock()
     generation.resume_after_refit = MagicMock()
     generation.weight_synchronizer = MagicMock()
-    generation.weight_synchronizer.sync_weights.return_value = {"bytes": 16.0}
+    generation.weight_synchronizer.sync_weights.side_effect = lambda **_: (
+        events.append("transfer") or {"bytes": 16.0}
+    )
 
     metrics = refit_policy_generation(
         policy,
@@ -243,6 +295,8 @@ def test_megatron_m2n_refit_delegates_entirely_to_the_synchronizer() -> None:
     )
 
     assert metrics == {"bytes": 16.0}
+    assert events == ["sync", "transfer"]
+    policy.sync_params_before_refit.assert_called_once_with()
     generation.weight_synchronizer.sync_weights.assert_called_once_with(
         timer=None, kv_scales={"layer.0": 0.5}
     )
@@ -257,11 +311,10 @@ def test_refit_returns_empty_metrics_when_synchronizer_returns_none() -> None:
     generation = object.__new__(MegatronGeneration)
     generation.weight_synchronizer = MagicMock()
     generation.weight_synchronizer.sync_weights.return_value = None
+    policy = MagicMock()
 
-    assert (
-        refit_policy_generation(MagicMock(), generation, colocated_inference=False)
-        == {}
-    )
+    assert refit_policy_generation(policy, generation, colocated_inference=False) == {}
+    policy.sync_params_before_refit.assert_called_once_with()
 
 
 class TestMaskSampleFilter:
@@ -2754,6 +2807,66 @@ def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping(
         result_batch["message_log"][i][0]["content"] for i in range(result_batch.size)
     ]
     assert surviving_prompts == ["prompt_1", "prompt_1", "prompt_1"]
+
+
+@pytest.mark.parametrize(
+    ("kv_cache_dtype", "precision", "error"),
+    [
+        ("fp8", "fp8", "DTensor backend is not supported"),
+        ("fp8_e4m3", "fp8", "DTensor backend is not supported"),
+        ("fp8_ds_mla", "fp8", None),
+        ("fp8_ds_mla", "bfloat16", "requires precision='fp8'"),
+        ("auto", "bfloat16", None),
+    ],
+)
+def test_setup_dtensor_fp8_kv_cache_guard(
+    mock_grpo_components, monkeypatch, kv_cache_dtype, precision, error
+):
+    import nemo_rl.algorithms.grpo as grpo_mod
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.val_period = 0
+    master_config.grpo.batch_multiplier = 1
+    master_config.data.update(shuffle=False, num_workers=0)
+    master_config.policy.update(
+        model_name="deepseek-v4-test",
+        dtensor_cfg={"enabled": True},
+        megatron_cfg={"enabled": False},
+    )
+    master_config.policy["generation"]["vllm_cfg"].update(
+        async_engine=False, precision=precision, kv_cache_dtype=kv_cache_dtype
+    )
+    checkpointer = MagicMock()
+    checkpointer.get_latest_checkpoint_path.return_value = None
+    checkpointer.load_training_info.return_value = None
+    checkpointer.get_resume_paths.return_value = (None, None)
+    monkeypatch.setattr(grpo_mod, "Logger", MagicMock())
+    monkeypatch.setattr(grpo_mod, "CheckpointManager", lambda _config: checkpointer)
+    monkeypatch.setattr(grpo_mod, "StatefulDataLoader", MagicMock())
+    monkeypatch.setattr(grpo_mod, "RayVirtualCluster", MagicMock())
+    monkeypatch.setattr(
+        grpo_mod, "prepare_segment_topology", lambda *_args: (None, [], {})
+    )
+
+    class GenerationInitReached(Exception):
+        pass
+
+    generation_init = MagicMock(side_effect=GenerationInitReached)
+    monkeypatch.setattr(grpo_mod, "VllmGeneration", generation_init)
+    policy_init = MagicMock(
+        side_effect=AssertionError("Policy initialization is unexpected")
+    )
+    monkeypatch.setattr(grpo_mod, "Policy", policy_init)
+
+    with (
+        pytest.raises(AssertionError, match=error)
+        if error
+        else pytest.raises(GenerationInitReached)
+    ):
+        grpo_mod.setup(master_config, MagicMock(), MagicMock(), None)
+
+    assert generation_init.call_count == int(error is None)
+    policy_init.assert_not_called()
 
 
 def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node(
