@@ -93,6 +93,14 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
     "nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor": [
         "nemo_gym"
     ],
+    # The controller itself: TransferQueue client (bundled in the vLLM tier) plus
+    # nemo_gym for deferred routed-experts assembly and capture receipts. Given an
+    # explicit venv so it never lands on a pre-started raylet worker whose site
+    # initialisation predates the driver's `uv run --extra nemo_gym` sync.
+    "nemo_rl.algorithms.single_controller.SingleControllerActor": [
+        "vllm",
+        "nemo_gym",
+    ],
     "nemo_rl.environments.tools.retriever.RAGEnvironment": None,
     "nemo_rl.environments.nemo_gym.NemoGym": ["nemo_gym"],
     # ModelOpt quantization-aware workers

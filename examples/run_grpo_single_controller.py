@@ -30,6 +30,7 @@ from typing import Any
 import ray
 from omegaconf import OmegaConf
 
+from nemo_rl.utils.venvs import make_actor_runtime_env
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils import (
     MasterConfig,
@@ -160,7 +161,13 @@ def main() -> None:
     )
 
     print("🚀 Launching SingleControllerActor")
-    sc = SingleControllerActor.remote(
+    # Registered venv (vllm + nemo_gym): see actor_environments.py. Without it Ray may
+    # reuse a pre-started idle worker that cannot import nemo_gym (token capture).
+    sc = SingleControllerActor.options(
+        runtime_env=make_actor_runtime_env(
+            "nemo_rl.algorithms.single_controller.SingleControllerActor"
+        )
+    ).remote(
         master_config=config,
         actor_args=actor_args,
         setup_timing_metrics=setup_timing_metrics,
