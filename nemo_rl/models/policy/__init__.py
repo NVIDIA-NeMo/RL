@@ -42,14 +42,15 @@ def _patch_transformers_tokenizer_class_set():
     import transformers
     from packaging.version import Version as PkgVersion
 
-    # Transformers 5.12.1 still ships both registry entries, so the patch remains
-    # load-bearing across the currently supported backend environments.
+    # Transformers 5.12.1 (vLLM/base venvs) and 5.15.1 (automodel venv) still
+    # ship both registry entries, so the patch remains load-bearing across the
+    # currently supported backend environments.
     # TODO: remove this patch (and the assert below) once the deepseek_v3
     # entries actually disappear upstream.
     # https://github.com/NVIDIA-NeMo/RL/issues/2764
-    assert PkgVersion(transformers.__version__) < PkgVersion("5.13.0"), (
+    assert PkgVersion(transformers.__version__) < PkgVersion("5.16.0"), (
         f"transformers {transformers.__version__} detected. "
-        "The deepseek_v3 tokenizer-blocklist patch was verified against <5.13. "
+        "The deepseek_v3 tokenizer-blocklist patch was verified against <5.16. "
         "Check if the upstream fix now applies and remove this patch if so."
     )
 
@@ -201,6 +202,10 @@ class DTensorConfig(TypedDict):
     automodel_kwargs: NotRequired[AutomodelKwargs]
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]
+    # DTensor v2 only. Default True: hand checkpoints to dcp.async_save (stages a
+    # host-memory copy of the sharded state). Set False for a blocking save when
+    # host memory is the bottleneck.
+    async_checkpoint_save: NotRequired[bool]
 
 
 class SequencePackingConfigDisabled(TypedDict):

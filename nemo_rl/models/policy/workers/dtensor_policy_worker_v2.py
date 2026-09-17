@@ -301,7 +301,12 @@ class DTensorPolicyWorkerV2Impl(
                     "dequantize_base_checkpoint", False
                 ),
                 "is_peft": self.lora_enabled,
-                "is_async": True,
+                # Async saves stage the full sharded model+optimizer state in
+                # host memory (dcp.async_save + DefaultStager) before a helper
+                # process writes it. On memory-tight nodes (large MoE, few
+                # nodes, colocated vLLM sleep backup) that staging copy can
+                # OOM-kill the job; allow recipes to fall back to blocking saves.
+                "is_async": config["dtensor_cfg"].get("async_checkpoint_save", True),
             },
         )
 
