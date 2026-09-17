@@ -64,6 +64,8 @@ _PLACEHOLDER_STYLE_PROCESSOR_NAMES = frozenset(
     {
         "NemotronNanoVLV2Processor",
         "NemotronH_Nano_Omni_Reasoning_V3Processor",
+        # Nemotron 3.5 Super VL shares the Nano Omni processor implementation.
+        "NemotronH_Omni_Reasoning_V3Processor",
     }
 )
 

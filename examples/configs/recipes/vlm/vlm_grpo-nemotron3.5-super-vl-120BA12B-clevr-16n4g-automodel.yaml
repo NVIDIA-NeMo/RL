@@ -1,0 +1,128 @@
+defaults: ../../vlm_grpo_3B.yaml
+# Nemotron 3.5 Super VL (NemotronH_Omni_Reasoning_V3) image GRPO on CLEVR-CoGenT
+# with the automodel (DTensor v2) backend. Mirrors
+# vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml for the Nano Omni
+# model; parallelism follows dapo-nemotron3.5-super-vl-120BA12B-16n8g-automodel.yaml
+# but sized for 4-GPU GB200 nodes (16 nodes x 4 GPUs, train EP4, vLLM TP4/EP4).
+#
+# Requirements: see docs/guides/models/nemotron/nemotron-3.5-super-vl.md
+# (Automodel main @ 6ae5ca23+, vLLM super_vl_rl_v0.25.1 fork @ 33484aad+).
+#
+# Model-specific notes:
+#   - The vision tower is frozen (freeze_config) and vLLM loads the checkpoint
+#     from disk (load_format=auto via ModelFlag.VLLM_LOAD_FORMAT_AUTO for
+#     model_type nemotron_h_omni), so the vision weights vLLM generates with are
+#     the checkpoint's regardless of refit. The Automodel Omni adapter's
+#     per-tensor refit path streams native RADIO names (query/key/value shards);
+#     the vLLM fork maps those onto its fused attn.qkv.
+#   - hf_config_overrides.num_nextn_predict_layers=0 drops the MTP head on the
+#     training side. vLLM only sees it as a top-level override, so it still
+#     instantiates the post-RADIO vision_final_layernorm that this MTP-trained
+#     checkpoint carries (fork PR #45).
+#   - skip_tokenizer_init must stay false (inherited from vlm_grpo_3B.yaml).
+#   - No expandable_segments (breaks the colocated IPC refit on some clusters).
+grpo:
+  deduplicate_multimodal_data: true
+  num_prompts_per_step: 32
+  val_at_start: true
+checkpointing:
+  checkpoint_dir: results/vlm_grpo-nemotron3.5-super-vl-clevr
+  checkpoint_must_save_by: 00:03:20:00
+  keep_top_k: 2
+policy:
+  model_name: nvidia/nemotron-3.5-super-pre-ea-text-08282026
+  tokenizer:
+    name: nvidia/nemotron-3.5-super-pre-ea-text-08282026
+  hf_config_overrides:
+    num_nextn_predict_layers: 0
+  # Must be a multiple of the data-parallel size (64 GPUs at 16n4g, EP does not
+  # reduce DP for batch sharding); 512 samples per step -> 8 optimizer steps.
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  logprob_chunk_size: 2048
+  max_total_sequence_length: 8192
+  make_sequence_length_divisible_by: 8
+  optimizer:
+    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+      master_weights: true
+      store_param_remainders: true
+      exp_avg_dtype: torch.bfloat16
+      exp_avg_sq_dtype: torch.bfloat16
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  dtensor_cfg:
+    expert_parallel_size: 4
+    activation_checkpointing: true
+    # Blocking checkpoint save. The async path stages the full sharded
+    # model+optimizer state in host RAM on top of the colocated vLLM sleep
+    # backup and trainer offload buffers; on 8 x 4-GPU nodes that reached
+    # ~890 GB/node and the Slurm step was OOM-killed at the first save.
+    async_checkpoint_save: false
+    moe_parallelizer:
+      ignore_router_for_ac: true
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: te
+        linear: te
+        rms_norm: torch_fp32
+        experts: gmm
+        dispatcher: deepep
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+      freeze_config:
+        freeze_vision_tower: true
+        freeze_audio_tower: true
+        freeze_language_model: false
+  generation:
+    max_new_tokens: 4096
+    bad_words:
+    - <image>
+    - <img>
+    - </img>
+    - <so_embedding>
+    - <so_start>
+    - <so_end>
+    vllm_cfg:
+      tensor_parallel_size: 4
+      expert_parallel_size: 4
+      enforce_eager: true
+      max_model_len: 8192
+      cap_max_tokens_to_context: true
+      logprobs_mode: raw_logprobs
+      gpu_memory_utilization: 0.5
+      enable_prefix_caching: false
+      skip_tokenizer_init: false
+    vllm_kwargs:
+      moe_backend: triton
+      mamba_ssm_cache_dtype: float32
+      limit_mm_per_prompt:
+        image: 2
+      max_num_batched_tokens: 16384
+      mm_processor_cache_gb: 0
+      skip_mm_profiling: true
+      # On Blackwell the default FLASH_ATTN encoder backend picks FA4 (CuTe DSL),
+      # whose _flash_attn_fwd returns (out, lse) while the v0.25.1 precompiled
+      # wheel's flash_attn_interface unpacks four values -> the RADIO vision
+      # encoder dies with "not enough values to unpack (expected 4, got 2)".
+      # Use torch SDPA for the (small) vision encoder instead.
+      mm_encoder_attn_backend: TORCH_SDPA
+data:
+  default:
+    prompt_file: examples/prompts/clevr_cogent_cot_nemotron_omni.txt
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl-super-3.5
+    name: vlm_grpo-nemotron3.5-super-vl-clevr-16n4g
+cluster:
+  gpus_per_node: 4
+  num_nodes: 16

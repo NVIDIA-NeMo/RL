@@ -8,9 +8,9 @@ recipe, and understand the settings that are specific to this model.
 
 > [!IMPORTANT]
 > **Early access.** The text-only DAPO recipe runs end-to-end (resume from
-> checkpoint included) and validation accuracy rises over the first tens of
-> steps, but no run has yet been taken to full convergence. Multimodal (image)
-> RL on this model is not yet supported on the AutoModel path; see
+> checkpoint included) and reaches 0.79 AIME-2024 accuracy by step 50, but no
+> run has yet been taken to full convergence. The image GRPO recipe (CLEVR-CoGenT)
+> has been brought up but not yet validated at scale; see
 > [Known Issues](#known-issues).
 
 ## Support Status
@@ -27,6 +27,7 @@ Nemotron 3.5 Super VL is **Functionally Ready** (text-only).
 | Model | Modality | Training backend | Parallelism | Inference | Precision |
 | --- | --- | --- | --- | --- | --- |
 | Nemotron 3.5 Super VL (120B-A12B) | LLM (text-only path) | AutoModel (DTensor) | FSDP2 + EP | vLLM (Super VL fork) | BF16 compute, FP32 master |
+| Nemotron 3.5 Super VL (120B-A12B) | VLM (image, frozen vision tower) | AutoModel (DTensor) | FSDP2 + EP | vLLM (Super VL fork) | BF16 compute, FP32 master |
 
 Notes:
 
@@ -37,10 +38,10 @@ Notes:
 - **Generation** uses a vLLM fork; stock vLLM 0.25.1 does not register the
   `NemotronH_Omni_Reasoning_V3` architecture. See
   [Build the Environment](#build-the-environment).
-- The vision tower is constructed on both the training and generation side, but
-  the recipe drives the model text-only: the tokenizer path (no processor) is
-  used, so the DTensor worker runs with `is_vlm=false` and vLLM never receives
-  images.
+- The DAPO recipe drives the model text-only (tokenizer path, `is_vlm=false`,
+  vLLM never receives images). The image GRPO recipe uses the
+  `NemotronH_Omni_Reasoning_V3Processor` and `run_vlm_grpo.py`; the vision tower
+  is frozen and vLLM loads the checkpoint from disk (`load_format=auto`).
 
 ## Build the Environment
 
@@ -111,15 +112,21 @@ The checkpoint ships as 63 safetensors shards (~232 GB, BF16) with remote code
 (`modeling_nemotron_h_omni.py`, `modeling_radio.py`); `trust_remote_code` is
 always enabled by NeMo RL.
 
-## Example Recipe
+## Example Recipes
 
-DAPO on DAPO-Math-17K with AIME-2024 validation, AutoModel (DTensor) training
-with colocated vLLM generation. The recipe YAML under
-`examples/configs/recipes/` is the source of truth.
+AutoModel (DTensor) training with colocated vLLM generation. The recipe YAMLs
+under `examples/configs/recipes/` are the source of truth.
 
-| Algo | Seq | Train EP | vLLM TP/EP | `max_new_tokens` | Nodes | Recipe |
-|---|---|---|---|---|---|---|
-| DAPO | 9216 | 8 | 8 / 8 | 8192 | 16 x 8 GPUs | [`dapo-nemotron3.5-super-vl-120BA12B-16n8g-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-nemotron3.5-super-vl-120BA12B-16n8g-automodel.yaml) |
+| Algo | Data | Seq | Train EP | vLLM TP/EP | `max_new_tokens` | Nodes | Recipe |
+|---|---|---|---|---|---|---|---|
+| DAPO (text) | DAPO-Math-17K / AIME-2024 | 9216 | 8 | 8 / 8 | 8192 | 16 x 8 GPUs | [`dapo-nemotron3.5-super-vl-120BA12B-16n8g-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-nemotron3.5-super-vl-120BA12B-16n8g-automodel.yaml) |
+| GRPO (image) | CLEVR-CoGenT | 8192 | 4 | 4 / 4 | 4096 | 16 x 4 GPUs | [`vlm_grpo-nemotron3.5-super-vl-120BA12B-clevr-16n4g-automodel.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron3.5-super-vl-120BA12B-clevr-16n4g-automodel.yaml) |
+
+The image recipe mirrors the Nano Omni CLEVR recipe
+(`vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml`): frozen vision
+and audio towers (`automodel_kwargs.freeze_config`), image tokens as
+`bad_words`, `limit_mm_per_prompt.image: 2`, `mm_processor_cache_gb: 0`, and the
+Nemotron Omni CLEVR prompt. Launch it with `examples/run_vlm_grpo.py`.
 
 The recipe mirrors the Nemotron 3.5 Lightning DAPO recipe: dynamic sampling
 (`batch_multiplier: 3`), Clip-Higher (`ratio_clip_max: 0.28`), overlong
@@ -215,11 +222,32 @@ TBD.
   assumption.** Larger EP on 4-GPU nodes needs the `hybridep` or `torch`
   dispatcher (`policy.dtensor_cfg.automodel_kwargs.backend.dispatcher`) or a
   DeepEP build with MNNVL enabled; not validated here.
-- **Vision weights are not refit into vLLM.** The AutoModel Omni state-dict
-  adapter's per-tensor HF conversion does not re-fuse the RADIO q/k/v
-  projections for transformers-native RADIO checkpoints, so vLLM's vision tower
-  keeps its dummy initialization. Harmless for the text-only recipe; blocks
-  image RL until fixed.
+- **Vision-weight refit needs the Automodel adapter fix.** Upstream Automodel's
+  Omni state-dict adapter renames native RADIO keys to the legacy tree in its
+  per-tensor conversion without fusing q/k/v, so vLLM silently drops every RADIO
+  attention weight during refit (the refit manifest counts sent keys, not
+  vLLM-consumed ones). This branch's Automodel submodule carries the fix (keep
+  native names; the vLLM fork loads them as q/k/v shards), pending upstream. The
+  image recipe additionally freezes the vision tower and uses `load_format=auto`,
+  so generation uses the checkpoint's vision weights either way.
+- **vLLM vision encoder must not use FLASH_ATTN on Blackwell.** With the
+  v0.25.1 precompiled wheel, `get_flash_attn_version` selects FA4 (CuTe DSL) on
+  SM100, and the wheel's `flash_attn_interface` unpacks four return values from a
+  CuTe `_flash_attn_fwd` that returns two. The language model is unaffected (it
+  uses FlashInfer), but the RADIO encoder crashes on the first image batch. The
+  image recipe sets `vllm_kwargs.mm_encoder_attn_backend: TORCH_SDPA`.
+- **Host memory is the limit for node counts below 16.** Per 4-GPU GB200 node
+  (942 GB) the colocated run holds ~88 GiB of pinned vLLM sleep backup per TP
+  worker plus, while the trainer is offloaded for generation, the sharded
+  params + optimizer state of 4 ranks. On 8 nodes the offload copies are not
+  returned to the OS after onload (a caching allocator outside glibc keeps
+  them), so the node sits at ~880 GB and the first checkpoint save is
+  OOM-killed. 16 nodes peak at ~840 GB including the save. The image recipe
+  also sets `policy.dtensor_cfg.async_checkpoint_save: false` to avoid the
+  extra async staging copy during saves.
+- **Image RL validated only on 16 x 4-GPU nodes.** Save and resume were
+  exercised end to end (2-step save, resume, 20-step job chain); 8-node runs
+  fail at the first checkpoint save for the host-memory reason above.
 - **Benign warning at load:** `Checkpoint key mismatch ... missing=80
   ...experts.{down_projs,gate_and_up_projs}`. The routed experts are written in
   place through strided views and the Omni adapter wrapper does not forward the
