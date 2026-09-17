@@ -853,7 +853,8 @@ Depending on your data shape, you may want to change these values."""
 
         The receipt records the resolving stage in ``terminal_selection``
         (``declared``/``response_id``/``content``/``heuristic`` — failed
-        selections stamp the last stage attempted) and the witness trail in
+        selections stamp the last stage attempted; ``None`` when no stage ran
+        because the manifest failed to parse) and the witness trail in
         ``terminal_attribution_reason``. Retry duplicates are dead-branch
         rows: they stay in the manifest (their staged rows are fetched,
         verified, and cleaned) but never join the terminal chain —
@@ -888,7 +889,7 @@ Depending on your data shape, you may want to change these values."""
         terminal_record = None
         selection_reason = None
         attribution_reason = None
-        terminal_selection = "heuristic"
+        terminal_selection = None
         parsed_records = None
         try:
             parsed_records = [
@@ -912,6 +913,7 @@ Depending on your data shape, you may want to change these values."""
                 terminal_selection = "declared"
                 selection_reason = None
             else:
+                terminal_selection = "heuristic"
                 selection = select_terminal_call(parsed_records)
                 if selection.terminal_model_call_id is not None:
                     terminal_record = deduped[selection.terminal_model_call_id]

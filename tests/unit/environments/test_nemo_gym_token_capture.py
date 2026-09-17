@@ -359,6 +359,24 @@ def test_unattributed_scored_response_falls_back_to_the_heuristic() -> None:
     assert "response_id_no_match" in (receipt["terminal_attribution_reason"] or "")
 
 
+def test_receipt_assembly_leaves_terminal_selection_unset_on_invalid_row() -> None:
+    env = _capture_env()
+    invalid = _manifest_record("c2", parent="c1")
+    del invalid["chain_hash"]  # CallRecord requires it: the manifest fails to parse
+    records = [_manifest_record("c1"), invalid]
+    manifest = {"rollout_id": "r0", "records": records, "failures": []}
+    receipt = env._assemble_receipt(
+        "r0", manifest, terminal_response_id=None, reward=0.0
+    )
+    assert receipt["capture_poisoned"] is True
+    assert receipt["failure_reason"] == "invalid_manifest_row"
+    assert receipt["terminal_model_call_id"] is None
+    # No attribution stage ran, so the receipt must not be stamped with a
+    # method (a "heuristic" label here would inflate that bucket's fraction).
+    assert receipt["terminal_selection"] is None
+    assert receipt["terminal_attribution_reason"] is None
+
+
 def test_declared_and_response_id_witnesses_corroborate() -> None:
     env = _capture_env()
     records = [
