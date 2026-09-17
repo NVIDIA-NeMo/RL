@@ -94,7 +94,7 @@ env:
     placement_strategy: PACK
 ```
 
-`PACK` validates configuration, routing, and teardown on one machine, but it does not provide node-level capacity isolation. The other supported Ray strategies are `SPREAD` and `STRICT_PACK`.
+`PACK` validates configuration, routing, and teardown on one machine, but it does not provide node-level capacity isolation. The other supported Ray strategies are `SPREAD` and `STRICT_PACK`. Shards with `replicas > 1` require the default `STRICT_SPREAD`; replicas share one merged configuration and port range, so any other strategy could place them on the same node.
 
 See `examples/nemo_gym/grpo_sharded_gym_smoke.yaml` for a complete manual smoke configuration.
 
