@@ -498,6 +498,12 @@ def resolve_critic_pretrain_config(
     # build_value_train_data's apply_env_mask), so critic/explained_var stays on
     # the same yardstick as every earlier run and this stays a clean A/B.
     cfg.setdefault("train_on_env_masked", False)
+    # Train the critic on TRUNCATED rollouts too (spec: the 196k budget is part
+    # of the environment; a truncated rollout's evaluated reward IS a legitimate
+    # MC sample of the return, and excluding them makes V optimistic exactly on
+    # long-horizon states). TRAIN ONLY — held-out batches keep the overlong
+    # mask so critic/explained_var stays on the historical yardstick.
+    cfg.setdefault("train_on_truncated", False)
     cfg["train_on_env_masked"] = bool(cfg["train_on_env_masked"])
     # ---- Response-level held-out split (see split_group_responses) ----
     # heldout_mod holds out whole PROMPTS, which measures generalisation to an
@@ -574,14 +580,37 @@ def split_group_responses(
     so a positional cut is an unbiased split, and being deterministic it
     survives resume and reproduces across runs.
     """
-    size = group["batch"].size
+    batch = group["batch"]
+    size = batch.size
+    if "rollout_local_idx" in batch:
+        # Multi-trace shards: rows are TRACES, several per rollout, stored
+        # contiguously per rollout. `start`/`end` are ROLLOUT indices; cutting
+        # by raw row position would split a rollout's root and subagent traces
+        # across train/heldout (label leakage: siblings share the reward).
+        rid = batch["rollout_local_idx"].tolist()
+        assert all(a <= b for a, b in zip(rid, rid[1:])), (
+            "rollout_local_idx is not non-decreasing within a group — the "
+            "flatten order changed; response-level splitting cannot cut at "
+            "rollout boundaries."
+        )
+        n_rollouts = len(set(rid))
+        assert 0 <= start < end <= n_rollouts, (
+            f"response slice [{start}, {end}) out of range for a group of "
+            f"{n_rollouts} rollouts ({size} trace rows); check critic_pretrain."
+            "heldout_responses_per_group against the shards' gens_per_prompt"
+        )
+        row_start = next((i for i, r in enumerate(rid) if r >= start), size)
+        row_end = next((i for i, r in enumerate(rid) if r >= end), size)
+        out = dict(group)
+        out["batch"] = batch.slice(row_start, row_end)
+        return out
     assert 0 <= start < end <= size, (
         f"response slice [{start}, {end}) out of range for a group of {size} "
         "samples; check critic_pretrain.heldout_responses_per_group against "
         "the shards' gens_per_prompt"
     )
     out = dict(group)
-    out["batch"] = group["batch"].slice(start, end)
+    out["batch"] = batch.slice(start, end)
     return out
 
 
@@ -608,6 +637,7 @@ def build_value_train_data(
     tokenizer: Any,
     master_config: Any,
     apply_env_mask: bool = True,
+    apply_overlong_mask: bool = True,
 ) -> tuple[BatchedDataDict, BatchedDataDict]:
     """Assemble (train_data, repeated_batch) from loaded group payloads.
 
@@ -626,9 +656,18 @@ def build_value_train_data(
     """
     per_prompt_batches = [g["batch"] for g in groups]
     repeated_batch = BatchedDataDict.from_batches(per_prompt_batches)
+    # Explicit per-row group identity (one shard group = one prompt). Under
+    # multi-trace, sibling traces have different prompts, so prompt-token
+    # grouping cannot recover this — carry it positionally instead.
+    repeated_batch["shard_group_id"] = torch.cat(
+        [
+            torch.full((b.size,), gi, dtype=torch.int64)
+            for gi, b in enumerate(per_prompt_batches)
+        ]
+    )
 
     use_overlong_filtering = master_config.ppo["overlong_filtering"]
-    if use_overlong_filtering:
+    if use_overlong_filtering and apply_overlong_mask:
         loss_multiplier = repeated_batch["loss_multiplier"].clone()
         truncated = repeated_batch["truncated"]
         if isinstance(truncated, list):
@@ -684,6 +723,34 @@ def build_value_train_data(
     )
     train_data.to("cpu")
     return train_data, repeated_batch
+
+
+def _pad_rows_for_value(
+    data: BatchedDataDict, multiple: int
+) -> tuple[BatchedDataDict, int]:
+    """Row-pad every per-row tensor to a multiple of the value model's sharding.
+
+    Multi-trace batches have a variable row count; the value workers shard rows
+    by data-parallel rank. Padding duplicates row 0 with sample_mask zeroed so
+    padded rows contribute no loss and no metric. Returns (padded_batch,
+    n_unpadded); the input is returned unchanged when already divisible.
+    """
+    n = data["input_ids"].shape[0]
+    pad = (-n) % max(int(multiple), 1)
+    if pad == 0:
+        return data, n
+    out = type(data)()
+    idx = torch.zeros(pad, dtype=torch.long)
+    for key, value in data.items():
+        if torch.is_tensor(value) and value.dim() >= 1 and value.shape[0] == n:
+            out[key] = torch.cat([value, value[idx]], dim=0)
+        elif isinstance(value, list) and len(value) == n:
+            out[key] = list(value) + [value[0]] * pad
+        else:
+            out[key] = value
+    out["sample_mask"] = out["sample_mask"].clone()
+    out["sample_mask"][n:] = 0
+    return out, n
 
 
 # ===============================================================================
@@ -757,6 +824,13 @@ def _forward_values_and_returns(
             ],
         )
     if critic_batch is not None:
+        if "trace_in_rollout_idx" in repeated_batch and bool(
+            (repeated_batch["trace_in_rollout_idx"] != 0).any()
+        ):
+            raise NotImplementedError(
+                "Privileged critic pretraining is not supported on multi-trace "
+                "shards (the reference-block remap assumes one trace per rollout)."
+            )
         vals_aug = value_model.get_values(critic_batch)["values"].squeeze(-1)
         critic_batch["values"] = vals_aug
         train_data["values"] = remap_by_response_mask(
@@ -765,19 +839,31 @@ def _forward_values_and_returns(
             train_data["token_mask"],
         )
     else:
-        train_data["values"] = value_model.get_values(train_data)["values"].squeeze(-1)
+        _value_dp = value_model.sharding_annotations.get_axis_size("data_parallel")
+        _padded, _n_rows = _pad_rows_for_value(train_data, _value_dp)
+        train_data["values"] = value_model.get_values(_padded)["values"].squeeze(-1)[
+            :_n_rows
+        ]
     value_model.finish_inference()
 
-    initial_prompt_message_logs = extract_initial_prompt_messages(
-        repeated_batch["message_log"],
-        repeated_batch["length"],
-    )
-    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-        initial_prompt_message_logs,
-        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-    )
+    if "rollout_local_idx" in repeated_batch:
+        # Sibling traces have different prompts — prompt-token grouping would
+        # put each trace in its own group and corrupt the residual/B_LOO
+        # diagnostics. Use the explicit per-row shard group ids instead
+        # (stamped by build_value_train_data; one shard group = one prompt).
+        prompt_ids_for_adv = repeated_batch["shard_group_id"].unsqueeze(-1)
+    else:
+        initial_prompt_message_logs = extract_initial_prompt_messages(
+            repeated_batch["message_log"],
+            repeated_batch["length"],
+        )
+        prompt_batched_flat, _ = batched_message_log_to_flat_message(
+            initial_prompt_message_logs,
+            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+        )
+        prompt_ids_for_adv = prompt_batched_flat["token_ids"]
     adv_kwargs = dict(
-        prompt_ids=prompt_batched_flat["token_ids"],
+        prompt_ids=prompt_ids_for_adv,
         rewards=train_data["rewards"],
         mask=train_data["token_mask"],
         values=train_data["values"],
@@ -915,8 +1001,14 @@ def _heldout_metrics(
     # that component out and would read as a large regression versus the
     # absolute arm when nothing regressed.
     abs_values = values + to_abs.unsqueeze(-1).to(values.dtype)
+    # Trajectory-level AUCs count each ROLLOUT once: sibling traces repeat the
+    # rollout reward, and a per-row AUC would be delegation-weighted.
+    if "trace_in_rollout_idx" in repeated_batch:
+        _ft = (repeated_batch["trace_in_rollout_idx"] == 0).cpu()
+    else:
+        _ft = torch.ones(values.shape[0], dtype=torch.bool)
     metrics["critic/terminal_auc"] = terminal_value_reward_auc(
-        abs_values, train_data["rewards"], scored_mask
+        abs_values[_ft], train_data["rewards"][_ft], scored_mask[_ft]
     )
     # Sibling ranking with the task held fixed — the calibration-free go/no-go
     # complement to explained variance, and the only AUC that is not confounded
@@ -932,12 +1024,15 @@ def _heldout_metrics(
     if group_ids is not None:
         metrics.update(
             within_group_auc(
-                values, train_data["rewards"], group_ids.cpu(), scored_mask
+                values[_ft],
+                train_data["rewards"][_ft],
+                group_ids.cpu()[_ft],
+                scored_mask[_ft],
             )
         )
     metrics.update(getattr(adv_estimator, "last_metrics", {}) or {})
     metrics.update(priv_metrics)
-    metrics["reward"] = train_data["rewards"].float().mean().item()
+    metrics["reward"] = train_data["rewards"][_ft].float().mean().item()
     metrics["num_heldout_samples"] = float(train_data["input_ids"].shape[0])
     return metrics
 
@@ -1481,10 +1576,18 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
             tokenizer,
             master_config,
             apply_env_mask=not cp_config["train_on_env_masked"],
+            apply_overlong_mask=not cp_config["train_on_truncated"],
         )
-        if train_data["input_ids"].shape[0] != expected_gbs:
+        num_step_rows = train_data["input_ids"].shape[0]
+        if "trace_in_rollout_idx" in repeated_batch:
+            num_step_rollouts = int(
+                (repeated_batch["trace_in_rollout_idx"] == 0).sum()
+            )
+        else:
+            num_step_rollouts = num_step_rows
+        if num_step_rollouts != expected_gbs:
             raise ValueError(
-                f"Step batch has {train_data['input_ids'].shape[0]} samples but "
+                f"Step batch has {num_step_rollouts} rollouts ({num_step_rows} trace rows) but "
                 f"value.train_global_batch_size={expected_gbs}. Override "
                 "value.train_global_batch_size (and critic_pretrain."
                 "groups_per_step) to match groups_per_step * gens_per_prompt "
@@ -1522,11 +1625,20 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
             # and the real rewards must keep flowing to logging/metrics.
             soft_rewards = train_data["rewards"].float().clone()
             sample_mask = train_data["sample_mask"].float()
+            # Multi-trace: the group mean must be over ROLLOUTS — sibling
+            # traces repeat the rollout reward, so a row mean would overweight
+            # delegation-heavy rollouts. The soft target still broadcasts to
+            # every trace row of the group (same semantics as a real reward).
+            first_trace_all = (
+                (repeated_batch["trace_in_rollout_idx"] == 0)
+                if "trace_in_rollout_idx" in repeated_batch
+                else torch.ones_like(sample_mask, dtype=torch.bool)
+            )
             off = 0
             for g in groups:
                 n = int(g["batch"].size)
                 sl = slice(off, off + n)
-                kept = sample_mask[sl] > 0
+                kept = (sample_mask[sl] > 0) & first_trace_all[sl]
                 # An all-masked group keeps its raw rewards: its loss is fully
                 # masked anyway, so no target is ever trained on.
                 if bool(kept.any()):
@@ -1560,7 +1672,16 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
         value_train_batch = _prepare_value_train_batch(
             value_train_batch, adv_estimator, master_config
         )
-        value_results = value_model.train(value_train_batch, value_loss_fn)
+        _value_dp = value_model.sharding_annotations.get_axis_size("data_parallel")
+        _pad_mult = _value_dp * max(
+            int(master_config.value["train_micro_batch_size"]), 1
+        )
+        value_train_batch, _ = _pad_rows_for_value(value_train_batch, _pad_mult)
+        value_results = value_model.train(
+            value_train_batch,
+            value_loss_fn,
+            gbs=value_train_batch["input_ids"].shape[0],
+        )
         value_model.finish_training()
 
         # ---- Metrics ----
