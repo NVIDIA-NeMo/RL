@@ -40,8 +40,8 @@ installs its controller; it does not independently reread the controller snapsho
 Failures may leave partial or overwritten objects and do not roll back peers'
 restores. A failed restore is unusable; start with a fresh restore environment.
 
-New checkpoints use checksum-free format v3. Legacy v1/v2 payload and index
-layouts remain readable, but their historical checksum fields are ignored.
+Checkpoints use checksum-free format v3. Earlier development formats are not
+supported.
 """
 
 from __future__ import annotations
@@ -63,7 +63,6 @@ from typing import Any, Iterator, cast
 import ray
 import torch
 
-_PLUGIN_MARKER = "_nemo_rl_mooncake_checkpoint"
 _STORAGE_DIR = "mooncake_storage"
 _MANIFEST_FILE = "manifest.json"
 # Per Ray wait, not a whole-checkpoint deadline; match TQ Simple's default.
@@ -727,10 +726,8 @@ class _CheckpointParticipant:
             return self._save_shard(body)
         if operation == "DISCOVER_SAVE":
             return self._discover_save(body)
-        if operation == "LOAD_OBJECTS":
-            return self._load_objects(body)
         if operation == "LOAD_SHARDS":
-            return self._load_objects(body)
+            return self._load_shards(body)
         raise ValueError(f"Unsupported Mooncake checkpoint operation: {operation!r}")
 
     def _discover_save(self, body: Mapping[str, Any]) -> dict[str, Any]:
@@ -922,24 +919,10 @@ class _CheckpointParticipant:
             "saved_keys": [obj.key for obj in objects],
         }
 
-    def _load_objects(self, body: Mapping[str, Any]) -> dict[str, Any]:
+    def _load_shards(self, body: Mapping[str, Any]) -> dict[str, Any]:
         root = self._checkpoint_root(body)
-        if body.get("operation") == "LOAD_SHARDS":
-            entries = _read_shard_indexes(root, body.get("shards"))
-            _require_clean_store(self._store, [entry.key for entry in entries])
-        else:
-            values = body.get("objects")
-            if not isinstance(values, list):
-                raise ValueError("Mooncake restore request has no object list")
-            entries = [
-                _manifest_object_from_mapping(value)
-                for value in values
-                if isinstance(value, Mapping)
-            ]
-            if len(entries) != len(values):
-                raise ValueError("Malformed Mooncake restore object")
-        if len({entry.key for entry in entries}) != len(entries):
-            raise ValueError("Duplicate Mooncake restore key")
+        entries = _read_shard_indexes(root, body.get("shards"))
+        _require_clean_store(self._store, [entry.key for entry in entries])
 
         endpoint_values = body.get("current_endpoints")
         if (
@@ -1246,7 +1229,7 @@ def _save_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
 
 def _load_manifest(
     checkpoint_root: Path,
-) -> tuple[list[_ManifestObject] | list[_ShardIndex], dict[str, Any]]:
+) -> tuple[list[_ShardIndex], dict[str, Any]]:
     storage_dir = checkpoint_root / _STORAGE_DIR
     manifest_text = (storage_dir / _MANIFEST_FILE).read_text(encoding="utf-8")
     manifest = json.loads(manifest_text)
@@ -1266,83 +1249,10 @@ def _load_manifest(
         "gdr_staging_buffer_mb": raw_layout["gdr_staging_buffer_mb"],
     }
 
-    if "format_version" in manifest:
-        version = manifest["format_version"]
-        if type(version) is not int or version not in (2, 3) or "objects" in manifest:
-            raise ValueError("Unsupported Mooncake checkpoint manifest format version")
-        shards = _parse_shard_indexes(manifest.get("shards"))
-        return shards, layout
-
-    values = manifest.get("objects")
-    if not isinstance(values, list):
-        raise ValueError("Mooncake checkpoint manifest has no object list")
-    entries: list[_ManifestObject] = []
-    keys: set[str] = set()
-    next_offset: dict[str, int] = {}
-    for value in values:
-        if not isinstance(value, Mapping):
-            raise ValueError("Malformed Mooncake checkpoint object")
-        entry = _manifest_object_from_mapping(value)
-        if entry.key in keys or entry.offset != next_offset.get(entry.shard, 0):
-            raise ValueError(f"Malformed Mooncake checkpoint entry for {entry.key!r}")
-        keys.add(entry.key)
-        next_offset[entry.shard] = entry.offset + entry.size
-        entries.append(entry)
-    if [entry.key for entry in entries] != sorted(keys):
-        raise ValueError("Mooncake checkpoint manifest keys are not sorted")
-    for shard, size in next_offset.items():
-        path = storage_dir / shard
-        if not path.is_file() or path.stat().st_size != size:
-            raise ValueError(f"Missing or corrupt Mooncake checkpoint shard: {shard}")
-    return entries, layout
-
-
-def _restore_assignments(
-    entries: list[_ManifestObject], participants: list[_ParticipantInfo]
-) -> dict[str, list[_ManifestObject]]:
-    shards: dict[str, list[_ManifestObject]] = {}
-    shard_bytes: dict[str, int] = {}
-    for entry in entries:
-        shards.setdefault(entry.shard, []).append(entry)
-        shard_bytes[entry.shard] = shard_bytes.get(entry.shard, 0) + entry.size
-    assignments = {participant.participant_id: [] for participant in participants}
-    assigned_bytes = {participant.participant_id: 0 for participant in participants}
-    for shard in sorted(shards, key=lambda value: (-shard_bytes[value], value)):
-        participant = min(
-            participants,
-            key=lambda value: (
-                assigned_bytes[value.participant_id],
-                value.participant_id,
-            ),
-        )
-        assignments[participant.participant_id].extend(shards[shard])
-        assigned_bytes[participant.participant_id] += shard_bytes[shard]
-    return {
-        participant_id: sorted(values, key=lambda value: (value.shard, value.offset))
-        for participant_id, values in assignments.items()
-        if values
-    }
-
-
-def _validate_restore_response(
-    request: _ParticipantRequest, response: Mapping[str, Any]
-) -> list[str]:
-    if response.get("participant_id") != request.participant.participant_id:
-        raise RuntimeError("Mooncake restore ACK identity mismatch")
-    values = request.body.get("objects")
-    if not isinstance(values, list):
-        raise RuntimeError("Malformed Mooncake restore request")
-    expected: list[str] = []
-    for value in values:
-        if not isinstance(value, Mapping) or not isinstance(value.get("key"), str):
-            raise RuntimeError("Malformed Mooncake restore request key")
-        expected.append(value["key"])
-    restored = response.get("restored_keys")
-    if restored != expected:
-        raise RuntimeError(
-            f"Mooncake restore ACK mismatch from {request.participant.participant_id}"
-        )
-    return expected
+    version = manifest.get("format_version")
+    if type(version) is not int or version != 3 or "objects" in manifest:
+        raise ValueError("Unsupported Mooncake checkpoint manifest format version")
+    return _parse_shard_indexes(manifest.get("shards")), layout
 
 
 def _require_clean_store(
@@ -1435,53 +1345,51 @@ def _load_storage_checkpoint(manager: Any, checkpoint_dir: str) -> None:
     """Restore payload on current clients before TQ loads its controller."""
     _validate_checkpoint_runtime(manager)
     checkpoint_root = Path(checkpoint_dir).resolve()
-    entries, saved_layout = _load_manifest(checkpoint_root)
+    shards, saved_layout = _load_manifest(checkpoint_root)
     current_layout = _storage_layout(manager.config)
     if saved_layout != current_layout:
         raise ValueError(
             "Mooncake checkpoint storage layout does not match this runtime: "
             f"saved={saved_layout}, current={current_layout}"
         )
-    if entries and isinstance(entries[0], _ShardIndex):
-        _load_sharded_checkpoint(
-            manager, checkpoint_root, cast(list[_ShardIndex], entries)
-        )
-        return
-    entries = cast(list[_ManifestObject], entries)
+    if shards:
+        _load_sharded_checkpoint(manager, checkpoint_root, shards)
 
-    store = manager.storage_client._store
-    if not entries:
-        return
-    _require_clean_store(store, [entry.key for entry in entries])
-    participants, workers = _live_participants(manager)
-    if not participants:
-        raise RuntimeError("No live Mooncake checkpoint participants")
-    assignments = _restore_assignments(entries, participants)
-    by_id = {participant.participant_id: participant for participant in participants}
-    current_endpoints = {participant.transport_endpoint for participant in participants}
-    requests = [
-        _ParticipantRequest(
-            by_id[participant_id],
-            _request_body(
-                manager,
-                "LOAD_OBJECTS",
-                checkpoint_root=str(checkpoint_root),
-                objects=[asdict(entry) for entry in assignments[participant_id]],
-                current_endpoints=sorted(current_endpoints),
-            ),
-        )
-        for participant_id in sorted(assignments)
-    ]
-    responses = _fanout_requests(
-        requests,
-        workers=workers,
-        local=manager._checkpoint_participant,
-        timeout_s=_DEFAULT_TIMEOUT_S,
-    )
-    _require_exact_responses(requests, responses, operation="restore")
-    for request in requests:
-        response = responses[request.participant.participant_id]
-        _validate_restore_response(request, response)
+
+class _CheckpointManagerMixin:
+    """Add explicit checkpoint operations to TQ's lazily imported manager."""
+
+    config: dict[str, Any]
+
+    def __init__(self, controller_info: Any, config: dict[str, Any]) -> None:
+        if _checkpoint_enabled(config):
+            config = dict(config)
+            if ray.get_runtime_context().get_actor_id() is None:
+                # A driver/task has no actor command endpoint. It may use
+                # Mooncake, but must not own otherwise unreachable payload.
+                # Keep the controller's published config unchanged so actors
+                # still mount their configured storage capacity.
+                config["global_segment_size"] = 0
+        # The optional TQ base is supplied at installation, not at module import.
+        cast(Any, super()).__init__(controller_info, config)
+        self._checkpoint_workers: list[Any] = []
+        self._checkpoint_participant: _CheckpointParticipant | None = None
+        if _checkpoint_enabled(self.config):
+            _validate_checkpoint_runtime(self)
+            if self.config["global_segment_size"] > 0:
+                self._checkpoint_participant = _CheckpointParticipant(self)
+
+    async def save_checkpoint(self, checkpoint_dir: str) -> None:
+        if not _checkpoint_enabled(self.config):
+            await cast(Any, super()).save_checkpoint(checkpoint_dir)
+            return
+        await asyncio.to_thread(_save_storage_checkpoint, self, checkpoint_dir)
+
+    async def load_checkpoint(self, checkpoint_dir: str) -> None:
+        if not _checkpoint_enabled(self.config):
+            await cast(Any, super()).load_checkpoint(checkpoint_dir)
+            return
+        await asyncio.to_thread(_load_storage_checkpoint, self, checkpoint_dir)
 
 
 def configure_checkpoint_workers(workers: list[Any]) -> None:
@@ -1495,7 +1403,7 @@ def configure_checkpoint_workers(workers: list[Any]) -> None:
     import transfer_queue as tq
 
     manager = tq.get_client().storage_manager
-    if not getattr(type(manager), _PLUGIN_MARKER, False):
+    if not isinstance(manager, _CheckpointManagerMixin):
         raise RuntimeError("Mooncake checkpoint manager is not installed")
     manager._checkpoint_workers = list(workers)
 
@@ -1510,7 +1418,7 @@ def run_checkpoint_command(body: Mapping[str, Any]) -> dict[str, Any] | None:
     if client is None:
         return None
     manager = client.storage_manager
-    if not getattr(type(manager), _PLUGIN_MARKER, False):
+    if not isinstance(manager, _CheckpointManagerMixin):
         return None
     participant = manager._checkpoint_participant
     return None if participant is None else participant._dispatch(body)
@@ -1518,48 +1426,24 @@ def run_checkpoint_command(body: Mapping[str, Any]) -> dict[str, Any] | None:
 
 def install_tq_mooncake_checkpoint_plugin() -> None:
     """Install the explicit-checkpoint storage manager once."""
+    # TransferQueue is optional outside this backend.
     from transfer_queue.storage.managers import mooncake_manager
     from transfer_queue.storage.managers.base import StorageManagerFactory
 
     manager_registry = StorageManagerFactory._registry
     current_manager = manager_registry.get("MooncakeStore")
-    if getattr(current_manager, _PLUGIN_MARKER, False):
+    if isinstance(current_manager, type) and issubclass(
+        current_manager, _CheckpointManagerMixin
+    ):
         return
     if current_manager is not mooncake_manager.MooncakeStorageManager:
         raise RuntimeError("Unexpected TQ MooncakeStore manager registration")
 
-    class CheckpointMooncakeStorageManager(mooncake_manager.MooncakeStorageManager):
-        def __init__(self, controller_info: Any, config: dict[str, Any]) -> None:
-            if _checkpoint_enabled(config):
-                config = dict(config)
-                if ray.get_runtime_context().get_actor_id() is None:
-                    # A driver/task has no actor command endpoint. It may use
-                    # Mooncake, but must not own otherwise unreachable payload.
-                    # Keep the controller's published config unchanged so actors
-                    # still mount their configured storage capacity.
-                    config["global_segment_size"] = 0
-            super().__init__(controller_info, config)
-            self._checkpoint_workers: list[Any] = []
-            self._checkpoint_participant: _CheckpointParticipant | None = None
-            if _checkpoint_enabled(self.config):
-                _validate_checkpoint_runtime(self)
-                if self.config["global_segment_size"] > 0:
-                    self._checkpoint_participant = _CheckpointParticipant(self)
+    class CheckpointMooncakeStorageManager(
+        _CheckpointManagerMixin, mooncake_manager.MooncakeStorageManager
+    ):
+        pass
 
-        async def save_checkpoint(self, checkpoint_dir: str) -> None:
-            if not _checkpoint_enabled(self.config):
-                await super().save_checkpoint(checkpoint_dir)
-                return
-            await asyncio.to_thread(_save_storage_checkpoint, self, checkpoint_dir)
-
-        async def load_checkpoint(self, checkpoint_dir: str) -> None:
-            if not _checkpoint_enabled(self.config):
-                await super().load_checkpoint(checkpoint_dir)
-                return
-            await asyncio.to_thread(_load_storage_checkpoint, self, checkpoint_dir)
-
-    CheckpointMooncakeStorageManager.__name__ = "CheckpointMooncakeStorageManager"
-    setattr(CheckpointMooncakeStorageManager, _PLUGIN_MARKER, True)
     manager_registry["MooncakeStore"] = CheckpointMooncakeStorageManager
 
 

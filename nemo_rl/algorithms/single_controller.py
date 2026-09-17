@@ -142,6 +142,11 @@ from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
     configure_checkpoint_workers,
 )
 from nemo_rl.data_plane.async_utils import call_data_plane
+from nemo_rl.data_plane.observability import (
+    is_metrics_client,
+    log_step_metrics,
+    metrics_never_fail_the_step,
+)
 from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
     DP_TRAIN_FIELDS,
@@ -1818,6 +1823,39 @@ class SingleControllerActor:
         if errors:
             raise BaseExceptionGroup("post-train DataPlane cleanup failed", errors)
 
+    def _log_data_plane_metrics(self, total_step_time: float) -> None:
+        """Log this step's data-plane cost. Never raises.
+
+        On by default, so this runs every step of every recipe. Mirrors
+        ``grpo_sync._log_data_plane_metrics``.
+        """
+        with metrics_never_fail_the_step(self._train_steps):
+            self._log_data_plane_metrics_impl(total_step_time)
+
+    def _log_data_plane_metrics_impl(self, total_step_time: float) -> None:
+        """Log this step's data-plane cost. No-op unless observability is enabled.
+
+        The synchronous loop logs these series from ``_log_data_plane_metrics``
+        in ``grpo_sync``. Without the same call here the single-controller path
+        builds the metrics client, pays for its counters on every op, and emits
+        nothing -- the failure is silent, because an empty dashboard looks the
+        same as a data plane that cost nothing.
+
+        Driver scope only, and the prefix says so. This client issues the
+        advantage stage's get, the put that writes the advantages back, and
+        the post-train clear; the bulk traffic is
+        the trainer and generation workers' own clients, in their own
+        processes with their own counters, so ``comm_volume_mb`` here is well
+        under what the job actually moved. ``grpo_sync`` gets a cluster view by
+        fanning out over its policy worker group; this loop has no such group to
+        fan out over, so driver scope is all there is here.
+        """
+        if not is_metrics_client(self._dp_client):
+            return  # observability disabled -> plain adapter
+
+        metrics = self._dp_client.get_step_metrics(total_step_time)
+        log_step_metrics(self._logger, metrics, self._train_steps, "driver")
+
     @staticmethod
     def _group_ids_from_meta(meta: KVBatchMeta) -> list[str]:
         """Return stable prompt-group IDs in canonical sample order."""
@@ -3143,6 +3181,11 @@ class SingleControllerActor:
             self._logger.log_metrics(
                 step_metrics, step=self._train_steps, prefix="train"
             )
+            # Must precede the step_finished=True log below. That log commits
+            # the wandb step, and wandb silently discards anything logged
+            # against a step it has already committed -- no exception, no
+            # failed return, just an empty chart. grpo_sync had the same bug.
+            self._log_data_plane_metrics(total_time)
             # step_finished=True here since this is the final log of our current step.
             self._logger.log_metrics(
                 timing_metrics,
@@ -4710,8 +4753,9 @@ class SingleControllerActor:
         Flow:
           1. _rollout_permitted.clear()  — no new dispatches
           2. Optionally calibrate FP8 KV-cache scales.
-          3. weight_synchronizer.sync_weights(kv_scales=...)
-          4. _rollout_permitted.set()   — resume
+          3. Materialize deferred policy parameter all-gathers.
+          4. weight_synchronizer.sync_weights(kv_scales=...)
+          5. _rollout_permitted.set()   — resume
 
         Args:
             calibration_data: Optional data used to calibrate FP8 KV-cache
@@ -4769,6 +4813,11 @@ class SingleControllerActor:
         # -- and STALE is not absent, so asking again at promotion time would include a
         # shard the communicator was deliberately built without.
         participants = self._refit_participants()
+
+        # Recovery may repeat the transport, but an optimizer update only needs
+        # one parameter all-gather, so keep this outside the retry block.
+        with self._timer.time("prepare_for_generation/sync_policy_params"):
+            await asyncio.to_thread(self._trainer.sync_params_before_refit)
 
         try:
             await self._sync_weights_within(kv_scales, "first")

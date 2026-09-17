@@ -204,6 +204,15 @@ Periodic snapshots currently require all of the following:
   samplers qualify. A custom sampler must explicitly declare both
   `supports_buffer_checkpoint = True` and `supports_training_claims = True`.
 
+With `data_plane.backend: mooncake_cpu`, data-plane checkpointing also requires
+`async_rl.generation_fleet_health.restart_dead_shards: false`. Setup rejects
+automatic shard restarts because replacing a generation worker can discard
+its owned Mooncake payload and leave stale checkpoint worker handles. This
+restriction applies to both trainer-step checkpoints and periodic rollout
+snapshots; restarting the whole job from a saved checkpoint is still supported.
+Support for live shard restarts is tracked in
+[NVIDIA-NeMo/RL#4178](https://github.com/NVIDIA-NeMo/RL/issues/4178).
+
 Each trainer or bootstrap anchor has a `rollout_snapshots/` directory. A
 published `snapshot_NNNNNN/` contains the native TQ snapshot and matching
 replay, dataloader, controller, replacement-reserve, and unfinished-rollout

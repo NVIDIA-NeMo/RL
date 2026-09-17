@@ -1071,6 +1071,21 @@ def setup_single_controller(
             f"data_plane.backend={dp_config['backend']!r}."
         )
     if master_config.checkpointing["enabled"]:
+        if (
+            master_config.checkpointing.get("save_data_plane")
+            and dp_config["backend"] == "mooncake_cpu"
+            and master_config.async_rl.generation_fleet_health.restart_dead_shards
+        ):
+            raise ValueError(
+                "Mooncake data-plane checkpointing does not support "
+                "async_rl.generation_fleet_health.restart_dead_shards=true: "
+                "replacing generation workers can lose their owned payload "
+                "and leave stale checkpoint worker handles. Set "
+                "async_rl.generation_fleet_health.restart_dead_shards=false "
+                "when checkpointing.enabled=true, "
+                "checkpointing.save_data_plane=true, and "
+                "data_plane.backend='mooncake_cpu'."
+            )
         sampler_supports_replay_recovery = sampler_supports_buffer_checkpoint(
             master_config.async_rl.sampler
         )

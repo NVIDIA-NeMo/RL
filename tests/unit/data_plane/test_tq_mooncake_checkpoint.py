@@ -1381,18 +1381,48 @@ def test_plugin_install_does_not_change_the_normal_put_path(
     )
 
 
+def test_plugin_install_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    from transfer_queue.storage.managers import mooncake_manager
+    from transfer_queue.storage.managers.base import StorageManagerFactory
+
+    monkeypatch.setitem(
+        StorageManagerFactory._registry,
+        "MooncakeStore",
+        mooncake_manager.MooncakeStorageManager,
+    )
+    install_tq_mooncake_checkpoint_plugin()
+    installed_manager = StorageManagerFactory._registry["MooncakeStore"]
+
+    install_tq_mooncake_checkpoint_plugin()
+
+    assert StorageManagerFactory._registry["MooncakeStore"] is installed_manager
+    assert issubclass(installed_manager, checkpoint_plugin._CheckpointManagerMixin)
+    assert issubclass(installed_manager, mooncake_manager.MooncakeStorageManager)
+
+
+@pytest.mark.parametrize("registration", [None, object(), SimpleNamespace])
+def test_plugin_install_rejects_unexpected_registration(
+    monkeypatch: pytest.MonkeyPatch, registration: Any
+) -> None:
+    from transfer_queue.storage.managers.base import StorageManagerFactory
+
+    monkeypatch.setitem(StorageManagerFactory._registry, "MooncakeStore", registration)
+
+    with pytest.raises(RuntimeError, match="Unexpected TQ MooncakeStore"):
+        install_tq_mooncake_checkpoint_plugin()
+
+    assert StorageManagerFactory._registry["MooncakeStore"] is registration
+
+
 def test_configure_and_command_reuse_the_existing_process_local_manager(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import transfer_queue as tq
     from transfer_queue import interface as tq_interface
 
-    class FakeManager(SimpleNamespace):
-        pass
-
-    setattr(FakeManager, checkpoint_plugin._PLUGIN_MARKER, True)
-    manager = FakeManager(
-        **vars(_manager(_FakeStore(_FakeCluster({}, {}), "10.0.0.1:12301")))
+    manager = object.__new__(checkpoint_plugin._CheckpointManagerMixin)
+    manager.__dict__.update(
+        vars(_manager(_FakeStore(_FakeCluster({}, {}), "10.0.0.1:12301")))
     )
     participant = _participant(manager)
     client = SimpleNamespace(storage_manager=manager)
@@ -1410,6 +1440,21 @@ def test_configure_and_command_reuse_the_existing_process_local_manager(
         checkpoint_plugin._request_body(manager, "DESCRIBE")
     )
     assert response["participant"] == asdict(participant.info)
+
+
+def test_configure_rejects_and_command_ignores_uninstalled_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transfer_queue as tq
+    from transfer_queue import interface as tq_interface
+
+    client = SimpleNamespace(storage_manager=SimpleNamespace())
+    monkeypatch.setattr(tq, "get_client", lambda: client)
+    monkeypatch.setattr(tq_interface, "_TQ_CLIENT", client)
+
+    with pytest.raises(RuntimeError, match="checkpoint manager is not installed"):
+        checkpoint_plugin.configure_checkpoint_workers([])
+    assert checkpoint_plugin.run_checkpoint_command({"operation": "DESCRIBE"}) is None
 
 
 def test_command_does_not_initialize_a_client_on_non_owner_ranks(
@@ -1461,6 +1506,8 @@ def test_installed_manager_keeps_non_actor_clients_out_of_the_storage_topology(
         self.storage_client.global_segment_size = config["global_segment_size"]
         self.storage_manager_id = fake.storage_manager_id
         self.controller_info = controller_info
+        self.controller_handshake_socket = None
+        self.zmq_context = SimpleNamespace(term=lambda: None)
 
     monkeypatch.setattr(mooncake_manager.MooncakeStorageManager, "__init__", base_init)
     monkeypatch.setattr(
@@ -1501,8 +1548,10 @@ def test_installed_manager_keeps_non_actor_clients_out_of_the_storage_topology(
     assert manager_closes == ["manager"]
 
 
-def test_installed_manager_dispatches_explicit_storage_save_and_load(
+@pytest.mark.parametrize("enabled", [False, True])
+def test_installed_manager_dispatches_only_enabled_checkpoint_operations(
     monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
 ) -> None:
     from transfer_queue.storage.managers import mooncake_manager
     from transfer_queue.storage.managers.base import StorageManagerFactory
@@ -1515,7 +1564,7 @@ def test_installed_manager_dispatches_explicit_storage_save_and_load(
     install_tq_mooncake_checkpoint_plugin()
     manager_type = StorageManagerFactory._registry["MooncakeStore"]
     manager = object.__new__(manager_type)
-    manager.config = {"checkpoint": {"enabled": True}}
+    manager.config = {"checkpoint": {"enabled": enabled}}
     manager.storage_manager_id = "test-manager"
     manager.controller_handshake_socket = None
     manager.zmq_context = SimpleNamespace(term=lambda: None)
@@ -1531,12 +1580,26 @@ def test_installed_manager_dispatches_explicit_storage_save_and_load(
         lambda _manager, path: calls.append(("load", path)),
     )
 
+    async def base_save(_self: Any, path: str) -> None:
+        calls.append(("base-save", path))
+
+    async def base_load(_self: Any, path: str) -> None:
+        calls.append(("base-load", path))
+
+    monkeypatch.setattr(
+        mooncake_manager.MooncakeStorageManager, "save_checkpoint", base_save
+    )
+    monkeypatch.setattr(
+        mooncake_manager.MooncakeStorageManager, "load_checkpoint", base_load
+    )
+
     asyncio.run(manager.save_checkpoint("/checkpoint-save"))
     asyncio.run(manager.load_checkpoint("/checkpoint-load"))
 
+    prefix = "" if enabled else "base-"
     assert calls == [
-        ("save", "/checkpoint-save"),
-        ("load", "/checkpoint-load"),
+        (f"{prefix}save", "/checkpoint-save"),
+        (f"{prefix}load", "/checkpoint-load"),
     ]
 
 
@@ -1695,56 +1758,31 @@ def test_save_rejects_foreign_or_invalid_owner_memory_before_writing(
         )
 
 
-@pytest.mark.parametrize("version", [1, 2])
-def test_load_accepts_legacy_layouts_without_verifying_historical_checksums(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: int
+@pytest.mark.parametrize(
+    "format_fields",
+    [
+        {"objects": []},
+        {"format_version": 2, "shards": []},
+        {"format_version": 1, "shards": []},
+        {"format_version": 4, "shards": []},
+        {"format_version": "3", "shards": []},
+        {"format_version": 3.0, "shards": []},
+        {"format_version": True, "shards": []},
+        {"format_version": 3, "shards": [], "objects": []},
+    ],
+)
+def test_load_rejects_legacy_or_unsupported_manifest_formats(
+    tmp_path: Path, format_fields: dict[str, Any]
 ) -> None:
-    checkpoint_dir = _checkpoint_dir(tmp_path)
-    storage_dir = checkpoint_dir / "mooncake_storage"
+    storage_dir = tmp_path / "mooncake_storage"
     storage_dir.mkdir()
-    objects = []
-    offset = 0
-    with (storage_dir / "part-00000.bin").open("wb") as output:
-        for key, value in sorted(_payloads().items()):
-            output.write(value)
-            objects.append(
-                {
-                    "key": key,
-                    "shard": "part-00000.bin",
-                    "offset": offset,
-                    "size": len(value),
-                    "sha256": "historical checksum deliberately ignored",
-                    "saved_owner": "old-owner",
-                }
-            )
-            offset += len(value)
     manifest = {
         "storage_layout": {"use_gdr": False, "gdr_staging_buffer_mb": 1024},
-        "objects": objects,
+        **format_fields,
     }
-    if version == 2:
-        (storage_dir / "part-00000.bin.index.json").write_text(
-            json.dumps({"objects": objects})
-        )
-        del manifest["objects"]
-        manifest.update(
-            format_version=2,
-            shards=[
-                {
-                    "shard": "part-00000.bin",
-                    "object_count": len(objects),
-                    "payload_bytes": offset,
-                    "saved_owner": "old-owner",
-                    "index_sha256": "historical checksum deliberately ignored",
-                }
-            ],
-        )
     (storage_dir / "manifest.json").write_text(json.dumps(manifest))
-    cluster = _FakeCluster({}, {})
-    manager = _manager(_FakeStore(cluster, "127.0.0.1:12301"))
-    _wire_participants(monkeypatch, [_participant(manager)])
-    _load_storage_checkpoint(manager, str(checkpoint_dir))
-    assert cluster.objects == _payloads()
+    with pytest.raises(ValueError, match="Unsupported.*format version"):
+        checkpoint_plugin._load_manifest(tmp_path)
 
 
 def test_batch_failure_preserves_primary_error_and_quarantines_cleanup_failure(
@@ -1766,3 +1804,35 @@ def test_batch_failure_preserves_primary_error_and_quarantines_cleanup_failure(
     assert any("buffer cleanup failed" in note for note in error.value.__notes__)
     assert len(quarantined_buffers) == 1
     assert not quarantined_buffers[0].closed
+
+
+@pytest.mark.parametrize(
+    ("status_name", "is_memory"), [("PROCESSING", True), ("COMPLETE", False)]
+)
+def test_save_rejects_incomplete_or_nonmemory_replicas(
+    monkeypatch: pytest.MonkeyPatch, status_name: str, is_memory: bool
+) -> None:
+    endpoint = "127.0.0.1:12301"
+    store = _FakeStore(_FakeCluster({}, {}), endpoint)
+    participant = _participant(_manager(store))
+    replica = _FakeMemoryReplica(endpoint, 4)
+    replica.status.name = status_name
+    monkeypatch.setattr(replica, "is_memory_replica", lambda: is_memory)
+    monkeypatch.setattr(
+        replica,
+        "get_memory_descriptor",
+        lambda: pytest.fail("ineligible replica reached memory descriptor access"),
+    )
+    monkeypatch.setattr(
+        store, "batch_get_replica_desc", lambda _keys: {"key": [replica]}
+    )
+
+    with pytest.raises(RuntimeError, match="no COMPLETE memory replica"):
+        participant._dispatch(
+            checkpoint_plugin._request_body(
+                participant._manager,
+                "DISCOVER_SAVE",
+                keys=["key"],
+                current_endpoints=[endpoint],
+            )
+        )
