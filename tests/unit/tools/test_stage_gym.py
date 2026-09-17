@@ -3,6 +3,7 @@
 """Atomic staging of the pinned Gym tree with patches and overlays."""
 
 import json
+import os
 from pathlib import Path
 import subprocess
 
@@ -81,3 +82,33 @@ def test_already_applied_patch_fails_instead_of_reversing(tmp_path, monkeypatch)
     with pytest.raises(subprocess.CalledProcessError):
         stage_gym.stage(repo, output)
     assert not output.exists()
+
+
+def test_complete_overlay_applies_to_pinned_gym(tmp_path):
+    """Exercise GNU patch, including context rules that git apply ignores."""
+    root = Path(__file__).resolve().parents[3]
+    source = root / "3rdparty/Gym-workspace/Gym"
+    probe = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source),
+            "cat-file",
+            "-e",
+            f"{stage_gym.GYM_BASE}^{{commit}}",
+        ],
+        capture_output=True,
+        check=False,
+    )
+    if probe.returncode:
+        message = "Initialize the pinned Gym submodule for native patch application"
+        if os.environ.get("NRL_REQUIRE_PINNED_GYM"):
+            pytest.fail(message)
+        pytest.skip(message)
+    output = tmp_path / "runtime-gym"
+    stage_gym.stage(source, output)
+    simple = (output / "responses_api_agents/simple_agent/app.py").read_text()
+    assert "budget.consume(model_response.usage.output_tokens" in simple
+    assert (output / "nemo_gym/judge_verdict.py").read_bytes() == (
+        stage_gym.ASSETS / "gym_overlays/judge_verdict.py"
+    ).read_bytes()

@@ -601,7 +601,8 @@ for integrated training or cross-cluster validation.
 The historical failure ledger and measurements remain unchanged. This document
 is self-contained for code review; access to private cluster artifacts is not
 implied by possession of the branch.
-# Finite-dataset drain (2026-09-17)
+
+## Finite-dataset drain (2026-09-17)
 
 At EOF, stop admitting new prompts but keep the collector running until its
 in-flight workers enqueue their final groups. Clearing `running` first drops
@@ -609,10 +610,19 @@ those groups and raises `Trajectory collection stopped before enqueue completed`
 The flag is cleared in a `finally` block even when draining fails. Tests cover
 both the final enqueue and error cleanup. This ports the tested `bf3a59e` runtime
 fix into this maintenance branch; it does not change the data or reward recipe.
-# Complete judge verdicts (2026-09-17)
+
+## Complete judge verdicts (2026-09-17)
 
 Strict judging rejects incomplete Responses and text containing both verdict
 labels. These are retryable judge failures, not positive or negative rewards.
 A completed, unambiguous negative verdict remains valid and is never retried.
 Tests cover capped/conflicting replies and successful verdicts. This ports the
 tested `b41e457` runtime helper; the configured attempt count remains YAML-owned.
+
+## Clean Gym patch application (2026-09-17)
+
+The rollout-budget patch needs its final blank context line. Without it, GNU
+`patch --fuzz=0` interprets the asymmetric context as an EOF-only hunk and fails
+on the pinned `simple_agent/app.py`, even though `git apply --check` succeeds.
+The new staging regression applies the entire overlay to pinned Gym. Set
+`NRL_REQUIRE_PINNED_GYM=1` to reject a missing pin instead of skipping that test.
