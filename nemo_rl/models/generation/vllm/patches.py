@@ -622,6 +622,459 @@ def _patch_vllm_glm_decoder_sequence_parallel_moe(logger) -> None:
     logger.info("Successfully disabled decoder-level SP-MoE for GLM DSA models.")
 
 
+def _patch_vllm_monolithic_routing_replay_base(logger) -> None:
+    """Add routing-replay buffer plumbing to ``FusedMoEExpertsMonolithic``.
+
+    Backports the base-class half of vllm-project/vllm#44214 ("Enable router
+    replay output from FlashInfer monolithic MoE kernel"). On vLLM 0.25.1,
+    routed-experts capture (``enable_return_routed_experts`` /
+    ``router_replay``) only works through the modular MoE kernel path via
+    ``router.set_capture_fn()`` -- the monolithic path (FlashInfer TRT-LLM,
+    used by MXFP8/NVFP4/MXFP4 monolithic kernels) fuses routing into the
+    kernel itself, so ``module.router`` isn't a ``BaseRouter`` there and
+    nothing ever captures it. The routed-experts buffer then silently stays
+    at its zero-initialized default (see ``RoutedExpertsCapturer.__init__``),
+    which NeMo-RL's router_replay then replays into Megatron's MoE
+    all-to-all dispatch as if every token routed to expert 0 -- observed as
+    ``RuntimeError: Split sizes doesn't match total dim 0 size`` in
+    ``megatron/core/tensor_parallel/mappings.py``'s ``all_to_all`` on a
+    policy using ``vllm_kwargs.moe_backend=flashinfer_trtllm`` with MXFP8 and
+    ``policy.router_replay.enabled=true``.
+
+    Paired with ``_patch_vllm_trtllm_fp8_routing_replay`` (which opts
+    ``TrtLlmFp8ExpertsMonolithic`` -- the fp8 block-scale/MXFP8 monolithic
+    kernel NeMo-RL's MXFP8-rollout recipes use -- into this) and
+    ``_patch_vllm_bind_routed_experts_capturer_monolithic`` (the
+    ``GPUModelRunner`` side that wires it up and hard-fails instead of
+    silently corrupting routing for any other monolithic kernel that hasn't
+    opted in, backported from the same PR plus vllm-project/vllm#48622).
+
+    Remove all three patches after upgrading to a vLLM release containing
+    #44214 and #48622, and re-validate router_replay + MXFP8 rollouts.
+    """
+    try:
+        file_to_patch = _get_vllm_file(
+            "model_executor/layers/fused_moe/modular_kernel.py"
+        )
+    except RuntimeError:
+        logger.warning(
+            "Could not locate modular_kernel.py for the monolithic routing "
+            "replay base patch."
+        )
+        return
+
+    old_snippet = """    @staticmethod
+    def is_monolithic() -> bool:
+        return True
+
+    def apply(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        router_logits: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        # grouped topk + fused topk bias parameters
+        num_expert_group: int | None = None,
+        e_score_correction_bias: torch.Tensor | None = None,
+        routed_scaling_factor: float | None = None,
+        topk_group: int | None = None,
+    ) -> torch.Tensor:
+        \"\"\"
+        Same as apply(), except uses router_logits as opposed
+        to the topk_ids and topk_weights. This is useful for kernels
+        with fused router and fused_experts (e.g. FLASHINFER_TRTLLM).
+        \"\"\"
+        raise NotImplementedError
+"""
+
+    new_snippet = """    @staticmethod
+    def is_monolithic() -> bool:
+        return True
+
+    # Backport of vllm-project/vllm#44214: lets a monolithic kernel opt into
+    # routing-replay capture and stages the per-token expert-ID buffer that
+    # NeMo-RL's router_replay reads via ``enable_return_routed_experts``.
+    routing_replay_capture_fn: Callable[[torch.Tensor], None] | None = None
+    _routing_replay_buffer: torch.Tensor | None = None
+
+    def supports_routing_replay_capture(self) -> bool:
+        \"\"\"Whether this expert supports routing replay capture.
+
+        Subclasses backed by a kernel that exposes routed expert IDs
+        (e.g. FlashInfer's ``routing_replay_out``) should override.
+        \"\"\"
+        return False
+
+    def set_capture_fn(
+        self,
+        capture_fn: Callable[[torch.Tensor], None] | None,
+    ) -> None:
+        self.routing_replay_capture_fn = capture_fn
+        if capture_fn is None:
+            self._routing_replay_buffer = None
+            return
+        self._routing_replay_buffer = torch.empty(
+            (self.moe_config.max_num_tokens, self.moe_config.experts_per_token),
+            dtype=torch.int16,
+            device=self.moe_config.device,
+        )
+
+    def _maybe_make_routing_replay_buffer(
+        self,
+        num_tokens: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if self.routing_replay_capture_fn is None:
+            return None
+        buf = self._routing_replay_buffer
+        assert buf is not None
+        if buf.shape[0] < num_tokens or buf.device != device:
+            raise ValueError(
+                "Routing replay buffer was initialized for "
+                f"{buf.shape[0]} tokens on {buf.device}, but the kernel "
+                f"received {num_tokens} tokens on {device}."
+            )
+        return buf
+
+    def _maybe_dispatch_routing_replay(
+        self,
+        routing_replay_out: torch.Tensor | None,
+        num_tokens: int,
+    ) -> None:
+        if routing_replay_out is None or self.routing_replay_capture_fn is None:
+            return
+        self.routing_replay_capture_fn(routing_replay_out[:num_tokens])
+
+    def apply(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        router_logits: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        # grouped topk + fused topk bias parameters
+        num_expert_group: int | None = None,
+        e_score_correction_bias: torch.Tensor | None = None,
+        routed_scaling_factor: float | None = None,
+        topk_group: int | None = None,
+    ) -> torch.Tensor:
+        \"\"\"
+        Same as apply(), except uses router_logits as opposed
+        to the topk_ids and topk_weights. This is useful for kernels
+        with fused router and fused_experts (e.g. FLASHINFER_TRTLLM).
+        \"\"\"
+        raise NotImplementedError
+"""
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if new_snippet in content:
+            logger.info("vLLM monolithic routing-replay base patch already applied.")
+            return
+        if old_snippet not in content:
+            logger.warning(
+                "Could not apply vLLM monolithic routing-replay base patch: "
+                "expected vLLM 0.25.1 source shape was not found in %s.",
+                file_to_patch,
+            )
+            return
+        write_back(content.replace(old_snippet, new_snippet, 1))
+
+    logger.info(
+        "Successfully added routing-replay buffer support to "
+        "FusedMoEExpertsMonolithic."
+    )
+
+
+def _patch_vllm_trtllm_fp8_routing_replay(logger) -> None:
+    """Wire routing-replay capture through the fp8/MXFP8 monolithic TRT-LLM kernel.
+
+    Backports the ``TrtLlmFp8ExpertsMonolithic`` half of
+    vllm-project/vllm#44214 onto vLLM 0.25.1. This is the monolithic kernel
+    NeMo-RL's ``vllm_kwargs.moe_backend=flashinfer_trtllm`` MXFP8-rollout
+    recipes select (both the ``[128, 128]`` fp8 block-scale and ``[1, 32]``
+    MXFP8 block shapes route through ``_apply_block_scale``). Requires
+    ``_patch_vllm_monolithic_routing_replay_base`` to have run first, since
+    it adds the ``_maybe_make_routing_replay_buffer`` /
+    ``_maybe_dispatch_routing_replay`` methods this patch calls.
+
+    See ``_patch_vllm_monolithic_routing_replay_base`` for why this matters:
+    without it, MXFP8 rollouts under ``policy.router_replay.enabled=true``
+    silently replay all-zero routing into Megatron's training-side MoE
+    dispatch instead of raising or, after this patch, actually capturing
+    real per-token expert IDs.
+    """
+    try:
+        file_to_patch = _get_vllm_file(
+            "model_executor/layers/fused_moe/experts/trtllm_fp8_moe.py"
+        )
+    except RuntimeError:
+        logger.warning(
+            "Could not locate trtllm_fp8_moe.py for the fp8/MXFP8 routing "
+            "replay patch."
+        )
+        return
+
+    class_old = """class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolithic):
+    \"\"\"
+    Fp8 TRTLLM-Gen MoE kernels. Supports monolithic interface.
+    \"\"\"
+
+    def __init__(
+"""
+    class_new = """class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolithic):
+    \"\"\"
+    Fp8 TRTLLM-Gen MoE kernels. Supports monolithic interface.
+    \"\"\"
+
+    def supports_routing_replay_capture(self) -> bool:
+        return True
+
+    def __init__(
+"""
+
+    block_scale_old = """            n_group = num_expert_group or 0
+            selected_topk_group = topk_group or 0
+
+        kwargs = dict(
+"""
+    block_scale_new = """            n_group = num_expert_group or 0
+            selected_topk_group = topk_group or 0
+
+        routing_replay_out = self._maybe_make_routing_replay_buffer(
+            num_tokens=hidden_states.shape[0],
+            device=hidden_states.device,
+        )
+
+        kwargs = dict(
+"""
+
+    block_scale_tail_old = """            use_shuffled_weight=use_shuffled_weight,
+            weight_layout=weight_layout,
+            fp8_quantization_type=fp8_quant_type,
+        )
+        if is_mxfp8 or activation == MoEActivation.RELU2_NO_MUL:
+            kwargs["activation_type"] = activation_type
+        return flashinfer.fused_moe.trtllm_fp8_block_scale_moe(**kwargs)
+"""
+    block_scale_tail_new = """            use_shuffled_weight=use_shuffled_weight,
+            weight_layout=weight_layout,
+            fp8_quantization_type=fp8_quant_type,
+            routing_replay_out=routing_replay_out,
+        )
+        if is_mxfp8 or activation == MoEActivation.RELU2_NO_MUL:
+            kwargs["activation_type"] = activation_type
+        result = flashinfer.fused_moe.trtllm_fp8_block_scale_moe(**kwargs)
+        self._maybe_dispatch_routing_replay(
+            routing_replay_out, num_tokens=hidden_states.shape[0]
+        )
+        return result
+"""
+
+    per_tensor_old = """        out = flashinfer.fused_moe.trtllm_fp8_per_tensor_scale_moe(
+            routing_logits=router_logits,
+            routing_bias=e_score_correction_bias,
+            hidden_states=hidden_states,
+            gemm1_weights=w1,
+            output1_scales_scalar=self._g1_scale_c,
+            output1_scales_gate_scalar=self._g1_alphas,
+            gemm2_weights=w2,
+            output2_scales_scalar=self._g2_alphas,
+            num_experts=global_num_experts,
+            top_k=self.topk,
+            n_group=num_expert_group or 0,
+            topk_group=topk_group or 0,
+            intermediate_size=self.intermediate_size_per_partition,
+            local_expert_offset=self.ep_rank * self.local_num_experts,
+            local_num_experts=self.local_num_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            use_routing_scales_on_input=apply_router_weight_on_input,
+            routing_method_type=self.routing_method_type,
+            activation_type=activation_type,
+        )
+        return out
+"""
+    per_tensor_new = """        routing_replay_out = self._maybe_make_routing_replay_buffer(
+            num_tokens=hidden_states.shape[0],
+            device=hidden_states.device,
+        )
+        out = flashinfer.fused_moe.trtllm_fp8_per_tensor_scale_moe(
+            routing_logits=router_logits,
+            routing_bias=e_score_correction_bias,
+            hidden_states=hidden_states,
+            gemm1_weights=w1,
+            output1_scales_scalar=self._g1_scale_c,
+            output1_scales_gate_scalar=self._g1_alphas,
+            gemm2_weights=w2,
+            output2_scales_scalar=self._g2_alphas,
+            num_experts=global_num_experts,
+            top_k=self.topk,
+            n_group=num_expert_group or 0,
+            topk_group=topk_group or 0,
+            intermediate_size=self.intermediate_size_per_partition,
+            local_expert_offset=self.ep_rank * self.local_num_experts,
+            local_num_experts=self.local_num_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            use_routing_scales_on_input=apply_router_weight_on_input,
+            routing_method_type=self.routing_method_type,
+            activation_type=activation_type,
+            routing_replay_out=routing_replay_out,
+        )
+        self._maybe_dispatch_routing_replay(
+            routing_replay_out, num_tokens=hidden_states.shape[0]
+        )
+        return out
+"""
+
+    hunks = [
+        ("class", class_old, class_new),
+        ("block_scale_buffer", block_scale_old, block_scale_new),
+        ("block_scale_tail", block_scale_tail_old, block_scale_tail_new),
+        ("per_tensor", per_tensor_old, per_tensor_new),
+    ]
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if all(new in content for _, _, new in hunks):
+            logger.info("vLLM fp8/MXFP8 routing-replay patch already applied.")
+            return
+        missing = [name for name, old, _ in hunks if old not in content]
+        if missing:
+            logger.warning(
+                "Could not apply vLLM fp8/MXFP8 routing-replay patch: "
+                "expected vLLM 0.25.1 source shape for %s was not found in "
+                "%s.",
+                ", ".join(missing),
+                file_to_patch,
+            )
+            return
+        for _, old, new in hunks:
+            content = content.replace(old, new, 1)
+        write_back(content)
+
+    logger.info(
+        "Successfully wired routing-replay capture through "
+        "TrtLlmFp8ExpertsMonolithic (fp8 block-scale and MXFP8)."
+    )
+
+
+def _patch_vllm_bind_routed_experts_capturer_monolithic(logger) -> None:
+    """Bind routed-experts capture to monolithic MoE kernels, and stop
+    silently skipping any monolithic kernel that doesn't support it.
+
+    Backports vllm-project/vllm#48622 ("Exclude draft routers from expert
+    capture") and the ``GPUModelRunner`` half of #44214 onto vLLM 0.25.1.
+
+    #48622 alone: ``_bind_routed_experts_capturer`` walks
+    ``self.compilation_config.static_forward_context.values()``, which
+    includes MTP/draft-model MoE layers. NeMo-RL's recipes run
+    ``megatron_cfg.mtp_num_layers`` heads that get loaded into vLLM too (see
+    ``quantization_ignore_patterns`` excluding ``mtp.*`` in the MXFP8-rollout
+    recipes), and a draft MoE layer can share ``layer_id=0`` with the
+    target's first MoE layer, corrupting the shared capture buffer. The fix
+    scopes capture binding to ``self.model.modules()`` (the target model
+    only) instead.
+
+    #44214 on top of that: without an explicit ``is_monolithic`` branch, a
+    monolithic kernel's ``module.router`` is never a ``BaseRouter`` (routing
+    is fused into the kernel), so the ``isinstance(module.router,
+    BaseRouter)`` check just silently skips it -- the routed-experts buffer
+    for that layer stays at its zero-initialized default with no warning.
+    This raises instead, unless the kernel has opted in via
+    ``supports_routing_replay_capture()`` (see
+    ``_patch_vllm_monolithic_routing_replay_base`` /
+    ``_patch_vllm_trtllm_fp8_routing_replay``).
+
+    Requires the other two patches in this file to have run first.
+    """
+    try:
+        file_to_patch = _get_vllm_file("v1/worker/gpu_model_runner.py")
+    except RuntimeError:
+        logger.warning(
+            "Could not locate gpu_model_runner.py for the routed-experts "
+            "capturer binding patch."
+        )
+        return
+
+    old_snippet = """    def _bind_routed_experts_capturer(self, capturer: RoutedExpertsCapturer) -> None:
+        from vllm.model_executor.layers.fused_moe.layer import MoERunner
+        from vllm.model_executor.layers.fused_moe.router.base_router import (
+            BaseRouter,
+        )
+
+        for module in self.compilation_config.static_forward_context.values():
+            if isinstance(module, MoERunner) and isinstance(module.router, BaseRouter):
+                layer_id = module.layer_id
+
+                def _capture_fn(topk_ids, _layer_id=layer_id, _capturer=capturer):
+                    _capturer.capture(_layer_id, topk_ids)
+
+                module.router.set_capture_fn(_capture_fn)
+"""
+    new_snippet = """    def _bind_routed_experts_capturer(self, capturer: RoutedExpertsCapturer) -> None:
+        from vllm.model_executor.layers.fused_moe.layer import MoERunner
+        from vllm.model_executor.layers.fused_moe.modular_kernel import (
+            FusedMoEExpertsMonolithic,
+        )
+        from vllm.model_executor.layers.fused_moe.router.base_router import (
+            BaseRouter,
+        )
+
+        for module in self.model.modules():
+            if not isinstance(module, MoERunner):
+                continue
+            layer_id = module.layer_id
+
+            def _capture_fn(topk_ids, _layer_id=layer_id, _capturer=capturer):
+                _capturer.capture(_layer_id, topk_ids)
+
+            quant_method = module._quant_method
+            moe_kernel = getattr(quant_method, "moe_kernel", None)
+            impl = getattr(moe_kernel, "impl", None)
+            fused_experts = getattr(impl, "fused_experts", None)
+            if quant_method.is_monolithic:
+                if not (
+                    isinstance(fused_experts, FusedMoEExpertsMonolithic)
+                    and fused_experts.supports_routing_replay_capture()
+                ):
+                    raise ValueError(
+                        "--enable-return-routed-experts is not supported with "
+                        f"monolithic MoE kernel {type(fused_experts).__name__}; "
+                        "routed expert IDs would be silently all-zero."
+                    )
+                fused_experts.set_capture_fn(_capture_fn)
+            elif isinstance(module.router, BaseRouter):
+                module.router.set_capture_fn(_capture_fn)
+"""
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if new_snippet in content:
+            logger.info(
+                "vLLM routed-experts capturer binding patch already applied."
+            )
+            return
+        if old_snippet not in content:
+            logger.warning(
+                "Could not apply vLLM routed-experts capturer binding patch: "
+                "expected vLLM 0.25.1 source shape was not found in %s.",
+                file_to_patch,
+            )
+            return
+        write_back(content.replace(old_snippet, new_snippet, 1))
+
+    logger.info(
+        "Successfully rebound routed-experts capture to target-model-only "
+        "modules, with monolithic-kernel opt-in support."
+    )
+
+
 def ensure_vllm_source_compat() -> None:
     """Apply interpreter-independent vLLM source-compat patches.
 
@@ -692,3 +1145,9 @@ def _apply_vllm_patches(
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
+    # Order matters: the base class must gain the routing-replay buffer
+    # methods before TrtLlmFp8ExpertsMonolithic calls them, and both must be
+    # in place before GPUModelRunner starts dispatching capture to them.
+    _patch_vllm_monolithic_routing_replay_base(patch_logger)
+    _patch_vllm_trtllm_fp8_routing_replay(patch_logger)
+    _patch_vllm_bind_routed_experts_capturer_monolithic(patch_logger)
