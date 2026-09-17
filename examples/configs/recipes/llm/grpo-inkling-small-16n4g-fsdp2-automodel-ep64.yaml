@@ -1,0 +1,97 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  max_num_epochs: 10
+  max_num_steps: 500
+  val_period: 15
+  max_val_samples: 64
+  val_batch_size: 64
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 2
+checkpointing:
+  checkpoint_dir: results/grpo-inkling-small-16n4g-fsdp2-automodel-ep64
+policy:
+  model_name: thinkingmachines/Inkling-Small
+  tokenizer:
+    chat_template_kwargs:
+      reasoning_effort: medium
+    tokenizer_kwargs:
+      eos_token: <|content_model_end_sampling|>
+      pad_token: <|content_model_end_sampling|>
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 10240
+  logprob_chunk_size: 2048
+  offload_optimizer_for_logprob: true
+  optimizer:
+    kwargs:
+      lr: 3.0e-07
+      weight_decay: 0.1
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 1.0e-08
+      end_factor: 1.0
+      total_iters: 10
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 10
+  dtensor_cfg:
+    expert_parallel_size: 64
+    activation_checkpointing: true
+    automodel_kwargs:
+      freeze_config:
+        freeze_vision_tower: true
+        freeze_audio_tower: true
+        freeze_language_model: false
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: sdpa
+        linear: torch
+        rms_norm: torch_fp32
+        experts: torch_mm
+        dispatcher: torch
+        gate_precision: float32
+        enable_hf_state_dict_adapter: true
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: true
+  generation:
+    max_new_tokens: 8192
+    vllm_cfg:
+      tensor_parallel_size: 8
+      skip_tokenizer_init: false
+      env_vars:
+        VLLM_USE_V2_MODEL_RUNNER: '1'
+    vllm_kwargs:
+      tokenizer_mode: inkling
+      language_model_only: true
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  log_dir: logs/grpo-inkling-small-16n4g-fsdp2-automodel-ep64
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    entity: nv-welcome
+    project: nemo-rl-Inkling
+    name: grpo-inkling-small-16n4g-fsdp2-automodel-ep64
+cluster:
+  gpus_per_node: 4
+  num_nodes: 16
