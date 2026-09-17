@@ -45,6 +45,13 @@ extracts that file into its local scratch directory and builds there. Parallel
 jobs therefore cannot race while building editable Megatron-Core extensions
 from one shared source checkout.
 
+The source overlay intentionally differs from the nightly image's Bridge
+revision. The launcher therefore rebuilds actor environments in node-local
+scratch. It also sets `UV_FROZEN=1`: the source `pyproject.toml` and `uv.lock`
+match the image fingerprint, and the frozen setting prevents newer `uv`
+versions from re-resolving equivalent FlashInfer index URLs with different
+trailing-slash normalization.
+
 The original Hugging Face weights, venvs, and compiler caches stay node-local,
 but `NRL_MEGATRON_CHECKPOINT_DIR` points to the shared converted-checkpoint
 cache. All policy ranks can therefore read the `run_config.yaml` and weight

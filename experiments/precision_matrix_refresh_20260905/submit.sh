@@ -72,6 +72,8 @@ esac
 : "${SLURM_ACCOUNT:?Set SLURM_ACCOUNT after checking FairShare}"
 : "${WANDB_HOME:=/home/${USER}}"
 : "${NRL_DISABLE_NUMA_MEMBIND:=1}"
+: "${NRL_FORCE_REBUILD_VENVS:=true}"
+: "${UV_FROZEN:=1}"
 
 case "${MODEL}:${MODE}" in
   super:sync|super:async)
@@ -326,10 +328,10 @@ if [[ "${PERFORMANCE_RECIPE}" == 1 ]]; then
   fi
 fi
 
-printf 'cluster=%s\nmodel=%s\nmode=%s\narm=%s\ntopology=%s\nconfig=%s\nnodes=%s\nsegment=%s\nsteps=%s\nshared_model=%s\nmoe_backend=%s\ndatasets_cache=%s\nnuma_membind_disabled=%s\nsha=%s\nrun=%s\n' \
+printf 'cluster=%s\nmodel=%s\nmode=%s\narm=%s\ntopology=%s\nconfig=%s\nnodes=%s\nsegment=%s\nsteps=%s\nshared_model=%s\nmoe_backend=%s\ndatasets_cache=%s\nnuma_membind_disabled=%s\nforce_rebuild_venvs=%s\nuv_frozen=%s\nsha=%s\nrun=%s\n' \
   "${CLUSTER}" "${MODEL}" "${MODE}" "${ARM}" "${TOPOLOGY}" "${CONFIG}" "${NUM_NODES}" \
   "${SEGMENT_SIZE}" "${MAX_STEPS}" "${USE_SHARED_MODEL}" "${MOE_BACKEND}" "${DATASETS_CACHE}" \
-  "${NRL_DISABLE_NUMA_MEMBIND}" "${SOURCE_SHA}" "${RUN_NAME}"
+  "${NRL_DISABLE_NUMA_MEMBIND}" "${NRL_FORCE_REBUILD_VENVS}" "${UV_FROZEN}" "${SOURCE_SHA}" "${RUN_NAME}"
 printf 'overrides:'
 printf ' %q' "${COMMON_OVERRIDES[@]}" "${PRECISION_OVERRIDES[@]}"
 printf '\n'
@@ -419,6 +421,8 @@ export RAY_TMPDIR=${LOCAL_JOB_ROOT}/ray; \
 export PYTHONPATH=${RUN_REPO}:${RUN_REPO}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:${RUN_REPO}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM; \
 export FLA_TILELANG=0; \
 export NRL_DISABLE_NUMA_MEMBIND=${NRL_DISABLE_NUMA_MEMBIND}; \
+export NRL_FORCE_REBUILD_VENVS=${NRL_FORCE_REBUILD_VENVS}; \
+export UV_FROZEN=${UV_FROZEN}; \
 ${COMMAND}"
 
 SETUP_COMMAND="set -euo pipefail; \
