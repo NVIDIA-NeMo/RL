@@ -82,6 +82,24 @@ super_output=$(
 grep -F -- 'policy.generation.vllm_cfg.gpu_memory_utilization=0.6' \
   <<<"${super_output}" >/dev/null
 
+qwen235_memory_output=$(
+  ACTION=render \
+  CLUSTER=lyris \
+  MODEL=qwen235 \
+  MODE=sync \
+  ARM=bf16-bf16 \
+  PERFORMANCE_RECIPE=1 \
+  GPU_MEMORY_UTILIZATION=0.65 \
+  MAX_STEPS=20 \
+  SLURM_ACCOUNT=test \
+  REPO="${REPO}" \
+  "${SCRIPT_DIR}/submit.sh"
+)
+
+grep -F -- 'gpu_memory_utilization=0.65' <<<"${qwen235_memory_output}" >/dev/null
+grep -F -- 'policy.generation.vllm_cfg.gpu_memory_utilization=0.65' \
+  <<<"${qwen235_memory_output}" >/dev/null
+
 # Qwen3-235B has 1,536 expert rows. FlashInfer TRTLLM BF16 requires each
 # TP-local expert dimension to be divisible by 128, so TP8 (192 rows) is
 # unsupported. Keep every precision arm on the same supported TP4 topology.

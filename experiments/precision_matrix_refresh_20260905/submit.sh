@@ -10,6 +10,7 @@ ARM=${ARM:-bf16-bf16}
 TOPOLOGY=${TOPOLOGY:-default}
 PERFORMANCE_RECIPE=${PERFORMANCE_RECIPE:-0}
 SUPER_GPU_MEMORY_UTILIZATION=${SUPER_GPU_MEMORY_UTILIZATION:-}
+GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-${SUPER_GPU_MEMORY_UTILIZATION}}
 MODEL_SNAPSHOT_OVERRIDE=${MODEL_SNAPSHOT_OVERRIDE:-}
 SOURCE_ARCHIVE_OVERRIDE=${SOURCE_ARCHIVE_OVERRIDE:-}
 SOURCE_ARCHIVE_SHA256=${SOURCE_ARCHIVE_SHA256:-}
@@ -324,13 +325,9 @@ if [[ "${PERFORMANCE_RECIPE}" == 1 ]]; then
     PRECISION_OVERRIDES+=("++policy.generation.refit_transport=nccl_reshard")
   fi
 
-  if [[ -n "${SUPER_GPU_MEMORY_UTILIZATION}" ]]; then
-    if [[ "${MODEL}" != super ]]; then
-      echo "SUPER_GPU_MEMORY_UTILIZATION is only valid for MODEL=super" >&2
-      exit 2
-    fi
+  if [[ -n "${GPU_MEMORY_UTILIZATION}" ]]; then
     PRECISION_OVERRIDES+=(
-      "++policy.generation.vllm_cfg.gpu_memory_utilization=${SUPER_GPU_MEMORY_UTILIZATION}"
+      "++policy.generation.vllm_cfg.gpu_memory_utilization=${GPU_MEMORY_UTILIZATION}"
     )
   fi
 
@@ -347,10 +344,10 @@ if [[ "${PERFORMANCE_RECIPE}" == 1 ]]; then
   fi
 fi
 
-printf 'cluster=%s\nmodel=%s\nmode=%s\narm=%s\ntopology=%s\nconfig=%s\nnodes=%s\nsegment=%s\nsteps=%s\nshared_model=%s\nmoe_backend=%s\nsuper_gpu_memory_utilization=%s\ndatasets_cache=%s\nnuma_membind_disabled=%s\nforce_rebuild_venvs=%s\nactor_venv_root=%s\nsha=%s\nsource_payload_sha=%s\nsource_archive_override=%s\nsource_archive_sha256=%s\nray_memory_usage_threshold=%s\nrun=%s\n' \
+printf 'cluster=%s\nmodel=%s\nmode=%s\narm=%s\ntopology=%s\nconfig=%s\nnodes=%s\nsegment=%s\nsteps=%s\nshared_model=%s\nmoe_backend=%s\ngpu_memory_utilization=%s\ndatasets_cache=%s\nnuma_membind_disabled=%s\nforce_rebuild_venvs=%s\nactor_venv_root=%s\nsha=%s\nsource_payload_sha=%s\nsource_archive_override=%s\nsource_archive_sha256=%s\nray_memory_usage_threshold=%s\nrun=%s\n' \
   "${CLUSTER}" "${MODEL}" "${MODE}" "${ARM}" "${TOPOLOGY}" "${CONFIG}" "${NUM_NODES}" \
   "${SEGMENT_SIZE}" "${MAX_STEPS}" "${USE_SHARED_MODEL}" "${MOE_BACKEND}" \
-  "${SUPER_GPU_MEMORY_UTILIZATION}" "${DATASETS_CACHE}" \
+  "${GPU_MEMORY_UTILIZATION}" "${DATASETS_CACHE}" \
   "${NRL_DISABLE_NUMA_MEMBIND}" "${NRL_FORCE_REBUILD_VENVS}" "${ACTOR_VENV_ROOT}" "${SOURCE_SHA}" \
   "${SOURCE_PAYLOAD_SHA}" "${SOURCE_ARCHIVE_OVERRIDE}" "${SOURCE_ARCHIVE_SHA256}" \
   "${RAY_memory_usage_threshold:-}" "${RUN_NAME}"

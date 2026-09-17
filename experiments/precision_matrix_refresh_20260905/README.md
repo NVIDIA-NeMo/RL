@@ -23,12 +23,13 @@ Qwen3.5 performance runs use 128 prompts and 16 generations per prompt, for a
 training global batch size of 2048. The launcher applies all three values to
 every Qwen3.5 precision arm so BF16 and MXFP8 rollout runs stay matched.
 
-Nemotron3 Super's vLLM 0.25.1 automatic KV-cache accounting can overestimate
-available memory after CuMem sleep-pool reclamation. Set
-`SUPER_GPU_MEMORY_UTILIZATION=0.6` for every Super arm to reproduce the matched
-memory override used by the HybridEP evaluation. This keeps GBS, parallelism,
-CUDA Graphs, and all workload settings unchanged. The launcher leaves the
-upstream recipe's `0.7` value intact when this variable is unset.
+vLLM 0.25.1 automatic KV-cache accounting can overestimate available memory
+after CuMem sleep-pool reclamation. Set `GPU_MEMORY_UTILIZATION` to the same
+value for every comparison arm when a model needs more wake-up headroom. This
+keeps GBS, parallelism, CUDA Graphs, and all workload settings unchanged. The
+launcher leaves each recipe's value intact when the variable is unset.
+`SUPER_GPU_MEMORY_UTILIZATION` remains a compatibility alias for existing Super
+commands.
 
 Use the cluster-specific launcher so its scheduler arguments match the target
 cluster. OCI requests `batch` and four GPU GRES per node. Ptyche requests
