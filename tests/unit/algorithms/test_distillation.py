@@ -1282,6 +1282,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch):
         master_config.env,
         base_urls=["http://reserved-vllm"],
         model_name="test-policy",
+        generation_backend="vllm",
         tokenizer=tokenizer,
         enable_router_replay=False,
         use_fastokens=False,

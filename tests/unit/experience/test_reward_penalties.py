@@ -123,10 +123,6 @@ class TestShouldMaskFlaggedSamples:
         )
 
 
-class _FakeGeneration:
-    cfg = {"max_total_sequence_length": 100}
-
-
 def _gate_result(mask_sample):
     return {
         "full_result": {
@@ -153,10 +149,10 @@ class TestMaskEnvFlaggedSamplesBatchedGate:
             results=results,
             timer=Timer(),
             timer_prefix="timing/test",
-            policy_generation=_FakeGeneration(),
             input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
             tokenizer=_FakeTokenizer(),
             log_full_result_tables=False,
+            max_total_tokens_per_sample=100,
             mask_env_flagged_samples=mask_env_flagged_samples,
         )
         return rollout_result.final_batch
