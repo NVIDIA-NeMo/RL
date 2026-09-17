@@ -1665,6 +1665,8 @@ class MegatronGenerationRefitMixin:
             param_name_by_id = {
                 id(param): name for name, param in decoder.named_parameters()
             }
+            # MCore converts only parameters with MXFP8 storage; the TE recipe
+            # selected BF16 parameters already, before checkpoint loading.
             persistent_buffers = quantize_params_to_mxfp8(
                 decoder, backend=_resolve_mxfp8_refit_backend(core.config)
             )

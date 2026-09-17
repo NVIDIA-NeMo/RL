@@ -522,6 +522,11 @@ class MegatronConfig(TypedDict):
     # Path to a per-module Transformer Engine precision recipe loaded into
     # Megatron quant_recipe.
     te_precision_config_file: NotRequired[str]
+    # Keep boundary transformer layers in BF16, including parameter storage.
+    first_last_layers_bf16: NotRequired[bool]
+    # Nonnegative layer counts; used when first_last_layers_bf16 is true.
+    num_layers_at_start_in_bf16: NotRequired[int]
+    num_layers_at_end_in_bf16: NotRequired[int]
     # Passed through to the Megatron model's freeze() method.
     # Supported keys are model-specific, such as freeze_vision_model,
     # freeze_vision_projection, and freeze_language_model.

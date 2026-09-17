@@ -27,6 +27,7 @@ nemo_rl.models.megatron.setup, focusing on:
 import os
 import warnings
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, call, patch
@@ -616,9 +617,7 @@ class TestApplyModelOverrides:
 
     def test_rejects_first_class_megatron_config_conflict(self):
         """A first-class field cannot also be supplied through model_overrides."""
-        from nemo_rl.models.megatron.setup import (
-            _validate_model_override_conflicts,
-        )
+        from nemo_rl.models.megatron.setup import _validate_model_override_conflicts
 
         with pytest.raises(
             ValueError,
@@ -1175,6 +1174,94 @@ class TestApplyPrecisionConfig:
             }
             _apply_precision_config(model_cfg, config, torch.float32)
             assert model_cfg.pipeline_dtype == expected_dtype
+
+    def test_applies_bf16_boundary_layers(self) -> None:
+        """Training and dedicated inference use the same boundary settings."""
+        # Keep the optional Megatron/Bridge dependency out of test collection.
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "first_last_layers_bf16": True,
+                "num_layers_at_start_in_bf16": 2,
+                "num_layers_at_end_in_bf16": 4,
+            }
+        }
+
+        _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert model_cfg.first_last_layers_bf16 is True
+        assert model_cfg.num_layers_at_start_in_bf16 == 2
+        assert model_cfg.num_layers_at_end_in_bf16 == 4
+
+    def test_colocated_inference_model_applies_precision_recipe(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Colocated inference resolves its recipe before model construction."""
+        # Keep the optional Megatron/Bridge dependency out of test collection.
+        import nemo_rl.models.megatron.setup as setup
+
+        recipe_file = tmp_path / "te_precision.yaml"
+        recipe_file.write_text("{}")
+        recipe = self._quant_recipe({})
+        monkeypatch.setattr(setup, "load_quantization_recipe", lambda _: recipe)
+        provider = SimpleNamespace(
+            params_dtype=torch.bfloat16,
+            quant_recipe=None,
+            pipeline_model_parallel_size=1,
+            tensor_model_parallel_size=1,
+            context_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+            sequence_parallel=False,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
+            transformer_impl="inference_optimized",
+        )
+
+        def finalize() -> None:
+            assert provider.quant_recipe is recipe
+            assert provider.first_last_layers_bf16 is True
+            assert provider.num_layers_at_start_in_bf16 == 2
+            assert provider.num_layers_at_end_in_bf16 == 4
+
+        provider.finalize = MagicMock(side_effect=finalize)
+        inference_model = MagicMock()
+        get_model = MagicMock(return_value=[inference_model])
+        monkeypatch.setattr(setup, "_apply_parallelism_config", lambda *_: None)
+        monkeypatch.setattr(setup, "_apply_moe_config", lambda *_: None)
+        monkeypatch.setattr(
+            setup, "build_inference_pg_collection", lambda *_args, **_kwargs: object()
+        )
+        monkeypatch.setattr(setup, "get_model", get_model)
+        monkeypatch.setattr(setup, "inference_model_alloc_region", MagicMock)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+
+        policy_cfg = {
+            "megatron_cfg": {
+                "transformer_impl": "inference_optimized",
+                "freeze_moe_router": False,
+                "pipeline_dtype": "bfloat16",
+                "te_precision_config_file": str(recipe_file),
+                "first_last_layers_bf16": True,
+                "num_layers_at_start_in_bf16": 2,
+                "num_layers_at_end_in_bf16": 4,
+            }
+        }
+        megatron_cfg = SimpleNamespace(
+            ddp=object(),
+            dist=SimpleNamespace(use_tp_pp_dp_mapping=False),
+            rng=SimpleNamespace(data_parallel_random_init=False),
+        )
+
+        result = setup.build_inference_model(policy_cfg, megatron_cfg, provider)
+
+        assert result is inference_model
+        provider.finalize.assert_called_once_with()
+        assert get_model.call_args.args[0] is provider
 
     @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
     def test_loads_te_precision_config_when_configured(

@@ -738,7 +738,7 @@ def test_megatron_m2n_rejects_weights_with_no_local_destination(
         worker._build_destination_hf_to_local_param_map(refit_info, [])
 
 
-@pytest.mark.parametrize("grouped_gemm_backend", ["torch", "flashinfer"])
+@pytest.mark.parametrize("grouped_gemm_backend", ["torch", "flashinfer", "vllm"])
 def test_prepare_mxfp8_refit_replaces_only_quantized_parameters_idempotently(
     monkeypatch: pytest.MonkeyPatch,
     grouped_gemm_backend: str,
