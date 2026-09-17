@@ -47,6 +47,20 @@ ACTOR_ENVIRONMENT_REGISTRY[
 ] = PY_EXECUTABLES.AUTOMODEL
 ```
 
+Select the extension in `configs/grpo_math_1B.yaml`:
+
+```yaml
+policy:
+  worker_extension_cls_fqn: template_project.worker_extension.DTensorPolicyWorkerV2Extension
+```
+
+The `Policy(worker_extension_cls_fqn=...)` constructor argument is deprecated.
+It is copied into the config and follows the same validation rules. If both
+are set, they must match. With `quant_cfg`, the extension must name the exact
+ModelOpt worker for the selected backend; custom subclasses are not accepted
+through either channel. Existing quantization recipes that omit the field
+continue to work: initialization fills it in and warns with the selected FQN.
+
 ## Testing
 
 This project includes a comprehensive test suite following NeMo RL's testing patterns.

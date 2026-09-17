@@ -186,6 +186,9 @@ class TeacherWorkerGroup:
                 "running the teacher unquantized (ignoring the policy's quant_cfg)."
             )
             cfg["quant_cfg"] = None
+        # Teachers always use the plain Megatron worker, not the student's
+        # explicitly configured (or automatically filled) extension class.
+        cfg.pop("worker_extension_cls_fqn", None)
 
         tp = teacher_cfg.tensor_model_parallel_size
         pp = teacher_cfg.pipeline_model_parallel_size

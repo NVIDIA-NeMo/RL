@@ -200,10 +200,10 @@ class VllmConfig(GenerationConfig):
     real_quant_export_cpu_offload: NotRequired[bool]
     real_quant_ignore: NotRequired[list[str]]
 
-    # FQN of a worker extension class to use instead of the resolved default
-    # generation worker. Must be a subclass of the resolved worker and cannot
-    # be combined with quant_cfg. Its runtime environment must already be in
-    # ACTOR_ENVIRONMENT_REGISTRY.
+    # FQN of a worker extension class to use instead of the backend default.
+    # Must subclass the backend worker and be in ACTOR_ENVIRONMENT_REGISTRY.
+    # With quant_cfg, this must name the sync/async ModelOpt worker; when unset,
+    # it is filled automatically with a warning.
     worker_extension_cls_fqn: NotRequired[str | None]
 
 

@@ -13,6 +13,21 @@ There are two vLLM rollout modes:
 
 See [Verified Configurations](#verified-configurations) for the workflow + recipe combinations that have been empirically validated, and [Supported Quantization Formats](#supported-quantization-formats) for the full set of available formats. Results are recipe- and model-specific: the generic W4A4 `NVFP4_DEFAULT_CFG` has known GRPO convergence issues, while the routed-expert Qwen3 W4A4 real-quant recipe below completed the documented single-seed campaign.
 
+## Worker Class Selection
+
+`policy.worker_extension_cls_fqn` and
+`policy.generation.worker_extension_cls_fqn` select the policy and vLLM workers.
+When `quant_cfg` is set, the FQN must match the ModelOpt worker for the selected
+backend (Megatron, DTensor V1/V2, or synchronous/asynchronous vLLM). An
+incompatible FQN raises an error naming the required class before workers are
+allocated. Custom subclasses are not accepted with `quant_cfg`.
+
+Existing recipes can continue to omit the field: initialization fills it into
+the config and warns with the selected FQN. Set that FQN explicitly to silence
+the warning; update it if you change backend, `dtensor_cfg._v2`, or
+`vllm_cfg.async_engine`. Frozen non-colocated teachers clear the student's
+quantization and worker-extension settings and use the plain Megatron worker.
+
 ## Verified Configurations
 
 The following workflow + quantization recipe combinations have been validated end-to-end (Megatron training + NVFP4-quantized vLLM generation + held-out validation):

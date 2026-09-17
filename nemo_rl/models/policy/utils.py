@@ -18,7 +18,7 @@ import traceback
 import warnings
 from datetime import timedelta
 from enum import Enum
-from typing import Any, Dict, Iterable, Optional, cast
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, cast
 
 import torch
 import torch.distributed as dist
@@ -55,6 +55,10 @@ except ImportError:
     NEMO_AUTOMODEL_AVAILABLE = False
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.models.worker_config import resolve_worker_cls
+
+if TYPE_CHECKING:
+    from nemo_rl.models.policy import PolicyConfig
 
 # Plain Hugging Face classes remain separate from the NeMo AutoModel wrappers so
 # callers that manage distribution can request them when NeMo AutoModel is installed.
@@ -121,16 +125,17 @@ POLICY_WORKER_OVERRIDES = {
 }
 
 
-def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
-    """Return the quantized policy worker FQN if ``quant_cfg`` is set, else ``default_cls``.
-
-    Safe to call even when ModelOpt is not installed — returns ``default_cls``
-    unchanged whenever ``quant_cfg`` is ``None``, so the core policy path stays
-    import-free of ModelOpt.
-    """
-    if config.get("quant_cfg") is None:
-        return default_cls
-    return POLICY_WORKER_OVERRIDES.get(default_cls, default_cls)
+def resolve_policy_worker_cls(default_cls: str, config: "PolicyConfig") -> str:
+    """Resolve the configured policy worker without importing ModelOpt."""
+    return resolve_worker_cls(
+        default_cls,
+        config,
+        quantized_cls=(
+            POLICY_WORKER_OVERRIDES.get(default_cls, default_cls)
+            if config.get("quant_cfg") is not None
+            else None
+        ),
+    )
 
 
 def resolve_model_class(
