@@ -7,11 +7,12 @@ This page collects NeMo RL guidance for post-training Nemotron 3.5 Super VL
 recipe, and understand the settings that are specific to this model.
 
 > [!IMPORTANT]
-> **Early access.** The text-only DAPO recipe runs end-to-end (resume from
-> checkpoint included) and reaches 0.79 AIME-2024 accuracy by step 50, but no
-> run has yet been taken to full convergence. The image GRPO recipe (CLEVR-CoGenT)
-> has been brought up but not yet validated at scale; see
-> [Known Issues](#known-issues).
+> **Early access.** Both recipes run end-to-end on 16 x 4-GPU nodes with
+> checkpoint resume: the text DAPO recipe reaches 0.79 AIME-2024 accuracy by
+> step 50 and the image GRPO recipe (CLEVR-CoGenT, frozen vision tower) reaches
+> 0.84 validation accuracy by step 20 (see [Reference Results](#reference-results)),
+> but no run has been taken to full convergence and fewer than 16 nodes is not
+> supported; see [Known Issues](#known-issues).
 
 ## Support Status
 
@@ -209,7 +210,49 @@ you request from the scheduler.
 
 ## Reference Results
 
-TBD.
+### Training curves
+
+Both runs use 16 x 4-GPU GB200 nodes (train EP4, vLLM TP4/EP4) with the
+AutoModel (DTensor) backend and colocated vLLM generation, chained as 4-hour
+Slurm jobs that resume from the latest checkpoint (`checkpoint_must_save_by:
+00:03:20:00`, `save_period: 10`). Curves are wandb exports; the x axis is the
+training step.
+
+**Text DAPO, DAPO-Math-17K / AIME-2024** — the DAPO recipe run on the text-SFT
+checkpoint (`nvidia/nemotron-3.5-super-pre-ea-text-08282026`), 50 steps,
+`max_new_tokens: 8192`.
+
+![Nemotron 3.5 Super VL text DAPO training curves](../../../assets/nemotron/nemotron-3.5-super-vl-text-dapo-16n4g.png)
+
+AIME-2024 validation accuracy climbs from 0.53 at step 0 to **0.79 at step 50**
+(0.55 at step 20, 0.69 at step 40) while the mean validation response length
+falls from ~5,700 to ~4,600 tokens and `truncation_rate` drops from ~0.28 to
+~0.15: the policy gets both more accurate and more concise. Training reward
+rises from around -0.2 to a noisy 0.4-0.7 band. `gen_kl_error` stays in the
+0.003-0.004 range and `token_mult_prob_error` in 1.03-1.04 throughout, so the
+trainer and vLLM stay in agreement across the refits; the isolated
+`token_mult_prob_error` spike at step 49 coincides with a job boundary and
+resume.
+
+**Image GRPO, CLEVR-CoGenT** — the image recipe on the early-access VL
+checkpoint (`NVIDIA-Nemotron-3.5-Super-EA-09112026`), vision tower frozen,
+first 20 steps of the chain.
+
+![Nemotron 3.5 Super VL image GRPO training curves](../../../assets/nemotron/nemotron-3.5-super-vl-image-grpo-clevr-16n4g.png)
+
+CLEVR-CoGenT (valA, 256 samples) accuracy rises from 0.57 at step 0 to 0.77 at
+step 10 and **0.84 at step 20**, with training reward moving from ~0.6 to a
+0.80-0.85 band by step 10. Mean validation response length stays short
+(~1,330 to ~1,250 tokens of the 4,096 budget) and `truncation_rate` falls from
+~0.15 to a 0.03-0.13 band. `gen_kl_error` sits at 0.006-0.009 and
+`token_mult_prob_error` at 1.045-1.06, both flat, i.e. the language-model refit
+is healthy while vLLM keeps serving the checkpoint's vision weights
+(`load_format=auto`, vision frozen). The chain is still running; the curves
+will be extended as more steps complete.
+
+Both runs were also exercised for save/resume: the text chain resumed across
+five jobs, the image recipe was validated with a 2-step save followed by a
+resume to step 4 before the long run.
 
 ## Known Issues
 
