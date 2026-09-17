@@ -296,18 +296,10 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     # shard from re-entering rotation on one lucky probe.
     healthy_threshold: PositiveInt = 2
     # How a shard is chosen. least_outstanding steers away from a slow or wedged shard
-    # without needing that diagnosed first. A Literal of one, like on_dead_shard below:
-    # nothing dispatches on this value, so accepting "round_robin" would silently give
-    # the caller least_outstanding anyway.
+    # without needing that diagnosed first. A Literal of one: nothing dispatches on this
+    # value, so accepting "round_robin" would silently give the caller least_outstanding
+    # anyway.
     selection: Literal["least_outstanding"] = "least_outstanding"
-    # What to do once a shard is quarantined, for the case that cannot be recovered from.
-    #
-    # "Recovery modes arrive with the communicator rebuild" used to sit here as a forward
-    # reference. The rebuild has since landed, and recovery is not selected through this
-    # field at all: the reconcile rebuilds over the survivors whenever a shard becomes
-    # absent, whatever this says. A Literal of one for the same reason as selection above
-    # -- nothing dispatches on the value, so a second option would be a lie.
-    on_dead_shard: Literal["fail_fast"] = "fail_fast"
     # Attempts to bring a shard back before retiring it permanently, counted across the
     # whole run rather than per incident.
     max_restart_attempts_per_shard: PositiveInt = 5
@@ -342,6 +334,35 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     # measurement, so a frontier-scale model needs this raised or it will abort a healthy
     # refit. Set it explicitly there; set it to None to disarm the watchdog entirely.
     refit_timeout_s: Optional[PositiveFloat] = 300.0
+    # Restart dead shards and re-admit them at the next refit. Off by default: without
+    # it the fleet only ever shrinks, which is safe but means a long run ends smaller
+    # than it started. Recreating a vLLM worker mid-run is the most invasive thing this
+    # feature does, so it is opt-in rather than implied by fleet_health.enabled.
+    restart_dead_shards: bool = False
+    # Budget for one restart attempt. Deliberately not refit_timeout_s: a refit is a
+    # bandwidth-bound transfer between processes that are already up, while this recreates
+    # a Ray actor and loads a model from disk. 300s would abort healthy restarts.
+    #
+    # Needed because nothing under restart_shard has a bound of its own -- it ends in
+    # ray.get calls with no timeout, and create_worker returns before the actor is
+    # scheduled, so a placement-group bundle that can never be filled (a lost node) blocks
+    # in post_init rather than raising. Unbounded, that shard stays RESTARTING for the rest
+    # of the run: never retried, because it is no longer DEAD, and never retired, because
+    # retirement is driven by restart attempts. The timeout is what turns a silent park
+    # into a failed attempt that eventually retires the shard.
+    #
+    # 1800s is generous on purpose. Firing early costs a restart that was merely slow;
+    # firing late costs only that a lost shard is written off later than it could have been.
+    restart_timeout_s: PositiveFloat = 1800.0
+    # Wait after a failed restart before the shard is eligible again.
+    #
+    # Without it the attempts are not spaced at all: a failed restart returns the shard to
+    # DEAD and the next probe tick picks it straight back up, so at the default 5s probe
+    # interval the whole max_restart_attempts_per_shard budget can be spent inside 25s, on
+    # one cause, with none of the attempts having waited for it to clear. The motivating
+    # failure has exactly that shape -- an orphaned EngineCore held its GPU for 370s, so
+    # every attempt inside that window failed on placement for the same reason.
+    restart_backoff_s: PositiveFloat = 60.0
 
     @model_validator(mode="after")
     def _check_consistent(self) -> "FleetHealthConfig":
