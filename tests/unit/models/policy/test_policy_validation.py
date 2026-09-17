@@ -20,6 +20,7 @@ the world_size compatibility validation that prevents confusing reshape errors
 when the cluster size is insufficient for the specified parallelism configuration.
 """
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -482,6 +483,9 @@ def test_policy_selects_worker_extension_from_config_or_constructor(
         ),
         patch("nemo_rl.models.policy.lm_policy.RayWorkerBuilder") as worker_builder,
         patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup"),
+        pytest.warns(DeprecationWarning, match="constructor|deprecated")
+        if explicit_extension_fqn is not None
+        else nullcontext(),
     ):
         Policy(
             cluster=create_mock_cluster(world_size=1),
@@ -491,32 +495,101 @@ def test_policy_selects_worker_extension_from_config_or_constructor(
         )
 
     assert worker_builder.call_args.args[0] == "tests.extensions.CustomPolicyWorker"
+    assert config["worker_extension_cls_fqn"] == "tests.extensions.CustomPolicyWorker"
 
 
-def test_policy_constructor_worker_extension_allows_quantization() -> None:
-    """The constructor argument may extend the quant-resolved worker; the config field may not."""
-    config = create_dtensor_config("test-model", tp=1)
+@pytest.mark.parametrize(
+    ("backend", "expected_worker"),
+    [
+        (
+            "dtensor",
+            "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2",
+        ),
+        (
+            "dtensor_v2",
+            "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2",
+        ),
+        (
+            "megatron",
+            "nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker.MegatronQuantPolicyWorker",
+        ),
+    ],
+)
+@pytest.mark.parametrize("source", ["implicit", "config", "constructor"])
+def test_policy_quant_worker_is_selected_from_config(
+    backend: str, expected_worker: str, source: str, monkeypatch
+) -> None:
+    """Legacy recipes and explicit FQNs must launch the same registered worker."""
+    monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "9.0")
+    config = (
+        create_megatron_config("test-model", tp=1)
+        if backend == "megatron"
+        else create_dtensor_config("test-model", tp=1)
+    )
+    if backend == "dtensor_v2":
+        config["dtensor_cfg"]["_v2"] = True
     config["quant_cfg"] = "NVFP4"
+    if source == "config":
+        config["worker_extension_cls_fqn"] = expected_worker
 
     with (
         patch("nemo_rl.models.policy.lm_policy.RayQueue"),
-        patch.dict(
-            "nemo_rl.distributed.ray_actor_environment_registry.ACTOR_ENVIRONMENT_REGISTRY",
-            {"tests.extensions.CustomPolicyWorker": "python"},
-        ),
         patch("nemo_rl.models.policy.lm_policy.RayWorkerBuilder") as worker_builder,
         patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup"),
         patch("nemo_rl.models.policy.lm_policy.get_hf_config"),
         patch("nemo_rl.models.policy.lm_policy.FLOPTracker"),
+        pytest.warns(UserWarning, match="setting it automatically")
+        if source == "implicit"
+        else pytest.warns(DeprecationWarning, match="deprecated")
+        if source == "constructor"
+        else nullcontext(),
     ):
         Policy(
             cluster=create_mock_cluster(world_size=1),
             config=config,
             tokenizer=create_mock_tokenizer(),
-            worker_extension_cls_fqn="tests.extensions.CustomPolicyWorker",
+            worker_extension_cls_fqn=expected_worker
+            if source == "constructor"
+            else None,
         )
 
-    assert worker_builder.call_args.args[0] == "tests.extensions.CustomPolicyWorker"
+    assert worker_builder.call_args.args[0] == expected_worker
+    assert (
+        worker_builder.call_args.args[1]["worker_extension_cls_fqn"] == expected_worker
+    )
+    assert config["worker_extension_cls_fqn"] == expected_worker
+
+
+@pytest.mark.parametrize("source", ["implicit", "config", "constructor"])
+def test_policy_rejects_dtensor_v1_with_quant_worker(source: str) -> None:
+    """An extension must not bypass the upstream DTensor v1 guard."""
+    config = create_dtensor_config("test-model", tp=1)
+    config["dtensor_cfg"]["_v2"] = False
+    config["quant_cfg"] = "NVFP4"
+    extension_fqn = (
+        "nemo_rl.modelopt.models.policy.workers."
+        "dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2"
+    )
+    if source == "config":
+        config["worker_extension_cls_fqn"] = extension_fqn
+    cluster = create_mock_cluster(world_size=1)
+
+    with (
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerBuilder") as worker_builder,
+        pytest.warns(DeprecationWarning, match="deprecated")
+        if source == "constructor"
+        else nullcontext(),
+        pytest.raises(ValueError, match="_v2=false selects the DTensor v1 backend"),
+    ):
+        Policy(
+            cluster=cluster,
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+            worker_extension_cls_fqn=extension_fqn if source == "constructor" else None,
+        )
+
+    worker_builder.assert_not_called()
+    cluster._init_placement_groups.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -528,7 +601,12 @@ def test_policy_constructor_worker_extension_allows_quantization() -> None:
                 "quant_cfg": "NVFP4",
             },
             None,
-            "worker_extension_cls_fqn and quant_cfg are mutually exclusive",
+            "quant_cfg requires worker_extension_cls_fqn=.*DTensorQuantPolicyWorkerV2",
+        ),
+        (
+            {"quant_cfg": "NVFP4"},
+            "tests.extensions.CustomPolicyWorker",
+            "quant_cfg requires worker_extension_cls_fqn=.*DTensorQuantPolicyWorkerV2",
         ),
         (
             {"worker_extension_cls_fqn": "tests.extensions.ConfigWorker"},
@@ -545,13 +623,19 @@ def test_policy_rejects_invalid_worker_extension_config(
     config = create_dtensor_config("test-model", tp=1)
     config.update(config_updates)
 
-    with pytest.raises(ValueError, match=error_match):
+    cluster = create_mock_cluster(world_size=1)
+    with (
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerBuilder") as worker_builder,
+        pytest.raises(ValueError, match=error_match),
+    ):
         Policy(
-            cluster=create_mock_cluster(world_size=1),
+            cluster=cluster,
             config=config,
             tokenizer=create_mock_tokenizer(),
             worker_extension_cls_fqn=explicit_extension_fqn,
         )
+    worker_builder.assert_not_called()
+    cluster._init_placement_groups.assert_not_called()
 
 
 @pytest.mark.parametrize("from_config", [False, True])
