@@ -61,6 +61,7 @@ from nemo_rl.data_plane.schema import (
     ROUTED_LEN_FIELD,
 )
 from nemo_rl.experience.route_assembly import RouteFragment
+from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 
 # These names come from nemo_gym.token_id_capture.staging.records.StagedCallRecord,
 # transformed by stage() below. Adding a field means editing both this list and
@@ -348,8 +349,12 @@ class MegatronPayloadStageResult:
     response_metadata: dict[str, Any]
 
 
-PREFIX_SPLICE_SUFFIX_FIELD = "prefix_splice_suffix_token_ids"
-PREFIX_SPLICE_BOUNDARY_FIELD = "prefix_splice_boundary_token_id"
+# Request-metadata keys the Megatron chat endpoint writes when it defers the
+# prefix splice to the engine's prompt preparer. Must match the constants of
+# the same name in Megatron-LM's ``megatron/core/inference/inference_request.py``;
+# the names mirror the ``replace_prefix_tokens`` arguments they feed.
+PREFIX_TEMPLATE_TOKEN_IDS_FIELD = "template_prefix_token_ids"
+PREFIX_EOS_TOKEN_ID_FIELD = "eos_token_id"
 
 
 class ChainPrefixCache:
@@ -411,7 +416,8 @@ class TQMegatronPromptPreparer:
 
     Mirrors the vLLM worker: ``prepare_prompt`` resolves the prefix through the
     shared ``resolve_admission_prefix`` / ``ChainPrefixCache`` pair, then splices
-    it at the boundary the Megatron endpoint described in ``offload_params``.
+    it with the shared ``replace_prefix_tokens`` using the rendered prior-turn
+    tokens and EOS id the Megatron endpoint carried in ``offload_params``.
     """
 
     def __init__(self, source: TQTokenSource) -> None:
@@ -453,25 +459,28 @@ class TQMegatronPromptPreparer:
         )
         updated_offload_params["ng_capture"] = updated_admission.model_dump(mode="json")
 
-        suffix_token_ids = updated_offload_params.get(PREFIX_SPLICE_SUFFIX_FIELD)
-        boundary_token_id = updated_offload_params.get(PREFIX_SPLICE_BOUNDARY_FIELD)
-        if suffix_token_ids is not None or boundary_token_id is not None:
-            if not isinstance(suffix_token_ids, list) or any(
-                type(token_id) is not int for token_id in suffix_token_ids
+        template_prefix_token_ids = updated_offload_params.get(
+            PREFIX_TEMPLATE_TOKEN_IDS_FIELD
+        )
+        eos_token_id = updated_offload_params.get(PREFIX_EOS_TOKEN_ID_FIELD)
+        if template_prefix_token_ids is not None or eos_token_id is not None:
+            if not isinstance(template_prefix_token_ids, list) or any(
+                type(token_id) is not int for token_id in template_prefix_token_ids
             ):
                 raise ValueError(
-                    "MInf capture request carries no valid prompt suffix tokens"
+                    "MInf capture request carries no valid template prefix tokens"
                 )
-            if type(boundary_token_id) is not int:
-                raise ValueError(
-                    "MInf capture request carries no valid prefix boundary token"
-                )
-            # The splice relies on the endpoint's suffix starting with the
-            # boundary token; the post-condition below verifies the result.
-            prompt_prefix = prefix_token_ids
-            if prompt_prefix and prompt_prefix[-1] == boundary_token_id:
-                prompt_prefix = prompt_prefix[:-1]
-            prompt = prompt_prefix + suffix_token_ids
+            if type(eos_token_id) is not int:
+                raise ValueError("MInf capture request carries no valid EOS token id")
+            # Same splice as the vLLM worker (vllm_worker_async.py); the
+            # post-condition below verifies the result.
+            prompt = replace_prefix_tokens(
+                tokenizer=None,
+                model_prefix_token_ids=prefix_token_ids,
+                template_prefix_token_ids=template_prefix_token_ids,
+                template_token_ids=prompt,
+                eos_token_id=eos_token_id,
+            )
         elif admission.staging_chain:
             raise ValueError(
                 "MInf staged-prefix request carries no prompt splice metadata"
