@@ -37,12 +37,10 @@ import tempfile
 import pytest
 import torch
 
-# Upstream (mingyu) checkout — sibling of RL/. Its nemo_rl package is the
-# parity reference. Overridable for a differently-located checkout.
-UPSTREAM_ROOT = os.environ.get(
-    "XTOKEN_UPSTREAM_ROOT",
-    "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/avenkateshha/nemo_rl/xtoken_nemorl",
-)
+# The external reference checkout is intentionally opt-in so this test remains
+# portable. Its nemo_rl package is loaded in a subprocess to avoid co-importing
+# two repositories with the same package name.
+UPSTREAM_ROOT = os.environ.get("XTOKEN_UPSTREAM_ROOT", "")
 
 
 # ----------------------------------------------------------------------------- #
@@ -363,6 +361,8 @@ def _run_upstream(fx, tmpdir):
 # Tests
 # ----------------------------------------------------------------------------- #
 def _assert_parity(case_name):
+    if not UPSTREAM_ROOT:
+        pytest.skip("set XTOKEN_UPSTREAM_ROOT to run cross-repository parity")
     if not os.path.isdir(UPSTREAM_ROOT):
         pytest.skip(f"upstream checkout not found at {UPSTREAM_ROOT}")
     with tempfile.TemporaryDirectory() as tmp:

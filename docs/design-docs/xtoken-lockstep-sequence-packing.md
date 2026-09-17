@@ -2,7 +2,7 @@
 
 Status: Proposed
 
-Target: `avenkateshha/xtoken-v6-loss`
+Target: xToken v6 loss and sequence-packing implementation
 
 Last updated: 2026-08-13
 
