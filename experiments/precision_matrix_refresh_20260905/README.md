@@ -47,9 +47,9 @@ from one shared source checkout.
 
 The source overlay intentionally differs from the nightly image's Bridge
 revision. The launcher therefore rebuilds actor environments in node-local
-scratch. It also sets `UV_FROZEN=1`: the source `pyproject.toml` and `uv.lock`
-match the image fingerprint, and the frozen setting prevents newer `uv`
-versions from re-resolving equivalent FlashInfer index URLs with different
+scratch. It prefixes `/root/.local/bin` to `PATH` so every actor uses the `uv`
+version pinned by the nightly Dockerfile. This prevents a newer login-node
+`uv` from re-resolving equivalent FlashInfer index URLs with different
 trailing-slash normalization.
 
 The original Hugging Face weights, venvs, and compiler caches stay node-local,
