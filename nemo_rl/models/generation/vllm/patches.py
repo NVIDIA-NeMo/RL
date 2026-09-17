@@ -13,8 +13,13 @@
 # limitations under the License.
 
 import os
+from collections.abc import Iterator
 from contextlib import contextmanager
 from importlib.util import find_spec
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
 
 from nemo_rl.models.generation.vllm.config import (
     VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
@@ -844,6 +849,48 @@ from torch import nn"""
 
     logger.info("Applied NemotronH fp32 LM head source patch.")
     return True
+@contextmanager
+def modelopt_moe_amax_aliases(model: "torch.nn.Module") -> Iterator[None]:
+    """Temporarily expose nested ModelOpt MoE amax buffers to vLLM's loader.
+
+    Verified against vLLM 0.26.0: ``RoutedExperts.load_weights`` maps expert
+    amax keys to names such as ``w13_input_quantizer._amax``, then resolves
+    them with one ``getattr``. This refit path sends ModelOpt buffers through
+    that loader, which offers no hook for resolving nested target names.
+
+    Nemotron-H reached this loader after vLLM removed the inner
+    ``NemotronHModel.load_weights`` in 0.26.0. Its old flat parameter lookup
+    accepted dotted keys exposed by our buffer-to-parameter adapter:
+    https://github.com/vllm-project/vllm/commit/c233d90aa826df072872df47b201450059be8e71
+
+    Aliases reference the original tensors without registering additional
+    buffers or state-dict entries. Existing attributes belong to the caller
+    or an outer context and are preserved. Only aliases created here are
+    removed, including when setup or weight loading raises.
+
+    Args:
+        model: ModelOpt model whose MoE quantizer buffers will be refitted.
+    """
+    aliased: list[tuple["torch.nn.Module", str]] = []
+    try:
+        for module in model.modules():
+            for child_name, child in module.named_children():
+                if not child_name.startswith(("w13_", "w2_")):
+                    continue
+                if not child_name.endswith("_quantizer"):
+                    continue
+                for buf_name, buf in child.named_buffers(recurse=False):
+                    if not buf_name.endswith("_amax"):
+                        continue
+                    alias = f"{child_name}.{buf_name}"
+                    if hasattr(module, alias):
+                        continue
+                    setattr(module, alias, buf)
+                    aliased.append((module, alias))
+        yield
+    finally:
+        for module, alias in reversed(aliased):
+            delattr(module, alias)
 
 
 def ensure_vllm_source_compat() -> None:
