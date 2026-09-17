@@ -3,16 +3,16 @@
 This page collects NeMo RL guidance for post-training Nemotron 3.5 Super VL
 (`NemotronH_Omni_Reasoning_V3`), a hybrid Mamba + Attention MoE model with
 512 routed experts (22 active) and a RADIO vision tower, on the AutoModel
-(DTensor) backend. Use it to set up the environment, launch the DAPO math
-recipe, and understand the settings that are specific to this model.
+(DTensor) backend. Use it to set up the environment, launch the text DAPO and
+image GRPO recipes, and understand the settings that are specific to this model.
 
 > [!IMPORTANT]
 > **Early access.** Both recipes run end-to-end on 16 x 4-GPU nodes with
 > checkpoint resume: the text DAPO recipe reaches 0.79 AIME-2024 accuracy by
-> step 50 and the image GRPO recipe (CLEVR-CoGenT, frozen vision tower) reaches
-> 0.84 validation accuracy by step 20 (see [Reference Results](#reference-results)),
-> but no run has been taken to full convergence and fewer than 16 nodes is not
-> supported; see [Known Issues](#known-issues).
+> step 50 and the image GRPO recipe (CLEVR-CoGenT) reaches 0.84 validation
+> accuracy by step 20 (see [Reference Results](#reference-results)). No run has
+> been taken to full convergence yet, and fewer than 16 nodes is not supported;
+> see [Known Issues](#known-issues).
 
 ## Support Status
 
@@ -21,14 +21,15 @@ recipe, and understand the settings that are specific to this model.
 | **Functionally Ready** | Runnable end-to-end and numerically validated with an initial training run. |
 | **Long-Run Convergence Validated** | Trains stably over a full-length run with a healthy, reproducible reward curve. |
 
-Nemotron 3.5 Super VL is **Functionally Ready** (text-only).
+Nemotron 3.5 Super VL is **Functionally Ready** for both text (DAPO) and image
+(GRPO) post-training.
 
 ## What's Supported
 
 | Model | Modality | Training backend | Parallelism | Inference | Precision |
 | --- | --- | --- | --- | --- | --- |
-| Nemotron 3.5 Super VL (120B-A12B) | LLM (text-only path) | AutoModel (DTensor) | FSDP2 + EP | vLLM (Super VL fork) | BF16 compute, FP32 master |
-| Nemotron 3.5 Super VL (120B-A12B) | VLM (image, frozen vision tower) | AutoModel (DTensor) | FSDP2 + EP | vLLM (Super VL fork) | BF16 compute, FP32 master |
+| Nemotron 3.5 Super VL (120B-A12B) | LLM (text) | AutoModel (DTensor) | FSDP2 + EP | vLLM (Super VL fork) | BF16 compute, FP32 master |
+| Nemotron 3.5 Super VL (120B-A12B) | VLM (image) | AutoModel (DTensor) | FSDP2 + EP | vLLM (Super VL fork) | BF16 compute, FP32 master |
 
 Notes:
 
@@ -41,8 +42,9 @@ Notes:
   [Build the Environment](#build-the-environment).
 - The DAPO recipe drives the model text-only (tokenizer path, `is_vlm=false`,
   vLLM never receives images). The image GRPO recipe uses the
-  `NemotronH_Omni_Reasoning_V3Processor` and `run_vlm_grpo.py`; the vision tower
-  is frozen and vLLM loads the checkpoint from disk (`load_format=auto`).
+  `NemotronH_Omni_Reasoning_V3Processor` via `run_vlm_grpo.py`; for this
+  architecture vLLM loads the checkpoint from disk (`load_format=auto`) and the
+  language model is refit every step.
 
 ## Build the Environment
 
@@ -96,25 +98,6 @@ export UV_LOCK_TIMEOUT=3600
 > regenerate `/opt/nemo_rl_container_fingerprint` with
 > `python tools/generate_fingerprint.py` so the version check passes.
 
-## Get the Weights
-
-The DAPO recipe defaults `policy.model_name` and `policy.tokenizer.name` to
-the HF Hub checkpoint `nvidia/nemotron-3.5-super-pre-ea-text-08282026` (gated,
-text SFT); the image GRPO recipe defaults to the early-access VL checkpoint
-`nvidia/NVIDIA-Nemotron-3.5-Super-EA-09112026`. To use a local checkpoint
-instead, override both keys:
-
-```bash
-uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/dapo-nemotron3.5-super-vl-120BA12B-16n8g-automodel.yaml \
-  policy.model_name=/your/path/to/nemotron-3.5-super-vl \
-  policy.tokenizer.name=/your/path/to/nemotron-3.5-super-vl
-```
-
-The checkpoint ships as 63 safetensors shards (~232 GB, BF16) with remote code
-(`modeling_nemotron_h_omni.py`, `modeling_radio.py`); `trust_remote_code` is
-always enabled by NeMo RL.
-
 ## Example Recipes
 
 AutoModel (DTensor) training with colocated vLLM generation. The recipe YAMLs
@@ -122,16 +105,22 @@ under `examples/configs/recipes/` are the source of truth.
 
 | Algo | Data | Seq | Train EP | vLLM TP/EP | `max_new_tokens` | Nodes | Recipe |
 |---|---|---|---|---|---|---|---|
-| DAPO (text) | DAPO-Math-17K / AIME-2024 | 9216 | 8 | 8 / 8 | 8192 | 16 x 8 GPUs | [`dapo-nemotron3.5-super-vl-120BA12B-16n8g-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-nemotron3.5-super-vl-120BA12B-16n8g-automodel.yaml) |
+| DAPO (text) | DAPO-Math-17K / AIME-2024 | 9216 | 4 | 4 / 4 | 8192 | 16 x 4 GPUs | [`dapo-nemotron3.5-super-vl-120BA12B-16n4g-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-nemotron3.5-super-vl-120BA12B-16n4g-automodel.yaml) |
 | GRPO (image) | CLEVR-CoGenT | 8192 | 4 | 4 / 4 | 4096 | 16 x 4 GPUs | [`vlm_grpo-nemotron3.5-super-vl-120BA12B-clevr-16n4g-automodel.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron3.5-super-vl-120BA12B-clevr-16n4g-automodel.yaml) |
 
-The image recipe mirrors the Nano Omni CLEVR recipe
-(`vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml`): frozen vision
-and audio towers (`automodel_kwargs.freeze_config`), image tokens as
-`bad_words`, `limit_mm_per_prompt.image: 2`, `mm_processor_cache_gb: 0`, and the
-Nemotron Omni CLEVR prompt. Launch it with `examples/run_vlm_grpo.py`.
+Both recipes are sized for 16 x 4-GPU GB200 nodes: train `expert_parallel_size: 4`
+and vLLM `tensor_parallel_size: 4` / `expert_parallel_size: 4` (one vLLM engine
+per node). See [Parallelism](#parallelism) for why EP must stay within a node.
 
-The recipe mirrors the Nemotron 3.5 Lightning DAPO recipe: dynamic sampling
+The image recipe mirrors the Nano Omni CLEVR recipe
+(`vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml`):
+`automodel_kwargs.freeze_config` trains the language model and keeps the vision
+and audio towers fixed, image tokens are `bad_words`, `limit_mm_per_prompt.image: 2`,
+`mm_processor_cache_gb: 0`, the Nemotron Omni CLEVR prompt, and
+`train_global_batch_size: 64` (a multiple of the 64-way data parallelism). Launch
+it with `examples/run_vlm_grpo.py`.
+
+The text recipe mirrors the Nemotron 3.5 Lightning DAPO recipe: dynamic sampling
 (`batch_multiplier: 3`), Clip-Higher (`ratio_clip_max: 0.28`), overlong
 filtering and soft overlong reward shaping, `reference_policy_kl_penalty: 0`,
 FusedAdam with FP32 master weights, activation checkpointing, and
@@ -147,7 +136,7 @@ These are set in the recipe and are required for this model:
 |---|---|---|
 | `policy.hf_config_overrides.num_nextn_predict_layers` | `0` | The checkpoint ships one MTP layer (`mtp.*` tensors). AutoModel builds it by default; this drops it on the training side. Keep `generation.vllm_kwargs.speculative_config` unset for the same reason. |
 | `policy.generation.vllm_cfg.skip_tokenizer_init` | `false` | vLLM's multimodal encoder budget calls the tokenizer during engine init for this architecture; the text-only default (`true`) fails with `You cannot pass text prompts when skip_tokenizer_init=True`. |
-| `policy.generation.vllm_kwargs.skip_mm_profiling` | `true` | No images are ever sent; skip reserving encoder-cache memory. |
+| `policy.generation.vllm_kwargs.skip_mm_profiling` | `true` | Skip vLLM's multimodal profiling pass at engine init. The text recipe never sends images; the image recipe's CLEVR inputs (at most two small images per prompt) run without the profiling-based encoder-cache reservation. |
 | `policy.generation.vllm_kwargs.mamba_ssm_cache_dtype` | `float32` | Matches the checkpoint's `mamba_ssm_cache_dtype`. |
 | `policy.dtensor_cfg.automodel_kwargs.force_hf` | unset | The custom AutoModel implementation and its state-dict adapter are required for EP and per-tensor refit. |
 | `policy.dtensor_cfg.env_vars.PYTORCH_CUDA_ALLOC_CONF` | unset | See [Known Issues](#known-issues): `expandable_segments:True` breaks the colocated IPC refit on some clusters. |
@@ -158,8 +147,8 @@ These are set in the recipe and are required for this model:
   dispatcher (V1 `Buffer` API) assumes an expert-parallel group of up to 8 ranks
   is intranode and exchanges CUDA IPC memory handles. If the group spans nodes
   (for example EP=8 on 4-GPU GB200 nodes), `Buffer` initialization fails with
-  `CUDA error ... deep_ep.cpp 'invalid resource handle'`. On 4-GPU nodes use
-  `expert_parallel_size: 4`.
+  `CUDA error ... deep_ep.cpp 'invalid resource handle'`. Both recipes use
+  `expert_parallel_size: 4` for 4-GPU nodes.
 - **vLLM TP and EP live on the same GPUs.** `expert_parallel_size ==
   tensor_parallel_size` runs one engine per node with dense layers TP-sharded
   and experts EP-sharded (`enable_expert_parallel`). Set both to the GPUs per
@@ -168,55 +157,36 @@ These are set in the recipe and are required for this model:
   persistent memory per GPU does not depend on EP; EP only changes the
   transient unsharded expert weights and all-to-all traffic.
 
-### Memory
-
-Per-GPU persistent state is FP32 master weights, FP32 gradients, and BF16 Adam
-moments (about 1.45 TB total for 121B parameters), sharded over the world. At
-64 GPUs that is about 23 GB per GPU plus activations; 4 nodes of 4 GPUs is the
-practical minimum, and a single 4-GPU node OOMs at the first refit.
-
-### Wall-clock and checkpointing
-
-Generation dominates (about 85% of step time). On 64 GB200 GPUs a step takes
-about 15 minutes with one generation batch and about 30 minutes when dynamic
-sampling needs a second batch, which becomes common once validation accuracy
-climbs. Checkpoints (FP32 master + optimizer) are about 1.8 TB each; the recipe
-keeps `keep_top_k: 2` ranked by `val:accuracy`, and
-`checkpoint_must_save_by: 00:03:20:00` leaves enough margin under a 4-hour
-Slurm limit for the timeout save to complete. Resume is automatic from the
-latest checkpoint in `checkpointing.checkpoint_dir`; chaining Slurm jobs with the
-same name under `ray.sub`'s `--dependency=singleton` runs them back to back.
-
 ## Launch
+
+Both recipes default to 16 nodes x 4 GPUs.
 
 ```bash
 export NRL_FORCE_REBUILD_VENVS=true
 
-# DAPO, 16 nodes x 8 GPUs (recipe default)
+# Text DAPO (DAPO-Math-17K / AIME-2024)
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/dapo-nemotron3.5-super-vl-120BA12B-16n8g-automodel.yaml
+  --config examples/configs/recipes/llm/dapo-nemotron3.5-super-vl-120BA12B-16n4g-automodel.yaml
 
-# Same recipe on 4-GPU nodes (e.g. GB200 NVL72): 16 nodes x 4 GPUs, EP/TP = 4
-uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/dapo-nemotron3.5-super-vl-120BA12B-16n8g-automodel.yaml \
-  cluster.gpus_per_node=4 \
-  policy.dtensor_cfg.expert_parallel_size=4 \
-  policy.generation.vllm_cfg.tensor_parallel_size=4 \
-  policy.generation.vllm_cfg.expert_parallel_size=4
+# Image GRPO (CLEVR-CoGenT)
+uv run examples/run_vlm_grpo.py \
+  --config examples/configs/recipes/vlm/vlm_grpo-nemotron3.5-super-vl-120BA12B-clevr-16n4g-automodel.yaml
 ```
 
-On Slurm, keep `cluster.num_nodes` and `cluster.gpus_per_node` in step with what
-you request from the scheduler.
+Resume is automatic from the latest checkpoint in `checkpointing.checkpoint_dir`;
+chaining Slurm jobs with the same name under `ray.sub`'s
+`--dependency=singleton` runs them back to back. On Slurm, keep
+`cluster.num_nodes` and `cluster.gpus_per_node` in step with what you request
+from the scheduler.
 
 ## Reference Results
 
 ### Training curves
 
-Both runs use 16 x 4-GPU GB200 nodes (train EP4, vLLM TP4/EP4) with the
-AutoModel (DTensor) backend and colocated vLLM generation, chained as 4-hour
-Slurm jobs that resume from the latest checkpoint (`checkpoint_must_save_by:
-00:03:20:00`, `save_period: 10`). Curves are wandb exports; the x axis is the
-training step.
+Both runs use the recipe defaults (16 x 4-GPU GB200 nodes, train EP4, vLLM
+TP4/EP4) with the AutoModel (DTensor) backend and colocated vLLM generation,
+chained as 4-hour Slurm jobs that resume from the latest checkpoint. Curves are
+wandb exports; the x axis is the training step.
 
 **Text DAPO, DAPO-Math-17K / AIME-2024** — the DAPO recipe run on the text-SFT
 checkpoint (`nvidia/nemotron-3.5-super-pre-ea-text-08282026`), 50 steps,
@@ -235,8 +205,8 @@ trainer and vLLM stay in agreement across the refits; the isolated
 resume.
 
 **Image GRPO, CLEVR-CoGenT** — the image recipe on the early-access VL
-checkpoint (`NVIDIA-Nemotron-3.5-Super-EA-09112026`), vision tower frozen,
-first 20 steps of the chain.
+checkpoint (`NVIDIA-Nemotron-3.5-Super-EA-09112026`), first 20 steps of the
+chain.
 
 ![Nemotron 3.5 Super VL image GRPO training curves](../../../assets/nemotron/nemotron-3.5-super-vl-image-grpo-clevr-16n4g.png)
 
@@ -245,10 +215,9 @@ step 10 and **0.84 at step 20**, with training reward moving from ~0.6 to a
 0.80-0.85 band by step 10. Mean validation response length stays short
 (~1,330 to ~1,250 tokens of the 4,096 budget) and `truncation_rate` falls from
 ~0.15 to a 0.03-0.13 band. `gen_kl_error` sits at 0.006-0.009 and
-`token_mult_prob_error` at 1.045-1.06, both flat, i.e. the language-model refit
-is healthy while vLLM keeps serving the checkpoint's vision weights
-(`load_format=auto`, vision frozen). The chain is still running; the curves
-will be extended as more steps complete.
+`token_mult_prob_error` at 1.045-1.06, both flat, i.e. trainer and vLLM stay
+in agreement across the refits. The chain is still running; the curves will be
+extended as more steps complete.
 
 Both runs were also exercised for save/resume: the text chain resumed across
 five jobs, the image recipe was validated with a 2-step save followed by a
@@ -295,11 +264,3 @@ resume to step 4 before the long run.
   OOM-killed. 16 nodes peak at ~840 GB including the save. The image recipe
   also sets `policy.dtensor_cfg.async_checkpoint_save: false` to avoid the
   extra async staging copy during saves.
-- **Image RL validated only on 16 x 4-GPU nodes.** Save and resume were
-  exercised end to end (2-step save, resume, 20-step job chain); 8-node runs
-  fail at the first checkpoint save for the host-memory reason above.
-- **Benign warning at load:** `Checkpoint key mismatch ... missing=80
-  ...experts.{down_projs,gate_and_up_projs}`. The routed experts are written in
-  place through strided views and the Omni adapter wrapper does not forward the
-  in-place bookkeeping to the checkpoint loader; the weights are loaded.
-- **No run has been taken to full convergence.**

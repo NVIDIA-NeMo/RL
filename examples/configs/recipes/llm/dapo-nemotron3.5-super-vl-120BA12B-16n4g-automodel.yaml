@@ -3,7 +3,8 @@ defaults: ../../grpo_math_1B.yaml
 # Mamba+Attention MoE backbone, 512 routed / 22 active experts, + RADIO vision
 # tower) DAPO-512 on the automodel (DTensor v2) backend, text-only math task.
 # Same task/algorithm settings as dapo-nanov3.5-30BA3B-4n8g-automodel.yaml;
-# parallelism follows grpo-nemotron3-super-120BA12B-16n8g-automodel-ep8.yaml.
+# Sized for 16 x 4-GPU GB200 nodes (train EP4, vLLM TP4/EP4); see the model
+# guide for why EP must stay within a node.
 #
 # Requirements (see pyproject.toml):
 #   - Automodel pinned at main @ 9d875a6d (Nemotron 3.5 Super VL, #3801), which
@@ -94,7 +95,7 @@ policy:
   - milestones:
     - 10
   dtensor_cfg:
-    expert_parallel_size: 8
+    expert_parallel_size: 4
     activation_checkpointing: true
     moe_parallelizer:
       ignore_router_for_ac: true
@@ -122,8 +123,8 @@ policy:
   generation:
     max_new_tokens: 8192
     vllm_cfg:
-      tensor_parallel_size: 8
-      expert_parallel_size: 8
+      tensor_parallel_size: 4
+      expert_parallel_size: 4
       gpu_memory_utilization: 0.5
       enforce_eager: true
       # vLLM's multimodal encoder budget (NemotronH_Nano_VL_V2 processor info)
@@ -157,5 +158,5 @@ logger:
     project: nemo-rl-super-3.5
     name: dapo-nemotron3.5-super-vl-120BA12B-16n8g-automodel
 cluster:
-  gpus_per_node: 8
+  gpus_per_node: 4
   num_nodes: 16

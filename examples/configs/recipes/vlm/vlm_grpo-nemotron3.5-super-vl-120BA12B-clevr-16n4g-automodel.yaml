@@ -2,7 +2,7 @@ defaults: ../../vlm_grpo_3B.yaml
 # Nemotron 3.5 Super VL (NemotronH_Omni_Reasoning_V3) image GRPO on CLEVR-CoGenT
 # with the automodel (DTensor v2) backend. Mirrors
 # vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml for the Nano Omni
-# model; parallelism follows dapo-nemotron3.5-super-vl-120BA12B-16n8g-automodel.yaml
+# model; parallelism follows dapo-nemotron3.5-super-vl-120BA12B-16n4g-automodel.yaml
 # but sized for 4-GPU GB200 nodes (16 nodes x 4 GPUs, train EP4, vLLM TP4/EP4).
 #
 # Requirements: see docs/guides/models/nemotron/nemotron-3.5-super-vl.md
