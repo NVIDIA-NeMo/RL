@@ -8,6 +8,7 @@ MODEL=${MODEL:-qwen30}
 MODE=${MODE:-async}
 ARM=${ARM:-bf16-bf16}
 TOPOLOGY=${TOPOLOGY:-default}
+PERFORMANCE_RECIPE=${PERFORMANCE_RECIPE:-0}
 MAX_STEPS=${MAX_STEPS:-20}
 RUN_GROUP=${RUN_GROUP:-$(date +%Y%m%d-%H%M%S)}
 WALLTIME=${WALLTIME:-04:00:00}
@@ -20,16 +21,16 @@ case "${ACTION}" in
   *) echo "ACTION must be render, test-only, or submit" >&2; exit 2 ;;
 esac
 case "${MODEL}" in
-  qwen30|qwen235|lightning|qwen35) ;;
-  *) echo "MODEL must be qwen30, qwen235, lightning, or qwen35" >&2; exit 2 ;;
+  qwen30|qwen235|lightning|qwen35|super) ;;
+  *) echo "MODEL must be qwen30, qwen235, lightning, qwen35, or super" >&2; exit 2 ;;
 esac
 case "${MODE}" in
   sync|async) ;;
   *) echo "MODE must be sync or async" >&2; exit 2 ;;
 esac
 case "${ARM}" in
-  bf16-bf16|bf16-mxfp8|mxfp8-mxfp8) ;;
-  *) echo "ARM must be bf16-bf16, bf16-mxfp8, or mxfp8-mxfp8" >&2; exit 2 ;;
+  bf16-bf16|bf16-mxfp8|mxfp8-false-mxfp8|mxfp8-true-mxfp8|mxfp8-mxfp8) ;;
+  *) echo "ARM must be bf16-bf16, bf16-mxfp8, mxfp8-false-mxfp8, or mxfp8-true-mxfp8" >&2; exit 2 ;;
 esac
 case "${TOPOLOGY}" in
   default|ep32-alltoall|ep32-hybridep) ;;
@@ -73,6 +74,14 @@ esac
 : "${NRL_DISABLE_NUMA_MEMBIND:=1}"
 
 case "${MODEL}:${MODE}" in
+  super:sync|super:async)
+    CONFIG=examples/configs/recipes/llm/performance/grpo-nemotron3-super-120BA12B-32n4g.yaml
+    NUM_NODES=32
+    SEGMENT_SIZE=8
+    MODEL_CACHE=models--nvidia--NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+    FIRST_BF16=2
+    LAST_BF16=6
+    ;;
   qwen30:sync)
     CONFIG=${EXPERIMENT}/qwen30-sync.yaml
     NUM_NODES=8
@@ -153,11 +162,31 @@ case "${MODEL}:${MODE}" in
     ;;
 esac
 
+if [[ "${PERFORMANCE_RECIPE}" == 1 ]]; then
+  if [[ "${TOPOLOGY}" != default ]]; then
+    echo "Performance recipes do not allow topology overrides" >&2
+    exit 2
+  fi
+  PERF_DIR=examples/configs/recipes/llm/performance
+  case "${MODEL}:${MODE}" in
+    qwen30:sync) CONFIG=${PERF_DIR}/grpo-qwen3-30ba3b-4n4g.yaml; NUM_NODES=4; SEGMENT_SIZE=4 ;;
+    qwen30:async) CONFIG=${PERF_DIR}/grpo-qwen3-30ba3b-4n4g-async-1off.yaml ;;
+    qwen235:sync) CONFIG=${EXPERIMENT}/qwen235-performance-sync.yaml ;;
+    qwen235:async) CONFIG=${PERF_DIR}/grpo-qwen3-235b-32n4g-async-1off.yaml ;;
+    qwen35:sync) CONFIG=${EXPERIMENT}/qwen35-performance-sync.yaml ;;
+    qwen35:async) CONFIG=${EXPERIMENT}/qwen35-performance-async.yaml ;;
+    super:sync) CONFIG=${PERF_DIR}/grpo-nemotron3-super-120BA12B-32n4g.yaml ;;
+    super:async) CONFIG=${PERF_DIR}/grpo-nemotron3-super-120BA12B-32n4g-async-1off.yaml ;;
+    *) echo "No audited performance recipe for ${MODEL}:${MODE}" >&2; exit 2 ;;
+  esac
+fi
+
 SOURCE_SHA=$(git -C "${REPO}" rev-parse HEAD 2>/dev/null || printf unknown)
 RUN_NAME="pmx-${CLUSTER}-${MODEL}-${MODE}-${ARM}-${TOPOLOGY}-${RUN_GROUP}"
 JOB_NAME="${SLURM_ACCOUNT}-pmx.${CLUSTER}-${MODEL}-${MODE}-${ARM}-${TOPOLOGY}-${RUN_GROUP}"
 RUN_ROOT="${RESULT_ROOT}/${RUN_NAME}"
 LOCAL_JOB_ROOT="${LOCAL_ROOT}/${RUN_NAME}"
+RUN_REPO="${LOCAL_JOB_ROOT}/source"
 DATASETS_CACHE="${LOCAL_JOB_ROOT}/hf/datasets"
 DATASET_STAGE_COMMAND="if [ -d ${HF_HOME_SOURCE}/datasets ]; then rsync -a --ignore-existing ${HF_HOME_SOURCE}/datasets/ ${LOCAL_JOB_ROOT}/hf/datasets/; fi"
 if [[ "${MODE}" == async ]]; then
@@ -168,14 +197,16 @@ if [[ "${MODE}" == async ]]; then
 fi
 USE_SHARED_MODEL=${USE_SHARED_MODEL:-$([[ ${CLUSTER}:${MODEL} == lyris:qwen235 ]] && printf 1 || printf 0)}
 MOE_BACKEND=flashinfer_trtllm
-if [[ "${MODEL}:${ARM}" == qwen235:bf16-bf16 ]]; then
-  MOE_BACKEND=triton
-fi
 
 COMMON_OVERRIDES=(
   "grpo.max_num_steps=${MAX_STEPS}"
   "grpo.val_at_start=false"
+  "grpo.val_period=0"
   "++grpo.val_at_end=false"
+  "++grpo.skip_reference_policy_logprobs_calculation=false"
+  "++grpo.seq_logprob_error_threshold=null"
+  "loss_fn.force_on_policy_ratio=false"
+  "loss_fn.reference_policy_kl_penalty=0.01"
   "cluster.num_nodes=${NUM_NODES}"
   "cluster.gpus_per_node=4"
   "++policy.generation.refit_timeout_s=300.0"
@@ -222,14 +253,34 @@ case "${ARM}" in
       "policy.generation.vllm_cfg.num_last_layers_in_bf16=${LAST_BF16}"
     )
     ;;
-  mxfp8-mxfp8)
+  mxfp8-false-mxfp8)
+    PRECISION_OVERRIDES=(
+      "policy.megatron_cfg.fp8_cfg.enabled=true"
+      "policy.megatron_cfg.fp8_cfg.fp8=e4m3"
+      "policy.megatron_cfg.fp8_cfg.fp8_recipe=mxfp8"
+      "policy.megatron_cfg.fp8_cfg.fp8_param=false"
+      "++policy.megatron_cfg.moe_router_dtype=fp32"
+      "++policy.megatron_cfg.te_precision_config_file=${RUN_REPO}/${EXPERIMENT}/te_routed.yaml"
+      "++policy.megatron_cfg.first_last_layers_bf16=true"
+      "++policy.megatron_cfg.num_layers_at_start_in_bf16=${FIRST_BF16}"
+      "++policy.megatron_cfg.num_layers_at_end_in_bf16=${LAST_BF16}"
+      "policy.megatron_cfg.distributed_data_parallel_config.overlap_param_gather=true"
+      "policy.megatron_cfg.distributed_data_parallel_config.overlap_grad_reduce=true"
+      "policy.generation.vllm_cfg.precision=fp8"
+      "++policy.generation.vllm_cfg.is_mx=true"
+      "policy.generation.vllm_cfg.refit_prequantize=$([[ ${MODE} == sync ]] && printf true || printf false)"
+      "policy.generation.vllm_cfg.num_first_layers_in_bf16=${FIRST_BF16}"
+      "policy.generation.vllm_cfg.num_last_layers_in_bf16=${LAST_BF16}"
+    )
+    ;;
+  mxfp8-true-mxfp8|mxfp8-mxfp8)
     PRECISION_OVERRIDES=(
       "policy.megatron_cfg.fp8_cfg.enabled=true"
       "policy.megatron_cfg.fp8_cfg.fp8=e4m3"
       "policy.megatron_cfg.fp8_cfg.fp8_recipe=mxfp8"
       "policy.megatron_cfg.fp8_cfg.fp8_param=true"
       "++policy.megatron_cfg.moe_router_dtype=fp32"
-      "++policy.megatron_cfg.te_precision_config_file=${EXPERIMENT}/te_routed_fp8param.yaml"
+      "++policy.megatron_cfg.te_precision_config_file=${RUN_REPO}/${EXPERIMENT}/te_routed_fp8param.yaml"
       "++policy.megatron_cfg.first_last_layers_bf16=true"
       "++policy.megatron_cfg.num_layers_at_start_in_bf16=${FIRST_BF16}"
       "++policy.megatron_cfg.num_layers_at_end_in_bf16=${LAST_BF16}"
@@ -243,6 +294,37 @@ case "${ARM}" in
     )
     ;;
 esac
+
+if [[ "${PERFORMANCE_RECIPE}" == 1 ]]; then
+  # Keep workload and topology from the audited recipe; add only matched
+  # precision, refit, and metric controls.
+  NORMALIZED_OVERRIDES=()
+  for override in "${COMMON_OVERRIDES[@]}" "${PRECISION_OVERRIDES[@]}"; do
+    case "${override}" in
+      *overlap_param_gather=*|*overlap_grad_reduce=*) continue ;;
+    esac
+    override=${override#++}
+    NORMALIZED_OVERRIDES+=("++${override}")
+  done
+  COMMON_OVERRIDES=("${NORMALIZED_OVERRIDES[@]}")
+  PRECISION_OVERRIDES=("++loss_fn.use_importance_sampling_correction=true")
+
+  if [[ "${MODE}" == async ]]; then
+    PRECISION_OVERRIDES+=("++policy.generation.refit_transport=nccl_reshard")
+  fi
+
+  # Qwen3.5 carries its model-specific vision, attention, GDN, and shared
+  # expert exclusions in the wrapper YAML. Other performance recipes need
+  # their routed-expert-only rollout scope supplied here.
+  if [[ "${ARM}" == *-mxfp8 && "${MODEL}" != qwen35 ]]; then
+    if [[ "${MODEL}" == super ]]; then
+      IGNORE_PATTERNS='["*layers.*.mixer.qkv_proj","*layers.*.mixer.o_proj","*layers.*.mixer.in_proj","*layers.*.mixer.out_proj","*layers.*.mixer.up_proj","*layers.*.mixer.down_proj","*layers.*.mixer.gate","*layers.*.mixer.shared_experts.*","*layers.*.mixer.fc1_latent_proj","*layers.*.mixer.fc2_latent_proj","*mtp.*","lm_head"]'
+    else
+      IGNORE_PATTERNS='["*layers.*.self_attn.*","*layers.*.mlp.gate","*layers.*.mlp.shared_experts.*","*mtp.*","lm_head"]'
+    fi
+    PRECISION_OVERRIDES+=("++policy.generation.vllm_cfg.quantization_ignore_patterns=${IGNORE_PATTERNS}")
+  fi
+fi
 
 printf 'cluster=%s\nmodel=%s\nmode=%s\narm=%s\ntopology=%s\nconfig=%s\nnodes=%s\nsegment=%s\nsteps=%s\nshared_model=%s\nmoe_backend=%s\ndatasets_cache=%s\nnuma_membind_disabled=%s\nsha=%s\nrun=%s\n' \
   "${CLUSTER}" "${MODEL}" "${MODE}" "${ARM}" "${TOPOLOGY}" "${CONFIG}" "${NUM_NODES}" \
@@ -290,6 +372,10 @@ if [[ "${ACTION}" == submit ]]; then
 fi
 
 SOURCE_SHA=$(git -C "${REPO}" rev-parse HEAD)
+if [[ -n "${EXPECTED_SOURCE_SHA:-}" && "${SOURCE_SHA}" != "${EXPECTED_SOURCE_SHA}" ]]; then
+  echo "Source changed after preflight: expected ${EXPECTED_SOURCE_SHA}, got ${SOURCE_SHA}" >&2
+  exit 2
+fi
 SOURCE_STATE=$(git -C "${REPO}" submodule status --recursive)
 SOURCE_ID=$(printf '%s\n%s\n' "${SOURCE_SHA}" "${SOURCE_STATE}" | sha256sum | cut -c1-16)
 SOURCE_ARCHIVE_ROOT=${SOURCE_ARCHIVE_ROOT:-/home/${USER}/.cache/nemo-rl-source-archives}
@@ -315,8 +401,6 @@ if [[ "${ACTION}" == submit && ! -f "${SOURCE_ARCHIVE}" ]]; then
 fi
 
 mkdir -p "${RUN_ROOT}/logs"
-
-RUN_REPO="${LOCAL_JOB_ROOT}/source"
 
 COMMAND=$(printf '%q ' /opt/nemo_rl_venv/bin/python examples/run_grpo.py \
   --config "${CONFIG}" "${COMMON_OVERRIDES[@]}" "${PRECISION_OVERRIDES[@]}")
@@ -346,7 +430,7 @@ ${DATASET_STAGE_COMMAND}"
 
 export CONTAINER
 export MOUNTS="/lustre:/lustre,/home:/home,${WANDB_HOME}/.netrc:/root/.netrc"
-if [[ "${CLUSTER}" == oci ]]; then
+if [[ "${CLUSTER}" == oci || "${CLUSTER}" == lyris ]]; then
   MOUNTS="${MOUNTS},/raid/scratch:/raid/scratch"
 fi
 export CONTAINER_REMAP_ROOT=1

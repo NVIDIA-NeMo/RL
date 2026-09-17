@@ -1,0 +1,8 @@
+defaults: ./qwen35-async.yaml
+
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 16
+
+policy:
+  train_global_batch_size: 2048

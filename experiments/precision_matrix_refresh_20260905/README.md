@@ -1,27 +1,23 @@
 # Precision Matrix Refresh
 
-This experiment compares three precision arms on one pinned NeMo-RL source
-revision. Each model and execution mode keeps its workload, GPU count, and
-parallelism fixed across the three arms.
+This experiment compares four precision arms on one pinned NeMo-RL source
+revision. Each model and execution mode keeps its workload, GPU count,
+parallelism, and two policy logprob passes fixed across all arms.
 
 | Arm | Policy training | Rollout |
 |---|---|---|
-| `bf16-bf16` | BF16 | BF16 FlashInfer TRTLLM, except Qwen3-235B TP8 uses Triton |
+| `bf16-bf16` | BF16 | BF16 FlashInfer TRTLLM |
 | `bf16-mxfp8` | BF16 | MXFP8 FlashInfer TRTLLM |
-| `mxfp8-mxfp8` | MXFP8 with `fp8_param=true` | MXFP8 FlashInfer TRTLLM |
+| `mxfp8-false-mxfp8` | MXFP8 with BF16 parameters | MXFP8 FlashInfer TRTLLM |
+| `mxfp8-true-mxfp8` | MXFP8 with MXFP8 parameters | MXFP8 FlashInfer TRTLLM |
 
-`sync` uses colocated CUDA IPC refit. The Qwen3-30B-A3B, Qwen3.5-35B-A3B,
-and Nemotron 3.5 Lightning Sync recipes use eight nodes and EP32 so BF16
-policy and reference initialization fit in host memory. `async` uses
+`sync` uses colocated CUDA IPC refit. `async` uses
 disaggregated NCCL Reshard refit and keeps the smaller training topology because
 generation has separate workers. Qwen3.5 Async reserves one four-node segment
 for training and one four-node segment for generation, which keeps the EP16
 training group inside one NVLink domain. All runs execute 20 steps; reports use
-steps 2-19. Qwen3-235B has a
-1536-wide expert dimension. TP8 produces a 192-wide local BF16 expert shard,
-which the FlashInfer TRTLLM BF16 kernel rejects because it is not a multiple of
-128. The Triton baseline matches the upstream Qwen3-235B performance recipe;
-both MXFP8 arms continue to use FlashInfer TRTLLM.
+steps 2-20. Every arm uses the same FlashInfer TRTLLM backend so precision is
+the only generation change.
 
 Qwen3.5 performance runs use 128 prompts and 16 generations per prompt, for a
 training global batch size of 2048. The launcher applies all three values to
@@ -57,10 +53,10 @@ shards produced by the one-time Hugging Face-to-Megatron conversion.
 Run one arm on OCI:
 
 ```bash
-MODEL=qwen30 MODE=async ARM=mxfp8-mxfp8 ACTION=test-only \
+MODEL=qwen30 MODE=async ARM=mxfp8-true-mxfp8 PERFORMANCE_RECIPE=1 ACTION=test-only \
   ./experiments/precision_matrix_refresh_20260905/submit_oci.sh
 
-MODEL=qwen30 MODE=async ARM=mxfp8-mxfp8 ACTION=submit \
+MODEL=qwen30 MODE=async ARM=mxfp8-true-mxfp8 PERFORMANCE_RECIPE=1 ACTION=submit \
   ./experiments/precision_matrix_refresh_20260905/submit_oci.sh
 ```
 
