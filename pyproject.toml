@@ -25,7 +25,11 @@ dependencies = [
   "setuptools",
   "pip",                                                                                                 # Required for frozen environments; uv venv --seed may not reliably install pip
   "ninja",                                                                                               # for flash-attn parallel build
-  "torch==2.13.0",
+  # torch is deliberately unpinned here: each backend extra pins the torch its
+  # wheels were built against (vllm/mcore/automodel/fsdp: 2.13.0; sglang/trtllm:
+  # 2.11.0) and resolves in its own conflict fork, so the driver venv only needs
+  # *a* torch. See the per-extra pins below.
+  "torch",
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
   "ray[default]>=2.55.1",
@@ -49,7 +53,7 @@ dependencies = [
   "plotly",
   "sympy>=1.14.0",
   "pillow>=12.3.0",                                                                                      # Address CVE (Pillow 12.3.0)
-  "torchvision==0.28.0",
+  "torchvision",
   # torchaudio and torchcodec are NOT installed in the container image.
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
   # Keep the base range compatible with backend-specific pins while selecting 5.12.1
@@ -118,6 +122,8 @@ dependencies = [
 
 [project.optional-dependencies]
 fsdp = [
+  "torch==2.13.0",
+  "torchvision==0.28.0",
   "transformers==5.12.1",
   # Build against the runtime torch/CUDA ABI; the old wheels target torch 2.10.
   "flash-attn==2.8.1",
@@ -126,6 +132,9 @@ fsdp = [
   "tilelang>=0.1.9,<0.1.13; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 automodel = [
+  # Colocated with vLLM engines (CUDA-IPC refit); must share vLLM's torch ABI.
+  "torch==2.13.0",
+  "torchvision==0.28.0",
   "nemo-automodel[moe]",
   # Automodel's FLA kernels require this TileLang version on Hopper.
   # Keep this scoped to the automodel fork; sglang intentionally pins TileLang 0.1.8.
@@ -144,6 +153,9 @@ automodel = [
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
 ]
 vllm = [
+  # ABI of the vLLM 0.29.0 cu130 wheels.
+  "torch==2.13.0",
+  "torchvision==0.28.0",
   "transformers==5.12.1",
   "tilelang==0.1.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "cuda-python",
@@ -162,6 +174,10 @@ vllm = [
   "nvidia-cutlass-dsl[cu13]==4.6.2",
 ]
 sglang = [
+  # sglang-miles (3003d70f) and sglang-kernel 0.4.5 are built against torch 2.11;
+  # on 2.13 sgl_kernel fails with `undefined symbol: _ZNK2at10TensorBase14const_data_ptr…`.
+  "torch==2.11.0",
+  "torchvision==0.26.0",
   # sgl-project/sglang branch `sglang-miles` (based on v0.5.16). Needed for the
   # begin_weight_update / end_weight_update refit session: quantized weights
   # carry derived scales (swizzled blockscales, g1/g2 alphas) that have to be
@@ -194,6 +210,9 @@ mcore = [
   # dependency megatron-core[dev,mlm] and its [tool.uv.sources] path mapping, so Megatron-LM
   # pyproject changes propagate on bump without any mirror here.
   "megatron-bridge[te,ssm]",
+  # Colocated with vLLM engines (CUDA-IPC refit); must share vLLM's torch ABI.
+  "torch==2.13.0",
+  "torchvision==0.28.0",
   "transformers==5.12.1",
   "tilelang==0.1.9; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
@@ -231,6 +250,10 @@ mcore = [
 # without compiling (prepare_metadata_for_build_wheel returns static metadata).
 # The actual ~60-min wheel build is triggered by `uv sync --extra trtllm`.
 trtllm = [
+  # tensorrt-llm 1.3.0rc21 requires torch<=2.13.0a0 and its libth_common.so is
+  # built against 2.11 (`undefined symbol: _ZNR5torch7Library4_def…` on 2.13).
+  "torch==2.11.0",
+  "torchvision==0.26.0",
   "tensorrt-llm==1.3.0rc21",
   "transformers==5.5.4",
   "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
@@ -245,8 +268,8 @@ nemo_gym = ["nemo_gym"]
 
 # This is a default group so that we install these even with bare `uv sync`
 build = [
-  # Build requirement for TE
-  "torch==2.13.0",
+  # Build requirement for TE (version comes from the extra being synced)
+  "torch",
   # Build requirement for TE
   "setuptools",
   "packaging",
@@ -422,8 +445,6 @@ override-dependencies = [
   "timm<=1.0.22",
   "fastapi[standard]>=0.133.0,<0.137.0",
   "nvidia-modelopt[torch]>=0.44.0a0",
-  # Match the ABI of the vLLM 0.29.0 CUDA wheels.
-  "torch==2.13.0",
   # vLLM 0.29 lists instanttensor (the optional `load_format="instanttensor"`
   # safetensors loader) as an unconditional dependency, but it only publishes
   # x86_64 wheels and its sdist compiles libaio/liburing/boost. vLLM imports it
