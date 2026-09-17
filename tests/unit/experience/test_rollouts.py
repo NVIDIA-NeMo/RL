@@ -239,6 +239,8 @@ class TestRolloutDebugInfo:
         assert info["mask_sample"] is True
         assert info["num_segments"] == 5
         assert info["num_compactions"] == 1
+        assert info["num_root_compactions"] == 1
+        assert info["num_subagent_compactions"] == 0
         assert info["num_subagent_sessions"] == 1
         assert info["segments"][1]["segment_boundary_reason"] == "compaction"
         assert info["segments"][3]["parent_session_id"] == "ses_main"
@@ -248,6 +250,31 @@ class TestRolloutDebugInfo:
             "segment_index": None,
             "segment_boundary_reason": "",
         }
+
+    def test_splits_compactions_by_root_and_subagent_session(self):
+        # Root compacts once. The subagent compacts once too, but its summary
+        # segment arrives WITHOUT parent_session_id (the fork's compaction
+        # call does not forward the parent header), so a per-segment split
+        # would misattribute it to the root. Classification is per session.
+        full_result = {
+            "reward": 0.0,
+            "instance_config": {"name": "inst", "problem_info": {}},
+            "responses": [
+                self._segment("ses_main", 0, ""),
+                self._segment("ses_main", 1, "compaction"),
+                self._segment("ses_main", 2, "post_compaction"),
+                self._segment("ses_sub", 0, "", parent="ses_main"),
+                self._segment("ses_sub", 1, "compaction"),  # no parent stamp
+                self._segment("ses_sub", 2, "post_compaction", parent="ses_main"),
+            ],
+        }
+
+        info = _rollout_debug_info(full_result)
+
+        assert info["num_compactions"] == 2
+        assert info["num_root_compactions"] == 1
+        assert info["num_subagent_compactions"] == 1
+        assert info["num_subagent_sessions"] == 1
 
     def test_degrades_gracefully_without_swe_fields(self):
         # Non-SWE Gym agents / legacy single-response results.

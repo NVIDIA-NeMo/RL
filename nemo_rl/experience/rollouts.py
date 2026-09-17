@@ -1499,6 +1499,24 @@ def _rollout_debug_info(full_result: dict) -> dict:
     subagent_sessions = {
         m.get("session_id") for m in segment_metas if m.get("parent_session_id")
     }
+    # Root vs subagent split. Classify per SESSION, not per segment: a
+    # subagent's own compaction-summary segment is dumped without
+    # parent_session_id (the fork's compaction call does not forward it), so
+    # judging that segment by its own parent field would count it as root.
+    # A session is a subagent if ANY of its segments carries a parent id.
+    sessions: dict[str, list[dict]] = {}
+    for m in segment_metas:
+        sessions.setdefault(str(m.get("session_id") or ""), []).append(m)
+
+    def _session_compactions(segs: list[dict]) -> int:
+        return sum(1 for s in segs if s.get("segment_boundary_reason") == "compaction")
+
+    num_root_compactions = sum(
+        _session_compactions(segs)
+        for segs in sessions.values()
+        if not any(s.get("parent_session_id") for s in segs)
+    )
+    num_subagent_compactions = num_compactions - num_root_compactions
     return {
         "instance_id": problem_info.get("instance_id") or instance_config.get("name"),
         "dataset_name": problem_info.get("dataset_name"),
@@ -1515,6 +1533,8 @@ def _rollout_debug_info(full_result: dict) -> dict:
         "final_eval_time": full_result.get("final_eval_time"),
         "num_segments": len(responses),
         "num_compactions": num_compactions,
+        "num_root_compactions": num_root_compactions,
+        "num_subagent_compactions": num_subagent_compactions,
         "num_subagent_sessions": len(subagent_sessions),
         "segments": [
             {
@@ -2447,6 +2467,19 @@ def run_async_nemo_gym_rollout(
                 1 for info in rollout_infos if info["num_compactions"] > 0
             )
             / batch_size,
+            # Same count split by session kind: the root (task) session vs the
+            # subagent sessions it spawned via the `task` tool (each subagent
+            # has its own history, segment counter and compaction).
+            **_calculate_single_metric(
+                [info.get("num_root_compactions", 0) for info in rollout_infos],
+                batch_size,
+                "compactions_per_sample/root",
+            ),
+            **_calculate_single_metric(
+                [info.get("num_subagent_compactions", 0) for info in rollout_infos],
+                batch_size,
+                "compactions_per_sample/subagent",
+            ),
             **_calculate_single_metric(
                 [info["num_subagent_sessions"] for info in rollout_infos],
                 batch_size,
