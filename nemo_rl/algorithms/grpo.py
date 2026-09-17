@@ -4434,10 +4434,15 @@ def async_grpo_train(
 
                 # Per-trace diagnostics (wandb: train/logprob_error/*/by_*,
                 # train/multi_trace/{env_masked,empty_rollout,seq_logprob_masked}
-                # _trace_fraction, trace_kind_*): seq error / gate-mask rate by
-                # trace index and segment kind, masked-fraction decomposition,
-                # |logprob err| by position. Needs real prev_logprobs and the
-                # Gym per-trace fields; merged into `metrics` below.
+                # _trace_fraction, trace_kind_*, trainable_tokens/*, rollouts/*,
+                # {trainable_tokens,traces}_per_rollout/*): seq error / gate-mask
+                # rate by trace index and segment kind, length-robust |Δ| stats
+                # (seq_{mean,max}_abs_err, seq_gen_tokens, alt_gate_masked_fraction
+                # -- diagnostic only, the live gate above is unchanged),
+                # masked-fraction decomposition, |logprob err| by position, and
+                # trainable-token counts by kind / compaction status / rollout.
+                # Needs real prev_logprobs and the Gym per-trace fields; merged
+                # into `metrics` below.
                 multi_trace_diag_metrics: dict[str, float] = {}
                 if not skip_prev_logprobs and "mask_sample" in repeated_batch:
                     multi_trace_diag_metrics = compute_multi_trace_diagnostics(
@@ -4456,6 +4461,10 @@ def async_grpo_train(
                         generation_logprobs=train_data["generation_logprobs"],
                         prev_logprobs=train_data["prev_logprobs"],
                         num_unpadded_traces=num_unpadded_traces,
+                        seq_logprob_error_threshold=seq_logprob_error_threshold,
+                        # Positional per-trace rollout id (None for legacy
+                        # single-trace buffers); padded rows are sliced off.
+                        trace_rollout_ids=trace_rollout_ids,
                     )
 
                 # Pad teacher logprobs to match train_data sequence length.

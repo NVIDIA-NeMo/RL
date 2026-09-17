@@ -75,6 +75,23 @@ def _small_batch():
     )
 
 
+def _uncompacted_batch():
+    """`_small_batch` with row 2 turned into an `uncompacted` trace that trains.
+
+    row 2: rollout C / trace 0 / uncompacted, 4 valid tokens with |err| = 0.5
+           each (mean exp|err| = e^0.5 < 2), not masked by anything.
+    """
+    b = _small_batch()
+    b["trace_kinds"] = ["pre_compaction", "compaction_summary", "uncompacted", "empty"]
+    b["trace_in_rollout_idx"] = torch.tensor([0, 1, 0, 0])
+    b["mask_sample"] = torch.tensor([False, False, False, True])
+    b["pre_seq_error_sample_loss_mask"] = torch.tensor([1.0, 1.0, 1.0, 0.0])
+    b["sample_mask"] = torch.tensor([1.0, 0.0, 1.0, 0.0])
+    b["seq_mult_prob_error"] = torch.tensor([1.1, 3.0, math.exp(0.5), 0.0])
+    b["prev_logprobs"][2] = torch.tensor([0.0, -0.5, -0.5, -0.5, -0.5, 0.0])
+    return b
+
+
 class TestTraceIndexBucket:
     def test_buckets(self):
         assert trace_index_bucket(0) == "0"
@@ -201,6 +218,254 @@ class TestComputeMultiTraceDiagnostics:
         assert compute_multi_trace_diagnostics(**b) == compute_multi_trace_diagnostics(
             **_small_batch()
         )
+
+
+class TestLengthRobustSeqErrorMetrics:
+    """`seq_{mean,max}_abs_err`, `seq_gen_tokens`, `alt_gate_masked_fraction`."""
+
+    def test_mean_and_max_abs_err_and_gen_tokens_by_kind(self):
+        m = compute_multi_trace_diagnostics(**_small_batch())
+        _assert_all_finite(m)
+        k = "by_segment_kind"
+        # row 0: |err| = .1,.2,.3,.4 over 4 tokens; row 1: |err| = 5,5 over 2.
+        assert m[f"logprob_error/seq_mean_abs_err/{k}/pre_compaction/mean"] == pytest.approx(0.25)
+        assert m[f"logprob_error/seq_mean_abs_err/{k}/compaction_summary/mean"] == pytest.approx(5.0)
+        assert m[f"logprob_error/seq_max_abs_err/{k}/pre_compaction/mean"] == pytest.approx(0.4)
+        assert m[f"logprob_error/seq_max_abs_err/{k}/pre_compaction/max"] == pytest.approx(0.4)
+        assert m[f"logprob_error/seq_max_abs_err/{k}/compaction_summary/mean"] == pytest.approx(5.0)
+        assert m[f"logprob_error/seq_max_abs_err/{k}/compaction_summary/max"] == pytest.approx(5.0)
+        assert m[f"logprob_error/seq_gen_tokens/{k}/pre_compaction/mean"] == pytest.approx(4.0)
+        assert m[f"logprob_error/seq_gen_tokens/{k}/compaction_summary/mean"] == pytest.approx(2.0)
+        # Not gate-eligible (env-masked / empty) -> omitted like the existing buckets.
+        for kind in ("post_compaction", "empty"):
+            assert not any(
+                key.startswith("logprob_error/") and f"/{k}/{kind}" in key for key in m
+            )
+
+    def test_mean_and_max_abs_err_by_trace_index(self):
+        m = compute_multi_trace_diagnostics(**_small_batch())
+        i = "by_trace_in_rollout_idx"
+        # bucket "0" = rows {0, 3}; row 3 (empty) is not eligible -> row 0 only.
+        assert m[f"logprob_error/seq_mean_abs_err/{i}/0/mean"] == pytest.approx(0.25)
+        assert m[f"logprob_error/seq_max_abs_err/{i}/0/mean"] == pytest.approx(0.4)
+        assert m[f"logprob_error/seq_max_abs_err/{i}/0/max"] == pytest.approx(0.4)
+        assert m[f"logprob_error/seq_gen_tokens/{i}/0/mean"] == pytest.approx(4.0)
+        assert m[f"logprob_error/seq_mean_abs_err/{i}/1/mean"] == pytest.approx(5.0)
+        assert m[f"logprob_error/seq_max_abs_err/{i}/1/mean"] == pytest.approx(5.0)
+        assert m[f"logprob_error/seq_max_abs_err/{i}/1/max"] == pytest.approx(5.0)
+        assert m[f"logprob_error/seq_gen_tokens/{i}/1/mean"] == pytest.approx(2.0)
+        assert not any("/2plus" in key for key in m)
+
+    def test_max_over_traces_differs_from_mean_in_shared_bucket(self):
+        b = _small_batch()
+        b["trace_in_rollout_idx"] = torch.tensor([0, 0, 2, 0])  # rows 0 and 1 share "0"
+        m = compute_multi_trace_diagnostics(**b)
+        i = "by_trace_in_rollout_idx"
+        assert m[f"logprob_error/seq_mean_abs_err/{i}/0/mean"] == pytest.approx((0.25 + 5.0) / 2)
+        assert m[f"logprob_error/seq_max_abs_err/{i}/0/mean"] == pytest.approx((0.4 + 5.0) / 2)
+        assert m[f"logprob_error/seq_max_abs_err/{i}/0/max"] == pytest.approx(5.0)
+        assert m[f"logprob_error/seq_gen_tokens/{i}/0/mean"] == pytest.approx(3.0)
+
+    def test_alt_gate_masked_fraction(self):
+        m = compute_multi_trace_diagnostics(**_small_batch(), seq_logprob_error_threshold=2.0)
+        _assert_all_finite(m)
+        a = "logprob_error/alt_gate_masked_fraction"
+        # ln 2 ~ 0.693: row 0 (mean .25) passes, row 1 (mean 5) is masked.
+        assert m[f"{a}/by_segment_kind/pre_compaction"] == pytest.approx(0.0)
+        assert m[f"{a}/by_segment_kind/compaction_summary"] == pytest.approx(1.0)
+        assert m[f"{a}/by_trace_in_rollout_idx/0"] == pytest.approx(0.0)
+        assert m[f"{a}/by_trace_in_rollout_idx/1"] == pytest.approx(1.0)
+        assert f"{a}/by_segment_kind/post_compaction" not in m
+        assert f"{a}/by_segment_kind/empty" not in m
+        # Jensen: never masks more than the live gate in any bucket.
+        for key, value in m.items():
+            if key.startswith(a + "/"):
+                live = m["logprob_error/seq_masked_fraction/" + key[len(a) + 1 :]]
+                assert value <= live + 1e-9, key
+
+    def test_alt_gate_absent_without_usable_threshold(self):
+        for thr in (None, 1.0, 0.5):
+            m = compute_multi_trace_diagnostics(
+                **_small_batch(), seq_logprob_error_threshold=thr
+            )
+            assert not any(k.startswith("logprob_error/alt_gate_masked_fraction/") for k in m)
+            # The other length-robust keys do not depend on the threshold.
+            assert "logprob_error/seq_mean_abs_err/by_segment_kind/pre_compaction/mean" in m
+        # Defaults keep the existing call signature working unchanged.
+        assert compute_multi_trace_diagnostics(**_small_batch()) == compute_multi_trace_diagnostics(
+            **_small_batch(), seq_logprob_error_threshold=None, trace_rollout_ids=None
+        )
+
+    def test_alt_gate_is_length_robust_where_live_gate_is_not(self):
+        # One 8-token trace with a single outlier |err| = 3: mean exp|err| =
+        # (7 + e^3) / 8 ~ 3.39 > 2 -> the live gate masks it; mean |err| =
+        # 0.375 < ln 2 -> the length-robust alternative does not.
+        token_mask = torch.tensor([[0] + [1] * 8], dtype=torch.float32)
+        prev = torch.zeros(1, 9)
+        prev[0, 8] = -3.0
+        live_err = (7 + math.exp(3.0)) / 8
+        m = compute_multi_trace_diagnostics(
+            seq_mult_prob_error=torch.tensor([live_err]),
+            masked_by_seq_logprob_error=torch.tensor([True]),
+            pre_seq_error_sample_loss_mask=torch.tensor([1.0]),
+            mask_sample=[False],
+            is_empty_rollout=[False],
+            trace_in_rollout_idx=[0],
+            trace_kinds=["uncompacted"],
+            token_mask=token_mask,
+            sample_mask=torch.tensor([0.0]),
+            generation_logprobs=torch.zeros(1, 9),
+            prev_logprobs=prev,
+            num_unpadded_traces=1,
+            seq_logprob_error_threshold=2.0,
+        )
+        _assert_all_finite(m)
+        assert m["logprob_error/seq_masked_fraction/by_segment_kind/uncompacted"] == 1.0
+        assert m["logprob_error/alt_gate_masked_fraction/by_segment_kind/uncompacted"] == 0.0
+        assert m["logprob_error/seq_mean_abs_err/by_segment_kind/uncompacted/mean"] == pytest.approx(0.375)
+        assert m["logprob_error/seq_max_abs_err/by_segment_kind/uncompacted/max"] == pytest.approx(3.0)
+        assert m["logprob_error/seq_gen_tokens/by_segment_kind/uncompacted/mean"] == pytest.approx(8.0)
+
+    def test_nan_logprobs_are_dropped_not_propagated(self):
+        b = _small_batch()
+        # A NaN at a NON-generated position of row 0 must change nothing.
+        b["prev_logprobs"][0, 5] = float("nan")
+        m = compute_multi_trace_diagnostics(**b, seq_logprob_error_threshold=2.0)
+        _assert_all_finite(m)
+        p = "logprob_error/seq_mean_abs_err/by_segment_kind/pre_compaction/mean"
+        assert m[p] == pytest.approx(0.25)
+        assert m["logprob_error/alt_gate_masked_fraction/by_segment_kind/pre_compaction"] == 0.0
+        # A NaN on a generated token: the trace's mean/max drop out of the
+        # averages (no other eligible trace in the bucket -> keys omitted), the
+        # token count stays, and the alt gate counts it as masked like the live
+        # gate would (`err <= thr` is False for NaN).
+        b["prev_logprobs"][0, 2] = float("nan")
+        m = compute_multi_trace_diagnostics(**b, seq_logprob_error_threshold=2.0)
+        _assert_all_finite(m)
+        assert p not in m
+        assert "logprob_error/seq_max_abs_err/by_segment_kind/pre_compaction/mean" not in m
+        assert "logprob_error/seq_max_abs_err/by_segment_kind/pre_compaction/max" not in m
+        assert m["logprob_error/seq_gen_tokens/by_segment_kind/pre_compaction/mean"] == pytest.approx(4.0)
+        assert m["logprob_error/alt_gate_masked_fraction/by_segment_kind/pre_compaction"] == 1.0
+
+
+class TestTrainableTokenMetrics:
+    """`multi_trace/trainable_tokens/*` and the per-rollout compaction split."""
+
+    def test_totals_by_kind_and_rollups(self):
+        m = compute_multi_trace_diagnostics(**_small_batch())
+        _assert_all_finite(m)
+        t = "multi_trace/trainable_tokens"
+        # Only row 0 (pre_compaction, 4 tokens) survives token_mask * sample_mask.
+        assert m[f"{t}/total"] == 4.0
+        assert m[f"{t}/by_segment_kind/pre_compaction"] == 4.0
+        assert m[f"{t}/by_segment_kind/compaction_summary"] == 0.0
+        assert m[f"{t}/by_segment_kind/post_compaction"] == 0.0
+        assert m[f"{t}/by_segment_kind/empty"] == 0.0
+        assert m[f"{t}/compacted_rollouts"] == 4.0
+        assert m[f"{t}/uncompacted_rollouts"] == 0.0
+        assert m[f"{t}/compacted_fraction"] == pytest.approx(1.0)
+        # No rollout ids -> no per-rollout keys.
+        assert not any(
+            k.startswith("multi_trace/rollouts/") or "_per_rollout/" in k for k in m
+        )
+
+    def test_per_rollout_classification(self):
+        m = compute_multi_trace_diagnostics(**_small_batch(), trace_rollout_ids=[0, 0, 0, 1])
+        _assert_all_finite(m)
+        # Rollout 0 = rows {0,1,2} (compaction kinds) -> compacted;
+        # rollout 1 = row 3 whose only trace is `empty` -> uncompacted.
+        assert m["multi_trace/rollouts/compacted_count"] == 1.0
+        assert m["multi_trace/rollouts/uncompacted_count"] == 1.0
+        assert m["multi_trace/trainable_tokens_per_rollout/compacted/mean"] == pytest.approx(4.0)
+        assert m["multi_trace/trainable_tokens_per_rollout/uncompacted/mean"] == pytest.approx(0.0)
+        assert m["multi_trace/traces_per_rollout/compacted/mean"] == pytest.approx(3.0)
+        assert m["multi_trace/traces_per_rollout/uncompacted/mean"] == pytest.approx(1.0)
+
+    def test_padded_rollout_ids_and_list_input_agree(self):
+        # The trainer pads trace_rollout_ids with duplicate rows; only the first
+        # num_unpadded_traces entries count. List and tensor inputs agree.
+        m_list = compute_multi_trace_diagnostics(**_small_batch(), trace_rollout_ids=[0, 0, 0, 1])
+        m_padded = compute_multi_trace_diagnostics(
+            **_small_batch(), trace_rollout_ids=torch.tensor([0, 0, 0, 1, 0, 0])
+        )
+        assert m_list == m_padded
+        assert "multi_trace/rollouts/compacted_count" in m_list
+
+    def test_uncompacted_kind_rollup_and_mixed_rollouts(self):
+        m = compute_multi_trace_diagnostics(
+            **_uncompacted_batch(), trace_rollout_ids=[0, 0, 1, 2], seq_logprob_error_threshold=2.0
+        )
+        _assert_all_finite(m)
+        t = "multi_trace/trainable_tokens"
+        assert m[f"{t}/total"] == 8.0
+        assert m[f"{t}/by_segment_kind/pre_compaction"] == 4.0
+        assert m[f"{t}/by_segment_kind/uncompacted"] == 4.0
+        assert m[f"{t}/compacted_rollouts"] == 4.0
+        assert m[f"{t}/uncompacted_rollouts"] == 4.0
+        assert m[f"{t}/compacted_fraction"] == pytest.approx(0.5)
+        # Rollout 0 = rows {0,1} compacted; rollout 1 = row 2 (uncompacted);
+        # rollout 2 = row 3 (empty) -> two uncompacted rollouts, 4 and 0 tokens.
+        assert m["multi_trace/rollouts/compacted_count"] == 1.0
+        assert m["multi_trace/rollouts/uncompacted_count"] == 2.0
+        assert m["multi_trace/trainable_tokens_per_rollout/compacted/mean"] == pytest.approx(4.0)
+        assert m["multi_trace/trainable_tokens_per_rollout/uncompacted/mean"] == pytest.approx(2.0)
+        assert m["multi_trace/traces_per_rollout/compacted/mean"] == pytest.approx(2.0)
+        assert m["multi_trace/traces_per_rollout/uncompacted/mean"] == pytest.approx(1.0)
+        # The uncompacted trace also shows up in the length-robust buckets.
+        assert m["logprob_error/seq_mean_abs_err/by_segment_kind/uncompacted/mean"] == pytest.approx(0.5)
+        assert m["logprob_error/seq_max_abs_err/by_segment_kind/uncompacted/max"] == pytest.approx(0.5)
+        assert m["logprob_error/seq_gen_tokens/by_segment_kind/uncompacted/mean"] == pytest.approx(4.0)
+        assert m["logprob_error/alt_gate_masked_fraction/by_segment_kind/uncompacted"] == 0.0
+        assert m["logprob_error/seq_masked_fraction/by_segment_kind/uncompacted"] == 0.0
+
+    def test_subagent_tokens_in_total_but_in_neither_rollup(self):
+        b = _uncompacted_batch()
+        b["trace_kinds"] = ["pre_compaction", "compaction_summary", "subagent", "empty"]
+        m = compute_multi_trace_diagnostics(**b, trace_rollout_ids=[0, 0, 0, 1])
+        _assert_all_finite(m)
+        t = "multi_trace/trainable_tokens"
+        assert m[f"{t}/total"] == 8.0
+        assert m[f"{t}/by_segment_kind/subagent"] == 4.0
+        assert m[f"{t}/compacted_rollouts"] == 4.0
+        assert m[f"{t}/uncompacted_rollouts"] == 0.0
+        assert m[f"{t}/compacted_fraction"] == pytest.approx(0.5)
+        # Per rollout the subagent trace belongs to a rollout that compacted.
+        assert m["multi_trace/rollouts/compacted_count"] == 1.0
+        assert m["multi_trace/trainable_tokens_per_rollout/compacted/mean"] == pytest.approx(8.0)
+        assert m["multi_trace/traces_per_rollout/compacted/mean"] == pytest.approx(3.0)
+
+    def test_no_valid_tokens_omits_fraction_and_keeps_counts(self):
+        b = _small_batch()
+        b["sample_mask"] = torch.zeros(4)
+        m = compute_multi_trace_diagnostics(**b, trace_rollout_ids=[0, 0, 0, 1])
+        _assert_all_finite(m)
+        t = "multi_trace/trainable_tokens"
+        assert m[f"{t}/total"] == 0.0
+        assert m[f"{t}/by_segment_kind/pre_compaction"] == 0.0
+        assert m[f"{t}/compacted_rollouts"] == 0.0
+        assert m[f"{t}/uncompacted_rollouts"] == 0.0
+        assert f"{t}/compacted_fraction" not in m
+        assert m["multi_trace/rollouts/compacted_count"] == 1.0
+        assert m["multi_trace/trainable_tokens_per_rollout/compacted/mean"] == 0.0
+        assert m["multi_trace/traces_per_rollout/compacted/mean"] == pytest.approx(3.0)
+
+    def test_empty_rollout_class_reports_zero_count_and_no_mean(self):
+        m = compute_multi_trace_diagnostics(**_small_batch(), trace_rollout_ids=[0, 0, 0, 0])
+        _assert_all_finite(m)
+        assert m["multi_trace/rollouts/compacted_count"] == 1.0
+        assert m["multi_trace/rollouts/uncompacted_count"] == 0.0
+        assert "multi_trace/trainable_tokens_per_rollout/uncompacted/mean" not in m
+        assert "multi_trace/traces_per_rollout/uncompacted/mean" not in m
+        assert m["multi_trace/traces_per_rollout/compacted/mean"] == pytest.approx(4.0)
+
+    def test_unknown_kind_is_uncompacted_per_rollout_but_in_neither_rollup(self):
+        b = _small_batch()
+        b["trace_kinds"] = ["pre_compaction", "compaction_summary", "post_compaction", None]
+        m = compute_multi_trace_diagnostics(**b, trace_rollout_ids=[0, 0, 0, 1])
+        assert m["multi_trace/trainable_tokens/by_segment_kind/unknown"] == 0.0
+        assert m["multi_trace/rollouts/uncompacted_count"] == 1.0
+        assert m["multi_trace/trainable_tokens/uncompacted_rollouts"] == 0.0
 
 
 class TestFinalizeSumCountMetrics:
