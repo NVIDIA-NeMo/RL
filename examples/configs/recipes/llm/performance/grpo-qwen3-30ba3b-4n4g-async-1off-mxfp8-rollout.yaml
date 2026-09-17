@@ -9,6 +9,8 @@ checkpointing:
 policy:
   megatron_cfg:
     expert_model_parallel_size: 8
+    env_vars:
+      NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "8"
   generation:
     colocated:
       enabled: false
