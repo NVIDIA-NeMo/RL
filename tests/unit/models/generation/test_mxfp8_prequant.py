@@ -19,7 +19,10 @@ import torch
 
 from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
     MXFP8_BLOCK_SIZE,
+    MXFP8_SCALE_DTYPE,
+    MXFP8_SCALE_SUFFIX,
     _mxfp8_e4m3_quantize_torch,
+    canonicalize_mxfp8_refit_output,
     mxfp8_e4m3_quantize_for_refit,
 )
 
@@ -81,6 +84,47 @@ def test_refit_quantize_preserves_single_scale_block_dimension():
     _, scales = mxfp8_e4m3_quantize_for_refit(x)
 
     assert scales.shape == (8, 1)
+
+
+def test_refit_wire_format_canonicalizes_scale_shape_and_zero_bytes():
+    values = torch.ones(2, 64, dtype=torch.float8_e4m3fn)
+    scales = torch.tensor([0, 3, 4, 0], dtype=MXFP8_SCALE_DTYPE)
+
+    got_values, got_scales = canonicalize_mxfp8_refit_output(
+        values.shape, values, scales
+    )
+
+    assert got_values is values
+    assert got_scales.shape == (2, 2)
+    assert torch.equal(
+        got_scales, torch.tensor([[1, 3], [4, 1]], dtype=MXFP8_SCALE_DTYPE)
+    )
+    assert MXFP8_SCALE_SUFFIX == "_scale_from_checkpoint"
+
+
+@pytest.mark.parametrize(
+    "values,scales,error",
+    [
+        (
+            torch.ones(2, 64, dtype=torch.bfloat16),
+            torch.ones(4, dtype=torch.uint8),
+            "values must use",
+        ),
+        (
+            torch.ones(2, 64, dtype=torch.float8_e4m3fn),
+            torch.ones(4, dtype=torch.int32),
+            "scales must use",
+        ),
+        (
+            torch.ones(2, 64, dtype=torch.float8_e4m3fn),
+            torch.ones(3, dtype=torch.uint8),
+            "scales must contain",
+        ),
+    ],
+)
+def test_refit_wire_format_rejects_incompatible_tensors(values, scales, error):
+    with pytest.raises(ValueError, match=error):
+        canonicalize_mxfp8_refit_output(values.shape, values, scales)
 
 
 def test_blackwell_refit_prequantization_requires_flashinfer(monkeypatch):
