@@ -577,4 +577,7 @@ def test_pack_input_ids_with_cpu_boundaries():
         input_ids, cu_q, cu_qp, cp_rank=0, cp_size=1, roll_shift=-1
     )
     assert actual.shape == (1, 32)
-    assert torch.equal(actual[0, :10], input_ids[0, 1:11])
+    expected_seq0 = _rolled_padded_seq(input_ids[0], 11, 16, -1)
+    expected_seq1 = _rolled_padded_seq(input_ids[1], 16, 16, -1)
+    assert torch.equal(actual[0, :16], expected_seq0)
+    assert torch.equal(actual[0, 16:], expected_seq1)

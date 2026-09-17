@@ -771,11 +771,14 @@ class LogprobsPostProcessor:
                 dtype=token_logprobs.dtype,
                 device=token_logprobs.device,
             )
-            cu_seqlens = processed_inputs.flash_attn_kwargs.cu_seqlens_q
+            cu_seqlens = to_cpu_int_tuple(
+                processed_inputs.flash_attn_kwargs.cu_seqlens_q
+            )
+            input_lengths_cpu = to_cpu_int_tuple(input_lengths)
             for i in range(original_batch_size):
-                start = cu_seqlens[i].item() + 1
-                end = cu_seqlens[i + 1].item()
-                seq_len_actual = input_lengths[i].item()
+                start = cu_seqlens[i] + 1
+                end = cu_seqlens[i + 1]
+                seq_len_actual = input_lengths_cpu[i]
                 unpacked_logprobs[i, 1:seq_len_actual] = token_logprobs[0, start:end]
             token_logprobs = unpacked_logprobs
         else:
@@ -980,12 +983,15 @@ class TopkLogitsPostProcessor:
                 device=idx.device,
             )
 
-            cu_seqlens = processed_inputs.flash_attn_kwargs.cu_seqlens_q
+            cu_seqlens = to_cpu_int_tuple(
+                processed_inputs.flash_attn_kwargs.cu_seqlens_q
+            )
+            input_lengths_cpu = to_cpu_int_tuple(input_lengths)
 
             for i in range(original_batch_size):
-                start = cu_seqlens[i].item()
-                end = cu_seqlens[i + 1].item()
-                seq_len_actual = input_lengths[i].item()
+                start = cu_seqlens[i]
+                end = cu_seqlens[i + 1]
+                seq_len_actual = input_lengths_cpu[i]
 
                 # Extract the corresponding portion from packed results
                 # Note: vals and idx are [1, packed_seq_len, k] due to packing
