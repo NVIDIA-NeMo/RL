@@ -1585,6 +1585,15 @@ class NemoGymShardSet:
         compare=False,
     )
 
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state.pop("_replica_lock", None)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._replica_lock = threading.Lock()
+
     @property
     def is_sharded(self) -> bool:
         return self.placement_group is not None

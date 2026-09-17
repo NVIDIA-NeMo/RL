@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock
 
 import pytest
+from ray import cloudpickle
 
 from nemo_rl.environments.nemo_gym import NemoGymShardSet, as_nemo_gym_shard_set
 from nemo_rl.environments.nemo_gym_shards import ShardSetupError
@@ -221,6 +222,17 @@ def test_concurrent_replica_selection_serializes_the_round_robin_cursor():
 
     assert first_pick.result() is first
     assert second_pick.result() is second
+
+
+def test_shard_set_recreates_its_lock_after_ray_serialization():
+    first, second = _FakeActor("first"), _FakeActor("second")
+    shard_set = _shard_set({"busy": [first, second]}, {"alpha": "busy"})
+    assert shard_set.pick_handle("alpha") is first
+
+    restored = cloudpickle.loads(cloudpickle.dumps(shard_set))
+
+    assert restored.pick_handle("alpha").shard_name == "second"
+    assert restored.pick_handle("alpha").shard_name == "first"
 
 
 def test_a_group_that_mixes_agents_across_shards_is_rejected():
