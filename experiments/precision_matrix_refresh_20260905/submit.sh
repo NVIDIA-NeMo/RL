@@ -72,7 +72,9 @@ esac
 : "${SLURM_ACCOUNT:?Set SLURM_ACCOUNT after checking FairShare}"
 : "${WANDB_HOME:=/home/${USER}}"
 : "${NRL_DISABLE_NUMA_MEMBIND:=1}"
-: "${NRL_FORCE_REBUILD_VENVS:=true}"
+: "${NRL_FORCE_REBUILD_VENVS:=false}"
+: "${NRL_IGNORE_VERSION_MISMATCH:=1}"
+: "${ACTOR_VENV_ROOT:=/opt/ray_venvs}"
 
 case "${MODEL}:${MODE}" in
   super:sync|super:async)
@@ -327,10 +329,10 @@ if [[ "${PERFORMANCE_RECIPE}" == 1 ]]; then
   fi
 fi
 
-printf 'cluster=%s\nmodel=%s\nmode=%s\narm=%s\ntopology=%s\nconfig=%s\nnodes=%s\nsegment=%s\nsteps=%s\nshared_model=%s\nmoe_backend=%s\ndatasets_cache=%s\nnuma_membind_disabled=%s\nforce_rebuild_venvs=%s\nsha=%s\nrun=%s\n' \
+printf 'cluster=%s\nmodel=%s\nmode=%s\narm=%s\ntopology=%s\nconfig=%s\nnodes=%s\nsegment=%s\nsteps=%s\nshared_model=%s\nmoe_backend=%s\ndatasets_cache=%s\nnuma_membind_disabled=%s\nforce_rebuild_venvs=%s\nactor_venv_root=%s\nsha=%s\nrun=%s\n' \
   "${CLUSTER}" "${MODEL}" "${MODE}" "${ARM}" "${TOPOLOGY}" "${CONFIG}" "${NUM_NODES}" \
   "${SEGMENT_SIZE}" "${MAX_STEPS}" "${USE_SHARED_MODEL}" "${MOE_BACKEND}" "${DATASETS_CACHE}" \
-  "${NRL_DISABLE_NUMA_MEMBIND}" "${NRL_FORCE_REBUILD_VENVS}" "${SOURCE_SHA}" "${RUN_NAME}"
+  "${NRL_DISABLE_NUMA_MEMBIND}" "${NRL_FORCE_REBUILD_VENVS}" "${ACTOR_VENV_ROOT}" "${SOURCE_SHA}" "${RUN_NAME}"
 printf 'overrides:'
 printf ' %q' "${COMMON_OVERRIDES[@]}" "${PRECISION_OVERRIDES[@]}"
 printf '\n'
@@ -407,12 +409,11 @@ COMMAND=$(printf '%q ' /opt/nemo_rl_venv/bin/python examples/run_grpo.py \
   --config "${CONFIG}" "${COMMON_OVERRIDES[@]}" "${PRECISION_OVERRIDES[@]}")
 COMMAND="set -euo pipefail; cd ${RUN_REPO}; \
 export HOME=/root; \
-export PATH=/root/.local/bin:\${PATH}; \
 export HF_HOME=${LOCAL_JOB_ROOT}/hf; \
 export HF_DATASETS_CACHE=${DATASETS_CACHE}; \
 export HUGGINGFACE_HUB_CACHE=${LOCAL_JOB_ROOT}/hf/hub; \
 export NRL_MEGATRON_CHECKPOINT_DIR=${HF_HOME_SOURCE}/nemo_rl; \
-export NEMO_RL_VENV_DIR=${LOCAL_JOB_ROOT}/venv; \
+export NEMO_RL_VENV_DIR=${ACTOR_VENV_ROOT}; \
 export VLLM_CACHE_ROOT=${LOCAL_JOB_ROOT}/vllm; \
 export TORCHINDUCTOR_CACHE_DIR=${LOCAL_JOB_ROOT}/inductor; \
 export TRITON_CACHE_DIR=${LOCAL_JOB_ROOT}/triton; \
@@ -422,6 +423,7 @@ export PYTHONPATH=${RUN_REPO}:${RUN_REPO}/3rdparty/Megatron-Bridge-workspace/Meg
 export FLA_TILELANG=0; \
 export NRL_DISABLE_NUMA_MEMBIND=${NRL_DISABLE_NUMA_MEMBIND}; \
 export NRL_FORCE_REBUILD_VENVS=${NRL_FORCE_REBUILD_VENVS}; \
+export NRL_IGNORE_VERSION_MISMATCH=${NRL_IGNORE_VERSION_MISMATCH}; \
 ${COMMAND}"
 
 SETUP_COMMAND="set -euo pipefail; \

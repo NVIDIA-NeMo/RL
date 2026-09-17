@@ -46,11 +46,11 @@ jobs therefore cannot race while building editable Megatron-Core extensions
 from one shared source checkout.
 
 The source overlay intentionally differs from the nightly image's Bridge
-revision. The launcher therefore rebuilds actor environments in node-local
-scratch. It prefixes `/root/.local/bin` to `PATH` so every actor uses the `uv`
-version pinned by the nightly Dockerfile. This prevents a newer login-node
-`uv` from re-resolving equivalent FlashInfer index URLs with different
-trailing-slash normalization.
+revision, while its `pyproject.toml`, `uv.lock`, and actor-environment registry
+match the image fingerprint. The launcher therefore reuses the image's
+prebuilt `/opt/ray_venvs` and places the node-local Bridge and Megatron-LM
+source first on `PYTHONPATH`. This avoids resolving unchanged dependencies and
+still runs the pinned source revision used by the experiment.
 
 The original Hugging Face weights, venvs, and compiler caches stay node-local,
 but `NRL_MEGATRON_CHECKPOINT_DIR` points to the shared converted-checkpoint
