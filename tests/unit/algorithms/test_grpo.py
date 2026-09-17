@@ -2438,11 +2438,11 @@ def test_dapo_dynamic_sampling_filters_zero_std(mock_grpo_components):
         ]
     )
 
-    # First prompt has zero std (all rewards are 1.0)
+    # The first prompt's rewards are identical, but its computed std contains
+    # tiny positive floating-point noise.
     # Second prompt has non-zero std (rewards: 0.5, 0.5, 0.0)
-    std = torch.tensor(
-        [0.0, 0.0, 0.0, 0.25, 0.25, 0.25]
-    )  # First prompt has zero std, second has non-zero
+    std = torch.tensor([1e-7, 1e-7, 1e-7, 0.25, 0.25, 0.25])
+    is_trivial_distribution = torch.tensor([True, True, True, False, False, False])
     baseline = torch.tensor([1.0, 1.0, 1.0, 0.33, 0.33, 0.33])
 
     master_config = mock_grpo_components["master_config"]
@@ -2462,6 +2462,7 @@ def test_dapo_dynamic_sampling_filters_zero_std(mock_grpo_components):
         dynamic_sampling_num_gen_batches,
         master_config,
         timer,
+        is_trivial_distribution=is_trivial_distribution,
     )
 
     # Only the second prompt (indices 3,4,5) should be selected since first has zero std
@@ -2772,7 +2773,7 @@ def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping(
     # call site.
     input_ids = torch.stack([m[0]["token_ids"] for m in repeated_batch["message_log"]])
     rewards = repeated_batch["total_reward"]
-    baseline, raw_std, _ = calculate_baseline_and_std_per_prompt(
+    baseline, raw_std, is_trivial_distribution = calculate_baseline_and_std_per_prompt(
         input_ids,
         rewards,
         torch.ones_like(rewards),
@@ -2797,6 +2798,7 @@ def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping(
         dynamic_sampling_num_gen_batches=1,
         master_config=master_config,
         timer=Timer(),
+        is_trivial_distribution=is_trivial_distribution,
     )
 
     # Only the second group should survive — the first group's raw rewards are
@@ -3725,7 +3727,11 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
     monkeypatch.setattr(
         grpo_mod,
         "calculate_baseline_and_std_per_prompt",
-        lambda *_args, **_kwargs: (torch.tensor([0.1]), torch.tensor([1.0])),
+        lambda *_args, **_kwargs: (
+            torch.tensor([0.1]),
+            torch.tensor([1.0]),
+            torch.tensor([False]),
+        ),
     )
     monkeypatch.setattr(
         grpo_mod,

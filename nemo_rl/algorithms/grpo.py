@@ -1905,6 +1905,7 @@ def dynamic_sampling(
     master_config: MasterConfig,
     timer: Timer,
     batch_cache: BatchedDataDict[DatumSpec] = None,
+    is_trivial_distribution: torch.Tensor | None = None,
 ) -> BatchedDataDict[DatumSpec]:
     """Implements the dynamic sampling algorithm to select prompts with non-zero standard deviation.
 
@@ -1925,6 +1926,9 @@ def dynamic_sampling(
         dynamic_sampling_num_gen_batches (int): Number of generation batches processed at the current step.
         master_config (MasterConfig): Configuration containing GRPO and policy settings.
         batch_cache (BatchedDataDict[DatumSpec], optional): Cache storing previously selected prompts with non-zero std.
+        is_trivial_distribution (torch.Tensor, optional): Exact-equality mask for each
+            sample's reward comparison set. When provided, trivial groups are
+            filtered even if floating-point roundoff produces a positive std.
 
     Returns:
         tuple: A tuple containing:
@@ -1951,12 +1955,17 @@ def dynamic_sampling(
     # If sampled prompts (with non-zero std) are fewer than num_prompts_per_step * num_generations_per_prompt, continue sampling until dynamic_sampling_max_gen_batches is reached.
     if master_config.grpo.use_dynamic_sampling:
         with timer.time("dynamic_sampling"):
-            # Get the prompt indices with non-zero std
-            non_zero_std_mask = std != 0.0
+            # Exact reward equality, rather than floating-point std noise, decides
+            # whether a prompt has useful reward variation.
+            non_trivial_reward_mask = (
+                std != 0.0
+                if is_trivial_distribution is None
+                else ~is_trivial_distribution
+            )
 
             keep_prompt_indices = torch.arange(
-                len(non_zero_std_mask), device=std.device
-            )[non_zero_std_mask].tolist()
+                len(non_trivial_reward_mask), device=std.device
+            )[non_trivial_reward_mask].tolist()
 
             # Only select the inputs that have non-zero std
             # total_reward is already a part of repeated_batch so we don't need to add it again
@@ -3292,7 +3301,11 @@ def _grpo_train_impl(
                         print("Computing advantages on GPU!")
                         # Just fix the device id for now
                         device_id = 0
-                        baseline, std, _ = calculate_baseline_and_std_per_prompt(
+                        (
+                            baseline,
+                            std,
+                            is_trivial_distribution,
+                        ) = calculate_baseline_and_std_per_prompt(
                             input_ids.cuda(device_id),
                             rewards.cuda(device_id),
                             torch.ones_like(rewards).cuda(device_id),
@@ -3305,8 +3318,13 @@ def _grpo_train_impl(
                         )
                         baseline = baseline.cpu()
                         std = std.cpu()
+                        is_trivial_distribution = is_trivial_distribution.cpu()
                     else:
-                        baseline, std, _ = calculate_baseline_and_std_per_prompt(
+                        (
+                            baseline,
+                            std,
+                            is_trivial_distribution,
+                        ) = calculate_baseline_and_std_per_prompt(
                             input_ids,
                             rewards,
                             torch.ones_like(rewards),
@@ -3324,6 +3342,7 @@ def _grpo_train_impl(
                             master_config,
                             timer,
                             batch_cache,
+                            is_trivial_distribution=is_trivial_distribution,
                         )
                     )
                     if ds_metrics:
