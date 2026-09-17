@@ -851,6 +851,22 @@ SingleController, however, each individual tensor must currently fit because
 the CPU PUT path does not create the chunk metadata required by an oversized
 GDR GET.
 
+With Gym token capture, the existing `use_gdr: true` setting also reuses vLLM's
+native GPU token IDs, logprobs, and async router snapshots for the same PUT.
+The worker retains views without extra capture copies, assembles the request
+payload on GPU, and shares it with the serving process through CUDA IPC until
+PUT completes. A shared batch allocation stays alive until its last retained
+view is released. PUT still runs at call completion with the same fields, keys,
+and digests.
+
+Prefix caching keeps its existing behavior and CPU router history. Cached prefix
+rows missing from GPU snapshots are uploaded only if included in this PUT's
+delta; fresh rows keep their GPU sources. CPU serving/digest copies, CPU-origin
+prompt tokens, and TQ's GPU staging copy remain. When the execution path or device placement
+cannot provide reusable GPU outputs, or preemption invalidates retained
+history, the existing CPU-produced PUT is used. No additional configuration
+is required.
+
 Capacity rule of thumb (any backend):
 
 ```
