@@ -609,3 +609,10 @@ those groups and raises `Trajectory collection stopped before enqueue completed`
 The flag is cleared in a `finally` block even when draining fails. Tests cover
 both the final enqueue and error cleanup. This ports the tested `bf3a59e` runtime
 fix into this maintenance branch; it does not change the data or reward recipe.
+# Complete judge verdicts (2026-09-17)
+
+Strict judging rejects incomplete Responses and text containing both verdict
+labels. These are retryable judge failures, not positive or negative rewards.
+A completed, unambiguous negative verdict remains valid and is never retried.
+Tests cover capped/conflicting replies and successful verdicts. This ports the
+tested `b41e457` runtime helper; the configured attempt count remains YAML-owned.
