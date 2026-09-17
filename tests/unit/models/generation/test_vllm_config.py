@@ -107,6 +107,23 @@ def test_refit_prequantize_rejects_nccl_reshard() -> None:
         validate_vllm_quantization_config(generation_config)
 
 
+def test_refit_prequantize_rejects_native_reload() -> None:
+    generation_config = cast(
+        VllmConfig,
+        {
+            "vllm_cfg": {
+                "precision": "fp8",
+                "is_mx": True,
+                "refit_prequantize": True,
+                "refit_with_reload_api": True,
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="not supported with refit_with_reload_api"):
+        validate_vllm_quantization_config(generation_config)
+
+
 @pytest.mark.parametrize(
     "field",
     ["refit_cache_loader_routes"],
