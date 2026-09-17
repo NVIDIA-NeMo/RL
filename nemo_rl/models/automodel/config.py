@@ -49,6 +49,7 @@ class RuntimeConfig(NamedTuple):
     model_class: type
     model_config: Any  # AutoConfig
     hf_config_overrides: dict[str, Any]
+    model_load_dtype: torch.dtype
 
     # Attention configuration
     allow_flash_attn_args: bool
