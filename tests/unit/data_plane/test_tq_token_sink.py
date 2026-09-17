@@ -212,8 +212,7 @@ def test_generation_prefix_uses_checkpoint_and_chunk_scoped_key(
     assert second.staging_key == second_key
     assert first_key != second_key
     assert [
-        snapshot.model_dump()
-        for snapshot in source.fetch([first_key, second_key])
+        snapshot.model_dump() for snapshot in source.fetch([first_key, second_key])
     ] == [
         record.model_dump(exclude={"extras"}),
         record.model_dump(exclude={"extras"}),

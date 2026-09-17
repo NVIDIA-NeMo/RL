@@ -754,9 +754,10 @@ def test_periodic_flush_rearms_when_fresh_buffer_fills_during_tq_write():
     assert first_result == [1]
     assert state.periodic_flush_due is True
     assert worker.flush_due_generation_chunks() == 1
-    assert [
-        record.token_ids_delta for _, record in sink.generation_prefix_records
-    ] == [[10, 20, 21], [22, 23]]
+    assert [record.token_ids_delta for _, record in sink.generation_prefix_records] == [
+        [10, 20, 21],
+        [22, 23],
+    ]
 
 
 def test_terminal_completion_waits_for_periodic_flush_and_clears_its_row():
@@ -1001,9 +1002,7 @@ def test_abort_waits_for_generation_cut_before_failing_the_call():
     receipt: list[GenerationCutReceipt] = []
     cut_thread = threading.Thread(
         target=lambda: receipt.append(
-            VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(
-                worker, inventory
-            )
+            VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(worker, inventory)
         )
     )
     abort_thread = threading.Thread(
@@ -1060,9 +1059,7 @@ def test_generation_cut_recovers_terminal_evidence_from_durable_tq_row():
         request,
         _served_content([11, 12], [-0.1, -0.2]),
     )
-    worker._staging_source = _MemoryPrefixSource(
-        {}, records={"r0/c1": sink.records[0]}
-    )
+    worker._staging_source = _MemoryPrefixSource({}, records={"r0/c1": sink.records[0]})
     worker._completed_capture_calls.clear()
     inventory = GenerationCutInventory.build(
         checkpoint_id="checkpoint-1",

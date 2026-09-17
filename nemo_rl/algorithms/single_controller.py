@@ -4401,24 +4401,10 @@ class SingleControllerActor:
                             tmp_path,
                             gym_staging_keys=gym_staging_keys,
                         )
-                        # The immutable TQ checkpoint now owns these active-prefix
-                        # rows. Remove only checkpoint-scoped copies from the live
-                        # staging partition so periodic cuts do not accumulate. A
-                        # terminal row may also appear in a cut receipt due to a
-                        # completion race; it is deliberately retained for the live
-                        # finalizer.
-                        await self._clear_generation_cut_staging_rows(
-                            generation_cut_staging_keys
-                        )
-                        generation_cut_rows_cleared = True
                 barrier_released = time.monotonic()
 
                 if trainer_state_changed:
                     await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
-                    await self._clear_generation_cut_staging_rows(
-                        generation_cut_staging_keys
-                    )
-                    generation_cut_rows_cleared = True
                     if gym_checkpoint is not None:
                         gym_abort_attempted = True
                         await self._release_prepared_gym_checkpoint(
@@ -4483,13 +4469,6 @@ class SingleControllerActor:
                 recovery_errors: list[BaseException] = [save_error]
                 if tmp_path.exists():
                     await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
-                if not generation_cut_rows_cleared:
-                    try:
-                        await self._clear_generation_cut_staging_rows(
-                            generation_cut_staging_keys
-                        )
-                    except BaseException as cleanup_error:
-                        recovery_errors.append(cleanup_error)
                 if gym_checkpoint is not None and not gym_abort_attempted:
                     try:
                         await self._release_prepared_gym_checkpoint(
