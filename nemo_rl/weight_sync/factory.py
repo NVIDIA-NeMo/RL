@@ -221,6 +221,11 @@ def create_weight_synchronizer(
                 train_cluster=train_cluster,
                 inference_cluster=inference_cluster,
                 refit_timeout_s=refit_timeout_s,
+                # refit_policy_generation()/the single-controller refit path
+                # already call policy.sync_params_before_refit() upstream of
+                # sync_weights(); doing it again here would re-run the
+                # deferred optimizer-update all-gather a second time per refit.
+                sync_policy_params=False,
                 release_grads_before_refit=release_grads_before_refit,
             )
 
@@ -234,6 +239,9 @@ def create_weight_synchronizer(
             train_cluster=train_cluster,
             inference_cluster=inference_cluster,
             refit_timeout_s=refit_timeout_s,
+            # See NcclReshardWeightSynchronizer above: the caller already
+            # owns this call.
+            sync_policy_params=False,
             release_grads_before_refit=release_grads_before_refit,
         )
 

@@ -89,6 +89,11 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
                     train_cluster=train_cluster,
                     inference_cluster=inference_cluster,
                     refit_timeout_s=refit_timeout_s,
+                    # refit_policy_generation()/the single-controller refit path
+                    # already call policy.sync_params_before_refit() before
+                    # this synchronizer's sync_weights(); doing it again here
+                    # would re-run the deferred optimizer-update all-gather.
+                    sync_policy_params=False,
                 )
             else:
                 self._transport = CollectiveWeightSynchronizer(
@@ -97,6 +102,7 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
                     train_cluster=train_cluster,
                     inference_cluster=inference_cluster,
                     refit_timeout_s=refit_timeout_s,
+                    sync_policy_params=False,
                 )
         self._stale = True
 
