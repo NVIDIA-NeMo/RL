@@ -153,6 +153,17 @@ def _as_routed_experts_tensor(
     return tensor.to(dtype=dtype)
 
 
+def validate_rollout_prompt(expected: list[int], actual: list[int] | None) -> None:
+    """Reject rollouts generated from a different prompt than the learner's."""
+    if actual != expected:
+        actual_length = None if actual is None else len(actual)
+        raise ValueError(
+            "vLLM processed prompt differs from the learner prompt: "
+            f"expected_length={len(expected)}, actual_length={actual_length}. "
+            "Refusing to train on a different prompt."
+        )
+
+
 def format_prompt_for_vllm_generation(
     data: BatchedDataDict[GenerationDatumSpec], sample_idx: Optional[int] = None
 ) -> list[dict[str, Any]]:
