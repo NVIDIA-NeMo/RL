@@ -51,9 +51,11 @@ not supported. Omit or disable the configuration for existing static behavior.
 
 For MoE, the minimum active size is raised until `active_CP * TP >= EP`. Workers
 also check that each actual expert communication group is contained within its
-task's ranks. This constraint prevents expert collectives from crossing task
-boundaries; it is not an end-to-end validation of MoE auxiliary losses or router
-replay. The smoke recipe uses a dense model.
+task's ranks. This keeps every EP collective inside one active-CP task and prevents
+experts from communicating across independently scheduled CP blocks. Router
+auxiliary losses and per-layer MoE metrics stay attached to the real microbatch
+that produced them; placeholder tasks carry zero valid tokens and do not affect
+loss normalization.
 
 ## Dispatch and execution
 
@@ -183,6 +185,34 @@ importance ratios within 0.01 of one, and generation KL below 0.1, and writes
 `smoke_result.json` in that log directory. A completed smoke run verifies
 execution and finite training metrics, not convergence or a speedup over static CP.
 
+### Dynamic-CP MoE quick smoke tests
+
+`perf_runs/run_gb200_dynamic_cp_moe.sh` runs the distributed loss and attention
+preflights followed by a two-to-five-step real-model GRPO smoke test. It defaults
+to Qwen3-30B-A3B, five steps, four nodes total (two generation nodes and two
+policy nodes inherited from the async 1-off recipe), and a one-hour QoS limit:
+
+```bash
+DYNAMIC_CP_MOE_STEPS=5 DRY_RUN=0 \
+  bash perf_runs/run_gb200_dynamic_cp_moe.sh
+```
+
+Select the other model cases with `DYNAMIC_CP_MOE_MODEL=qwen235b` or
+`DYNAMIC_CP_MOE_MODEL=nemotron3-nano`. Qwen3-30B-A3B uses TP1/EP8 and therefore
+runs its policy task at CP8. Qwen3-235B-A22B uses TP8/EP16, so its minimum active
+CP is two. Nemotron-3-Nano-30B-A3B uses TP2/EP8, so its minimum active CP is four.
+Larger active sizes remain available for longer generated sequences.
+
+The Qwen3-30B-A3B recipe exercises `aux_loss`; Qwen3-235B-A22B exercises
+`seq_aux_loss`; and the Nemotron recipe exercises its inherited router setup.
+The post-run check requires the expected active CP size, finite training metrics,
+the requested number of steps, and the configured MoE metric when applicable.
+
+The recipes log to both TensorBoard and W&B. The launcher defaults
+`WANDB_MODE=online`, uses `/home/humairafirdo/hf_home`, and prints both settings
+before submission. Set `WANDB_MODE=offline` explicitly when online logging is not
+wanted.
+
 ### Ten-step Nsight profile
 
 `perf_runs/run_gb200_dynamic_cp_profile.sh` runs the same dense Qwen3-32B setup
@@ -205,19 +235,31 @@ into `<job-id>-logs/ray/**/nsight/`.
 ### Ten-step dynamic/static comparison
 
 `perf_runs/run_gb200_cp_comparison.sh` runs matched ten-step jobs with the same
-model, batch, TP=2, PP=1, base CP=1, generation setup, container, and W&B
-project. Set `CP_MODE=dynamic` to allow active CP sizes 1–8, or
-`CP_MODE=static` to keep CP=1. Use different `CP_RUN_NAME` values so the W&B
-runs and local logs remain distinct.
+Qwen3-30B-A3B model, batch, TP4/EP4/PP1 policy topology, generation setup,
+container, and W&B project. EP4 is only a sharding change; it does not remove
+experts or change model weights. On the two policy nodes, TP4 creates two lanes
+and `CP1 * TP4 = EP4`, so a complete expert group fits inside CP1. The dynamic
+run can execute two CP1 tasks or one CP2 task, while the capacity-matched static
+run stays at CP2.
 
-The launcher accepts `CP_MAX_TOTAL_SEQUENCE_LENGTH`, `CP_TOKENS_PER_RANK`,
-`CP_MAX_SIZE`, and `STATIC_CP_SIZE`. A fair capacity-matched comparison uses the
-smallest fixed CP that can accommodate the configured maximum at the same
-per-rank token budget. For example, compare dynamic CP1–2 against static CP2
-with an 8192-token maximum and a 4096-token per-rank budget. Static CP1 remains
-useful as an unconstrained throughput reference when it fits in memory; static
-CP8 is a capacity-matched baseline only when the workload actually requires
-CP8.
+The default workload has an 8192-token ceiling, 4096 tokens per rank, and a
+global batch of 512 formed from 16 prompts times 32 generations. The launcher
+uses the batch QoS and a six-hour limit. Use different `CP_RUN_NAME` values so
+the W&B runs and local logs remain distinct.
+
+The launcher also accepts `CP_NUM_STEPS`, `CP_TRAIN_GLOBAL_BATCH_SIZE`,
+`CP_NUM_PROMPTS_PER_STEP`, `CP_NUM_GENERATIONS_PER_PROMPT`,
+`CP_MAX_TOTAL_SEQUENCE_LENGTH`, `CP_TOKENS_PER_RANK`, `CP_MAX_SIZE`, and
+`STATIC_CP_SIZE`. Prompt count times generations must equal the global batch.
+A static CP1 run remains useful as an unconstrained throughput and CP1 sanity
+reference when it fits in memory, but it is not the capacity-matched baseline
+for 8192 tokens at the 4096-token budget.
+
+The correctness smoke keeps the original TP1/EP8 topology and is therefore
+forced to CP8. The performance pair uses TP4/EP4 specifically to expose an
+adaptive CP1/CP2 choice on the same eight policy GPUs. Both sides of the pair
+use TP4/EP4, so the measured difference is dynamic versus fixed CP rather than
+a model or expert-layout difference between the two runs.
 
 After each run, `perf_runs/analyze_cp_sequence_lengths.py` writes
 `sequence_length_distribution.json` beside the driver log. It reports length

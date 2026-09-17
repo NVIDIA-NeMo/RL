@@ -30,6 +30,51 @@ from nemo_rl.distributed.named_sharding import NamedSharding
 logger = logging.getLogger(__name__)
 
 
+def _enabled_global_aux_loss(megatron_cfg: dict[str, Any]) -> bool:
+    """Return whether a full-DP global aux collective is configured.
+
+    The coefficient can originate in the HF model provider rather than this
+    dictionary, so the routing type itself must be rejected.
+    """
+    routing_type = megatron_cfg.get("moe_router_load_balancing_type")
+    routing_types = (
+        list(routing_type)
+        if isinstance(routing_type, (list, tuple))
+        else [routing_type]
+    )
+    return "global_aux_loss" in routing_types
+
+
+def _minimum_cp_size_for_experts(
+    megatron_cfg: dict[str, Any], configured_minimum: int
+) -> int:
+    """Keep every EP collective inside one dynamically scheduled task.
+
+    Dynamic CP tasks contain ``CP * TP`` contiguous model ranks.  The pinned
+    MCore rank order puts a complete EP group inside such a block once it is at
+    least EP ranks wide.  ETP changes that layout, so support it only after it
+    has a dedicated topology implementation.
+    """
+    expert_parallel = megatron_cfg["expert_model_parallel_size"]
+    tensor_parallel = megatron_cfg["tensor_model_parallel_size"]
+    expert_tensor_parallel = megatron_cfg.get("expert_tensor_parallel_size", 1)
+    if expert_tensor_parallel != 1:
+        raise ValueError(
+            "Dynamic CP MoE requires expert_tensor_parallel_size=1"
+        )
+    if expert_parallel <= 1:
+        return configured_minimum
+    minimum = configured_minimum
+    while minimum * tensor_parallel < expert_parallel:
+        minimum *= 2
+    if (minimum * tensor_parallel) % expert_parallel:
+        raise ValueError(
+            "Dynamic CP requires expert_model_parallel_size to divide "
+            "min_dynamic_cp_size * tensor_model_parallel_size"
+        )
+    return minimum
+
+
 def dynamic_cp_config(cfg: dict[str, Any]) -> DynamicContextParallelConfig | None:
     """Read optional config without introducing defaults at worker call sites."""
     megatron = cfg.get("megatron_cfg")
@@ -62,16 +107,26 @@ def validate_dynamic_cp(cfg: dict[str, Any], *, lanes: int) -> None:
         raise ValueError("Dynamic CP does not support MTP or HybridEP input prepadding")
     if cfg["sequence_packing"].get("pair_grouping_key"):
         raise ValueError("Dynamic CP does not yet schedule atomic preference pairs")
+    if _enabled_global_aux_loss(mc):
+        raise ValueError(
+            "Dynamic CP does not support global_aux_loss: its per-forward "
+            "TP*DP*CP collective cannot be called by uneven CP task lists. "
+            "Use aux_loss or seq_aux_loss instead."
+        )
     # Probe even empty plans, so invalid domains/bounds fail at initialization.
     tp = mc["tensor_model_parallel_size"]
-    minimum = dynamic.min_size
-    while minimum * tp < mc["expert_model_parallel_size"]:
-        minimum *= 2
+    minimum = _minimum_cp_size_for_experts(mc, dynamic.min_size)
+    maximum = dynamic.max_size or lanes
+    if minimum > maximum:
+        raise ValueError(
+            "Dynamic CP cannot contain an EP group: effective min_size "
+            f"{minimum} exceeds max_size {maximum} (CP*TP must be >= EP)"
+        )
     plan_cp_phases(
         [],
         lanes=lanes,
         min_size=minimum,
-        max_size=dynamic.max_size or lanes,
+        max_size=maximum,
         tokens_per_rank=dynamic.tokens_per_rank,
         sequence_parallel_size=tp if mc["sequence_parallel"] else 1,
         user_pad_multiple=cfg["make_sequence_length_divisible_by"],
@@ -104,6 +159,16 @@ class CPBatchSchedule:
     groups_by_batch: tuple[tuple[CPSyncGroup, ...], ...]
 
 
+def owned_real_task_count(plan: CPRankPlan) -> int:
+    """Count unique real packed tasks owned by this lane across all steps."""
+    return sum(
+        1
+        for step in plan.steps
+        for task in step.assignments
+        if task.sample_indices and plan.lane == task.lane_start
+    )
+
+
 def _schedule_parameters(
     cfg: dict[str, Any], sharding: NamedSharding
 ) -> tuple[int, int, int, int, int, int, int]:
@@ -114,9 +179,7 @@ def _schedule_parameters(
     cp = sharding.shape["context_parallel"]
     lanes = sharding.shape["data_parallel"] * cp
     tp = mc["tensor_model_parallel_size"]
-    minimum = dynamic.min_size
-    while minimum * tp < mc["expert_model_parallel_size"]:
-        minimum *= 2
+    minimum = _minimum_cp_size_for_experts(mc, dynamic.min_size)
     fp8 = mc.get("fp8_cfg") or {}
     alignment = 1
     if fp8.get("enabled"):

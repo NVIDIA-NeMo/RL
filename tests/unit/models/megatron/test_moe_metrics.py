@@ -121,6 +121,48 @@ def test_get_moe_metrics_aggregation_and_per_layer_logging(monkeypatch):
 
 
 @pytest.mark.mcore
+def test_dynamic_cp_metrics_use_one_fixed_sum_group(monkeypatch):
+    """Uneven lanes must not reduce through the last router task's group."""
+    from nemo_rl.models import megatron as megatron_module
+    from nemo_rl.models.megatron.common import get_moe_metrics
+
+    entry = SimpleNamespace(values=torch.tensor([1.0, 3.0]))
+    live_tracker = SimpleNamespace(metrics={"load_balancing_loss": entry})
+    reductions = []
+    fixed_group = object()
+
+    def _all_reduce(values, *, group):
+        reductions.append(group)
+        values.mul_(2.0)
+
+    monkeypatch.setattr(
+        megatron_module.common, "get_moe_metrics_tracker", lambda: live_tracker
+    )
+    monkeypatch.setattr(
+        megatron_module.common,
+        "get_moe_layer_wise_logging_tracker",
+        lambda: {"load_balancing_loss": {"values": entry.values}},
+    )
+    monkeypatch.setattr(
+        megatron_module.common,
+        "reduce_aux_losses_tracker_across_ranks",
+        lambda: pytest.fail("dynamic CP used the mutable per-task router group"),
+    )
+    monkeypatch.setattr(megatron_module.common.dist, "all_reduce", _all_reduce)
+    monkeypatch.setattr(
+        megatron_module.common, "clear_aux_losses_tracker", lambda: None
+    )
+
+    metrics = get_moe_metrics(
+        loss_scale=0.25,
+        dynamic_parallel_group=fixed_group,
+    )
+
+    assert reductions == [fixed_group]
+    assert metrics["load_balancing_loss"] == pytest.approx(1.0)
+
+
+@pytest.mark.mcore
 @pytest.mark.parametrize(
     "routing_type,aux_loss_coeff,z_loss_coeff,expected",
     [

@@ -1,0 +1,52 @@
+defaults: ./grpo-qwen3-30ba3b-4n4g-async-1off.yaml
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  max_num_steps: 5
+  val_period: 1000
+  val_at_start: false
+  val_at_end: false
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-async-dynamiccp-quick
+policy:
+  hf_config_overrides:
+    # Exercise the normal per-microbatch router auxiliary loss in this smoke run.
+    router_aux_loss_coef: 0.001
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 4096
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    sequence_parallel: false
+    freeze_moe_router: false
+    moe_router_load_balancing_type: aux_loss
+    moe_per_layer_logging: true
+    moe_hybridep_prepad_packed_inputs: false
+    dynamic_context_parallel:
+      enabled: true
+      min_size: 1
+      # The inherited async 1-off layout leaves two 4-GPU nodes for policy.
+      # TP1/EP8 therefore requires and exactly fills one active CP8 task.
+      max_size: 8
+      tokens_per_rank: 4096
+    fp8_cfg:
+      enabled: false
+  sequence_packing:
+    enabled: true
+  dynamic_batching:
+    enabled: false
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-4n4g-async-dynamiccp-quick
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3-30ba3b-4n4g-async-dynamiccp-quick
+data_plane:
+  enabled: false

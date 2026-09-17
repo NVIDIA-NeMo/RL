@@ -1,0 +1,30 @@
+defaults: ./grpo-qwen3-30ba3b-4n4g-async-1off-megatron-dynamiccp-quick.yaml
+grpo:
+  # Keep the original Qwen30B performance recipe's 32 generations per prompt.
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 32
+  max_num_steps: 10
+policy:
+  train_global_batch_size: 512
+  max_total_sequence_length: 8192
+  make_sequence_length_divisible_by: 4
+  megatron_cfg:
+    # The two policy nodes provide eight ranks. TP4 creates two scheduling
+    # lanes; EP4 fits completely inside one CP1*TP4 task. Dynamic CP can
+    # therefore execute two CP1 tasks or one CP2 task without crossing an EP
+    # collective between independently scheduled tasks.
+    tensor_model_parallel_size: 4
+    expert_model_parallel_size: 4
+    sequence_parallel: true
+    dynamic_context_parallel:
+      min_size: 1
+      max_size: 2
+      tokens_per_rank: 4096
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-4n4g-async-dynamiccp-10step
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl-cp-comparison
+    name: qwen3-30ba3b-4n4g-async-dynamiccp-10step
+

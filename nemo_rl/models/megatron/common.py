@@ -201,6 +201,7 @@ def get_moe_metrics(
     num_layers: Optional[int] = None,
     mtp_num_layers: Optional[int] = None,
     track_names: Optional[list[str]] = None,
+    dynamic_parallel_group: Optional[dist.ProcessGroup] = None,
 ) -> dict[str, Any]:
     """Returns Mixture of Experts (MoE) auxiliary-loss metrics.
 
@@ -222,6 +223,10 @@ def get_moe_metrics(
             records for the configured ``moe_router_load_balancing_type``, so callers
             should derive it via ``get_aux_loss_track_names(model_config)``. Defaults to
             None, which disables pre-initialization.
+        dynamic_parallel_group: Fixed TP*DP*CP group used only by dynamic CP.
+            Dynamic lanes can execute different numbers of microbatches and the
+            router's per-forward TP*CP group changes with each task, so its last
+            recorded reduction group is not safe for end-of-step metric sync.
 
     Returns:
         dict[str, Any]: A flat dict of aggregated metrics. For each aux loss name,
@@ -258,8 +263,25 @@ def get_moe_metrics(
         for name in track_names:
             mcore_tracker.ensure_initialized(name, tracker_num_layers)
 
-    reduce_aux_losses_tracker_across_ranks()
+    dynamic_names: Optional[list[str]] = None
+    if dynamic_parallel_group is None:
+        reduce_aux_losses_tracker_across_ranks()
+    else:
+        # Each task contributes local router statistics on exactly its active
+        # TP*CP ranks. A single SUM over the fixed full policy group therefore
+        # counts every real task once, irrespective of uneven lane task counts.
+        # The caller's loss_scale is 1 / number_of_unique_real_tasks.
+        mcore_tracker = get_moe_metrics_tracker()
+        dynamic_names = (
+            track_names if track_names is not None else list(mcore_tracker.metrics)
+        )
+        for name in dynamic_names:
+            entry = mcore_tracker.metrics.get(name)
+            if entry is not None:
+                dist.all_reduce(entry.values, group=dynamic_parallel_group)
     tracker = get_moe_layer_wise_logging_tracker()
+    if dynamic_names is not None:
+        tracker = {name: tracker[name] for name in dynamic_names if name in tracker}
 
     metrics: dict[str, Any] = {}
     if len(tracker) > 0:

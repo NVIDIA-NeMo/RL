@@ -1,0 +1,13 @@
+defaults: ./grpo-qwen3-30ba3b-4n4g-async-1off-megatron-dynamiccp-10step.yaml
+policy:
+  # CP2 is capacity-matched to an 8192-token maximum at 4096 tokens/rank.
+  # With TP4 and sequence parallelism, packed sequences align to CP*2*TP=16.
+  make_sequence_length_divisible_by: 16
+  megatron_cfg:
+    context_parallel_size: 2
+    dynamic_context_parallel:
+      enabled: false
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-4n4g-async-staticcp-10step
+  wandb:
+    name: qwen3-30ba3b-4n4g-async-staticcp-10step

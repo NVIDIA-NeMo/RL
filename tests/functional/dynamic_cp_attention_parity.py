@@ -94,7 +94,7 @@ def main() -> None:
             context_parallel_size=base_cp,
             hybrid_context_parallel=True,
         )
-        initialize_dynamic_cp_runtime()
+        initialize_dynamic_cp_runtime(max_cp_size=world // tp)
         torch.manual_seed(123)
         model_parallel_cuda_manual_seed(123)
         config = TransformerConfig(

@@ -23,9 +23,12 @@ from nemo_rl.distributed.dynamic_context_parallel import (
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.policy.dynamic_cp import (
+    _enabled_global_aux_loss,
+    _minimum_cp_size_for_experts,
     build_cp_dispatch,
     collect_cp_outputs,
     cp_schedule_matches,
+    owned_real_task_count,
 )
 
 
@@ -63,6 +66,79 @@ class TestDynamicCPDispatch(unittest.TestCase):
             ],
         )
 
+    def test_moe_minimum_contains_complete_expert_group(self):
+        self.assertEqual(
+            _minimum_cp_size_for_experts(
+                {
+                    "tensor_model_parallel_size": 1,
+                    "expert_tensor_parallel_size": 1,
+                    "expert_model_parallel_size": 8,
+                },
+                1,
+            ),
+            8,
+        )
+        self.assertEqual(
+            _minimum_cp_size_for_experts(
+                {
+                    "tensor_model_parallel_size": 2,
+                    "expert_tensor_parallel_size": 1,
+                    "expert_model_parallel_size": 16,
+                },
+                1,
+            ),
+            8,
+        )
+        with self.assertRaisesRegex(ValueError, "expert_tensor_parallel_size=1"):
+            _minimum_cp_size_for_experts(
+                {
+                    "tensor_model_parallel_size": 2,
+                    "expert_tensor_parallel_size": 2,
+                    "expert_model_parallel_size": 8,
+                },
+                1,
+            )
+        with self.assertRaisesRegex(ValueError, "expert_tensor_parallel_size=1"):
+            _minimum_cp_size_for_experts(
+                {
+                    "tensor_model_parallel_size": 2,
+                    "expert_tensor_parallel_size": 2,
+                    "expert_model_parallel_size": 1,
+                },
+                1,
+            )
+        with self.assertRaisesRegex(ValueError, "to divide"):
+            _minimum_cp_size_for_experts(
+                {
+                    "tensor_model_parallel_size": 2,
+                    "expert_tensor_parallel_size": 1,
+                    "expert_model_parallel_size": 12,
+                },
+                1,
+            )
+
+    def test_global_aux_loss_is_rejected_even_with_provider_coefficient(self):
+        self.assertTrue(
+            _enabled_global_aux_loss(
+                {"moe_router_load_balancing_type": "global_aux_loss"}
+            )
+        )
+        self.assertTrue(
+            _enabled_global_aux_loss(
+                {
+                    "moe_router_load_balancing_type": [
+                        "aux_loss",
+                        "global_aux_loss",
+                    ]
+                }
+            )
+        )
+        self.assertFalse(
+            _enabled_global_aux_loss(
+                {"moe_router_load_balancing_type": "seq_aux_loss"}
+            )
+        )
+
     def test_outputs_from_nonzero_static_cp_are_preserved(self):
         dispatch = build_cp_dispatch(
             self.data, self.cfg, self.mesh, batch_size=None, training=False
@@ -82,6 +158,29 @@ class TestDynamicCPDispatch(unittest.TestCase):
         torch.testing.assert_close(restored["logprobs"].flatten(), torch.arange(5))
         with self.assertRaises(ValueError):
             collect_cp_outputs(results[::2], dispatch, self.data.size)
+
+    def test_moe_dispatch_never_schedules_less_than_ep_over_tp(self):
+        cfg = {**self.cfg, "megatron_cfg": dict(self.cfg["megatron_cfg"])}
+        cfg["megatron_cfg"].update(
+            {
+                "expert_tensor_parallel_size": 1,
+                "expert_model_parallel_size": 8,
+                "dynamic_context_parallel": {
+                    "enabled": True,
+                    "tokens_per_rank": 8,
+                    "max_size": 4,
+                },
+            }
+        )
+        dispatch = build_cp_dispatch(
+            self.data, cfg, self.mesh, batch_size=None, training=False
+        )
+        assert all(
+            task.cp_size == 4
+            for dp_plans in dispatch.plans
+            for plan in dp_plans
+            for task in plan.steps[0].assignments
+        )
 
     def test_global_normalizer_and_autograd_do_not_count_cp_copies(self):
         dispatch = build_cp_dispatch(
@@ -198,6 +297,20 @@ class TestDynamicCPDispatch(unittest.TestCase):
             for plan in dp_plans
         ]
         self.assertEqual(sorted(local_counts), [1, 1, 1, 2])
+        unique_real_tasks = sum(
+            1
+            for group in dispatch.schedule.groups_by_batch[0]
+            for task in group.assignments
+            if task.sample_indices
+        )
+        self.assertEqual(
+            sum(
+                owned_real_task_count(plan)
+                for dp_plans in dispatch.plans
+                for plan in dp_plans
+            ),
+            unique_real_tasks,
+        )
         self.assertTrue(
             all(
                 len(plan.steps[0].groups) == 1

@@ -106,7 +106,7 @@ from nemo_rl.models.megatron.train import (
     megatron_forward_backward,
 )
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.dynamic_cp import dynamic_cp_config
+from nemo_rl.models.policy.dynamic_cp import dynamic_cp_config, owned_real_task_count
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -1313,7 +1313,28 @@ class MegatronPolicyWorkerImpl(
         model_config = getattr(self.model, "config", None)
         num_moe_experts = getattr(model_config, "num_moe_experts", None)
         if num_moe_experts is not None and num_moe_experts > 1:
-            moe_loss_scale = 1.0 / max(1, total_num_microbatches)
+            dynamic_moe_group = None
+            if cp_plan is not None:
+                # Count task owners, not rank-local microbatches: a CP=C task
+                # appears on C lanes but represents one packed model call.
+                local_real_tasks = owned_real_task_count(cp_plan)
+                global_real_tasks = torch.tensor(
+                    local_real_tasks, dtype=torch.int64, device="cuda"
+                )
+                torch.distributed.all_reduce(
+                    global_real_tasks,
+                    group=parallel_state.get_data_parallel_group(
+                        with_context_parallel=True
+                    ),
+                )
+                moe_loss_scale = 1.0 / max(1, int(global_real_tasks.item()))
+                dynamic_moe_group = (
+                    parallel_state.get_tensor_and_data_parallel_group(
+                        with_context_parallel=True
+                    )
+                )
+            else:
+                moe_loss_scale = 1.0 / max(1, total_num_microbatches)
             moe_metrics = get_moe_metrics(
                 loss_scale=moe_loss_scale,
                 per_layer_logging=self.cfg["megatron_cfg"]["moe_per_layer_logging"],
@@ -1324,6 +1345,7 @@ class MegatronPolicyWorkerImpl(
                 num_layers=getattr(model_config, "num_layers", None),
                 mtp_num_layers=getattr(model_config, "mtp_num_layers", None),
                 track_names=get_aux_loss_track_names(model_config),
+                dynamic_parallel_group=dynamic_moe_group,
             )
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics

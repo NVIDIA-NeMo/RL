@@ -2116,11 +2116,12 @@ def setup_model_and_optimizer(
         get_position_embedding_ranks=get_position_embedding_ranks,
     )
 
-    if (
-        dynamic_cp_config(policy_cfg) is not None
-        and megatron_cfg.model.hybrid_context_parallel
-    ):
-        initialize_dynamic_cp_runtime()
+    dynamic = dynamic_cp_config(policy_cfg)
+    if dynamic is not None:
+        initialize_dynamic_cp_runtime(
+            max_cp_size=dynamic.max_size
+            or parallel_state.get_data_parallel_world_size(with_context_parallel=True)
+        )
         # The Ray driver supplies packed-task synchronization groups and each
         # lane's possibly uneven task list. Use MCore's standard PP=1 executor,
         # whose no_sync handling covers every local task except the last, rather

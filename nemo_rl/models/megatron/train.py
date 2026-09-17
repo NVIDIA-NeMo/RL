@@ -213,7 +213,7 @@ def model_forward(
         position_ids = None
 
     additional_kwargs = {}
-    # Mamba models currently do not support packed_seq_params
+    # Packed metadata drives TE attention and the Mamba/GatedDelta CP layouts.
     if packed_seq_params is not None:
         additional_kwargs["packed_seq_params"] = (
             bind_attention_cp_group(model, packed_seq_params)
