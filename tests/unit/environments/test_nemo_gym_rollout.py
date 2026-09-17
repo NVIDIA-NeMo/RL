@@ -589,6 +589,7 @@ def test_l0_gym_environments_roll_out_through_nemo_rl(l0_nemo_gym, case, accepte
         max_seq_len=_GENERATION_CONFIG["max_total_sequence_length"],
         generation_config=deepcopy(_GENERATION_CONFIG),
         log_full_result_tables=True,
+        num_generations_per_prompt=1,
     )
 
     final_batch = result.final_batch
