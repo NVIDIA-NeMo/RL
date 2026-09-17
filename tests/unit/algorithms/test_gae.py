@@ -54,7 +54,7 @@ def device(request: pytest.FixtureRequest) -> torch.device:
     return torch.device(request.param)
 
 
-@pytest.mark.parametrize("seq_len", [1, 8, 257])
+@pytest.mark.parametrize("seq_len", [1, 8, 257, 1024])
 @pytest.mark.parametrize(
     "reward_dtype,value_dtype,mask_dtype",
     [
