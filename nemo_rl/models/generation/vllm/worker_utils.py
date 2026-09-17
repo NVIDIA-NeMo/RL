@@ -19,6 +19,7 @@ TOKENIZER_REQUIRED_ARCHITECTURES = frozenset(
         "Gemma3ForConditionalGeneration",
         "Gemma4ForConditionalGeneration",
         "Gemma4UnifiedForConditionalGeneration",
+        "InklingForConditionalGeneration",
         "Mistral3ForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",

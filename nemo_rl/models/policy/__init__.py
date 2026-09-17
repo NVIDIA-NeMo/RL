@@ -45,14 +45,15 @@ def _patch_transformers_tokenizer_class_set():
     import transformers
     from packaging.version import Version as PkgVersion
 
-    # Transformers 5.12.1 still ships both registry entries, so the patch remains
+    # Transformers 5.14.0 still ships both registry entries, so the patch remains
     # load-bearing across the currently supported backend environments.
+    # https://github.com/huggingface/transformers/blob/v5.14.0/src/transformers/models/auto/tokenization_auto.py#L371
     # TODO: remove this patch (and the assert below) once the deepseek_v3
     # entries actually disappear upstream.
     # https://github.com/NVIDIA-NeMo/RL/issues/2764
-    assert PkgVersion(transformers.__version__) < PkgVersion("5.13.0"), (
+    assert PkgVersion(transformers.__version__) < PkgVersion("5.15.0"), (
         f"transformers {transformers.__version__} detected. "
-        "The deepseek_v3 tokenizer-blocklist patch was verified against <5.13. "
+        "The deepseek_v3 tokenizer-blocklist patch was verified against <5.15. "
         "Check if the upstream fix now applies and remove this patch if so."
     )
 
