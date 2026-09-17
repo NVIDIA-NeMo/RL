@@ -659,6 +659,13 @@ class PolicyConfig(TypedDict):
     # Works best with a fixed refit_buffer_size_gb; the buffers stay resident on the
     # trainer GPU between refits (2x half-buffer bytes).
     refit_persistent_ipc_buffers: NotRequired[bool]
+    # Release completed gradient buffers before non-colocated collective refit.
+    # Existing optimizer and FP8 cache knobs control the additional memory released
+    # by the same offload_before_refit lifecycle.
+    release_grads_before_refit: NotRequired[bool]
+    # Move optimizer state to CPU when offload_before_refit runs. Defaults to True
+    # in the Megatron runtime for backward compatibility.
+    offload_optimizer_for_refit: NotRequired[bool]
     optimizer: NotRequired[PytorchOptimizerConfig | None]
     scheduler: NotRequired[
         list[SinglePytorchSchedulerConfig | SinglePytorchMilestonesConfig]
