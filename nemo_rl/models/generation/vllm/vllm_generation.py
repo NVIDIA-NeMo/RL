@@ -231,16 +231,16 @@ class VllmGeneration(GenerationInterface):
 
         assert_reload_refit_config_supported(self.cfg)
 
-        extension_fqn = self.cfg.get("worker_extension_cls_fqn")
-        if extension_fqn is not None and self.cfg.get("quant_cfg") is not None:
-            raise ValueError(
-                "worker_extension_cls_fqn and quant_cfg are mutually exclusive: "
-                "a custom generation worker cannot be combined with ModelOpt "
-                "quantization"
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            worker_cls = "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
+        else:
+            worker_cls = (
+                "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker"
             )
-        if extension_fqn is not None:
+        worker_cls = resolve_generation_worker_cls(worker_cls, self.cfg)
+        if self.cfg.get("worker_extension_cls_fqn") is not None:
             # Validate registration before allocating workers or placement groups.
-            get_actor_python_env(extension_fqn)
+            get_actor_python_env(worker_cls)
 
         self.sharding_annotations = NamedSharding(
             layout=np.arange(cluster.world_size()).reshape(
@@ -265,16 +265,6 @@ class VllmGeneration(GenerationInterface):
             use_unified_pg=needs_cross_node_parallelism,
         )
 
-        # Create worker builder for VllmGenerationWorker
-        if self.cfg["vllm_cfg"]["async_engine"]:
-            worker_cls = "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
-        else:
-            worker_cls = (
-                "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker"
-            )
-        worker_cls = resolve_generation_worker_cls(worker_cls, self.cfg)
-        if extension_fqn is not None:
-            worker_cls = extension_fqn
         if self.cfg["vllm_cfg"]["async_engine"]:
             worker_builder = RayWorkerBuilder(
                 worker_cls, config, defer_model_load=defer_model_load

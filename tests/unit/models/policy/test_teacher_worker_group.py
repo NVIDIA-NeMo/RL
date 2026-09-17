@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from unittest.mock import MagicMock
 
 import pytest
@@ -94,7 +95,18 @@ def test_create_teacher_configs_deduplicates():
     assert len(configs) == 2
 
 
-def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
+@pytest.mark.parametrize("quant_cfg", [None, "NVFP4"])
+@pytest.mark.parametrize(
+    "extension_fqn",
+    [
+        None,
+        "tests.extensions.CustomPolicyWorker",
+        "nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker.MegatronQuantPolicyWorker",
+    ],
+)
+def test_teacher_worker_group_clears_student_settings(
+    monkeypatch, quant_cfg, extension_fqn
+):
     """Frozen teachers do not require rollout-to-training route consistency."""
     import nemo_rl.distributed.worker_groups as worker_groups
     from nemo_rl.models.policy.teacher_worker_group import (
@@ -106,12 +118,16 @@ def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
 
     class FakeWorkerBuilder:
         def __init__(self, worker_path, cfg, **kwargs):
-            del worker_path, kwargs
+            del kwargs
+            captured["worker_path"] = worker_path
             captured["cfg"] = cfg
 
     class FakeWorkerGroup:
         def __init__(self, cluster, worker_builder, **kwargs):
             del cluster, worker_builder, kwargs
+
+        def shutdown(self, *, cleanup_method: str) -> bool:
+            return True
 
     monkeypatch.setattr(worker_groups, "RayWorkerBuilder", FakeWorkerBuilder)
     monkeypatch.setattr(worker_groups, "RayWorkerGroup", FakeWorkerGroup)
@@ -124,6 +140,8 @@ def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
         "sequence_packing": {"enabled": False},
         "dynamic_batching": {"enabled": False},
         "router_replay": {"enabled": True},
+        "quant_cfg": quant_cfg,
+        "worker_extension_cls_fqn": extension_fqn,
     }
     teacher_config = TeacherConfig(
         alias="teacher",
@@ -139,16 +157,29 @@ def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
         megatron_cfg_overrides={},
     )
 
-    teacher = TeacherWorkerGroup(
-        teacher_config,
-        cluster,
-        policy_config,
-        MagicMock(),
-    )
+    with (
+        pytest.warns(UserWarning, match="quantization is not supported")
+        if quant_cfg
+        else nullcontext()
+    ):
+        teacher = TeacherWorkerGroup(
+            teacher_config,
+            cluster,
+            policy_config,
+            MagicMock(),
+        )
 
     assert captured["cfg"]["router_replay"]["enabled"] is False
     assert teacher.cfg["router_replay"]["enabled"] is False
     assert policy_config["router_replay"]["enabled"] is True
+    assert (
+        captured["worker_path"]
+        == "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
+    )
+    assert captured["cfg"]["quant_cfg"] is None
+    assert "worker_extension_cls_fqn" not in captured["cfg"]
+    assert policy_config["quant_cfg"] == quant_cfg
+    assert policy_config["worker_extension_cls_fqn"] == extension_fqn
 
 
 def test_teacher_worker_group_drops_the_student_pretrained_checkpoint(monkeypatch):

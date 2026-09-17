@@ -93,6 +93,7 @@ checkpointing:
   save_optimizer: true
 
 policy:
+  worker_extension_cls_fqn: template_project.worker_extension.DTensorPolicyWorkerV2Extension
   model_name: "Qwen/Qwen2.5-1.5B"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default

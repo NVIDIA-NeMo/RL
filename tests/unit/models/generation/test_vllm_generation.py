@@ -195,7 +195,7 @@ def test_vllm_generation_rejects_worker_extension_with_quantization() -> None:
 
     with pytest.raises(
         ValueError,
-        match="worker_extension_cls_fqn and quant_cfg are mutually exclusive",
+        match="quant_cfg requires worker_extension_cls_fqn=.*VllmQuantGenerationWorker",
     ):
         VllmGeneration(cluster, config, defer_model_load=True)
 
