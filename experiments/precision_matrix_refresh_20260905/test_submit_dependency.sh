@@ -40,8 +40,9 @@ output=$(
 )
 
 grep -Fx -- '--dependency=afterok:12345' <<<"${output}" >/dev/null
-grep -F -- 'export PATH="${SLURM_COMMAND_PATH:-/usr/local/bin}:${PATH}"' \
-  "${REPO}/ray.sub" >/dev/null
+grep -F -- 'resolve_slurm_cli_path()' "${REPO}/ray.sub" >/dev/null
+grep -F -- '/cm/local/apps/slurm/*/bin' "${REPO}/ray.sub" >/dev/null
+grep -F -- 'Unable to find srun, scontrol, and sinfo' "${REPO}/ray.sub" >/dev/null
 
 qwen35_output=$(
   ACTION=render \

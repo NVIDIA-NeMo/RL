@@ -24,8 +24,37 @@
 
 set -eoux pipefail
 
-# OCI batch shells may omit the Slurm client wrappers from PATH.
-export PATH="${SLURM_COMMAND_PATH:-/usr/local/bin}:${PATH}"
+# Batch shells on some clusters omit Slurm clients from PATH. Login-node
+# wrappers are not necessarily mounted on compute nodes, so resolve a real
+# client installation before the launcher makes any scheduler calls.
+resolve_slurm_cli_path() {
+  local candidate
+
+  if command -v srun >/dev/null 2>&1 \
+    && command -v scontrol >/dev/null 2>&1 \
+    && command -v sinfo >/dev/null 2>&1; then
+    return 0
+  fi
+
+  for candidate in \
+    "${SLURM_COMMAND_PATH:-}" \
+    /cm/local/apps/slurm/*/bin \
+    /cm/shared/apps/slurm/*/bin \
+    /usr/local/bin; do
+    [[ -n "${candidate}" ]] || continue
+    if [[ -x "${candidate}/srun" \
+      && -x "${candidate}/scontrol" \
+      && -x "${candidate}/sinfo" ]]; then
+      export PATH="${candidate}:${PATH}"
+      return 0
+    fi
+  done
+
+  echo "Unable to find srun, scontrol, and sinfo on this compute node" >&2
+  return 127
+}
+
+resolve_slurm_cli_path
 
 # Record job-start epoch so Python can measure pre-Python overhead
 export NRL_JOB_START_EPOCH=$(date +%s.%N)

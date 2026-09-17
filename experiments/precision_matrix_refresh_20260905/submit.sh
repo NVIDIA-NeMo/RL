@@ -372,6 +372,14 @@ if [[ -n "${AFTEROK_JOB_ID}" ]]; then
   SBATCH_DEPENDENCY=(--dependency="afterok:${AFTEROK_JOB_ID}")
 fi
 
+# Resolve through login-node wrappers while they are available. ray.sub also
+# probes versioned Slurm directories because wrapper paths may not be mounted
+# on compute nodes.
+if [[ -z "${SLURM_COMMAND_PATH:-}" ]] && command -v scontrol >/dev/null 2>&1; then
+  SLURM_COMMAND_PATH=$(dirname "$(readlink -f "$(command -v scontrol)")")
+fi
+export SLURM_COMMAND_PATH
+
 exec sbatch "${SBATCH_MODE[@]}" \
   --nodes="${NUM_NODES}" \
   "${GPU_REQUEST[@]}" \
