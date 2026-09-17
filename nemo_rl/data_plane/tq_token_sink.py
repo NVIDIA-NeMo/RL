@@ -411,7 +411,7 @@ class TQMegatronPromptPreparer:
 
     Mirrors the vLLM worker: ``prepare_prompt`` resolves the prefix through the
     shared ``resolve_admission_prefix`` / ``ChainPrefixCache`` pair, then splices
-    it at the boundary the Megatron endpoint described in ``request_metadata``.
+    it at the boundary the Megatron endpoint described in ``offload_params``.
     """
 
     def __init__(self, source: TQTokenSource) -> None:
@@ -422,21 +422,21 @@ class TQMegatronPromptPreparer:
         self,
         prompt: str | list[int] | torch.Tensor,
         *,
-        request_metadata: dict[str, Any] | None = None,
+        offload_params: dict[str, Any] | None = None,
     ) -> tuple[str | list[int] | torch.Tensor, dict[str, Any] | None]:
         """Fetch a chained prefix, splice it into the prompt, and update admission."""
-        if request_metadata is None:
+        if offload_params is None:
             return prompt, None
-        capture_payload = request_metadata.get("ng_capture")
+        capture_payload = offload_params.get("ng_capture")
         if capture_payload is None:
-            return prompt, request_metadata
+            return prompt, offload_params
 
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.records import CaptureAdmission
 
         admission = CaptureAdmission.model_validate(capture_payload)
         if admission.mode == "text":
-            return prompt, request_metadata
+            return prompt, offload_params
         if not isinstance(prompt, list):
             raise TypeError("MInf token-in capture requires a token-id list prompt")
 
@@ -447,14 +447,14 @@ class TQMegatronPromptPreparer:
                 f"expected {admission.prev_len}, got {len(prefix_token_ids)}"
             )
 
-        updated_metadata = dict(request_metadata)
+        updated_offload_params = dict(offload_params)
         updated_admission = admission.model_copy(
             update={"required_prefix_token_ids": prefix_token_ids}
         )
-        updated_metadata["ng_capture"] = updated_admission.model_dump(mode="json")
+        updated_offload_params["ng_capture"] = updated_admission.model_dump(mode="json")
 
-        suffix_token_ids = updated_metadata.get(PREFIX_SPLICE_SUFFIX_FIELD)
-        boundary_token_id = updated_metadata.get(PREFIX_SPLICE_BOUNDARY_FIELD)
+        suffix_token_ids = updated_offload_params.get(PREFIX_SPLICE_SUFFIX_FIELD)
+        boundary_token_id = updated_offload_params.get(PREFIX_SPLICE_BOUNDARY_FIELD)
         if suffix_token_ids is not None or boundary_token_id is not None:
             if not isinstance(suffix_token_ids, list) or any(
                 type(token_id) is not int for token_id in suffix_token_ids
@@ -479,7 +479,7 @@ class TQMegatronPromptPreparer:
 
         if prompt[: admission.prev_len] != prefix_token_ids:
             raise ValueError("MInf failed to apply the authorized token prefix")
-        return prompt, updated_metadata
+        return prompt, updated_offload_params
 
 
 class TQMegatronTokenStager:
@@ -557,12 +557,12 @@ class TQMegatronTokenStager:
         payload: Any,
         *,
         finished_metadata: Any,
-        request_metadata: dict[str, Any] | None = None,
+        offload_params: dict[str, Any] | None = None,
     ) -> MegatronPayloadStageResult | None:
         """Stage an admitted request, or decline ordinary non-capture traffic."""
         if not isinstance(uid, str) or not uid:
             raise ValueError("MInf request UID must be a non-empty string")
-        capture_payload = (request_metadata or {}).get("ng_capture")
+        capture_payload = (offload_params or {}).get("ng_capture")
         if capture_payload is None:
             return None
         try:
