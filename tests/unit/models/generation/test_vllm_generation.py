@@ -23,6 +23,7 @@ import types
 import warnings
 from copy import deepcopy
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1169,22 +1170,39 @@ def test_nvfp4_pertoken_rejects_unsupported_topology(mutation):
         )
 
 
-@pytest.mark.parametrize(
-    "vllm_cfg",
-    [
-        {"tensor_parallel_size": 2},
-        {"pipeline_parallel_size": 2, "async_engine": True},
-        {
-            "tensor_parallel_size": 2,
-            "pipeline_parallel_size": 2,
-            "async_engine": True,
-        },
-    ],
-)
-def test_nvfp4_pertoken_validation_accepts_vllm_model_parallelism(vllm_cfg):
-    """Setup accepts TP and async PP values for vLLM to validate further."""
+@pytest.mark.parametrize("async_engine", [False, True])
+@pytest.mark.parametrize("tensor_parallel_size", [1, 2])
+def test_nvfp4_pertoken_validation_accepts_vllm_tensor_parallelism(
+    async_engine: bool, tensor_parallel_size: int
+) -> None:
+    """TP remains configurable with either engine mode and PP=1."""
     config = _make_nvfp4_pertoken_generation_config()
-    config["vllm_cfg"].update(vllm_cfg)
+    config["vllm_cfg"].update(
+        tensor_parallel_size=tensor_parallel_size, async_engine=async_engine
+    )
+    configure_generation_config(
+        config, MagicMock(pad_token_id=0, eos_token_id=1), is_eval=False
+    )
+
+
+@pytest.mark.parametrize("async_engine", [False, True])
+def test_nvfp4_pertoken_rejects_pipeline_parallel_refit(async_engine: bool) -> None:
+    config = _make_nvfp4_pertoken_generation_config()
+    config["vllm_cfg"].update(pipeline_parallel_size=2, async_engine=async_engine)
+    with pytest.raises(ValueError, match="does not support vLLM PP>1.*refit"):
+        configure_generation_config(
+            config, MagicMock(pad_token_id=0, eos_token_id=1), is_eval=False
+        )
+
+
+@pytest.mark.parametrize("rollout", [None, {"enabled": False}])
+def test_disabled_nvfp4_preserves_async_pipeline_parallelism(
+    rollout: dict[str, bool] | None,
+) -> None:
+    config = deepcopy(basic_vllm_test_config)
+    if rollout is not None:
+        config["nvfp4_pertoken_rollout"] = rollout
+    config["vllm_cfg"].update(pipeline_parallel_size=2, async_engine=True)
     configure_generation_config(
         config, MagicMock(pad_token_id=0, eos_token_id=1), is_eval=False
     )
@@ -1323,7 +1341,12 @@ def test_main_worker_configures_nvfp4_pertoken_engine_kwargs(monkeypatch):
 
 
 @pytest.mark.vllm
-def test_main_worker_accepts_nvfp4_pertoken_over_framework_defaults():
+@pytest.mark.parametrize(
+    "explicit_kwargs", [{}, {"kernel_config": {"enable_flashinfer_autotune": False}}]
+)
+def test_main_worker_accepts_nvfp4_pertoken_over_framework_defaults(
+    explicit_kwargs: dict[str, Any],
+) -> None:
     """Framework defaults must not look like explicit user conflicts."""
     pytest.importorskip("vllm")
     from vllm.model_executor.layers.quantization import get_quantization_config
@@ -1340,9 +1363,10 @@ def test_main_worker_accepts_nvfp4_pertoken_over_framework_defaults():
         "quantization": "fp8",
         "load_format": "dummy",
         "hf_overrides": {"max_position_embeddings": 4096},
+        **deepcopy(explicit_kwargs),
     }
     vllm_worker._configure_nvfp4_pertoken_engine_kwargs(
-        {"nvfp4_pertoken_rollout": {"enabled": True}, "vllm_kwargs": {}},
+        {"nvfp4_pertoken_rollout": {"enabled": True}, "vllm_kwargs": explicit_kwargs},
         llm_kwargs,
     )
 
@@ -1379,6 +1403,9 @@ def test_main_worker_rejects_explicit_quantization_for_nvfp4_pertoken():
         {"quantization": "fp8"},
         {"load_format": "auto"},
         {"hf_overrides": {"quantization_config": {}}},
+        {"enable_flashinfer_autotune": True},
+        {"enable_flashinfer_autotune": False},
+        {"enable_flashinfer_autotune": None},
         {"kernel_config": {"enable_flashinfer_autotune": True}},
     ],
 )

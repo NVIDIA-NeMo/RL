@@ -1684,15 +1684,9 @@ def _apply_precision_config(
         # value and fails, instead of quantizing layers the trainer keeps BF16.
         resolved_ignore = resolve_boundary_ignore_patterns(
             num_hidden_layers=num_hidden_layers,
-            first_last_layers_bf16=bool(
-                getattr(model_cfg, "first_last_layers_bf16", False)
-            ),
-            num_layers_at_start_in_bf16=int(
-                getattr(model_cfg, "num_layers_at_start_in_bf16", 1) or 0
-            ),
-            num_layers_at_end_in_bf16=int(
-                getattr(model_cfg, "num_layers_at_end_in_bf16", 1) or 0
-            ),
+            first_last_layers_bf16=model_cfg.first_last_layers_bf16,
+            num_layers_at_start_in_bf16=model_cfg.num_layers_at_start_in_bf16,
+            num_layers_at_end_in_bf16=model_cfg.num_layers_at_end_in_bf16,
             expected_additional_ignore=per_token_rollout.additional_ignore,
         )
         print(

@@ -552,7 +552,7 @@ def setup(
         "A generation config in the PolicyConfig is required for GRPO"
     )
     if generation_config["backend"] == "vllm":
-        normalize_nvfp4_pertoken_policy_config(policy_config)
+        normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="grpo")
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
     elif generation_config["backend"] == "dynamo":
         # Validate the complete managed-Dynamo boundary before allocating Ray

@@ -177,12 +177,12 @@ models, but this release has the following enforced or validated boundaries:
 | Hardware and kernel | NVIDIA Blackwell with the FlashInfer TRT-LLM NVFP4 fused-MoE backend; GB200 is validated |
 | Training precision | BF16 persistent parameters with `fp4_param=false`; backward computation uses TE's dequantized path |
 | Rollout placement | Colocated vLLM rollout only; standalone evaluation is not supported because the dummy-loaded engine requires a refit first |
-| vLLM parallelism | EP must be 1; the shipped end-to-end recipe uses TP=1 and PP=1; PP>1 requires the asynchronous engine |
+| vLLM parallelism | EP and PP must be 1; PP>1 is rejected for both engine modes because refit does not yet handle another stage's expert weights. TP remains configurable; the shipped end-to-end recipe uses TP=1 |
 | Cache and decoding | `kv_cache_dtype=auto`; speculative decoding is not supported |
 | Refit transport | Default colocated CUDA IPC/ZMQ path (`refit_transport: null`) |
 | Configuration | `generation.quant_cfg`, `generation.real_quant`, and explicit vLLM quantization/load-format overrides are mutually exclusive with this mode |
 | Layer exclusions | Derived from the Megatron BF16 boundary; legacy `additional_ignore` must describe exactly the same complete expert layers |
-| Algorithm coverage | End-to-end validation is GRPO only. PPO and distillation reuse the same Megatron training worker and vLLM refit path and are expected to work, but are unvalidated and warn at setup. The SingleController path is unsupported: it requires non-colocated rollout, which this mode rejects |
+| Algorithm coverage | End-to-end validation is GRPO only. PPO and distillation reuse the same Megatron training worker and vLLM refit path and are expected to work, but are unvalidated and warn at setup. SingleController explicitly rejects this mode during configuration validation: its vLLM path requires non-colocated rollout, while this mode requires colocated rollout |
 
 An additional architecture is eligible only when Megatron-Bridge can export its
 HF-named BF16 weights and the pinned vLLM model exposes a complete compatible
@@ -290,7 +290,8 @@ Longer stability validation is ongoing.
   proposed in [vLLM issue #53687](https://github.com/vllm-project/vllm/issues/53687)
   and quantization before the expert-parallel gather.
 - Add end-to-end coverage for more mapping families and hybrid dense/MoE
-  layouts, including supported PP stages with no local NVFP4 targets.
+  layouts. Enable vLLM PP>1 after refit handles weights owned by other stages,
+  including coverage for stages with no local NVFP4 targets.
 - Add native NVFP4 backward computation.
 - Complete longer stability and model-quality studies and publish the training
   curves.

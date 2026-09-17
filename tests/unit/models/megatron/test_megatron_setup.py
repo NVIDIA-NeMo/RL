@@ -26,7 +26,7 @@ nemo_rl.models.megatron.setup, focusing on:
 
 import os
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -47,6 +47,40 @@ _EXPECTED_BF16_BOUNDARY = [
     "*.layers.46.mlp.experts*",
     "*.layers.47.mlp.experts*",
 ]
+
+
+def _nvfp4_model_config() -> SimpleNamespace:
+    # Megatron is optional outside the mcore test lane.
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    boundary_fields = {
+        "first_last_layers_bf16",
+        "num_layers_at_start_in_bf16",
+        "num_layers_at_end_in_bf16",
+    }
+    defaults = {
+        item.name: item.default
+        for item in fields(TransformerConfig)
+        if item.name in boundary_fields
+    }
+    return SimpleNamespace(num_layers=48, **defaults)
+
+
+@pytest.mark.mcore
+def test_mcore_bf16_boundary_defaults_match_driver_constants() -> None:
+    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
+        MCORE_DEFAULT_NUM_LAYERS_AT_END_IN_BF16,
+        MCORE_DEFAULT_NUM_LAYERS_AT_START_IN_BF16,
+    )
+
+    model_cfg = _nvfp4_model_config()
+    assert (
+        model_cfg.num_layers_at_start_in_bf16
+        == MCORE_DEFAULT_NUM_LAYERS_AT_START_IN_BF16
+    )
+    assert (
+        model_cfg.num_layers_at_end_in_bf16 == MCORE_DEFAULT_NUM_LAYERS_AT_END_IN_BF16
+    )
 
 
 @dataclass
@@ -1702,9 +1736,7 @@ class TestApplyPrecisionConfig:
                     config["megatron_cfg"][key] = value
 
         with pytest.raises(ValueError, match="requires policy.precision"):
-            _apply_precision_config(
-                SimpleNamespace(num_layers=48), config, torch.bfloat16
-            )
+            _apply_precision_config(_nvfp4_model_config(), config, torch.bfloat16)
 
     @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
     def test_nvfp4_pertoken_accepts_complete_training_contract(self, mock_load_recipe):
@@ -1716,7 +1748,7 @@ class TestApplyPrecisionConfig:
 
         mock_load_recipe.side_effect = load_quantization_recipe
 
-        model_cfg = SimpleNamespace(num_layers=48)
+        model_cfg = _nvfp4_model_config()
         config = {
             "precision": "bfloat16",
             "generation": {
@@ -1805,9 +1837,7 @@ class TestApplyPrecisionConfig:
         if value is not None:
             env_vars[variable] = value
         with pytest.raises(ValueError, match="invalid env values") as exc_info:
-            _apply_precision_config(
-                SimpleNamespace(num_layers=48), nvfp4_policy, torch.bfloat16
-            )
+            _apply_precision_config(_nvfp4_model_config(), nvfp4_policy, torch.bfloat16)
         message = str(exc_info.value)
         assert f"{variable}={expected}" in message
         assert f"invalid env values: {{{variable!r}: {value!r}}}" in message
@@ -1824,9 +1854,7 @@ class TestApplyPrecisionConfig:
             "NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING"
             not in nvfp4_policy["megatron_cfg"]["env_vars"]
         )
-        _apply_precision_config(
-            SimpleNamespace(num_layers=48), nvfp4_policy, torch.bfloat16
-        )
+        _apply_precision_config(_nvfp4_model_config(), nvfp4_policy, torch.bfloat16)
 
     @pytest.mark.parametrize("evaluation", [False, True])
     def test_nvfp4_pertoken_accepts_arbitrary_recipe_keys(
@@ -1846,9 +1874,7 @@ class TestApplyPrecisionConfig:
                 if matcher["config"] == old:
                     matcher["config"] = new
         recipe_path.write_text(yaml.safe_dump(recipe, sort_keys=False))
-        _apply_precision_config(
-            SimpleNamespace(num_layers=48), nvfp4_policy, torch.bfloat16
-        )
+        _apply_precision_config(_nvfp4_model_config(), nvfp4_policy, torch.bfloat16)
 
     @pytest.mark.parametrize("catchall_first", [False, True])
     def test_nvfp4_pertoken_rejects_missing_or_misordered_catchall(
@@ -1863,9 +1889,7 @@ class TestApplyPrecisionConfig:
             recipe["matchers"] = {"fallthrough_bf16": catchall, **recipe["matchers"]}
         recipe_path.write_text(yaml.safe_dump(recipe, sort_keys=False))
         with pytest.raises(ValueError, match="mismatches") as exc_info:
-            _apply_precision_config(
-                SimpleNamespace(num_layers=48), nvfp4_policy, torch.bfloat16
-            )
+            _apply_precision_config(_nvfp4_model_config(), nvfp4_policy, torch.bfloat16)
         message = str(exc_info.value)
         for mode in ("training", "evaluation"):
             if catchall_first:
@@ -1918,9 +1942,7 @@ class TestApplyPrecisionConfig:
         }
         recipe_path.write_text(yaml.safe_dump(recipe, sort_keys=False))
         with pytest.raises(ValueError, match="mismatches") as exc_info:
-            _apply_precision_config(
-                SimpleNamespace(num_layers=48), nvfp4_policy, torch.bfloat16
-            )
+            _apply_precision_config(_nvfp4_model_config(), nvfp4_policy, torch.bfloat16)
         message = str(exc_info.value)
         assert f"{module_path} ({mode}): expected bf16, got" in message
         assert precision in message
@@ -1940,9 +1962,7 @@ class TestApplyPrecisionConfig:
         }
         recipe_path.write_text(yaml.safe_dump(recipe, sort_keys=False))
         with pytest.raises(ValueError, match="mismatches") as exc_info:
-            _apply_precision_config(
-                SimpleNamespace(num_layers=48), nvfp4_policy, torch.bfloat16
-            )
+            _apply_precision_config(_nvfp4_model_config(), nvfp4_policy, torch.bfloat16)
         assert f"self_attention.linear_qkv ({mode}): expected bf16, got nvfp4" in str(
             exc_info.value
         )
@@ -1960,9 +1980,7 @@ class TestApplyPrecisionConfig:
         recipe["configs"]["nvfp4"]["evaluation_recipe"] = evaluation_recipe
         recipe_path.write_text(yaml.safe_dump(recipe, sort_keys=False))
         with pytest.raises(ValueError, match="mismatches") as exc_info:
-            _apply_precision_config(
-                SimpleNamespace(num_layers=48), nvfp4_policy, torch.bfloat16
-            )
+            _apply_precision_config(_nvfp4_model_config(), nvfp4_policy, torch.bfloat16)
         message = str(exc_info.value)
         assert "mlp.experts.linear_fc1 (evaluation): expected nvfp4, got" in message
         assert "(training)" not in message
@@ -1979,7 +1997,7 @@ class TestApplyPrecisionConfig:
 
         from nemo_rl.models.megatron.setup import _apply_precision_config
 
-        model_cfg = SimpleNamespace(num_layers=48)
+        model_cfg = _nvfp4_model_config()
         config = {
             "precision": "bfloat16",
             "generation": {
