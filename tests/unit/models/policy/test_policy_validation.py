@@ -29,6 +29,7 @@ from nemo_rl.models.generation.vllm.config import (
     VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
 
@@ -435,12 +436,19 @@ def test_policy_flops_tracker_uses_hf_config_overrides() -> None:
     mock_from_config.assert_called_once_with("test/model", model_config)
 
 
+@pytest.mark.parametrize(
+    "draft_config",
+    [None, {"enabled": False}, Eagle3DraftConfig(enabled=False)],
+    ids=["omitted", "mapping", "typed"],
+)
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
 def test_nvfp4_pertoken_rejects_dtensor_training_backend(
     mock_ray_worker_group,
-    tiny_llama_model_path,
+    draft_config,
 ):
-    config = create_dtensor_config(tiny_llama_model_path, tp=1)
+    config = create_dtensor_config("test/model", tp=1)
+    if draft_config is not None:
+        config["draft"] = draft_config
     config["generation"]["backend"] = "vllm"
     config["generation"]["nvfp4_pertoken_rollout"] = {"enabled": True}
 
@@ -452,6 +460,8 @@ def test_nvfp4_pertoken_rejects_dtensor_training_backend(
         )
 
     mock_ray_worker_group.assert_not_called()
+    if draft_config is not None:
+        assert isinstance(config["draft"], Eagle3DraftConfig)
 
 
 @pytest.mark.parametrize(
