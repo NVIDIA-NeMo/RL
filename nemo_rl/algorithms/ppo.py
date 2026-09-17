@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import math
 import os
 import time
 import warnings
@@ -50,6 +51,9 @@ from nemo_rl.algorithms.grpo import (
     extract_initial_prompt_messages,
     refit_policy_generation,
     scale_rewards,
+)
+from nemo_rl.algorithms.multi_trace_metrics import (
+    compute_multi_trace_diagnostics,
 )
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
@@ -1108,6 +1112,11 @@ def setup(
             "invalid_tool_call_patterns", None
         )
         thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
+        # Multi-trace opt-in: train on subagent-session traces too (plural
+        # `responses` envs). NeMo-RL-side knob, not part of Gym's global config.
+        train_on_all_session_traces = bool(
+            nemo_gym_dict.pop("train_on_all_session_traces", False)
+        )
         # Reuse image-baked cache + venv dirs so the gym doesn't rebuild them.
         uv_cache_dir = get_nemo_gym_uv_cache_dir()
         if uv_cache_dir is not None:
@@ -1123,6 +1132,7 @@ def setup(
             # PPO has no Megatron generation backend, so router-replay / routed-
             # experts preservation is N/A (this gym path is vLLM-only).
             require_routed_experts=False,
+            train_on_all_session_traces=train_on_all_session_traces,
             initial_global_config_dict=nemo_gym_dict,
         )
         nemo_gym_opts = {}
@@ -2078,6 +2088,8 @@ def _build_ppo_rollout_dump_payload(
     repeated_batch: BatchedDataDict[DatumSpec],
     turn_spans: Optional[Any] = None,
     adv_raw_metrics: dict[str, float] | None = None,
+    trace_group_ids: Optional[torch.Tensor] = None,
+    trace_rollout_ids: Optional[torch.Tensor] = None,
 ) -> dict[str, Any]:
     """Build the packed per-token rollout dump payload for torch.save.
 
@@ -2186,7 +2198,18 @@ def _build_ppo_rollout_dump_payload(
             if value is not None:
                 payload[f"adv_raw_{key}"] = float(value)
 
-    if num_generations_per_prompt > 0:
+    if trace_group_ids is not None and trace_rollout_ids is not None:
+        # Multi-trace batches: rows are traces, several per rollout, so the
+        # positional idx // GPP derivation is wrong. Use the explicit ids
+        # (already padded to the train_data row count).
+        payload["prompt_group_index"] = trace_group_ids.to(torch.int64)[
+            sample_indices
+        ].to(torch.int32)
+        payload["generation_index"] = (
+            trace_rollout_ids.to(torch.int64)
+            % max(int(num_generations_per_prompt), 1)
+        )[sample_indices].to(torch.int32)
+    elif num_generations_per_prompt > 0:
         payload["prompt_group_index"] = (
             sample_indices // num_generations_per_prompt
         ).to(torch.int32)
@@ -2428,6 +2451,21 @@ def ppo_train(
                             thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                         )
                         repeated_batch = nemo_gym_rollout_result.final_batch
+                        # Multi-trace rollouts (subagent sessions / compaction
+                        # segments) are only supported on the ASYNC PPO path,
+                        # which carries the per-trace accounting (unique-rollout
+                        # batch check, DP padding, trace ids). Reject here
+                        # rather than silently training with broken group
+                        # arithmetic.
+                        if "trace_in_rollout_idx" in repeated_batch and bool(
+                            (repeated_batch["trace_in_rollout_idx"] != 0).any()
+                        ):
+                            raise NotImplementedError(
+                                "Multi-trace NeMo Gym rollouts require async PPO "
+                                "(ppo.async_ppo.enabled=true). Either enable async "
+                                "PPO or disable env.nemo_gym."
+                                "train_on_all_session_traces."
+                            )
                         # The gym path rebuilds the batch from the rollout results
                         # and drops the input-only DatumSpec fields; graft them back
                         # so train-time consumers see the same batch shape every
@@ -3857,7 +3895,74 @@ def async_ppo_train(
                         )
 
                     per_prompt_batches = [t["batch"] for t in trajectories]
+
+                    # Backfill buffer entries checkpointed before multi-trace
+                    # support (one row per rollout, no per-trace fields) so a
+                    # mixed old/new buffer batches uniformly: from_batches
+                    # requires identical key sets, and a mixed batch would
+                    # otherwise be silently dropped after sample() already
+                    # popped it (permanent stall).
+                    for prompt_batch in per_prompt_batches:
+                        if "rollout_local_idx" not in prompt_batch:
+                            prompt_batch["rollout_local_idx"] = torch.arange(
+                                prompt_batch.size, dtype=torch.int64
+                            )
+                            prompt_batch["trace_in_rollout_idx"] = torch.zeros(
+                                prompt_batch.size, dtype=torch.int64
+                            )
+                        if "is_empty_rollout" not in prompt_batch:
+                            prompt_batch["is_empty_rollout"] = torch.zeros(
+                                prompt_batch.size, dtype=torch.bool
+                            )
+                        if "trace_metadata" not in prompt_batch:
+                            prompt_batch["trace_metadata"] = [
+                                {} for _ in range(prompt_batch.size)
+                            ]
+                        if "rollout_info" not in prompt_batch:
+                            prompt_batch["rollout_info"] = [
+                                {} for _ in range(prompt_batch.size)
+                            ]
                     repeated_batch = BatchedDataDict.from_batches(per_prompt_batches)
+
+                    # Multi-trace rollouts (subagent sessions / compaction
+                    # segments): each buffer entry is one prompt group whose
+                    # rows are traces, several of which can belong to the same
+                    # rollout. Build group and rollout identifiers positionally
+                    # — grouping by input token ids no longer works because
+                    # sibling traces have different prompts.
+                    samples_per_prompt_group = master_config.ppo[
+                        "num_generations_per_prompt"
+                    ]
+                    multi_trace = all(
+                        "rollout_local_idx" in b for b in per_prompt_batches
+                    )
+                    trace_group_ids = None
+                    trace_rollout_ids = None
+                    has_multi_trace_rollouts = False
+                    if multi_trace:
+                        group_id_parts = []
+                        rollout_id_parts = []
+                        for group_index, prompt_batch in enumerate(per_prompt_batches):
+                            local_rollout_ids = prompt_batch["rollout_local_idx"].to(
+                                torch.int64
+                            )
+                            group_id_parts.append(
+                                torch.full(
+                                    (local_rollout_ids.shape[0],),
+                                    group_index,
+                                    dtype=torch.int64,
+                                )
+                            )
+                            rollout_id_parts.append(
+                                group_index * samples_per_prompt_group
+                                + local_rollout_ids
+                            )
+                        trace_group_ids = torch.cat(group_id_parts)
+                        trace_rollout_ids = torch.cat(rollout_id_parts)
+                        has_multi_trace_rollouts = bool(
+                            trace_rollout_ids.numel()
+                            != torch.unique(trace_rollout_ids).numel()
+                        )
 
                     per_group_metrics: dict[str, list] = {}
                     for t in trajectories:
@@ -3865,11 +3970,50 @@ def async_ppo_train(
                             per_group_metrics.setdefault(k, []).append(v)
                     rollout_metrics = aggregate_rollout_metrics(per_group_metrics)
 
+                # PPO-arm restrictions that would silently mis-train on
+                # multi-trace batches — fail loud instead (see multi_trace.md).
+                if has_multi_trace_rollouts:
+                    if master_config.value.get("swe_privileged_critic", {}).get(
+                        "enabled"
+                    ) or (
+                        master_config.value.get("privileged_critic") or {}
+                    ).get("enabled"):
+                        raise NotImplementedError(
+                            "Multi-trace rollouts are not supported with a "
+                            "privileged critic (the reference-block remap assumes "
+                            "one trace per rollout)."
+                        )
+                    if master_config.ppo["adv_estimator"].get("residual_baseline"):
+                        raise NotImplementedError(
+                            "Multi-trace rollouts are not supported with "
+                            "residual_baseline=true (B_LOO group semantics are "
+                            "rollout-level, not trace-level)."
+                        )
+
+                # Enforce fixed training batch. In multi-trace mode the fixed
+                # quantity is the ROLLOUT count; the trace count (rows) varies
+                # step to step.
                 expected_batch_size = (
                     master_config.ppo["num_prompts_per_step"]
                     * master_config.ppo["num_generations_per_prompt"]
                 )
-                if repeated_batch.size != expected_batch_size:
+                if multi_trace:
+                    num_rollouts_in_batch = int(
+                        torch.unique(trace_rollout_ids).numel()
+                    )
+                    if num_rollouts_in_batch != expected_batch_size:
+                        print(
+                            f"❌ Unexpected rollout count: got {num_rollouts_in_batch}, "
+                            f"expected {expected_batch_size}. Waiting for correct "
+                            "buffer content."
+                        )
+                        time.sleep(0.5)
+                        continue
+                    print(
+                        f"Got trajectory batch: {repeated_batch.size} traces from "
+                        f"{num_rollouts_in_batch} rollouts"
+                    )
+                elif repeated_batch.size != expected_batch_size:
                     print(
                         f"❌ Unexpected training batch size: got {repeated_batch.size}, "
                         f"expected {expected_batch_size}. Waiting for correct buffer "
@@ -3959,6 +4103,74 @@ def async_ppo_train(
                     turn_spans = build_turn_spans_for_batch(
                         master_config, repeated_batch, train_data
                     )
+
+                    # ---- Multi-trace DP padding ----
+                    # The variable trace count is generally not divisible by the
+                    # sharding granularity of the value/policy forwards and
+                    # trains. Pad by duplicating row 0 with sample_mask=0 so
+                    # padding rows contribute no gradient; their values/logprobs
+                    # are computed but never used. Skip when the batch already
+                    # has the legacy expected size (preserves pre-multi-trace
+                    # behavior exactly).
+                    num_unpadded_traces = train_data["input_ids"].shape[0]
+                    if multi_trace and num_unpadded_traces != expected_batch_size:
+                        dp_size = policy.sharding_annotations.get_axis_size(
+                            "data_parallel"
+                        )
+                        train_micro_batch_size = int(
+                            master_config.policy["train_micro_batch_size"]
+                        )
+                        logprob_batch_size = int(
+                            master_config.policy.get("logprob_batch_size") or 1
+                        )
+                        padding_multiple = dp_size * math.lcm(
+                            max(train_micro_batch_size, 1),
+                            max(logprob_batch_size, 1),
+                        )
+                        padding_rows = (-num_unpadded_traces) % padding_multiple
+                        if padding_rows > 0:
+                            padding_indices = torch.zeros(
+                                padding_rows, dtype=torch.long
+                            )
+                            for data_key in [
+                                "input_ids",
+                                "input_lengths",
+                                "generation_logprobs",
+                                "rewards",
+                                "token_mask",
+                                "sample_mask",
+                            ]:
+                                train_data[data_key] = torch.cat(
+                                    [
+                                        train_data[data_key],
+                                        train_data[data_key][padding_indices],
+                                    ],
+                                    dim=0,
+                                )
+                            train_data["sample_mask"][num_unpadded_traces:] = 0
+                            rewards = torch.cat([rewards, rewards[padding_indices]])
+                            trace_group_ids = torch.cat(
+                                [trace_group_ids, trace_group_ids[padding_indices]]
+                            )
+                            trace_rollout_ids = torch.cat(
+                                [
+                                    trace_rollout_ids,
+                                    trace_rollout_ids[padding_indices],
+                                ]
+                            )
+                            if turn_spans is not None:
+                                raise NotImplementedError(
+                                    "Multi-trace batches with turn-level GAE "
+                                    "(turn_gae) are not supported yet: the "
+                                    "turn-span structure has no defined padding "
+                                    "semantics. Use token-level GAE, or size "
+                                    "the batch so no padding is needed."
+                                )
+                            print(
+                                f"  📊 Padded trace batch from {num_unpadded_traces} "
+                                f"to {train_data['input_ids'].shape[0]} rows for "
+                                f"DP={dp_size} x mbs divisibility"
+                            )
 
                 # ---- 3. Value forward (critic on GPU, then offloaded) ----
                 # GPU state entering here: policy OFF, value OFF (see refit/step
@@ -4064,31 +4276,77 @@ def async_ppo_train(
                 seq_logprob_error_threshold = master_config.ppo.get(
                     "seq_logprob_error_threshold", None
                 )
+                seq_error_tensors: dict = {}
                 seq_error_result = compute_and_apply_seq_logprob_error_masking(
                     train_data=train_data,
                     rewards=rewards,
                     seq_logprob_error_threshold=seq_logprob_error_threshold,
+                    tensor_out=seq_error_tensors,
                 )
                 seq_logprob_error_metrics = seq_error_result
                 if "num_masked_seqs" in seq_logprob_error_metrics:
                     seq_logprob_error_metrics["num_masked_seqs_by_logprob_error"] = (
                         seq_logprob_error_metrics.pop("num_masked_seqs")
                     )
+                pre_seq_error_sample_loss_mask = seq_error_tensors.get(
+                    "pre_seq_error_sample_loss_mask",
+                    train_data["sample_mask"].detach().clone(),
+                )
+                seq_mult_prob_error = seq_error_tensors.get(
+                    "seq_mult_prob_error",
+                    torch.zeros_like(train_data["sample_mask"], dtype=torch.float32),
+                )
+                masked_by_seq_logprob_error = seq_error_tensors.get(
+                    "masked_by_seq_logprob_error",
+                    torch.zeros_like(train_data["sample_mask"], dtype=torch.bool),
+                )
+
+                # Per-trace diagnostics (wandb: train/logprob_error/*/by_*,
+                # multi_trace/* trace-kind splits). Needs the Gym per-trace
+                # fields; merged into `metrics` below.
+                multi_trace_diag_metrics: dict[str, float] = {}
+                if multi_trace and "mask_sample" in repeated_batch:
+                    multi_trace_diag_metrics = compute_multi_trace_diagnostics(
+                        seq_mult_prob_error=seq_mult_prob_error,
+                        masked_by_seq_logprob_error=masked_by_seq_logprob_error,
+                        pre_seq_error_sample_loss_mask=pre_seq_error_sample_loss_mask,
+                        mask_sample=repeated_batch["mask_sample"],
+                        is_empty_rollout=repeated_batch["is_empty_rollout"],
+                        trace_in_rollout_idx=repeated_batch["trace_in_rollout_idx"],
+                        trace_kinds=[
+                            (md or {}).get("kind", "unknown")
+                            for md in repeated_batch["trace_metadata"]
+                        ],
+                        token_mask=train_data["token_mask"],
+                        sample_mask=train_data["sample_mask"],
+                        generation_logprobs=train_data["generation_logprobs"],
+                        prev_logprobs=train_data["prev_logprobs"],
+                        num_unpadded_traces=num_unpadded_traces,
+                    )
 
                 # ---- 6. GAE advantages/returns (uses fresh values) ----
                 with timer.time("advantage_calculation"):
                     print("▶ Computing advantages...")
-                    initial_prompt_message_logs = extract_initial_prompt_messages(
-                        repeated_batch["message_log"],
-                        repeated_batch["length"],
-                    )
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        initial_prompt_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del initial_prompt_message_logs
-                    del prompt_batched_flat
+                    if multi_trace:
+                        # Sibling traces have different prompts, so prompt-token
+                        # grouping is meaningless; use the positional prompt-group
+                        # ids instead. GAE itself is per-sequence — prompt_ids
+                        # only feed group-based DIAGNOSTICS (residual B_LOO
+                        # metrics), which with GPP=1 now group a rollout's
+                        # traces together (interpret residual/* accordingly).
+                        prompt_ids_for_adv = trace_group_ids.unsqueeze(-1)
+                    else:
+                        initial_prompt_message_logs = extract_initial_prompt_messages(
+                            repeated_batch["message_log"],
+                            repeated_batch["length"],
+                        )
+                        prompt_batched_flat, _ = batched_message_log_to_flat_message(
+                            initial_prompt_message_logs,
+                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                        )
+                        prompt_ids_for_adv = prompt_batched_flat["token_ids"]
+                        del initial_prompt_message_logs
+                        del prompt_batched_flat
 
                     adv_kwargs = dict(
                         prompt_ids=prompt_ids_for_adv,
@@ -4174,6 +4432,15 @@ def async_ppo_train(
                     value_train_batch, adv_estimator, master_config
                 )
 
+                # Multi-trace batches with a variable row count train as ONE
+                # global batch (the padded row count); legacy-shaped batches
+                # keep the configured train_global_batch_size chunking.
+                multi_trace_gbs = (
+                    train_data["input_ids"].shape[0]
+                    if multi_trace and num_unpadded_traces != expected_batch_size
+                    else None
+                )
+
                 # Extra critic-only passes when ppo.critic_ppo_epochs exceeds
                 # ppo_epochs. They run before the shared loop below so that loop
                 # -- and the GPU state it leaves behind -- is untouched. Ordering
@@ -4189,7 +4456,10 @@ def async_ppo_train(
                     for _ in range(critic_ppo_epochs - ppo_epochs):
                         with timer.time("value_training"):
                             value_model.train(
-                                value_train_batch, value_loss_fn, timer=timer
+                                value_train_batch,
+                                value_loss_fn,
+                                gbs=multi_trace_gbs,
+                                timer=timer,
                             )
                     with timer.time("value_training"):
                         value_model.finish_training()
@@ -4202,6 +4472,7 @@ def async_ppo_train(
                         value_results = value_model.train(
                             value_train_batch,
                             value_loss_fn,
+                            gbs=multi_trace_gbs,
                             timer=timer,
                         )
                         # After the LAST critic update: forward-only pass to score
@@ -4211,6 +4482,7 @@ def async_ppo_train(
                                 value_train_batch,
                                 value_loss_fn,
                                 eval_mode=True,
+                                gbs=multi_trace_gbs,
                                 timer=timer,
                             )
                         value_model.finish_training()
@@ -4231,7 +4503,10 @@ def async_ppo_train(
                             POLICY_GENERATION_STALE = True
                         with timer.time("policy_training"):
                             train_results = policy.train(
-                                train_data, loss_fn, timer=timer
+                                train_data,
+                                loss_fn,
+                                gbs=multi_trace_gbs,
+                                timer=timer,
                             )
                             if epoch < ppo_epochs - 1:
                                 policy.offload_to_cpu()
@@ -4469,6 +4744,60 @@ def async_ppo_train(
                     total_valid_tokens += metrics["global_valid_toks"]
                 # Always log seq-level error metrics (useful for tuning threshold).
                 metrics.update(seq_logprob_error_metrics)
+                metrics.update(multi_trace_diag_metrics)
+
+                # Multi-trace batch composition metrics (wandb: train/multi_trace/*)
+                if multi_trace:
+                    unpadded_sample_mask = train_data["sample_mask"][
+                        :num_unpadded_traces
+                    ]
+                    unpadded_rollout_ids = trace_rollout_ids[
+                        :num_unpadded_traces
+                    ].tolist()
+                    rollout_trace_counts: dict[int, int] = {}
+                    rollout_has_unmasked_trace: dict[int, bool] = {}
+                    for rollout_id, is_unmasked in zip(
+                        unpadded_rollout_ids,
+                        (unpadded_sample_mask > 0).tolist(),
+                    ):
+                        rollout_trace_counts[rollout_id] = (
+                            rollout_trace_counts.get(rollout_id, 0) + 1
+                        )
+                        rollout_has_unmasked_trace[rollout_id] = (
+                            rollout_has_unmasked_trace.get(rollout_id, False)
+                            or is_unmasked
+                        )
+                    multi_trace_rollout_count = max(len(rollout_trace_counts), 1)
+                    unpadded_trace_lengths = train_data["input_lengths"][
+                        :num_unpadded_traces
+                    ]
+                    metrics["multi_trace/num_traces"] = int(num_unpadded_traces)
+                    metrics["multi_trace/num_rollouts"] = len(rollout_trace_counts)
+                    metrics["multi_trace/traces_per_rollout_mean"] = (
+                        num_unpadded_traces / multi_trace_rollout_count
+                    )
+                    metrics["multi_trace/traces_per_rollout_max"] = max(
+                        rollout_trace_counts.values(), default=0
+                    )
+                    metrics["multi_trace/padding_rows"] = int(
+                        train_data["input_ids"].shape[0] - num_unpadded_traces
+                    )
+                    metrics["multi_trace/masked_trace_fraction"] = float(
+                        (unpadded_sample_mask <= 0).float().mean().item()
+                    )
+                    # Rollouts contributing zero gradient (all traces masked) —
+                    # dominated by agent timeouts / OOM / empty dumps.
+                    metrics["multi_trace/fully_masked_rollout_fraction"] = sum(
+                        1
+                        for has_unmasked_trace in rollout_has_unmasked_trace.values()
+                        if not has_unmasked_trace
+                    ) / multi_trace_rollout_count
+                    metrics["multi_trace/mean_trace_length"] = float(
+                        unpadded_trace_lengths.float().mean().item()
+                    )
+                    metrics["multi_trace/max_trace_length"] = int(
+                        unpadded_trace_lengths.max().item()
+                    )
 
                 # ---- Checkpointing ----
                 consumed_samples += master_config.ppo["num_prompts_per_step"]
@@ -4591,20 +4920,120 @@ def async_ppo_train(
             if not _should_log_nemo_gym_responses(master_config):
                 log_data = {}
                 log_data["content"] = flat_messages_content
-                log_data["rewards"] = rewards.tolist()
+                # Slice off DP-padding rows added in multi-trace mode.
+                log_data["rewards"] = rewards[:num_unpadded_traces].tolist()
                 log_data["input_lengths"] = input_lengths.tolist()
-                log_data["token_ids"] = train_data["input_ids"].tolist()
-                log_data["token_loss_mask"] = train_data["token_mask"].tolist()
-                log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
-                log_data["advantages"] = train_data["advantages"].tolist()
-                log_data["generation_logprobs"] = train_data[
-                    "generation_logprobs"
+                log_data["token_ids"] = train_data["input_ids"][
+                    :num_unpadded_traces
                 ].tolist()
-                log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
+                log_data["token_loss_mask"] = train_data["token_mask"][
+                    :num_unpadded_traces
+                ].tolist()
+                log_data["sample_loss_mask"] = train_data["sample_mask"][
+                    :num_unpadded_traces
+                ].tolist()
+                log_data["advantages"] = train_data["advantages"][
+                    :num_unpadded_traces
+                ].tolist()
+                log_data["generation_logprobs"] = train_data["generation_logprobs"][
+                    :num_unpadded_traces
+                ].tolist()
+                log_data["prev_logprobs"] = train_data["prev_logprobs"][
+                    :num_unpadded_traces
+                ].tolist()
                 logger.log_batched_dict_as_jsonl(
                     log_data, f"train_data_step{step + 1}.jsonl"
                 )
                 del log_data
+
+            # Compact per-trace debug record — written EVERY step (no token
+            # arrays), so trace kinds, masking and reward attribution can be
+            # reconstructed offline (rollout_debug_step*.jsonl, same schema as
+            # the GRPO loop's).
+            if "rollout_info" in repeated_batch:
+                n_dbg = num_unpadded_traces
+                dbg_adv = train_data["advantages"][:n_dbg].detach().cpu()
+                dbg_tm = train_data["token_mask"][:n_dbg].detach().cpu().bool()
+                dbg_has_tokens = dbg_tm.any(dim=-1)
+                dbg_first_tok = dbg_tm.float().argmax(dim=-1)
+                dbg_adv_first = dbg_adv.gather(1, dbg_first_tok.unsqueeze(1)).squeeze(1)
+                dbg_adv_first = torch.where(
+                    dbg_has_tokens, dbg_adv_first, torch.zeros_like(dbg_adv_first)
+                )
+                dbg_adv_min = torch.where(
+                    dbg_tm, dbg_adv, torch.full_like(dbg_adv, float("inf"))
+                ).min(dim=-1).values
+                dbg_adv_max = torch.where(
+                    dbg_tm, dbg_adv, torch.full_like(dbg_adv, float("-inf"))
+                ).max(dim=-1).values
+                dbg_adv_min = torch.where(
+                    dbg_has_tokens, dbg_adv_min, torch.zeros_like(dbg_adv_min)
+                )
+                dbg_adv_max = torch.where(
+                    dbg_has_tokens, dbg_adv_max, torch.zeros_like(dbg_adv_max)
+                )
+                dbg_values = None
+                if "values" in train_data:
+                    dbg_vals = train_data["values"][:n_dbg].detach().cpu()
+                    dbg_values = torch.where(
+                        dbg_has_tokens,
+                        dbg_vals.gather(1, dbg_first_tok.unsqueeze(1)).squeeze(1),
+                        torch.zeros(n_dbg),
+                    )
+                rollout_debug = {
+                    "rollout_info": list(repeated_batch["rollout_info"])[:n_dbg],
+                    "trace_metadata": list(repeated_batch["trace_metadata"])[:n_dbg],
+                    "rollout_local_idx": repeated_batch["rollout_local_idx"][
+                        :n_dbg
+                    ].tolist(),
+                    "trace_in_rollout_idx": repeated_batch["trace_in_rollout_idx"][
+                        :n_dbg
+                    ].tolist(),
+                    "is_empty_rollout": repeated_batch["is_empty_rollout"][
+                        :n_dbg
+                    ].tolist(),
+                    "trace_group_id": (
+                        trace_group_ids[:n_dbg].tolist()
+                        if trace_group_ids is not None
+                        else [None] * n_dbg
+                    ),
+                    "trace_rollout_id": (
+                        trace_rollout_ids[:n_dbg].tolist()
+                        if trace_rollout_ids is not None
+                        else [None] * n_dbg
+                    ),
+                    "reward": rewards[:n_dbg].tolist(),
+                    "sample_loss_mask": train_data["sample_mask"][:n_dbg].tolist(),
+                    "pre_seq_error_sample_loss_mask": pre_seq_error_sample_loss_mask[
+                        :n_dbg
+                    ]
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                    "seq_mult_prob_error": seq_mult_prob_error[:n_dbg]
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                    "masked_by_seq_logprob_error": masked_by_seq_logprob_error[:n_dbg]
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                    "advantage": dbg_adv_first.tolist(),
+                    "advantage_min": dbg_adv_min.tolist(),
+                    "advantage_max": dbg_adv_max.tolist(),
+                    # First-generated-token value: the critic's V(s_0) for this
+                    # trace (PPO-only field vs the GRPO schema).
+                    "value_first_token": (
+                        dbg_values.tolist() if dbg_values is not None else [None] * n_dbg
+                    ),
+                    "num_generated_tokens": dbg_tm.sum(dim=-1).tolist(),
+                    "total_tokens": input_lengths[:n_dbg].tolist(),
+                    "trainer_weight_version": [weight_version] * n_dbg,
+                }
+                logger.log_batched_dict_as_jsonl(
+                    rollout_debug, f"rollout_debug_step{step + 1}.jsonl"
+                )
+                del rollout_debug
 
             if _should_log_ppo_rollout_dump(master_config, step + 1):
                 with timer.time("rollout_dump"):
@@ -4624,6 +5053,8 @@ def async_ppo_train(
                         repeated_batch=repeated_batch,
                         turn_spans=turn_spans,
                         adv_raw_metrics=getattr(adv_estimator, "last_metrics", None),
+                        trace_group_ids=trace_group_ids,
+                        trace_rollout_ids=trace_rollout_ids,
                     )
                     torch.save(rollout_dump_payload, rollout_dump_path)
                     print(f"  📝 Dumped rollout data to {rollout_dump_path}")

@@ -81,6 +81,11 @@ class NemoGymConfig(TypedDict):
     require_routed_experts: NotRequired[
         bool
     ]  # Require Gym output items to carry R3 routed_experts
+    # Train on ALL session traces of a rollout (root + subagent sessions +
+    # compaction segments) when the env returns a plural `responses` list.
+    # False (default): keep only the root session's traces — matches legacy
+    # single-trace behavior even against a plural-responses Gym.
+    train_on_all_session_traces: NotRequired[bool]
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -356,6 +361,23 @@ Depending on your data shape, you may want to change these values."""
         # else: no responses at all (crashed agent, contract-violating env) —
         # fall through with zero traces so the empty-rollout masking below
         # handles it instead of crashing the whole rollout batch.
+
+        if len(responses) > 1 and not self.cfg.get(
+            "train_on_all_session_traces", False
+        ):
+            # Opt-in gate: keep only the ROOT session's segments (empty
+            # parent_session_id) so a plural-responses Gym reproduces legacy
+            # single-session training exactly. NOTE: without compaction a
+            # subagent's every segment carries its parent id; with compaction
+            # a subagent's own summary segment is dumped without one (classify
+            # per session before relying on this filter under compaction).
+            root_responses = [
+                r
+                for r in responses
+                if not ((r.get("metadata") or {}).get("parent_session_id"))
+            ]
+            if root_responses:
+                responses = root_responses
 
         trace_results = []
         for response in responses:
