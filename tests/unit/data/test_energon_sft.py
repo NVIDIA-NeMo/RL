@@ -385,7 +385,15 @@ def test_task_encoder_batches_heterogeneous_message_logs():
     assert prepared["pixel_values"].tensors[1] is None
 
 
-def test_task_encoder_runs_split_encode_and_batch_lifecycle_methods():
+def test_task_encoder_runs_split_encode_and_batch_lifecycle_methods(monkeypatch):
+    from megatron.energon.task_encoder.base import WorkerConfig
+
+    class _FakeWorkerConfig:
+        active_worker_sample_index = 0
+
+        def worker_seed(self) -> int:
+            return 0
+
     adapter = _adapter(_FakeQwenProcessor())
     encoder = _encoder(adapter, include_source_ids=True)
 
@@ -395,6 +403,9 @@ def test_task_encoder_runs_split_encode_and_batch_lifecycle_methods():
 
     assert encoder.encode_batch(batch) is batch
     assert batch["source_ids"] == ["sample-0"]
+    monkeypatch.setattr(
+        WorkerConfig, "active_worker_config", _FakeWorkerConfig(), raising=False
+    )
     with pytest.raises(RuntimeError, match="packing is not configured"):
         encoder.select_samples_to_pack([preencoded])
 
