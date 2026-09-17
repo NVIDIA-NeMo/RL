@@ -6,7 +6,7 @@ defaults: ../../vlm_grpo_3B.yaml
 # but sized for 4-GPU GB200 nodes (16 nodes x 4 GPUs, train EP4, vLLM TP4/EP4).
 #
 # Requirements: see docs/guides/models/nemotron/nemotron-3.5-super-vl.md
-# (Automodel main @ 6ae5ca23+, vLLM super_vl_rl_v0.25.1 fork @ 33484aad+).
+# (Automodel main @ 9d875a6d+, vLLM super_vl_rl_v0.25.1 fork @ 33484aad+).
 #
 # Model-specific notes:
 #   - The vision tower is frozen (freeze_config) and vLLM loads the checkpoint

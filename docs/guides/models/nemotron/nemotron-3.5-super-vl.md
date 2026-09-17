@@ -52,7 +52,7 @@ Both AutoModel and vLLM come from pinned sources in this branch.
 ### 1. Pinned sources
 
 - **AutoModel** — the submodule is pinned to
-  [`6ae5ca23`](https://github.com/NVIDIA-NeMo/Automodel/commit/6ae5ca23895d1e06c81cc6103732a20510833fda)
+  [`9d875a6d`](https://github.com/NVIDIA-NeMo/Automodel/commit/9d875a6d3fafe1d101e2d22c39a80d06b3c2ba5d)
   on `main`, which includes Nemotron 3.5 Super VL support
   ([#3801](https://github.com/NVIDIA-NeMo/Automodel/pull/3801)) and the
   `fc2_latent_proj` dtype fix
@@ -267,14 +267,19 @@ resume to step 4 before the long run.
   assumption.** Larger EP on 4-GPU nodes needs the `hybridep` or `torch`
   dispatcher (`policy.dtensor_cfg.automodel_kwargs.backend.dispatcher`) or a
   DeepEP build with MNNVL enabled; not validated here.
-- **Vision-weight refit needs the Automodel adapter fix.** Upstream Automodel's
-  Omni state-dict adapter renames native RADIO keys to the legacy tree in its
-  per-tensor conversion without fusing q/k/v, so vLLM silently drops every RADIO
-  attention weight during refit (the refit manifest counts sent keys, not
-  vLLM-consumed ones). This branch's Automodel submodule carries the fix (keep
-  native names; the vLLM fork loads them as q/k/v shards), pending upstream. The
-  image recipe additionally freezes the vision tower and uses `load_format=auto`,
-  so generation uses the checkpoint's vision weights either way.
+- **Vision-weight refit requires a vLLM loader that understands the native
+  RADIO layout.** Automodel's Omni state-dict adapter keeps the transformers-
+  native RADIO names in its per-tensor conversion (Automodel
+  [#3924](https://github.com/NVIDIA-NeMo/Automodel/pull/3924), included in the
+  pinned commit); it cannot fuse q/k/v into the legacy `attn.qkv` one tensor at
+  a time. The pinned vLLM fork maps those names onto its fused qkv as q/k/v
+  shards, so refit covers the whole vision tower. Upstream vLLM `radio.py` only
+  accepts the legacy `radio_model.*` layout and would silently drop the streamed
+  vision weights, so before moving to upstream vLLM either its loader needs the
+  native branch or NeMo-RL must convert the vision subtree as a group via
+  `to_hf` (and skip refit for frozen vision parameters). The image recipe
+  freezes the vision tower and uses `load_format=auto`, so generation uses the
+  checkpoint's vision weights regardless.
 - **vLLM vision encoder must not use FLASH_ATTN on Blackwell.** With the
   v0.25.1 precompiled wheel, `get_flash_attn_version` selects FA4 (CuTe DSL) on
   SM100, and the wheel's `flash_attn_interface` unpacks four return values from a
