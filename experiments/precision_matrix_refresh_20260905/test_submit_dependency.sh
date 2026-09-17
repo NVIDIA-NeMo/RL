@@ -43,6 +43,8 @@ output=$(
 
 grep -Fx -- '--dependency=afterok:12345' <<<"${output}" >/dev/null
 grep -F -- "${TMP_ROOT}/results/source-archives/nemo-rl-" <<<"${output}" >/dev/null
+grep -F -- "source_payload_sha=$(git -C "${REPO}" rev-parse HEAD)" \
+  <<<"${output}" >/dev/null
 grep -F -- 'resolve_slurm_cli_path()' "${REPO}/ray.sub" >/dev/null
 grep -F -- '/cm/local/apps/slurm/*/bin' "${REPO}/ray.sub" >/dev/null
 grep -F -- 'Unable to find srun, scontrol, and sinfo' "${REPO}/ray.sub" >/dev/null
@@ -111,3 +113,35 @@ direct_model_output=$(
 
 grep -F -- "policy.model_name=${TMP_ROOT}/direct-model" \
   <<<"${direct_model_output}" >/dev/null
+
+touch "${TMP_ROOT}/existing-source.tar"
+source_archive_sha256=$(sha256sum "${TMP_ROOT}/existing-source.tar" | cut -d ' ' -f 1)
+source_archive_output=$(
+  PATH="${TMP_ROOT}/bin:${PATH}" \
+  ACTION=test-only \
+  CLUSTER=oci \
+  PARTITION=batch \
+  MODEL=qwen30 \
+  MODE=sync \
+  ARM=bf16-bf16 \
+  SLURM_ACCOUNT=test \
+  REPO="${REPO}" \
+  CONTAINER="${TMP_ROOT}/container.sqsh" \
+  HF_HOME_SOURCE="${TMP_ROOT}/hf" \
+  WANDB_HOME="${TMP_ROOT}/home" \
+  RESULT_ROOT="${TMP_ROOT}/results" \
+  LOCAL_ROOT="${TMP_ROOT}/local" \
+  SOURCE_ARCHIVE_OVERRIDE="${TMP_ROOT}/existing-source.tar" \
+  SOURCE_ARCHIVE_SHA256="${source_archive_sha256}" \
+  SOURCE_PAYLOAD_SHA=test-source \
+  "${SCRIPT_DIR}/submit.sh"
+)
+
+grep -F -- "source_archive_override=${TMP_ROOT}/existing-source.tar" \
+  <<<"${source_archive_output}" >/dev/null
+grep -F -- "source_archive_sha256=${source_archive_sha256}" \
+  <<<"${source_archive_output}" >/dev/null
+grep -F -- 'source_payload_sha=test-source' \
+  <<<"${source_archive_output}" >/dev/null
+grep -F -- "tar -xf ${TMP_ROOT}/existing-source.tar" \
+  <<<"${source_archive_output}" >/dev/null

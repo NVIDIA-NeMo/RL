@@ -11,6 +11,9 @@ TOPOLOGY=${TOPOLOGY:-default}
 PERFORMANCE_RECIPE=${PERFORMANCE_RECIPE:-0}
 SUPER_GPU_MEMORY_UTILIZATION=${SUPER_GPU_MEMORY_UTILIZATION:-}
 MODEL_SNAPSHOT_OVERRIDE=${MODEL_SNAPSHOT_OVERRIDE:-}
+SOURCE_ARCHIVE_OVERRIDE=${SOURCE_ARCHIVE_OVERRIDE:-}
+SOURCE_ARCHIVE_SHA256=${SOURCE_ARCHIVE_SHA256:-}
+SOURCE_PAYLOAD_SHA=${SOURCE_PAYLOAD_SHA:-}
 MAX_STEPS=${MAX_STEPS:-20}
 RUN_GROUP=${RUN_GROUP:-$(date +%Y%m%d-%H%M%S)}
 WALLTIME=${WALLTIME:-04:00:00}
@@ -187,6 +190,9 @@ if [[ "${PERFORMANCE_RECIPE}" == 1 ]]; then
 fi
 
 SOURCE_SHA=$(git -C "${REPO}" rev-parse HEAD 2>/dev/null || printf unknown)
+if [[ -z "${SOURCE_PAYLOAD_SHA}" ]]; then
+  SOURCE_PAYLOAD_SHA=${SOURCE_SHA}
+fi
 RUN_NAME="pmx-${CLUSTER}-${MODEL}-${MODE}-${ARM}-${TOPOLOGY}-${RUN_GROUP}"
 JOB_NAME="${SLURM_ACCOUNT}-pmx.${CLUSTER}-${MODEL}-${MODE}-${ARM}-${TOPOLOGY}-${RUN_GROUP}"
 RUN_ROOT="${RESULT_ROOT}/${RUN_NAME}"
@@ -341,11 +347,13 @@ if [[ "${PERFORMANCE_RECIPE}" == 1 ]]; then
   fi
 fi
 
-printf 'cluster=%s\nmodel=%s\nmode=%s\narm=%s\ntopology=%s\nconfig=%s\nnodes=%s\nsegment=%s\nsteps=%s\nshared_model=%s\nmoe_backend=%s\nsuper_gpu_memory_utilization=%s\ndatasets_cache=%s\nnuma_membind_disabled=%s\nforce_rebuild_venvs=%s\nactor_venv_root=%s\nsha=%s\nrun=%s\n' \
+printf 'cluster=%s\nmodel=%s\nmode=%s\narm=%s\ntopology=%s\nconfig=%s\nnodes=%s\nsegment=%s\nsteps=%s\nshared_model=%s\nmoe_backend=%s\nsuper_gpu_memory_utilization=%s\ndatasets_cache=%s\nnuma_membind_disabled=%s\nforce_rebuild_venvs=%s\nactor_venv_root=%s\nsha=%s\nsource_payload_sha=%s\nsource_archive_override=%s\nsource_archive_sha256=%s\nray_memory_usage_threshold=%s\nrun=%s\n' \
   "${CLUSTER}" "${MODEL}" "${MODE}" "${ARM}" "${TOPOLOGY}" "${CONFIG}" "${NUM_NODES}" \
   "${SEGMENT_SIZE}" "${MAX_STEPS}" "${USE_SHARED_MODEL}" "${MOE_BACKEND}" \
   "${SUPER_GPU_MEMORY_UTILIZATION}" "${DATASETS_CACHE}" \
-  "${NRL_DISABLE_NUMA_MEMBIND}" "${NRL_FORCE_REBUILD_VENVS}" "${ACTOR_VENV_ROOT}" "${SOURCE_SHA}" "${RUN_NAME}"
+  "${NRL_DISABLE_NUMA_MEMBIND}" "${NRL_FORCE_REBUILD_VENVS}" "${ACTOR_VENV_ROOT}" "${SOURCE_SHA}" \
+  "${SOURCE_PAYLOAD_SHA}" "${SOURCE_ARCHIVE_OVERRIDE}" "${SOURCE_ARCHIVE_SHA256}" \
+  "${RAY_memory_usage_threshold:-}" "${RUN_NAME}"
 printf 'overrides:'
 printf ' %q' "${COMMON_OVERRIDES[@]}" "${PRECISION_OVERRIDES[@]}"
 printf '\n'
@@ -388,9 +396,14 @@ fi
 
 if [[ "${ACTION}" == submit ]]; then
   git -C "${REPO}" -c fetch.recurseSubmodules=false pull --ff-only
-  git -C "${REPO}" submodule update --init --recursive --checkout
-  if [[ -n "$(git -C "${REPO}" status --porcelain --untracked-files=no --ignore-submodules=none)" ]]; then
-    echo "Repository and pinned submodules must be clean before submission" >&2
+  if [[ -z "${SOURCE_ARCHIVE_OVERRIDE}" ]]; then
+    git -C "${REPO}" submodule update --init --recursive --checkout
+    if [[ -n "$(git -C "${REPO}" status --porcelain --untracked-files=no --ignore-submodules=none)" ]]; then
+      echo "Repository and pinned submodules must be clean before submission" >&2
+      exit 2
+    fi
+  elif [[ -n "$(git -C "${REPO}" status --porcelain --untracked-files=no --ignore-submodules=all)" ]]; then
+    echo "Repository must be clean before submission" >&2
     exit 2
   fi
 fi
@@ -400,31 +413,47 @@ if [[ -n "${EXPECTED_SOURCE_SHA:-}" && "${SOURCE_SHA}" != "${EXPECTED_SOURCE_SHA
   echo "Source changed after preflight: expected ${EXPECTED_SOURCE_SHA}, got ${SOURCE_SHA}" >&2
   exit 2
 fi
-SOURCE_STATE=$(git -C "${REPO}" submodule status --recursive)
-SOURCE_ID=$(printf '%s\n%s\n' "${SOURCE_SHA}" "${SOURCE_STATE}" | sha256sum | cut -c1-16)
-# Compute nodes do not necessarily share the login node's /home filesystem.
-# Keep one immutable tar on shared storage, then expand it into node-local
-# scratch so source files never create metadata traffic on Lustre at runtime.
-SOURCE_ARCHIVE_ROOT=${SOURCE_ARCHIVE_ROOT:-${RESULT_ROOT}/source-archives}
-SOURCE_ARCHIVE="${SOURCE_ARCHIVE_ROOT}/nemo-rl-${SOURCE_ID}.tar"
-
-if [[ "${ACTION}" == submit && ! -f "${SOURCE_ARCHIVE}" ]]; then
-  mkdir -p "${SOURCE_ARCHIVE_ROOT}"
-  SOURCE_MANIFEST=$(mktemp "${TMPDIR:-/tmp}/nemo-rl-source-manifest.XXXXXX")
-  SOURCE_ARCHIVE_TMP=$(mktemp "${TMPDIR:-/tmp}/nemo-rl-source.XXXXXX.tar")
-  trap 'rm -f "${SOURCE_MANIFEST:-}" "${SOURCE_ARCHIVE_TMP:-}"' EXIT
-  git -C "${REPO}" ls-files -z --recurse-submodules --cached --full-name > "${SOURCE_MANIFEST}"
-  tar --null -cf "${SOURCE_ARCHIVE_TMP}" -C "${REPO}" -T "${SOURCE_MANIFEST}"
+if [[ -n "${SOURCE_ARCHIVE_OVERRIDE}" ]]; then
+  : "${SOURCE_ARCHIVE_SHA256:?Set SOURCE_ARCHIVE_SHA256 with SOURCE_ARCHIVE_OVERRIDE}"
+  : "${SOURCE_PAYLOAD_SHA:?Set SOURCE_PAYLOAD_SHA with SOURCE_ARCHIVE_OVERRIDE}"
+  SOURCE_ARCHIVE=${SOURCE_ARCHIVE_OVERRIDE}
   if [[ ! -f "${SOURCE_ARCHIVE}" ]]; then
-    mv "${SOURCE_ARCHIVE_TMP}" "${SOURCE_ARCHIVE}"
+    echo "Missing source archive override: ${SOURCE_ARCHIVE}" >&2
+    exit 2
   fi
-  rm -f "${SOURCE_MANIFEST}" "${SOURCE_ARCHIVE_TMP}"
-  trap - EXIT
-fi
+  ACTUAL_SOURCE_ARCHIVE_SHA256=$(sha256sum "${SOURCE_ARCHIVE}" | cut -d ' ' -f 1)
+  if [[ "${ACTUAL_SOURCE_ARCHIVE_SHA256}" != "${SOURCE_ARCHIVE_SHA256}" ]]; then
+    echo "Source archive SHA256 mismatch: expected ${SOURCE_ARCHIVE_SHA256}, got ${ACTUAL_SOURCE_ARCHIVE_SHA256}" >&2
+    exit 2
+  fi
+else
+  SOURCE_PAYLOAD_SHA=${SOURCE_SHA}
+  SOURCE_STATE=$(git -C "${REPO}" submodule status --recursive)
+  SOURCE_ID=$(printf '%s\n%s\n' "${SOURCE_SHA}" "${SOURCE_STATE}" | sha256sum | cut -c1-16)
+  # Compute nodes do not necessarily share the login node's /home filesystem.
+  # Keep one immutable tar on shared storage, then expand it into node-local
+  # scratch so source files never create metadata traffic on Lustre at runtime.
+  SOURCE_ARCHIVE_ROOT=${SOURCE_ARCHIVE_ROOT:-${RESULT_ROOT}/source-archives}
+  SOURCE_ARCHIVE="${SOURCE_ARCHIVE_ROOT}/nemo-rl-${SOURCE_ID}.tar"
 
-if [[ "${ACTION}" == submit && ! -f "${SOURCE_ARCHIVE}" ]]; then
-  echo "Failed to create source archive: ${SOURCE_ARCHIVE}" >&2
-  exit 2
+  if [[ "${ACTION}" == submit && ! -f "${SOURCE_ARCHIVE}" ]]; then
+    mkdir -p "${SOURCE_ARCHIVE_ROOT}"
+    SOURCE_MANIFEST=$(mktemp "${TMPDIR:-/tmp}/nemo-rl-source-manifest.XXXXXX")
+    SOURCE_ARCHIVE_TMP=$(mktemp "${TMPDIR:-/tmp}/nemo-rl-source.XXXXXX.tar")
+    trap 'rm -f "${SOURCE_MANIFEST:-}" "${SOURCE_ARCHIVE_TMP:-}"' EXIT
+    git -C "${REPO}" ls-files -z --recurse-submodules --cached --full-name > "${SOURCE_MANIFEST}"
+    tar --null -cf "${SOURCE_ARCHIVE_TMP}" -C "${REPO}" -T "${SOURCE_MANIFEST}"
+    if [[ ! -f "${SOURCE_ARCHIVE}" ]]; then
+      mv "${SOURCE_ARCHIVE_TMP}" "${SOURCE_ARCHIVE}"
+    fi
+    rm -f "${SOURCE_MANIFEST}" "${SOURCE_ARCHIVE_TMP}"
+    trap - EXIT
+  fi
+
+  if [[ "${ACTION}" == submit && ! -f "${SOURCE_ARCHIVE}" ]]; then
+    echo "Failed to create source archive: ${SOURCE_ARCHIVE}" >&2
+    exit 2
+  fi
 fi
 
 mkdir -p "${RUN_ROOT}/logs"
