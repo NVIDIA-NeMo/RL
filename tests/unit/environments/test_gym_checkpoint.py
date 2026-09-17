@@ -293,11 +293,6 @@ def test_topology_fingerprint_excludes_dynamic_checkpoint_phase() -> None:
             "completed-result acknowledgement",
         ),
         (
-            ["completed_result_acknowledgement"],
-            ["external_storage_reference_index_v1"],
-            "continuation-index support",
-        ),
-        (
             [
                 "agent_continuation_index_v1",
                 "completed_result_acknowledgement",
@@ -323,6 +318,78 @@ def test_turn_recovery_capability_guardrails(
             concurrency_contract="serialized_per_session",
             instance_role=None,
             features=agent_features,
+        )
+    )
+    topology = GymCheckpointTopology.from_discovered(
+        [
+            GymDiscoveredParticipant(
+                participant=model.participant("policy-route"),
+                capabilities=model,
+            ),
+            GymDiscoveredParticipant(
+                participant=agent.participant("agent-route"),
+                capabilities=agent,
+            ),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match=error):
+        topology.validate_turn_recovery_capabilities()
+
+
+def test_turn_recovery_accepts_acknowledgement_only_drain_agent() -> None:
+    model = GymControlCapabilities.model_validate(
+        _capabilities(features=["external_storage_reference_index_v1"])
+    )
+    agent = GymControlCapabilities.model_validate(
+        _capabilities(
+            component="responses_api_agents",
+            name="agent",
+            admission_states=["accepting"],
+            concurrency_contract="serialized_per_session",
+            instance_role=None,
+            features=["completed_result_acknowledgement"],
+        )
+    )
+    topology = GymCheckpointTopology.from_discovered(
+        [
+            GymDiscoveredParticipant(
+                participant=model.participant("policy-route"),
+                capabilities=model,
+            ),
+            GymDiscoveredParticipant(
+                participant=agent.participant("agent-route"),
+                capabilities=agent,
+            ),
+        ]
+    )
+
+    topology.validate_turn_recovery_capabilities()
+
+
+@pytest.mark.parametrize(
+    ("features", "error"),
+    [
+        ([], "completed-result acknowledgement"),
+        (["completed_result_acknowledgement"], "join the export/restore"),
+    ],
+)
+def test_turn_recovery_validates_agents_before_checkpoint_mode(
+    features: list[str],
+    error: str,
+) -> None:
+    model = GymControlCapabilities.model_validate(
+        _capabilities(features=["external_storage_reference_index_v1"])
+    )
+    agent = GymControlCapabilities.model_validate(
+        _capabilities(
+            component="responses_api_agents",
+            name="agent",
+            admission_states=["accepting"],
+            checkpoint_mode="stateless",
+            concurrency_contract="stateless",
+            instance_role=None,
+            features=features,
         )
     )
     topology = GymCheckpointTopology.from_discovered(
@@ -387,6 +454,11 @@ def test_restart_only_resource_requires_agent_fresh_restart_support() -> None:
                 ),
             ]
         )
+
+    drain_only = agent.model_copy(
+        update={"features": ["completed_result_acknowledgement"]}
+    )
+    topology_for(drain_only).validate_turn_recovery_capabilities()
 
     with pytest.raises(RuntimeError, match="restored-continuation discard"):
         topology_for(agent).validate_turn_recovery_capabilities()
