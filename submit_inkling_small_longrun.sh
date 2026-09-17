@@ -62,5 +62,5 @@ printf -v COMMAND '%q ' "${DRIVER[@]}" \
 export COMMAND CONTAINER
 export MOUNTS="/lustre:/lustre,$WORK_DIR:/opt/nemo-rl"
 sbatch --nodes=16 --ntasks-per-node=1 --exclusive --account=general_sa \
-    --partition=batch,tcpo,36x2-a01r,a02grace --time=03:59:00 \
+    --partition=batch,tcpo,36x2-a01r --time=03:59:00 \
     --job-name="$RUN" "${DEPENDENCY[@]}" "${SUBMIT_OPTIONS[@]}" ray.sub
