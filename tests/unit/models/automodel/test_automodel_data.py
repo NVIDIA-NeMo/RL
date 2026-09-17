@@ -342,10 +342,13 @@ class TestProcessMicrobatch:
             tokenizer=mock_tokenizer,
             enable_seq_packing=True,
             cfg={
-                "dtensor_cfg": {"sequence_parallel": False},
+                "dtensor_cfg": {
+                    "sequence_parallel": False,
+                    "context_parallel_size": 1,
+                    "tensor_parallel_size": 1,
+                },
                 "sequence_packing": {"train_mb_tokens": 999},
             },
-            cp_size=1,
         )
 
         assert result.input_ids.tolist() == [[1, 2, 3, 2, 4, 5, 2, 2, 2, 2, 2, 2]]
@@ -362,18 +365,22 @@ class TestProcessMicrobatch:
     @patch("torch.Tensor.cuda", lambda self: self)
     def test_plan_driven_packing_rejects_order_and_length_drift(self, mock_tokenizer):
         cfg = {
-            "dtensor_cfg": {"sequence_parallel": False},
+            "dtensor_cfg": {
+                "sequence_parallel": False,
+                "context_parallel_size": 1,
+                "tensor_parallel_size": 1,
+            },
             "sequence_packing": {"train_mb_tokens": 12},
         }
         wrong_order = self._planned_microbatch()
         wrong_order["batch_item_id"] = torch.tensor([11, 10])
         with pytest.raises(ValueError, match="batch_item_id order"):
-            process_microbatch(wrong_order, mock_tokenizer, True, cfg, 1)
+            process_microbatch(wrong_order, mock_tokenizer, True, cfg)
 
         wrong_length = self._planned_microbatch()
         wrong_length["input_lengths"] = torch.tensor([2, 2])
         with pytest.raises(ValueError, match="input lengths drifted"):
-            process_microbatch(wrong_length, mock_tokenizer, True, cfg, 1)
+            process_microbatch(wrong_length, mock_tokenizer, True, cfg)
 
     @patch("torch.Tensor.cuda", lambda self: self)
     def test_plan_driven_tp_training_requires_fixed_physical_tail(self, mock_tokenizer):
@@ -386,11 +393,11 @@ class TestProcessMicrobatch:
                 cfg={
                     "dtensor_cfg": {
                         "sequence_parallel": False,
+                        "context_parallel_size": 1,
                         "tensor_parallel_size": 2,
                     },
                     "sequence_packing": {"train_mb_tokens": 12},
                 },
-                cp_size=1,
             )
 
         fixed_tail_mb = self._planned_microbatch()
@@ -401,11 +408,11 @@ class TestProcessMicrobatch:
             cfg={
                 "dtensor_cfg": {
                     "sequence_parallel": False,
+                    "context_parallel_size": 1,
                     "tensor_parallel_size": 2,
                 },
                 "sequence_packing": {"train_mb_tokens": 12},
             },
-            cp_size=1,
         )
         assert result.seq_len == 12
 

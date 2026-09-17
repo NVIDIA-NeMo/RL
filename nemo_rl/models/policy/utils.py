@@ -353,6 +353,7 @@ def ensure_teacher_ipc_row_buffer(
             dtype=dtype,
             device=device,
         )
+    assert storage is not None
     return storage
 
 

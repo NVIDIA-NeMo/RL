@@ -362,12 +362,13 @@ def process_microbatch(
             mb, input_lengths=mb["input_lengths"]
         )
         if planned_geometry is not None:
+            cp_size = int(cfg["dtensor_cfg"]["context_parallel_size"])
             if cp_size != 1:
                 raise NotImplementedError(
                     "Plan-driven Automodel packing currently supports only "
                     "context_parallel_size=1."
                 )
-            tp_size = int(cfg.get("dtensor_cfg", {}).get("tensor_parallel_size", 1))
+            tp_size = int(cfg["dtensor_cfg"]["tensor_parallel_size"])
             train_mb_tokens = int(cfg["sequence_packing"]["train_mb_tokens"])
             if (
                 getattr(mb, "lockstep_side_id", None) == "student"

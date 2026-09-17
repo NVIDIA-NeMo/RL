@@ -1434,10 +1434,10 @@ class TestLossPostProcessor:
     def test_xtoken_packing_selects_axis_aware_wrapper_even_when_fusion_enabled(
         self,
     ):
+        import nemo_rl.models.megatron.train as megatron_train
         from nemo_rl.algorithms.loss.loss_functions import (
             CrossTokenizerDistillationLossFn,
         )
-        import nemo_rl.models.megatron.train as megatron_train
 
         packed_params = MagicMock(
             cu_seqlens_q=torch.tensor([0, 3], dtype=torch.int32),
@@ -1891,8 +1891,9 @@ class TestFullLogitsPostProcessor:
         assert relayout_args.kwargs == {"cp_group": cp_group, "seq_dim": 1}
 
     def test_packed_cp1_restores_dense_logical_rows(self):
-        import nemo_rl.models.megatron.train as megatron_train
         from megatron.core.packed_seq_params import PackedSeqParams
+
+        import nemo_rl.models.megatron.train as megatron_train
 
         data = BatchedDataDict(
             {
@@ -1947,8 +1948,9 @@ class TestFullLogitsPostProcessor:
         assert restored[1, :, 0].tolist() == [10.0, 11.0, 0.0, 0.0, 0.0, 0.0]
 
     def test_packed_cp1_streams_valid_prefixes_without_retaining_tensors(self):
-        import nemo_rl.models.megatron.train as megatron_train
         from megatron.core.packed_seq_params import PackedSeqParams
+
+        import nemo_rl.models.megatron.train as megatron_train
 
         data = BatchedDataDict(
             {
@@ -2023,8 +2025,9 @@ class TestFullLogitsPostProcessor:
         )
 
     def test_packed_cp2_uses_per_sequence_head_tail_boundaries(self):
-        import nemo_rl.models.megatron.train as megatron_train
         from megatron.core.packed_seq_params import PackedSeqParams
+
+        import nemo_rl.models.megatron.train as megatron_train
 
         cp_group = MagicMock()
         data = BatchedDataDict(
@@ -2085,8 +2088,9 @@ class TestFullLogitsPostProcessor:
         assert mock_allgather.call_args_list[1].args[0].shape == (1, 4, 1)
 
     def test_packed_cp2_streams_zero_overlap_rows_and_keeps_collective_order(self):
-        import nemo_rl.models.megatron.train as megatron_train
         from megatron.core.packed_seq_params import PackedSeqParams
+
+        import nemo_rl.models.megatron.train as megatron_train
 
         cp_group = MagicMock()
         data = BatchedDataDict(

@@ -590,6 +590,7 @@ class TestCollatorChatMode:
                 {
                     "loss_multiplier": 1.0,
                     "idx": 0,
+                    "sample_id": "chat#same-tokenizer",
                     "message_log": [
                         {"role": "user", "content": "hi"},
                         {"role": "assistant", "content": "ok"},
@@ -625,6 +626,7 @@ class TestCollatorChatMode:
         datum = {
             "loss_multiplier": 1.0,
             "idx": 0,
+            "sample_id": "chat#teacher-index",
             "message_log": [
                 {"role": "user", "content": "hi"},
                 {"role": "assistant", "content": "ok"},

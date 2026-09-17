@@ -47,22 +47,22 @@ from nemo_rl.algorithms.x_token.loss_utils import (
     localize_alignment,
     parse_projection_file,
     prepare_xtoken_cross_tokenizer_loss_input,
-    slice_sparse_projection_cols,
     rebuild_teacher_full_logits_from_ipc,
     rebuild_teacher_sparse_logits_from_ipc,
     select_teacher_topk_indices,
+    slice_sparse_projection_cols,
     valid_chunk_mask,
 )
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch
 from nemo_rl.distributed.model_utils import group_all_reduce_sum_with_grad
 from nemo_rl.distributed.named_sharding import NamedSharding
-from nemo_rl.models.policy.utils import DENSE_TEACHER_IPC_FLAT_LAYOUT
 from nemo_rl.distributed.ray_actor_environment_registry import (
     ACTOR_ENVIRONMENT_REGISTRY,
     PY_EXECUTABLES,
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+from nemo_rl.models.policy.utils import DENSE_TEACHER_IPC_FLAT_LAYOUT
 
 # ---------------------------------------------------------------------------
 # alignment_from_flat_batch
@@ -135,23 +135,33 @@ def test_automodel_cp_layout_localizes_xtoken_windows_after_global_shift():
         patch(
             "nemo_rl.algorithms.x_token.loss_utils."
             "rebuild_teacher_full_logits_from_ipc",
-            return_value=teacher_logits,
+            return_value=(teacher_logits, 0),
         ) as rebuild_teacher,
     ):
-        student_logits, teachers, aligns, tp_group, returned_cp_group = (
-            prepare_xtoken_cross_tokenizer_loss_input(
-                local_logits,
-                data,
-                projection_matrix_paths=["projection.pt"],
-                context_parallel_group=cp_group,
-                cp_sharder=cp_sharder,
-            )
+        (
+            student_logits,
+            teachers,
+            sparse_teachers,
+            aligns,
+            dense_reconstruction_fallbacks,
+            tp_group,
+            returned_cp_group,
+            dp_cp_group,
+        ) = prepare_xtoken_cross_tokenizer_loss_input(
+            local_logits,
+            data,
+            projection_matrix_paths=["projection.pt"],
+            context_parallel_group=cp_group,
+            cp_sharder=cp_sharder,
         )
 
     torch.testing.assert_close(student_logits, full_student_logits[:, 3:6])
     assert teachers[0] is teacher_logits
+    assert sparse_teachers == {}
+    assert dense_reconstruction_fallbacks == {0: 0}
     assert tp_group is None
     assert returned_cp_group is cp_group
+    assert dp_cp_group is None
     torch.testing.assert_close(aligns[0].student_input_ids, data["input_ids"][:, 3:6])
     torch.testing.assert_close(aligns[0].student_token_mask, data["token_mask"][:, 3:6])
     torch.testing.assert_close(aligns[0].student_chunk_id, torch.tensor([[14, 15, -1]]))

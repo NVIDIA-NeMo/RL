@@ -20,7 +20,6 @@ from typing import Any, Optional
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 from nemo_rl.data.datasets.utils import load_dataset_from_path
 
-
 _SOURCE_ID_KEYS = ("sample_id", "id", "uuid")
 
 

@@ -1666,9 +1666,7 @@ def prepare_xtoken_cross_tokenizer_loss_input(
         align.teacher_spans = _chunk_ids_to_spans(teacher_chunk_id_global, max_pairs)
         # Preserve the aligner's real per-sample chunk count rather than
         # iterating every padded pair slot; pair_valid remains the final gate.
-        align.num_chunks = to_local_if_dtensor(
-            data[f"{alignment_prefix}num_chunks"]
-        )
+        align.num_chunks = to_local_if_dtensor(data[f"{alignment_prefix}num_chunks"])
         # Teacher input ids for this CP rank's contiguous teacher window (matches
         # the teacher-logit / teacher_chunk_id slice).
         teacher_ids_full = to_local_if_dtensor(data[f"teacher_{i}_input_ids"])

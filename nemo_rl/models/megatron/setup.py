@@ -575,12 +575,8 @@ def _use_megatron_fsdp(config: PolicyConfig) -> bool:
     Megatron-Core has renamed that flag to ``use_megatron_fsdp``. Honor the
     legacy spelling as a fallback for existing recipes.
     """
-    ddp_cfg = config.get("megatron_cfg", {}).get(
-        "distributed_data_parallel_config", {}
-    )
-    return bool(
-        ddp_cfg.get("use_megatron_fsdp", ddp_cfg.get("use_custom_fsdp", False))
-    )
+    ddp_cfg = config.get("megatron_cfg", {}).get("distributed_data_parallel_config", {})
+    return bool(ddp_cfg.get("use_megatron_fsdp", ddp_cfg.get("use_custom_fsdp", False)))
 
 
 def _resolve_iter_dir_from_root(

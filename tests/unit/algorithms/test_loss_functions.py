@@ -2455,11 +2455,11 @@ def test_distillation_loss_num_valid_samples_respects_sample_mask():
         "teacher_topk_indices": torch.empty(0, dtype=torch.long),
     }
     loss_fn = DistillationLossFn(
-        {
-            "kl_type": "forward",
-            "mixed_kl_weight": 0.5,
-            "zero_outside_topk": False,
-        }
+        DistillationLossConfig(
+            kl_type="forward",
+            mixed_kl_weight=0.5,
+            zero_outside_topk=False,
+        )
     )
 
     _, metrics = loss_fn(
@@ -2890,6 +2890,8 @@ def test_cross_tokenizer_partitioned_cp_ce_matches_cp1_value_and_gradient(tmp_pa
 
     torch.testing.assert_close(cp2_loss, cp1_loss)
     torch.testing.assert_close(cp2_logprobs.grad, cp1_logprobs.grad)
+
+
 def test_cross_tokenizer_same_vocab_topk_ignores_masked_and_padding_rows(tmp_path):
     """Invalid teacher rows cannot change same-vocab forward loss or gradient."""
     cfg = _ct_loss_cfg(str(tmp_path / "unused_projection.pt"))

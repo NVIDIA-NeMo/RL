@@ -29,12 +29,12 @@ import pytest
 import ray
 import torch
 
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.data.packing import (
     LockstepPackingItem,
     SidePackingSpec,
     build_lockstep_packing_plan,
 )
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import (
     ACTOR_ENVIRONMENT_REGISTRY,
@@ -642,6 +642,7 @@ class TestProcessMicrobatch:
         assert torch.equal(full_tokens, mbridge_batch["input_ids"])
         assert torch.equal(cu_seqlens, mbridge_batch["cu_seqlens_q"])
         assert torch.equal(cu_seqlens_padded, mbridge_batch["cu_seqlens_q_padded"])
+
     def test_process_microbatch_no_packing_context_parallel_shards_sequence_data(
         self,
     ):

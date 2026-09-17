@@ -119,7 +119,6 @@ from nemo_rl.models.policy.utils import (
     can_reuse_teacher_ipc_token_buffer,
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
-    ensure_teacher_ipc_buffer,
     ensure_teacher_ipc_token_buffer,
     extract_batch_item_ids,
     extract_teacher_ipc_valid_lengths,

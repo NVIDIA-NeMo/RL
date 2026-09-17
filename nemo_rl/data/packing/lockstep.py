@@ -26,7 +26,6 @@ from dataclasses import dataclass
 from fractions import Fraction
 from numbers import Integral
 
-
 PhysicalSizeFn = Callable[[tuple[int, ...]], int]
 
 

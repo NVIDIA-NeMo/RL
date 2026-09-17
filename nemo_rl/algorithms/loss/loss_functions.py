@@ -36,7 +36,6 @@ from nemo_rl.algorithms.x_token.loss_utils import (
     ce_label_mask,
     next_token_accuracy,
     select_teacher_topk_indices,
-    slice_sparse_projection_cols,
     student_next_token_ce,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict

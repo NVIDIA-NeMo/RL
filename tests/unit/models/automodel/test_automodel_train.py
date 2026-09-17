@@ -589,9 +589,7 @@ class TestLossPostProcessor:
         mock_xtoken_wrapper_class,
         mock_generic_wrapper_class,
         base_cfg,
-        mock_device_mesh,
         mock_cp_mesh,
-        mock_tp_mesh,
         processed_inputs_with_flash,
     ):
         from nemo_rl.algorithms.loss.loss_functions import (
@@ -604,9 +602,7 @@ class TestLossPostProcessor:
         processor = LossPostProcessor(
             loss_fn=loss_fn,
             cfg=base_cfg,
-            device_mesh=mock_device_mesh,
             cp_mesh=mock_cp_mesh,
-            tp_mesh=mock_tp_mesh,
             cp_size=1,
             dp_size=1,
             enable_seq_packing=True,
@@ -624,6 +620,7 @@ class TestLossPostProcessor:
             processed_inputs=processed_inputs_with_flash,
             global_valid_seqs=torch.tensor(1.0),
             global_valid_toks=torch.tensor(1.0),
+            cp_sharder=None,
         )
 
         mock_xtoken_wrapper_class.assert_called_once()
@@ -852,6 +849,7 @@ class TestSparseLogitsPostProcessor:
             processed_inputs=MagicMock(),
             original_batch_size=1,
             original_seq_len=2,
+            cp_sharder=None,
         )
 
         assert torch.equal(
@@ -2048,9 +2046,7 @@ class TestFullLogitsPostProcessorSeqPacking:
     def test_restores_one_dense_row_per_logical_sample(self):
         processor = FullLogitsPostProcessor(
             cfg={"sequence_packing": {"enabled": True}},
-            device_mesh=MagicMock(),
             cp_mesh=None,
-            tp_mesh=MagicMock(),
             cp_size=1,
             enable_seq_packing=True,
         )
@@ -2086,6 +2082,7 @@ class TestFullLogitsPostProcessorSeqPacking:
             processed_inputs=processed_inputs,
             original_batch_size=2,
             original_seq_len=6,
+            cp_sharder=None,
         )
 
         assert restored.shape == (2, 6, 2)

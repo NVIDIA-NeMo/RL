@@ -1680,8 +1680,9 @@ def test_megatron_move_model_does_not_serialize_extra_state():
 def test_full_logits_ipc_uses_valid_prefix_slab_and_preserves_logical_indices(
     monkeypatch,
 ):
-    from nemo_rl.models.policy.workers import megatron_policy_worker as mpw
     from megatron.core.packed_seq_params import PackedSeqParams
+
+    from nemo_rl.models.policy.workers import megatron_policy_worker as mpw
 
     batch_sizes = [7, 2, 1]
     batch_item_ids = [list(range(10, 17)), [20, 21], [30]]
@@ -1851,8 +1852,9 @@ def test_full_logits_ipc_uses_valid_prefix_slab_and_preserves_logical_indices(
 
 
 def test_full_logits_ipc_releases_and_grows_slab_before_forward(monkeypatch):
-    from nemo_rl.models.policy.workers import megatron_policy_worker as mpw
     from megatron.core.packed_seq_params import PackedSeqParams
+
+    from nemo_rl.models.policy.workers import megatron_policy_worker as mpw
 
     events = []
     input_lengths = [4, 3]

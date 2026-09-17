@@ -1293,9 +1293,7 @@ class SparseLogitsPostProcessor:
             sorted_vals = self._gather_and_slice_cp(
                 sorted_vals, cp_sharder, sequence_dim
             )
-            sorted_idx = self._gather_and_slice_cp(
-                sorted_idx, cp_sharder, sequence_dim
-            )
+            sorted_idx = self._gather_and_slice_cp(sorted_idx, cp_sharder, sequence_dim)
             log_z = self._gather_and_slice_cp(log_z, cp_sharder, sequence_dim)
             if gt_in_topk is not None:
                 gt_in_topk = self._gather_and_slice_cp(
@@ -1310,9 +1308,7 @@ class SparseLogitsPostProcessor:
         sequence_dim: int,
     ) -> torch.Tensor:
         """Restore canonical order, then emit this CP rank's IPC window."""
-        full = cp_sharder.gather_token_tensor(
-            tensor, seq_dim=sequence_dim, trim=True
-        )
+        full = cp_sharder.gather_token_tensor(tensor, seq_dim=sequence_dim, trim=True)
         full_seq_len = int(full.shape[sequence_dim])
         if full_seq_len % self.cp_size != 0:
             raise ValueError(
@@ -1322,9 +1318,7 @@ class SparseLogitsPostProcessor:
             )
         cp_rank = torch.distributed.get_rank(self.cp_mesh.get_group())
         local_len = full_seq_len // self.cp_size
-        return full.narrow(
-            sequence_dim, cp_rank * local_len, local_len
-        ).contiguous()
+        return full.narrow(sequence_dim, cp_rank * local_len, local_len).contiguous()
 
     def _localize_force_ids(
         self,

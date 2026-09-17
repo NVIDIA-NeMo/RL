@@ -15,7 +15,6 @@
 """Contains data processors for evaluation."""
 
 import json
-from copy import deepcopy
 import logging
 from copy import deepcopy
 from typing import Any, Dict, cast
