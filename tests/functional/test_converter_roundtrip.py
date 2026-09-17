@@ -486,7 +486,8 @@ def main():
         config_v2 = copy.deepcopy(config_v1)
         config_v2["policy"]["dtensor_cfg"]["_v2"] = True
         config_v2["policy"]["dtensor_cfg"]["checkpoint"] = {
-            "model_save_format": "torch_save"
+            "model_save_format": "torch_save",
+            "save_consolidated": "false",
         }
         dcp_checkpoint_path_v2 = create_dcp_checkpoint(model_name, config_v2, temp_dir)
 

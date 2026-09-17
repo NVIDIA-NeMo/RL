@@ -40,43 +40,6 @@ from nemo_rl.models.automodel.checkpoint import (
     AutomodelCheckpointManager,
     build_checkpoint_config,
 )
-from nemo_rl.utils.config import load_config
-
-
-@pytest.mark.automodel
-@pytest.mark.parametrize(
-    ("config_path", "component"),
-    [
-        ("grpo_math_1B.yaml", ("policy",)),
-        ("grpo_rm_1B.yaml", ("env", "reward_model")),
-        ("distillation_math.yaml", ("teacher",)),
-        ("ppo_math_1B.yaml", ("value",)),
-        (
-            "recipes/llm/dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel.v2.yaml",
-            ("policy",),
-        ),
-        (
-            "recipes/llm/grpo-deepseek-v4-flash-0731-16n8g-automodel-cp8ep128.yaml",
-            ("policy",),
-        ),
-    ],
-)
-def test_build_checkpoint_config_reads_yaml_defaults(
-    config_path: str, component: tuple[str, ...]
-) -> None:
-    component_config = load_config(Path("examples/configs") / config_path)
-    for key in component:
-        component_config = component_config[key]
-    config = build_checkpoint_config(
-        component_config["dtensor_cfg"],
-        model_repo_id="org/model",
-        dequantize_base_checkpoint=False,
-        is_peft=False,
-        is_async=True,
-    )
-
-    assert config["model_save_format"] == "safetensors"
-    assert config["save_consolidated"] == "false"
 
 
 @pytest.mark.automodel

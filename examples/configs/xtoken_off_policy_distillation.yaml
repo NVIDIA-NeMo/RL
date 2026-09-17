@@ -162,6 +162,9 @@ teachers:
     dtensor_cfg:
       enabled: true
       _v2: true
+      checkpoint:
+        model_save_format: "safetensors"
+        save_consolidated: "false"
       cpu_offload: false
       sequence_parallel: false
       activation_checkpointing: true
@@ -214,6 +217,9 @@ teachers:
   #   dtensor_cfg:
   #     enabled: true
   #     _v2: true
+  #     checkpoint:
+  #       model_save_format: "safetensors"
+  #       save_consolidated: "false"
   #     cpu_offload: false
   #     sequence_parallel: false
   #     activation_checkpointing: true

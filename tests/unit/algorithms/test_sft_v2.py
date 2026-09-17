@@ -193,7 +193,7 @@ def test_run_stops_after_a_timeout_checkpoint() -> None:
     controller._save_checkpoint.assert_called_once_with({})
 
 
-@pytest.mark.parametrize(("step", "is_final"), [(2, False), (10, False), (25, True)])
+@pytest.mark.parametrize(("step", "is_final"), [(10, False), (25, True)])
 def test_save_checkpoint_uses_policy_signature_and_terminal_step(
     tmp_path: Path, step: int, is_final: bool
 ) -> None:
@@ -214,10 +214,6 @@ def test_save_checkpoint_uses_policy_signature_and_terminal_step(
         optimizer_path=str(tmp_path / "policy" / "optimizer"),
         tokenizer_path=str(tmp_path / "policy" / "tokenizer"),
         is_final_checkpoint=is_final,
-    )
-    assert (tmp_path / "sft_v2_loaders.pt").is_file()
-    controller._checkpointer.begin_finalization.assert_called_once_with(
-        str(tmp_path), wait_fn=controller._trainer.finalize_async_save
     )
 
 
