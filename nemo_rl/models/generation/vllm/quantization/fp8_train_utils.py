@@ -70,6 +70,7 @@ def canonicalize_mxfp8_refit_output(
     scales = scales.masked_fill(scales == 0, 1)
     return values, scales
 
+
 _EXPERT_WEIGHT_PATTERN = re.compile(
     r"^(?P<prefix>.+\.experts)\.(?P<expert_id>\d+)\."
     r"(?P<projection>gate_proj|up_proj|down_proj)\.weight$"
