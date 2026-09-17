@@ -2533,9 +2533,11 @@ def run_async_nemo_gym_rollout(
 
     # Think-tag drift, count only and always on (the reward-zeroing penalty
     # stays gated by penalize_malformed_think_tag inside apply_reward_penalties).
-    if master_config and "token_ids" in master_config:
+    if resolved_reward_penalty_config and "token_ids" in resolved_reward_penalty_config:
         rollout_metrics.update(
-            _think_tag_violation_metrics(rollout_results, master_config["token_ids"])
+            _think_tag_violation_metrics(
+                rollout_results, resolved_reward_penalty_config["token_ids"]
+            )
         )
 
     # Convert LLMMessageLogType to FlatMessagesType for generation
