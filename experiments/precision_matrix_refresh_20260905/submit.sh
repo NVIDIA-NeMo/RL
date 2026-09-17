@@ -10,6 +10,7 @@ ARM=${ARM:-bf16-bf16}
 TOPOLOGY=${TOPOLOGY:-default}
 PERFORMANCE_RECIPE=${PERFORMANCE_RECIPE:-0}
 SUPER_GPU_MEMORY_UTILIZATION=${SUPER_GPU_MEMORY_UTILIZATION:-}
+MODEL_SNAPSHOT_OVERRIDE=${MODEL_SNAPSHOT_OVERRIDE:-}
 MAX_STEPS=${MAX_STEPS:-20}
 RUN_GROUP=${RUN_GROUP:-$(date +%Y%m%d-%H%M%S)}
 WALLTIME=${WALLTIME:-04:00:00}
@@ -353,16 +354,24 @@ if [[ "${ACTION}" == render ]]; then
   exit 0
 fi
 
+MODEL_SOURCE="${HF_HOME_SOURCE}/hub/${MODEL_CACHE}"
+if [[ -n "${MODEL_SNAPSHOT_OVERRIDE}" ]]; then
+  MODEL_SOURCE="${MODEL_SNAPSHOT_OVERRIDE}"
+fi
+
 for path in "${REPO}/${CONFIG}" "${REPO}/ray.sub" "${CONTAINER}" \
-  "${HF_HOME_SOURCE}/hub/${MODEL_CACHE}" "${WANDB_HOME}/.netrc"; do
+  "${MODEL_SOURCE}" "${WANDB_HOME}/.netrc"; do
   if [[ ! -e "${path}" ]]; then
     echo "Missing required path: ${path}" >&2
     exit 2
   fi
 done
 
-MODEL_STAGE_COMMAND="rsync -a --ignore-existing ${HF_HOME_SOURCE}/hub/${MODEL_CACHE}/ ${LOCAL_JOB_ROOT}/hf/hub/${MODEL_CACHE}/;"
-if [[ "${USE_SHARED_MODEL}" == 1 ]]; then
+MODEL_STAGE_COMMAND="rsync -a --ignore-existing ${MODEL_SOURCE}/ ${LOCAL_JOB_ROOT}/hf/hub/${MODEL_CACHE}/;"
+if [[ -n "${MODEL_SNAPSHOT_OVERRIDE}" ]]; then
+  COMMON_OVERRIDES+=("policy.model_name=${MODEL_SNAPSHOT_OVERRIDE}")
+  MODEL_STAGE_COMMAND=""
+elif [[ "${USE_SHARED_MODEL}" == 1 ]]; then
   MODEL_REF_FILE="${HF_HOME_SOURCE}/hub/${MODEL_CACHE}/refs/main"
   if [[ ! -f "${MODEL_REF_FILE}" ]]; then
     echo "Missing model ref: ${MODEL_REF_FILE}" >&2
