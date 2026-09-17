@@ -36,7 +36,10 @@ run_test() {
 
 run_test fast uv run --no-sync pytest -q \
     tests/unit/models/generation/test_mxfp8_prequant.py
-run_test uv run --no-sync bash ./tests/functional/grpo_vllm_mxfp8_rollout_gb200.sh
+run_test env REFIT_PREQUANTIZE=false uv run --no-sync bash \
+    ./tests/functional/grpo_vllm_mxfp8_rollout_gb200.sh
+run_test env REFIT_PREQUANTIZE=true uv run --no-sync bash \
+    ./tests/functional/grpo_vllm_mxfp8_rollout_gb200.sh
 
 # MXFP8 leg of the Megatron M-to-N reshard refit. Sized for 2 GPUs
 # (cluster.gpus_per_node=2, 1 train + 1 gen), so it fits this shard's runner.
