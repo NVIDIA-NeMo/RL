@@ -89,8 +89,8 @@ dies after admission is poisoned from the capture middleware's `finally` hook.
 
 MInf now uses the same canonical durability boundary through two generic engine
 hooks. These hooks (`DynamicInferenceEngine.payload_stager` /
-`prompt_preparer`, the `RequestPayloadStager` protocol, and the prefix-splice
-request metadata) come from
+`prompt_preparer`, the `RequestPayloadStager` protocol, and the rendered
+prior-turn tokens plus EOS id carried as request metadata) come from
 [NVIDIA/Megatron-LM PR #7015](https://github.com/NVIDIA/Megatron-LM/pull/7015)
 and are not yet in the Megatron-LM pinned through Megatron-Bridge; setup fails
 with a `NotImplementedError` naming that dependency until the pin is bumped.
@@ -98,7 +98,8 @@ with a `NotImplementedError` naming that dependency until the pin is bumped.
 Gym's complete `CaptureAdmission` travels as opaque request metadata.
 Before engine admission, the model-parallel coordinator resolves an admitted
 `staging_chain` through `TQTokenSource`, splices the exact parent tokens into
-the rendered prompt, and broadcasts that prepared request to every rank. When
+the rendered prompt with the same `replace_prefix_tokens` the vLLM worker uses,
+and broadcasts that prepared request to every rank. When
 generation completes, the coordinator passes that admission, the exact
 `OffloadedRequestPayload`, and the finished request's policy epoch to
 `TQMegatronTokenStager`. A request that straddles a refit carries more than

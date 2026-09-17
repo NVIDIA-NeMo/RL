@@ -39,8 +39,8 @@ from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
 )
 
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
-    PREFIX_SPLICE_BOUNDARY_FIELD,
-    PREFIX_SPLICE_SUFFIX_FIELD,
+    PREFIX_EOS_TOKEN_ID_FIELD,
+    PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
     STAGING_FIELDS,
     ChainPrefixCache,
     TQMegatronPromptPreparer,
@@ -320,8 +320,8 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
         [80, 81, 99, 20, 21],
         offload_params={
             "ng_capture": admission.model_dump(mode="json"),
-            PREFIX_SPLICE_SUFFIX_FIELD: [99, 20, 21],
-            PREFIX_SPLICE_BOUNDARY_FIELD: 99,
+            PREFIX_TEMPLATE_TOKEN_IDS_FIELD: [80, 81, 99],
+            PREFIX_EOS_TOKEN_ID_FIELD: 99,
         },
     )
 
@@ -530,28 +530,28 @@ def test_megatron_preparer_resolves_chains_through_the_shared_cache():
         staging_chain=["k1", "k2"],
         parent_chain_hash="b" * 64,
     )
-    for admission, prompt, suffix in (
-        (child, [80, 99, 5], [99, 5]),
-        (grandchild, [80, 81, 82, 99, 6], [99, 6]),
+    for admission, prompt, template_prefix in (
+        (child, [80, 99, 5], [80, 99]),
+        (grandchild, [80, 81, 82, 99, 6], [80, 81, 82, 99]),
     ):
         preparer.prepare_prompt(
             prompt,
             offload_params={
                 "ng_capture": admission.model_dump(mode="json"),
-                PREFIX_SPLICE_SUFFIX_FIELD: suffix,
-                PREFIX_SPLICE_BOUNDARY_FIELD: 99,
+                PREFIX_TEMPLATE_TOKEN_IDS_FIELD: template_prefix,
+                PREFIX_EOS_TOKEN_ID_FIELD: 99,
             },
         )
     # k1 was cached by the child call; the grandchild fetched only k2.
     assert source.calls == [["k1"], ["k2"]]
 
 
-def test_prefix_splice_keys_match_megatron_constants():
+def test_prefix_field_keys_match_megatron_constants():
     """The endpoint writes Megatron's constants; the preparer reads NeMo-RL's copies."""
     mcore = pytest.importorskip("megatron.core.inference.inference_request")
-    if not hasattr(mcore, "PREFIX_SPLICE_SUFFIX_FIELD"):
+    if not hasattr(mcore, "PREFIX_TEMPLATE_TOKEN_IDS_FIELD"):
         pytest.skip(
             "pinned megatron-core predates MInf prefix-splice metadata (Megatron-LM #7015)"
         )
-    assert PREFIX_SPLICE_SUFFIX_FIELD == mcore.PREFIX_SPLICE_SUFFIX_FIELD
-    assert PREFIX_SPLICE_BOUNDARY_FIELD == mcore.PREFIX_SPLICE_BOUNDARY_FIELD
+    assert PREFIX_TEMPLATE_TOKEN_IDS_FIELD == mcore.PREFIX_TEMPLATE_TOKEN_IDS_FIELD
+    assert PREFIX_EOS_TOKEN_ID_FIELD == mcore.PREFIX_EOS_TOKEN_ID_FIELD
