@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Guards for the vLLM source patches that had no coverage.
+"""Guards for vLLM source patches and scoped runtime workarounds.
 
 The two port patches ship their own suites. These cover the remaining patches:
 
@@ -28,6 +28,9 @@ The two port patches ship their own suites. These cover the remaining patches:
   ``RAY_ENABLE_UV_RUN_RUNTIME_ENV`` and every user ``extra_env_vars`` to the
   Ray workers. Being additive rather than clobbering is the whole point of the
   rewrite, and it is pure string handling, so it is cheap to pin.
+* ``modelopt_moe_amax_aliases`` adapts nested ModelOpt buffers to vLLM's
+  MoE refit loader. Its lifecycle and installed-loader compatibility are
+  checked here, alongside the source patches.
 """
 
 import ast
@@ -35,6 +38,7 @@ import logging
 import os
 import sys
 import types
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -136,6 +140,163 @@ class NemotronHForCausalLM:
 _MOE_SOURCE = "model_executor/layers/fused_moe/runner/moe_runner.py"
 _MOE_PATCH_FN = "_patch_vllm_moe_routed_experts_capture"
 _MOE_MARKER = "NeMo-RL patch (routed-experts capture for router replay)"
+
+
+@pytest.fixture
+def modelopt_moe_model() -> torch.nn.Module:
+    model = torch.nn.Module()
+    model.experts = torch.nn.Module()
+    for name in ("w13_input_quantizer", "w2_input_quantizer"):
+        quantizer = torch.nn.Module()
+        quantizer.register_buffer("_amax", torch.tensor(-1.0))
+        model.experts.add_module(name, quantizer)
+    model.in_proj = torch.nn.Linear(1, 1)
+    model.in_proj.input_quantizer = torch.nn.Module()
+    model.in_proj.input_quantizer.register_buffer("_amax", torch.tensor(-1.0))
+    return model
+
+
+def test_modelopt_moe_amax_aliases_preserve_buffer_identity_and_registration(
+    modelopt_moe_model: torch.nn.Module,
+) -> None:
+    model = modelopt_moe_model
+    buffers_before = list(model.named_buffers())
+    parameters_before = list(model.named_parameters())
+    state_before = {name: value.clone() for name, value in model.state_dict().items()}
+
+    with patches.modelopt_moe_amax_aliases(model):
+        for name in ("w13_input_quantizer", "w2_input_quantizer"):
+            assert (
+                getattr(model.experts, f"{name}._amax")
+                is getattr(model.experts, name)._amax
+            )
+        assert list(model.named_buffers()) == buffers_before
+        assert list(model.named_parameters()) == parameters_before
+        torch.testing.assert_close(model.state_dict(), state_before)
+        assert not hasattr(model.in_proj, "input_quantizer._amax")
+
+    assert not hasattr(model.experts, "w13_input_quantizer._amax")
+    assert not hasattr(model.experts, "w2_input_quantizer._amax")
+    torch.testing.assert_close(model.state_dict(), state_before)
+
+
+def test_modelopt_moe_amax_aliases_support_nested_and_repeated_use(
+    modelopt_moe_model: torch.nn.Module,
+) -> None:
+    model = modelopt_moe_model
+    for _ in range(2):
+        with patches.modelopt_moe_amax_aliases(model):
+            with patches.modelopt_moe_amax_aliases(model):
+                assert getattr(model.experts, "w13_input_quantizer._amax") is (
+                    model.experts.w13_input_quantizer._amax
+                )
+            assert hasattr(model.experts, "w13_input_quantizer._amax")
+        assert not hasattr(model.experts, "w13_input_quantizer._amax")
+        assert not hasattr(model.experts, "w2_input_quantizer._amax")
+
+
+def test_modelopt_moe_amax_aliases_preserve_existing_attributes(
+    modelopt_moe_model: torch.nn.Module,
+) -> None:
+    model = modelopt_moe_model
+    existing = torch.tensor(123.0)
+    setattr(model.experts, "w13_input_quantizer._amax", existing)
+    with patches.modelopt_moe_amax_aliases(model):
+        assert getattr(model.experts, "w13_input_quantizer._amax") is existing
+        assert hasattr(model.experts, "w2_input_quantizer._amax")
+    assert getattr(model.experts, "w13_input_quantizer._amax") is existing
+    assert not hasattr(model.experts, "w2_input_quantizer._amax")
+
+
+@pytest.mark.parametrize("during_setup", [False, True])
+def test_modelopt_moe_amax_aliases_clean_up_on_error(
+    modelopt_moe_model: torch.nn.Module,
+    monkeypatch: pytest.MonkeyPatch,
+    during_setup: bool,
+) -> None:
+    model = modelopt_moe_model
+
+    def fail_buffer_scan(*, recurse: bool = True) -> None:
+        # The first quantizer's alias must already exist when the second fails.
+        assert hasattr(model.experts, "w13_input_quantizer._amax")
+        raise RuntimeError("quantizer scan failed")
+
+    if during_setup:
+        monkeypatch.setattr(
+            model.experts.w2_input_quantizer, "named_buffers", fail_buffer_scan
+        )
+    expected = "quantizer scan failed" if during_setup else "refit failed"
+    with pytest.raises(RuntimeError, match=expected):
+        with patches.modelopt_moe_amax_aliases(model):
+            raise RuntimeError("refit failed")
+    assert not hasattr(model.experts, "w13_input_quantizer._amax")
+    assert not hasattr(model.experts, "w2_input_quantizer._amax")
+
+
+@pytest.mark.vllm
+def test_modelopt_moe_amax_aliases_satisfy_installed_vllm_loader(
+    modelopt_moe_model: torch.nn.Module,
+) -> None:
+    # Keep the optional vLLM import inside the test selected by its marker.
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+    class LoaderFixture(torch.nn.Module):
+        """CPU state for the installed loader and its real expert mapping."""
+
+        load_weights = RoutedExperts.load_weights
+        get_expert_mapping = RoutedExperts.get_expert_mapping
+        build_expert_params_mapping = staticmethod(
+            RoutedExperts.build_expert_params_mapping
+        )
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.layer_name = "model.layers.1.mixer.experts"
+            self.moe_config = SimpleNamespace(
+                hidden_dim_unpadded=1, num_experts=2, num_logical_experts=2
+            )
+            self.expert_map_manager = SimpleNamespace(num_fused_shared_experts=0)
+            self.ckpt_gate_proj_name = "up_proj"
+            self.ckpt_down_proj_name = "down_proj"
+            self.ckpt_up_proj_name = ""
+            self.lora_base_layer_prefix = ""
+
+    def load_amax(
+        param: torch.Tensor, loaded_weight: torch.Tensor, **kwargs: object
+    ) -> bool:
+        param.copy_(torch.maximum(param, loaded_weight))
+        return True
+
+    model = modelopt_moe_model
+    experts = LoaderFixture()
+    for name, quantizer in model.experts.named_children():
+        experts.add_module(name, quantizer)
+        quantizer._amax.weight_loader = load_amax
+    model.experts = experts
+    weights = [
+        (f"{expert}.{projection}.input_quantizer._amax", torch.tensor(value))
+        for expert, projection, value in (
+            (0, "up_proj", 2.0),
+            (1, "up_proj", 6.0),
+            (0, "down_proj", 1.0),
+            (1, "down_proj", 0.25),
+        )
+    ]
+
+    with pytest.raises(AttributeError, match=r"w13_input_quantizer\._amax"):
+        list(experts.load_weights(weights))
+    with patches.modelopt_moe_amax_aliases(model):
+        loaded = list(experts.load_weights(weights))
+        assert loaded == [
+            "w13_input_quantizer._amax",
+            "w13_input_quantizer._amax",
+            "w2_input_quantizer._amax",
+            "w2_input_quantizer._amax",
+        ]
+    torch.testing.assert_close(experts.w13_input_quantizer._amax, torch.tensor(6.0))
+    torch.testing.assert_close(experts.w2_input_quantizer._amax, torch.tensor(1.0))
+    assert not hasattr(experts, "w13_input_quantizer._amax")
+    assert not hasattr(experts, "w2_input_quantizer._amax")
 
 
 @pytest.fixture

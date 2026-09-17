@@ -62,10 +62,11 @@ from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.utils.cuda_graph import set_cuda_graph_modules
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine import TEQuantizationParams
 from megatron.core.inference.shards import build_inference_pg_collection
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.quantization.quant_config import MatchContext
+from megatron.core.quantization.quant_config import MatchContext, RecipeConfig
 from megatron.core.quantization.utils import load_quantization_recipe
 from megatron.core.rerun_state_machine import RerunMode, get_rerun_state_machine
 from megatron.core.transformer import MegatronModule
@@ -1465,6 +1466,52 @@ def _validate_te_precision_config(
                 )
 
 
+def _validate_nvfp4_pertoken_precision_recipe(quant_recipe: RecipeConfig) -> None:
+    """Check effective module precision under the outer NVFP4 autocast context."""
+    expected_precision = {
+        "decoder.layers.0.self_attention.linear_qkv": "bf16",
+        "decoder.layers.0.self_attention.linear_proj": "bf16",
+        "decoder.layers.0.mlp.experts.linear_fc1": "nvfp4",
+        "decoder.layers.0.mlp.experts.linear_fc2": "nvfp4",
+        "decoder.layers.0.mlp.linear_fc1": "bf16",
+        "decoder.layers.0.mlp.linear_fc2": "bf16",
+        "decoder.layers.0.mlp.shared_experts.linear_fc1": "bf16",
+        "decoder.layers.0.mlp.shared_experts.linear_fc2": "bf16",
+    }
+    mismatches = []
+    for path, expected in expected_precision.items():
+        matched = quant_recipe.match(MatchContext(module_path=path, layer_number=0))
+        params = (
+            TEQuantizationParams.parse_from_config(matched)
+            if matched is not None
+            else None
+        )
+        for mode in ("training", "evaluation"):
+            # Megatron inherits outer NVFP4 for unmatched modules or recipes
+            # that do not override quantized autocast. Evaluation falls back
+            # to the training recipe only when its own recipe is absent.
+            actual = "nvfp4"
+            if params is not None:
+                recipe = params.training_recipe
+                if mode == "evaluation" and params.evaluation_recipe is not None:
+                    recipe = params.evaluation_recipe
+                if recipe.override_quantized_autocast:
+                    if recipe.fp8_quantization_recipe is not None:
+                        actual = f"fp8 ({_quant_recipe_name(recipe.fp8_quantization_recipe)})"
+                    elif recipe.fp4_quantization_recipe is not None:
+                        actual = _quant_recipe_name(recipe.fp4_quantization_recipe)
+                    else:
+                        actual = "bf16"
+            if actual != expected:
+                mismatches.append(f"{path} ({mode}): expected {expected}, got {actual}")
+    if mismatches:
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout requires a TE recipe with BF16 "
+            "attention, dense MLPs, and shared experts, and routed-expert-only "
+            "NVFP4 in training and evaluation; mismatches: " + "; ".join(mismatches)
+        )
+
+
 def _apply_precision_config(
     model_cfg: Any, config: PolicyConfig, dtype: torch.dtype
 ) -> None:
@@ -1547,6 +1594,8 @@ def _apply_precision_config(
     if per_token_rollout is not None:
         required_env = {
             "NVTE_NVFP4_ROW_SCALED_ACTIVATION": "1",
+            "NVTE_NVFP4_DISABLE_RHT": "1",
+            "NVTE_NVFP4_DISABLE_2D_QUANTIZATION": "1",
             "NVTE_BACKWARD_OVERRIDE": "dequantized",
         }
         env_vars = megatron_cfg.get("env_vars") or {}
@@ -1572,9 +1621,8 @@ def _apply_precision_config(
                 "megatron_cfg.fp4_cfg={enabled: true, fp4: e2m1, "
                 "fp4_recipe: nvfp4, fp4_param: false}, a routed-expert TE "
                 "precision recipe, and env_vars "
-                "NVTE_NVFP4_ROW_SCALED_ACTIVATION=1 plus "
-                "NVTE_BACKWARD_OVERRIDE=dequantized; invalid env values: "
-                f"{invalid_env}"
+                f"{', '.join(f'{key}={value}' for key, value in required_env.items())}; "
+                f"invalid env values: {invalid_env}"
             )
 
     if fp8_on and fp4_on:
@@ -1624,38 +1672,7 @@ def _apply_precision_config(
     if per_token_rollout is not None:
         assert quant_recipe is not None
 
-        def _match(module_path: str) -> str | None:
-            return quant_recipe.match_to_config_key(
-                MatchContext(module_path=module_path, layer_number=0)
-            )
-
-        expected_matches = {
-            "decoder.layers.0.self_attention.linear_qkv": "bf16",
-            "decoder.layers.0.self_attention.linear_proj": "bf16",
-            "decoder.layers.0.mlp.experts.linear_fc1": "nvfp4",
-            "decoder.layers.0.mlp.experts.linear_fc2": "nvfp4",
-        }
-        mismatches = {
-            path: (_match(path), expected)
-            for path, expected in expected_matches.items()
-            if _match(path) != expected
-        }
-        accidentally_quantized = {
-            path: _match(path)
-            for path in (
-                "decoder.layers.0.mlp.linear_fc1",
-                "decoder.layers.0.mlp.linear_fc2",
-                "decoder.layers.0.mlp.shared_experts.linear_fc1",
-                "decoder.layers.0.mlp.shared_experts.linear_fc2",
-            )
-            if _match(path) == "nvfp4"
-        }
-        if mismatches or accidentally_quantized:
-            raise ValueError(
-                "generation.nvfp4_pertoken_rollout requires a TE recipe with "
-                "BF16 attention and routed-expert-only NVFP4; mismatches="
-                f"{mismatches}, unexpected NVFP4={accidentally_quantized}"
-            )
+        _validate_nvfp4_pertoken_precision_recipe(quant_recipe)
 
         num_hidden_layers = getattr(
             model_cfg, "num_layers", getattr(model_cfg, "num_hidden_layers", None)
@@ -1667,15 +1684,9 @@ def _apply_precision_config(
         # value and fails, instead of quantizing layers the trainer keeps BF16.
         resolved_ignore = resolve_boundary_ignore_patterns(
             num_hidden_layers=num_hidden_layers,
-            first_last_layers_bf16=bool(
-                getattr(model_cfg, "first_last_layers_bf16", False)
-            ),
-            num_layers_at_start_in_bf16=int(
-                getattr(model_cfg, "num_layers_at_start_in_bf16", 1) or 0
-            ),
-            num_layers_at_end_in_bf16=int(
-                getattr(model_cfg, "num_layers_at_end_in_bf16", 1) or 0
-            ),
+            first_last_layers_bf16=model_cfg.first_last_layers_bf16,
+            num_layers_at_start_in_bf16=model_cfg.num_layers_at_start_in_bf16,
+            num_layers_at_end_in_bf16=model_cfg.num_layers_at_end_in_bf16,
             expected_additional_ignore=per_token_rollout.additional_ignore,
         )
         print(

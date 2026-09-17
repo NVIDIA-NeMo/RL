@@ -45,7 +45,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.utils import replace_parameter
 
 from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
-    DEFAULT_NVFP4_IGNORE,
+    DEFAULT_NVFP4_PERTOKEN_IGNORE,
     NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS,
     NvFp4PerTokenRolloutConfig,
     boundary_layer_indices,
@@ -61,7 +61,7 @@ from nemo_rl.models.generation.vllm.vllm_backend import (
 
 logger = init_logger(__name__)
 
-__all__ = ["DEFAULT_NVFP4_IGNORE", "NvFp4PerTokenRolloutConfig"]
+__all__ = ["DEFAULT_NVFP4_PERTOKEN_IGNORE", "NvFp4PerTokenRolloutConfig"]
 
 NVFP4_PER_TOKEN_METHOD = "nvfp4_pertoken"
 
@@ -729,7 +729,13 @@ class NvFp4PerTokenWorkerExtension(VllmInternalWorkerExtension):
 def _reject_conflicting_engine_kwargs(llm_kwargs: dict[str, Any]) -> None:
     """Reject explicit engine settings incompatible with per-token NVFP4."""
     conflicts = [
-        key for key in ("worker_extension_cls", "quantization") if key in llm_kwargs
+        key
+        for key in (
+            "worker_extension_cls",
+            "quantization",
+            "enable_flashinfer_autotune",
+        )
+        if key in llm_kwargs
     ]
     if "load_format" in llm_kwargs and llm_kwargs["load_format"] != "dummy":
         conflicts.append("load_format")
@@ -745,6 +751,8 @@ def _reject_conflicting_engine_kwargs(llm_kwargs: dict[str, Any]) -> None:
         raise ValueError(
             "nvfp4_pertoken cannot overwrite explicit vLLM settings: "
             + ", ".join(sorted(set(conflicts)))
+            + ". Remove these overrides; nvfp4_pertoken manages these settings "
+            "and sets kernel_config.enable_flashinfer_autotune=false."
         )
 
 

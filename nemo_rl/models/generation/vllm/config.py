@@ -433,10 +433,11 @@ def validate_nvfp4_pertoken_generation(
     vllm_cfg = config["vllm_cfg"]
     if not colocated.get("enabled"):
         raise ValueError("generation.nvfp4_pertoken_rollout requires colocated rollout")
-    if vllm_cfg["pipeline_parallel_size"] > 1 and not vllm_cfg.get("async_engine"):
+    if vllm_cfg["pipeline_parallel_size"] > 1:
         raise ValueError(
-            "generation.nvfp4_pertoken_rollout with vLLM PP>1 requires "
-            "async_engine=true"
+            "generation.nvfp4_pertoken_rollout does not support vLLM PP>1 yet: "
+            "a stage that owns quantized layers rejects another stage's expert "
+            "weights during refit. Set generation.vllm_cfg.pipeline_parallel_size=1."
         )
     if vllm_cfg.get("expert_parallel_size") != 1:
         raise ValueError("generation.nvfp4_pertoken_rollout requires vLLM EP=1")

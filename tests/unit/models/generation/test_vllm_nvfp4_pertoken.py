@@ -508,7 +508,7 @@ def test_rollout_config_defaults(nvfp4_module):
     cfg2 = M.NvFp4PerTokenRolloutConfig.model_validate(
         {"enabled": True, "additional_ignore": [layer_ignore]}
     )
-    assert cfg2.resolved_ignore() == [*M.DEFAULT_NVFP4_IGNORE, layer_ignore]
+    assert cfg2.resolved_ignore() == [*M.DEFAULT_NVFP4_PERTOKEN_IGNORE, layer_ignore]
 
     with pytest.raises(ValidationError, match="unknown_key"):
         M.NvFp4PerTokenRolloutConfig.model_validate({"enabled": True, "unknown_key": 1})

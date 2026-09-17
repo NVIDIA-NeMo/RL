@@ -31,3 +31,9 @@ matchers:
     type: "glob"
     pattern: "*.experts.linear_fc2"
     enabled: true
+  # First match wins: keep this last so routed experts retain NVFP4.
+  fallthrough_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*"
+    enabled: true
