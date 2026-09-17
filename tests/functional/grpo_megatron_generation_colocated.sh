@@ -55,6 +55,73 @@ cleanup() {
     if [[ -r /sys/fs/cgroup/memory.events ]]; then
         cp /sys/fs/cgroup/memory.events "$DIAGNOSTIC_DIR/memory.events.after"
     fi
+    # Post-hoc only: nothing above runs before the training, so the run happens
+    # under exactly the conditions that produced the failures on this baseline.
+    # Everything here is best-effort and must never change $exit_code -- the
+    # training's own 139 is the primary datum.
+    if [[ "$exit_code" -ne 0 ]]; then
+        {
+            printf 'training_exit_code=%s\n' "$exit_code"
+            printf 'core_pattern=%s\n' "$(cat /proc/sys/kernel/core_pattern 2>&1)"
+            printf 'core_uses_pid=%s\n' "$(cat /proc/sys/kernel/core_uses_pid 2>&1)"
+            printf 'ulimit_c=%s\n' "$(ulimit -c)"
+            printf 'libc6=%s\n' "$(dpkg-query -W -f='${Version}' libc6 2>/dev/null || printf unknown)"
+        } > "$DIAGNOSTIC_DIR/forensics.txt" 2>&1
+        mkdir -p "$DIAGNOSTIC_DIR/fx"
+        # Resolved here, not at script start: this arm must leave the pre-training
+        # path byte-identical to the baseline that actually failed.
+        PY_EXE_FX=$(uv run --no-sync python -c 'import sys; print(sys.executable)' 2>/dev/null || printf python3)
+
+        # Record what the crash left behind BEFORE touching the package set: an
+        # install that fails or drags libraries with it must not be able to
+        # destroy or misrepresent the evidence.
+        shopt -s nullglob
+        cores=("$PROJECT_ROOT"/core*)
+        shopt -u nullglob
+        for c in "${cores[@]}"; do
+            [[ -f $c ]] && printf 'core_found=%s size=%s mtime=%s\n' \
+                "$c" "$(stat -c %s "$c")" "$(stat -c %Y "$c")" >> "$DIAGNOSTIC_DIR/forensics.txt"
+        done
+        if [[ ${#cores[@]} -eq 0 ]]; then
+            printf 'core_found=NONE\n' >> "$DIAGNOSTIC_DIR/forensics.txt"
+        fi
+
+        # gdb is absent from this image. Installing it now cannot change a crash
+        # that already happened, but it can move the libraries gdb resolves the
+        # core against, so hold libc and record whether that held.
+        if [[ ${#cores[@]} -gt 0 ]] && ! command -v gdb > /dev/null 2>&1; then
+            apt-mark hold libc6 libc-bin libc6-dev > "$DIAGNOSTIC_DIR/fx/apt-hold.log" 2>&1
+            apt-get update -qq && apt-get install -y -qq --no-install-recommends gdb
+            apt-mark unhold libc6 libc-bin libc6-dev >> "$DIAGNOSTIC_DIR/fx/apt-hold.log" 2>&1
+        fi > "$DIAGNOSTIC_DIR/fx/gdb-install.log" 2>&1
+        printf 'gdb=%s libc6_after_install=%s\n' \
+            "$(command -v gdb || printf none)" \
+            "$(dpkg-query -W -f='${Version}' libc6 2>/dev/null || printf unknown)" \
+            >> "$DIAGNOSTIC_DIR/forensics.txt"
+
+        for c in "${cores[@]}"; do
+            [[ -f $c ]] || continue
+            base=$(basename "$c")
+            gdb_rc=127
+            if command -v gdb > /dev/null 2>&1; then
+                gdb_rc=0
+                timeout 900 gdb -batch -q -ex 'thread apply all bt' -ex 'info sharedlibrary' \
+                    "$PY_EXE_FX" "$c" > "$DIAGNOSTIC_DIR/fx/gdb-$base.txt" 2>&1 || gdb_rc=$?
+            fi
+            if [[ "$gdb_rc" -eq 0 ]] && grep -q '^#0 ' "$DIAGNOSTIC_DIR/fx/gdb-$base.txt" 2>/dev/null; then
+                printf 'core_parsed=%s frames=yes\n' "$base" >> "$DIAGNOSTIC_DIR/forensics.txt"
+            elif [[ "$(stat -c %s "$c")" -le 3000000000 ]]; then
+                printf 'core_parsed=%s frames=no gdb_rc=%s -- preserving raw core\n' \
+                    "$base" "$gdb_rc" >> "$DIAGNOSTIC_DIR/forensics.txt"
+                cp -a "$c" "$DIAGNOSTIC_DIR/fx/" \
+                    || printf 'core_preserve_FAILED=%s\n' "$base" >> "$DIAGNOSTIC_DIR/forensics.txt"
+            else
+                printf 'core_parsed=%s frames=no gdb_rc=%s -- core too large to preserve (%s bytes)\n' \
+                    "$base" "$gdb_rc" "$(stat -c %s "$c")" >> "$DIAGNOSTIC_DIR/forensics.txt"
+            fi
+        done
+        dmesg > "$DIAGNOSTIC_DIR/fx/dmesg.txt" 2>&1
+    fi
     if [[ "$exit_code" -ne 0 && -d /tmp/ray/session_latest/logs ]]; then
         mkdir -p "$DIAGNOSTIC_DIR/ray"
         cp -a /tmp/ray/session_latest/logs/. "$DIAGNOSTIC_DIR/ray/" \
