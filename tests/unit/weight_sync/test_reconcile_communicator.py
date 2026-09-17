@@ -140,6 +140,7 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
         # asks the backend which one that is. A stand-in has to carry every hook the code
         # under test reads, or it tests a shape the product never has.
         get_collective_sender_spec=lambda: SimpleNamespace(nccl_peer="nemo"),
+        get_refit_payload_mode=lambda: "hf_export",
     )
     from nemo_rl.models.generation.vllm import vllm_generation
 
@@ -150,20 +151,19 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
     # update_weights_from_collective asserts on it.
     refit_info_pushes = []
     generation.prepare_refit_info = lambda info: refit_info_pushes.append(info)
-    generation.rebuild_collective = (
-        lambda membership, ip, port: vllm_generation.VllmGeneration.rebuild_collective(
+    generation.rebuild_collective = lambda membership, ip, port: (
+        vllm_generation.VllmGeneration.rebuild_collective(
             generation, membership, ip, port
         )
     )
     policy_calls = []
+    refit_payload_modes = []
     policy = SimpleNamespace(
-        prepare_refit_info=lambda: {"model.weight": object()},
-        init_collective=lambda ip,
-        port,
-        world_size,
-        *,
-        train_world_size,
-        nccl_peer=None: (
+        prepare_refit_info=lambda *, refit_payload_mode: (
+            refit_payload_modes.append(refit_payload_mode) or {"model.weight": object()}
+        ),
+        refit_payload_modes=refit_payload_modes,
+        init_collective=lambda ip, port, world_size, *, train_world_size, nccl_peer=None: (
             policy_calls.append(
                 {
                     "ip": ip,
@@ -200,6 +200,36 @@ class TestRebuildDispatch:
         # _FakeWorker raises if touched, so reaching here is the assertion; confirm the
         # survivors really were called.
         assert [w.idx for w in workers if w.calls] == [0, 1, 3]
+
+    def test_metadata_uses_the_generation_payload_contract(self, monkeypatch):
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        sync, _, _ = _rebuildable(dead_shards=(2,))
+
+        sync.reconcile_communicator([2])
+
+        assert sync._policy.refit_payload_modes == ["hf_export"]
+
+    def test_rebuild_repeats_the_prequantization_handshake(self, monkeypatch):
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        sync, _, _ = _rebuildable(dead_shards=(2,))
+        initial_info = {"model.weight": {"dtype": "bfloat16"}}
+        updated_info = {"model.weight": {"dtype": "float8_e4m3fn"}}
+        pushed_info = []
+        enabled_names = []
+        sync._policy.cfg = {"megatron_cfg": {"enabled": True}}
+        sync._policy.prepare_refit_info = lambda *, refit_payload_mode: initial_info
+        sync._policy.enable_refit_prequantize = lambda names: (
+            enabled_names.extend(names) or updated_info
+        )
+        sync._generation.prepare_refit_info = lambda info: (
+            pushed_info.append(info)
+            or (["model.weight"] if len(pushed_info) == 1 else None)
+        )
+
+        sync.reconcile_communicator([2])
+
+        assert enabled_names == ["model.weight"]
+        assert pushed_info == [initial_info, updated_info]
 
     def test_survivors_get_compacted_prefixes(self, monkeypatch):
         monkeypatch.setattr("ray.get", lambda futures: futures)
@@ -411,10 +441,9 @@ class TestControllerCallSite:
         _condemn(monitor, 1)
         calls = []
         synchronizer = SimpleNamespace(
-            reconcile_communicator=lambda absent, force=False: calls.append(
-                list(absent)
+            reconcile_communicator=lambda absent, force=False: (
+                calls.append(list(absent)) or False
             )
-            or False
         )
         ctrl = self._controller(monitor, synchronizer)
 
