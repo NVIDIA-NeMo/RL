@@ -1563,11 +1563,23 @@ def apply_reward_penalties(
                 f"but found roles: {roles}. These penalties are not supported for non-Gym rollout paths."
             )
 
+    def is_rollout_representative(result: dict) -> bool:
+        """Return whether this is the rollout's representative trace.
+
+        This is the first trace, excluding an empty-rollout dummy. Rollout-scoped
+        penalties run once on this trace; legacy results lack trace_idx and default in.
+        """
+        return result.get("trace_idx", 0) == 0 and not result.get(
+            "is_empty_rollout", False
+        )
+
     # --- Penalty 1: Duplicated reasoning / final answer ---
     if _get_reward_penalty_config_value(
         reward_penalty_config, "penalize_duplicated_reasoning"
     ):
         for result in results:
+            if not is_rollout_representative(result):
+                continue
             output_items = result["full_result"].get("response", {}).get("output", [])
             is_duplicated = False
             for item1, item2 in zip(output_items, output_items[1:]):
@@ -1597,6 +1609,8 @@ def apply_reward_penalties(
         reward_penalty_config, "penalize_empty_final_answer"
     ):
         for result in results:
+            if not is_rollout_representative(result):
+                continue
             output_items = result["full_result"].get("response", {}).get("output", [])
             # Skip if the last output item is a function_call — it is legit for model to
             # produce reasoning and then a function_call as the last output item in PivotRL
@@ -1620,13 +1634,19 @@ def apply_reward_penalties(
                 counts["empty_final_answer"] += 1
 
     # --- Penalty 3: unwanted token in generation ---
+    # Token check runs on every trace (subagent/compaction traces included),
+    # but a rollout is only counted once (its traces share full_result, so the
+    # reward is zeroed once anyway).
     if _get_reward_penalty_config_value(
         reward_penalty_config, "penalize_unwanted_tokens"
     ):
         unwanted_token_ids = _get_required_reward_penalty_token_ids(
             reward_penalty_config, "unwanted"
         )
+        unwanted_violated_rollouts: set[int] = set()
         for result in results:
+            if result.get("is_empty_rollout", False):
+                continue
             has_unwanted_token = False
             for msg in result["message_log"]:
                 if msg["role"] != "assistant":
@@ -1638,8 +1658,8 @@ def apply_reward_penalties(
                     break
             if has_unwanted_token:
                 result["full_result"]["reward"] = 0.0
-
-                counts["unwanted_token"] += 1
+                unwanted_violated_rollouts.add(id(result["full_result"]))
+        counts["unwanted_token"] = len(unwanted_violated_rollouts)
 
     # --- Penalty 4: Malformed think tags (existing flag + optional token ID + string) ---
     if _get_reward_penalty_config_value(
@@ -1656,7 +1676,10 @@ def apply_reward_penalties(
                 "reward_penalties.token_ids.think_open and "
                 "reward_penalties.token_ids.think_close must both be set"
             )
+        think_tag_violated_rollouts: set[int] = set()
         for result in results:
+            if result.get("is_empty_rollout", False):
+                continue
             has_violation = any(
                 msg.get("role") == "assistant"
                 and msg.get("has_malformed_thinking", False)
@@ -1696,8 +1719,12 @@ def apply_reward_penalties(
                         has_violation = True
                         break
 
-            # 4b) String check on generation_str per output item.
-            if not has_violation:
+            # 4b) String check on generation_str per output item. generation_str
+            # is attached by the trace builder, which processes the per-segment
+            # `responses` in multi-trace mode (the aggregate `response` is
+            # stripped without decoding) — so read whichever holds the decoded
+            # items. Run once per rollout (segments cover the whole rollout).
+            if not has_violation and is_rollout_representative(result):
                 thinking_tags = (
                     _get_reward_penalty_config_value(
                         reward_penalty_config, "thinking_tags"
@@ -1709,23 +1736,27 @@ def apply_reward_penalties(
                         "reward_penalties.thinking_tags must contain open and close tags"
                     )
                 think_open_text, think_close_text = thinking_tags[:2]
-                output_items = (
-                    result["full_result"].get("response", {}).get("output", [])
-                )
-                for item in output_items:
-                    gen_str = item.get("generation_str", "")
-                    if not gen_str:
-                        continue
-                    if (
-                        gen_str.count(think_open_text) > 0
-                        or gen_str.count(think_close_text) > 1
-                    ):
-                        has_violation = True
+                full_result = result["full_result"]
+                decoded_responses = full_result.get("responses") or [
+                    full_result.get("response") or {}
+                ]
+                for response in decoded_responses:
+                    for item in (response or {}).get("output", []) or []:
+                        gen_str = item.get("generation_str", "")
+                        if not gen_str:
+                            continue
+                        if (
+                            gen_str.count(think_open_text) > 0
+                            or gen_str.count(think_close_text) > 1
+                        ):
+                            has_violation = True
+                            break
+                    if has_violation:
                         break
             if has_violation:
                 result["full_result"]["reward"] = 0.0
-
-                counts["malformed_think_tag"] += 1
+                think_tag_violated_rollouts.add(id(result["full_result"]))
+        counts["malformed_think_tag"] = len(think_tag_violated_rollouts)
 
     return counts
 
@@ -1756,10 +1787,31 @@ def graft_nemo_gym_input_fields(
     scratch field ``run_async_nemo_gym_rollout`` writes in place), so a stored
     batch matches the pre-rollout inputs regardless of call batching, and so
     nothing downstream mutates a dict the dataset may hand out again.
+
+    Multi-trace: ``final_batch`` has one row per TRACE while ``input_batch``
+    has one row per rollout. ``rollout_local_idx`` maps each trace back to its
+    parent rollout; input fields are expanded through it so grafted rows stay
+    row-aligned with ``final_batch``.
     """
+    rollout_local_idx = final_batch.get("rollout_local_idx")
+
+    def _expand(values):
+        if rollout_local_idx is None:
+            return values
+        if torch.is_tensor(values):
+            return values[rollout_local_idx]
+        return [values[int(i)] for i in rollout_local_idx]
+
+    n_traces = len(final_batch["message_log"])
     for key in NEMO_GYM_INPUT_ONLY_FIELDS:
         if key not in final_batch and key in input_batch:
-            final_batch[key] = input_batch[key]
+            expanded = _expand(input_batch[key])
+            assert len(expanded) == n_traces, (
+                f"graft_nemo_gym_input_fields: '{key}' expanded to {len(expanded)} "
+                f"rows but final_batch has {n_traces} traces — rollout_local_idx "
+                f"misalignment."
+            )
+            final_batch[key] = expanded
     rows = final_batch.get("extra_env_info") or []
     if rows:
         final_batch["extra_env_info"] = [
@@ -1853,7 +1905,25 @@ def run_async_nemo_gym_rollout(
             )
         )
 
-        # Tensorize all token ids
+        # Environments may return multiple traces per rollout (subagent
+        # sessions, compaction segments); run_rollouts returns a LIST of
+        # traces per row (legacy envs: a single dict — normalize). Flatten to
+        # a per-trace batch while remembering which rollout each trace belongs
+        # to — all traces of a rollout share the rollout's reward (and
+        # downstream the same advantage).
+        rollout_results: list[list[dict]] = [
+            [r] if isinstance(r, dict) else r for r in results
+        ]
+        results = []
+        trace_rollout_local_idx: list[int] = []
+        trace_in_rollout_idx: list[int] = []
+        for rollout_idx, rollout_traces in enumerate(rollout_results):
+            for t_idx, trace in enumerate(rollout_traces):
+                results.append(trace)
+                trace_rollout_local_idx.append(rollout_idx)
+                trace_in_rollout_idx.append(t_idx)
+
+        # Tensorize all token ids (per trace)
         for r in results:
             _tensorize_by_key(r["input_message_log"], "token_ids")
             _tensorize_by_key(r["message_log"], "token_ids")
@@ -1862,13 +1932,22 @@ def run_async_nemo_gym_rollout(
                 "generation_logprobs",
             )
 
-    # Length-based reward shaping for low-effort prompts
-    shaping = _apply_effort_shaping(results, nemo_gym_rows, effort_config)
+    # Length-based reward shaping for low-effort prompts. Pass ONE trace per
+    # rollout (the last — its final assistant message is the rollout's final
+    # answer) so the shaping stays row-aligned; the reward mutation lands on
+    # the shared full_result and therefore applies to all sibling traces.
+    shaping = _apply_effort_shaping(
+        [rollout_traces[-1] for rollout_traces in rollout_results],
+        nemo_gym_rows,
+        effort_config,
+    )
     length_rewards_low = shaping.length_rewards_low
     rewards_low = shaping.rewards_low
     low_lengths = shaping.low_lengths
     high_lengths = shaping.high_lengths
 
+    # Penalties run per trace (subagent traces included); a triggered
+    # penalty zeroes the shared rollout reward for all sibling traces.
     resolved_reward_penalty_config = resolve_reward_penalty_config(
         reward_penalty_config, tokenizer, thinking_tags=thinking_tags
     )
@@ -1889,24 +1968,55 @@ def run_async_nemo_gym_rollout(
             max_total_tokens_per_sample = policy_generation.cfg[
                 "max_total_sequence_length"
             ]
-        all_sample_metrics = [
-            {
-                "total_reward": r["full_result"]["reward"],
-                "assistant_tokens": sum(
-                    len(m["token_ids"])
-                    for m in r["message_log"]
-                    if m["role"] == "assistant"
-                ),
-                "total_tokens": sum(len(m["token_ids"]) for m in r["message_log"]),
-                "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
-                "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"])
-                == max_total_tokens_per_sample,
-            }
-            for r in results
+        trace_total_tokens = [
+            sum(len(m["token_ids"]) for m in r["message_log"]) for r in results
         ]
+        trace_hit_max_tokens = [
+            t == max_total_tokens_per_sample for t in trace_total_tokens
+        ]
+        # Per-trace turn counts: each trace is one on-policy segment, so this
+        # is the number comparable to the per-segment `agent_max_turns` cap
+        # (turns_per_sample below sums over all of a rollout's traces and can
+        # legitimately exceed the cap once sessions compact or spawn subagents).
+        turns_per_trace = [
+            sum(1 for m in r["message_log"] if m["role"] == "user") for r in results
+        ]
+        all_sample_metrics = []
+        trace_cursor = 0
+        for rollout_traces in rollout_results:
+            t_slice = slice(trace_cursor, trace_cursor + len(rollout_traces))
+            trace_cursor += len(rollout_traces)
+            all_sample_metrics.append(
+                {
+                    "total_reward": rollout_traces[0]["full_result"]["reward"],
+                    "assistant_tokens": sum(
+                        len(m["token_ids"])
+                        for r in rollout_traces
+                        for m in r["message_log"]
+                        if m["role"] == "assistant"
+                    ),
+                    "total_tokens": sum(trace_total_tokens[t_slice]),
+                    "turn_count": sum(
+                        1
+                        for r in rollout_traces
+                        for m in r["message_log"]
+                        if m["role"] == "user"
+                    ),
+                    "hit_max_tokens": any(trace_hit_max_tokens[t_slice]),
+                    "num_traces": len(rollout_traces),
+                }
+            )
 
     # Aggregate metrics across all samples
     with timer.time(f"{timer_prefix}/aggregate_metrics"):
+
+        def _pct(values: list[float], p: float) -> float:
+            if not values:
+                return 0.0
+            sorted_v = sorted(values)
+            idx = min(int(len(sorted_v) * p / 100), len(sorted_v) - 1)
+            return float(sorted_v[idx])
+
         rollout_metrics = {
             **rollout_loop_timing_metrics,
             **_calculate_single_metric(
@@ -1914,6 +2024,13 @@ def run_async_nemo_gym_rollout(
                 batch_size,
                 "turns_per_sample",
             ),
+            **_calculate_single_metric(
+                turns_per_trace,
+                len(turns_per_trace),
+                "turns_per_trace",
+            ),
+            "turns_per_trace/p95": _pct(turns_per_trace, 95),
+            "turns_per_trace/p99": _pct(turns_per_trace, 99),
             **_calculate_single_metric(
                 [m["total_tokens"] for m in all_sample_metrics],
                 batch_size,
@@ -1923,6 +2040,11 @@ def run_async_nemo_gym_rollout(
                 [m["assistant_tokens"] for m in all_sample_metrics],
                 batch_size,
                 "gen_tokens_per_sample",
+            ),
+            **_calculate_single_metric(
+                [m["num_traces"] for m in all_sample_metrics],
+                batch_size,
+                "traces_per_sample",
             ),
             **_calculate_single_metric(
                 [m["total_reward"] for m in all_sample_metrics],
@@ -1943,14 +2065,15 @@ def run_async_nemo_gym_rollout(
             # / batch_size,
         }
 
-    # Per-agent misc metrics
+    # Per-agent misc metrics (per rollout; traces share the rollout's full_result)
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
-        for nemo_gym_row, result in zip(nemo_gym_rows, results):
+        for nemo_gym_row, rollout_traces in zip(nemo_gym_rows, rollout_results):
             agent_ref = nemo_gym_row["agent_ref"]
             agent_name = agent_ref["name"]
-            agent_to_results[agent_name].append(result["full_result"])
-            result["agent_ref"] = agent_ref
+            agent_to_results[agent_name].append(rollout_traces[0]["full_result"])
+            for trace in rollout_traces:
+                trace["agent_ref"] = agent_ref
 
         per_agent_metrics = {}
         for agent_name, agent_results in agent_to_results.items():
@@ -1983,6 +2106,11 @@ def run_async_nemo_gym_rollout(
     timer.stop(f"{timer_prefix}/total")
     rollout_metrics.update(timer.get_timing_metrics("sum"))
 
+    # Rollouts that produced no generation data (masked from gradient)
+    rollout_metrics["empty_rollout_count"] = sum(
+        1 for r in results if r.get("is_empty_rollout")
+    )
+
     # Convert LLMMessageLogType to FlatMessagesType for generation
     input_batch_for_input_ids = BatchedDataDict[DatumSpec](
         {
@@ -1995,6 +2123,13 @@ def run_async_nemo_gym_rollout(
     )
     input_ids = batched_flat["token_ids"]
 
+    rollout_local_idx_t = torch.tensor(trace_rollout_local_idx, dtype=torch.int64)
+    trace_in_rollout_idx_t = torch.tensor(trace_in_rollout_idx, dtype=torch.int64)
+    loss_multiplier = input_batch["loss_multiplier"]
+    if not torch.is_tensor(loss_multiplier):
+        loss_multiplier = torch.tensor(loss_multiplier)
+
+
     final_batch = BatchedDataDict[DatumSpec](
         {
             "agent_ref": [r["agent_ref"] for r in results],
@@ -2003,7 +2138,21 @@ def run_async_nemo_gym_rollout(
             "length": torch.tensor(
                 [len(r["input_message_log"][0]["token_ids"]) for r in results]
             ),
-            "loss_multiplier": input_batch["loss_multiplier"],
+            # Each trace inherits its parent rollout's loss multiplier.
+            "loss_multiplier": loss_multiplier[rollout_local_idx_t],
+            # Which rollout within this prompt group each trace belongs to, and
+            # the trace's index within its rollout. Downstream training uses
+            # these to (a) share one advantage/group across all traces of a
+            # rollout and (b) form advantage groups without relying on input
+            # token ids (sibling traces have different prompts).
+            "rollout_local_idx": rollout_local_idx_t,
+            "trace_in_rollout_idx": trace_in_rollout_idx_t,
+            # True for the masked dummy trace of a rollout that produced no
+            # generation data (used by the sync-path guard and diagnostics).
+            "is_empty_rollout": torch.tensor(
+                [bool(r.get("is_empty_rollout", False)) for r in results],
+                dtype=torch.bool,
+            ),
             # Unnecessary parts of the DatumSpec unused by the GRPO algorithm
             # extra_env_info: dict[str, Any]
             # idx: int
@@ -2012,11 +2161,11 @@ def run_async_nemo_gym_rollout(
             # Extra information not in the DatumSpec used by the GRPO algorithm
             "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
             # Add truncated field to match other rollout paths (reusing hit_max_tokens logic)
-            "truncated": torch.tensor(
-                [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool
-            ),
+            "truncated": torch.tensor(trace_hit_max_tokens, dtype=torch.bool),
             # Agent/env-driven mask flag — True means this sample should be masked
-            # from the GRPO gradient (kept for advantage computation).
+            # from the GRPO gradient (kept for advantage computation). Rollouts
+            # that produced no generation data (is_empty_rollout) are always
+            # masked; their reward still enters the group baseline.
             "mask_sample": torch.tensor(
                 [
                     bool(
@@ -2024,6 +2173,7 @@ def run_async_nemo_gym_rollout(
                             "mask_sample", False
                         )
                     )
+                    or bool(r.get("is_empty_rollout", False))
                     for r in results
                 ],
                 dtype=torch.bool,
@@ -2061,9 +2211,10 @@ def run_async_nemo_gym_rollout(
         ),
     }
     if resolved_reward_penalty_config and results:
+        # Penalty counts are per rollout; rate over rollouts, not traces.
         for key, (flag, metric_name) in _PENALTY_METRICS.items():
             if _get_reward_penalty_config_value(resolved_reward_penalty_config, flag):
-                rollout_metrics[metric_name] = penalty_counts[key] / len(results)
+                rollout_metrics[metric_name] = penalty_counts[key] / len(rollout_results)
 
     return AsyncNemoGymRolloutResult(
         input_ids=input_ids,

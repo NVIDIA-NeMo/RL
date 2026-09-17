@@ -488,8 +488,20 @@ class AsyncNemoGymRolloutImpl:
             results, env_timing_metrics = await nemo_gym_env.run_rollouts.remote(
                 inputs, self._tokenizer, timer_prefix
             )
+            # run_rollouts returns a LIST of traces per row (multi-trace:
+            # subagent sessions / compaction segments). This impl has no
+            # multi-trace support — fail loudly rather than silently training
+            # on only the representative trace.
+            for row_traces in results:
+                if len(row_traces) != 1:
+                    raise NotImplementedError(
+                        f"AsyncNemoGymRolloutImpl received a multi-trace rollout "
+                        f"({len(row_traces)} traces). Multi-trace training is only "
+                        f"supported via the run_async_nemo_gym_rollout path in "
+                        f"nemo_rl/experience/rollouts.py."
+                    )
             # Convert results to completions.
-            completions = [self._result_to_completion(r) for r in results]
+            completions = [self._result_to_completion(r[0]) for r in results]
 
         # Compute rollout metrics.
         with timer.time(f"{timer_prefix}/compute_metrics"):

@@ -13,6 +13,7 @@
 # limitations under the License.
 import gc
 import json
+import math
 import os
 import time
 import warnings
@@ -2534,6 +2535,30 @@ def grpo_train(
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result
 
+                        # Multi-trace rollouts (subagents/compaction) change the
+                        # batch shape (traces != rollouts) and break the
+                        # input-token-id advantage grouping used below; the
+                        # masked empty-rollout dummy trace (single pad-token
+                        # prompt) would likewise form a bogus all-pad advantage
+                        # group here. Only the async GRPO path supports both.
+                        if "trace_in_rollout_idx" in repeated_batch and bool(
+                            (repeated_batch["trace_in_rollout_idx"] != 0).any()
+                        ):
+                            raise NotImplementedError(
+                                "The environment returned multiple traces per rollout "
+                                "(subagent sessions / compaction segments). This is only "
+                                "supported with async GRPO — set grpo.async_grpo.enabled=true."
+                            )
+                        if "is_empty_rollout" in repeated_batch and bool(
+                            repeated_batch["is_empty_rollout"].any()
+                        ):
+                            raise NotImplementedError(
+                                "The environment returned rollouts with no generation data "
+                                "(masked dummy traces). The sync GRPO path groups advantages "
+                                "by input token ids, which cannot represent these — use async "
+                                "GRPO (grpo.async_grpo.enabled=true)."
+                            )
+
                         # NeMo Gym responses can be very large and expensive to log. Here we have logic to opt-in to logging.
                         if not _should_log_nemo_gym_responses(master_config):
                             for key in list(rollout_metrics):
@@ -3355,6 +3380,7 @@ def validate(
         print(f"▶ Starting validation at step {step}...", flush=True)
 
         total_rewards = []
+        rollout_rewards_for_accuracy = []
         total_lengths = []
         all_message_logs = []  # Collect all message logs
 
@@ -3409,7 +3435,20 @@ def validate(
                     greedy=False,
                 )
 
+            # total_rewards stays per trace so it remains aligned with
+            # all_message_logs (sample display and the val jsonl pair reward i
+            # with conversation i). Accuracy is computed over rollouts: each
+            # rollout counted once via its first trace.
             total_rewards.extend(val_batch["total_reward"].tolist())
+            if "trace_in_rollout_idx" in val_batch:
+                first_trace_mask = val_batch["trace_in_rollout_idx"] == 0
+                rollout_rewards_for_accuracy.extend(
+                    val_batch["total_reward"][first_trace_mask].tolist()
+                )
+            else:
+                rollout_rewards_for_accuracy.extend(
+                    val_batch["total_reward"].tolist()
+                )
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
             # Collect message logs for later display
@@ -3423,9 +3462,9 @@ def validate(
             all_message_logs.extend(to_env)
 
         # Calculate validation metrics
-        num_samples = len(total_rewards)
+        num_samples = len(rollout_rewards_for_accuracy)
         if num_samples > 0:
-            rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
+            rewards_t = torch.tensor(rollout_rewards_for_accuracy, dtype=torch.float32)
             accuracy = rewards_t.mean().item()
         else:
             accuracy = 0.0
@@ -3496,7 +3535,7 @@ def aggregate_rollout_metrics(
     Different metric types are aggregated according to their semantics:
     - Metrics ending with "/min" or starting with "min_" (excluding "_rate" suffix): take the minimum
     - Metrics ending with "/max" or starting with "max_" (excluding "_rate" suffix): take the maximum
-    - "total_turns": summed
+    - "total_turns" / "empty_rollout_count": summed
     - Non-numeric values: passed through as-is
     - All other numeric metrics: averaged
 
@@ -3514,7 +3553,7 @@ def aggregate_rollout_metrics(
             aggregated[k] = min(v)
         elif k.endswith("/max") or (k.startswith("max_") and not k.endswith("_rate")):
             aggregated[k] = max(v)
-        elif k == "total_turns":
+        elif k in ("total_turns", "empty_rollout_count"):
             aggregated[k] = sum(v)
         else:
             aggregated[k] = sum(v) / len(v)
@@ -3973,7 +4012,70 @@ def async_grpo_train(
 
                     # Concatenate per-prompt groups into a single training batch
                     per_prompt_batches = [t["batch"] for t in trajectories]
+
+                    # Backfill buffer entries checkpointed before multi-trace
+                    # support (one row per rollout, no per-trace fields) so a
+                    # mixed old/new buffer batches uniformly: from_batches
+                    # requires identical key sets, and a mixed batch would
+                    # otherwise be silently dropped after sample() already
+                    # popped it (permanent stall).
+                    for prompt_batch in per_prompt_batches:
+                        if "rollout_local_idx" not in prompt_batch:
+                            prompt_batch["rollout_local_idx"] = torch.arange(
+                                prompt_batch.size, dtype=torch.int64
+                            )
+                            prompt_batch["trace_in_rollout_idx"] = torch.zeros(
+                                prompt_batch.size, dtype=torch.int64
+                            )
+                        if "is_empty_rollout" not in prompt_batch:
+                            prompt_batch["is_empty_rollout"] = torch.zeros(
+                                prompt_batch.size, dtype=torch.bool
+                            )
                     repeated_batch = BatchedDataDict.from_batches(per_prompt_batches)
+
+                    # Multi-trace rollouts (subagent sessions / compaction
+                    # segments): each buffer entry is one prompt group whose
+                    # rows are traces, several of which can belong to the same
+                    # rollout. Build advantage-group and rollout identifiers
+                    # positionally — grouping by input token ids no longer
+                    # works because sibling traces have different prompts.
+                    multi_trace = all(
+                        "rollout_local_idx" in b for b in per_prompt_batches
+                    )
+                    trace_group_ids = None
+                    trace_rollout_ids = None
+                    has_multi_trace_rollouts = False
+                    if multi_trace:
+                        group_id_parts = []
+                        rollout_id_parts = []
+                        for group_index, prompt_batch in enumerate(per_prompt_batches):
+                            local_rollout_ids = prompt_batch["rollout_local_idx"].to(
+                                torch.int64
+                            )
+                            group_id_parts.append(
+                                torch.full(
+                                    (local_rollout_ids.shape[0],),
+                                    group_index,
+                                    dtype=torch.int64,
+                                )
+                            )
+                            rollout_id_parts.append(
+                                group_index * samples_per_prompt_group
+                                + local_rollout_ids
+                            )
+                        trace_group_ids = torch.cat(group_id_parts)
+                        trace_rollout_ids = torch.cat(rollout_id_parts)
+                        # Restrictions below only apply when some rollout truly
+                        # has multiple traces; single-trace batches (every
+                        # trace its own rollout) keep full estimator support.
+                        has_multi_trace_rollouts = bool(
+                            trace_rollout_ids.numel()
+                            != torch.unique(trace_rollout_ids).numel()
+                        )
+                        if has_multi_trace_rollouts:
+                            assert not opd_module.is_opd_enabled(master_config), (
+                                "Multi-trace NeMo Gym rollouts are not supported with OPD."
+                            )
 
                     # Teacher logprobs are stored in batch dict by collection-time
                     # computation and padded by from_batches. Extract here.
@@ -3992,11 +4094,21 @@ def async_grpo_train(
                     rollout_metrics = aggregate_rollout_metrics(per_group_metrics)
 
                 # Enforce fixed training batch: num_prompts_per_step * num_generations_per_prompt
+                # In multi-trace mode the fixed quantity is the ROLLOUT count;
+                # the trace count (rows) varies step to step.
                 expected_batch_size = (
                     master_config.grpo["num_prompts_per_step"]
                     * master_config.grpo["num_generations_per_prompt"]
                 )
-                if repeated_batch.size != expected_batch_size:
+                if multi_trace:
+                    num_rollouts_in_batch = int(torch.unique(trace_rollout_ids).numel())
+                    if num_rollouts_in_batch != expected_batch_size:
+                        print(
+                            f"❌ Unexpected rollout count: got {num_rollouts_in_batch}, expected {expected_batch_size}. Skipping step and waiting for correct buffer content."
+                        )
+                        time.sleep(0.5)
+                        continue
+                elif repeated_batch.size != expected_batch_size:
                     print(
                         f"❌ Unexpected training batch size: got {repeated_batch.size}, expected {expected_batch_size}. Skipping step and waiting for correct buffer content."
                     )
@@ -4010,30 +4122,54 @@ def async_grpo_train(
                         f"Configuration error: (num_prompts_per_step * num_generations_per_prompt) = {expected_batch_size} must be divisible by data_parallel size {dp_size}."
                     )
 
-                print(f"Got trajectory batch (size: {repeated_batch.size})")
+                if multi_trace:
+                    print(
+                        f"Got trajectory batch: {repeated_batch.size} traces from {num_rollouts_in_batch} rollouts"
+                    )
+                else:
+                    print(f"Got trajectory batch (size: {repeated_batch.size})")
 
                 print("▶ Processing rewards...")
                 with timer.time("reward_calculation"):
-                    # Extract original prompt messages using the length field
-                    # This correctly handles multi-turn prompts that contain assistant messages
-                    initial_prompt_message_logs = extract_initial_prompt_messages(
-                        repeated_batch["message_log"],
-                        repeated_batch["length"],
-                    )
+                    prompt_ids_for_adv = None
+                    if not multi_trace:
+                        # Extract original prompt messages using the length field
+                        # This correctly handles multi-turn prompts that contain assistant messages
+                        initial_prompt_message_logs = extract_initial_prompt_messages(
+                            repeated_batch["message_log"],
+                            repeated_batch["length"],
+                        )
 
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        initial_prompt_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del initial_prompt_message_logs
-                    del prompt_batched_flat
+                        prompt_batched_flat, _ = batched_message_log_to_flat_message(
+                            initial_prompt_message_logs,
+                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                        )
+                        prompt_ids_for_adv = prompt_batched_flat["token_ids"]
+                        del initial_prompt_message_logs
+                        del prompt_batched_flat
 
                     rewards = repeated_batch["total_reward"]
 
-                    print(
-                        f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
-                    )
+                    if multi_trace:
+                        # One reward per rollout (all traces of a rollout carry
+                        # the same reward) — report rollout-level stats.
+                        seen_rollout_ids: set[int] = set()
+                        first_trace_indices: list[int] = []
+                        for trace_index, rollout_id in enumerate(
+                            trace_rollout_ids.tolist()
+                        ):
+                            if rollout_id not in seen_rollout_ids:
+                                seen_rollout_ids.add(rollout_id)
+                                first_trace_indices.append(trace_index)
+                        rollout_rewards = rewards[torch.tensor(first_trace_indices)]
+                        print(
+                            f"  📊 Rewards stats (per rollout): min={rollout_rewards.min():.4f}, max={rollout_rewards.max():.4f}, mean={rollout_rewards.mean():.4f}, std={rollout_rewards.std():.4f}"
+                        )
+                    else:
+                        rollout_rewards = rewards
+                        print(
+                            f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
+                        )
 
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
@@ -4095,6 +4231,77 @@ def async_grpo_train(
                         master_config.policy,
                     )
                     train_data.to("cpu")
+
+                    # The variable trace count is generally not divisible by the
+                    # sharding granularity. Pad by duplicating row 0 with
+                    # sample_mask=0 so padding rows contribute no gradient and
+                    # no advantage statistics (their rollout id duplicates an
+                    # existing rollout, so the per-rollout dedup ignores them).
+                    # Granularity: each DP shard must also be divisible by the
+                    # train/logprob micro-batch sizes when sequence packing /
+                    # dynamic batching are off (make_microbatch_iterator
+                    # asserts this), so pad to dp * lcm(mbs, logprob_bs).
+                    # Skip when the batch already has the legacy expected size
+                    # (preserves pre-multi-trace behavior exactly).
+                    num_unpadded_traces = train_data["input_ids"].shape[0]
+                    if multi_trace and num_unpadded_traces != expected_batch_size:
+                        train_micro_batch_size = int(
+                            master_config["policy"]["train_micro_batch_size"]
+                        )
+                        logprob_batch_size = int(
+                            master_config["policy"].get("logprob_batch_size") or 1
+                        )
+                        padding_multiple = dp_size * math.lcm(
+                            max(train_micro_batch_size, 1),
+                            max(logprob_batch_size, 1),
+                        )
+                        padding_rows = (-num_unpadded_traces) % padding_multiple
+                        if padding_rows > 0:
+                            padding_indices = torch.zeros(
+                                padding_rows, dtype=torch.long
+                            )
+                            for data_key in [
+                                "input_ids",
+                                "input_lengths",
+                                "generation_logprobs",
+                                "token_mask",
+                                "sample_mask",
+                            ]:
+                                train_data[data_key] = torch.cat(
+                                    [
+                                        train_data[data_key],
+                                        train_data[data_key][padding_indices],
+                                    ],
+                                    dim=0,
+                                )
+                            train_data["sample_mask"][num_unpadded_traces:] = 0
+                            rewards = torch.cat(
+                                [rewards, rewards[padding_indices]]
+                            )
+                            trace_group_ids = torch.cat(
+                                [
+                                    trace_group_ids,
+                                    trace_group_ids[padding_indices],
+                                ]
+                            )
+                            trace_rollout_ids = torch.cat(
+                                [
+                                    trace_rollout_ids,
+                                    trace_rollout_ids[padding_indices],
+                                ]
+                            )
+                            if trajectory_teacher_logprobs is not None:
+                                trajectory_teacher_logprobs = torch.cat(
+                                    [
+                                        trajectory_teacher_logprobs,
+                                        trajectory_teacher_logprobs[
+                                            padding_indices
+                                        ],
+                                    ]
+                                )
+                            print(
+                                f"  📊 Padded trace batch from {num_unpadded_traces} to {train_data['input_ids'].shape[0]} rows for DP={dp_size} x mbs divisibility"
+                            )
 
                 # Training phase (same as sync version)
                 # Skip prev_logprobs computation when force_on_policy_ratio=True
@@ -4188,23 +4395,105 @@ def async_grpo_train(
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
 
-                    train_data["advantages"] = adv_estimator.compute_advantage(
-                        prompt_ids=prompt_ids_for_adv,
-                        rewards=rewards,
-                        mask=mask,
-                        repeated_batch=repeated_batch,
-                        logprobs_policy=train_data["prev_logprobs"],
-                        logprobs_reference=train_data.get("reference_policy_logprobs"),
-                        # OPD kwargs (ignored by non-OPD estimators via **kwargs)
-                        teacher_logprobs=trajectory_teacher_logprobs.to(
-                            train_data["prev_logprobs"].device
-                        )
-                        if trajectory_teacher_logprobs is not None
-                        else None,
-                        prev_logprobs=train_data["prev_logprobs"],
-                        generation_logprobs=train_data["generation_logprobs"],
-                        sample_mask=train_data["sample_mask"],
+                    use_rollout_level_advantages = multi_trace and isinstance(
+                        adv_estimator, GRPOAdvantageEstimator
                     )
+                    if has_multi_trace_rollouts and not use_rollout_level_advantages:
+                        raise NotImplementedError(
+                            "Multi-trace NeMo Gym rollouts currently only support the GRPO advantage estimator."
+                        )
+                    zero_std_group_fraction = None
+                    if use_rollout_level_advantages:
+                        # Advantages are computed at the ROLLOUT level (one
+                        # reward per rollout, leave-one-out baseline across the
+                        # rollouts of a prompt group) and then broadcast to
+                        # every trace of the rollout, so subagent/compaction
+                        # traces all train with the same advantage.
+                        rollout_id_to_unique_index: dict[int, int] = {}
+                        unique_rollout_first_indices: list[int] = []
+                        trace_to_unique_rollout: list[int] = []
+                        for rollout_id in trace_rollout_ids.tolist():
+                            if rollout_id not in rollout_id_to_unique_index:
+                                rollout_id_to_unique_index[rollout_id] = len(
+                                    unique_rollout_first_indices
+                                )
+                                unique_rollout_first_indices.append(
+                                    len(trace_to_unique_rollout)
+                                )
+                            trace_to_unique_rollout.append(
+                                rollout_id_to_unique_index[rollout_id]
+                            )
+                        first_trace_indices_tensor = torch.tensor(
+                            unique_rollout_first_indices, dtype=torch.long
+                        )
+                        trace_to_unique_rollout_tensor = torch.tensor(
+                            trace_to_unique_rollout, dtype=torch.long
+                        )
+
+                        unique_rollout_rewards = rewards[first_trace_indices_tensor]
+                        unique_rollout_groups = trace_group_ids[
+                            first_trace_indices_tensor
+                        ]
+
+                        # Fraction of prompt groups whose rollout rewards are all
+                        # identical (zero std -> zero advantage -> no learning signal).
+                        group_to_rewards: dict[int, set] = {}
+                        for group_id, reward_value in zip(
+                            unique_rollout_groups.tolist(),
+                            unique_rollout_rewards.tolist(),
+                        ):
+                            group_to_rewards.setdefault(group_id, set()).add(
+                                reward_value
+                            )
+                        zero_std_group_fraction = sum(
+                            1
+                            for group_rewards in group_to_rewards.values()
+                            if len(group_rewards) <= 1
+                        ) / max(len(group_to_rewards), 1)
+
+                        rollout_advantages = adv_estimator.compute_advantage(
+                            prompt_ids=unique_rollout_groups.unsqueeze(-1),
+                            rewards=unique_rollout_rewards,
+                            mask=torch.ones(
+                                (unique_rollout_rewards.shape[0], 1),
+                                dtype=mask.dtype,
+                                device=unique_rollout_rewards.device,
+                            ),
+                        )  # [num_rollouts, 1]
+                        train_data["advantages"] = (
+                            rollout_advantages[:, 0][trace_to_unique_rollout_tensor]
+                            .unsqueeze(-1)
+                            .expand(mask.shape)
+                            .contiguous()
+                        )
+                    else:
+                        # Single-trace batch (or legacy buffer entries): full
+                        # estimator support. With positional ids available,
+                        # group by them (equivalent to the per-prompt-group
+                        # semantics); otherwise fall back to prompt token ids.
+                        train_data["advantages"] = adv_estimator.compute_advantage(
+                            prompt_ids=(
+                                trace_group_ids.unsqueeze(-1)
+                                if multi_trace
+                                else prompt_ids_for_adv
+                            ),
+                            rewards=rewards,
+                            mask=mask,
+                            repeated_batch=repeated_batch,
+                            logprobs_policy=train_data["prev_logprobs"],
+                            logprobs_reference=train_data.get(
+                                "reference_policy_logprobs"
+                            ),
+                            # OPD kwargs (ignored by non-OPD estimators via **kwargs)
+                            teacher_logprobs=trajectory_teacher_logprobs.to(
+                                train_data["prev_logprobs"].device
+                            )
+                            if trajectory_teacher_logprobs is not None
+                            else None,
+                            prev_logprobs=train_data["prev_logprobs"],
+                            generation_logprobs=train_data["generation_logprobs"],
+                            sample_mask=train_data["sample_mask"],
+                        )
                     if (
                         hasattr(adv_estimator, "last_metrics")
                         and adv_estimator.last_metrics
@@ -4255,6 +4544,17 @@ def async_grpo_train(
                         train_results = policy.train(
                             train_data,
                             loss_fn,
+                            # When the trace count differs from the legacy
+                            # expected batch size, train on the whole (padded)
+                            # batch as one global batch. Batches with the
+                            # legacy shape keep the configured
+                            # train_global_batch_size chunking.
+                            gbs=(
+                                train_data["input_ids"].shape[0]
+                                if multi_trace
+                                and num_unpadded_traces != expected_batch_size
+                                else None
+                            ),
                             timer=timer,
                         )
 
@@ -4339,7 +4639,8 @@ def async_grpo_train(
                         # Resume trajectory collection after validation
                         trajectory_collector.resume.remote()
                 # Get flat advantages and token mask for masked metrics computation
-                flat_advantages = train_data["advantages"]
+                # (slice off DP-padding rows added in multi-trace mode)
+                flat_advantages = train_data["advantages"][:num_unpadded_traces]
                 flat_token_mask = flat_messages["token_loss_mask"]
                 # Save content for logging before deleting flat_messages
                 flat_messages_content = flat_messages.get("content", [])
@@ -4352,7 +4653,9 @@ def async_grpo_train(
 
                 metrics = {
                     "loss": train_results["loss"].numpy(),
-                    "reward": rewards.numpy(),
+                    # Per-rollout rewards (identical to per-trace rewards when
+                    # each rollout has a single trace)
+                    "reward": rollout_rewards.numpy(),
                     "grad_norm": train_results["grad_norm"].numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
@@ -4400,6 +4703,65 @@ def async_grpo_train(
                     else:
                         metrics[k] = np.sum(v).item()
                 metrics.update(rollout_metrics)
+
+                # Multi-trace batch composition metrics (wandb: train/multi_trace/*)
+                if multi_trace:
+                    unpadded_sample_mask = train_data["sample_mask"][
+                        :num_unpadded_traces
+                    ]
+                    unpadded_rollout_ids = trace_rollout_ids[
+                        :num_unpadded_traces
+                    ].tolist()
+                    rollout_trace_counts: dict[int, int] = {}
+                    rollout_has_unmasked_trace: dict[int, bool] = {}
+                    for rollout_id, is_unmasked in zip(
+                        unpadded_rollout_ids,
+                        (unpadded_sample_mask > 0).tolist(),
+                    ):
+                        rollout_trace_counts[rollout_id] = (
+                            rollout_trace_counts.get(rollout_id, 0) + 1
+                        )
+                        rollout_has_unmasked_trace[rollout_id] = (
+                            rollout_has_unmasked_trace.get(rollout_id, False)
+                            or is_unmasked
+                        )
+                    multi_trace_rollout_count = max(len(rollout_trace_counts), 1)
+                    unpadded_trace_lengths = train_data["input_lengths"][
+                        :num_unpadded_traces
+                    ]
+                    metrics["multi_trace/num_traces"] = int(num_unpadded_traces)
+                    metrics["multi_trace/num_rollouts"] = len(
+                        rollout_trace_counts
+                    )
+                    metrics["multi_trace/traces_per_rollout_mean"] = (
+                        num_unpadded_traces / multi_trace_rollout_count
+                    )
+                    metrics["multi_trace/traces_per_rollout_max"] = max(
+                        rollout_trace_counts.values(), default=0
+                    )
+                    metrics["multi_trace/padding_rows"] = int(
+                        train_data["input_ids"].shape[0] - num_unpadded_traces
+                    )
+                    metrics["multi_trace/masked_trace_fraction"] = float(
+                        (unpadded_sample_mask <= 0).float().mean().item()
+                    )
+                    # Rollouts contributing zero gradient (all traces masked) —
+                    # dominated by agent timeouts / OOM / empty dumps.
+                    metrics["multi_trace/fully_masked_rollout_fraction"] = sum(
+                        1
+                        for has_unmasked_trace in rollout_has_unmasked_trace.values()
+                        if not has_unmasked_trace
+                    ) / multi_trace_rollout_count
+                    if zero_std_group_fraction is not None:
+                        metrics["multi_trace/zero_std_group_fraction"] = (
+                            zero_std_group_fraction
+                        )
+                    metrics["multi_trace/mean_trace_length"] = float(
+                        unpadded_trace_lengths.float().mean().item()
+                    )
+                    metrics["multi_trace/max_trace_length"] = int(
+                        unpadded_trace_lengths.max().item()
+                    )
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
@@ -4515,20 +4877,33 @@ def async_grpo_train(
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
                 log_data["content"] = flat_messages_content
-                log_data["rewards"] = rewards.tolist()
+                # Slice off DP-padding rows added in multi-trace mode.
+                log_data["rewards"] = rewards[:num_unpadded_traces].tolist()
                 if master_config.grpo["use_dynamic_sampling"]:
                     # In dynamic sampling, `rewards` corresponds to filtered rewards
-                    log_data["filtered_rewards"] = rewards.tolist()
+                    log_data["filtered_rewards"] = rewards[
+                        :num_unpadded_traces
+                    ].tolist()
                     log_data["rewards"] = repeated_batch["total_reward"].tolist()
                 log_data["input_lengths"] = input_lengths.tolist()
-                log_data["token_ids"] = train_data["input_ids"].tolist()
-                log_data["token_loss_mask"] = train_data["token_mask"].tolist()
-                log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
-                log_data["advantages"] = train_data["advantages"].tolist()
+                log_data["token_ids"] = train_data["input_ids"][
+                    :num_unpadded_traces
+                ].tolist()
+                log_data["token_loss_mask"] = train_data["token_mask"][
+                    :num_unpadded_traces
+                ].tolist()
+                log_data["sample_loss_mask"] = train_data["sample_mask"][
+                    :num_unpadded_traces
+                ].tolist()
+                log_data["advantages"] = train_data["advantages"][
+                    :num_unpadded_traces
+                ].tolist()
                 log_data["generation_logprobs"] = train_data[
                     "generation_logprobs"
+                ][:num_unpadded_traces].tolist()
+                log_data["prev_logprobs"] = train_data["prev_logprobs"][
+                    :num_unpadded_traces
                 ].tolist()
-                log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
                 logger.log_batched_dict_as_jsonl(
                     log_data, f"train_data_step{step + 1}.jsonl"
                 )
@@ -4579,7 +4954,7 @@ def async_grpo_train(
             if "draft_loss" in metrics:
                 print(f"  • Draft Loss: {metrics['draft_loss']:.4f}")
             print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
-            print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
+            print(f"  • Avg Reward: {np.mean(rollout_rewards.numpy()):.4f}")
             print(f"  • Buffer Size: {buffer_size_current}")
             print(f"  • Avg Trajectory Age: {avg_trajectory_age:.2f} steps")
 
