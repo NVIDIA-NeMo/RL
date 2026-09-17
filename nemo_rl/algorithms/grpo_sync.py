@@ -133,9 +133,9 @@ def _train_fields_for_step(skip_prev_logprobs: bool) -> tuple[str, ...]:
     )
 
 
-# ── DAPO non-zero-std dynamic sampling, slice-only ─────────────────────
+# ── DAPO non-trivial-reward dynamic sampling, slice-only ───────────────
 # Slice-only formulation of nemo_rl.algorithms.grpo.dynamic_sampling: filter
-# on std != 0, accumulate survivors across iterations, slice on overflow.
+# on exact reward variation, accumulate survivors across iterations, slice on overflow.
 # Bulk in TQ untouched except for clear_samples of dropped/discarded uids.
 
 
@@ -188,15 +188,17 @@ def _apply_dynamic_sampling(
     pending_unfiltered_rewards.append(driver_carry["total_reward"])
 
     # Filter input comes from ``meta.tags`` so the filter decision is
-    # meta-only — no tensor data needed. The driver mirrored ``std``
-    # into tags right after baseline/std compute.
+    # meta-only — no tensor data needed. The driver mirrored the exact
+    # trivial-distribution mask into tags after baseline/std computation.
     if meta.tags is None:
         raise ValueError(
             "_apply_dynamic_sampling: meta.tags is None — driver must "
-            "stamp 'std' into meta.tags before this call."
+            "stamp 'is_trivial_distribution' into meta.tags before this call."
         )
-    keep_idx = [i for i, t in enumerate(meta.tags) if t["std"] != 0.0]
-    drop_keys = [k for k, t in zip(meta.sample_ids, meta.tags) if t["std"] == 0.0]
+    keep_idx = [i for i, t in enumerate(meta.tags) if not t["is_trivial_distribution"]]
+    drop_keys = [
+        k for k, t in zip(meta.sample_ids, meta.tags) if t["is_trivial_distribution"]
+    ]
     if drop_keys:
         policy.discard_samples(drop_keys, meta.partition_id)
 
@@ -770,25 +772,28 @@ def grpo_train_sync(
                             master_config.grpo.reward_shaping,
                         )
                     (
-                        driver_carry["baseline"],
-                        driver_carry["std"],
-                        _,
+                        baseline,
+                        std,
+                        is_trivial_distribution,
                     ) = calculate_baseline_and_std_per_prompt(
                         driver_carry["prompt_ids_for_adv"],
                         driver_carry["total_reward"],
                         torch.ones_like(driver_carry["total_reward"]),
                         leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
                     )
+                    driver_carry["baseline"] = baseline
+                    driver_carry["std"] = std
                     # Mirror std onto meta so dynamic_sampling can filter
                     # without fetching tensor data.
                     meta.stamp_tags(
                         {
                             "std": driver_carry["std"].tolist(),
                             "baseline": driver_carry["baseline"].tolist(),
+                            "is_trivial_distribution": is_trivial_distribution.tolist(),
                         }
                     )
 
-                # ── Dynamic sampling (DAPO non-zero-std filter) ────────
+                # ── Dynamic sampling (DAPO reward-variation filter) ───
                 # Slice-only; bulk in TQ untouched except for clear_samples
                 # of dropped / overflow-discarded uids.
                 ds_metrics: dict = {}
