@@ -402,7 +402,10 @@ if [[ -n "${EXPECTED_SOURCE_SHA:-}" && "${SOURCE_SHA}" != "${EXPECTED_SOURCE_SHA
 fi
 SOURCE_STATE=$(git -C "${REPO}" submodule status --recursive)
 SOURCE_ID=$(printf '%s\n%s\n' "${SOURCE_SHA}" "${SOURCE_STATE}" | sha256sum | cut -c1-16)
-SOURCE_ARCHIVE_ROOT=${SOURCE_ARCHIVE_ROOT:-/home/${USER}/.cache/nemo-rl-source-archives}
+# Compute nodes do not necessarily share the login node's /home filesystem.
+# Keep one immutable tar on shared storage, then expand it into node-local
+# scratch so source files never create metadata traffic on Lustre at runtime.
+SOURCE_ARCHIVE_ROOT=${SOURCE_ARCHIVE_ROOT:-${RESULT_ROOT}/source-archives}
 SOURCE_ARCHIVE="${SOURCE_ARCHIVE_ROOT}/nemo-rl-${SOURCE_ID}.tar"
 
 if [[ "${ACTION}" == submit && ! -f "${SOURCE_ARCHIVE}" ]]; then

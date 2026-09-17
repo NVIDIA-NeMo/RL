@@ -16,6 +16,7 @@ touch "${TMP_ROOT}/container.sqsh" "${TMP_ROOT}/home/.netrc"
 cat > "${TMP_ROOT}/bin/sbatch" <<'EOF'
 #!/usr/bin/env bash
 printf 'COMMAND=%s\n' "${COMMAND:-}"
+printf 'SETUP_COMMAND=%s\n' "${SETUP_COMMAND:-}"
 printf '%s\n' "$@"
 EOF
 chmod +x "${TMP_ROOT}/bin/sbatch"
@@ -41,6 +42,7 @@ output=$(
 )
 
 grep -Fx -- '--dependency=afterok:12345' <<<"${output}" >/dev/null
+grep -F -- "${TMP_ROOT}/results/source-archives/nemo-rl-" <<<"${output}" >/dev/null
 grep -F -- 'resolve_slurm_cli_path()' "${REPO}/ray.sub" >/dev/null
 grep -F -- '/cm/local/apps/slurm/*/bin' "${REPO}/ray.sub" >/dev/null
 grep -F -- 'Unable to find srun, scontrol, and sinfo' "${REPO}/ray.sub" >/dev/null
