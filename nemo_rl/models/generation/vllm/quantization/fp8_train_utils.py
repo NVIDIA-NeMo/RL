@@ -17,6 +17,55 @@ import torch
 
 MXFP8_BLOCK_SIZE = 32
 MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
+MXFP8_SCALE_DTYPE = torch.uint8
+MXFP8_SCALE_SUFFIX = "_scale_from_checkpoint"
+
+
+def canonicalize_mxfp8_refit_output(
+    weight_shape: torch.Size | tuple[int, ...],
+    values: torch.Tensor,
+    scales: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Validate and normalize the MXFP8 refit wire representation.
+
+    Both trainer-side and vLLM receiver-side quantization produce this format:
+    E4M3 values retain the logical checkpoint shape, while E8M0 scale bytes use
+    one entry per 32 values along the final dimension. The scale tensor is sent
+    as the matching ``*_scale_from_checkpoint`` parameter.
+    """
+    shape = torch.Size(weight_shape)
+    if not shape or shape[-1] % MXFP8_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"MXFP8 requires a non-empty shape with the last dim divisible by "
+            f"{MXFP8_BLOCK_SIZE}, got {tuple(shape)}."
+        )
+    if values.shape != shape:
+        raise ValueError(
+            f"MXFP8 values must preserve weight shape {tuple(shape)}, got "
+            f"{tuple(values.shape)}."
+        )
+    if values.dtype != MXFP8_VALUE_DTYPE:
+        raise ValueError(
+            f"MXFP8 values must use {MXFP8_VALUE_DTYPE}, got {values.dtype}."
+        )
+    if scales.dtype != MXFP8_SCALE_DTYPE:
+        raise ValueError(
+            f"MXFP8 scales must use {MXFP8_SCALE_DTYPE}, got {scales.dtype}."
+        )
+
+    scale_shape = torch.Size((*shape[:-1], shape[-1] // MXFP8_BLOCK_SIZE))
+    expected_scales = scale_shape.numel()
+    if scales.numel() != expected_scales:
+        raise ValueError(
+            f"MXFP8 scales must contain {expected_scales} values for weight "
+            f"shape {tuple(shape)}, got {scales.numel()}."
+        )
+    scales = scales.reshape(scale_shape)
+    # An E8M0 byte of zero represents 2^-127. FlashInfer emits it for all-zero
+    # blocks, but TRTLLM does not accept it. Changing the scale to one preserves
+    # the represented zeros because every value in the block is zero.
+    scales = scales.masked_fill(scales == 0, 1)
+    return values, scales
 
 
 def _mxfp8_e4m3_quantize_torch(
@@ -86,13 +135,7 @@ def mxfp8_e4m3_quantize_for_refit(
                 x_scales = x_scales.view(x.size(0), -1)
     if x_q is None or x_scales is None:
         x_q, x_scales = _mxfp8_e4m3_quantize_torch(x)
-    x_scales = x_scales.reshape(*x.shape[:-1], x.shape[-1] // MXFP8_BLOCK_SIZE)
-    # Match the receiver path's zero-scale clamp: an E8M0 byte of 0 (2^-127)
-    # destabilizes the TRTLLM kernels, and pre-quantized tensors skip the
-    # receiver-side quantize branch where the clamp normally runs.
-    # pyrefly: ignore  # no-matching-overload
-    x_scales = x_scales.masked_fill(x_scales == 0, 1)
-    return x_q, x_scales
+    return canonicalize_mxfp8_refit_output(x.shape, x_q, x_scales)
 
 
 def get_vllm_qkv_scale_names(layer_idx: int) -> dict[str, str]:

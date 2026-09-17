@@ -38,6 +38,10 @@ from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
 from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
     pad_flashinfer_scale_k,
 )
+from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+    MXFP8_SCALE_SUFFIX,
+    canonicalize_mxfp8_refit_output,
+)
 from nemo_rl.models.generation.vllm.utils import is_grouped_moe_expert_weight_name
 from nemo_rl.models.generation.vllm.worker_utils import (
     refit_cache_loader_routes_enabled,
@@ -592,7 +596,6 @@ _GROUPED_EXPERT_WEIGHT_SUFFIXES = (
     "mlp.experts.gate_up_proj",
     "mlp.experts.down_proj",
 )
-_SCALE_FROM_CHECKPOINT_SUFFIX = "_scale_from_checkpoint"
 
 
 def _is_grouped_expert_weight(name: str) -> bool:
@@ -600,9 +603,9 @@ def _is_grouped_expert_weight(name: str) -> bool:
 
 
 def _grouped_expert_weight_name_from_scale(name: str) -> str | None:
-    if not name.endswith(_SCALE_FROM_CHECKPOINT_SUFFIX):
+    if not name.endswith(MXFP8_SCALE_SUFFIX):
         return None
-    weight_name = name.removesuffix(_SCALE_FROM_CHECKPOINT_SUFFIX)
+    weight_name = name.removesuffix(MXFP8_SCALE_SUFFIX)
     return weight_name if _is_grouped_expert_weight(weight_name) else None
 
 
@@ -649,9 +652,7 @@ def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
 
     value, scale = mxfp8_e4m3_quantize(weight)
     value = value.reshape(weight.shape)
-    scale = scale.reshape(*weight.shape[:-1], weight.shape[-1] // 32)
-    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
-    return value, scale
+    return canonicalize_mxfp8_refit_output(weight.shape, value, scale)
 
 
 def get_quantized_weight_iterator(
@@ -969,7 +970,7 @@ def _reroute_grouped_moe_expert_scale(
     if scale.ndim != 3:
         raise ValueError(f"Grouped MXFP8 scale {key!r} must be 3D, got {scale.ndim}D.")
 
-    weight_name = key.removesuffix(_SCALE_FROM_CHECKPOINT_SUFFIX)
+    weight_name = key.removesuffix(MXFP8_SCALE_SUFFIX)
     base, projection = weight_name.rsplit(".", 1)
     if projection == "down_proj":
         return [

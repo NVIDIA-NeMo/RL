@@ -2802,6 +2802,7 @@ class MegatronPolicyWorkerImpl(
 
         from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
             MXFP8_BLOCK_SIZE,
+            MXFP8_SCALE_SUFFIX,
         )
 
         self._refit_prequant_names = set(param_names)
@@ -2823,7 +2824,7 @@ class MegatronPolicyWorkerImpl(
                 )
             scale_shape = torch.Size((*shape[:-1], shape[-1] // MXFP8_BLOCK_SIZE))
             refit_param_info_hf[name] = (shape, torch.float8_e4m3fn)
-            refit_param_info_hf[name + "_scale_from_checkpoint"] = (
+            refit_param_info_hf[name + MXFP8_SCALE_SUFFIX] = (
                 scale_shape,
                 torch.uint8,
             )
@@ -2844,12 +2845,13 @@ class MegatronPolicyWorkerImpl(
         # Deferred: pulls in the heavy nemo_rl...generation.vllm package init,
         # which trainer workers only need when prequantized refit is enabled.
         from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+            MXFP8_SCALE_SUFFIX,
             mxfp8_e4m3_quantize_for_refit,
         )
 
         param_lp, param_scale = mxfp8_e4m3_quantize_for_refit(tensor)
         yield name, param_lp
-        yield name + "_scale_from_checkpoint", param_scale
+        yield name + MXFP8_SCALE_SUFFIX, param_scale
 
     async def update_weights_from_collective(
         self, refit_timeout_s: Optional[float] = None
