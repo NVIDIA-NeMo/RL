@@ -59,6 +59,7 @@ from nemo_rl.algorithms.reward_functions import (
 from nemo_rl.algorithms.utils import (
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
+    calculate_is_trivial_prompt_distribution,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_efficiency_summary,
@@ -1905,7 +1906,7 @@ def dynamic_sampling(
     master_config: MasterConfig,
     timer: Timer,
     batch_cache: BatchedDataDict[DatumSpec] = None,
-    is_trivial_distribution: torch.Tensor | None = None,
+    is_trivial_prompt_distribution: torch.Tensor | None = None,
 ) -> BatchedDataDict[DatumSpec]:
     """Implements the dynamic sampling algorithm to select prompts with non-zero standard deviation.
 
@@ -1926,9 +1927,10 @@ def dynamic_sampling(
         dynamic_sampling_num_gen_batches (int): Number of generation batches processed at the current step.
         master_config (MasterConfig): Configuration containing GRPO and policy settings.
         batch_cache (BatchedDataDict[DatumSpec], optional): Cache storing previously selected prompts with non-zero std.
-        is_trivial_distribution (torch.Tensor, optional): Exact-equality mask for each
-            sample's reward comparison set. When provided, trivial groups are
-            filtered even if floating-point roundoff produces a positive std.
+        is_trivial_prompt_distribution (torch.Tensor, optional): Exact-equality
+            mask for each sample's full prompt reward group. When provided,
+            trivial groups are filtered all-or-nothing even if floating-point
+            roundoff produces a positive std.
 
     Returns:
         tuple: A tuple containing:
@@ -1959,8 +1961,8 @@ def dynamic_sampling(
             # whether a prompt has useful reward variation.
             non_trivial_reward_mask = (
                 std != 0.0
-                if is_trivial_distribution is None
-                else ~is_trivial_distribution
+                if is_trivial_prompt_distribution is None
+                else ~is_trivial_prompt_distribution
             )
 
             keep_prompt_indices = torch.arange(
@@ -3297,6 +3299,15 @@ def _grpo_train_impl(
                         and "unshaped_total_reward" in repeated_batch
                         else None
                     )
+                    is_trivial_prompt_distribution = (
+                        calculate_is_trivial_prompt_distribution(
+                            input_ids,
+                            std_rewards if std_rewards is not None else rewards,
+                            torch.ones_like(rewards),
+                        )
+                        if master_config.grpo.use_dynamic_sampling
+                        else None
+                    )
                     if master_config.grpo.calculate_advantages_on_gpu:
                         print("Computing advantages on GPU!")
                         # Just fix the device id for now
@@ -3304,7 +3315,7 @@ def _grpo_train_impl(
                         (
                             baseline,
                             std,
-                            is_trivial_distribution,
+                            _,
                         ) = calculate_baseline_and_std_per_prompt(
                             input_ids.cuda(device_id),
                             rewards.cuda(device_id),
@@ -3318,12 +3329,11 @@ def _grpo_train_impl(
                         )
                         baseline = baseline.cpu()
                         std = std.cpu()
-                        is_trivial_distribution = is_trivial_distribution.cpu()
                     else:
                         (
                             baseline,
                             std,
-                            is_trivial_distribution,
+                            _,
                         ) = calculate_baseline_and_std_per_prompt(
                             input_ids,
                             rewards,
@@ -3342,7 +3352,9 @@ def _grpo_train_impl(
                             master_config,
                             timer,
                             batch_cache,
-                            is_trivial_distribution=is_trivial_distribution,
+                            is_trivial_prompt_distribution=(
+                                is_trivial_prompt_distribution
+                            ),
                         )
                     )
                     if ds_metrics:

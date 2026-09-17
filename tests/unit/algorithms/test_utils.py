@@ -27,6 +27,7 @@ from nemo_rl.algorithms.utils import (
     STEP_WINDOW_WALL_CLOCK_CATEGORIES,
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
+    calculate_is_trivial_prompt_distribution,
     get_tokenizer,
     maybe_pad_last_batch,
     print_efficiency_summary,
@@ -794,6 +795,18 @@ def test_calculate_baseline_and_std_per_prompt_marks_trivial_leave_one_out_set()
 
     torch.testing.assert_close(baseline[0], torch.tensor(0.95))
     assert is_trivial.tolist() == [True] + [False] * 7
+
+
+def test_calculate_is_trivial_prompt_distribution_uses_full_group():
+    """A mixed prompt is non-trivial for every row, independent of LOO peers."""
+    rewards = torch.tensor([0.0] + [0.95] * 7)
+    prompts = torch.zeros(8, 1, dtype=torch.long)
+
+    is_trivial = calculate_is_trivial_prompt_distribution(
+        prompts, rewards, torch.ones_like(rewards)
+    )
+
+    assert is_trivial.tolist() == [False] * 8
 
 
 def test_calculate_baseline_and_std_per_prompt_marks_trivial_from_std_rewards():
