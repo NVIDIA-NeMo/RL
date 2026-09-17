@@ -236,6 +236,12 @@ def validate_vllm_quantization_config(config: VllmConfig) -> None:
             "policy.generation.vllm_cfg.refit_prequantize is not supported with "
             "nccl_reshard; that transport owns its weight-format conversion."
         )
+    if refit_prequantize and vllm_cfg.get("refit_with_reload_api"):
+        raise ValueError(
+            "policy.generation.vllm_cfg.refit_prequantize is not supported with "
+            "refit_with_reload_api; prequantized refit uses receiver scale names "
+            "that are not accepted by vLLM's native reload path."
+        )
     for field in ("refit_cache_loader_routes",):
         value = vllm_cfg.get(field)
         if value is not None and not isinstance(value, bool):

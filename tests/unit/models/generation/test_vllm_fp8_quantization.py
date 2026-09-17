@@ -2408,6 +2408,28 @@ def test_mxfp8_reload_iterator_emits_upstream_checkpoint_names(fp8_module, monke
     assert quantized[1][1].dtype == torch.uint8
 
 
+def test_quantized_weight_iterator_consumes_source_lazily(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    consumed = []
+
+    def source_weights():
+        for name in ("model.embed_tokens.weight", "model.norm.weight"):
+            consumed.append(name)
+            yield name, torch.zeros(1)
+
+    fp8.global_fp8_config = fp8.FP8Config()
+    monkeypatch.setattr(fp8, "_is_fp8_weight", lambda _name, _model: False)
+    iterator = fp8.get_quantized_weight_iterator(
+        source_weights(),
+        types.SimpleNamespace(model=object()),
+        refit_with_reload_api=True,
+    )
+
+    assert consumed == []
+    assert next(iterator)[0] == "model.embed_tokens.weight"
+    assert consumed == ["model.embed_tokens.weight"]
+
+
 @pytest.mark.parametrize("is_deepseek_v4", [False, True])
 @pytest.mark.parametrize("change_layout", ["none", "dtype", "shape"])
 def test_process_fp8_moe_preserves_storage_and_loaders(
