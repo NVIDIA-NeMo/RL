@@ -59,7 +59,8 @@ def canonicalize_mxfp8_refit_output(
             f"MXFP8 scales must use {MXFP8_SCALE_DTYPE}, got {scales.dtype}."
         )
 
-    values = values.reshape(shape)
+    if values.shape != shape:
+        values = values.reshape(shape)
     scale_shape = torch.Size((*shape[:-1], shape[-1] // MXFP8_BLOCK_SIZE))
     expected_scales = scale_shape.numel()
     if scales.numel() != expected_scales:
