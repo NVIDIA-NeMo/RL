@@ -4,10 +4,11 @@
 # (gold_loss=true, xtoken_loss=true). `teachers:` is a list — append more
 # entries for multi-teacher distillation (Llama-3.2-3B second-teacher
 # example follows the first entry below). Each teacher carries its own
-# `projection_matrix_path` (null => same-tokenizer teacher: direct KL, no
-# projection / no alignment) and `weight`. Override the model names,
-# tokenizers, projection paths, and data_files via Hydra CLI for other pairs,
-# e.g. teachers.0.projection_matrix_path=/path/to/projection_matrix.pt
+# `aligner` block and `weight`; a null `aligner.projection_matrix_path` marks a
+# same-tokenizer teacher (direct KL, no projection / no alignment). Override the
+# model names, tokenizers, projection paths, and data_files via Hydra CLI for
+# other pairs, e.g.
+# teachers.0.aligner.projection_matrix_path=/path/to/projection_matrix.pt
 
 defaults: distillation_math.yaml
 
@@ -21,9 +22,9 @@ distillation:
   val_at_end: false
 
 loss_fn:
-  # NOTE: the per-(student, teacher) projection matrix path now lives on each
-  # `teachers[i].projection_matrix_path` (see below), not here. The knobs in
-  # this block are shared across all teachers.
+  # NOTE: the per-(student, teacher) projection matrix path now lives at
+  # `teachers[i].aligner.projection_matrix_path` (see below), not here. The
+  # knobs in this block are shared across all teachers.
   # See docs/guides/xtoken-off-policy-distillation.md for how to produce the
   # projection file.
   # Loss-mode selection (shared default; override per teacher via
@@ -140,12 +141,15 @@ teacher: null
 # One entry per teacher. Add more list items for multi-teacher distillation.
 teachers:
   - model_name: "microsoft/Phi-4-mini-instruct"
-    # ---- per-teacher cross-tokenizer knobs ----
-    # projection_matrix_path: this teacher's student->teacher projection .pt.
-    # null => same-tokenizer teacher (direct KL, no projection / no alignment).
-    # Override per run, e.g.
-    #   teachers.0.projection_matrix_path=/path/to/projection_matrix.pt
-    projection_matrix_path: null
+    # ---- per-teacher aligner knobs ----
+    aligner:
+      # This teacher's student->teacher projection .pt. null => same-tokenizer
+      # teacher (direct KL, no projection / no alignment). Override per run:
+      # teachers.0.aligner.projection_matrix_path=/path/to/projection_matrix.pt
+      projection_matrix_path: null
+      # In chat mode, drop the opener content pair from this teacher's KD
+      # alignment. The CE token mask is unaffected.
+      drop_first_assistant_chunk_kl: false
     weight: 1.0                  # static loss weight in kd_loss_mode=sum
     # gold_loss / xtoken_loss (optional): per-teacher overrides of the loss_fn
     gold_loss: true
@@ -201,10 +205,12 @@ teachers:
   # wholesale on merge, so a recipe that wants multiple teachers must restate
   # the whole list (see the multi-teacher nightly recipe under
   # examples/configs/recipes/llm/). Example second teacher — Llama-3.2-3B, same
-  # tokenizer as the student => same-vocab direct KL (projection_matrix_path: null,
-  # no alignment). Uncomment to enable:
+  # tokenizer as the student => same-vocab direct KL
+  # (aligner.projection_matrix_path: null, no alignment). Uncomment to enable:
   - model_name: "meta-llama/Llama-3.2-3B"
-    projection_matrix_path: null
+    aligner:
+      projection_matrix_path: null
+      drop_first_assistant_chunk_kl: false
     weight: 1.0
     tokenizer:
       name: "meta-llama/Llama-3.2-3B"
