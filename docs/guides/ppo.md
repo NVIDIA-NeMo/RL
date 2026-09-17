@@ -102,7 +102,7 @@ value:
       data_parallel_sharding_strategy: "optim_grads_params"
 ```
 
-For a DTensor PPO recipe, see [ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp.yaml](../../examples/configs/recipes/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp.yaml).
+For a DTensor PPO recipe, see [ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp-dynbatch.yaml](../../examples/configs/recipes/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp-dynbatch.yaml).
 
 ## Generalized Advantage Estimation (GAE)
 
