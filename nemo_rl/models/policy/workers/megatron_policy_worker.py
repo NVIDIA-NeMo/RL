@@ -988,7 +988,7 @@ class MegatronPolicyWorkerImpl(
 
         When we use seq_logprob_error_threshold with seq_logprob_error_in_loss,
         we only have access to the global valid token count. After the full batch is computed.
-        
+
         Therefore, we need to normalize the gradient values by the global valid token count.
         All microbatches have now finished, so sum survivor counts over DP, broadcast them to
         every PP stage, and correct gradients before the optimizer clips them.
@@ -1013,7 +1013,7 @@ class MegatronPolicyWorkerImpl(
                 src=parallel_state.get_pipeline_model_parallel_last_rank(),
                 group=parallel_state.get_pipeline_model_parallel_group(),
             )
-        
+
         # counts is a tensor with 2 elements: [kept_seqs, kept_toks]
         kept_seqs, kept_toks = counts
         if kept_toks.item() == 0 and not eval_mode:

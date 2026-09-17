@@ -487,11 +487,11 @@ def _validate_seq_logprob_error_in_loss(master_config: MasterConfig) -> None:
             "without use_kl_in_reward"
         )
     policy = master_config.policy
-    if not policy["megatron_cfg"]["enabled"]:
+    if "megatron_cfg" not in policy or not policy["megatron_cfg"]["enabled"]:
         raise ValueError("grpo.seq_logprob_error_in_loss requires the Megatron backend")
     if (
         policy["megatron_cfg"].get("mtp_num_layers")
-        or policy["draft"]["enabled"]
+        or ("draft" in policy and policy["draft"]["enabled"])
         or loss.positive_example_nll_weight != 0
         or opd_module.is_opd_enabled(master_config)
     ):
@@ -3632,9 +3632,13 @@ def _grpo_train_impl(
                     del logprob_data
                     del extra_multimodal_data
 
-                # Seq-level logprob error metrics/masking require real prev_logprobs
+                # Separate-pass seq-level metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
-                    # Cannot compute seq-level metrics with placeholder prev_logprobs
+                    # In-loss filtering reports counts through all_mb_metrics.
+                    # Use {} so placeholder zeros cannot overwrite those counts
+                    # when seq_logprob_error_metrics is merged after training.
+                    # Otherwise, placeholder prev_logprobs cannot provide
+                    # sequence-error metrics.
                     seq_logprob_error_metrics = (
                         {}
                         if master_config.grpo.seq_logprob_error_in_loss
@@ -5431,9 +5435,13 @@ def async_grpo_train(
                             train_data["prev_logprobs"]
                         )
 
-                # Seq-level logprob error metrics/masking require real prev_logprobs
+                # Separate-pass seq-level metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
-                    # Cannot compute seq-level metrics with placeholder prev_logprobs
+                    # In-loss filtering reports counts through all_mb_metrics.
+                    # Use {} so placeholder zeros cannot overwrite those counts
+                    # when seq_logprob_error_metrics is merged after training.
+                    # Otherwise, placeholder prev_logprobs cannot provide
+                    # sequence-error metrics.
                     seq_logprob_error_metrics = (
                         {}
                         if master_config.grpo.seq_logprob_error_in_loss

@@ -154,6 +154,40 @@ def test_rejected_nonfinite_logprobs_do_not_poison_loss(bad_value):
     assert metrics["seq_logprob_error_valid_tokens"] == 4
 
 
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("poison", ["policy", "reference"])
+def test_rejected_nonfinite_logprobs_stay_contained_under_reference_kl(
+    bad_value: float, poison: str
+) -> None:
+    """The KL term must not resurrect a rejected sequence's nonfinite logprob."""
+    data, values = _batch()
+    if poison == "policy":
+        values[1, :2] = bad_value
+    else:
+        data["reference_policy_logprobs"][1, 1:3] = bad_value
+    lp = values.requires_grad_()
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            force_on_policy_ratio=True,
+            token_level_loss=True,
+            reference_policy_kl_penalty=0.1,
+        ),
+        seq_logprob_error_threshold=2.0,
+    )
+    loss, metrics = loss_fn(
+        next_token_logprobs=lp,
+        data=data,
+        global_valid_seqs=torch.tensor(3.0),
+        global_valid_toks=torch.tensor(6.0),
+    )
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(lp.grad).all()
+    assert torch.count_nonzero(lp.grad[1]) == 0
+    assert math.isfinite(metrics["kl_penalty"])
+    assert metrics["seq_logprob_error_valid_tokens"] == 4
+
+
 def test_sequence_error_uses_only_loss_tokens_and_preserves_threshold_boundary():
     policy = torch.zeros(3, 3, requires_grad=True)
     generation = torch.tensor(
@@ -239,7 +273,7 @@ def test_packed_loss_preserves_sequence_decisions_and_survivor_counts():
     wrapper = SequencePackingLossWrapper(
         loss_fn=loss_fn,
         prepare_fn=prepare_logprobs,
-        cu_seqlens_q=(0, 4, 7, 9, 13),
+        cu_seqlens_q=torch.tensor([0, 4, 7, 9, 13]),
     )
     loss, metrics = wrapper(
         next_token_logits=stream,

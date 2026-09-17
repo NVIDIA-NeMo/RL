@@ -274,8 +274,10 @@ def assert_prev_logprobs_available(master_config: Any) -> None:
     if is_opd_enabled(master_config) and _skip_prev_logprobs(master_config):
         raise ValueError(
             "adv_estimator='opd' requires real prev_logprobs, but the config zeros them "
-            "(loss_fn.force_on_policy_ratio=True with grpo.seq_logprob_error_threshold unset). "
-            "Set seq_logprob_error_threshold or disable force_on_policy_ratio."
+            "(loss_fn.force_on_policy_ratio=True with either "
+            "grpo.seq_logprob_error_threshold unset or grpo.seq_logprob_error_in_loss=True). "
+            "Set seq_logprob_error_threshold and disable seq_logprob_error_in_loss, "
+            "or disable force_on_policy_ratio."
         )
 
 
