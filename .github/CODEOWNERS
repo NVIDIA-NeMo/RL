@@ -1,4 +1,13 @@
 # Order is important: later matches have higher precedence
+#
+# Non-blocking reviewer suggestions can be added alongside the enforced
+# rules below with a `# suggest: <path-pattern> @user-or-team ...` comment
+# line, using the same path-pattern syntax. GitHub's own CODEOWNERS parser
+# ignores comment lines, so a `# suggest:` entry can never become a
+# required reviewer no matter what branch protection does -- it's requested
+# automatically (visible in the Reviewers sidebar) on top of whatever's
+# already enforced, via .github/workflows/suggest-reviewers.yml. None are
+# defined yet; add one under the relevant enforced rule when useful.
 
 # List of reviewer teams
 # @nvidia-nemo/rl_reviewers_algo
