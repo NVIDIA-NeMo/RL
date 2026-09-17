@@ -797,6 +797,8 @@ class MegatronPolicyWorkerImpl(
         self.model_slices_context_parallel_inputs = (
             _model_slices_context_parallel_inputs(self.model)
         )
+        mtp_num_layers = self._get_model_config().mtp_num_layers
+        self.mtp_enabled = mtp_num_layers is not None and mtp_num_layers > 0
         # A media placeholder is an ordinary vocabulary entry, so text that
         # legitimately contains it must not be read as an anchor demanding a
         # projected feature. Only models that accept the mask are sent one.
@@ -1052,10 +1054,11 @@ class MegatronPolicyWorkerImpl(
 
                 # Pre-compute the MTP loss mask, only when MTP is enabled, so
                 # process_microbatch can pack it.
-                model_config = self._get_model_config()
-                mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
-                mtp_enabled = mtp_num_layers is not None and mtp_num_layers > 0
-                if mtp_enabled and "token_mask" in batch and "sample_mask" in batch:
+                if (
+                    self.mtp_enabled
+                    and "token_mask" in batch
+                    and "sample_mask" in batch
+                ):
                     mtp_loss_mask = batch["token_mask"] * batch[
                         "sample_mask"
                     ].unsqueeze(-1)
@@ -1077,6 +1080,7 @@ class MegatronPolicyWorkerImpl(
                     delegate_pack_to_model=self.delegate_pack_to_model,
                     delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
                     model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+                    mtp_enabled=self.mtp_enabled,
                 )
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
@@ -1118,7 +1122,7 @@ class MegatronPolicyWorkerImpl(
                     self._set_mtp_grad_scale_func(lambda: mtp_scale)
 
                     # Forward pass.
-                    draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
+                    draft_enabled = "draft" in self.cfg and self.cfg["draft"].enabled
                     use_router_replay = _should_use_router_replay(
                         enabled=self._router_replay_enabled,
                         data=batch,
@@ -1139,6 +1143,7 @@ class MegatronPolicyWorkerImpl(
                             global_valid_toks=global_valid_toks,
                             sampling_params=self.sampling_params,
                             straggler_timer=self.mcore_state.straggler_timer,
+                            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
                             draft_model=self.draft_model,
                             enable_hidden_capture=draft_enabled,
                             use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
@@ -1425,8 +1430,7 @@ class MegatronPolicyWorkerImpl(
             metric_normalizations = {}
 
         model_config = self._get_model_config()
-        mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
-        mtp_enabled = mtp_num_layers is not None and mtp_num_layers > 0
+        mtp_enabled = self.mtp_enabled
         mtp_detach_heads = bool(getattr(model_config, "mtp_detach_heads", False))
         mtp_loss_scaling_factor = getattr(model_config, "mtp_loss_scaling_factor", 0.1)
         loss_type = getattr(loss_fn, "loss_type", LossType.TOKEN_LEVEL)
@@ -1448,7 +1452,7 @@ class MegatronPolicyWorkerImpl(
                 "policy.megatron_cfg.mtp_detach_heads=True on the SingleController "
                 "split training path because the MTP auxiliary gradient must be "
                 "normalized by valid tokens independently of the main loss. "
-                f"Got loss_type={loss_type}, mtp_num_layers={mtp_num_layers}, "
+                f"Got loss_type={loss_type}, mtp_num_layers={model_config.mtp_num_layers}, "
                 f"mtp_loss_scaling_factor={mtp_loss_scaling_factor}."
             )
 
@@ -1733,6 +1737,7 @@ class MegatronPolicyWorkerImpl(
             delegate_pack_to_model=self.delegate_pack_to_model,
             delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+            mtp_enabled=self.mtp_enabled,
         )
         state["total_num_microbatches"] += int(num_microbatches)
 
@@ -1750,7 +1755,7 @@ class MegatronPolicyWorkerImpl(
         # hooks. The 1/N rescale happens once at finish.
         placeholder_n = torch.tensor(1.0, device="cuda")
 
-        draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
+        draft_enabled = "draft" in self.cfg and self.cfg["draft"].enabled
         use_router_replay = _should_use_router_replay(
             enabled=self._router_replay_enabled,
             data=data,
@@ -1779,6 +1784,7 @@ class MegatronPolicyWorkerImpl(
                     global_valid_toks=placeholder_n,
                     sampling_params=self.sampling_params,
                     straggler_timer=self.mcore_state.straggler_timer,
+                    model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
                     draft_model=self.draft_model,
                     enable_hidden_capture=draft_enabled,
                     use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
@@ -2173,6 +2179,7 @@ class MegatronPolicyWorkerImpl(
             delegate_pack_to_model=self.delegate_pack_to_model,
             delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+            mtp_enabled=self.mtp_enabled,
         )
 
         use_fused_linear_logprobs = self.cfg["megatron_cfg"].get(
@@ -2202,6 +2209,7 @@ class MegatronPolicyWorkerImpl(
                 defer_fp32_logits=self.defer_fp32_logits,
                 sampling_params=self.sampling_params,
                 straggler_timer=self.mcore_state.straggler_timer,
+                model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
                 use_router_replay=use_router_replay,
                 router_replay_train=False,
@@ -2417,6 +2425,7 @@ class MegatronPolicyWorkerImpl(
             delegate_pack_to_model=self.delegate_pack_to_model,
             delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+            mtp_enabled=self.mtp_enabled,
         )
 
         list_of_outputs = megatron_forward_backward(
@@ -2435,6 +2444,7 @@ class MegatronPolicyWorkerImpl(
             defer_fp32_logits=self.defer_fp32_logits,
             sampling_params=self.sampling_params,
             straggler_timer=self.mcore_state.straggler_timer,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
             enable_opd_full_capture=(payload == "hidden_states"),
         )
 
@@ -2676,6 +2686,7 @@ class MegatronPolicyWorkerImpl(
             delegate_pack_to_model=self.delegate_pack_to_model,
             delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+            mtp_enabled=self.mtp_enabled,
         )
 
         list_of_outputs = megatron_forward_backward(
@@ -2689,6 +2700,7 @@ class MegatronPolicyWorkerImpl(
             defer_fp32_logits=self.defer_fp32_logits,
             sampling_params=self.sampling_params,
             straggler_timer=self.mcore_state.straggler_timer,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
         )
 
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
@@ -2902,8 +2914,7 @@ class MegatronPolicyWorkerImpl(
                 the model-parallel group, or None when unavailable (e.g. clip_grad == 0 or
                 mtp_detach_heads=False). Logged under "mtp_metrics" as "grad_norm".
         """
-        mtp_num_layers = getattr(self.model.config, "mtp_num_layers", None)
-        if mtp_num_layers is not None and mtp_num_layers > 0:
+        if self.mtp_enabled:
             from nemo_rl.models.megatron.common import get_mtp_metrics
 
             # MTP layers live only on the last pipeline stage, so the tracker is
@@ -4250,35 +4261,33 @@ class MegatronPolicyWorkerImpl(
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/sync_params_before_refit")
     def sync_params_before_refit(self) -> None:
-        """Materialize optimizer updates before a refit reads model parameters."""
-        # With MXFP8 overlap, the optimizer updates FP32 master shards and the
-        # next parameter all-gather requantizes them into the model weights. A
-        # refit happens between optimizer steps, before that next training
-        # forward, so force the gather now. This both gives generation the
-        # latest weights and leaves hooks disabled while the shared param/grad
-        # buffer is held across refit. The normal train-step transition
-        # re-enables them.
-        # Deliberately conditional on the hooks being enabled. Every state in
-        # which they are already off is one where the weights are current
-        # anyway: before the first train step the buffer holds the checkpoint;
-        # eval entry already forced a sync via disable_forward_pre_hook(
-        # param_sync=True) and runs no optimizer step; a skipped step leaves the
-        # masters unchanged; and a successful step re-enables the hooks before
-        # returning. If a stale case is ever found, note that staging alone does
-        # NOT fix it - with reuse_grad_buf_for_mxfp8_param_ag param_data aliases
-        # grad_data, so zero_grad_buffer() wipes the parameters and
-        # _copy_main_params_to_param_buffer restores only this rank's shard,
-        # leaving every other DP rank at zero. Upstream pairs that staging with a
-        # following start_param_sync (DistributedOptimizer.
-        # prepare_model_params_for_param_sync); any fix needs the sync too.
+        """Materialize optimizer updates before a refit reads model parameters.
+
+        ``overlap_param_gather`` defers this work to the next training forward,
+        but refit reads the parameters first. Megatron-FSDP handles this in its
+        own module hooks and is intentionally not handled here.
+        """
         if (
-            self._uses_mxfp8_overlap_shared_param_buffer()
-            and self._forward_pre_hook_enabled()
+            not isinstance(self.model, DistributedDataParallel)
+            or not self.model.ddp_config.overlap_param_gather
+            or not self._forward_pre_hook_enabled()
         ):
-            # An in-flight async checkpoint may still read these tensors, so settle it
-            # before the explicit gather mutates the shared parameter buffer.
+            # Disabled hooks mean no optimizer update is waiting to be gathered.
+            return
+
+        if self._uses_mxfp8_overlap_shared_param_buffer():
+            # This path requantizes updated master shards into the shared buffer.
+            # Hold that buffer materialized until the next training step.
             self.finalize_async_save()
             self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
+            return
+
+        # BF16 master shards are already in the DDP parameter buffer; only the
+        # all-gather remains. Settle checkpoint reads before rewriting it.
+        self.finalize_async_save()
+        self.model.start_param_sync(force_sync=True)
+        # Ensure exporters cannot observe a partially gathered buffer.
+        torch.cuda.synchronize()
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
