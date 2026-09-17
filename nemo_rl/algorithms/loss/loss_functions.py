@@ -1953,8 +1953,9 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
             [V_student, top_k]) or the sparse multi-token format
             (dict[(student_id, teacher_id)] -> count), loaded lazily on first
             call by each worker process. Runtime-injected by
-            ``xtoken_off_policy_distillation.setup`` from ``teachers[i]``; not a
-            user loss_fn key in YAML.
+            ``xtoken_off_policy_distillation.setup`` from
+            ``teachers[i].aligner.projection_matrix_path``; not a user loss_fn
+            key in YAML.
         gold_loss: If True, switch to the gold-loss formulation: split the
             vocab into an exact-token-mapped *common* set (KL) and an
             *uncommon* set (sorted L1).

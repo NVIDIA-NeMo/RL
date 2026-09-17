@@ -36,11 +36,12 @@ from __future__ import annotations
 
 import math
 import os
+import warnings
 from typing import Any, NotRequired, Optional, TypedDict, cast
 
 import numpy as np
 import torch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
@@ -158,19 +159,33 @@ def _default_off_policy_distillation_save_state() -> OffPolicyDistillationSaveSt
     }
 
 
+class TeacherAlignerConfig(BaseModel, extra="allow"):
+    """Per-teacher token-alignment configuration.
+
+    Attributes:
+        projection_matrix_path: Path to this teacher's student-to-teacher
+            projection matrix. ``None`` marks a same-tokenizer teacher, which
+            bypasses projection and alignment and uses direct per-position KL.
+        drop_first_assistant_chunk_kl: Whether chat-mode alignment drops the
+            first content pair in each assistant message for this teacher. The
+            CE token mask is unaffected.
+    """
+
+    projection_matrix_path: Optional[str] = None
+    drop_first_assistant_chunk_kl: bool = False
+
+
 class TeacherConfig(BaseModel, extra="allow"):
     """Per-teacher config for multi-teacher cross-tokenizer distillation.
 
     Carries the full ``PolicyConfig`` content (``model_name``, ``tokenizer``,
     ``dtensor_cfg``, …) as permitted extras, plus the cross-tokenizer knobs
-    declared below. Use :meth:`policy_config` to recover the plain
-    ``PolicyConfig`` dict for ``Policy`` construction.
+    declared below. Alignment-specific settings live in the typed ``aligner``
+    block. Use :meth:`policy_config` to recover the plain ``PolicyConfig`` dict
+    for ``Policy`` construction.
 
     Attributes:
-        projection_matrix_path: Path to this teacher's student->teacher
-            projection matrix. ``None`` marks a *same-tokenizer* teacher:
-            projection and alignment are skipped and the loss uses a direct
-            per-position KL on the shared vocab.
+        aligner: This teacher's projection and chat-alignment settings.
         weight: Static loss weight for this teacher when several teachers are
             aggregated (``kd_loss_mode="sum"`` / the convex ``"averaged_logits"``
             mix). Single-teacher runs leave it at ``1.0``.
@@ -181,18 +196,69 @@ class TeacherConfig(BaseModel, extra="allow"):
             same semantics as ``gold_loss``.
     """
 
-    projection_matrix_path: Optional[str] = None
+    aligner: TeacherAlignerConfig = Field(default_factory=TeacherAlignerConfig)
     weight: float = 1.0
     gold_loss: Optional[bool] = None
     xtoken_loss: Optional[bool] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_projection_matrix_path(cls, value: Any) -> Any:
+        """Migrate the released root projection path into ``aligner``."""
+        if not isinstance(value, dict) or "projection_matrix_path" not in value:
+            return value
+
+        migrated = dict(value)
+        legacy_path = migrated.pop("projection_matrix_path")
+        if "aligner" not in migrated:
+            migrated["aligner"] = {"projection_matrix_path": legacy_path}
+        else:
+            raw_aligner = migrated["aligner"]
+            if isinstance(raw_aligner, TeacherAlignerConfig):
+                if (
+                    "projection_matrix_path" in raw_aligner.model_fields_set
+                    and raw_aligner.projection_matrix_path != legacy_path
+                ):
+                    raise ValueError(
+                        "conflicting projection matrix paths at "
+                        "teachers[i].projection_matrix_path and "
+                        "teachers[i].aligner.projection_matrix_path"
+                    )
+                aligner = raw_aligner.model_dump()
+                aligner["projection_matrix_path"] = legacy_path
+                migrated["aligner"] = aligner
+            elif isinstance(raw_aligner, dict):
+                aligner = dict(raw_aligner)
+                if (
+                    "projection_matrix_path" in aligner
+                    and aligner["projection_matrix_path"] != legacy_path
+                ):
+                    raise ValueError(
+                        "conflicting projection matrix paths at "
+                        "teachers[i].projection_matrix_path and "
+                        "teachers[i].aligner.projection_matrix_path"
+                    )
+                aligner["projection_matrix_path"] = legacy_path
+                migrated["aligner"] = aligner
+            else:
+                raise ValueError(
+                    "teachers[i].aligner must be a mapping when using the legacy "
+                    "teachers[i].projection_matrix_path field"
+                )
+
+        warnings.warn(
+            "teachers[i].projection_matrix_path is deprecated; use "
+            "teachers[i].aligner.projection_matrix_path instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        return migrated
 
     def policy_config(self) -> PolicyConfig:
         """Recover the plain ``PolicyConfig`` dict (cross-tokenizer knobs stripped)."""
         return cast(
             PolicyConfig,
-            self.model_dump(
-                exclude={"projection_matrix_path", "weight", "gold_loss", "xtoken_loss"}
-            ),
+            self.model_dump(exclude={"aligner", "weight", "gold_loss", "xtoken_loss"}),
         )
 
 
@@ -205,6 +271,20 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_shared_drop_first_assistant_chunk_kl(cls, value: Any) -> Any:
+        """Reject the unreleased shared spelling instead of ignoring it."""
+        if isinstance(value, dict):
+            data = value.get("data")
+            if isinstance(data, dict) and "drop_first_assistant_chunk_kl" in data:
+                raise ValueError(
+                    "data.drop_first_assistant_chunk_kl was replaced by the "
+                    "per-teacher "
+                    "teachers[i].aligner.drop_first_assistant_chunk_kl field"
+                )
+        return value
 
 
 # ===============================================================================
@@ -264,13 +344,14 @@ def setup(
     # validated against their projection matrix in the loss.
     student_vocab = len(student_tokenizer)
     for i, teacher in enumerate(teachers):
-        if teacher.projection_matrix_path is None:
+        if teacher.aligner.projection_matrix_path is None:
             assert len(teacher_tokenizers[i]) == student_vocab, (
-                f"teachers[{i}] has projection_matrix_path=null (same-vocab "
-                f"teacher) but its tokenizer vocab ({len(teacher_tokenizers[i])}) "
-                f"!= student vocab ({student_vocab}). A same-vocab teacher must "
-                "share the student tokenizer; set a projection_matrix_path to "
-                "run it as a cross-tokenizer teacher."
+                f"teachers[{i}].aligner.projection_matrix_path is null "
+                f"(same-vocab teacher) but its tokenizer vocab "
+                f"({len(teacher_tokenizers[i])}) != student vocab "
+                f"({student_vocab}). A same-vocab teacher must share the "
+                "student tokenizer; set aligner.projection_matrix_path to run "
+                "it as a cross-tokenizer teacher."
             )
 
     set_seed(distillation_config["seed"])
@@ -301,11 +382,11 @@ def setup(
     # no alignment — the loss does a direct per-position KL there).
     aligners: list[Optional[TokenAligner]] = [
         None
-        if teacher.projection_matrix_path is None
+        if teacher.aligner.projection_matrix_path is None
         else TokenAligner(
             student_tokenizer=student_tokenizer,
             teacher_tokenizer=teacher_tokenizers[i],
-            projection_matrix_path=teacher.projection_matrix_path,
+            projection_matrix_path=teacher.aligner.projection_matrix_path,
         )
         for i, teacher in enumerate(teachers)
     ]
@@ -320,11 +401,11 @@ def setup(
         make_seq_div_by_teachers=[
             tc["make_sequence_length_divisible_by"] for tc in teacher_configs
         ],
-        # Chat/instruct knobs; default to the raw-text path.
+        drop_first_assistant_chunk_kl_by_teacher=[
+            teacher.aligner.drop_first_assistant_chunk_kl for teacher in teachers
+        ],
+        # Shared chat/instruct knobs; default to the raw-text path.
         mode=data_config.get("collator_mode", "text"),
-        drop_first_assistant_chunk_kl=data_config.get(
-            "drop_first_assistant_chunk_kl", False
-        ),
         include_thinking_in_loss=data_config.get("include_thinking_in_loss", False),
         native_thinking_alignment=data_config.get("native_thinking_alignment", False),
         kd_alignment_regions=data_config.get("kd_alignment_regions", None),
@@ -480,7 +561,9 @@ def setup(
         **loss_config,
         "student_vocab_size": len(student_tokenizer),
         "teacher_vocab_sizes": [len(tok) for tok in teacher_tokenizers],
-        "projection_matrix_paths": [t.projection_matrix_path for t in teachers],
+        "projection_matrix_paths": [
+            teacher.aligner.projection_matrix_path for teacher in teachers
+        ],
         "teacher_weights": [t.weight for t in teachers],
         "teacher_gold_loss": [t.gold_loss for t in teachers],
         "teacher_xtoken_loss": [t.xtoken_loss for t in teachers],
