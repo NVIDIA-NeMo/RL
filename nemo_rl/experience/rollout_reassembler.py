@@ -45,7 +45,13 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 from nemo_rl.experience.payload import pack_payload
-from nemo_rl.experience.reward_penalties import RewardChecks, finalize_capture_reward
+from nemo_rl.experience.reward_penalties import (
+    CAPTURE_PENALTIES,
+    FinalizedReward,
+    RewardChecks,
+    RewardLogContext,
+    finalize_capture_reward,
+)
 from nemo_rl.experience.route_assembly import (
     ROUTE_MISSING_SENTINEL,
     RouteFragment,
@@ -98,6 +104,7 @@ class FinalizedGroup:
     staging_keys: list[str]
     canonical_output_tokens: int = 0
     metrics: dict[str, float] = field(default_factory=dict)
+    reward_observations: list[FinalizedReward] = field(default_factory=list)
     # True when the finalizer rejected the whole group as a structural outcome
     # (see drop_reason); the caller aborts the slot instead of committing it.
     # Policy decisions like a low valid-row fraction are no longer made here --
@@ -397,6 +404,7 @@ class RolloutReassembler:
         loss_multiplier: float = 1.0,
         canonical_sample_ids: Optional[list[str]] = None,
         reward_checks: Optional[list[RewardChecks | None]] = None,
+        reward_log_contexts: Optional[list[RewardLogContext | None]] = None,
     ) -> FinalizedGroup:
         """Publish exactly N canonical rows for one prompt group.
 
@@ -429,6 +437,14 @@ class RolloutReassembler:
         )
         assert len(checks_by_rollout) == len(rollout_ids), (
             "reward_checks must be one per rollout"
+        )
+        log_contexts = (
+            reward_log_contexts
+            if reward_log_contexts is not None
+            else [None] * len(rollout_ids)
+        )
+        assert len(log_contexts) == len(rollout_ids), (
+            "reward_log_contexts must be one per rollout"
         )
         _group_t0 = time.perf_counter()
         rows = [
@@ -468,14 +484,10 @@ class RolloutReassembler:
                 metrics[name] = metrics.get(name, 0.0) + value
         config = self._reward_penalty_config
         if config is not None:
-            for category, enabled in (
-                ("duplicated_reasoning", config.penalize_duplicated_reasoning),
-                ("empty_final_answer", config.penalize_empty_final_answer),
-                ("unwanted_token", config.penalize_unwanted_tokens),
-            ):
-                if enabled:
-                    metrics[f"finalize/penalty_count/{category}"] = float(
-                        sum(row.penalty_counts[category] for row in valid_rows)
+            for spec in CAPTURE_PENALTIES:
+                if spec.enabled(config):
+                    metrics[f"finalize/penalty_count/{spec.name}"] = float(
+                        sum(row.penalty_counts[spec.name] for row in valid_rows)
                     )
         # Ledger-derived admission counters (per group): each manifest row
         # carries its admission mode. token_in_rate near 1.0 is the capture
@@ -716,6 +728,13 @@ class RolloutReassembler:
                 int(mask) for row in valid_rows for mask in row.token_mask
             ),
             metrics=metrics,
+            reward_observations=[
+                FinalizedReward(sample_id, row.rollout_id, row.reward, context)
+                for sample_id, row, context in zip(
+                    canonical_sample_ids, rows, log_contexts
+                )
+                if row.valid
+            ],
             valid_row_count=len(valid_rows),
             total_row_count=len(rows),
         )

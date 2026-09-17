@@ -1402,7 +1402,9 @@ class TestPeriodicRolloutCheckpoint:
             SetupTimingMetrics(),
         )
 
-    @pytest.mark.parametrize("changed_setting", [None, "penalty", "effort"])
+    @pytest.mark.parametrize(
+        "changed_setting", [None, "penalty", "effort", "extras", "inactive"]
+    )
     def test_pre_step_snapshot_contains_only_rollout_state(
         self, tmp_path: Path, changed_setting
     ):
@@ -1435,7 +1437,7 @@ class TestPeriodicRolloutCheckpoint:
         state = torch.load(
             snapshot / ROLLOUT_RECOVERY_STATE_FILENAME, weights_only=True
         )
-        assert state["reward_settings"] == actor._capture_reward_settings()
+        assert state["reward_settings"] == actor._capture_reward_settings().to_state()
         actor._last_checkpoint_path = str(snapshot)
         actor._data_plane_checkpoint_metadata = actor._dp_client.save_calls[-1][
             "metadata"
@@ -1446,7 +1448,25 @@ class TestPeriodicRolloutCheckpoint:
             actor._master_config.env["nemo_gym"] = {
                 "effort_levels": {"low_weight": 1, "low_string": "budget"}
             }
-        if changed_setting:
+        elif changed_setting == "extras":
+            actor._master_config.reward_penalties = (
+                actor._master_config.reward_penalties.model_validate(
+                    {
+                        "experiment_note": "resume",
+                        "token_ids": {"unwanted": [42], "note": "unused"},
+                    }
+                )
+            )
+            actor._master_config.env["nemo_gym"] = {"effort_levels": {"note": "unused"}}
+        elif changed_setting == "inactive":
+            actor._master_config.env["nemo_gym"] = {
+                "effort_levels": {
+                    "low_weight": 0,
+                    "low_ub": 10,
+                    "low_string": "different",
+                }
+            }
+        if changed_setting in ("penalty", "effort"):
             with pytest.raises(ValueError, match="reward settings differ"):
                 asyncio.run(
                     actor._maybe_restore_rollout_recovery(restored_replay_groups=0)
@@ -1696,6 +1716,117 @@ class TestPeriodicRolloutCheckpoint:
         logged = actor._logger.log_metrics.call_args.args[0]
         assert logged["generation_counter_discontinuity"] == 1.0
         assert "generation_output_tokens_per_second" not in logged
+
+    def _saved_snapshot(self, actor, tmp_path: Path) -> Path:
+        try:
+            assert asyncio.run(actor._save_rollout_checkpoint(force=True))
+        finally:
+            actor._checkpointer.shutdown()
+        return (
+            tmp_path
+            / "checkpoints"
+            / BOOTSTRAP_DIRNAME
+            / "rollout_snapshots"
+            / "snapshot_000001"
+        )
+
+    def test_restore_rejects_legacy_schema_2_capture_sidecar(self, tmp_path: Path):
+        """A pre-reward-settings (schema 2) sidecar cannot be restored under capture."""
+        actor = self._actor(tmp_path)
+        snapshot = self._saved_snapshot(actor, tmp_path)
+        recovery_path = snapshot / ROLLOUT_RECOVERY_STATE_FILENAME
+        state = torch.load(recovery_path, weights_only=True)
+        state["schema_version"] = 2
+        del state["reward_settings"]
+        del state["finalizer_metrics_by_group"]
+        torch.save(state, recovery_path)
+        actor._last_checkpoint_path = str(snapshot)
+        actor._data_plane_checkpoint_metadata = {
+            **actor._dp_client.save_calls[-1]["metadata"],
+            "rollout_recovery_schema_version": 2,
+            "rollout_recovery_payload_sha256": hashlib.sha256(
+                recovery_path.read_bytes()
+            ).hexdigest(),
+        }
+        with pytest.raises(ValueError, match="unsupported legacy capture checkpoint"):
+            asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=0))
+
+    @pytest.mark.parametrize("checkpoint_kind", ["snapshot", "full"])
+    def test_snapshot_persists_and_restores_pending_finalizer_metrics(
+        self, tmp_path: Path, checkpoint_kind: str
+    ):
+        """Only canonical groups' pending statistics are saved; restore keeps them."""
+        from nemo_rl.experience.reward_penalties import (
+            FinalizedReward,
+            RewardLogContext,
+        )
+        from nemo_rl.experience.rollout_recovery import parse_rollout_recovery_state
+
+        actor = self._actor(tmp_path)
+        claimed_meta = KVBatchMeta(
+            partition_id=_PARTITION_ID,
+            task_name=None,
+            sample_ids=["claimed-group_g0"],
+            sequence_lengths=[16],
+            tags=[{"weight_version": 0}],
+        )
+        canonical_group = {
+            "meta": claimed_meta,
+            "start_weight": 0,
+            "end_weight": 0,
+            "target_step": 0,
+            "group_id": "claimed-group",
+        }
+        actor._buffer.training_claims = [canonical_group]
+        actor._dp_client.sample_ids = list(claimed_meta.sample_ids)
+        pending = {"finalize/reward_count": 1.0, "finalize/reward_sum": 2.0}
+        actor._finalizer_metrics_by_group = {
+            "claimed-group": dict(pending),
+            "unfinished-group": {"finalize/reward_count": 9.0},
+        }
+        observations = [
+            FinalizedReward(
+                "claimed-group_g0",
+                "physical-attempt",
+                2.0,
+                RewardLogContext("agent", '{"answer":"ok"}'),
+            )
+        ]
+        actor._finalizer_rewards_by_group = {
+            "claimed-group": observations,
+            "unfinished-group": [],
+        }
+        if checkpoint_kind == "snapshot":
+            snapshot = self._saved_snapshot(actor, tmp_path)
+        else:
+            actor._buffer.training_claims = []
+            actor._buffer._metadata_state["groups"] = [canonical_group]
+            actor._train_steps = 1
+            actor._trainer_version = 1
+            try:
+                asyncio.run(actor._save_checkpoint({}, is_policy_training_step=True))
+            finally:
+                actor._checkpointer.shutdown()
+            snapshot = tmp_path / "checkpoints" / "step_1"
+        state = torch.load(
+            snapshot / ROLLOUT_RECOVERY_STATE_FILENAME, weights_only=True
+        )
+        assert state["finalizer_metrics_by_group"] == {"claimed-group": pending}
+        assert parse_rollout_recovery_state(state).finalizer_rewards_by_group == {
+            "claimed-group": observations
+        }
+
+        actor._finalizer_metrics_by_group = {}
+        actor._finalizer_rewards_by_group = {}
+        actor._buffer.training_claims = []
+        actor._buffer._metadata_state["groups"] = [canonical_group]
+        actor._last_checkpoint_path = str(snapshot)
+        actor._data_plane_checkpoint_metadata = actor._dp_client.save_calls[-1][
+            "metadata"
+        ]
+        asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=1))
+        assert actor._finalizer_metrics_by_group == {"claimed-group": pending}
+        assert actor._finalizer_rewards_by_group == {"claimed-group": observations}
 
     def test_snapshot_reindexes_rows_owned_by_active_streamed_step(
         self, tmp_path: Path
@@ -2343,6 +2474,7 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._total_valid_tokens = 0
     actor._replacement_reserve = []
     actor._finalizer_metrics_by_group = {}
+    actor._finalizer_rewards_by_group = {}
     actor._async_cfg = SimpleNamespace(
         sampler=SimpleNamespace(name="in_order"),
         max_buffered_rollouts=4,

@@ -71,6 +71,7 @@ from typing import (
 import ray
 import torch
 from ray.exceptions import RayActorError
+from wandb import Table
 
 from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.async_utils.replay_buffer import (
@@ -143,7 +144,12 @@ from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lo
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
-from nemo_rl.experience.reward_penalties import aggregate_capture_reward_metrics
+from nemo_rl.experience.reward_penalties import (
+    CaptureRewardSettings,
+    FinalizedReward,
+    aggregate_capture_reward_metrics,
+    capture_reward_result_tables,
+)
 from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
@@ -154,7 +160,7 @@ from nemo_rl.experience.rollout_recovery import (
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
 )
-from nemo_rl.experience.rollouts import EffortLevelsConfig
+from nemo_rl.experience.rollouts import get_effort_config
 from nemo_rl.experience.route_plan import decode_route_plan
 from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
 from nemo_rl.models.generation.fleet_health import ShardState
@@ -164,7 +170,11 @@ from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.utils.checkpoint import CheckpointManager, PathLike
-from nemo_rl.utils.logger import TELEMETRY_WALL_TIME_METRIC, Logger
+from nemo_rl.utils.logger import (
+    TELEMETRY_WALL_TIME_METRIC,
+    Logger,
+    should_log_nemo_gym_full_result_tables,
+)
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 if TYPE_CHECKING:
@@ -309,6 +319,12 @@ class SingleControllerActor:
         self._partition_id: str = actor_args.partition_id
 
         self._master_config = master_config
+        self._log_full_result_tables = master_config.logger[
+            "wandb_enabled"
+        ] and should_log_nemo_gym_full_result_tables(
+            wandb_enabled=master_config.logger["wandb_enabled"],
+            wandb_config=master_config.logger["wandb"],
+        )
         self._algo_cfg = algo_config(master_config)
         self._async_cfg = master_config.async_rl
         self._is_ppo: bool = is_ppo_run(master_config)
@@ -373,6 +389,7 @@ class SingleControllerActor:
         self._finalizer_waiters = 0
         self._finalizer_unknown_outcomes = 0
         self._finalizer_metrics_by_group: dict[str, dict[str, float]] = {}
+        self._finalizer_rewards_by_group: dict[str, list[FinalizedReward]] = {}
         teacher_worker_groups = getattr(actor_args, "teacher_worker_groups", None) or {}
         if teacher_worker_groups:
             self._teacher_coordinator: Optional[
@@ -968,11 +985,14 @@ class SingleControllerActor:
             weights_only=True,
         )
         parsed_state = parse_rollout_recovery_state(state)
-        if (
-            self._master_config.token_capture.enabled
-            and state.get("reward_settings") != self._capture_reward_settings()
-        ):
-            raise ValueError("capture reward settings differ from the checkpoint")
+        current_reward_settings = self._capture_reward_settings()
+        if current_reward_settings is not None:
+            if parsed_state.reward_settings is None:
+                raise ValueError(
+                    "unsupported legacy capture checkpoint: reward_settings are missing; "
+                    "migration of older capture checkpoints is not supported"
+                )
+            parsed_state.reward_settings.require_compatible(current_reward_settings)
         if parsed_state.ledger_state["schema_version"] != expected_schema_version:
             raise ValueError(
                 "rollout recovery sidecar schema does not match native TQ metadata"
@@ -1000,6 +1020,11 @@ class SingleControllerActor:
             self._finalizer_metrics_by_group = {
                 group_id: metrics
                 for group_id, metrics in parsed_state.finalizer_metrics_by_group.items()
+                if group_id in canonical_group_ids
+            }
+            self._finalizer_rewards_by_group = {
+                group_id: rows
+                for group_id, rows in parsed_state.finalizer_rewards_by_group.items()
                 if group_id in canonical_group_ids
             }
             if self._master_config.token_capture.enabled:
@@ -1710,6 +1735,9 @@ class SingleControllerActor:
                     )
                     self._finalizer_metrics_by_group[request.group_id] = dict(
                         finalized.metrics
+                    )
+                    self._finalizer_rewards_by_group[request.group_id] = list(
+                        finalized.reward_observations
                     )
                     committed = True
         finally:
@@ -2524,6 +2552,7 @@ class SingleControllerActor:
             consumed_training_claim_ids: list[str] = []
             consumed_group_count = 0
             step_finalizer_metrics: dict[str, list[float]] = {}
+            step_finalizer_rewards: list[FinalizedReward] = []
             step_finalizer_group_ids: set[str] = set()
 
             with self._timer.time("total_step_time"):
@@ -2646,6 +2675,9 @@ class SingleControllerActor:
                             if group_id in step_finalizer_group_ids:
                                 continue
                             step_finalizer_group_ids.add(group_id)
+                            step_finalizer_rewards.extend(
+                                self._finalizer_rewards_by_group.get(group_id, [])
+                            )
                             for name, value in self._finalizer_metrics_by_group.get(
                                 group_id, {}
                             ).items():
@@ -2888,6 +2920,7 @@ class SingleControllerActor:
                     self._buffer.release_training_claims(consumed_training_claim_ids)
                     for group_id in step_finalizer_group_ids:
                         self._finalizer_metrics_by_group.pop(group_id, None)
+                        self._finalizer_rewards_by_group.pop(group_id, None)
                 for _ in range(consumed_group_count):
                     self._buffer_capacity.release()
                 step_metrics.update(
@@ -2917,8 +2950,15 @@ class SingleControllerActor:
                     aggregate_rollout_metrics(per_group_rollout_metrics)
                 )
                 step_metrics.update(
-                    aggregate_capture_reward_metrics(step_finalizer_metrics)
+                    aggregate_capture_reward_metrics(
+                        step_finalizer_metrics, step_finalizer_rewards
+                    )
                 )
+                if self._log_full_result_tables:
+                    for name, data in capture_reward_result_tables(
+                        step_finalizer_rewards
+                    ).items():
+                        step_metrics[name] = Table(data=data, columns=["Full result"])
                 try:
                     step_metrics.update(
                         await asyncio.to_thread(self._gen.get_step_metrics)
@@ -3784,18 +3824,14 @@ class SingleControllerActor:
         )
         return len(stale_tasks)
 
-    def _capture_reward_settings(self) -> dict[str, Any] | None:
+    def _capture_reward_settings(self) -> CaptureRewardSettings | None:
         """Save run-scoped settings once, alongside raw captured rewards."""
         if not self._master_config.token_capture.enabled:
             return None
-        gym = self._master_config.env.get("nemo_gym")
-        effort = gym.get("effort_levels") if gym is not None else None
-        return {
-            "penalties": self._master_config.reward_penalties.model_dump(),
-            "effort": EffortLevelsConfig.model_validate(effort).model_dump()
-            if effort is not None
-            else None,
-        }
+        return CaptureRewardSettings.from_configs(
+            self._master_config.reward_penalties,
+            get_effort_config(self._master_config.env),
+        )
 
     async def _capture_rollout_checkpoint_cut(
         self,
@@ -3821,23 +3857,16 @@ class SingleControllerActor:
             len(group["meta"].sample_ids) for group in replay_metadata["groups"]
         )
 
-        recovery_state = self._rollout_manager.recovery_ledger.state_dict()
-        recovery_state["reward_settings"] = self._capture_reward_settings()
-        recovery_state["batch_shortfall"] = self._batch_shortfall.copy()
-        recovery_state["sampler_stamps_target_steps"] = (
-            self._sampler_stamps_target_steps
-        )
         canonical_group_ids = {group["group_id"] for group in replay_metadata["groups"]}
-        recovery_state["finalizer_metrics_by_group"] = {
-            group_id: dict(metrics)
-            for group_id, metrics in self._finalizer_metrics_by_group.items()
-            if group_id in canonical_group_ids
-        }
-        recovery_state["groups"] = [
-            group
-            for group in recovery_state["groups"]
-            if group["group_id"] not in canonical_group_ids
-        ]
+        recovery_state = build_rollout_recovery_state(
+            self._rollout_manager.recovery_ledger,
+            batch_shortfall=self._batch_shortfall,
+            sampler_stamps_target_steps=self._sampler_stamps_target_steps,
+            finalizer_metrics_by_group=self._finalizer_metrics_by_group,
+            finalizer_rewards_by_group=self._finalizer_rewards_by_group,
+            reward_settings=self._capture_reward_settings(),
+            canonical_group_ids=canonical_group_ids,
+        )
         payload_buffer = io.BytesIO()
         await asyncio.to_thread(torch.save, recovery_state, payload_buffer)
         recovery_payload = payload_buffer.getvalue()
@@ -4489,19 +4518,14 @@ class SingleControllerActor:
                         batch_shortfall=self._batch_shortfall,
                         sampler_stamps_target_steps=(self._sampler_stamps_target_steps),
                         finalizer_metrics_by_group=self._finalizer_metrics_by_group,
-                    )
-                    rollout_recovery_state["reward_settings"] = (
-                        self._capture_reward_settings()
-                    )
-                    if replay_metadata is not None:
-                        canonical_group_ids = {
+                        finalizer_rewards_by_group=self._finalizer_rewards_by_group,
+                        reward_settings=self._capture_reward_settings(),
+                        canonical_group_ids={
                             group["group_id"] for group in replay_metadata["groups"]
                         }
-                        rollout_recovery_state["groups"] = [
-                            group
-                            for group in rollout_recovery_state["groups"]
-                            if group["group_id"] not in canonical_group_ids
-                        ]
+                        if replay_metadata is not None
+                        else set(),
+                    )
                     payload_buffer = io.BytesIO()
                     await asyncio.to_thread(
                         torch.save,

@@ -22,7 +22,7 @@ import ray
 import torch
 
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
-from nemo_rl.experience.reward_penalties import RewardChecks
+from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup, RolloutReassembler
 from nemo_rl.utils.venvs import make_actor_runtime_env
 
@@ -73,6 +73,7 @@ class ReassemblyRequest:
     # Dataset-level loss weight shared by every completion in this prompt group.
     loss_multiplier: float = 1.0
     reward_checks: tuple[RewardChecks | None, ...] | None = None
+    reward_log_contexts: tuple[RewardLogContext | None, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -183,6 +184,9 @@ class RolloutReassemblerActor:  # pragma: no cover
             canonical_sample_ids=list(request.canonical_sample_ids),
             reward_checks=list(request.reward_checks)
             if request.reward_checks is not None
+            else None,
+            reward_log_contexts=list(request.reward_log_contexts)
+            if request.reward_log_contexts is not None
             else None,
         )
         assert_metadata_only(result)

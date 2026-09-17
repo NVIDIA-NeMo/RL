@@ -14,13 +14,18 @@
 
 """Capture reward parity with the standard path, without token decoding."""
 
+import json
 from itertools import product
 
 import pytest
 
 from nemo_rl.algorithms.grpo import RewardPenaltyConfig
 from nemo_rl.experience.reward_penalties import (
+    CaptureRewardSettings,
+    FinalizedReward,
+    RewardLogContext,
     aggregate_capture_reward_metrics,
+    capture_reward_result_tables,
     compute_reward_checks,
     finalize_capture_reward,
     has_duplicated_reasoning,
@@ -258,3 +263,182 @@ def test_active_effort_requires_positive_bound(bound):
         EffortLevelsConfig(low_weight=0, low_string="budget", low_ub=bound).low_ub
         == bound
     )
+
+
+def test_metric_pooling_single_row_reports_nan_stddev_and_no_disabled_keys():
+    import math
+
+    metrics = aggregate_capture_reward_metrics(
+        {
+            "finalize/reward_count": [1.0],
+            "finalize/reward_sum": [2.0],
+            "finalize/reward_sumsq": [4.0],
+            "finalize/reward_min": [2.0],
+            "finalize/reward_max": [2.0],
+        }
+    )
+    assert math.isnan(metrics.pop("total_reward/stddev"))
+    assert metrics == {
+        "finalize/reward_count": 1.0,
+        "total_reward/mean": 2.0,
+        "total_reward/min": 2.0,
+        "total_reward/max": 2.0,
+    }
+
+
+def test_metric_pooling_mixes_low_and_high_effort_groups():
+    metrics = aggregate_capture_reward_metrics(
+        {
+            "finalize/reward_count": [2.0, 1.0],
+            "finalize/reward_sum": [3.0, 1.0],
+            "finalize/reward_sumsq": [5.0, 1.0],
+            "finalize/reward_min": [1.0, 1.0],
+            "finalize/reward_max": [2.0, 1.0],
+            # Group 0: two low rows (lengths 100, 300); group 1: one high row.
+            "finalize/effort/low/100": [1.0],
+            "finalize/effort/low/300": [1.0],
+            "finalize/effort/high/700": [0.0, 1.0],
+            "finalize/effort/length_reward_sum": [1.6],
+            "finalize/effort/reward_sum": [3.0],
+        }
+    )
+    assert metrics["mean_length_low"] == 200
+    assert metrics["median_length_low"] == 200
+    assert metrics["mean_length_high"] == 700
+    assert metrics["median_length_high"] == 700
+    assert metrics["mean_length_reward_low"] == pytest.approx(0.8)
+    assert metrics["mean_reward_low"] == 1.5
+    assert "mean_reward_high" not in metrics
+
+
+def test_reward_settings_ignore_extras_and_inactive_options():
+    baseline = CaptureRewardSettings.from_configs(RewardPenaltyConfig(), None)
+    config = RewardPenaltyConfig.model_validate(
+        {
+            "experiment_note": "retry",
+            "token_ids": {"unwanted": [42], "think_open": 1, "note": "unused"},
+        }
+    )
+    inactive_effort = EffortLevelsConfig(
+        low_weight=0, low_string="changed", low_ub=123, note="unused"
+    )
+    assert CaptureRewardSettings.from_configs(config, inactive_effort) == baseline
+    assert (
+        CaptureRewardSettings.from_state({"version": 1, "penalties": {}, "effort": {}})
+        == baseline
+    )
+    assert CaptureRewardSettings.from_state(baseline.to_state()) == baseline
+
+
+def test_reward_settings_normalize_active_tokens_and_nested_extras():
+    settings = CaptureRewardSettings.from_configs(
+        RewardPenaltyConfig(
+            penalize_unwanted_tokens=True, token_ids={"unwanted": [42, 7, 42]}
+        ),
+        EffortLevelsConfig(low_weight=1, low_string="budget"),
+    )
+    restored = CaptureRewardSettings.from_state(
+        {
+            "penalties": {
+                "penalize_unwanted_tokens": True,
+                "token_ids": {"unwanted": [7, 42], "note": "unused"},
+                "note": "unused",
+            },
+            "effort": {"low_weight": 1, "low_string": "budget", "note": "unused"},
+        }
+    )
+    assert restored == settings
+    restored.require_compatible(settings)
+
+
+@pytest.mark.parametrize(
+    "change,expected",
+    [
+        (
+            {"penalties": {"penalize_empty_final_answer": True}},
+            "penalize_empty_final_answer",
+        ),
+        (
+            {
+                "penalties": {
+                    "penalize_unwanted_tokens": True,
+                    "token_ids": {"unwanted": [2]},
+                }
+            },
+            "token_ids.unwanted",
+        ),
+        (
+            {"effort": {"low_weight": 1, "low_string": "budget", "low_ub": 100}},
+            "effort.low_ub",
+        ),
+        ({"effort": None}, "effort.enabled"),
+    ],
+)
+def test_reward_settings_reject_semantic_changes_with_field_names(change, expected):
+    settings = CaptureRewardSettings.from_configs(
+        RewardPenaltyConfig(), EffortLevelsConfig(low_weight=1, low_string="budget")
+    )
+    changed = CaptureRewardSettings.from_state({**settings.to_state(), **change})
+    with pytest.raises(ValueError, match=expected):
+        settings.require_compatible(changed)
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        None,
+        {},
+        {"version": 1, "penalties": None, "effort": None},
+        {"version": 2, "penalties": {}, "effort": None},
+        {"version": True, "penalties": {}, "effort": None},
+        {"version": 1, "penalties": {"penalize_unwanted_tokens": True}, "effort": None},
+        {
+            "version": 1,
+            "penalties": {},
+            "effort": {"low_weight": 1, "low_string": "budget", "low_ub": 0},
+        },
+    ],
+)
+def test_reward_settings_reject_invalid_records(state):
+    with pytest.raises(ValueError):
+        CaptureRewardSettings.from_state(state)
+
+
+def test_final_reward_distribution_and_agent_tables_are_pooled_exactly():
+    # Unequal groups: averaging their medians (0 and 2) would incorrectly give 1.
+    context = RewardLogContext("agent", '{"answer":"ok","reward":99}')
+    observations = [
+        FinalizedReward(
+            f"sample-{i}",
+            f"attempt-{i}",
+            value,
+            context if i == 0 else RewardLogContext("other", None),
+        )
+        for i, value in enumerate([0.0, 2.0, 2.0, 8.0])
+    ]
+    metrics = aggregate_capture_reward_metrics(
+        {
+            "finalize/reward_count": [1.0, 3.0],
+            "finalize/reward_sum": [0.0, 12.0],
+            "finalize/reward_sumsq": [0.0, 72.0],
+            "finalize/reward_min": [0.0, 2.0],
+            "finalize/reward_max": [0.0, 8.0],
+        },
+        observations,
+    )
+    assert metrics["total_reward/mean"] == 3.0
+    assert metrics["total_reward/median"] == 2.0
+    assert metrics["total_reward/histogram"] == [0.0, 2.0, 2.0, 8.0]
+    assert metrics["other/reward/mean"] == 4.0
+    assert metrics["agent/reward/histogram"] == [0.0]
+    tables = capture_reward_result_tables(observations)
+    assert set(tables) == {"agent/full_result"}
+    assert json.loads(tables["agent/full_result"][0][0]) == {
+        "answer": "ok",
+        "reward": 0.0,
+        "ng_rollout_id": "attempt-0",
+        "sample_id": "sample-0",
+    }
+    with pytest.raises(ValueError, match="valid-row count"):
+        aggregate_capture_reward_metrics({"finalize/reward_count": [3.0]}, observations)
+    assert aggregate_capture_reward_metrics({"finalize/reward_count": [0.0]}, []) == {}

@@ -108,6 +108,7 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         loss_multiplier=0.25,
         canonical_sample_ids=["group_g0"],
         reward_checks=None,
+        reward_log_contexts=None,
     )
 
 
@@ -143,6 +144,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "mask_sample",
         "loss_multiplier",
         "reward_checks",
+        "reward_log_contexts",
     }
     assert {f.name for f in fields(FinalizedGroup)} == {
         "meta",
@@ -151,6 +153,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "staging_keys",
         "canonical_output_tokens",
         "metrics",
+        "reward_observations",
         "dropped",
         "drop_reason",
         "valid_row_count",

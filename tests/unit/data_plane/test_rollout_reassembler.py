@@ -941,10 +941,13 @@ def test_penalized_rewards_reach_grpo_advantages_without_token_changes(
     )
     assert advantages[:2, 0].tolist() == [-1.5, 1.5]
     metrics = aggregate_capture_reward_metrics(
-        {k: [v] for k, v in finalized.metrics.items()}
+        {k: [v] for k, v in finalized.metrics.items()}, finalized.reward_observations
     )
     assert metrics["empty_final_answer_rate"] == 0.5
     assert metrics["total_reward/mean"] == 1.5
+    assert metrics["total_reward/median"] == 1.5
+    assert metrics["total_reward/histogram"] == [0.0, 3.0]
+    assert [row.sample_id for row in finalized.reward_observations] == ids[:2]
     assert metrics["mean_reward_low"] == 0.0  # -3 and +3, before zeroing.
     assert metrics["mean_length_low"] == 2
     assert metrics["median_length_low"] == 2

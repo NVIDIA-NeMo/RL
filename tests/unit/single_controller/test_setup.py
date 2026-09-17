@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import threading
+import warnings
 from pathlib import Path
 from typing import Any, Optional
 from unittest.mock import MagicMock, patch
@@ -643,6 +644,23 @@ class TestSetup:
             ValueError, match="does not support.*penalize_malformed_think_tag"
         ):
             validate_single_controller_config(mc)
+
+    def test_capture_allows_text_and_token_penalties_without_warning(
+        self, patched_factories
+    ):
+        mc = _make_master_config()
+        mc.env["should_use_nemo_gym"] = True
+        mc.token_capture.enabled = True
+        mc.reward_penalties = RewardPenaltyConfig(
+            penalize_duplicated_reasoning=True,
+            penalize_empty_final_answer=True,
+            penalize_unwanted_tokens=True,
+            token_ids={"unwanted": [99]},
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            validate_single_controller_config(mc)
+        assert not [w for w in caught if "reward_penalties" in str(w.message)]
 
     def test_resolves_and_passes_reward_penalties(self, patched_factories):
         mc = _make_master_config()

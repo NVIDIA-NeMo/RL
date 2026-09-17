@@ -148,12 +148,22 @@ shaping requires `low_ub > 0`. High-effort rewards remain unchanged. A 900-token
 call followed by a 100-token call uses 100 tokens for shaping in both paths.
 
 Recovery saves raw rewards and three Boolean checks per unfinished rollout, and
-reward settings once per checkpoint. Restoring with different reward settings
-fails before replay. Finalized rows retain their saved rewards. Migration of
-older capture checkpoints is outside scope.
+reward settings once per checkpoint. A versioned, validated projection compares
+the active reward rules: irrelevant config extras, inactive parameters and the
+order or duplication of unwanted IDs do not prevent resume. Changes to active
+rules fail before replay and identify the differing settings. Finalized rows
+retain their saved rewards. Recovery schema 6 also preserves pending reward
+observations and optional agent log context. Migration of older capture
+checkpoints is outside scope; missing reward settings are rejected explicitly.
 
-Penalty rates and final reward statistics use valid finalized rows. Existing
-low/high effort means and exact length medians are preserved; `mean_reward_low`
+Penalty rates and final reward statistics use valid finalized rows. Reward mean,
+standard deviation, minimum, maximum, exact median and histogram are pooled from
+individual final rewards for the groups consumed by each training step. Agent
+reward statistics use those same final values. When full-result table logging is
+enabled, agent results retain their context and sample identity with the final
+reward substituted after shaping and penalties. This retains one reward
+observation per valid row, plus optional table data, in pending checkpoint state.
+Existing low/high effort means and exact length medians are preserved; `mean_reward_low`
 measures the shaped reward before penalties. Pending statistics survive recovery
 and are consumed once. Malformed-thinking penalties and message-level advantage
 overrides remain unsupported with capture and fail at setup.

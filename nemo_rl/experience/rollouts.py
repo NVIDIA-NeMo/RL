@@ -441,6 +441,13 @@ class EffortLevelsConfig(BaseModel, extra="allow"):
         return self
 
 
+def get_effort_config(env: dict[str, Any]) -> Optional[EffortLevelsConfig]:
+    """Resolve the optional Gym effort config using its centralized defaults."""
+    gym = env.get("nemo_gym")
+    effort = gym.get("effort_levels") if gym is not None else None
+    return EffortLevelsConfig.model_validate(effort) if effort is not None else None
+
+
 @dataclass
 class _EffortShapingMetrics:
     length_rewards_low: list[float]
@@ -486,9 +493,8 @@ def _apply_effort_shaping(
     lengths = [_terminal_completion_length(r) for r in results]
     orig_rewards = [r["full_result"]["reward"] for r in results]
     for i, result in enumerate(results):
-        # Token-capture receipt rows with no resolvable terminal length are
-        # skipped fail-closed: shaping a length we do not have would award the
-        # maximum shortness bonus to a row that may be arbitrarily long.
+        # Inline results with a missing or empty message log have no terminal
+        # length. Skip them to avoid awarding an unearned shortness bonus.
         length = lengths[i]
         if length is None:
             continue
