@@ -2826,6 +2826,9 @@ class MegatronPolicyWorkerImpl(
         refit_payload_mode: RefitPayloadMode,
     ) -> dict[str, tuple[torch.Size, torch.dtype]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
+        # Every negotiation starts from the source-native representation. The
+        # generation worker selects prequantized names again after this pass.
+        self._refit_prequant_names.clear()
         self.refit_payload_mode = refit_payload_mode
         self.refit_param_info_mcore = self._calculate_refit_param_info()
 

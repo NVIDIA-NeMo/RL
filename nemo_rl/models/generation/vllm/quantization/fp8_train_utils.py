@@ -74,8 +74,8 @@ def mxfp8_e4m3_quantize_for_refit(
     Mirrors the receiver path in quantization/fp8.py load_weights
     (mxfp8_e4m3_quantize + scale reshape) so the streamed E4M3 data and
     *_scale_from_checkpoint scales load bit-identically without receiver-side
-    re-quantization. Uses the same flashinfer kernel as vLLM on Blackwell and
-    the torch reference elsewhere.
+    re-quantization. Uses the same FlashInfer CuTe-DSL backend as vLLM on
+    Blackwell and the torch reference elsewhere.
     """
     x_q = x_scales = None
     if x.is_cuda and torch.cuda.get_device_capability(x.device) >= (10, 0):
@@ -88,7 +88,10 @@ def mxfp8_e4m3_quantize_for_refit(
             ) from exc
         else:
             x_q, x_scales = flashinfer_mxfp8_quantize(
-                x, is_sf_swizzled_layout=False, alignment=32
+                x,
+                is_sf_swizzled_layout=False,
+                alignment=32,
+                backend="cute-dsl",
             )
             if x_scales.ndim == 1 and x.ndim == 2:
                 x_scales = x_scales.view(x.size(0), -1)
