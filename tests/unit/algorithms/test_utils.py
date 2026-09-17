@@ -796,6 +796,43 @@ def test_calculate_baseline_and_std_per_prompt_marks_trivial_leave_one_out_set()
     assert is_trivial.tolist() == [True] + [False] * 7
 
 
+def test_calculate_baseline_and_std_per_prompt_marks_trivial_from_std_rewards():
+    """DAPO case: triviality must be computed on std_rewards, not on rewards."""
+    rewards = torch.tensor([0.0, -0.2, -1.0, 1.0, 0.0, 1.0])
+    std_rewards = torch.tensor([0.0, 0.0, 0.0, 1.0, 0.0, 1.0])
+    prompts = torch.tensor([[0], [0], [0], [1], [1], [1]])
+    valid_mask = torch.ones(6)
+
+    _, std, is_trivial = calculate_baseline_and_std_per_prompt(
+        prompts,
+        rewards,
+        valid_mask,
+        leave_one_out_baseline=False,
+        std_rewards=std_rewards,
+    )
+
+    assert is_trivial.tolist() == [True, True, True, False, False, False]
+    assert torch.allclose(std[:3], torch.zeros(3))
+    assert (std[3:] > 0).all()
+
+
+def test_calculate_baseline_and_std_per_prompt_marks_trivial_full_group_when_not_leave_one_out():
+    """Without leave-one-out, the comparison set includes self, so an outlier's
+    own group (not just its peers) determines triviality."""
+    rewards = torch.tensor([0.0] + [0.95] * 7)
+    prompts = torch.zeros(8, 1, dtype=torch.long)
+    valid_mask = torch.ones(8)
+
+    _, _, is_trivial = calculate_baseline_and_std_per_prompt(
+        prompts,
+        rewards,
+        valid_mask,
+        leave_one_out_baseline=False,
+    )
+
+    assert is_trivial.tolist() == [False] * 8
+
+
 def test_calculate_baseline_and_std_per_prompt_mixed_prompt_sizes():
     """Test calculate_baseline_and_std_per_prompt with different number of generations per prompt."""
     # Prompt 0 has 2 generations, Prompt 1 has 3 generations
