@@ -96,9 +96,92 @@ def test_gae_fast_path_matches_recurrence(
     # Compare all positions: the private helper carries advantages through gaps
     # and returns = advantages + values even outside the response mask.
     for actual_tensor, expected_tensor in zip(actual, expected):
-        torch.testing.assert_close(actual_tensor, expected_tensor, rtol=1e-5, atol=1e-5)
+        # Mixed inputs can promote the result to float64; choose the tolerance
+        # from the effective output dtype, not just the rewards' dtype.
+        tolerance = 1e-13 if actual_tensor.dtype == torch.float64 else 1e-5
+        torch.testing.assert_close(
+            actual_tensor, expected_tensor, rtol=tolerance, atol=tolerance
+        )
     torch.testing.assert_close(actual[0][3], torch.zeros_like(actual[0][3]))
     torch.testing.assert_close(actual[1][3], values[3].to(actual[1].dtype))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_gae_unit_discount_matches_closed_form_with_masked_gaps(
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    """Check both production paths against hand-calculated, exact binary values."""
+    rewards = torch.tensor(
+        [[123, 0.5, 123, -0.25, 0.75, 123], [123] * 6],
+        device=device,
+        dtype=dtype,
+    )
+    values = torch.tensor(
+        [[999, 0.125, 999, 0.25, -0.5, 999], [999] * 6],
+        device=device,
+        dtype=dtype,
+    )
+    mask = torch.tensor([[0, 1, 0, 1, 1, 0], [0] * 6], device=device, dtype=dtype)
+    # At valid positions, R = [0.5 - 0.25 + 0.75, -0.25 + 0.75, 0.75]
+    # and A = R - V = [0.875, 0.25, 1.25]. Masked positions carry the next
+    # valid A (or zero after the final valid token), but returns still add V.
+    expected_advantages = torch.tensor(
+        [[0.875, 0.875, 0.25, 0.25, 1.25, 0], [0] * 6],
+        device=device,
+        dtype=dtype,
+    )
+    expected_returns = torch.tensor(
+        [[999.875, 1.0, 999.25, 0.5, 0.75, 999], [999] * 6],
+        device=device,
+        dtype=dtype,
+    )
+    estimator = GeneralizedAdvantageEstimator(
+        GAEConfig(gae_lambda=1.0), ClippedPGLossConfig()
+    )
+
+    # A tensor-valued lambda deliberately selects the actual production
+    # recurrence, independently of the copied helper used in other tests.
+    for override in (None, torch.ones(2, device=device, dtype=dtype)):
+        advantages, returns = estimator._compute_gae(
+            rewards, values, mask, gae_lambda=override
+        )
+        torch.testing.assert_close(advantages, expected_advantages, rtol=0, atol=0)
+        torch.testing.assert_close(returns, expected_returns, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("seq_len", [196_608, 1_048_576])
+def test_gae_fast_path_long_sequence_matches_analytic_returns(seq_len: int) -> None:
+    """Bound FP32 error against a closed form without a long Python recurrence."""
+    # Keep this CPU-only: the intended driver-side path must handle long
+    # sequences, without adding hundreds of thousands of CUDA launches in CI.
+    reward_per_token = 2.0**-20
+    rewards = torch.full((1, seq_len), reward_per_token, dtype=torch.float32)
+    rewards[:, -1] = 1.0
+    values = torch.full_like(rewards, 32.0)
+    mask = torch.ones_like(rewards)
+    estimator = GeneralizedAdvantageEstimator(
+        GAEConfig(gae_lambda=1.0), ClippedPGLossConfig()
+    )
+
+    advantages, returns = estimator._compute_gae(rewards, values, mask)
+
+    # Count the remaining nonterminal rewards analytically, rather than using
+    # either a reverse cumsum or the GAE recurrence as the oracle. Each reward
+    # and suffix sum is exactly representable in FP32 at these sequence lengths.
+    remaining = torch.arange(seq_len - 1, -1, -1, dtype=torch.float64).unsqueeze(0)
+    expected_returns = 1.0 + remaining * reward_per_token
+    expected_advantages = expected_returns - values.double()
+    # Here 30 <= |A| < 32, so subtracting V rounds by at most half an FP32 ULP.
+    # The old FP32 recurrence loses the small reward in (reward + 32) - 32;
+    # matching that accumulated error is not the mathematical correctness goal.
+    tolerance = 2.0**-20
+    torch.testing.assert_close(
+        advantages.double(), expected_advantages, rtol=0, atol=tolerance
+    )
+    torch.testing.assert_close(
+        returns.double(), expected_returns, rtol=0, atol=tolerance
+    )
 
 
 @pytest.mark.parametrize(
