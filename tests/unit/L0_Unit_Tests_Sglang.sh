@@ -15,6 +15,12 @@
 #!/bin/bash
 # Shard: All SGLang tests (base sglang files + sglang-marked tests anywhere)
 
+# TEMPORARY (verification branch for #4139 sglang triage - DO NOT MERGE):
+# pytest's default output is a dot map, so a green shard does not show which
+# cases ran. -v makes each nodeid appear in the job log, which is the only way
+# to confirm the new spawn regression test executed rather than being filtered.
+export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:-} -v"
+
 source "$(dirname "${BASH_SOURCE[0]}")/run_unit_shard_common.sh"
 
 SGLANG_PATHS=(
