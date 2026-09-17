@@ -51,7 +51,7 @@ digraph token_capture_flow {
     group="right",
     color="#ea580c",
     fillcolor="#ffedd5",
-    label="Megatron — carry capture state through generation\nInferenceClient.add_request_with_id(..., request_metadata=...)\nCaptureAdmission and exact prompt remain on the engine request"
+    label="Megatron — carry capture state through generation\nInferenceClient.add_request_with_id(..., offload_params=...)\nCaptureAdmission and exact prompt remain on the engine request"
   ];
 
   vllm_generate [

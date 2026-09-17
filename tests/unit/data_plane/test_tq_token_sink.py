@@ -254,7 +254,7 @@ def test_megatron_stager_writes_canonical_row_and_returns_coords(
         "minf-response-1",
         payload,
         finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
-        request_metadata={"ng_capture": admission.model_dump(mode="json")},
+        offload_params={"ng_capture": admission.model_dump(mode="json")},
     )
 
     assert result is not None
@@ -290,7 +290,7 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
                 generated_log_probs=[-0.25, -0.5],
             ),
             finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
-            request_metadata={"ng_capture": root.model_dump(mode="json")},
+            offload_params={"ng_capture": root.model_dump(mode="json")},
         )
         assert root_result is not None
         root_coords = root_result.response_metadata["ng_commit_coords"]
@@ -318,7 +318,7 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
 
     prompt, metadata = preparer.prepare_prompt(
         [80, 81, 99, 20, 21],
-        request_metadata={
+        offload_params={
             "ng_capture": admission.model_dump(mode="json"),
             PREFIX_SPLICE_SUFFIX_FIELD: [99, 20, 21],
             PREFIX_SPLICE_BOUNDARY_FIELD: 99,
@@ -355,7 +355,7 @@ def test_megatron_stager_stamps_admission_epoch_when_request_spans_refit(
                 generated_log_probs=[-0.1, -0.2],
             ),
             finished_metadata=SimpleNamespace(policy_epoch=[(0, 7), (1, 8), (2, 9)]),
-            request_metadata={"ng_capture": admission.model_dump(mode="json")},
+            offload_params={"ng_capture": admission.model_dump(mode="json")},
         )
     assert result is not None
     coords = result.response_metadata["ng_commit_coords"]
@@ -397,7 +397,7 @@ def test_megatron_stager_poisons_malformed_payloads_with_capture_failed(
         "minf-response-1",
         SimpleNamespace(**fields),
         finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
-        request_metadata={"ng_capture": admission.model_dump(mode="json")},
+        offload_params={"ng_capture": admission.model_dump(mode="json")},
     )
 
     assert result is not None
@@ -438,7 +438,7 @@ def test_megatron_stager_declines_ineligible_requests(
             generated_log_probs=[-0.1],
         ),
         finished_metadata=SimpleNamespace(policy_epoch=policy_epoch),
-        request_metadata=(
+        offload_params=(
             {"ng_capture": admission.model_dump(mode="json")}
             if with_capture_metadata
             else None
@@ -536,7 +536,7 @@ def test_megatron_preparer_resolves_chains_through_the_shared_cache():
     ):
         preparer.prepare_prompt(
             prompt,
-            request_metadata={
+            offload_params={
                 "ng_capture": admission.model_dump(mode="json"),
                 PREFIX_SPLICE_SUFFIX_FIELD: suffix,
                 PREFIX_SPLICE_BOUNDARY_FIELD: 99,
