@@ -1782,12 +1782,12 @@ class TestLogprobsPostProcessorSeqPacking:
 
         original_batch_size = 4
         original_seq_len = 32
-        packed_seq_len = 128  # All 4 sequences packed
-        vocab_size = 32000
+        packed_seq_len = 82  # Unequal lengths exercise boundaries and output padding.
+        vocab_size = 64
 
         logits = torch.randn(1, packed_seq_len, vocab_size)
         input_ids = torch.randint(0, vocab_size, (1, packed_seq_len))
-        input_lengths = torch.tensor([32, 32, 32, 32])
+        input_lengths = torch.tensor([11, 32, 23, 16])
         data_dict = BatchedDataDict({"input_lengths": input_lengths})
 
         @dataclass
@@ -1795,7 +1795,7 @@ class TestLogprobsPostProcessorSeqPacking:
             cu_seqlens_q: torch.Tensor
 
         flash_kwargs = MockFlashAttnKwargs(
-            cu_seqlens_q=torch.tensor([0, 32, 64, 96, 128])
+            cu_seqlens_q=torch.tensor([0, 11, 43, 66, 82])
         )
 
         processed_inputs = ProcessedInputs(
@@ -1807,17 +1807,29 @@ class TestLogprobsPostProcessorSeqPacking:
             vlm_kwargs={},
         )
 
-        result = processor(
-            logits=logits,
-            data_dict=data_dict,
-            processed_inputs=processed_inputs,
-            original_batch_size=original_batch_size,
-            original_seq_len=original_seq_len,
-            cp_sharder=None,
-        )
+        with patch.object(
+            torch.Tensor, "item", side_effect=AssertionError("per-sequence item()")
+        ):
+            result = processor(
+                logits=logits,
+                data_dict=data_dict,
+                processed_inputs=processed_inputs,
+                original_batch_size=original_batch_size,
+                original_seq_len=original_seq_len,
+                cp_sharder=None,
+            )
 
         # Result should be unpacked to original shape
         assert result.shape == (original_batch_size, original_seq_len)
+
+        expected = torch.zeros_like(result)
+        for i, (start, end) in enumerate(zip((0, 11, 43, 66), (11, 43, 66, 82))):
+            seq_logprobs = torch.log_softmax(logits[0, start : end - 1], dim=-1)
+            targets = input_ids[0, start + 1 : end]
+            expected[i, 1 : end - start] = seq_logprobs.gather(
+                -1, targets.unsqueeze(-1)
+            ).squeeze(-1)
+        torch.testing.assert_close(result, expected)
 
     def test_logprobs_masking_without_sequence_packing(
         self, base_cfg, mock_device_mesh, mock_cp_mesh, mock_tp_mesh
@@ -1882,11 +1894,11 @@ class TestTopkLogitsPostProcessorSeqPacking:
 
         original_batch_size = 4
         original_seq_len = 32
-        packed_seq_len = 128  # All 4 sequences packed
-        vocab_size = 32000
+        packed_seq_len = 82  # Unequal lengths exercise boundaries and output padding.
+        vocab_size = 64
 
         logits = torch.randn(1, packed_seq_len, vocab_size)
-        input_lengths = torch.tensor([32, 32, 32, 32])
+        input_lengths = torch.tensor([11, 32, 23, 16])
         data_dict = BatchedDataDict({"input_lengths": input_lengths})
 
         @dataclass
@@ -1894,7 +1906,7 @@ class TestTopkLogitsPostProcessorSeqPacking:
             cu_seqlens_q: torch.Tensor
 
         flash_kwargs = MockFlashAttnKwargs(
-            cu_seqlens_q=torch.tensor([0, 32, 64, 96, 128])
+            cu_seqlens_q=torch.tensor([0, 11, 43, 66, 82])
         )
 
         processed_inputs = ProcessedInputs(
@@ -1906,18 +1918,30 @@ class TestTopkLogitsPostProcessorSeqPacking:
             vlm_kwargs={},
         )
 
-        vals, idx = processor(
-            logits=logits,
-            data_dict=data_dict,
-            processed_inputs=processed_inputs,
-            original_batch_size=original_batch_size,
-            original_seq_len=original_seq_len,
-            cp_sharder=None,
-        )
+        with patch.object(
+            torch.Tensor, "item", side_effect=AssertionError("per-sequence item()")
+        ):
+            vals, idx = processor(
+                logits=logits,
+                data_dict=data_dict,
+                processed_inputs=processed_inputs,
+                original_batch_size=original_batch_size,
+                original_seq_len=original_seq_len,
+                cp_sharder=None,
+            )
 
         # Result should be unpacked to original shape
         assert vals.shape == (original_batch_size, original_seq_len, k)
         assert idx.shape == (original_batch_size, original_seq_len, k)
+
+        expected_vals = torch.zeros_like(vals)
+        expected_idx = torch.zeros_like(idx)
+        for i, (start, end) in enumerate(zip((0, 11, 43, 66), (11, 43, 66, 82))):
+            seq_vals, seq_idx = torch.topk(logits[0, start:end], k=k, dim=-1)
+            expected_vals[i, : end - start] = seq_vals
+            expected_idx[i, : end - start] = seq_idx
+        torch.testing.assert_close(vals, expected_vals)
+        torch.testing.assert_close(idx, expected_idx)
 
 
 # =====================

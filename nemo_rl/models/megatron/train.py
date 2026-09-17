@@ -384,8 +384,8 @@ def forward_with_post_processing_fn(
             with torch.no_grad():
                 shifted_input_ids = _pack_input_ids(
                     data_dict["input_ids"],
-                    packed_seq_params.cu_seqlens_q,
-                    packed_seq_params.cu_seqlens_q_padded,
+                    to_cpu_int_tuple(packed_seq_params.cu_seqlens_q),
+                    to_cpu_int_tuple(packed_seq_params.cu_seqlens_q_padded),
                     roll_shift=-1,
                 )
                 shifted_input_embeds = capture.model.embedding(
@@ -644,14 +644,6 @@ class LossPostProcessor:
                     "Disable fuse_loss for the value model."
                 )
 
-            cu_seqlens_q = to_cpu_int_tuple(packed_seq_params.cu_seqlens_q)
-            padded_boundaries = (
-                packed_seq_params.cu_seqlens_q_padded
-                if packed_seq_params.cu_seqlens_q_padded is not None
-                else packed_seq_params.cu_seqlens_q
-            )
-            cu_seqlens_q_padded = to_cpu_int_tuple(padded_boundaries)
-            if fuse_loss:
                 wrapper_cls = SequencePackingFusionLossWrapper
                 prepare_fn = partial(
                     prepare_packed_loss_input,
@@ -662,6 +654,12 @@ class LossPostProcessor:
                 wrapper_cls = SequencePackingLossWrapper
                 prepare_fn = prepare_loss_input_wrapped
 
+            cu_seqlens_q = to_cpu_int_tuple(packed_seq_params.cu_seqlens_q)
+            cu_seqlens_q_padded = (
+                to_cpu_int_tuple(packed_seq_params.cu_seqlens_q_padded)
+                if packed_seq_params.cu_seqlens_q_padded is not None
+                else cu_seqlens_q
+            )
             loss_fn_wrapped = wrapper_cls(
                 loss_fn=self.loss_fn,
                 prepare_fn=prepare_fn,
@@ -1029,7 +1027,7 @@ class TopkLogitsPostProcessor:
     def __call__(
         self,
         data_dict: BatchedDataDict[Any],
-        cu_seqlens_padded: torch.Tensor,
+        cu_seqlens_padded: Optional[torch.Tensor | CpuIntTuple],
         original_seq_length: int,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes top-k logits and indices.
@@ -1050,7 +1048,12 @@ class TopkLogitsPostProcessor:
         pack = self.cfg["sequence_packing"]["enabled"]
         cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
         unpacked_seqlen = data_dict["input_ids"].shape[1]
-        seq_lengths = data_dict["input_lengths"]
+        cu_seqlens_padded_cpu = None
+        seq_lengths_cpu = None
+        if pack:
+            assert cu_seqlens_padded is not None
+            cu_seqlens_padded_cpu = to_cpu_int_tuple(cu_seqlens_padded)
+            seq_lengths_cpu = to_cpu_int_tuple(data_dict["input_lengths"])
 
         def processor_fn_inner(output_tensor):
             tp_grp = get_tensor_model_parallel_group()
@@ -1074,9 +1077,10 @@ class TopkLogitsPostProcessor:
             if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
                 cp_grp = get_context_parallel_group()
                 if pack:
+                    assert cu_seqlens_padded_cpu is not None
                     # Per-sequence CP allgather following packed-sequence logic
                     batch_size = data_dict["input_ids"].shape[0]
-                    total_packed_len = int(cu_seqlens_padded[-1].item())
+                    total_packed_len = cu_seqlens_padded_cpu[-1]
 
                     topk_vals_full = torch.zeros(
                         (1, total_packed_len, self.k),
@@ -1090,8 +1094,8 @@ class TopkLogitsPostProcessor:
                     )
 
                     for i in range(batch_size):
-                        start_idx = int(cu_seqlens_padded[i].item())
-                        end_idx = int(cu_seqlens_padded[i + 1].item())
+                        start_idx = cu_seqlens_padded_cpu[i]
+                        end_idx = cu_seqlens_padded_cpu[i + 1]
                         if end_idx > start_idx:
                             local_vals_slice = topk_vals_local[
                                 :, start_idx // cp_size : end_idx // cp_size, :
@@ -1134,6 +1138,8 @@ class TopkLogitsPostProcessor:
                 topk_idx_full = topk_idx_local
 
             if pack:
+                assert cu_seqlens_padded_cpu is not None
+                assert seq_lengths_cpu is not None
                 batch_size = data_dict["input_ids"].shape[0]
                 out_vals = torch.zeros(
                     (batch_size, unpacked_seqlen, self.k),
@@ -1146,8 +1152,8 @@ class TopkLogitsPostProcessor:
                     device=topk_idx_full.device,
                 )
                 for i in range(batch_size):
-                    seq_len = int(seq_lengths[i].item())
-                    start_idx = int(cu_seqlens_padded[i].item())
+                    seq_len = seq_lengths_cpu[i]
+                    start_idx = cu_seqlens_padded_cpu[i]
                     if seq_len > 0:
                         out_vals[i, :seq_len, :] = topk_vals_full[
                             0, start_idx : start_idx + seq_len, :
