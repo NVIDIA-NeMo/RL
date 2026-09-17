@@ -601,3 +601,11 @@ for integrated training or cross-cluster validation.
 The historical failure ledger and measurements remain unchanged. This document
 is self-contained for code review; access to private cluster artifacts is not
 implied by possession of the branch.
+# Finite-dataset drain (2026-09-17)
+
+At EOF, stop admitting new prompts but keep the collector running until its
+in-flight workers enqueue their final groups. Clearing `running` first drops
+those groups and raises `Trajectory collection stopped before enqueue completed`.
+The flag is cleared in a `finally` block even when draining fails. Tests cover
+both the final enqueue and error cleanup. This ports the tested `bf3a59e` runtime
+fix into this maintenance branch; it does not change the data or reward recipe.
