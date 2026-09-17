@@ -147,6 +147,9 @@ def test_blackwell_refit_prequantization_matches_vllm_backend(monkeypatch):
         shape = torch.Size((2, MXFP8_BLOCK_SIZE))
         ndim = 2
 
+        def size(self, dim):
+            return self.shape[dim]
+
     call_kwargs = {}
 
     def fake_mxfp8_quantize(_tensor, **kwargs):
