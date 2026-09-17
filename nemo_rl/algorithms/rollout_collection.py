@@ -582,17 +582,65 @@ def collect_rollouts(
             # consecutive-failure abort counter for a successful group).
             try:
                 rewards = payload["batch"]["total_reward"]
-                record = {
-                    "dataset_idx": dataset_idx,
-                    "num_samples": int(payload["batch"].size),
-                    "reward_mean": float(rewards.float().mean()),
-                    "truncated_frac": float(
-                        payload["batch"]["truncated"].float().mean()
-                    ),
-                    "seconds": round(
-                        time.perf_counter() - complete_group["start"], 1
-                    ),
-                }
+                batch = payload["batch"]
+                # Multi-trace rollouts fan out into one row per trace; the
+                # manifest's pass-rate/truncation stats must stay PER ROLLOUT
+                # (sibling traces repeat the rollout reward — a row-mean would
+                # overweight delegation-heavy rollouts and corrupt pi0@k pool
+                # selection downstream). A rollout counts as truncated if ANY
+                # of its traces hit the cap (budget-censored reward).
+                if "trace_in_rollout_idx" in batch:
+                    first_trace = batch["trace_in_rollout_idx"] == 0
+                    rollout_ids = batch["rollout_local_idx"]
+                    truncated_by_rollout: dict[int, bool] = {}
+                    for rid, trunc in zip(
+                        rollout_ids.tolist(), batch["truncated"].tolist()
+                    ):
+                        truncated_by_rollout[rid] = (
+                            truncated_by_rollout.get(rid, False) or bool(trunc)
+                        )
+                    rollout_rewards = rewards[first_trace]
+                    trace_kinds = [
+                        (md or {}).get("kind", "unknown")
+                        for md in batch.get("trace_metadata") or []
+                    ]
+                    record = {
+                        "dataset_idx": dataset_idx,
+                        # num_samples stays the ROLLOUT count (pre-multi-trace
+                        # consumers read it as generations-per-group).
+                        "num_samples": int(first_trace.sum()),
+                        "num_traces": int(batch.size),
+                        "num_subagent_traces": sum(
+                            1 for k in trace_kinds if k == "subagent"
+                        ),
+                        "num_compaction_traces": sum(
+                            1
+                            for k in trace_kinds
+                            if k
+                            in ("compaction_summary", "pre_compaction", "post_compaction")
+                        ),
+                        "num_empty_rollouts": int(
+                            batch["is_empty_rollout"].sum()
+                        ),
+                        "reward_mean": float(rollout_rewards.float().mean()),
+                        "truncated_frac": (
+                            sum(truncated_by_rollout.values())
+                            / max(len(truncated_by_rollout), 1)
+                        ),
+                        "seconds": round(
+                            time.perf_counter() - complete_group["start"], 1
+                        ),
+                    }
+                else:
+                    record = {
+                        "dataset_idx": dataset_idx,
+                        "num_samples": int(batch.size),
+                        "reward_mean": float(rewards.float().mean()),
+                        "truncated_frac": float(batch["truncated"].float().mean()),
+                        "seconds": round(
+                            time.perf_counter() - complete_group["start"], 1
+                        ),
+                    }
                 with state_lock:
                     stats["completed"] += 1
                     stats["samples"] += record["num_samples"]
