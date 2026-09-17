@@ -14,7 +14,7 @@
 
 """Unit tests for the WeightSynchronizer abstraction and its implementations."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
