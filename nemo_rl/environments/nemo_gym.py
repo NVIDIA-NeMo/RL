@@ -377,6 +377,18 @@ Depending on your data shape, you may want to change these values."""
                 if not ((r.get("metadata") or {}).get("parent_session_id"))
             ]
             if root_responses:
+                # Strip the bulky token arrays from the traces we are NOT
+                # training on — they'd otherwise ride along inside the shared
+                # full_result (replay-buffer checkpoints, full_result logging).
+                root_ids = {id(r) for r in root_responses}
+                for filtered in responses:
+                    if id(filtered) in root_ids:
+                        continue
+                    for output_item_dict in filtered.get("output") or []:
+                        if isinstance(output_item_dict, dict):
+                            output_item_dict.pop("prompt_token_ids", None)
+                            output_item_dict.pop("generation_token_ids", None)
+                            output_item_dict.pop("generation_log_probs", None)
                 responses = root_responses
 
         trace_results = []

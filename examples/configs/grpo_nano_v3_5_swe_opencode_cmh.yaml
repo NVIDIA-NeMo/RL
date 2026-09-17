@@ -73,9 +73,11 @@ grpo:
   dynamic_sampling_max_gen_batches: 10
   batch_multiplier: 1
 
-  penalize_invalid_tool_call: true
+  # Disabled for cross-arm parity: the PPO arm cannot apply message-level
+  # advantage overwrites (NotImplementedError in ppo.py).
+  penalize_invalid_tool_call: false
   invalid_tool_call_advantage: -5.0
-  penalize_malformed_thinking: true
+  penalize_malformed_thinking: false
   malformed_thinking_advantage: -5.0
 
   reward_shaping:
@@ -231,8 +233,10 @@ policy:
       params_dtype: "float32"
 
       adam_beta1: 0.9
-      adam_beta2: 0.999
-      adam_eps: 1e-8
+      # Match the PPO arm's policy optimizer numerics (cross-arm parity;
+      # eps=1e-8 acts as a hidden ~0.64x LR on MoE experts).
+      adam_beta2: 0.95
+      adam_eps: 1e-10
 
       sgd_momentum: 0.9
 
@@ -257,7 +261,7 @@ policy:
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
       overlap_grad_reduce: false
-      overlap_param_gather: true
+      overlap_param_gather: false
       average_in_collective: false
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
@@ -351,6 +355,9 @@ policy:
         reasoning_parser: nano_v3
 
     vllm_kwargs:
+      # Symmetric cross-GPU deadlock fix carried from the PPO yaml
+      # (custom-allreduce kernel park on TP-4; costs a few % decode).
+      disable_custom_all_reduce: true
       attention_backend: FLASH_ATTN
       moe_backend: triton
       mamba_ssm_cache_dtype: "float32"

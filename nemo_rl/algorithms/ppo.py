@@ -4117,15 +4117,31 @@ def async_ppo_train(
                         dp_size = policy.sharding_annotations.get_axis_size(
                             "data_parallel"
                         )
+                        # The VALUE model consumes the same padded batch
+                        # (get_values + train), so the padding multiple must
+                        # satisfy its sharding/micro-batching too — value
+                        # parallelism is configurable independently of policy.
+                        value_dp_size = value_model.sharding_annotations.get_axis_size(
+                            "data_parallel"
+                        )
                         train_micro_batch_size = int(
                             master_config.policy["train_micro_batch_size"]
                         )
                         logprob_batch_size = int(
                             master_config.policy.get("logprob_batch_size") or 1
                         )
-                        padding_multiple = dp_size * math.lcm(
+                        value_micro_batch_size = int(
+                            master_config.value.get("train_micro_batch_size")
+                            or train_micro_batch_size
+                        )
+                        value_logprob_batch_size = int(
+                            master_config.value.get("logprob_batch_size") or 1
+                        )
+                        padding_multiple = math.lcm(dp_size, value_dp_size) * math.lcm(
                             max(train_micro_batch_size, 1),
                             max(logprob_batch_size, 1),
+                            max(value_micro_batch_size, 1),
+                            max(value_logprob_batch_size, 1),
                         )
                         padding_rows = (-num_unpadded_traces) % padding_multiple
                         if padding_rows > 0:
@@ -4600,7 +4616,10 @@ def async_ppo_train(
                         trajectory_collector.resume.remote()
 
                 # ---- Metrics ----
-                flat_advantages = train_data["advantages"]
+                # train_data rows are PADDED in multi-trace mode while
+                # flat_messages kept the unpadded originals — slice before the
+                # masked_select or the shapes cannot broadcast.
+                flat_advantages = train_data["advantages"][:num_unpadded_traces]
                 flat_token_mask = flat_messages["token_loss_mask"]
                 flat_messages_content = flat_messages.get("content", [])
                 del flat_messages
@@ -4615,9 +4634,17 @@ def async_ppo_train(
                 if getattr(adv_estimator, "last_metrics", None):
                     metrics.update(adv_estimator.last_metrics)
 
+                # Report rewards per ROLLOUT (first trace of each), not per
+                # padded trace — sibling traces repeat the rollout reward and
+                # padding duplicates row 0, both of which would bias the mean.
+                first_trace_mask = (
+                    repeated_batch["trace_in_rollout_idx"] == 0
+                ).numpy()
                 metrics.update(
                     {
-                        "reward": rewards.numpy(),
+                        "reward": rewards[:num_unpadded_traces].numpy()[
+                            first_trace_mask
+                        ],
                         "mean_prompt_length": repeated_batch["length"].numpy(),
                         "total_num_tokens": input_lengths.numpy(),
                         "advantages/mean": torch.mean(response_advantages)
@@ -5074,15 +5101,25 @@ def async_ppo_train(
             metrics["max_trajectory_policy_age"] = max_trajectory_policy_age
 
             # Track the worst-mismatch example plot (parity with sync PPO).
+            # Slice train_data tensors to the UNPADDED trace count: padding
+            # rows (sample_mask=0) yield NaN mult_prob_error inside the plot
+            # fn, whose argmax can then index past the unpadded
+            # prompt_lengths/full_lengths.
             if metrics.get("token_mult_prob_error", 0) > 1.05:
                 logger.log_plot_token_mult_prob_error(
                     {
                         "prompt_lengths": repeated_batch["length"],
                         "full_lengths": input_lengths,
-                        "generation_logprobs": train_data["generation_logprobs"],
-                        "prev_logprobs": train_data["prev_logprobs"],
-                        "token_mask": train_data["token_mask"],
-                        "sample_mask": train_data["sample_mask"],
+                        "generation_logprobs": train_data["generation_logprobs"][
+                            :num_unpadded_traces
+                        ],
+                        "prev_logprobs": train_data["prev_logprobs"][
+                            :num_unpadded_traces
+                        ],
+                        "token_mask": train_data["token_mask"][:num_unpadded_traces],
+                        "sample_mask": train_data["sample_mask"][
+                            :num_unpadded_traces
+                        ],
                     },
                     step + 1,
                     name="train/token_mult_prob_error_plot_sample",
@@ -5310,7 +5347,15 @@ def validate(
                     greedy=False,
                 )
 
-            total_rewards.extend(val_batch["total_reward"].tolist())
+            # Multi-trace: count each ROLLOUT once (sibling traces repeat the
+            # rollout reward and would inflate/deflate validation accuracy).
+            if "trace_in_rollout_idx" in val_batch:
+                first_trace_mask = val_batch["trace_in_rollout_idx"] == 0
+                total_rewards.extend(
+                    val_batch["total_reward"][first_trace_mask].tolist()
+                )
+            else:
+                total_rewards.extend(val_batch["total_reward"].tolist())
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
             # Collect message logs for later display
