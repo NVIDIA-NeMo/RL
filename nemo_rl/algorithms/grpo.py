@@ -48,6 +48,10 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
+from nemo_rl.algorithms.multi_trace_metrics import (
+    compute_multi_trace_diagnostics,
+    finalize_sum_count_metrics,
+)
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
@@ -3570,9 +3574,15 @@ def aggregate_rollout_metrics(
             aggregated[k] = max(v)
         elif k in ("total_turns", "empty_rollout_count"):
             aggregated[k] = sum(v)
+        elif k.endswith("/sum") or k.endswith("/count"):
+            # Exact-aggregation pairs (reward/by_*, termination/*,
+            # compaction/*, format/*): sum, then derive /mean and /rate below.
+            aggregated[k] = sum(v)
         else:
             aggregated[k] = sum(v) / len(v)
-    return aggregated
+    # X/sum + X/count -> X/mean (exact over all rollouts in the step);
+    # rollout-level event counts -> /rate over rollouts/count.
+    return finalize_sum_count_metrics(aggregated)
 
 
 def _gen_benchmark_skip_training() -> bool:
@@ -4421,6 +4431,33 @@ def async_grpo_train(
                     torch.zeros_like(train_data["sample_mask"], dtype=torch.bool),
                 )
 
+
+                # Per-trace diagnostics (wandb: train/logprob_error/*/by_*,
+                # train/multi_trace/{env_masked,empty_rollout,seq_logprob_masked}
+                # _trace_fraction, trace_kind_*): seq error / gate-mask rate by
+                # trace index and segment kind, masked-fraction decomposition,
+                # |logprob err| by position. Needs real prev_logprobs and the
+                # Gym per-trace fields; merged into `metrics` below.
+                multi_trace_diag_metrics: dict[str, float] = {}
+                if not skip_prev_logprobs and "mask_sample" in repeated_batch:
+                    multi_trace_diag_metrics = compute_multi_trace_diagnostics(
+                        seq_mult_prob_error=seq_mult_prob_error,
+                        masked_by_seq_logprob_error=masked_by_seq_logprob_error,
+                        pre_seq_error_sample_loss_mask=pre_seq_error_sample_loss_mask,
+                        mask_sample=repeated_batch["mask_sample"],
+                        is_empty_rollout=repeated_batch["is_empty_rollout"],
+                        trace_in_rollout_idx=repeated_batch["trace_in_rollout_idx"],
+                        trace_kinds=[
+                            (md or {}).get("kind", "unknown")
+                            for md in repeated_batch["trace_metadata"]
+                        ],
+                        token_mask=train_data["token_mask"],
+                        sample_mask=train_data["sample_mask"],
+                        generation_logprobs=train_data["generation_logprobs"],
+                        prev_logprobs=train_data["prev_logprobs"],
+                        num_unpadded_traces=num_unpadded_traces,
+                    )
+
                 # Pad teacher logprobs to match train_data sequence length.
                 if trajectory_teacher_logprobs is not None:
                     trajectory_teacher_logprobs = _pad_teacher_logprobs(
@@ -4759,6 +4796,7 @@ def async_grpo_train(
                     else:
                         metrics[k] = np.sum(v).item()
                 metrics.update(rollout_metrics)
+                metrics.update(multi_trace_diag_metrics)
 
                 # Multi-trace batch composition metrics (wandb: train/multi_trace/*)
                 if multi_trace:

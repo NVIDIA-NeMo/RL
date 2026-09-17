@@ -15,6 +15,7 @@
 import asyncio
 import gc
 import json
+import math
 import tempfile
 from copy import deepcopy
 from dataclasses import asdict
@@ -42,7 +43,15 @@ from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
     generate_responses_async,
+    _compaction_rollout_metrics,
     _rollout_debug_info,
+    _rollout_has_think_tag_violation,
+    _termination_kind,
+    _think_tag_violation_metrics,
+    _trace_has_think_tag_token_violation,
+    _trace_kind,
+    _trace_kind_metrics,
+    apply_reward_penalties,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
@@ -256,6 +265,353 @@ class TestRolloutDebugInfo:
         json.dumps(empty)
         assert empty["instance_id"] is None
         assert empty["segments"] == []
+
+
+class TestTerminationKind:
+    """Unit tests for _termination_kind (one-hot terminal reason of a rollout)."""
+
+    def test_priority_order(self):
+        # agent OOM beats everything, then agent timeout, then agent_error_kind.
+        assert (
+            _termination_kind(
+                {"oom_killed": True, "agent_timed_out": True, "agent_error_kind": "max_iteration"}
+            )
+            == "agent_oom"
+        )
+        assert (
+            _termination_kind({"agent_timed_out": True, "agent_error_kind": "context_window"})
+            == "agent_timeout"
+        )
+        # agent_error_kind beats eval flags.
+        assert (
+            _termination_kind({"agent_error_kind": "stuck_in_loop", "eval_timed_out": True})
+            == "stuck_in_loop"
+        )
+        assert (
+            _termination_kind({"eval_oom_killed": True, "eval_timed_out": True}) == "eval_oom"
+        )
+
+    def test_named_and_other_error_kinds(self):
+        for kind in ("max_iteration", "context_window", "stuck_in_loop"):
+            assert _termination_kind({"agent_error_kind": kind}) == kind
+        assert _termination_kind({"agent_error_kind": "bench_crashed"}) == "other_error"
+
+    def test_eval_flags_and_completed(self):
+        assert _termination_kind({"eval_timed_out": True}) == "eval_timeout"
+        assert _termination_kind({}) == "completed"
+        assert (
+            _termination_kind(
+                {
+                    "agent_error_kind": None,
+                    "agent_timed_out": False,
+                    "oom_killed": False,
+                    "eval_timed_out": False,
+                    "eval_oom_killed": None,
+                }
+            )
+            == "completed"
+        )
+
+
+class TestTraceKind:
+    """Unit tests for _trace_kind (segment kind of a trace)."""
+
+    @staticmethod
+    def _md(segment_index="0", reason="", parent=""):
+        return {
+            "session_id": "ses_main",
+            "parent_session_id": parent,
+            "segment_index": segment_index,
+            "segment_boundary_reason": reason,
+        }
+
+    def test_subagent_wins_over_everything(self):
+        assert (
+            _trace_kind(self._md("1", "compaction", parent="ses_main"), {"num_compactions": 1})
+            == "subagent"
+        )
+
+    def test_compaction_segments(self):
+        info = {"num_compactions": 1}
+        assert _trace_kind(self._md("1", "compaction"), info) == "compaction_summary"
+        assert _trace_kind(self._md("2", "post_compaction"), info) == "post_compaction"
+        # segment 0 of a rollout that compacted is the pre-compaction head.
+        assert _trace_kind(self._md("0"), info) == "pre_compaction"
+        assert _trace_kind(self._md(0), info) == "pre_compaction"  # int index tolerated
+
+    def test_uncompacted_and_legacy_metadata(self):
+        assert _trace_kind(self._md("0"), {"num_compactions": 0}) == "uncompacted"
+        assert _trace_kind({}, {"num_compactions": 0}) == "uncompacted"
+        assert _trace_kind(None, None) == "uncompacted"
+        assert _trace_kind({}, {}) == "uncompacted"
+
+    def test_empty_rollout_dummy(self):
+        assert _trace_kind({}, {"num_compactions": 0}, is_empty_rollout=True) == "empty"
+        # The flag wins even if stale metadata says otherwise.
+        assert (
+            _trace_kind(self._md("1", "compaction"), {"num_compactions": 1}, is_empty_rollout=True)
+            == "empty"
+        )
+
+
+class TestCompactionRolloutMetrics:
+    """Unit tests for _compaction_rollout_metrics (per-group /sum + /count pairs)."""
+
+    TERMINATION_KINDS = (
+        "completed",
+        "max_iteration",
+        "context_window",
+        "stuck_in_loop",
+        "other_error",
+        "agent_timeout",
+        "agent_oom",
+        "eval_timeout",
+        "eval_oom",
+    )
+
+    def test_sums_and_counts(self):
+        infos = [
+            {"num_compactions": 0, "mask_sample": False, "resolved": True},
+            # masked AND resolved: agent timed out after a good patch.
+            {"num_compactions": 1, "mask_sample": True, "resolved": True, "agent_timed_out": True},
+            {"num_compactions": 2, "mask_sample": False, "resolved": False, "agent_error_kind": "max_iteration"},
+            {"num_compactions": 3, "mask_sample": True, "resolved": False, "oom_killed": True},
+        ]
+        rewards = [1.0, 1.0, 0.0, 0.0]
+        m = _compaction_rollout_metrics(infos, rewards)
+
+        assert m["rollouts/count"] == 4
+        assert (m["reward/by_num_compactions/0/sum"], m["reward/by_num_compactions/0/count"]) == (1.0, 1)
+        assert (m["reward/by_num_compactions/1/sum"], m["reward/by_num_compactions/1/count"]) == (1.0, 1)
+        assert (m["reward/by_num_compactions/2plus/sum"], m["reward/by_num_compactions/2plus/count"]) == (0.0, 2)
+
+        assert m["termination/completed/count"] == 1
+        assert m["termination/agent_timeout/count"] == 1
+        assert m["termination/max_iteration/count"] == 1
+        assert m["termination/agent_oom/count"] == 1
+        assert m["reward/by_termination/agent_timeout/sum"] == 1.0
+        assert m["reward/by_termination/agent_timeout/count"] == 1
+        assert m["reward/by_termination/completed/sum"] == 1.0
+
+        assert m["mask_sample/by_kind/agent_timeout/count"] == 1
+        assert m["mask_sample/by_kind/agent_oom/count"] == 1
+        assert m["mask_sample/by_kind/completed/count"] == 0
+        assert (m["reward/masked/sum"], m["reward/masked/count"]) == (1.0, 2)
+        assert (m["reward/unmasked/sum"], m["reward/unmasked/count"]) == (1.0, 2)
+        assert m["reward/masked_resolved/count"] == 1
+
+        # Stable key set: every termination kind is present even when absent.
+        for kind in self.TERMINATION_KINDS:
+            assert f"termination/{kind}/count" in m
+            assert f"reward/by_termination/{kind}/sum" in m
+            assert f"reward/by_termination/{kind}/count" in m
+            assert f"mask_sample/by_kind/{kind}/count" in m
+        assert all(math.isfinite(v) for v in m.values())
+        json.dumps(m)
+
+    def test_empty_group(self):
+        m = _compaction_rollout_metrics([], [])
+        assert m["rollouts/count"] == 0
+        assert all(v == 0 for v in m.values())
+
+    def test_length_mismatch_is_an_error(self):
+        with pytest.raises(AssertionError):
+            _compaction_rollout_metrics([{}], [1.0, 0.0])
+
+
+class TestTraceKindMetrics:
+    """Unit tests for _trace_kind_metrics (per-trace sizes by segment kind)."""
+
+    def test_compaction_sizes_and_turns_by_kind(self):
+        kinds = ["pre_compaction", "compaction_summary", "post_compaction", "subagent", "uncompacted", "empty"]
+        turns = [10, 1, 5, 3, 7, 1]
+        prompt = [50000, 90000, 3000, 2000, 1000, 1]
+        gen = [4000, 1500, 2000, 500, 800, 0]
+        m = _trace_kind_metrics(kinds, turns, prompt, gen)
+
+        assert (
+            m["compaction/summary_gen_tokens/sum"],
+            m["compaction/summary_gen_tokens/count"],
+            m["compaction/summary_gen_tokens/max"],
+        ) == (1500, 1, 1500)
+        assert (
+            m["compaction/trigger_prompt_tokens/sum"],
+            m["compaction/trigger_prompt_tokens/count"],
+            m["compaction/trigger_prompt_tokens/max"],
+        ) == (90000, 1, 90000)
+        assert (
+            m["compaction/post_compaction_prompt_tokens/sum"],
+            m["compaction/post_compaction_prompt_tokens/count"],
+            m["compaction/post_compaction_prompt_tokens/max"],
+        ) == (3000, 1, 3000)
+        assert m["turns_per_trace/by_kind/pre_compaction/sum"] == 10
+        assert m["turns_per_trace/by_kind/post_compaction/sum"] == 5
+        assert m["turns_per_trace/by_kind/subagent/max"] == 3
+        assert m["turns_per_trace/by_kind/uncompacted/count"] == 1
+        # The forced single-call summary and the dummy are not turn-comparable.
+        assert not any(k.startswith("turns_per_trace/by_kind/compaction_summary") for k in m)
+        assert not any(k.startswith("turns_per_trace/by_kind/empty") for k in m)
+
+    def test_absent_kinds_emit_zeros(self):
+        m = _trace_kind_metrics(["uncompacted", "uncompacted"], [4, 6], [100, 200], [10, 20])
+        assert (
+            m["compaction/summary_gen_tokens/sum"],
+            m["compaction/summary_gen_tokens/count"],
+            m["compaction/summary_gen_tokens/max"],
+        ) == (0, 0, 0)
+        assert m["compaction/trigger_prompt_tokens/count"] == 0
+        assert m["compaction/post_compaction_prompt_tokens/count"] == 0
+        assert (
+            m["turns_per_trace/by_kind/uncompacted/sum"],
+            m["turns_per_trace/by_kind/uncompacted/count"],
+            m["turns_per_trace/by_kind/uncompacted/max"],
+        ) == (10, 2, 6)
+        assert m["turns_per_trace/by_kind/subagent/count"] == 0
+
+
+class TestThinkTagViolation:
+    """Unit tests for the think-tag detection helpers (think_open=12, think_close=13)."""
+
+    TOKEN_IDS = {"think_open": 12, "think_close": 13}
+
+    @staticmethod
+    def _msg(role, ids):
+        return {"role": role, "token_ids": torch.tensor(ids, dtype=torch.long)}
+
+    @classmethod
+    def _trace(cls, message_log, full_result=None, **extra):
+        return {
+            "message_log": message_log,
+            "input_message_log": message_log[:1],
+            "full_result": full_result if full_result is not None else {"reward": 1.0, "responses": []},
+            **extra,
+        }
+
+    # -- token-ID check -----------------------------------------------------
+
+    def test_token_check_accepts_well_formed_turns(self):
+        # thinking enabled: prompt ends with <think>, generation closes it once.
+        log = [self._msg("user", [1, 2, 12]), self._msg("assistant", [5, 6, 13, 7])]
+        assert _trace_has_think_tag_token_violation(log, 12, 13) is False
+        # thinking disabled: balanced prompt, no tags generated.
+        log = [self._msg("user", [1, 12, 13]), self._msg("assistant", [5, 6])]
+        assert _trace_has_think_tag_token_violation(log, 12, 13) is False
+        # multi-turn: later prompts include earlier <think>...</think> pairs.
+        log = [
+            self._msg("user", [1, 12]),
+            self._msg("assistant", [5, 13, 7]),
+            self._msg("user", [1, 12, 5, 13, 7, 8, 12]),
+            self._msg("assistant", [9, 13, 10]),
+        ]
+        assert _trace_has_think_tag_token_violation(log, 12, 13) is False
+
+    def test_token_check_flags_bad_generations_and_prompts(self):
+        # generated <think>
+        log = [self._msg("user", [1, 12]), self._msg("assistant", [12, 5, 13])]
+        assert _trace_has_think_tag_token_violation(log, 12, 13) is True
+        # thinking enabled but never closed
+        log = [self._msg("user", [1, 12]), self._msg("assistant", [5, 6])]
+        assert _trace_has_think_tag_token_violation(log, 12, 13) is True
+        # two closes
+        log = [self._msg("user", [1, 12]), self._msg("assistant", [5, 13, 6, 13])]
+        assert _trace_has_think_tag_token_violation(log, 12, 13) is True
+        # close generated with thinking disabled
+        log = [self._msg("user", [1, 12, 13]), self._msg("assistant", [5, 13])]
+        assert _trace_has_think_tag_token_violation(log, 12, 13) is True
+        # unexpected prompt pattern (two opens)
+        log = [self._msg("user", [12, 12]), self._msg("assistant", [5, 13])]
+        assert _trace_has_think_tag_token_violation(log, 12, 13) is True
+        # violation only in a later pair is still caught
+        log = [
+            self._msg("user", [1, 12]),
+            self._msg("assistant", [5, 13]),
+            self._msg("user", [1, 12, 5, 13, 12]),
+            self._msg("assistant", [5]),
+        ]
+        assert _trace_has_think_tag_token_violation(log, 12, 13) is True
+
+    def test_token_check_honours_configured_ids_and_list_token_ids(self):
+        log = [self._msg("user", [1, 100]), self._msg("assistant", [5, 101])]
+        assert _trace_has_think_tag_token_violation(log, 100, 101) is False
+        assert _trace_has_think_tag_token_violation(log, 12, 13) is False  # balanced 0/0
+        log = [{"role": "user", "token_ids": [1, 12]}, {"role": "assistant", "token_ids": [12, 13]}]
+        assert _trace_has_think_tag_token_violation(log, 12, 13) is True
+
+    # -- string check + combined predicate ----------------------------------
+
+    def test_string_check_reads_responses_or_response(self):
+        ok_log = [self._msg("user", [1, 12]), self._msg("assistant", [5, 13])]
+
+        def result_with(gen_str, legacy=False):
+            resp = {"output": [{"type": "message", "generation_str": gen_str}]}
+            full = {"reward": 1.0, "response": resp} if legacy else {"reward": 1.0, "responses": [resp]}
+            return self._trace(ok_log, full)
+
+        assert _rollout_has_think_tag_violation(result_with("plan</think>done"), self.TOKEN_IDS) is False
+        assert _rollout_has_think_tag_violation(result_with("<think>x</think>"), self.TOKEN_IDS) is True
+        assert _rollout_has_think_tag_violation(result_with("a</think>b</think>"), self.TOKEN_IDS) is True
+        assert (
+            _rollout_has_think_tag_violation(result_with("a</think>b</think>", legacy=True), self.TOKEN_IDS)
+            is True
+        )
+        # No decoded text at all -> only the token check applies.
+        assert _rollout_has_think_tag_violation(self._trace(ok_log, {"reward": 1.0}), self.TOKEN_IDS) is False
+        assert _rollout_has_think_tag_violation(self._trace(ok_log, {"reward": 1.0}), None) is False
+
+    def test_combined_predicate_uses_token_check(self):
+        bad_log = [self._msg("user", [1, 12]), self._msg("assistant", [5, 6])]
+        assert _rollout_has_think_tag_violation(self._trace(bad_log), self.TOKEN_IDS) is True
+
+    # -- metrics + penalty wiring -------------------------------------------
+
+    def test_violation_metrics_count_rollouts_and_traces_without_touching_reward(self):
+        ok_log = [self._msg("user", [1, 12]), self._msg("assistant", [5, 13])]
+        bad_log = [self._msg("user", [1, 12]), self._msg("assistant", [5, 6])]
+        shared_a = {"reward": 1.0, "responses": []}
+        shared_b = {"reward": 1.0, "responses": [{"output": [{"generation_str": "<think>oops"}]}]}
+        shared_c = {"reward": 0.0, "responses": []}
+        shared_d = {"reward": 0.0, "responses": []}
+        rollout_results = [
+            # A: token violation on the second trace only
+            [self._trace(ok_log, shared_a), self._trace(bad_log, shared_a)],
+            # B: clean tokens, string violation
+            [self._trace(ok_log, shared_b)],
+            # C: clean
+            [self._trace(ok_log, shared_c), self._trace(ok_log, shared_c), self._trace(ok_log, shared_c)],
+            # D: empty dummy, ignored
+            [self._trace(ok_log, shared_d, is_empty_rollout=True)],
+        ]
+        m = _think_tag_violation_metrics(rollout_results, self.TOKEN_IDS)
+        assert m == {
+            "format/think_tag_violation/count": 2,
+            "format/think_tag_violation/by_trace_in_rollout_idx/0/count": 0,
+            "format/think_tag_violation/by_trace_in_rollout_idx/1/count": 1,
+            "format/think_tag_violation/by_trace_in_rollout_idx/2plus/count": 0,
+        }
+        # Count-only: rewards are untouched.
+        assert [r["reward"] for r in (shared_a, shared_b, shared_c, shared_d)] == [1.0, 1.0, 0.0, 0.0]
+
+    def test_apply_reward_penalties_still_zeroes_reward_when_flag_set(self):
+        ok_log = [self._msg("user", [1, 12]), self._msg("assistant", [5, 13])]
+        bad_log = [self._msg("user", [1, 12]), self._msg("assistant", [5, 6])]
+        shared_bad = {"reward": 1.0, "responses": []}
+        shared_ok = {"reward": 1.0, "responses": []}
+        results = [
+            self._trace(ok_log, shared_bad, trace_idx=0),
+            self._trace(bad_log, shared_bad, trace_idx=1),
+            self._trace(ok_log, shared_ok, trace_idx=0),
+        ]
+        cfg = {"penalize_malformed_think_tag": True, "token_ids": self.TOKEN_IDS}
+        counts = apply_reward_penalties(results, cfg)
+        assert counts["malformed_think_tag"] == 1  # one rollout, not two traces
+        assert shared_bad["reward"] == 0.0
+        assert shared_ok["reward"] == 1.0
+
+        # Flag off: nothing happens even with the same violation.
+        shared_bad["reward"] = 1.0
+        counts = apply_reward_penalties(results, {"token_ids": self.TOKEN_IDS})
+        assert counts["malformed_think_tag"] == 0
+        assert shared_bad["reward"] == 1.0
 
 
 @pytest.fixture(scope="function")

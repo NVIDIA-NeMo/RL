@@ -1528,6 +1528,325 @@ def _rollout_debug_info(full_result: dict) -> dict:
     }
 
 
+# One-hot terminal reason of a rollout (see _termination_kind). Fixed order so
+# every group emits the same key set (absent kinds emit 0).
+_TERMINATION_KINDS: tuple[str, ...] = (
+    "completed",
+    "max_iteration",
+    "context_window",
+    "stuck_in_loop",
+    "other_error",
+    "agent_timeout",
+    "agent_oom",
+    "eval_timeout",
+    "eval_oom",
+)
+_NAMED_AGENT_ERROR_KINDS = frozenset({"max_iteration", "context_window", "stuck_in_loop"})
+
+# Segment kind of a trace (see _trace_kind).
+_TRACE_KINDS: tuple[str, ...] = (
+    "uncompacted",
+    "pre_compaction",
+    "compaction_summary",
+    "post_compaction",
+    "subagent",
+    "empty",
+)
+# Trace kinds whose per-trace turn count is comparable to `agent_max_turns`
+# (the compaction summary is a single forced call; the empty dummy has none).
+_TURN_COUNT_TRACE_KINDS: tuple[str, ...] = (
+    "uncompacted",
+    "pre_compaction",
+    "post_compaction",
+    "subagent",
+)
+
+
+def _termination_kind(info: dict) -> str:
+    """One-hot terminal reason of a rollout from its ``_rollout_debug_info`` record.
+
+    Priority (first match wins): oom_killed -> ``agent_oom``; agent_timed_out ->
+    ``agent_timeout``; agent_error_kind in {max_iteration, context_window,
+    stuck_in_loop} -> that string; any other non-empty agent_error_kind ->
+    ``other_error``; eval_oom_killed -> ``eval_oom``; eval_timed_out ->
+    ``eval_timeout``; else ``completed``.
+    """
+    if info.get("oom_killed"):
+        return "agent_oom"
+    if info.get("agent_timed_out"):
+        return "agent_timeout"
+    error_kind = info.get("agent_error_kind") or ""
+    if not isinstance(error_kind, str):
+        error_kind = str(error_kind)
+    if error_kind in _NAMED_AGENT_ERROR_KINDS:
+        return error_kind
+    if error_kind:
+        return "other_error"
+    if info.get("eval_oom_killed"):
+        return "eval_oom"
+    if info.get("eval_timed_out"):
+        return "eval_timeout"
+    return "completed"
+
+
+def _trace_kind(
+    trace_metadata: dict | None,
+    rollout_info: dict | None,
+    is_empty_rollout: bool = False,
+) -> str:
+    """Segment kind of one trace from its env metadata and its rollout's info.
+
+    ``subagent`` (parent_session_id set) > ``compaction_summary``
+    (segment_boundary_reason == "compaction") > ``post_compaction``
+    (== "post_compaction") > ``pre_compaction`` (segment_index "0" of a rollout
+    that compacted at least once) > ``uncompacted``. The empty-rollout dummy
+    trace is ``empty``.
+    """
+    if is_empty_rollout:
+        return "empty"
+    md = trace_metadata or {}
+    if md.get("parent_session_id"):
+        return "subagent"
+    reason = md.get("segment_boundary_reason") or ""
+    if reason == "compaction":
+        return "compaction_summary"
+    if reason == "post_compaction":
+        return "post_compaction"
+    num_compactions = (rollout_info or {}).get("num_compactions") or 0
+    if str(md.get("segment_index", "")) == "0" and num_compactions > 0:
+        return "pre_compaction"
+    return "uncompacted"
+
+
+def _trace_index_bucket(trace_in_rollout_idx: int) -> str:
+    """``0`` / ``1`` / ``2plus`` bucket of a trace's index within its rollout."""
+    idx = int(trace_in_rollout_idx)
+    return "0" if idx <= 0 else ("1" if idx == 1 else "2plus")
+
+
+def _compaction_rollout_metrics(
+    rollout_infos: list[dict], rewards: list[float]
+) -> dict[str, float]:
+    """Per-prompt-group rollout metrics as exact ``/sum`` + ``/count`` pairs.
+
+    Emitted as sums/counts (not means) so the trainer can aggregate the 64
+    prompt groups exactly (sum, then divide) instead of averaging per-group
+    means over unequal bucket sizes. ``finalize_sum_count_metrics`` in
+    ``nemo_rl.algorithms.multi_trace_metrics`` derives ``/mean`` and ``/rate``.
+
+    Keys: ``rollouts/count``; ``reward/by_num_compactions/{0,1,2plus}/{sum,count}``;
+    ``termination/{kind}/count`` and ``reward/by_termination/{kind}/{sum,count}``
+    for every kind in ``_TERMINATION_KINDS``; ``mask_sample/by_kind/{kind}/count``
+    (termination kind of env-masked rollouts); ``reward/{masked,unmasked}/{sum,count}``;
+    ``reward/masked_resolved/count`` (env-masked AND resolved: inflates the
+    baseline of every unmasked sibling with no gradient of its own).
+    """
+    assert len(rollout_infos) == len(rewards), (
+        f"{len(rollout_infos)} rollout infos vs {len(rewards)} rewards"
+    )
+    rewards = [float(r) for r in rewards]
+    metrics: dict[str, float] = {"rollouts/count": len(rollout_infos)}
+
+    by_num_compactions: dict[str, list[float]] = {"0": [], "1": [], "2plus": []}
+    by_termination: dict[str, list[float]] = {k: [] for k in _TERMINATION_KINDS}
+    masked_by_kind: dict[str, int] = {k: 0 for k in _TERMINATION_KINDS}
+    masked_rewards: list[float] = []
+    unmasked_rewards: list[float] = []
+    masked_resolved = 0
+    for info, reward in zip(rollout_infos, rewards):
+        num_compactions = info.get("num_compactions") or 0
+        by_num_compactions[
+            "0" if num_compactions == 0 else ("1" if num_compactions == 1 else "2plus")
+        ].append(reward)
+        kind = _termination_kind(info)
+        by_termination[kind].append(reward)
+        if info.get("mask_sample"):
+            masked_by_kind[kind] += 1
+            masked_rewards.append(reward)
+            if bool(info.get("resolved")):
+                masked_resolved += 1
+        else:
+            unmasked_rewards.append(reward)
+
+    for bucket, values in by_num_compactions.items():
+        metrics[f"reward/by_num_compactions/{bucket}/sum"] = sum(values)
+        metrics[f"reward/by_num_compactions/{bucket}/count"] = len(values)
+    for kind in _TERMINATION_KINDS:
+        values = by_termination[kind]
+        metrics[f"termination/{kind}/count"] = len(values)
+        metrics[f"reward/by_termination/{kind}/sum"] = sum(values)
+        metrics[f"reward/by_termination/{kind}/count"] = len(values)
+        metrics[f"mask_sample/by_kind/{kind}/count"] = masked_by_kind[kind]
+    metrics["reward/masked/sum"] = sum(masked_rewards)
+    metrics["reward/masked/count"] = len(masked_rewards)
+    metrics["reward/unmasked/sum"] = sum(unmasked_rewards)
+    metrics["reward/unmasked/count"] = len(unmasked_rewards)
+    metrics["reward/masked_resolved/count"] = masked_resolved
+    return metrics
+
+
+def _trace_kind_metrics(
+    kinds: list[str],
+    turns_per_trace: list[int],
+    prompt_tokens: list[int],
+    gen_tokens: list[int],
+) -> dict[str, float]:
+    """Per-trace size metrics split by segment kind, as ``/sum``, ``/count``, ``/max``.
+
+    ``compaction/summary_gen_tokens/*``: generated tokens of compaction-summary
+    traces (summary length). ``compaction/trigger_prompt_tokens/*``: prompt
+    tokens of compaction-summary traces (= context size when compaction fired).
+    ``compaction/post_compaction_prompt_tokens/*``: prompt size of the first
+    post-compaction call (system + summary scaffold). ``turns_per_trace/by_kind/
+    {kind}/*`` for kinds in ``_TURN_COUNT_TRACE_KINDS``. Keys are always present
+    (0 when the kind is absent) so the key set is stable across groups.
+    """
+    assert len(kinds) == len(turns_per_trace) == len(prompt_tokens) == len(gen_tokens)
+
+    def _sum_count_max(values: list[int], key: str) -> dict[str, float]:
+        return {
+            f"{key}/sum": sum(values),
+            f"{key}/count": len(values),
+            f"{key}/max": max(values, default=0),
+        }
+
+    summary_rows = [i for i, k in enumerate(kinds) if k == "compaction_summary"]
+    post_rows = [i for i, k in enumerate(kinds) if k == "post_compaction"]
+    metrics: dict[str, float] = {
+        **_sum_count_max(
+            [gen_tokens[i] for i in summary_rows], "compaction/summary_gen_tokens"
+        ),
+        **_sum_count_max(
+            [prompt_tokens[i] for i in summary_rows],
+            "compaction/trigger_prompt_tokens",
+        ),
+        **_sum_count_max(
+            [prompt_tokens[i] for i in post_rows],
+            "compaction/post_compaction_prompt_tokens",
+        ),
+    }
+    for kind in _TURN_COUNT_TRACE_KINDS:
+        metrics.update(
+            _sum_count_max(
+                [t for t, k in zip(turns_per_trace, kinds) if k == kind],
+                f"turns_per_trace/by_kind/{kind}",
+            )
+        )
+    return metrics
+
+
+def _count_token(token_ids, token_id: int) -> int:
+    if torch.is_tensor(token_ids):
+        return int((token_ids == token_id).sum().item())
+    return sum(1 for t in token_ids if t == token_id)
+
+
+def _trace_has_think_tag_token_violation(
+    message_log: list[dict], think_open_token_id: int, think_close_token_id: int
+) -> bool:
+    """Token-ID think-tag check over one trace's (user, assistant) pairs.
+
+    Thinking mode is inferred from the prompt: open == close means
+    enable_thinking=False (expect 0 open / 0 close in the generation);
+    open == close + 1 (trailing ``<think>``) means enable_thinking=True (expect
+    0 open / 1 close). Any other prompt pattern or generation count is a violation.
+    """
+    for prev, msg in zip(message_log, message_log[1:]):
+        if prev.get("role") != "user" or msg.get("role") != "assistant":
+            continue
+        prompt_open = _count_token(prev["token_ids"], think_open_token_id)
+        prompt_close = _count_token(prev["token_ids"], think_close_token_id)
+        if prompt_open == prompt_close:
+            expected_open, expected_close = 0, 0
+        elif prompt_open == prompt_close + 1:
+            expected_open, expected_close = 0, 1
+        else:
+            return True
+        if (
+            _count_token(msg["token_ids"], think_open_token_id) != expected_open
+            or _count_token(msg["token_ids"], think_close_token_id) != expected_close
+        ):
+            return True
+    return False
+
+
+def _rollout_has_think_tag_string_violation(full_result: dict) -> bool:
+    """String think-tag check on the decoded ``generation_str`` of every output item.
+
+    Catches ``<think>`` / ``</think>`` spelled with regular tokens. Reads the
+    per-segment ``responses`` when present (the aggregate ``response`` is
+    stripped without decoding in multi-trace mode), else ``response``.
+    ``<think>`` must never be generated; ``</think>`` at most once per item.
+    """
+    decoded_responses = full_result.get("responses") or [
+        full_result.get("response") or {}
+    ]
+    for response in decoded_responses:
+        for item in (response or {}).get("output", []) or []:
+            gen_str = item.get("generation_str", "") if isinstance(item, dict) else ""
+            if gen_str and (gen_str.count("<think>") > 0 or gen_str.count("</think>") > 1):
+                return True
+    return False
+
+
+def _rollout_has_think_tag_violation(result: dict, token_ids_cfg: dict | None) -> bool:
+    """Think-tag violation for one trace: token-ID check on its message_log OR the
+    rollout-wide string check on its shared ``full_result``. Pure; touches no reward.
+    """
+    cfg = token_ids_cfg or {}
+    return _trace_has_think_tag_token_violation(
+        result["message_log"], cfg.get("think_open", 12), cfg.get("think_close", 13)
+    ) or _rollout_has_think_tag_string_violation(result["full_result"])
+
+
+def _think_tag_violation_metrics(
+    rollout_results: list[list[dict]], token_ids_cfg: dict | None
+) -> dict[str, int]:
+    """Count-only think-tag violations (always on; independent of the penalty flag).
+
+    ``format/think_tag_violation/count``: rollouts with a violation in any trace
+    (same predicate as the ``penalize_malformed_think_tag`` penalty, i.e.
+    ``_rollout_has_think_tag_violation`` over the rollout's real traces).
+    ``format/think_tag_violation/by_trace_in_rollout_idx/{0,1,2plus}/count``:
+    traces failing the token-ID check, by index within their rollout.
+    """
+    cfg = token_ids_cfg or {}
+    think_open = cfg.get("think_open", 12)
+    think_close = cfg.get("think_close", 13)
+    rollout_violations = 0
+    trace_violations = {"0": 0, "1": 0, "2plus": 0}
+    for rollout_traces in rollout_results:
+        real_traces = [
+            (t_idx, trace)
+            for t_idx, trace in enumerate(rollout_traces)
+            if not trace.get("is_empty_rollout", False)
+        ]
+        if not real_traces:
+            continue
+        token_violations = [
+            _trace_has_think_tag_token_violation(
+                trace["message_log"], think_open, think_close
+            )
+            for _, trace in real_traces
+        ]
+        for (t_idx, _), violated in zip(real_traces, token_violations):
+            if violated:
+                trace_violations[_trace_index_bucket(t_idx)] += 1
+        # == any(_rollout_has_think_tag_violation(t, cfg) for t in traces):
+        # the string check reads the shared full_result, so run it once.
+        if any(token_violations) or _rollout_has_think_tag_string_violation(
+            real_traces[0][1]["full_result"]
+        ):
+            rollout_violations += 1
+    return {
+        "format/think_tag_violation/count": rollout_violations,
+        **{
+            f"format/think_tag_violation/by_trace_in_rollout_idx/{bucket}/count": n
+            for bucket, n in trace_violations.items()
+        },
+    }
+
+
 def apply_reward_penalties(
     results: list[dict], reward_penalty_config: dict[str, Any] | BaseModel | None
 ) -> dict[str, int]:
@@ -2060,6 +2379,23 @@ def run_async_nemo_gym_rollout(
             _rollout_debug_info(rollout_traces[0]["full_result"])
             for rollout_traces in rollout_results
         ]
+        # Per-trace segment kind and sizes (carried in trace_metadata below and
+        # used for the per-kind metrics).
+        trace_kinds = [
+            _trace_kind(
+                r.get("trace_metadata"),
+                rollout_infos[trace_rollout_local_idx[i]],
+                is_empty_rollout=bool(r.get("is_empty_rollout", False)),
+            )
+            for i, r in enumerate(results)
+        ]
+        trace_prompt_tokens = [
+            len(r["input_message_log"][0]["token_ids"]) for r in results
+        ]
+        trace_gen_tokens = [
+            sum(len(m["token_ids"]) for m in r["message_log"] if m["role"] == "assistant")
+            for r in results
+        ]
 
     # Aggregate metrics across all samples
     with timer.time(f"{timer_prefix}/aggregate_metrics"):
@@ -2118,6 +2454,18 @@ def run_async_nemo_gym_rollout(
             ),
             "mask_sample_rate": sum(1 for info in rollout_infos if info["mask_sample"])
             / batch_size,
+            # Exact-aggregation (/sum + /count) rollout splits: reward by
+            # compaction count / termination kind / env mask, termination and
+            # mask counts. The trainer sums these across prompt groups and
+            # derives /mean and /rate (multi_trace_metrics.finalize_sum_count_metrics).
+            **_compaction_rollout_metrics(
+                rollout_infos, [m["total_reward"] for m in all_sample_metrics]
+            ),
+            # Per-trace sizes by segment kind (summary length, context at
+            # compaction trigger, post-compaction prompt, turns by kind).
+            **_trace_kind_metrics(
+                trace_kinds, turns_per_trace, trace_prompt_tokens, trace_gen_tokens
+            ),
             **_calculate_single_metric(
                 [m["total_reward"] for m in all_sample_metrics],
                 batch_size,
@@ -2182,6 +2530,13 @@ def run_async_nemo_gym_rollout(
     rollout_metrics["empty_rollout_count"] = sum(
         1 for r in results if r.get("is_empty_rollout")
     )
+
+    # Think-tag drift, count only and always on (the reward-zeroing penalty
+    # stays gated by penalize_malformed_think_tag inside apply_reward_penalties).
+    if master_config and "token_ids" in master_config:
+        rollout_metrics.update(
+            _think_tag_violation_metrics(rollout_results, master_config["token_ids"])
+        )
 
     # Convert LLMMessageLogType to FlatMessagesType for generation
     input_batch_for_input_ids = BatchedDataDict[DatumSpec](
@@ -2263,13 +2618,10 @@ def run_async_nemo_gym_rollout(
             "trace_metadata": [
                 {
                     **(r.get("trace_metadata") or {}),
+                    "kind": trace_kinds[i],
                     "turns": turns_per_trace[i],
-                    "prompt_tokens": len(r["input_message_log"][0]["token_ids"]),
-                    "gen_tokens": sum(
-                        len(m["token_ids"])
-                        for m in r["message_log"]
-                        if m["role"] == "assistant"
-                    ),
+                    "prompt_tokens": trace_prompt_tokens[i],
+                    "gen_tokens": trace_gen_tokens[i],
                 }
                 for i, r in enumerate(results)
             ],
