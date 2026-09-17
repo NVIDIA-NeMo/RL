@@ -25,11 +25,12 @@ dependencies = [
   "setuptools",
   "pip",                                                                                                 # Required for frozen environments; uv venv --seed may not reliably install pip
   "ninja",                                                                                               # for flash-attn parallel build
-  # torch is deliberately unpinned here: each backend extra pins the torch its
+  # Deliberately a range, not an exact pin: each backend extra pins the torch its
   # wheels were built against (vllm/mcore/automodel/fsdp: 2.13.0; sglang/trtllm:
-  # 2.11.0) and resolves in its own conflict fork, so the driver venv only needs
-  # *a* torch. See the per-extra pins below.
-  "torch",
+  # 2.11.0) and resolves in its own uv conflict fork, so the base spec must admit
+  # both. The ceiling keeps the driver venv from drifting to a newer torch on a
+  # relock; it resolves to the highest allowed (2.13.0), matching vLLM.
+  "torch>=2.11,<2.14",
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
   "ray[default]>=2.55.1",
@@ -53,7 +54,7 @@ dependencies = [
   "plotly",
   "sympy>=1.14.0",
   "pillow>=12.3.0",                                                                                      # Address CVE (Pillow 12.3.0)
-  "torchvision",
+  "torchvision>=0.26,<0.29",  # tracks the torch range above (0.26 <-> 2.11, 0.28 <-> 2.13)
   # torchaudio and torchcodec are NOT installed in the container image.
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
   # Keep the base range compatible with backend-specific pins while selecting 5.12.1
