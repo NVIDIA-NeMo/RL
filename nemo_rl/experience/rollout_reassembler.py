@@ -442,15 +442,23 @@ class RolloutReassembler:
         # on a declaring harness is a regression signal. Failed selections
         # stamp the last stage attempted, so masked rollouts stay visible in
         # their method's bucket (cross-reference finalize/invalid_row_rate).
-        # Method list is derived from Gym's own type rather than hand-copied,
-        # so a new resolution method Gym adds gets a bucket automatically
-        # instead of silently missing from these metrics.
-        from typing import get_args
+        # Receipts whose manifest never parsed carry no method (None) and
+        # fall in no bucket. Method list is derived from Gym's own type
+        # rather than hand-copied, so a new resolution method Gym adds gets a
+        # bucket automatically instead of silently missing from these
+        # metrics; the annotation is ``Literal[...] | None``, so unwrap the
+        # Literal and skip the None member.
+        from typing import Literal, get_args, get_origin
 
         from nemo_gym.token_id_capture.staging.records import RolloutReceipt
 
-        terminal_selection_methods = get_args(
-            RolloutReceipt.model_fields["terminal_selection"].annotation
+        terminal_selection_methods = tuple(
+            method
+            for member in get_args(
+                RolloutReceipt.model_fields["terminal_selection"].annotation
+            )
+            if get_origin(member) is Literal
+            for method in get_args(member)
         )
         for method in terminal_selection_methods:
             method_receipts = sum(
