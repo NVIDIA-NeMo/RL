@@ -444,10 +444,11 @@ override-dependencies = [
   "pytest>=9.0.3",
   "langchain>=0.3.28",      # Address CVE-2025-65106
   "langchain-core>=0.3.80", # Address CVE-2025-65106
-  # Forces numpy past tensorrt-llm's `numpy>=2.0.0,<2.4` cap (resolves to
-  # 2.5.x). The original driver — TransferQueue pinning `numpy<2.0.0` — is
+  # Forces numpy past tensorrt-llm's `numpy>=2.0.0,<2.4` cap. The original
+  # driver — TransferQueue pinning `numpy<2.0.0` — is
   # gone as of TQ v0.1.9; drop this override once the trtllm cap lifts.
-  "numpy>=2.1.0",
+  # Numba 0.65 (imported by vLLM's Inkling processor) rejects NumPy 2.5.
+  "numpy>=2.1.0,<2.5",
   # av (PyAV) bundles FFmpeg-derived codecs that may incur royalties. Exclude it from the
   # shipped container; audio/video tests install it via tools/install_audio_deps.sh.
   "av; sys_platform == 'never'",
