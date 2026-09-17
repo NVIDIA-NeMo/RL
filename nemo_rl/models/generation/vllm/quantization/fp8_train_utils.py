@@ -28,10 +28,11 @@ def canonicalize_mxfp8_refit_output(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Validate and normalize the MXFP8 refit wire representation.
 
-    Both trainer-side and vLLM receiver-side quantization produce this format:
-    E4M3 values retain the logical checkpoint shape, while E8M0 scale bytes use
-    one entry per 32 values along the final dimension. The scale tensor is sent
-    as the matching ``*_scale_from_checkpoint`` parameter.
+    Both supported trainer-side and vLLM receiver-side quantizers produce this
+    format: E4M3 values retain the logical checkpoint shape, while E8M0 scale
+    bytes use one entry per 32 values along the final dimension. A zero scale
+    byte is only valid for an all-zero value block. The scale tensor is sent as
+    the matching ``*_scale_from_checkpoint`` parameter.
     """
     shape = torch.Size(weight_shape)
     if not shape or shape[-1] % MXFP8_BLOCK_SIZE != 0:
@@ -115,8 +116,8 @@ def mxfp8_e4m3_quantize_for_refit(
     Mirrors the receiver path in quantization/fp8.py load_weights
     (mxfp8_e4m3_quantize + scale reshape) so the streamed E4M3 data and
     *_scale_from_checkpoint scales load bit-identically without receiver-side
-    re-quantization. Uses the same flashinfer kernel as vLLM on Blackwell and
-    the torch reference elsewhere.
+    re-quantization. Uses the same FlashInfer CuTe-DSL backend as vLLM on
+    Blackwell and the torch reference elsewhere.
     """
     x_q = x_scales = None
     if x.is_cuda and torch.cuda.get_device_capability(x.device) >= (10, 0):
@@ -129,7 +130,10 @@ def mxfp8_e4m3_quantize_for_refit(
             ) from exc
         else:
             x_q, x_scales = flashinfer_mxfp8_quantize(
-                x, is_sf_swizzled_layout=False, alignment=32
+                x,
+                is_sf_swizzled_layout=False,
+                alignment=32,
+                backend="cute-dsl",
             )
             if x_scales.ndim == 1 and x.ndim == 2:
                 x_scales = x_scales.view(x.size(0), -1)
