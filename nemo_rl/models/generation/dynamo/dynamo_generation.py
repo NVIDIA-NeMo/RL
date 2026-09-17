@@ -20,6 +20,7 @@ from typing import Any, AsyncGenerator, Optional
 import ray
 import torch
 
+from nemo_rl.data.multimodal_utils import VLLM_PROMPT_KEYS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.dynamo.config import DynamoConfig
@@ -374,10 +375,10 @@ class DynamoGeneration(GenerationInterface):
         data: BatchedDataDict["GenerationDatumSpec"],
         sample_idx: int,
     ) -> list[int]:
-        if "vllm_content" in data:
+        if VLLM_PROMPT_KEYS & data.keys():
             raise NotImplementedError(
                 "DynamoGeneration direct generate() supports token-ID LLM "
-                "prompts only; multimodal vllm_content is not supported."
+                "prompts only; multimodal vLLM prompt data is not supported."
             )
 
         input_length = int(data["input_lengths"][sample_idx].item())

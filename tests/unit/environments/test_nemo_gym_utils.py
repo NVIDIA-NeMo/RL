@@ -18,9 +18,13 @@ These run in the default L0 suite. Keep this module free of heavy imports
 """
 
 import copy
+import sys
+import types
+from contextlib import contextmanager
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+from omegaconf import DictConfig
 
 from nemo_rl.environments import nemo_gym as nemo_gym_mod
 from nemo_rl.environments.nemo_gym import (
@@ -197,6 +201,20 @@ def test_build_nemo_gym_config_uv_dirs(detected_uv_dirs, configured, expected):
     )
     global_config = cfg["initial_global_config_dict"]
     assert (global_config["uv_cache_dir"], global_config["uv_venv_dir"]) == expected
+
+
+def test_build_nemo_gym_config_moves_port_range_to_actor_fields(detected_uv_dirs):
+    cfg = build_nemo_gym_config(
+        _env_configs(port_range_low=6000, port_range_high=6999),
+        base_urls=[],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+    )
+
+    assert (cfg["port_range_low"], cfg["port_range_high"]) == (6000, 6999)
+    assert "port_range_low" not in cfg["initial_global_config_dict"]
+    assert "port_range_high" not in cfg["initial_global_config_dict"]
 
 
 def test_build_nemo_gym_config_router_replay_off_uses_default_dtype(detected_uv_dirs):
@@ -403,3 +421,127 @@ def test_nemo_gym_shutdown_before_spinup_is_a_noop():
     actor.__init__({})
 
     actor.shutdown()  # must not raise
+
+
+@contextmanager
+def _stub_gym_resolved_config(resolved):
+    """Stand in for nemo_gym.global_config, which lives in the actor's venv."""
+    package = types.ModuleType("nemo_gym")
+    module = types.ModuleType("nemo_gym.global_config")
+    module.get_global_config_dict = lambda: resolved
+    with patch.dict(
+        sys.modules, {"nemo_gym": package, "nemo_gym.global_config": module}
+    ):
+        yield
+
+
+def _spun_up_actor():
+    cls = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class
+    actor = cls.__new__(cls)
+    actor.__init__({})
+    actor.rh = MagicMock()
+    return actor
+
+
+def test_list_entries_reports_entry_names_and_server_types():
+    resolved = DictConfig(
+        {
+            "math_agent": {
+                "responses_api_agents": {"simple_agent": {"entrypoint": "app.py"}}
+            },
+            "math_env": {"resources_servers": {"math": {"entrypoint": "app.py"}}},
+            # An entry can carry more than one server type.
+            "judge": {
+                "responses_api_models": {"local_vllm_model": {"entrypoint": "app.py"}},
+                "resources_servers": {"judge_tools": {"entrypoint": "app.py"}},
+            },
+            # Plain Gym settings are not entries.
+            "port_range_low": 5000,
+            "default_host": "10.0.0.1",
+            "config_paths": ["a.yaml"],
+        }
+    )
+
+    with _stub_gym_resolved_config(resolved):
+        entries = _spun_up_actor().list_entries()
+
+    assert entries == {
+        "math_agent": ["responses_api_agents"],
+        "math_env": ["resources_servers"],
+        "judge": ["responses_api_models", "resources_servers"],
+    }
+
+
+def test_list_entries_skips_dicts_that_hold_no_server_type():
+    """A dict-shaped setting is not an entry unless it nests a server type."""
+    resolved = DictConfig(
+        {
+            "real_entry": {"resources_servers": {"env": {"entrypoint": "app.py"}}},
+            "some_setting": {"nested": "value"},
+        }
+    )
+
+    with _stub_gym_resolved_config(resolved):
+        entries = _spun_up_actor().list_entries()
+
+    assert entries == {"real_entry": ["resources_servers"]}
+
+
+def test_list_entries_skips_an_entry_that_starts_no_server():
+    resolved = DictConfig(
+        {
+            "math_env": {"resources_servers": {"math": {"entrypoint": "app.py"}}},
+            "code_gen": {"resources_servers": {"code": {"host": "10.0.0.1"}}},
+        }
+    )
+
+    with _stub_gym_resolved_config(resolved):
+        entries = _spun_up_actor().list_entries()
+
+    assert entries == {"math_env": ["resources_servers"]}
+
+
+def test_list_entries_before_spinup_raises():
+    cls = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class
+    actor = cls.__new__(cls)
+    actor.__init__({})
+
+    with pytest.raises(RuntimeError, match="call _spinup"):
+        actor.list_entries()
+
+
+class TestUnresolvedAgentRefsAreDiagnosable:
+    """A Gym older than the checkout that prepared the data must say so.
+
+    ``task_source`` routing is new. A current Gym strips ``agent_ref`` from collated rows
+    and stamps ``task_source`` instead, then resolves it back inside ``run_examples``. An
+    older Gym has no resolver, so the same dataset arrives unroutable -- and the first
+    thing that touched it was an unguarded ``row["agent_ref"]``, which surfaced as a bare
+    KeyError inside a Ray TaskError inside an ExceptionGroup.
+    """
+
+    def test_resolved_rows_pass_through(self):
+        rows = [{"agent_ref": {"name": "a"}}, {"agent_ref": {"name": "b"}}]
+        nemo_gym_mod._require_resolved_agent_refs(rows)  # must not raise
+
+    def test_a_stale_gym_is_named_along_with_the_remedy(self):
+        rows = [
+            {"agent_ref": {"name": "a"}},
+            {"task_source": "workplace_assistant_simple_agent"},
+        ]
+        with pytest.raises(RuntimeError) as excinfo:
+            nemo_gym_mod._require_resolved_agent_refs(rows)
+        message = str(excinfo.value)
+        assert "1 of 2" in message
+        assert "workplace_assistant_simple_agent" in message
+        assert "NRL_FORCE_REBUILD_VENVS" in message
+
+    def test_a_row_with_no_routing_at_all_says_that_instead(self):
+        """Different cause, different fix: rebuilding venvs would not help here."""
+        with pytest.raises(RuntimeError, match="no task_source either"):
+            nemo_gym_mod._require_resolved_agent_refs([{"id": "x"}])
+
+    def test_an_empty_agent_ref_counts_as_unresolved(self):
+        """Gym writes {"name": ...}; a bare {} routes nowhere."""
+        with pytest.raises(RuntimeError):
+            nemo_gym_mod._require_resolved_agent_refs([{"agent_ref": {}}])
