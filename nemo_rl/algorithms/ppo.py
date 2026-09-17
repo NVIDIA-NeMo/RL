@@ -4130,10 +4130,13 @@ def async_ppo_train(
                         logprob_batch_size = int(
                             master_config.policy.get("logprob_batch_size") or 1
                         )
+                        # Required key — fail loud rather than assume the
+                        # policy's value if the config is malformed.
                         value_micro_batch_size = int(
-                            master_config.value.get("train_micro_batch_size")
-                            or train_micro_batch_size
+                            master_config.value["train_micro_batch_size"]
                         )
+                        # null is a legal setting meaning "no chunking
+                        # constraint" (same treatment as the policy line above).
                         value_logprob_batch_size = int(
                             master_config.value.get("logprob_batch_size") or 1
                         )
@@ -4999,14 +5002,15 @@ def async_ppo_train(
                 dbg_adv_max = torch.where(
                     dbg_has_tokens, dbg_adv_max, torch.zeros_like(dbg_adv_max)
                 )
-                dbg_values = None
-                if "values" in train_data:
-                    dbg_vals = train_data["values"][:n_dbg].detach().cpu()
-                    dbg_values = torch.where(
-                        dbg_has_tokens,
-                        dbg_vals.gather(1, dbg_first_tok.unsqueeze(1)).squeeze(1),
-                        torch.zeros(n_dbg),
-                    )
+                # PPO always runs the critic forward before this point; a
+                # missing "values" key is a broken step, not a case to paper
+                # over.
+                dbg_vals = train_data["values"][:n_dbg].detach().cpu()
+                dbg_values = torch.where(
+                    dbg_has_tokens,
+                    dbg_vals.gather(1, dbg_first_tok.unsqueeze(1)).squeeze(1),
+                    torch.zeros(n_dbg),
+                )
                 rollout_debug = {
                     "rollout_info": list(repeated_batch["rollout_info"])[:n_dbg],
                     "trace_metadata": list(repeated_batch["trace_metadata"])[:n_dbg],
@@ -5050,9 +5054,7 @@ def async_ppo_train(
                     "advantage_max": dbg_adv_max.tolist(),
                     # First-generated-token value: the critic's V(s_0) for this
                     # trace (PPO-only field vs the GRPO schema).
-                    "value_first_token": (
-                        dbg_values.tolist() if dbg_values is not None else [None] * n_dbg
-                    ),
+                    "value_first_token": dbg_values.tolist(),
                     "num_generated_tokens": dbg_tm.sum(dim=-1).tolist(),
                     "total_tokens": input_lengths[:n_dbg].tolist(),
                     "trainer_weight_version": [weight_version] * n_dbg,

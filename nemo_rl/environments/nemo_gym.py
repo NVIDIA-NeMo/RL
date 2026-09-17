@@ -376,20 +376,29 @@ Depending on your data shape, you may want to change these values."""
                 for r in responses
                 if not ((r.get("metadata") or {}).get("parent_session_id"))
             ]
-            if root_responses:
-                # Strip the bulky token arrays from the traces we are NOT
-                # training on — they'd otherwise ride along inside the shared
-                # full_result (replay-buffer checkpoints, full_result logging).
-                root_ids = {id(r) for r in root_responses}
-                for filtered in responses:
-                    if id(filtered) in root_ids:
-                        continue
-                    for output_item_dict in filtered.get("output") or []:
-                        if isinstance(output_item_dict, dict):
-                            output_item_dict.pop("prompt_token_ids", None)
-                            output_item_dict.pop("generation_token_ids", None)
-                            output_item_dict.pop("generation_log_probs", None)
-                responses = root_responses
+            if not root_responses:
+                # The agent's main session always exists and always dumps its
+                # turns; a plural result with ONLY subagent sessions means the
+                # harness lost the root trace. Training on subagent traces in
+                # a root-only arm would silently contaminate the baseline.
+                raise ValueError(
+                    "train_on_all_session_traces=false but the env returned no "
+                    "root-session trace (all responses carry parent_session_id). "
+                    f"Response metadata: {[r.get('metadata') for r in responses]}"
+                )
+            # Strip the bulky token arrays from the traces we are NOT
+            # training on — they'd otherwise ride along inside the shared
+            # full_result (replay-buffer checkpoints, full_result logging).
+            root_ids = {id(r) for r in root_responses}
+            for filtered in responses:
+                if id(filtered) in root_ids:
+                    continue
+                for output_item_dict in filtered.get("output") or []:
+                    if isinstance(output_item_dict, dict):
+                        output_item_dict.pop("prompt_token_ids", None)
+                        output_item_dict.pop("generation_token_ids", None)
+                        output_item_dict.pop("generation_log_probs", None)
+            responses = root_responses
 
         trace_results = []
         for response in responses:
