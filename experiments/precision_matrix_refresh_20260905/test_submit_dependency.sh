@@ -40,6 +40,7 @@ output=$(
 )
 
 grep -Fx -- '--dependency=afterok:12345' <<<"${output}" >/dev/null
+grep -Fx -- '--export=ALL,PATH=/usr/local/bin:/usr/bin:/bin' <<<"${output}" >/dev/null
 
 qwen35_output=$(
   ACTION=render \
