@@ -33,6 +33,7 @@ from nemo_rl.models.generation.vllm.config import (
 from nemo_rl.models.generation.vllm.patches import (
     VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
 )
+from nemo_rl.models.worker_config import resolve_worker_cls
 from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
 
 if TYPE_CHECKING:
@@ -59,16 +60,17 @@ _NEMOTRON_H_MODEL_TYPES = frozenset({"nemotron_h"})
 _NEMOTRON_H_ARCHITECTURES = frozenset({"NemotronHForCausalLM"})
 
 
-def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
-    """Return the quantized policy worker FQN if ``quant_cfg`` is set, else ``default_cls``.
-
-    Safe to call even when ModelOpt is not installed — returns ``default_cls``
-    unchanged whenever ``quant_cfg`` is ``None``, so the core policy path stays
-    import-free of ModelOpt.
-    """
-    if config.get("quant_cfg") is None:
-        return default_cls
-    return POLICY_WORKER_OVERRIDES.get(default_cls, default_cls)
+def resolve_policy_worker_cls(default_cls: str, config: "PolicyConfig") -> str:
+    """Resolve the configured policy worker without importing ModelOpt."""
+    return resolve_worker_cls(
+        default_cls,
+        config,
+        quantized_cls=(
+            POLICY_WORKER_OVERRIDES.get(default_cls, default_cls)
+            if config.get("quant_cfg") is not None
+            else None
+        ),
+    )
 
 
 def _normalize_model_type(model_type: object) -> str:
