@@ -122,7 +122,10 @@ def test_refit_wire_format_restores_flashinfer_flattened_leading_dimensions():
 
     assert got_values.shape == weight_shape
     assert got_scales.shape == (3, 5, 2)
-    assert torch.equal(got_values.reshape(-1), values.reshape(-1))
+    assert torch.equal(
+        got_values.view(torch.uint8).reshape(-1),
+        values.view(torch.uint8).reshape(-1),
+    )
     assert torch.equal(
         got_scales.reshape(-1), scales.masked_fill(scales == 0, 1).reshape(-1)
     )
