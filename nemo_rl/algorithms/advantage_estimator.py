@@ -505,11 +505,10 @@ class GeneralizedAdvantageEstimator:
         lam_value = self._resolve_lambda_value()
         lam_policy = self._resolve_lambda_policy(mask)
 
-        # If lambdas differ, compute GAE twice (decoupled); otherwise once.
-        need_decouple = (
-            self.gae_lambda_value is not None
-            or self.gae_lambda_policy is not None
-            or self.length_adaptive_alpha > 0
+        # A tensor policy lambda is length-adaptive and may differ per sample.
+        # Scalar overrides only need separate passes when their resolved values differ.
+        need_decouple = isinstance(lam_policy, torch.Tensor) or (
+            lam_value != lam_policy
         )
         if need_decouple:
             _, returns = self._compute_gae(
@@ -529,6 +528,7 @@ class GeneralizedAdvantageEstimator:
                 token_level_rewards,
                 values,
                 mask,
+                gae_lambda=lam_value,
             )
 
         # Whiten advantages (optional) and zero out masked positions (always)
