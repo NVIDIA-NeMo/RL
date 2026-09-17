@@ -1370,7 +1370,10 @@ class AsyncNemoGymRolloutImpl:
             )
 
         rollout_metrics.update(env_timing_metrics)
-        rollout_metrics[f"{timer_prefix}/routing/groups/{instance_label}"] = 1
+        for handle in shard_set.all_handles:
+            label = shard_set.instance_label(handle)
+            rollout_metrics[f"{timer_prefix}/routing/group_share/{label}"] = 0
+        rollout_metrics[f"{timer_prefix}/routing/group_share/{instance_label}"] = 1
 
         return completions, prompt_message_log, rollout_metrics
 

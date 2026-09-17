@@ -57,7 +57,8 @@ env:
         # `replicas: N` makes N identical instances of a shard.
         # Each instance runs on one node.
         # The router assigns prompt groups round-robin.
-        # Replication needs N more nodes and the default STRICT_SPREAD.
+        # With STRICT_SPREAD, this full configuration needs N+1 nodes total.
+        # That is N more than the one-node PACK setup described above.
         # It cannot be exercised by this one-node config.
         # Replicas share one merged config and therefore one port range.
         # replicas: 2

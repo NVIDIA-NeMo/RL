@@ -46,6 +46,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleMetadata,
 )
 from nemo_rl.environments.interfaces import EnvironmentReturn
+from nemo_rl.environments.nemo_gym import NemoGymShardSet
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -2473,6 +2474,69 @@ def test_prepare_nemo_gym_rows_stamps_distinct_legacy_prompt_groups():
     assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [0, 0, 0, 0]
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 0, 1]
     assert [row["_rowidx"] for row in rows] == [0, 1, 2, 3]
+
+
+def test_rollout_manager_rotates_replicas_and_reports_group_share():
+    first, second = object(), object()
+    selected = []
+    manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._timeouts = RolloutTimeouts()
+    manager._max_gym_row_attempts = 1
+    manager._deadline_registry = None
+    manager._num_generations_per_prompt = 1
+    manager._task_to_env = {
+        "nemo_gym": NemoGymShardSet(
+            handles={"tools": [first, second]},
+            route_to_shard={"agent": "tools"},
+        )
+    }
+    manager._tokenizer = None
+    manager._effort_config = None
+    manager._stats = None
+
+    async def fake_stream_rows(
+        environment,
+        pending,
+        results,
+        shaping_by_rowidx,
+        total_rows,
+        timer_prefix,
+        *,
+        on_completion,
+    ):
+        del total_rows, timer_prefix, on_completion
+        selected.append(environment)
+        for row in pending:
+            rowidx = row["_rowidx"]
+            results[rowidx] = {"input_message_log": [{"token_ids": [1]}]}
+            shaping_by_rowidx[rowidx] = SimpleNamespace(
+                length_rewards_low=[],
+                rewards_low=[],
+                low_lengths=[],
+                high_lengths=[],
+            )
+
+    manager._stream_rows = fake_stream_rows
+    manager._results_to_completions = lambda _results: ([object()], {})
+    manager._compute_rollout_metrics = lambda *_args: {}
+    manager._compute_reward_penalty_metrics = lambda *_args: {}
+
+    async def run_group():
+        return await manager._run_rollouts(
+            inputs=[{"_rowidx": 0, "agent_ref": {"name": "agent"}}],
+            timer=rollouts_mod.Timer(),
+            timer_prefix="timing/test",
+        )
+
+    metrics = [asyncio.run(run_group())[2] for _ in range(3)]
+
+    assert selected == [first, second, first]
+    per_group_metrics = {key: [group[key] for group in metrics] for key in metrics[0]}
+    from nemo_rl.algorithms.grpo import aggregate_rollout_metrics
+
+    aggregated = aggregate_rollout_metrics(per_group_metrics)
+    assert aggregated["timing/test/routing/group_share/tools/0"] == pytest.approx(2 / 3)
+    assert aggregated["timing/test/routing/group_share/tools/1"] == pytest.approx(1 / 3)
 
 
 def test_rollout_manager_attributes_awaited_stream_failure_to_instance():
