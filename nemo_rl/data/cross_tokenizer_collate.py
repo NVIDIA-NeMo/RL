@@ -66,6 +66,10 @@ class CrossTokenizerCollator:
         ctx_length_student: Hard tokenization length cap on the student
             side (also the padded sequence length of the student tensor).
         ctx_length_teachers: Per-teacher tokenization length caps.
+        drop_first_assistant_chunk_kl_by_teacher: Per-teacher flags controlling
+            whether chat alignment drops the first content pair in each
+            assistant message. The list retains a slot for same-tokenizer
+            teachers so its indices match ``aligners``.
         make_seq_div_by_student: Round student sequence length up to a
             multiple of this value (typically TP * CP * 2 for DTensor V2).
         make_seq_div_by_teachers: Per-teacher sequence-length divisors.
@@ -79,10 +83,10 @@ class CrossTokenizerCollator:
         aligners: List[Optional[TokenAligner]],
         ctx_length_student: int,
         ctx_length_teachers: List[int],
+        drop_first_assistant_chunk_kl_by_teacher: List[bool],
         make_seq_div_by_student: int = 1,
         make_seq_div_by_teachers: Optional[List[int]] = None,
         mode: str = "text",
-        drop_first_assistant_chunk_kl: bool = False,
         include_thinking_in_loss: bool = False,
         native_thinking_alignment: bool = False,
         kd_alignment_regions: Optional[List[str]] = None,
@@ -93,6 +97,12 @@ class CrossTokenizerCollator:
             "teacher_tokenizers, aligners, and ctx_length_teachers must all "
             f"have length == num_teachers ({n})."
         )
+        if len(drop_first_assistant_chunk_kl_by_teacher) != n:
+            raise ValueError(
+                "drop_first_assistant_chunk_kl_by_teacher must have length "
+                f"== num_teachers ({n}), got "
+                f"{len(drop_first_assistant_chunk_kl_by_teacher)}."
+            )
         if make_seq_div_by_teachers is None:
             make_seq_div_by_teachers = [1] * n
         assert len(make_seq_div_by_teachers) == n
@@ -142,7 +152,9 @@ class CrossTokenizerCollator:
         self.make_seq_div_by_student = make_seq_div_by_student
         self.make_seq_div_by_teachers = make_seq_div_by_teachers
         self.mode = mode
-        self.drop_first_assistant_chunk_kl = drop_first_assistant_chunk_kl
+        self.drop_first_assistant_chunk_kl_by_teacher = list(
+            drop_first_assistant_chunk_kl_by_teacher
+        )
         self.include_thinking_in_loss = include_thinking_in_loss
         # Downstream consumers assume real tokens occupy the leading
         # positions: ``input_lengths = attention_mask.sum(-1)`` plus the
@@ -310,7 +322,9 @@ class CrossTokenizerCollator:
                     t_spans[j],
                     student_asst_mask=s_mask[j],
                     teacher_asst_mask=t_mask[j],
-                    drop_first_content_pair=self.drop_first_assistant_chunk_kl,
+                    drop_first_content_pair=(
+                        self.drop_first_assistant_chunk_kl_by_teacher[i]
+                    ),
                 )
                 per_sample_pairs.append(
                     [

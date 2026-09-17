@@ -32,7 +32,10 @@ policy:
 # TP2xCP2.
 teachers:
   - model_name: "Qwen/Qwen3-4B"
-    projection_matrix_path: null   # set per-run via teachers.0.projection_matrix_path
+    aligner:
+      # Set per run via teachers.0.aligner.projection_matrix_path.
+      projection_matrix_path: null
+      drop_first_assistant_chunk_kl: false
     weight: 1.0
     tokenizer:
       name: "Qwen/Qwen3-4B"
