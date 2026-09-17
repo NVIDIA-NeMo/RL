@@ -98,6 +98,7 @@ from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerAct
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
@@ -109,7 +110,6 @@ from nemo_rl.experience.route_plan import (
     encode_route_plan,
 )
 from nemo_rl.utils.checkpoint import CheckpointManager
-from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.utils.logger import TELEMETRY_WALL_TIME_METRIC
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
