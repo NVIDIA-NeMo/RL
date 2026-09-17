@@ -145,6 +145,7 @@ def test_blackwell_refit_prequantization_matches_vllm_backend(monkeypatch):
         is_cuda = True
         device = "cuda"
         shape = torch.Size((2, MXFP8_BLOCK_SIZE))
+        ndim = 2
 
     call_kwargs = {}
 
