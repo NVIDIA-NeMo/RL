@@ -42,6 +42,10 @@ import torch
 from tensordict import TensorDict
 
 if TYPE_CHECKING:
+    from megatron.core.inference.inference_request import (
+        RequestPromptPreparationResult,
+    )
+
     # Deferred: nemo_gym is an optional extra absent in non-gym runs; runtime
     # uses import locally so this module (and the finalizer actor importing
     # it) stays importable without it.
@@ -429,20 +433,30 @@ class TQMegatronPromptPreparer:
         prompt: str | list[int] | torch.Tensor,
         *,
         offload_params: dict[str, Any] | None = None,
-    ) -> tuple[str | list[int] | torch.Tensor, dict[str, Any] | None]:
+    ) -> RequestPromptPreparationResult:
         """Fetch a chained prefix, splice it into the prompt, and update admission."""
+        # Deferred because the prompt preparer is optional and requires the
+        # Megatron-LM hooks from NVIDIA/Megatron-LM#7015.
+        from megatron.core.inference.inference_request import (
+            RequestPromptPreparationResult,
+        )
+
         if offload_params is None:
-            return prompt, None
+            return RequestPromptPreparationResult(prompt=prompt)
         capture_payload = offload_params.get("ng_capture")
         if capture_payload is None:
-            return prompt, offload_params
+            return RequestPromptPreparationResult(
+                prompt=prompt, offload_params=offload_params
+            )
 
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.records import CaptureAdmission
 
         admission = CaptureAdmission.model_validate(capture_payload)
         if admission.mode == "text":
-            return prompt, offload_params
+            return RequestPromptPreparationResult(
+                prompt=prompt, offload_params=offload_params
+            )
         if not isinstance(prompt, list):
             raise TypeError("MInf token-in capture requires a token-id list prompt")
 
@@ -488,7 +502,9 @@ class TQMegatronPromptPreparer:
 
         if prompt[: admission.prev_len] != prefix_token_ids:
             raise ValueError("MInf failed to apply the authorized token prefix")
-        return prompt, updated_offload_params
+        return RequestPromptPreparationResult(
+            prompt=prompt, offload_params=updated_offload_params
+        )
 
 
 class TQMegatronTokenStager:

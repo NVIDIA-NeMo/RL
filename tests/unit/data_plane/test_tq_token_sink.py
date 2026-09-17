@@ -316,7 +316,7 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
         TQTokenSource(tq_client, staging_partition=staging_partition)
     )
 
-    prompt, metadata = preparer.prepare_prompt(
+    result = preparer.prepare_prompt(
         [80, 81, 99, 20, 21],
         offload_params={
             "ng_capture": admission.model_dump(mode="json"),
@@ -325,9 +325,14 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
         },
     )
 
-    assert prompt == [10, 11, 12, 99, 20, 21]
-    assert metadata is not None
-    assert metadata["ng_capture"]["required_prefix_token_ids"] == [10, 11, 12, 99]
+    assert result.prompt == [10, 11, 12, 99, 20, 21]
+    assert result.offload_params is not None
+    assert result.offload_params["ng_capture"]["required_prefix_token_ids"] == [
+        10,
+        11,
+        12,
+        99,
+    ]
 
 
 def test_megatron_stager_stamps_admission_epoch_when_request_spans_refit(
