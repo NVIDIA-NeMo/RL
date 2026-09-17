@@ -27,7 +27,7 @@ MCORE_DEFAULT_NUM_LAYERS_AT_START_IN_BF16 = 1
 MCORE_DEFAULT_NUM_LAYERS_AT_END_IN_BF16 = 1
 # Ordinary linears are BF16 by construction in NvFp4PerTokenConfig. Only
 # semantic BF16 decoder-layer boundaries belong in ModelOpt's ignore list.
-DEFAULT_NVFP4_IGNORE: list[str] = []
+DEFAULT_NVFP4_PERTOKEN_IGNORE: list[str] = []
 
 _FULL_EXPERT_LAYER_IGNORE_RE = re.compile(r"^\*\.layers\.(\d+)\.mlp\.experts\*$")
 # vLLM module prefixes for a decoder layer's routed experts always carry the
@@ -152,4 +152,4 @@ class NvFp4PerTokenRolloutConfig(BaseModel, extra="forbid"):
     ] = Field(default_factory=list)
 
     def resolved_ignore(self) -> list[str]:
-        return [*DEFAULT_NVFP4_IGNORE, *self.additional_ignore]
+        return [*DEFAULT_NVFP4_PERTOKEN_IGNORE, *self.additional_ignore]

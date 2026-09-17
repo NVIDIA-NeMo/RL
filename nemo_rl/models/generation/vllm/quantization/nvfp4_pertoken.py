@@ -45,7 +45,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.utils import replace_parameter
 
 from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
-    DEFAULT_NVFP4_IGNORE,
+    DEFAULT_NVFP4_PERTOKEN_IGNORE,
     NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS,
     NvFp4PerTokenRolloutConfig,
     boundary_layer_indices,
@@ -61,7 +61,7 @@ from nemo_rl.models.generation.vllm.vllm_backend import (
 
 logger = init_logger(__name__)
 
-__all__ = ["DEFAULT_NVFP4_IGNORE", "NvFp4PerTokenRolloutConfig"]
+__all__ = ["DEFAULT_NVFP4_PERTOKEN_IGNORE", "NvFp4PerTokenRolloutConfig"]
 
 NVFP4_PER_TOKEN_METHOD = "nvfp4_pertoken"
 
