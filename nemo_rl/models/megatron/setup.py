@@ -63,6 +63,7 @@ from megatron.bridge.utils.cuda_graph import set_cuda_graph_modules
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.inference.shards import build_inference_pg_collection
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import load_quantization_recipe
@@ -1379,12 +1380,28 @@ def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
         model_cfg.mtp_num_layers = megatron_cfg["mtp_num_layers"]
     if "mtp_loss_scaling_factor" in megatron_cfg:
         model_cfg.mtp_loss_scaling_factor = megatron_cfg["mtp_loss_scaling_factor"]
-    if "disable_mtp_loss" in megatron_cfg:
-        model_cfg.disable_mtp_loss = megatron_cfg["disable_mtp_loss"]
     if "mtp_use_repeated_layer" in megatron_cfg:
         model_cfg.mtp_use_repeated_layer = megatron_cfg["mtp_use_repeated_layer"]
     if "mtp_detach_heads" in megatron_cfg:
         model_cfg.mtp_detach_heads = megatron_cfg["mtp_detach_heads"]
+
+
+def _freeze_disabled_mtp(models: list[MegatronModule]) -> list[MegatronModule]:
+    """Freeze retained MTP heads before DDP and optimizer construction."""
+    for model in models:
+        if isinstance(model, HybridModel):
+            if model.config.freeze_base_model_for_mtp:
+                raise ValueError(
+                    "disable_mtp_loss and freeze_base_model_for_mtp cannot both be enabled"
+                )
+            if model.mtp_process:
+                model.mtp.requires_grad_(False)
+        elif model.config.mtp_num_layers:
+            raise ValueError(
+                "disable_mtp_loss requires HybridModel's compute_mtp_loss control "
+                f"when MTP layers are present; got {type(model).__name__}"
+            )
+    return models
 
 
 def _quant_recipe_name(recipe: Any) -> str | None:
@@ -2338,6 +2355,9 @@ def setup_model_and_optimizer(
 
     if additional_pre_wrap_hooks:
         pre_wrap_hook.extend(additional_pre_wrap_hooks)
+
+    if policy_cfg["megatron_cfg"].get("disable_mtp_loss", False):
+        pre_wrap_hook.append(_freeze_disabled_mtp)
 
     # Model, optimizer, and learning rate.
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()

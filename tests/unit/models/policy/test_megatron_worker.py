@@ -1153,9 +1153,9 @@ def test_megatron_refit_bridge_tasks_export_logical_quantized_weights(
     logical_weight = torch.arange(8, dtype=torch.bfloat16).reshape(4, 2)
     bf16_source = torch.ones((2, 2), dtype=torch.bfloat16)
     dequantize = MagicMock(
-        side_effect=lambda tensor: logical_weight
-        if tensor is quantized_source
-        else tensor
+        side_effect=lambda tensor: (
+            logical_weight if tensor is quantized_source else tensor
+        )
     )
     monkeypatch.setattr(
         worker_module,
@@ -4828,17 +4828,14 @@ def test_mtp_loss_enabled_requires_layers_and_enabled_loss(
 
     config = SimpleNamespace(
         mtp_num_layers=mtp_num_layers,
-        disable_mtp_loss=disable_mtp_loss,
     )
 
-    assert _mtp_loss_enabled(config) is expected
+    assert _mtp_loss_enabled(config, disable_mtp_loss=disable_mtp_loss) is expected
 
 
-@pytest.mark.parametrize(
-    "step_state,expected_preserve_grads", [(None, False), ({}, True)]
-)
-def test_megatron_prepare_for_lp_inference_preserves_open_step_grads(
-    monkeypatch, step_state, expected_preserve_grads
+@pytest.mark.parametrize("step_state,keep_train_buffers", [(None, False), ({}, True)])
+def test_megatron_prepare_for_lp_inference_keeps_open_step_grads(
+    monkeypatch, step_state, keep_train_buffers
 ):
     from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
@@ -4850,6 +4847,11 @@ def test_megatron_prepare_for_lp_inference_preserves_open_step_grads(
     worker.optimizer = None
     worker.optimizer_cpu_offload = False
     worker.offload_optimizer_for_logprob = False
+    worker.megatron_cfg = SimpleNamespace(
+        optimizer=SimpleNamespace(), ddp=SimpleNamespace()
+    )
+    worker._opd_full_teacher_lm_head = None
+    worker.rank = 0
     worker._train_step_state = step_state
     move_calls = []
     worker.move_model = lambda model, device, **kwargs: (
@@ -4861,46 +4863,37 @@ def test_megatron_prepare_for_lp_inference_preserves_open_step_grads(
     monkeypatch.setattr(worker_module.gc, "collect", lambda: None)
     monkeypatch.setattr(worker_module.torch.cuda, "empty_cache", lambda: None)
 
-    MegatronPolicyWorkerImpl.prepare_for_lp_inference(worker)
+    MegatronPolicyWorkerImpl.prepare_for_lp_inference(
+        worker, keep_train_buffers=keep_train_buffers
+    )
 
     allocator_wakeup.cuda.assert_called_once_with()
     assert worker.model.eval_called
-    assert move_calls == [
-        ("cuda", {"move_grads": False}),
-        (
-            "cpu",
-            {
-                "move_params": False,
-                "move_grads": True,
-                "preserve_grads": expected_preserve_grads,
-            },
-        ),
-    ]
+    expected_calls = [("cuda", {"move_grads": False})]
+    if not keep_train_buffers:
+        expected_calls.append(
+            (
+                "cpu",
+                {
+                    "move_params": False,
+                    "move_grads": True,
+                },
+            )
+        )
+    assert move_calls == expected_calls
 
 
-def test_megatron_releases_preserved_grad_host_buffers(monkeypatch):
-    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+def test_megatron_rejects_discarding_open_step_gradients():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
 
-    class FakeDistributedDataParallel:
-        def __init__(self):
-            self.buffers = [MagicMock()]
-            self.expert_parallel_buffers = [MagicMock()]
-
-    monkeypatch.setattr(
-        worker_module,
-        "DistributedDataParallel",
-        FakeDistributedDataParallel,
-    )
     worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.model = FakeDistributedDataParallel()
-
-    MegatronPolicyWorkerImpl._release_preserved_grad_host_buffers(worker)
-
-    for buffer in worker.model.buffers + worker.model.expert_parallel_buffers:
-        buffer.release_grad_data_cpu.assert_called_once_with()
+    worker._train_step_state = {}
+    with pytest.raises(RuntimeError, match="keep_train_buffers=True"):
+        worker.prepare_for_lp_inference()
+    with pytest.raises(RuntimeError, match="Cannot discard"):
+        worker.move_model(MagicMock(), "cpu", move_grads=True)
 
 
 def test_megatron_save_checkpoint_rejects_open_split_step():

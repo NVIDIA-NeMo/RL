@@ -511,6 +511,7 @@ class MegatronConfig(TypedDict):
     # Populated by the algorithm before Megatron setup to size the LR scheduler.
     train_iters: NotRequired[int]
     # When True, retain MTP checkpoint parameters but skip and freeze the MTP training loss path.
+    # Skip HybridModel's auxiliary objective while retaining frozen MTP weights.
     disable_mtp_loss: NotRequired[bool]
     # When True, repeat a single MTP layer mtp_num_layers times instead of using distinct layers.
     mtp_use_repeated_layer: NotRequired[bool]

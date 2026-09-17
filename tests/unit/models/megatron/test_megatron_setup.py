@@ -5081,7 +5081,6 @@ class TestApplyMTPConfig:
         model_cfg = SimpleNamespace(
             mtp_num_layers=1,
             mtp_loss_scaling_factor=0.3,
-            disable_mtp_loss=False,
             mtp_use_repeated_layer=True,
             mtp_detach_heads=False,
         )
@@ -5097,4 +5096,4 @@ class TestApplyMTPConfig:
         assert model_cfg.mtp_num_layers == 1
         assert model_cfg.mtp_use_repeated_layer is True
         assert model_cfg.mtp_loss_scaling_factor == 0.0
-        assert model_cfg.disable_mtp_loss is True
+        assert not hasattr(model_cfg, "disable_mtp_loss")

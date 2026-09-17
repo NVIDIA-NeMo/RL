@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 import torch
 from megatron.core import tensor_parallel
 from megatron.core.models.gpt import GPTModel
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.packed_seq_params import PackedSeqParams, TreePackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -164,6 +165,7 @@ def model_forward(
     use_fused_linear_logprobs: bool = False,
     media_token_validity_mask: Optional[torch.Tensor] = None,
     model_slices_context_parallel_inputs: bool = False,
+    compute_mtp_loss: bool = True,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
@@ -185,6 +187,7 @@ def model_forward(
             projected feature, already in this model's token layout. Only passed
             when the model accepts it; otherwise the model derives its own.
         model_slices_context_parallel_inputs: Whether the model CP-slices its own inputs.
+        compute_mtp_loss: Whether to execute the auxiliary MTP objective.
 
     Returns:
         torch.Tensor: Output tensor from the model (logits)
@@ -200,6 +203,13 @@ def model_forward(
         position_ids = None
 
     additional_kwargs = {}
+    if not compute_mtp_loss:
+        if isinstance(unwrap_model(model), HybridModel):
+            additional_kwargs["compute_mtp_loss"] = False
+        elif get_model_config(model).mtp_num_layers:
+            raise ValueError(
+                "Disabling MTP computation requires HybridModel's compute_mtp_loss control"
+            )
     # Mamba models currently do not support packed_seq_params
     if packed_seq_params is not None:
         additional_kwargs["packed_seq_params"] = packed_seq_params
@@ -278,6 +288,7 @@ def forward_with_post_processing_fn(
     use_router_replay: bool = False,
     router_replay_train: bool = False,
     model_slices_context_parallel_inputs: bool = False,
+    compute_mtp_loss: bool = True,
 ) -> Tuple[torch.Tensor, Callable]:
     """Perform forward pass with pre-processed microbatch and return output tensor and post-processing function.
 
@@ -299,6 +310,7 @@ def forward_with_post_processing_fn(
         enable_opd_full_capture: Whether to capture pre-LM-head hidden states for
             the full-vocabulary MOPD teacher payload
         model_slices_context_parallel_inputs: Whether the model CP-slices its own inputs.
+        compute_mtp_loss: Whether to execute the auxiliary MTP objective.
 
     Returns:
         tuple: (output_tensor, post_processing_fn_wrapped)
@@ -357,6 +369,7 @@ def forward_with_post_processing_fn(
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
                 media_token_validity_mask=media_token_validity_mask,
                 model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
+                compute_mtp_loss=compute_mtp_loss,
             )
     except Exception:
         # The forward above armed the router-replay action (set_router_replay_forward);
@@ -488,6 +501,7 @@ def megatron_forward_backward(
     use_router_replay: bool = False,
     router_replay_train: bool = False,
     model_slices_context_parallel_inputs: bool = False,
+    compute_mtp_loss: bool = True,
 ) -> Any:
     """Execute forward and backward passes using Megatron's utilities.
 
@@ -513,6 +527,7 @@ def megatron_forward_backward(
         enable_opd_full_capture: Whether to capture pre-LM-head hidden states for
             the full-vocabulary MOPD teacher payload
         model_slices_context_parallel_inputs: Whether the model CP-slices its own inputs.
+        compute_mtp_loss: Whether to execute the auxiliary MTP objective.
 
     Returns:
         Results from the forward/backward execution
@@ -532,6 +547,7 @@ def megatron_forward_backward(
         use_router_replay=use_router_replay,
         router_replay_train=router_replay_train,
         model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
+        compute_mtp_loss=compute_mtp_loss,
     )
     forward_backward_func = get_forward_backward_func()
     if use_router_replay:
