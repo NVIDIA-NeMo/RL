@@ -30,9 +30,12 @@ checkpointing:
   checkpoint_must_save_by: 00:03:20:00
   keep_top_k: 2
 policy:
-  model_name: nvidia/nemotron-3.5-super-pre-ea-text-08282026
+  # Early-access Nemotron 3.5 Super VL checkpoint (README title:
+  # NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16). Override both keys with a
+  # local snapshot path if the hub repo is not reachable from the cluster.
+  model_name: nvidia/NVIDIA-Nemotron-3.5-Super-EA-09112026
   tokenizer:
-    name: nvidia/nemotron-3.5-super-pre-ea-text-08282026
+    name: nvidia/NVIDIA-Nemotron-3.5-Super-EA-09112026
   hf_config_overrides:
     num_nextn_predict_layers: 0
   # Must be a multiple of the data-parallel size (64 GPUs at 16n4g, EP does not

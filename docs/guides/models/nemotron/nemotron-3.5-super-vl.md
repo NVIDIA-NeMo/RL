@@ -97,9 +97,11 @@ export UV_LOCK_TIMEOUT=3600
 
 ## Get the Weights
 
-The recipe defaults `policy.model_name` and `policy.tokenizer.name` to the
-HF Hub checkpoint `nvidia/nemotron-3.5-super-pre-ea-text-08282026` (gated). To
-use a local checkpoint instead, override both keys:
+The DAPO recipe defaults `policy.model_name` and `policy.tokenizer.name` to
+the HF Hub checkpoint `nvidia/nemotron-3.5-super-pre-ea-text-08282026` (gated,
+text SFT); the image GRPO recipe defaults to the early-access VL checkpoint
+`nvidia/NVIDIA-Nemotron-3.5-Super-EA-09112026`. To use a local checkpoint
+instead, override both keys:
 
 ```bash
 uv run examples/run_grpo.py \
