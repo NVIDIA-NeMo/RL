@@ -89,6 +89,8 @@ def test_refit_quantize_preserves_single_scale_block_dimension():
 
 def test_refit_wire_format_canonicalizes_scale_shape_and_zero_bytes():
     values = torch.ones(2, 64, dtype=torch.float8_e4m3fn)
+    values[0, :MXFP8_BLOCK_SIZE] = 0
+    values[1, MXFP8_BLOCK_SIZE:] = 0
     scales = torch.tensor([0, 3, 4, 0], dtype=MXFP8_SCALE_DTYPE)
 
     got_values, got_scales = canonicalize_mxfp8_refit_output(

@@ -1967,6 +1967,32 @@ def test_enable_refit_prequantize_derives_metadata_without_export():
     assert worker._refit_prequant_names == {"model.a.weight"}
 
 
+def test_prepare_source_refit_info_resets_previous_prequantization_selection():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    name = "model.weight"
+    worker._refit_prequant_names = {name}
+    worker._calculate_refit_param_info = lambda: {}
+
+    def _iter_params():
+        dtype = (
+            torch.float8_e4m3fn
+            if name in worker._refit_prequant_names
+            else torch.bfloat16
+        )
+        yield name, torch.ones(2, 64, dtype=dtype)
+
+    worker._iter_params_with_optional_kv_scales = _iter_params
+
+    info = worker._prepare_source_refit_info("hf_export")
+
+    assert worker._refit_prequant_names == set()
+    assert info[name] == (torch.Size([2, 64]), torch.bfloat16)
+
+
 def test_enable_refit_prequantize_rejects_indivisible_last_dim():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
