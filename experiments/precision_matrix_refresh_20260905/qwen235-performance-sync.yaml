@@ -5,4 +5,8 @@ defaults: ../../examples/configs/recipes/llm/performance/grpo-qwen3-235b-16n4g.y
 policy:
   generation:
     vllm_cfg:
+      # 1,536 expert rows / TP4 = 384, which satisfies the FlashInfer TRTLLM
+      # BF16 requirement that the TP-local intermediate size divide by 128.
+      # Apply this topology to every precision arm for a matched comparison.
+      tensor_parallel_size: 4
       gpu_memory_utilization: 0.5
