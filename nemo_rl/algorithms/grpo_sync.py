@@ -886,10 +886,14 @@ def grpo_train_sync(
                         extras_bdd["reference_policy_logprobs"] if compute_ref else None
                     )
 
-                # Seq-level logprob error metrics/masking require real prev_logprobs
+                # Separate-pass seq-level metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
                     sample_mask = loss_multiplier
-                    # Cannot compute seq-level metrics with placeholder prev_logprobs
+                    # In-loss filtering reports counts through all_mb_metrics.
+                    # Use {} so placeholder zeros cannot overwrite those counts
+                    # when seq_logprob_error_metrics is merged after training.
+                    # Otherwise, placeholder prev_logprobs cannot provide
+                    # sequence-error metrics.
                     seq_logprob_error_metrics = (
                         {}
                         if master_config.grpo.seq_logprob_error_in_loss

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -5616,6 +5617,32 @@ class TestComputeAndApplySeqLogprobErrorMasking:
             }
         )
 
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+    @pytest.mark.parametrize("field", ["prev_logprobs", "generation_logprobs"])
+    @pytest.mark.parametrize("masked_position", [True, False])
+    def test_nonfinite_logprobs_respect_token_mask(
+        self, bad: float, field: str, masked_position: bool
+    ) -> None:
+        """Padding cannot poison a row, but nonfinite response errors reject it."""
+        train_data = self._create_train_data(
+            2,
+            4,
+            torch.zeros(2, 4),
+            torch.zeros(2, 4),
+            token_mask=torch.tensor([[1.0, 1.0, 1.0, 0.0]] * 2),
+        )
+        train_data[field][0, 3 if masked_position else 1] = bad
+        result = compute_and_apply_seq_logprob_error_masking(
+            train_data, torch.ones(2), seq_logprob_error_threshold=2.0
+        )
+        assert result["num_masked_seqs"] == (0 if masked_position else 1)
+        assert train_data["sample_mask"].tolist() == [
+            1.0 if masked_position else 0.0,
+            1.0,
+        ]
+        if masked_position:
+            assert math.isfinite(result["max_seq_mult_prob_error"])
+
     def test_no_threshold_only_computes_metrics(self):
         """Test that when threshold is None, only metrics are computed (no masking)."""
         batch_size, seq_length = 4, 10
@@ -6137,15 +6164,25 @@ def test_in_loss_threshold_skips_policy_forward_without_disabling_threshold():
     assert config.grpo.seq_logprob_error_threshold == 2.0
 
 
-def test_validate_single_forward_config(mock_grpo_components):
+@pytest.mark.parametrize("include_draft", [True, False])
+def test_validate_single_forward_config(
+    mock_grpo_components, include_draft: bool
+) -> None:
     config = mock_grpo_components["master_config"]
     config.grpo.seq_logprob_error_in_loss = True
     config.grpo.seq_logprob_error_threshold = 2.0
     config.loss_fn.force_on_policy_ratio = True
     config.loss_fn.token_level_loss = True
     config.policy["megatron_cfg"] = {"enabled": True, "mtp_num_layers": 0}
-    config.policy["draft"] = {"enabled": False}
+    if include_draft:
+        config.policy["draft"] = {"enabled": False}
+    else:
+        config.policy.pop("draft", None)
     _validate_seq_logprob_error_in_loss(config)
+
+    del config.policy["megatron_cfg"]
+    with pytest.raises(ValueError, match="requires the Megatron backend"):
+        _validate_seq_logprob_error_in_loss(config)
 
 
 @pytest.mark.parametrize(
