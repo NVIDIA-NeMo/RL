@@ -1481,6 +1481,53 @@ def resolve_reward_penalty_config(
     return resolved
 
 
+def _rollout_debug_info(full_result: dict) -> dict:
+    """Compact, JSON-serializable rollout-level record for offline debugging.
+
+    Built from the env's ``full_result`` (NeMo Gym SWE agent
+    ``SWEBenchVerifyResponse``); every field is optional so other Gym agents
+    degrade to a mostly-empty record. No token arrays — this rides in the
+    replay buffer and is written per step as ``rollout_debug_step*.jsonl``.
+    """
+    instance_config = full_result.get("instance_config") or {}
+    problem_info = instance_config.get("problem_info") or {}
+    responses = full_result.get("responses") or []
+    segment_metas = [dict((r or {}).get("metadata") or {}) for r in responses]
+    num_compactions = sum(
+        1 for m in segment_metas if m.get("segment_boundary_reason") == "compaction"
+    )
+    subagent_sessions = {
+        m.get("session_id") for m in segment_metas if m.get("parent_session_id")
+    }
+    return {
+        "instance_id": problem_info.get("instance_id") or instance_config.get("name"),
+        "dataset_name": problem_info.get("dataset_name"),
+        "reward": full_result.get("reward"),
+        "resolved": full_result.get("resolved"),
+        "patch_exists": full_result.get("patch_exists"),
+        "mask_sample": bool(instance_config.get("mask_sample", False)),
+        "agent_error_kind": full_result.get("agent_error_kind"),
+        "agent_timed_out": full_result.get("agent_timed_out"),
+        "eval_timed_out": full_result.get("eval_timed_out"),
+        "oom_killed": full_result.get("oom_killed"),
+        "eval_oom_killed": full_result.get("eval_oom_killed"),
+        "openhands_run_time": full_result.get("openhands_run_time"),
+        "final_eval_time": full_result.get("final_eval_time"),
+        "num_segments": len(responses),
+        "num_compactions": num_compactions,
+        "num_subagent_sessions": len(subagent_sessions),
+        "segments": [
+            {
+                "session_id": m.get("session_id"),
+                "parent_session_id": m.get("parent_session_id") or "",
+                "segment_index": m.get("segment_index"),
+                "segment_boundary_reason": m.get("segment_boundary_reason") or "",
+            }
+            for m in segment_metas
+        ],
+    }
+
+
 def apply_reward_penalties(
     results: list[dict], reward_penalty_config: dict[str, Any] | BaseModel | None
 ) -> dict[str, int]:
@@ -2006,6 +2053,13 @@ def run_async_nemo_gym_rollout(
                     "num_traces": len(rollout_traces),
                 }
             )
+        # Rollout-level debug provenance (compaction/subagent counts, env
+        # failure flags, mask). Logged per step by the trainer and used for
+        # the compaction metrics below.
+        rollout_infos = [
+            _rollout_debug_info(rollout_traces[0]["full_result"])
+            for rollout_traces in rollout_results
+        ]
 
     # Aggregate metrics across all samples
     with timer.time(f"{timer_prefix}/aggregate_metrics"):
@@ -2046,6 +2100,24 @@ def run_async_nemo_gym_rollout(
                 batch_size,
                 "traces_per_sample",
             ),
+            # Compaction / masking visibility (per rollout). traces_per_sample
+            # conflates compaction segments with subagent sessions; these do not.
+            **_calculate_single_metric(
+                [info["num_compactions"] for info in rollout_infos],
+                batch_size,
+                "compactions_per_sample",
+            ),
+            "compaction_rate": sum(
+                1 for info in rollout_infos if info["num_compactions"] > 0
+            )
+            / batch_size,
+            **_calculate_single_metric(
+                [info["num_subagent_sessions"] for info in rollout_infos],
+                batch_size,
+                "subagent_sessions_per_sample",
+            ),
+            "mask_sample_rate": sum(1 for info in rollout_infos if info["mask_sample"])
+            / batch_size,
             **_calculate_single_metric(
                 [m["total_reward"] for m in all_sample_metrics],
                 batch_size,
@@ -2129,6 +2201,12 @@ def run_async_nemo_gym_rollout(
     if not torch.is_tensor(loss_multiplier):
         loss_multiplier = torch.tensor(loss_multiplier)
 
+    def expand_rollout_field(values):
+        """Broadcast a per-rollout field onto this batch's traces."""
+        if torch.is_tensor(values):
+            return values[rollout_local_idx_t]
+        return [values[i] for i in trace_rollout_local_idx]
+
 
     final_batch = BatchedDataDict[DatumSpec](
         {
@@ -2178,6 +2256,24 @@ def run_async_nemo_gym_rollout(
                 ],
                 dtype=torch.bool,
             ),
+            # Debug provenance (no token arrays). Per trace: the env's segment
+            # metadata plus this trace's sizes. Per rollout (repeated on each
+            # of its traces): reward/failure flags/compaction counts. Written
+            # by the trainer as rollout_debug_step*.jsonl.
+            "trace_metadata": [
+                {
+                    **(r.get("trace_metadata") or {}),
+                    "turns": turns_per_trace[i],
+                    "prompt_tokens": len(r["input_message_log"][0]["token_ids"]),
+                    "gen_tokens": sum(
+                        len(m["token_ids"])
+                        for m in r["message_log"]
+                        if m["role"] == "assistant"
+                    ),
+                }
+                for i, r in enumerate(results)
+            ],
+            "rollout_info": expand_rollout_field(rollout_infos),
         }
     )
 

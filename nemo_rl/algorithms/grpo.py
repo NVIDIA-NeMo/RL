@@ -2167,6 +2167,7 @@ def compute_and_apply_seq_logprob_error_masking(
     train_data: BatchedDataDict,
     rewards: torch.Tensor,
     seq_logprob_error_threshold: Optional[float],
+    tensor_out: Optional[dict] = None,
 ) -> dict:
     """Compute sequence-level logprob error metrics and optionally mask high-error sequences.
 
@@ -2280,6 +2281,20 @@ def compute_and_apply_seq_logprob_error_masking(
                 f" → {masked_correct_pct:.2%}",
                 flush=True,
             )
+
+    # Optionally expose the per-sequence tensors for the per-trace debug
+    # record (rollout_debug_step*.jsonl) without polluting the metrics dict.
+    if tensor_out is not None:
+        pre_mask = (
+            original_sample_mask
+            if seq_logprob_error_threshold is not None
+            else sample_mask.detach().clone()
+        )
+        tensor_out["pre_seq_error_sample_loss_mask"] = pre_mask
+        tensor_out["seq_mult_prob_error"] = seq_mult_prob_error.detach().clone()
+        tensor_out["masked_by_seq_logprob_error"] = (pre_mask > 0) & (
+            train_data["sample_mask"] <= 0
+        )
 
     return {
         "max_seq_mult_prob_error": max_seq_mult_prob_error,
@@ -4031,6 +4046,16 @@ def async_grpo_train(
                             prompt_batch["is_empty_rollout"] = torch.zeros(
                                 prompt_batch.size, dtype=torch.bool
                             )
+                        # Debug provenance (rollout_debug_step*.jsonl); entries
+                        # checkpointed before it was added lack these keys.
+                        if "trace_metadata" not in prompt_batch:
+                            prompt_batch["trace_metadata"] = [
+                                {} for _ in range(prompt_batch.size)
+                            ]
+                        if "rollout_info" not in prompt_batch:
+                            prompt_batch["rollout_info"] = [
+                                {} for _ in range(prompt_batch.size)
+                            ]
                     repeated_batch = BatchedDataDict.from_batches(per_prompt_batches)
 
                     # Multi-trace rollouts (subagent sessions / compaction
@@ -4357,6 +4382,8 @@ def async_grpo_train(
                         )
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
+                # seq_error_tensors feeds the per-trace rollout_debug jsonl.
+                seq_error_tensors: dict = {}
                 if skip_prev_logprobs:
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
                     seq_logprob_error_metrics = {
@@ -4374,12 +4401,25 @@ def async_grpo_train(
                         train_data=train_data,
                         rewards=rewards,
                         seq_logprob_error_threshold=seq_logprob_error_threshold,
+                        tensor_out=seq_error_tensors,
                     )
                     seq_logprob_error_metrics = seq_error_result
                     if "num_masked_seqs" in seq_logprob_error_metrics:
                         seq_logprob_error_metrics[
                             "num_masked_seqs_by_logprob_error"
                         ] = seq_logprob_error_metrics.pop("num_masked_seqs")
+                pre_seq_error_sample_loss_mask = seq_error_tensors.get(
+                    "pre_seq_error_sample_loss_mask",
+                    train_data["sample_mask"].detach().clone(),
+                )
+                seq_mult_prob_error = seq_error_tensors.get(
+                    "seq_mult_prob_error",
+                    torch.zeros_like(train_data["sample_mask"], dtype=torch.float32),
+                )
+                masked_by_seq_logprob_error = seq_error_tensors.get(
+                    "masked_by_seq_logprob_error",
+                    torch.zeros_like(train_data["sample_mask"], dtype=torch.bool),
+                )
 
                 # Pad teacher logprobs to match train_data sequence length.
                 if trajectory_teacher_logprobs is not None:
@@ -4670,6 +4710,22 @@ def async_grpo_train(
                     if response_advantages.numel() > 0
                     else 0.0,
                 }
+                if master_config["grpo"].get("penalize_invalid_tool_call", False):
+                    num_rollouts_for_penalty = (
+                        int(torch.unique(trace_rollout_ids[:num_unpadded_traces]).numel())
+                        if trace_rollout_ids is not None
+                        else int(num_unpadded_traces)
+                    )
+                    metrics["penalty/invalid_tool_call/msg_count"] = invalid_tool_call_msg_count
+                    metrics["penalty/invalid_tool_call/rollout_fraction"] = (
+                        len(invalid_tool_call_rollouts) / max(num_rollouts_for_penalty, 1)
+                    )
+                    metrics["penalty/invalid_tool_call/by_segment_kind/compaction_msg_count"] = (
+                        invalid_tool_call_by_kind["compaction"]
+                    )
+                    metrics["penalty/invalid_tool_call/by_segment_kind/other_msg_count"] = (
+                        invalid_tool_call_by_kind["other"]
+                    )
                 if "moe_metrics" in train_results:
                     metrics.update(
                         {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
@@ -4908,6 +4964,79 @@ def async_grpo_train(
                     log_data, f"train_data_step{step + 1}.jsonl"
                 )
                 del log_data
+
+            # Compact per-trace debug record — written EVERY step regardless of
+            # env.should_log_nemo_gym_responses (it carries no token arrays), so
+            # compaction, masking and reward attribution can be reconstructed
+            # offline. One row per unpadded trace; rollout-level fields
+            # (rollout_info) are repeated on each of the rollout's traces.
+            if "rollout_info" in repeated_batch:
+                n_dbg = num_unpadded_traces
+                dbg_adv = train_data["advantages"][:n_dbg].detach().cpu()
+                dbg_tm = train_data["token_mask"][:n_dbg].detach().cpu().bool()
+                dbg_has_tokens = dbg_tm.any(dim=-1)
+                # Advantage of the first generated token (= the broadcast
+                # rollout advantage unless the first message was an invalid
+                # tool call), plus min/max over generated tokens so the -5
+                # invalid-tool-call override is visible.
+                dbg_first_tok = dbg_tm.float().argmax(dim=-1)
+                dbg_adv_first = dbg_adv.gather(1, dbg_first_tok.unsqueeze(1)).squeeze(1)
+                dbg_adv_first = torch.where(
+                    dbg_has_tokens, dbg_adv_first, torch.zeros_like(dbg_adv_first)
+                )
+                dbg_adv_min = torch.where(
+                    dbg_tm, dbg_adv, torch.full_like(dbg_adv, float("inf"))
+                ).min(dim=-1).values
+                dbg_adv_max = torch.where(
+                    dbg_tm, dbg_adv, torch.full_like(dbg_adv, float("-inf"))
+                ).max(dim=-1).values
+                dbg_adv_min = torch.where(
+                    dbg_has_tokens, dbg_adv_min, torch.zeros_like(dbg_adv_min)
+                )
+                dbg_adv_max = torch.where(
+                    dbg_has_tokens, dbg_adv_max, torch.zeros_like(dbg_adv_max)
+                )
+                rollout_debug = {
+                    "rollout_info": list(repeated_batch["rollout_info"])[:n_dbg],
+                    "trace_metadata": list(repeated_batch["trace_metadata"])[:n_dbg],
+                    "rollout_local_idx": repeated_batch["rollout_local_idx"][:n_dbg].tolist(),
+                    "trace_in_rollout_idx": repeated_batch["trace_in_rollout_idx"][:n_dbg].tolist(),
+                    "is_empty_rollout": repeated_batch["is_empty_rollout"][:n_dbg].tolist(),
+                    "trace_group_id": (
+                        trace_group_ids[:n_dbg].tolist()
+                        if trace_group_ids is not None
+                        else [None] * n_dbg
+                    ),
+                    "trace_rollout_id": (
+                        trace_rollout_ids[:n_dbg].tolist()
+                        if trace_rollout_ids is not None
+                        else [None] * n_dbg
+                    ),
+                    "reward": rewards[:n_dbg].tolist(),
+                    "sample_loss_mask": train_data["sample_mask"][:n_dbg].tolist(),
+                    "pre_seq_error_sample_loss_mask": pre_seq_error_sample_loss_mask[:n_dbg]
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                    "seq_mult_prob_error": seq_mult_prob_error[:n_dbg]
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                    "masked_by_seq_logprob_error": masked_by_seq_logprob_error[:n_dbg]
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                    "advantage": dbg_adv_first.tolist(),
+                    "advantage_min": dbg_adv_min.tolist(),
+                    "advantage_max": dbg_adv_max.tolist(),
+                    "num_generated_tokens": dbg_tm.sum(dim=-1).tolist(),
+                    "total_tokens": input_lengths[:n_dbg].tolist(),
+                    "trainer_weight_version": [weight_version] * n_dbg,
+                }
+                logger.log_batched_dict_as_jsonl(
+                    rollout_debug, f"rollout_debug_step{step + 1}.jsonl"
+                )
+                del rollout_debug
             del train_data
             del flat_messages_content
 

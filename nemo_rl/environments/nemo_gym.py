@@ -359,6 +359,11 @@ Depending on your data shape, you may want to change these values."""
 
         trace_results = []
         for response in responses:
+            # Per-segment provenance from the env (for the SWE agent:
+            # session_id, parent_session_id, segment_index,
+            # segment_boundary_reason). Carried on every trace so the trainer
+            # can write per-segment-kind debug rows (rollout_debug_step*.jsonl).
+            trace_metadata = dict(response.get("metadata") or {})
             # A response yields at most one message log (segments must be
             # prefix-contiguous — the builder hard-asserts on mid-segment
             # history rewrites). Segments with no trainable generations yield
@@ -367,11 +372,22 @@ Depending on your data shape, you may want to change these values."""
             for nemo_rl_message_log in self._build_trace_message_logs(
                 response, tokenizer
             ):
+                if trace_metadata.get("segment_boundary_reason") == "compaction":
+                    # This segment's generation IS the summary the next segment
+                    # conditions on; keep the decoded text (attached by the
+                    # builder above as generation_str) so summary quality can
+                    # be inspected offline.
+                    trace_metadata["generation_text"] = "".join(
+                        item.get("generation_str", "")
+                        for item in (response.get("output") or [])
+                        if isinstance(item, dict)
+                    )
                 trace_results.append(
                     {
                         "message_log": nemo_rl_message_log,
                         "input_message_log": nemo_rl_message_log[:1],
                         "full_result": nemo_gym_result,
+                        "trace_metadata": trace_metadata,
                     }
                 )
 
@@ -426,6 +442,7 @@ Depending on your data shape, you may want to change these values."""
                     "input_message_log": dummy_message_log[:1],
                     "full_result": nemo_gym_result,
                     "is_empty_rollout": True,
+                    "trace_metadata": {},
                 }
             )
 

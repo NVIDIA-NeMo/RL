@@ -370,3 +370,101 @@ def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
             f"expected null top_logprobs accepted-with-None or rejected as 4xx, "
             f"got {null_resp.status_code}: {null_resp.text}"
         )
+
+
+def test_postprocess_nemo_gym_result_carries_trace_metadata():
+    """Multi-trace results carry each segment's env metadata on its trace, and the
+    compaction segment additionally keeps its decoded generation (the summary)."""
+
+    class DummyTokenizer:
+        def batch_decode(self, batch):
+            return ["tok:" + ",".join(map(str, ids)) for ids in batch]
+
+        def apply_chat_template(self, input_messages, tokenize=True):
+            assert tokenize
+            return [1, 2, 3]
+
+    def _item(text, prompt_ids, gen_ids):
+        return {
+            "type": "message",
+            "content": [{"text": text}],
+            "prompt_token_ids": prompt_ids,
+            "generation_token_ids": gen_ids,
+            "generation_log_probs": [-0.1] * len(gen_ids),
+        }
+
+    env = NemoGym.__new__(NemoGym)
+    env.cfg = {}
+
+    nemo_gym_result = {
+        "response": {"output": [_item("legacy", [1], [2])]},
+        "responses": [
+            {
+                "output": [_item("a0", [1, 2], [3, 4])],
+                "metadata": {
+                    "session_id": "ses_main",
+                    "parent_session_id": "",
+                    "segment_index": "0",
+                    "segment_boundary_reason": "",
+                },
+            },
+            {
+                "output": [_item("summary", [1, 2, 3, 4, 5], [7, 8])],
+                "metadata": {
+                    "session_id": "ses_main",
+                    "parent_session_id": "",
+                    "segment_index": "1",
+                    "segment_boundary_reason": "compaction",
+                },
+            },
+        ],
+        "responses_create_params": {"input": [{"role": "user", "content": "hi"}]},
+    }
+
+    result = env._postprocess_nemo_gym_to_nemo_rl_result(nemo_gym_result, DummyTokenizer())
+
+    assert [r["trace_idx"] for r in result] == [0, 1]
+    assert all(r["full_result"] is nemo_gym_result for r in result)
+
+    seg0, seg1 = (r["trace_metadata"] for r in result)
+    assert seg0["session_id"] == "ses_main"
+    assert seg0["segment_index"] == "0"
+    assert seg0["segment_boundary_reason"] == ""
+    assert "generation_text" not in seg0
+
+    assert seg1["segment_boundary_reason"] == "compaction"
+    # The compaction segment's generation is the summary; keep its text.
+    assert seg1["generation_text"] == "tok:7,8"
+
+    # The legacy aggregate response is stripped of its bulky token arrays.
+    legacy_item = nemo_gym_result["response"]["output"][0]
+    assert "prompt_token_ids" not in legacy_item
+    assert "generation_token_ids" not in legacy_item
+
+
+def test_postprocess_nemo_gym_result_empty_rollout_has_empty_trace_metadata():
+    class DummyTokenizer:
+        pad_token_id = 0
+
+        def batch_decode(self, batch):
+            return ["decoded"] * len(batch)
+
+        def apply_chat_template(self, input_messages, tokenize=True):
+            return [1, 2, 3]
+
+    env = NemoGym.__new__(NemoGym)
+    env.cfg = {}
+
+    nemo_gym_result = {
+        "response": None,
+        "responses": [],
+        "reward": 0.0,
+        "responses_create_params": {"input": [{"role": "user", "content": "hi"}]},
+    }
+
+    result = env._postprocess_nemo_gym_to_nemo_rl_result(nemo_gym_result, DummyTokenizer())
+
+    assert len(result) == 1
+    assert result[0]["is_empty_rollout"] is True
+    assert result[0]["trace_metadata"] == {}
+    assert result[0]["trace_idx"] == 0

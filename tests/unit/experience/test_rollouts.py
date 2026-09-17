@@ -42,6 +42,7 @@ from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
     generate_responses_async,
+    _rollout_debug_info,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
@@ -176,6 +177,85 @@ def test_generate_responses_async_allows_sglang_opt_in():
     assert updated_batch["message_log"][0][-1]["content"] == "ok"
     assert generated_ids[0].tolist() == [2]
     assert gen_metrics["total_generated_tokens"] == 1
+class TestRolloutDebugInfo:
+    """Unit tests for _rollout_debug_info (rollout_debug_step*.jsonl provenance)."""
+
+    @staticmethod
+    def _segment(session_id, segment_index, reason, parent=""):
+        return {
+            "metadata": {
+                "session_id": session_id,
+                "parent_session_id": parent,
+                "segment_index": str(segment_index),
+                "segment_boundary_reason": reason,
+            }
+        }
+
+    def test_counts_compactions_and_subagents_from_segment_metadata(self):
+        full_result = {
+            "reward": 1.0,
+            "resolved": True,
+            "patch_exists": True,
+            "agent_error_kind": None,
+            "agent_timed_out": False,
+            "eval_timed_out": False,
+            "oom_killed": False,
+            "eval_oom_killed": False,
+            "openhands_run_time": 1234.5,
+            "final_eval_time": 60.0,
+            "instance_config": {
+                "name": "inst",
+                "mask_sample": True,
+                "problem_info": {
+                    "instance_id": "django__django-1",
+                    "dataset_name": "swegym",
+                },
+            },
+            "responses": [
+                self._segment("ses_main", 0, ""),
+                self._segment("ses_main", 1, "compaction"),
+                self._segment("ses_main", 2, "post_compaction"),
+                self._segment("ses_sub", 0, "", parent="ses_main"),
+                {"metadata": None},  # tolerated: legacy/empty metadata
+            ],
+        }
+
+        info = _rollout_debug_info(full_result)
+
+        # Must be JSON-serializable: it is written to jsonl every step.
+        json.dumps(info)
+        assert info["instance_id"] == "django__django-1"
+        assert info["dataset_name"] == "swegym"
+        assert info["reward"] == 1.0
+        assert info["mask_sample"] is True
+        assert info["num_segments"] == 5
+        assert info["num_compactions"] == 1
+        assert info["num_subagent_sessions"] == 1
+        assert info["segments"][1]["segment_boundary_reason"] == "compaction"
+        assert info["segments"][3]["parent_session_id"] == "ses_main"
+        assert info["segments"][4] == {
+            "session_id": None,
+            "parent_session_id": "",
+            "segment_index": None,
+            "segment_boundary_reason": "",
+        }
+
+    def test_degrades_gracefully_without_swe_fields(self):
+        # Non-SWE Gym agents / legacy single-response results.
+        info = _rollout_debug_info(
+            {"reward": 0.0, "response": {"output": []}, "instance_config": {"name": "x"}}
+        )
+        json.dumps(info)
+        assert info["instance_id"] == "x"
+        assert info["num_segments"] == 0
+        assert info["num_compactions"] == 0
+        assert info["num_subagent_sessions"] == 0
+        assert info["mask_sample"] is False
+
+        empty = _rollout_debug_info({})
+        json.dumps(empty)
+        assert empty["instance_id"] is None
+        assert empty["segments"] == []
 
 
 @pytest.fixture(scope="function")
