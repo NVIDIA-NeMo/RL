@@ -373,7 +373,6 @@ if [[ -n "${AFTEROK_JOB_ID}" ]]; then
 fi
 
 exec sbatch "${SBATCH_MODE[@]}" \
-  --export=ALL,PATH=/usr/local/bin:/usr/bin:/bin \
   --nodes="${NUM_NODES}" \
   "${GPU_REQUEST[@]}" \
   --exclusive \

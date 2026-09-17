@@ -24,6 +24,9 @@
 
 set -eoux pipefail
 
+# OCI batch shells may omit the Slurm client wrappers from PATH.
+export PATH="${SLURM_COMMAND_PATH:-/usr/local/bin}:${PATH}"
+
 # Record job-start epoch so Python can measure pre-Python overhead
 export NRL_JOB_START_EPOCH=$(date +%s.%N)
 

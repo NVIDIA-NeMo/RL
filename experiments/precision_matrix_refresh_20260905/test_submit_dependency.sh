@@ -40,7 +40,8 @@ output=$(
 )
 
 grep -Fx -- '--dependency=afterok:12345' <<<"${output}" >/dev/null
-grep -Fx -- '--export=ALL,PATH=/usr/local/bin:/usr/bin:/bin' <<<"${output}" >/dev/null
+grep -F -- 'export PATH="${SLURM_COMMAND_PATH:-/usr/local/bin}:${PATH}"' \
+  "${REPO}/ray.sub" >/dev/null
 
 qwen35_output=$(
   ACTION=render \
