@@ -24,6 +24,8 @@ import torch
 import torch.distributed as dist
 import zmq
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
+
+from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
@@ -564,14 +566,27 @@ def stream_weights_via_ipc_zmq_impl(
         release_staging_buffers()
 
 
+# Positions in ``torch.multiprocessing.reductions.rebuild_cuda_tensor``'s
+# argument tuple (unchanged since torch 1.x; see its signature).
+_REBUILD_CUDA_TENSOR_ARG_DEVICE_INDEX = 6
+_REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX = 7
+
+
 def rebuild_cuda_tensor_from_ipc(
     cuda_ipc_handle: tuple, device_id: int
 ) -> torch.Tensor:
     """Rebuild a CUDA tensor from an IPC handle."""
     func = rebuild_cuda_tensor
     args = cuda_ipc_handle[0]
-    list_args = list(args)
-    list_args[6] = device_id
+    list_args: list[Any] = list(args)
+    list_args[_REBUILD_CUDA_TENSOR_ARG_DEVICE_INDEX] = device_id
+    # The producer (training venv) may run a newer torch than this consumer;
+    # see nemo_rl.utils.cuda_ipc for the version-byte compatibility rewrite.
+    list_args[_REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX] = (
+        normalize_cuda_ipc_handle(
+            list_args[_REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX]
+        )
+    )
     return func(*list_args)
 
 
