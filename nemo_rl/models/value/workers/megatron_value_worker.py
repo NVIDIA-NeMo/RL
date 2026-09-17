@@ -14,6 +14,7 @@
 
 import gc
 import os
+import re
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Iterator, Optional, TypeVar
@@ -83,6 +84,134 @@ from nemo_rl.models.value.interfaces import ValueOutputSpec
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+# Block type -> metric name, keyed by Nemotron-H's hybrid_override_pattern
+# ("MEMEMEM*EMEM..."), which is exact where parameter-name heuristics are not:
+# every block is decoder.layers.N.mixer.*, and only the pattern says whether
+# that mixer is Mamba, MoE, or attention.
+_HYBRID_BLOCK_NAMES = {"M": "mamba", "E": "moe", "*": "attention", "-": "mlp"}
+# Fixed, rank-independent ordering for the cross-rank reduction. _grad_norm_group_of
+# must only ever return names from this tuple.
+_GRAD_NORM_GROUP_ORDER = (
+    "attention",
+    "mamba",
+    "moe",
+    "mlp",
+    "value_head",
+    "embedding",
+    "other",
+)
+_LAYER_IDX_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+# mcore renamed this: hybrid_override_pattern is deprecated in favour of
+# hybrid_layer_pattern (hybrid_model.py), and the HF->mcore bridge maps
+# ("hybrid_override_pattern", "hybrid_layer_pattern"). Try both, newest first --
+# reading only the old name silently yields None and dumps all 88 layers into
+# "other", which is exactly what the first version of this metric did.
+_HYBRID_PATTERN_ATTRS = ("hybrid_layer_pattern", "hybrid_override_pattern")
+# Fallback when no pattern is exposed: Nemotron-H mixer submodule names.
+_NAME_HINTS = (
+    ("attention", ("q_proj", "k_proj", "v_proj", "o_proj", "linear_qkv", "self_attention")),
+    ("mamba", ("a_log", "conv1d", "dt_bias", "in_proj", "mixer.d")),
+    ("moe", ("experts", "router", ".gate.", "latent_proj", "linear_fc")),
+)
+
+
+def _hybrid_pattern_of(model: Any) -> Optional[str]:
+    """Best-effort lookup of the hybrid layer pattern across mcore versions."""
+    for obj in (getattr(model, "config", None), model):
+        for attr in _HYBRID_PATTERN_ATTRS:
+            pat = getattr(obj, attr, None)
+            if isinstance(pat, str) and pat:
+                return pat
+    return None
+
+
+def _grad_norm_group_of(name: str, hybrid_pattern: Optional[str]) -> str:
+    """Bucket a parameter by which part of the network it belongs to."""
+    if "output_layer" in name:
+        # The value head: freshly initialized, so its gradients start far larger
+        # than the pretrained backbone's. This is the bucket to watch.
+        return "value_head"
+    if "embedding" in name:
+        return "embedding"
+    m = _LAYER_IDX_RE.search(name)
+    if m and hybrid_pattern:
+        idx = int(m.group(1))
+        if 0 <= idx < len(hybrid_pattern):
+            return _HYBRID_BLOCK_NAMES.get(hybrid_pattern[idx], "other")
+    lowered = name.lower()
+    for group, hints in _NAME_HINTS:
+        if any(h in lowered for h in hints):
+            return group
+    return "other"
+
+
+def _pre_clip_grad_norms_by_group(
+    model: Any, hybrid_pattern: Optional[str], mp_group: Any
+) -> dict[str, torch.Tensor]:
+    """Per-group PRE-clip gradient norms, for diagnosing what drives the global norm.
+
+    Must be called BEFORE ``optimizer.step()``, which is where Megatron clips
+    (``optimizer.py``: ``grad_norm = self.get_grad_norm()`` then clip). mcore DDP
+    accumulates into ``param.main_grad``, not ``param.grad``.
+
+    Sums squares locally then all-reduces SUM over the model-parallel group, so
+    TP/EP-sharded tensors reconstruct their true norm (each rank holds a disjoint
+    shard). Tensors REPLICATED across TP ranks are skipped on all but one rank
+    via mcore's own ``param_is_not_tensor_parallel_duplicate`` -- the same guard
+    ``get_grad_norm_fp32`` uses. Without it a replicated tensor is counted once
+    per TP rank, which inflated the value head above the true global norm.
+    """
+    try:
+        from megatron.core.tensor_parallel.layers import (
+            param_is_not_tensor_parallel_duplicate,
+        )
+    except ImportError:  # pragma: no cover - older mcore
+        param_is_not_tensor_parallel_duplicate = None
+
+    sums: dict[str, torch.Tensor] = defaultdict(float)
+    chunks = model if isinstance(model, list) else [model]
+    for chunk in chunks:
+        for name, param in chunk.named_parameters():
+            grad = getattr(param, "main_grad", None)
+            if grad is None:
+                grad = param.grad
+            if grad is None:
+                continue
+            if (
+                param_is_not_tensor_parallel_duplicate is not None
+                and not param_is_not_tensor_parallel_duplicate(param)
+            ):
+                continue
+            group = _grad_norm_group_of(name, hybrid_pattern)
+            sums[group] = sums[group] + grad.detach().float().pow(2).sum()
+
+    # The reduction below is a COLLECTIVE: every rank in mp_group must call it
+    # with the same shape, and all of them must call it. Both are easy to get
+    # wrong here -- `sorted(sums)` is rank-dependent, because the TP-duplicate
+    # filter above drops replicated params (e.g. the value head) on every rank
+    # but one, so those ranks never create that key. Mismatched shapes wedge the
+    # group until the NCCL watchdog fires (job 3404713, SIGSEGV at step 1).
+    # Always build the full vector in a FIXED order, zero-filled, and never
+    # return early.
+    device = torch.cuda.current_device() if torch.cuda.is_available() else None
+    stacked = torch.zeros(
+        len(_GRAD_NORM_GROUP_ORDER), dtype=torch.float32, device=device
+    )
+    for i, key in enumerate(_GRAD_NORM_GROUP_ORDER):
+        val = sums.get(key)
+        if val is not None:
+            stacked[i] = torch.as_tensor(val, device=device).reshape(())
+    if mp_group is not None and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(
+            stacked, op=torch.distributed.ReduceOp.SUM, group=mp_group
+        )
+    stacked = stacked.sqrt().cpu()
+    return {
+        key: stacked[i]
+        for i, key in enumerate(_GRAD_NORM_GROUP_ORDER)
+        if stacked[i] > 0
+    }
 
 
 def _install_value_head_load_skip(chunk: GPTModel) -> None:
@@ -528,11 +657,19 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
 
                 # Update parameters
                 if not eval_mode:
+                    # BEFORE step(): step() is what clips, so this is the only
+                    # place the pre-clip per-group breakdown is observable.
+                    pg_collection = get_pg_collection(self.model)
+                    grad_norm_groups = _pre_clip_grad_norms_by_group(
+                        self.model,
+                        _hybrid_pattern_of(self.model),
+                        pg_collection.mp,
+                    )
+
                     update_successful, grad_norm, num_zeros_in_grad = (
                         self.optimizer.step()
                     )
 
-                    pg_collection = get_pg_collection(self.model)
                     update_successful = logical_and_across_model_parallel_group(
                         update_successful, mp_group=pg_collection.mp
                     )
@@ -545,6 +682,7 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
                         0.0,
                         0.0,
                     )
+                    grad_norm_groups = {}
 
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
                     torch.cuda.empty_cache()
@@ -615,6 +753,8 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
             "grad_norm": torch.tensor([grad_norm])
             if grad_norm is not None
             else torch.tensor([0.0]),
+            # Pre-clip norm split by network part; see _pre_clip_grad_norms_by_group.
+            "grad_norm_groups": grad_norm_groups,
         }
 
         # Collect MoE aux metrics if applicable

@@ -57,6 +57,7 @@ import torch
 from nemo_rl.algorithms.rollout_collection import load_group, parse_group_index
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.utils.timer import TimeoutChecker
 
 FILE_LIST_NAME = "critic_pretrain_files.json"
 
@@ -86,6 +87,169 @@ def split_heldout(files: list[Path], heldout_mod: int) -> tuple[list[Path], list
         idx = parse_group_index(f.name)
         (heldout if idx % heldout_mod == 0 else train).append(f)
     return train, heldout
+
+
+def pick_response_donors(
+    base_files: list[Path], donors_per_step: int, full_per_step: int, seed: int
+) -> set[Path]:
+    """Choose which prompts donate their tail responses to the response-eval set.
+
+    Sized so both pools run out together: a step consumes ``donors_per_step``
+    donor groups and ``full_per_step`` full ones, so the donor share of the
+    corpus must be ``a / (a + b)``. Any other split exhausts one pool early and
+    silently shortens the epoch to whichever runs dry first.
+
+    Deterministic in ``seed`` and in the (sorted) base set, so resume
+    regenerates exactly the same donors — a re-draw would leak previously
+    held-out responses into training.
+    """
+    if donors_per_step <= 0:
+        return set()
+    ordered = sorted(base_files, key=str)
+    n_donors = round(len(ordered) * donors_per_step / (donors_per_step + full_per_step))
+    n_donors = max(0, min(len(ordered), n_donors))
+    return set(random.Random(seed).sample(ordered, n_donors))
+
+
+RESPONSE_SPLIT_NAME = "response_split.json"
+
+
+def load_or_create_response_split(
+    shards_dir: str | Path,
+    base_files: list[Path],
+    donors_per_step: int,
+    full_per_step: int,
+    heldout_responses_per_group: int,
+    heldout_mod: int,
+    seed: int,
+    redraw: bool = False,
+) -> set[Path]:
+    """The donor assignment as a shards-level sidecar, shared by every run.
+
+    ``pick_response_donors`` is deterministic in (sorted base set, seed) — but
+    the base set is a moving target while a collection fills, and a
+    different-length base gives a completely DIFFERENT draw, not a superset.
+    Two runs are therefore only comparable if they launch on the identical file
+    set. This sidecar freezes the assignment once, in SHARDS_DIR itself: the
+    first run writes it, every later run loads and VERIFIES it, so all arms of
+    an A/B score the same donors' tail responses no matter when they launch.
+
+    File names are stored RELATIVE to ``shards_dir`` so the /lustre and
+    /scratch aliases of the same directory read one split. Any drift — base
+    set, K, a/b ratio, heldout_mod, seed — fails loud. ``redraw=True``
+    (``critic_pretrain.response_split_redraw``) renames the old sidecar aside
+    and draws a fresh split: the explicit, logged way to accept that eval
+    comparability with earlier runs on this collection is broken.
+
+    Concurrent first launches write identical content (same base, same seed;
+    atomic replace), so the race is benign; a launch during collection followed
+    by one after it is exactly the drift case the verification rejects.
+    """
+    shards_dir = Path(shards_dir)
+    split_path = shards_dir / RESPONSE_SPLIT_NAME
+    rel_of = {p: os.path.relpath(str(p), str(shards_dir)) for p in base_files}
+    base_rel = sorted(rel_of.values())
+    expected = {
+        "heldout_responses_per_group": heldout_responses_per_group,
+        "donors_per_step": donors_per_step,
+        "full_per_step": full_per_step,
+        "heldout_mod": heldout_mod,
+        "seed": seed,
+    }
+    if split_path.exists() and not redraw:
+        with open(split_path) as f:
+            saved = json.load(f)
+        for key, want in expected.items():
+            got = saved.get(key)
+            if got != want:
+                raise ValueError(
+                    f"{split_path} was drawn with {key}={got!r} but this run uses "
+                    f"{want!r}. The donor assignment is only meaningful for the "
+                    "parameters it was drawn with — relaunch with the recorded "
+                    "parameters, or pass ++critic_pretrain.response_split_redraw="
+                    "true to draw a fresh split (breaks eval comparability with "
+                    "every earlier run on this collection)."
+                )
+        saved_base = saved["base_files"]
+        if saved_base != base_rel:
+            gone = sorted(set(saved_base) - set(base_rel))
+            new = sorted(set(base_rel) - set(saved_base))
+            raise ValueError(
+                f"{split_path} was drawn over {len(saved_base)} base groups but "
+                f"this run sees {len(base_rel)} ({len(new)} new, {len(gone)} "
+                f"missing; e.g. new={new[:3]} missing={gone[:3]}). A split drawn "
+                "on a different base is a different experiment — if the "
+                "collection finished since the split was drawn (pilot -> "
+                "production), pass ++critic_pretrain.response_split_redraw=true; "
+                "if files vanished, restore them."
+            )
+        donors_rel = set(saved["donors"])
+        abs_of = {r: p for p, r in rel_of.items()}
+        print(
+            f"  ✓ Response split loaded from {split_path}: "
+            f"{len(donors_rel)}/{len(base_rel)} donors "
+            f"(drawn {saved.get('created', '?')})"
+        )
+        return {abs_of[r] for r in donors_rel}
+
+    donors = pick_response_donors(base_files, donors_per_step, full_per_step, seed)
+    payload = {
+        **expected,
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "n_base": len(base_files),
+        "n_donors": len(donors),
+        "donors": sorted(rel_of[p] for p in donors),
+        "base_files": base_rel,
+    }
+    if split_path.exists():  # redraw: keep the old assignment for the record
+        backup = split_path.with_name(
+            f"{RESPONSE_SPLIT_NAME}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+        )
+        os.replace(split_path, backup)
+        print(f"  ⚠️ response_split_redraw: previous split moved to {backup}")
+    tmp = split_path.with_name(f"{RESPONSE_SPLIT_NAME}.tmp-{os.getpid()}")
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=1)
+    os.replace(tmp, split_path)
+    print(
+        f"  ✓ Response split drawn and frozen to {split_path}: "
+        f"{len(donors)}/{len(base_files)} donors (K="
+        f"{heldout_responses_per_group}, a={donors_per_step}, b={full_per_step})"
+    )
+    return donors
+
+
+def build_packed_epoch_stream(
+    donors: list[Path],
+    fulls: list[Path],
+    donors_per_step: int,
+    full_per_step: int,
+    num_epochs: int,
+    seed: int,
+) -> list[Path]:
+    """Multi-epoch stream where every ``a + b`` slice is a exactly-GBS step.
+
+    Donor groups contribute ``gpp - K`` samples and full groups ``gpp``, so a
+    step is only a fixed sample count if it mixes a FIXED number of each:
+    ``a`` donors + ``b`` fulls. Emitting them pre-interleaved in step order
+    keeps the flat-list contract the rest of the loop (and the whole frozen /
+    resume path) is built on — ``train_files[step * gps : (step + 1) * gps]``
+    stays correct with ``gps = a + b``.
+
+    Epoch ``e`` shuffles each pool with ``Random(seed + e)`` independently, so
+    the same prefix-replay guarantee as ``build_epoch_stream`` holds.
+    """
+    stream: list[Path] = []
+    for epoch in range(num_epochs):
+        d = sorted(donors, key=str)
+        f = sorted(fulls, key=str)
+        random.Random(seed + epoch).shuffle(d)
+        random.Random(seed + epoch + 10_000).shuffle(f)
+        steps = min(len(d) // donors_per_step, len(f) // full_per_step)
+        for s in range(steps):
+            stream.extend(d[s * donors_per_step : (s + 1) * donors_per_step])
+            stream.extend(f[s * full_per_step : (s + 1) * full_per_step])
+    return stream
 
 
 def build_epoch_stream(
@@ -227,6 +391,20 @@ def within_group_auc(
     return out
 
 
+def _same_model_dir(a: Any, b: Any) -> bool:
+    """True if two model paths resolve to the same directory.
+
+    Only claims equality when BOTH paths exist and resolve to one real
+    directory — realpath() passes a nonexistent path through unchanged, which
+    would silently equate two genuinely different (and missing) checkpoints.
+    """
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+    if not (os.path.isdir(a) and os.path.isdir(b)):
+        return False
+    return os.path.realpath(a) == os.path.realpath(b)
+
+
 def verify_shard_meta(
     shards_dir: str | Path, master_config: Any, tokenizer: Any
 ) -> None:
@@ -251,11 +429,25 @@ def verify_shard_meta(
         ),
         "max_total_sequence_length": master_config.policy["max_total_sequence_length"],
     }
+    alias_noted = False
     for meta_path in metas:
         with open(meta_path) as f:
             meta = json.load(f)
         for key, want in expected.items():
             got = meta.get(key)
+            # A "<ckpt>_copy" symlink alias is the normal way to give a second
+            # run its own Megatron import cache under HF_HOME (the cache dir is
+            # keyed on the literal path). Same target => same weights and same
+            # tokenizer, so the shards are valid; chat_template_sha256 below is
+            # what actually guards token-id validity.
+            if key == "model_name" and got != want and _same_model_dir(got, want):
+                if not alias_noted:
+                    print(
+                        f"  ✓ model_name differs by path alias only "
+                        f"({got!r} -> {os.path.realpath(str(got))}); accepting shards."
+                    )
+                    alias_noted = True
+                continue
             assert got == want, (
                 f"Shard provenance mismatch in {meta_path}: {key}={got!r} but this "
                 f"run expects {want!r}. Shards are token-id level and are only "
@@ -294,6 +486,63 @@ def resolve_critic_pretrain_config(
     # per-token strings (for the token-level HTML heatmap) are ~35k/sample, so
     # store them only for a bounded, contrastful subset of samples per text group
     cfg.setdefault("dump_token_samples", 4)
+    # Train the critic on env-flagged (mask_sample) rollouts instead of dropping
+    # them. The policy masks these because a wall-clock timeout makes the reward
+    # unattributable to the actions; the critic's job is different — it predicts
+    # the return, and for a timed-out trajectory 0 IS the realised return. On the
+    # SWE shards this is ~13% more data whose label is specifically "this
+    # trajectory went nowhere", which is the within-trajectory signal a
+    # terminal-reward critic is otherwise starved of.
+    #
+    # TRAIN ONLY. The held-out batches keep masking regardless (see
+    # build_value_train_data's apply_env_mask), so critic/explained_var stays on
+    # the same yardstick as every earlier run and this stays a clean A/B.
+    cfg.setdefault("train_on_env_masked", False)
+    cfg["train_on_env_masked"] = bool(cfg["train_on_env_masked"])
+    # ---- Response-level held-out split (see split_group_responses) ----
+    # heldout_mod holds out whole PROMPTS, which measures generalisation to an
+    # unseen task. That is not the regime stage C runs in: PPO trains over the
+    # same prompt set this critic was pretrained on, so at serve time the critic
+    # is scoring FRESH RESPONSES to prompts it has already memorised. K > 0
+    # reserves the last K responses of every training group for a second eval
+    # set that reproduces exactly that condition.
+    #
+    # Both splits are reported. The prompt-level one keeps its existing metric
+    # names, so critic/explained_var stays comparable to every earlier run.
+    cfg.setdefault("heldout_responses_per_group", 0)
+    cfg["heldout_responses_per_group"] = int(cfg["heldout_responses_per_group"])
+    # Donor groups per step. Only a SUBSET of prompts gives up responses, so the
+    # cost is (donor fraction x K/gpp) of the corpus rather than K/gpp of it:
+    # at gpp=16, K=4, GBS=512 a step packs a donors x 12 + b fulls x 16 = 512,
+    # e.g. a=16/b=20 loses 11% of training data where holding K out of EVERY
+    # group would lose 25%. b is derived and the tiling is asserted exact.
+    cfg.setdefault("heldout_response_donor_groups_per_step", 0)
+    cfg["heldout_response_donor_groups_per_step"] = int(
+        cfg["heldout_response_donor_groups_per_step"]
+    )
+    # Scoring the response-eval set over every training prompt would cost more
+    # than a train step; cap it at a FIXED prefix of the (sorted) train files so
+    # the metric is comparable across steps, runs and resumes.
+    cfg.setdefault("heldout_response_max_groups", 512)
+    cfg["heldout_response_max_groups"] = int(cfg["heldout_response_max_groups"])
+    # Redraw the shards-level donor assignment (response_split.json) instead of
+    # loading it. Breaks eval comparability with every earlier run on the same
+    # collection — the sidecar exists precisely to prevent that happening by
+    # accident — so this must be asked for explicitly (pilot -> production).
+    cfg.setdefault("response_split_redraw", False)
+    cfg["response_split_redraw"] = bool(cfg["response_split_redraw"])
+    # ---- Stage-1 soft targets (prior consolidation) ----
+    # For the first N epochs every sample regresses to its GROUP's mean reward
+    # instead of its own 0/1 outcome. The target is identical across a task's
+    # trajectories, so per-trajectory features have nothing left to explain and
+    # the only zero-loss solution is task-keyed — replay epochs cannot buy
+    # anything by memorising individual trajectories (which is what ate the
+    # gpp8 run: train EV 0.53 > the 0.44 task-prior ceiling). Hard 0/1 targets
+    # resume from epoch N (stage 2). BOTH held-out evals always score against
+    # the REAL rewards, so validation_response/critic/explained_var reads the
+    # same quantity in every phase.
+    cfg.setdefault("soft_target_epochs", 0)
+    cfg["soft_target_epochs"] = int(cfg["soft_target_epochs"])
     for key in (
         "groups_per_step",
         "heldout_mod",
@@ -306,6 +555,34 @@ def resolve_critic_pretrain_config(
         f"critic_pretrain.num_epochs must be >= 1, got {cfg['num_epochs']}"
     )
     return cfg
+
+
+def split_group_responses(
+    group: dict[str, Any], start: int, end: int
+) -> dict[str, Any]:
+    """A copy of a loaded group holding only samples ``[start, end)``.
+
+    The unit of the shard pipeline is a whole group (one prompt x gpp
+    responses), so a response-level train/eval split has to cut INSIDE the
+    payload. ``BatchedDataDict.slice`` does the per-field work — tensors,
+    ``message_log`` and ``extra_env_info`` are all per-sample and slice
+    together, which is what keeps a sliced group a valid input to
+    ``build_value_train_data``.
+
+    Slicing by POSITION (not a shuffle) is deliberate: generation order carries
+    no meaning here — the gym fans out gpp independent rollouts of one prompt —
+    so a positional cut is an unbiased split, and being deterministic it
+    survives resume and reproduces across runs.
+    """
+    size = group["batch"].size
+    assert 0 <= start < end <= size, (
+        f"response slice [{start}, {end}) out of range for a group of {size} "
+        "samples; check critic_pretrain.heldout_responses_per_group against "
+        "the shards' gens_per_prompt"
+    )
+    out = dict(group)
+    out["batch"] = group["batch"].slice(start, end)
+    return out
 
 
 def message_spans(message_log: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -330,8 +607,14 @@ def build_value_train_data(
     groups: list[dict[str, Any]],
     tokenizer: Any,
     master_config: Any,
+    apply_env_mask: bool = True,
 ) -> tuple[BatchedDataDict, BatchedDataDict]:
     """Assemble (train_data, repeated_batch) from loaded group payloads.
+
+    ``apply_env_mask=False`` keeps env-flagged (``mask_sample``) rollouts in the
+    batch — see ``critic_pretrain.train_on_env_masked``. Overlong filtering is
+    unaffected either way. Callers building HELD-OUT batches must leave this
+    True so the eval yardstick never moves.
 
     Follows async_ppo_train's reward-processing + inline loss-mask block
     verbatim (overlong filtering, env-flagged sample masking, unmask ALL
@@ -354,12 +637,21 @@ def build_value_train_data(
         repeated_batch["loss_multiplier"] = loss_multiplier
 
     if "mask_sample" in repeated_batch:
-        loss_multiplier = repeated_batch["loss_multiplier"].clone()
         mask_sample = repeated_batch["mask_sample"]
         if isinstance(mask_sample, list):
             mask_sample = torch.tensor(mask_sample, dtype=torch.bool)
-        loss_multiplier[mask_sample.bool()] = 0
-        repeated_batch["loss_multiplier"] = loss_multiplier
+        mask_sample = mask_sample.bool()
+        if apply_env_mask:
+            loss_multiplier = repeated_batch["loss_multiplier"].clone()
+            loss_multiplier[mask_sample] = 0
+            repeated_batch["loss_multiplier"] = loss_multiplier
+        elif int(mask_sample.sum()):
+            # Say what is being kept: this is the whole point of the flag, and
+            # silence here would make an env-mask A/B unfalsifiable from a log.
+            print(
+                f"  📊 train_on_env_masked: KEEPING "
+                f"{int(mask_sample.sum())}/{len(mask_sample)} env-flagged samples"
+            )
 
     # PPO's inline loss-mask setup: unmask all assistant messages.
     for message_log in repeated_batch["message_log"]:
@@ -525,8 +817,14 @@ def _heldout_metrics(
     heldout_files: list[Path],
     tokenizer: Any,
     master_config: Any,
+    response_slice: Optional[tuple[int, int]] = None,
 ) -> dict[str, float]:
     """Critic quality on held-out rollouts: EV, positional EV/ECE, terminal AUC.
+
+    ``response_slice=(start, end)`` scores only those response positions of each
+    group, which is how the response-level eval set is drawn from prompts that
+    are ALSO in training (see ``critic_pretrain.heldout_responses_per_group``).
+    Left None the whole group is scored, i.e. the prompt-level held-out set.
 
     On the turn-level path every metric is scored at the positions the critic is
     actually supervised at (turn anchors) — scoring an anchor-layout return
@@ -541,6 +839,8 @@ def _heldout_metrics(
     )
 
     groups = [load_group(p) for p in heldout_files]
+    if response_slice is not None:
+        groups = [split_group_responses(g, *response_slice) for g in groups]
     train_data, repeated_batch = build_value_train_data(
         groups, tokenizer, master_config
     )
@@ -863,6 +1163,73 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
     assert all_files, f"No group files found under {cp_config['shards_dir']}"
     verify_shard_meta(cp_config["shards_dir"], master_config, tokenizer)
     num_epochs = cp_config["num_epochs"]
+
+    # ---- Response-level split: same prompts as training, unseen responses ----
+    # heldout_mod holds out whole PROMPTS, i.e. it measures generalisation to an
+    # unseen task. That is NOT the regime stage C runs in: PPO trains over the
+    # same prompt set this critic was pretrained on, so at serve time the critic
+    # scores fresh responses to prompts it has already memorised. K > 0 reserves
+    # the last K responses of a SUBSET of prompts (the donors) for a second eval
+    # set reproducing exactly that condition. Both splits are reported and the
+    # prompt-level one keeps its metric names, so critic/explained_var stays
+    # comparable to every earlier run.
+    n_resp_heldout = cp_config["heldout_responses_per_group"]
+    gpp = int(master_config.ppo["num_generations_per_prompt"])
+    donors_per_step = cp_config["heldout_response_donor_groups_per_step"]
+    full_per_step = 0
+    donor_set: set[Path] = set()
+    if n_resp_heldout > 0:
+        assert 0 < n_resp_heldout < gpp, (
+            f"critic_pretrain.heldout_responses_per_group={n_resp_heldout} must be "
+            f"in (0, num_generations_per_prompt={gpp})"
+        )
+        assert donors_per_step > 0, (
+            "critic_pretrain.heldout_responses_per_group > 0 requires "
+            "critic_pretrain.heldout_response_donor_groups_per_step > 0 (how many "
+            "reduced-size groups each step packs)."
+        )
+        gbs = int(value_config["train_global_batch_size"])
+        donor_samples = donors_per_step * (gpp - n_resp_heldout)
+        rest = gbs - donor_samples
+        # Exact tiling or nothing: a step that does not total GBS would trip the
+        # batch-size check every step, and rounding it would silently drop data.
+        assert rest >= 0 and rest % gpp == 0, (
+            f"No exact packing: {donors_per_step} donor groups x "
+            f"({gpp} - {n_resp_heldout}) = {donor_samples} samples leaves "
+            f"{rest} of value.train_global_batch_size={gbs}, which is not a "
+            f"multiple of gpp={gpp}. Pick a donors_per_step where "
+            f"(GBS - a*(gpp-K)) % gpp == 0."
+        )
+        full_per_step = rest // gpp
+
+    def _make_stream(base: list[Path]) -> list[Path]:
+        """The multi-epoch train stream, packed when a response split is on.
+
+        Both the fresh and the resume path go through here so they cannot build
+        different orders — the resume path's prefix check compares the two.
+        """
+        nonlocal donor_set
+        if n_resp_heldout <= 0:
+            return build_epoch_stream(base, num_epochs, cp_config["seed"])
+        donor_set = load_or_create_response_split(
+            cp_config["shards_dir"],
+            base,
+            donors_per_step,
+            full_per_step,
+            n_resp_heldout,
+            cp_config["heldout_mod"],
+            cp_config["seed"],
+            redraw=cp_config["response_split_redraw"],
+        )
+        return build_packed_epoch_stream(
+            [p for p in base if p in donor_set],
+            [p for p in base if p not in donor_set],
+            donors_per_step,
+            full_per_step,
+            num_epochs,
+            cp_config["seed"],
+        )
+
     frozen = None
     if last_checkpoint_path is not None:
         file_list_path = os.path.join(last_checkpoint_path, FILE_LIST_NAME)
@@ -876,7 +1243,7 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
         # the base in its pre-shuffle order (list_group_files sorts by path) and
         # regenerate the stream for the num_epochs asked for NOW.
         base_train = [_Path(p) for p in sorted({str(p) for p in frozen_train})]
-        train_files = build_epoch_stream(base_train, num_epochs, cp_config["seed"])
+        train_files = _make_stream(base_train)
         n_frozen = len(frozen_train)
         # Fail loud rather than train on a different sequence than the
         # checkpoint recorded: the regenerated stream MUST reproduce the frozen
@@ -905,7 +1272,7 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
             )
     else:
         base_train, heldout_files = split_heldout(all_files, cp_config["heldout_mod"])
-        train_files = build_epoch_stream(base_train, num_epochs, cp_config["seed"])
+        train_files = _make_stream(base_train)
     missing = [
         p for p in set(train_files) | set(heldout_files) if not os.path.exists(p)
     ]
@@ -914,6 +1281,20 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
     )
 
     groups_per_step = cp_config["groups_per_step"]
+    if n_resp_heldout > 0:
+        # A packed step is a+b groups by construction, and the stream is emitted
+        # in that layout — so groups_per_step is DERIVED, not configured. Take it
+        # over rather than letting a stale launcher value slice across step
+        # boundaries and mix a donor tail into the next step's batch.
+        packed_gps = donors_per_step + full_per_step
+        if groups_per_step != packed_gps:
+            print(
+                f"  ℹ️ groups_per_step {groups_per_step} -> {packed_gps} "
+                f"({donors_per_step} donor x {gpp - n_resp_heldout} + "
+                f"{full_per_step} full x {gpp} = "
+                f"{value_config['train_global_batch_size']} samples/step)"
+            )
+        groups_per_step = packed_gps
     # drop-last within the whole multi-epoch stream
     planned_steps = len(train_files) // groups_per_step
     if cp_config["max_steps"] is not None:
@@ -1043,6 +1424,37 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
     eval_period = cp_config["eval_period"]
     heldout_eval_files = heldout_files[: cp_config["heldout_max_groups"]]
 
+    # The response-eval set is drawn ONLY from donor prompts — those are the
+    # ones whose tail responses were withheld from training. A fixed prefix of
+    # the sorted donors (not the shuffled stream) so the same prompts are scored
+    # at every eval and the curve moves only when the critic does.
+    response_eval_files: list[Path] = []
+    if n_resp_heldout > 0:
+        response_eval_files = sorted(donor_set, key=str)[
+            : cp_config["heldout_response_max_groups"]
+        ]
+        n_donor, n_full = len(donor_set), len(base_train) - len(donor_set)
+        lost = len(donor_set) * n_resp_heldout
+        total = len(base_train) * gpp
+        print(
+            f"  ✓ Response-level split: {n_donor} donor prompts train on responses "
+            f"[0,{gpp - n_resp_heldout}) and are evaluated on "
+            f"[{gpp - n_resp_heldout},{gpp}); {n_full} prompts train on all {gpp}. "
+            f"Withheld {lost}/{total} samples ({100 * lost / max(total, 1):.1f}%). "
+            f"Response eval scores {len(response_eval_files)} prompts."
+        )
+
+    # Walltime-bounded save. planned_steps is many 4h windows long, so without
+    # this a window that never lands on a save_period multiple is lost outright
+    # (is_last_step only fires at the very end of the whole multi-epoch stream).
+    # fit_last_save_time makes it fire one iteration EARLY, using the running
+    # mean step time, so the save itself fits inside the budget.
+    timeout = TimeoutChecker(
+        timeout=master_config.checkpointing["checkpoint_must_save_by"],
+        fit_last_save_time=True,
+    )
+    timeout.start_iterations()
+
     # ------------------------------------------------------------------
     # Train loop: one pass over the frozen file order.
     # ------------------------------------------------------------------
@@ -1052,8 +1464,23 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
 
         step_files = train_files[step * groups_per_step : (step + 1) * groups_per_step]
         groups = [load_group(p) for p in step_files]
+        if n_resp_heldout > 0:
+            # Per FILE, not per position: donor membership is a fixed property
+            # of a prompt, so its withheld tail stays withheld in every epoch.
+            groups = [
+                split_group_responses(g, 0, gpp - n_resp_heldout)
+                if p in donor_set
+                else g
+                for g, p in zip(groups, step_files)
+            ]
+        # Train-only: held-out batches (evaluate_heldout / the value dump) always
+        # apply the env mask, so critic/explained_var keeps comparing like with
+        # like across runs regardless of this flag.
         train_data, repeated_batch = build_value_train_data(
-            groups, tokenizer, master_config
+            groups,
+            tokenizer,
+            master_config,
+            apply_env_mask=not cp_config["train_on_env_masked"],
         )
         if train_data["input_ids"].shape[0] != expected_gbs:
             raise ValueError(
@@ -1061,8 +1488,55 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
                 f"value.train_global_batch_size={expected_gbs}. Override "
                 "value.train_global_batch_size (and critic_pretrain."
                 "groups_per_step) to match groups_per_step * gens_per_prompt "
-                "of the stored shards."
+                "of the stored shards"
+                + (
+                    f", MINUS the {n_resp_heldout} responses/group reserved for "
+                    f"the response-level eval: expected "
+                    f"{groups_per_step} * ({gpp} - {n_resp_heldout}) = "
+                    f"{groups_per_step * (gpp - n_resp_heldout)}."
+                    if n_resp_heldout > 0
+                    else "."
+                )
             )
+
+        # ---- Stage-1 soft targets: regress to the group-mean reward ----
+        # Applied BEFORE returns are computed, so GAE broadcasts the soft target
+        # to every token exactly like a real reward. Donor groups were already
+        # sliced above, so a donor's mean is over its TRAINING responses only —
+        # the withheld eval responses never leak into the target. The epoch
+        # boundary is derived from the frozen stream, so it is stable across
+        # resume and across NUM_EPOCHS extensions (stage 2 = relaunch with a
+        # larger num_epochs and the same soft_target_epochs).
+        soft_target_epochs = cp_config["soft_target_epochs"]
+        steps_per_epoch = max(1, len(train_files) // num_epochs // groups_per_step)
+        in_soft_phase = (step // steps_per_epoch) < soft_target_epochs
+        if soft_target_epochs > 0 and step % steps_per_epoch == 0:
+            print(
+                f"  🎯 epoch {step // steps_per_epoch}: "
+                f"{'SOFT group-mean' if in_soft_phase else 'HARD per-trajectory'} "
+                f"value targets (soft_target_epochs={soft_target_epochs}, "
+                f"steps_per_epoch={steps_per_epoch})"
+            )
+        if in_soft_phase:
+            # Clone: train_data["rewards"] aliases repeated_batch["total_reward"],
+            # and the real rewards must keep flowing to logging/metrics.
+            soft_rewards = train_data["rewards"].float().clone()
+            sample_mask = train_data["sample_mask"].float()
+            off = 0
+            for g in groups:
+                n = int(g["batch"].size)
+                sl = slice(off, off + n)
+                kept = sample_mask[sl] > 0
+                # An all-masked group keeps its raw rewards: its loss is fully
+                # masked anyway, so no target is ever trained on.
+                if bool(kept.any()):
+                    soft_rewards[sl] = soft_rewards[sl][kept].mean()
+                off += n
+            assert off == soft_rewards.shape[0], (
+                f"group sizes sum to {off} but the batch has "
+                f"{soft_rewards.shape[0]} samples"
+            )
+            train_data["rewards"] = soft_rewards
 
         print("▶ Computing values...")
         priv_metrics: dict[str, float] = {}
@@ -1120,7 +1594,13 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
         )
         metrics.update(getattr(adv_estimator, "last_metrics", {}) or {})
         metrics.update(priv_metrics)
-        metrics["reward"] = train_data["rewards"].float().mean().item()
+        # Real rewards, not the (possibly soft) value targets: train/reward must
+        # stay comparable across phases and runs.
+        _real_rewards = repeated_batch["total_reward"]
+        if isinstance(_real_rewards, list):
+            _real_rewards = torch.tensor(_real_rewards)
+        metrics["reward"] = _real_rewards.float().mean().item()
+        metrics["critic/soft_targets"] = 1.0 if in_soft_phase else 0.0
         metrics["num_samples"] = float(train_data["input_ids"].shape[0])
         metrics["total_step_time"] = time.perf_counter() - step_start
         logger.log_metrics(metrics, step + 1, prefix="train")
@@ -1132,11 +1612,16 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
         )
 
         # ---- Held-out eval ----
+        # The two eval sets are gated on ONE schedule but independently on their
+        # own file lists: nesting the response-level eval under
+        # `if heldout_eval_files` would silently disable it whenever
+        # heldout_mod <= 0, which is exactly the config someone picks when they
+        # want the response split to be the only eval.
         is_last_step = step + 1 == planned_steps
-        if heldout_eval_files and (
-            (eval_period > 0 and (step + 1) % eval_period == 0) or is_last_step
-        ):
-            print("🔍 Held-out eval...")
+        do_eval = (eval_period > 0 and (step + 1) % eval_period == 0) or is_last_step
+
+        if do_eval and heldout_eval_files:
+            print("🔍 Held-out eval (unseen prompts)...")
             val_metrics = _heldout_metrics(
                 value_model,
                 adv_estimator,
@@ -1146,8 +1631,31 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
             )
             logger.log_metrics(val_metrics, step + 1, prefix="validation")
             print(
-                f"  heldout: ev={val_metrics.get('critic/explained_var', float('nan')):.4f} "
+                f"  heldout (unseen prompt): "
+                f"ev={val_metrics.get('critic/explained_var', float('nan')):.4f} "
                 f"terminal_auc={val_metrics.get('critic/terminal_auc', float('nan')):.4f}"
+            )
+
+        # Same prompts as training, responses the critic has never seen — the
+        # stage C condition. Its own prefix, so it never collides with the
+        # unseen-prompt numbers above.
+        if do_eval and response_eval_files:
+            print("🔍 Response-level eval (seen prompts, unseen responses)...")
+            resp_metrics = _heldout_metrics(
+                value_model,
+                adv_estimator,
+                response_eval_files,
+                tokenizer,
+                master_config,
+                response_slice=(gpp - n_resp_heldout, gpp),
+            )
+            logger.log_metrics(resp_metrics, step + 1, prefix="validation_response")
+            print(
+                f"  heldout (unseen response): "
+                f"ev={resp_metrics.get('critic/explained_var', float('nan')):.4f} "
+                f"terminal_auc={resp_metrics.get('critic/terminal_auc', float('nan')):.4f} "
+                f"within_group_auc_q4="
+                f"{resp_metrics.get('critic/within_group_auc_q4', float('nan')):.4f}"
             )
 
         # ---- Checkpoint (value/ only — stage C's warm-start seed layout) ----
@@ -1157,7 +1665,16 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
         save_state["consumed_samples"] = save_state.get("consumed_samples", 0) + int(
             train_data["input_ids"].shape[0]
         )
-        if checkpointing_enabled and (is_last_step or step % save_period == 0):
+        timeout.mark_iteration()
+        should_save_by_step = is_last_step or step % save_period == 0
+        # Latches: fires once, then returns False for the rest of the window.
+        should_save_by_timeout = timeout.check_save()
+        if should_save_by_timeout and not should_save_by_step:
+            print(
+                f"⏰ checkpoint_must_save_by budget reached — saving at step {step} "
+                "before the walltime."
+            )
+        if checkpointing_enabled and (should_save_by_step or should_save_by_timeout):
             print(f"💾 Saving checkpoint for step {step}...")
             checkpoint_path = checkpointer.init_tmp_checkpoint(
                 step, save_state, master_config

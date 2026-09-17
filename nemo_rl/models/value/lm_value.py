@@ -386,6 +386,9 @@ class Value(ValueInterface):
         aggregated_results = {
             "loss": results[0]["global_loss"],
             "grad_norm": results[0]["grad_norm"],
+            # Already reduced across the model-parallel group inside the worker,
+            # so rank 0's copy is the whole picture (same as grad_norm above).
+            "grad_norm_groups": results[0].get("grad_norm_groups", {}),
         }
 
         # Aggregate metrics across all workers

@@ -97,6 +97,7 @@ from nemo_rl.environments.nemo_gym import (
 )
 from nemo_rl.experience.rollouts import (
     get_nemo_gym_thinking_tags,
+    graft_nemo_gym_input_fields,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
@@ -1718,6 +1719,20 @@ def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
         "critic/loss": value_results["loss"].numpy(),
     }
 
+    # Pre-clip gradient norm split by network part (attention / mamba / moe /
+    # value_head / embedding). clip_grad applies ONE global norm across all of
+    # them, so when the total sits far above the threshold this shows which part
+    # is setting the clip factor for everything else. gnorm_frac is the share of
+    # the squared global norm, so the fractions sum to 1.
+    gn_groups = value_results.get("grad_norm_groups") or {}
+    if gn_groups:
+        sq = {k: float(v) ** 2 for k, v in gn_groups.items()}
+        sq_total = sum(sq.values())
+        for k, v in gn_groups.items():
+            critic_metrics[f"critic/gnorm/{k}"] = float(v)
+            if sq_total > 0:
+                critic_metrics[f"critic/gnorm_frac/{k}"] = sq[k] / sq_total
+
     for k, v in value_mb_metrics.items():
         if k in {
             "lr",
@@ -2396,9 +2411,10 @@ def ppo_train(
                             "stop_token_ids": None,
                             "stop_strings": None,
                         }
+                        gym_input_batch = repeated_batch
                         nemo_gym_rollout_result = run_async_nemo_gym_rollout(
                             policy_generation=policy_generation,
-                            input_batch=repeated_batch,
+                            input_batch=gym_input_batch,
                             tokenizer=tokenizer,
                             task_to_env=task_to_env,
                             max_seq_len=master_config.policy[
@@ -2412,6 +2428,14 @@ def ppo_train(
                             thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                         )
                         repeated_batch = nemo_gym_rollout_result.final_batch
+                        # The gym path rebuilds the batch from the rollout results
+                        # and drops the input-only DatumSpec fields; graft them back
+                        # so train-time consumers see the same batch shape every
+                        # other rollout path produces. Without this the SWE
+                        # privileged critic has no extra_env_info to read and the
+                        # step dies at the value forward.
+                        graft_nemo_gym_input_fields(repeated_batch, gym_input_batch)
+                        del gym_input_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result
 
@@ -2629,6 +2653,13 @@ def ppo_train(
                         {
                             "input_ids": train_data["input_ids"],
                             "input_lengths": train_data["input_lengths"],
+                            # Required by the top-k/top-p logprob path: with
+                            # filtering on, LogprobsPostProcessor masks out the
+                            # -inf logprobs of tokens that fell outside the
+                            # policy's nucleus, and needs both masks to do it
+                            # (models/megatron/train.py). Mirrors grpo.py.
+                            "token_mask": train_data["token_mask"],
+                            "sample_mask": train_data["sample_mask"],
                             **extra_multimodal_data,
                         }
                     )
@@ -4006,6 +4037,10 @@ def async_ppo_train(
                         {
                             "input_ids": train_data["input_ids"],
                             "input_lengths": train_data["input_lengths"],
+                            # See the sync path above: top-k/top-p logprob
+                            # masking needs both masks on the worker.
+                            "token_mask": train_data["token_mask"],
+                            "sample_mask": train_data["sample_mask"],
                             **extra_multimodal_data,
                         }
                     )

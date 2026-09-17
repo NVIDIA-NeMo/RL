@@ -1730,6 +1730,47 @@ def apply_reward_penalties(
     return counts
 
 
+# Input-side DatumSpec fields that `run_async_nemo_gym_rollout` does NOT copy into
+# its `final_batch` (the generic multi-turn path keeps them, the NeMo-Gym path
+# rebuilds the batch from scratch). Grafted back by
+# `graft_nemo_gym_input_fields` so both PPO driver loops see the same batch shape
+# as every other rollout path.
+NEMO_GYM_INPUT_ONLY_FIELDS: tuple[str, ...] = ("extra_env_info", "idx", "task_name")
+
+
+def graft_nemo_gym_input_fields(
+    final_batch: BatchedDataDict[Any],
+    input_batch: BatchedDataDict[Any],
+) -> BatchedDataDict[Any]:
+    """Copy the input-only DatumSpec fields back onto a NeMo-Gym ``final_batch``.
+
+    ``run_async_nemo_gym_rollout`` builds ``final_batch`` from the rollout results
+    alone, so ``extra_env_info`` / ``idx`` / ``task_name`` are dropped. Anything
+    that needs the task's environment metadata at TRAIN time therefore has to get
+    it back here — in particular the privileged (answer-conditioned) critics,
+    which read ``extra_env_info[i]["responses_create_params"]["metadata"]`` to
+    build the critic's reference block. Rows are row-aligned with ``final_batch``
+    because the gym path preserves input order.
+
+    ``extra_env_info`` rows are shallow-copied minus ``_rowidx`` (a per-call
+    scratch field ``run_async_nemo_gym_rollout`` writes in place), so a stored
+    batch matches the pre-rollout inputs regardless of call batching, and so
+    nothing downstream mutates a dict the dataset may hand out again.
+    """
+    for key in NEMO_GYM_INPUT_ONLY_FIELDS:
+        if key not in final_batch and key in input_batch:
+            final_batch[key] = input_batch[key]
+    rows = final_batch.get("extra_env_info") or []
+    if rows:
+        final_batch["extra_env_info"] = [
+            {k: v for k, v in row.items() if k != "_rowidx"}
+            if isinstance(row, dict)
+            else row
+            for row in rows
+        ]
+    return final_batch
+
+
 def run_async_nemo_gym_rollout(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],

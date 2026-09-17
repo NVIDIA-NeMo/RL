@@ -945,6 +945,7 @@ class AsyncTrajectoryCollector:
             from nemo_rl.algorithms.grpo import _should_use_nemo_gym
             from nemo_rl.experience.rollouts import (
                 get_nemo_gym_thinking_tags,
+                graft_nemo_gym_input_fields,
                 run_async_nemo_gym_rollout,
             )
 
@@ -983,6 +984,12 @@ class AsyncTrajectoryCollector:
                     thinking_tags=get_nemo_gym_thinking_tags(self.master_config.env),
                 )
                 final_batch = nemo_gym_rollout_result.final_batch
+                # The gym path rebuilds the batch and drops the input-only
+                # DatumSpec fields. Graft them back BEFORE the group is banked:
+                # the replay buffer is what the train loop sees, and a privileged
+                # critic reads extra_env_info there to build its reference block.
+                # (Mirrors rollout_collection.build_group_payload.)
+                graft_nemo_gym_input_fields(final_batch, repeated_batch)
                 rollout_metrics = nemo_gym_rollout_result.rollout_metrics
             else:
                 final_batch, rollout_metrics = run_async_multi_turn_rollout(

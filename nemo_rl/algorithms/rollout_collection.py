@@ -181,16 +181,13 @@ def build_group_payload(
     path); graft them back from the input batch so downstream consumers see the
     same batch shape the PPO driver loops build, and so answer-conditioned
     (privileged) critics can reach ``extra_env_info`` at train time.
+
+    One implementation, shared with both PPO loops, so a shard collected here and
+    a rollout trained on live can never disagree about what the critic sees.
     """
-    for key in ("extra_env_info", "idx", "task_name"):
-        if key not in final_batch and key in input_batch:
-            final_batch[key] = input_batch[key]
-    # _rowidx is a per-call scratch field run_async_nemo_gym_rollout writes into
-    # extra_env_info rows (always 0 for single-sample calls); drop it so stored
-    # rows match the pre-rollout inputs regardless of call batching.
-    for row in final_batch.get("extra_env_info") or []:
-        if isinstance(row, dict):
-            row.pop("_rowidx", None)
+    from nemo_rl.experience.rollouts import graft_nemo_gym_input_fields
+
+    graft_nemo_gym_input_fields(final_batch, input_batch)
     return {
         "format_version": SHARD_FORMAT_VERSION,
         "dataset_idx": dataset_idx,
