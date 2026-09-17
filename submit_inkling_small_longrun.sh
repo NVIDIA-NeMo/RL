@@ -14,12 +14,15 @@
 # limitations under the License.
 set -euo pipefail
 DEPENDENCY=()
-case "${1:-}" in
-    -d|--dependent) DEPENDENCY=("--dependency=afterany:${JOBID:?Set JOBID for a dependent run}"); shift ;;
-    "") ;;
-    *) echo "Usage: $0 [-d|--dependent]" >&2; exit 1 ;;
-esac
-[[ $# -eq 0 ]] || { echo "Unexpected arguments" >&2; exit 1; }
+SUBMIT_OPTIONS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--dependent) DEPENDENCY=("--dependency=afterany:${JOBID:?Set JOBID for a dependent run}") ;;
+        --hold) SUBMIT_OPTIONS+=(--hold) ;;
+        *) echo "Usage: $0 [-d|--dependent] [--hold]" >&2; exit 1 ;;
+    esac
+    shift
+done
 
 WORK_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 RUN=grpo-inkling-small-16n4g-fsdp2-automodel-ep64
@@ -29,9 +32,15 @@ PROJECT=${PROJECT:-nemo-rl-Inkling}
 ENTITY=${ENTITY:-nv-welcome}
 CKPTDIR=${CKPTDIR:-$WORK_DIR/results/${PROJECT}_${RUN}}
 [[ -f "$CONTAINER" && -f "$MODEL_DIR/model.safetensors.index.json" ]]
-if [[ -n "${NRL_CREDENTIALS_FILE:-}" ]]; then
-    source "$NRL_CREDENTIALS_FILE"
+set +x
+CREDENTIALS_FILE=${NRL_CREDENTIALS_FILE:-$HOME/.env}
+if [[ -f "$CREDENTIALS_FILE" ]]; then
+    source "$CREDENTIALS_FILE"
 fi
+if [[ "$ENTITY" == nv-welcome && -n "${WANDB_API_KEY_NVWELCOME:-}" ]]; then
+    export WANDB_API_KEY="$WANDB_API_KEY_NVWELCOME"
+fi
+export WANDB_API_KEY HF_TOKEN
 export PYTHONPATH="$WORK_DIR"
 unset NRL_IGNORE_VERSION_MISMATCH
 export HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1 ENROOT_ROOTFS_WRITABLE=1
@@ -54,4 +63,4 @@ export COMMAND CONTAINER
 export MOUNTS="/lustre:/lustre,$WORK_DIR:/opt/nemo-rl"
 sbatch --nodes=16 --ntasks-per-node=1 --exclusive --account=general_sa \
     --partition=batch,tcpo,36x2-a01r,a02grace --time=03:59:00 \
-    --job-name="$RUN" "${DEPENDENCY[@]}" ray.sub
+    --job-name="$RUN" "${DEPENDENCY[@]}" "${SUBMIT_OPTIONS[@]}" ray.sub
