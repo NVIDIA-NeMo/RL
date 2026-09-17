@@ -108,7 +108,6 @@ from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
-    should_save_as_final_checkpoint,
     validate_warm_start_checkpoint,
 )
 from nemo_rl.utils.logger import (
@@ -1997,9 +1996,7 @@ def ppo_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            is_final_checkpoint=should_save_as_final_checkpoint(
-                                is_last_step=is_last_step
-                            ),
+                            is_final_checkpoint=is_last_step,
                         )
                         policy.offload_to_cpu()
 
@@ -2016,9 +2013,7 @@ def ppo_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "value", "tokenizer"
                             ),
-                            is_final_checkpoint=should_save_as_final_checkpoint(
-                                is_last_step=is_last_step
-                            ),
+                            is_final_checkpoint=is_last_step,
                         )
                         value_model.finish_training()
 
@@ -2974,9 +2969,7 @@ def async_ppo_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            is_final_checkpoint=should_save_as_final_checkpoint(
-                                is_last_step=is_last_step
-                            ),
+                            is_final_checkpoint=is_last_step,
                         )
                         policy.offload_to_cpu()
 
@@ -2993,9 +2986,7 @@ def async_ppo_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "value", "tokenizer"
                             ),
-                            is_final_checkpoint=should_save_as_final_checkpoint(
-                                is_last_step=is_last_step
-                            ),
+                            is_final_checkpoint=is_last_step,
                         )
                         value_model.finish_training()
 

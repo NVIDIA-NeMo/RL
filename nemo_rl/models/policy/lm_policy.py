@@ -1388,8 +1388,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             ):
                 raise ValueError(
                     "policy.dtensor_cfg.checkpoint.model_save_format must be None or "
-                    "omitted "
-                    "when using DTensorPolicyWorker (_v2=False)."
+                    "omitted when using DTensorPolicyWorker (_v2=False)."
                 )
             futures = self.worker_group.run_all_workers_single_data(
                 "save_checkpoint",

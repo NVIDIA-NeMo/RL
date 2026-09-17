@@ -162,7 +162,6 @@ from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.utils.checkpoint import (
     CheckpointManager,
     PathLike,
-    should_save_as_final_checkpoint,
 )
 from nemo_rl.utils.logger import TELEMETRY_WALL_TIME_METRIC, Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
@@ -2999,9 +2998,7 @@ class SingleControllerActor:
                         await self._save_checkpoint(
                             step_metrics,
                             is_policy_training_step=is_policy_training_step,
-                            is_final_checkpoint=should_save_as_final_checkpoint(
-                                is_last_step=is_last_step
-                            ),
+                            is_final_checkpoint=is_last_step,
                         )
                     if defer_refit_for_save:
                         # The save is done; wake the engine unless the loop is about to exit.

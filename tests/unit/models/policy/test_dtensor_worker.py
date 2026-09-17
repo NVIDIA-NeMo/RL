@@ -148,6 +148,10 @@ def create_test_config(
         },
         "dtensor_cfg": {
             **({"_v2": dtensor_v2} if dtensor_v2 else {}),
+            "checkpoint": {
+                "model_save_format": "safetensors" if dtensor_v2 else None,
+                "save_consolidated": "false",
+            },
             "enabled": True,
             "cpu_offload": cpu_offload,
             "sequence_parallel": sp,
@@ -213,6 +217,7 @@ def update_lora_config(
 ):
     if enabled:
         config["dtensor_cfg"]["_v2"] = True
+        config["dtensor_cfg"]["checkpoint"]["model_save_format"] = "safetensors"
 
     config["dtensor_cfg"]["lora"].update(
         {

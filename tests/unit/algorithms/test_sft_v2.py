@@ -14,9 +14,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 
 import pytest
 
@@ -27,6 +28,7 @@ from nemo_rl.algorithms.sft_v2 import (
 )
 from nemo_rl.data.energon.sft_types import StepEnvelope
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.models.policy.lm_policy import Policy
 
 _ACTOR_CLS = SFTSingleControllerActor.__ray_metadata__.modified_class
 
@@ -189,6 +191,34 @@ def test_run_stops_after_a_timeout_checkpoint() -> None:
     # training unsaved until the walltime kill.
     assert controller._run_train_step.call_count == 2
     controller._save_checkpoint.assert_called_once_with({})
+
+
+@pytest.mark.parametrize(("step", "is_final"), [(2, False), (10, False), (25, True)])
+def test_save_checkpoint_uses_policy_signature_and_terminal_step(
+    tmp_path: Path, step: int, is_final: bool
+) -> None:
+    controller = _save_controller()
+    controller._save_state.total_steps = step
+    # Enforce the public signature so removed or missing keywords fail this test.
+    controller._trainer = create_autospec(Policy, instance=True)
+    controller._placement_plan = SimpleNamespace(logical_world_size=2)
+    controller._loader_state_dicts = MagicMock(return_value=[{}, {}])
+    controller._checkpointer = MagicMock()
+    controller._checkpointer.init_tmp_checkpoint.return_value = str(tmp_path)
+    controller._checkpointer.save_optimizer = True
+
+    controller._save_checkpoint({})
+
+    controller._trainer.save_checkpoint.assert_called_once_with(
+        weights_path=str(tmp_path / "policy" / "weights"),
+        optimizer_path=str(tmp_path / "policy" / "optimizer"),
+        tokenizer_path=str(tmp_path / "policy" / "tokenizer"),
+        is_final_checkpoint=is_final,
+    )
+    assert (tmp_path / "sft_v2_loaders.pt").is_file()
+    controller._checkpointer.begin_finalization.assert_called_once_with(
+        str(tmp_path), wait_fn=controller._trainer.finalize_async_save
+    )
 
 
 def test_checkpoint_metric_tags_the_configured_train_metric() -> None:

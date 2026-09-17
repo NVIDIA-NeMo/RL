@@ -204,24 +204,6 @@ _AUTOMODEL_ONLY_CHECKPOINT_FIELDS = frozenset(
 )
 
 
-def should_save_as_final_checkpoint(
-    *, is_last_step: bool, early_stop_requested: bool = False
-) -> bool:
-    """Return whether a checkpoint represents a completed training run.
-
-    A timeout-triggered checkpoint is a resumable interruption point, not a
-    completed run, so timeout state is intentionally not accepted here.
-
-    Args:
-        is_last_step: Whether the algorithm reached its final training step.
-        early_stop_requested: Whether the algorithm deliberately ended early.
-
-    Returns:
-        True when downstream checkpoint logic should apply final-save behavior.
-    """
-    return is_last_step or early_stop_requested
-
-
 class CheckpointManager:
     """Manages model checkpoints during training.
 

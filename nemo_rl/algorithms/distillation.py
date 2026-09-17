@@ -77,7 +77,6 @@ from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
-    should_save_as_final_checkpoint,
 )
 from nemo_rl.utils.logger import (
     Logger,
@@ -1082,9 +1081,7 @@ def _distillation_train_impl(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            is_final_checkpoint=should_save_as_final_checkpoint(
-                                is_last_step=is_last_step
-                            ),
+                            is_final_checkpoint=is_last_step,
                         )
                         torch.save(
                             dataloader.state_dict(),

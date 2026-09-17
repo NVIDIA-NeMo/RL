@@ -51,25 +51,6 @@ def checkpoint_manager(checkpoint_config):
     return CheckpointManager(checkpoint_config)
 
 
-@pytest.mark.parametrize(
-    ("is_last_step", "early_stop_requested", "expected"),
-    [
-        (False, False, False),
-        (True, False, True),
-        (False, True, True),
-        (True, True, True),
-    ],
-)
-def test_should_save_as_final_checkpoint(is_last_step, early_stop_requested, expected):
-    assert (
-        checkpoint_module.should_save_as_final_checkpoint(
-            is_last_step=is_last_step,
-            early_stop_requested=early_stop_requested,
-        )
-        is expected
-    )
-
-
 def test_checkpoint_manager_rejects_top_level_automodel_fields(checkpoint_config):
     legacy_fields = {
         "model_save_format": "torch_save",

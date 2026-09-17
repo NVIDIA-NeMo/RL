@@ -70,12 +70,9 @@ def build_checkpoint_config(
 ) -> dict[str, Any]:
     """Build the Automodel checkpoint config for a DTensor v2 worker.
 
-    Component configs such as teachers and reward models do not necessarily
-    inherit the policy exemplar. Preserve NeMo-RL's established defaults at
-    this single integration boundary instead of inheriting Automodel's
-    ``save_consolidated="final"`` default accidentally. This is an
-    integration-boundary helper for the two DTensor v2 workers, not a
-    general-purpose config builder.
+    Read NeMo-RL settings from the YAML-backed checkpoint block and forward
+    them to Automodel. This integration boundary is shared by the two DTensor
+    v2 workers; defaults belong in the exemplar configs.
 
     Args:
         dtensor_cfg: The worker's ``policy.dtensor_cfg`` / ``value.dtensor_cfg``
@@ -97,36 +94,17 @@ def build_checkpoint_config(
         accepts, meant to be splatted into
         ``AutomodelCheckpointingConfig(enabled=True, checkpoint_dir="", **result)``.
     """
-    checkpoint_fields = (
-        "model_save_format",
-        "save_consolidated",
-        "single_rank_consolidation",
-        "consolidation_timeout_minutes",
-    )
-    legacy_fields = [field for field in checkpoint_fields if field in dtensor_cfg]
-    if legacy_fields:
-        fields = ", ".join(f"dtensor_cfg.{field}" for field in legacy_fields)
-        raise ValueError(f"{fields} must be moved under dtensor_cfg.checkpoint.")
-
-    checkpoint_cfg = dtensor_cfg.get("checkpoint", {})
-    if "model_save_format" in checkpoint_cfg:
-        model_save_format = checkpoint_cfg["model_save_format"]
-        if model_save_format not in ("torch_save", "safetensors"):
-            raise ValueError(
-                "dtensor_cfg.checkpoint.model_save_format must be 'torch_save' or "
-                "'safetensors' when using DTensor v2; omit it to use "
-                "'safetensors'."
-            )
-    else:
-        model_save_format = "safetensors"
+    raw_checkpoint_config = dtensor_cfg["checkpoint"]
+    model_save_format = raw_checkpoint_config["model_save_format"]
+    if model_save_format not in ("torch_save", "safetensors"):
+        raise ValueError(
+            "dtensor_cfg.checkpoint.model_save_format must be 'torch_save' or "
+            "'safetensors' when using DTensor v2."
+        )
 
     checkpoint_config = {
         "model_save_format": model_save_format,
-        "save_consolidated": (
-            checkpoint_cfg["save_consolidated"]
-            if "save_consolidated" in checkpoint_cfg
-            else "false"
-        ),
+        "save_consolidated": raw_checkpoint_config["save_consolidated"],
         "model_repo_id": model_repo_id,
         "dequantize_base_checkpoint": dequantize_base_checkpoint,
         "is_peft": is_peft,
@@ -136,8 +114,8 @@ def build_checkpoint_config(
         "single_rank_consolidation",
         "consolidation_timeout_minutes",
     ):
-        if field in checkpoint_cfg:
-            checkpoint_config[field] = checkpoint_cfg[field]
+        if field in raw_checkpoint_config:
+            checkpoint_config[field] = raw_checkpoint_config[field]
 
     if skip_task_head_prefixes_for_base_model is not None:
         checkpoint_config["skip_task_head_prefixes_for_base_model"] = (

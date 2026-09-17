@@ -134,7 +134,16 @@ def policy(cluster, tokenizer, request):
         "dtensor_cfg": {
             **simple_policy_config["dtensor_cfg"],
             "_v2": use_v2,
-            **({"model_save_format": "torch_save"} if use_v2 else {}),
+            **(
+                {
+                    "checkpoint": {
+                        "model_save_format": "torch_save",
+                        "save_consolidated": "false",
+                    }
+                }
+                if use_v2
+                else {}
+            ),
         },
     }
     policy = Policy(

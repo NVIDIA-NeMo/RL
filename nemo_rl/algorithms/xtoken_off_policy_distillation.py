@@ -66,7 +66,6 @@ from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
-    should_save_as_final_checkpoint,
 )
 from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
@@ -783,9 +782,7 @@ def xtoken_off_policy_distillation_train(
                             tokenizer_path=os.path.join(
                                 ckpt_path, "policy", "tokenizer"
                             ),
-                            is_final_checkpoint=should_save_as_final_checkpoint(
-                                is_last_step=is_last_step
-                            ),
+                            is_final_checkpoint=is_last_step,
                         )
                         torch.save(
                             dataloader.state_dict(),

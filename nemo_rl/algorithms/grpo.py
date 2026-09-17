@@ -145,7 +145,6 @@ from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
-    should_save_as_final_checkpoint,
 )
 from nemo_rl.utils.logger import (
     Logger,
@@ -3855,9 +3854,8 @@ def _grpo_train_impl(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            is_final_checkpoint=should_save_as_final_checkpoint(
-                                is_last_step=is_last_step,
-                                early_stop_requested=early_stop_message is not None,
+                            is_final_checkpoint=(
+                                is_last_step or early_stop_message is not None
                             ),
                         )
                         if master_config.data["use_multiple_dataloader"]:
@@ -5735,9 +5733,8 @@ def async_grpo_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            is_final_checkpoint=should_save_as_final_checkpoint(
-                                is_last_step=is_last_step,
-                                early_stop_requested=early_stop_message is not None,
+                            is_final_checkpoint=(
+                                is_last_step or early_stop_message is not None
                             ),
                         )
                         # Save the dataloader state at the checkpoint cut
