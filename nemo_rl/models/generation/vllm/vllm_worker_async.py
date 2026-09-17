@@ -1334,9 +1334,7 @@ class VllmAsyncGenerationWorkerImpl(
         if not chunk_token_ids:
             with state.lock:
                 state.rollback_frozen_buffer(flush_id)
-                state.refresh_periodic_flush_due(
-                    self._generation_chunk_flush_tokens
-                )
+                state.refresh_periodic_flush_due(self._generation_chunk_flush_tokens)
             return False
 
         staged_key = None
@@ -1370,9 +1368,7 @@ class VllmAsyncGenerationWorkerImpl(
             with state.lock:
                 state.seal_frozen_buffer(flush_id)
                 state.generation_cut_staging_keys.append(staged_key)
-                state.refresh_periodic_flush_due(
-                    self._generation_chunk_flush_tokens
-                )
+                state.refresh_periodic_flush_due(self._generation_chunk_flush_tokens)
         except Exception:
             with state.lock:
                 frozen = state.frozen_buffer
@@ -1630,9 +1626,7 @@ class VllmAsyncGenerationWorkerImpl(
         # staged or rolled back. If abort won first, use its terminal evidence.
         with state.lifecycle_lock:
             with self._capture_registry_lock:
-                current = self._capture_calls_by_model_call_id.get(
-                    prefix.model_call_id
-                )
+                current = self._capture_calls_by_model_call_id.get(prefix.model_call_id)
             if current is not state or state.terminal_started:
                 return None
 
@@ -1780,9 +1774,7 @@ class VllmAsyncGenerationWorkerImpl(
                 state = self._capture_calls_by_model_call_id.get(prefix.model_call_id)
             if state is None:
                 acknowledgements.append(
-                    self._completed_generation_cut_ack(
-                        prefix, inventory.checkpoint_id
-                    )
+                    self._completed_generation_cut_ack(prefix, inventory.checkpoint_id)
                 )
                 continue
             acknowledgement = self._checkpoint_active_generation_cut(
