@@ -175,6 +175,32 @@ def test_outdated_v2_key_under_the_new_name_is_rejected(value):
         check_outdated_config({"policy": {"automodel_cfg": {"_v2": value}}})
 
 
+@pytest.mark.parametrize("legacy_v2", [False, True])
+@pytest.mark.parametrize("block_name", ["dtensor_cfg", "automodel_cfg"])
+@pytest.mark.parametrize("explicit_worker", [False, True])
+def test_quant_worker_selection_does_not_bypass_outdated_config_checks(
+    legacy_v2: bool, block_name: str, explicit_worker: bool
+) -> None:
+    """Quantized worker FQNs must not hide the backend migration error."""
+    policy_config = {
+        block_name: {"enabled": True, "_v2": legacy_v2},
+        "quant_cfg": "NVFP4",
+    }
+    if explicit_worker:
+        policy_config["worker_extension_cls_fqn"] = (
+            "nemo_rl.modelopt.models.policy.workers."
+            "automodel_quant_policy_worker.AutomodelQuantPolicyWorker"
+        )
+    error_match = (
+        r"policy\.dtensor_cfg has been renamed"
+        if block_name == "dtensor_cfg"
+        else r"policy\.automodel_cfg\._v2 has been removed"
+    )
+
+    with pytest.raises(ValueError, match=error_match):
+        check_outdated_config({"policy": policy_config})
+
+
 @pytest.mark.parametrize("section", ["value", "teacher"])
 def test_each_top_level_section_is_checked_for_v2(section):
     with pytest.raises(
