@@ -504,13 +504,6 @@ RUN <<"EOF" bash -exu
 # mount here. Normal uv artifacts stay in /root/.cache/uv.
 export TRTLLM_WHEEL_CACHE_DIR=/opt/trtllm_wheels
 export TRTLLM_REQUIRE_CACHED_WHEEL=1
-# The cache mount is builder-local and CI's builder is per job. When the
-# hermetic layer above came from the registry cache, the mount is empty here;
-# re-seed it from the mirror the hermetic stage wrote into the image so the
-# trtllm venv prefetch below finds the wheel instead of refusing to compile.
-if [[ -d "${TRTLLM_WHEEL_CACHE_MIRROR_DIR}" ]]; then
-    rsync -a --ignore-existing "${TRTLLM_WHEEL_CACHE_MIRROR_DIR}/" "${TRTLLM_WHEEL_CACHE_DIR}/"
-fi
 # Worker-venv prefetch, phase 2: the nemo_rl project itself.
 #
 # The other half of the split described in the dependency stage. Every venv already holds
