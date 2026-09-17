@@ -997,8 +997,12 @@ class MegatronPolicyWorkerImpl(
                 "filtering; refusing an empty optimizer update. Check "
                 "grpo.seq_logprob_error_threshold."
             )
-        token_factor = float((global_valid_toks / kept_toks.clamp(min=1)).item())
-        sequence_factor = float((global_valid_seqs / kept_seqs.clamp(min=1)).item())
+        # Counts are weighted by sample_mask and may be positive fractions.
+        # Only replace zero denominators (possible during evaluation).
+        token_denominator = torch.where(kept_toks > 0, kept_toks, 1.0)
+        sequence_denominator = torch.where(kept_seqs > 0, kept_seqs, 1.0)
+        token_factor = float((global_valid_toks / token_denominator).item())
+        sequence_factor = float((global_valid_seqs / sequence_denominator).item())
         if not eval_mode:
             # Finish any overlap on the comm stream before touching the reduced
             # gradient buffers (including distributed-optimizer gradient shards).
