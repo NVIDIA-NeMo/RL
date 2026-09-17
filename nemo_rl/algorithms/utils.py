@@ -221,6 +221,30 @@ def calculate_baseline_and_std_per_prompt(
     return baseline, std, is_trivial_distribution
 
 
+def calculate_is_trivial_prompt_distribution(
+    prompts: torch.Tensor,
+    rewards: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return an all-or-nothing exact-equality mask for each prompt group.
+
+    Unlike the per-sample mask returned by
+    ``calculate_baseline_and_std_per_prompt``, this always compares the full
+    valid reward group. It is therefore independent of leave-one-out baseline
+    semantics and safe to use for prompt-level dynamic sampling.
+    """
+    is_trivial_prompt_distribution = torch.ones_like(rewards, dtype=torch.bool)
+    for prompt in torch.unique(prompts, dim=0):
+        prompt_mask = (prompts == prompt).all(1)
+        valid_rewards = rewards[prompt_mask & valid_mask.bool()]
+        is_trivial = valid_rewards.numel() <= 1 or (
+            valid_rewards.amin() == valid_rewards.amax()
+        )
+        is_trivial_prompt_distribution[prompt_mask] = is_trivial
+
+    return is_trivial_prompt_distribution
+
+
 def surpress_user_warnings(f):  # type: ignore
     @wraps(f)
     def wrapper(*args, **kwargs):  # type: ignore
