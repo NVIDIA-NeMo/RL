@@ -104,6 +104,8 @@ class VllmSpecificArgs(TypedDict):
     refit_with_reload_api: NotRequired[bool]
     # A filepath that can be imported to register a vLLM reasoning parser
     reasoning_parser_plugin: NotRequired[str]
+    # [pd_disagg] prefill/decode disaggregation; see nemo_rl/models/generation/vllm/pd_disagg.py
+    pd_disagg: NotRequired[dict[str, Any]]
 
 
 class VllmDeltaCompressionConfig(BaseModel, extra="allow"):

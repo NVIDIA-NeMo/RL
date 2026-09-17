@@ -1501,14 +1501,22 @@ def setup_single_controller(
         # Before the Gym task is built, so Gym can be handed the router's single URL.
         # These two statements are the only failable ones related to the port holder's creation.
         try:
-            generation_router = _maybe_start_generation_router(
-                gym_base_urls, master_config
-            )
-            gym_spinup_base_urls = (
-                [ray.get(generation_router.base_url.remote())]
-                if generation_router is not None
-                else gym_base_urls
-            )
+            # [pd_disagg] a vllm-router (prefill -> decode) fronts the fleet and is the
+            # single URL Gym receives; the NeMo-RL generation_router is bypassed.
+            from nemo_rl.models.generation.vllm.pd_disagg import maybe_start_pd_router
+            pd_router_url = maybe_start_pd_router(master_config, gym_base_urls)
+            if pd_router_url is not None:
+                generation_router = None
+                gym_spinup_base_urls = [pd_router_url]
+            else:
+                generation_router = _maybe_start_generation_router(
+                    gym_base_urls, master_config
+                )
+                gym_spinup_base_urls = (
+                    [ray.get(generation_router.base_url.remote())]
+                    if generation_router is not None
+                    else gym_base_urls
+                )
         except BaseException:
             if megatron_port_holder is not None:
                 ray.kill(megatron_port_holder)

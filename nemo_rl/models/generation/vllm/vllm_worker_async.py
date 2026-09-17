@@ -513,6 +513,13 @@ class VllmAsyncGenerationWorkerImpl(
         against the admission (length == ``prev_len``, equal to an inline
         prefix) and requires it for a ``staging_chain`` admission.
         """
+        # [pd_disagg] prefill engines run preprocess_chat's prefix resolution + splice
+        # (identical engine prompt to decode's) but never begin/commit the call: the
+        # decode engine, which sees the whole output, owns the ledger entry. With no
+        # _capture_calls entry, _finish/_abort_request_capture are no-ops here.
+        from nemo_rl.models.generation.vllm.pd_disagg import capture_disabled_for_role
+        if capture_disabled_for_role(self.cfg, getattr(self, "_pd_role", None)):
+            return
         capture = self.token_capture
         if capture is None:
             return
@@ -1103,6 +1110,17 @@ class VllmAsyncGenerationWorkerImpl(
         openai_serving_chat = NeMoRLOpenAIServingChat(**serving_chat_kwargs)
 
         generation_config = self.cfg
+
+        # [pd_disagg] vllm-router health-checks every engine on GET /health and proxies
+        # GET /v1/models; the in-process server otherwise exposes POST routes only.
+        @app.get("/health")
+        async def pd_health() -> JSONResponse:
+            return JSONResponse(content={"status": "ok"})
+
+        @app.get("/v1/models")
+        async def pd_show_available_models() -> JSONResponse:
+            models = await openai_serving_models.show_available_models()
+            return JSONResponse(content=models.model_dump())
 
         # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
         @app.post("/v1/chat/completions")

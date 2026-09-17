@@ -325,6 +325,10 @@ class BaseVllmGenerationWorker:
                 DEFAULT_VLLM_PORT_RANGE_LOW
                 + engine_index_on_node * DEFAULT_VLLM_PORTS_PER_ENGINE
             )
+            # [pd_disagg] the worker derives its P/D role and a unique NIXL side-channel
+            # port on the node from these.
+            env_vars["NRL_VLLM_ENGINE_NODE_IDX"] = str(node_idx)
+            env_vars["NRL_VLLM_ENGINE_IDX_ON_NODE"] = str(engine_index_on_node)
 
         # Check if this worker is part of a parallel group (TP or TP+PP).
         # A worker is part of a parallel group if it's a secondary member (local_bundle_indices is None)
@@ -492,6 +496,11 @@ class BaseVllmGenerationWorker:
             )
 
             configure_nixl_worker(self.cfg, vllm_kwargs)
+
+        # [pd_disagg] prefill/decode role: NIXL KV-transfer config, per-role env and kwargs.
+        from nemo_rl.distributed.virtual_cluster import _get_node_ip_local as _pd_node_ip
+        from nemo_rl.models.generation.vllm.pd_disagg import apply_pd_disagg
+        self._pd_role = apply_pd_disagg(self.cfg, vllm_kwargs, node_ip=_pd_node_ip())
 
         # A speculative_config with num_speculative_tokens == 0 is the supported
         # way to disable speculative decoding (e.g. MTP) from a launch script
