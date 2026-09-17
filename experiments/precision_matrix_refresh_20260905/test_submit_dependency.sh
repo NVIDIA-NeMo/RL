@@ -59,3 +59,20 @@ qwen35_output=$(
 grep -F -- 'grpo.num_prompts_per_step=128' <<<"${qwen35_output}" >/dev/null
 grep -F -- 'grpo.num_generations_per_prompt=16' <<<"${qwen35_output}" >/dev/null
 grep -F -- 'policy.train_global_batch_size=2048' <<<"${qwen35_output}" >/dev/null
+
+super_output=$(
+  ACTION=render \
+  CLUSTER=oci \
+  MODEL=super \
+  MODE=sync \
+  ARM=bf16-bf16 \
+  PERFORMANCE_RECIPE=1 \
+  SUPER_GPU_MEMORY_UTILIZATION=0.6 \
+  MAX_STEPS=20 \
+  SLURM_ACCOUNT=test \
+  REPO="${REPO}" \
+  "${SCRIPT_DIR}/submit.sh"
+)
+
+grep -F -- 'policy.generation.vllm_cfg.gpu_memory_utilization=0.6' \
+  <<<"${super_output}" >/dev/null
