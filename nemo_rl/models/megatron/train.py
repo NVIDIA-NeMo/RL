@@ -14,6 +14,7 @@
 
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -50,11 +51,16 @@ from nemo_rl.algorithms.loss import (
     wrap_loss_fn_with_input_preparation,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
 from nemo_rl.algorithms.loss.utils import _pack_input_ids
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
+from nemo_rl.algorithms.x_token.packing_loss import (
+    XTokenSequencePackingLossWrapper,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
+    cp_load_balanced_to_contiguous,
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
@@ -78,6 +84,7 @@ PostProcessingFunction = Union[
     "LogprobsPostProcessor",
     "TeacherFullPayloadPostProcessor",
     "TopkLogitsPostProcessor",
+    "FullLogitsPostProcessor",
 ]
 
 
@@ -146,6 +153,25 @@ def suspend_activation_offload_for_forward_only(
                 model_config.fine_grained_activation_offloading = original_value
 
 
+@dataclass(frozen=True)
+class StreamedFullLogitsMetadata:
+    """Tensor-free record for one packed full-logit microbatch.
+
+    The corresponding valid-prefix values have already been copied into the
+    persistent IPC slab. Keeping only scalar geometry in Megatron's
+    ``forward_data_store`` prevents it from retaining either the model output or
+    a view that can obscure which allocation owns the exported payload.
+    """
+
+    batch_size: int
+    logical_seq_len: int
+    local_vocab_size: int
+    dtype: torch.dtype
+    device: torch.device
+    storage_token_offset: int
+    stored_seq_lengths: tuple[int, ...]
+
+
 def model_forward(
     model: GPTModel,
     data_dict: BatchedDataDict[Any],
@@ -153,9 +179,9 @@ def model_forward(
     position_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     packed_seq_params: Optional[PackedSeqParams] = None,
+    padding_mask: Optional[torch.Tensor] = None,
     defer_fp32_logits: Optional[bool] = False,
     mtp_loss_mask: Optional[torch.Tensor] = None,
-    padding_mask: Optional[torch.Tensor] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     use_fused_linear_logprobs: bool = False,
     media_token_validity_mask: Optional[torch.Tensor] = None,
@@ -265,6 +291,8 @@ def forward_with_post_processing_fn(
     defer_fp32_logits: Optional[bool] = False,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
+    global_valid_kd_toks: Optional[torch.Tensor] = None,
+    global_valid_chunks_by_idx: Optional[dict[int, torch.Tensor]] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     draft_model: Optional[MegatronModule] = None,
@@ -288,6 +316,7 @@ def forward_with_post_processing_fn(
         defer_fp32_logits: Whether to defer FP32 conversion of logits
         global_valid_seqs: Global valid sequence count for loss normalization
         global_valid_toks: Global valid token count for loss normalization
+        global_valid_chunks_by_idx: Global valid alignment-chunk counts by teacher
         sampling_params: Sampling parameters (top-k, top-p, temperature)
         straggler_timer: Straggler detector for profiling the forward pass
         draft_model: Draft model for online draft model training
@@ -312,8 +341,8 @@ def forward_with_post_processing_fn(
     position_ids = processed_mb.position_ids
     packed_seq_params = processed_mb.packed_seq_params
     cu_seqlens_padded = processed_mb.cu_seqlens_padded
-    mtp_loss_mask = processed_mb.mtp_loss_mask
     padding_mask = processed_mb.padding_mask
+    mtp_loss_mask = processed_mb.mtp_loss_mask
     routed_experts_cp_sharded = processed_mb.routed_experts_cp_sharded
     original_seq_length = processed_mb.original_seq_length
     media_token_validity_mask = processed_mb.media_token_validity_mask
@@ -346,9 +375,9 @@ def forward_with_post_processing_fn(
                 position_ids=position_ids,
                 attention_mask=attention_mask,
                 packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
                 defer_fp32_logits=defer_fp32_logits,
                 mtp_loss_mask=mtp_loss_mask,
-                padding_mask=padding_mask,
                 straggler_timer=straggler_timer,
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
                 media_token_validity_mask=media_token_validity_mask,
@@ -426,6 +455,8 @@ def forward_with_post_processing_fn(
             packed_seq_params=packed_seq_params,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
+            global_valid_kd_toks=global_valid_kd_toks,
+            global_valid_chunks_by_idx=global_valid_chunks_by_idx,
         )
     elif isinstance(post_processing_fn, LogprobsPostProcessor):
         assert original_seq_length is not None
@@ -455,6 +486,12 @@ def forward_with_post_processing_fn(
             cu_seqlens_padded=cu_seqlens_padded,
             original_seq_length=original_seq_length,
         )
+    elif isinstance(post_processing_fn, FullLogitsPostProcessor):
+        post_processing_fn_wrapped = post_processing_fn(
+            data_dict=data_dict,
+            cu_seqlens_padded=cu_seqlens_padded,
+            packed_seq_params=packed_seq_params,
+        )
     else:
         raise TypeError(
             f"Unknown post-processing function type: {type(post_processing_fn)}"
@@ -474,6 +511,8 @@ def megatron_forward_backward(
     defer_fp32_logits: Optional[bool] = False,
     global_valid_seqs: Optional[torch.Tensor] = None,
     global_valid_toks: Optional[torch.Tensor] = None,
+    global_valid_kd_toks: Optional[torch.Tensor] = None,
+    global_valid_chunks_by_idx: Optional[dict[int, torch.Tensor]] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     draft_model: Optional[MegatronModule] = None,
@@ -501,6 +540,7 @@ def megatron_forward_backward(
         defer_fp32_logits: Whether to skip the conversion of logits to fp32
         global_valid_seqs: Global valid sequence count for loss normalization
         global_valid_toks: Global valid token count for loss normalization
+        global_valid_chunks_by_idx: Global valid alignment-chunk counts by teacher
         sampling_params: Sampling parameters (top-k, top-p, temperature)
         straggler_timer: Straggler detector for profiling the forward pass
         draft_model: Draft model for online draft model training
@@ -518,6 +558,8 @@ def megatron_forward_backward(
         defer_fp32_logits=defer_fp32_logits,
         global_valid_seqs=global_valid_seqs,
         global_valid_toks=global_valid_toks,
+        global_valid_kd_toks=global_valid_kd_toks,
+        global_valid_chunks_by_idx=global_valid_chunks_by_idx,
         sampling_params=sampling_params,
         straggler_timer=straggler_timer,
         draft_model=draft_model,
@@ -599,6 +641,8 @@ class LossPostProcessor:
         packed_seq_params: Optional[PackedSeqParams] = None,
         global_valid_seqs: Optional[torch.Tensor] = None,
         global_valid_toks: Optional[torch.Tensor] = None,
+        global_valid_kd_toks: Optional[torch.Tensor] = None,
+        global_valid_chunks_by_idx: Optional[dict[int, torch.Tensor]] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
         """Create a loss post-processing function for training.
 
@@ -611,6 +655,7 @@ class LossPostProcessor:
             packed_seq_params: Parameters for packed sequences (optional)
             global_valid_seqs: Global valid sequence count for loss normalization
             global_valid_toks: Global valid token count for loss normalization
+            global_valid_chunks_by_idx: Global valid alignment-chunk counts by teacher
 
         Returns:
             Callable: Function that takes output tensor and returns (loss, metrics) tuple
@@ -632,7 +677,10 @@ class LossPostProcessor:
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
         if pack_sequences and packed_seq_params is not None:
             fuse_loss = self.cfg.get("sequence_packing", {}).get("fuse_loss", False)
-            if fuse_loss:
+            if isinstance(self.loss_fn, CrossTokenizerDistillationLossFn):
+                wrapper_cls = XTokenSequencePackingLossWrapper
+                prepare_fn = prepare_loss_input_wrapped
+            elif fuse_loss:
                 # The fused path prepares loss via prepare_packed_loss_input and
                 # cannot honor a custom prepare_fn (e.g. the value model's); guard
                 # rather than silently bypass it.
@@ -700,12 +748,16 @@ class LossPostProcessor:
                     context_parallel_group=get_context_parallel_group(),
                 )
 
-        loss_fn_wrapped = partial(
-            loss_fn_wrapped,
-            data=data_dict,
-            global_valid_seqs=global_valid_seqs,
-            global_valid_toks=global_valid_toks,
-        )
+        loss_kwargs: dict[str, Any] = {
+            "data": data_dict,
+            "global_valid_seqs": global_valid_seqs,
+            "global_valid_toks": global_valid_toks,
+        }
+        if isinstance(self.loss_fn, CrossTokenizerDistillationLossFn):
+            loss_kwargs["global_valid_kd_toks"] = global_valid_kd_toks
+        if global_valid_chunks_by_idx:
+            loss_kwargs["global_valid_chunks_by_idx"] = global_valid_chunks_by_idx
+        loss_fn_wrapped = partial(loss_fn_wrapped, **loss_kwargs)
 
         if self.cp_normalize:
             cp_size = get_context_parallel_world_size()
@@ -1134,6 +1186,282 @@ class TopkLogitsPostProcessor:
                     "topk_logits": topk_vals_full[:, :original_seq_length],
                     "topk_indices": topk_idx_full[:, :original_seq_length],
                 }
+
+        return processor_fn_inner
+
+
+class FullLogitsPostProcessor:
+    """Export this rank's raw teacher logits (full local vocab shard, no reduction).
+
+    Cross-tokenizer distillation ships the teacher's full-vocab logits to the
+    student and does all vocab reduction student-side, so each tensor-parallel
+    rank emits its local vocab shard untouched (fp32). Under context parallelism
+    each rank additionally re-emits its *contiguous* sequence slice (see below).
+    The IPC consumer reassembles the global ``[B, T_t, V_t]`` from the per-rank
+    shards. This is the Megatron counterpart of the DTensor
+    ``FullLogitsPostProcessor``.
+
+    Packed THD outputs normally restore one dense logical row per input sample.
+    With ``packed_output_storage``, their valid prefixes are instead streamed
+    directly into a flat IPC slab. Under CP, each physical sequence is first
+    reconstructed from its native per-sequence head/tail shards, then this rank
+    emits the same contiguous logical sequence window used by the unpacked IPC
+    contract.
+    """
+
+    def __init__(
+        self,
+        cfg: PolicyConfig,
+        *,
+        packed_output_storage: Optional[torch.Tensor] = None,
+    ) -> None:
+        self.cfg = cfg
+        self.packed_output_storage = packed_output_storage
+        self._packed_output_token_cursor = 0
+        if packed_output_storage is not None:
+            if not cfg["sequence_packing"]["enabled"]:
+                raise ValueError(
+                    "Packed full-logit streaming storage requires sequence packing."
+                )
+            if packed_output_storage.ndim != 2:
+                raise ValueError(
+                    "Packed full-logit streaming storage must be two-dimensional, "
+                    f"got shape={tuple(packed_output_storage.shape)}."
+                )
+            if packed_output_storage.dtype != torch.float32:
+                raise TypeError(
+                    "Packed full-logit streaming storage must use torch.float32, "
+                    f"got {packed_output_storage.dtype}."
+                )
+
+    @property
+    def packed_output_token_cursor(self) -> int:
+        """Number of valid-prefix tokens committed to streaming storage."""
+        return self._packed_output_token_cursor
+
+    def __call__(
+        self,
+        data_dict: BatchedDataDict[Any],
+        cu_seqlens_padded: Optional[torch.Tensor],
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ) -> Callable[
+        [torch.Tensor],
+        Tuple[
+            torch.Tensor,
+            Dict[str, Union[torch.Tensor, StreamedFullLogitsMetadata]],
+        ],
+    ]:
+        """Create a post-processing function that emits raw full-vocab logit shards.
+
+        Args:
+            data_dict: Batched data dictionary.
+            cu_seqlens_padded: Physical cumulative sequence boundaries.
+            packed_seq_params: Packed metadata carrying distinct raw and padded
+                cumulative boundaries.
+
+        Returns:
+            Callable that maps the model output tensor to
+            ``(dummy_loss, {"full_logits": local_vocab_shard})`` where the shard
+            is ``[B, S_local_contiguous, V_local]`` in fp32. When
+            ``packed_output_storage`` was supplied at construction, packed values
+            are copied directly into that flat valid-prefix slab and
+            ``full_logits`` is tensor-free :class:`StreamedFullLogitsMetadata`.
+        """
+        pack = self.cfg["sequence_packing"]["enabled"]
+        if pack and (packed_seq_params is None or cu_seqlens_padded is None):
+            raise ValueError(
+                "Packed full-logit export requires PackedSeqParams and padded "
+                "cumulative sequence boundaries."
+            )
+
+        def processor_fn_inner(output_tensor):
+            # fp32 for the consumer's precision-sensitive log_softmax / projection
+            # (KL math) and a dtype-consistent IPC buffer producer<->consumer. No
+            # vocab reduction: the local TP shard is emitted as-is and the student
+            # reassembles the full vocab.
+            logits = output_tensor.to(torch.float32)
+            if pack:
+                assert packed_seq_params is not None
+                assert cu_seqlens_padded is not None
+                raw_cu_seqlens = packed_seq_params.cu_seqlens_q
+                if raw_cu_seqlens is None:
+                    raise ValueError(
+                        "PackedSeqParams.cu_seqlens_q must preserve raw boundaries."
+                    )
+                batch_size, logical_seq_len = data_dict["input_ids"].shape[:2]
+                if (
+                    int(raw_cu_seqlens.numel()) != batch_size + 1
+                    or int(cu_seqlens_padded.numel()) != batch_size + 1
+                ):
+                    raise ValueError(
+                        "Packed full-logit boundary cardinality does not match "
+                        f"the logical batch size {batch_size}."
+                    )
+                cp_size = get_context_parallel_world_size()
+                if logical_seq_len % cp_size != 0:
+                    raise ValueError(
+                        f"Logical sequence width {logical_seq_len} must be "
+                        f"divisible by context-parallel size {cp_size}."
+                    )
+                cp_rank = (
+                    torch.distributed.get_rank(get_context_parallel_group())
+                    if cp_size > 1
+                    else 0
+                )
+                local_logical_len = logical_seq_len // cp_size
+                logical_window_start = cp_rank * local_logical_len
+                logical_window_end = logical_window_start + local_logical_len
+                cp_padding_multiple = 2 * cp_size if cp_size > 1 else 1
+                input_lengths = data_dict["input_lengths"]
+                cp_group = get_context_parallel_group() if cp_size > 1 else None
+                sample_slices: list[tuple[int, int, int, int]] = []
+                stored_seq_lengths: list[int] = []
+                for sample_index in range(batch_size):
+                    raw_length = int(
+                        (
+                            raw_cu_seqlens[sample_index + 1]
+                            - raw_cu_seqlens[sample_index]
+                        ).item()
+                    )
+                    input_length = int(input_lengths[sample_index].item())
+                    if raw_length != input_length:
+                        raise ValueError(
+                            "Packed raw boundary disagrees with input_lengths "
+                            f"for sample {sample_index}: raw={raw_length}, "
+                            f"input_length={input_length}."
+                        )
+                    padded_start = int(cu_seqlens_padded[sample_index].item())
+                    padded_end = int(cu_seqlens_padded[sample_index + 1].item())
+                    padded_length = padded_end - padded_start
+                    if (
+                        padded_start % cp_padding_multiple != 0
+                        or padded_length % cp_padding_multiple != 0
+                    ):
+                        raise ValueError(
+                            "Packed padded boundaries must be divisible by the "
+                            "load-balanced CP chunk count: "
+                            f"sample={sample_index}, start={padded_start}, "
+                            f"length={padded_length}, "
+                            f"multiple={cp_padding_multiple}."
+                        )
+                    local_start = padded_start // cp_size
+                    local_length = padded_length // cp_size
+                    if local_start + local_length > logits.shape[1]:
+                        raise ValueError(
+                            "Packed logit slice exceeds local output width for "
+                            f"sample {sample_index}."
+                        )
+                    overlap_start = logical_window_start
+                    overlap_end = min(raw_length, logical_window_end)
+                    stored_seq_len = max(0, overlap_end - overlap_start)
+                    sample_slices.append(
+                        (local_start, local_length, overlap_start, stored_seq_len)
+                    )
+                    stored_seq_lengths.append(stored_seq_len)
+
+                output_storage = self.packed_output_storage
+                storage_token_offset = self._packed_output_token_cursor
+                stored_tokens = sum(stored_seq_lengths)
+                next_token_cursor = storage_token_offset + stored_tokens
+                if output_storage is None:
+                    unpacked = logits.new_zeros(
+                        (batch_size, local_logical_len, logits.shape[-1])
+                    )
+                else:
+                    if (
+                        output_storage.shape[1] != logits.shape[-1]
+                        or output_storage.device != logits.device
+                    ):
+                        raise ValueError(
+                            "Packed full-logit streaming storage does not match "
+                            "the model output vocabulary/device: "
+                            f"storage={tuple(output_storage.shape)}/"
+                            f"{output_storage.device}, logits={tuple(logits.shape)}/"
+                            f"{logits.device}."
+                        )
+                    if next_token_cursor > output_storage.shape[0]:
+                        raise ValueError(
+                            "Packed full-logit streaming output exceeds the "
+                            "preallocated IPC slab: "
+                            f"required={next_token_cursor}, "
+                            f"capacity={output_storage.shape[0]}."
+                        )
+
+                destination_token_cursor = storage_token_offset
+                for sample_index, (
+                    local_start,
+                    local_length,
+                    source_start,
+                    stored_seq_len,
+                ) in enumerate(sample_slices):
+                    physical = logits.narrow(1, local_start, local_length)
+                    if cp_size > 1:
+                        assert cp_group is not None
+                        padded_length = local_length * cp_size
+                        physical = allgather_cp_sharded_tensor(
+                            physical, cp_group, seq_dim=1
+                        )
+                        if physical.shape[1] != padded_length:
+                            physical = physical.reshape(
+                                1, padded_length, physical.shape[-1]
+                            )
+                    if stored_seq_len > 0:
+                        if output_storage is None:
+                            destination_start = source_start - logical_window_start
+                            unpacked[
+                                sample_index,
+                                destination_start : destination_start + stored_seq_len,
+                            ].copy_(
+                                physical[
+                                    0, source_start : source_start + stored_seq_len
+                                ]
+                            )
+                        else:
+                            next_destination = destination_token_cursor + stored_seq_len
+                            output_storage[
+                                destination_token_cursor:next_destination
+                            ].copy_(
+                                physical[
+                                    0, source_start : source_start + stored_seq_len
+                                ]
+                            )
+                            destination_token_cursor = next_destination
+                    del physical
+
+                if output_storage is not None:
+                    if destination_token_cursor != next_token_cursor:
+                        raise RuntimeError(
+                            "Packed full-logit streaming cursor did not consume "
+                            "the validated microbatch geometry: "
+                            f"cursor={destination_token_cursor}, "
+                            f"expected={next_token_cursor}."
+                        )
+                    self._packed_output_token_cursor = next_token_cursor
+                    return output_tensor.new_zeros(()), {
+                        "full_logits": StreamedFullLogitsMetadata(
+                            batch_size=batch_size,
+                            logical_seq_len=local_logical_len,
+                            local_vocab_size=int(logits.shape[-1]),
+                            dtype=logits.dtype,
+                            device=logits.device,
+                            storage_token_offset=storage_token_offset,
+                            stored_seq_lengths=tuple(stored_seq_lengths),
+                        )
+                    }
+
+                return output_tensor.new_zeros(()), {"full_logits": unpacked}
+
+            # mcore shards the seq dim load-balanced (each rank holds chunks
+            # ``cp_rank`` and ``2*cp-1-cp_rank`` of ``2*cp``), but the IPC
+            # consumer routes shards by a contiguous ``global_seq_start`` over
+            # the teacher CP group. Restore global order and emit this rank's
+            # contiguous slice, else a teacher_cp != student_cp pairing lands
+            # teacher data at the wrong seq positions in the consumer's dest.
+            if get_context_parallel_world_size() > 1:
+                logits = cp_load_balanced_to_contiguous(
+                    logits, cp_group=get_context_parallel_group(), seq_dim=1
+                )
+            return output_tensor.new_zeros(()), {"full_logits": logits}
 
         return processor_fn_inner
 

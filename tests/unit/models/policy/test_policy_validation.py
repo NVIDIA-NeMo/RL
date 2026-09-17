@@ -23,7 +23,14 @@ when the cluster size is insufficient for the specified parallelism configuratio
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
+from nemo_rl.data.packing import (
+    LockstepPackingItem,
+    SidePackingSpec,
+    build_lockstep_packing_plan,
+)
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
@@ -59,6 +66,53 @@ def create_mock_tokenizer():
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
     return tokenizer
+
+
+@pytest.mark.parametrize("entrypoint", ["train", "full_logits"])
+def test_lockstep_plan_dp_must_match_policy_dp(entrypoint):
+    plan = build_lockstep_packing_plan(
+        batch_uid=5,
+        items=tuple(
+            LockstepPackingItem(sample_id=f"sample-{i}", batch_item_id=i)
+            for i in range(4)
+        ),
+        sides=(
+            SidePackingSpec(
+                side_id="student",
+                capacity=8,
+                raw_lengths=(2, 2, 2, 2),
+                effective_lengths=(2, 2, 2, 2),
+            ),
+        ),
+        data_parallel_size=2,
+    )
+    data = BatchedDataDict(
+        {
+            "batch_item_id": torch.arange(4),
+            "input_ids": torch.zeros((4, 2), dtype=torch.long),
+            "input_lengths": torch.full((4,), 2, dtype=torch.long),
+        }
+    )
+    policy = Policy.__new__(Policy)
+    policy.use_sequence_packing = True
+    policy.use_dynamic_batches = False
+    policy.sharding_annotations = MagicMock()
+    policy.sharding_annotations.get_axis_size.return_value = 1
+
+    with pytest.raises(ValueError, match=r"targets DP=2.*uses DP=1"):
+        if entrypoint == "train":
+            policy._shard_for_train(
+                data,
+                batch_size=4,
+                packing_plan=plan,
+                packing_side_id="student",
+            )
+        else:
+            policy.get_full_logits_ipc(
+                data,
+                packing_plan=plan,
+                packing_side_id="student",
+            )
 
 
 def create_dtensor_config(

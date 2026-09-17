@@ -21,6 +21,13 @@ from nemo_rl.data.packing.algorithms import (
     SequencePacker,
     get_packer,
 )
+from nemo_rl.data.packing.lockstep import (
+    LockstepPackingItem,
+    LockstepPackingPlan,
+    SidePackingPlan,
+    SidePackingSpec,
+    build_lockstep_packing_plan,
+)
 from nemo_rl.data.packing.metrics import PackingMetrics
 
 __all__ = [
@@ -32,4 +39,9 @@ __all__ = [
     "ModifiedFirstFitDecreasingPacker",
     "get_packer",
     "PackingMetrics",
+    "LockstepPackingItem",
+    "SidePackingSpec",
+    "SidePackingPlan",
+    "LockstepPackingPlan",
+    "build_lockstep_packing_plan",
 ]

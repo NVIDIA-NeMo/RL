@@ -14,6 +14,7 @@
 
 import json
 import tempfile
+from pathlib import Path
 
 import pytest
 from datasets import Dataset
@@ -27,6 +28,10 @@ from nemo_rl.data.datasets.response_datasets.geometry3k import format_geometry3k
 from nemo_rl.data.datasets.response_datasets.intent import (
     IntentDataset,
     _format_options,
+)
+from nemo_rl.data.datasets.response_datasets.response_dataset import (
+    ResponseDataset,
+    resolve_source_sample_id,
 )
 from nemo_rl.data.processors import PROCESSOR_REGISTRY
 
@@ -125,10 +130,11 @@ def test_response_dataset(input_key, output_key, is_save_to_disk, file_ext, toke
     # check the first example
     first_example = dataset.dataset[0]
 
-    # only contains messages and task_name
-    assert len(first_example.keys()) == 2
+    # Formatted response rows retain their durable source identity.
+    assert len(first_example.keys()) == 3
     assert "messages" in first_example
     assert "task_name" in first_example
+    assert "sample_id" in first_example
 
     # check the combined message
     chat_template = "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer:'}}{%- elif message['role'] == 'assistant'  %}{{' ' + message['content'].strip()}}{%- endif %}{% endfor %}"
@@ -161,10 +167,11 @@ def test_response_dataset_gsm8k_with_subset():
     # check the first example
     first_example = dataset.dataset[0]
 
-    # only contains messages and task_name
-    assert len(first_example.keys()) == 2
+    # Formatted response rows retain their durable source identity.
+    assert len(first_example.keys()) == 3
     assert "messages" in first_example
     assert "task_name" in first_example
+    assert "sample_id" in first_example
 
     # check the content
     assert first_example["messages"][0]["role"] == "user"
@@ -219,6 +226,53 @@ def test_gsm8k_subset_defaults_to_main(monkeypatch):
     load_response_dataset({"dataset_name": "gsm8k", "split": "train"})
 
     assert captured["name"] == "main"
+
+
+def test_response_dataset_preserves_upstream_uuid(tmp_path: Path):
+    data_path = tmp_path / "uuid.json"
+    data_path.write_text(
+        json.dumps(
+            [
+                {
+                    "input": "question",
+                    "output": "answer",
+                    "uuid": "550e8400-e29b-41d4-a716-446655440000",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    dataset = ResponseDataset(str(data_path))
+
+    assert dataset.dataset[0]["sample_id"] == ("550e8400-e29b-41d4-a716-446655440000")
+
+
+def test_response_dataset_raw_ordinals_survive_validation_split(tmp_path: Path):
+    data_path = tmp_path / "split.json"
+    rows = [
+        {"input": f"question-{ordinal}", "output": f"answer-{ordinal}"}
+        for ordinal in range(8)
+    ]
+    data_path.write_text(json.dumps(rows), encoding="utf-8")
+
+    dataset = ResponseDataset(str(data_path), split_validation_size=2, seed=17)
+    all_rows = [*dataset.dataset, *dataset.val_dataset]
+    actual_by_question = {
+        row["messages"][0]["content"]: row["sample_id"] for row in all_rows
+    }
+    expected_by_question = {
+        f"question-{ordinal}": resolve_source_sample_id(
+            {},
+            ordinal,
+            data_path=str(data_path),
+            subset=None,
+            split=None,
+        )
+        for ordinal in range(8)
+    }
+
+    assert actual_by_question == expected_by_question
 
 
 def test_helpsteer3_dataset():

@@ -23,6 +23,8 @@ from nemo_rl.algorithms.loss import (
     DistillationLossFn,
     DPOLossConfig,
     DPOLossFn,
+    MseValueLossConfig,
+    MseValueLossFn,
     NLLLossFn,
     prepare_loss_input,
 )
@@ -30,15 +32,10 @@ from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
 from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.algorithms.x_token.loss_utils import (
-    build_exact_token_map,
-    chunk_average_log_probs,
-    localize_alignment,
-    valid_chunk_mask,
+    LocalizedAlignment,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
-    cp_load_balanced_to_contiguous,
-    cp_shift_next,
     vocab_parallel_gather_columns,
 )
 
@@ -2443,6 +2440,61 @@ def test_distillation_loss_fn_call():
         assert field in metrics
 
 
+def test_distillation_loss_num_valid_samples_respects_sample_mask():
+    """The metric counts participating rows, not padded microbatch capacity."""
+    torch.manual_seed(0)
+    student_log_probs = torch.log_softmax(torch.randn(2, 3, 4), dim=-1)
+    teacher_log_probs = torch.log_softmax(torch.randn(2, 3, 4), dim=-1)
+    sample_mask = torch.tensor([1.0, 0.0])
+    data = {
+        "input_ids": torch.zeros(2, 4, dtype=torch.long),
+        "input_lengths": torch.full((2,), 4, dtype=torch.long),
+        "token_mask": torch.ones(2, 4),
+        "sample_mask": sample_mask,
+        "teacher_topk_logits": torch.empty(0),
+        "teacher_topk_indices": torch.empty(0, dtype=torch.long),
+    }
+    loss_fn = DistillationLossFn(
+        DistillationLossConfig(
+            kl_type="forward",
+            mixed_kl_weight=0.5,
+            zero_outside_topk=False,
+        )
+    )
+
+    _, metrics = loss_fn(
+        student_log_probs,
+        teacher_log_probs,
+        None,
+        data,
+        global_valid_seqs=sample_mask.sum(),
+        global_valid_toks=torch.tensor(3.0),
+    )
+
+    assert metrics["num_valid_samples"] == 1
+
+
+def test_mse_value_loss_num_valid_samples_respects_sample_mask():
+    loss_fn = MseValueLossFn(MseValueLossConfig())
+    sample_mask = torch.tensor([1.0, 0.0])
+    data = BatchedDataDict(
+        {
+            "token_mask": torch.ones(2, 3),
+            "sample_mask": sample_mask,
+            "returns": torch.zeros(2, 3),
+        }
+    )
+
+    _, metrics = loss_fn(
+        torch.zeros(2, 3),
+        data,
+        global_valid_seqs=sample_mask.sum(),
+        global_valid_toks=torch.tensor(3.0),
+    )
+
+    assert metrics["num_valid_samples"] == 1
+
+
 # ---------------------------------------------------------------------------
 # CrossTokenizerDistillationLossFn — CPU synthetic-tensor coverage for the
 # gold path (KL on the exact-mapped common partition + L1 on the uncommon
@@ -2456,6 +2508,30 @@ _CT_V_STUDENT = 6
 _CT_V_TEACHER = 5
 _CT_TOPK = 2
 _CT_TEMPERATURE = 2.0
+
+
+def test_cross_tokenizer_rebuild_single_teacher_logits_without_copy(monkeypatch):
+    """MBS=1 must not duplicate the full teacher-logit IPC tensor."""
+    import sys
+    from types import SimpleNamespace
+
+    teacher_logits = torch.randn(4, 7, dtype=torch.float32)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setitem(
+        sys.modules,
+        "nemo_rl.models.policy.utils",
+        SimpleNamespace(
+            rebuild_cuda_tensor_from_ipc=lambda _handle, _device: teacher_logits
+        ),
+    )
+
+    rebuilt = CrossTokenizerDistillationLossFn._rebuild_teacher_full_logits(
+        {"teacher_full_logits_ipc": [{"logits_ipc": object()}]}
+    )
+
+    assert rebuilt.shape == (1, 4, 7)
+    assert rebuilt.dtype == torch.float32
+    assert rebuilt.data_ptr() == teacher_logits.data_ptr()
 
 
 def _write_ct_projection(tmp_path):
@@ -2479,17 +2555,13 @@ def _write_ct_projection(tmp_path):
     return str(path)
 
 
-def _ct_loss_cfg(projection_path, *, gold_loss):
+def _ct_loss_cfg(projection_path):
     # Per-teacher metadata as ``setup`` injects it: parallel lists, one entry
     # per teacher (here a single teacher).
     return {
-        "gold_loss": gold_loss,
-        "xtoken_loss": False,
         "temperature": _CT_TEMPERATURE,
         "vocab_topk": 4,
-        "uncommon_topk": 8192,
         "reverse_kl": False,
-        "exact_token_match_only": False,
         "kl_loss_weight": 1.0,
         "ce_loss_scale": 1.0,
         "dynamic_loss_scaling": False,
@@ -2500,157 +2572,12 @@ def _ct_loss_cfg(projection_path, *, gold_loss):
         "projection_matrix_paths": [projection_path],
         "teacher_vocab_sizes": [_CT_V_TEACHER],
         "teacher_weights": [1.0],
-        "teacher_gold_loss": [None],
-        "teacher_xtoken_loss": [None],
     }
-
-
-def _ct_gold_data(student_chunk_id, teacher_chunk_id, pair_valid, sample_mask):
-    """Flat CT loss data dict the gold path consumes.
-
-    ``_compute_gold`` reads the ``alignment_*`` keys via
-    ``alignment_from_flat_batch`` plus ``sample_mask``. The partition masks
-    and ``pair_is_correct`` are required by the schema but unused by the gold
-    path, so they are filled with correctly shaped zeros/ones.
-    """
-    b, t_s = student_chunk_id.shape
-    t_t = teacher_chunk_id.shape[1]
-    max_pairs = pair_valid.shape[1]
-    return BatchedDataDict(
-        {
-            "input_ids": torch.zeros((b, t_s), dtype=torch.long),
-            "input_lengths": torch.full((b,), t_s, dtype=torch.long),
-            "token_mask": torch.ones((b, t_s)),
-            "sample_mask": sample_mask,
-            "alignment_pair_valid": pair_valid,
-            "alignment_pair_is_correct": torch.ones((b, max_pairs), dtype=torch.bool),
-            "alignment_student_exact_partition_mask": torch.zeros(
-                (b, t_s), dtype=torch.bool
-            ),
-            "alignment_teacher_exact_partition_mask": torch.zeros(
-                (b, t_t), dtype=torch.bool
-            ),
-            "alignment_student_chunk_id": student_chunk_id,
-            "alignment_teacher_chunk_id": teacher_chunk_id,
-            "alignment_num_chunks": pair_valid.sum(dim=1).long(),
-        }
-    )
-
-
-def _ct_gold_prep(logits, teacher_logits, data):
-    """Mirror ``prepare_loss_input``'s shared prep for the single-rank (no-CP)
-    gold path: CP-relaid student logits + localized, next-token-shifted align."""
-    student_logits = cp_load_balanced_to_contiguous(logits, cp_group=None)
-    align = localize_alignment(
-        data, teacher_seq_len=teacher_logits.shape[1], cp_group=None
-    )
-    align.student_chunk_id = cp_shift_next(
-        cp_load_balanced_to_contiguous(align.student_chunk_id, cp_group=None),
-        None,
-        fill=-1,
-    )
-    align.teacher_chunk_id = cp_shift_next(align.teacher_chunk_id, None, fill=-1)
-    return student_logits, align
-
-
-def test_cross_tokenizer_gold_loss_matches_reference(tmp_path):
-    """Gold path == (KL on common + L1 on uncommon) * T**2, with no CE term.
-
-    Independently recomputes ``kl_common`` from the public helpers, pinning
-    the next-token shift, chunk averaging, common-index slice, forward-KL
-    direction, sample_mask gating, valid-chunk normalization, and the T**2
-    combination.
-    """
-    torch.manual_seed(0)
-    path = _write_ct_projection(tmp_path)
-    loss_fn = CrossTokenizerDistillationLossFn(_ct_loss_cfg(path, gold_loss=True))
-
-    student_chunk_id = torch.tensor([[0, 0, 1]], dtype=torch.long)
-    teacher_chunk_id = torch.tensor([[0, 0, 1]], dtype=torch.long)
-    pair_valid = torch.ones((1, 2), dtype=torch.bool)
-    sample_mask = torch.tensor([1.0])
-    data = _ct_gold_data(student_chunk_id, teacher_chunk_id, pair_valid, sample_mask)
-
-    logits = torch.randn(1, 3, _CT_V_STUDENT)
-    teacher_logits = torch.randn(1, 3, _CT_V_TEACHER)
-
-    student_logits, align = _ct_gold_prep(logits, teacher_logits, data)
-    loss, kl_common, l1_uncommon, n_valid, _ = loss_fn._compute_gold(
-        student_logits,
-        teacher_logits,
-        align,
-        projection_matrix_path=loss_fn.projection_matrix_paths[0],
-        teacher_vocab_size=loss_fn.teacher_vocab_sizes[0],
-        xtoken_loss=loss_fn.xtoken_loss,
-    )
-
-    assert torch.isfinite(loss)
-    assert kl_common.item() >= 0.0
-    assert l1_uncommon.item() >= 0.0
-    assert n_valid.item() == 2
-
-    # Combination + temperature**2 scaling (gold step 6); no CE term.
-    T = _CT_TEMPERATURE
-    assert torch.allclose(loss, (kl_common + l1_uncommon) * (T * T), atol=1e-6)
-
-    # Reference recompute of kl_common from the public helpers.
-    exact = build_exact_token_map(
-        path, logits.device, xtoken_loss=False, teacher_vocab_size=_CT_V_TEACHER
-    )
-    assert exact["common_student"].tolist() == [0, 5]
-    assert exact["common_teacher"].tolist() == [0, 4]
-
-    s_lp = torch.log_softmax(logits.float() / T, dim=-1)[:, :-1]
-    t_lp = torch.log_softmax(teacher_logits / T, dim=-1)[:, :-1]
-    s_chunks, s_sizes = chunk_average_log_probs(s_lp, student_chunk_id[:, 1:], 2)
-    t_chunks, t_sizes = chunk_average_log_probs(t_lp, teacher_chunk_id[:, 1:], 2)
-    vc = valid_chunk_mask(s_sizes, t_sizes, pair_valid) & sample_mask.bool().unsqueeze(
-        -1
-    )
-    sc = s_chunks[:, :, exact["common_student"]]
-    tc = t_chunks[:, :, exact["common_teacher"]]
-    per_chunk = (
-        torch.nn.functional.kl_div(sc, tc, reduction="none", log_target=True).sum(
-            dim=-1
-        )
-        * vc
-    )
-    expected_kl_common = per_chunk.sum() / vc.float().sum().clamp(min=1.0)
-    assert torch.allclose(kl_common, expected_kl_common, atol=1e-5)
-
-
-def test_cross_tokenizer_gold_loss_all_samples_masked_is_zero(tmp_path):
-    """sample_mask all-zero -> zero loss and zero valid chunks (the gold path
-    consults sample_mask, not just the geometric chunk mask)."""
-    path = _write_ct_projection(tmp_path)
-    loss_fn = CrossTokenizerDistillationLossFn(_ct_loss_cfg(path, gold_loss=True))
-
-    student_chunk_id = torch.tensor([[0, 0, 1]], dtype=torch.long)
-    data = _ct_gold_data(
-        student_chunk_id,
-        student_chunk_id.clone(),
-        torch.ones((1, 2), dtype=torch.bool),
-        torch.zeros(1),  # every sample masked out
-    )
-    logits = torch.randn(1, 3, _CT_V_STUDENT)
-    teacher_logits = torch.randn(1, 3, _CT_V_TEACHER)
-
-    student_logits, align = _ct_gold_prep(logits, teacher_logits, data)
-    loss, _, _, n_valid, _ = loss_fn._compute_gold(
-        student_logits,
-        teacher_logits,
-        align,
-        projection_matrix_path=loss_fn.projection_matrix_paths[0],
-        teacher_vocab_size=loss_fn.teacher_vocab_sizes[0],
-        xtoken_loss=loss_fn.xtoken_loss,
-    )
-    assert n_valid.item() == 0
-    assert torch.equal(loss.detach(), torch.zeros(()))
 
 
 def test_cross_tokenizer_mismatched_per_teacher_lists_raises(tmp_path):
     """Unequal-length per-teacher lists fail loudly at construction."""
-    cfg = _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
+    cfg = _ct_loss_cfg(_write_ct_projection(tmp_path))
     # Two weights but a single entry in every other per-teacher list.
     cfg["teacher_weights"] = [1.0, 1.0]
     with pytest.raises(ValueError, match="per-teacher lists must be equal length"):
@@ -2659,7 +2586,7 @@ def test_cross_tokenizer_mismatched_per_teacher_lists_raises(tmp_path):
 
 def test_normalize_teacher_by_vocab_rejected_outside_sum_mode(tmp_path):
     """normalize_teacher_by_vocab is a no-op outside sum mode, so reject it there."""
-    cfg = _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
+    cfg = _ct_loss_cfg(_write_ct_projection(tmp_path))
     cfg["kd_loss_mode"] = "averaged_logits"
     cfg["normalize_teacher_by_vocab"] = True
     with pytest.raises(ValueError, match="normalize_teacher_by_vocab"):
@@ -2669,7 +2596,7 @@ def test_normalize_teacher_by_vocab_rejected_outside_sum_mode(tmp_path):
 def test_cross_tokenizer_ce_uniform_logits_equals_log_vocab(tmp_path):
     """_compute_ce on uniform logits equals log(V_student) per valid token."""
     loss_fn = CrossTokenizerDistillationLossFn(
-        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
+        _ct_loss_cfg(_write_ct_projection(tmp_path))
     )
     b, t_s = 1, 5
     logits = torch.zeros(b, t_s, _CT_V_STUDENT)  # uniform -> CE == log(V)
@@ -2685,11 +2612,74 @@ def test_cross_tokenizer_ce_uniform_logits_equals_log_vocab(tmp_path):
     assert torch.allclose(ce, torch.log(torch.tensor(float(_CT_V_STUDENT))), atol=1e-5)
 
 
+def test_cross_tokenizer_ce_megatron_uses_chunked_raw_shards(tmp_path, monkeypatch):
+    """Plain Megatron CE routes raw TP/CP shards without rank-3 gathers."""
+    loss_fn = CrossTokenizerDistillationLossFn(
+        _ct_loss_cfg(_write_ct_projection(tmp_path))
+    )
+    local_logits = torch.randn(1, 2, 3)
+    tp_group = object()
+    cp_group = object()
+    calls = {}
+
+    def reject_rank3_gather(*_args, **_kwargs):
+        raise AssertionError("CE attempted a rank-3 CP gather")
+
+    def fake_get_rank(group):
+        assert group is tp_group
+        return 1
+
+    def fake_get_world_size(group):
+        assert group in (tp_group, cp_group)
+        return 2
+
+    def fake_logprobs(**kwargs):
+        calls.update(kwargs)
+        return torch.full((1, 3), -torch.log(torch.tensor(float(_CT_V_STUDENT))))
+
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.loss.loss_functions.allgather_cp_contiguous_tensor",
+        reject_rank3_gather,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.loss.loss_functions.get_next_token_logprobs_from_logits",
+        fake_logprobs,
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", fake_get_rank)
+    monkeypatch.setattr(torch.distributed, "get_world_size", fake_get_world_size)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.randint(0, _CT_V_STUDENT, (1, 4)),
+            "token_mask": torch.ones(1, 4),
+            "sample_mask": torch.ones(1),
+        }
+    )
+    global_valid_toks = data["token_mask"][:, 1:].sum()
+    ce = loss_fn._compute_ce(
+        local_logits,
+        data,
+        global_valid_toks,
+        student_logits_contig=local_logits,
+        tp_group=tp_group,
+        cp_group=cp_group,
+    )
+
+    assert calls["next_token_logits"] is local_logits
+    assert calls["input_ids"] is data["input_ids"]
+    assert calls["vocab_parallel_rank"] == 1
+    assert calls["vocab_parallel_group"] is tp_group
+    assert calls["context_parallel_group"] is cp_group
+    assert calls["chunk_size"] == 256
+    assert torch.allclose(ce, torch.log(torch.tensor(float(_CT_V_STUDENT))), atol=1e-5)
+
+
 def test_cross_tokenizer_ce_respects_sample_mask(tmp_path):
     """A masked sample must not contribute to _compute_ce: the B=2 result with
     sample 1 masked equals the CE over sample 0 alone."""
     loss_fn = CrossTokenizerDistillationLossFn(
-        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
+        _ct_loss_cfg(_write_ct_projection(tmp_path))
     )
     b, t_s = 2, 5
     torch.manual_seed(0)
@@ -2725,7 +2715,7 @@ def test_cross_tokenizer_prepare_loss_input_partitions_canonical_ce(
 ):
     """Automodel CP assigns one disjoint canonical CE window to each rank."""
     loss_fn = CrossTokenizerDistillationLossFn(
-        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
+        _ct_loss_cfg(_write_ct_projection(tmp_path))
     )
     full_logprobs = torch.tensor([[-1.0, -2.0, -3.0]], requires_grad=True)
     token_mask = torch.tensor([[1.0, 1.0, 0.0, 1.0]])
@@ -2771,7 +2761,7 @@ def test_cross_tokenizer_prepare_loss_input_rejects_nondivisible_cp_window(
 ):
     """Automodel CP rejects canonical CE windows that cannot partition evenly."""
     loss_fn = CrossTokenizerDistillationLossFn(
-        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
+        _ct_loss_cfg(_write_ct_projection(tmp_path))
     )
     next_token_logprobs = torch.tensor(
         [[-1.0, -2.0, -3.0, -4.0, -5.0]], requires_grad=True
@@ -2810,7 +2800,7 @@ def test_cross_tokenizer_precomputed_ce_reduces_partitioned_cp_window(
 ):
     """Precomputed CE sums CP-window values while preserving local gradients."""
     loss_fn = CrossTokenizerDistillationLossFn(
-        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
+        _ct_loss_cfg(_write_ct_projection(tmp_path))
     )
     data = BatchedDataDict({"sample_mask": torch.ones(1)})
     next_token_logprobs = torch.tensor([[-1.0, -2.0]], requires_grad=True)
@@ -2850,7 +2840,7 @@ def test_cross_tokenizer_precomputed_ce_reduces_partitioned_cp_window(
 def test_cross_tokenizer_partitioned_cp_ce_matches_cp1_value_and_gradient(tmp_path):
     """Summed CP2 CE windows are numerically identical to the CP1 full CE."""
     loss_fn = CrossTokenizerDistillationLossFn(
-        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
+        _ct_loss_cfg(_write_ct_projection(tmp_path))
     )
     data = BatchedDataDict(
         {
@@ -2900,6 +2890,130 @@ def test_cross_tokenizer_partitioned_cp_ce_matches_cp1_value_and_gradient(tmp_pa
 
     torch.testing.assert_close(cp2_loss, cp1_loss)
     torch.testing.assert_close(cp2_logprobs.grad, cp1_logprobs.grad)
+
+
+def test_cross_tokenizer_same_vocab_topk_ignores_masked_and_padding_rows(tmp_path):
+    """Invalid teacher rows cannot change same-vocab forward loss or gradient."""
+    cfg = _ct_loss_cfg(str(tmp_path / "unused_projection.pt"))
+    cfg["projection_matrix_paths"] = [None]
+    cfg["teacher_vocab_sizes"] = [_CT_V_STUDENT]
+    cfg["vocab_topk"] = 2
+    cfg["temperature"] = 1.0
+    cfg["ce_loss_scale"] = 0.0
+    loss_fn = CrossTokenizerDistillationLossFn(cfg)
+
+    torch.manual_seed(7)
+    student_base = torch.randn(2, 4, _CT_V_STUDENT)
+    input_ids = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]])
+    token_mask = torch.tensor([[1, 1, 1, 0], [1, 1, 1, 1]])
+    sample_mask = torch.tensor([True, False])
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": torch.tensor([3, 4]),
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+        }
+    )
+    align = LocalizedAlignment(
+        sample_mask=sample_mask,
+        student_input_ids=input_ids,
+        student_token_mask=token_mask,
+    )
+
+    teacher_clean = torch.full((2, 4, _CT_V_STUDENT), -10.0)
+    teacher_clean[0, 0, 0:2] = torch.tensor([8.0, 7.0])
+    teacher_clean[0, 1, 0:2] = torch.tensor([7.0, 8.0])
+    teacher_corrupt = teacher_clean.clone()
+    # Padding in the valid sample and every predictor in the masked sample
+    # advertise different, overwhelmingly large columns.
+    teacher_corrupt[0, 2:, 2:4] = torch.tensor([100.0, 90.0])
+    teacher_corrupt[1, :, 4:6] = torch.tensor([200.0, 190.0])
+
+    def run(teacher_logits):
+        student_logits = student_base.clone().requires_grad_(True)
+        loss, metrics = loss_fn(
+            data=data,
+            global_valid_seqs=sample_mask.sum(),
+            global_valid_toks=torch.tensor(2.0),
+            logits=student_logits,
+            student_logits_contig=student_logits,
+            teacher_full_logits_by_idx={0: teacher_logits},
+            aligns_by_idx={0: align},
+        )
+        loss.backward()
+        return loss.detach(), metrics, student_logits.grad.detach()
+
+    clean_loss, clean_metrics, clean_grad = run(teacher_clean)
+    corrupt_loss, corrupt_metrics, corrupt_grad = run(teacher_corrupt)
+
+    torch.testing.assert_close(corrupt_loss, clean_loss, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(corrupt_grad, clean_grad, rtol=1e-6, atol=1e-6)
+    assert clean_metrics["num_valid_samples"] == 1
+    assert corrupt_metrics["num_valid_samples"] == 1
+    assert torch.count_nonzero(clean_grad[1]).item() == 0
+    assert torch.count_nonzero(clean_grad[0, 2:]).item() == 0
+
+
+def test_same_vocab_chat_kd_uses_semantic_mask_and_its_own_denominator(tmp_path):
+    """Template scaffold stays in CE but cannot enter direct same-vocab KD."""
+    cfg = _ct_loss_cfg(str(tmp_path / "unused_projection.pt"))
+    cfg["projection_matrix_paths"] = [None]
+    cfg["teacher_vocab_sizes"] = [_CT_V_STUDENT]
+    cfg["vocab_topk"] = 3
+    cfg["temperature"] = 1.0
+    cfg["ce_loss_scale"] = 0.0
+    loss_fn = CrossTokenizerDistillationLossFn(cfg)
+
+    torch.manual_seed(19)
+    student = torch.randn(1, 5, _CT_V_STUDENT, requires_grad=True)
+    teacher = torch.randn(1, 5, _CT_V_STUDENT)
+    input_ids = torch.tensor([[0, 1, 2, 3, 4]])
+    ce_mask = torch.ones(1, 5, dtype=torch.long)
+    # Only labels at positions 3 (content) and 4 (explicit EOT) are KD targets,
+    # hence predictors 2 and 3 receive KD gradients.
+    kd_mask = torch.tensor([[0, 0, 0, 1, 1]])
+    sample_mask = torch.ones(1)
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": torch.tensor([5]),
+            "token_mask": ce_mask,
+            "kd_token_mask": kd_mask,
+            "sample_mask": sample_mask,
+        }
+    )
+    align = LocalizedAlignment(
+        sample_mask=sample_mask,
+        student_input_ids=input_ids,
+        student_token_mask=ce_mask,
+        student_kd_token_mask=kd_mask,
+    )
+    expected_kd = loss_fn._direct_topk_kl(
+        student,
+        teacher,
+        align,
+        torch.tensor(2.0),
+        tp_group=None,
+        cp_group=None,
+    )
+    loss, metrics = loss_fn(
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        # CE has four next-token targets, while semantic KD has two.
+        global_valid_toks=torch.tensor(4.0),
+        global_valid_kd_toks=torch.tensor(2.0),
+        logits=student,
+        student_logits_contig=student,
+        teacher_full_logits_by_idx={0: teacher},
+        aligns_by_idx={0: align},
+    )
+    torch.testing.assert_close(loss, expected_kd)
+    assert metrics["kl_loss"] == pytest.approx(expected_kd.item())
+    loss.backward()
+    assert torch.count_nonzero(student.grad[0, :2]).item() == 0
+    assert torch.count_nonzero(student.grad[0, 2:4]).item() > 0
+    assert torch.count_nonzero(student.grad[0, 4]).item() == 0
 
 
 # ── Metric-normalization advertisement (PR #2683) ─────────────────────────

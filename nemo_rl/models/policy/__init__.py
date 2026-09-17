@@ -207,12 +207,23 @@ class DTensorConfig(TypedDict):
     # Model config
     lora_cfg: NotRequired[LoRAConfig | LoRAConfigDisabled]
     automodel_kwargs: NotRequired[AutomodelKwargs]
+    # Dtype used when loading weights via from_pretrained. Valid values:
+    # "float32" (default), "bfloat16", "float16". Reference/teacher workers
+    # (init_optimizer=False) can set this to "bfloat16" / "float16" to halve
+    # init-time and resident parameter memory. Trainable workers MUST keep
+    # the default "float32" to preserve master-weight precision; non-float32
+    # is rejected by validate_and_prepare_config when init_optimizer=True.
+    load_precision: NotRequired[str]
+    # Shard the model before loading its weights instead of loading the
+    # unwrapped model first. Lowers peak memory for large checkpoints.
+    shard_before_load: NotRequired[bool]
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]
 
 
 class SequencePackingConfigDisabled(TypedDict):
     enabled: Literal[False]
+    fuse_loss: NotRequired[bool]
 
 
 class SequencePackingConfig(TypedDict):
@@ -221,6 +232,7 @@ class SequencePackingConfig(TypedDict):
     # Not required because some algorithms like SFT don't calculate log probs
     logprob_mb_tokens: NotRequired[int]
     algorithm: str
+    sequence_length_round: NotRequired[int]
     # Preserve the packer's order (or omit for backward compatibility), or
     # execute each DP rank's assigned bins largest-first for allocator reuse.
     microbatch_order: NotRequired[Literal["packer", "largest_first"]]
@@ -277,6 +289,13 @@ class MegatronOptimizerConfig(TypedDict):
     # distributed optimizer
     use_distributed_optimizer: bool
     use_precision_aware_optimizer: bool
+    # Precision-aware optimizer tensor dtypes. These are optional MCore
+    # pass-throughs; when omitted, MCore owns their defaults.
+    main_grads_dtype: NotRequired[str]
+    main_params_dtype: NotRequired[str]
+    exp_avg_dtype: NotRequired[str]
+    exp_avg_sq_dtype: NotRequired[str]
+    store_param_remainders: NotRequired[bool]
     clip_grad: float
     # knob to enable optimizer cpu offload
     optimizer_cpu_offload: bool
@@ -302,8 +321,12 @@ class MegatronSchedulerConfig(TypedDict):
 
 class MegatronDDPConfig(TypedDict):
     grad_reduce_in_fp32: bool
+    # Communicate low-precision gradients while accumulating each reduced shard
+    # in FP32, then cast the result back to the gradient-buffer dtype.
+    reduce_scatter_with_fp32_accumulation: NotRequired[bool]
     overlap_grad_reduce: bool
     overlap_param_gather: bool
+    use_megatron_fsdp: NotRequired[bool]
     use_custom_fsdp: bool
     data_parallel_sharding_strategy: str
 
@@ -637,6 +660,11 @@ class PolicyConfig(TypedDict):
     max_total_sequence_length: int
     # This sets the clipping norm for the DTensorPolicyWorkers (Megatron's is called clip_grad)
     max_grad_norm: NotRequired[float | int | None]
+    # Freeze (requires_grad=False) any parameter whose name contains one of these
+    # substrings. Use for submodules that never receive gradients (e.g. the
+    # nemotron_h multi-token-prediction head, ["mtp"], during distillation) to keep
+    # optimizer save/load symmetric and avoid checkpoint-resume key mismatches.
+    freeze_parameter_patterns: NotRequired[list[str] | None]
     refit_buffer_size_gb: NotRequired[float | int]
     optimizer: NotRequired[PytorchOptimizerConfig | None]
     scheduler: NotRequired[

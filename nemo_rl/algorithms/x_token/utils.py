@@ -84,6 +84,8 @@ def assert_xtoken_ipc_node_local(
     teacher_cp: int,
     student_dp: int,
     teacher_dp: int,
+    student_pp: int,
+    teacher_pp: int,
 ) -> None:
     """Fail fast if the teacher->student logit transport would cross a node.
 
@@ -92,12 +94,16 @@ def assert_xtoken_ipc_node_local(
     A single-node job is therefore always safe; a multi-node job is only safe
     when every student rank's required teacher shards live on its own node.
 
+    The model-parallel group is ``tp * cp * pp``. Pipeline parallelism counts
+    even though only the last stage produces logits: the group must stay inside
+    one node for that stage to be co-located with the student ranks that import
+    its buffers.
     """
     if num_nodes <= 1:
         return
 
-    student_group = student_tp * student_cp
-    teacher_group = teacher_tp * teacher_cp
+    student_group = student_tp * student_cp * student_pp
+    teacher_group = teacher_tp * teacher_cp * teacher_pp
     assert teacher_dp == student_dp, (
         "Multi-node xtoken distillation uses node-local CUDA IPC for the teacher "
         "logits, which requires teacher and student to share a data_parallel "
@@ -107,18 +113,18 @@ def assert_xtoken_ipc_node_local(
     )
     assert teacher_group == student_group, (
         "Multi-node xtoken distillation requires teacher and student to share "
-        f"the same model-parallel group size tp*cp (got teacher={teacher_group}, "
+        f"the same model-parallel group size tp*cp*pp (got teacher={teacher_group}, "
         f"student={student_group}); differing sizes imply a non-colocated grid "
         "whose teacher shards are not node-local."
     )
     assert student_group <= gpus_per_node, (
-        f"Multi-node xtoken distillation needs the model-parallel group tp*cp "
+        f"Multi-node xtoken distillation needs the model-parallel group tp*cp*pp "
         f"({student_group}) to fit within one node ({gpus_per_node} GPUs); a "
         "group spanning nodes makes the teacher-logit IPC cross-node."
     )
     assert gpus_per_node % student_group == 0, (
         f"Multi-node xtoken distillation needs gpus_per_node ({gpus_per_node}) "
-        f"to be a multiple of the model-parallel group tp*cp ({student_group}) "
+        f"to be a multiple of the model-parallel group tp*cp*pp ({student_group}) "
         "so DP groups are node-aligned and never straddle a node boundary."
     )
 

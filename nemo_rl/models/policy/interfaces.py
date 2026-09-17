@@ -18,6 +18,7 @@ import ray
 import torch
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data.packing import LockstepPackingPlan
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec, RefitPayloadMode
 from nemo_rl.utils.timer import Timer
@@ -126,6 +127,8 @@ class PolicyInterface(ABC):
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
+        packing_plan: Optional[LockstepPackingPlan] = None,
+        packing_side_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Train the policy on a global batch of data.
 
@@ -135,6 +138,8 @@ class PolicyInterface(ABC):
             eval_mode: Whether to run in evaluation mode (no gradient updates)
             gbs: Global batch size override (if None, uses config default)
             mbs: Micro batch size override (if None, uses config default)
+            packing_plan: Optional controller-owned xToken lockstep packing plan.
+            packing_side_id: Side key in ``packing_plan``; provided together.
         """
         pass
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import os
 import pprint
+from pathlib import Path
 
 from omegaconf import OmegaConf
 
@@ -25,6 +26,8 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     MasterConfig,
     setup,
+    validate_xtoken_packing_setup,
+    validate_xtoken_tokenizer_reuse,
     xtoken_off_policy_distillation_train,
 )
 from nemo_rl.data.utils import setup_response_data
@@ -44,6 +47,12 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     )
     parser.add_argument(
         "--config", type=str, default=None, help="Path to YAML config file"
+    )
+    parser.add_argument(
+        "--resolved-config-output",
+        type=str,
+        default=None,
+        help="Optional path for the fully resolved, validated configuration",
     )
     args, overrides = parser.parse_known_args()
     return args, overrides
@@ -65,13 +74,23 @@ def main() -> None:
 
     config = OmegaConf.to_container(config, resolve=True)
     config = MasterConfig(**config)
+    validate_xtoken_packing_setup(config)
+
+    if args.resolved_config_output:
+        resolved_config_path = Path(args.resolved_config_output).resolve()
+        resolved_config_path.parent.mkdir(parents=True, exist_ok=True)
+        OmegaConf.save(
+            config=OmegaConf.create(config.model_dump(mode="json")),
+            f=resolved_config_path,
+        )
+        print(f"Resolved config written to: {resolved_config_path}", flush=True)
 
     # Per-teacher same-vocab vs cross-tokenizer is determined solely by
     # `teachers[i].aligner.projection_matrix_path` (null => same-vocab direct
-    # KL; set => cross-tokenizer). The consistency check (a same-vocab teacher
-    # must actually share the student's vocab) needs the real tokenizers and
-    # lives in `setup()` — comparing tokenizer *names* here is wrong, e.g.
-    # Llama-3.2-3B and Llama-3.2-1B have different names but the same vocab.
+    # KL; set => cross-tokenizer). Safe direct token reuse is checked using the
+    # full tokenizer mapping/backend, special-token state, chat template, and
+    # template kwargs. Tokenizer names and vocabulary sizes alone are not
+    # sufficient evidence of semantic identity.
 
     print("Final config:")
     pprint.pprint(config)
@@ -83,8 +102,6 @@ def main() -> None:
             flush=True,
         )
 
-    init_ray()
-
     # Student tokenizer + one tokenizer per teacher (same-tokenizer teachers
     # included — needed for vocab sizing in setup()).
     student_tokenizer = get_tokenizer(config.policy["tokenizer"])
@@ -92,6 +109,7 @@ def main() -> None:
         get_tokenizer(teacher.policy_config()["tokenizer"])
         for teacher in config.teachers
     ]
+    validate_xtoken_tokenizer_reuse(config, student_tokenizer, teacher_tokenizers)
 
     # `env_configs=None` skips the env-creation block (no rollout path);
     # `setup_response_data` then handles dataset construction, the optional
@@ -101,6 +119,8 @@ def main() -> None:
     train_dataset, val_dataset = setup_response_data(
         student_tokenizer, config.data, env_configs=None
     )
+
+    init_ray()
 
     (
         student_policy,

@@ -51,6 +51,7 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.x_token.packing_loss import XTOKEN_LOGICAL_METRICS_KEY
 from nemo_rl.data.multimodal_utils import (
     attach_media_token_validity_mask,
     chunks_accept_media_token_validity_mask,
@@ -96,8 +97,10 @@ from nemo_rl.models.megatron.setup import (
     validate_model_paths,
 )
 from nemo_rl.models.megatron.train import (
+    FullLogitsPostProcessor,
     LogprobsPostProcessor,
     LossPostProcessor,
+    StreamedFullLogitsMetadata,
     TeacherFullPayloadPostProcessor,
     TopkLogitsPostProcessor,
     aggregate_training_statistics,
@@ -111,10 +114,19 @@ from nemo_rl.models.policy.interfaces import (
     TeacherFullPayloadOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    DENSE_TEACHER_IPC_FLAT_LAYOUT,
     broadcast_hf_buckets_via_distributed_impl,
+    can_reuse_teacher_ipc_token_buffer,
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
+    ensure_teacher_ipc_token_buffer,
+    extract_batch_item_ids,
+    extract_teacher_ipc_valid_lengths,
+    get_dense_ipc_sequence_layout,
+    get_handle_from_tensor,
     get_runtime_env_for_policy_worker,
+    localize_teacher_ipc_valid_lengths,
+    partition_teacher_ipc_token_buffer,
     send_hf_buckets_via_ipc_actor_impl,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -444,6 +456,43 @@ class MegatronPolicyWorkerImpl(
     _remote_sparse_refit: Any = None
     _async_checkpoint_cuda_cache_active: bool = False
 
+    def _ensure_teacher_ipc_storage(
+        self,
+        *,
+        total_tokens: int,
+        vocab_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Reuse or replace the compact IPC slab without overlapping owners."""
+        storage = self._teacher_ipc_storage
+        if storage is not None and not can_reuse_teacher_ipc_token_buffer(
+            storage,
+            total_tokens=total_tokens,
+            vocab_size=vocab_size,
+            dtype=dtype,
+            device=device,
+        ):
+            # A new get_full_logits_ipc call starts only after the previous
+            # student train call has returned, so its imported views are no
+            # longer live. Drop the producer owner and stale handle before the
+            # replacement allocation; otherwise both multi-GiB slabs overlap.
+            self._teacher_ipc_storage = None
+            self._teacher_ipc_handles = []
+            del storage
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        storage = ensure_teacher_ipc_token_buffer(
+            self._teacher_ipc_storage,
+            total_tokens=total_tokens,
+            vocab_size=vocab_size,
+            dtype=dtype,
+            device=device,
+        )
+        self._teacher_ipc_storage = storage
+        return storage
+
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
 
@@ -596,6 +645,13 @@ class MegatronPolicyWorkerImpl(
         init_telemetry_worker()
 
         self.cfg = config
+        # Persistent compact CUDA IPC token slab for cross-tokenizer teacher
+        # full logits, lazily allocated on the first ``get_full_logits_ipc``
+        # call (grown as needed), reused across calls, and freed via
+        # ``release_ipc_buffer``. Logical row and TP/CP geometry remain in each
+        # handle while zero padding is omitted from the physical allocation.
+        self._teacher_ipc_storage: Optional[torch.Tensor] = None
+        self._teacher_ipc_handles: list[tuple[Any, ...]] = []
         self._router_replay_enabled = router_replay_enabled(config)
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
@@ -961,15 +1017,12 @@ class MegatronPolicyWorkerImpl(
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function.
 
-        ``check_dim_skip_keys`` is accepted for parity with the v1/v2 DTensor
-        workers (cross-tokenizer ride-along tensors whose dim 1 is not the
-        student sequence axis). Megatron doesn't run cross-tokenizer, so it
-        must be None.
+        ``check_dim_skip_keys`` names cross-tokenizer ride-along tensors whose
+        dim 1 is NOT the student sequence axis (teacher tokenization / alignment
+        keys); it is forwarded to the microbatch iterator's sequence-dim
+        validation so those keys pass through untouched, matching the v2 DTensor
+        worker.
         """
-        assert check_dim_skip_keys is None, (
-            "check_dim_skip_keys is only supported by the v2 DTensor worker; "
-            "Megatron does not run cross-tokenizer distillation."
-        )
         self.timer.start("train")
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
@@ -1032,6 +1085,10 @@ class MegatronPolicyWorkerImpl(
                 batch = gb_result["batch"]
                 global_valid_seqs = gb_result["global_valid_seqs"]
                 global_valid_toks = gb_result["global_valid_toks"]
+                global_valid_kd_toks = gb_result.get(
+                    "global_valid_kd_toks", global_valid_toks
+                )
+                global_valid_chunks_by_idx = gb_result["global_valid_chunks_by_idx"]
 
                 # Pre-compute the MTP loss mask, only when MTP is enabled, so
                 # process_microbatch can pack it.
@@ -1062,6 +1119,7 @@ class MegatronPolicyWorkerImpl(
                     delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
                     model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
                     mtp_enabled=self.mtp_enabled,
+                    skip_keys=check_dim_skip_keys,
                 )
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
@@ -1122,6 +1180,8 @@ class MegatronPolicyWorkerImpl(
                             defer_fp32_logits=self.defer_fp32_logits,
                             global_valid_seqs=global_valid_seqs,
                             global_valid_toks=global_valid_toks,
+                            global_valid_kd_toks=global_valid_kd_toks,
+                            global_valid_chunks_by_idx=global_valid_chunks_by_idx,
                             sampling_params=self.sampling_params,
                             straggler_timer=self.mcore_state.straggler_timer,
                             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
@@ -1205,20 +1265,29 @@ class MegatronPolicyWorkerImpl(
                     gb_loss_metrics = []
                     mb_losses = []
                     for x in losses_reduced:
-                        loss_metrics = {}
-                        for k in x.keys():
-                            if "_min" in k or "_max" in k:
-                                loss_metrics[k] = x[k]
-                            else:
-                                loss_metrics[k] = x[k] / num_global_batches
-                        gb_loss_metrics.append(loss_metrics)
-                        curr_lr = self.scheduler.get_lr(self.optimizer.param_groups[0])
-                        curr_wd = self.scheduler.get_wd()
-                        loss_metrics["lr"] = curr_lr
-                        loss_metrics["wd"] = curr_wd
-                        loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
-                        loss_metrics["global_valid_toks"] = global_valid_toks.item()
-                        mb_losses.append(loss_metrics["loss"])
+                        logical_metrics = x.get(XTOKEN_LOGICAL_METRICS_KEY)
+                        metric_records = (
+                            logical_metrics if logical_metrics is not None else [x]
+                        )
+                        for metric_record in metric_records:
+                            if metric_record["num_valid_samples"] <= 0:
+                                continue
+                            loss_metrics = {}
+                            for key, value in metric_record.items():
+                                if "_min" in key or "_max" in key:
+                                    loss_metrics[key] = value
+                                else:
+                                    loss_metrics[key] = value / num_global_batches
+                            curr_lr = self.scheduler.get_lr(
+                                self.optimizer.param_groups[0]
+                            )
+                            curr_wd = self.scheduler.get_wd()
+                            loss_metrics["lr"] = curr_lr
+                            loss_metrics["wd"] = curr_wd
+                            loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
+                            loss_metrics["global_valid_toks"] = global_valid_toks.item()
+                            gb_loss_metrics.append(loss_metrics)
+                            mb_losses.append(loss_metrics["loss"])
 
                 else:
                     gb_loss_metrics = None
@@ -2683,6 +2752,482 @@ class MegatronPolicyWorkerImpl(
         return BatchedDataDict.from_batches(
             [{"topk_logits": topk_logits.cpu(), "topk_indices": topk_indices.cpu()}]
         )
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/get_full_logits_ipc")
+    def get_full_logits_ipc(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        micro_batch_size: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Teacher forward; full-vocab logits exposed via persistent CUDA IPC storage.
+
+        Megatron counterpart of ``DTensorPolicyWorkerV2.get_full_logits_ipc`` for
+        cross-tokenizer distillation. Each microbatch's raw logit shard is
+        written into a compact ``[sum(valid_local_T), V]`` persistent token
+        slab. Packed rows store only the overlap of their authoritative raw
+        ``input_lengths`` prefix with this teacher CP rank; the postprocessor
+        already zeroes the omitted logical suffix. Unpacked rows retain their
+        complete width because their padding logits are not guaranteed zero.
+        The handle preserves ``buf_idx=0`` / bin-local
+        ``sample_index_in_buf`` identity while adding physical token offsets.
+        Returns ``{"per_sample_handles": list, "dp_rank": int}``
+        with TP/CP shard metadata (``vocab_start_index``, ``global_seq_start``,
+        ...) used to reassemble the global ``[T_t, V_t]`` teacher logits.
+
+        Tensor, context and pipeline parallelism are supported for models using
+        NeMo-RL's generic Megatron batch path and may differ from the student's.
+        Models that pack and context-shard inside their own forward must use
+        ``context_parallel_size == 1`` for this unpacked IPC path. Under PP only
+        the LAST stage runs the output layer, so ``megatron_forward_backward``
+        returns an empty output list on every earlier stage and this method
+        returns no handles there; :func:`aggregate_per_sample_handles` skips
+        those empty contributions.
+        Multi-node PP is guarded separately by
+        :func:`assert_xtoken_ipc_node_local`, which requires the whole
+        ``tp * cp * pp`` group to fit inside one node so the producing stage is
+        co-located with the importing student ranks.
+
+        Sequence-packed outputs are reconstructed one physical sample at a time
+        by :class:`FullLogitsPostProcessor` and streamed directly into the
+        persistent IPC slab.
+        """
+        if (
+            self.delegate_pack_to_model
+            and parallel_state.get_context_parallel_world_size() > 1
+        ):
+            raise NotImplementedError(
+                "get_full_logits_ipc does not support context parallelism for "
+                "models that pack and context-shard inside their own forward. "
+                "Set context_parallel_size=1 for this teacher."
+            )
+
+        forward_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+        self.model.eval()
+
+        # Size the persistent slab from logical input before the forward. Packed
+        # output streams into this allocation microbatch-by-microbatch, so it
+        # must never fall back to a post-forward allocation that overlaps model
+        # outputs. Pipeline stages without the output layer legitimately emit
+        # no handles and do not allocate a slab.
+        cp_rank = parallel_state.get_context_parallel_rank()
+        cp_size = parallel_state.get_context_parallel_world_size()
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        full_seq_len, target_local_seq, global_seq_start = (
+            get_dense_ipc_sequence_layout(data, cp_rank=cp_rank, cp_size=cp_size)
+        )
+        planned_valid_lengths = extract_teacher_ipc_valid_lengths(
+            data,
+            data.size,
+            full_seq_len=full_seq_len,
+            compact_padding=self.cfg["sequence_packing"]["enabled"],
+        )
+        planned_total_stored_tokens = sum(
+            localize_teacher_ipc_valid_lengths(
+                planned_valid_lengths,
+                full_seq_len=full_seq_len,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+            )
+        )
+        pack = self.cfg["sequence_packing"]["enabled"]
+        stream_packed_outputs = pack and parallel_state.is_pipeline_last_stage(
+            ignore_virtual=True
+        )
+        packed_output_storage: Optional[torch.Tensor] = None
+        planned_local_vocab_size: Optional[int] = None
+        if stream_packed_outputs:
+            final_padded_vocab_size = int(self.final_padded_vocab_size)
+            if (
+                tp_size <= 0
+                or final_padded_vocab_size <= 0
+                or final_padded_vocab_size % tp_size != 0
+            ):
+                raise ValueError(
+                    "The padded teacher vocabulary must be positive and divisible "
+                    "by tensor parallelism for packed IPC streaming: "
+                    f"vocab={final_padded_vocab_size}, tp={tp_size}."
+                )
+            planned_local_vocab_size = final_padded_vocab_size // tp_size
+            current_storage = self._teacher_ipc_storage
+            storage_device = (
+                current_storage.device
+                if current_storage is not None
+                else torch.device("cuda", torch.cuda.current_device())
+            )
+            # Do not retain an alias while _ensure_teacher_ipc_storage drops an
+            # incompatible worker-owned tensor; that would keep both slabs live.
+            del current_storage
+            packed_output_storage = self._ensure_teacher_ipc_storage(
+                total_tokens=planned_total_stored_tokens,
+                vocab_size=planned_local_vocab_size,
+                dtype=torch.float32,
+                device=storage_device,
+            )
+        elif not pack:
+            # Preserve the existing unpacked path. It cannot omit padding logits,
+            # but can still replace a known undersized slab before the forward.
+            current_storage = self._teacher_ipc_storage
+            growth_geometry = None
+            if (
+                current_storage is not None
+                and current_storage.ndim == 2
+                and current_storage.shape[0] < planned_total_stored_tokens
+            ):
+                growth_geometry = (
+                    int(current_storage.shape[1]),
+                    current_storage.dtype,
+                    current_storage.device,
+                )
+            del current_storage
+            if growth_geometry is not None:
+                vocab_size, storage_dtype, storage_device = growth_geometry
+                self._ensure_teacher_ipc_storage(
+                    total_tokens=planned_total_stored_tokens,
+                    vocab_size=vocab_size,
+                    dtype=storage_dtype,
+                    device=storage_device,
+                )
+
+        (
+            mb_iterator,
+            num_microbatches,
+            forward_mbs,
+            seq_length,
+            padded_seq_length,
+        ) = get_microbatch_iterator(
+            data,
+            self.cfg,
+            forward_batch_size,
+            straggler_timer=self.mcore_state.straggler_timer,
+            delegate_pack_to_model=self.delegate_pack_to_model,
+            delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+            mtp_enabled=self.mtp_enabled,
+        )
+
+        batch_item_ids_by_microbatch: list[Optional[list[int]]] = []
+        valid_lengths_by_microbatch: list[list[int]] = []
+
+        def recording_iterator():
+            for processed_mb in mb_iterator:
+                logical_batch_size = processed_mb.data_dict.size
+                batch_item_ids_by_microbatch.append(
+                    extract_batch_item_ids(
+                        processed_mb.data_dict,
+                        logical_batch_size,
+                        required=self.cfg["sequence_packing"]["enabled"],
+                    )
+                )
+                input_ids = processed_mb.data_dict.get("input_ids")
+                if not isinstance(input_ids, torch.Tensor) or input_ids.ndim < 2:
+                    raise ValueError(
+                        "Dense teacher IPC requires logical input_ids on every "
+                        "processed microbatch."
+                    )
+                valid_lengths_by_microbatch.append(
+                    extract_teacher_ipc_valid_lengths(
+                        processed_mb.data_dict,
+                        logical_batch_size,
+                        full_seq_len=int(input_ids.shape[1]),
+                        compact_padding=self.cfg["sequence_packing"]["enabled"],
+                    )
+                )
+                yield processed_mb
+
+        full_logits_postprocessor = FullLogitsPostProcessor(
+            cfg=self.cfg,
+            packed_output_storage=packed_output_storage,
+        )
+        list_of_outputs = megatron_forward_backward(
+            model=self.model,
+            data_iterator=recording_iterator(),
+            seq_length=padded_seq_length,
+            mbs=forward_mbs,
+            num_microbatches=num_microbatches,
+            post_processing_fn=full_logits_postprocessor,
+            forward_only=True,
+            defer_fp32_logits=self.defer_fp32_logits,
+            sampling_params=None,
+            straggler_timer=self.mcore_state.straggler_timer,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+        )
+
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        dp_rank = parallel_state.get_data_parallel_rank()
+        world_rank = torch.distributed.get_rank()
+        # The scheduler's ``padded_seq_length`` is the physical packed-bin width;
+        # it is intentionally not IPC geometry. The consumer's masks/alignment
+        # use the logical ``data['input_ids']`` axis. Packed post-processing writes
+        # valid prefixes directly into the persistent slab; unpacked processing
+        # continues to return logical rectangles.
+
+        per_sample_handles: list[dict[str, Any]] = []
+        storage: Optional[torch.Tensor] = None
+        token_partitions: list[list[tuple[int, torch.Tensor]]] = []
+        local_valid_lengths_by_microbatch: list[list[int]] = []
+        total_stored_tokens = 0
+        row_offsets: list[int] = []
+        payload_ipc: Optional[tuple[Any, ...]] = None
+        batch_sizes: list[int] = []
+        local_vocab_size = 0
+        streamed_metadata: list[StreamedFullLogitsMetadata] = []
+        if stream_packed_outputs and not list_of_outputs:
+            raise RuntimeError(
+                "The packed teacher IPC output stage produced no microbatch metadata."
+            )
+        if list_of_outputs:
+            if len(batch_item_ids_by_microbatch) != len(list_of_outputs) or len(
+                valid_lengths_by_microbatch
+            ) != len(list_of_outputs):
+                raise ValueError(
+                    "Dense teacher IPC output count does not match the consumed "
+                    "microbatch metadata count: "
+                    f"outputs={len(list_of_outputs)}, "
+                    f"identities={len(batch_item_ids_by_microbatch)}, "
+                    f"valid_lengths={len(valid_lengths_by_microbatch)}."
+                )
+            local_valid_lengths_by_microbatch = [
+                localize_teacher_ipc_valid_lengths(
+                    valid_lengths,
+                    full_seq_len=full_seq_len,
+                    cp_rank=cp_rank,
+                    cp_size=cp_size,
+                )
+                for valid_lengths in valid_lengths_by_microbatch
+            ]
+            total_stored_tokens = sum(
+                sum(valid_lengths)
+                for valid_lengths in local_valid_lengths_by_microbatch
+            )
+            if total_stored_tokens != planned_total_stored_tokens:
+                raise ValueError(
+                    "Dense teacher IPC planned token capacity does not match "
+                    "the consumed microbatches: "
+                    f"planned={planned_total_stored_tokens}, "
+                    f"actual={total_stored_tokens}."
+                )
+
+            if stream_packed_outputs:
+                if packed_output_storage is None or planned_local_vocab_size is None:
+                    raise RuntimeError(
+                        "Packed teacher IPC streaming reached the output stage "
+                        "without preallocated storage geometry."
+                    )
+                storage = packed_output_storage
+                local_vocab_size = planned_local_vocab_size
+                next_streamed_token_offset = 0
+                for output_index, out in enumerate(list_of_outputs):
+                    metadata = out.get("full_logits")
+                    if not isinstance(metadata, StreamedFullLogitsMetadata):
+                        raise TypeError(
+                            "Packed teacher IPC must return tensor-free streamed "
+                            f"metadata, got output={output_index}, "
+                            f"type={type(metadata).__name__}."
+                        )
+                    expected_lengths = tuple(
+                        local_valid_lengths_by_microbatch[output_index]
+                    )
+                    expected_batch_size = len(expected_lengths)
+                    if (
+                        metadata.batch_size != expected_batch_size
+                        or metadata.logical_seq_len != target_local_seq
+                        or metadata.local_vocab_size != local_vocab_size
+                        or metadata.dtype != storage.dtype
+                        or metadata.device != storage.device
+                        or metadata.storage_token_offset != next_streamed_token_offset
+                        or metadata.stored_seq_lengths != expected_lengths
+                    ):
+                        raise ValueError(
+                            "Packed teacher IPC streamed metadata disagrees with "
+                            "the planned logical geometry: "
+                            f"output={output_index}, metadata={metadata}, "
+                            f"expected_batch={expected_batch_size}, "
+                            f"expected_seq={target_local_seq}, "
+                            f"expected_vocab={local_vocab_size}, "
+                            f"expected_dtype={storage.dtype}, "
+                            f"expected_device={storage.device}, "
+                            f"expected_offset={next_streamed_token_offset}, "
+                            f"expected_lengths={expected_lengths}."
+                        )
+                    streamed_metadata.append(metadata)
+                    batch_sizes.append(expected_batch_size)
+                    next_streamed_token_offset += sum(expected_lengths)
+                if (
+                    next_streamed_token_offset != total_stored_tokens
+                    or full_logits_postprocessor.packed_output_token_cursor
+                    != total_stored_tokens
+                ):
+                    raise ValueError(
+                        "Packed teacher IPC streaming did not fill the planned slab "
+                        "exactly: "
+                        f"metadata_tokens={next_streamed_token_offset}, "
+                        f"cursor={full_logits_postprocessor.packed_output_token_cursor}, "
+                        f"planned={total_stored_tokens}."
+                    )
+            else:
+                first_vals = list_of_outputs[0]["full_logits"]
+                if not isinstance(first_vals, torch.Tensor) or first_vals.ndim != 3:
+                    raise ValueError(
+                        "Dense teacher IPC expects three-dimensional logits, got "
+                        f"type={type(first_vals).__name__}, "
+                        f"shape={getattr(first_vals, 'shape', None)}."
+                    )
+                local_vocab_size = int(first_vals.shape[-1])
+                for output_index, out in enumerate(list_of_outputs):
+                    vals = out["full_logits"]
+                    if not isinstance(vals, torch.Tensor) or vals.ndim != 3:
+                        raise ValueError(
+                            "Dense teacher IPC expects three-dimensional logits, "
+                            f"got output={output_index}, "
+                            f"type={type(vals).__name__}, "
+                            f"shape={getattr(vals, 'shape', None)}."
+                        )
+                    batch_size_mb, seq_len_mb, output_vocab_size = vals.shape
+                    if batch_size_mb <= 0:
+                        raise ValueError(
+                            "Dense teacher IPC microbatches must contain at least "
+                            f"one logical row, got output={output_index}."
+                        )
+                    if (
+                        seq_len_mb > target_local_seq
+                        or output_vocab_size != local_vocab_size
+                        or vals.dtype != first_vals.dtype
+                        or vals.device != first_vals.device
+                    ):
+                        raise ValueError(
+                            "Dense teacher IPC outputs must share sequence/vocabulary "
+                            "geometry, dtype, and device: "
+                            f"output={output_index}, value={tuple(vals.shape)}/"
+                            f"{vals.dtype}/{vals.device}, expected seq_len<="
+                            f"{target_local_seq}, vocab={local_vocab_size}, "
+                            f"where={first_vals.dtype}/{first_vals.device}."
+                        )
+                    if len(valid_lengths_by_microbatch[output_index]) != batch_size_mb:
+                        raise ValueError(
+                            "Dense teacher IPC valid-length cardinality does not "
+                            f"match output={output_index}: lengths="
+                            f"{len(valid_lengths_by_microbatch[output_index])}, "
+                            f"rows={batch_size_mb}."
+                        )
+                    batch_sizes.append(int(batch_size_mb))
+                storage = self._ensure_teacher_ipc_storage(
+                    total_tokens=total_stored_tokens,
+                    vocab_size=local_vocab_size,
+                    dtype=first_vals.dtype,
+                    device=first_vals.device,
+                )
+
+            token_partitions = partition_teacher_ipc_token_buffer(
+                storage, local_valid_lengths_by_microbatch
+            )
+            if total_stored_tokens > 0:
+                payload_ipc = get_handle_from_tensor(storage)
+                self._teacher_ipc_handles = [payload_ipc]
+            else:
+                self._teacher_ipc_handles = []
+            row_cursor = 0
+            for batch_size in batch_sizes:
+                row_offsets.append(row_cursor)
+                row_cursor += batch_size
+
+        for output_index, out in enumerate(list_of_outputs):
+            vals = None
+            if stream_packed_outputs:
+                metadata = streamed_metadata[output_index]
+                batch_size_mb = metadata.batch_size
+                seq_len_mb = metadata.logical_seq_len
+            else:
+                # Drop each dense forward-output owner immediately after its copy.
+                vals = out.pop("full_logits")
+                assert isinstance(vals, torch.Tensor)
+                batch_size_mb, seq_len_mb, _ = vals.shape
+            assert storage is not None
+            row_partitions = token_partitions[output_index]
+            local_valid_lengths = local_valid_lengths_by_microbatch[output_index]
+            if len(row_partitions) != batch_size_mb:
+                raise ValueError(
+                    "Dense teacher IPC output does not match its compact token "
+                    f"partition: rows={batch_size_mb}, partitions="
+                    f"{len(row_partitions)}."
+                )
+
+            batch_item_ids = batch_item_ids_by_microbatch[output_index]
+            full_vocab_size = local_vocab_size * tp_size
+            vocab_start_index = tp_rank * local_vocab_size
+            vocab_end_index = (tp_rank + 1) * local_vocab_size
+            for sample_index_in_buf in range(batch_size_mb):
+                token_offset, row_view = row_partitions[sample_index_in_buf]
+                stored_seq_len = local_valid_lengths[sample_index_in_buf]
+                if stored_seq_len > seq_len_mb or tuple(row_view.shape) != (
+                    stored_seq_len,
+                    local_vocab_size,
+                ):
+                    raise ValueError(
+                        "Dense teacher IPC valid-prefix partition exceeds its "
+                        f"source row: output={output_index}, sample="
+                        f"{sample_index_in_buf}, stored={stored_seq_len}, "
+                        f"source_shape={None if vals is None else tuple(vals.shape)}, "
+                        "view_shape="
+                        f"{tuple(row_view.shape)}."
+                    )
+                if vals is not None and stored_seq_len > 0:
+                    row_view.copy_(vals[sample_index_in_buf, :stored_seq_len])
+                handle_record = {
+                    "payload_ipc": payload_ipc,
+                    "buf_idx": 0,
+                    "sample_index_in_buf": sample_index_in_buf,
+                    "ipc_layout": DENSE_TEACHER_IPC_FLAT_LAYOUT,
+                    "storage_shape": tuple(storage.shape),
+                    "storage_row_offset": row_offsets[output_index],
+                    "storage_capacity_rows": sum(batch_sizes),
+                    "storage_token_offset": token_offset,
+                    "storage_used_tokens": total_stored_tokens,
+                    "storage_capacity_tokens": int(storage.shape[0]),
+                    "stored_seq_len": stored_seq_len,
+                    "valid_seq_len": valid_lengths_by_microbatch[output_index][
+                        sample_index_in_buf
+                    ],
+                    "actual_shape": (target_local_seq, local_vocab_size),
+                    "dtype": storage.dtype,
+                    "tp_rank": tp_rank,
+                    "cp_rank": cp_rank,
+                    "tp_size": tp_size,
+                    "cp_size": cp_size,
+                    "world_rank": world_rank,
+                    "vocab_start_index": vocab_start_index,
+                    "vocab_end_index": vocab_end_index,
+                    "global_seq_start": global_seq_start,
+                    "full_vocab_size": full_vocab_size,
+                    "full_seq_len": full_seq_len,
+                    "vocab_sharded": tp_size > 1,
+                    "sequence_sharded": cp_size > 1,
+                }
+                if batch_item_ids is not None:
+                    handle_record["batch_item_id"] = batch_item_ids[sample_index_in_buf]
+                per_sample_handles.append(handle_record)
+            if vals is not None:
+                del vals
+        # Force the async copies above to complete before the IPC handles are
+        # consumed by the student process, so the consumer can't observe a
+        # partially written buffer.
+        torch.cuda.synchronize()
+        return {"per_sample_handles": per_sample_handles, "dp_rank": dp_rank}
+
+    def release_ipc_buffer(self) -> None:
+        """Free the persistent teacher-logit IPC storage.
+
+        Called once at the end of training / validation (and on error) by the
+        driver, not per call.
+        """
+        self._teacher_ipc_storage = None
+        self._teacher_ipc_handles = []
+        gc.collect()
+        torch.cuda.empty_cache()
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
@@ -4336,7 +4881,13 @@ class MegatronPolicyWorkerImpl(
         else:
             # Ordinary offload case
             if move_params:
-                model.to(device=device, non_blocking=True)
+                # Inference-only Megatron teachers are not wrapped in DDP.
+                # Loading a CPU state dict into a CUDA module only copies the
+                # values back into its existing CUDA parameters; it does not
+                # change their device and therefore does not free GPU memory.
+                # Move the module itself, matching the DTensor worker's
+                # offload/onload lifecycle.
+                model = model.to(device=device, non_blocking=True)
         return model
 
     def move_optimizer(self, device: str):

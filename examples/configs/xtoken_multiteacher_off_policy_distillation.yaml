@@ -1,7 +1,7 @@
 # Cross-tokenizer off-policy distillation (supports multiple teachers).
 #
-# Defaults: Llama-3.2-1B (student) <- Multi teacher: microsoft/Phi-4-mini-instruct (H-KL loss mode) + Llama-3.2-3B
-# (gold_loss=true, xtoken_loss=true). `teachers:` is a list — append more
+# Defaults: Llama-3.2-1B (student) <- Multi teacher: microsoft/Phi-4-mini-instruct
+# + Llama-3.2-3B, v6 cross-tokenizer KD (prefix-bidir partition KL). `teachers:` is a list — append more
 # entries for multi-teacher distillation (Llama-3.2-3B second-teacher
 # example follows the first entry below). Each teacher carries its own
 # `aligner` block and `weight`; a null `aligner.projection_matrix_path` marks a
@@ -20,6 +20,11 @@ distillation:
   val_period: 0               # validation disabled by default
   val_at_start: false
   val_at_end: false
+  # Offload the student model/optimizer to CPU after each optimizer step. The
+  # student and the teachers share the same GPUs, so on memory-tight pairings
+  # (large MoE teacher) the next step's teacher forward otherwise competes with
+  # resident student optimizer state.
+  offload_student_after_step: false
 
 loss_fn:
   # NOTE: the per-(student, teacher) projection matrix path now lives at
@@ -27,30 +32,57 @@ loss_fn:
   # knobs in this block are shared across all teachers.
   # See docs/guides/xtoken-off-policy-distillation.md for how to produce the
   # projection file.
-  # Loss-mode selection (shared default; override per teacher via
-  # teachers[i].gold_loss / .xtoken_loss in `sum` mode):
-  #   gold_loss=false                    -> P-KL: full-vocab teacher logits
-  #     transported via IPC; the loss derives a microbatch-global top-k
-  #     (size `vocab_topk`) inside, projects student to teacher vocab via
-  #     M, and chunk-averages KL on the [k] subset. CE term is added.
-  #   gold_loss=true, xtoken_loss=false  -> gold-loss:
-  #     KL on the exact-mapped common vocab (top-1 weight == 1.0) + L1
-  #     on the uncommon vocab tail (sorted, capped at `uncommon_topk`).
-  #   gold_loss=true, xtoken_loss=true   -> relaxed gold: same partition
-  #     math but exact-map threshold is >= 0.6 and collisions are resolved
-  #     by keeping the higher-weight student.
-  # `xtoken_loss=true` requires `gold_loss=true`.
-  gold_loss: false
-  xtoken_loss: false
+  #
+  # A cross-tokenizer teacher's KD term is the v6 prefix-bidir partition KL:
+  # a common-vocab partition KL/JSD on the exact 1-to-1 token map, plus a
+  # batched mismatch partition KL over prefix-support alternatives for non-
+  # 1-to-1 chunks (MtoM-as-ALM + rest bucket) and an optional position-0 KL,
+  # combined with a next-token student CE term. A same-tokenizer teacher
+  # (teachers[i].aligner.projection_matrix_path: null) uses a direct top-k KL.
   temperature: 1.0
-  vocab_topk: 8192            # P-KL only; size of the microbatch-global
-                              # top-k derived inside the loss
-  uncommon_topk: 8192         # gold-loss only; caps the L1 uncommon tail
-  reverse_kl: false
-  exact_token_match_only: false
-  kl_loss_weight: 1.0         # P-KL only
-  ce_loss_scale: 0.1          # P-KL only
-  dynamic_loss_scaling: true  # P-KL only
+  vocab_topk: 8192            # same-vocab direct-KL path only (top-k size)
+  reverse_kl: false           # KL(student||teacher) instead of KL(teacher||student)
+  kl_loss_weight: 1.0         # KD weight in fixed-weight mode
+  ce_loss_scale: 0.1          # CE weight in fixed-weight mode
+  dynamic_loss_scaling: true  # rescale KD to match CE magnitude each step
+                              # (kl_loss_weight / ce_loss_scale then ignored)
+  # ---- v6 (prefix-bidir partition KL) knobs ----
+  # Common-vocab support source: false => derive the exact 1-to-1 map from the
+  # projection matrix; true => from each teacher's forward pseudo-target table
+  # (teachers[i].aligner.pseudo_target_path, required when true).
+  common_indices_from_subtoks: false
+  # Per-chunk "logits[t-1] predicts token t" shift, skipped for chunks at a
+  # sequence start.
+  kl_chunk_shift: false
+  # Loss fn for the 1-to-1 common-vocab term and the position-0 term:
+  # "kl" | "jsd" | "bce".
+  prefix_bidir_v3_loss_fn: "kl"
+  # Loss fn for the position-N-1 (last-position) partition KL; null => inherit
+  # prefix_bidir_v3_loss_fn.
+  prefix_bidir_v3_last_pos_loss_fn: null
+  # beta for the generalized JSD mixture (0.5 => symmetric JSD; used when a
+  # loss fn above is "jsd").
+  prefix_bidir_v3_jsd_beta: 0.5
+  # Add the position-0 partition KL on common vocab for non-1-to-1 chunks.
+  prefix_bidir_v3_position_0_kl: false
+  # Drop chunks whose realized teacher label fell outside the teacher's true
+  # top-k (0 disables the filter).
+  prefix_bidir_v3_noise_filter_topk: 0
+  # Teacher-logit IPC transport for cross-tokenizer teachers. 0 keeps the
+  # exact dense full-vocab path; k > 0 sends row-wise sparse support with the
+  # exact full-vocab log-normalizer and a rest bucket.
+  teacher_topk_ipc_k: 0
+  # Sparse support selection. The current port supports row-wise top-k
+  # independently at each teacher position.
+  teacher_topk_ipc_support_mode: "row_topk"
+  # When sparse transport is active, reserve each realized teacher label in
+  # the support. This also permits one-element mismatch support in v6.
+  teacher_topk_ipc_keep_realized: true
+  # Advanced (unset => v6 defaults): the non-1-to-1 mismatch weighting
+  # (prefix_bidir_v3_mismatch_pos0_alpha / _mismatch_loss_beta, both require
+  # position_0_kl: true) and the pure-ALM baseline
+  # (prefix_bidir_v3_pure_alm). See
+  # CrossTokenizerDistillationLossConfig for the full set.
   # ---- Multi-teacher aggregation (defaults reproduce single-teacher) ----
   # kd_loss_mode: how per-teacher KD terms are combined.
   #   "sum"             -> total_kd = Σ_i weight_i * KD_i  (default)
@@ -63,6 +95,11 @@ loss_fn:
   sum_weights_metric: null
   alpha: 1.0                  # softmax temperature on dynamic teacher weights
   normalize_teacher_by_vocab: false  # rescale by log(V_t_i)/log(min_j V_t_j)
+  # Per-teacher routing observability is emitted under the training prefix:
+  #   train/teacher_<i>/routed_samples  - non-padding rows sent to teacher i
+  #   train/teacher_<i>/routed_tokens   - input tokens in teacher i's tokenizer
+  #   train/teacher_<i>/weighted_kl     - contribution to train/kl_loss after
+  #                                       teacher weight / vocab normalization
 
 checkpointing:
   enabled: false
@@ -97,7 +134,18 @@ policy:
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
+    # dtype the checkpoint is materialized in, independent of `precision` (the
+    # compute dtype). "float32" keeps fp32 optimizer master weights.
+    load_precision: "float32"
+    # Shard before loading weights instead of materializing the unwrapped model
+    # on every rank first. Lowers peak memory for large checkpoints.
+    shard_before_load: false
   max_grad_norm: 1.0
+  # Freeze (requires_grad=False) parameters whose name contains any of these
+  # substrings; null => nothing frozen. Use for submodules that never receive a
+  # gradient, e.g. ["mtp"] for a nemotron_h multi-token-prediction head, so the
+  # optimizer state saved at a checkpoint matches what is expected on resume.
+  freeze_parameter_patterns: null
   dynamic_batching:
     enabled: false
     train_mb_tokens: 2048
@@ -110,6 +158,7 @@ policy:
     algorithm: "modified_first_fit_decreasing"
     microbatch_order: "packer"
     sequence_length_round: 64
+    fuse_loss: false
   optimizer:
     name: "torch.optim.AdamW"
     kwargs:
@@ -146,11 +195,12 @@ teachers:
       # In chat mode, drop the opener content pair from this teacher's KD
       # alignment. The CE token mask is unaffected.
       drop_first_assistant_chunk_kl: false
+      # Optional forward (student->teacher) and reverse (teacher->student)
+      # sub-token chain tables (.pt with `subtoks` / `lengths`). Needed for
+      # prefix support and, when common_indices_from_subtoks=true, the common map.
+      pseudo_target_path: null
+      reverse_pseudo_target_path: null
     weight: 1.0                  # static loss weight in kd_loss_mode=sum
-    # gold_loss / xtoken_loss (optional): per-teacher overrides of the loss_fn
-    gold_loss: true
-    xtoken_loss: true
-    # globals, honored only in kd_loss_mode=sum. Omit to use the globals.
     tokenizer:
       name: "microsoft/Phi-4-mini-instruct"
     train_global_batch_size: 64
@@ -170,6 +220,11 @@ teachers:
       tensor_parallel_size: 1
       context_parallel_size: 1
       custom_parallel_plan: null
+      # A teacher runs inference-only, so "bfloat16" here halves initialization
+      # and resident parameter memory at no cost — there is no optimizer whose
+      # master weights would lose precision.
+      load_precision: "bfloat16"
+      shard_before_load: false
     max_grad_norm: 1.0
     dynamic_batching:
       enabled: false
@@ -183,6 +238,7 @@ teachers:
       algorithm: "modified_first_fit_decreasing"
       microbatch_order: "packer"
       sequence_length_round: 64
+      fuse_loss: false
     optimizer:
       name: "torch.optim.AdamW"
       kwargs:
@@ -224,6 +280,11 @@ teachers:
       tensor_parallel_size: 1
       context_parallel_size: 1
       custom_parallel_plan: null
+      # A teacher runs inference-only, so "bfloat16" here halves initialization
+      # and resident parameter memory at no cost — there is no optimizer whose
+      # master weights would lose precision.
+      load_precision: "bfloat16"
+      shard_before_load: false
     max_grad_norm: 1.0
     dynamic_batching:
       enabled: false
@@ -237,6 +298,7 @@ teachers:
       algorithm: "modified_first_fit_decreasing"
       microbatch_order: "packer"
       sequence_length_round: 64
+      fuse_loss: false
     optimizer:
       name: "torch.optim.AdamW"
       kwargs:

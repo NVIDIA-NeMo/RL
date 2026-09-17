@@ -38,7 +38,7 @@ from nemo_rl.data.multimodal_utils import (
     VLLM_PROMPT_KEYS,
     PackedTensor,
 )
-from nemo_rl.data.packing import get_packer
+from nemo_rl.data.packing import LockstepPackingPlan, get_packer
 from nemo_rl.distributed.collectives import (
     gather_jagged_object_lists,
     rebalance_nd_tensor,
@@ -135,6 +135,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         self.micro_batch_indices = None
         self.micro_batch_lengths = None
         self.elem_counts_per_gb = None
+        self.lockstep_packing_plan: LockstepPackingPlan | None = None
+        self.lockstep_side_id: str | None = None
+        self.lockstep_bin_indices: tuple[int, ...] | None = None
 
     def get_multimodal_dict(
         self,
@@ -925,6 +928,89 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
         return aggregated_shards
 
+    def shard_by_packing_plan(
+        self,
+        plan: LockstepPackingPlan,
+        *,
+        side_id: str,
+    ) -> list["SlicedDataDict"]:
+        """Shard one logical global batch using a controller-owned lockstep plan.
+
+        Unlike :meth:`shard_by_batch_size`, this method never computes or
+        repairs bin membership.  It validates occurrence IDs, follows the
+        plan's canonical contiguous DP ownership, and installs the physical-bin
+        schedule expected by backend microbatch iterators.
+        """
+        if side_id not in plan.sides:
+            raise ValueError(
+                f"lockstep plan batch_uid={plan.batch_uid} has no side "
+                f"{side_id!r}; available sides are {tuple(plan.sides)!r}."
+            )
+        if "batch_item_id" not in self.data:
+            raise ValueError(
+                "plan-driven sharding requires a batch_item_id field assigned "
+                "by the xToken controller."
+            )
+        item_ids_value = self.data["batch_item_id"]
+        if isinstance(item_ids_value, torch.Tensor):
+            if item_ids_value.ndim != 1:
+                raise ValueError(
+                    "batch_item_id must be a one-dimensional tensor or list; "
+                    f"got shape {tuple(item_ids_value.shape)}."
+                )
+            item_ids = tuple(int(value) for value in item_ids_value.tolist())
+        elif isinstance(item_ids_value, list):
+            item_ids = tuple(int(value) for value in item_ids_value)
+        else:
+            raise TypeError(
+                "batch_item_id must be a one-dimensional tensor or list, got "
+                f"{type(item_ids_value).__name__}."
+            )
+        if len(set(item_ids)) != len(item_ids):
+            raise ValueError(
+                "batch_item_id values must be occurrence-unique before "
+                f"plan-driven sharding; got {item_ids}."
+            )
+        if len(item_ids) != len(plan.canonical_batch_item_ids) or set(item_ids) != set(
+            plan.canonical_batch_item_ids
+        ):
+            missing = sorted(set(plan.canonical_batch_item_ids) - set(item_ids))
+            unexpected = sorted(set(item_ids) - set(plan.canonical_batch_item_ids))
+            raise ValueError(
+                f"batch_item_id membership differs from lockstep plan "
+                f"batch_uid={plan.batch_uid}: missing={missing}, "
+                f"unexpected={unexpected}."
+            )
+
+        row_by_id = {item_id: row for row, item_id in enumerate(item_ids)}
+        side_plan = plan.sides[side_id]
+        shards: list[SlicedDataDict] = []
+        for rank_bin_indices in side_plan.rank_bin_indices:
+            rank_bins = [plan.bins[bin_index] for bin_index in rank_bin_indices]
+            rank_item_ids = [item_id for values in rank_bins for item_id in values]
+            rank_rows = [row_by_id[item_id] for item_id in rank_item_ids]
+            shard = SlicedDataDict(self.select_indices(rank_rows).data)
+
+            micro_batch_indices: list[list[int]] = []
+            row_offset = 0
+            for values in rank_bins:
+                next_offset = row_offset + len(values)
+                micro_batch_indices.append([row_offset, next_offset])
+                row_offset = next_offset
+            shard.micro_batch_indices = [micro_batch_indices]
+            shard.micro_batch_lengths = [
+                [
+                    side_plan.physical_tokens_by_bin[bin_index]
+                    for bin_index in rank_bin_indices
+                ]
+            ]
+            shard.elem_counts_per_gb = [len(rank_item_ids)]
+            shard.lockstep_packing_plan = plan
+            shard.lockstep_side_id = side_id
+            shard.lockstep_bin_indices = rank_bin_indices
+            shards.append(shard)
+        return shards
+
     def get_batch(self, batch_idx, batch_size=None) -> "SlicedDataDict":
         """Slices a subbatch from the batch.
 
@@ -980,6 +1066,13 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     f"end: {end} is greater than the shape of the tensor: {self.data[k].shape[0]} for key: {k}"
                 )
             sliced_batch[k] = self.data[k][start:end]
+        # A lockstep plan is immutable controller metadata, not a batch-axis
+        # payload. Preserve it through the global-batch and physical-bin slices
+        # taken inside workers so each backend can validate the materialized
+        # IDs and geometry instead of silently recomputing membership.
+        sliced_batch.lockstep_packing_plan = self.lockstep_packing_plan
+        sliced_batch.lockstep_side_id = self.lockstep_side_id
+        sliced_batch.lockstep_bin_indices = self.lockstep_bin_indices
         return sliced_batch
 
     def repeat_interleave(

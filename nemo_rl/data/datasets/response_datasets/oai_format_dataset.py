@@ -19,6 +19,9 @@ from typing import Any, Callable, Union
 from datasets import load_dataset
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
+from nemo_rl.data.datasets.response_datasets.response_dataset import (
+    attach_source_sample_id,
+)
 
 
 class PreservingDataset:
@@ -107,6 +110,8 @@ class OpenAIFormatDataset(RawDataset):
             heterogeneous schemas (e.g., for tool calls with varying argument
             structures). If False, uses standard HuggingFace dataset loading.
             Default is False for backward compatibility.
+        subset: Optional source subset/config used in synthesized sample IDs.
+        split: Source split used in synthesized sample IDs.
 
     Notes:
         - system_key and system_prompt are optional. If provided, it will be added
@@ -127,6 +132,8 @@ class OpenAIFormatDataset(RawDataset):
         system_prompt: str | None = None,
         tool_key: str | None = "tools",
         use_preserving_dataset: bool = False,
+        subset: str | None = None,
+        split: str | None = "train",
         **kwargs,
     ):
         self.chat_key = chat_key
@@ -141,6 +148,18 @@ class OpenAIFormatDataset(RawDataset):
         if not use_preserving_dataset:
             # Use the standard HuggingFace approach (faster and more standard)
             original_dataset = load_dataset("json", data_files=data_path)["train"]
+            original_dataset = original_dataset.map(
+                attach_source_sample_id,
+                with_indices=True,
+                remove_columns=["sample_id"]
+                if "sample_id" in original_dataset.column_names
+                else None,
+                fn_kwargs={
+                    "data_path": data_path,
+                    "subset": subset,
+                    "split": split,
+                },
+            )
             # Format the dataset
             self.dataset = original_dataset.map(self.format_data)
 
@@ -175,8 +194,21 @@ class OpenAIFormatDataset(RawDataset):
             # Load JSON files directly
             with open(data_path, "r") as f:
                 original_dataset = [json.loads(line) for line in f]
+            identified_dataset = [
+                {
+                    **item,
+                    **attach_source_sample_id(
+                        item,
+                        raw_ordinal,
+                        data_path=data_path,
+                        subset=subset,
+                        split=split,
+                    ),
+                }
+                for raw_ordinal, item in enumerate(original_dataset)
+            ]
             # Format the dataset
-            formatted_data = [self.format_data(item) for item in original_dataset]
+            formatted_data = [self.format_data(item) for item in identified_dataset]
             # Use PreservingDataset to maintain exact structure
             self.dataset = PreservingDataset(formatted_data)
 
@@ -193,7 +225,11 @@ class OpenAIFormatDataset(RawDataset):
         assert messages[-1]["role"] == "assistant"
 
         # Preserve tools if they exist in the data
-        result = {"messages": messages, "task_name": self.task_name}
+        result = {
+            "messages": messages,
+            "task_name": self.task_name,
+            "sample_id": data["sample_id"],
+        }
         if self.tool_key and self.tool_key in data:
             result["tools"] = data[self.tool_key]
 

@@ -16,6 +16,7 @@ import asyncio
 import os
 import tempfile
 import time
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -1674,6 +1675,368 @@ def test_megatron_move_model_does_not_serialize_extra_state():
     assert moved_model is model
     assert model.weight.device.type == "cpu"
     assert model.scale.device.type == "cpu"
+
+
+def test_full_logits_ipc_uses_valid_prefix_slab_and_preserves_logical_indices(
+    monkeypatch,
+):
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    from nemo_rl.models.policy.workers import megatron_policy_worker as mpw
+
+    batch_sizes = [7, 2, 1]
+    batch_item_ids = [list(range(10, 17)), [20, 21], [30]]
+    input_lengths = [[1, 4, 2, 0, 3, 1, 2], [3, 1], [4]]
+    processed_microbatches = []
+    for ids, lengths in zip(batch_item_ids, input_lengths, strict=True):
+        cumulative_lengths = [0]
+        for length in lengths:
+            cumulative_lengths.append(cumulative_lengths[-1] + length)
+        cu_seqlens = torch.tensor(cumulative_lengths, dtype=torch.int32)
+        packed_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens,
+            cu_seqlens_kv_padded=cu_seqlens,
+        )
+        processed_microbatches.append(
+            SimpleNamespace(
+                data_dict=BatchedDataDict(
+                    {
+                        "batch_item_id": torch.tensor(ids),
+                        "input_ids": torch.zeros(len(ids), 4, dtype=torch.long),
+                        "input_lengths": torch.tensor(lengths),
+                    }
+                ),
+                cu_seqlens_padded=cu_seqlens,
+                packed_seq_params=packed_params,
+            )
+        )
+
+    def fake_get_microbatch_iterator(*_args, **_kwargs):
+        return iter(processed_microbatches), len(batch_sizes), 1, 4, 4
+
+    retained_outputs = []
+
+    def fake_megatron_forward_backward(**kwargs):
+        outputs = []
+        for bin_index, processed_mb in enumerate(kwargs["data_iterator"]):
+            physical_tokens = int(processed_mb.cu_seqlens_padded[-1].item())
+            output_tensor = torch.full(
+                (1, physical_tokens, 2),
+                float(bin_index + 1),
+                dtype=torch.bfloat16,
+            )
+            wrapped = kwargs["post_processing_fn"](
+                data_dict=processed_mb.data_dict,
+                cu_seqlens_padded=processed_mb.cu_seqlens_padded,
+                packed_seq_params=processed_mb.packed_seq_params,
+            )
+            _, output = wrapped(output_tensor)
+            outputs.append(output)
+        retained_outputs.extend(outputs)
+        return outputs
+
+    def fake_handle(storage):
+        return (tuple(storage.shape), int(storage.storage_offset()))
+
+    monkeypatch.setattr(mpw, "get_microbatch_iterator", fake_get_microbatch_iterator)
+    monkeypatch.setattr(
+        mpw, "megatron_forward_backward", fake_megatron_forward_backward
+    )
+    monkeypatch.setattr(mpw, "get_handle_from_tensor", fake_handle)
+    monkeypatch.setattr(mpw.torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(mpw.torch.cuda.nvtx, "range_push", lambda _name: None)
+    monkeypatch.setattr(mpw.torch.cuda.nvtx, "range_pop", lambda: None)
+    monkeypatch.setattr(mpw.torch.distributed, "get_rank", lambda: 7)
+    monkeypatch.setattr(mpw.parallel_state, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        mpw.parallel_state, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(mpw.parallel_state, "get_data_parallel_rank", lambda: 0)
+    monkeypatch.setattr(mpw.parallel_state, "get_context_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        mpw.parallel_state, "get_context_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(
+        mpw.parallel_state,
+        "is_pipeline_last_stage",
+        lambda ignore_virtual: ignore_virtual,
+    )
+
+    worker = object.__new__(mpw.MegatronPolicyWorkerImpl)
+    worker.delegate_pack_to_model = False
+    worker.cfg = {
+        "logprob_batch_size": 1,
+        "sequence_packing": {"enabled": True},
+    }
+    worker.model = SimpleNamespace(eval=lambda: None)
+    worker.mcore_state = SimpleNamespace(straggler_timer=None)
+    worker.defer_fp32_logits = False
+    worker.final_padded_vocab_size = 2
+    flat_input_lengths = [value for microbatch in input_lengths for value in microbatch]
+    worker._teacher_ipc_storage = torch.empty(sum(flat_input_lengths), 2)
+    worker._teacher_ipc_handles = []
+
+    result = mpw.MegatronPolicyWorkerImpl.get_full_logits_ipc(
+        worker,
+        BatchedDataDict(
+            {
+                "input_ids": torch.zeros(sum(batch_sizes), 4, dtype=torch.long),
+                "input_lengths": torch.tensor(flat_input_lengths),
+            }
+        ),
+        micro_batch_size=1,
+    )
+
+    assert worker._teacher_ipc_storage.shape == (sum(flat_input_lengths), 2)
+    assert [record["batch_item_id"] for record in result["per_sample_handles"]] == [
+        item_id for microbatch in batch_item_ids for item_id in microbatch
+    ]
+    assert [record["buf_idx"] for record in result["per_sample_handles"]] == [
+        0,
+    ] * sum(batch_sizes)
+    assert [
+        record["sample_index_in_buf"] for record in result["per_sample_handles"]
+    ] == [index for batch_size in batch_sizes for index in range(batch_size)]
+    assert [
+        record["storage_row_offset"] for record in result["per_sample_handles"]
+    ] == [0] * 7 + [7] * 2 + [9]
+    expected_token_offsets = []
+    token_cursor = 0
+    for valid_length in flat_input_lengths:
+        expected_token_offsets.append(token_cursor)
+        token_cursor += valid_length
+    assert [
+        record["storage_token_offset"] for record in result["per_sample_handles"]
+    ] == expected_token_offsets
+    assert [
+        record["stored_seq_len"] for record in result["per_sample_handles"]
+    ] == flat_input_lengths
+    assert [
+        record["valid_seq_len"] for record in result["per_sample_handles"]
+    ] == flat_input_lengths
+    assert [record["actual_shape"] for record in result["per_sample_handles"]] == [
+        (4, 2)
+    ] * sum(batch_sizes)
+    assert worker._teacher_ipc_handles == [((sum(flat_input_lengths), 2), 0)]
+    assert {record["payload_ipc"] for record in result["per_sample_handles"]} == {
+        worker._teacher_ipc_handles[0]
+    }
+    token_cursor = 0
+    for expected_value, valid_length in zip(
+        [
+            bin_index + 1
+            for bin_index, batch_size in enumerate(batch_sizes)
+            for _ in range(batch_size)
+        ],
+        flat_input_lengths,
+        strict=True,
+    ):
+        assert torch.equal(
+            worker._teacher_ipc_storage[token_cursor : token_cursor + valid_length],
+            torch.full((valid_length, 2), float(expected_value)),
+        )
+        token_cursor += valid_length
+    assert token_cursor == worker._teacher_ipc_storage.shape[0]
+    assert all(
+        isinstance(output["full_logits"], mpw.StreamedFullLogitsMetadata)
+        for output in retained_outputs
+    )
+    assert all(
+        not isinstance(value, torch.Tensor)
+        for output in retained_outputs
+        for value in vars(output["full_logits"]).values()
+    )
+
+
+def test_full_logits_ipc_releases_and_grows_slab_before_forward(monkeypatch):
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    from nemo_rl.models.policy.workers import megatron_policy_worker as mpw
+
+    events = []
+    input_lengths = [4, 3]
+    cu_seqlens = torch.tensor([0, 4, 7], dtype=torch.int32)
+    packed_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens,
+        cu_seqlens_kv_padded=cu_seqlens,
+    )
+    processed_microbatch = SimpleNamespace(
+        data_dict=BatchedDataDict(
+            {
+                "batch_item_id": torch.tensor([10, 11]),
+                "input_ids": torch.zeros(2, 4, dtype=torch.long),
+                "input_lengths": torch.tensor(input_lengths),
+            }
+        ),
+        cu_seqlens_padded=cu_seqlens,
+        packed_seq_params=packed_params,
+    )
+
+    def fake_get_microbatch_iterator(*_args, **_kwargs):
+        return iter([processed_microbatch]), 1, 1, 4, 4
+
+    def fake_megatron_forward_backward(**kwargs):
+        processed_mb = next(kwargs["data_iterator"])
+        events.append("forward")
+        assert worker._teacher_ipc_storage.shape == (sum(input_lengths), 2)
+        wrapped = kwargs["post_processing_fn"](
+            data_dict=processed_mb.data_dict,
+            cu_seqlens_padded=processed_mb.cu_seqlens_padded,
+            packed_seq_params=processed_mb.packed_seq_params,
+        )
+        _, output = wrapped(torch.ones(1, sum(input_lengths), 2))
+        return [output]
+
+    real_ensure = mpw.ensure_teacher_ipc_token_buffer
+
+    def recording_ensure(storage, **kwargs):
+        events.append("allocate" if storage is None else "reuse")
+        if storage is None:
+            assert old_storage_ref() is None
+            assert worker._teacher_ipc_storage is None
+            assert worker._teacher_ipc_handles == []
+        return real_ensure(storage, **kwargs)
+
+    monkeypatch.setattr(mpw, "get_microbatch_iterator", fake_get_microbatch_iterator)
+    monkeypatch.setattr(
+        mpw, "megatron_forward_backward", fake_megatron_forward_backward
+    )
+    monkeypatch.setattr(mpw, "ensure_teacher_ipc_token_buffer", recording_ensure)
+    monkeypatch.setattr(
+        mpw, "get_handle_from_tensor", lambda storage: (tuple(storage.shape), 0)
+    )
+    monkeypatch.setattr(mpw.gc, "collect", lambda: events.append("collect"))
+    monkeypatch.setattr(
+        mpw.torch.cuda, "empty_cache", lambda: events.append("empty_cache")
+    )
+    monkeypatch.setattr(mpw.torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(mpw.torch.cuda.nvtx, "range_push", lambda _name: None)
+    monkeypatch.setattr(mpw.torch.cuda.nvtx, "range_pop", lambda: None)
+    monkeypatch.setattr(mpw.torch.distributed, "get_rank", lambda: 7)
+    monkeypatch.setattr(mpw.parallel_state, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        mpw.parallel_state, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(mpw.parallel_state, "get_data_parallel_rank", lambda: 0)
+    monkeypatch.setattr(mpw.parallel_state, "get_context_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        mpw.parallel_state, "get_context_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(
+        mpw.parallel_state,
+        "is_pipeline_last_stage",
+        lambda ignore_virtual: ignore_virtual,
+    )
+
+    worker = object.__new__(mpw.MegatronPolicyWorkerImpl)
+    worker.delegate_pack_to_model = False
+    worker.cfg = {
+        "logprob_batch_size": 1,
+        "sequence_packing": {"enabled": True},
+    }
+    worker.model = SimpleNamespace(eval=lambda: None)
+    worker.mcore_state = SimpleNamespace(straggler_timer=None)
+    worker.defer_fp32_logits = False
+    worker.final_padded_vocab_size = 2
+    old_storage = torch.empty(3, 2)
+    old_storage_ref = weakref.ref(old_storage)
+    worker._teacher_ipc_storage = old_storage
+    worker._teacher_ipc_handles = [("old",)]
+    del old_storage
+
+    mpw.MegatronPolicyWorkerImpl.get_full_logits_ipc(
+        worker,
+        BatchedDataDict(
+            {
+                "input_ids": torch.zeros(2, 4, dtype=torch.long),
+                "input_lengths": torch.tensor(input_lengths),
+            }
+        ),
+        micro_batch_size=1,
+    )
+
+    assert events == ["collect", "empty_cache", "allocate", "forward"]
+    assert worker._teacher_ipc_storage.shape == (sum(input_lengths), 2)
+
+
+def test_full_logits_ipc_nonlast_pipeline_stage_does_not_allocate(monkeypatch):
+    from nemo_rl.models.policy.workers import megatron_policy_worker as mpw
+
+    processed_microbatch = SimpleNamespace(
+        data_dict=BatchedDataDict(
+            {
+                "batch_item_id": torch.tensor([10]),
+                "input_ids": torch.zeros(1, 4, dtype=torch.long),
+                "input_lengths": torch.tensor([3]),
+            }
+        )
+    )
+
+    monkeypatch.setattr(
+        mpw,
+        "get_microbatch_iterator",
+        lambda *_args, **_kwargs: (iter([processed_microbatch]), 1, 1, 4, 4),
+    )
+
+    def fake_forward_backward(**kwargs):
+        list(kwargs["data_iterator"])
+        assert kwargs["post_processing_fn"].packed_output_storage is None
+        return []
+
+    monkeypatch.setattr(mpw, "megatron_forward_backward", fake_forward_backward)
+    monkeypatch.setattr(mpw.torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(mpw.torch.cuda.nvtx, "range_push", lambda _name: None)
+    monkeypatch.setattr(mpw.torch.cuda.nvtx, "range_pop", lambda: None)
+    monkeypatch.setattr(mpw.torch.distributed, "get_rank", lambda: 7)
+    monkeypatch.setattr(mpw.parallel_state, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        mpw.parallel_state, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(mpw.parallel_state, "get_data_parallel_rank", lambda: 0)
+    monkeypatch.setattr(mpw.parallel_state, "get_context_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        mpw.parallel_state, "get_context_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(
+        mpw.parallel_state,
+        "is_pipeline_last_stage",
+        lambda ignore_virtual: not ignore_virtual,
+    )
+
+    worker = object.__new__(mpw.MegatronPolicyWorkerImpl)
+    worker.delegate_pack_to_model = False
+    worker.cfg = {
+        "logprob_batch_size": 1,
+        "sequence_packing": {"enabled": True},
+    }
+    worker.model = SimpleNamespace(eval=lambda: None)
+    worker.mcore_state = SimpleNamespace(straggler_timer=None)
+    worker.defer_fp32_logits = False
+    worker._teacher_ipc_storage = None
+    worker._teacher_ipc_handles = []
+    worker._ensure_teacher_ipc_storage = MagicMock(
+        side_effect=AssertionError("non-last PP stage must not allocate IPC storage")
+    )
+
+    result = mpw.MegatronPolicyWorkerImpl.get_full_logits_ipc(
+        worker,
+        BatchedDataDict(
+            {
+                "input_ids": torch.zeros(1, 4, dtype=torch.long),
+                "input_lengths": torch.tensor([3]),
+            }
+        ),
+        micro_batch_size=1,
+    )
+
+    assert result == {"per_sample_handles": [], "dp_rank": 0}
+    worker._ensure_teacher_ipc_storage.assert_not_called()
 
 
 def test_megatron_prepare_for_training_restores_optimizer():

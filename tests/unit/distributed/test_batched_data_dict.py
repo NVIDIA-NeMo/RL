@@ -16,11 +16,98 @@ import pytest
 import torch
 
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.packing import (
+    LockstepPackingItem,
+    SidePackingSpec,
+    build_lockstep_packing_plan,
+)
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
     SequencePackingArgs,
 )
+
+
+def test_shard_by_packing_plan_follows_shared_ids_and_side_geometry():
+    plan = build_lockstep_packing_plan(
+        batch_uid=12,
+        items=tuple(
+            LockstepPackingItem(sample_id=f"row-{i}", batch_item_id=100 + i)
+            for i in range(8)
+        ),
+        data_parallel_size=2,
+        sides=(
+            SidePackingSpec(
+                side_id="student",
+                capacity=10,
+                raw_lengths=(4, 4, 2, 2, 3, 3, 2, 2),
+                effective_lengths=(4, 4, 2, 2, 3, 3, 2, 2),
+            ),
+            SidePackingSpec(
+                side_id="teacher_0",
+                capacity=12,
+                raw_lengths=(3, 3, 3, 3, 4, 4, 2, 2),
+                effective_lengths=(3, 3, 3, 3, 4, 4, 2, 2),
+            ),
+        ),
+    )
+    # Present the physical batch in a deliberately non-canonical order.  The
+    # explicit IDs, rather than row positions, drive routing.
+    order = [3, 0, 2, 1, 7, 5, 4, 6]
+    batch = BatchedDataDict(
+        {
+            "batch_item_id": [100 + i for i in order],
+            "value": torch.tensor(order),
+            "label": [f"v{i}" for i in order],
+        }
+    )
+    shards = batch.shard_by_packing_plan(plan, side_id="teacher_0")
+    assert len(shards) == 2
+    for rank, shard in enumerate(shards):
+        bin_indices = plan.sides["teacher_0"].rank_bin_indices[rank]
+        expected_ids = [
+            item_id for bin_index in bin_indices for item_id in plan.bins[bin_index]
+        ]
+        assert shard["batch_item_id"] == expected_ids
+        assert shard["value"].tolist() == [item_id - 100 for item_id in expected_ids]
+        assert shard.elem_counts_per_gb == [4]
+        assert shard.lockstep_packing_plan is plan
+        assert shard.lockstep_side_id == "teacher_0"
+        assert shard.lockstep_bin_indices == bin_indices
+        assert shard.micro_batch_lengths == [
+            [
+                plan.sides["teacher_0"].physical_tokens_by_bin[bin_index]
+                for bin_index in bin_indices
+            ]
+        ]
+        global_batch = shard.get_batch(0)
+        assert global_batch.lockstep_packing_plan is plan
+        assert global_batch.lockstep_side_id == "teacher_0"
+        for (
+            microbatch
+        ) in global_batch.make_microbatch_iterator_for_packable_sequences():
+            assert microbatch.lockstep_packing_plan is plan
+            assert microbatch.lockstep_side_id == "teacher_0"
+
+
+def test_shard_by_packing_plan_rejects_missing_occurrence_id():
+    plan = build_lockstep_packing_plan(
+        batch_uid=13,
+        items=(LockstepPackingItem(sample_id="row", batch_item_id=7),),
+        data_parallel_size=1,
+        sides=(
+            SidePackingSpec(
+                side_id="student",
+                capacity=8,
+                raw_lengths=(4,),
+                effective_lengths=(4,),
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="requires a batch_item_id"):
+        BatchedDataDict({"value": torch.tensor([1])}).shard_by_packing_plan(
+            plan, side_id="student"
+        )
 
 
 def test_shard_by_batch_size_basic():
