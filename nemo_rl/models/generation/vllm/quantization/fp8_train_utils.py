@@ -42,10 +42,15 @@ def canonicalize_mxfp8_refit_output(
             f"MXFP8 requires a non-empty shape with the last dim divisible by "
             f"{MXFP8_BLOCK_SIZE}, got {tuple(shape)}."
         )
-    if values.shape != shape:
+    if values.numel() != shape.numel():
         raise ValueError(
-            f"MXFP8 values must preserve weight shape {tuple(shape)}, got "
-            f"{tuple(values.shape)}."
+            f"MXFP8 values must contain {shape.numel()} elements for weight "
+            f"shape {tuple(shape)}, got {values.numel()}."
+        )
+    if not values.shape or values.shape[-1] != shape[-1]:
+        raise ValueError(
+            f"MXFP8 values must preserve the final dimension {shape[-1]} for "
+            f"weight shape {tuple(shape)}, got {tuple(values.shape)}."
         )
     if values.dtype != MXFP8_VALUE_DTYPE:
         raise ValueError(
@@ -56,6 +61,7 @@ def canonicalize_mxfp8_refit_output(
             f"MXFP8 scales must use {MXFP8_SCALE_DTYPE}, got {scales.dtype}."
         )
 
+    values = values.reshape(shape)
     scale_shape = torch.Size((*shape[:-1], shape[-1] // MXFP8_BLOCK_SIZE))
     expected_scales = scale_shape.numel()
     if scales.numel() != expected_scales:
