@@ -769,6 +769,26 @@ basic_megatron_test_config: PolicyConfig = {
 }
 
 
+@pytest.mark.parametrize(
+    "megatron_cfg_update",
+    [
+        {"virtual_pipeline_model_parallel_size": 2},
+        {"pipeline_model_parallel_layout": "E(tt|)*13tL"},
+    ],
+)
+def test_megatron_generation_rejects_virtual_pipeline_parallelism_before_cluster_setup(
+    megatron_cfg_update,
+):
+    config = deepcopy(basic_megatron_test_config)
+    config["megatron_cfg"].update(megatron_cfg_update)
+    cluster = MagicMock()
+
+    with pytest.raises(ValueError, match="virtual pipeline parallelism"):
+        MegatronGeneration(config=config, tokenizer=object(), cluster=cluster)
+
+    cluster._init_placement_groups.assert_not_called()
+
+
 @pytest.fixture(scope="function")
 def cluster():
     """A 1-node, 2-GPU virtual cluster (enough for tp/pp up to 2)."""

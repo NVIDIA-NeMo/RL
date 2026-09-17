@@ -233,6 +233,12 @@ def import_model_from_hf_name(
     orig_num_layers_in_last_pipeline_stage = (
         model_provider.num_layers_in_last_pipeline_stage
     )
+    orig_virtual_pipeline_model_parallel_size = getattr(
+        model_provider, "virtual_pipeline_model_parallel_size", None
+    )
+    orig_pipeline_model_parallel_layout = getattr(
+        model_provider, "pipeline_model_parallel_layout", None
+    )
     orig_pipeline_dtype = model_provider.pipeline_dtype
 
     if megatron_config is not None:
@@ -255,6 +261,16 @@ def import_model_from_hf_name(
         model_provider.num_layers_in_last_pipeline_stage = megatron_config[
             "num_layers_in_last_pipeline_stage"
         ]
+        if hasattr(model_provider, "virtual_pipeline_model_parallel_size"):
+            model_provider.virtual_pipeline_model_parallel_size = megatron_config.get(
+                "virtual_pipeline_model_parallel_size",
+                orig_virtual_pipeline_model_parallel_size,
+            )
+        if hasattr(model_provider, "pipeline_model_parallel_layout"):
+            model_provider.pipeline_model_parallel_layout = megatron_config.get(
+                "pipeline_model_parallel_layout",
+                orig_pipeline_model_parallel_layout,
+            )
         model_provider.pipeline_dtype = to_torch_dtype(
             megatron_config["pipeline_dtype"]
         )
@@ -299,6 +315,18 @@ def import_model_from_hf_name(
     config.expert_tensor_parallel_size = orig_expert_tensor_parallel_size
     config.num_layers_in_first_pipeline_stage = orig_num_layers_in_first_pipeline_stage
     config.num_layers_in_last_pipeline_stage = orig_num_layers_in_last_pipeline_stage
+    if (
+        hasattr(config, "virtual_pipeline_model_parallel_size")
+        or orig_virtual_pipeline_model_parallel_size is not None
+    ):
+        config.virtual_pipeline_model_parallel_size = (
+            orig_virtual_pipeline_model_parallel_size
+        )
+    if (
+        hasattr(config, "pipeline_model_parallel_layout")
+        or orig_pipeline_model_parallel_layout is not None
+    ):
+        config.pipeline_model_parallel_layout = orig_pipeline_model_parallel_layout
     config.pipeline_dtype = orig_pipeline_dtype
 
     # Stage the save next to the final path, then atomically rename into place

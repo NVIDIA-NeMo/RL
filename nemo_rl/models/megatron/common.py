@@ -33,6 +33,11 @@ def _round_up_to_multiple(value: int, multiple: int) -> int:
     )
 
 
+def chunk_prefixed_key(chunk_idx: int, name: str) -> str:
+    """Return the flattened state-dict key for a VPP model chunk."""
+    return f"{chunk_idx}/{name}"
+
+
 def broadcast_tensor(
     tensor: torch.Tensor | None, src_rank: int, group: dist.ProcessGroup
 ) -> torch.Tensor:

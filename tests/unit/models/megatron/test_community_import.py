@@ -270,6 +270,78 @@ def test_import_model_from_hf_name_calls_bridge_save(monkeypatch, tmp_path):
     assert sorted(p.name for p in tmp_path.iterdir()) == ["out"]
 
 
+def test_import_model_from_hf_name_tolerates_missing_optional_vpp_keys(monkeypatch):
+    module = _load_community_import_module(monkeypatch)
+    _install_runtime_stubs_for_hf_import(monkeypatch)
+
+    class FakeProvider:
+        def __init__(self):
+            self.tensor_model_parallel_size = 1
+            self.pipeline_model_parallel_size = 1
+            self.context_parallel_size = 1
+            self.expert_model_parallel_size = 1
+            self.expert_tensor_parallel_size = 1
+            self.num_layers_in_first_pipeline_stage = None
+            self.num_layers_in_last_pipeline_stage = None
+            self.virtual_pipeline_model_parallel_size = 2
+            self.pipeline_model_parallel_layout = "orig-layout"
+            self.pipeline_dtype = "fp32"
+
+        def finalize(self):
+            pass
+
+        def initialize_model_parallel(self, seed):
+            self.seed = seed
+
+        def provide_distributed_model(self, wrap_with_ddp, post_wrap_hook):
+            config = SimpleNamespace()
+            return [SimpleNamespace(config=config)]
+
+    class FakeBridge:
+        def __init__(self):
+            self.provider = FakeProvider()
+            self.saved_model = None
+
+        def to_megatron_provider(self, load_weights):
+            assert load_weights is True
+            return self.provider
+
+        def save_megatron_model(self, megatron_model, output_path):
+            self.saved_model = megatron_model
+            _stage_conversion(output_path)
+
+    fake_bridge = FakeBridge()
+
+    class FakeAutoBridge:
+        @staticmethod
+        def from_hf_pretrained(hf_model_name, *args, **kwargs):
+            assert hf_model_name == "fake/hf-model"
+            return fake_bridge
+
+    monkeypatch.setattr(module, "AutoBridge", FakeAutoBridge)
+
+    module.import_model_from_hf_name(
+        "fake/hf-model",
+        "/tmp/out",
+        {
+            "tensor_model_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_size": 1,
+            "expert_model_parallel_size": 1,
+            "expert_tensor_parallel_size": 1,
+            "num_layers_in_first_pipeline_stage": None,
+            "num_layers_in_last_pipeline_stage": None,
+            "pipeline_dtype": "fp32",
+            "sequence_parallel": False,
+            "gradient_accumulation_fusion": False,
+        },
+    )
+
+    saved_config = fake_bridge.saved_model[0].config
+    assert saved_config.virtual_pipeline_model_parallel_size == 2
+    assert saved_config.pipeline_model_parallel_layout == "orig-layout"
+
+
 @pytest.mark.parametrize(
     ("occupant", "overwrite", "staged_wins"),
     [

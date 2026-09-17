@@ -52,6 +52,41 @@ from nemo_rl.utils.checkpoint import CheckpointManager
 pytestmark = pytest.mark.mcore
 
 
+class _FakeModelChunk:
+    def __init__(self):
+        self.training_modes: list[bool] = []
+        self.zero_grad_buffer_calls = 0
+        self.inference_params = object()
+
+    def train(self, mode: bool) -> None:
+        self.training_modes.append(mode)
+
+    def zero_grad_buffer(self) -> None:
+        self.zero_grad_buffer_calls += 1
+
+
+def test_value_worker_model_chunk_helpers_apply_to_all_chunks():
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    worker = MegatronValueWorkerImpl.__new__(MegatronValueWorkerImpl)
+    chunks = [_FakeModelChunk(), _FakeModelChunk()]
+    worker.model = chunks
+
+    assert worker._model_chunks() == chunks
+    assert worker._primary_model() is chunks[0]
+
+    worker._set_models_train_mode(False)
+    assert [chunk.training_modes for chunk in chunks] == [[False], [False]]
+
+    worker._zero_grad_buffer()
+    assert [chunk.zero_grad_buffer_calls for chunk in chunks] == [1, 1]
+
+    worker._clear_inference_params()
+    assert [chunk.inference_params for chunk in chunks] == [None, None]
+
+
 def test_get_values_suspends_activation_offload() -> None:
     """Value inference must preserve the activation-offload training warmup."""
     from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -73,14 +108,17 @@ def test_get_values_suspends_activation_offload() -> None:
             self.do_offload = True
 
     manager = OffloadManager()
+    model_train_modes: list[bool] = []
     model_config = SimpleNamespace(fine_grained_activation_offloading=True)
-    model = SimpleNamespace(config=model_config, eval=lambda: None)
-    worker = SimpleNamespace(
-        cfg={"train_micro_batch_size": 1},
-        model=model,
-        _policy_like_cfg={},
-        mcore_state=SimpleNamespace(straggler_timer=None),
+    model = SimpleNamespace(
+        config=model_config,
+        train=lambda mode: model_train_modes.append(mode),
     )
+    worker = MegatronValueWorkerImpl.__new__(MegatronValueWorkerImpl)
+    worker.cfg = {"train_micro_batch_size": 1}
+    worker.model = model
+    worker._policy_like_cfg = {}
+    worker.mcore_state = SimpleNamespace(straggler_timer=None)
     observed_states: list[tuple[bool, bool]] = []
 
     def run_forward_only(**kwargs: Any) -> list[dict[str, torch.Tensor]]:
@@ -116,6 +154,7 @@ def test_get_values_suspends_activation_offload() -> None:
         result = MegatronValueWorkerImpl.get_values(worker, BatchedDataDict({}))
 
     torch.testing.assert_close(result["values"], torch.tensor([[1.0]]))
+    assert model_train_modes == [False]
     assert observed_states == [(False, False)]
     assert model_config.fine_grained_activation_offloading is True
     assert manager.do_offload is True
@@ -270,9 +309,11 @@ def test_prepare_for_training_leaves_native_cpu_optimizer_placement():
     class _TrainableModel:
         def __init__(self) -> None:
             self.train_called = False
+            self.train_mode: bool | None = None
 
-        def train(self) -> None:
+        def train(self, mode: bool = True) -> None:
             self.train_called = True
+            self.train_mode = mode
 
     worker = object.__new__(MegatronValueWorkerImpl)
     model = _TrainableModel()
@@ -288,6 +329,7 @@ def test_prepare_for_training_leaves_native_cpu_optimizer_placement():
     MegatronValueWorkerImpl.prepare_for_training(worker)
 
     assert model.train_called
+    assert model.train_mode is True
 
 
 @pytest.fixture

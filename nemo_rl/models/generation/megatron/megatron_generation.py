@@ -35,6 +35,9 @@ from nemo_rl.models.generation.megatron.config import (
     dedicated_inference_megatron_cfg,
     merged_inference_megatron_cfg,
 )
+from nemo_rl.models.generation.megatron.validation import (
+    validate_megatron_generation_backend_config,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
@@ -290,12 +293,10 @@ class MegatronGeneration(GenerationInterface):
             reserved_http_server_ports: Driver-reserved OpenAI server ports, keyed by
                 the distributed rank that will adopt each one (non-colocated only).
         """
-        # Import here to avoid circular imports
-        from nemo_rl.models.policy.lm_policy import Policy
-
         assert (cluster is None) != (policy is None), (
             "Provide exactly one of `cluster` or `policy`."
         )
+        validate_megatron_generation_backend_config(config)
         assert not (skip_weight_load and policy is not None), (
             "skip_weight_load only applies to the dedicated inference policy."
         )
@@ -303,6 +304,9 @@ class MegatronGeneration(GenerationInterface):
             "reserved_http_server_ports only applies to the dedicated inference "
             "policy; when colocated, pass them to the training policy instead."
         )
+
+        # Import here to avoid circular imports
+        from nemo_rl.models.policy.lm_policy import Policy
 
         # `self.cfg` exposes the `generation` that matches the `GenerationInterface` contract.
         # `self._policy_config` keeps a reference to the full PolicyConfig. Dedicated
