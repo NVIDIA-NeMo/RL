@@ -85,6 +85,8 @@ grep -F -- 'policy.generation.vllm_cfg.gpu_memory_utilization=0.6' \
 # unsupported. Keep every precision arm on the same supported TP4 topology.
 grep -F -- 'tensor_parallel_size: 4' \
   "${SCRIPT_DIR}/qwen235-performance-sync.yaml" >/dev/null
+grep -F -- 'gpu_memory_utilization: 0.7' \
+  "${SCRIPT_DIR}/qwen235-performance-sync.yaml" >/dev/null
 
 mkdir -p "${TMP_ROOT}/direct-model"
 direct_model_output=$(
