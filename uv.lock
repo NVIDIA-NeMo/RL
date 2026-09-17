@@ -2094,30 +2094,10 @@ wheels = [
 
 [[package]]
 name = "gitpython"
-version = "3.1.59"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "platform_machine == 'x86_64' and sys_platform == 'linux'",
-    "platform_machine == 'aarch64' and sys_platform == 'linux'",
-]
-dependencies = [
-    { name = "gitdb", marker = "extra == 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/ca/dc/126b28e76b24a9268ba931ad3e012f71ebdadf62fd9f17758f7074bb0b20/gitpython-3.1.59.tar.gz", hash = "sha256:0a1475cfdc38a5bfba1a3e9a4a9da52a39749ecec322b772915c019f94e5b7e4", size = 230445, upload-time = "2026-08-10T12:03:20.271Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ef/ed/ae57eb7d344f43f87b74b3a281ead6ec7d6394eef72a7b1dcb28dd089550/gitpython-3.1.59-py3-none-any.whl", hash = "sha256:67a82f537384578643624c8b2c531938a9b82be431663e575dcf638526631d4c", size = 220996, upload-time = "2026-08-10T12:03:18.804Z" },
-]
-
-[[package]]
-name = "gitpython"
 version = "3.1.62"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "platform_machine == 'x86_64' and sys_platform == 'linux'",
-    "platform_machine == 'aarch64' and sys_platform == 'linux'",
-]
 dependencies = [
-    { name = "gitdb", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-fsdp' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-nemo-gym' or extra != 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "gitdb" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/e0/db/3ca813cbacb23ab6fe46ff38a9b5ef8e73e970c8051f2ce903aacafe0446/gitpython-3.1.62.tar.gz", hash = "sha256:1791de66309bc0c7cfca40bf8d2e3de7ca091cbf94e6051be1ad0722c61062af", size = 231728, upload-time = "2026-09-07T02:57:21.155Z" }
 wheels = [
@@ -3534,8 +3514,7 @@ dependencies = [
     { name = "cloudpickle" },
     { name = "databricks-sdk" },
     { name = "fastapi", extra = ["standard"] },
-    { name = "gitpython", version = "3.1.59", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "gitpython", version = "3.1.62", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-fsdp' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-nemo-gym' or extra != 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "gitpython" },
     { name = "importlib-metadata" },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-proto" },
@@ -3630,15 +3609,16 @@ wheels = [
 
 [[package]]
 name = "mooncake-transfer-engine-cuda13"
-version = "0.3.11.post1"
+version = "0.3.13.post1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
+    { name = "msgpack" },
     { name = "requests" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f4/05/0bcfca875a141f7bf0cd56575f06354e52fa1869de810916b30d86ef2b2a/mooncake_transfer_engine_cuda13-0.3.11.post1-cp313-cp313-manylinux_2_35_x86_64.whl", hash = "sha256:9d88915de79cfc14b14ae4416ceaeb82242b53569f46ae0d7f7de9f63800ef6c", size = 42689671, upload-time = "2026-05-24T16:10:02.193Z" },
-    { url = "https://files.pythonhosted.org/packages/da/82/f7e4c9f6f31dd8eee1e92a89e7e9ac2c79ba90db42c88656156bf1f12d03/mooncake_transfer_engine_cuda13-0.3.11.post1-cp313-cp313-manylinux_2_39_aarch64.whl", hash = "sha256:ab3a0bc2ea791af42bd7b0d957f5ef5876a1975dab9414e9239070ce0038edb5", size = 18090582, upload-time = "2026-05-24T16:20:32.863Z" },
+    { url = "https://files.pythonhosted.org/packages/36/6d/650a7c2a35f79eb4d456a4a9174d631a11415928347c88f70111e27893b2/mooncake_transfer_engine_cuda13-0.3.13.post1-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:0b20c7f2d1cc8f2775bcd6b788e1a2f7816d4a5e834ea5b84e428a055fe6a2c3", size = 74329292, upload-time = "2026-08-31T11:34:26.437Z" },
+    { url = "https://files.pythonhosted.org/packages/22/36/2c8a5dfb53dadc0f2c93b674fbc40e8f9bed1fd8951b6106f5cec9cf0ced/mooncake_transfer_engine_cuda13-0.3.13.post1-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:4bb1fd45e4ca03105dcec194dd77fa53255e71bf26306707d599261e8e0f4b03", size = 97873992, upload-time = "2026-08-31T11:34:34.384Z" },
 ]
 
 [[package]]
@@ -3950,7 +3930,7 @@ dependencies = [
     { name = "devtools" },
     { name = "fastapi", extra = ["standard"], marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-fsdp' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-nemo-gym' or (extra == 'extra-7-nemo-rl-modelopt' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nvrx' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-trtllm')" },
     { name = "fonttools" },
-    { name = "gitpython", version = "3.1.62", source = { registry = "https://pypi.org/simple" } },
+    { name = "gitpython" },
     { name = "httptools" },
     { name = "hydra-core", version = "1.3.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "hydra-core", version = "1.3.4", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or (extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-nemo-gym') or (extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-modelopt' and extra != 'extra-7-nemo-rl-sglang') or (extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-nvrx' and extra != 'extra-7-nemo-rl-sglang') or (extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-trtllm') or (extra != 'extra-7-nemo-rl-modelopt' and extra != 'extra-7-nemo-rl-nemo-gym' and extra != 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
@@ -4226,8 +4206,7 @@ dev = [
     { name = "types-requests" },
 ]
 docs = [
-    { name = "gitpython", version = "3.1.59", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "gitpython", version = "3.1.62", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-fsdp' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-nemo-gym' or extra != 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "gitpython" },
     { name = "myst-parser" },
     { name = "nvidia-sphinx-theme" },
     { name = "python-dotenv" },
@@ -4297,7 +4276,7 @@ requires-dist = [
     { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'mcore'", specifier = "~=7.3" },
     { name = "mistral-common", marker = "extra == 'automodel'", specifier = ">=1.11.0" },
     { name = "mlflow", specifier = ">=3.13.0" },
-    { name = "mooncake-transfer-engine-cuda13", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = "==0.3.11.post1" },
+    { name = "mooncake-transfer-engine-cuda13", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = "==0.3.13.post1" },
     { name = "nccl4py", marker = "sys_platform != 'darwin'" },
     { name = "nemo-automodel", extras = ["moe"], marker = "extra == 'automodel'", editable = "3rdparty/Automodel-workspace/Automodel" },
     { name = "nemo-gym", marker = "extra == 'nemo-gym'", editable = "3rdparty/Gym-workspace/Gym" },
@@ -4365,7 +4344,7 @@ requires-dist = [
     { name = "vllm", marker = "platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'vllm'", url = "https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1-cp38-abi3-manylinux_2_28_aarch64.whl" },
     { name = "vllm", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'vllm'", url = "https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1-cp38-abi3-manylinux_2_28_x86_64.whl" },
     { name = "vllm", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'vllm') or (sys_platform != 'linux' and extra == 'vllm')", specifier = "==0.25.1" },
-    { name = "wandb", specifier = ">=0.28.0" },
+    { name = "wandb", specifier = ">=0.30.0" },
     { name = "zstandard" },
 ]
 provides-extras = ["fsdp", "automodel", "vllm", "sglang", "mcore", "trtllm", "modelopt", "nvrx", "nemo-gym"]
@@ -8539,10 +8518,13 @@ provides-extras = ["zen", "bench", "tensorizer", "fastsafetensors", "instanttens
 
 [[package]]
 name = "wandb"
-version = "0.28.1"
+version = "0.30.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-exporter-otlp-proto-http" },
+    { name = "opentelemetry-sdk" },
     { name = "packaging" },
     { name = "platformdirs" },
     { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
@@ -8550,15 +8532,15 @@ dependencies = [
     { name = "pydantic" },
     { name = "pyyaml" },
     { name = "requests" },
-    { name = "sentry-sdk" },
     { name = "typing-extensions" },
+    { name = "xxhash" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/92/fb/8d3f96a8b143060d6fa145462d0785981373e04694e4152555ccb5d23939/wandb-0.28.1.tar.gz", hash = "sha256:870ccb1a01238b0ac07c6fd96a0810a1f79090aba04ea29f4ee012ac8327705d", size = 40578119, upload-time = "2026-07-16T18:47:05.413Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/86/10/c4481d12b26f57606d1ef7c8d56825ad6af769cbb8cd29ee501ac6bbbc2d/wandb-0.30.0.tar.gz", hash = "sha256:f2d7de3c2019204f493f3f9e9166071c2be36f74140af2e1409b4de0fd84c454", size = 40862616, upload-time = "2026-09-09T00:16:41.551Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e2/1a/d15bcfb4417fa69edcaa33db8ea012db733da1057e193b047e3f69fdd671/wandb-0.28.1-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:ae9ae6fb29e2e2b1d097ed8b75c0c0240c778c2a8cad1d996dee870a1e401c2c", size = 24832138, upload-time = "2026-07-16T18:46:47.433Z" },
-    { url = "https://files.pythonhosted.org/packages/b3/da/49924c7df2952dfd82c86c3779c339c0c3d6f6439387c03d97d0470c3658/wandb-0.28.1-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:8cfb898b6a6c884d9c9294b02764e88bce65049f027a124d6bee53fe722469b6", size = 26486533, upload-time = "2026-07-16T18:46:49.839Z" },
-    { url = "https://files.pythonhosted.org/packages/11/c0/06b23518e29690784f1b3081e39c7679ca076cb0af094cb9b4bb309150f5/wandb-0.28.1-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:cf2b1533945395e4fdbe6182b272bb0ca8a02c10b3086a395e2d57686ae3ed0d", size = 25022635, upload-time = "2026-07-16T18:46:52.376Z" },
-    { url = "https://files.pythonhosted.org/packages/23/30/6de2f7995a8a6eecbd03d24c79a139a734c0168f5520cf4c7ccb43c1dbbc/wandb-0.28.1-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:7233061080507a4b4098bed1ccb381ce6f890c60397cd4153d060285bcb267bd", size = 27008895, upload-time = "2026-07-16T18:46:55.025Z" },
+    { url = "https://files.pythonhosted.org/packages/91/69/0593b9e43cd3fc257a0f6ceaf5e078f2b28baf1968e00dfa1be98261ee68/wandb-0.30.0-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:72b564712e85e10d78d37ccdaef4a908d28cbb39240c9c00fa4dde567150c764", size = 24049519, upload-time = "2026-09-09T00:16:25.874Z" },
+    { url = "https://files.pythonhosted.org/packages/26/13/775a4c7d87fb771a2ddb104ce7c5c5d393e48720e448b4e8c43aac7cd4ce/wandb-0.30.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:bad9412f137d02303bf178513e0109f4fed37a6c817604085a1a4151047d8790", size = 26105520, upload-time = "2026-09-09T00:16:28.146Z" },
+    { url = "https://files.pythonhosted.org/packages/58/36/4974e9ec44c23dd28a39c8ee699f1b8911dd6619c932c3fe94b016bc8a1f/wandb-0.30.0-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:1f2cc20c033f1650d387ca073177e629f1e2a1b5c4be393698e3db4752b9cf3a", size = 24112309, upload-time = "2026-09-09T00:16:30.3Z" },
+    { url = "https://files.pythonhosted.org/packages/05/77/5eddd97f33f581f4d167f41bbf4736f2a51ad7271b9c9ed5dceb6994cbd6/wandb-0.30.0-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:e7dc3b0b1567f6a121d8f7a58131b5d085861139a653ef8bed1569c9be796721", size = 26320243, upload-time = "2026-09-09T00:16:32.878Z" },
 ]
 
 [[package]]
