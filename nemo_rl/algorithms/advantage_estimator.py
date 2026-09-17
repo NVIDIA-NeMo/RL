@@ -596,7 +596,9 @@ class GeneralizedAdvantageEstimator:
             # for both advantages and returns, including fully masked rows.
             indices = torch.arange(gen_len, device=values.device)
             next_valid = torch.where(mask.bool(), indices, gen_len)
-            next_valid = next_valid.flip(-1).cummin(-1).values.flip(-1)
+            next_valid = next_valid.flip(-1)
+            next_valid = next_valid.cummin(-1).values
+            next_valid = next_valid.flip(-1)
             padded_values = torch.nn.functional.pad(values, (0, 1))
             advantages = reward_to_go - padded_values.gather(-1, next_valid)
             return advantages, advantages + values
