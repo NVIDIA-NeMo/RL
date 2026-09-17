@@ -350,6 +350,13 @@ class MegatronConfig(TypedDict):
     num_layers_in_first_pipeline_stage: int | None
     num_layers_in_last_pipeline_stage: int | None
     context_parallel_size: int
+    # Megatron-Core ends every batched pipeline p2p with torch.cuda.synchronize()
+    # (guard for an old PyTorch batch_isend_irecv race). The device-wide sync also
+    # waits for TapChannel's side-stream tap sends, so PP>1 draft co-training
+    # stalls the source stages on their own transfer until the draft stage posts
+    # its receive. False keeps only the stream-ordered Work.wait(). Omit to keep
+    # Megatron-Core's default (True).
+    batch_p2p_sync: NotRequired[bool]
     # Nemotron Omni RADIO/provider booleans. Omit any field to retain the model
     # provider's checkpoint/default value.
     radio_force_cpe_eval_mode: NotRequired[bool]

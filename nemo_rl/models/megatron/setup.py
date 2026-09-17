@@ -902,6 +902,9 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
     ]
     model_cfg.sequence_parallel = config["megatron_cfg"]["sequence_parallel"]
     model_cfg.context_parallel_size = config["megatron_cfg"]["context_parallel_size"]
+    # Omitted -> Megatron-Core's default (True); see MegatronConfig.batch_p2p_sync.
+    if "batch_p2p_sync" in config["megatron_cfg"]:
+        model_cfg.batch_p2p_sync = config["megatron_cfg"]["batch_p2p_sync"]
 
     if model_cfg.context_parallel_size > 1:
         # Either NeMo-RL does the packing+CP-sharding itself (classic mcore
