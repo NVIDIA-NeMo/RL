@@ -2533,21 +2533,27 @@ def refit_policy_generation(
     Returns:
         Scalar metrics reported by the selected weight synchronizer.
     """
-    # Every SGLang deployment reaches its refit through this hook: `setup`
-    # attaches an SGLang synchronizer that owns the whole lifecycle (phase
-    # transitions, engine recovery, pause/flush, transport), so SGLang never
-    # touches the branches below.
     synchronizer = getattr(policy_generation, "weight_synchronizer", None)
-    if synchronizer is not None:
-        return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
-
-    if isinstance(policy_generation, SGLangGeneration):
+    if isinstance(policy_generation, SGLangGeneration) and synchronizer is None:
         # Fail loudly rather than falling through to the vLLM branches, which
         # would call methods the SGLang path does not implement.
         raise RuntimeError(
             "SGLang refits require policy_generation.weight_synchronizer to be "
             "set. Attach one with create_weight_synchronizer(...) during setup."
         )
+
+    # Materialize deferred Megatron parameter all-gathers before any transport
+    # reads policy weights, including synchronizers that return early below.
+    sync_context = (
+        timer.time("prepare_for_generation/sync_policy_params")
+        if timer is not None
+        else nullcontext()
+    )
+    with sync_context:
+        policy.sync_params_before_refit()
+
+    if synchronizer is not None:
+        return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
 
     if colocated_inference:
         policy.offload_before_refit()
@@ -3173,6 +3179,9 @@ def _grpo_train_impl(
                                 "max_total_sequence_length"
                             ],
                             generation_config=generation_config,
+                            num_generations_per_prompt=(
+                                master_config.grpo.num_generations_per_prompt
+                            ),
                             log_full_result_tables=should_log_nemo_gym_full_result_tables(
                                 wandb_enabled=master_config.logger["wandb_enabled"],
                                 wandb_config=master_config.logger["wandb"],
@@ -4194,6 +4203,7 @@ def validate(
                     task_to_env=val_task_to_env,
                     max_seq_len=master_config.policy["max_total_sequence_length"],
                     generation_config=generation_config,
+                    num_generations_per_prompt=val_num_generations_per_prompt,
                     sampling_params=val_sampling_params,
                     log_full_result_tables=should_log_nemo_gym_full_result_tables(
                         wandb_enabled=master_config.logger["wandb_enabled"],

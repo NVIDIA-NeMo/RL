@@ -92,6 +92,9 @@ def _controller(*, shard_count=3, router=None, unhealthy_threshold=3):
         base_urls=_urls(shard_count),
     )
     ctrl._generation_router = router
+    # The probe pump also ticks the engine supervisor. None is its
+    # "restart_dead_shards is off" value, which is what these tests want.
+    ctrl._engine_supervisor = None
     ctrl._async_cfg = SimpleNamespace(
         generation_fleet_health=SimpleNamespace(
             probe_interval_s=0.001, probe_timeout_s=1.0
@@ -162,11 +165,48 @@ class TestFailureDrain:
         asyncio.run(ctrl._drain_router_failures())
         assert ctrl._gen_fleet.state_of(1) is ShardState.SUSPECT
 
-    def test_enough_router_failures_condemn_the_shard(self):
+    def test_one_burst_is_one_observation_not_three(self):
+        """Requests to a backend are concurrent, so a single outage fails them together.
+
+        Counted per request, three in-flight failures walked the streak 1, 2, 3 and
+        condemned the shard on one tick -- and on a single-shard fleet that ends the run,
+        because min_healthy_shards=1 leaves the router nothing to route to. The evidence
+        is one observation of one outage, whatever its fan-out.
+        """
         router = _FakeRouter(failures={_urls(3)[1]: 3})
         ctrl = _controller(router=router, unhealthy_threshold=3)
         asyncio.run(ctrl._drain_router_failures())
+        assert ctrl._gen_fleet.state_of(1) is ShardState.SUSPECT
+        assert 1 in ctrl._gen_fleet.serving_shards(), (
+            "suspect shards still take traffic"
+        )
+
+    def test_three_failing_windows_still_condemn_the_shard(self):
+        """What the threshold is actually calibrated against: consecutive windows."""
+        url = _urls(3)[1]
+        ctrl = _controller(router=_FakeRouter(), unhealthy_threshold=3)
+        for _ in range(3):
+            ctrl._generation_router = _FakeRouter(failures={url: 7})
+            asyncio.run(ctrl._drain_router_failures())
         assert ctrl._gen_fleet.state_of(1) is ShardState.DEAD
+
+    def test_a_success_between_windows_resets_the_streak(self):
+        """A shard that drops one burst and recovers must not accumulate toward death."""
+        url = _urls(3)[1]
+        ctrl = _controller(router=_FakeRouter(), unhealthy_threshold=3)
+        for _ in range(5):
+            ctrl._generation_router = _FakeRouter(failures={url: 4})
+            asyncio.run(ctrl._drain_router_failures())
+            ctrl._generation_router = _FakeRouter(successes={url: 1})
+            asyncio.run(ctrl._drain_router_failures())
+        assert ctrl._gen_fleet.state_of(1) is not ShardState.DEAD
+
+    def test_the_failure_count_survives_into_the_record(self):
+        """Aggregating the accounting must not aggregate away the evidence."""
+        url = _urls(3)[1]
+        ctrl = _controller(router=_FakeRouter(failures={url: 9}))
+        asyncio.run(ctrl._drain_router_failures())
+        assert "9 failed request(s)" in ctrl._gen_fleet.snapshot()[1].last_error
 
     def test_a_success_in_the_window_clears_the_streak(self):
         """consecutive_reported_failures is a STREAK, and nothing on this path cleared it.
@@ -191,10 +231,16 @@ class TestFailureDrain:
         )
 
     def test_a_wedged_shard_is_still_condemned_on_time(self):
-        """It produces no successes, so its timing must be unchanged."""
-        router = _FakeRouter(failures={_urls(3)[1]: 3})
-        ctrl = _controller(router=router, unhealthy_threshold=3)
-        asyncio.run(ctrl._drain_router_failures())
+        """It produces no successes, so nothing clears its streak.
+
+        Timing is now three drain windows rather than one tick -- the same budget the
+        probe path spends on the same verdict, since both are paced by probe_interval_s.
+        """
+        url = _urls(3)[1]
+        ctrl = _controller(router=_FakeRouter(), unhealthy_threshold=3)
+        for _ in range(3):
+            ctrl._generation_router = _FakeRouter(failures={url: 3})
+            asyncio.run(ctrl._drain_router_failures())
         assert ctrl._gen_fleet.state_of(1) is ShardState.DEAD
 
     def test_successes_are_applied_before_failures_in_the_same_window(self):

@@ -39,6 +39,7 @@ import torch
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, backend_config
+from nemo_rl.data_plane.observability import is_metrics_client
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
     GLOBAL_FORWARD_PAD_SEQLEN,
@@ -383,6 +384,23 @@ class TQWorkerMixin:
     def _forward_pad_seqlen(self, meta: "KVBatchMeta") -> int:
         """Cross-DP forward pad target, minted by :meth:`TQPolicy._stamp_pad_seqlen`."""
         return int((meta.extra_info or {}).get(GLOBAL_FORWARD_PAD_SEQLEN, 0))
+
+    def get_data_plane_snapshot(self) -> "dict[str, Any] | None":
+        """This rank's data-plane counters, for cluster-wide aggregation.
+
+        Returns ``None`` when observability is off or no client exists, so
+        the driver can filter rather than special-case. The payload is
+        counters only (about 1 kB), not tensors.
+
+        Closes this rank's step window (``step_wall_ms``, ``step_max_ms``) as
+        it reads, since the driver calls this once per step. Neither a sum
+        the cluster reduces with a max nor a max itself can be differenced
+        out of a cumulative counter, so without the reset the cluster's
+        per-step figures would latch at the worst call ever seen.
+        """
+        if not is_metrics_client(self._dp_client):
+            return None
+        return self._dp_client.snapshot(reset_step_window=True)
 
     def _fetch(
         self,
