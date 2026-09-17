@@ -7,7 +7,8 @@ git config --global --add safe.directory "$PROJECT_ROOT"
 
 set -eou pipefail
 
-EXP_NAME=$(basename "$0" .sh)
+REFIT_PREQUANTIZE=${REFIT_PREQUANTIZE:-true}
+EXP_NAME=$(basename "$0" .sh)-prequant-$REFIT_PREQUANTIZE
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
 LOG_DIR=$EXP_DIR/logs
 JSON_METRICS=$EXP_DIR/metrics.json
@@ -43,7 +44,7 @@ uv run coverage run -a --data-file="$PROJECT_ROOT/tests/.coverage" --source="$PR
     policy.generation.max_new_tokens=128 \
     policy.generation.vllm_cfg.precision=fp8 \
     ++policy.generation.vllm_cfg.is_mx=true \
-    policy.generation.vllm_cfg.refit_prequantize=true \
+    policy.generation.vllm_cfg.refit_prequantize="$REFIT_PREQUANTIZE" \
     policy.generation.vllm_cfg.kv_cache_dtype=auto \
     policy.generation.vllm_cfg.max_model_len=256 \
     policy.generation.vllm_cfg.gpu_memory_utilization=0.5 \
@@ -70,4 +71,4 @@ uv run tests/check_metrics.py "$JSON_METRICS" \
 assert_grep 'quantization=modelopt_mxfp8|quant_algo.*MXFP8' "$RUN_LOG"
 assert_grep 'NRL_MXFP8_EFFECTIVE_IGNORE=.*self_attn' "$RUN_LOG"
 
-echo "[PASS] GB200 dense Qwen GRPO vLLM MXFP8 rollout functional test"
+echo "[PASS] GB200 dense Qwen GRPO vLLM MXFP8 rollout functional test (refit_prequantize=$REFIT_PREQUANTIZE)"

@@ -149,14 +149,15 @@ different runtime tradeoff:
 | Receiver-side (default) | 64 bytes of BF16 | The rollout worker uses vLLM's installed quantizer | Runtime alignment is more important than refit transfer cost |
 | Trainer-side (`refit_prequantize: true`) | 32 bytes of E4M3 values + 1 E8M0 scale byte | The policy worker uses FlashInfer on Blackwell | Colocated refit transfer and receiver work are measurable bottlenecks |
 
-Both paths produce the same explicit refit wire format: the E4M3 value tensor
-keeps the logical checkpoint shape, and the matching
-`*_scale_from_checkpoint` tensor stores E8M0 bytes with shape
+The transport payloads differ, but both paths produce the same explicit
+post-quantization loader representation: the E4M3 value tensor keeps the
+logical checkpoint shape, and the matching `*_scale_from_checkpoint` tensor
+stores E8M0 bytes with shape
 `(*weight.shape[:-1], weight.shape[-1] / 32)`. NeMo RL validates this contract
 and applies the same scale reshape and zero-scale handling on both paths. The
 GB200 test suite checks bitwise parity against the installed vLLM quantizer and
-runs a functional GRPO refit across the separate policy and rollout worker
-environments with numerical error bounds.
+runs functional GRPO refits for both paths across the separate policy and
+rollout worker environments with numerical error bounds.
 
 To train with FP8, you need to set the Megatron path and configure it using the following settings:
 
