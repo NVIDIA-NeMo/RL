@@ -105,6 +105,37 @@ def test_refit_wire_format_canonicalizes_scale_shape_and_zero_bytes():
     assert MXFP8_SCALE_SUFFIX == "_scale_from_checkpoint"
 
 
+def test_refit_wire_format_restores_flashinfer_flattened_leading_dimensions():
+    weight_shape = (3, 5, 64)
+    values = torch.arange(
+        torch.Size(weight_shape).numel(), dtype=torch.float32
+    ).to(torch.float8_e4m3fn)
+    values = values.reshape(-1, weight_shape[-1])
+    scales = torch.arange(
+        torch.Size(weight_shape).numel() // MXFP8_BLOCK_SIZE,
+        dtype=torch.uint8,
+    ).reshape(-1, weight_shape[-1] // MXFP8_BLOCK_SIZE)
+
+    got_values, got_scales = canonicalize_mxfp8_refit_output(
+        weight_shape, values, scales
+    )
+
+    assert got_values.shape == weight_shape
+    assert got_scales.shape == (3, 5, 2)
+    assert torch.equal(got_values.reshape(-1), values.reshape(-1))
+    assert torch.equal(
+        got_scales.reshape(-1), scales.masked_fill(scales == 0, 1).reshape(-1)
+    )
+
+
+def test_refit_wire_format_rejects_values_with_wrong_reduction_dimension():
+    values = torch.ones(4, 48, dtype=torch.float8_e4m3fn)
+    scales = torch.ones(6, dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="final dimension"):
+        canonicalize_mxfp8_refit_output((3, 64), values, scales)
+
+
 @pytest.mark.parametrize(
     "values,scales,error",
     [
