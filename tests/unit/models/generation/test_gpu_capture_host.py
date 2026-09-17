@@ -629,6 +629,11 @@ async def test_nonoverlap_cleanup_precedes_finalization(
     assert case.rpc.calls[-1][0] == expected
     if path == "collective":
         assert not case.rpc.direct_calls
+        payload = case.sink.payloads["call"]
+        assert payload is not None
+        assert payload.generated_token_ids is case.tensors.generated_token_ids
+        assert cpu_cuda == ["sync"]
+        case.assert_released()
     assert case.state.export_task is case.state.release_reply is None
 
 

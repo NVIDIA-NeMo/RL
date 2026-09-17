@@ -1103,7 +1103,8 @@ def test_resumed_requests_discard_gpu_history_for_original_cpu_put(
     "path",
     [
         "supported",
-        "ray",
+        "ray_legacy",
+        "ray_v2",
         "sync_routes",
         "speculative",
         "pipeline",
@@ -1121,7 +1122,7 @@ def test_native_optimization_availability_preserves_existing_paths(
     runner.vllm_config = SimpleNamespace(
         speculative_config=object() if path == "speculative" else None,
         parallel_config=SimpleNamespace(
-            distributed_executor_backend="ray" if path == "ray" else "uni",
+            distributed_executor_backend="ray" if path.startswith("ray_") else "uni",
             pipeline_parallel_size=2 if path == "pipeline" else 1,
             decode_context_parallel_size=2 if path == "context" else 1,
         ),
@@ -1136,8 +1137,12 @@ def test_native_optimization_availability_preserves_existing_paths(
         ),
     )
     worker = SimpleNamespace(model_runner=runner)
-    actor = object()
-    if path == "ray":
+    actor = (
+        SimpleNamespace(execute_method=SimpleNamespace(remote=lambda: None))
+        if path == "ray_legacy"
+        else SimpleNamespace()
+    )
+    if path.startswith("ray_"):
         monkeypatch.setattr(
             ray, "get_runtime_context", lambda: SimpleNamespace(current_actor=actor)
         )
@@ -1146,13 +1151,14 @@ def test_native_optimization_availability_preserves_existing_paths(
         frontend_hostname="other-host" if path == "remote" else socket.gethostname(),
         require_routed_experts=True,
     )
-    assert (capability is not None) == (path in ("supported", "ray"))
+    supported = path in ("supported", "ray_legacy", "ray_v2")
+    assert (capability is not None) == supported
     if capability is not None:
         assert capability.gpu_uuid == str(
             torch.cuda.get_device_properties(runner.device).uuid
         )
-        assert capability.worker is (actor if path == "ray" else None)
-    assert (runner.sample_tokens is not original) == (path in ("supported", "ray"))
+        assert capability.worker is (actor if path == "ray_legacy" else None)
+    assert (runner.sample_tokens is not original) == supported
 
 
 @cuda_required

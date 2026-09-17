@@ -732,5 +732,9 @@ def configure_gpu_output_capture(
         return None
     owner = None
     if parallel.distributed_executor_backend == "ray":
-        owner = ray.get_runtime_context().current_actor
+        actor = ray.get_runtime_context().current_actor
+        # RayExecutorV2 exposes no execute_method; keep GPU capture active via
+        # the executor's existing collective_rpc path instead.
+        if callable(getattr(getattr(actor, "execute_method", None), "remote", None)):
+            owner = actor
     return GpuCaptureOwner(existing.gpu_uuid, owner)
