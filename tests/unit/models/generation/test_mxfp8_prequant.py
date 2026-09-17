@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -137,6 +138,33 @@ def test_blackwell_refit_prequantization_requires_flashinfer(monkeypatch):
 
     with pytest.raises(RuntimeError, match=r"sm100\+ requires FlashInfer"):
         mxfp8_e4m3_quantize_for_refit(FakeBlackwellTensor())
+
+
+def test_blackwell_refit_prequantization_matches_vllm_backend(monkeypatch):
+    class FakeBlackwellTensor:
+        is_cuda = True
+        device = "cuda"
+        shape = torch.Size((2, MXFP8_BLOCK_SIZE))
+
+    call_kwargs = {}
+
+    def fake_mxfp8_quantize(_tensor, **kwargs):
+        call_kwargs.update(kwargs)
+        return (
+            torch.zeros(2, MXFP8_BLOCK_SIZE, dtype=torch.float8_e4m3fn),
+            torch.zeros(2, dtype=torch.uint8),
+        )
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (10, 0))
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer",
+        SimpleNamespace(mxfp8_quantize=fake_mxfp8_quantize),
+    )
+
+    mxfp8_e4m3_quantize_for_refit(FakeBlackwellTensor())
+
+    assert call_kwargs["backend"] == "cute-dsl"
 
 
 @pytest.mark.skipif(
