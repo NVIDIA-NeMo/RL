@@ -212,15 +212,15 @@ Hydra CLI:
 ```bash
 uv run python examples/run_xtoken_off_policy_distillation.py \
     --config examples/configs/xtoken_off_policy_distillation.yaml \
-    teachers.0.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt \
+    teachers.0.aligner.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt \
     cluster.gpus_per_node=8 \
     cluster.num_nodes=1
 ```
 
-The exemplar config keeps each teacher's `projection_matrix_path` as `null`, so
-the projection matrix must always be supplied at the CLI (per teacher, e.g.
-`teachers.0.projection_matrix_path=...`) — this keeps the config reusable across
-(student, teacher) pairs. `data.train.data_files` and `data.train.subset`
+The exemplar config keeps each teacher's `aligner.projection_matrix_path` as
+`null`, so the projection matrix must always be supplied at the CLI (per
+teacher, e.g. `teachers.0.aligner.projection_matrix_path=...`) — this keeps the
+config reusable across (student, teacher) pairs. `data.train.data_files` and `data.train.subset`
 already point at the default NVIDIA corpus described above; override them only
 to train on your own `.arrow`/`.parquet`/`.json`/`.txt` corpus. Set both, since a
 file path requires `subset` to be null:
@@ -248,7 +248,7 @@ Other relevant fields:
 ```bash
 uv run python examples/run_xtoken_off_policy_distillation.py \
     --config examples/configs/xtoken_multiteacher_off_policy_distillation.yaml \
-    teachers.0.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_phi-mini_top4.pt \
+    teachers.0.aligner.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_phi-mini_top4.pt \
     cluster.gpus_per_node=8 \
     cluster.num_nodes=1
 ```

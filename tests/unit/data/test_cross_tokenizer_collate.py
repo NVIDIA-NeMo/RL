@@ -22,7 +22,7 @@ exercise the single-cross-tokenizer-teacher case (index 0).
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -171,9 +171,27 @@ class TestCollatorOutputKeys:
             aligners=[aligner],
             ctx_length_student=8,
             ctx_length_teachers=[8],
+            drop_first_assistant_chunk_kl_by_teacher=[False],
         )
         out = collator([_datum("hello", 0), _datum("world", 1)])
         assert _EXPECTED_COLLATOR_KEYS.issubset(set(out.keys()))
+
+    def test_drop_first_flags_must_match_teacher_count(self):
+        student_tok = FakeTokenizer(vocab_size=32, prefix="s")
+        teacher_tok = FakeTokenizer(vocab_size=24, prefix="t")
+        aligner = _fake_aligner(b=1, t_s=8, t_t=8)
+
+        with pytest.raises(
+            ValueError, match="drop_first_assistant_chunk_kl_by_teacher"
+        ):
+            CrossTokenizerCollator(
+                student_tokenizer=student_tok,
+                teacher_tokenizers=[teacher_tok],
+                aligners=[aligner],
+                ctx_length_student=8,
+                ctx_length_teachers=[8],
+                drop_first_assistant_chunk_kl_by_teacher=[],
+            )
 
 
 class TestCollatorShapes:
@@ -187,6 +205,7 @@ class TestCollatorShapes:
             aligners=[aligner],
             ctx_length_student=8,
             ctx_length_teachers=[16],
+            drop_first_assistant_chunk_kl_by_teacher=[False],
         )
         out = collator([_datum("ab", 0), _datum("cd", 1)])
         assert out["input_ids"].shape == (2, 8)
@@ -209,6 +228,7 @@ class TestCollatorShapes:
             aligners=[aligner],
             ctx_length_student=8,
             ctx_length_teachers=[8],
+            drop_first_assistant_chunk_kl_by_teacher=[False],
         )
         out = collator([_datum("abc", 0)])  # 3 chars → 3 real tokens
         assert int(out["input_lengths"][0]) == 3
@@ -228,6 +248,7 @@ class TestCollatorTruncation:
             aligners=[aligner],
             ctx_length_student=ctx,
             ctx_length_teachers=[ctx],
+            drop_first_assistant_chunk_kl_by_teacher=[False],
         )
         # 10 chars; ctx=4 → sample is kept, trailing 6 chars dropped.
         out = collator([_datum("abcdefghij", 0)])
@@ -250,6 +271,7 @@ class TestCollatorSequenceDivisibility:
             aligners=[aligner],
             ctx_length_student=10,
             ctx_length_teachers=[10],
+            drop_first_assistant_chunk_kl_by_teacher=[False],
             make_seq_div_by_student=8,
             make_seq_div_by_teachers=[4],
         )
@@ -276,6 +298,7 @@ class TestCollatorPadTokenFallback:
             aligners=[aligner],
             ctx_length_student=4,
             ctx_length_teachers=[4],
+            drop_first_assistant_chunk_kl_by_teacher=[False],
         )
         # Setting `pad_token` to the eos string is enough; HF tokenizers
         # update pad_token_id from that assignment. Our fake doesn't have
@@ -294,6 +317,7 @@ class TestCollatorReadsMessageLog:
             aligners=[aligner],
             ctx_length_student=8,
             ctx_length_teachers=[8],
+            drop_first_assistant_chunk_kl_by_teacher=[False],
         )
         out = collator(
             [
@@ -388,6 +412,7 @@ class TestCollatorChatMode:
             aligners=[aligner],
             ctx_length_student=64,
             ctx_length_teachers=[64],
+            drop_first_assistant_chunk_kl_by_teacher=[False],
             mode="chat",
         )
         datum = {
@@ -419,6 +444,7 @@ class TestCollatorChatMode:
             aligners=[None],
             ctx_length_student=32,
             ctx_length_teachers=[32],
+            drop_first_assistant_chunk_kl_by_teacher=[False],
             mode="chat",
         )
         out = collator(
@@ -438,6 +464,58 @@ class TestCollatorChatMode:
             key.startswith(("teacher_0_", "alignment_0_")) for key in out.keys()
         )
 
+    def test_drop_first_flag_uses_original_teacher_index(self):
+        student_tok = FakeChatTokenizer(
+            {"user": ("[U]", ""), "assistant": ("[A]", "[E]")}
+        )
+        teacher_0_tok = FakeChatTokenizer(
+            {"user": ("<u0>", ""), "assistant": ("<a0>", "<e0>")}
+        )
+        teacher_2_tok = FakeChatTokenizer(
+            {"user": ("<u2>", ""), "assistant": ("<a2>", "<e2>")}
+        )
+        aligner_0 = _chat_aligner(student_tok, teacher_0_tok)
+        aligner_2 = _chat_aligner(student_tok, teacher_2_tok)
+        collator = CrossTokenizerCollator(
+            student_tokenizer=student_tok,
+            teacher_tokenizers=[teacher_0_tok, student_tok, teacher_2_tok],
+            aligners=[aligner_0, None, aligner_2],
+            ctx_length_student=64,
+            ctx_length_teachers=[64, 64, 64],
+            drop_first_assistant_chunk_kl_by_teacher=[False, False, True],
+            mode="chat",
+        )
+        datum = {
+            "loss_multiplier": 1.0,
+            "idx": 0,
+            "message_log": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "ok"},
+            ],
+        }
+
+        with (
+            patch.object(
+                aligner_0,
+                "align_one_offset_per_asst",
+                wraps=aligner_0.align_one_offset_per_asst,
+            ) as align_0,
+            patch.object(
+                aligner_2,
+                "align_one_offset_per_asst",
+                wraps=aligner_2.align_one_offset_per_asst,
+            ) as align_2,
+        ):
+            out = collator([datum])
+
+        assert align_0.call_args.kwargs["drop_first_content_pair"] is False
+        assert align_2.call_args.kwargs["drop_first_content_pair"] is True
+        assert "teacher_0_input_ids" in out and "alignment_0_pair_valid" in out
+        assert "teacher_2_input_ids" in out and "alignment_2_pair_valid" in out
+        assert not any(
+            key.startswith(("teacher_1_", "alignment_1_")) for key in out.keys()
+        )
+
     def test_native_thinking_alignment_not_implemented(self):
         tok = FakeChatTokenizer({"assistant": ("", "")})
         aligner = _chat_aligner(tok, tok)
@@ -448,6 +526,7 @@ class TestCollatorChatMode:
                 aligners=[aligner],
                 ctx_length_student=32,
                 ctx_length_teachers=[32],
+                drop_first_assistant_chunk_kl_by_teacher=[False],
                 mode="chat",
                 include_thinking_in_loss=True,
                 native_thinking_alignment=True,
