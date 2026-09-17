@@ -74,6 +74,7 @@ from nemo_rl.data.dataloader import CyclingDataLoader
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
@@ -95,7 +96,6 @@ from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 from nemo_rl.utils.timer import Timer
-from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from tests.unit.algorithms.utils import (
     create_mock_batch,
 )
