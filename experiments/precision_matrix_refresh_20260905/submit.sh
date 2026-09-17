@@ -281,7 +281,7 @@ if [[ "${USE_SHARED_MODEL}" == 1 ]]; then
 fi
 
 if [[ "${ACTION}" == submit ]]; then
-  git -C "${REPO}" pull --ff-only
+  git -C "${REPO}" -c fetch.recurseSubmodules=false pull --ff-only
   git -C "${REPO}" submodule update --init --recursive --checkout
   if [[ -n "$(git -C "${REPO}" status --porcelain --untracked-files=no --ignore-submodules=none)" ]]; then
     echo "Repository and pinned submodules must be clean before submission" >&2
