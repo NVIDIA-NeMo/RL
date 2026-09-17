@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from nemo_rl.environments.nemo_gym import NemoGym
+from nemo_rl.environments.nemo_gym import NemoGym, _external_staging_backend
 
 # Receipt assembly imports nemo_gym at call time (resolve_terminal etc.), so
 # these tests must run in the Nemo_Gym shard, not the base-env Environments one.
@@ -34,6 +34,30 @@ def _capture_env() -> NemoGym:
 
 def _digest(label: str) -> str:
     return hashlib.sha256(label.encode()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("generation_backend", "expected"),
+    [("vllm", "vllm_worker"), ("megatron", "megatron_worker")],
+)
+def test_external_staging_backend_maps_generation_backend(
+    generation_backend: str, expected: str
+) -> None:
+    token_capture = {"generation_backend": generation_backend}
+
+    assert _external_staging_backend(token_capture) == expected
+    assert token_capture == {"generation_backend": generation_backend}
+
+
+@pytest.mark.parametrize(
+    "token_capture",
+    [{}, {"generation_backend": None}, {"generation_backend": "sglang"}],
+)
+def test_external_staging_backend_rejects_missing_or_invalid_backend(
+    token_capture: dict,
+) -> None:
+    with pytest.raises(ValueError, match="setup-derived generation_backend"):
+        _external_staging_backend(token_capture)
 
 
 def _manifest_record(
@@ -335,6 +359,24 @@ def test_unattributed_scored_response_falls_back_to_the_heuristic() -> None:
     assert "response_id_no_match" in (receipt["terminal_attribution_reason"] or "")
 
 
+def test_receipt_assembly_leaves_terminal_selection_unset_on_invalid_row() -> None:
+    env = _capture_env()
+    invalid = _manifest_record("c2", parent="c1")
+    del invalid["chain_hash"]  # CallRecord requires it: the manifest fails to parse
+    records = [_manifest_record("c1"), invalid]
+    manifest = {"rollout_id": "r0", "records": records, "failures": []}
+    receipt = env._assemble_receipt(
+        "r0", manifest, terminal_response_id=None, reward=0.0
+    )
+    assert receipt["capture_poisoned"] is True
+    assert receipt["failure_reason"] == "invalid_manifest_row"
+    assert receipt["terminal_model_call_id"] is None
+    # No attribution stage ran, so the receipt must not be stamped with a
+    # method (a "heuristic" label here would inflate that bucket's fraction).
+    assert receipt["terminal_selection"] is None
+    assert receipt["terminal_attribution_reason"] is None
+
+
 def test_declared_and_response_id_witnesses_corroborate() -> None:
     env = _capture_env()
     records = [
@@ -398,3 +440,33 @@ def test_postprocess_passes_the_scored_response_to_attribution() -> None:
     receipt = result["receipt"]
     assert receipt["terminal_model_call_id"] == "c2"
     assert receipt["terminal_selection"] == "response_id"
+
+
+def test_setup_nemo_gym_config_megatron_keeps_async_rollout_check_satisfied() -> None:
+    """setup_nemo_gym_config must not set mcore_generation_config.async_engine.
+
+    should_use_async_rollouts asserts that key is absent for the megatron
+    backend, and should_use_nemo_gym calls it after setup_nemo_gym_config has run.
+    """
+    from nemo_rl.algorithms.grpo import MasterConfig
+    from nemo_rl.environments.nemo_gym import (
+        setup_nemo_gym_config,
+        should_use_nemo_gym,
+    )
+
+    config = MasterConfig.model_construct(
+        env={"should_use_nemo_gym": True},
+        policy={
+            "generation": {
+                "backend": "megatron",
+                "mcore_generation_config": {"expose_http_server": False},
+            }
+        },
+    )
+
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    mcore_cfg = config.policy["generation"]["mcore_generation_config"]
+    assert mcore_cfg["expose_http_server"] is True
+    assert "async_engine" not in mcore_cfg
+    assert should_use_nemo_gym(config) is True

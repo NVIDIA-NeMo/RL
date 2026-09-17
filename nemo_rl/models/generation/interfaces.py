@@ -29,6 +29,7 @@ RefitPayloadMode = Literal["hf_export", "logical_weights"]
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+    from nemo_rl.data_plane.interfaces import DataPlaneConfig
 
 # Routed-expert index tensors ([seq, layers, topk]) are carried in the narrowest
 # signed dtype that fits ids 0..num_experts-1 plus the -1 missing-route sentinel:
@@ -609,6 +610,34 @@ class GenerationInterface(ABC):
         raise NotImplementedError(
             "async_rl.generation_fleet_health.enabled=true is not supported for the "
             f"{type(self).__name__} generation backend"
+        )
+
+    def setup_token_capture(
+        self, dp_cfg: "DataPlaneConfig", staging_partition: str
+    ) -> None:
+        """Install token capture in the serving workers (``token_capture.enabled``).
+
+        Declared here for the same reason as :meth:`attach_fleet_health`: the
+        single-controller setup calls this on whichever backend is configured, so an
+        unsupported backend says so itself instead of failing with AttributeError.
+
+        Args:
+            dp_cfg: Data-plane config the workers use to build their in-worker client.
+            staging_partition: Data-plane partition that captured rows are staged in.
+        """
+        raise NotImplementedError(
+            f"token_capture.enabled is not supported for {type(self).__name__}"
+        )
+
+    def set_rollout_weight_version(self, version: int) -> None:
+        """Rotate the weight version workers stamp on captured model calls.
+
+        Args:
+            version: Trainer weight version now being served, applied to all
+                subsequent captured requests.
+        """
+        raise NotImplementedError(
+            f"token_capture.enabled is not supported for {type(self).__name__}"
         )
 
     # Optional hook; backends may override to invalidate any reusable caches

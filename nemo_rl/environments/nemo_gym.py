@@ -299,6 +299,19 @@ _TOKEN_CAPTURE_CONTROL_PREFIX = "/training-token-capture/control"
 _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
 
 
+def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
+    """Map the setup-derived generation backend to Gym's capture backend."""
+    generation_backend = token_capture.get("generation_backend")
+    if generation_backend == "vllm":
+        return "vllm_worker"
+    if generation_backend == "megatron":
+        return "megatron_worker"
+    raise ValueError(
+        "token_capture.enabled requires setup-derived generation_backend to be "
+        f"'vllm' or 'megatron'; got {generation_backend!r}"
+    )
+
+
 def _detect_invalid_tool_call_and_malformed_thinking(
     output_item_dict: dict[str, Any],
     invalid_tool_call_patterns: list[str] | None = None,
@@ -541,6 +554,7 @@ Depending on your data shape, you may want to change these values."""
         self._control_headers: Dict[str, str] = {}
         self._control_timeout_s = 60.0
         if self._token_capture_enabled:
+            assert token_capture is not None
             policy_overrides = (
                 initial_global_config_dict.setdefault("policy_model", {})
                 .setdefault("responses_api_models", {})
@@ -560,6 +574,7 @@ Depending on your data shape, you may want to change these values."""
                 "lineage_store": ("nemo_gym.token_id_capture.lineage:FileLineageStore"),
                 "lineage_store_kwargs": {"root": os.path.join(capture_dir, "lineage")},
                 "external_staging": True,
+                "external_staging_backend": _external_staging_backend(token_capture),
                 "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
             }
             # Gym resolves the credential inside each serving process. Keep
@@ -888,7 +903,8 @@ Depending on your data shape, you may want to change these values."""
 
         The receipt records the resolving stage in ``terminal_selection``
         (``declared``/``response_id``/``content``/``heuristic`` — failed
-        selections stamp the last stage attempted) and the witness trail in
+        selections stamp the last stage attempted; ``None`` when no stage ran
+        because the manifest failed to parse) and the witness trail in
         ``terminal_attribution_reason``. Retry duplicates are dead-branch
         rows: they stay in the manifest (their staged rows are fetched,
         verified, and cleaned) but never join the terminal chain —
@@ -904,9 +920,10 @@ Depending on your data shape, you may want to change these values."""
         Such rows are structurally off-chain and do not poison; if the
         *terminal* request itself died this way, the missing-terminal-row
         check below still masks the rollout. Every other failure reason
-        (``worker_capture_failed``, ``invalid_worker_commit_coordinates``)
-        marks a call whose completion WAS served — a hole in the chain —
-        and poisons.
+        (for example ``worker_capture_failed``,
+        ``invalid_worker_commit_coordinates``, or ``unresolved_parent``; a
+        reason-less failure row poisons as ``capture_failed``) marks a call
+        whose completion WAS served — a hole in the chain — and poisons.
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
@@ -922,7 +939,7 @@ Depending on your data shape, you may want to change these values."""
         terminal_record = None
         selection_reason = None
         attribution_reason = None
-        terminal_selection = "heuristic"
+        terminal_selection = None
         parsed_records = None
         try:
             parsed_records = [
@@ -946,6 +963,7 @@ Depending on your data shape, you may want to change these values."""
                 terminal_selection = "declared"
                 selection_reason = None
             else:
+                terminal_selection = "heuristic"
                 selection = select_terminal_call(parsed_records)
                 if selection.terminal_model_call_id is not None:
                     terminal_record = deduped[selection.terminal_model_call_id]
@@ -1354,16 +1372,19 @@ def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> Non
 def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config = config.policy["generation"]
 
-    backend = generation_config.get("backend")
-    if backend == "vllm":
-        # Enable the http server. Requires both async engine and the expose_http_server flag
+    # Enable the backend's OpenAI-compatible server.
+    if generation_config["backend"] == "vllm":
         generation_config["vllm_cfg"]["async_engine"] = True
         generation_config["vllm_cfg"]["expose_http_server"] = True
-    elif backend == "megatron":
-        # Enable the http server for Gym dispatch over the Megatron generation backend.
+    elif generation_config["backend"] == "megatron":
+        # Megatron Inference is always async; should_use_async_rollouts rejects
+        # an explicit mcore_generation_config.async_engine key.
         generation_config["mcore_generation_config"]["expose_http_server"] = True
     else:
-        raise ValueError(f"NeMo Gym does not support generation backend {backend!r}.")
+        raise ValueError(
+            "NeMo-Gym setup supports vllm or megatron generation; got "
+            f"{generation_config['backend']!r}"
+        )
 
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None
