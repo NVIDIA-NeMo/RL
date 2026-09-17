@@ -619,3 +619,111 @@ def test_the_release_is_abandoned_rather_than_waited_on():
             )
             return
     raise AssertionError("release_within not found")
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "prepare_refit_info",
+        "update_weights_from_collective",
+        "prepare_nccl_reshard_refit_info",
+        "nccl_reshard_refit",
+    ],
+)
+def test_refit_fan_outs_address_surviving_leaders_only(method):
+    """A refit call that walks the whole worker group calls the shard that just died.
+
+    run_all_workers_single_data iterates every worker. On the recovery path a shard is
+    absent BY CONSTRUCTION -- that is why the path is running -- so the whole-group
+    fan-out is wrong exactly when it executes, and ray.get raises ActorDiedError out of
+    reconcile_communicator, past the recovery, into the run.
+
+    The recovery path is where this bites: it is reached precisely because a shard is
+    absent, so the whole-group fan-out is wrong exactly when it runs. Three of these
+    four calls were already converted to _refit_leader_workers; this is the fourth,
+    and missing one of a set is the bug class design_vllm_fault_tolerance.md section
+    8.5.5 exists for.
+    """
+    tree = ast.parse(
+        (REPO_ROOT / "nemo_rl/models/generation/vllm/vllm_generation.py").read_text()
+    )
+    fn = next(
+        (
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and n.name == method
+        ),
+        None,
+    )
+    assert fn is not None, f"VllmGeneration.{method} not found"
+
+    names = {n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute)} | {
+        n.id for n in ast.walk(fn) if isinstance(n, ast.Name)
+    }
+    assert "_refit_leader_workers" in names, (
+        f"{method} must address the surviving DP leaders; without it a lost shard makes "
+        "this call its dead actor and the refit fails after the rebuild succeeded"
+    )
+    assert "run_all_workers_single_data" not in names, (
+        f"{method} still walks the whole worker group, which includes the shard the "
+        "recovery just removed"
+    )
+
+
+@pytest.mark.parametrize(
+    ("synchronizer", "function"),
+    [
+        ("collective_weight_synchronizer.py", "reconcile_communicator"),
+        ("nccl_reshard_weight_synchronizer.py", "_build"),
+    ],
+)
+def test_membership_is_recorded_before_any_refit_dispatch(synchronizer, function):
+    """Ordering, not presence: recording it after a dispatch is the same as not at all.
+
+    Every refit dispatch resolves targets through _refit_leader_workers, which falls back
+    to the whole fleet while no membership is recorded. So a dispatch that runs before
+    set_refit_membership addresses the shard the reconcile is removing, and ray.get raises
+    ActorDiedError out of the recovery.
+
+    It has been hit twice: once via the whole-group fan-out in prepare_refit_info, and
+    again after that was converted, because set_refit_membership still sat below the
+    call. The reshard side was correct throughout -- _build records first.
+    """
+    tree = ast.parse((REPO_ROOT / "nemo_rl" / "weight_sync" / synchronizer).read_text())
+    fn = next(
+        (
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and n.name == function
+        ),
+        None,
+    )
+    assert fn is not None, f"{synchronizer}::{function} not found"
+
+    record, dispatch = [], []
+    for node in ast.walk(fn):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        target = node.func
+        # Only calls onto the generation handle can reach a dead generation actor.
+        if not (
+            isinstance(target.value, ast.Attribute)
+            and target.value.attr == "_generation"
+        ):
+            continue
+        if target.attr == "set_refit_membership":
+            record.append(node.lineno)
+        elif target.attr.startswith(
+            ("prepare_", "update_weights", "rebuild", "nccl_reshard")
+        ):
+            dispatch.append(node.lineno)
+
+    assert record, f"{synchronizer}::{function} never records the membership"
+    assert dispatch, f"{synchronizer}::{function} makes no generation dispatch to guard"
+    assert min(record) < min(dispatch), (
+        f"{synchronizer}::{function} records the membership at line {min(record)} but "
+        f"dispatches to the generation fleet at line {min(dispatch)}. Anything before the "
+        "record falls back to the whole fleet, including the shard being removed."
+    )

@@ -248,8 +248,18 @@ class TestModelForward:
         call_kwargs = mock_model.call_args[1]
         assert call_kwargs["fp32_output"] is False
 
-    def test_model_forward_clears_position_ids_for_multimodal(self):
-        """Test model_forward sets position_ids to None for multimodal data."""
+    @pytest.mark.parametrize(
+        ("model_slices_context_parallel_inputs", "keeps_position_ids"),
+        [
+            pytest.param(False, False, id="vlm-derives-own-positions"),
+            pytest.param(True, True, id="caller-packed-model-keeps-positions"),
+        ],
+    )
+    def test_model_forward_position_ids_for_multimodal(
+        self, model_slices_context_parallel_inputs, keeps_position_ids
+    ):
+        """Multimodal batches drop caller position_ids unless the model consumes
+        caller-packed inputs (Nemotron Omni), whose MTP block needs them."""
         from nemo_rl.models.megatron.train import model_forward
 
         mock_model = MagicMock()
@@ -259,17 +269,22 @@ class TestModelForward:
         mock_data_dict.get_multimodal_dict.return_value = {
             "images": torch.randn(1, 3, 224, 224)
         }
+        position_ids = torch.tensor([[0, 1, 2]])
 
         model_forward(
             model=mock_model,
             data_dict=mock_data_dict,
             input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
-            position_ids=torch.tensor([[0, 1, 2]]),
+            position_ids=position_ids,
             attention_mask=torch.ones(1, 3),
+            model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
         )
 
         call_kwargs = mock_model.call_args[1]
-        assert call_kwargs["position_ids"] is None
+        if keeps_position_ids:
+            assert call_kwargs["position_ids"] is position_ids
+        else:
+            assert call_kwargs["position_ids"] is None
 
 
 class TestApplyTemperatureScaling:
@@ -402,9 +417,13 @@ class TestForwardWithPostProcessingFn:
                 data_iterator=data_iterator,
                 model=MagicMock(),
                 post_processing_fn=post_processor,
+                model_slices_context_parallel_inputs=True,
             )
 
         mock_model_forward.assert_called_once()
+        forward_kwargs = mock_model_forward.call_args.kwargs
+        assert forward_kwargs["model_slices_context_parallel_inputs"] is True
+        assert forward_kwargs["position_ids"] is processed_mb.position_ids
 
     @patch("nemo_rl.models.megatron.train.model_forward")
     def test_forward_with_topk_post_processor(self, mock_model_forward):
@@ -956,10 +975,15 @@ class TestMegatronForwardBackward:
             mbs=1,
             post_processing_fn=post_processor,
             forward_only=True,
+            model_slices_context_parallel_inputs=True,
         )
 
         call_kwargs = mock_fb_func.call_args[1]
         assert call_kwargs["forward_only"] is True
+        forward_step_func = call_kwargs["forward_step_func"]
+        assert (
+            forward_step_func.keywords["model_slices_context_parallel_inputs"] is True
+        )
 
     @patch("nemo_rl.models.megatron.train.get_forward_backward_func")
     def test_forward_only_preserves_activation_offload_warmup(
