@@ -2644,6 +2644,7 @@ def test_reattach_preserves_marker_across_aliased_message_log_views():
     view free to overwrite the repaired media with the static payload.
     """
     from nemo_rl.data.multimodal_utils import ROLLOUT_MATCHED_MEDIA_KEY
+
     static_image = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0)
     rollout_matched = PackedTensor(torch.tensor([[9.0]]), dim_to_pack=0)
     original_logs = [

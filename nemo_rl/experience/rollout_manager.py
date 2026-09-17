@@ -792,11 +792,17 @@ class AsyncNemoGymRolloutImpl:
         # repaired media.
         processed_target_ids: set[int] = set()
         attach_static_multimodal_payload(
-            prompt_message_log, source_message_log, processed_target_ids
+            prompt_message_log,
+            source_message_log,
+            processed_target_ids=processed_target_ids,
+            tokenizer=self._tokenizer,
         )
         for completion in completions:
             attach_static_multimodal_payload(
-                completion.message_log, source_message_log, processed_target_ids
+                completion.message_log,
+                source_message_log,
+                processed_target_ids=processed_target_ids,
+                tokenizer=self._tokenizer,
             )
 
         timer.stop(f"{timer_prefix}/total")

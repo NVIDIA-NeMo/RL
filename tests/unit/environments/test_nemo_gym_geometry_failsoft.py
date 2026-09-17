@@ -71,9 +71,7 @@ def test_geometry_failure_strips_media_masks_sample_and_marks_turns(monkeypatch)
     def fake_attach(user_message, **kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
-            user_message["pixel_values"] = PackedTensor(
-                torch.ones(1, 1), dim_to_pack=0
-            )
+            user_message["pixel_values"] = PackedTensor(torch.ones(1, 1), dim_to_pack=0)
         else:
             raise RolloutGeometryUnderdetermined("count is ambiguous")
 
@@ -114,9 +112,9 @@ def test_geometry_failure_strips_media_masks_sample_and_marks_turns(monkeypatch)
     ]
     assert len(user_messages) == 2
     for message in user_messages:
-        assert not any(
-            isinstance(value, PackedTensor) for value in message.values()
-        ), "media must be stripped from every turn after a geometry failure"
+        assert not any(isinstance(value, PackedTensor) for value in message.values()), (
+            "media must be stripped from every turn after a geometry failure"
+        )
         assert message[ROLLOUT_MATCHED_MEDIA_KEY] is True
     assert nemo_gym_result["instance_config"]["mask_sample"] is True
     # Only turns before the failure ever attached; the failing turn stopped it.
