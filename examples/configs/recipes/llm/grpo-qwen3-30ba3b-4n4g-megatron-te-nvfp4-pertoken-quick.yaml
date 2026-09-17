@@ -30,6 +30,7 @@ policy:
       NVTE_NVFP4_ROW_SCALED_ACTIVATION: '1'
       NVTE_NVFP4_DISABLE_RHT: '1'
       NVTE_NVFP4_DISABLE_2D_QUANTIZATION: '1'
+      # Backward-gradient setting; optional with dequantized backward.
       NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING: '1'
       NVTE_BACKWARD_OVERRIDE: dequantized
 cluster:
