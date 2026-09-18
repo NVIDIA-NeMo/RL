@@ -334,13 +334,17 @@ policy:
     env_vars: null
 
   draft:
-    # Draft co-training speculator. Currently only eagle3 is supported.
+    # Default draft speculator; DFlash and DSpark have dedicated recipe configs.
     speculator_type: eagle3
     enabled: false
     model_name: null
     loss_weight: 0.1
     num_layers: null
     aux_layer_indices: null
+    # Optional draft-only optimizer schedule. Set a mapping with `lr` and
+    # optional `min_lr`/`weight_decay` to enable it.
+    optimizer: null
+
     # Tokens per FP32 vocab tile in the streaming draft soft-CE. Lower it if the
     # tile (token_chunk_size x vocab, in fp32) is too large for the device;
     # raise it if the GPU is launch-bound.

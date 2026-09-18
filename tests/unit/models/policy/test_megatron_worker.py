@@ -1154,9 +1154,9 @@ def test_megatron_refit_bridge_tasks_export_logical_quantized_weights(
     logical_weight = torch.arange(8, dtype=torch.bfloat16).reshape(4, 2)
     bf16_source = torch.ones((2, 2), dtype=torch.bfloat16)
     dequantize = MagicMock(
-        side_effect=lambda tensor: logical_weight
-        if tensor is quantized_source
-        else tensor
+        side_effect=lambda tensor: (
+            logical_weight if tensor is quantized_source else tensor
+        )
     )
     monkeypatch.setattr(
         worker_module,
@@ -1844,6 +1844,27 @@ def test_compute_moe_grad_scale_clamps_zero_valid_tokens():
         worker, torch.tensor(0.0)
     )
     assert torch.allclose(scale_fn(), torch.tensor(1.0))
+
+
+def test_split_train_api_rejects_direct_packed_sft_rows():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    data = BatchedDataDict(
+        {
+            "packed_cu_seqlens": torch.tensor([[0, 4]], dtype=torch.int32),
+            "target_ids": torch.ones(1, 4, dtype=torch.long),
+        }
+    )
+
+    with pytest.raises(NotImplementedError, match="split training API"):
+        MegatronPolicyWorkerImpl._train_microbatch_body(
+            worker,
+            {"loss_fn": NLLLossFn()},
+            data,
+        )
 
 
 @pytest.mark.parametrize(

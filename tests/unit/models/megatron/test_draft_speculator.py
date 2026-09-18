@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
+from nemo_rl.models.policy.draft_config import DFlashDraftConfig, Eagle3DraftConfig
 
 pytestmark = pytest.mark.mcore
 
@@ -107,3 +107,47 @@ def test_eagle3_speculator_delegates_existing_model_build(
         pg_collection=pg_collection,
         policy_model_chunk=policy_model_chunk,
     )
+
+
+def test_dflash_provider_builds_body_from_target_dimensions() -> None:
+    from nemo_rl.models.megatron.draft.dflash import DFlashBody
+    from nemo_rl.models.megatron.draft.training import resolve_draft_speculator
+
+    config = DFlashDraftConfig(
+        enabled=True,
+        gamma=3,
+        anchors_per_sample=2,
+        mask_token_id=99,
+        target_hidden_state_layer_ids=[1, 3],
+        num_layers=2,
+    )
+    provider = SimpleNamespace(
+        hidden_size=32,
+        ffn_hidden_size=64,
+        num_attention_heads=4,
+        num_query_groups=2,
+        kv_channels=8,
+        tensor_model_parallel_size=1,
+        sequence_parallel=False,
+        num_layers=4,
+        use_cpu_initialization=True,
+        fp16=False,
+        bf16=False,
+        params_dtype=__import__("torch").float32,
+        init_method_std=0.02,
+        layernorm_epsilon=1e-6,
+        rotary_base=1_000_000.0,
+    )
+    speculator = resolve_draft_speculator(config)
+    assert speculator is not None
+
+    body = speculator.build_model(
+        model_provider=provider,
+        pg_collection=SimpleNamespace(tp=None),
+        policy_model_chunk=MagicMock(),
+    )
+
+    assert isinstance(body, DFlashBody)
+    assert body.config.hidden_size == 32
+    assert body.config.num_target_taps == 2
+    assert body.config.num_hidden_layers == 2

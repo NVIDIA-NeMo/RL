@@ -762,6 +762,66 @@ def test_prepare_nccl_reshard_refit_info_validates_before_building_map(monkeypat
     assert not hasattr(ext, "nccl_reshard_refit_info")
 
 
+@pytest.mark.parametrize("speculator_type", ["dflash", "dspark"])
+def test_prepare_nccl_reshard_refit_info_builds_draft_runtime(
+    monkeypatch, speculator_type
+):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    draft_model = object()
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        get_draft_model=lambda: draft_model,
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(method=speculator_type)
+        ),
+    )
+    ext.pp_comm_groups = {}
+    ext._uses_unquantized_flashinfer_trtllm = lambda: False
+    ext._validate_native_layerwise_refit = MagicMock()
+    ext.build_hf_to_local_param_map = MagicMock(return_value=HFToLocalParamMap())
+    monkeypatch.setattr(
+        vllm_backend,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=1),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.weight_sync.nccl_reshard_utils.restore_refit_info_placements",
+        lambda value: value,
+    )
+    refit_info = {
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": "model.layers.0.mlp.down_proj.weight",
+                    "global_shape": [2, 2],
+                    "dtype": "torch.float32",
+                }
+            ]
+        },
+        "misc_meta": {
+            "draft.model.weight": {
+                "shape": [2],
+                "dtype": "torch.float32",
+            }
+        },
+    }
+
+    ext.prepare_nccl_reshard_refit_info(refit_info)
+
+    assert ext._draft_runtime_adapter is not None
+    assert ext._draft_runtime_adapter.model is draft_model
+    assert ext._model_update_manifest is not None
+    assert ext._model_update_manifest.target.ordered_names == (
+        "model.layers.0.mlp.down_proj.weight",
+    )
+    assert ext._model_update_manifest.draft is not None
+    assert ext._model_update_manifest.draft.ordered_names == ("draft.model.weight",)
+
+
 def test_nccl_reshard_trtllm_refit_rejects_fp8_kv_cache(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
@@ -886,7 +946,7 @@ def test_nccl_reshard_lifecycle_repeats_for_trtllm_moe_modules(monkeypatch):
     for cycle in range(2):
         with ext._weight_update_lifecycle("nccl_reshard") as finalize:
             call_order.append(("transfer", cycle))
-            finalize()
+            finalize(False)
 
     assert call_order == [
         ("initialize", trtllm_moe),
@@ -900,7 +960,24 @@ def test_nccl_reshard_lifecycle_repeats_for_trtllm_moe_modules(monkeypatch):
     ]
 
 
-def test_nccl_reshard_refit_runs_transport_lifecycle(monkeypatch):
+@pytest.mark.parametrize(
+    ("misc_meta", "expected_finalize_draft"),
+    [
+        ({}, False),
+        (
+            {
+                "draft.model.weight": {
+                    "shape": [2],
+                    "dtype": "torch.float32",
+                }
+            },
+            True,
+        ),
+    ],
+)
+def test_nccl_reshard_refit_runs_transport_lifecycle(
+    monkeypatch, misc_meta, expected_finalize_draft
+):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
@@ -909,9 +986,12 @@ def test_nccl_reshard_refit_runs_transport_lifecycle(monkeypatch):
     ext.nccl_reshard_refit_info = {
         "layer_names": [],
         "per_layer_params": {},
-        "misc_meta": {},
+        "misc_meta": misc_meta,
     }
     ext.pp_comm_groups = {}
+    ext._model_update_manifest = SimpleNamespace(
+        draft=object() if expected_finalize_draft else None
+    )
     ext._receive_and_load_misc_params = MagicMock()
     ext._maybe_process_fp8_kv_cache = MagicMock()
     finalize = MagicMock()
@@ -934,7 +1014,7 @@ def test_nccl_reshard_refit_runs_transport_lifecycle(monkeypatch):
 
     assert ext.nccl_reshard_refit() is True
     assert lifecycle_calls == ["nccl_reshard"]
-    finalize.assert_called_once_with()
+    finalize.assert_called_once_with(expected_finalize_draft)
 
 
 def test_build_hf_to_local_param_map_quantizes_bf16_for_mxfp8(monkeypatch):

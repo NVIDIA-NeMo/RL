@@ -99,8 +99,10 @@ def _reshard(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_size=8)
             gen,
             name,
             (
-                lambda n: lambda *a, **k: getattr(vllm_generation.VllmGeneration, n)(
-                    gen, *a, **k
+                lambda n: (
+                    lambda *a, **k: getattr(vllm_generation.VllmGeneration, n)(
+                        gen, *a, **k
+                    )
                 )
             )(name),
         )
@@ -121,12 +123,7 @@ def _reshard(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_size=8)
         sync_params_before_refit=lambda: None,
         init_collective=lambda *a, **k: ["train-f"],
         init_nccl_reshard_comm_group=lambda **k: ["train-bulk"],
-        prepare_nccl_reshard_refit_info=lambda tp,
-        gp,
-        tws,
-        iws,
-        *,
-        refit_payload_mode: (
+        prepare_nccl_reshard_refit_info=lambda tp, gp, tws, iws, *, refit_payload_mode: (
             plan_calls.append(
                 {
                     "train_world_size": tws,
@@ -277,8 +274,8 @@ class TestRefitDispatchExcludesTheDeadShard:
         from nemo_rl.models.generation.vllm import vllm_generation
 
         sync, gen, workers, _, kill = _reshard(dp_size=4, dead_shards=(1,))
-        gen.update_weights_from_collective = (
-            lambda: vllm_generation.VllmGeneration.update_weights_from_collective(gen)
+        gen.update_weights_from_collective = lambda: (
+            vllm_generation.VllmGeneration.update_weights_from_collective(gen)
         )
         gen.set_refit_membership(
             plan_refit_membership(
