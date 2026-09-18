@@ -51,8 +51,12 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
+    _AsyncLLMHTTPClient,
     _CheckpointCaptureGate,
     _RequestOutputDeltaAccumulator,
+    _RESTORED_PREFIX_TERMINAL_PROMPT_KEY,
+    _RestoredPrefixTerminal,
+    _classify_restored_prefix_terminal,
     _remaining_generation_limits_after_prefix,
 )
 
@@ -455,6 +459,109 @@ def test_restored_generation_prefix_reduces_independent_output_limits(
         )
         == expected
     )
+
+
+@pytest.mark.parametrize(
+    ("prompt_token_ids", "generation_token_count", "output_limit", "reason"),
+    [
+        ([1, 2, 3, 4], 2, 2, "output_limit"),
+        ([1, 2, 3, 4], 2, 8, "model_limit"),
+        ([1, 2, 3, 4], 2, 2, "output_and_model_limit"),
+    ],
+)
+def test_restored_prefix_at_limit_is_a_terminal_length_completion(
+    prompt_token_ids: list[int],
+    generation_token_count: int,
+    output_limit: int,
+    reason: str,
+) -> None:
+    model_max_tokens = 4 if "model" in reason else 8
+    terminal = _classify_restored_prefix_terminal(
+        prompt_token_ids=prompt_token_ids,
+        generation_token_count=generation_token_count,
+        requested_output_tokens=output_limit,
+        model_max_tokens=model_max_tokens,
+    )
+
+    assert terminal is not None
+    assert terminal.reason == reason
+    assert terminal.original_prompt_token_count == 2
+
+
+def test_restored_prefix_below_limits_still_generates_a_tail() -> None:
+    assert (
+        _classify_restored_prefix_terminal(
+            prompt_token_ids=[1, 2, 3, 4],
+            generation_token_count=2,
+            requested_output_tokens=3,
+            model_max_tokens=5,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("prompt_token_ids", "generation_token_count", "output_limit", "match"),
+    [
+        ([1, 2, 3, 4], 3, 2, "exceeds the restored request output budget"),
+        ([1, 2, 3, 4, 5], 2, 4, "exceeds restored model capacity"),
+    ],
+)
+def test_restored_prefix_beyond_current_limits_fails_closed(
+    prompt_token_ids: list[int],
+    generation_token_count: int,
+    output_limit: int,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        _classify_restored_prefix_terminal(
+            prompt_token_ids=prompt_token_ids,
+            generation_token_count=generation_token_count,
+            requested_output_tokens=output_limit,
+            model_max_tokens=4,
+        )
+
+
+def test_terminal_restored_prefix_skips_physical_generation(monkeypatch) -> None:
+    terminal = _RestoredPrefixTerminal(
+        prompt_token_ids=(1, 2, 3, 4),
+        generation_token_count=2,
+        reason="output_limit",
+    )
+    final_output = object()
+    build_output = MagicMock(return_value=final_output)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async."
+        "_build_restored_prefix_terminal_output",
+        build_output,
+    )
+    engine = SimpleNamespace(
+        model_config=object(),
+        renderer=object(),
+        input_processor=object(),
+        vllm_config=object(),
+        generate=MagicMock(),
+        abort=MagicMock(),
+    )
+
+    async def scenario() -> list[object]:
+        client = _AsyncLLMHTTPClient(engine, asyncio.get_running_loop())
+        return [
+            output
+            async for output in client.generate(
+                {
+                    "prompt_token_ids": list(terminal.prompt_token_ids),
+                    _RESTORED_PREFIX_TERMINAL_PROMPT_KEY: terminal,
+                },
+                SimpleNamespace(),
+                "request-1",
+            )
+        ]
+
+    assert asyncio.run(scenario()) == [final_output]
+    build_output.assert_called_once_with("request-1", terminal)
+    engine.generate.assert_not_called()
+    engine.abort.assert_not_called()
 
 
 def test_generation_set_rollout_weight_version_fans_out(monkeypatch):
@@ -1769,6 +1876,102 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
     assert "generation prefix restored:" in caplog.text
     assert f"prefix_digest={cut_record.digest}" in caplog.text
     assert "prefix_tokens=2 tail_tokens=1 total_generation_tokens=3" in caplog.text
+
+
+def test_terminal_restored_cut_publishes_canonical_row_with_zero_new_tail():
+    sink = _MemorySink()
+    original_worker = _worker_with_capture(sink)
+    original_worker._rollout_weight_version = 7
+    original_request = _FakeRequest(
+        ng_capture={
+            "rollout_id": "r0",
+            "model_call_id": "c1",
+            "mode": "text",
+        },
+        stream=False,
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        original_worker, original_request, [10, 11]
+    )
+    VllmAsyncGenerationWorkerImpl._observe_request_capture(
+        original_worker,
+        original_request,
+        SimpleNamespace(
+            outputs=[
+                SimpleNamespace(
+                    token_ids=[12, 13],
+                    logprobs=[
+                        {12: SimpleNamespace(logprob=-0.1)},
+                        {13: SimpleNamespace(logprob=-0.2)},
+                    ],
+                )
+            ]
+        ),
+    )
+    receipt = VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(
+        original_worker,
+        GenerationCutInventory.build(
+            checkpoint_id="checkpoint-1",
+            server_name="policy",
+            active_prefixes=[
+                GenerationCutPrefix(
+                    ticket_id="ticket-1",
+                    rollout_id="r0",
+                    attempt_index=0,
+                    model_call_id="c1",
+                    admitted_at=1.0,
+                )
+            ],
+        ),
+    )
+    (cut_key,) = receipt.prefixes[0].staging_keys
+    cut_record = sink.generation_prefix_records[-1][1]
+
+    resumed_worker = _worker_with_capture(sink)
+    resumed_worker._rollout_weight_version = 9
+    resumed_worker._staging_source = _MemoryPrefixSource(
+        {}, records={cut_key: cut_record}
+    )
+    request = _FakeRequest(
+        ng_capture={
+            "rollout_id": "r0-a1",
+            "model_call_id": "c2",
+            "mode": "text",
+            "generation_cut": {
+                "source_capture_key": "r0",
+                "source_model_call_id": "c1",
+                "staging_keys": [cut_key],
+                "generation_token_count": 2,
+                "digest": cut_record.digest,
+            },
+        },
+        stream=False,
+    )
+    admission = resumed_worker._capture_admission(request)
+    generation_cut = resumed_worker._resolve_generation_cut(admission, [])
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        resumed_worker,
+        request,
+        [10, 11, 12, 13],
+        admission=admission,
+        prefix_token_ids=[],
+        generation_cut=generation_cut,
+        resumed_generation_token_ids=[12, 13],
+    )
+
+    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        resumed_worker,
+        request,
+        _served_content([], []),
+    )
+
+    final_record = sink.records[-1]
+    assert content["ng_commit_coords"]["disposition"] == "staged"
+    assert final_record.token_ids_delta == [10, 11, 12, 13]
+    assert final_record.token_mask_delta == [0.0, 0.0, 1.0, 1.0]
+    assert final_record.generation_log_probs_delta == [0.0, 0.0, -0.1, -0.2]
+    assert resumed_worker._completed_capture_calls["c2"].generation_token_count == 2
+    assert sink.cleared_generation_prefix_keys == [cut_key]
 
 
 def test_checkpoint_gate_holds_terminal_stage_until_reopened():
