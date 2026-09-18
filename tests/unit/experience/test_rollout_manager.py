@@ -1059,7 +1059,10 @@ def test_receipt_completion_drops_mask_flag_when_gate_off():
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
 
 
-def test_streamed_receipt_callback_uses_current_completion_conversion():
+@pytest.mark.parametrize("log_full_result_tables", [False, True])
+def test_streamed_receipt_callback_uses_current_completion_conversion(
+    log_full_result_tables,
+):
     class _RunRolloutsRemote:
         def options(self, *, num_returns):
             assert num_returns == "streaming"
@@ -1081,7 +1084,7 @@ def test_streamed_receipt_callback_uses_current_completion_conversion():
 
             return stream()
 
-    impl = _nemo_gym_impl(False)
+    impl = _nemo_gym_impl(False, log_full_result_tables=log_full_result_tables)
     env = type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     results = [None]
     shaping = [None]
@@ -1107,6 +1110,11 @@ def test_streamed_receipt_callback_uses_current_completion_conversion():
     assert generation_index == 0
     assert completion.env_extras["ng_rollout_id"] == "r0"
     assert "mask_sample" not in completion.env_extras["instance_config"]
+    context = completion.env_extras["ng_reward_log_context"]
+    assert context.agent_name == "resolved-agent"
+    assert (context.full_result_json is not None) is log_full_result_tables
+    if log_full_result_tables:
+        assert "reward" not in json.loads(context.full_result_json)
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
@@ -2226,3 +2234,64 @@ class TestGenerateForFinalizationFlow:
         assert (
             restored._impl.seen_recovery_granularity is RecoveryGranularity.PROMPT_GROUP
         )
+
+
+def test_capture_completion_preserves_checks_and_raw_reward_until_finalization():
+    from nemo_rl.experience.reward_penalties import RewardChecks
+
+    impl = _nemo_gym_impl(
+        True, {"penalize_empty_final_answer": True}, log_full_result_tables=True
+    )
+    checks = RewardChecks(False, True, True)
+    result = {
+        "rollout_id": "r",
+        "receipt": {"rollout_id": "r", "manifest": []},
+        "reward_checks": checks,
+        "message_log": [],
+        "input_message_log": [],
+        "full_result": {"reward": -2.0, "response": {"output": []}},
+    }
+    completions, counts = impl._results_to_completions([result])
+    assert completions[0].reward == -2.0
+    assert completions[0].env_extras["ng_reward_checks"] == checks
+    assert sum(counts.values()) == 0
+    assert impl._compute_reward_penalty_metrics(counts, 0) == {}
+    metrics = impl._compute_rollout_metrics(completions, "agent")
+    assert not any(k.startswith(("total_reward/", "agent/reward/")) for k in metrics)
+
+
+@pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+def test_capture_manager_seals_checks_and_forwards_them_to_reassembly(
+    monkeypatch, granularity
+):
+    from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
+
+    checks = RewardChecks(True, True, True)
+    log_context = RewardLogContext("agent", '{"answer":"ok"}')
+    original = _receipt_record
+
+    def with_checks(*args, **kwargs):
+        record = original(*args, **kwargs)
+        for completion in record.completions:
+            completion.env_extras["ng_reward_checks"] = checks
+            completion.env_extras["ng_reward_log_context"] = log_context
+        return record
+
+    monkeypatch.setattr(f"{__name__}._receipt_record", with_checks)
+    mgr = _make_capture_manager(
+        _FakeCaptureBuffer(),
+        recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
+    )
+    request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+    assert request.rewards == (0.5, 0.5)
+    assert request.reward_checks == (checks, checks)
+    assert request.reward_log_contexts == (log_context, log_context)
+    restored = RolloutRecoveryLedger.from_state_dict(mgr.recovery_ledger.state_dict())
+    assert (
+        tuple(restored.finalization_inputs(request.group_id)[5])
+        == request.reward_checks
+    )
+    assert (
+        tuple(restored.finalization_inputs(request.group_id)[6])
+        == request.reward_log_contexts
+    )

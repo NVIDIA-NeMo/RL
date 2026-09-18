@@ -107,6 +107,8 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         prompt_idx=17,
         loss_multiplier=0.25,
         canonical_sample_ids=["group_g0"],
+        reward_checks=None,
+        reward_log_contexts=None,
     )
 
 
@@ -141,6 +143,8 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "prompt_idx",
         "mask_sample",
         "loss_multiplier",
+        "reward_checks",
+        "reward_log_contexts",
     }
     assert {f.name for f in fields(FinalizedGroup)} == {
         "meta",
@@ -149,6 +153,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "staging_keys",
         "canonical_output_tokens",
         "metrics",
+        "reward_observations",
         "dropped",
         "drop_reason",
         "valid_row_count",
@@ -244,3 +249,18 @@ def test_dependency_check_propagates_import_error(
     with pytest.raises(ModuleNotFoundError) as exc_info:
         actor.check_dependencies()
     assert exc_info.value is import_error
+
+
+def test_reward_checks_remain_metadata_only_and_reach_finalizer():
+    from nemo_rl.experience.reward_penalties import RewardChecks
+
+    checks = RewardChecks(True, True, True)
+    request = replace(_request(), reward_checks=(checks,))
+    assert_metadata_only(request)
+    actor = object.__new__(RolloutReassemblerActor.__ray_metadata__.modified_class)
+    actor._finalizer = MagicMock()
+    actor._finalizer.finalize_group.return_value = FinalizedGroup(
+        None, 4, 4, [], dropped=True
+    )
+    actor.finalize(request)
+    assert actor._finalizer.finalize_group.call_args.kwargs["reward_checks"] == [checks]

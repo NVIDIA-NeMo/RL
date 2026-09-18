@@ -102,6 +102,7 @@ def _controller(actor: object) -> Any:
     ctrl._finalizer_waiters = 0
     ctrl._finalizer_unknown_outcomes = 0
     ctrl._finalizer_metrics_by_group = {}
+    ctrl._finalizer_rewards_by_group = {}
     ctrl._rollout_recovery_ledger = MagicMock()
     ctrl._rollout_recovery_ledger.__contains__.return_value = False
     ctrl._rollout_manager = MagicMock()
