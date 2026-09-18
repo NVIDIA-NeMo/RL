@@ -877,3 +877,211 @@ def test_deferred_chain_hash_corruption_rejects_the_row(
     )
     assert not row.valid
     assert (row.rejection_reason or "").startswith("rebuild_failed:chain_hash_mismatch")
+
+
+# ── multimodal rows ─────────────────────────────────────────────────────────
+
+MEDIA_CANONICAL_PARTITION = "rollout_data_media_fin_test"
+MEDIA_STAGING_PARTITION = "rollout_staging_media_fin_test"
+
+
+@pytest.fixture()
+def media_partitions(tq_client):
+    from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS
+
+    tq_client.register_partition(
+        partition_id=MEDIA_STAGING_PARTITION,
+        fields=list(STAGING_FIELDS) + list(MEDIA_STAGING_FIELDS),
+        num_samples=64,
+        consumer_tasks=["finalize"],
+    )
+    tq_client.register_partition(
+        partition_id=MEDIA_CANONICAL_PARTITION,
+        fields=[
+            "input_ids",
+            "input_lengths",
+            "generation_logprobs",
+            "token_mask",
+            "sample_mask",
+            "prompt_ids_for_adv",
+            "total_reward",
+            "mask_sample",
+            "truncated",
+            "pixel_values",
+            "imgs_sizes",
+            "num_frames",
+        ],
+        num_samples=64,
+        consumer_tasks=["train"],
+    )
+    yield
+    tq_client.clear_samples(sample_ids=None, partition_id=MEDIA_STAGING_PARTITION)
+    tq_client.clear_samples(sample_ids=None, partition_id=MEDIA_CANONICAL_PARTITION)
+
+
+def _engine_media_tensors():
+    """MInf packed patches for two 4x4 images with patch_dim 2: 8 patches of 12."""
+    torch.manual_seed(1)
+    return {
+        "imgs": torch.randn(1, 8, 12),
+        "imgs_sizes": torch.tensor([[4, 4], [4, 4]], dtype=torch.int32),
+    }
+
+
+def _stage_vlm_rollout(tq_client, rollout_id: str, *, media_tensors=...):
+    """Stage one VLM root call through the MInf stager and build its receipt."""
+    from types import SimpleNamespace
+
+    from nemo_rl.data_plane.tq_token_sink import TQMegatronTokenStager
+
+    stager = TQMegatronTokenStager(
+        TQTokenSink(tq_client, staging_partition=MEDIA_STAGING_PARTITION)
+    )
+    admission = nemo_gym.CaptureAdmission(
+        rollout_id=rollout_id, model_call_id="c1", mode="text"
+    )
+    result = stager.stage(
+        f"resp-{rollout_id}",
+        SimpleNamespace(
+            prompt_token_ids=[80, 99, 99, 99, 81],
+            generated_token_ids=[12, 2],
+            generated_log_probs=[-0.25, -0.5],
+            compact_prompt_token_ids=[80, 99, 81],
+            media_tensors=(
+                _engine_media_tensors() if media_tensors is ... else media_tensors
+            ),
+        ),
+        finished_metadata=SimpleNamespace(policy_epoch=[(0, 4)]),
+        offload_params={"ng_capture": admission.model_dump(mode="json")},
+    )
+    assert result is not None
+    coords = result.response_metadata["ng_commit_coords"]
+    assert coords["disposition"] == "staged"
+    manifest_row = {
+        "model_call_id": "c1",
+        "parent_call_id": None,
+        "mode": "text",
+        "prev_len": 0,
+        "delta_len": coords["delta_len"],
+        "cum_len": coords["cum_len"],
+        "weight_version": coords["weight_version"],
+        "digest": coords["digest"],
+        "extras_digest": coords["extras_digest"],
+        "staging_key": coords["staging_key"],
+        "chain_hash": coords["chain_hash"],
+        "cumulative_hash": coords["cumulative_hash"],
+        "response_id": f"resp-{rollout_id}",
+    }
+    return {
+        "rollout_id": rollout_id,
+        "terminal_model_call_id": "c1",
+        "manifest": [manifest_row],
+        "terminal_selection": "declared",
+    }
+
+
+def _media_finalizer(tq_client):
+    return RolloutReassembler(
+        tq_client,
+        partition_id=MEDIA_CANONICAL_PARTITION,
+        staging_partition=MEDIA_STAGING_PARTITION,
+        pad_token_id=PAD,
+        max_seq_len=4096,
+    )
+
+
+@pytest.mark.parametrize("case", ["attached", "no-media-tensors", "columns-drift"])
+def test_finalize_rollout_media(tq_client, media_partitions, case):
+    """Media on the call row: the terminal call's digest-covered geometry says whether
+    media columns must exist, the columns are read and checked against it, and the
+    packed-patch layout is handed to the trainer unchanged."""
+    receipt = _stage_vlm_rollout(
+        tq_client, "mm", media_tensors=None if case == "no-media-tensors" else ...
+    )
+    engine = _engine_media_tensors()
+    if case == "columns-drift":
+        # The columns are outside the digest; overwrite them so they disagree with it.
+        tampered = dict(
+            engine, imgs_sizes=torch.tensor([[8, 8], [4, 4]], dtype=torch.int32)
+        )
+        TQTokenSink(tq_client, staging_partition=MEDIA_STAGING_PARTITION).stage_media(
+            receipt["manifest"][0]["staging_key"], tampered
+        )
+
+    row = _media_finalizer(tq_client).finalize_rollout("mm", receipt, reward=1.0)
+
+    if case == "columns-drift":
+        assert not row.valid
+        assert row.rejection_reason.startswith("media_mismatch"), row.rejection_reason
+        return
+    assert row.valid, row.rejection_reason
+    assert row.token_ids == [80, 99, 99, 99, 81, 12, 2]
+    # Media rides the call row: no extra staging key to clean up.
+    assert row.staging_keys == [receipt["manifest"][0]["staging_key"]]
+    if case == "no-media-tensors":
+        assert row.media is None  # no geometry staged -> treated as a text row
+        return
+    assert set(row.media) == {"pixel_values", "imgs_sizes", "num_frames"}
+    pixels = row.media["pixel_values"].as_tensor()
+    assert pixels.shape == (
+        8,
+        12,
+    )  # [1, total_patches, F] squeezed to [total_patches, F]
+    assert torch.equal(pixels, engine["imgs"].squeeze(0))
+    assert row.media["imgs_sizes"].as_tensor().tolist() == [[4, 4], [4, 4]]
+    assert row.media["num_frames"].as_tensor().tolist() == [1, 1]
+
+
+def test_finalize_group_publishes_media_with_empty_rows_for_text_siblings(
+    tq_client, media_partitions
+):
+    from nemo_rl.data.multimodal_utils import (
+        PackedTensor,
+        reassemble_packed_multimodal,
+        row_shapes_key,
+    )
+
+    group_id = "mmgrp"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    receipt = _stage_vlm_rollout(tq_client, rollout_ids[0])
+    engine = _engine_media_tensors()
+
+    finalized = _media_finalizer(tq_client).finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt, None],  # sibling lost its receipt -> placeholder without media
+        [1.0, 0.0],
+        mask_sample=[False, False],
+        fallback_weight_version=4,
+        prompt_idx=3,
+    )
+
+    assert not finalized.dropped
+    assert finalized.meta is not None
+    assert {"pixel_values", "imgs_sizes", "num_frames"} <= set(finalized.meta.fields)
+    tags = finalized.meta.tags
+    assert tags[0][row_shapes_key("pixel_values")]["shapes"] == [[8, 12]]
+    # Text siblings still carry the companion tag, with no segments to rebuild.
+    assert tags[1][row_shapes_key("pixel_values")]["shapes"] == []
+
+    rows = tq_client.get_samples(
+        sample_ids=rollout_ids,
+        partition_id=MEDIA_CANONICAL_PARTITION,
+        select_fields=["input_ids", "pixel_values", "imgs_sizes", "num_frames"],
+    )
+    fields = {
+        name: rows.get(name) for name in ("pixel_values", "imgs_sizes", "num_frames")
+    }
+    reassemble_packed_multimodal(fields, tags)
+    pixels = fields["pixel_values"]
+    assert isinstance(pixels, PackedTensor)
+    assert pixels.logical_segment_counts_by_row() == [1, 0]
+    assert torch.equal(pixels.as_tensor(), engine["imgs"].squeeze(0))
+    assert fields["imgs_sizes"].as_tensor().tolist() == [[4, 4], [4, 4]]
+
+    # The call row (tokens and media columns alike) was cleared after publishing.
+    source = TQTokenSource(tq_client, staging_partition=MEDIA_STAGING_PARTITION)
+    with pytest.raises(KeyError):
+        source.fetch([receipt["manifest"][0]["staging_key"]])
+    with pytest.raises(KeyError):
+        source.fetch_media(receipt["manifest"][0]["staging_key"])

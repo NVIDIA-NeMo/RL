@@ -41,11 +41,13 @@ from typing import Any, Optional
 
 import torch
 
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
 from nemo_rl.data_plane.tq_token_sink import (
     TQTokenSink,
     TQTokenSource,
+    StagedMediaTensors,
 )
 from nemo_rl.experience.payload import pack_payload
 from nemo_rl.experience.route_assembly import (
@@ -82,6 +84,11 @@ class FinalizedRollout:
     # the executed route plan; None when the rollout staged no routes.
     routed_experts: Optional[torch.Tensor] = None
     route_plan: Optional[RouteAssemblyPlan] = None
+    # Trainer-ready media for this row (one logical row per PackedTensor):
+    # the engine's own vision-encoder inputs read off the terminal call's media
+    # columns and checked against its digest-covered media summary. None for
+    # text rollouts.
+    media: Optional[dict[str, PackedTensor]] = None
 
 
 @dataclass
@@ -106,6 +113,85 @@ class FinalizedGroup:
     # (the caller does not read these when dropped is True).
     valid_row_count: int = 0
     total_row_count: int = 0
+
+
+def _media_mismatch(staged: StagedMediaTensors, summary: Any) -> Optional[str]:
+    """Check the staged media columns against the digest-covered media summary.
+
+    The tensors are outside Gym's digest; the summary (imgs_sizes, num_frames,
+    num_tiles, embedding count) is inside it. Agreement ties the pixels the
+    trainer will project to the prompt the policy generated against.
+    """
+    if staged.imgs.ndim not in (2, 3, 4) or staged.imgs.numel() == 0:
+        return f"imgs has unsupported shape {tuple(staged.imgs.shape)}"
+    for name in ("imgs_sizes", "num_frames", "num_tiles"):
+        engine_value = getattr(summary, name, None)
+        staged_tensor = getattr(staged, name)
+        staged_value = (
+            None
+            if staged_tensor is None
+            else staged_tensor.reshape(-1, 2).tolist()
+            if name == "imgs_sizes"
+            else (None if staged_tensor is None else staged_tensor.reshape(-1).tolist())
+        )
+        if engine_value is None and staged_value is None:
+            continue
+        if engine_value is None or staged_value is None:
+            return f"{name} summary={engine_value} columns={staged_value}"
+        if [
+            list(v) if isinstance(v, (list, tuple)) else v for v in engine_value
+        ] != staged_value:
+            return f"{name} summary={engine_value} columns={staged_value}"
+    return None
+
+
+def _trainer_media(staged: StagedMediaTensors) -> dict[str, PackedTensor]:
+    """Wrap the engine's media tensors as the trainer's one-row PackedTensors.
+
+    ``pixel_values`` keeps MInf's packed-patch layout: ``[total_patches, C*P*P]``
+    per row, which the Megatron-Bridge Omni model accepts directly (its
+    ``_patchify_dynamic_images`` passes already-patchified inputs through), so
+    rows concatenate along dim 0 with no padding. ``imgs_sizes`` and
+    ``num_frames`` mirror what ``extract_multimodal_model_inputs`` emits on the
+    token-echo path (stills get one frame per image).
+    """
+    imgs = staged.imgs
+    if imgs.ndim == 3 and imgs.shape[0] == 1:
+        imgs = imgs.squeeze(0)
+    media = {"pixel_values": PackedTensor([imgs], dim_to_pack=0)}
+    if staged.imgs_sizes is not None:
+        sizes = staged.imgs_sizes.reshape(-1, 2).to(torch.int32)
+        media["imgs_sizes"] = PackedTensor([sizes], dim_to_pack=0)
+        frames = (
+            staged.num_frames.reshape(-1).to(torch.int32)
+            if staged.num_frames is not None
+            else torch.ones(sizes.shape[0], dtype=torch.int32)
+        )
+        media["num_frames"] = PackedTensor([frames], dim_to_pack=0)
+    return media
+
+
+def _media_fields_for_group(rows: list[FinalizedRollout]) -> dict[str, PackedTensor]:
+    """Stack per-rollout media into group-level PackedTensors, one logical row each.
+
+    Rows without media (text rollouts, placeholders) contribute an empty
+    logical row so every media field stays aligned with ``input_ids``.
+    """
+    per_row = [row.media if (row.valid and row.media) else None for row in rows]
+    if not any(per_row):
+        return {}
+    fields = sorted({key for media in per_row if media for key in media})
+    stacked: dict[str, PackedTensor] = {}
+    for key in fields:
+        reference = next(media[key] for media in per_row if media and key in media)
+        parts = [
+            media[key]
+            if (media and key in media)
+            else PackedTensor.empty_rows_like(reference, 1)
+            for media in per_row
+        ]
+        stacked[key] = PackedTensor.concat(parts)
+    return stacked
 
 
 class RolloutReassembler:
@@ -239,6 +325,13 @@ class RolloutReassembler:
         weight_versions = [record.weight_version for record in parsed.manifest]
         min_wv, max_wv = min(weight_versions), max(weight_versions)
 
+        # Media: the terminal call's staged extras say whether the engine saw
+        # media. If so its row also carries the media columns the Megatron
+        # worker staged; read them and check they describe the same media.
+        media, media_failure = self._resolve_media(parsed, fetched_by_call)
+        if media_failure is not None:
+            return rejected(media_failure, staging_keys)
+
         route_plan = None
         routed_experts: Optional[torch.Tensor] = None
         if self._router_replay_enabled:
@@ -319,7 +412,46 @@ class RolloutReassembler:
             max_wv=max_wv,
             routed_experts=routed_experts,
             route_plan=route_plan,
+            media=media,
         )
+
+    def _resolve_media(
+        self,
+        parsed: Any,
+        fetched_by_call: dict[str, Any],
+    ) -> tuple[Optional[dict[str, PackedTensor]], Optional[str]]:
+        """Read and verify the terminal call's media columns when it carried media.
+
+        Returns ``(media, rejection_reason)``; text rollouts return
+        ``(None, None)`` without a fetch. The media columns live on the call row
+        itself, so cleanup needs no extra key.
+        """
+        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        from nemo_gym.token_id_capture.staging.media import parse_multimodal_extras
+
+        terminal = (
+            fetched_by_call.get(parsed.terminal_model_call_id)
+            if parsed.terminal_model_call_id is not None
+            else None
+        )
+        if terminal is None:
+            return None, None
+        try:
+            _, summary = parse_multimodal_extras(terminal.extras)
+        except (TypeError, ValueError) as error:
+            return None, f"invalid_media_extras:{error}"
+        if summary is None:
+            return None, None
+        try:
+            staged = self._source.fetch_media(terminal.staging_key)
+        except KeyError as error:
+            return None, f"media_columns_missing:{error}"
+        except (TypeError, ValueError) as error:
+            return None, f"invalid_media_columns:{error}"
+        problem = _media_mismatch(staged, summary)
+        if problem is not None:
+            return None, f"media_mismatch:{problem}"
+        return _trainer_media(staged), None
 
     def _execute_direct_plan(
         self,
@@ -581,6 +713,9 @@ class RolloutReassembler:
             train_batch["routed_experts"] = self._build_routed_experts_tensor(
                 rows, max_len=max_len, metrics=metrics
             )
+        # Media rides the same packed/tagged transport as the token-echo path
+        # (pack_payload encodes PackedTensor fields and mints row-shape tags).
+        train_batch.update(_media_fields_for_group(rows))
         sample_ids, fields, tags = pack_payload(
             train_batch,
             weight_version=group_min_wv,

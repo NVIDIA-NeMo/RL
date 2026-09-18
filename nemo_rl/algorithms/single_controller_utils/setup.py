@@ -1175,6 +1175,24 @@ def setup_single_controller(
                 "token_capture.enabled supports vllm or megatron; got "
                 f"{generation_config['backend']!r}"
             )
+        if processor is not None:
+            # Multimodal capture: the media tensors ride a per-rollout staging
+            # row and the compact/expanded prompt split is handled by the
+            # Megatron preparer/stager pair. The vLLM capture path stages the
+            # pre-processor prompt and carries no media, so it stays off.
+            if generation_config["backend"] != "megatron":
+                raise NotImplementedError(
+                    "token_capture.enabled with a multimodal policy is supported "
+                    "on policy.generation.backend=megatron only; the vLLM capture "
+                    "path does not yet carry media (see "
+                    "docs/design-docs/token-capture-ledger.md)"
+                )
+            if master_config.grpo.deduplicate_multimodal_data:
+                raise ValueError(
+                    "token_capture.enabled does not support "
+                    "grpo.deduplicate_multimodal_data=true: capture rows carry "
+                    "their own media"
+                )
         generation_config_dict = cast(dict[str, Any], generation_config)
         if (
             generation_config["backend"] == "vllm"
@@ -1815,7 +1833,10 @@ def setup_single_controller(
         from nemo_rl.data_plane.schema import (
             ROUTED_EXPERTS_FIELD as STAGING_ROUTED_EXPERTS_FIELD,
         )
-        from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS
+        from nemo_rl.data_plane.tq_token_sink import (
+            MEDIA_STAGING_FIELDS,
+            STAGING_FIELDS,
+        )
 
         r3_enabled = router_replay_enabled(master_config.policy)
         if token_capture_cfg.defer_routed_experts_to_policy and not r3_enabled:
@@ -1842,10 +1863,13 @@ def setup_single_controller(
             consumer_tasks=["prev_lp", "ref_lp", "train"],
             grpo_group_size=group_size,
         )
+        # Multimodal runs stage the engine's media tensors as extra columns on
+        # each call row (see tq_token_sink.MEDIA_STAGING_FIELDS).
         dp_client.register_partition(
             partition_id=token_capture_cfg.staging_partition,
             fields=list(STAGING_FIELDS)
-            + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else []),
+            + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else [])
+            + (list(MEDIA_STAGING_FIELDS) if processor is not None else []),
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize", "prev_lp", "train"],
         )

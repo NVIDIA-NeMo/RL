@@ -73,10 +73,51 @@ from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 # round-trip equality check -- but only for required StagedCallRecord fields. An
 # optional field Gym adds that this sink never stages will default identically
 # on both sides and pass that check silently.
+# Compact-space token delta for calls that carried media (see Gym's
+# ``nemo_gym.token_id_capture.staging.media``). ``token_ids_delta`` stays the
+# expanded sequence the trainer needs; the compact form is what the next turn's
+# chat render must be spliced against. ``COMPACT_LEN_FIELD`` is 0 when the call
+# staged no compact form, in which case the compact and expanded deltas coincide
+# and readers fall back to ``token_ids_delta``.
+COMPACT_TOKEN_IDS_FIELD = "compact_token_ids_delta"
+COMPACT_LEN_FIELD = "compact_len"
+# Extras key Gym uses for the compact delta (popped into the column above, like
+# routed_experts) and for the media summary (left in the extras JSON).
+COMPACT_TOKEN_IDS_EXTRAS_KEY = "compact_token_ids_delta"
+MEDIA_EXTRAS_KEY = "media"
+# offload_params sibling key the MInf preparer writes for the stager: the
+# compact length of the parent chain it spliced in. Reserved-prefix-free ('_'
+# keys are engine-owned) and never read by Megatron itself.
+MINF_CAPTURE_PARAMS_FIELD = "ng_capture_minf"
+COMPACT_PREV_LEN_KEY = "compact_prev_len"
+
+# Media the engine's vision encoder consumed, staged as extra columns on the
+# call row (a second put onto the same staging key, after the token row is
+# durable). ``imgs`` is MInf's packed-patch tensor ``[1, total_patches, C*P*P]``
+# (or padded pixels), ``imgs_sizes`` ``[N, 2]``, ``num_frames`` / ``num_tiles``
+# when the request carried them. Each tensor is flattened to one ``[1, numel]``
+# row; ``media_geometry_json`` records shape and dtype per name. Registered on
+# the staging partition only for multimodal runs; the finalizer reads them off
+# the terminal call of each rollout.
+MEDIA_IMGS_FIELD = "media_imgs"
+MEDIA_IMGS_SIZES_FIELD = "media_imgs_sizes"
+MEDIA_NUM_FRAMES_FIELD = "media_num_frames"
+MEDIA_NUM_TILES_FIELD = "media_num_tiles"
+MEDIA_GEOMETRY_FIELD = "media_geometry_json"
+MEDIA_TENSOR_COLUMNS: dict[str, str] = {
+    "imgs": MEDIA_IMGS_FIELD,
+    "imgs_sizes": MEDIA_IMGS_SIZES_FIELD,
+    "num_frames": MEDIA_NUM_FRAMES_FIELD,
+    "num_tiles": MEDIA_NUM_TILES_FIELD,
+}
+MEDIA_STAGING_FIELDS = [*MEDIA_TENSOR_COLUMNS.values(), MEDIA_GEOMETRY_FIELD]
+
 STAGING_FIELDS = [
     "token_ids_delta",
     "token_mask_delta",
     "generation_logprobs_delta",
+    COMPACT_TOKEN_IDS_FIELD,
+    COMPACT_LEN_FIELD,
     "schema_version",
     "digest_version",
     "extras_digest_version",
@@ -119,6 +160,16 @@ def _optional_digest_fields(value: str | None) -> tuple[torch.Tensor, torch.Tens
 
 
 @dataclass(frozen=True)
+class StagedMediaTensors:
+    """The media tensors one staged call ran on, restored to their original shapes."""
+
+    imgs: torch.Tensor
+    imgs_sizes: torch.Tensor | None
+    num_frames: torch.Tensor | None
+    num_tiles: torch.Tensor | None
+
+
+@dataclass(frozen=True)
 class FetchedStagedCall:
     """One explicitly identified small-column finalization fetch result.
 
@@ -131,6 +182,9 @@ class FetchedStagedCall:
     snapshot: StagedCallBaseSnapshot
     routed_len: int
     fragment: RouteFragment | None = None
+    # Decoded extras JSON (minus the columns the sink popped out), None when
+    # the call staged no extras. Carries Gym's media summary for VLM calls.
+    extras: dict[str, Any] | None = None
 
 
 def _call_dp(dp_client: Any, method_name: str, **kwargs: Any) -> Any:
@@ -269,6 +323,33 @@ class TQTokenSink:
                 if extras_metadata is not None
                 else None
             )
+            compact_delta = (
+                extras_metadata.pop(COMPACT_TOKEN_IDS_EXTRAS_KEY, None)
+                if extras_metadata is not None
+                else None
+            )
+            if compact_delta is not None:
+                if (
+                    not isinstance(compact_delta, list)
+                    or not compact_delta
+                    or any(type(token_id) is not int for token_id in compact_delta)
+                ):
+                    raise ValueError(
+                        "compact_token_ids_delta must be a non-empty list of ints"
+                    )
+                field_dict[COMPACT_TOKEN_IDS_FIELD] = torch.tensor(
+                    [compact_delta], dtype=torch.int64
+                )
+                field_dict[COMPACT_LEN_FIELD] = torch.tensor(
+                    [len(compact_delta)], dtype=torch.int64
+                )
+            else:
+                # Sentinel row: jagged columns cannot be empty. compact_len 0
+                # tells readers the compact delta equals token_ids_delta.
+                field_dict[COMPACT_TOKEN_IDS_FIELD] = torch.tensor(
+                    [[0]], dtype=torch.int64
+                )
+                field_dict[COMPACT_LEN_FIELD] = torch.tensor([0], dtype=torch.int64)
             field_dict[ROUTED_EXTRAS_METADATA_FIELD] = _bytes_tensor(
                 json.dumps(
                     extras_metadata,
@@ -345,6 +426,42 @@ class TQTokenSink:
         """Drop staged rows (finalizer / eviction cleanup)."""
         self._store.clear(staging_keys)
 
+    def stage_media(self, staging_key: str, media_tensors: dict[str, Any]) -> None:
+        """Add the engine's media tensors to an already-staged call row.
+
+        A second put onto the same key: TQ tracks field readiness per field, so
+        the media columns land beside the token columns without rewriting them.
+        Raises on failure; the caller decides how to report it (the finalizer
+        rejects the rollout as ``media_columns_missing`` either way).
+        """
+        imgs = media_tensors.get("imgs")
+        if not isinstance(imgs, torch.Tensor) or imgs.numel() == 0:
+            raise ValueError("media_tensors must carry a non-empty imgs tensor")
+        unknown = sorted(set(media_tensors) - set(MEDIA_TENSOR_COLUMNS))
+        if unknown:
+            raise ValueError(f"unsupported media tensors: {unknown}")
+        geometry: dict[str, Any] = {}
+        field_dict: dict[str, torch.Tensor] = {}
+        for name, column in MEDIA_TENSOR_COLUMNS.items():
+            tensor = media_tensors.get(name)
+            if tensor is None:
+                # Sentinel row: jagged columns cannot be empty; absence is
+                # recorded by the missing geometry entry.
+                field_dict[column] = torch.zeros((1, 1), dtype=torch.int64)
+                continue
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(f"media tensor {name!r} must be a torch.Tensor")
+            flat = tensor.detach().cpu().contiguous().reshape(1, -1)
+            field_dict[column] = flat
+            geometry[name] = {
+                "shape": list(tensor.shape),
+                "dtype": str(tensor.dtype).removeprefix("torch."),
+            }
+        field_dict[MEDIA_GEOMETRY_FIELD] = _bytes_tensor(
+            json.dumps(geometry, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
+        self._store.put(staging_key, field_dict)
+
 
 @dataclass(frozen=True)
 class MegatronPayloadStageResult:
@@ -361,12 +478,36 @@ PREFIX_TEMPLATE_TOKEN_IDS_FIELD = "template_prefix_token_ids"
 PREFIX_EOS_TOKEN_ID_FIELD = "eos_token_id"
 
 
+@dataclass(frozen=True)
+class PrefixChains:
+    """One resolved ``staging_chain`` in both token spaces.
+
+    ``expanded`` is the concatenated ``token_ids_delta`` chain: what the engine
+    prompt must start with and what Gym's capture core verifies. ``compact`` is
+    the concatenated compact deltas (falling back to the expanded delta for
+    calls that staged none): what a multimodal chat render is spliced against.
+    They are identical for text-only chains.
+    """
+
+    expanded: list[int]
+    compact: list[int]
+
+    def __add__(self, other: "PrefixChains") -> "PrefixChains":
+        return PrefixChains(
+            expanded=self.expanded + other.expanded,
+            compact=self.compact + other.compact,
+        )
+
+
+_EMPTY_CHAINS = PrefixChains(expanded=[], compact=[])
+
+
 class ChainPrefixCache:
     """Worker-local cache of resolved ``staging_chain`` prefixes."""
 
     def __init__(self, source: Any | None = None) -> None:
         self._source = source
-        self._cache: dict[str, list[int]] = {}
+        self._cache: dict[str, PrefixChains] = {}
         self._lock = threading.Lock()
 
     def install(self, source: Any) -> None:
@@ -376,43 +517,66 @@ class ChainPrefixCache:
             self._cache.clear()
 
     def fetch(self, staging_chain: list[str]) -> list[int]:
-        """Assemble prefix token ids from staging_chain, with a worker-local FIFO (256-entry) cache."""
+        """Assemble the expanded prefix from staging_chain (see :meth:`fetch_chains`)."""
+        return list(self.fetch_chains(staging_chain).expanded)
+
+    def fetch_chains(self, staging_chain: list[str]) -> PrefixChains:
+        """Assemble both prefix spaces from staging_chain, with a worker-local FIFO (256-entry) cache."""
         cache = self._cache
         with self._lock:
             source = self._source
-            cached_ids: list[int] = []
+            cached: PrefixChains = _EMPTY_CHAINS
             miss_start = 0
             for i, key in enumerate(staging_chain):
                 if key in cache:
-                    cached_ids = cache[key]
+                    cached = cache[key]
                     miss_start = i + 1
             miss_keys = staging_chain[miss_start:]
         if not miss_keys:
-            return list(cached_ids)
+            return PrefixChains(list(cached.expanded), list(cached.compact))
         if source is None:
             raise RuntimeError(
                 "staging source not initialized; call setup_token_capture() first"
             )
         # TQ read stays outside the lock so concurrent fetches overlap.
-        fetched = source.fetch_prefix_token_ids(miss_keys)
-        result = cached_ids + fetched
+        fetch_chains = getattr(source, "fetch_prefix_chains", None)
+        if fetch_chains is not None:
+            fetched = fetch_chains(miss_keys)
+        else:
+            # A source that predates compact chains (or a text-only test double)
+            # serves one space; the compact chain coincides with it.
+            expanded = list(source.fetch_prefix_token_ids(miss_keys))
+            fetched = PrefixChains(expanded=expanded, compact=list(expanded))
+        result = cached + fetched
         last_key = staging_chain[-1]
         with self._lock:
             cache[last_key] = result
             if len(cache) > 256:
                 del cache[next(iter(cache))]
-        return result
+        return PrefixChains(list(result.expanded), list(result.compact))
 
 
 def resolve_admission_prefix(
     admission: Any, chain_prefix: ChainPrefixCache
 ) -> list[int]:
     """Resolve a ``CaptureAdmission`` to the flat prefix the engine prompt starts with."""
+    return resolve_admission_prefix_chains(admission, chain_prefix).expanded
+
+
+def resolve_admission_prefix_chains(
+    admission: Any, chain_prefix: ChainPrefixCache
+) -> PrefixChains:
+    """Resolve a ``CaptureAdmission`` to its prefix in both token spaces.
+
+    An inline ``required_prefix_token_ids`` prefix has no separate compact form:
+    Gym only inlines prefixes for text chains.
+    """
     if admission.mode == "text":
-        return []
+        return PrefixChains(expanded=[], compact=[])
     if admission.staging_chain:
-        return chain_prefix.fetch(list(admission.staging_chain))
-    return list(admission.required_prefix_token_ids)
+        return chain_prefix.fetch_chains(list(admission.staging_chain))
+    inline = list(admission.required_prefix_token_ids)
+    return PrefixChains(expanded=inline, compact=list(inline))
 
 
 class TQMegatronPromptPreparer:
@@ -460,7 +624,8 @@ class TQMegatronPromptPreparer:
         if not isinstance(prompt, list):
             raise TypeError("MInf token-in capture requires a token-id list prompt")
 
-        prefix_token_ids = resolve_admission_prefix(admission, self._chain_prefix)
+        chains = resolve_admission_prefix_chains(admission, self._chain_prefix)
+        prefix_token_ids = chains.expanded
         if len(prefix_token_ids) != admission.prev_len:
             raise ValueError(
                 "MInf capture prefix length mismatch: "
@@ -468,10 +633,18 @@ class TQMegatronPromptPreparer:
             )
 
         updated_offload_params = dict(offload_params)
+        # Gym verifies the engine's *expanded* prompt against this prefix.
         updated_admission = admission.model_copy(
             update={"required_prefix_token_ids": prefix_token_ids}
         )
         updated_offload_params["ng_capture"] = updated_admission.model_dump(mode="json")
+        # The stager needs the compact length of the spliced chain to cut this
+        # call's compact delta (Gym's MegatronCaptureAdapter reads it off the
+        # payload the stager assembles).
+        updated_offload_params[MINF_CAPTURE_PARAMS_FIELD] = {
+            **(updated_offload_params.get(MINF_CAPTURE_PARAMS_FIELD) or {}),
+            COMPACT_PREV_LEN_KEY: len(chains.compact),
+        }
 
         template_prefix_token_ids = updated_offload_params.get(
             PREFIX_TEMPLATE_TOKEN_IDS_FIELD
@@ -486,11 +659,16 @@ class TQMegatronPromptPreparer:
                 )
             if type(eos_token_id) is not int:
                 raise ValueError("MInf capture request carries no valid EOS token id")
-            # Same splice as the vLLM worker (vllm_worker_async.py); the
-            # post-condition below verifies the result.
+            # Same splice as the vLLM worker (vllm_worker_async.py), but in the
+            # *compact* token space: the chat endpoint renders one media token
+            # per image and the engine expands every media token it is handed
+            # (Megatron-LM ``_build_vlm_request``), so splicing the expanded
+            # chain here would expand the previous turn twice. The engine's
+            # expanded prompt is then checked against ``chains.expanded`` by
+            # Gym's capture core when the call is staged.
             prompt = replace_prefix_tokens(
                 tokenizer=None,
-                model_prefix_token_ids=prefix_token_ids,
+                model_prefix_token_ids=chains.compact,
                 template_prefix_token_ids=template_prefix_token_ids,
                 template_token_ids=prompt,
                 eos_token_id=eos_token_id,
@@ -500,10 +678,69 @@ class TQMegatronPromptPreparer:
                 "MInf staged-prefix request carries no prompt splice metadata"
             )
 
-        if prompt[: admission.prev_len] != prefix_token_ids:
+        if prompt[: len(chains.compact)] != chains.compact:
             raise ValueError("MInf failed to apply the authorized token prefix")
         return RequestPromptPreparationResult(
             prompt=prompt, offload_params=updated_offload_params
+        )
+
+
+def media_geometry(media_tensors: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Gym's digest-covered media geometry, read off the engine's media tensors.
+
+    ``imgs_sizes`` / ``num_frames`` / ``num_tiles`` become plain int lists; the
+    modality is ``video`` when the engine carried frame counts. The finalizer
+    checks the staged media columns against this before publishing a row.
+    """
+    if not media_tensors or media_tensors.get("imgs") is None:
+        return None
+
+    def as_list(name: str) -> list | None:
+        tensor = media_tensors.get(name)
+        return None if tensor is None else tensor.detach().cpu().tolist()
+
+    num_frames = as_list("num_frames")
+    return {
+        "modality": "video" if num_frames is not None else "image",
+        "imgs_sizes": as_list("imgs_sizes"),
+        "num_frames": num_frames,
+        "num_tiles": as_list("num_tiles"),
+    }
+
+
+@dataclass(frozen=True)
+class _MegatronCapturePayload:
+    """The MInf offloaded payload plus the worker-side context Gym's adapter reads."""
+
+    prompt_token_ids: Any
+    generated_token_ids: Any
+    generated_log_probs: Any
+    compact_prompt_token_ids: Any
+    media: dict[str, Any] | None
+    compact_prev_len: int
+
+    @classmethod
+    def from_offloaded(
+        cls, payload: Any, minf_params: Any
+    ) -> "_MegatronCapturePayload":
+        compact_prev_len = 0
+        if (
+            isinstance(minf_params, dict)
+            and minf_params.get(COMPACT_PREV_LEN_KEY) is not None
+        ):
+            compact_prev_len = minf_params[COMPACT_PREV_LEN_KEY]
+            if type(compact_prev_len) is not int or compact_prev_len < 0:
+                raise ValueError(
+                    "MInf capture request carries an invalid compact_prev_len: "
+                    f"{compact_prev_len!r}"
+                )
+        return cls(
+            prompt_token_ids=getattr(payload, "prompt_token_ids", None),
+            generated_token_ids=getattr(payload, "generated_token_ids", None),
+            generated_log_probs=getattr(payload, "generated_log_probs", None),
+            compact_prompt_token_ids=getattr(payload, "compact_prompt_token_ids", None),
+            media=media_geometry(getattr(payload, "media_tensors", None)),
+            compact_prev_len=compact_prev_len,
         )
 
 
@@ -523,6 +760,7 @@ class TQMegatronTokenStager:
         )
         from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
 
+        self._sink = sink
         self._capture = RolloutTokenCapture(
             sink=sink,
             # MInf passes the authoritative version explicitly for every call.
@@ -595,6 +833,7 @@ class TQMegatronTokenStager:
                 payload,
                 capture_payload=capture_payload,
                 finished_metadata=finished_metadata,
+                minf_params=(offload_params or {}).get(MINF_CAPTURE_PARAMS_FIELD),
             )
         except Exception:  # noqa: BLE001 — capture failure must not fail generation
             logging.getLogger(__name__).exception(
@@ -608,6 +847,7 @@ class TQMegatronTokenStager:
         *,
         capture_payload: Any,
         finished_metadata: Any,
+        minf_params: Any = None,
     ) -> MegatronPayloadStageResult:
         """Validate and stage traffic that carries a Gym capture admission."""
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
@@ -619,11 +859,28 @@ class TQMegatronTokenStager:
             weight_version=self._weight_version(finished_metadata),
         )
         # Gym's MegatronCaptureAdapter reads prompt/generated ids and log
-        # probs off the offloaded payload. A malformed payload poisons the
-        # call with ``capture_failed`` coordinates (surfacing in Gym as
+        # probs off the offloaded payload, plus the multimodal material
+        # (compact prompt, media summary, and the compact length of the
+        # spliced chain the preparer recorded). A malformed payload poisons
+        # the call with ``capture_failed`` coordinates (surfacing in Gym as
         # ``worker_capture_failed``, matching vLLM) instead of raising here,
         # which would leave Gym with no coordinates at all.
-        coords = self._capture.complete_call_from_response(call, payload)
+        capture_payload_view = _MegatronCapturePayload.from_offloaded(
+            payload, minf_params
+        )
+        coords = self._capture.complete_call_from_response(call, capture_payload_view)
+        # Media tensors ride the same row as extra columns once the token row
+        # is durable. They are outside Gym's digest; the digest-covered geometry
+        # in extras (media_geometry above) names them, and the finalizer checks
+        # the columns against it before publishing.
+        media_tensors = getattr(payload, "media_tensors", None)
+        if coords.disposition == "staged" and media_tensors:
+            try:
+                self._sink.stage_media(coords.staging_key, media_tensors)
+            except Exception:  # noqa: BLE001 — finalizer rejects media_columns_missing
+                logging.getLogger(__name__).exception(
+                    "MInf media staging failed for %s", coords.staging_key
+                )
         return MegatronPayloadStageResult(
             response_metadata={
                 "ng_commit_coords": coords.model_dump(mode="json"),
@@ -655,14 +912,27 @@ class TQTokenSource:
 
     def fetch_prefix_token_ids(self, staging_keys: list[str]) -> list[int]:
         """Bulk-fetch ordered delta chain and concatenate token_ids_delta into a prefix."""
+        return self.fetch_prefix_chains(staging_keys).expanded
+
+    def fetch_prefix_chains(self, staging_keys: list[str]) -> PrefixChains:
+        """Bulk-fetch the ordered delta chain in both token spaces.
+
+        The compact chain uses each row's ``compact_token_ids_delta`` when the
+        call staged one (``compact_len > 0``) and its ``token_ids_delta``
+        otherwise, so text calls contribute the same ids to both chains.
+        """
         if not staging_keys:
-            return []
+            return PrefixChains(expanded=[], compact=[])
         if len(set(staging_keys)) != len(staging_keys):
             raise KeyError("prefix fetch: staging_keys contains duplicates")
         try:
             rows = self._store.get(
                 staging_keys,
-                select_fields=["token_ids_delta"],
+                select_fields=[
+                    "token_ids_delta",
+                    COMPACT_TOKEN_IDS_FIELD,
+                    COMPACT_LEN_FIELD,
+                ],
             )
         except Exception as error:  # noqa: BLE001 — protocol maps any miss to KeyError
             raise KeyError(
@@ -674,12 +944,69 @@ class TQTokenSource:
             raise KeyError(
                 f"prefix fetch incomplete: requested {len(staging_keys)} keys, got {n_rows}"
             )
-        result: list[int] = []
+        expanded: list[int] = []
+        compact: list[int] = []
         for index in range(n_rows):
             row = _select_row(rows, index)
-            delta = row["token_ids_delta"].squeeze(0).tolist()
-            result.extend(int(t) for t in delta)
-        return result
+            delta = [int(t) for t in row["token_ids_delta"].squeeze(0).tolist()]
+            expanded.extend(delta)
+            compact_len = _row_scalar_int(row, COMPACT_LEN_FIELD)
+            if compact_len > 0:
+                compact_delta = [
+                    int(t) for t in row[COMPACT_TOKEN_IDS_FIELD].squeeze(0).tolist()
+                ]
+                if len(compact_delta) != compact_len:
+                    raise ValueError(
+                        f"compact_token_ids_delta length {len(compact_delta)} does not "
+                        f"match compact_len {compact_len}"
+                    )
+                compact.extend(compact_delta)
+            else:
+                compact.extend(delta)
+        return PrefixChains(expanded=expanded, compact=compact)
+
+    def fetch_media(self, staging_key: str) -> StagedMediaTensors:
+        """Read one call's media columns; ``KeyError`` when the row carries none."""
+        try:
+            rows = self._store.get([staging_key], select_fields=MEDIA_STAGING_FIELDS)
+        except Exception as error:  # noqa: BLE001 — protocol maps misses to KeyError
+            raise KeyError(
+                f"media columns for {staging_key!r} could not be fetched from "
+                f"{self._staging_partition!r}: {error}"
+            ) from error
+        n_rows = int(rows.batch_size[0]) if len(rows.batch_size) else 0
+        if n_rows != 1:
+            raise KeyError(f"media columns for {staging_key!r} missing")
+        row = _select_row(rows, 0)
+        geometry = json.loads(_row_text(row, MEDIA_GEOMETRY_FIELD))
+        if not isinstance(geometry, dict) or "imgs" not in geometry:
+            raise ValueError("staged media geometry must describe imgs")
+        tensors: dict[str, torch.Tensor | None] = {}
+        for name, column in MEDIA_TENSOR_COLUMNS.items():
+            spec = geometry.get(name)
+            if spec is None:
+                tensors[name] = None
+                continue
+            flat = row[column].reshape(-1)
+            dtype = getattr(torch, spec["dtype"], None)
+            if not isinstance(dtype, torch.dtype):
+                raise ValueError(
+                    f"media column {column!r} names unknown dtype {spec['dtype']!r}"
+                )
+            shape = torch.Size(spec["shape"])
+            if flat.numel() != shape.numel():
+                raise ValueError(
+                    f"media column {column!r} holds {flat.numel()} values but its "
+                    f"geometry describes {shape.numel()}"
+                )
+            tensors[name] = flat.to(dtype).reshape(shape)
+        assert tensors["imgs"] is not None
+        return StagedMediaTensors(
+            imgs=tensors["imgs"],
+            imgs_sizes=tensors["imgs_sizes"],
+            num_frames=tensors["num_frames"],
+            num_tiles=tensors["num_tiles"],
+        )
 
     def fetch_for_finalization(
         self,
@@ -746,6 +1073,7 @@ class TQTokenSource:
                     fragment=(
                         _row_to_route_fragment(row) if include_route_fragments else None
                     ),
+                    extras=_row_extras(row),
                 )
             )
         return fetched
@@ -838,6 +1166,16 @@ def _row_to_base_snapshot(row: Any) -> StagedCallBaseSnapshot:
             "cumulative_hash_bytes", "cumulative_hash_present"
         ),
     )
+
+
+def _row_extras(row: Any) -> dict[str, Any] | None:
+    """Decode the staged extras JSON (None for ``null`` / absent extras)."""
+    decoded = json.loads(_row_text(row, ROUTED_EXTRAS_METADATA_FIELD))
+    if decoded is None:
+        return None
+    if not isinstance(decoded, dict):
+        raise ValueError("staged extras metadata must be a JSON object or null")
+    return decoded
 
 
 def _row_to_route_fragment(row: Any) -> RouteFragment | None:
