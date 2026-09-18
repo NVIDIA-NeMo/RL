@@ -283,16 +283,16 @@ def _resolve_pad_token_id(tokenizer: Any, prompt_config: _PromptConfig) -> int:
         pad_token_id = int(
             text_tokenizer.convert_tokens_to_ids(prompt_config.pad_token)
         )
-    elif text_tokenizer.pad_token_id is not None:
-        pad_token_id = int(text_tokenizer.pad_token_id)
     else:
-        raise ValueError(
-            "Megatron SFT packed data requires a pad token distinct from EOS"
-        )
+        default_pad_token_id = text_tokenizer.pad_token_id
+        if default_pad_token_id is None:
+            raise ValueError(
+                "Megatron SFT packed data requires a pad token distinct from EOS"
+            )
+        pad_token_id = int(default_pad_token_id)
 
-    if text_tokenizer.eos_token_id is not None and pad_token_id == int(
-        text_tokenizer.eos_token_id
-    ):
+    eos_token_id = text_tokenizer.eos_token_id
+    if eos_token_id is not None and pad_token_id == int(eos_token_id):
         raise ValueError(
             "Megatron SFT packed data requires a pad token distinct from EOS"
         )

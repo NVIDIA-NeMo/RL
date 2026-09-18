@@ -334,7 +334,37 @@ The processor runs inside Energon loader workers and returns the same tokenized 
 
 The v1 `SFTProcessorAdapter` and `HFMultimodalSFTProcessorAdapter` are narrow integration interfaces. They are planned to be replaced by a more comprehensive modular processor implementation; dataset loading and the policy-facing batch shape should remain stable through that change.
 
-Sequence packing is unavailable in this path, on both sides: `packing_buffer_size` and `max_samples_per_sequence` are typed null-only, and `policy.sequence_packing` (like `policy.dynamic_batching`) is rejected at startup with `SFTv2 requires fixed NeMo-RL batching.` Packing is deferred to a later stage of the Energon integration. Energon does not provide a separate offline sequence-packing pipeline either; offline preparation may store length and media-cost metadata, but should not pre-concatenate multimodal conversations.
+To let Energon form model-ready multimodal packs, set the packing buffer and
+enable fused sequence packing:
+
+```yaml
+policy:
+  sequence_packing:
+    enabled: true
+    fuse_loss: true
+    algorithm: balanced_greedy_knapsack
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    max_sequences_per_bin: 16  # optional conversation limit per physical pack
+data:
+  energon:
+    packing_buffer_size: 64    # enables Energon-owned packing
+    max_samples_per_sequence: null  # optional shard read-order control
+```
+
+Both config blocks are required because Energon builds the packs while the
+policy block selects and configures the packer. `max_sequences_per_bin` limits
+the conversations placed in one pack. The similarly named
+`max_samples_per_sequence` controls how many consecutive samples Energon reads
+from one shard; it does not affect pack layout.
+
+Without an Energon packing buffer, SFTv2 currently requires fixed batching.
+Dynamic batching and HybridEP flex dispatch are not supported with
+Energon-owned packs.
+
+With Energon-owned packing, each `sample_mask` entry represents one physical
+pack, so `num_valid_samples` counts non-empty packs rather than source
+conversations. NLL loss scaling is unchanged because it is normalized by
+`global_valid_toks`.
 
 Training dataloader checkpoints include the Energon worker state plus a fingerprint of the source, loader, and processor settings. Restore must occur before the first iteration, and a changed fingerprint fails instead of silently continuing with a different stream. SFTv2 accepts a single train source; use an Energon metadataset to blend prepared sources.
 
