@@ -78,7 +78,6 @@ basic_vllm_test_config: VllmConfig = {
     "stop_strings": None,
     "vllm_cfg": {
         "precision": "bfloat16",
-        "refit_cache_loader_routes": False,
         "tensor_parallel_size": 1,
         "pipeline_parallel_size": 1,
         "expert_parallel_size": 1,
@@ -146,59 +145,6 @@ basic_dtensor_test_config: PolicyConfig = {
     "make_sequence_length_divisible_by": 1,
     "generation": deepcopy(basic_vllm_test_config),
 }
-
-
-@pytest.mark.vllm
-def test_prepare_refit_info_skips_missing_metadata():
-    generation = VllmGeneration.__new__(VllmGeneration)
-    generation.worker_group = MagicMock()
-
-    assert generation.prepare_refit_info(None) is None
-    generation.worker_group.run_all_workers_single_data.assert_not_called()
-
-
-@pytest.mark.vllm
-def test_prepare_refit_info_uses_live_leaders_and_unions_prequant_names():
-    generation = VllmGeneration.__new__(VllmGeneration)
-    generation.cfg = {"vllm_cfg": {"async_engine": False}}
-
-    first_worker = MagicMock()
-    first_worker.prepare_refit_info.remote.return_value = "first"
-    second_worker = MagicMock()
-    second_worker.prepare_refit_info.remote.return_value = "second"
-    generation._refit_leader_workers = MagicMock(
-        return_value=[first_worker, second_worker]
-    )
-    state_dict_info = {"model.layers.0.weight": object()}
-
-    with (
-        patch(
-            "nemo_rl.models.generation.vllm.vllm_generation."
-            "assert_refit_unsupported_grouped_moe_params"
-        ),
-        patch(
-            "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
-            return_value=[
-                ["model.layers.1.weight", "model.layers.0.weight"],
-                ["model.layers.2.weight", "model.layers.1.weight"],
-            ],
-        ) as ray_get,
-    ):
-        result = generation.prepare_refit_info(state_dict_info)
-
-    assert result == [
-        "model.layers.0.weight",
-        "model.layers.1.weight",
-        "model.layers.2.weight",
-    ]
-    generation._refit_leader_workers.assert_called_once_with()
-    first_worker.prepare_refit_info.remote.assert_called_once_with(
-        state_dict_info=state_dict_info
-    )
-    second_worker.prepare_refit_info.remote.assert_called_once_with(
-        state_dict_info=state_dict_info
-    )
-    ray_get.assert_called_once_with(["first", "second"])
 
 
 @pytest.mark.parametrize("async_engine", [False, True])

@@ -16,7 +16,7 @@ import os
 import types
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import vllm  # noqa: F401
@@ -531,17 +531,10 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             return
         super()._synchronize_before_ipc_data_ack()
 
-    def prepare_refit_info(
-        self,
-        state_dict_info: dict[str, Any],
-        serialized_fp8_config: Optional[dict[str, Any]] = None,
-    ) -> Optional[list[str]]:
+    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+        super().prepare_refit_info(state_dict_info)
         if not self._is_real_quant_model():
-            return super().prepare_refit_info(state_dict_info, serialized_fp8_config)
-
-        # Real quantization owns a separate refit handshake and must not import
-        # the legacy FP8 quantization path.
-        self.state_dict_info = state_dict_info
+            return
         self._get_modelopt_reload_roots()
         quant_config = (
             self.model_runner.vllm_config.model_config.hf_config.quantization_config
@@ -560,7 +553,6 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 "Fused ModelOpt MoE refits require all experts local; "
                 "vLLM expert parallelism is unsupported"
             )
-        return None
 
     @contextmanager
     def _patch_named_parameters_to_include_buffers(self, model):

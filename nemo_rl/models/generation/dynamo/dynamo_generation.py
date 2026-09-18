@@ -623,17 +623,12 @@ class DynamoGeneration(GenerationInterface):
             train_world_size=train_world_size,
         )
 
-    def prepare_refit_info(
-        self, state_dict_info: Optional[dict[str, Any]]
-    ) -> Optional[list[str]]:
+    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Serialize checkpoint-format tensor metadata for native vLLM refit."""
-        if state_dict_info is None:
-            return None
         channel = self._refit_channel
         if channel is None:
             raise RuntimeError("Dynamo refit channel is unavailable")
         channel.prepare(state_dict_info)
-        return None
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
         raise NotImplementedError(
