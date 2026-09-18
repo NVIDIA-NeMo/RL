@@ -19,7 +19,7 @@ import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, fields
-from typing import Any, Callable, Optional, TypeVar, cast
+from typing import Any, Callable, Literal, Optional, TypeVar, cast
 
 import numpy as np
 import ray
@@ -358,6 +358,10 @@ class GRPOConfig(BaseModel, extra="allow"):
     max_num_steps: int = 1000000
     max_rollout_turns: int = 1
     normalize_rewards: bool = True
+    # Participation of loss-masked rewards in prompt-group baseline/std.
+    # "exclude" preserves validity-aware statistics; "include" enables ablations.
+    # Neither value changes the loss mask.
+    masked_reward_policy: Literal["exclude", "include"] = "exclude"
     # Clipping bounds for normalized advantages to prevent extreme values
     # When set, advantages are clipped to [advantage_clip_low, advantage_clip_high] after normalization
     # Default: null (no clipping)
@@ -2751,6 +2755,35 @@ def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int
     return num_masked
 
 
+def _advantage_valid_mask(
+    sample_mask: torch.Tensor, grpo_config: GRPOConfig
+) -> torch.Tensor:
+    """Select reward participation without changing the sample loss mask."""
+    if grpo_config.masked_reward_policy == "include":
+        return torch.ones_like(sample_mask)
+    return sample_mask
+
+
+def _dynamic_sampling_valid_mask(
+    repeated_batch: BatchedDataDict[DatumSpec], grpo_config: GRPOConfig
+) -> torch.Tensor:
+    """Apply the reward policy to masks available before logprob computation.
+
+    Starts from ``_baseline_valid_mask`` (``mask_sample`` and zero
+    ``loss_multiplier`` rows excluded) and, under ``overlong_filtering``, also
+    drops truncated rows, which the loss will drop later in the step.
+    """
+    valid_mask = _baseline_valid_mask(repeated_batch, repeated_batch["total_reward"])
+    if grpo_config.overlong_filtering and "truncated" in repeated_batch:
+        truncated = torch.as_tensor(
+            repeated_batch["truncated"], dtype=torch.bool, device=valid_mask.device
+        )
+        valid_mask = valid_mask * (~truncated).to(valid_mask.dtype)
+    # Sequence-logprob-error filtering runs after dynamic sampling. Its mask
+    # applies to final advantages but is not available for this admission step.
+    return _advantage_valid_mask(valid_mask, grpo_config)
+
+
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     """Whether NeMo Gym is responsible for full response logging.
 
@@ -3693,11 +3726,12 @@ def _grpo_train_impl(
                 ):
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
-                    # Binary participation mask for the group statistics (see
-                    # _baseline_valid_mask). Taken before overlong filtering, so
-                    # truncated rollouts keep voting; masked and zero-loss rows
-                    # do not.
-                    valid_mask = _baseline_valid_mask(repeated_batch, rewards)
+                    # Policy-selected participation mask for the group
+                    # statistics (see _dynamic_sampling_valid_mask), built from
+                    # the masks available before the logprob pass.
+                    valid_mask = _dynamic_sampling_valid_mask(
+                        repeated_batch, master_config.grpo
+                    )
 
                     print("▶ Computing advantages...", flush=True)
                     # For DAPO with reward shaping, compute std on the raw
@@ -3816,9 +3850,6 @@ def _grpo_train_impl(
                     backfill_missing_routed_experts(repeated_batch["message_log"])
 
                     prompt_ids_for_adv = repeated_batch[PROMPT_GROUP_IDS_KEY]
-                    # Recompute on the (possibly dynamic-sampling filtered) batch,
-                    # before overlong filtering rewrites loss_multiplier.
-                    baseline_valid_mask = _baseline_valid_mask(repeated_batch, rewards)
                     del valid_mask
                     del baseline
                     del std
@@ -4015,6 +4046,9 @@ def _grpo_train_impl(
                     token_mask = train_data["token_mask"]
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
+                    advantage_valid_mask = _advantage_valid_mask(
+                        sample_mask, master_config.grpo
+                    )
 
                     train_data["advantages"] = adv_estimator.compute_advantage(
                         prompt_ids=prompt_ids_for_adv,
@@ -4023,12 +4057,13 @@ def _grpo_train_impl(
                         repeated_batch=repeated_batch,
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
-                        valid_mask=baseline_valid_mask,
+                        valid_mask=advantage_valid_mask,
                     )
                     del prompt_ids_for_adv
 
                     # Log rewards and advantages information. The pct_*
-                    # diagnostics count the same rows that voted in the baseline.
+                    # diagnostics count the statistics population of the
+                    # configured policy: the same mask handed to compute_advantage.
                     _log_mixed_rewards_and_advantages_information(
                         logger=logger,
                         total_steps=total_steps,
@@ -4036,10 +4071,9 @@ def _grpo_train_impl(
                         baseline=baseline_for_log,
                         advantages=train_data["advantages"],
                         env_baseline=env_baseline_for_log,
-                        valid_mask=baseline_valid_mask,
+                        valid_mask=advantage_valid_mask,
                     )
                     del baseline_for_log, env_baseline_for_log
-                    del baseline_valid_mask
 
                     penalty_metrics = (
                         _apply_configured_message_level_advantage_penalties(
@@ -5669,11 +5703,6 @@ def async_grpo_train(
                         )
 
                     rewards = repeated_batch["total_reward"]
-                    # Binary participation mask for the group baseline (see
-                    # _baseline_valid_mask). Taken before overlong filtering, so
-                    # truncated rollouts keep voting; masked and zero-loss rows
-                    # do not.
-                    baseline_valid_mask = _baseline_valid_mask(repeated_batch, rewards)
 
                     print(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
@@ -5850,7 +5879,9 @@ def async_grpo_train(
                         repeated_batch=repeated_batch,
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
-                        valid_mask=baseline_valid_mask,
+                        valid_mask=_advantage_valid_mask(
+                            sample_mask, master_config.grpo
+                        ),
                         # OPD kwargs (ignored by non-OPD estimators via **kwargs)
                         teacher_logprobs=trajectory_teacher_logprobs.to(
                             train_data["prev_logprobs"].device
@@ -5867,7 +5898,6 @@ def async_grpo_train(
                     ):
                         rollout_metrics.update(adv_estimator.last_metrics)
                     del prompt_ids_for_adv
-                    del baseline_valid_mask
 
                     # Log advantages stats
                     # Note: For GRPOAdvantageEstimator with normalize_rewards=True, these are

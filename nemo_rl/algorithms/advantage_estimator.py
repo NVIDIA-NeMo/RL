@@ -23,9 +23,10 @@ This module provides different advantage estimation strategies:
 - OPDAdvantageEstimator: Multi-Teacher On-Policy Distillation (MOPD) token-level distillation advantages
 
 Every group-relative estimator (GRPO, GDPO, Reinforce++) accepts ``valid_mask``
-and must honor it: the SingleController always passes ``final_sample_mask`` as
-``valid_mask`` so token-capture placeholder rows (and sequence-logprob-error
-masked rows) do not vote in their siblings' baselines.
+and must honor it. GRPO training selects this mask with
+``grpo.masked_reward_policy`` independently of the sample loss mask: by default
+loss-masked rewards are excluded from prompt-group statistics; ``include``
+lets those rewards participate for ablations.
 
 Reference papers:
 - ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
