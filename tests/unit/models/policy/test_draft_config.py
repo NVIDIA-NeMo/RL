@@ -44,6 +44,7 @@ def test_eagle3_draft_config_preserves_legacy_defaults() -> None:
         "loss_weight": 0.1,
         "num_layers": None,
         "aux_layer_indices": None,
+        "token_chunk_size": 4096,
         "optimizer": None,
     }
 
@@ -355,3 +356,34 @@ def test_qwen3_8b_dspark_recipe_keeps_cuda_graphs_with_eager_backend() -> None:
         "backend": "eager",
         "cudagraph_mode": "PIECEWISE",
     }
+
+
+def test_coerce_draft_config_accepts_a_raw_mapping() -> None:
+    """PolicyConfig is a TypedDict, so hand-built configs arrive as dicts.
+
+    Every downstream reader accesses the draft config by attribute, so the
+    mapping input has to survive as a validated model rather than a dict.
+    """
+    from nemo_rl.models.policy.draft_config import coerce_draft_config
+
+    coerced = coerce_draft_config({"enabled": True, "model_name": "draft"})
+
+    assert isinstance(coerced, Eagle3DraftConfig)
+    assert coerced.enabled is True
+    assert coerced.model_name == "draft"
+
+
+def test_coerce_draft_config_passes_through_models_and_none() -> None:
+    from nemo_rl.models.policy.draft_config import coerce_draft_config
+
+    already = Eagle3DraftConfig(enabled=True)
+
+    assert coerce_draft_config(already) is already
+    assert coerce_draft_config(None) is None
+
+
+def test_raw_mapping_draft_config_requests_refit_when_enabled() -> None:
+    from nemo_rl.models.policy.draft_config import draft_refit_enabled
+
+    assert draft_refit_enabled({"enabled": True}) is True
+    assert draft_refit_enabled({"enabled": False}) is False

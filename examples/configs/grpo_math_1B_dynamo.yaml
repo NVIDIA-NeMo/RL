@@ -30,6 +30,8 @@ policy:
     enabled: false
   dtensor_cfg:
     _v2: false
+    checkpoint:
+      model_save_format: null
     enabled: true
     cpu_offload: false
     activation_checkpointing: false

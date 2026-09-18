@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
 
@@ -133,9 +134,22 @@ def test_direct_packed_rows_reject_missing_target_aligned_field():
         policy.train(batch, MagicMock())
 
 
-def test_direct_packed_rows_reject_draft_training():
+@pytest.mark.parametrize("draft", [{"enabled": True}, Eagle3DraftConfig(enabled=True)])
+def test_direct_packed_rows_reject_draft_training(draft):
     policy = _policy()
-    policy.cfg["draft"] = {"enabled": True}
+    policy.cfg["draft"] = draft
 
     with pytest.raises(NotImplementedError, match="draft training"):
         policy.train(_direct_batch(), MagicMock())
+
+
+@pytest.mark.parametrize(
+    "draft", [None, {"enabled": False}, Eagle3DraftConfig(enabled=False)]
+)
+def test_direct_packed_rows_accept_disabled_draft(draft):
+    policy = _policy()
+    policy.cfg["draft"] = draft
+
+    policy.train(_direct_batch(), MagicMock())
+
+    policy.worker_group.run_all_workers_sharded_data.assert_called_once()

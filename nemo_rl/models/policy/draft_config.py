@@ -13,7 +13,8 @@
 # limitations under the License.
 
 import difflib
-from typing import Annotated, ClassVar, Literal, Self, TypeAlias
+from collections.abc import Mapping
+from typing import Annotated, Any, ClassVar, Literal, Self, TypeAlias
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -186,6 +187,23 @@ class DSparkDraftConfig(BaseModel, extra="forbid"):
 DraftConfig: TypeAlias = Eagle3DraftConfig | DFlashDraftConfig | DSparkDraftConfig
 
 
-def draft_refit_enabled(config: DraftConfig | None) -> bool:
+def coerce_draft_config(
+    config: DraftConfig | Mapping[str, Any] | None,
+) -> DraftConfig | None:
+    """Normalize raw mappings while preserving the selected speculator contract."""
+    if config is None or isinstance(
+        config, (Eagle3DraftConfig, DFlashDraftConfig, DSparkDraftConfig)
+    ):
+        return config
+    speculator_type = config.get("speculator_type", "eagle3")
+    if speculator_type == "dflash":
+        return DFlashDraftConfig.model_validate(config)
+    if speculator_type == "dspark":
+        return DSparkDraftConfig.model_validate(config)
+    return Eagle3DraftConfig.model_validate(config)
+
+
+def draft_refit_enabled(config: DraftConfig | Mapping[str, Any] | None) -> bool:
     """Return whether generation must accept refitted draft weights."""
-    return config is not None and config.enabled
+    coerced = coerce_draft_config(config)
+    return coerced is not None and coerced.enabled

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Protocol, cast
 
@@ -53,6 +54,7 @@ from nemo_rl.models.policy.draft_config import (
     DraftConfig,
     DSparkDraftConfig,
     Eagle3DraftConfig,
+    coerce_draft_config,
 )
 
 if TYPE_CHECKING:
@@ -1051,12 +1053,13 @@ _SPECULATOR_FACTORIES: dict[
 
 
 def resolve_draft_speculator(
-    config: DraftConfig | None,
+    config: DraftConfig | Mapping[str, Any] | None,
 ) -> DraftTrainingProvider | None:
     """Resolve an enabled draft configuration to its speculator."""
-    if config is None or not config.enabled:
+    coerced = coerce_draft_config(config)
+    if coerced is None or not coerced.enabled:
         return None
     return cast(
         DraftTrainingProvider,
-        _SPECULATOR_FACTORIES[config.speculator_type](config),
+        _SPECULATOR_FACTORIES[coerced.speculator_type](coerced),
     )

@@ -149,6 +149,32 @@ class TestModelForward:
         call_kwargs = mock_model.call_args[1]
         assert call_kwargs["packed_seq_params"] == mock_packed_seq_params
 
+    def test_model_forward_drops_prepacked_boundary_transport_fields(self):
+        """Packed boundary containers must not become VLM forward kwargs."""
+        from nemo_rl.models.megatron.train import model_forward
+
+        mock_model = MagicMock(return_value=torch.randn(1, 3, 100))
+        mock_data_dict = MagicMock()
+        mock_data_dict.get_multimodal_dict.return_value = {
+            "cu_seqlens": torch.tensor([0, 3], dtype=torch.int32),
+            "cu_seqlens_padded": torch.tensor([0, 4], dtype=torch.int32),
+            "pixel_values": torch.randn(1, 3, 2, 2),
+        }
+
+        model_forward(
+            model=mock_model,
+            data_dict=mock_data_dict,
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
+            position_ids=None,
+            attention_mask=None,
+            packed_seq_params=MagicMock(),
+        )
+
+        call_kwargs = mock_model.call_args.kwargs
+        assert "cu_seqlens" not in call_kwargs
+        assert "cu_seqlens_padded" not in call_kwargs
+        assert "pixel_values" in call_kwargs
+
     def test_model_forward_passes_padding_mask(self):
         """Packed fake-token positions are forwarded to the MCore MoE router."""
         from nemo_rl.models.megatron.train import model_forward
@@ -200,6 +226,25 @@ class TestModelForward:
         assert torch.equal(mock_scatter.call_args.args[0], padding_mask.transpose(0, 1))
         assert mock_scatter.call_args.kwargs["group"] is tp_group
         assert torch.equal(result, scattered.transpose(0, 1))
+
+    def test_model_owned_cp_keeps_full_padding_mask(self):
+        """A model that slices CP inputs must receive its full THD padding mask."""
+        from nemo_rl.models.megatron.train import _prepare_padding_mask_for_model
+
+        model = SimpleNamespace(config=SimpleNamespace(sequence_parallel=True))
+        padding_mask = torch.tensor([[False, True, False, True]])
+
+        with patch(
+            "nemo_rl.models.megatron.train.tensor_parallel.scatter_to_sequence_parallel_region"
+        ) as mock_scatter:
+            result = _prepare_padding_mask_for_model(
+                model,
+                padding_mask,
+                model_slices_context_parallel_inputs=True,
+            )
+
+        mock_scatter.assert_not_called()
+        assert result is padding_mask
 
     def test_non_first_gpt_stage_padding_mask_is_sequence_parallel_sharded(self):
         """GPTModel only shards the mask itself on its embedding stage."""

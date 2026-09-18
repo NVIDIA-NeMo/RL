@@ -366,7 +366,9 @@ class _StreamingVocabParallelSoftCE(torch.autograd.Function):
         )
         # pyrefly: ignore[implicitly-defined-attribute]
         ctx.token_chunk_size = token_chunk_size
-        ctx.tp_group = tp_group  # pyrefly: ignore[implicitly-defined-attribute]
+        # tp_group is deliberately not saved: backward rebuilds both
+        # distributions from the already TP-reduced log-normalizers, so the
+        # gradient is purely local and needs no collective.
         return numerators
 
     @staticmethod
