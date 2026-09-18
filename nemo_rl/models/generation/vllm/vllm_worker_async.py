@@ -67,6 +67,100 @@ LOGGER = logging.getLogger(__name__)
 # evicting fresh evidence merely because a large deployment completed more
 # than 100k calls, while still bounding idle-job memory growth.
 _COMPLETED_CAPTURE_RETENTION_S = 60.0 * 60.0
+_RESTORED_PREFIX_TERMINAL_PROMPT_KEY = "__nemo_rl_restored_prefix_terminal__"
+
+
+@dataclass(frozen=True)
+class _RestoredPrefixTerminal:
+    """A restored call whose durable output already reached a terminal limit."""
+
+    prompt_token_ids: tuple[int, ...]
+    generation_token_count: int
+    reason: str
+
+    @property
+    def original_prompt_token_count(self) -> int:
+        return len(self.prompt_token_ids) - self.generation_token_count
+
+
+def _classify_restored_prefix_terminal(
+    *,
+    prompt_token_ids: list[int],
+    generation_token_count: int,
+    requested_output_tokens: int | None,
+    model_max_tokens: int,
+) -> _RestoredPrefixTerminal | None:
+    """Classify an exact terminal prefix or reject an incompatible restore."""
+    prompt_token_count = len(prompt_token_ids)
+    if generation_token_count < 0:
+        raise ValueError("generation_token_count must be non-negative")
+    if generation_token_count > prompt_token_count:
+        raise ValueError(
+            "Durable generation prefix contains more generated tokens than the "
+            "restored engine prompt."
+        )
+    if (
+        requested_output_tokens is not None
+        and generation_token_count > requested_output_tokens
+    ):
+        raise ValueError(
+            "Durable generation prefix token count "
+            f"({generation_token_count}) exceeds the restored request output "
+            f"budget ({requested_output_tokens})."
+        )
+    if prompt_token_count > model_max_tokens:
+        raise ValueError(
+            "Durable generation prefix prompt length "
+            f"({prompt_token_count}) exceeds restored model capacity "
+            f"({model_max_tokens})."
+        )
+
+    reached_output_limit = (
+        requested_output_tokens is not None
+        and generation_token_count == requested_output_tokens
+    )
+    reached_model_capacity = prompt_token_count == model_max_tokens
+    if not reached_output_limit and not reached_model_capacity:
+        return None
+
+    if reached_output_limit and reached_model_capacity:
+        reason = "output_and_model_limit"
+    elif reached_output_limit:
+        reason = "output_limit"
+    else:
+        reason = "model_limit"
+    return _RestoredPrefixTerminal(
+        prompt_token_ids=tuple(prompt_token_ids),
+        generation_token_count=generation_token_count,
+        reason=reason,
+    )
+
+
+def _build_restored_prefix_terminal_output(
+    request_id: str, terminal: _RestoredPrefixTerminal
+) -> Any:
+    """Build the final vLLM output for a prefix that needs no more decoding."""
+    # Deferred: vLLM is an optional dependency for non-vLLM installations.
+    from vllm.outputs import CompletionOutput, RequestOutput
+
+    return RequestOutput(
+        request_id=request_id,
+        prompt=None,
+        prompt_token_ids=list(terminal.prompt_token_ids),
+        prompt_logprobs=None,
+        outputs=[
+            CompletionOutput(
+                index=0,
+                text="",
+                token_ids=[],
+                cumulative_logprob=0.0,
+                logprobs=[],
+                finish_reason="length",
+                stop_reason=None,
+            )
+        ],
+        finished=True,
+    )
 
 
 @dataclass
@@ -391,6 +485,19 @@ class _AsyncLLMHTTPClient:
         request_id: str,
         kwargs: dict[str, Any],
     ) -> AsyncGenerator[Any, None]:
+        terminal = (
+            prompt.get(_RESTORED_PREFIX_TERMINAL_PROMPT_KEY)
+            if isinstance(prompt, dict)
+            else None
+        )
+        if isinstance(terminal, _RestoredPrefixTerminal):
+            # The prefix is already the exact output an uninterrupted request
+            # would have returned with finish_reason="length". Run it through
+            # the ordinary vLLM response/capture path without issuing a new
+            # physical generation or duplicating the durable prefix as a tail.
+            yield _build_restored_prefix_terminal_output(request_id, terminal)
+            return
+
         iterator = None
         completed = False
 
@@ -1785,6 +1892,7 @@ class VllmAsyncGenerationWorkerImpl(
 
         from fastapi import Header, HTTPException, Request
         from fastapi.responses import JSONResponse, StreamingResponse
+        from pydantic import PrivateAttr
         from vllm.entrypoints.chat_utils import load_chat_template
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
@@ -1865,7 +1973,7 @@ class VllmAsyncGenerationWorkerImpl(
                 """
                 if request.max_completion_tokens is not None:
                     request.max_completion_tokens = max_tokens
-                elif request.max_tokens is not None:
+                else:
                     request.max_tokens = max_tokens
 
             def _clamp_max_tokens(
@@ -1958,6 +2066,7 @@ class VllmAsyncGenerationWorkerImpl(
                 capture_prefix_token_ids: list[int] | None = None
                 generation_cut = None
                 resumed_generation_token_ids: list[int] = []
+                restored_request_output_tokens: int | None = None
                 if admission is not None:
                     capture_prefix_token_ids = await asyncio.to_thread(
                         worker_self._resolve_admission_prefix, admission
@@ -1969,6 +2078,7 @@ class VllmAsyncGenerationWorkerImpl(
                     )
                     engine_prefix_token_ids = list(capture_prefix_token_ids)
                     if generation_cut is not None:
+                        restored_request_output_tokens = actual_request_max_tokens
                         engine_prefix_token_ids.extend(generation_cut.token_ids_delta)
                         resumed_generation_token_ids = [
                             token_id
@@ -1988,13 +2098,10 @@ class VllmAsyncGenerationWorkerImpl(
                                 admission.generation_cut.generation_token_count
                             ),
                         )
-                        if remaining_output_tokens is not None:
-                            if remaining_output_tokens <= 0:
-                                raise VLLMValidationError(
-                                    "Durable generation prefix already exhausts max_tokens.",
-                                    parameter="max_tokens",
-                                    value=actual_request_max_tokens,
-                                )
+                        if (
+                            remaining_output_tokens is not None
+                            and remaining_output_tokens > 0
+                        ):
                             actual_request_max_tokens = remaining_output_tokens
                         if remaining_min_tokens is not None:
                             request.min_tokens = remaining_min_tokens
@@ -2078,8 +2185,38 @@ class VllmAsyncGenerationWorkerImpl(
 
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
 
+                restored_prefix_terminal = None
+                if generation_cut is not None:
+                    try:
+                        restored_prefix_terminal = (
+                            _classify_restored_prefix_terminal(
+                                prompt_token_ids=final_prompt_token_ids,
+                                generation_token_count=(
+                                    admission.generation_cut.generation_token_count
+                                ),
+                                requested_output_tokens=(
+                                    restored_request_output_tokens
+                                ),
+                                model_max_tokens=self.model_config.max_model_len,
+                            )
+                        )
+                    except ValueError as error:
+                        # This is not an ordinary context-overflow/no-generation
+                        # result. The selected checkpoint is incompatible with
+                        # this request or model and must fail closed.
+                        raise VLLMValidationError(
+                            str(error),
+                            parameter="generation_prefix",
+                            value=(
+                                admission.generation_cut.generation_token_count
+                            ),
+                        ) from error
+
                 # Clamp after prefix replacement since the prompt length may have changed.
-                if actual_request_max_tokens is not None:
+                if (
+                    restored_prefix_terminal is None
+                    and actual_request_max_tokens is not None
+                ):
                     self._clamp_max_tokens(
                         request,
                         actual_request_max_tokens,
@@ -2098,6 +2235,38 @@ class VllmAsyncGenerationWorkerImpl(
                     resumed_generation_token_ids=resumed_generation_token_ids,
                 )
 
+                if restored_prefix_terminal is not None:
+                    # Sampling validation still runs before the engine-client
+                    # adapter sees the terminal marker. No decoding will occur,
+                    # so the placeholder one-token request must not retain a
+                    # positive suffix minimum from the original request.
+                    request.min_tokens = 0
+                    self._set_max_tokens(request, 1)
+                    engine_prompt[_RESTORED_PREFIX_TERMINAL_PROMPT_KEY] = (
+                        restored_prefix_terminal
+                    )
+                    if (
+                        len(final_prompt_token_ids)
+                        == self.model_config.max_model_len
+                    ):
+                        # vLLM computes the available output budget before it
+                        # invokes engine_client.generate and rejects a prompt
+                        # with zero remaining slots. The engine client never
+                        # consumes this validation-only prompt: it returns the
+                        # full durable prefix carried by the marker instead.
+                        engine_prompt["prompt_token_ids"] = final_prompt_token_ids[
+                            :-1
+                        ]
+                    request._restored_prefix_terminal = restored_prefix_terminal
+                    LOGGER.info(
+                        "generation prefix already terminal: "
+                        "rollout_id=%s model_call_id=%s prefix_tokens=%d reason=%s",
+                        admission.rollout_id,
+                        admission.model_call_id,
+                        restored_prefix_terminal.generation_token_count,
+                        restored_prefix_terminal.reason,
+                    )
+
                 return res
 
         ########################################
@@ -2112,6 +2281,9 @@ class VllmAsyncGenerationWorkerImpl(
             # Ledger-authoritative token capture: the call identity the ledger
             # attaches (rollout_id, call_id, parent_call_id, prev_len, mode).
             ng_capture: Optional[dict[str, Any]] = None
+            _restored_prefix_terminal: _RestoredPrefixTerminal | None = PrivateAttr(
+                default=None
+            )
 
             def to_sampling_params(self, *args, **kwargs):
                 sampling_params = super().to_sampling_params(*args, **kwargs)
@@ -2231,6 +2403,38 @@ class VllmAsyncGenerationWorkerImpl(
                     or final_res is None
                 ):
                     return response
+
+                restored_prefix_terminal = request._restored_prefix_terminal
+                if (
+                    isinstance(restored_prefix_terminal, _RestoredPrefixTerminal)
+                    and response.usage is not None
+                ):
+                    # The synthetic engine result has an empty *new* tail, but
+                    # externally this is the same completed response as the
+                    # uninterrupted call: its durable prefix is the completion.
+                    response.usage.prompt_tokens = (
+                        restored_prefix_terminal.original_prompt_token_count
+                    )
+                    response.usage.completion_tokens = (
+                        restored_prefix_terminal.generation_token_count
+                    )
+                    response.usage.total_tokens = (
+                        response.usage.prompt_tokens
+                        + response.usage.completion_tokens
+                    )
+                    if response.prompt_token_ids is not None:
+                        response.prompt_token_ids = list(
+                            restored_prefix_terminal.prompt_token_ids[
+                                : restored_prefix_terminal.original_prompt_token_count
+                            ]
+                        )
+                    request_metadata = (
+                        args[4]
+                        if len(args) >= 5
+                        else kwargs.get("request_metadata")
+                    )
+                    if request_metadata is not None:
+                        request_metadata.final_usage_info = response.usage
 
                 if request.logprobs and return_as_token_id:
                     response = attach_token_information_to_chat_response_choices(
