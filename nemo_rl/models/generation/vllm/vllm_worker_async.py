@@ -30,11 +30,10 @@ import uvicorn
 from fastapi import FastAPI
 
 from nemo_rl.data.captured_media import (
-    MEDIA_CAPTURE_FIELD,
+    MEDIA_SPANS_FIELD,
     CapturedMediaItem,
     CapturedMedia,
     capture_processed_media,
-    verify_media_chain,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -70,17 +69,15 @@ LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from nemo_gym.token_id_capture.staging.capture import ActiveCall
-    from nemo_gym.token_id_capture.staging.protocols import TensorAttachment
 
 
 @dataclass
 class CapturedRequest:
-    """Request-local ownership of tokens and immutable processed-image bytes."""
+    """Request-local ownership of tokens and processed-media snapshots."""
 
     call: "ActiveCall"
     prompt_token_ids: list[int]
     media: CapturedMedia | None
-    attachments: tuple["TensorAttachment", ...]
 
 
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
@@ -220,6 +217,8 @@ class VllmAsyncGenerationWorkerImpl(
         self._rollout_weight_version = 0
         self._capture_calls: dict[int, CapturedRequest] = {}
         self._capture_media = False
+        self._capture_patch_size: int | None = None
+        self._staging_sink = None
         self._capture_image_token_id: int | None = None
         self._staging_source: Any | None = None
         # Guarded by _prefix_cache_lock: _fetch_chain_prefix runs on executor
@@ -515,9 +514,6 @@ class VllmAsyncGenerationWorkerImpl(
         sink = TQTokenSink(dp_client, staging_partition=staging_partition)
         if capture_media:
             # Optional engine/Gym capabilities are checked only on VLM workers.
-            from nemo_gym.token_id_capture.staging.protocols import (
-                AttachmentStagingSink,
-            )
             from vllm.model_executor.models.nano_nemotron_vl import (
                 NanoNemotronVLProcessingInfo,
             )
@@ -540,10 +536,8 @@ class VllmAsyncGenerationWorkerImpl(
                     "Omni media capture requires one image-context token ID"
                 )
             self._capture_image_token_id = int(context_ids[0])
-            if not isinstance(sink, AttachmentStagingSink):
-                raise ValueError(
-                    "Media capture requires a tensor-attachment staging sink"
-                )
+            self._capture_patch_size = int(info.get_hf_config().patch_size)
+        self._staging_sink = sink
         self._capture_media = capture_media
         self._staging_source = TQTokenSource(
             dp_client, staging_partition=staging_partition
@@ -584,7 +578,6 @@ class VllmAsyncGenerationWorkerImpl(
         admission: Any | None = None,
         prefix_token_ids: list[int] | None = None,
         media: CapturedMedia | None = None,
-        attachments: tuple["TensorAttachment", ...] = (),
     ) -> None:
         """Admit one ledger-forwarded call into the capture layer.
 
@@ -611,7 +604,7 @@ class VllmAsyncGenerationWorkerImpl(
             stream=bool(getattr(request, "stream", False)),
         )
         self._capture_calls[id(request)] = CapturedRequest(
-            call, list(prompt_token_ids), media, attachments
+            call, list(prompt_token_ids), media
         )
 
     def _capture_request_media(
@@ -620,16 +613,16 @@ class VllmAsyncGenerationWorkerImpl(
         *,
         admission: Any | None,
         splice: PrefixSplice | None = None,
-    ) -> tuple[CapturedMedia | None, tuple["TensorAttachment", ...]]:
+    ) -> CapturedMedia | None:
         """Run off-loop: resolve retained geometry and snapshot processed pixels."""
         if admission is None:
-            return None, ()
+            return None
         if not self._capture_media:
             if engine_prompt.get("mm_placeholders") or engine_prompt.get("mm_kwargs"):
                 raise ValueError(
                     "Multimodal token capture requires media capture setup"
                 )
-            return None, ()
+            return None
         retained: tuple[CapturedMediaItem, ...] = ()
         if admission.parent_call_id is not None:
             # Optional Gym dependency: this method only runs on captured calls.
@@ -641,7 +634,7 @@ class VllmAsyncGenerationWorkerImpl(
                 raise RuntimeError("Media capture staging source is not initialized")
             if admission.staging_chain:
                 calls = source.fetch_for_finalization(
-                    list(admission.staging_chain), include_route_fragments=True
+                    list(admission.staging_chain), include_route_fragments=False
                 )
             else:
                 # Inline token admissions still have receipt-owned parent keys.
@@ -653,7 +646,7 @@ class VllmAsyncGenerationWorkerImpl(
                     visited.add(parent)
                     call = source.fetch_for_finalization(
                         [staging_key(admission.rollout_id, parent)],
-                        include_route_fragments=True,
+                        include_route_fragments=False,
                     )[0]
                     calls.append(call)
                     parent = call.snapshot.parent_call_id
@@ -682,16 +675,25 @@ class VllmAsyncGenerationWorkerImpl(
                 raise ValueError(
                     "Retained image chain does not match capture admission"
                 )
-            descriptors = verify_media_chain(calls, required=True)
-            retained = tuple(
-                image for descriptor in descriptors for image in descriptor.items
-            )
+            retained_items = []
+            for call in calls:
+                extras = call.extras or {}
+                if MEDIA_SPANS_FIELD not in extras:
+                    raise ValueError("Retained vLLM media spans are missing")
+                for value in extras[MEDIA_SPANS_FIELD]:
+                    item = CapturedMediaItem.from_dict(value)
+                    item.verify_tokens(
+                        call.snapshot.token_ids_delta, origin=call.snapshot.prev_len
+                    )
+                    retained_items.append(item)
+            retained = tuple(retained_items)
         return capture_processed_media(
             engine_prompt,
             prev_len=admission.prev_len,
             retained=retained,
             splice=splice,
             image_token_id=self._capture_image_token_id,
+            patch_size=self._capture_patch_size,
         )
 
     def _fetch_chain_prefix(self, staging_chain: list[str]) -> list[int]:
@@ -796,10 +798,9 @@ class VllmAsyncGenerationWorkerImpl(
     def _finish_request_capture(self, request: Any, content: dict) -> dict:
         """Stage the finished call and ride its coords on the response.
 
-        Fail-closed: the sink write happens inside complete_call —
-        the coords exist only after the bytes are durable, and any capture
-        failure degrades to capture_failed coords without breaking the
-        completion. Token ids and logprobs are stripped: the staged delta is
+        Token failures produce capture_failed coords. Media is staged on the
+        same key before returning; the finalizer rejects missing media if that
+        second write fails. Token ids and logprobs are stripped: the staged delta is
         the only token store on this path, so the worker->gate hop carries
         text + delta ids + coords only.
         """
@@ -813,7 +814,10 @@ class VllmAsyncGenerationWorkerImpl(
         # nemo_gym.token_id_capture.adapters.vllm.extract_prompt_ids).
         payload["prompt_token_ids"] = prompt_token_ids
         if state.media is not None:
-            payload[MEDIA_CAPTURE_FIELD] = state.media.to_dict()
+            from nemo_rl.data_plane.tq_token_sink import media_geometry
+
+            payload["media"] = media_geometry(state.media.tensors)
+            payload[MEDIA_SPANS_FIELD] = [item.to_dict() for item in state.media.items]
         adapter = self.token_capture.adapter
         if adapter is not None:
             try:
@@ -826,8 +830,14 @@ class VllmAsyncGenerationWorkerImpl(
                 prompt_len=len(prompt_token_ids),
                 generated_len=len(generated_token_ids),
             )
-        coords = self.token_capture.complete_call_from_response(
-            call, payload, attachments=state.attachments
+        from nemo_rl.data_plane.tq_token_sink import complete_call_with_media
+
+        coords = complete_call_with_media(
+            self.token_capture,
+            call,
+            payload,
+            sink=self._staging_sink,
+            media_tensors=state.media.tensors if state.media is not None else None,
         )
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
@@ -1051,7 +1061,7 @@ class VllmAsyncGenerationWorkerImpl(
                         )
                     # Token capture, text mode: the full render is the exact
                     # engine prompt.
-                    media, attachments = await asyncio.to_thread(
+                    media = await asyncio.to_thread(
                         worker_self._capture_request_media,
                         res[1][0],
                         admission=admission,
@@ -1061,7 +1071,6 @@ class VllmAsyncGenerationWorkerImpl(
                         res[1][0]["prompt_token_ids"],
                         admission=admission,
                         media=media,
-                        attachments=attachments,
                     )
                     return res
 
@@ -1112,7 +1121,7 @@ class VllmAsyncGenerationWorkerImpl(
                     template_token_ids=engine_prompt["prompt_token_ids"],
                 )
                 final_prompt_token_ids = splice.token_ids
-                media, attachments = await asyncio.to_thread(
+                media = await asyncio.to_thread(
                     worker_self._capture_request_media,
                     engine_prompt,
                     admission=admission,
@@ -1137,7 +1146,6 @@ class VllmAsyncGenerationWorkerImpl(
                     admission=admission,
                     prefix_token_ids=capture_prefix_token_ids,
                     media=media,
-                    attachments=attachments,
                 )
 
                 return res

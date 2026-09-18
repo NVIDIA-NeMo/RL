@@ -189,6 +189,12 @@ def model_forward(
     multimodal_data = data_dict.get_multimodal_dict(
         as_tensors=True, device=input_ids_cp_sharded.device
     )
+    # Captured Omni patches concatenate across rollout rows as [patches, features].
+    # The pinned Bridge learner accepts the same patches with a singleton batch
+    # dimension. imgs_sizes distinguishes this layout from other VLM inputs.
+    pixels = multimodal_data.get("pixel_values")
+    if "imgs_sizes" in multimodal_data and pixels is not None and pixels.ndim == 2:
+        multimodal_data["pixel_values"] = pixels.unsqueeze(0)
     # VLM wrappers normally derive their own positions or expand the token sequence,
     # so position_ids are dropped for multimodal batches.
     # A model that consumes caller-packed THD inputs keeps them:

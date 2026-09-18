@@ -60,15 +60,8 @@ def test_gym_staging_package_is_importable_in_the_nemo_gym_lane():
 
 
 def test_image_pixels_round_trip_with_tokens_through_live_tq(tq_client):
-    from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
-    from nemo_gym.token_id_capture.staging.records import CaptureAdmission
-
-    from nemo_rl.data.captured_media import (
-        MEDIA_STAGING_FIELDS,
-        capture_processed_media,
-        verify_media_chain,
-    )
-    from tests.unit.data.test_captured_media import Span, engine_prompt
+    from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS
+    from tests.unit.data.test_captured_media import Span, engine_prompt, packed, stage
 
     partition = "worker_media_capture_test"
     tq_client.register_partition(
@@ -78,34 +71,22 @@ def test_image_pixels_round_trip_with_tokens_through_live_tq(tq_client):
         consumer_tasks=["finalize"],
     )
     pixels = torch.arange(18, dtype=torch.float32).reshape(3, 2, 3)
-    descriptor, attachments = capture_processed_media(
-        engine_prompt([10, 18, 18], [(Span(1, 2), pixels)]),
-        prev_len=0,
-    )
-    capture = RolloutTokenCapture(
-        sink=TQTokenSink(tq_client, staging_partition=partition),
-        weight_version_fn=lambda: 0,
-    )
     try:
-        coords = capture.complete_call(
-            capture.begin_call(
-                CaptureAdmission(rollout_id="media", model_call_id="c1", mode="text")
-            ),
-            prompt_token_ids=[10, 18, 18],
-            generated_token_ids=[2],
-            generated_logprobs=[-0.25],
-            extras={"media_capture": descriptor.to_dict()},
-            attachments=attachments,
+        record, _ = stage(
+            tq_client,
+            engine_prompt([10, 18, 18], [(Span(1, 2), pixels)]),
+            partition=partition,
         )
-        assert coords.disposition == "staged"
         source = TQTokenSource(tq_client, staging_partition=partition)
-        calls = source.fetch_for_finalization([coords.staging_key])
-        assert calls[0].snapshot.token_ids_delta == [10, 18, 18, 2]
-        verified = verify_media_chain(calls, required=True)[0]
-        restored = verified.decode_tensors(source.fetch_media(coords.staging_key))[0][
-            "pixel_values"
-        ][0]
-        torch.testing.assert_close(restored, pixels, rtol=0, atol=0)
+        [call] = source.fetch_for_finalization([record.staging_key])
+        assert call.snapshot.token_ids_delta == [10, 18, 18, 31, 2]
+        assert call.extras["media"]["imgs_sizes"] == [[2, 3]]
+        torch.testing.assert_close(
+            source.fetch_media(record.staging_key).imgs[0],
+            packed(pixels),
+            rtol=0,
+            atol=0,
+        )
     finally:
         tq_client.clear_samples(sample_ids=None, partition_id=partition)
 

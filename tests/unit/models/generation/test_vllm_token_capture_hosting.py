@@ -206,6 +206,7 @@ def _worker_with_capture(sink: _MemorySink):
 
     worker = _fake_worker()
     worker._capture_calls = {}
+    worker._staging_sink = sink
     worker._prefix_cache = {}
     worker._prefix_cache_lock = threading.Lock()
     worker._staging_source = None
@@ -500,6 +501,11 @@ def test_omni_capture_setup_rejects_video_pruning(monkeypatch, pruning_rate):
         NanoNemotronVLProcessingInfo,
         "get_hf_processor",
         lambda self: SimpleNamespace(_img_context_token_ids=[18]),
+    )
+    monkeypatch.setattr(
+        NanoNemotronVLProcessingInfo,
+        "get_hf_config",
+        lambda self: SimpleNamespace(patch_size=2),
     )
     worker = _fake_worker()
     worker.llm = SimpleNamespace(

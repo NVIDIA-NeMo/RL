@@ -8,6 +8,7 @@ import torch
 
 pytest.importorskip("nemo_gym.token_id_capture.staging")
 
+from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
 from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
 from nemo_gym.token_id_capture.staging.records import (
     CallRecord,
@@ -16,18 +17,27 @@ from nemo_gym.token_id_capture.staging.records import (
 )
 
 from nemo_rl.data.captured_media import (
-    MEDIA_CAPTURE_FIELD,
-    MEDIA_STAGING_FIELDS,
-    attachment_tensors,
-    capture_processed_media,
+    MEDIA_SPANS_FIELD,
+    pack_images,
 )
-from nemo_rl.data.multimodal_utils import (
-    extract_multimodal_model_inputs,
-    reassemble_packed_multimodal,
+from nemo_rl.data.captured_media import (
+    capture_processed_media as _capture_processed_media,
 )
+from nemo_rl.data.multimodal_utils import reassemble_packed_multimodal
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
-from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, ROUTED_EXTRAS_METADATA_FIELD
-from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS, TQTokenSink, TQTokenSource
+from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
+from nemo_rl.data_plane.tq_token_sink import (
+    MEDIA_GEOMETRY_FIELD,
+    MEDIA_IMGS_FIELD,
+    MEDIA_IMGS_SIZES_FIELD,
+    MEDIA_NUM_FRAMES_FIELD,
+    MEDIA_STAGING_FIELDS,
+    STAGING_FIELDS,
+    TQTokenSink,
+    TQTokenSource,
+    complete_call_with_media,
+    media_geometry,
+)
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler
 from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
@@ -35,6 +45,18 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
 )
 
 pytestmark = pytest.mark.nemo_gym
+
+
+def capture_processed_media(prompt, **kwargs):
+    # Tiny fixtures use one-pixel patches; the worker supplies the model's size.
+    kwargs.setdefault("patch_size", 1)
+    kwargs.setdefault("image_token_id", 18)
+    return _capture_processed_media(prompt, **kwargs)
+
+
+def packed(pixels):
+    frames = pixels.unsqueeze(0) if pixels.ndim == 3 else pixels
+    return frames.permute(0, 2, 3, 1).reshape(-1, 3)
 
 
 @dataclass(frozen=True)
@@ -82,16 +104,23 @@ def dp():
 
 
 def stage(
-    dp, prompt, *, parent=None, retained=(), call_id="c1", rollout_id="r0", routes=False
+    dp,
+    prompt,
+    *,
+    parent=None,
+    retained=(),
+    call_id="c1",
+    rollout_id="r0",
+    routes=False,
+    partition="staging",
+    sink=None,
 ):
+    sink = sink or TQTokenSink(dp, staging_partition=partition)
     capture = RolloutTokenCapture(
-        sink=TQTokenSink(dp, staging_partition="staging"),
-        weight_version_fn=lambda: 3,
+        sink=sink, weight_version_fn=lambda: 3, adapter=VLLMCaptureAdapter()
     )
     prev_len = parent.cum_len if parent is not None else 0
-    descriptor, attachments = capture_processed_media(
-        prompt, prev_len=prev_len, retained=retained, image_token_id=18
-    )
+    media = capture_processed_media(prompt, prev_len=prev_len, retained=retained)
     admission = CaptureAdmission(
         rollout_id=rollout_id,
         model_call_id=call_id,
@@ -101,18 +130,23 @@ def stage(
         required_prefix_token_ids=prompt["prompt_token_ids"][:prev_len],
         parent_chain_hash=parent.chain_hash if parent else None,
     )
-    extras = {MEDIA_CAPTURE_FIELD: descriptor.to_dict()}
+    message = {"generation_token_ids": [31, 2], "generation_log_probs": [-0.25, -0.5]}
     if routes:
-        extras["routed_experts"] = [[[0]]] * (
+        message["routed_experts"] = [[[0]]] * (
             len(prompt["prompt_token_ids"]) + 2 - prev_len
         )
-    coords = capture.complete_call(
+    payload = {
+        "prompt_token_ids": prompt["prompt_token_ids"],
+        "choices": [{"message": message}],
+        "media": media_geometry(media.tensors),
+        MEDIA_SPANS_FIELD: [item.to_dict() for item in media.items],
+    }
+    coords = complete_call_with_media(
+        capture,
         capture.begin_call(admission),
-        prompt_token_ids=prompt["prompt_token_ids"],
-        generated_token_ids=[31, 2],
-        generated_logprobs=[-0.25, -0.5],
-        extras=extras,
-        attachments=attachments,
+        payload,
+        sink=sink,
+        media_tensors=media.tensors,
     )
     assert coords.disposition == "staged"
     record = CallRecord(
@@ -120,7 +154,7 @@ def stage(
         mode=admission.mode,
         response_id=f"response-{call_id}",
     )
-    return record, descriptor
+    return record, media
 
 
 def receipt(*records, rollout_id="r0", terminal=None):
@@ -139,7 +173,6 @@ def finalizer(dp, **kwargs):
         staging_partition="staging",
         pad_token_id=0,
         max_seq_len=1000,
-        capture_media=True,
         **kwargs,
     )
 
@@ -157,8 +190,8 @@ def test_two_turn_images_are_captured_once_and_survive_restart(dp, tmp_path):
         call_id="c2",
     )
     source = TQTokenSource(dp, staging_partition="staging")
-    assert source.fetch_media(root.staging_key)["pixel_values"].numel() == a.numel()
-    assert source.fetch_media(child.staging_key)["pixel_values"].numel() == b.numel()
+    assert source.fetch_media(root.staging_key).imgs.numel() == a.numel()
+    assert source.fetch_media(child.staging_key).imgs.numel() == b.numel()
     # Both the descriptor and pixels are restored with the ordinary call rows.
     dp.save_checkpoint(tmp_path / "checkpoint")
     restored = NoOpDataPlaneClient()
@@ -171,8 +204,8 @@ def test_two_turn_images_are_captured_once_and_survive_restart(dp, tmp_path):
     assert row.media["imgs_sizes"].as_tensor().tolist() == [[2, 3], [4, 2]]
     assert row.media["num_frames"].as_tensor().tolist() == [1, 1]
     pixels = row.media["pixel_values"].as_tensor()
-    torch.testing.assert_close(pixels[0, :, :2, :3], a, rtol=0, atol=0)
-    torch.testing.assert_close(pixels[1, :, :4, :2], b, rtol=0, atol=0)
+    torch.testing.assert_close(pixels[:6], packed(a), rtol=0, atol=0)
+    torch.testing.assert_close(pixels[6:], packed(b), rtol=0, atol=0)
 
 
 def test_publication_packs_mixed_rows_and_cleans_all_call_media(dp):
@@ -202,29 +235,27 @@ def test_publication_packs_mixed_rows_and_cleans_all_call_media(dp):
     assert fields["sample_mask"].tolist() == [1.0, 1.0, 0.0]
     materialized = dict(fields)
     reassemble_packed_multimodal(materialized, result.meta.tags)
-    assert materialized["pixel_values"].row_shapes() == [[[1, 3, 2, 3]], [], []]
-    torch.testing.assert_close(materialized["pixel_values"].as_tensor(), a.unsqueeze(0))
+    assert materialized["pixel_values"].row_shapes() == [[[6, 3]], [], []]
+    torch.testing.assert_close(materialized["pixel_values"].as_tensor(), packed(a))
     assert dp.list_sample_ids("staging") == []
 
 
-@pytest.mark.parametrize("corruption", ["missing", "pixels", "descriptor"])
+@pytest.mark.parametrize("corruption", ["missing", "geometry"])
 def test_missing_or_corrupt_media_rejects_rollout(dp, corruption):
     root, _ = stage(
         dp, engine_prompt([10, 18, 18, 11], [(Span(1, 2), torch.ones(3, 2, 3))])
     )
     stored = dp._partitions["staging"].rows[root.staging_key]
     if corruption == "missing":
-        del stored["pixel_values"]
-    elif corruption == "pixels":
-        stored["pixel_values"][0] += 1
+        del stored[MEDIA_IMGS_FIELD]
     else:
-        stored[ROUTED_EXTRAS_METADATA_FIELD] = torch.tensor(
-            list(b"null"), dtype=torch.uint8
-        )
+        stored[MEDIA_IMGS_SIZES_FIELD][0] += 1
     row = finalizer(dp).finalize_rollout("r0", receipt(root), reward=1.0)
     assert not row.valid
-    assert row.rejection_reason.startswith("media_assembly:")
-    assert row.media == {}
+    assert row.rejection_reason.startswith(
+        ("media_columns_missing:", "media_mismatch:")
+    )
+    assert row.media is None
 
 
 def test_image_free_continuation_has_no_pixel_column(dp):
@@ -238,7 +269,7 @@ def test_image_free_continuation_has_no_pixel_column(dp):
         call_id="c2",
     )
     assert descriptor.items == ()
-    assert "pixel_values" not in dp._partitions["staging"].rows[child.staging_key]
+    assert MEDIA_IMGS_FIELD not in dp._partitions["staging"].rows[child.staging_key]
     row = finalizer(dp).finalize_rollout("r0", receipt(root, child), reward=1.0)
     assert row.valid, row.rejection_reason
     assert row.media["imgs_sizes"].as_tensor().tolist() == [[2, 3]]
@@ -251,54 +282,38 @@ def test_repeated_asset_occurrences_remain_distinct(dp):
     )
     row = finalizer(dp).finalize_rollout("r0", receipt(root), reward=1.0)
     assert row.valid
-    assert row.media["pixel_values"].as_tensor().shape == (2, 3, 2, 3)
+    assert row.media["pixel_values"].as_tensor().shape == (12, 3)
 
 
-def test_captured_inputs_match_existing_learner_conversion(dp):
-    class NemotronH_Nano_Omni_Reasoning_V3Processor:
-        model_input_names = ["input_ids", "pixel_values", "imgs_sizes"]
-        tokenizer = SimpleNamespace(model_input_names=["input_ids"])
-
-    pixels = torch.arange(18, dtype=torch.float32).reshape(3, 2, 3)
-    root, _ = stage(dp, engine_prompt([18, 18], [(Span(0, 2), pixels)]))
-    row = finalizer(dp).finalize_rollout("r0", receipt(root), reward=1.0)
-    expected = extract_multimodal_model_inputs(
-        NemotronH_Nano_Omni_Reasoning_V3Processor(),
-        {
-            "input_ids": torch.tensor([18, 18]),
-            "pixel_values": pixels.unsqueeze(0),
-            "imgs_sizes": torch.tensor([[2, 3]]),
-        },
-    )
-    assert row.valid, row.rejection_reason
-    assert set(row.media) == set(expected)
-    for name in expected:
-        torch.testing.assert_close(
-            row.media[name].as_tensor(), expected[name].as_tensor(), rtol=0, atol=0
-        )
-        assert row.media[name].pad_to_max_shape == expected[name].pad_to_max_shape
+def test_patch_order_matches_bridge_dynamic_images():
+    frames = torch.arange(96, dtype=torch.float32).reshape(2, 3, 4, 4)
+    result = pack_images(frames, torch.tensor([[4, 4], [4, 4]]), patch_size=2)
+    expected = torch.stack(
+        [
+            frame[:, y : y + 2, x : x + 2].reshape(-1)
+            for frame in frames
+            for y in (0, 2)
+            for x in (0, 2)
+        ]
+    ).unsqueeze(0)
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_pixel_snapshot_owns_storage_and_preserves_dtype(dtype):
     a = torch.arange(18, dtype=dtype).reshape(3, 2, 3)
-    original = a.clone()
-    descriptor, attachments = capture_processed_media(
+    original = packed(a.clone())
+    media = capture_processed_media(
         engine_prompt([18, 18], [(Span(0, 2), a)]), prev_len=0
     )
     a.zero_()
-    restored = descriptor.decode_tensors(attachment_tensors(descriptor, attachments))[
-        0
-    ]["pixel_values"][0]
-    torch.testing.assert_close(restored, original, rtol=0, atol=0)
+    torch.testing.assert_close(media.tensors["imgs"][0], original, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize(
-    "change", ["pixels", "length", "size", "dropped", "cache_reference"]
-)
+@pytest.mark.parametrize("change", ["length", "size", "dropped", "cache_reference"])
 def test_changed_retained_images_fail_before_inference(change):
     a = torch.ones(3, 2, 3)
-    first, _ = capture_processed_media(
+    first = capture_processed_media(
         engine_prompt([10, 18, 18, 11], [(Span(1, 2), a)]), prev_len=0
     )
     image = (
@@ -317,7 +332,7 @@ def test_changed_retained_images_fail_before_inference(change):
 def test_splice_coordinates_handle_reasoning_shift_and_repeated_pad_runs():
     a, b = torch.ones(3, 2, 3), torch.ones(3, 3, 2)
     original = [10, 18, 18, 11, 77, 78, 31, 2]
-    first, _ = capture_processed_media(
+    first = capture_processed_media(
         engine_prompt(original, [(Span(1, 2), a)]), prev_len=0
     )
     # The template drops old reasoning; the new image uses the same pad run.
@@ -329,7 +344,7 @@ def test_splice_coordinates_handle_reasoning_shift_and_repeated_pad_runs():
         template_token_ids=template,
     )
     prompt = engine_prompt(template, [(Span(1, 2), a), (Span(7, 2), b)])
-    captured, _ = capture_processed_media(
+    captured = capture_processed_media(
         prompt, prev_len=len(original), retained=first.items, splice=splice
     )
     assert captured.items[0].embedding_spans[0][0] == 9
@@ -340,7 +355,7 @@ def test_splice_coordinates_handle_reasoning_shift_and_repeated_pad_runs():
 def test_changed_retained_pad_run_cannot_steal_the_next_image():
     a = torch.ones(3, 2, 3)
     original = [10, 18, 18, 18, 18, 11, 2, 31, 2]
-    first, _ = capture_processed_media(
+    first = capture_processed_media(
         engine_prompt(original, [(Span(1, 4), a)]), prev_len=0
     )
     template_prefix = [10, 18, 18, 11, 2, 31, 2]
@@ -382,57 +397,24 @@ def test_span_mask_is_preserved_on_remap():
     prompt = engine_prompt(
         [10, 31, 2, 11, 18, 18, 12], [(Span(3, 4, mask), torch.ones(3, 2, 3))]
     )
-    captured, _ = capture_processed_media(prompt, prev_len=4, splice=splice)
+    captured = capture_processed_media(prompt, prev_len=4, splice=splice)
     assert captured.items[0].embedding_spans[0][0] == 5
     assert prompt["mm_placeholders"]["image"][0].is_embed is mask
 
 
-def test_missing_attachment_is_not_a_successful_token_commit(dp):
-    descriptor, _ = capture_processed_media(
-        engine_prompt([18, 18], [(Span(0, 2), torch.ones(3, 2, 3))]), prev_len=0
-    )
-    capture = RolloutTokenCapture(
-        sink=TQTokenSink(dp, staging_partition="staging"), weight_version_fn=lambda: 0
-    )
-    coords = capture.complete_call(
-        capture.begin_call(
-            CaptureAdmission(rollout_id="r0", model_call_id="c1", mode="text")
-        ),
-        prompt_token_ids=[18, 18],
-        generated_token_ids=[2],
-        generated_logprobs=[-0.5],
-        extras={MEDIA_CAPTURE_FIELD: descriptor.to_dict()},
-    )
-    assert coords.disposition == "capture_failed"
-    assert dp.list_sample_ids("staging") == []
+def test_failed_media_write_is_rejected_by_shared_finalizer(dp, monkeypatch):
+    sink = TQTokenSink(dp, staging_partition="staging")
 
+    def fail(*args):
+        raise OSError("media write failed")
 
-def test_partial_put_never_returns_successful_coords(dp, monkeypatch):
-    put = dp.put_samples
-
-    def partial_put(*, fields, **kwargs):
-        put(fields=fields.select("token_ids_delta"), **kwargs)
-        raise RuntimeError("lost media write acknowledgement")
-
-    monkeypatch.setattr(dp, "put_samples", partial_put)
-    descriptor, attachments = capture_processed_media(
-        engine_prompt([18, 18], [(Span(0, 2), torch.ones(3, 2, 3))]), prev_len=0
+    monkeypatch.setattr(sink, "stage_media", fail)
+    record, _ = stage(
+        dp, engine_prompt([18, 18], [(Span(0, 2), torch.ones(3, 2, 3))]), sink=sink
     )
-    capture = RolloutTokenCapture(
-        sink=TQTokenSink(dp, staging_partition="staging"), weight_version_fn=lambda: 0
-    )
-    coords = capture.complete_call(
-        capture.begin_call(
-            CaptureAdmission(rollout_id="r0", model_call_id="c1", mode="text")
-        ),
-        prompt_token_ids=[18, 18],
-        generated_token_ids=[2],
-        generated_logprobs=[-0.5],
-        extras={MEDIA_CAPTURE_FIELD: descriptor.to_dict()},
-        attachments=attachments,
-    )
-    assert coords.disposition == "capture_failed"
-    assert dp.list_sample_ids("staging") == []
+    row = finalizer(dp).finalize_rollout("r0", receipt(record), reward=1.0)
+    assert not row.valid
+    assert row.rejection_reason.startswith("media_columns_missing:")
 
 
 def test_media_and_routes_share_extras_integrity(dp):
@@ -448,11 +430,6 @@ def test_media_and_routes_share_extras_integrity(dp):
     assert row.media and row.routed_experts is not None
 
 
-def test_deferred_routes_and_media_capture_are_rejected(dp):
-    with pytest.raises(ValueError, match="direct router"):
-        finalizer(dp, router_replay_enabled=True, defer_routed_experts_to_policy=True)
-
-
 @pytest.mark.parametrize("inline", [False, True])
 def test_worker_restart_recovers_retained_geometry_without_fetching_pixels(
     dp, inline, monkeypatch
@@ -464,7 +441,10 @@ def test_worker_restart_recovers_retained_geometry_without_fetching_pixels(
         source, "fetch_media", lambda _: pytest.fail("prefix lookup fetched pixels")
     )
     worker = SimpleNamespace(
-        _capture_media=True, _capture_image_token_id=18, _staging_source=source
+        _capture_media=True,
+        _capture_image_token_id=18,
+        _capture_patch_size=1,
+        _staging_source=source,
     )
     prefix = [10, 18, 18, 11, 31, 2]
     admission = CaptureAdmission(
@@ -477,17 +457,17 @@ def test_worker_restart_recovers_retained_geometry_without_fetching_pixels(
         required_prefix_token_ids=prefix if inline else [],
         staging_chain=[] if inline else [root.staging_key],
     )
-    descriptor, attachments = VllmAsyncGenerationWorkerImpl._capture_request_media(
+    descriptor = VllmAsyncGenerationWorkerImpl._capture_request_media(
         worker,
         engine_prompt(prefix + [50], [(Span(1, 2), a)]),
         admission=admission,
     )
     assert descriptor.items == ()
-    assert attachments == ()
+    assert descriptor.tensors is None
     with pytest.raises(ValueError, match="Retained media"):
         VllmAsyncGenerationWorkerImpl._capture_request_media(
             worker,
-            engine_prompt(prefix + [50], [(Span(1, 2), a + 1)]),
+            engine_prompt(prefix + [50], [(Span(1, 2), torch.ones(3, 3, 2))]),
             admission=admission,
         )
 
@@ -497,6 +477,7 @@ def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(dp
 
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
     worker._capture_calls = {}
+    worker._staging_sink = TQTokenSink(dp, staging_partition="staging")
     worker.token_capture = RolloutTokenCapture(
         sink=TQTokenSink(dp, staging_partition="staging"),
         weight_version_fn=lambda: 0,
@@ -505,13 +486,11 @@ def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(dp
     request = SimpleNamespace(
         ng_capture={"rollout_id": "r0", "model_call_id": "c1", "mode": "text"}
     )
-    descriptor, attachments = capture_processed_media(
+    descriptor = capture_processed_media(
         engine_prompt([18, 18], [(Span(0, 2), torch.ones(3, 2, 3))]),
         prev_len=0,
     )
-    worker._begin_request_capture(
-        request, [18, 18], media=descriptor, attachments=attachments
-    )
+    worker._begin_request_capture(request, [18, 18], media=descriptor)
     content = {
         "choices": [
             {
@@ -525,13 +504,11 @@ def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(dp
     }
     response = worker._finish_request_capture(request, content)
     assert response["ng_commit_coords"]["disposition"] == "staged"
-    assert MEDIA_CAPTURE_FIELD not in response and "pixel_values" not in response
+    assert "media" not in response and MEDIA_SPANS_FIELD not in response
     assert worker._capture_calls == {}
     torch.testing.assert_close(
-        TQTokenSource(dp, staging_partition="staging").fetch_media("r0/c1")[
-            "pixel_values"
-        ],
-        torch.ones(18),
+        TQTokenSource(dp, staging_partition="staging").fetch_media("r0/c1").imgs,
+        torch.ones(1, 6, 3),
     )
 
 
@@ -564,38 +541,31 @@ def test_native_video_keeps_frames_and_timestamp_separated_embeddings(dp):
     row = finalizer(dp).finalize_rollout("r0", receipt(record), reward=1.0)
     assert row.valid, row.rejection_reason
     torch.testing.assert_close(
-        row.media["pixel_values"].as_tensor(), frames, rtol=0, atol=0
+        row.media["pixel_values"].as_tensor(), packed(frames), rtol=0, atol=0
     )
     assert row.media["imgs_sizes"].as_tensor().tolist() == [[2, 2]] * 4
     assert row.media["num_frames"].as_tensor().tolist() == [4]
 
 
-def test_image_video_order_and_frame_groups_survive_checkpoint(dp, tmp_path):
-    frames_a = torch.full((2, 3, 2, 2), 2.0)
-    image = torch.full((3, 4, 2), 5.0)
-    frames_b = torch.full((4, 3, 4, 2), 9.0)
-    tokens = [10, 90, 18, 91, 18, 11, 18, 18]
-    root, media = stage(
-        dp, video_prompt(tokens, [(Span(1, 4), frames_a)], [(Span(6, 2), image)])
-    )
+def test_video_frame_groups_survive_checkpoint(dp, tmp_path):
+    frames_a, frames_b = torch.ones(2, 3, 2, 2), torch.full((4, 3, 4, 2), 9.0)
+    tokens = [10, 90, 18, 91, 18, 11]
+    root, media = stage(dp, video_prompt(tokens, [(Span(1, 4), frames_a)]))
     prefix = tokens + [31, 2]
-    child_tokens = prefix + [90, 18, 91, 18]
-    child, added = stage(
+    child, _ = stage(
         dp,
         video_prompt(
-            child_tokens,
+            prefix + [90, 18, 91, 18],
             [(Span(1, 4), frames_a), (Span(len(prefix), 4), frames_b)],
-            [(Span(6, 2), image)],
         ),
         parent=root,
         retained=media.items,
         call_id="c2",
     )
-    assert len(added.items) == 1 and added.items[0].modality == "video"
     assert (
         TQTokenSource(dp, staging_partition="staging")
-        .fetch_media(child.staging_key)["pixel_values"]
-        .numel()
+        .fetch_media(child.staging_key)
+        .imgs.numel()
         == frames_b.numel()
     )
     dp.save_checkpoint(tmp_path / "video")
@@ -603,19 +573,33 @@ def test_image_video_order_and_frame_groups_survive_checkpoint(dp, tmp_path):
     restored.load_checkpoint(tmp_path / "video")
     row = finalizer(restored).finalize_rollout("r0", receipt(root, child), reward=1.0)
     assert row.valid, row.rejection_reason
-    assert row.media["num_frames"].as_tensor().tolist() == [2, 1, 4]
-    assert row.media["imgs_sizes"].as_tensor().tolist() == [[2, 2]] * 2 + [[4, 2]] * 5
-    pixels = row.media["pixel_values"].as_tensor()
-    torch.testing.assert_close(pixels[:2, :, :2, :2], frames_a, rtol=0, atol=0)
-    torch.testing.assert_close(pixels[2], image, rtol=0, atol=0)
-    torch.testing.assert_close(pixels[3:], frames_b, rtol=0, atol=0)
+    assert row.media["num_frames"].as_tensor().tolist() == [2, 4]
+    assert row.media["imgs_sizes"].as_tensor().tolist() == [[2, 2]] * 2 + [[4, 2]] * 4
+    torch.testing.assert_close(
+        row.media["pixel_values"].as_tensor(),
+        torch.cat([packed(frames_a), packed(frames_b)]),
+        rtol=0,
+        atol=0,
+    )
 
 
-@pytest.mark.parametrize("change", ["pixels", "order", "frames", "timestamps"])
+def test_mixed_image_video_capture_is_explicitly_unsupported():
+    with pytest.raises(ValueError, match="image-only or video-only"):
+        capture_processed_media(
+            video_prompt(
+                [18, 90, 18],
+                [(Span(1, 2), torch.ones(2, 3, 2, 2))],
+                [(Span(0, 1), torch.ones(3, 2, 2))],
+            ),
+            prev_len=0,
+        )
+
+
+@pytest.mark.parametrize("change", ["frames", "timestamps"])
 def test_changed_retained_video_is_rejected(change):
     frames = torch.arange(48, dtype=torch.float32).reshape(4, 3, 2, 2)
     tokens = [90, 18, 91, 18]
-    media, _ = capture_processed_media(
+    media = capture_processed_media(
         video_prompt(tokens, [(Span(0, 4), frames)]), prev_len=0, image_token_id=18
     )
     if change == "pixels":
@@ -638,7 +622,7 @@ def test_changed_retained_video_is_rejected(change):
 def test_video_placeholder_remap_preserves_all_timestamp_tokens():
     frames = torch.ones(4, 3, 2, 2)
     original = [10, 77, 90, 18, 91, 18, 31, 2]
-    first, _ = capture_processed_media(
+    first = capture_processed_media(
         video_prompt(original, [(Span(2, 4), frames)]), prev_len=0, image_token_id=18
     )
     template_prefix = [10, 90, 18, 91, 18, 31, 2]
@@ -650,7 +634,7 @@ def test_video_placeholder_remap_preserves_all_timestamp_tokens():
         template_token_ids=template,
     )
     prompt = video_prompt(template, [(Span(1, 4), frames), (Span(7, 4), frames)])
-    added, _ = capture_processed_media(
+    added = capture_processed_media(
         prompt,
         prev_len=len(original),
         retained=first.items,
@@ -662,54 +646,28 @@ def test_video_placeholder_remap_preserves_all_timestamp_tokens():
     assert splice.token_ids == original + [92, 18, 93, 18]
 
 
-@pytest.mark.parametrize("column", ["pixel_values", "imgs_sizes", "num_frames"])
-@pytest.mark.parametrize("failure", ["missing", "corrupt"])
-def test_video_requires_every_committed_tensor(dp, column, failure):
+@pytest.mark.parametrize(
+    "column",
+    [
+        MEDIA_IMGS_FIELD,
+        MEDIA_IMGS_SIZES_FIELD,
+        MEDIA_NUM_FRAMES_FIELD,
+        MEDIA_GEOMETRY_FIELD,
+    ],
+)
+def test_video_requires_every_committed_tensor(dp, column):
     record, _ = stage(
         dp, video_prompt([90, 18, 91, 18], [(Span(0, 4), torch.ones(4, 3, 2, 2))])
     )
-    stored = dp._partitions["staging"].rows[record.staging_key]
-    if failure == "missing":
-        del stored[column]
-    else:
-        stored[column][0] += 1
+    del dp._partitions["staging"].rows[record.staging_key][column]
     row = finalizer(dp).finalize_rollout("r0", receipt(record), reward=1.0)
-    assert not row.valid and row.rejection_reason.startswith("media_assembly:")
-
-
-def test_packed_omni_patches_restore_exact_frames_for_current_bridge(dp):
-    frames = torch.arange(96, dtype=torch.float32).reshape(2, 3, 4, 4)
-    patches = (
-        frames.reshape(2, 3, 2, 2, 2, 2).permute(0, 2, 4, 1, 3, 5).reshape(1, 8, 12)
-    )
-    data = {
-        "imgs": patches,
-        "imgs_sizes": torch.tensor([[4, 4], [4, 4]]),
-        "num_frames": torch.tensor([2]),
-    }
-    prompt = {
-        "prompt_token_ids": [18, 18],
-        "mm_placeholders": {"video": [Span(0, 2)]},
-        "mm_kwargs": {"video": [SimpleNamespace(get_data=lambda: data)]},
-    }
-    record, descriptor = stage(dp, prompt)
-    assert descriptor.items[0].layout == "packed_patches"
-    restored = descriptor.decode_tensors(
-        TQTokenSource(dp, staging_partition="staging").fetch_media(record.staging_key)
-    )[0]
-    torch.testing.assert_close(restored["pixel_values"], patches, rtol=0, atol=0)
-    row = finalizer(dp).finalize_rollout("r0", receipt(record), reward=1.0)
-    assert row.valid, row.rejection_reason
-    torch.testing.assert_close(
-        row.media["pixel_values"].as_tensor(), frames, rtol=0, atol=0
-    )
-    assert row.media["num_frames"].as_tensor().tolist() == [2]
+    assert not row.valid and row.rejection_reason.startswith("media_columns_missing:")
 
 
 def test_native_video_rejects_inconsistent_frame_count():
     prompt = video_prompt([18, 18], [(Span(0, 2), torch.ones(4, 3, 2, 2))])
     prompt["mm_kwargs"]["video"][0].get_data()["video_num_patches"] = torch.tensor(2)
-    with pytest.raises(ValueError, match="frame geometry"):
+    with pytest.raises(ValueError, match="frame count"):
         capture_processed_media(prompt, prev_len=0, image_token_id=18)
 
 
@@ -763,7 +721,7 @@ def test_real_vllm_video_replacement_round_trips(dp, temporal_patch_size):
     assert row.token_ids[:-2] == tokens
     assert row.media["num_frames"].as_tensor().tolist() == [4]
     torch.testing.assert_close(
-        row.media["pixel_values"].as_tensor(), frames, rtol=0, atol=0
+        row.media["pixel_values"].as_tensor(), packed(frames), rtol=0, atol=0
     )
 
 
@@ -792,7 +750,7 @@ def test_video_publication_with_text_and_rejected_siblings(dp):
     assert result.valid_row_count == 2
     fields = dict(dp.get_samples(result.meta.sample_ids, "train", result.meta.fields))
     reassemble_packed_multimodal(fields, result.meta.tags)
-    for name in MEDIA_STAGING_FIELDS:
+    for name in ("pixel_values", "imgs_sizes", "num_frames"):
         assert fields[name].logical_segment_counts_by_row() == [1, 0, 0]
     assert fields["num_frames"].as_tensor().tolist() == [2]
     assert dp.list_sample_ids("staging") == []
