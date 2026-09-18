@@ -168,6 +168,7 @@ def _build_server(monkeypatch, serving_chat_kwargs):
     _install_fake_vllm(monkeypatch)
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.token_capture = None
     worker.cfg = {
         "temperature": 1.0,
         "top_p": 1.0,
