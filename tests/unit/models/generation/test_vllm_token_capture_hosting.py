@@ -1052,6 +1052,79 @@ def test_abort_waits_for_generation_cut_before_failing_the_call():
     assert worker._completed_capture_calls["c1"].coords.disposition == "failed"
 
 
+def test_terminal_completion_waits_for_concurrent_generation_cut_and_publishes_once():
+    sink = _BlockingPrefixSink()
+    worker = _capture_worker_with_periodic_flush(sink, threshold=0)
+    request = _begin_captured_request(worker, [10])
+    _observe(worker, request, [11, 12], [-0.1, -0.2])
+    inventory = GenerationCutInventory.build(
+        checkpoint_id="checkpoint-1",
+        server_name="policy",
+        active_prefixes=[
+            GenerationCutPrefix(
+                ticket_id="ticket-1",
+                rollout_id="r0",
+                attempt_index=0,
+                model_call_id="c1",
+                admitted_at=1.0,
+            )
+        ],
+    )
+    cut_receipts: list[GenerationCutReceipt] = []
+    terminal_results: list[dict] = []
+    failures: list[BaseException] = []
+
+    def cut() -> None:
+        try:
+            cut_receipts.append(
+                VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(
+                    worker, inventory
+                )
+            )
+        except BaseException as error:
+            failures.append(error)
+
+    def finish() -> None:
+        try:
+            terminal_results.append(
+                VllmAsyncGenerationWorkerImpl._finish_request_capture(
+                    worker,
+                    request,
+                    _served_content([11, 12, 13], [-0.1, -0.2, -0.3]),
+                )
+            )
+        except BaseException as error:
+            failures.append(error)
+
+    cut_thread = threading.Thread(target=cut)
+    terminal_thread = threading.Thread(target=finish)
+    cut_thread.start()
+    try:
+        assert sink.write_started.wait(timeout=5.0)
+        terminal_thread.start()
+        terminal_thread.join(timeout=0.05)
+        assert terminal_thread.is_alive()
+        assert sink.records == []
+    finally:
+        sink.release_write.set()
+        cut_thread.join(timeout=5.0)
+        terminal_thread.join(timeout=5.0)
+
+    assert not cut_thread.is_alive()
+    assert not terminal_thread.is_alive()
+    assert failures == []
+    assert len(cut_receipts) == 1
+    assert len(sink.generation_prefix_records) == 1
+    assert sink.generation_prefix_records[0][1].token_ids_delta == [10, 11, 12]
+    assert len(sink.records) == 1
+    assert sink.records[0].token_ids_delta == [10, 11, 12, 13]
+    assert terminal_results[0]["ng_commit_coords"]["disposition"] == "staged"
+    assert sink.cleared_generation_prefix_keys == [
+        "__generation_cut__/checkpoint-1/r0/c1/0"
+    ]
+    assert worker._capture_calls == {}
+
+
 def test_completed_capture_evidence_expires_by_age_not_entry_count(monkeypatch):
     worker = _worker_with_capture(_MemorySink())
     now = [100.0]
