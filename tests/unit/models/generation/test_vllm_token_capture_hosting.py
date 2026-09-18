@@ -167,6 +167,7 @@ def test_generation_setup_token_capture_fans_out(monkeypatch):
         "setup_token_capture",
         dp_cfg={"backend": "simple"},
         staging_partition="rollout_staging",
+        capture_images=False,
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
     )
 
@@ -365,9 +366,9 @@ def test_staging_chain_prefix_flows_through_adapter_and_begin_call():
     assert admission.required_prefix_token_ids == []
     # enter_prefix is the production writer of the request field.
     assert request.required_prefix_token_ids == prefix
-    call, prompt = worker._capture_calls[id(request)]
-    assert call.prefix_token_ids == prefix
-    assert prompt == [10, 11, 12, 20]
+    state = worker._capture_calls[id(request)]
+    assert state.call.prefix_token_ids == prefix
+    assert state.prompt_token_ids == [10, 11, 12, 20]
 
 
 def test_inline_prefix_admission_resolves_without_a_fetch():

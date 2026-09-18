@@ -79,6 +79,7 @@ class RolloutReassemblerActorConfig:
     router_replay_enabled: bool
     defer_routed_experts_to_policy: bool
     max_seq_len: int
+    capture_images: bool = False
 
 
 def assert_metadata_only(value: Any, *, path: str = "rpc") -> None:
@@ -133,6 +134,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             router_replay_enabled=config.router_replay_enabled,
             defer_routed_experts_to_policy=config.defer_routed_experts_to_policy,
             max_seq_len=config.max_seq_len,
+            capture_images=config.capture_images,
         )
 
     def check_dependencies(self) -> None:
