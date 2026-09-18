@@ -666,6 +666,9 @@ class PolicyConfig(TypedDict):
     # Move optimizer state to CPU when offload_before_refit runs. Defaults to True
     # in the Megatron runtime for backward compatibility.
     offload_optimizer_for_refit: NotRequired[bool]
+    # Reuse pageable CPU storage across optimizer offload cycles. This avoids
+    # repeated allocation and first-touch costs while retaining one host copy.
+    reuse_optimizer_cpu_buffers_for_refit: NotRequired[bool]
     optimizer: NotRequired[PytorchOptimizerConfig | None]
     scheduler: NotRequired[
         list[SinglePytorchSchedulerConfig | SinglePytorchMilestonesConfig]
