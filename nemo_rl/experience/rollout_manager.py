@@ -1535,6 +1535,15 @@ class AsyncNemoGymRolloutImpl:
             **calculate_single_metric(
                 assistant_tokens, n, f"{agent_name}/gen_tokens_per_sample"
             ),
+            # Per-agent-ref truncation metrics: per-agent breakdown of
+            # truncation / natural-termination rates, keyed by agent for
+            # per-agent dashboards.
+            **calculate_single_metric(
+                [float(t) for t in truncated], n, f"{agent_name}/truncation_rate"
+            ),
+            **calculate_single_metric(
+                [float(not t) for t in truncated], n, f"{agent_name}/natural_termination_rate"
+            ),
         }
 
         # Agent-level metrics. Receipts are lineage records, not agent
