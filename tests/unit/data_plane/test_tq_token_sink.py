@@ -28,6 +28,7 @@ import hashlib
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 
@@ -39,10 +40,13 @@ from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
 )
 
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
+    COMPACT_PREV_LEN_KEY,
+    MINF_CAPTURE_PARAMS_FIELD,
     PREFIX_EOS_TOKEN_ID_FIELD,
     PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
     STAGING_FIELDS,
     ChainPrefixCache,
+    PrefixChains,
     TQMegatronPromptPreparer,
     TQMegatronTokenStager,
     TQTokenSink,
@@ -233,74 +237,181 @@ def test_fetch_prefix_token_ids_rejects_duplicates(tq_client, staging_partition)
         source.fetch_prefix_token_ids(["r/c", "r/c"])
 
 
-def test_megatron_stager_writes_canonical_row_and_returns_coords(
-    tq_client, staging_partition
-):
+def _minf_media_tensors():
+    """Packed patches the toy encoder consumed: one 4x4 image, patch 2 -> 4 patches."""
+    return {
+        "imgs": torch.arange(4 * 12, dtype=torch.float32).reshape(1, 4, 12),
+        "imgs_sizes": torch.tensor([[4, 4]], dtype=torch.int32),
+    }
+
+
+def _minf_payload(*, multimodal: bool, media_tensors=...):
+    """A finished MInf payload. Multimodal: compact [80, 99, 81] expanded to three 99s."""
+    if not multimodal:
+        return SimpleNamespace(
+            prompt_token_ids=[10, 11],
+            generated_token_ids=[12, 13],
+            generated_log_probs=[-0.25, -0.5],
+        )
+    return SimpleNamespace(
+        prompt_token_ids=[80, 99, 99, 99, 81],
+        generated_token_ids=[12, 2],
+        generated_log_probs=[-0.25, -0.5],
+        compact_prompt_token_ids=[80, 99, 81],
+        media_tensors=_minf_media_tensors() if media_tensors is ... else media_tensors,
+    )
+
+
+def _stage_root(tq_client, staging_partition, payload, *, rollout_id="minf-r0"):
     stager = TQMegatronTokenStager(
         TQTokenSink(tq_client, staging_partition=staging_partition)
     )
-    payload = SimpleNamespace(
-        prompt_token_ids=[10, 11],
-        generated_token_ids=[12, 13],
-        generated_log_probs=[-0.25, -0.5],
+    root = nemo_gym.CaptureAdmission(
+        rollout_id=rollout_id, model_call_id="c1", mode="text"
     )
-    admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0",
-        model_call_id="c1",
-        mode="text",
-    )
-
     result = stager.stage(
         "minf-response-1",
         payload,
         finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
-        offload_params={"ng_capture": admission.model_dump(mode="json")},
+        offload_params={"ng_capture": root.model_dump(mode="json")},
     )
-
     assert result is not None
-    coords = result.response_metadata["ng_commit_coords"]
+    return stager, result.response_metadata["ng_commit_coords"]
+
+
+@pytest.mark.parametrize("multimodal", [False, True], ids=["text", "multimodal"])
+def test_megatron_stager_writes_canonical_row_and_returns_coords(
+    tq_client, staging_partition, multimodal
+):
+    """The expanded delta is the canonical row. A VLM call also stages the compact
+    delta in its own column, the media geometry in the extras JSON, and the engine's
+    media tensors as extra columns on the same key; a text call stages none of those
+    and its compact chain falls back to the expanded one."""
+    _, coords = _stage_root(
+        tq_client, staging_partition, _minf_payload(multimodal=multimodal)
+    )
     assert coords["staging_key"] == "minf-r0/c1"
     assert coords["weight_version"] == 7
     assert coords["disposition"] == "staged"
-    [snapshot] = TQTokenSource(tq_client, staging_partition=staging_partition).fetch(
-        ["minf-r0/c1"]
-    )
-    assert snapshot.token_ids_delta == [10, 11, 12, 13]
-    assert snapshot.token_mask_delta == [0.0, 0.0, 1.0, 1.0]
-    assert snapshot.generation_log_probs_delta == [0.0, 0.0, -0.25, -0.5]
+    source = TQTokenSource(tq_client, staging_partition=staging_partition)
+    [fetched] = source.fetch_for_finalization(["minf-r0/c1"])
+    chains = source.fetch_prefix_chains(["minf-r0/c1"])
+    assert source.fetch_prefix_token_ids(["minf-r0/c1"]) == chains.expanded
+
+    if not multimodal:
+        assert fetched.snapshot.token_ids_delta == [10, 11, 12, 13]
+        assert fetched.snapshot.token_mask_delta == [0.0, 0.0, 1.0, 1.0]
+        assert fetched.snapshot.generation_log_probs_delta == [0.0, 0.0, -0.25, -0.5]
+        assert fetched.extras is None
+        assert chains.compact == chains.expanded == [10, 11, 12, 13]
+        with pytest.raises(KeyError, match="media columns"):
+            source.fetch_media("minf-r0/c1")
+        return
+
+    assert fetched.snapshot.token_ids_delta == [80, 99, 99, 99, 81, 12, 2]
+    assert chains.expanded == [80, 99, 99, 99, 81, 12, 2]
+    assert chains.compact == [80, 99, 81, 12, 2]
+    assert fetched.extras == {
+        "media": {
+            "modality": "image",
+            "imgs_sizes": [[4, 4]],
+            "num_frames": None,
+            "num_tiles": None,
+        }
+    }
+    media = source.fetch_media("minf-r0/c1")
+    assert torch.equal(media.imgs, _minf_media_tensors()["imgs"])
+    assert media.imgs.dtype == torch.float32
+    assert media.imgs_sizes.tolist() == [[4, 4]]
+    assert media.num_frames is None and media.num_tiles is None
 
 
-@pytest.mark.parametrize("prefix_source", ["staging_chain", "capture_admission"])
+@pytest.mark.parametrize(
+    ("media_tensors", "error"),
+    [
+        ({"imgs_sizes": torch.tensor([[4, 4]])}, "non-empty imgs"),
+        (
+            {"imgs": torch.ones(1, 2, 3), "pixel_values": torch.ones(1)},
+            "unsupported media tensors",
+        ),
+    ],
+)
+def test_stage_media_rejects_malformed_tensors(
+    tq_client, staging_partition, media_tensors, error
+):
+    sink = TQTokenSink(tq_client, staging_partition=staging_partition)
+    with pytest.raises(ValueError, match=error):
+        sink.stage_media("k", media_tensors)
+
+
+_PREPARER_CASES = {
+    # (root payload or None for an inline prefix, prev_len, prompt, template prefix, eos,
+    #  expected prompt, expected required prefix, expected compact_prev_len)
+    "staging_chain": (
+        SimpleNamespace(
+            prompt_token_ids=[10, 11],
+            generated_token_ids=[12, 99],
+            generated_log_probs=[-0.25, -0.5],
+        ),
+        4,
+        [80, 81, 99, 20, 21],
+        [80, 81, 99],
+        99,
+        [10, 11, 12, 99, 20, 21],
+        [10, 11, 12, 99],
+        4,
+    ),
+    "capture_admission": (
+        None,
+        4,
+        [80, 81, 99, 20, 21],
+        [80, 81, 99],
+        99,
+        [10, 11, 12, 99, 20, 21],
+        [10, 11, 12, 99],
+        4,
+    ),
+    # Turn 2 of a VLM rollout: the chat endpoint renders the history in compact form
+    # (one media token per image, "a cat" retokenized as 13 not 12), so the preparer
+    # splices the *compact* chain, hands Gym the *expanded* chain to verify the engine
+    # prompt against, and tells the stager how much of the compact prompt the chain covers.
+    "multimodal_chain": (
+        _minf_payload(multimodal=True),
+        7,
+        [80, 99, 81, 13, 2, 20, 21],
+        [80, 99, 81, 13, 2],
+        2,
+        [80, 99, 81, 12, 2, 20, 21],
+        [80, 99, 99, 99, 81, 12, 2],
+        5,
+    ),
+}
+
+
+@pytest.mark.parametrize("prefix_source", list(_PREPARER_CASES))
 def test_megatron_prompt_preparer_splices_resolved_prefix(
     tq_client, staging_partition, prefix_source
 ):
-    admission_kwargs = {}
-    if prefix_source == "staging_chain":
-        stager = TQMegatronTokenStager(
-            TQTokenSink(tq_client, staging_partition=staging_partition)
-        )
-        root = nemo_gym.CaptureAdmission(
-            rollout_id="minf-r0", model_call_id="c1", mode="text"
-        )
-        root_result = stager.stage(
-            "minf-response-1",
-            SimpleNamespace(
-                prompt_token_ids=[10, 11],
-                generated_token_ids=[12, 99],
-                generated_log_probs=[-0.25, -0.5],
-            ),
-            finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
-            offload_params={"ng_capture": root.model_dump(mode="json")},
-        )
-        assert root_result is not None
-        root_coords = root_result.response_metadata["ng_commit_coords"]
+    (
+        root_payload,
+        prev_len,
+        prompt,
+        template_prefix,
+        eos,
+        expected_prompt,
+        expected_required,
+        expected_compact_prev_len,
+    ) = _PREPARER_CASES[prefix_source]
+    stager = None
+    if root_payload is not None:
+        stager, root_coords = _stage_root(tq_client, staging_partition, root_payload)
         admission_kwargs = {
             "staging_chain": [root_coords["staging_key"]],
             "parent_chain_hash": root_coords["chain_hash"],
         }
     else:
         admission_kwargs = {
-            "required_prefix_token_ids": [10, 11, 12, 99],
+            "required_prefix_token_ids": expected_required,
             "parent_chain_hash": _digest("chain:c1"),
         }
 
@@ -308,7 +419,7 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
         rollout_id="minf-r0",
         model_call_id="c2",
         parent_call_id="c1",
-        prev_len=4,
+        prev_len=prev_len,
         mode="token_in",
         **admission_kwargs,
     )
@@ -317,22 +428,48 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
     )
 
     result = preparer.prepare_prompt(
-        [80, 81, 99, 20, 21],
+        prompt,
         offload_params={
             "ng_capture": admission.model_dump(mode="json"),
-            PREFIX_TEMPLATE_TOKEN_IDS_FIELD: [80, 81, 99],
-            PREFIX_EOS_TOKEN_ID_FIELD: 99,
+            PREFIX_TEMPLATE_TOKEN_IDS_FIELD: template_prefix,
+            PREFIX_EOS_TOKEN_ID_FIELD: eos,
         },
     )
 
-    assert result.prompt == [10, 11, 12, 99, 20, 21]
+    assert result.prompt == expected_prompt
     assert result.offload_params is not None
-    assert result.offload_params["ng_capture"]["required_prefix_token_ids"] == [
-        10,
-        11,
-        12,
-        99,
-    ]
+    assert (
+        result.offload_params["ng_capture"]["required_prefix_token_ids"]
+        == expected_required
+    )
+    assert result.offload_params[MINF_CAPTURE_PARAMS_FIELD] == {
+        COMPACT_PREV_LEN_KEY: expected_compact_prev_len
+    }
+
+    if prefix_source != "multimodal_chain":
+        return
+    # The engine expands the spliced compact prompt; the stager cuts the compact
+    # delta at compact_prev_len and Gym verifies the expanded prefix.
+    turn2 = stager.stage(
+        "minf-response-2",
+        SimpleNamespace(
+            prompt_token_ids=[80, 99, 99, 99, 81, 12, 2, 20, 21],
+            generated_token_ids=[30],
+            generated_log_probs=[-0.1],
+            compact_prompt_token_ids=result.prompt,
+            media_tensors=_minf_media_tensors(),
+        ),
+        finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
+        offload_params=result.offload_params,
+    )
+    coords2 = turn2.response_metadata["ng_commit_coords"]
+    assert coords2["disposition"] == "staged"
+    assert (coords2["prev_len"], coords2["delta_len"]) == (7, 3)
+    chains = TQTokenSource(
+        tq_client, staging_partition=staging_partition
+    ).fetch_prefix_chains([root_coords["staging_key"], coords2["staging_key"]])
+    assert chains.expanded == [80, 99, 99, 99, 81, 12, 2, 20, 21, 30]
+    assert chains.compact == [80, 99, 81, 12, 2, 20, 21, 30]
 
 
 def test_megatron_stager_stamps_admission_epoch_when_request_spans_refit(
@@ -453,23 +590,42 @@ def test_megatron_stager_declines_ineligible_requests(
 
 
 class _RecordingSource:
-    """Stand-in for TQTokenSource: records fetched keys, returns 2 tokens per key."""
+    """Stand-in for TQTokenSource: records fetched keys, returns 2 tokens per key.
 
-    def __init__(self):
+    With ``chains=True`` it also serves the compact space (one token per key), as
+    TQTokenSource does; otherwise only the expanded space, as older sources did.
+    """
+
+    def __init__(self, *, chains=False):
         self.calls = []
+        if chains:
+            self.fetch_prefix_chains = self._fetch_prefix_chains
 
     def fetch_prefix_token_ids(self, keys):
         self.calls.append(list(keys))
         return [int(k[1:]) * 10 + i for k in keys for i in range(2)]
 
+    def _fetch_prefix_chains(self, keys):
+        return PrefixChains(
+            expanded=self.fetch_prefix_token_ids(keys),
+            compact=[int(k[1:]) * 10 for k in keys],
+        )
 
-def test_chain_prefix_cache_fetches_only_uncached_suffix():
-    source = _RecordingSource()
+
+@pytest.mark.parametrize("chains", [False, True], ids=["expanded-only", "both-spaces"])
+def test_chain_prefix_cache_fetches_only_uncached_suffix(chains):
+    source = _RecordingSource(chains=chains)
     cache = ChainPrefixCache(source)
 
     assert cache.fetch(["k1", "k2"]) == [10, 11, 20, 21]
     assert cache.fetch(["k1", "k2", "k3"]) == [10, 11, 20, 21, 30, 31]
     assert cache.fetch(["k1", "k2"]) == [10, 11, 20, 21]
+    assert source.calls == [["k1", "k2"], ["k3"]]
+    # A source without compact chains coincides with the expanded space.
+    expected_compact = [10, 20, 30] if chains else [10, 11, 20, 21, 30, 31]
+    assert cache.fetch_chains(["k1", "k2", "k3"]) == PrefixChains(
+        expanded=[10, 11, 20, 21, 30, 31], compact=expected_compact
+    )
     assert source.calls == [["k1", "k2"], ["k3"]]
 
 
