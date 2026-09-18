@@ -63,18 +63,22 @@ def test_image_pixels_round_trip_with_tokens_through_live_tq(tq_client):
     from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
     from nemo_gym.token_id_capture.staging.records import CaptureAdmission
 
-    from nemo_rl.data.captured_media import capture_processed_images, verify_image_chain
+    from nemo_rl.data.captured_media import (
+        MEDIA_STAGING_FIELDS,
+        capture_processed_media,
+        verify_media_chain,
+    )
     from tests.unit.data.test_captured_media import Span, engine_prompt
 
     partition = "worker_media_capture_test"
     tq_client.register_partition(
         partition_id=partition,
-        fields=STAGING_FIELDS + ["pixel_values"],
+        fields=STAGING_FIELDS + list(MEDIA_STAGING_FIELDS),
         num_samples=4,
         consumer_tasks=["finalize"],
     )
     pixels = torch.arange(18, dtype=torch.float32).reshape(3, 2, 3)
-    descriptor, attachments = capture_processed_images(
+    descriptor, attachments = capture_processed_media(
         engine_prompt([10, 18, 18], [(Span(1, 2), pixels)]),
         prev_len=0,
     )
@@ -90,15 +94,17 @@ def test_image_pixels_round_trip_with_tokens_through_live_tq(tq_client):
             prompt_token_ids=[10, 18, 18],
             generated_token_ids=[2],
             generated_logprobs=[-0.25],
-            extras={"image_capture": descriptor.to_dict()},
+            extras={"media_capture": descriptor.to_dict()},
             attachments=attachments,
         )
         assert coords.disposition == "staged"
         source = TQTokenSource(tq_client, staging_partition=partition)
         calls = source.fetch_for_finalization([coords.staging_key])
         assert calls[0].snapshot.token_ids_delta == [10, 18, 18, 2]
-        verified = verify_image_chain(calls, required=True)[0]
-        restored = verified.decode_pixels(source.fetch_pixels(coords.staging_key))[0]
+        verified = verify_media_chain(calls, required=True)[0]
+        restored = verified.decode_tensors(source.fetch_media(coords.staging_key))[0][
+            "pixel_values"
+        ][0]
         torch.testing.assert_close(restored, pixels, rtol=0, atol=0)
     finally:
         tq_client.clear_samples(sample_ids=None, partition_id=partition)
