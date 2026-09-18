@@ -1716,7 +1716,9 @@ def _create_checkpoint_config(
         pretrained_checkpoint=pretrained_path,
         fully_parallel_save=True,
         fully_parallel_load=True,
-        load_rng=False,
+        # A training resume restores RNG independently of optimizer retention.
+        # Fresh/pretrained initialization keeps Bridge's finetune semantics.
+        load_rng=weights_path is not None,
         load_main_params_from_ckpt=load_main_params_from_ckpt,
     )
     # Forward checkpoint knobs only when explicitly set in YAML; otherwise Megatron

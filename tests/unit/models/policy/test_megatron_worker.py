@@ -1153,9 +1153,9 @@ def test_megatron_refit_bridge_tasks_export_logical_quantized_weights(
     logical_weight = torch.arange(8, dtype=torch.bfloat16).reshape(4, 2)
     bf16_source = torch.ones((2, 2), dtype=torch.bfloat16)
     dequantize = MagicMock(
-        side_effect=lambda tensor: logical_weight
-        if tensor is quantized_source
-        else tensor
+        side_effect=lambda tensor: (
+            logical_weight if tensor is quantized_source else tensor
+        )
     )
     monkeypatch.setattr(
         worker_module,
@@ -3163,7 +3163,7 @@ def test_megatron_checkpoint_save_kill_and_restore(
                 tokenizer=tokenizer,
                 weights_path=weights_path,  # This should trigger checkpoint loading
                 optimizer_path=optimizer_path,
-                init_reference_model=False,
+                init_reference_model=True,
             )
 
             # Get logprobs from restored policy (should match the saved state)
@@ -3187,58 +3187,9 @@ def test_megatron_checkpoint_save_kill_and_restore(
             ).item()
             print(f"Max difference: {max_diff}, Mean difference: {mean_diff}")
 
-            if logprobs_match:
-                print(
-                    "✓ SUCCESS: Checkpoint loading works! Model state was restored correctly."
-                )
-            else:
-                print(
-                    "⚠ WARNING: Checkpoint may not have loaded correctly. Difference too large."
-                )
-                print("This could indicate:")
-                print("1. Checkpoint loading is not implemented for runtime loading")
-                print("2. Checkpoint loading only works during initial model setup")
-                print("3. The checkpoint format or loading logic needs adjustment")
-
-                # But still verify the checkpoint structure is valid
-                iter_dirs = [
-                    d for d in os.listdir(checkpoint_dir) if d.startswith("iter_")
-                ]
-                latest_iter_dir = os.path.join(checkpoint_dir, sorted(iter_dirs)[-1])
-                iter_contents = os.listdir(latest_iter_dir)
-
-                print("\nCheckpoint structure verification:")
-                print(f"  - Checkpoint dir exists: {os.path.exists(checkpoint_dir)}")
-                print(f"  - Iteration dirs: {iter_dirs}")
-                print(f"  - Latest iter contents: {iter_contents}")
-
-                expected_checkpoint_files = ["common.pt"]
-                for expected_file in expected_checkpoint_files:
-                    file_exists = any(expected_file in f for f in iter_contents)
-                    print(f"  - Expected file '{expected_file}' exists: {file_exists}")
-                    assert file_exists, (
-                        f"Required checkpoint file {expected_file} not found"
-                    )
-
-                total_checkpoint_size = sum(
-                    os.path.getsize(os.path.join(latest_iter_dir, f))
-                    for f in iter_contents
-                    if os.path.isfile(os.path.join(latest_iter_dir, f))
-                )
-                print(f"  - Total checkpoint size: {total_checkpoint_size} bytes")
-                assert total_checkpoint_size > 1024, "Checkpoint appears too small"
-
-            print("\n=== VERIFICATION COMPLETE ===")
-            print("✓ Checkpoint save functionality works correctly")
-            print("✓ Checkpoint structure is valid for restoration")
-            print("✓ Worker shutdown and restart works")
-            print("✓ Fresh worker has different parameters (proving no auto-load)")
-            if logprobs_match:
-                print("✓ Checkpoint loading works and restores correct model state")
-            else:
-                print(
-                    "✓ Checkpoint infrastructure is in place (loading may need implementation)"
-                )
+            torch.testing.assert_close(
+                logprobs_restored, logprobs_before_save, rtol=1e-5, atol=1e-4
+            )
 
         finally:
             # Step 4: Cleanup

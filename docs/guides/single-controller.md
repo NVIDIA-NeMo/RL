@@ -95,7 +95,7 @@ With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint co
 - A native TQ snapshot containing rollout tensor payloads and TQ state.
 - A metadata-only replay index describing the completed rollout groups stored in TQ.
 - A `rollout_recovery.pt` ownership ledger describing unfinished prompt groups that must be redispatched after a restart.
-- A `replacement_reserve.pt` sidecar containing prompts held for dropped-rollout replacement, when applicable.
+- A `replacement_reserve.pt` sidecar containing prompts held for dropped-rollout replacement, including an empty list when none are held. Legacy recovery-schema-2 checkpoints may omit this file.
 - The sampler dispatch position needed to continue scheduling from the correct point.
 
 The TQ snapshot and replay index are captured under the same checkpoint barrier. Generation may continue while the snapshot is written, but completed-group commits and destructive TQ clears wait at the barrier. This ensures that the TQ snapshot and replay index describe the same set of groups.
@@ -227,6 +227,33 @@ generation in the group has finished.
 When a sampler does not support replay recovery, a requested data-plane checkpoint is written in `shadow` mode. The TQ snapshot is retained, but no authoritative replay index is written and its rows are not restored into the training replay buffer.
 
 Native TQ save/load currently requires `data_plane.backend: "simple"`. Mooncake-backed storage is not recoverable through this mechanism. A failure while saving or validating the TQ snapshot prevents the incomplete checkpoint bundle from becoming the latest resumable checkpoint.
+
+### Context-compaction recovery
+
+Runs with `token_capture.context_compaction: true` use the same checkpoint path,
+including empty replay, buffered replay and unfinished rollouts. On an otherwise
+valid CC configuration, enable `checkpointing.enabled` and
+`checkpointing.save_data_plane`, set a durable `checkpointing.checkpoint_dir`, and
+restart with the same directory. There is no separate CC save-data switch or
+requirement to drain the replay buffer. Periodic snapshots use the configuration
+above and remain disabled by default; both restore-selection modes apply.
+
+A compacted logical response can span several physical training rows. Replay
+restore validates logical-owner and segment metadata, preserves the physical
+rows and ownerless execution padding, and retains logical-group advantage
+calculation. The recovery ledger stores segment receipts and media references;
+tensor payloads stay in native TQ. New recovery state uses schema 3, while ordinary
+schema-2 state remains readable.
+
+The existing sibling/prompt-group recovery policies also apply to CC during live
+retries and cold restart. With the default sibling policy, sealed siblings survive
+and only unfinished siblings regenerate. This does not restore an in-progress
+Gym tool execution or guarantee exactly-once external tool side effects.
+Megatron training resume loads the saved policy RNG and preserves it across
+reference-model and wrapper initialization; fresh-start behavior is unchanged.
+
+Other CC restrictions still apply, including GRPO, the supported fixed-batch
+Megatron path, direct routed-expert assembly, and `in_order` with zero lookahead.
 
 ## Async-RL Knobs and Sampler Modes
 

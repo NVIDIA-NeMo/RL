@@ -31,6 +31,7 @@ from megatron.bridge.training.checkpointing import (
     maybe_finalize_async_save,
     save_checkpoint,
 )
+from megatron.bridge.training.setup import _preserve_rng_state
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.training.utils.train_utils import (
     logical_and_across_model_parallel_group,
@@ -762,36 +763,44 @@ class MegatronPolicyWorkerImpl(
         if param_sync_func is not None:
             get_model_config(self.model).param_sync_func = param_sync_func
 
-        # Step 5: Setup reference model if needed
-        if init_reference_model:
-            self.model = self.move_model(self.model, "cpu")
-            self.reference_state_dict = setup_reference_model_state(
+        # Reference construction must not advance the restored policy RNG.
+        # Keep fresh-run RNG ordering unchanged, including PEFT warm starts.
+        checkpoint_cfg = self.megatron_cfg.checkpoint
+        with (
+            _preserve_rng_state()
+            if checkpoint_cfg.load_rng and not checkpoint_cfg.finetune
+            else nullcontext()
+        ):
+            # Step 5: Setup reference model if needed
+            if init_reference_model:
+                self.model = self.move_model(self.model, "cpu")
+                self.reference_state_dict = setup_reference_model_state(
+                    config,
+                    self.megatron_cfg,
+                    pretrained_path,
+                    pre_load_checkpoint_hook=getattr(
+                        self, "_pre_load_checkpoint_hook", None
+                    ),
+                )
+                self.model = self.move_model(self.model, "cuda")
+                log_gpu_memory_diagnostics(
+                    label="after_ref_model", worker_type="MegatronPolicyWorker"
+                )
+
+            # Step 6: Finalize setup (including the HF bridge wrapper).
+            (
+                self.megatron_tokenizer,
+                self.megatron_bridge,
+                self.should_disable_forward_pre_hook,
+                self.dp_size,
+            ) = finalize_megatron_setup(
                 config,
                 self.megatron_cfg,
-                pretrained_path,
-                pre_load_checkpoint_hook=getattr(
-                    self, "_pre_load_checkpoint_hook", None
-                ),
+                hf_model_name,
+                worker_sharding_annotations,
+                self.model,
+                self.optimizer,
             )
-            self.model = self.move_model(self.model, "cuda")
-            log_gpu_memory_diagnostics(
-                label="after_ref_model", worker_type="MegatronPolicyWorker"
-            )
-
-        # Step 6: Finalize setup
-        (
-            self.megatron_tokenizer,
-            self.megatron_bridge,
-            self.should_disable_forward_pre_hook,
-            self.dp_size,
-        ) = finalize_megatron_setup(
-            config,
-            self.megatron_cfg,
-            hf_model_name,
-            worker_sharding_annotations,
-            self.model,
-            self.optimizer,
-        )
         self._first_train_step_forward_pre_hook_disabled = False
         self._first_train_step_param_sync_func = None
         if self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled():

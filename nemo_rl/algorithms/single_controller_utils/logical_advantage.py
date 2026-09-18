@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Validate complete logical owners before the existing GRPO estimator runs."""
+"""Validate logical owners for replay restore and the existing GRPO estimator."""
 
 from dataclasses import dataclass
 
@@ -51,34 +51,21 @@ class LogicalOwnerBatch:
         return values[self.row_owner.clamp_min(0)] * (self.row_owner >= 0)
 
 
-def build_logical_owner_batch(
-    meta: KVBatchMeta,
-    *,
-    prompt_ids: torch.Tensor,
-    rewards: torch.Tensor,
-    sample_mask: torch.Tensor,
-    expected_group_size: int,
-) -> LogicalOwnerBatch:
-    """Check complete groups, deduplicate owner rows, and combine their validity.
+def validate_logical_owner_metadata(
+    meta: KVBatchMeta, *, expected_group_size: int
+) -> dict[str, dict[int, list[int]]]:
+    """Return physical rows by dispatch group and slot after structural checks.
 
-    Dispatch IDs determine the estimator's grouping, independently of prompt
-    tokens. Each logical owner contributes once, regardless of segment count.
+    Ownerless execution padding is validated but not returned as an owner.
+    Reward, prompt and mask checks require tensors and remain in the advantage
+    stage; replay metadata alone cannot establish those invariants.
     """
     if (
         meta.tags is None
         or len(meta.tags) != meta.size
         or len(set(meta.sample_ids)) != meta.size
-        or prompt_ids.ndim != 2
-        or prompt_ids.shape[0] != meta.size
-        or prompt_ids.dtype not in (torch.int32, torch.int64)
-        or rewards.shape != (meta.size,)
-        or sample_mask.shape != (meta.size,)
-        or not torch.isfinite(rewards).all()
-        or not ((sample_mask == 0) | (sample_mask == 1)).all()
     ):
-        raise ValueError(
-            "CC advantage inputs must be finite, binary-masked, row-aligned"
-        )
+        raise ValueError("CC owner metadata must be row-aligned with unique sample IDs")
 
     groups: dict[str, dict[int, list[int]]] = {}
     for row, tag in enumerate(meta.tags):
@@ -102,9 +89,8 @@ def build_logical_owner_batch(
                 or tag["segment_index"] is not None
                 or type(tag["segment_count"]) is not int
                 or tag["segment_count"] != 0
-                or sample_mask[row] != 0
             ):
-                raise ValueError("CC execution padding must be ownerless and masked")
+                raise ValueError("CC execution padding must be ownerless")
             continue
         slot, segment, count = (
             tag["logical_slot"],
@@ -123,17 +109,52 @@ def build_logical_owner_batch(
             raise ValueError("CC owner/segment identity is invalid")
         slots.setdefault(slot, []).append(row)
 
-    representatives, validity, group_ids = [], [], []
-    row_owner = torch.full((meta.size,), -1, dtype=torch.long, device=rewards.device)
-    for group_index, slots in enumerate(groups.values()):
+    for slots in groups.values():
         if set(slots) != set(range(expected_group_size)):
             raise ValueError("CC estimator requires every logical slot in each group")
         for rows in slots.values():
-            first = rows[0]
             counts = {meta.tags[row]["segment_count"] for row in rows}
             indices = {meta.tags[row]["segment_index"] for row in rows}
             if counts != {len(rows)} or indices != set(range(len(rows))):
                 raise ValueError("CC estimator requires every segment exactly once")
+    if not groups:
+        raise ValueError("CC metadata requires logical owners")
+    return groups
+
+
+def build_logical_owner_batch(
+    meta: KVBatchMeta,
+    *,
+    prompt_ids: torch.Tensor,
+    rewards: torch.Tensor,
+    sample_mask: torch.Tensor,
+    expected_group_size: int,
+) -> LogicalOwnerBatch:
+    """Check complete groups, deduplicate owner rows, and combine their validity.
+
+    Dispatch IDs determine the estimator's grouping, independently of prompt
+    tokens. Each logical owner contributes once, regardless of segment count.
+    """
+    if (
+        prompt_ids.ndim != 2
+        or prompt_ids.shape[0] != meta.size
+        or prompt_ids.dtype not in (torch.int32, torch.int64)
+        or rewards.shape != (meta.size,)
+        or sample_mask.shape != (meta.size,)
+        or not torch.isfinite(rewards).all()
+        or not ((sample_mask == 0) | (sample_mask == 1)).all()
+    ):
+        raise ValueError(
+            "CC advantage inputs must be finite, binary-masked, row-aligned"
+        )
+    groups = validate_logical_owner_metadata(
+        meta, expected_group_size=expected_group_size
+    )
+    representatives, validity, group_ids = [], [], []
+    row_owner = torch.full((meta.size,), -1, dtype=torch.long, device=rewards.device)
+    for group_index, slots in enumerate(groups.values()):
+        for rows in slots.values():
+            first = rows[0]
             if any(
                 rewards[row] != rewards[first]
                 or not torch.equal(prompt_ids[row], prompt_ids[first])
@@ -144,8 +165,8 @@ def build_logical_owner_batch(
             representatives.append(first)
             group_ids.append(group_index)
             validity.append(sample_mask[rows].amin())
-    if not representatives:
-        raise ValueError("CC estimator requires logical owners, not padding alone")
+    if (sample_mask[row_owner < 0] != 0).any():
+        raise ValueError("CC execution padding must be masked")
     return LogicalOwnerBatch(
         representative_rows=torch.tensor(
             representatives, dtype=torch.long, device=rewards.device

@@ -1158,8 +1158,6 @@ def setup_single_controller(
     # ==========================
     checkpointer = CheckpointManager(master_config.checkpointing)
     trainer_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    if token_capture_cfg.context_compaction and trainer_checkpoint_path is not None:
-        raise ValueError("CC checkpoint/resume is not supported initially")
     loaded_state = cast(
         Optional[dict[str, Any]],
         checkpointer.load_training_info(trainer_checkpoint_path),

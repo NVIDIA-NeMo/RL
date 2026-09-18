@@ -7,6 +7,7 @@ does not qualify a live Ray cluster, vLLM or TransferQueue deployment.
 """
 
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -15,8 +16,10 @@ import torch
 import nemo_rl.environments.nemo_gym as gym_environment
 from nemo_rl.environments.nemo_gym import NemoGym
 from nemo_rl.experience.failures import GymTransportError
-from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
+from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.rollout_manager import RolloutRetryPolicy
+from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
 from nemo_rl.experience.rollout_reassembler_actor import (
     RolloutReassemblerActor,
     assert_metadata_only,
@@ -323,7 +326,7 @@ def test_manifest_failure_is_fatal_and_preserves_staging(owner_stack):
 
 
 @pytest.mark.parametrize("failure_type", [GymTransportError, ValueError, TimeoutError])
-def test_cc_group_never_redispatches_even_with_large_ordinary_budgets(failure_type):
+def test_cc_group_uses_ordinary_retry_budgets(failure_type):
     attempts = []
 
     async def execute_then_lose_response(_sample):
@@ -346,12 +349,136 @@ def test_cc_group_never_redispatches_even_with_large_ordinary_budgets(failure_ty
         retry_policy=policy,
         on_run=execute_then_lose_response,
     )
-    with pytest.raises(failure_type, match="response lost"):
-        asyncio.run(manager.generate_for_finalization({"idx": 1}))
-    assert attempts == ["mutation applied"]
-    assert len(buffer.abort_calls) == 1
+    if failure_type is ValueError:
+        with pytest.raises(ValueError, match="response lost"):
+            asyncio.run(manager.generate_for_finalization({"idx": 1}))
+        expected_attempts = 4
+    else:
+        assert asyncio.run(manager.generate_for_finalization({"idx": 1})) is None
+        expected_attempts = 5
+    assert attempts == ["mutation applied"] * expected_attempts
+    assert len(buffer.abort_calls) == expected_attempts
     assert buffer.commit_calls == []
-    assert manager.stats.skipped == 0
+    assert manager.stats.skipped == (0 if failure_type is ValueError else 1)
+
+
+@pytest.mark.parametrize("granularity", ["sibling", "prompt_group"])
+@pytest.mark.parametrize(
+    "interruption", ["runtime", "data_retry", "cold", "sealed_cold"]
+)
+def test_cc_retry_and_restart_reuse_durable_evidence(
+    owner_stack: tuple, tmp_path: Path, granularity: str, interruption: str
+) -> None:
+    harness, plane, finalizer = owner_stack
+    policy = RolloutRetryPolicy(
+        max_infra_attempts=2,
+        max_data_attempts=2,
+        max_gym_row_attempts=1,
+        backoff_base_s=0,
+        max_backoff_s=0,
+    )
+
+    def make_manager():
+        return _make_capture_manager(
+            _FakeCaptureBuffer(),
+            context_compaction=True,
+            retry_policy=policy,
+            recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
+        )
+
+    manager = make_manager()
+    calls, observed = [], {}
+
+    async def run(
+        _sample, *, rollout_ids, generation_indices, on_completion, recovery_granularity
+    ):
+        calls.append((list(rollout_ids), list(generation_indices)))
+        for index in generation_indices:
+            owner = rollout_ids[index]
+            segments = tuple(
+                [
+                    await asyncio.to_thread(
+                        capture_segment, harness, f"{owner}_s{s}", child=True
+                    )
+                    for s in range(2 if index == 0 else 1)
+                ]
+            )
+            observed[owner] = segments
+            await on_completion(
+                index,
+                Completion(
+                    message_log=[],
+                    env_extras={
+                        "ng_receipt": None,
+                        "ng_rollout_id": owner,
+                        "ng_logical_segments": segments,
+                    },
+                    reward=float(index),
+                    truncated=False,
+                ),
+            )
+            if len(calls) == 1 and (index == 0 or interruption == "sealed_cold"):
+                if interruption == "runtime":
+                    raise GymTransportError("lost stream")
+                if interruption == "data_retry":
+                    raise ValueError("invalid unfinished sibling")
+                if interruption == "cold" or index == 1:
+                    raise asyncio.CancelledError()
+
+    async def exercise():
+        nonlocal manager
+        manager._impl.run_rollout = run
+        if interruption in {"cold", "sealed_cold"}:
+            with pytest.raises(asyncio.CancelledError):
+                await manager.generate_for_finalization({"idx": 99})
+            assert len(calls) == 1  # Cancellation must not consume retry budgets.
+            path = tmp_path / "recovery.pt"
+            torch.save(manager.recovery_ledger.state_dict(), path)
+            restored = RolloutRecoveryLedger.from_state_dict(
+                torch.load(path, weights_only=True)
+            )
+            manager = make_manager()
+            manager._recovery_ledger = restored
+            async with manager._recovery_mutation() as cut:
+                restored.prepare_for_restart(cut)
+                restored.bind_runtime_prompt(
+                    cut, restored.groups()[0].group_id, {"idx": 99}
+                )
+            manager._impl.run_rollout = run
+            return await manager.generate_for_finalization(
+                {"idx": 99}, lineage_group_id=restored.groups()[0].group_id
+            )
+        return await manager.generate_for_finalization({"idx": 99})
+
+    request = asyncio.run(exercise())
+    assert_metadata_only(request)
+    if interruption == "sealed_cold":
+        assert len(calls) == 1
+        assert request.rollout_ids == tuple(calls[0][0])
+    else:
+        assert len(calls) == 2
+        assert calls[1][1] == ([1] if granularity == "sibling" else [0, 1])
+        assert (calls[0][0][0] == calls[1][0][0]) == (granularity == "sibling")
+        assert calls[0][0][1] != calls[1][0][1]
+    assert request.logical_segments == tuple(
+        observed[owner] for owner in request.rollout_ids
+    )
+    expected_keys = {
+        entry["staging_key"]
+        for segments in request.logical_segments
+        for segment in segments
+        for entry in segment.receipt["manifest"]
+    }
+    assert manager.recovery_ledger.expected_staging_keys() == expected_keys
+    actor = object.__new__(RolloutReassemblerActor.__ray_metadata__.modified_class)
+    actor._finalizer = finalizer
+    result = actor.finalize(request)
+    assert result.valid_row_count == result.total_row_count == 3
+    assert len(set(result.meta.sample_ids)) == 3
+    assert [tag["logical_slot"] for tag in result.meta.tags] == [0, 0, 1]
+    assert not any(
+        part == "staged" and key in expected_keys for part, key in plane.rows
+    )
 
 
 def test_cc_converter_rejects_ordinary_receipt_fallback():

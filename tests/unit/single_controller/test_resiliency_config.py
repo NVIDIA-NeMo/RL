@@ -92,8 +92,8 @@ class TestDefaultsAreInert:
             ("lookahead", "zero lookahead"),
             ("sampler", "zero lookahead"),
             ("gbs", "must equal policy.train_global_batch_size"),
-            ("checkpoint", "checkpoint/resume"),
-            ("rollout_checkpoint", "CC rollout checkpoint/resume"),
+            ("checkpoint", None),
+            ("rollout_checkpoint", None),
             ("dynamic", "use_dynamic_sampling not supported"),
             ("sequence_loss", "token-level GRPO"),
             ("packing", "fixed-batch"),
@@ -125,10 +125,10 @@ class TestDefaultsAreInert:
             ).sampler
         elif bad == "gbs":
             config.policy["train_global_batch_size"] -= 1
-        elif bad == "checkpoint":
-            config.checkpointing["enabled"] = True
-        elif bad == "rollout_checkpoint":
-            config.rollout_checkpointing.snapshot_attempt_interval_s = 60
+        elif bad in ("checkpoint", "rollout_checkpoint"):
+            config.checkpointing.update(enabled=True, save_data_plane=True)
+            if bad == "rollout_checkpoint":
+                config.rollout_checkpointing.snapshot_attempt_interval_s = 60
         elif bad == "dynamic":
             config.grpo.use_dynamic_sampling = True
         elif bad == "sequence_loss":

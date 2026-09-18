@@ -1697,8 +1697,8 @@ class TQReplayBuffer:
             expected_partition_id: Partition this buffer writes to; must
                 match the envelope.
             expected_group_size: num_generations_per_prompt; every group must
-                hold exactly this many rows (a changed group size silently
-                breaks the group-relative baseline).
+                hold exactly this many logical responses. CC responses may span
+                multiple rows, with additional ownerless execution padding.
             expected_manifest_digest: Digest returned by the matching native
                 TQ checkpoint load. It must match the replay metadata file.
 
@@ -1711,6 +1711,12 @@ class TQReplayBuffer:
                 sample_ids), disagrees with the native TQ snapshot, or exceeds
                 ``max_groups``.
         """
+        # Defer to avoid the SC setup -> replay buffer import cycle.
+        from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
+            has_logical_owners,
+            validate_logical_owner_metadata,
+        )
+
         if self.meta_list or self._group_ids or self._training_claims:
             raise RuntimeError(
                 "Replay-buffer checkpoint loading requires an empty local buffer"
@@ -1774,8 +1780,9 @@ class TQReplayBuffer:
             num_lengths = (
                 len(meta.sequence_lengths) if meta.sequence_lengths is not None else -1
             )
-            if not (
-                len(meta.sample_ids) == num_tags == num_lengths == expected_group_size
+            logical = has_logical_owners(meta)
+            if not (len(meta.sample_ids) == num_tags == num_lengths) or (
+                not logical and len(meta.sample_ids) != expected_group_size
             ):
                 raise ValueError(
                     "Replay buffer checkpoint group misaligned: "
@@ -1783,6 +1790,12 @@ class TQReplayBuffer:
                     f"sequence_lengths={num_lengths}, "
                     f"expected_group_size={expected_group_size}"
                 )
+            if logical:
+                owners = validate_logical_owner_metadata(
+                    meta, expected_group_size=expected_group_size
+                )
+                if set(owners) != {group["group_id"]}:
+                    raise ValueError("CC replay group_id disagrees with owner metadata")
             for sid in meta.sample_ids:
                 if sid in seen_sample_ids:
                     raise ValueError(

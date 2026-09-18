@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, TypeVar
 
 import pytest
@@ -29,6 +30,8 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.experience.cc_media import SegmentMedia
+from nemo_rl.experience.rollout_reassembler import ActionOutputFlags, SegmentReceipt
 from nemo_rl.experience.rollout_recovery import (
     _ATTEMPT_STATE_FIELDS,
     _GROUP_STATE_FIELDS,
@@ -49,6 +52,134 @@ from nemo_rl.experience.rollout_recovery import (
 )
 
 _T = TypeVar("_T")
+
+
+def _cc_sealed_ledger() -> RolloutRecoveryLedger:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    owner = group.gate_rollout_id(0)
+    segments = tuple(
+        SegmentReceipt(
+            capture_rollout_id=f"{owner}_s{i}",
+            receipt={
+                "rollout_id": f"{owner}_s{i}",
+                "manifest": [{"staging_key": f"key-{i}"}],
+            },
+            selected_response_ids=(f"response-{i}",),
+            truncated=i == 1,
+            action_flags=(ActionOutputFlags(i == 0, i == 1),),
+            media=SegmentMedia(("pixel_values",), {"shapes": [2, 3]}, (1,)),
+        )
+        for i in range(2)
+    )
+    _mutate(
+        lambda cut: ledger.mark_sibling_sealed(
+            cut,
+            "g7",
+            generation_index=0,
+            gate_rollout_id=owner,
+            receipt=None,
+            reward=0.5,
+            mask_sample=True,
+            logical_segments=segments,
+        )
+    )
+    return ledger
+
+
+def test_cc_recovery_disk_round_trip_retains_completed_evidence(tmp_path: Path) -> None:
+    ledger = _cc_sealed_ledger()
+    state = ledger.state_dict()
+    path = tmp_path / "recovery.pt"
+    torch.save(state, path)
+    restored = RolloutRecoveryLedger.from_state_dict(
+        torch.load(path, weights_only=True)
+    )
+    _bind(restored, "g7", _prompt())
+    assert restored.state_dict() == state
+    assert restored.expected_staging_keys() == {"key-0", "key-1"}
+    before = ledger.get_group("g7").siblings[0].current_attempt
+    _mutate(lambda cut: restored.prepare_for_restart(cut))
+    retried = _mutate(lambda cut: restored.prepare_incomplete_retry(cut, "g7"))
+    assert retried.siblings[0].current_attempt == before
+    assert (
+        retried.siblings[1].current_attempt.attempt_id
+        != ledger.get_group("g7").siblings[1].current_attempt.attempt_id
+    )
+    assert retried.siblings[1].current_attempt.logical_segments is None
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing_field",
+        "missing_segment",
+        "foreign_capture",
+        "foreign_receipt",
+        "staging",
+        "duplicate",
+        "unsealed",
+        "legacy_cc",
+        "unknown_field",
+        "missing_descriptor_field",
+        "tensor",
+    ],
+)
+def test_cc_recovery_rejects_malformed_saved_ownership(damage: str) -> None:
+    state = _cc_sealed_ledger().state_dict()
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+    segments = attempt["logical_segments"]
+    if damage == "missing_field":
+        del attempt["logical_segments"]
+    elif damage == "missing_segment":
+        segments.pop()
+    elif damage == "foreign_capture":
+        segments[0]["capture_rollout_id"] = "foreign_s0"
+    elif damage == "foreign_receipt":
+        segments[0]["receipt"]["rollout_id"] = "foreign_s0"
+    elif damage == "staging":
+        attempt["staging_keys"] = []
+    elif damage == "duplicate":
+        segments[1]["receipt"]["manifest"][0]["staging_key"] = "key-0"
+    elif damage == "unsealed":
+        attempt["status"] = "abandoned"
+    elif damage == "legacy_cc":
+        state["schema_version"] = 2
+    elif damage == "missing_descriptor_field":
+        del segments[0]["action_flags"]
+    elif damage == "tensor":
+        segments[0]["media"]["row_tags"]["bad"] = torch.tensor([1])
+    else:
+        segments[0]["unknown"] = 1
+    with pytest.raises((ValueError, TypeError)):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
+def test_legacy_ordinary_recovery_still_loads() -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+    )
+    state = ledger.state_dict()
+    state["schema_version"] = 2
+    del state["groups"][0]["siblings"][0]["attempts"][0]["logical_segments"]
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+    assert restored.get_group("g7").siblings[0].current_attempt.logical_segments is None
 
 
 def _mutate(callback: Callable[[DataPlaneMutationCut], _T]) -> _T:
@@ -231,7 +362,7 @@ def _sealed_attempt_state() -> dict[str, Any]:
         ("mask_sample", "sealed attempts require a boolean mask_sample"),
         (
             "missing_receipt_staging",
-            "sealed missing-receipt attempt cannot own staging keys",
+            "sealed receipt staging manifest mismatch",
         ),
         ("receipt_type", "sealed attempt receipt must be a mapping or None"),
         ("receipt_manifest_type", "receipt must contain a manifest list"),
@@ -831,7 +962,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
     assert rewards == [0.0, 1.0]
     assert mask_sample == [True, False]
 
-    state["schema_version"] = 3
+    state["schema_version"] = ROLLOUT_RECOVERY_SCHEMA_VERSION + 1
     with pytest.raises(ValueError, match="Unsupported rollout-recovery schema version"):
         RolloutRecoveryLedger.from_state_dict(state)
 

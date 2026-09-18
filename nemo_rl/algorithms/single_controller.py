@@ -140,7 +140,9 @@ from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
+    SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS,
     PromptGroupPhase,
+    RolloutAttemptStatus,
     RolloutRecoveryState,
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
@@ -760,7 +762,7 @@ class SingleControllerActor:
         expected_schema_version = metadata.get("rollout_recovery_schema_version")
         if (
             isinstance(expected_schema_version, bool)
-            or expected_schema_version != ROLLOUT_RECOVERY_SCHEMA_VERSION
+            or expected_schema_version not in SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
         ):
             raise ValueError(
                 "native TQ checkpoint rollout recovery schema mismatch: "
@@ -797,6 +799,10 @@ class SingleControllerActor:
             weights_only=True,
         )
         parsed_state = parse_rollout_recovery_state(state)
+        if parsed_state.ledger_state["schema_version"] != expected_schema_version:
+            raise ValueError(
+                "rollout recovery sidecar schema disagrees with native TQ metadata"
+            )
         if len(parsed_state.ledger_state["groups"]) != expected_group_count:
             raise ValueError(
                 "rollout recovery sidecar group count does not match native "
@@ -806,7 +812,19 @@ class SingleControllerActor:
         recovery_ledger = self._rollout_manager.recovery_ledger
         async with self._data_plane_checkpoint_barrier.mutation() as cut:
             recovery_ledger.load_state_dict(cut, parsed_state.ledger_state)
-            recovery_ledger.prepare_for_restart(cut)
+            recovery_ledger.assert_checkpoint_safe()
+            if self._master_config.token_capture.enabled:
+                for group in recovery_ledger.groups():
+                    for sibling in group.siblings:
+                        attempt = sibling.current_attempt
+                        if (
+                            attempt.status is RolloutAttemptStatus.SEALED
+                            and bool(attempt.logical_segments)
+                            != self._master_config.token_capture.context_compaction
+                        ):
+                            raise ValueError(
+                                "recovery segments disagree with context_compaction mode"
+                            )
             self._batch_shortfall = parsed_state.batch_shortfall
             canonical_state = self._buffer.metadata_state_dict(
                 saved_capacity=self._async_cfg.max_buffered_rollouts
@@ -815,6 +833,12 @@ class SingleControllerActor:
                 group["group_id"] for group in canonical_state["groups"]
             }
             recovery_ledger.discard_canonical_groups(cut, canonical_group_ids)
+            if self._master_config.token_capture.enabled:
+                # Check saved ownership before restart normalization can discard it.
+                await self._validate_rollout_recovery_inventory(
+                    cut, replay_metadata=canonical_state, clear_unreferenced=False
+                )
+            recovery_ledger.prepare_for_restart(cut)
             if self._master_config.token_capture.enabled:
                 await self._validate_rollout_recovery_inventory(
                     cut,
@@ -1172,10 +1196,12 @@ class SingleControllerActor:
         reserve_path = os.path.join(
             self._last_checkpoint_path, REPLACEMENT_RESERVE_FILENAME
         )
-        # Absent for every run that never diverted a batch, which is every run that
-        # does not use "replace" -- so silence here rather than the buffer restore's
-        # warning, since this is the ordinary case rather than a lost artifact.
+        # Schema 3 writes even an empty reserve; legacy absence remains valid.
         if not os.path.exists(reserve_path):
+            if (self._data_plane_checkpoint_metadata or {}).get(
+                "rollout_recovery_schema_version", 0
+            ) >= 3:
+                raise FileNotFoundError(f"checkpoint is missing {reserve_path}")
             return
         # weights_only=False: spares are pickled DatumSpecs, and the checkpoint is a
         # trusted same-job artifact (the replay buffer restore loads on the same terms).
@@ -3567,12 +3593,11 @@ class SingleControllerActor:
             cut.dataloader_state,
             checkpoint_path / "train_dataloader.pt",
         )
-        if cut.replacement_reserve:
-            await asyncio.to_thread(
-                torch.save,
-                cut.replacement_reserve,
-                checkpoint_path / "replacement_reserve.pt",
-            )
+        await asyncio.to_thread(
+            torch.save,
+            cut.replacement_reserve,
+            checkpoint_path / REPLACEMENT_RESERVE_FILENAME,
+        )
         if cut.replay_metadata is not None:
             await asyncio.to_thread(
                 torch.save,
@@ -3953,12 +3978,11 @@ class SingleControllerActor:
             dataloader_state,
             os.path.join(checkpoint_path, "train_dataloader.pt"),
         )
-        if reserve_state:
-            await asyncio.to_thread(
-                torch.save,
-                reserve_state,
-                os.path.join(checkpoint_path, REPLACEMENT_RESERVE_FILENAME),
-            )
+        await asyncio.to_thread(
+            torch.save,
+            reserve_state,
+            os.path.join(checkpoint_path, REPLACEMENT_RESERVE_FILENAME),
+        )
         if replay_metadata is not None:
             await asyncio.to_thread(
                 torch.save,
