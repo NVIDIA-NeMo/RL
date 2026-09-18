@@ -1,14 +1,5 @@
-# Keep the upstream workload and parallelism; reserve enough memory for the
-# FlashInfer TRTLLM packed BF16 expert layout in every precision arm.
+# Keep the upstream performance workload and parallelism unchanged. In
+# particular, rollout remains TP8 with gpu_memory_utilization=0.4 for every
+# precision arm. The pinned vLLM overlay handles the gated BF16 expert padding
+# needed by FlashInfer TRTLLM without changing the benchmark topology.
 defaults: ../../examples/configs/recipes/llm/performance/grpo-qwen3-235b-16n4g.yaml
-
-policy:
-  generation:
-    vllm_cfg:
-      # 1,536 expert rows / TP4 = 384, which satisfies the FlashInfer TRTLLM
-      # BF16 requirement that the TP-local intermediate size divide by 128.
-      # Apply this topology to every precision arm for a matched comparison.
-      tensor_parallel_size: 4
-      # TP4 raises the BF16 model shard from 72.55 GiB to 109.56 GiB. A 0.7
-      # budget restores roughly the same 18 GiB KV headroom as TP8 at 0.5.
-      gpu_memory_utilization: 0.7
