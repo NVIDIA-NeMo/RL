@@ -1,0 +1,18 @@
+# Dedicated self-hosted judge; never binds to the policy endpoint or hosted provider.
+deepseek_v4_flash_judge_model:
+  responses_api_models:
+    vllm_model:
+      entrypoint: app.py
+      base_url: ${oc.env:SUPER_RL_JUDGE_URL}
+      api_key: unused-local-judge
+      model: deepseek-v4-flash
+      return_token_id_information: false
+      uses_reasoning_parser: true
+      uses_interleaved_reasoning: true
+      num_workers: 1
+      chat_template_kwargs:
+        thinking: true
+        # The pinned DeepSeek V4 tokenizer maps medium to high; use its native name.
+        reasoning_effort: high
+      extra_body: null
+      default_headers: {}

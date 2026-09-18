@@ -49,6 +49,95 @@ Gym result payloads are needed for a short debugging run.
 
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
 
+### Hosted DeepSeek V4 Flash judge
+
+The opt-in judge configuration lives in the NeMo RL repository, not in the Gym
+submodule. It reuses Gym's `responses_api_models/inference_provider/app.py`;
+no training or provider Python patch is introduced by this configuration.
+
+There are two different configuration layers:
+
+| File under `training_configs/judges/` | Load with | Purpose |
+| --- | --- | --- |
+| `nvidia_deepseek_v4_flash.yaml` | `env.nemo_gym.config_paths` | Gym provider definition; resolves the API key inside Gym |
+| `nvidia_deepseek_v4_flash_routes.yaml` | NeMo RL `defaults`, after the existing recipe | Math and equivalence resource-server judge bindings |
+
+To opt in:
+
+1. In a child NeMo RL YAML, inherit the existing training recipe first and the
+   routes fragment second. Paths in `defaults` are relative to that child YAML
+   (absolute paths also work).
+2. Copy the existing recipe's **complete** `env.nemo_gym.config_paths` list into
+   the child, then append
+   `${oc.env:NRL_REPO_ROOT}/training_configs/judges/nvidia_deepseek_v4_flash.yaml`.
+   List inheritance replaces a list; it does not append to it. Preserve all
+   existing policy, resource-server, and agent paths. Do not add the provider
+   YAML to NeMo RL `defaults`.
+3. Set `NRL_REPO_ROOT` to the absolute checkout path **inside the container**.
+   Make that checkout accessible at the same path to every Gym worker. Supply
+   `NVIDIA_API_KEY` through the launcher's secret environment injection, and
+   verify it reaches Gym subprocesses. Do not put the key in YAML, CLI overrides,
+   tracked files, shell tracing, or logs.
+4. Keep judge overrides in the child consistent with the routes fragment:
+   child values take precedence over parents. Inline `env.nemo_gym` values also
+   override values loaded by Gym from `config_paths`. Remove stale inline
+   provider definitions and old judge bindings instead of leaving two competing
+   configurations. Do not remove another provider while other resources use it.
+
+The endpoint is `https://inference-api.nvidia.com/v1`, with model identifier
+`nvidia/deepseek-ai/deepseek-v4-flash`. Judge requests use `reasoning_effort:
+medium`, `max_output_tokens: 8192`, and `temperature: 0`. The provider allows
+256 concurrent requests **per provider process**, not a cluster-wide limit;
+there is one provider worker per Gym instance. Equivalence judging also has a
+256-request endpoint limit. Math's existing `should_use_judge` behavior is
+enabled; this does not change its native verifier or force every row to call
+the hosted model.
+
+Only the `math_with_judge` and `equivalence_llm_judge` resource instances are
+redirected. This does not reroute data, disable reasoning, change the policy's
+generation budget, allocate GPUs, or configure `ns_tools`, `lc_judge`, or other
+consumers. The rest of the training recipe and cluster launcher are unchanged.
+
+The separate Gym file keeps `NVIDIA_API_KEY` out of the resolved **NeMo RL
+training configuration**. It is not a general secret-redaction mechanism:
+Gym must receive the resolved credential, so protect its runtime files and
+environment, and do not upload resolved Gym configs or environment dumps.
+
+#### Validation and reproducibility status
+
+This branch starts from PR3941 commit
+`ca06137460b7e2edcaf6f1fd67ddbda5ddd6b8e2`. On 2026-09-14, initializing its
+pinned Gym submodule from `https://github.com/NVIDIA-NeMo/Gym.git` failed with
+`not our ref 749432dc5de23b8eeb3d044c80350a7c0ae9a03f`. The gitlink is unchanged;
+do not silently replace it with a newer Gym checkout. A reachable source for
+that exact commit, or an explicitly reviewed dependency update, is needed
+before claiming a fresh recursive clone works.
+
+The offline regression tests use the real NeMo RL config loader and OmegaConf
+to check composition, judge settings, environment-path resolution, and the
+training-config secret boundary. They do **not** validate the unavailable
+pinned Gym parser/schema, provider request conversion, API availability,
+authentication, rate limits, or GPU training. In particular, confirm the
+8192-token cap at the outgoing provider request boundary during the eventual
+native canary. This is a reusable judge component, not yet a validated
+one-command AWS-CMH/HSG/H100 training recipe.
+
+In an already configured NeMo RL development environment, run the focused
+offline tests with:
+
+```bash
+uv run --group test pytest --noconftest -o addopts= tests/unit/environments/test_hosted_judge_configs.py -q
+```
+
+`--noconftest` isolates these config-only tests from the shared Ray/GPU test
+fixtures. Initial local checks used the existing Research Factory environment
+(Python 3.14.3, Hydra 1.3.2, OmegaConf 2.3.1), not the training container's
+Python 3.13.14 environment; native runtime qualification remains outstanding.
+All 12 hosted-judge tests and 9 existing lightweight config-loader tests passed.
+The 8 existing GRPO schema cases in `tests/unit/utils/test_config.py` could not
+run: importing GRPO failed because that local environment does not have `ray`.
+Those cases are not counted as passes.
+
 ### Version Requirements
 
 NeMo Gym runs as a Ray actor within NeMo RL's Ray cluster, so the same Ray and Python versions must be used in both environments.

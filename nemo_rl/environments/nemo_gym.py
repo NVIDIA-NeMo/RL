@@ -1200,6 +1200,30 @@ Depending on your data shape, you may want to change these values."""
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
 
+        # Gym's verifier wrapper returns tagged failures with a placeholder reward.
+        # Gym's contract treats every tagged row (judge, remote endpoint down,
+        # timeout, malformed reply) as retryable unless it is flagged terminal,
+        # so follow that flag instead of guessing from the class name. None of
+        # these rows is a training sample.
+        failure_class = nemo_gym_result.get("_ng_failure_class")
+        if failure_class:
+            terminal = bool(nemo_gym_result.get("_ng_failure_terminal"))
+            details = {
+                "failure_class": _bounded_nemo_gym_identity_value(failure_class),
+                "terminal": terminal,
+                "row": summarize_nemo_gym_row(nemo_gym_row),
+            }
+            if failure_class == "judge_failed":
+                details["judge_error"] = _bounded_nemo_gym_identity_value(
+                    nemo_gym_result.get("_ng_failure_judge_error")
+                )
+            emit_nemo_gym_trace("actor_tagged_rollout_failure", **details)
+            failure_type = RolloutDataFailure if terminal else GymTransportError
+            raise failure_type(
+                "NeMo Gym returned a tagged failed rollout; reward is not valid: "
+                + json.dumps(details, default=str)
+            )
+
         processor = getattr(self, "_processor", None)
         response = nemo_gym_result["response"]
         require_routed_experts = self.cfg.get("require_routed_experts", False)

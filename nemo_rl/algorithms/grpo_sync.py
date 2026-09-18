@@ -66,6 +66,7 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.reward_functions import apply_reward_shaping
+from nemo_rl.algorithms.metric_utils import without_generation_logger_payload
 from nemo_rl.algorithms.utils import (
     build_rollout_group_ids_from_sample_ids,
     calculate_baseline_and_std_per_prompt,
@@ -1353,7 +1354,11 @@ def grpo_train_sync(
                 is_async_rl=False,
             )
 
-            logger.log_metrics(metrics, total_steps + 1, prefix="train")
+            logger.log_metrics(
+                without_generation_logger_payload(metrics),
+                total_steps + 1,
+                prefix="train",
+            )
             logger.log_metrics(
                 performance_metrics, total_steps + 1, prefix="performance"
             )

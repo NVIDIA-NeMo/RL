@@ -49,6 +49,7 @@ from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
 )
+from nemo_rl.algorithms.metric_utils import without_generation_logger_payload
 from nemo_rl.algorithms.utils import (
     print_efficiency_summary,
     print_performance_metrics,
@@ -1980,7 +1981,11 @@ def ppo_train(
                 is_async_rl=master_config.ppo.async_ppo.enabled,
             )
 
-            logger.log_metrics(metrics, total_steps + 1, prefix="train")
+            logger.log_metrics(
+                without_generation_logger_payload(metrics),
+                total_steps + 1,
+                prefix="train",
+            )
             logger.log_metrics(
                 performance_metrics, total_steps + 1, prefix="performance"
             )
@@ -2997,7 +3002,9 @@ def async_ppo_train(
             )
 
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")
-            logger.log_metrics(metrics, step + 1, prefix="train")
+            logger.log_metrics(
+                without_generation_logger_payload(metrics), step + 1, prefix="train"
+            )
             logger.log_metrics(efficiency_loggable, step + 1, prefix="")
             logger.log_metrics(
                 timing_metrics,
