@@ -376,6 +376,11 @@ rsync -a --ignore-existing /tmp/trtllm-ccache-seed/ "${CCACHE_DIR}/"
 
 # uv uses the shared image cache. Only the custom wheel needs a cache mount
 # because uv can miss no-build-isolation wheels across build environments.
+# The mount is builder-local scratch: it is not part of this layer, so a later
+# stage cannot rely on it -- when this RUN is served from the BuildKit layer
+# cache the mount stays empty. The build below therefore also mirrors the
+# current content-addressed wheel into /opt/trtllm_wheels, which IS part of this
+# layer; the release stage and runtime `uv run --extra trtllm` read it from there.
 echo "TRT-LLM cache state before build:"
 du -sh /root/.cache/uv /root/.cache/trtllm-wheels
 
@@ -388,6 +393,7 @@ set +e
 # cache make overlayfs copy them up into this layer, and the copies outlive the rm -rf below.
 UV_CACHE_DIR=/root/.cache/uv \
     TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
+    TRTLLM_WHEEL_CACHE_MIRROR_DIR=/opt/trtllm_wheels \
     UV_PROJECT_ENVIRONMENT=/tmp/trtllm-build-venv \
     uv sync --verbose --link-mode symlink --locked --extra trtllm --no-install-project \
     2>&1 | tee "$TRTLLM_SYNC_LOG" \
@@ -501,14 +507,13 @@ EOF
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
-ARG BASE_IMAGE
-RUN --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked <<"EOF" bash -exu
-# Reuse the custom wheel produced by the hermetic stage. Normal uv artifacts
-# stay in /root/.cache/uv, which remains available to symlinked environments.
-# Mirror only the current content-addressed TRT-LLM wheel into the image so
-# runtime `uv run --extra trtllm` calls do not fall back to a source build.
-export TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels
-export TRTLLM_WHEEL_CACHE_MIRROR_DIR=/opt/trtllm_wheels
+RUN <<"EOF" bash -exu
+# Reuse the custom wheel the hermetic stage mirrored into /opt/trtllm_wheels
+# (the runtime default of the TRT-LLM build backend). It lives in that layer,
+# so it is present whether the TRT-LLM RUN executed on this builder or was
+# restored from the layer cache; do not read it from the builder-local cache
+# mount here. Normal uv artifacts stay in /root/.cache/uv.
+export TRTLLM_WHEEL_CACHE_DIR=/opt/trtllm_wheels
 export TRTLLM_REQUIRE_CACHED_WHEEL=1
 # Worker-venv prefetch, phase 2: the nemo_rl project itself.
 #
@@ -622,8 +627,8 @@ ARG WHEEL_CACHE_EXPORT_NONCE
 RUN --mount=type=bind,from=trtllm-wheel-cache-seed,source=.,target=/tmp/trtllm-wheel-cache-seed \
     --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked <<"EOF" bash -exu
 echo "Exporting TRT-LLM wheel cache for build ${WHEEL_CACHE_EXPORT_NONCE:-local} (${WHEEL_CACHE_EXPORT_MODE})"
-# If the release RUN was a BuildKit cache hit, restore the seed into a fresh
-# builder-local mount before exporting it.
+# If the hermetic TRT-LLM RUN was a BuildKit cache hit, this builder-local mount is empty;
+# restore the seed before exporting it.
 if [[ -z "$(find /root/.cache/trtllm-wheels -mindepth 1 -print -quit)" ]]; then
     rsync -a /tmp/trtllm-wheel-cache-seed/ /root/.cache/trtllm-wheels/
 fi

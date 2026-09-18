@@ -447,10 +447,9 @@ override-dependencies = [
   # 2.5.x). The original driver — TransferQueue pinning `numpy<2.0.0` — is
   # gone as of TQ v0.1.9; drop this override once the trtllm cap lifts.
   "numpy>=2.1.0",
-  # av (PyAV) carries CVE-bundled codec libs (libx264, libx265, libopenh264, libmp3lame).
-  # It is only needed by megatron-bridge's optional WAN diffusion path, which installs it
-  # at test time via scripts/install_diffusion_deps.sh. Exclude from the shipped container.
-  # "av; sys_platform == 'never'", # need it for energon
+  # av (PyAV) bundles FFmpeg-derived codecs that may incur royalties. Exclude it from the
+  # shipped container; audio/video tests install it via tools/install_audio_deps.sh.
+  "av; sys_platform == 'never'",
   # decord2 is pulled transitively by sglang → qwen-vl-utils[decord] on aarch64 Linux.
   # NeMo-RL no longer calls any decord API (replaced by torchvision/torchaudio).
   "decord2; sys_platform == 'never'",
