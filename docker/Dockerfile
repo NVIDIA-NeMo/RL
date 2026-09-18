@@ -266,13 +266,18 @@ UV_LINK_MODE=hardlink uv sync --frozen --all-groups --no-install-project
 # sync above deliberately uses --no-install-project, so nemo-rl itself is
 # never built at image time and its build-backend requirements
 # (setuptools>=78.1.1, wheel>=0.46.2; see pyproject.toml [build-system]) are
-# not fetched. Without this, an offline `uv run` that falls back to building
-# nemo-rl (e.g. changed source tree or a forwarded fork with a different lock)
-# fails with "setuptools was not found in the cache" because the network is
-# disabled. Warm JUST the backend without installing the project (keeps the
-# editable-work in the release stage cheap).
-uv cache clean setuptools wheel 2>/dev/null || true
-UV_LINK_MODE=hardlink uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" "setuptools==78.1.1" "wheel>=0.46.2"
+# never resolved into the cache. Offline, a `uv sync`/`uv run` that builds
+# nemo-rl (changed source tree, or a forwarded fork whose lock differs) fails
+# with "setuptools was not found in the cache" because the network is disabled
+# and uv must create the build environment for setuptools.build_meta from the
+# cache. Building the project here (network available) resolves and caches that
+# backend; the editable install in the release stage stays cheap (.pth).
+UV_LINK_MODE=hardlink uv build --wheel --out-dir /tmp/nemo_rl_wheels .
+# Self-test: rebuilding fully offline MUST succeed from the warmed cache, or
+# the image still cannot build nemo-rl without a network.
+rm -rf /tmp/nemo_rl_offline && mkdir -p /tmp/nemo_rl_offline
+UV_LINK_MODE=hardlink uv build --wheel --offline --out-dir /tmp/nemo_rl_offline .
+rm -rf /tmp/nemo_rl_wheels /tmp/nemo_rl_offline
 
 # Worker-venv prefetch, phase 1: third-party packages only.
 #
