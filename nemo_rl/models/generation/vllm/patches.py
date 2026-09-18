@@ -16,6 +16,10 @@ import os
 from contextlib import contextmanager
 from importlib.util import find_spec
 
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
+)
+
 
 def _get_vllm_file(relative_path: str) -> str:
     """Return absolute path to a vLLM file or raise if it cannot be found.
@@ -811,6 +815,153 @@ def _patch_vllm_minimax_m3_topk_buffer_layout(logger) -> None:
     logger.info("Successfully patched vLLM MiniMax-M3 top-k buffer layout.")
 
 
+def _patch_vllm_nemotron_h_fp32_lm_head(logger) -> bool:
+    """Compute NemotronH logits with an fp32 LM head (MiniMax-M1-style).
+
+    bf16 rounding of the logits GEMM output is the dominant contributor to
+    generation/training logprob mismatch (train/token_mult_prob_error). With
+    this patch the sampled-token logprobs come from fp32 logits, matching a
+    trainer that enables megatron_cfg.fp32_lm_head.
+
+    This must be a source patch (not a monkeypatch): the model executes in
+    vLLM's EngineCore worker subprocesses, which import vllm independently of
+    this process. The patched code is opt-in at runtime via an internal
+    NRL_VLLM_FP32_LM_HEAD=1 environment variable set from
+    policy.generation.vllm_cfg.fp32_lm_head.
+    When enabled, the live ParallelLMHead keeps its original parameter dtype
+    and quantization config; only the projection path casts hidden states,
+    weights, and optional bias to fp32 at runtime.
+    """
+    try:
+        file_to_patch = _get_vllm_file("model_executor/models/nemotron_h.py")
+    except RuntimeError:
+        logger.warning("Could not locate nemotron_h.py for the fp32 LM head patch.")
+        return False
+
+    old_import_snippet = """import torch
+from torch import nn"""
+    old_fp32_import_snippet = """import os
+
+import torch
+from torch import nn"""
+    new_import_snippet = old_fp32_import_snippet
+    old_lm_head_snippet = """        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=self.quant_config,
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )"""
+    new_lm_head_snippet = f"""        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=self.quant_config,
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )
+        self._nrl_fp32_lm_head = (
+            os.environ.get("{VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR}", "0") == "1"
+        )"""
+    old_logits_processor_snippet = (
+        "        self.logits_processor = LogitsProcessor(config.vocab_size)"
+    )
+    new_logits_processor_snippet = """        self.logits_processor = LogitsProcessor(config.vocab_size)
+        if self._nrl_fp32_lm_head:
+
+            def _nrl_fp32_lm_head_forward(
+                input_, embedding_bias=None, _lm_head=self.lm_head
+            ):
+                if not getattr(_lm_head, "_nrl_fp32_lm_head_forward_logged", False):
+                    print(
+                        "[fp32_lm_head] NemotronH vLLM lm_head.forward casts "
+                        "input and weight to fp32",
+                        flush=True,
+                    )
+                    _lm_head._nrl_fp32_lm_head_forward_logged = True
+                logits = torch.matmul(
+                    input_.to(dtype=torch.float32),
+                    _lm_head.weight.to(dtype=torch.float32).t(),
+                )
+                if embedding_bias is not None:
+                    logits = logits + embedding_bias.to(dtype=torch.float32)
+                return logits
+
+            self.lm_head.forward = _nrl_fp32_lm_head_forward
+            _orig_quant_apply = self.lm_head.quant_method.apply
+
+            def _nrl_fp32_lm_head_apply(
+                layer,
+                input_,
+                bias=None,
+                _lm_head=self.lm_head,
+                _orig_apply=_orig_quant_apply,
+                **kwargs,
+            ):
+                if layer is _lm_head:
+                    return _lm_head(input_, bias)
+                return _orig_apply(layer, input_, bias=bias, **kwargs)
+
+            self.lm_head.quant_method.apply = _nrl_fp32_lm_head_apply"""
+    old_snippet = """        logits = self.logits_processor(self.lm_head, hidden_states)
+        return logits"""
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if (
+            new_import_snippet in content
+            and new_lm_head_snippet in content
+            and new_logits_processor_snippet in content
+        ):
+            logger.info("NemotronH fp32 LM head patch already present.")
+            return True
+
+        if new_import_snippet not in content:
+            if old_fp32_import_snippet in content:
+                content = content.replace(
+                    old_fp32_import_snippet, new_import_snippet, 1
+                )
+            elif content.count(old_import_snippet) == 1:
+                content = content.replace(old_import_snippet, new_import_snippet, 1)
+            else:
+                logger.warning(
+                    "NemotronH fp32 LM head import anchor not found exactly once "
+                    "in %s; patch not applied.",
+                    file_to_patch,
+                )
+                return False
+
+        if new_lm_head_snippet not in content:
+            if content.count(old_lm_head_snippet) != 1:
+                logger.warning(
+                    "NemotronH fp32 LM head constructor anchor not found exactly "
+                    "once in %s; patch not applied.",
+                    file_to_patch,
+                )
+                return False
+            content = content.replace(old_lm_head_snippet, new_lm_head_snippet, 1)
+
+        if new_logits_processor_snippet not in content:
+            if content.count(old_logits_processor_snippet) != 1:
+                logger.warning(
+                    "NemotronH fp32 logits_processor anchor not found exactly once "
+                    "in %s; patch not applied.",
+                    file_to_patch,
+                )
+                return False
+            content = content.replace(
+                old_logits_processor_snippet, new_logits_processor_snippet, 1
+            )
+
+        if content.count(old_snippet) != 1:
+            logger.warning(
+                "NemotronH fp32 compute_logits anchor not found exactly once "
+                "in %s; patch not applied.",
+                file_to_patch,
+            )
+            return False
+        write_back(content)
+
+    logger.info("Applied NemotronH fp32 LM head source patch.")
+    return True
+
+
 def ensure_vllm_source_compat() -> None:
     """Apply interpreter-independent vLLM source-compat patches.
 
@@ -833,12 +984,22 @@ def _apply_vllm_patches(
     py_executable: str,
     *,
     extra_env_vars: list[str] | None = None,
+    nemotron_h_fp32_lm_head: bool | None = None,
 ) -> None:
     # Import lazily so importing the worker module does not import vLLM.
     import vllm.envs as envs
     from vllm.logger import init_logger
 
     patch_logger = init_logger("vllm_patch")
+    nemotron_h_fp32_lm_head_enabled = bool(nemotron_h_fp32_lm_head)
+    if nemotron_h_fp32_lm_head_enabled:
+        os.environ[VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR] = "1"
+        extra_env_vars = [
+            *(extra_env_vars or []),
+            VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
+        ]
+    else:
+        os.environ.pop(VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, None)
 
     # Whether the v1 patch matters at all depends on which executor vLLM will
     # select. 0.25 defaults this to "1" (RayExecutorV2), which has no
@@ -883,3 +1044,12 @@ def _apply_vllm_patches(
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
     _patch_vllm_minimax_m3_topk_buffer_layout(patch_logger)
+    if nemotron_h_fp32_lm_head_enabled and not _patch_vllm_nemotron_h_fp32_lm_head(
+        patch_logger
+    ):
+        raise RuntimeError(
+            "vllm_cfg.fp32_lm_head is enabled, but that flag currently maps to "
+            "the Nemotron-H-only vLLM fp32 LM head source patch, and the patch "
+            "could not be applied. Disable the flag or update the patch anchors "
+            "for this vLLM version."
+        )

@@ -119,7 +119,11 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     prepare_snapshot_paths,
     prune_bootstrap_snapshots,
 )
-from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
+from nemo_rl.algorithms.single_controller_utils.setup import (
+    SingleControllerActorArgs,
+    _maybe_restore_native_data_plane_checkpoint,
+    _register_single_controller_partitions,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
     apply_message_level_advantage_penalties,
@@ -130,7 +134,13 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
-from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
+from nemo_rl.data_plane import (
+    DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
+    KVBatchMeta,
+)
+from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
+    configure_checkpoint_workers,
+)
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.observability import (
     is_metrics_client,
@@ -165,7 +175,10 @@ from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.value.tq_value import TQValue
-from nemo_rl.utils.checkpoint import CheckpointManager, PathLike
+from nemo_rl.utils.checkpoint import (
+    CheckpointManager,
+    PathLike,
+)
 from nemo_rl.utils.logger import TELEMETRY_WALL_TIME_METRIC, Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
@@ -340,6 +353,62 @@ class SingleControllerActor:
             reference_logprobs_required=self._reference_logprobs_required,
         )
         self._dp_client = actor_args.dp_client
+        if master_config.data_plane["backend"] == "mooncake_cpu":
+            if actor_args.last_checkpoint_path is not None or (
+                master_config.checkpointing["enabled"]
+                and master_config.checkpointing.get("save_data_plane")
+            ):
+                checkpoint_workers = list(
+                    actor_args.trainer_handle.worker_group.workers
+                )
+                if actor_args.value_handle is not None:
+                    checkpoint_workers.extend(
+                        actor_args.value_handle.worker_group.workers
+                    )
+                for teacher in (actor_args.teacher_worker_groups or {}).values():
+                    checkpoint_workers.extend(teacher.worker_group.workers)
+                if master_config.token_capture.enabled:
+                    generation_workers = actor_args.gen_handle.worker_group
+                    checkpoint_workers.extend(
+                        generation_workers.workers[index]
+                        for index in generation_workers.dp_leader_worker_indices
+                    )
+                checkpoint_workers.extend(actor_args.finalizer_actors)
+                # Reuse existing actor RPCs. This actor's local store is handled
+                # directly: __init__ cannot service an RPC back to itself.
+                configure_checkpoint_workers(checkpoint_workers)
+            # actor_args is fully deserialized before __init__, so this process's
+            # Mooncake client and memory segment are attached. Teachers were
+            # attached during driver setup; restore now sees the full topology.
+            data_plane_load_started = time.monotonic()
+            data_plane_checkpoint_metadata = (
+                _maybe_restore_native_data_plane_checkpoint(
+                    load_checkpoint=self._dp_client.load_checkpoint,
+                    last_checkpoint_path=actor_args.last_checkpoint_path,
+                    save_state=actor_args.save_state,
+                    partition_id=self._partition_id,
+                    sampler_name=master_config.async_rl.sampler.name,
+                )
+            )
+            if actor_args.rollout_checkpoint_load_metrics is not None:
+                actor_args.rollout_checkpoint_load_metrics["tq_load_seconds"] = (
+                    time.monotonic() - data_plane_load_started
+                )
+            # A restored controller already contains the partition schema.
+            # Re-warming it with float32 placeholders conflicts with restored
+            # fields such as int64 input_ids. Fresh Mooncake runs still need
+            # the warm-up before concurrent producers start.
+            if data_plane_checkpoint_metadata is None:
+                _register_single_controller_partitions(
+                    self._dp_client,
+                    master_config=master_config,
+                    partition_id=self._partition_id,
+                    include_multimodal_fields=(
+                        actor_args.partition_includes_multimodal_fields
+                    ),
+                )
+        else:
+            data_plane_checkpoint_metadata = actor_args.data_plane_checkpoint_metadata
         self._gen: Generation = actor_args.gen_handle
         self._trainer: TQPolicy = actor_args.trainer_handle
         self._value: Optional[TQValue] = getattr(actor_args, "value_handle", None)
@@ -440,7 +509,7 @@ class SingleControllerActor:
         self._save_state: GRPOSaveState = actor_args.save_state
         self._last_checkpoint_path: Optional[str] = actor_args.last_checkpoint_path
         self._data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = (
-            actor_args.data_plane_checkpoint_metadata
+            data_plane_checkpoint_metadata
         )
         self._rollout_checkpoint_load_metrics = (
             actor_args.rollout_checkpoint_load_metrics
@@ -3061,6 +3130,7 @@ class SingleControllerActor:
                         await self._save_checkpoint(
                             step_metrics,
                             is_policy_training_step=is_policy_training_step,
+                            is_final_checkpoint=is_last_step,
                         )
                     if defer_refit_for_save:
                         # The save is done; wake the engine unless the loop is about to exit.
@@ -4374,12 +4444,14 @@ class SingleControllerActor:
         step_metrics: dict[str, Any],
         *,
         is_policy_training_step: bool,
+        is_final_checkpoint: bool,
     ) -> None:
         """Serialize full and rollout-only checkpoint publication."""
         async with self._checkpoint_save_lock:
             await self._save_checkpoint_impl(
                 step_metrics,
                 is_policy_training_step=is_policy_training_step,
+                is_final_checkpoint=is_final_checkpoint,
             )
 
     async def _save_checkpoint_impl(
@@ -4387,6 +4459,7 @@ class SingleControllerActor:
         step_metrics: dict[str, Any],
         *,
         is_policy_training_step: bool,
+        is_final_checkpoint: bool,
     ) -> None:
         """Write a full checkpoint for the just-finished train step.
 
@@ -4537,7 +4610,7 @@ class SingleControllerActor:
                 if self._checkpointer.save_optimizer
                 else None,
                 tokenizer_path=os.path.join(checkpoint_path, "value", "tokenizer"),
-                checkpointing_cfg=self._master_config.checkpointing,
+                is_final_checkpoint=is_final_checkpoint,
             )
             await asyncio.to_thread(self._value.finish_training)
             # Also covers a warmup step, which never ran prepare_for_training in
@@ -4558,7 +4631,7 @@ class SingleControllerActor:
             if self._checkpointer.save_optimizer and is_policy_training_step
             else None,
             tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
-            checkpointing_cfg=self._master_config.checkpointing,
+            is_final_checkpoint=is_final_checkpoint,
         )
 
         await asyncio.to_thread(

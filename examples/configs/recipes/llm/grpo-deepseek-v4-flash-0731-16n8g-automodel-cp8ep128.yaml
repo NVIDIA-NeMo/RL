@@ -31,7 +31,6 @@ checkpointing:
   keep_top_k: 1
   save_period: 2
   checkpoint_must_save_by: 00:03:45:00
-  model_save_format: null
 policy:
   model_name: deepseek-ai/DeepSeek-V4-Flash-0731
   refit_buffer_size_gb: 1
