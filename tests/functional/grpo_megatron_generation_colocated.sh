@@ -87,16 +87,27 @@ cleanup() {
         fi
 
         # gdb is absent from this image. Installing it now cannot change a crash
-        # that already happened, but it can move the libraries gdb resolves the
-        # core against, so hold libc and record whether that held.
-        if [[ ${#cores[@]} -gt 0 ]] && ! command -v gdb > /dev/null 2>&1; then
-            apt-mark hold libc6 libc-bin libc6-dev > "$DIAGNOSTIC_DIR/fx/apt-hold.log" 2>&1
-            apt-get update -qq && apt-get install -y -qq --no-install-recommends gdb
+        # that already happened, but it can move the libraries gdb would resolve
+        # the core against, so the hold is a precondition, not a best effort: if
+        # it does not take, skip the install and keep the core instead of
+        # producing a backtrace read against libraries the crash never used.
+        libc6_before_fx=$(dpkg-query -W -f='${Version}' libc6 2>/dev/null || printf unknown)
+        if [[ ${#cores[@]} -eq 0 ]]; then
+            printf 'gdb_install=skipped-no-core\n' >> "$DIAGNOSTIC_DIR/forensics.txt"
+        elif command -v gdb > /dev/null 2>&1; then
+            printf 'gdb_install=already-present\n' >> "$DIAGNOSTIC_DIR/forensics.txt"
+        elif ! apt-mark hold libc6 libc-bin libc6-dev > "$DIAGNOSTIC_DIR/fx/apt-hold.log" 2>&1; then
+            printf 'gdb_install=skipped-hold-failed\n' >> "$DIAGNOSTIC_DIR/forensics.txt"
+        else
+            {
+                apt-get update -qq && apt-get install -y -qq --no-install-recommends gdb
+            } > "$DIAGNOSTIC_DIR/fx/gdb-install.log" 2>&1
             apt-mark unhold libc6 libc-bin libc6-dev >> "$DIAGNOSTIC_DIR/fx/apt-hold.log" 2>&1
-        fi > "$DIAGNOSTIC_DIR/fx/gdb-install.log" 2>&1
-        printf 'gdb=%s libc6_after_install=%s\n' \
-            "$(command -v gdb || printf none)" \
-            "$(dpkg-query -W -f='${Version}' libc6 2>/dev/null || printf unknown)" \
+            printf 'gdb_install=attempted\n' >> "$DIAGNOSTIC_DIR/forensics.txt"
+        fi
+        libc6_after_fx=$(dpkg-query -W -f='${Version}' libc6 2>/dev/null || printf unknown)
+        printf 'gdb=%s libc6_before=%s libc6_after=%s\n' \
+            "$(command -v gdb || printf none)" "$libc6_before_fx" "$libc6_after_fx" \
             >> "$DIAGNOSTIC_DIR/forensics.txt"
 
         for c in "${cores[@]}"; do
@@ -108,16 +119,31 @@ cleanup() {
                 timeout 900 gdb -batch -q -ex 'thread apply all bt' -ex 'info sharedlibrary' \
                     "$PY_EXE_FX" "$c" > "$DIAGNOSTIC_DIR/fx/gdb-$base.txt" 2>&1 || gdb_rc=$?
             fi
-            if [[ "$gdb_rc" -eq 0 ]] && grep -q '^#0 ' "$DIAGNOSTIC_DIR/fx/gdb-$base.txt" 2>/dev/null; then
-                printf 'core_parsed=%s frames=yes\n' "$base" >> "$DIAGNOSTIC_DIR/forensics.txt"
+            # Frames alone do not make a backtrace trustworthy: gdb happily
+            # prints them after warning that the core and the binary or its
+            # shared libraries do not match, and those frames describe the wrong
+            # build. Treat any such warning, or a missing library map, the same
+            # as a failed parse -- keep the core and say why.
+            parse_note=""
+            if [[ "$gdb_rc" -ne 0 ]]; then
+                parse_note="gdb_rc=$gdb_rc"
+            elif ! grep -q '^#0 ' "$DIAGNOSTIC_DIR/fx/gdb-$base.txt" 2>/dev/null; then
+                parse_note="no-frames"
+            elif grep -qiE 'may not match|No shared library information|could not( be)? read' \
+                    "$DIAGNOSTIC_DIR/fx/gdb-$base.txt" 2>/dev/null; then
+                parse_note="binary-or-library-mismatch"
+            fi
+            if [[ -z "$parse_note" ]]; then
+                printf 'core_parsed=%s frames=yes verified=yes\n' "$base" \
+                    >> "$DIAGNOSTIC_DIR/forensics.txt"
             elif [[ "$(stat -c %s "$c")" -le 3000000000 ]]; then
-                printf 'core_parsed=%s frames=no gdb_rc=%s -- preserving raw core\n' \
-                    "$base" "$gdb_rc" >> "$DIAGNOSTIC_DIR/forensics.txt"
+                printf 'core_parsed=%s unreliable=%s -- preserving raw core\n' \
+                    "$base" "$parse_note" >> "$DIAGNOSTIC_DIR/forensics.txt"
                 cp -a "$c" "$DIAGNOSTIC_DIR/fx/" \
                     || printf 'core_preserve_FAILED=%s\n' "$base" >> "$DIAGNOSTIC_DIR/forensics.txt"
             else
-                printf 'core_parsed=%s frames=no gdb_rc=%s -- core too large to preserve (%s bytes)\n' \
-                    "$base" "$gdb_rc" "$(stat -c %s "$c")" >> "$DIAGNOSTIC_DIR/forensics.txt"
+                printf 'core_parsed=%s unreliable=%s -- core too large to preserve (%s bytes)\n' \
+                    "$base" "$parse_note" "$(stat -c %s "$c")" >> "$DIAGNOSTIC_DIR/forensics.txt"
             fi
         done
         dmesg > "$DIAGNOSTIC_DIR/fx/dmesg.txt" 2>&1
