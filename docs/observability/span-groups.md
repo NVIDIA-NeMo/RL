@@ -104,7 +104,7 @@ The controlling group is shown for each; a span is emitted whenever its group is
 | **RM** | `rl.rm.job`, `rl.rm.step`, `rl.rm.checkpointing`, `rl.rm.evaluate` |
 | **Distillation** | `rl.distillation.job`, `rl.distillation.step`, `rl.distillation.data_processing`, `rl.distillation.generation`, `rl.distillation.teacher_logprob_inference`, `rl.distillation.policy_training`, `rl.distillation.checkpointing`, `rl.distillation.evaluate` |
 | **SingleController** | `rl.sc.job`, `rl.sc.step`, `rl.sc.logprob_inference_prep`, `rl.sc.policy_and_reference_logprobs`, `rl.sc.value_inference_prep`, `rl.sc.value_inference`, `rl.sc.advantage_calculation`, `rl.sc.training_prep`, `rl.sc.policy_training`, `rl.sc.policy_optimizer_step`, `rl.sc.value_training`, `rl.sc.checkpointing` — opened inside the `SingleControllerActor`, which is where the run actually lives |
-| **SingleController** (rollout) | `rl.sc.generate_and_push` — `per_prompt` group (umbrella, so unbucketed), one span per dispatch attempt; and `idle/buffer_starvation` / `idle/refit_bubble` reusing async GRPO's `efficiency` category names |
+| **SingleController** (rollout) | `rl.sc.generate_and_push` — `per_prompt` group (umbrella, so unbucketed), one span per dispatch attempt; and `idle/buffer_starvation` / `idle/refit_bubble` reusing async GRPO's `efficiency` category names. `rl.idle.buffer_starvation` is one span per *wait*, not per poll — the pump retries every 5 ms, so a span per iteration would bury a startup stall under thousands of them; it carries `rl.idle.polls` |
 | **Transfer queue** | `rl.data_plane.<op>` — `data_plane` group, or `per_prompt` when the caller is a rollout; emitted wherever a data-plane client is built (SC actor, `TQPolicy` / `TQValue` workers) |
 | **NeMo-Gym** | `rl.gym.run_rollouts` — `rollout` group (umbrella, so unbucketed: batches overlap on the async path), one span per batch in the `NemoGym` actor, carrying `rl.gym.batch_size`; the HTTP calls Gym makes nest under it — see [NeMo-Gym spans](#nemo-gym-spans-cross-the-http-boundary) |
 | **vLLM** (driver-side) | `rl.vllm.generate`, `rl.vllm.generate_text` — `generation` group; nested under the active rollout span |
@@ -126,6 +126,7 @@ These are set on spans for filtering — they answer "which one?" / "what kind?"
 | `rl.weight_version` / `rl.target_weight_version` | async rollout batch: the weights it generated from, and the training step it targets |
 | `rl.num_prompt_groups` | async rollout batch width, so a gap-filling batch is not read as an unexplained speed-up |
 | `rl.gym.batch_size` | how many examples one `rl.gym.run_rollouts` span covers — the NeMo-Gym counterpart to `rl.num_prompt_groups` |
+| `rl.idle.polls` | how many retries one `rl.idle.buffer_starvation` span covers on the single-controller path, where the span is coalesced over a poll loop. Read it against the duration: the same ten seconds is two thousand clean 5 ms polls or two hundred polls whose selection ran long, which are opposite diagnoses |
 | `rl.rollout.attempt` | SingleController dispatch attempt: `0` is a first try, `> 0` a substitution after a skipped group, whose tokens were discarded |
 | `rl.target_step` | the training step an `rl.sc.generate_and_push` dispatch is aimed at; omitted when the dispatch is unstamped |
 | `rl.critic_epochs` | critic epochs covered by one `rl.sc.value_training` span |
@@ -206,6 +207,23 @@ Two driver-side phases are wired today, both children of `rl.grpo.step`:
 
 With these enabled, a step's child spans account for much more of the step
 duration, so a per-step goodput breakdown leaves a smaller unattributed gap.
+
+A wait implemented as a poll loop needs the other emitter,
+`start_efficiency_span`. `efficiency_span` is a context manager, so bracketing
+the sleep gives one span per iteration — on the single-controller pump, whose
+poll is 5 ms, a startup stall becomes thousands of identical spans. The
+hand-managed form opens the span on the first starved poll and ends it when the
+wait breaks, reporting the retry count as `rl.idle.polls`. It deliberately does
+not make the span current: held open across `await` points, a current span is
+copied into every task created during the wait, which would reparent unrelated
+rollout work under an idle span.
+
+Coalescing does mean the span covers the loop's own selection work, not just the
+sleeps. That is only sound because a *starved* poll never reaches the data
+plane — `evict()` returns early when nothing is stale, and `select()` gives up
+before claiming anything — so the span still has no bucketed children to be
+double-counted against. A wait whose retries do instrumented work cannot be
+coalesced this way.
 
 #### Why `idle/validation` is not a span
 
