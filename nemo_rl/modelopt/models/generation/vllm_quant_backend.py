@@ -485,7 +485,11 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         model = self.model_runner.model
         reload_roots = self._get_modelopt_reload_roots()
 
-        def finalize() -> None:
+        def finalize(finalize_draft: bool) -> None:
+            # Match the base lifecycle's finalize(finalize_draft) signature.
+            # finalize_draft can only be True when the manifest carries draft
+            # weights, and prepare_refit_info rejects those for real quant.
+            del finalize_draft
             try:
                 with torch.device(self.device):
                     _require_complete_modelopt_layerwise_reload(model)
@@ -532,6 +536,14 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         super()._synchronize_before_ipc_data_ack()
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+        # Reject before any weight moves: real-quant refits go through vLLM's
+        # layerwise reload, which has no drafter equivalent.
+        if self._is_real_quant_model() and any(
+            name.startswith("draft.") for name in state_dict_info
+        ):
+            raise RuntimeError(
+                "ModelOpt real-quant refit does not support draft finalization"
+            )
         super().prepare_refit_info(state_dict_info)
         if not self._is_real_quant_model():
             return
@@ -618,12 +630,19 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             for buf in attached:
                 del buf.weight_loader
 
-    def _load_weights(self, weights):
+    def _load_weights(self, weights, *, coverage=None):
         """Load pre-folded weights and activation-quantizer amax buffers.
 
         Weights arrive already folded from the Megatron side (weight_quantizer
         applied during export), so no fold_weight step is needed here.
+
+        ``coverage`` follows the base signature; the full delivered name set is
+        recorded here (real-quant deliberately filters some scale entries out
+        of the actual load, but they are still handled).
         """
+        if coverage is not None:
+            weights = list(weights)
+            coverage.record_loaded(tuple(name for name, _ in weights))
         if self._is_real_quant_model():
             weights = list(weights)
             source_storage_ptrs = {

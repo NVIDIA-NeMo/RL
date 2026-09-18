@@ -82,6 +82,30 @@ def test_check_nccl_reshard_refit_support_rejects_reload_api() -> None:
         check_nccl_reshard_refit_support(config)
 
 
+@pytest.mark.parametrize("method", ["eagle3", "dflash", "dspark"])
+def test_check_nccl_reshard_refit_support_rejects_draft_speculators(
+    method: str,
+) -> None:
+    """Co-trained drafters never reach process_weights_after_loading here."""
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_kwargs"] = {
+        "speculative_config": {"method": method}
+    }
+
+    with pytest.raises(ValueError, match="speculative_config.method"):
+        check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_accepts_mtp_speculator() -> None:
+    """MTP finalizes outside the draft manifest, so it stays supported."""
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_kwargs"] = {
+        "speculative_config": {"method": "mtp"}
+    }
+
+    check_nccl_reshard_refit_support(config)
+
+
 def test_check_nccl_reshard_refit_support_collects_without_vllm_cfg() -> None:
     config = _valid_nccl_reshard_config()
     config.policy["generation"]["backend"] = "sglang"
