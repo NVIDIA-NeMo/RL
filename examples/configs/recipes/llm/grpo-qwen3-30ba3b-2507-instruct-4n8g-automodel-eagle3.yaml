@@ -92,7 +92,13 @@ policy:
       backend:
         _target_: nemo_automodel.components.models.common.utils.BackendConfig
         experts: gmm
-        dispatcher: deepep
+        # HybridEP, not plain DeepEP: this container's deep_ep is built with
+        # HYBRID_EP_MULTINODE=1 (NVIDIA-NeMo/RL#4038); plain "deepep" hangs
+        # with "DeepEP error: timeout (dispatch CPU)" on this EP=32,
+        # 4-node/32-rank layout under the new deep_ep pin
+        # (NVIDIA-NeMo/RL#3436). NVIDIA-NeMo/RL#4037 will make this the
+        # repo-wide default for AutoModel MoE recipes once merged.
+        dispatcher: hybridep
         rope_fusion: false
         enable_hf_state_dict_adapter: true
   draft:
