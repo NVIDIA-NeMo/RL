@@ -21,5 +21,5 @@ PROJECT_ROOT=$(realpath "$SCRIPT_DIR/../..")
 
 NEMO_GYM_GRPO_CONFIG="$PROJECT_ROOT/examples/nemo_gym/grpo_sharded_gym_smoke.yaml" \
     bash "$SCRIPT_DIR/grpo_async_gym.sh" \
-    env.nemo_gym.placement_strategy=PACK \
+    +env.nemo_gym.placement_strategy=PACK \
     "$@"
