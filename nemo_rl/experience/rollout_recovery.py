@@ -30,12 +30,16 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Optional, Self, TypeAlias
 
+from nemo_rl.experience.cc_media import SegmentMedia
+from nemo_rl.experience.rollout_reassembler import ActionOutputFlags, SegmentReceipt
+from nemo_rl.experience.rollout_reassembler_actor import assert_metadata_only
+
 if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 2
-_SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {ROLLOUT_RECOVERY_SCHEMA_VERSION}
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 3
+SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {2, ROLLOUT_RECOVERY_SCHEMA_VERSION}
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
 
@@ -73,6 +77,7 @@ _ATTEMPT_STATE_FIELDS = frozenset(
         "reward",
         "mask_sample",
         "staging_keys",
+        "logical_segments",
     }
 )
 
@@ -178,6 +183,7 @@ class RolloutAttemptRecord:
     reward: Optional[float] = None
     mask_sample: Optional[bool] = None
     staging_keys: list[str] = field(default_factory=list)
+    logical_segments: tuple[SegmentReceipt, ...] | None = None
 
     @property
     def attempt_id(self) -> str:
@@ -282,6 +288,7 @@ class SiblingSealResult:
     receipt: Optional[dict[str, Any]]
     reward: float
     mask_sample: bool
+    logical_segments: tuple[SegmentReceipt, ...] | None = None
 
 
 def _new_attempt() -> RolloutAttemptRecord:
@@ -307,6 +314,69 @@ def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
             )
         staging_keys.append(entry["staging_key"])
     return staging_keys
+
+
+def _attempt_staging_keys(
+    gate_id: str,
+    receipt: dict[str, Any] | None,
+    segments: tuple[SegmentReceipt, ...] | None,
+) -> list[str]:
+    """Validate attempt custody, leaving token/chain proofs to the finalizer."""
+    if segments is None:
+        if receipt is not None and receipt.get("rollout_id") != gate_id:
+            raise ValueError("sealed receipt identity mismatch")
+        return _receipt_staging_keys(receipt)
+    if receipt is not None or not segments:
+        raise ValueError("CC recovery requires segments instead of an ordinary receipt")
+    assert_metadata_only(segments, path="recovery.logical_segments")
+    keys = []
+    for index, segment in enumerate(segments):
+        capture_id = f"{gate_id}_s{index}"
+        if segment.capture_rollout_id != capture_id:
+            raise ValueError("CC recovery segment identity mismatch")
+        if (
+            segment.receipt is not None
+            and segment.receipt.get("rollout_id") != capture_id
+        ):
+            raise ValueError("CC recovery receipt identity mismatch")
+        keys.extend(_receipt_staging_keys(segment.receipt))
+        # Retry cleanup can run before finalization; prove key ownership now.
+        for entry in (segment.receipt or {}).get("manifest", []):
+            call_id = entry.get("model_call_id")
+            if (
+                not isinstance(call_id, str)
+                or not call_id
+                or entry["staging_key"] != f"{capture_id}/{call_id}"
+            ):
+                raise ValueError("CC recovery has foreign staging ownership")
+    if len(keys) != len(set(keys)):
+        raise ValueError("CC recovery has duplicate staging ownership")
+    return keys
+
+
+def _segments_from_state(raw: Any) -> tuple[SegmentReceipt, ...] | None:
+    """Rebuild existing descriptors from weights-only-loadable primitive fields."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("CC recovery logical_segments must be a nonempty list")
+    segments = []
+    for item in raw:
+        if not isinstance(item, dict) or set(item) != {
+            field.name for field in dataclasses.fields(SegmentReceipt)
+        }:
+            raise ValueError("CC recovery segment must contain every descriptor field")
+        values = copy.deepcopy(item)
+        media = values.get("media")
+        flags = values.get("action_flags")
+        values["media"] = SegmentMedia(**media) if media is not None else None
+        values["action_flags"] = (
+            tuple(ActionOutputFlags(**flag) for flag in flags)
+            if flags is not None
+            else None
+        )
+        segments.append(SegmentReceipt(**values))
+    return tuple(segments)
 
 
 class RolloutRecoveryLedger:
@@ -447,7 +517,9 @@ class RolloutRecoveryLedger:
             attempt = sibling.current_attempt
             attempt.status = RolloutAttemptStatus.ABANDONED
             attempt.receipt = None
+            attempt.logical_segments = None
             attempt.reward = None
+            attempt.mask_sample = None
             attempt.staging_keys.clear()
         record.status = PromptGroupStatus.GENERATING
 
@@ -578,6 +650,7 @@ class RolloutRecoveryLedger:
         receipt: Optional[dict[str, Any]],
         reward: float,
         mask_sample: bool,
+        logical_segments: tuple[SegmentReceipt, ...] | None = None,
     ) -> None:
         """Record one streamed sibling receipt as soon as the row arrives."""
         cut.require_live()
@@ -587,7 +660,7 @@ class RolloutRecoveryLedger:
         sibling = self._require_sibling(record, generation_index)
         attempt = sibling.current_attempt
         expected_gate_rollout_id = record.gate_rollout_id(generation_index)
-        staging_keys = _receipt_staging_keys(receipt)
+        staging_keys = _attempt_staging_keys(gate_rollout_id, receipt, logical_segments)
         if not isinstance(mask_sample, bool):
             raise TypeError("mask_sample must be a bool")
         if gate_rollout_id != expected_gate_rollout_id:
@@ -603,6 +676,7 @@ class RolloutRecoveryLedger:
         if attempt.status == RolloutAttemptStatus.SEALED:
             if (
                 attempt.receipt == receipt
+                and attempt.logical_segments == logical_segments
                 and attempt.reward == float(reward)
                 and attempt.mask_sample is mask_sample
                 and attempt.staging_keys == staging_keys
@@ -620,6 +694,7 @@ class RolloutRecoveryLedger:
             )
 
         attempt.receipt = copy.deepcopy(receipt)
+        attempt.logical_segments = copy.deepcopy(logical_segments)
         attempt.reward = float(reward)
         attempt.mask_sample = mask_sample
         attempt.staging_keys = staging_keys
@@ -683,12 +758,21 @@ class RolloutRecoveryLedger:
                 )
             if not isinstance(result.mask_sample, bool):
                 raise TypeError("mask_sample must be a bool")
-            validated.append((attempt, result, _receipt_staging_keys(result.receipt)))
+            validated.append(
+                (
+                    attempt,
+                    result,
+                    _attempt_staging_keys(
+                        result.gate_rollout_id, result.receipt, result.logical_segments
+                    ),
+                )
+            )
 
         # Validate the complete cohort before changing any sibling. A checkpoint
         # therefore observes either no committed siblings or the complete group.
         for attempt, result, staging_keys in validated:
             attempt.receipt = copy.deepcopy(result.receipt)
+            attempt.logical_segments = copy.deepcopy(result.logical_segments)
             attempt.reward = float(result.reward)
             attempt.mask_sample = result.mask_sample
             attempt.staging_keys = staging_keys
@@ -867,6 +951,14 @@ class RolloutRecoveryLedger:
                                     "reward": attempt.reward,
                                     "mask_sample": attempt.mask_sample,
                                     "staging_keys": list(attempt.staging_keys),
+                                    "logical_segments": (
+                                        [
+                                            dataclasses.asdict(segment)
+                                            for segment in attempt.logical_segments
+                                        ]
+                                        if attempt.logical_segments is not None
+                                        else None
+                                    ),
                                 }
                                 for attempt in sibling.attempts
                             ],
@@ -897,7 +989,7 @@ class RolloutRecoveryLedger:
         if (
             isinstance(schema_version, bool)
             or not isinstance(schema_version, int)
-            or schema_version not in _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
+            or schema_version not in SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
         ):
             raise ValueError(
                 f"Unsupported rollout-recovery schema version: {schema_version!r}"
@@ -912,6 +1004,7 @@ class RolloutRecoveryLedger:
             record = cls._group_from_state(
                 raw_group,
                 seen_attempt_uuids=seen_attempt_uuids,
+                schema_version=schema_version,
             )
             if record.group_id in ledger._groups:
                 raise ValueError(f"duplicate recovery group_id={record.group_id!r}")
@@ -948,6 +1041,7 @@ class RolloutRecoveryLedger:
         raw_group: Any,
         *,
         seen_attempt_uuids: set[uuid.UUID],
+        schema_version: int,
     ) -> PromptGroupRecoveryRecord:
         if not isinstance(raw_group, dict):
             raise ValueError("rollout-recovery group must be a mapping")
@@ -1051,6 +1145,11 @@ class RolloutRecoveryLedger:
                         f"invalid rollout attempt status={raw_attempt_status!r}"
                     ) from error
                 receipt = attempt_state.get("receipt")
+                if schema_version >= 3 and "logical_segments" not in attempt_state:
+                    raise ValueError("recovery attempt is missing logical_segments")
+                segments = _segments_from_state(attempt_state.get("logical_segments"))
+                if schema_version < 3 and segments is not None:
+                    raise ValueError("CC recovery requires schema version 3")
                 reward = attempt_state.get("reward")
                 mask_sample = attempt_state.get("mask_sample")
                 staging_keys = attempt_state.get("staging_keys")
@@ -1065,22 +1164,18 @@ class RolloutRecoveryLedger:
                         raise ValueError(
                             "sealed attempts require a boolean mask_sample"
                         )
-                    if receipt is None:
-                        if staging_keys:
-                            raise ValueError(
-                                "sealed missing-receipt attempt cannot own staging keys"
-                            )
-                    elif isinstance(receipt, dict):
-                        if receipt.get("rollout_id") != gate_id:
-                            raise ValueError("sealed receipt identity mismatch")
-                        if _receipt_staging_keys(receipt) != staging_keys:
-                            raise ValueError("sealed receipt staging manifest mismatch")
-                    else:
+                    if receipt is not None and not isinstance(receipt, dict):
                         raise ValueError(
                             "sealed attempt receipt must be a mapping or None"
                         )
+                    if (
+                        _attempt_staging_keys(gate_id, receipt, segments)
+                        != staging_keys
+                    ):
+                        raise ValueError("sealed receipt staging manifest mismatch")
                 elif (
                     receipt is not None
+                    or segments is not None
                     or reward is not None
                     or mask_sample is not None
                     or staging_keys
@@ -1091,6 +1186,7 @@ class RolloutRecoveryLedger:
                         attempt_uuid=attempt_uuid,
                         status=attempt_status,
                         receipt=copy.deepcopy(receipt),
+                        logical_segments=segments,
                         reward=float(reward) if reward is not None else None,
                         mask_sample=mask_sample,
                         staging_keys=list(staging_keys),
@@ -1251,12 +1347,12 @@ def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
     if (
         isinstance(schema_version, bool)
         or not isinstance(schema_version, int)
-        or schema_version not in _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
+        or schema_version not in SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
     ):
         raise ValueError(
             "unsupported rollout recovery schema_version="
             f"{schema_version!r}; supported versions are "
-            f"{sorted(_SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS)}"
+            f"{sorted(SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS)}"
         )
     groups = state.get("groups")
     if not isinstance(groups, list):

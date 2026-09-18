@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
+from tensordict import TensorDict
 
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
@@ -237,10 +238,12 @@ def test_twenty_turn_shared_client_to_replay_and_advantages(
     asyncio.run(exercise())
 
 
-def test_mixed_cc_snapshot_preserves_rows_but_replay_restore_is_unsupported(
+@pytest.mark.parametrize("mask_all", [False, True])
+def test_mixed_cc_snapshot_restores_segmented_replay_and_owner_advantages(
     pipeline: tuple,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    mask_all: bool,
 ) -> None:
     harness, plane, finalizer = pipeline
     healthy = [capture_segment(harness, f"group_g0_s{i}") for i in range(3)]
@@ -249,6 +252,17 @@ def test_mixed_cc_snapshot_preserves_rows_but_replay_restore_is_unsupported(
     result = finalize(finalizer, [healthy, [failed]], execution_row_multiple=3)
     meta = result.meta
     assert meta.size == 6
+    if mask_all:
+        # A structurally sound group can be fully loss-filtered after capture.
+        # This is distinct from an all-invalid finalization with no input layout.
+        plane.put_samples(
+            sample_ids=meta.sample_ids,
+            partition_id="train",
+            fields=TensorDict(
+                {"mask_sample": torch.ones(meta.size, dtype=torch.bool)},
+                batch_size=[meta.size],
+            ),
+        )
 
     async def exercise() -> None:
         ctrl = await ready_controller(monkeypatch, plane, meta)
@@ -282,19 +296,36 @@ def test_mixed_cc_snapshot_preserves_rows_but_replay_restore_is_unsupported(
             pad_value_dict={"token_ids": 0},
             include_message_violation_fields=False,
         )
-        # Do not lie about the logical group size (2) to make six physical rows load.
-        with pytest.raises(ValueError, match="expected_group_size=2"):
-            await restored_buffer.load_state_dict(
-                state,
-                max_groups=1,
-                expected_partition_id="train",
-                expected_group_size=2,
-                expected_manifest_digest=native_metadata["manifest_digest"],
-            )
-        assert restored_buffer.meta_list == []
+        # Two logical owners, six physical rows, and capacity for one group.
+        count = await restored_buffer.load_state_dict(
+            state,
+            max_groups=1,
+            expected_partition_id="train",
+            expected_group_size=2,
+            expected_manifest_digest=native_metadata["manifest_digest"],
+        )
+        assert count == restored_buffer.size() == 1
+        assert restored_buffer.meta_list == [restored_meta]
+        assert restored_buffer.target_step_list == ctrl._buffer.target_step_list
+        assert restored_buffer.start_weight_list == ctrl._buffer.start_weight_list
+        assert restored_buffer.end_weight_list == ctrl._buffer.end_weight_list
         assert sorted(restored_plane.list_sample_ids("train")) == sorted(
             meta.sample_ids
         )
+        restored_ctrl = await ready_controller(
+            monkeypatch, restored_plane, restored_meta
+        )
+        await ctrl._advantage_stage(meta)
+        await restored_ctrl._advantage_stage(restored_meta)
+        for field in ("advantages", "sample_mask"):
+            original = plane.get_samples(meta.sample_ids, "train", [field])[field]
+            restored = restored_plane.get_samples(meta.sample_ids, "train", [field])[
+                field
+            ]
+            for left, right in zip(original.unbind(), restored.unbind(), strict=True):
+                torch.testing.assert_close(left, right, rtol=0, atol=0)
+                if mask_all:
+                    assert right.count_nonzero() == 0
         restored_plane.close()
 
     asyncio.run(exercise())

@@ -11,11 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import __future__
 import ast
 import asyncio
 import os
 import tempfile
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -1153,9 +1155,9 @@ def test_megatron_refit_bridge_tasks_export_logical_quantized_weights(
     logical_weight = torch.arange(8, dtype=torch.bfloat16).reshape(4, 2)
     bf16_source = torch.ones((2, 2), dtype=torch.bfloat16)
     dequantize = MagicMock(
-        side_effect=lambda tensor: logical_weight
-        if tensor is quantized_source
-        else tensor
+        side_effect=lambda tensor: (
+            logical_weight if tensor is quantized_source else tensor
+        )
     )
     monkeypatch.setattr(
         worker_module,
@@ -1843,6 +1845,128 @@ def test_disable_forward_pre_hook_until_next_step_uses_worker_override(
     assert worker._first_train_step_param_sync_func == "sync"
     assert model_config.param_sync_func is None
     assert worker._first_train_step_forward_pre_hook_disabled is True
+
+
+@pytest.mark.parametrize("init_reference_model", [False, True])
+@pytest.mark.parametrize(
+    ("load_rng", "finetune", "optimizer_path"),
+    [
+        (False, False, None),
+        (True, False, None),
+        (True, False, "optimizer"),
+        (True, True, None),
+    ],
+    ids=["fresh", "weights-only-resume", "full-resume", "finetune"],
+)
+def test_worker_initialization_preserves_only_restored_rng(
+    monkeypatch: pytest.MonkeyPatch,
+    load_rng: bool,
+    finetune: bool,
+    optimizer_path: str | None,
+    init_reference_model: bool,
+) -> None:
+    # Execute the complete production constructor without importing the optional
+    # GPU stack, as in the method-level CPU test above. Only its boundaries are
+    # doubled; the preservation condition and reference/finalizer order are real.
+    source_path = (
+        Path(__file__).parents[4]
+        / "nemo_rl/models/policy/workers/megatron_policy_worker.py"
+    )
+    tree = ast.parse(source_path.read_text())
+    method = next(
+        node
+        for cls in tree.body
+        if isinstance(cls, ast.ClassDef) and cls.name == "MegatronPolicyWorkerImpl"
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    namespace = {
+        name: MagicMock(return_value=None)
+        for name in (
+            "log_gpu_memory_diagnostics",
+            "apply_transformer_engine_patch",
+            "init_telemetry_worker",
+            "router_replay_enabled",
+            "maybe_preinit_nixl_checkpoint_engine",
+            "Timer",
+            "setup_distributed",
+            "handle_model_import",
+            "validate_megatron_config",
+            "_model_self_packs_for_cp",
+            "_model_self_packs_mtp_loss_mask",
+            "_model_slices_context_parallel_inputs",
+            "_model_accepts_media_token_validity_mask",
+            "_reserved_http_server_port_for_rank",
+        )
+    }
+    runtime = MagicMock()
+    runtime.megatron_cfg.checkpoint = SimpleNamespace(
+        load_rng=load_rng, finetune=finetune
+    )
+    components = MagicMock(param_sync_func=None)
+
+    def reference(*_args: object, **_kwargs: object) -> dict:
+        torch.rand(3)
+        return {}
+
+    def finalize(*_args: object) -> tuple:
+        torch.rand(5)
+        return None, None, False, 1
+
+    # The existing Bridge helper is separately qualified natively. This CPU
+    # double tests whether the worker places its RNG-consuming setup inside it.
+    preserve_rng = MagicMock(side_effect=lambda: torch.random.fork_rng(devices=[]))
+    namespace.update(
+        torch=torch,
+        os=os,
+        ray=SimpleNamespace(get_gpu_ids=lambda: [0]),
+        nullcontext=nullcontext,
+        _preserve_rng_state=preserve_rng,
+        get_rank_safe=lambda: 0,
+        validate_model_paths=lambda _: ("model", "pretrained", True),
+        validate_and_set_config=MagicMock(return_value=runtime),
+        setup_model_and_optimizer=MagicMock(return_value=components),
+        setup_reference_model_state=MagicMock(side_effect=reference),
+        finalize_megatron_setup=MagicMock(side_effect=finalize),
+    )
+    exec(
+        compile(
+            ast.Module(body=[method], type_ignores=[]),
+            str(source_path),
+            "exec",
+            flags=__future__.annotations.compiler_flag,
+        ),
+        namespace,
+    )
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("NRL_DISABLE_NUMA_BINDING", "1")
+    monkeypatch.setattr(torch.cuda, "set_device", lambda _: None)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    worker = MagicMock()
+    with torch.random.fork_rng(devices=[]):
+        torch.set_rng_state(torch.Generator().manual_seed(123).get_state())
+        before = torch.get_rng_state().clone()
+        if init_reference_model:
+            torch.rand(3)
+        torch.rand(5)
+        consumed = torch.get_rng_state().clone()
+        torch.set_rng_state(before)
+        namespace["__init__"](
+            worker,
+            {"megatron_cfg": {}},
+            SimpleNamespace(pad_token="pad"),
+            weights_path="weights" if load_rng else None,
+            optimizer_path=optimizer_path,
+            init_reference_model=init_reference_model,
+            worker_sharding_annotations=None,
+        )
+        restored = load_rng and not finetune
+        assert torch.equal(torch.get_rng_state(), before if restored else consumed)
+    assert preserve_rng.call_count == int(restored)
+    assert namespace["setup_reference_model_state"].call_count == int(
+        init_reference_model
+    )
+    namespace["finalize_megatron_setup"].assert_called_once()
 
 
 @pytest.mark.parametrize("update_successful", [False, True])
@@ -3163,7 +3287,7 @@ def test_megatron_checkpoint_save_kill_and_restore(
                 tokenizer=tokenizer,
                 weights_path=weights_path,  # This should trigger checkpoint loading
                 optimizer_path=optimizer_path,
-                init_reference_model=False,
+                init_reference_model=True,
             )
 
             # Get logprobs from restored policy (should match the saved state)
@@ -3187,58 +3311,9 @@ def test_megatron_checkpoint_save_kill_and_restore(
             ).item()
             print(f"Max difference: {max_diff}, Mean difference: {mean_diff}")
 
-            if logprobs_match:
-                print(
-                    "✓ SUCCESS: Checkpoint loading works! Model state was restored correctly."
-                )
-            else:
-                print(
-                    "⚠ WARNING: Checkpoint may not have loaded correctly. Difference too large."
-                )
-                print("This could indicate:")
-                print("1. Checkpoint loading is not implemented for runtime loading")
-                print("2. Checkpoint loading only works during initial model setup")
-                print("3. The checkpoint format or loading logic needs adjustment")
-
-                # But still verify the checkpoint structure is valid
-                iter_dirs = [
-                    d for d in os.listdir(checkpoint_dir) if d.startswith("iter_")
-                ]
-                latest_iter_dir = os.path.join(checkpoint_dir, sorted(iter_dirs)[-1])
-                iter_contents = os.listdir(latest_iter_dir)
-
-                print("\nCheckpoint structure verification:")
-                print(f"  - Checkpoint dir exists: {os.path.exists(checkpoint_dir)}")
-                print(f"  - Iteration dirs: {iter_dirs}")
-                print(f"  - Latest iter contents: {iter_contents}")
-
-                expected_checkpoint_files = ["common.pt"]
-                for expected_file in expected_checkpoint_files:
-                    file_exists = any(expected_file in f for f in iter_contents)
-                    print(f"  - Expected file '{expected_file}' exists: {file_exists}")
-                    assert file_exists, (
-                        f"Required checkpoint file {expected_file} not found"
-                    )
-
-                total_checkpoint_size = sum(
-                    os.path.getsize(os.path.join(latest_iter_dir, f))
-                    for f in iter_contents
-                    if os.path.isfile(os.path.join(latest_iter_dir, f))
-                )
-                print(f"  - Total checkpoint size: {total_checkpoint_size} bytes")
-                assert total_checkpoint_size > 1024, "Checkpoint appears too small"
-
-            print("\n=== VERIFICATION COMPLETE ===")
-            print("✓ Checkpoint save functionality works correctly")
-            print("✓ Checkpoint structure is valid for restoration")
-            print("✓ Worker shutdown and restart works")
-            print("✓ Fresh worker has different parameters (proving no auto-load)")
-            if logprobs_match:
-                print("✓ Checkpoint loading works and restores correct model state")
-            else:
-                print(
-                    "✓ Checkpoint infrastructure is in place (loading may need implementation)"
-                )
+            torch.testing.assert_close(
+                logprobs_restored, logprobs_before_save, rtol=1e-5, atol=1e-4
+            )
 
         finally:
             # Step 4: Cleanup

@@ -92,6 +92,7 @@ RolloutCompletionCallback = Callable[[int, Completion], Awaitable[None]]
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
+    from nemo_rl.experience.rollout_reassembler import SegmentReceipt
     from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 
 
@@ -2113,8 +2114,6 @@ class RolloutManager:
                     inflight_registry=inflight_registry,
                 )
             except Exception as error:
-                if self._context_compaction:
-                    raise
                 reason = type(error).__name__
                 if classify_rollout_failure(error) is FailureClass.INFRA:
                     infra_attempts += 1
@@ -2204,9 +2203,6 @@ class RolloutManager:
             rollout_ids=list(rollout_ids),
         )
         pending_group_results: dict[int, SiblingSealResult] = {}
-        # CC does not retry or checkpoint; keep segment metadata in this request
-        # while the existing ledger tracks sibling completion and publication.
-        cc_segments = {}
 
         async def _record_streamed_completion(
             generation_index: int, completion: Completion
@@ -2219,16 +2215,12 @@ class RolloutManager:
             if "ng_receipt" not in env_extras:
                 raise ValueError("token-capture completion must contain ng_receipt")
             receipt = env_extras["ng_receipt"]
+            segments = None
             if self._context_compaction:
                 segments = env_extras.get("ng_logical_segments")
                 if not segments:
                     raise ValueError("CC completion must contain logical segments")
-                if (
-                    generation_index in cc_segments
-                    and cc_segments[generation_index] != segments
-                ):
-                    raise ValueError("conflicting duplicate CC completion")
-                cc_segments[generation_index] = segments
+                segments = tuple(segments)
             gate_rollout_id = env_extras.get("ng_rollout_id")
             if receipt is not None and not isinstance(receipt, dict):
                 raise ValueError(
@@ -2270,6 +2262,7 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    logical_segments=segments,
                 )
                 previous = pending_group_results.get(generation_index)
                 if previous is not None:
@@ -2299,6 +2292,7 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    logical_segments=segments,
                 )
 
         try:
@@ -2331,6 +2325,16 @@ class RolloutManager:
                 rewards,
                 mask_sample,
             ) = self._recovery_ledger.finalization_inputs(group_id)
+            logical_segments = None
+            if self._context_compaction:
+                sealed = self._recovery_ledger.get_group(group_id)
+                selections: list[tuple[SegmentReceipt, ...]] = []
+                for sibling in sealed.siblings:
+                    segments = sibling.current_attempt.logical_segments
+                    if segments is None:
+                        raise ValueError("CC recovery is missing logical segments")
+                    selections.append(segments)
+                logical_segments = tuple(selections)
             request = ReassemblyRequest(
                 group_id=group_id,
                 rollout_ids=tuple(physical_rollout_ids),
@@ -2341,11 +2345,7 @@ class RolloutManager:
                 prompt_idx=int(recovery_group.prompt_id),
                 mask_sample=tuple(mask_sample),
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
-                logical_segments=(
-                    tuple(cc_segments[i] for i in range(len(rollout_ids)))
-                    if self._context_compaction
-                    else None
-                ),
+                logical_segments=logical_segments,
                 execution_row_multiple=self._execution_row_multiple,
             )
             from nemo_rl.experience.rollout_reassembler_actor import (

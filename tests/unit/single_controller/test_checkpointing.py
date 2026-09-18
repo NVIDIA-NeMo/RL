@@ -58,6 +58,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     REPLAY_BUFFER_METADATA_STORAGE,
     DataPlaneCheckpointBarrier,
     DataPlaneCheckpointMetadata,
+    TQReplayBuffer,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
@@ -114,6 +115,11 @@ from nemo_rl.utils.checkpoint import CheckpointManager
 from tests.unit.single_controller.test_setup import (
     patched_factories,  # noqa: F401
 )
+from tests.unit.single_controller.test_tq_replay_buffer import (
+    _make_cc_group_entry,
+    _make_metadata_envelope,
+)
+from tests.unit.experience.test_rollout_recovery import _cc_sealed_ledger
 
 # Instantiate the underlying class in-process (same pattern as
 # tests/unit/algorithms/test_async_utils.py for AsyncTrajectoryCollector).
@@ -1264,6 +1270,94 @@ class TestSaveTrigger:
 
 
 class TestPeriodicRolloutCheckpoint:
+    @pytest.mark.parametrize("anchor_step", [0, 1])
+    @pytest.mark.parametrize("claimed", [False, True])
+    def test_cc_snapshot_preserves_buffered_and_training_owned_rows(
+        self, tmp_path: Path, anchor_step: int, claimed: bool
+    ) -> None:
+        actor = self._actor(tmp_path)
+        actor._master_config.token_capture.context_compaction = True
+        actor._master_config.async_rl.sampler = InOrderSamplerConfig(
+            max_lookahead_versions=0
+        )
+        actor._buffer = TQReplayBuffer(
+            actor._dp_client,
+            _PARTITION_ID,
+            pad_value_dict={},
+            include_message_violation_fields=False,
+        )
+        actor._buffer.set_data_plane_checkpoint_barrier(
+            actor._data_plane_checkpoint_barrier
+        )
+        group = _make_cc_group_entry("claimed-group", [2, 1])
+        group.update(
+            start_weight=anchor_step, end_weight=anchor_step, target_step=anchor_step
+        )
+        group["meta"].partition_id = _PARTITION_ID
+        state = _make_metadata_envelope(
+            [group], partition_id=_PARTITION_ID, saved_capacity=4
+        )
+
+        async def exercise() -> None:
+            if anchor_step:
+                actor._train_steps = actor._trainer_version = anchor_step
+                await actor._save_checkpoint({}, is_policy_training_step=True)
+            await actor._buffer.load_state_dict(
+                state,
+                max_groups=4,
+                expected_partition_id=_PARTITION_ID,
+                expected_group_size=2,
+                expected_manifest_digest=state["manifest_digest"],
+            )
+            actor._dp_client.sample_ids = list(group["meta"].sample_ids)
+            if claimed:
+                assert await actor._buffer.claim_for_training([0]) == 1
+            assert await actor._save_rollout_checkpoint(force=True)
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            actor._checkpointer.shutdown()
+        anchor = BOOTSTRAP_DIRNAME if anchor_step == 0 else f"step_{anchor_step}"
+        snapshot = (
+            tmp_path / "checkpoints" / anchor / "rollout_snapshots" / "snapshot_000001"
+        )
+        manifest = json.loads(
+            (snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).read_text()
+        )
+        assert manifest["rolled_back_train_group_count"] == int(claimed)
+        assert torch.load(snapshot / "replacement_reserve.pt", weights_only=True) == []
+        restored_state = torch.load(
+            snapshot / REPLAY_BUFFER_METADATA_FILENAME, weights_only=False
+        )
+        metadata = json.loads((snapshot / "data_plane" / "metadata.json").read_text())[
+            "user_metadata"
+        ]
+        restored = TQReplayBuffer(
+            actor._dp_client,
+            _PARTITION_ID,
+            pad_value_dict={},
+            include_message_violation_fields=False,
+        )
+        assert (
+            asyncio.run(
+                restored.load_state_dict(
+                    restored_state,
+                    max_groups=4,
+                    expected_partition_id=_PARTITION_ID,
+                    expected_group_size=2,
+                    expected_manifest_digest=metadata["replay_manifest_digest"],
+                )
+            )
+            == 1
+        )
+        assert restored.meta_list == [group["meta"]]
+        assert restored.target_step_list == [anchor_step]
+        assert restored.start_weight_list == restored.end_weight_list == [anchor_step]
+        assert actor._buffer.training_owned_group_ids() == (
+            {"claimed-group"} if claimed else set()
+        )
+
     def test_restore_mode_rejects_removed_none_value(self):
         with pytest.raises(ValidationError, match="restore_mode"):
             RolloutCheckpointConfig.model_validate({"restore_mode": "none"})
@@ -1474,6 +1568,60 @@ class TestPeriodicRolloutCheckpoint:
 
 
 class TestDataPlaneCheckpoint:
+    @pytest.mark.parametrize(
+        "damage", [None, "missing_key", "missing_segments", "mode", "schema"]
+    )
+    def test_cc_recovery_validates_before_staging_cleanup(
+        self, tmp_path: Path, damage: str | None
+    ) -> None:
+        ledger = _cc_sealed_ledger()
+        keys = sorted(ledger.expected_staging_keys()) + ["orphan"]
+        state = ledger.state_dict()
+        attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+        if damage == "missing_segments":
+            attempt["logical_segments"] = None
+            attempt["staging_keys"] = []
+        recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
+        torch.save(state, recovery_path)
+        if damage == "missing_key":
+            keys.pop(0)
+        dp = _StagingInventoryDPClient(keys, partition_id=_STAGING_PARTITION_ID)
+        actor = _ACTOR_CLS(
+            _actor_master_config(tmp_path, token_capture_enabled=True),
+            _make_actor_args(
+                dp_client=dp,
+                last_checkpoint_path=str(tmp_path),
+                data_plane_checkpoint_metadata={
+                    "rollout_recovery_schema_version": 2 if damage == "schema" else 3,
+                    "rollout_recovery_payload_sha256": hashlib.sha256(
+                        recovery_path.read_bytes()
+                    ).hexdigest(),
+                    "rollout_recovery_group_count": 1,
+                },
+            ),
+            SetupTimingMetrics(),
+        )
+        actor._master_config.token_capture.context_compaction = damage != "mode"
+        actor._dataloader = SimpleNamespace(dataset={7: {"idx": 7}})
+        try:
+            if damage is not None:
+                with pytest.raises((ValueError, RuntimeError)):
+                    asyncio.run(
+                        actor._maybe_restore_rollout_recovery(restored_replay_groups=0)
+                    )
+                assert dp.clear_calls == []
+            else:
+                asyncio.run(
+                    actor._maybe_restore_rollout_recovery(restored_replay_groups=0)
+                )
+                assert dp.clear_calls == [(["orphan"], _STAGING_PARTITION_ID)]
+                restored = actor._rollout_recovery_ledger.get_group("g7")
+                assert restored.siblings[0].current_attempt.logical_segments is not None
+                assert restored.siblings[1].current_attempt.status.value == "abandoned"
+                assert restored.prompt_payload == {"idx": 7}
+        finally:
+            actor._checkpointer.shutdown()
+
     def test_metadata_uses_explicit_snapshot_identity(self, tmp_path):
         mc = _actor_master_config(
             tmp_path,
@@ -2829,6 +2977,25 @@ class TestReplayBufferPersistence:
 
 
 class TestReplacementReservePersistence:
+    @pytest.mark.parametrize("schema", [2, 3])
+    def test_missing_reserve_is_legacy_only(self, tmp_path: Path, schema: int) -> None:
+        actor = _ACTOR_CLS(
+            _actor_master_config(tmp_path), _make_actor_args(), SetupTimingMetrics()
+        )
+        actor._last_checkpoint_path = str(tmp_path)
+        actor._data_plane_checkpoint_metadata = {
+            "rollout_recovery_schema_version": schema
+        }
+        try:
+            if schema == 3:
+                with pytest.raises(FileNotFoundError, match="replacement_reserve"):
+                    asyncio.run(actor._maybe_restore_replacement_reserve())
+            else:
+                asyncio.run(actor._maybe_restore_replacement_reserve())
+            assert list(actor._replacement_reserve) == []
+        finally:
+            actor._checkpointer.shutdown()
+
     """The spare-prompt pool has to survive a restart, or the batch is lost.
 
     Diverting a batch into the pool advances the dataloader, so the dataloader state
@@ -2853,19 +3020,15 @@ class TestReplacementReservePersistence:
         # Saved, not consumed: the pool the run continues with is untouched.
         assert list(actor._replacement_reserve) == ["spare0", "spare1"]
 
-    def test_save_omits_the_file_when_the_pool_is_empty(self, tmp_path):
-        """Which is every run that never diverted, i.e. every non-replace run.
-
-        The restore is silent about a missing file for exactly this reason, so an
-        always-written empty file would make that silence indefensible.
-        """
+    def test_save_writes_an_empty_reserve(self, tmp_path):
+        """New checkpoints distinguish an empty pool from a missing sidecar."""
         mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=2)
 
         _run_train_pump(mc, _make_actor_args())
 
         step_dir = tmp_path / "checkpoints" / "step_2"
         assert step_dir.exists()
-        assert not (step_dir / "replacement_reserve.pt").exists()
+        assert torch.load(step_dir / "replacement_reserve.pt", weights_only=False) == []
 
     def test_run_restores_the_pooled_spares(self, tmp_path):
         ckpt_dir = tmp_path / "resume_ckpt"

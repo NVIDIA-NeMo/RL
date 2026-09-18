@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import io
 import threading
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -45,6 +46,7 @@ from nemo_rl.experience.route_plan import (
     RouteSpan,
     encode_route_plan,
 )
+from tests.unit.single_controller.test_logical_advantage import _batch as _logical_batch
 
 # Each record yields _N_GENS training rows.
 _N_GENS = 2
@@ -1080,6 +1082,20 @@ def _make_metadata_envelope(
     }
 
 
+def _make_cc_group_entry(
+    group_id: str, segments: list[int], *, padding: bool = True
+) -> dict[str, Any]:
+    meta, _ = _logical_batch(
+        [(group_id, [(float(slot), count) for slot, count in enumerate(segments)])],
+        padding=padding,
+    )
+    group = _make_group_entry(group_id, weight=3, target_step=4)
+    meta.partition_id = "rollout_data"
+    meta.sequence_lengths = [3] * meta.size
+    group["meta"] = meta
+    return group
+
+
 def _load(
     buf: TQReplayBuffer,
     state: dict[str, Any],
@@ -1572,6 +1588,131 @@ class TestTQReplayBufferLoadPreflight:
 
         assert _load(buf, state, max_groups=2) == 2
         assert buf.target_step_list == [1, 2]
+
+
+class TestCCReplayRestore:
+    @pytest.mark.parametrize("segments", [[1], [3], [1, 1], [3, 1], [2, 1, 3]])
+    @pytest.mark.parametrize("padding", [False, True])
+    def test_serialized_round_trip_preserves_physical_rows_and_group_capacity(
+        self, segments: list[int], padding: bool, tmp_path: Path
+    ) -> None:
+        groups = [
+            _make_cc_group_entry(name, segments, padding=padding)
+            for name in ("first", "second")
+        ]
+        # Exercise physical order independently of logical slot/segment order.
+        groups[0]["meta"] = groups[0]["meta"].subset(
+            list(reversed(range(groups[0]["meta"].size)))
+        )
+        state = _make_metadata_envelope(groups, saved_capacity=2)
+        source = _make_buffer(FakeDataPlaneClient())
+        assert (
+            _load(source, state, max_groups=2, expected_group_size=len(segments)) == 2
+        )
+        path = tmp_path / "replay.pt"
+        torch.save(source.metadata_state_dict(saved_capacity=2), path)
+        restored_state = torch.load(path, weights_only=False)  # Trusted test bytes.
+        dp = FakeDataPlaneClient()
+        restored = _make_buffer(dp)
+        assert (
+            _load(
+                restored,
+                restored_state,
+                max_groups=2,
+                expected_group_size=len(segments),
+            )
+            == 2
+        )
+        assert restored.size() == 2  # Not the number of segments/padding rows.
+        assert restored.start_weight_list == [3, 3]
+        assert restored.end_weight_list == [3, 3]
+        assert restored.target_step_list == [4, 4]
+        assert restored.count_for_target_step(4) == 2
+        assert restored.meta_list == [group["meta"] for group in groups]
+        assert restored.metadata_state_dict(saved_capacity=2) == state
+        assert dp.put_calls == dp.get_calls == dp.clear_calls == []
+
+    @pytest.mark.parametrize(
+        "corruption",
+        [
+            "partial_tags",
+            "missing_owner",
+            "missing_segment",
+            "duplicate_segment",
+            "wrong_owner",
+            "wrong_row_id",
+            "wrong_group_size",
+            "wrong_group_id",
+            "segment_count",
+            "padding_owner",
+            "padding_segment",
+            "padding_count",
+            "padding_only",
+            "boolean_segment",
+            "boolean_group_size",
+            "duplicate_row_id",
+        ],
+    )
+    def test_invalid_metadata_is_rejected_before_index_mutation(
+        self, corruption: str
+    ) -> None:
+        group = _make_cc_group_entry("broken", [2, 1])
+        meta = group["meta"]
+        if corruption == "partial_tags":
+            del meta.tags[0]["segment_count"]
+        elif corruption == "missing_owner":
+            group["meta"] = meta.subset([0, 1, 3])
+        elif corruption == "missing_segment":
+            group["meta"] = meta.subset([0, 2, 3])
+        elif corruption == "duplicate_segment":
+            meta.tags[1]["segment_index"] = 0
+        elif corruption == "wrong_owner":
+            meta.tags[0]["logical_rollout_id"] = "foreign_g0"
+        elif corruption == "wrong_row_id":
+            meta.sample_ids[0] = "foreign_g0_s0"
+        elif corruption == "wrong_group_size":
+            meta.tags[0]["logical_group_size"] = 3
+        elif corruption == "wrong_group_id":
+            group["group_id"] = "foreign"
+        elif corruption == "segment_count":
+            meta.tags[0]["segment_count"] = 3
+        elif corruption == "padding_owner":
+            meta.tags[-1]["logical_rollout_id"] = "broken_g0"
+        elif corruption == "padding_segment":
+            meta.tags[-1]["segment_index"] = 0
+        elif corruption == "padding_count":
+            meta.tags[-1]["segment_count"] = 1
+        elif corruption == "padding_only":
+            group["meta"] = meta.subset([3])
+        elif corruption == "boolean_segment":
+            meta.tags[0]["segment_index"] = False
+        elif corruption == "boolean_group_size":
+            meta.tags[0]["logical_group_size"] = True
+        elif corruption == "duplicate_row_id":
+            meta.sample_ids[1] = meta.sample_ids[0]
+        # Recompute the digest so structural validation, not integrity mismatch,
+        # rejects the bad group, even after an earlier sound group was validated.
+        state = _make_metadata_envelope([_make_cc_group_entry("sound", [1, 1]), group])
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        with pytest.raises(ValueError, match="CC"):
+            _load(buf, state)
+        assert buf.size() == 0 and buf.meta_list == []
+        assert dp.put_calls == dp.get_calls == dp.clear_calls == []
+
+    def test_cc_restore_preserves_digest_and_capacity_checks(self) -> None:
+        state = _make_metadata_envelope([_make_cc_group_entry("g", [3, 1])])
+        for kwargs, message in [
+            ({"max_groups": 0}, "more replay groups"),
+            ({"expected_manifest_digest": "wrong"}, "loaded TQ checkpoint"),
+        ]:
+            buf = _make_buffer(FakeDataPlaneClient())
+            with pytest.raises(ValueError, match=message):
+                _load(buf, state, **kwargs)
+            assert buf.size() == 0
+        state["groups"][0]["meta"].sequence_lengths[0] += 1
+        with pytest.raises(ValueError, match="digest does not match its contents"):
+            _load(_make_buffer(FakeDataPlaneClient()), state)
 
 
 class MultiPartitionFakeDataPlaneClient(FakeDataPlaneClient):

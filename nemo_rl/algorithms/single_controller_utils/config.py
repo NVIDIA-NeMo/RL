@@ -1416,10 +1416,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             or async_config.sampler.warmup_lookahead_versions is not None
         ):
             raise ValueError("CC requires the in_order sampler with zero lookahead")
-        if master_config.checkpointing["enabled"]:
-            raise ValueError("CC checkpoint/resume is not supported initially")
-        if master_config.rollout_checkpointing.snapshot_attempt_interval_s is not None:
-            raise ValueError("CC rollout checkpoint/resume is not supported initially")
         if reward_penalties_enabled or opd_module.is_opd_enabled(master_config):
             raise ValueError(
                 "CC does not support reward penalties or on-policy distillation"

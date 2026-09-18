@@ -2192,7 +2192,22 @@ class TestCreateCheckpointConfig:
         assert checkpoint_config.async_save is False
         assert checkpoint_config.fully_parallel_save is True
         assert checkpoint_config.fully_parallel_load is True
-        assert checkpoint_config.load_rng is False
+        assert checkpoint_config.load_rng is True
+
+    @pytest.mark.parametrize("resume_weights", [False, True])
+    @pytest.mark.parametrize("resume_optimizer", [False, True])
+    def test_rng_restore_follows_training_weights(
+        self, tmp_path, resume_weights, resume_optimizer
+    ):
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            str(tmp_path / "weights") if resume_weights else None,
+            str(tmp_path / "optimizer") if resume_optimizer else None,
+        )
+        assert config.load_rng is resume_weights
+        assert config.load_optim is resume_optimizer
 
     def test_missing_ckpt_cfg_defaults_to_sync_save(self, tmp_path):
         """An absent checkpoint block keeps Megatron Bridge's default (sync save).

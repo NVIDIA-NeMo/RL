@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import threading
 from pathlib import Path
 from typing import Any, Optional
@@ -335,9 +336,7 @@ def test_build_generation_passes_sglang_config():
     generation.finish_generation.assert_called_once_with()
 
 
-def test_cc_rejects_discovered_resume_even_when_checkpoint_saving_is_disabled(
-    tmp_path, patched_factories
-):
+def _make_cc_master_config() -> MasterConfig:
     mc = _make_master_config(
         megatron_enabled=True,
         env={"should_use_nemo_gym": True},
@@ -351,14 +350,111 @@ def test_cc_rejects_discovered_resume_even_when_checkpoint_saving_is_disabled(
         train_micro_batch_size=1,
         logprob_batch_size=1,
     )
-    mc.policy["generation"]["vllm_cfg"] = {
-        "async_engine": True,
-        "expose_http_server": True,
-    }
+    mc.policy["generation"].update(
+        model_name="test-model",
+        stop_strings=None,
+        stop_token_ids=None,
+        top_k=None,
+        vllm_cfg={"async_engine": True, "expose_http_server": True},
+    )
+    return mc
+
+
+@pytest.mark.parametrize(
+    "saving,interval,restore_mode",
+    [
+        (False, None, "latest"),
+        (True, None, "latest"),
+        (True, 60, "latest"),
+        (True, 60, "trainer_checkpoint"),
+    ],
+)
+def test_cc_restores_discovered_checkpoint(
+    tmp_path: Path,
+    patched_factories,
+    saving: bool,
+    interval: int | None,
+    restore_mode: str,
+) -> None:
+    mc = _make_cc_master_config()
     mc.checkpointing["checkpoint_dir"] = str(tmp_path)
-    (tmp_path / "step_3").mkdir()
-    # Real discovery must reject before reading even a training-info file.
-    with pytest.raises(ValueError, match="CC checkpoint/resume"):
+    mc.checkpointing.update(enabled=saving, save_data_plane=True, save_period=1)
+    mc.rollout_checkpointing = RolloutCheckpointConfig(
+        snapshot_attempt_interval_s=interval, restore_mode=restore_mode
+    )
+    checkpoint = tmp_path / "step_3"
+    (checkpoint / "policy" / "weights").mkdir(parents=True)
+    (checkpoint / "policy" / "optimizer").mkdir()
+    (checkpoint / DATA_PLANE_CHECKPOINT_DIR).mkdir()
+    (checkpoint / REPLAY_BUFFER_METADATA_FILENAME).touch()
+    (checkpoint / "training_info.json").write_text(json.dumps(vars(_save_state())))
+    torch.save({"cursor": 3}, checkpoint / "train_dataloader.pt")
+    policy = patched_factories["fake_policy"]
+    policy.cfg = mc.policy
+    policy.sharding_annotations.get_axis_size.return_value = 1
+    policy.load_data_plane_checkpoint.return_value = _native_tq_metadata()
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+    gym = MagicMock()
+    with (
+        patch.object(sc_setup_mod, "spinup_nemo_gym_actor", return_value=gym),
+        patch.object(sc_setup_mod.ray, "get", return_value=None) as ray_get,
+        patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        patch(
+            "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+            return_value=[MagicMock()],
+        ),
+        patch.object(
+            sc_setup_mod,
+            "resolve_latest_snapshot",
+            wraps=sc_setup_mod.resolve_latest_snapshot,
+        ) as resolve,
+    ):
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+    assert actor_args.last_checkpoint_path == str(checkpoint)
+    assert actor_args.save_state.current_step == 3
+    assert actor_args.data_plane_checkpoint_metadata == _native_tq_metadata()
+    policy.load_data_plane_checkpoint.assert_called_once_with(
+        checkpoint / DATA_PLANE_CHECKPOINT_DIR
+    )
+    patched_factories["dataloader"].load_state_dict.assert_called_once_with(
+        {"cursor": 3}
+    )
+    trainer_kwargs = patched_factories["_build_trainer"].call_args.kwargs
+    assert trainer_kwargs["weights_path"] == checkpoint / "policy" / "weights"
+    assert trainer_kwargs["optimizer_path"] == checkpoint / "policy" / "optimizer"
+    if interval is not None and restore_mode == "latest":
+        resolve.assert_called_once_with(
+            checkpoint,
+            expected_train_step=3,
+            expected_trainer_version=3,
+            expected_bootstrap_fingerprint=None,
+        )
+    else:
+        resolve.assert_not_called()
+    ray_get.assert_called_once_with(gym.setup_media_staging.remote.return_value)
+
+
+@pytest.mark.parametrize(
+    "invalid,reason",
+    [
+        ("no_data", "requires checkpointing.save_data_plane=true"),
+        ("no_trainer", "requires checkpointing.enabled=true"),
+        ("backend", "backend='mooncake_cpu'"),
+    ],
+)
+def test_cc_retains_shared_checkpoint_requirements(
+    patched_factories,
+    invalid: str,
+    reason: str,
+) -> None:
+    mc = _make_cc_master_config()
+    mc.checkpointing.update(
+        enabled=invalid != "no_trainer", save_data_plane=invalid != "no_data"
+    )
+    mc.rollout_checkpointing.snapshot_attempt_interval_s = 60
+    if invalid == "backend":
+        mc.data_plane["backend"] = "mooncake_cpu"
+    with pytest.raises((ValueError, NotImplementedError), match=reason):
         setup_single_controller(mc, MagicMock(pad_token_id=0))
     patched_factories["setup_response_data"].assert_not_called()
     patched_factories["_build_generation"].assert_not_called()
