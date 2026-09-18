@@ -68,7 +68,7 @@ def make_policy_factory(
     (architectural invariant — see
     ``tests/unit/data_plane/test_architecture_invariants.py``).
     """
-    if not data_plane_enabled(cfg):
+    if cfg is None or not data_plane_enabled(cfg):
         return None
 
     from nemo_rl.models.policy.tq_policy import TQPolicy
