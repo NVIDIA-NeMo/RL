@@ -30,6 +30,11 @@ actual_test_nemo_gym_sanity.json
 tests/functional/*/
 tests/unit/unit_results.json
 tests/unit/unit_results/
+perf_runs/
+profile_comparison_*.txt
+session/
+*.xlsx
+examples/configs/recipes/llm/performance/cutedsl-mxfp8/*
 
 # Cache
 uv_cache/

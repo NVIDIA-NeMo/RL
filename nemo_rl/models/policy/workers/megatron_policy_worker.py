@@ -20,6 +20,7 @@ import time
 import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import replace
 from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
 
 log = logging.getLogger(__name__)
@@ -98,7 +99,7 @@ from nemo_rl.models.megatron.train import (
     aggregate_training_statistics,
     megatron_forward_backward,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import Fp8Config, PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -132,6 +133,241 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 )
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+def _canonicalize_refit_glu_weight(
+    fused_weight: torch.Tensor,
+    *,
+    interleave_size: int,
+    param_name: str,
+) -> torch.Tensor:
+    """Restore an interleaved fused GLU weight to contiguous ``[gate; up]``.
+
+    Megatron's fused grouped-MLP path stores FC1 as alternating fixed-size
+    gate/up blocks. Hugging Face refit consumers expect the complete gate
+    projection followed by the complete up projection.
+    """
+    if (
+        isinstance(interleave_size, bool)
+        or not isinstance(interleave_size, int)
+        or interleave_size <= 0
+    ):
+        raise ValueError(
+            f"GLU interleave size for {param_name} must be a positive integer, "
+            f"got {interleave_size!r}."
+        )
+
+    rows_per_pair = 2 * interleave_size
+    if fused_weight.ndim == 0 or fused_weight.shape[0] % rows_per_pair != 0:
+        raise ValueError(
+            f"Cannot de-interleave {param_name} with shape "
+            f"{tuple(fused_weight.shape)}: dimension 0 must be divisible by "
+            f"2 * interleave_size ({rows_per_pair})."
+        )
+
+    shape = fused_weight.shape
+    return (
+        fused_weight.reshape(
+            shape[0] // rows_per_pair,
+            2,
+            interleave_size,
+            *shape[1:],
+        )
+        .transpose(0, 1)
+        .contiguous()
+        .reshape(shape)
+    )
+
+
+def _extract_refit_glu_projection(
+    fused_weight: torch.Tensor,
+    *,
+    interleave_size: int,
+    projection_index: int,
+    param_name: str,
+) -> torch.Tensor:
+    """Materialize one current gate/up projection from an interleaved FC1.
+
+    The NCCL reshard map is built once and reused after every optimizer step,
+    so it must retain the live interleaved Megatron parameter rather than a
+    one-time de-interleaved copy. This helper runs from ``LocalParamSpec.pre``
+    immediately before each transfer.
+    """
+    if projection_index not in (0, 1):
+        raise ValueError(
+            f"projection_index for {param_name} must be 0 (gate) or 1 (up), "
+            f"got {projection_index}."
+        )
+    if (
+        isinstance(interleave_size, bool)
+        or not isinstance(interleave_size, int)
+        or interleave_size <= 0
+    ):
+        raise ValueError(
+            f"GLU interleave size for {param_name} must be a positive integer, "
+            f"got {interleave_size!r}."
+        )
+
+    rows_per_pair = 2 * interleave_size
+    if fused_weight.ndim == 0 or fused_weight.shape[0] % rows_per_pair != 0:
+        raise ValueError(
+            f"Cannot de-interleave {param_name} with shape "
+            f"{tuple(fused_weight.shape)}: dimension 0 must be divisible by "
+            f"2 * interleave_size ({rows_per_pair})."
+        )
+
+    shape = fused_weight.shape
+    paired_blocks = fused_weight.reshape(
+        shape[0] // rows_per_pair,
+        2,
+        interleave_size,
+        *shape[1:],
+    )
+    return (
+        paired_blocks[:, projection_index]
+        .contiguous()
+        .reshape(shape[0] // 2, *shape[1:])
+    )
+
+
+def _interleaved_refit_projection_spec(
+    fused_weight: torch.Tensor,
+    *,
+    interleave_size: int,
+    projection_index: int,
+    param_name: str,
+) -> LocalParamSpec:
+    """Build a reusable refit spec backed by the live interleaved parameter."""
+
+    def pre(base: torch.Tensor) -> RefitCtx:
+        return RefitCtx(
+            buf=_extract_refit_glu_projection(
+                base,
+                interleave_size=interleave_size,
+                projection_index=projection_index,
+                param_name=param_name,
+            )
+        )
+
+    return LocalParamSpec(base=fused_weight, pre=pre)
+
+
+class _InterleavedGatedMLPRefitMapping:
+    """NeMo-RL-only export adapter for Megatron's interleaved GLU layout."""
+
+    def __init__(self, mapping: Any, interleave_size: int) -> None:
+        self.base_mapping = mapping
+        self.interleave_size = interleave_size
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.base_mapping, name)
+
+    def _canonicalize(
+        self, megatron_weights: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        if megatron_weights is None:
+            return None
+        megatron_weights = self.base_mapping.maybe_dequantize(megatron_weights)
+        return _canonicalize_refit_glu_weight(
+            megatron_weights,
+            interleave_size=self.interleave_size,
+            param_name=self.base_mapping.megatron_param,
+        )
+
+    def megatron_to_hf(
+        self,
+        megatron_weights: Optional[torch.Tensor],
+        megatron_module: Optional[torch.nn.Module],
+    ) -> dict[str, torch.Tensor]:
+        """Delegate export after restoring the canonical FC1 row layout."""
+        return self.base_mapping.megatron_to_hf(
+            self._canonicalize(megatron_weights), megatron_module
+        )
+
+
+def _refit_glu_interleave_size(mapping: Any, model_cfg: Any) -> Optional[int]:
+    """Return the finalized model's interleave size when a mapping needs it."""
+    from megatron.bridge.models.conversion.param_mapping import (
+        FusedGatedExpertMapping,
+        GatedMLPMapping,
+    )
+
+    if isinstance(mapping, _InterleavedGatedMLPRefitMapping):
+        return mapping.interleave_size
+
+    if isinstance(mapping, FusedGatedExpertMapping):
+        config_key = "moe_mlp_glu_interleave_size"
+    elif isinstance(mapping, GatedMLPMapping):
+        if ".shared_experts." in mapping.megatron_param:
+            config_key = "moe_shared_expert_glu_interleave_size"
+        elif mapping.is_expert:
+            config_key = "moe_mlp_glu_interleave_size"
+        else:
+            return None
+    else:
+        return None
+
+    interleave_size = getattr(model_cfg, config_key, None)
+    if interleave_size is None:
+        return None
+    if (
+        isinstance(interleave_size, bool)
+        or not isinstance(interleave_size, int)
+        or interleave_size <= 0
+    ):
+        raise ValueError(
+            f"{config_key} must be a positive integer or null, got {interleave_size!r}."
+        )
+    return interleave_size
+
+
+def _wrap_interleaved_refit_tasks(
+    conversion_tasks: Iterable[Any], model_cfg: Any
+) -> list[Any]:
+    """Attach NeMo RL's layout adapter to interleaved GLU refit tasks."""
+    wrapped_tasks = []
+    for task in conversion_tasks:
+        interleave_size = _refit_glu_interleave_size(task.mapping, model_cfg)
+        if interleave_size is None or isinstance(
+            task.mapping, _InterleavedGatedMLPRefitMapping
+        ):
+            wrapped_tasks.append(task)
+            continue
+        wrapped_tasks.append(
+            replace(
+                task,
+                mapping=_InterleavedGatedMLPRefitMapping(task.mapping, interleave_size),
+            )
+        )
+    return wrapped_tasks
+
+
+def _validate_refit_fp8_param_interleave(
+    model_cfg: Any, fp8_cfg: Optional[Fp8Config]
+) -> None:
+    """Reject FP8 parameter storage until refit also transforms its scales."""
+    if (
+        fp8_cfg is None
+        or not fp8_cfg.get("enabled", False)
+        or not fp8_cfg.get("fp8_param", False)
+    ):
+        return
+
+    interleaved_fields = [
+        name
+        for name in (
+            "moe_mlp_glu_interleave_size",
+            "moe_shared_expert_glu_interleave_size",
+        )
+        if getattr(model_cfg, name, None) is not None
+    ]
+    if interleaved_fields:
+        raise NotImplementedError(
+            "Refit does not support fp8_param=True with interleaved GLU weights "
+            f"({', '.join(interleaved_fields)}). The FP8 data and scale tensors "
+            "must be de-interleaved together. Use fp8_param=False for MXFP8 "
+            "compute until scale-aware refit export is implemented."
+        )
 
 
 def _should_use_router_replay(
@@ -2428,16 +2664,23 @@ class MegatronPolicyWorkerImpl(
         # Deferred import to avoid circular import issues.
         from nemo_rl.models.megatron.draft import draft_model_detached
 
+        model_cfg = self._get_model_config()
+        _validate_refit_fp8_param_interleave(model_cfg, self.fp8_cfg)
+
         with draft_model_detached([self.model]):
             if self._is_fp8_export():
-                return self.megatron_bridge._model_bridge.build_export_fp8_tasks(
-                    self.megatron_bridge.hf_pretrained, [self.model]
+                conversion_tasks = (
+                    self.megatron_bridge._model_bridge.build_export_fp8_tasks(
+                        self.megatron_bridge.hf_pretrained, [self.model]
+                    )
                 )
-            return [
-                task
-                for task in self.megatron_bridge.get_conversion_tasks([self.model])
-                if task is not None
-            ]
+            else:
+                conversion_tasks = [
+                    task
+                    for task in self.megatron_bridge.get_conversion_tasks([self.model])
+                    if task is not None
+                ]
+        return _wrap_interleaved_refit_tasks(conversion_tasks, model_cfg)
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.
@@ -2564,8 +2807,10 @@ class MegatronPolicyWorkerImpl(
             ).reshape(1)
             yield param_name, scale_tensor
 
-    def _iter_local_hf_param_shards(self) -> Iterator[tuple[str, torch.Tensor]]:
-        """Yield (hf_name, local_tp_shard) for this rank's locally owned FFN params.
+    def _iter_local_hf_param_shards(
+        self,
+    ) -> Iterator[tuple[str, torch.Tensor | LocalParamSpec]]:
+        """Yield local FFN shards or live-transform specs keyed by HF name.
 
         Used by the nccl_reshard_refit bulk path (``build_hf_to_local_param_map``).
         Only the FFN projections (gate/up/down_proj) take the bulk
@@ -2574,10 +2819,13 @@ class MegatronPolicyWorkerImpl(
 
         Unlike ``_iter_params_with_optional_kv_scales`` (PP broadcast + TP gather
         via ``export_hf_weights``), this yields TP-local shards directly from the
-        Megatron params — no collectives.  Returned tensors are views and must
-        not be modified in place.  EP: ``refit_conversion_tasks`` already holds
-        only this rank's local experts; PP non-local params have
-        ``param_weight is None``.
+        Megatron params — no collectives. Returned tensors are live views and
+        must not be modified in place. Interleaved FC1 parameters instead yield
+        ``LocalParamSpec`` hooks that materialize the current gate/up projection
+        immediately before each refit; keeping a one-time de-interleaved tensor
+        here would send stale weights after the first optimizer step. EP:
+        ``refit_conversion_tasks`` already holds only this rank's local experts;
+        PP non-local params have ``param_weight is None``.
         """
         from megatron.bridge.models.conversion.param_mapping import (
             FusedExpertMapping,
@@ -2593,6 +2841,7 @@ class MegatronPolicyWorkerImpl(
             assert m, f"expected trailing expert index in {megatron_name!r}"
             return m.group()
 
+        model_cfg = self._get_model_config()
         for task in self.refit_conversion_tasks:
             local_tensor = task.param_weight  # local megatron tensor
             if local_tensor is None:
@@ -2601,37 +2850,86 @@ class MegatronPolicyWorkerImpl(
             if task.global_param_name.endswith("_scale_inv"):
                 continue
 
-            if isinstance(task.mapping, GatedMLPMapping):
-                # FFN gate/up fused in linear_fc1 as [gate_shard; up_shard] (dim 0).
+            mapping = task.mapping
+            base_mapping = (
+                mapping.base_mapping
+                if isinstance(mapping, _InterleavedGatedMLPRefitMapping)
+                else mapping
+            )
+            interleave_size = _refit_glu_interleave_size(mapping, model_cfg)
+
+            if isinstance(base_mapping, GatedMLPMapping):
+                # The fused-kernel runtime layout can alternate gate/up blocks.
+                # Keep the live fused tensor and transform it on every refit.
+                if interleave_size is not None:
+                    yield (
+                        base_mapping.hf_param["gate"],
+                        _interleaved_refit_projection_spec(
+                            local_tensor,
+                            interleave_size=interleave_size,
+                            projection_index=0,
+                            param_name=task.global_param_name,
+                        ),
+                    )
+                    yield (
+                        base_mapping.hf_param["up"],
+                        _interleaved_refit_projection_spec(
+                            local_tensor,
+                            interleave_size=interleave_size,
+                            projection_index=1,
+                            param_name=task.global_param_name,
+                        ),
+                    )
+                    continue
                 gate, up = torch.chunk(local_tensor, 2, dim=0)
-                yield task.mapping.hf_param["gate"], gate
-                yield task.mapping.hf_param["up"], up
+                yield base_mapping.hf_param["gate"], gate
+                yield base_mapping.hf_param["up"], up
                 continue
 
-            if isinstance(task.mapping, FusedGatedExpertMapping):
+            if isinstance(base_mapping, FusedGatedExpertMapping):
                 # Grouped-GEMM MoE (e.g. Qwen3.5-VL): linear_fc1 fuses gate+up per
                 # expert [gate; up] (dim 0) — same layout as the dense branch
                 # above, but the hf_param is a single, index-less string.  Un-fuse
                 # into gate/up AND re-attach the per-expert index.
                 idx = _expert_idx(task.global_param_name)
-                prefix = str(task.mapping.hf_param)[: -len(".gate_up_proj")]
+                prefix = str(base_mapping.hf_param)[: -len(".gate_up_proj")]
+                if interleave_size is not None:
+                    yield (
+                        f"{prefix}.{idx}.gate_proj.weight",
+                        _interleaved_refit_projection_spec(
+                            local_tensor,
+                            interleave_size=interleave_size,
+                            projection_index=0,
+                            param_name=task.global_param_name,
+                        ),
+                    )
+                    yield (
+                        f"{prefix}.{idx}.up_proj.weight",
+                        _interleaved_refit_projection_spec(
+                            local_tensor,
+                            interleave_size=interleave_size,
+                            projection_index=1,
+                            param_name=task.global_param_name,
+                        ),
+                    )
+                    continue
                 gate, up = torch.chunk(local_tensor, 2, dim=0)
                 yield f"{prefix}.{idx}.gate_proj.weight", gate
                 yield f"{prefix}.{idx}.up_proj.weight", up
                 continue
 
-            if isinstance(task.mapping, FusedExpertMapping):
+            if isinstance(base_mapping, FusedExpertMapping):
                 # Grouped-GEMM down (linear_fc2): re-attach the per-expert index +
                 # ``.weight`` so it matches standard per-expert down_proj.
                 idx = _expert_idx(task.global_param_name)
-                prefix = str(task.mapping.hf_param)[: -len(".down_proj")]
+                prefix = str(base_mapping.hf_param)[: -len(".down_proj")]
                 yield f"{prefix}.{idx}.down_proj.weight", local_tensor
                 continue
 
             # Simple 1:1 mappings: only the FFN down_proj (and any non-gated
             # simple gate/up) hits this branch. QKV (a compound mapping) and
             # every non-FFN param fall through to misc, so they are skipped.
-            hf_param = task.mapping.hf_param
+            hf_param = base_mapping.hf_param
             if not isinstance(hf_param, dict) and is_nccl_reshard_param(str(hf_param)):
                 yield str(hf_param), local_tensor
 
@@ -3097,10 +3395,10 @@ class MegatronPolicyWorkerImpl(
         return self.nccl_reshard_refit_info
 
     def _build_expert_groups(self, param_map):
-        """Group this rank's local expert params into stack-ready views.
+        """Group this rank's local expert params into ordered refit sources.
 
         Keyed by (prefix, proj_type) and resolved to ordered ``param_map``
-        views ready for ``torch.stack``.
+        tensors/specs ready for per-refit materialization and ``torch.stack``.
 
         Megatron exposes each expert's projection as a separate param; this bins
         them so ``_group_experts`` can stack a layer's experts into one grouped
@@ -3114,20 +3412,18 @@ class MegatronPolicyWorkerImpl(
           * group 3 = proj type    -> ``"gate_proj"``
         so the name keys into ``("model.layers.3.mlp.experts", "gate_proj")``.
 
-        Returns ``{(prefix, proj): [tensor_0, tensor_1, ...]}`` — the per-expert
-        ``param_map`` views sorted by expert index.  Example — a layer with 2
+        Returns ``{(prefix, proj): [source_0, source_1, ...]}`` — the per-expert
+        ``param_map`` sources sorted by expert index. Example — a layer with 2
         local experts (gated MoE) yields three keys:
           ``(".../experts", "gate_proj"): [view(expert 0), view(expert 1)]``
           ``(".../experts", "up_proj")  : [view(expert 0), view(expert 1)]``
           ``(".../experts", "down_proj"): [view(expert 0), view(expert 1)]``
 
-        Resolving names → views here (rather than per refit in ``_group_experts``)
-        costs nothing extra — ``param_map`` already owns these views and they
-        stay valid across refits (weights are updated in place; the name→view
-        mapping is stable), so ``_group_experts`` only has to ``torch.stack``.
-        The index sort matters: the views are stacked in this order, so expert 0
-        must precede expert 1 to match the EP ``Shard(0)`` layout the gen side
-        expects.
+        Resolving names → sources here costs nothing extra. Plain tensor views
+        stay current because weights are updated in place; interleaved FC1
+        sources are ``LocalParamSpec`` hooks that derive current projections at
+        refit time. The index sort matters: expert 0 must precede expert 1 to
+        match the EP ``Shard(0)`` layout the gen side expects.
         """
         from nemo_rl.weight_sync.nccl_reshard_utils import _INDIVIDUAL_EXPERT_RE
 
@@ -3150,15 +3446,24 @@ class MegatronPolicyWorkerImpl(
     def _group_experts(self, proj, grouped_name, expert_groups):
         """Stack this rank's local experts for one projection into ``[E_local, ...]``.
 
-        Using the pre-calculated ``expert_groups`` (from ``_build_expert_groups``)
-        it is just calling torch.stack of all the local expert params.
+        Dynamic sources first materialize the current projection from the live
+        interleaved parameter; ordinary sources remain zero-copy tensor views.
         """
         prefix = grouped_name.rsplit(f".{proj}.weight", 1)[0]
-        expert_tensors = expert_groups.get((prefix, proj))
-        assert expert_tensors, (
+        expert_sources = expert_groups.get((prefix, proj))
+        assert expert_sources, (
             f"no local experts for {grouped_name!r} (proj={proj!r}); "
             "PP-filter / expert-group-metadata inconsistency"
         )
+
+        def materialize(source: torch.Tensor | LocalParamSpec) -> torch.Tensor:
+            if not isinstance(source, LocalParamSpec):
+                return source
+            if source.pre is None:
+                return source.base
+            return source.pre(source.base).buf
+
+        expert_tensors = [materialize(source) for source in expert_sources]
         return torch.stack(expert_tensors)
 
     def build_hf_to_local_param_map(self, refit_info: dict) -> HFToLocalParamMap:
@@ -3169,8 +3474,9 @@ class MegatronPolicyWorkerImpl(
         - grouped MoE expert: ``pre`` stacks the per-expert views into
           ``[E_local, ...]`` fresh each refit via ``_group_experts``.
         """
-        # This rank's local TP/EP HF param shards (live views), and the
-        # per-expert views grouped for torch.stack.  Build-time only.
+        # This rank's local TP/EP HF param sources (live views or dynamic
+        # interleave adapters), and the per-expert sources grouped for stacking.
+        # Build-time only; dynamic adapters run from pre() on every refit.
         param_map = dict(self._iter_local_hf_param_shards())
         expert_groups = self._build_expert_groups(param_map)
 
@@ -3189,7 +3495,12 @@ class MegatronPolicyWorkerImpl(
                 if p.get("grouped_expert_proj"):
                     mapping[name] = _expert_spec(p["grouped_expert_proj"], name)
                 else:
-                    mapping[name] = LocalParamSpec(base=param_map.get(name))
+                    source = param_map.get(name)
+                    mapping[name] = (
+                        source
+                        if isinstance(source, LocalParamSpec)
+                        else LocalParamSpec(base=source)
+                    )
         return HFToLocalParamMap(specs=mapping)
 
     async def nccl_reshard_refit(self, kv_scales=None, refit_timeout_s=None):

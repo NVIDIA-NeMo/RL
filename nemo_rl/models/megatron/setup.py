@@ -1085,6 +1085,10 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 
     if "moe_grouped_gemm" in config["megatron_cfg"]:
         model_cfg.moe_grouped_gemm = config["megatron_cfg"]["moe_grouped_gemm"]
+    if "moe_mlp_glu_interleave_size" in config["megatron_cfg"]:
+        model_cfg.moe_mlp_glu_interleave_size = config["megatron_cfg"][
+            "moe_mlp_glu_interleave_size"
+        ]
     model_cfg.moe_enable_routing_replay = router_replay_enabled(config)
 
 
@@ -1264,6 +1268,12 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.use_fused_weighted_squared_relu = config["megatron_cfg"][
         "use_fused_weighted_squared_relu"
     ]
+    # Transformer Engine operation-fuser path. For grouped MoE with MXFP8 this
+    # allows TE to select the CuTeDSL grouped-GEMM fusion.
+    if "use_transformer_engine_op_fuser" in config["megatron_cfg"]:
+        model_cfg.use_transformer_engine_op_fuser = config["megatron_cfg"][
+            "use_transformer_engine_op_fuser"
+        ]
     # NeMo-RL can pack multiple expanded Omni examples into one THD tensor.
     # Flash attention does not support the resulting padded multi-row layout,
     # so the canonical expanded-sequence contract must use backend dispatch.

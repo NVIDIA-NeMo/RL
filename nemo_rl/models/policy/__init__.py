@@ -440,6 +440,17 @@ class MegatronConfig(TypedDict):
     # gain when multiple experts are assigned per rank (num_local_experts > 1).
     # Requires TE >= 1.11.0 for FP8 and Ampere (sm_80) or newer.
     moe_grouped_gemm: NotRequired[bool]
+    # Store routed-expert GLU FC1 rows as alternating gate/up blocks of this
+    # size. Set to 32 for the CuTeDSL grouped-MoE MXFP8 fusion; omit or set None
+    # to retain the standard contiguous [gate; up] layout. The value must divide
+    # each TP-local gate/up projection size.
+    moe_mlp_glu_interleave_size: NotRequired[int | None]
+    # Route grouped MoE submodules through Transformer Engine's operation-fuser
+    # API. On SM100+ with MXFP8 this enables the CuTeDSL grouped-MLP fusion when
+    # moe_grouped_gemm is enabled, moe_mlp_glu_interleave_size is 32, and
+    # env_vars.NVTE_CUTEDSL_FUSED_GROUPED_MLP is "1". Requires TE >= 2.14.0.
+    # Omit to retain the Megatron provider default (currently False).
+    use_transformer_engine_op_fuser: NotRequired[bool]
     # HybridEP settings for MoE expert parallelism (requires moe_token_dispatcher_type='flex')
     # See: https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep
     moe_flex_dispatcher_backend: NotRequired[str]
