@@ -510,7 +510,7 @@ logger:
   log_dir: ${oc.env:SUPER_RL_ROOT}/smoke/logs
   num_val_samples_to_print: 0
   wandb_enabled: true
-  tensorboard_enabled: true
+  tensorboard_enabled: false
   mlflow_enabled: false
   swanlab_enabled: false
   monitor_gpus: true

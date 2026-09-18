@@ -43,6 +43,11 @@ policy:
       NRL_R3_TRACE_VERIFY_FORWARD: '0'
 data:
   shuffle: false
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
 checkpointing:
   save_period: 10
   ft_save_period: 1

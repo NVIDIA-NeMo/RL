@@ -107,6 +107,17 @@ confirms the delta's internal consistency, not that it can run today.
 
 ## Regular smoke environment contract
 
+Super RL uses **W&B only**, for smoke and full training alike:
+`logger.wandb_enabled: true`, `logger.tensorboard_enabled: false`,
+`logger.mlflow_enabled: false`, and `logger.swanlab_enabled: false`.
+The CP4/EP16 candidate inherits these settings; the Kimi delta also sets them
+explicitly to override an inherited logger configuration. Keep them unchanged
+when deriving a full-training config or preparing a smoke driver. Provide W&B
+credentials privately to the driver, and verify scalar delivery to the intended
+run before certifying a smoke. Do not disable W&B or fall back to TensorBoard
+when authentication fails. Historical TensorBoard-only smoke results do not
+certify W&B delivery. Other NeMo-RL recipes retain their own logger choices.
+
 `regular_s120_smoke.yaml` and `local_deepseek_v4_flash.yaml` read every private
 or site-specific input from the environment of the process that loads the
 config (the driver inside the training container). Nothing under

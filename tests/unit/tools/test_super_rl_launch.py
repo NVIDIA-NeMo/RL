@@ -174,6 +174,21 @@ def test_parser_error_does_not_repeat_source(tmp_path):
     assert "never-print" not in str(error.value)
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("wandb_enabled", False),
+        ("tensorboard_enabled", True),
+        ("mlflow_enabled", True),
+        ("swanlab_enabled", True),
+    ],
+)
+def test_kimi_delta_rejects_non_wandb_logging(field: str, value: bool) -> None:
+    config = read_yaml(CONFIG_ROOT / "experiments/kimi_s25.yaml")
+    config.logger[field] = value
+    assert any(f"logger.{field}" in error for error in experiment_errors(config))
+
+
 def test_kimi_delta_has_agreed_values_and_preserves_route_catalog():
     config = read_yaml(CONFIG_ROOT / "experiments/kimi_s25.yaml")
     assert experiment_errors(config) == []

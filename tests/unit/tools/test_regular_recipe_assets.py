@@ -4,8 +4,22 @@
 from pathlib import Path
 
 from omegaconf import OmegaConf
+import pytest
 
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
+
+
+@pytest.mark.parametrize(
+    "recipe",
+    ["regular_s120_smoke.yaml", "regular_s120_cp4_ep16.yaml", "kimi_s25.yaml"],
+)
+def test_super_rl_recipes_use_wandb_only(recipe: str) -> None:
+    root = Path(__file__).resolve().parents[3]
+    config = load_config(root / "training_configs/super_rl/experiments" / recipe)
+    assert config.logger.wandb_enabled is True
+    assert config.logger.tensorboard_enabled is False
+    assert config.logger.mlflow_enabled is False
+    assert config.logger.swanlab_enabled is False
 
 
 def test_local_deepseek_uses_native_reasoning_effort_name():

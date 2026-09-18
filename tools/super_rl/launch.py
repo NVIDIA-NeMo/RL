@@ -185,6 +185,10 @@ def experiment_errors(config: DictConfig) -> list[str]:
         "policy.megatron_cfg.env_vars.NRL_R3_TRACE_VERIFY_FORWARD": "0",
         "checkpointing.load_replay_buffer": False,
         "data.shuffle": False,
+        "logger.wandb_enabled": True,
+        "logger.tensorboard_enabled": False,
+        "logger.mlflow_enabled": False,
+        "logger.swanlab_enabled": False,
     }
     for key, expected in required.items():
         actual = OmegaConf.select(config, key)
