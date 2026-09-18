@@ -790,7 +790,8 @@ class LogprobsPostProcessor:
             original_seq_length: Sequence width before dense padding was applied
 
         Returns:
-            Callable: Function that takes output tensor and returns (dummy_loss, {"logprobs": token_logprobs})
+            Callable: Function that takes output tensor and returns (dummy_loss, {"logprobs": token_logprobs}),
+                plus a "token_mask" entry narrowed at -inf positions when top-k/top-p filtering is on
         """
         unpacked_input_ids = data_dict["input_ids"]
 
@@ -836,17 +837,20 @@ class LogprobsPostProcessor:
             )
 
             # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
+            result_dict: dict[str, torch.Tensor] = {}
             if need_top_k_or_top_p_filtering(self.sampling_params):
                 mask = data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1)
-                token_logprobs = mask_out_neg_inf_logprobs(
+                token_logprobs, finite_mask = mask_out_neg_inf_logprobs(
                     token_logprobs, mask, "prev_logprobs"
                 )
+                result_dict["token_mask"] = (data_dict["token_mask"] * finite_mask)[
+                    :, :original_seq_length
+                ]
 
             token_logprobs = token_logprobs[:, :original_seq_length]
+            result_dict["logprobs"] = token_logprobs
 
-            return torch.tensor(0.0, device=token_logprobs.device), {
-                "logprobs": token_logprobs
-            }
+            return torch.tensor(0.0, device=token_logprobs.device), result_dict
 
         return processor_fn_inner
 
