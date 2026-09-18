@@ -394,6 +394,17 @@ The SC path is still under active development. Feature gaps are tracked in [issu
 - Multimodal/VLM GRPO is supported with Megatron generation. Set
   `policy.is_vlm: true`; see the
   [CLEVR Single-Controller recipe](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron-single-controller-async.v1.yaml).
+- NeMo-Gym token capture also supports image-only Nemotron dynamic-resolution
+  rollouts with async vLLM generation and a Megatron learner. With
+  `token_capture.enabled: true` and the VLM processor configured, workers capture
+  the processed pixels used for inference together with each call's token delta.
+  The finalizer verifies the selected call chain and packs its images into the
+  ordinary training row; the Gym actor does not process the images again.
+  Retained images must keep identical pixels and geometry across calls. Image
+  columns share the token staging keys and their checkpoint/cleanup lifecycle.
+  This path requires the paired Gym tensor-attachment sink changes. Compaction,
+  native video/audio, other processor families, and
+  `token_capture.defer_routed_experts_to_policy: true` are not supported.
 - Multi-Teacher On-Policy Distillation (MOPD) is supported for text-only NeMo
   Gym rollouts; multimodal/VLM MOPD is not yet supported. See
   [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).

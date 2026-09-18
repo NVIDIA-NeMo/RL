@@ -21,13 +21,21 @@ import time
 import uuid
 import warnings
 from collections.abc import Awaitable, Callable
-from typing import Any, AsyncGenerator, Optional, cast
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
 import torch
 import uvicorn
 from fastapi import FastAPI
 
+from nemo_rl.data.captured_media import (
+    IMAGE_CAPTURE_FIELD,
+    CapturedImage,
+    CapturedMedia,
+    capture_processed_images,
+    verify_image_chain,
+)
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -58,11 +66,26 @@ from nemo_rl.models.generation.vllm.utils import (
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.openai_server_utils import (
-    replace_prefix_tokens,
+    PrefixSplice,
+    splice_prefix_tokens,
 )
 from nemo_rl.telemetry.setup import shutdown_telemetry
 
 LOGGER = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from nemo_gym.token_id_capture.staging.capture import ActiveCall
+    from nemo_gym.token_id_capture.staging.protocols import TensorAttachment
+
+
+@dataclass
+class CapturedRequest:
+    """Request-local ownership of tokens and immutable processed-image bytes."""
+
+    call: "ActiveCall"
+    prompt_token_ids: list[int]
+    media: CapturedMedia | None
+    attachments: tuple["TensorAttachment", ...]
 
 
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
@@ -200,9 +223,8 @@ class VllmAsyncGenerationWorkerImpl(
         # the set_rollout_weight_version fan-out from the SC's _sync_weights.
         self.token_capture = None
         self._rollout_weight_version = 0
-        # In-flight captured calls keyed by id(request): (ActiveCall, the
-        # exact engine prompt ids recorded at preprocess time).
-        self._capture_calls: dict[int, tuple[Any, list[int]]] = {}
+        self._capture_calls: dict[int, CapturedRequest] = {}
+        self._capture_images = False
         self._staging_source: Any | None = None
         # Guarded by _prefix_cache_lock: _fetch_chain_prefix runs on executor
         # threads (asyncio.to_thread), so lookups/evictions can be concurrent.
@@ -481,7 +503,11 @@ class VllmAsyncGenerationWorkerImpl(
         self.token_capture = capture
 
     async def setup_token_capture(
-        self, dp_cfg: dict[str, Any], staging_partition: str
+        self,
+        dp_cfg: dict[str, Any],
+        staging_partition: str,
+        *,
+        capture_images: bool = False,
     ) -> bool:
         """Host ledger-authoritative token capture in this worker.
 
@@ -502,6 +528,28 @@ class VllmAsyncGenerationWorkerImpl(
 
         dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
         sink = TQTokenSink(dp_client, staging_partition=staging_partition)
+        if capture_images:
+            # Optional engine/Gym capabilities are checked only on VLM workers.
+            from nemo_gym.token_id_capture.staging.protocols import (
+                AttachmentStagingSink,
+            )
+            from vllm.model_executor.models.nano_nemotron_vl import (
+                NanoNemotronVLProcessingInfo,
+            )
+
+            info = self.llm.renderer.get_mm_processor().info
+            if (
+                not isinstance(info, NanoNemotronVLProcessingInfo)
+                or not info.is_dynamic_tiler
+            ):
+                raise ValueError(
+                    "Image capture requires vLLM's Nemotron dynamic-image processor"
+                )
+            if not isinstance(sink, AttachmentStagingSink):
+                raise ValueError(
+                    "Image capture requires a tensor-attachment staging sink"
+                )
+        self._capture_images = capture_images
         self._staging_source = TQTokenSource(
             dp_client, staging_partition=staging_partition
         )
@@ -544,6 +592,8 @@ class VllmAsyncGenerationWorkerImpl(
         *,
         admission: Any | None = None,
         prefix_token_ids: list[int] | None = None,
+        media: CapturedMedia | None = None,
+        attachments: tuple["TensorAttachment", ...] = (),
     ) -> None:
         """Admit one ledger-forwarded call into the capture layer.
 
@@ -569,7 +619,85 @@ class VllmAsyncGenerationWorkerImpl(
             prefix_token_ids=prefix_token_ids,
             stream=bool(getattr(request, "stream", False)),
         )
-        self._capture_calls[id(request)] = (call, list(prompt_token_ids))
+        self._capture_calls[id(request)] = CapturedRequest(
+            call, list(prompt_token_ids), media, attachments
+        )
+
+    def _capture_request_media(
+        self,
+        engine_prompt: dict[str, Any],
+        *,
+        admission: Any | None,
+        splice: PrefixSplice | None = None,
+    ) -> tuple[CapturedMedia | None, tuple["TensorAttachment", ...]]:
+        """Run off-loop: resolve retained geometry and snapshot processed pixels."""
+        if admission is None:
+            return None, ()
+        if not self._capture_images:
+            if engine_prompt.get("mm_placeholders") or engine_prompt.get("mm_kwargs"):
+                raise ValueError(
+                    "Multimodal token capture requires image capture setup"
+                )
+            return None, ()
+        retained: tuple[CapturedImage, ...] = ()
+        if admission.parent_call_id is not None:
+            # Optional Gym dependency: this method only runs on captured calls.
+            from nemo_gym.token_id_capture.staging.digest import compute_chain_hash
+            from nemo_gym.token_id_capture.staging.records import staging_key
+
+            source = self._staging_source
+            if source is None:
+                raise RuntimeError("Image capture staging source is not initialized")
+            if admission.staging_chain:
+                calls = source.fetch_for_finalization(
+                    list(admission.staging_chain), include_route_fragments=True
+                )
+            else:
+                # Inline token admissions still have receipt-owned parent keys.
+                calls, visited = [], set()
+                parent = admission.parent_call_id
+                while parent is not None:
+                    if parent in visited:
+                        raise ValueError("Cycle in retained image chain")
+                    visited.add(parent)
+                    call = source.fetch_for_finalization(
+                        [staging_key(admission.rollout_id, parent)],
+                        include_route_fragments=True,
+                    )[0]
+                    calls.append(call)
+                    parent = call.snapshot.parent_call_id
+                calls.reverse()
+            parent, length, chain_hash = None, 0, None
+            for call in calls:
+                snapshot = call.snapshot
+                if (
+                    snapshot.rollout_id != admission.rollout_id
+                    or snapshot.parent_call_id != parent
+                    or snapshot.prev_len != length
+                    or snapshot.chain_hash
+                    != compute_chain_hash(chain_hash, snapshot.token_ids_delta)
+                ):
+                    raise ValueError("Invalid retained image call chain")
+                parent, length, chain_hash = (
+                    snapshot.model_call_id,
+                    snapshot.cum_len,
+                    snapshot.chain_hash,
+                )
+            if (parent, length, chain_hash) != (
+                admission.parent_call_id,
+                admission.prev_len,
+                admission.parent_chain_hash,
+            ):
+                raise ValueError(
+                    "Retained image chain does not match capture admission"
+                )
+            descriptors = verify_image_chain(calls, required=True)
+            retained = tuple(
+                image for descriptor in descriptors for image in descriptor.images
+            )
+        return capture_processed_images(
+            engine_prompt, prev_len=admission.prev_len, retained=retained, splice=splice
+        )
 
     def _fetch_chain_prefix(self, staging_chain: list[str]) -> list[int]:
         """Assemble prefix token ids from staging_chain, with a worker-local LRU cache."""
@@ -683,12 +811,14 @@ class VllmAsyncGenerationWorkerImpl(
         state = self._capture_calls.pop(id(request), None)
         if state is None:
             return content
-        call, prompt_token_ids = state
+        call, prompt_token_ids = state.call, state.prompt_token_ids
         payload = dict(content)
         # vLLM's OpenAI response carries no prompt ids; the adapter reads the
         # preprocess-time engine prompt off the payload (see
         # nemo_gym.token_id_capture.adapters.vllm.extract_prompt_ids).
         payload["prompt_token_ids"] = prompt_token_ids
+        if state.media is not None:
+            payload[IMAGE_CAPTURE_FIELD] = state.media.to_dict()
         adapter = self.token_capture.adapter
         if adapter is not None:
             try:
@@ -701,7 +831,9 @@ class VllmAsyncGenerationWorkerImpl(
                 prompt_len=len(prompt_token_ids),
                 generated_len=len(generated_token_ids),
             )
-        coords = self.token_capture.complete_call_from_response(call, payload)
+        coords = self.token_capture.complete_call_from_response(
+            call, payload, attachments=state.attachments
+        )
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
             # Token arrays and delta-aligned routes were staged to TQ above;
@@ -722,7 +854,7 @@ class VllmAsyncGenerationWorkerImpl(
         """Drop the in-flight capture state for a request that errored."""
         state = self._capture_calls.pop(id(request), None)
         if state is not None and self.token_capture is not None:
-            self.token_capture.fail_call(state[0], reason=reason)
+            self.token_capture.fail_call(state.call, reason=reason)
 
     # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
@@ -858,6 +990,13 @@ class VllmAsyncGenerationWorkerImpl(
                         message["tool_calls"] = list(message["tool_calls"])
 
                 messages_for_replace_prefix_tokens = deepcopy(messages)
+                # #4124: processor-only cache reads retain concrete pixels even
+                # when the engine's sender cache would return references.
+                if (
+                    worker_self._capture_images
+                    and worker_self._capture_admission(request) is not None
+                ):
+                    skip_mm_cache = True
 
                 # Temporarily set to 1 so vLLM's pre-tokenization length check passes;
                 # the actual value will be set through _clamp_max_tokens later.
@@ -923,8 +1062,17 @@ class VllmAsyncGenerationWorkerImpl(
                         )
                     # Token capture, text mode: the full render is the exact
                     # engine prompt.
+                    media, attachments = await asyncio.to_thread(
+                        worker_self._capture_request_media,
+                        res[1][0],
+                        admission=admission,
+                    )
                     worker_self._begin_request_capture(
-                        request, res[1][0]["prompt_token_ids"], admission=admission
+                        request,
+                        res[1][0]["prompt_token_ids"],
+                        admission=admission,
+                        media=media,
+                        attachments=attachments,
                     )
                     return res
 
@@ -968,13 +1116,19 @@ class VllmAsyncGenerationWorkerImpl(
 
                 engine_prompt = res[1][0]
 
-                final_prompt_token_ids = replace_prefix_tokens(
+                splice = splice_prefix_tokens(
                     tokenizer=self.renderer.tokenizer,
                     model_prefix_token_ids=model_prefix_token_ids,
                     template_prefix_token_ids=actual_corresponding_token_ids,
                     template_token_ids=engine_prompt["prompt_token_ids"],
                 )
-
+                final_prompt_token_ids = splice.token_ids
+                media, attachments = await asyncio.to_thread(
+                    worker_self._capture_request_media,
+                    engine_prompt,
+                    admission=admission,
+                    splice=splice,
+                )
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
 
                 # Clamp after prefix replacement since the prompt length may have changed.
@@ -993,6 +1147,8 @@ class VllmAsyncGenerationWorkerImpl(
                     final_prompt_token_ids,
                     admission=admission,
                     prefix_token_ids=capture_prefix_token_ids,
+                    media=media,
+                    attachments=attachments,
                 )
 
                 return res

@@ -78,7 +78,7 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
-from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
+from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS, uses_image_placeholder
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
@@ -172,6 +172,8 @@ class SingleControllerActorArgs:
     # Defaulted fields must follow the required ones above, so these stay last.
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None
     partition_includes_multimodal_fields: bool = False
+    # Whether the staging partition carries captured media columns.
+    staging_partition_includes_media: bool = False
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None
     rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None
     # None when async_rl.generation_fleet_health is disabled; the SingleController
@@ -302,8 +304,13 @@ def _register_single_controller_partitions(
     master_config: MasterConfig,
     partition_id: str,
     include_multimodal_fields: bool,
+    capture_media: bool = False,
 ) -> None:
-    """Warm all SingleController partitions before concurrent data-plane use."""
+    """Warm all SingleController partitions before concurrent data-plane use.
+
+    ``capture_media`` adds the media columns the vLLM worker stages beside each
+    captured call to the staging partition (VLM token capture only).
+    """
     algo_cfg = algo_config(master_config)
     policy_config = master_config.policy
     token_capture_cfg = master_config.token_capture
@@ -346,7 +353,8 @@ def _register_single_controller_partitions(
         dp_client.register_partition(
             partition_id=token_capture_cfg.staging_partition,
             fields=list(STAGING_FIELDS)
-            + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else []),
+            + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else [])
+            + (["pixel_values"] if capture_media else []),
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize", "prev_lp", "train"],
         )
@@ -1191,6 +1199,18 @@ def setup_single_controller(
     # ray_actor_environment_registry.py), so nothing here needs to change the
     # worker's environment.
     token_capture_cfg = master_config.token_capture
+    capture_images = token_capture_cfg.enabled and processor is not None
+    if capture_images:
+        if not uses_image_placeholder(processor):
+            raise ValueError(
+                "VLM token capture currently supports Nemotron dynamic images only"
+            )
+        if not policy_config["megatron_cfg"]["enabled"]:
+            raise ValueError(
+                "Dynamic-image token capture currently requires the Megatron learner"
+            )
+        if token_capture_cfg.defer_routed_experts_to_policy:
+            raise ValueError("VLM token capture requires direct router replay assembly")
     if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
         if not master_config.checkpointing["enabled"]:
             raise ValueError(
@@ -1885,12 +1905,17 @@ def setup_single_controller(
             master_config=master_config,
             partition_id=partition_id,
             include_multimodal_fields=processor is not None,
+            capture_media=capture_images,
         )
     if token_capture_cfg.enabled:
         # Host Gym's capture core in every vLLM DP leader (in-worker DP
         # client + TQTokenSink + the single install_capture call), and give
         # workers the initial weight version to stamp on captured calls.
-        generation.setup_token_capture(dp_config, token_capture_cfg.staging_partition)
+        generation.setup_token_capture(
+            dp_config,
+            token_capture_cfg.staging_partition,
+            capture_images=capture_images,
+        )
         generation.set_rollout_weight_version(0)
 
     if weight_synchronizer is None:
@@ -1953,6 +1978,7 @@ def setup_single_controller(
                 router_replay_enabled=router_replay_enabled(policy_config),
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
+                capture_images=capture_images,
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )
@@ -2012,6 +2038,7 @@ def setup_single_controller(
         last_checkpoint_path=recovery_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         partition_includes_multimodal_fields=processor is not None,
+        staging_partition_includes_media=capture_images,
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
         finalizer_actors=finalizer_actors,
