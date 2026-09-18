@@ -67,6 +67,12 @@ RL_BUCKET_ATTR = "rl.bucket"
 # without parsing it back out of the span name.
 RL_EFFICIENCY_CATEGORY_ATTR = "rl.efficiency.category"
 
+# Retry count for a wait that one span covers rather than one span per poll.
+# Without it the coalesced span's duration is unreadable: the same ten seconds
+# could be two thousand clean 5ms polls or two hundred polls whose selection
+# work ran long, which are opposite diagnoses.
+RL_IDLE_POLLS_ATTR = "rl.idle.polls"
+
 __all__ = [
     "managed_span",
     "umbrella_span",
@@ -91,9 +97,11 @@ __all__ = [
     "per_prompt_scope",
     "in_per_prompt_scope",
     "efficiency_span",
+    "start_efficiency_span",
     "startup_span",
     "setup_span",
     "RL_EFFICIENCY_CATEGORY_ATTR",
+    "RL_IDLE_POLLS_ATTR",
 ]
 
 
@@ -675,6 +683,25 @@ def umbrella_span(
             yield span
 
 
+def _efficiency_span_name_and_attrs(
+    category: str, attributes: Mapping[str, Any]
+) -> tuple[str, dict[str, Any]]:
+    """``(span name, attributes)`` for one efficiency category.
+
+    Shared by the two ways to open one of these spans so the bucket rules —
+    including which categories are deliberately unbucketed — cannot drift
+    between them.
+    """
+    bucket = bucket_for_efficiency_category(category)
+    if category in UNBUCKETED_SPAN_CATEGORIES:
+        bucket = None
+    attrs: dict[str, Any] = {RL_EFFICIENCY_CATEGORY_ATTR: category}
+    if bucket is not None:
+        attrs[RL_BUCKET_ATTR] = bucket.value
+    attrs.update(attributes)
+    return f"rl.{category.replace('/', '.')}", attrs
+
+
 @contextmanager
 def efficiency_span(
     category: str, tracer: Optional[Tracer] = None, **attributes: Any
@@ -698,19 +725,60 @@ def efficiency_span(
     covering the same interval as its children is counted twice. Wrap a wait,
     not a phase that does instrumented work.
     """
-    bucket = bucket_for_efficiency_category(category)
-    if category in UNBUCKETED_SPAN_CATEGORIES:
-        bucket = None
-    attrs: dict[str, Any] = {RL_EFFICIENCY_CATEGORY_ATTR: category}
-    if bucket is not None:
-        attrs[RL_BUCKET_ATTR] = bucket.value
-    attrs.update(attributes)
-    name = f"rl.{category.replace('/', '.')}"
+    name, attrs = _efficiency_span_name_and_attrs(category, attributes)
     # The lens helper rather than the wrapper above: the bucket is decided here,
     # from the category, and the wrapper would fill in the EFFICIENCY group's
     # default (overhead) for the categories deliberately left unbucketed.
     with _managed_span(RLSpanGroup.EFFICIENCY, name, tracer=tracer, **attrs) as span:
         yield span
+
+
+def start_efficiency_span(
+    category: str, tracer: Optional[Tracer] = None, **attributes: Any
+) -> Optional[Any]:
+    """Start an efficiency span the caller ends by hand, or None if disabled.
+
+    For a wait that is implemented as a poll loop, where the span has to outlive
+    a single iteration. :func:`efficiency_span` cannot express that twice over:
+    it is a context manager, so it cannot span iterations at all, and it
+    attaches the span to the context, so anything started while it was open
+    would nest underneath it. In an asyncio pump that is not hypothetical — a
+    task created during the wait copies the context it was created in, so
+    unrelated rollout work would reparent under an idle span. This starts the
+    span *without* attaching it: it adopts no children, and it does not have to,
+    since a wait has nothing to nest.
+
+    The caller owns the whole lifecycle, which is the cost of the coalescing:
+
+    - end it on the path that ends the wait, or the span runs to whenever the
+      loop happens to stop;
+    - end it on every other way out of the loop that lets the run continue --
+      ``break``, or the loop condition going false mid-wait -- since an unended
+      span stays open over whatever follows and is never exported. Exits that
+      end the run can be left alone: dropping the span costs nothing there;
+    - pass :data:`RL_IDLE_POLLS_ATTR` so the duration can be read against the
+      number of retries it covers.
+
+    Returns None when the efficiency group is off, which doubles as the
+    telemetry-off no-op: the ``is not None`` guards the caller already needs for
+    a hand-managed span are the same ones that skip the disabled path.
+
+    Prefer :func:`efficiency_span` for anything that fits in a ``with``.
+    """
+    if not is_span_group_enabled(RLSpanGroup.EFFICIENCY):
+        return None
+
+    from opentelemetry import trace as _trace
+
+    name, attrs = _efficiency_span_name_and_attrs(category, attributes)
+    if tracer is None:
+        tracer = _trace.get_tracer(__name__)
+    # start_span, not start_as_current_span: see above on why this span must not
+    # become current. No explicit parent, so it still nests under whatever is
+    # current *here*, which is the enclosing step.
+    span = tracer.start_span(name)
+    safe_set_span_attributes(span, attrs)
+    return span
 
 
 @contextmanager
