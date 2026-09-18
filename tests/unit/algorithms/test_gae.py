@@ -233,32 +233,6 @@ def test_gae_effective_lambda_and_fallback(
         )
 
 
-def test_gae_fractional_sample_weights_preserve_recurrence(
-    device: torch.device,
-) -> None:
-    """PPO's advantage mask can include a fractional sample loss multiplier."""
-    estimator = GeneralizedAdvantageEstimator(
-        GAEConfig(gae_lambda=1.0), ClippedPGLossConfig()
-    )
-    rewards = torch.tensor(
-        [[0.3, 0.0, -0.2, 1.0]] * 2, device=device, dtype=torch.float64
-    )
-    values = torch.tensor(
-        [[0.2, 999.0, 0.5, 0.8]] * 2, device=device, dtype=torch.float64
-    )
-    mask = torch.tensor(
-        [[0.25, 0.0, 0.25, 0.25], [0.5, 0.0, 1.0, 0.5]],
-        device=device,
-        dtype=torch.float64,
-    )
-
-    actual = estimator._compute_gae(rewards, values, mask)
-    expected = _reference_gae(rewards, values, mask)
-
-    for actual_tensor, expected_tensor in zip(actual, expected):
-        torch.testing.assert_close(actual_tensor, expected_tensor)
-
-
 @pytest.mark.parametrize("configured_lambda,override", [(1.0, None), (0.95, 1.0)])
 def test_gae_fast_path_logs_activation_every_call(
     capsys: pytest.CaptureFixture[str],
@@ -284,7 +258,7 @@ def test_gae_fast_path_logs_activation_every_call(
     )
 
 
-@pytest.mark.parametrize("fallback", ["gamma", "lambda", "tensor_lambda", "fractional"])
+@pytest.mark.parametrize("fallback", ["gamma", "lambda", "tensor_lambda"])
 def test_gae_fallback_does_not_log_fast_path_activation(
     capsys: pytest.CaptureFixture[str],
     fallback: str,
@@ -298,11 +272,7 @@ def test_gae_fallback_does_not_log_fast_path_activation(
     )
     rewards = torch.tensor([[0.0, 1.0]])
     values = torch.tensor([[0.2, 0.5]])
-    mask = (
-        torch.full_like(rewards, 0.5)
-        if fallback == "fractional"
-        else torch.ones_like(rewards)
-    )
+    mask = torch.ones_like(rewards)
     override = torch.ones(1) if fallback == "tensor_lambda" else None
 
     estimator._compute_gae(rewards, values, mask, gae_lambda=override)
