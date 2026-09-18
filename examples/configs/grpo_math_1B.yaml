@@ -122,8 +122,6 @@ checkpointing:
   # the buffered window fresh instead of reusing completed groups (which skew
   # toward short rollouts at a save boundary).
   load_replay_buffer: true
-  model_save_format: "safetensors"
-  save_consolidated: false
   save_optimizer: true
   # SingleController only: include native TQ state and the metadata-only replay
   # index. Required for recovery-capable samplers to preserve completed,
@@ -151,6 +149,12 @@ policy:
   dtensor_cfg:
     _v2: true
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      # Canonical Automodel modes: "false", "final", or "every".
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
@@ -243,6 +247,7 @@ policy:
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    fp32_lm_head: false # Emit fp32 logits from Megatron's LM head; must match policy.generation.vllm_cfg.fp32_lm_head.
     moe_per_layer_logging: False
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
@@ -455,6 +460,7 @@ policy:
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
+      fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head} # Compute Nemotron-H logits with an fp32 LM head.
       # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
       refit_with_reload_api: false
       tensor_parallel_size: 1
@@ -601,8 +607,9 @@ data_plane:
                                      # serialized groups and cost throughput;
                                      # higher buys little at linear HBM cost.
                                      # GDR needs that headroom to pay off.
-  # observability:                    # NotRequired
-  #   enabled: false
+  observability:                      # per-op data-plane timing/volume
+    enabled: true                     # per-op timing/volume; cost is below measurement noise
+    verify_tensor_hash: false         # debug: per-row hash of each row's values+dtype+shape, wire-in vs wire-out
 
 # Multi-Teacher On-Policy Distillation (MOPD): distills from one or more teacher
 # models into the policy via token-level teacher-minus-student logprob advantages,

@@ -502,10 +502,18 @@ def test_exit_on_max_epochs(mock_xtoken_components):
     assert mock_xtoken_components.student_policy.train.call_count == 4
 
 
-def test_exit_on_timeout(mock_xtoken_components, capsys):
+def test_exit_on_timeout(mock_xtoken_components, capsys, tmp_path):
     mock_xtoken_components.master_config.distillation["max_num_steps"] = 100
+    mock_xtoken_components.master_config.checkpointing["enabled"] = True
+    mock_xtoken_components.master_config.checkpointing["metric_name"] = None
+    mock_xtoken_components.checkpointer.init_tmp_checkpoint.return_value = str(
+        tmp_path / "tmp_step"
+    )
 
-    with patch.object(xt_mod, "TimeoutChecker") as mock_timeout_class:
+    with (
+        patch("nemo_rl.algorithms.xtoken_off_policy_distillation.torch.save"),
+        patch.object(xt_mod, "TimeoutChecker") as mock_timeout_class,
+    ):
         mock_timeout_instance = MagicMock()
         # False for 4 steps, then True (timeout).
         mock_timeout_instance.check_save.side_effect = [False] * 4 + [True]
@@ -515,6 +523,12 @@ def test_exit_on_timeout(mock_xtoken_components, capsys):
 
     # Loop should have run exactly 5 steps before tripping the timeout return.
     assert mock_xtoken_components.student_policy.train.call_count == 5
+    assert (
+        mock_xtoken_components.student_policy.save_checkpoint.call_args.kwargs[
+            "is_final_checkpoint"
+        ]
+        is False
+    )
 
     captured = capsys.readouterr()
     assert "Timeout reached, stopping training early." in captured.out
