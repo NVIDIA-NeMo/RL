@@ -19,7 +19,7 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, fields
-from typing import Any, Callable, Optional, TypeVar, cast
+from typing import Any, Callable, Literal, Optional, TypeVar, cast
 
 import numpy as np
 import ray
@@ -315,6 +315,10 @@ class GRPOConfig(BaseModel, extra="allow"):
     max_num_steps: int = 1000000
     max_rollout_turns: int = 1
     normalize_rewards: bool = True
+    # Participation of loss-masked rewards in prompt-group baseline/std.
+    # "exclude" preserves validity-aware statistics; "include" enables ablations.
+    # Neither value changes the loss mask.
+    masked_reward_policy: Literal["exclude", "include"] = "exclude"
     # Clipping bounds for normalized advantages to prevent extreme values
     # When set, advantages are clipped to [advantage_clip_low, advantage_clip_high] after normalization
     # Default: null (no clipping)
@@ -2373,9 +2377,9 @@ def _mask_sample_valid_mask(
 
     ``mask_sample`` is the environment's "do not learn from this row" flag (NeMo Gym
     sets it through ``instance_config``). ``_apply_mask_sample_filter`` already drops
-    those rows from the loss; this mask additionally keeps their rewards, which are
-    unreliable by definition, out of the per-prompt statistics so they cannot shift
-    their siblings' advantages. A missing ``mask_sample`` key yields an all-ones mask.
+    those rows from the loss. This helper describes environment masking; the
+    configured policy decides whether to use it in prompt-group statistics.
+    A missing ``mask_sample`` key yields an all-ones mask.
     """
     rewards = repeated_batch["total_reward"]
     valid_mask = torch.ones_like(rewards, dtype=torch.float32)
@@ -2387,6 +2391,31 @@ def _mask_sample_valid_mask(
         mask_sample = torch.tensor(mask_sample, dtype=torch.bool)
     valid_mask[mask_sample.bool().to(valid_mask.device)] = 0.0
     return valid_mask
+
+
+def _advantage_valid_mask(
+    sample_mask: torch.Tensor, grpo_config: GRPOConfig
+) -> torch.Tensor:
+    """Select reward participation without changing the sample loss mask."""
+    if grpo_config.masked_reward_policy == "include":
+        return torch.ones_like(sample_mask)
+    return sample_mask
+
+
+def _dynamic_sampling_valid_mask(
+    repeated_batch: BatchedDataDict[DatumSpec], grpo_config: GRPOConfig
+) -> torch.Tensor:
+    """Apply the reward policy to masks available before logprob computation."""
+    sample_mask = _mask_sample_valid_mask(repeated_batch)
+    sample_mask = sample_mask * repeated_batch["loss_multiplier"]
+    if grpo_config.overlong_filtering:
+        truncated = torch.as_tensor(
+            repeated_batch["truncated"], dtype=torch.bool, device=sample_mask.device
+        )
+        sample_mask = sample_mask * (~truncated).to(sample_mask.dtype)
+    # Sequence-logprob-error filtering runs after dynamic sampling. Its mask
+    # applies to final advantages but is not available for this admission step.
+    return _advantage_valid_mask(sample_mask, grpo_config)
 
 
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
@@ -3293,9 +3322,9 @@ def _grpo_train_impl(
                 ):
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
-                    # Env-excluded rows (mask_sample) do not vote in the per-prompt
-                    # baseline / std that dynamic sampling filters groups on.
-                    baseline_valid_mask = _mask_sample_valid_mask(repeated_batch)
+                    baseline_valid_mask = _dynamic_sampling_valid_mask(
+                        repeated_batch, master_config.grpo
+                    )
 
                     print("▶ Computing advantages...", flush=True)
                     # For DAPO with reward shaping, compute std on the raw
@@ -3579,10 +3608,9 @@ def _grpo_train_impl(
                         repeated_batch=repeated_batch,
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
-                        # Rows dropped from the loss (mask_sample, overlong filtering,
-                        # seq-logprob-error masking) do not vote in their siblings'
-                        # baseline / std either -- same contract as the SingleController.
-                        valid_mask=sample_mask,
+                        valid_mask=_advantage_valid_mask(
+                            sample_mask, master_config.grpo
+                        ),
                     )
                     del prompt_ids_for_adv
 
@@ -5382,10 +5410,9 @@ def async_grpo_train(
                         repeated_batch=repeated_batch,
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
-                        # Rows dropped from the loss (mask_sample, overlong filtering,
-                        # seq-logprob-error masking) do not vote in their siblings'
-                        # baseline / std either -- same contract as the SingleController.
-                        valid_mask=sample_mask,
+                        valid_mask=_advantage_valid_mask(
+                            sample_mask, master_config.grpo
+                        ),
                         # OPD kwargs (ignored by non-OPD estimators via **kwargs)
                         teacher_logprobs=trajectory_teacher_logprobs.to(
                             train_data["prev_logprobs"].device

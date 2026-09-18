@@ -39,9 +39,11 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     RewardPenaltyConfig,
     RewardScalingConfig,
+    _advantage_valid_mask,
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
+    _dynamic_sampling_valid_mask,
     _get_grpo_save_state,
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
@@ -358,6 +360,92 @@ class TestMaskSampleValidMask:
         assert torch.equal(
             _mask_sample_valid_mask(repeated_batch), torch.tensor([1.0, 1.0])
         )
+
+
+def test_masked_reward_policy_default_and_validation() -> None:
+    assert GRPOConfig().masked_reward_policy == "exclude"
+    with pytest.raises(ValueError, match="masked_reward_policy"):
+        GRPOConfig(masked_reward_policy="unknown")
+
+
+@pytest.mark.parametrize("policy", ["exclude", "include"])
+@pytest.mark.parametrize("leave_one_out", [False, True])
+@pytest.mark.parametrize("num_valid", [0, 1, 2, 3])
+@pytest.mark.parametrize("normalize", [False, True])
+def test_masked_reward_policy_controls_group_signal(
+    policy: str, leave_one_out: bool, num_valid: int, normalize: bool
+) -> None:
+    rewards = torch.tensor([1.0, 1.0, 0.0])
+    loss_mask = (torch.arange(3) < num_valid).float()
+    original_loss_mask = loss_mask.clone()
+    config = GRPOConfig(masked_reward_policy=policy)
+    estimator = GRPOAdvantageEstimator(
+        AdvEstimatorConfig(
+            normalize_rewards=normalize, use_leave_one_out_baseline=leave_one_out
+        ),
+        ClippedPGLossConfig(),
+    )
+    advantages = estimator.compute_advantage(
+        prompt_ids=torch.zeros(3, 2, dtype=torch.long),
+        rewards=rewards,
+        mask=loss_mask[:, None].expand(-1, 2),
+        valid_mask=_advantage_valid_mask(loss_mask, config),
+    )
+    effective_advantages = advantages * loss_mask[:, None]
+    assert torch.equal(loss_mask, original_loss_mask)
+    assert torch.isfinite(advantages).all()
+    assert effective_advantages[num_valid:].count_nonzero() == 0
+    if policy == "exclude" and num_valid < 3:
+        assert effective_advantages.count_nonzero() == 0
+    elif num_valid > 0:
+        expected = 0.5 if leave_one_out else 1.0 / 3.0
+        if normalize:
+            std = (0.5 if leave_one_out else 1.0 / 3.0) ** 0.5
+            expected /= std + 1e-6
+        assert advantages[0, 0].item() == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("policy", ["exclude", "include"])
+@pytest.mark.parametrize("mask_source", ["environment", "overlong", "preexisting"])
+def test_dynamic_sampling_uses_masked_reward_policy(
+    policy: str, mask_source: str
+) -> None:
+    # The masked row is the only source of reward variance in this group.
+    batch = BatchedDataDict(
+        {
+            "loss_multiplier": torch.tensor(
+                [1.0, 1.0, 0.0 if mask_source == "preexisting" else 1.0]
+            ),
+            "total_reward": torch.tensor([1.0, 1.0, 0.0]),
+            "mask_sample": [False, False, mask_source == "environment"],
+            "truncated": [False, False, mask_source == "overlong"],
+        }
+    )
+    original_loss_mask = batch["loss_multiplier"].clone()
+    config = GRPOConfig(
+        masked_reward_policy=policy,
+        overlong_filtering=True,
+        use_dynamic_sampling=True,
+        num_prompts_per_step=1,
+        num_generations_per_prompt=3,
+        use_leave_one_out_baseline=False,
+    )
+    baseline, std = calculate_baseline_and_std_per_prompt(
+        torch.zeros(3, 2, dtype=torch.long),
+        batch["total_reward"],
+        _dynamic_sampling_valid_mask(batch, config),
+        leave_one_out_baseline=False,
+    )
+    _, complete, _, _ = dynamic_sampling(
+        batch,
+        std,
+        baseline,
+        1,
+        MasterConfig.model_construct(grpo=config),
+        Timer(),
+    )
+    assert complete == (policy == "include")
+    assert torch.equal(batch["loss_multiplier"], original_loss_mask)
 
 
 class TestMaskSampleFilter:
@@ -4300,15 +4388,15 @@ def test_grpo_train_preserves_advantages_when_clipping_disabled(
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
-def test_grpo_train_passes_final_sample_mask_as_valid_mask(
-    mock_grpo_components, train_func, monkeypatch
+@pytest.mark.parametrize("policy", ["exclude", "include"])
+def test_grpo_train_passes_configured_advantage_mask(
+    mock_grpo_components, train_func, monkeypatch, policy
 ):
-    """Rows dropped from the loss must not vote in their siblings' baseline.
-
-    Both legacy loops hand the estimator the same ``sample_mask`` that reaches
-    ``policy.train`` (mask_sample / overlong / seq-logprob-error masking already
-    applied), mirroring the SingleController's ``valid_mask`` contract.
-    """
+    """Including a masked reward must not restore its training loss."""
+    config = mock_grpo_components["master_config"].grpo
+    config.masked_reward_policy = policy
+    batch = next(iter(mock_grpo_components["train_dataloader"]))
+    batch["mask_sample"] = torch.tensor([True])
     mock_adv_estimator = MagicMock()
     mock_adv_estimator.compute_advantage.return_value = torch.zeros(1, 2)
     monkeypatch.setattr(
@@ -4321,7 +4409,15 @@ def test_grpo_train_passes_final_sample_mask_as_valid_mask(
     mock_adv_estimator.compute_advantage.assert_called_once()
     valid_mask = mock_adv_estimator.compute_advantage.call_args.kwargs["valid_mask"]
     trained = mock_grpo_components["policy"].train.call_args[0][0]
-    assert torch.equal(valid_mask, trained["sample_mask"])
+    assert trained["sample_mask"].count_nonzero() == 0
+    expected = (
+        torch.ones_like(valid_mask) if policy == "include" else trained["sample_mask"]
+    )
+    assert torch.equal(valid_mask, expected)
+    assert (
+        mock_adv_estimator.compute_advantage.call_args.kwargs["mask"].count_nonzero()
+        == 0
+    )
 
 
 def test_clip_grpo_advantages_respects_config_bounds():

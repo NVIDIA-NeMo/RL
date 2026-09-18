@@ -525,15 +525,19 @@ class _AdvantageDataPlane:
 class _MaskRecordingAdvantageEstimator:
     def __init__(self) -> None:
         self.mask: torch.Tensor | None = None
+        self.valid_mask: torch.Tensor | None = None
 
-    def compute_advantage(self, *, rewards, mask, **kwargs) -> torch.Tensor:
+    def compute_advantage(self, *, rewards, mask, valid_mask, **kwargs) -> torch.Tensor:
         del kwargs
         self.mask = mask.clone()
+        self.valid_mask = valid_mask.clone()
         return rewards.unsqueeze(-1).expand_as(mask).clone()
 
 
+@pytest.mark.parametrize("policy", ["exclude", "include"])
 def test_advantage_stage_composes_all_filters_before_computing_advantages(
     capsys: pytest.CaptureFixture[str],
+    policy: str,
 ) -> None:
     batch_size, sequence_length = 4, 5
     generation_logprobs = torch.zeros(batch_size, sequence_length)
@@ -577,6 +581,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(
             seq_logprob_error_threshold=2.0,
+            masked_reward_policy=policy,
             overlong_filtering=True,
             invalid_tool_call_advantage=-5.0,
             malformed_thinking_advantage=None,
@@ -623,6 +628,12 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     assert estimator.mask is not None
     assert estimator.mask[0].all()
     assert estimator.mask[1:].count_nonzero() == 0
+    expected_valid_mask = (
+        torch.ones(batch_size)
+        if policy == "include"
+        else torch.tensor([1.0, 0.0, 0.0, 0.0])
+    )
+    assert torch.equal(estimator.valid_mask, expected_valid_mask)
     assert ctrl._step_log_dict["num_mask_sample_filtered"] == [1]
     metrics = ctrl._step_log_dict["seq_logprob_error_metrics"]
     assert len(metrics) == 1
@@ -841,8 +852,10 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
     assert logged.max().item() == pytest.approx(2.0)
 
 
+@pytest.mark.parametrize("policy", ["exclude", "include"])
 def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     capsys: pytest.CaptureFixture[str],
+    policy: str,
 ) -> None:
     batch_size, sequence_length = 2, 5
     data = TensorDict(
@@ -874,7 +887,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=GRPOConfig(seq_logprob_error_threshold=2.0)
+        grpo=GRPOConfig(seq_logprob_error_threshold=2.0, masked_reward_policy=policy)
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
