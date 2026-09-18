@@ -365,6 +365,35 @@ GRPO uses temperature, top-p (nucleus sampling), and top-k sampling during rollo
 
 **Known issue (Qwen models):** For some Qwen-based models, a `ValueError: Token id 151708 is out of vocabulary` error may occur when the policy drifts from its initial distribution. Setting `top_p` to `0.9999` in the generation config is a recommended workaround. For details and discussion, see [#237](https://github.com/NVIDIA-NeMo/RL/issues/237).
 
+### Masked rewards in advantage statistics
+
+`grpo.masked_reward_policy` controls whether loss-masked rewards participate in
+prompt-group baselines and standard deviations. It applies to GRPO, GDPO's
+per-reward statistics, and Reinforce++'s optional group baseline, across synchronous
+GRPO, asynchronous GRPO, and SingleController:
+
+- `exclude` (default): use the final sample loss mask for reward participation.
+- `include`: let every reward in the group participate, including loss-masked rows.
+
+Both options preserve the sample and token loss masks, so masked rows have no
+direct loss. Estimator-specific batch whitening is unchanged. For example, with
+rewards `[1, 1, 0]`, a masked last row, and leave-one-out disabled, the valid rows'
+baseline is `1` under `exclude` and `2/3` under `include`.
+
+To compare the policies, run the same config and revisions with only
+`grpo.masked_reward_policy=exclude` or `grpo.masked_reward_policy=include` changed.
+The include option covers all sample-mask sources, including environment masks,
+overlong filtering, sequence-logprob errors, and pre-existing zero loss weights;
+it does not distinguish failure reasons.
+
+Synchronous dynamic sampling uses the same policy for its reward standard
+deviation, applying the environment, pre-existing loss, and overlong masks
+available at that stage. Sequence-logprob-error masking happens later and therefore
+affects final advantage statistics but cannot affect this earlier admission step.
+With `exclude`, groups with at most one participating reward retain the existing
+zero group-relative signal behavior. SingleController still skips advantage
+computation when a whole chunk has no trainable tokens, under either policy.
+
 ## Performance Optimizations
 
 RL generations typically produce highly variable sequence lengths, which result in a significant amount of padding if approached naively. We address this with Sequence Packing and Dynamic Batching, which are techniques to reduce the amount of padding required. You can read more about these in the [design doc](../design-docs/sequence-packing-and-dynamic-batching.md).
