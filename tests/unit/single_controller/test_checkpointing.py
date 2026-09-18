@@ -1788,6 +1788,154 @@ class TestPeriodicRolloutCheckpoint:
         )
         assert recovery_state["pending_completed_execution_acknowledgements"] == []
 
+    def test_completion_after_initial_ack_flush_unblocks_prepare_and_publishes_clean_snapshot(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        actor._gym_participant_checkpointing_enabled = True
+        actor._master_config.rollout_checkpointing.gym.participant_checkpointing_enabled = True
+        actor._gym_checkpoint_topology = GymCheckpointTopology.model_validate(
+            {
+                "schema_version": 1,
+                "participants": [
+                    {
+                        "participant": {
+                            "server_name": "agent-route",
+                            "component": "responses_api_agents",
+                            "participant_name": "test-agent",
+                        },
+                        "schema_version": 1,
+                        "admission_states": ["accepting"],
+                        "checkpoint_mode": "export_restore",
+                        "concurrency_contract": "serialized_per_session",
+                        "multi_process": {
+                            "mode": "single_worker",
+                            "num_workers": 1,
+                        },
+                        "instance_role": None,
+                        "features": ["completed_result_acknowledgement"],
+                    }
+                ],
+            }
+        )
+        pending_state = {
+            "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+            "groups": [],
+            "pending_completed_execution_acknowledgements": [
+                {
+                    "rollout_id": "group-8_g0",
+                    "attempt_index": 0,
+                    "agent_name": "test-agent",
+                    "execution_generation": 1,
+                    "result_identity": "result-group-8_g0-0",
+                    "result_digest": "2" * 64,
+                }
+            ],
+        }
+
+        async def scenario() -> Any:
+            events: list[str] = []
+            acknowledgement_received = asyncio.Event()
+            empty_pass_entered = asyncio.Event()
+            release_empty_pass = asyncio.Event()
+            completion_recorded = asyncio.Event()
+            gym_actor = _FakeGymCheckpointActor(events)
+
+            async def acknowledge(
+                executions: list[dict[str, Any]],
+            ) -> dict[str, Any]:
+                events.append("acknowledge")
+                acknowledgement_received.set()
+                return {"acknowledged": executions}
+
+            async def prepare(checkpoint_id: str, deadline_ts: float) -> dict[str, Any]:
+                assert deadline_ts > time.time()
+                events.append("prepare")
+                # This completion crosses the actor boundary after SC's first
+                # pre-prepare ACK flush. Gym prepare cannot finish until the
+                # newly durable obligation is delivered.
+                async with actor._data_plane_checkpoint_barrier.mutation(
+                    "gym_acknowledgements"
+                ) as cut:
+                    actor._rollout_recovery_ledger.load_state_dict(cut, pending_state)
+                actor._schedule_completed_gym_acknowledgement_drain()
+                completion_recorded.set()
+                await asyncio.wait_for(acknowledgement_received.wait(), timeout=1.0)
+                while actor._rollout_recovery_ledger.pending_completed_execution_acknowledgements():
+                    await asyncio.sleep(0)
+                return {
+                    "checkpoint_id": checkpoint_id,
+                    "ready": True,
+                    "participants": [],
+                }
+
+            gym_actor.acknowledge_completed_executions = _AsyncRemoteMethod(acknowledge)
+            gym_actor.prepare_checkpoint = _AsyncRemoteMethod(prepare)
+            actor._env_handles = {"nemo_gym": gym_actor}
+
+            original_flush = actor._flush_completed_gym_acknowledgements
+            flush_calls = 0
+
+            async def tracked_flush() -> int:
+                nonlocal flush_calls
+                flush_calls += 1
+                events.append(f"flush-{flush_calls}")
+                if flush_calls == 1:
+                    # Hold an older best-effort drain after it observed an
+                    # empty outbox but before its task can retire. The
+                    # completion recorded by prepare must wake a successor.
+                    empty_pass_entered.set()
+                    await release_empty_pass.wait()
+                    return 0
+                return await original_flush()
+
+            actor._flush_completed_gym_acknowledgements = tracked_flush
+            old_drain = asyncio.create_task(
+                actor._drain_completed_gym_acknowledgements_best_effort()
+            )
+            actor._gym_completed_acknowledgement_task = old_drain
+            await asyncio.wait_for(empty_pass_entered.wait(), timeout=1.0)
+
+            save_task = asyncio.create_task(actor._save_rollout_checkpoint(force=True))
+            await asyncio.wait_for(completion_recorded.wait(), timeout=1.0)
+            assert actor._gym_completed_acknowledgement_task is old_drain
+            release_empty_pass.set()
+            result = await asyncio.wait_for(save_task, timeout=5.0)
+            await old_drain
+            replacement_drain = actor._gym_completed_acknowledgement_task
+            if replacement_drain is not None:
+                await replacement_drain
+            return result, events
+
+        try:
+            result, events = asyncio.run(scenario())
+            assert result.saved
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert events[:3] == ["flush-1", "flush-2", "prepare"]
+        assert sum(event.startswith("flush-") for event in events) >= 4
+        assert events.count("acknowledge") == 1
+        assert events.index("prepare") < events.index("acknowledge")
+        assert events.index("acknowledge") < events.index("commit")
+        assert events.index("commit") < events.index("resume")
+        assert (
+            actor._rollout_recovery_ledger.pending_completed_execution_acknowledgements()
+            == []
+        )
+        snapshot = (
+            tmp_path
+            / "checkpoints"
+            / BOOTSTRAP_DIRNAME
+            / "rollout_snapshots"
+            / "snapshot_000001"
+        )
+        recovery_state = torch.load(
+            snapshot / ROLLOUT_RECOVERY_STATE_FILENAME,
+            weights_only=True,
+        )
+        assert recovery_state["pending_completed_execution_acknowledgements"] == []
+
     def test_trainer_checkpoint_publishes_coordinated_gym_snapshot(
         self, tmp_path: Path
     ) -> None:
