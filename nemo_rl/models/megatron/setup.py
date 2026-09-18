@@ -301,8 +301,8 @@ from nemo_rl.models.megatron.config import (
     ModelAndOptimizerState,
     RuntimeConfig,
 )
+from nemo_rl.models.megatron.draft.training import resolve_draft_speculator
 from nemo_rl.models.megatron.draft.utils import (
-    build_draft_model,
     find_draft_owner_chunk,
     get_attached_draft_model,
 )
@@ -1475,6 +1475,15 @@ def _apply_precision_config(
         "float16": torch.float16,
     }
     model_cfg.pipeline_dtype = dtype_map[config["megatron_cfg"]["pipeline_dtype"]]
+    if config["megatron_cfg"].get("fp32_lm_head"):
+        if not hasattr(model_cfg, "logit_dtype"):
+            raise ValueError(
+                "policy.megatron_cfg.fp32_lm_head requires a Megatron-Bridge "
+                "provider that exposes logit_dtype; "
+                f"{type(model_cfg).__name__} does not."
+            )
+        # Megatron-LM emits fp32 logits from a bf16 x bf16 tensor-core GEMM.
+        model_cfg.logit_dtype = torch.float32
 
     te_precision_config_file = config["megatron_cfg"].get("te_precision_config_file")
     if te_precision_config_file is not None:
@@ -1898,11 +1907,11 @@ def _create_draft_pre_wrap_hook(
     preload_policy_from_pretrained: bool,
 ) -> Callable[[list[MegatronModule]], list[MegatronModule]]:
     """Create the hook that attaches draft weights before mixed-precision/DDP wrapping."""
-    draft_cfg = policy_cfg["draft"]
+    draft_speculator = resolve_draft_speculator(policy_cfg.get("draft"))
 
     def draft_pre_wrap_hook(model: list[MegatronModule]) -> list[MegatronModule]:
         """Optionally preload the base policy, then attach the draft module to the owner chunk."""
-        if not draft_cfg["enabled"]:
+        if draft_speculator is None:
             return model
 
         # Base pretrained checkpoints do not contain draft weights, so load the
@@ -1937,9 +1946,8 @@ def _create_draft_pre_wrap_hook(
             )
 
         pg_collection = get_pg_collection(model)
-        draft_model = build_draft_model(
-            megatron_cfg.model,
-            draft_config=draft_cfg,
+        draft_model = draft_speculator.build_model(
+            model_provider=megatron_cfg.model,
             pg_collection=pg_collection,
             policy_model_chunk=draft_owner,
         )
@@ -2156,7 +2164,7 @@ def setup_model_and_optimizer(
             "megatron_cfg.peft.restore_from is set but megatron_cfg.peft.enabled "
             "is False. Enable PEFT to warm start from an adapter checkpoint."
         )
-    draft_enabled = "draft" in policy_cfg and policy_cfg["draft"]["enabled"]
+    draft_enabled = "draft" in policy_cfg and policy_cfg["draft"].enabled
     resume_checkpoint_exists = (
         megatron_cfg.checkpoint.load is not None
         and checkpoint_exists(megatron_cfg.checkpoint.load)

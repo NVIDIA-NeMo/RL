@@ -116,9 +116,6 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             arms a watchdog and aborts its own communicator when it expires, which is
             what lets the controller rebuild over the survivors instead of blocking in
             NCCL forever. ``None`` disarms it entirely, so the hang protection is lost.
-        sync_policy_params: Whether this synchronizer owns the pre-transfer policy
-            parameter sync. A lifecycle wrapper may perform it earlier and disable it
-            here to avoid a duplicate worker round trip.
     """
 
     def __init__(
@@ -128,15 +125,12 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         train_cluster: Any,
         inference_cluster: Any,
         refit_timeout_s: Optional[float] = None,
-        *,
-        sync_policy_params: bool = True,
     ):
         self._policy = policy
         self._generation = generation
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
         self._refit_timeout_s = refit_timeout_s
-        self._sync_policy_params = sync_policy_params
         self._stale = True
         # What the communicators were last built over. None until init_communicator.
         self._built_membership: Optional[RefitMembership] = None
@@ -194,8 +188,6 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
-        if self._sync_policy_params:
-            self._policy.sync_params_before_refit()
         timer_context = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
             if timer is not None
