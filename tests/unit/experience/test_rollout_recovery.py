@@ -72,7 +72,9 @@ def _cc_sealed_ledger() -> RolloutRecoveryLedger:
             capture_rollout_id=f"{owner}_s{i}",
             receipt={
                 "rollout_id": f"{owner}_s{i}",
-                "manifest": [{"staging_key": f"key-{i}"}],
+                "manifest": [
+                    {"model_call_id": "call", "staging_key": f"{owner}_s{i}/call"}
+                ],
             },
             selected_response_ids=(f"response-{i}",),
             truncated=i == 1,
@@ -106,7 +108,8 @@ def test_cc_recovery_disk_round_trip_retains_completed_evidence(tmp_path: Path) 
     )
     _bind(restored, "g7", _prompt())
     assert restored.state_dict() == state
-    assert restored.expected_staging_keys() == {"key-0", "key-1"}
+    owner = ledger.get_group("g7").gate_rollout_id(0)
+    assert restored.expected_staging_keys() == {f"{owner}_s{i}/call" for i in range(2)}
     before = ledger.get_group("g7").siblings[0].current_attempt
     _mutate(lambda cut: restored.prepare_for_restart(cut))
     retried = _mutate(lambda cut: restored.prepare_incomplete_retry(cut, "g7"))
@@ -125,6 +128,9 @@ def test_cc_recovery_disk_round_trip_retains_completed_evidence(tmp_path: Path) 
         "missing_segment",
         "foreign_capture",
         "foreign_receipt",
+        "foreign_staging",
+        "wrong_call",
+        "missing_call",
         "staging",
         "duplicate",
         "unsealed",
@@ -146,10 +152,22 @@ def test_cc_recovery_rejects_malformed_saved_ownership(damage: str) -> None:
         segments[0]["capture_rollout_id"] = "foreign_s0"
     elif damage == "foreign_receipt":
         segments[0]["receipt"]["rollout_id"] = "foreign_s0"
+    elif damage in {"foreign_staging", "wrong_call", "missing_call"}:
+        entry = segments[0]["receipt"]["manifest"][0]
+        if damage == "foreign_staging":
+            entry["staging_key"] = "other_owner_s0/call"
+        elif damage == "wrong_call":
+            entry["model_call_id"] = "other_call"
+        else:
+            del entry["model_call_id"]
+        # Keep saved custody consistent: namespace validation must reject it.
+        attempt["staging_keys"][0] = entry["staging_key"]
     elif damage == "staging":
         attempt["staging_keys"] = []
     elif damage == "duplicate":
-        segments[1]["receipt"]["manifest"][0]["staging_key"] = "key-0"
+        manifest = segments[0]["receipt"]["manifest"]
+        manifest.append(dict(manifest[0]))
+        attempt["staging_keys"].insert(0, manifest[0]["staging_key"])
     elif damage == "unsealed":
         attempt["status"] = "abandoned"
     elif damage == "legacy_cc":

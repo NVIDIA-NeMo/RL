@@ -7,6 +7,7 @@ does not qualify a live Ray cluster, vLLM or TransferQueue deployment.
 """
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -360,6 +361,58 @@ def test_cc_group_uses_ordinary_retry_budgets(failure_type):
     assert len(buffer.abort_calls) == expected_attempts
     assert buffer.commit_calls == []
     assert manager.stats.skipped == (0 if failure_type is ValueError else 1)
+
+
+@pytest.mark.parametrize("granularity", ["sibling", "prompt_group"])
+def test_cc_rejects_foreign_staging_before_custody_and_cleanup(
+    owner_stack: tuple, granularity: str
+) -> None:
+    harness, _, _ = owner_stack
+    buffer = _FakeCaptureBuffer()
+    manager = _make_capture_manager(
+        buffer,
+        context_compaction=True,
+        recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
+    )
+
+    async def run(
+        _sample: dict,
+        *,
+        rollout_ids: list[str],
+        generation_indices: list[int],
+        on_completion: Callable[[int, Completion], Awaitable[None]],
+        **_: object,
+    ) -> None:
+        for index in generation_indices:
+            owner = rollout_ids[index]
+            segment = await asyncio.to_thread(capture_segment, harness, f"{owner}_s0")
+            segment.receipt["manifest"][0]["staging_key"] = "other_owner_s0/call"
+            await on_completion(
+                index,
+                Completion(
+                    message_log=[],
+                    env_extras={
+                        "ng_receipt": None,
+                        "ng_rollout_id": owner,
+                        "ng_logical_segments": (segment,),
+                    },
+                    reward=0.5,
+                    truncated=False,
+                ),
+            )
+
+    async def exercise() -> None:
+        manager._impl.run_rollout = run
+        with pytest.raises(ValueError, match="staging ownership"):
+            await manager.generate_for_finalization({"idx": 99})
+        assert manager.recovery_ledger.expected_staging_keys() == set()
+        async with manager._recovery_mutation() as cut:
+            await manager.discard_recovery_group(
+                cut, manager.recovery_ledger.groups()[0].group_id
+            )
+        assert buffer.cleared_staging_key_batches == [[]]
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("granularity", ["sibling", "prompt_group"])

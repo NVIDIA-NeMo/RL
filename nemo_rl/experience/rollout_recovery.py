@@ -340,6 +340,15 @@ def _attempt_staging_keys(
         ):
             raise ValueError("CC recovery receipt identity mismatch")
         keys.extend(_receipt_staging_keys(segment.receipt))
+        # Retry cleanup can run before finalization; prove key ownership now.
+        for entry in (segment.receipt or {}).get("manifest", []):
+            call_id = entry.get("model_call_id")
+            if (
+                not isinstance(call_id, str)
+                or not call_id
+                or entry["staging_key"] != f"{capture_id}/{call_id}"
+            ):
+                raise ValueError("CC recovery has foreign staging ownership")
     if len(keys) != len(set(keys)):
         raise ValueError("CC recovery has duplicate staging ownership")
     return keys

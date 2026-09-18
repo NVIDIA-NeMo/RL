@@ -1574,16 +1574,17 @@ class TestDataPlaneCheckpoint:
     def test_cc_recovery_validates_before_staging_cleanup(
         self, tmp_path: Path, damage: str | None
     ) -> None:
-        state = _cc_sealed_ledger().state_dict()
+        ledger = _cc_sealed_ledger()
+        keys = sorted(ledger.expected_staging_keys()) + ["orphan"]
+        state = ledger.state_dict()
         attempt = state["groups"][0]["siblings"][0]["attempts"][0]
         if damage == "missing_segments":
             attempt["logical_segments"] = None
             attempt["staging_keys"] = []
         recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
         torch.save(state, recovery_path)
-        keys = ["key-0", "key-1", "orphan"]
         if damage == "missing_key":
-            keys.remove("key-1")
+            keys.pop(0)
         dp = _StagingInventoryDPClient(keys, partition_id=_STAGING_PARTITION_ID)
         actor = _ACTOR_CLS(
             _actor_master_config(tmp_path, token_capture_enabled=True),
