@@ -24,13 +24,13 @@ import torch
 import torch.distributed as dist
 import zmq
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
-
-from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoModelForTextToWaveform,
 )
+
+from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
 
 # Try to import nemo_automodel classes, fallback to None if not available
 try:
