@@ -846,21 +846,37 @@ def iter_named_tensor_buckets(
     Waits on async DTensor redistributes (``.wait()``) before sizing, so the
     yielded tensors are always materialized and safe to serialize.
     """
+    yield from iter_named_tensor_group_buckets(
+        ([(name, tensor)] for name, tensor in params_generator),
+        buffer_size_bytes=buffer_size_bytes,
+    )
+
+
+def iter_named_tensor_group_buckets(
+    named_tensor_groups: Iterable[Iterable[tuple[str, torch.Tensor]]],
+    buffer_size_bytes: int,
+) -> "Iterable[list[tuple[str, torch.Tensor]]]":
+    """Bucket tensor groups without splitting companions from one source tensor."""
     if buffer_size_bytes <= 0:
         raise ValueError(f"buffer_size_bytes must be positive, got {buffer_size_bytes}")
 
     bucket: list[tuple[str, torch.Tensor]] = []
     bucket_size = 0
-    for name, tensor in params_generator:
-        if hasattr(tensor, "wait"):
-            tensor = tensor.wait()
-        tensor_size = tensor.numel() * tensor.element_size()
-        if bucket and bucket_size + tensor_size > buffer_size_bytes:
+    for named_tensor_group in named_tensor_groups:
+        materialized_group: list[tuple[str, torch.Tensor]] = []
+        group_size = 0
+        for name, tensor in named_tensor_group:
+            if hasattr(tensor, "wait"):
+                tensor = tensor.wait()
+            materialized_group.append((name, tensor))
+            group_size += tensor.numel() * tensor.element_size()
+
+        if bucket and bucket_size + group_size > buffer_size_bytes:
             yield bucket
             bucket = []
             bucket_size = 0
-        bucket.append((name, tensor))
-        bucket_size += tensor_size
+        bucket.extend(materialized_group)
+        bucket_size += group_size
 
     if bucket:
         yield bucket
@@ -1204,9 +1220,9 @@ def broadcast_hf_buckets_via_distributed_impl(
     ``dist.broadcast`` per tensor over the NCCL group, then waits for the Ray
     refs to confirm engines finished loading the bucket.
 
-    The rollout-engine lock wraps each bucket's broadcast so concurrent SGLang
-    NCCL operations (e.g. health-check pings) cannot collide with the
-    weight-update broadcast.
+    Trainer rank 0 acquires the rollout-engine lock for each bucket to serialize
+    weight-update broadcasts. The generation side does not acquire it; pausing
+    the health monitor keeps serving probes out of the refit phase.
     """
     import time as _time
 

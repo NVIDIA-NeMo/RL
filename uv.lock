@@ -120,7 +120,6 @@ overrides = [
     { name = "transformer-engine", extras = ["pytorch", "core-cu13"], git = "https://github.com/NVIDIA/TransformerEngine.git?rev=release_v2.15" },
     { name = "xgrammar", specifier = ">=0.2.1,<1.0.0" },
 ]
-excludes = ["nvidia-cutlass-dsl-libs-base"]
 
 [[manifest.dependency-metadata]]
 name = "causal-conv1d"
@@ -169,6 +168,39 @@ requires-dist = ["torch", "packaging", "ninja", "causal-conv1d"]
 name = "nv-grouped-gemm"
 version = "1.1.4.post7"
 requires-dist = ["setuptools", "wheel", "torch", "numpy"]
+
+[[manifest.dependency-metadata]]
+name = "nvidia-cutlass-dsl"
+version = "4.5.0"
+requires-dist = ["nvidia-cutlass-dsl-libs-cu13==4.5.0 ; extra == 'cu13'"]
+provides-extras = ["cu13"]
+
+[[manifest.dependency-metadata]]
+name = "nvidia-cutlass-dsl"
+version = "4.5.1"
+requires-dist = ["nvidia-cutlass-dsl-libs-cu13==4.5.1 ; extra == 'cu13'"]
+provides-extras = ["cu13"]
+
+[[manifest.dependency-metadata]]
+name = "nvidia-cutlass-dsl"
+version = "4.5.2"
+requires-dist = ["nvidia-cutlass-dsl-libs-cu13==4.5.2 ; extra == 'cu13'"]
+provides-extras = ["cu13"]
+
+[[manifest.dependency-metadata]]
+name = "nvidia-cutlass-dsl-libs-cu13"
+version = "4.5.0"
+requires-dist = ["numpy", "typing-extensions", "cuda-python>=12.8"]
+
+[[manifest.dependency-metadata]]
+name = "nvidia-cutlass-dsl-libs-cu13"
+version = "4.5.1"
+requires-dist = ["numpy", "typing-extensions", "cuda-python>=12.8"]
+
+[[manifest.dependency-metadata]]
+name = "nvidia-cutlass-dsl-libs-cu13"
+version = "4.5.2"
+requires-dist = ["numpy", "typing-extensions", "cuda-python>=12.8"]
 
 [[manifest.dependency-metadata]]
 name = "tensorrt"
@@ -4782,6 +4814,7 @@ resolution-markers = [
     "platform_machine == 'aarch64' and sys_platform == 'linux'",
 ]
 dependencies = [
+    { name = "nvidia-cutlass-dsl-libs-base" },
     { name = "nvidia-cutlass-dsl-libs-cu12" },
 ]
 wheels = [
@@ -4794,6 +4827,38 @@ cu13 = [
 ]
 
 [[package]]
+name = "nvidia-cutlass-dsl-libs-base"
+version = "4.6.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cuda-python" },
+    { name = "numpy" },
+    { name = "nvidia-cuda-nvdisasm" },
+    { name = "nvidia-cutlass-dsl-libs-core" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
+    { name = "typing-extensions" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e9/5c/0a82b9b2fee054788944d0e7a97b5e63ed0d304969c3b5c4168bed86b71c/nvidia_cutlass_dsl_libs_base-4.6.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:7b5f5502cc827039f42789e1e2ac9aef7010f4d26ef4b9d66f4ab082da0bcd2c", size = 3321628, upload-time = "2026-07-02T03:26:10.487Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/67/6c21b2d140bbd1ad94a2e22a0e2881457f9e363bdff1b35898a2d7d25aa2/nvidia_cutlass_dsl_libs_base-4.6.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:7f27357b87c5c797344cca073f1dcf00232aef427daf161adb3cd87b043e37c9", size = 2824911, upload-time = "2026-07-02T03:26:25.033Z" },
+]
+
+[[package]]
+name = "nvidia-cutlass-dsl-libs-core"
+version = "4.6.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cuda-python" },
+    { name = "numpy" },
+    { name = "nvidia-cuda-nvdisasm" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
+    { name = "typing-extensions" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/84/94/e4e2404ac06a477096ccf8127bf5d391510d36cafb4be86c8c15b4873b0d/nvidia_cutlass_dsl_libs_core-4.6.0-py3-none-any.whl", hash = "sha256:f9ea6d313a03cb11fa177da32e8747ad0cac51358850810f36aa6c4736192c27", size = 767713, upload-time = "2026-07-02T03:23:39.876Z" },
+]
+
+[[package]]
 name = "nvidia-cutlass-dsl-libs-cu12"
 version = "4.6.0"
 source = { registry = "https://pypi.org/simple" }
@@ -4801,6 +4866,7 @@ dependencies = [
     { name = "cuda-python" },
     { name = "numpy" },
     { name = "nvidia-cuda-nvdisasm" },
+    { name = "nvidia-cutlass-dsl-libs-base" },
     { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
     { name = "typing-extensions" },
 ]
@@ -4857,6 +4923,7 @@ dependencies = [
     { name = "cuda-python" },
     { name = "numpy" },
     { name = "nvidia-cuda-nvdisasm" },
+    { name = "nvidia-cutlass-dsl-libs-base" },
     { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" } },
     { name = "typing-extensions" },
 ]
