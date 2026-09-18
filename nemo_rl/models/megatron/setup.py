@@ -301,8 +301,8 @@ from nemo_rl.models.megatron.config import (
     ModelAndOptimizerState,
     RuntimeConfig,
 )
+from nemo_rl.models.megatron.draft.training import resolve_draft_speculator
 from nemo_rl.models.megatron.draft.utils import (
-    build_draft_model,
     find_draft_owner_chunk,
     get_attached_draft_model,
 )
@@ -1898,11 +1898,11 @@ def _create_draft_pre_wrap_hook(
     preload_policy_from_pretrained: bool,
 ) -> Callable[[list[MegatronModule]], list[MegatronModule]]:
     """Create the hook that attaches draft weights before mixed-precision/DDP wrapping."""
-    draft_cfg = policy_cfg["draft"]
+    draft_speculator = resolve_draft_speculator(policy_cfg.get("draft"))
 
     def draft_pre_wrap_hook(model: list[MegatronModule]) -> list[MegatronModule]:
         """Optionally preload the base policy, then attach the draft module to the owner chunk."""
-        if not draft_cfg.enabled:
+        if draft_speculator is None:
             return model
 
         # Base pretrained checkpoints do not contain draft weights, so load the
@@ -1937,9 +1937,8 @@ def _create_draft_pre_wrap_hook(
             )
 
         pg_collection = get_pg_collection(model)
-        draft_model = build_draft_model(
-            megatron_cfg.model,
-            draft_config=draft_cfg,
+        draft_model = draft_speculator.build_model(
+            model_provider=megatron_cfg.model,
             pg_collection=pg_collection,
             policy_model_chunk=draft_owner,
         )

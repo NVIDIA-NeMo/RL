@@ -21,13 +21,32 @@ the Megatron-side draft co-training work (NVIDIA-NeMo/RL#3701) so both
 backends read ``policy.draft`` the same way.
 """
 
+import difflib
 from collections.abc import Mapping
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, Field, TypeAdapter
+from pydantic import BaseModel, Field, TypeAdapter, model_validator
 
 
-class Eagle3DraftConfig(BaseModel, extra="allow"):
+class _DraftConfigBase(BaseModel, extra="allow"):
+    """Shared near-miss-key guard for every concrete draft config."""
+
+    @model_validator(mode="after")
+    def _reject_near_miss_extra_keys(self) -> "_DraftConfigBase":
+        # extra="allow" preserves genuinely novel legacy keys, but a typo of a
+        # declared field (e.g. "enalbed") would otherwise silently no-op the
+        # real field's default. Reject extras that look like misspellings.
+        declared = set(type(self).model_fields)
+        for key in self.model_extra or {}:
+            close = difflib.get_close_matches(key, declared, n=1, cutoff=0.8)
+            if close:
+                raise ValueError(
+                    f"unknown draft config key {key!r}; did you mean {close[0]!r}?"
+                )
+        return self
+
+
+class Eagle3DraftConfig(_DraftConfigBase):
     """Configuration for EAGLE-3 draft-model co-training with the policy.
 
     Runs on the Megatron backend (single-step distillation) or the DTensor v2
@@ -58,7 +77,7 @@ class Eagle3DraftConfig(BaseModel, extra="allow"):
     train_embed_and_head: bool = True
 
 
-class _BlockDraftConfig(BaseModel, extra="allow"):
+class _BlockDraftConfig(_DraftConfigBase):
     """Shared fields for the DTensor-v2-only block drafters (DSpark/DFlash).
 
     Architecture fields (block_size, target_layer_ids, mask_token_id, markov
@@ -135,8 +154,8 @@ def coerce_draft_config(
     # Hand-built PolicyConfig dicts (e.g. test fixtures, callers that predate
     # this discriminated union) commonly omit the discriminator entirely --
     # most often on a disabled draft block, which never cared which family it
-    # would have been. Default to eagle3, mirroring the pre-union behavior
-    # where it was the only (implicit) family.
+    # would have been. Default to eagle3, mirroring the pre-union implicit-
+    # eagle3-only behavior.
     if "speculator_type" not in config:
         config = {**config, "speculator_type": "eagle3"}
     return _DRAFT_CONFIG_ADAPTER.validate_python(config)

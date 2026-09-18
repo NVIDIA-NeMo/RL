@@ -156,13 +156,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
         # Normalize in place: every downstream reader (workers, setup, train)
         # accesses draft config by attribute, so a hand-built PolicyConfig has
-        # to be validated here rather than only inside MasterConfig. This
-        # mirrors NVIDIA-NeMo/RL#3701's Policy.__init__ contract so both
-        # backends share one draft-config normalization point.
+        # to be validated here rather than only inside MasterConfig.
         draft_config = coerce_draft_config(config.get("draft"))
         if draft_config is not None:
             config["draft"] = draft_config
-        draft_enabled = draft_config is not None and draft_config.enabled
+        draft_enabled = bool(draft_config is not None and draft_config.enabled)
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "

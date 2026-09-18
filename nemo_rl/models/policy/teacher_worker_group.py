@@ -27,7 +27,6 @@ from typing import Any, Optional
 
 import numpy as np
 import ray
-from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.opd import TeacherResourceConfig
@@ -168,16 +167,7 @@ class TeacherWorkerGroup:
             cfg["dtensor_cfg"]["enabled"] = False
         if "peft" in cfg["megatron_cfg"]:
             cfg["megatron_cfg"]["peft"]["enabled"] = False
-        if "draft" in cfg:
-            # policy_config's draft block may already be a coerced
-            # Eagle3DraftConfig/DSparkDraftConfig/DFlashDraftConfig instance
-            # (Policy.__init__ normalizes it in place) or still a raw dict,
-            # depending on whether the student Policy has been constructed
-            # yet -- handle both.
-            if isinstance(cfg["draft"], BaseModel):
-                cfg["draft"].enabled = False
-            else:
-                cfg["draft"]["enabled"] = False
+        cfg.pop("draft", None)
         # Router replay keeps the student's rollout and training logprobs
         # consistent. A frozen teacher has no training pass, and its text-only
         # TQ fetch does not carry routed_experts, so replay must stay off.

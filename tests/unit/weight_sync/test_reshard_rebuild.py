@@ -71,7 +71,11 @@ def _reshard(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_size=8)
 
     gen = SimpleNamespace(
         cfg={"vllm_cfg": {"async_engine": False}},
-        worker_group=SimpleNamespace(workers=workers, dp_size=dp_size),
+        worker_group=SimpleNamespace(
+            workers=workers,
+            dp_size=dp_size,
+            get_dp_leader_worker_idx=lambda shard: shard * workers_per_shard,
+        ),
         dp_size=dp_size,
         # Declared, because VllmGeneration declares it. It used to be read with a getattr
         # default, which meant this fake could omit it and still pass -- the getattr was

@@ -52,6 +52,7 @@ from nemo_rl.models.generation import (
     draft_full_refit_enabled,
 )
 from nemo_rl.models.generation.vllm.config import materialize_vllm_video_config
+from nemo_rl.models.policy.draft_config import draft_refit_enabled
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -103,6 +104,7 @@ def collect_trajectories(
             generation_config=generation_config,
             # This utility consumes the Tables below to write its trajectory JSONL.
             log_full_result_tables=True,
+            num_generations_per_prompt=1,
             max_rollout_turns=None,
             greedy=False,
         )
@@ -172,9 +174,7 @@ def main() -> None:
         assert config.policy["generation"] is not None, (
             "A generation config is required for GRPO"
         )
-        has_refit_draft_weights = (
-            "draft" in config.policy and config.policy["draft"]["enabled"]
-        )
+        has_refit_draft_weights = draft_refit_enabled(config.policy.get("draft"))
         trains_mtp = (
             "megatron_cfg" in config.policy
             and config.policy["megatron_cfg"]["enabled"]

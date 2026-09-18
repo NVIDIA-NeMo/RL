@@ -19,7 +19,7 @@ import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator, Mapping
+from typing import Callable, Iterator, Mapping, cast
 
 import torch
 import torch.distributed as dist
@@ -419,7 +419,7 @@ def _gather_tp_weight_if_needed(
     split_axis: int | None = None,
 ) -> Tensor:
     if split_axis is None:
-        tp_group = expected_shape_or_tp_group
+        tp_group = cast(dist.ProcessGroup | None, expected_shape_or_tp_group)
         if tp_group is None or not dist.is_available() or not dist.is_initialized():
             return local_weight
 
@@ -954,7 +954,10 @@ def load_hf_weights_to_eagle(
         config=unwrap_model(model).config,
     )
 
-    return model.load_state_dict(new_state, strict=False)
+    return cast(
+        tuple[list[str], list[str]],
+        model.load_state_dict(new_state, strict=False),
+    )
 
 
 def _require_state_tensor(

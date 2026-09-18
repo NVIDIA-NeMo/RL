@@ -156,6 +156,7 @@ where `lambda` is `policy.draft.loss_weight`.
 ## Important Knobs
 
 - `policy.draft.enabled`: attach and train the Eagle draft model
+- `policy.draft.speculator_type`: which speculator implementation to build. Currently pinned to `eagle3`, which is also the default, so configs that predate this key keep working unchanged; it exists as the extension point for future speculators (DFlash/DSpark)
 - `policy.draft.model_name`: checkpoint used to initialize the draft model
 - `policy.draft.loss_weight`: weight on the auxiliary draft loss
 - `policy.generation.vllm_kwargs.speculative_config.model`: draft checkpoint used by the vLLM drafter

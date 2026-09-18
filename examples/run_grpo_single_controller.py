@@ -44,7 +44,9 @@ from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
 from nemo_rl.models.generation import (
     configure_generation_config,
     draft_full_refit_enabled,
+    maybe_configure_engine_reaping_env,
 )
+from nemo_rl.models.policy.draft_config import draft_refit_enabled
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -127,6 +129,7 @@ def main() -> None:
 
     # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
     maybe_configure_data_plane_env(config.data_plane)
+    maybe_configure_engine_reaping_env(config.async_rl.generation_fleet_health.enabled)
     init_ray()
 
     processor = None
@@ -138,7 +141,7 @@ def main() -> None:
     assert config.policy["generation"] is not None, (
         "A generation config is required for SC-driven async GRPO"
     )
-    has_refit_draft_weights = bool(config.policy["draft"]["enabled"])
+    has_refit_draft_weights = draft_refit_enabled(config.policy.get("draft"))
     megatron_cfg = config.policy.get("megatron_cfg") or {}
     trains_mtp = bool(megatron_cfg.get("mtp_num_layers"))
     config.policy["generation"] = configure_generation_config(

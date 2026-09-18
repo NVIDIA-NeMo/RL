@@ -79,6 +79,10 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
 from nemo_rl.data_plane.interfaces import KVBatchMeta
+from nemo_rl.data_plane.observability import (
+    log_step_metrics,
+    metrics_never_fail_the_step,
+)
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS, DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -380,6 +384,42 @@ def _compute_seq_logprob_error_metrics(
             seq_logprob_error_metrics.pop("num_masked_seqs")
         )
     return masking_data["sample_mask"], seq_logprob_error_metrics
+
+
+def _log_data_plane_metrics(
+    policy: Any, logger: Logger, step: int, total_step_time: float
+) -> None:
+    """Log this step's data-plane cost. Never raises.
+
+    On by default, so this runs every step of every recipe.
+    """
+    with metrics_never_fail_the_step(step):
+        _log_data_plane_metrics_impl(policy, logger, step, total_step_time)
+
+
+def _log_data_plane_metrics_impl(
+    policy: Any, logger: Logger, step: int, total_step_time: float
+) -> None:
+    """Log this step's data-plane cost. No-op unless observability is enabled.
+
+    The policy computes both the metrics and the scope they cover, because
+    the baselines they are differenced against belong with the client whose
+    counters they baseline. This end owns only where they are logged.
+
+    The prefix names the scope because the two differ by a lot: the driver
+    issues about one op of each kind per step while the bulk traffic is the
+    workers' per-DP-rank ``get_samples``. Note that even the cluster view
+    omits the rollout actor, which builds its own client and is not on the
+    worker group -- so ``kv_first_write`` is not in these totals.
+    """
+    get_metrics = getattr(policy, "get_data_plane_step_metrics", None)
+    if not callable(get_metrics):
+        return  # not a data-plane policy
+    result = get_metrics(total_step_time)
+    if result is None:
+        return  # observability disabled -> plain adapter
+    metrics, scope = result
+    log_step_metrics(logger, metrics, step, scope)
 
 
 def grpo_train_sync(
@@ -1378,6 +1418,10 @@ def grpo_train_sync(
             logger.log_metrics(
                 performance_metrics, total_steps + 1, prefix="performance"
             )
+            # Before the step_finished=True log below, which commits the step:
+            # anything logged against a committed step is dropped by wandb, so
+            # these series were computed, printed, and silently discarded.
+            _log_data_plane_metrics(policy, logger, total_steps + 1, total_time)
             logger.log_metrics(
                 timing_metrics,
                 total_steps + 1,
