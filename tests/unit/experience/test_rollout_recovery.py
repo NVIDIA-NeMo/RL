@@ -223,7 +223,7 @@ def _sealed_attempt_state() -> dict[str, Any]:
 @pytest.mark.parametrize(
     ("case", "error_fragment"),
     [
-        ("attempt_uuid", "attempt_uuid must contain exactly 16 bytes"),
+        ("attempt_index", "attempt indices must be contiguous"),
         ("status_type", "invalid rollout attempt status"),
         ("status_value", "invalid rollout attempt status"),
         ("staging_keys", "staging_keys must be a list of strings"),
@@ -246,8 +246,8 @@ def test_restore_rejects_malformed_attempt_fields(
     state = _sealed_attempt_state()
     attempt = state["groups"][0]["siblings"][0]["attempts"][0]
 
-    if case == "attempt_uuid":
-        attempt["attempt_uuid"] = b"short"
+    if case == "attempt_index":
+        attempt["attempt_index"] = 2
     elif case == "status_type":
         attempt["status"] = None
     elif case == "status_value":
@@ -285,7 +285,7 @@ def test_restore_rejects_non_mapping_attempt() -> None:
         RolloutRecoveryLedger.from_state_dict(state)
 
 
-def test_restore_rejects_duplicate_attempt_identity() -> None:
+def test_restore_rejects_noncontiguous_attempt_identity() -> None:
     ledger = RolloutRecoveryLedger()
     _reserve(
         ledger,
@@ -293,18 +293,16 @@ def test_restore_rejects_duplicate_attempt_identity() -> None:
         admission_id="batch-7",
         prompt_id="7",
         prompt_payload=_prompt(),
-        expected_generations=2,
+        expected_generations=1,
         target_step=7,
         start_weight_version=6,
         admitted=True,
     )
     state = ledger.state_dict()
-    siblings = state["groups"][0]["siblings"]
-    siblings[1]["attempts"][0]["attempt_uuid"] = siblings[0]["attempts"][0][
-        "attempt_uuid"
-    ]
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+    attempt["attempt_index"] = 1
 
-    with pytest.raises(ValueError, match="duplicate rollout attempt identity"):
+    with pytest.raises(ValueError, match="attempt indices must be contiguous"):
         RolloutRecoveryLedger.from_state_dict(state)
 
 
@@ -756,6 +754,67 @@ def test_restart_preserves_sealed_sibling_and_retries_only_interrupted_one() -> 
     assert retry.siblings[1].current_attempt.status is RolloutAttemptStatus.RESERVED
 
 
+def test_dispatch_attempts_are_numeric_persisted_and_sibling_local() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        admitted=True,
+    )
+
+    first = _mutate(
+        lambda cut: ledger.allocate_dispatch_attempts(
+            cut, "g7", generation_indices=[0, 1]
+        )
+    )
+    sealed_id = group.gate_rollout_id(0)
+    _mutate(
+        lambda cut: ledger.mark_sibling_sealed(
+            cut,
+            "g7",
+            generation_index=0,
+            gate_rollout_id=sealed_id,
+            receipt={
+                "rollout_id": sealed_id,
+                "manifest": [{"staging_key": f"{sealed_id}/call"}],
+            },
+            reward=1.0,
+            mask_sample=False,
+        )
+    )
+    second = _mutate(
+        lambda cut: ledger.allocate_dispatch_attempts(cut, "g7", generation_indices=[1])
+    )
+    restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
+    third = _mutate(
+        lambda cut: restored.allocate_dispatch_attempts(
+            cut, "g7", generation_indices=[1]
+        )
+    )
+
+    assert first == {0: 0, 1: 0}
+    assert second == {1: 1}
+    assert third == {1: 2}
+    restored_group = restored.get_group("g7")
+    assert [
+        attempt.attempt_index for attempt in restored_group.siblings[1].attempts
+    ] == [
+        0,
+        1,
+        2,
+    ]
+    assert (
+        restored_group.siblings[0].current_attempt.status is RolloutAttemptStatus.SEALED
+    )
+    assert restored_group.gate_rollout_id(1) == "g7_g1-a2"
+
+
 @pytest.mark.parametrize(
     "recovery_granularity",
     [RecoveryGranularity.SIBLING, RecoveryGranularity.PROMPT_GROUP],
@@ -831,7 +890,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
     assert rewards == [0.0, 1.0]
     assert mask_sample == [True, False]
 
-    state["schema_version"] = 3
+    state["schema_version"] = ROLLOUT_RECOVERY_SCHEMA_VERSION + 1
     with pytest.raises(ValueError, match="Unsupported rollout-recovery schema version"):
         RolloutRecoveryLedger.from_state_dict(state)
 
@@ -1044,6 +1103,16 @@ def test_restore_rejects_unsupported_schema_version() -> None:
     }
 
     with pytest.raises(ValueError, match="Unsupported rollout-recovery schema"):
+        _load(RolloutRecoveryLedger(), state)  # type: ignore[arg-type]
+
+
+def test_restore_rejects_uuid_attempt_schema_with_migration_guidance() -> None:
+    state = {
+        "schema_version": 2,
+        "groups": [],
+    }
+
+    with pytest.raises(ValueError, match="cannot be safely migrated"):
         _load(RolloutRecoveryLedger(), state)  # type: ignore[arg-type]
 
 
