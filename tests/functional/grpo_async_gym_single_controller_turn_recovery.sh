@@ -111,6 +111,7 @@ else
     # and compute the cohort reward exactly once.
     jq -c -s '
         limit(1; .[])
+        | del(.agent_ref)
         | .task_source = "genrm_checkpoint_test_agent"
         | .responses_create_params.input = [{
             "role": "user",

@@ -845,6 +845,76 @@ def test_storage_reference_index_avoids_private_lineage_scan(tmp_path) -> None:
         gym_checkpoint_staging_keys(tmp_path, checkpoint)
 
 
+def test_storage_reference_index_deduplicates_matching_cross_model_references(
+    tmp_path,
+) -> None:
+    first_record = {
+        "schema_version": 1,
+        "capture_key": "group-7_g0",
+        "boundary_model_call_id": "call-1",
+        "kind": "token_capture_staging",
+        "key": "group-7_g0/call-1",
+    }
+
+    def build_checkpoint(second_record):
+        participants = []
+        for server_name, record in (
+            ("policy_model", first_record),
+            ("policy_model_reasoning_off", second_record),
+        ):
+            ledger_dir = tmp_path / "model-ledger" / server_name
+            ledger_dir.mkdir(parents=True, exist_ok=True)
+            reference_path = ledger_dir / "storage-references.jsonl"
+            reference_payload = (
+                json.dumps(record, separators=(",", ":")).encode() + b"\n"
+            )
+            reference_path.write_bytes(reference_payload)
+            manifest_path = ledger_dir / "manifest.json"
+            manifest_path.write_text("{}")
+            manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+            participant = {
+                "server_name": server_name,
+                "component": "responses_api_models",
+                "participant_name": server_name,
+            }
+            participants.append(
+                {
+                    "participant": participant,
+                    "payload": {
+                        "rollouts": 1,
+                        "rows": 1,
+                        "excluded_tombstoned": 0,
+                        "manifest_digest": manifest_digest,
+                        "storage_reference_index": {
+                            "schema_version": 1,
+                            "relative_path": str(reference_path.relative_to(tmp_path)),
+                            "sha256": hashlib.sha256(reference_payload).hexdigest(),
+                            "records": 1,
+                            "bytes": len(reference_payload),
+                        },
+                    },
+                    "manifest": {
+                        "participant": participant,
+                        "relative_path": str(manifest_path.relative_to(tmp_path)),
+                        "manifest_digest": manifest_digest,
+                    },
+                }
+            )
+        return GymCheckpointCommitResult.model_validate(
+            {"checkpoint_id": "snapshot-7", "participants": participants}
+        )
+
+    checkpoint = build_checkpoint(first_record)
+    assert gym_checkpoint_staging_keys(tmp_path, checkpoint) == {"group-7_g0/call-1"}
+
+    conflicting_record = {**first_record, "boundary_model_call_id": "call-2"}
+    with pytest.raises(ValueError, match="conflicting metadata"):
+        gym_checkpoint_staging_keys(
+            tmp_path,
+            build_checkpoint(conflicting_record),
+        )
+
+
 def test_restore_must_report_the_committed_artifact_coordinates() -> None:
     participant = {
         "server_name": "policy-route",

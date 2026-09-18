@@ -821,6 +821,100 @@ def test_actor_registry_fences_dispatch_and_tracks_frozen_membership() -> None:
         registry.freeze("snapshot-1")
 
 
+def test_actor_registry_waits_to_register_until_checkpoint_unfreezes() -> None:
+    async def exercise() -> None:
+        registry = GymActorExecutionRegistry()
+        before_freeze = GymExecutionIdentity(
+            rollout_id="rollout-before", attempt_index=0
+        )
+        before_freeze_2 = GymExecutionIdentity(
+            rollout_id="rollout-before-2", attempt_index=0
+        )
+        after_freeze = GymExecutionIdentity(rollout_id="rollout-after", attempt_index=0)
+        await registry.register_when_permitted([before_freeze, before_freeze_2])
+
+        frozen = registry.freeze("snapshot-1")
+        registration = asyncio.create_task(
+            registry.register_when_permitted([after_freeze])
+        )
+        await asyncio.sleep(0)
+
+        assert [execution.identity for execution in frozen] == [
+            before_freeze,
+            before_freeze_2,
+        ]
+        assert not registration.done()
+        assert registry.status()["live"] == 2
+
+        registry.unfreeze("snapshot-1")
+        await registration
+
+        assert registry.status()["live"] == 3
+
+    asyncio.run(exercise())
+
+
+def test_actor_registry_cancelled_wait_does_not_register() -> None:
+    async def exercise() -> None:
+        registry = GymActorExecutionRegistry()
+        execution = GymExecutionIdentity(rollout_id="rollout-1", attempt_index=0)
+        registry.freeze("snapshot-1")
+
+        registration = asyncio.create_task(
+            registry.register_when_permitted([execution])
+        )
+        await asyncio.sleep(0)
+        registration.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await registration
+
+        assert registry.status()["live"] == 0
+
+    asyncio.run(exercise())
+
+
+def test_actor_registry_waiter_observes_a_second_freeze() -> None:
+    async def exercise() -> None:
+        registry = GymActorExecutionRegistry()
+        execution = GymExecutionIdentity(rollout_id="rollout-1", attempt_index=0)
+        registry.freeze("snapshot-1")
+        registration = asyncio.create_task(
+            registry.register_when_permitted([execution])
+        )
+        await asyncio.sleep(0)
+
+        # Reclose admission before the first unfreeze wakes the waiter.
+        registry.unfreeze("snapshot-1")
+        registry.freeze("snapshot-2")
+        await asyncio.sleep(0)
+
+        assert not registration.done()
+        assert registry.status()["live"] == 0
+
+        registry.unfreeze("snapshot-2")
+        await registration
+        assert registry.status()["live"] == 1
+
+    asyncio.run(exercise())
+
+
+def test_actor_registry_batch_registration_rolls_back_on_error() -> None:
+    async def exercise() -> None:
+        registry = GymActorExecutionRegistry()
+        existing = GymExecutionIdentity(rollout_id="existing", attempt_index=0)
+        new = GymExecutionIdentity(rollout_id="new", attempt_index=0)
+        registry.register(existing)
+
+        with pytest.raises(ValueError, match="already live"):
+            await registry.register_when_permitted([new, existing])
+
+        assert registry.status()["live"] == 1
+        registry.release(existing)
+        assert registry.status()["live"] == 0
+
+    asyncio.run(exercise())
+
+
 def test_agent_prepare_retries_completed_result_blocker() -> None:
     env = _checkpoint_env()
     capabilities = {
