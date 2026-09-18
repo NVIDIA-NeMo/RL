@@ -312,6 +312,12 @@ def spinup_nemo_gym(master_config: Any, base_urls: list[str], model_name: str):
     nemo_gym_dict = dict(master_config.env["nemo_gym"])
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
+    # Multi-trace opt-in: NeMo-RL-side knob (read by the NemoGym actor's
+    # root-session filter), not part of Gym's global config. Without this the
+    # actor defaults to root-only and silently drops every subagent trace.
+    train_on_all_session_traces = bool(
+        nemo_gym_dict.pop("train_on_all_session_traces", False)
+    )
     uv_cache_dir = get_nemo_gym_uv_cache_dir()
     if uv_cache_dir is not None:
         nemo_gym_dict.setdefault("uv_cache_dir", uv_cache_dir)
@@ -324,6 +330,7 @@ def spinup_nemo_gym(master_config: Any, base_urls: list[str], model_name: str):
         invalid_tool_call_patterns=invalid_tool_call_patterns,
         thinking_tags=thinking_tags,
         require_routed_experts=False,
+        train_on_all_session_traces=train_on_all_session_traces,
         initial_global_config_dict=nemo_gym_dict,
     )
     nemo_gym_opts: dict[str, Any] = {}
