@@ -132,6 +132,13 @@ def coerce_draft_config(
         config, (Eagle3DraftConfig, DSparkDraftConfig, DFlashDraftConfig)
     ):
         return config
+    # Hand-built PolicyConfig dicts (e.g. test fixtures, callers that predate
+    # this discriminated union) commonly omit the discriminator entirely --
+    # most often on a disabled draft block, which never cared which family it
+    # would have been. Default to eagle3, mirroring the pre-union behavior
+    # where it was the only (implicit) family.
+    if "speculator_type" not in config:
+        config = {**config, "speculator_type": "eagle3"}
     return _DRAFT_CONFIG_ADAPTER.validate_python(config)
 
 
