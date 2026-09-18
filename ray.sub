@@ -265,6 +265,14 @@ COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
 # Pass partition/account explicitly for overlapping srun calls.
 COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
 COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
+# Opt-in: force host values of these comma-separated variables over the image's
+# baked ENV (pyxis lets the image win by default). Needed e.g. for UCX_NET_DEVICES=all
+# so NIXL KV transfer uses the RDMA HCAs instead of the image's management NIC.
+if [[ -n "${NRL_CONTAINER_ENV_FORWARD:-}" ]]; then
+  for _v in ${NRL_CONTAINER_ENV_FORWARD//,/ }; do
+    COMMON_SRUN_ARGS+=" --container-env=${_v}"
+  done
+fi
 # Number of CPUs per worker node. If the user did not set CPUS_PER_WORKER
 # explicitly, auto-detect it from SLURM so we claim every CPU the node actually
 # has (instead of the old GPUS_PER_NODE * 16 heuristic, which under-claims on
