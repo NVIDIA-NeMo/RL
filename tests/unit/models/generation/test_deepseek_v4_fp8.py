@@ -52,6 +52,23 @@ class OtherForCausalLM(torch.nn.Module):
         self.config = types.SimpleNamespace(model_type="deepseek_v3")
 
 
+class PostLoadDeepSeekV4ForCausalLM(DeepSeekV4ForCausalLM):
+    """Mirrors vLLM >= 0.29: ``load_weights`` ends with the model-level hook."""
+
+    def __init__(self):
+        super().__init__()
+        self.post_load_calls = 0
+
+    def load_weights(self, weights):
+        for _ in weights:
+            pass
+        self.process_weights_after_loading()
+        return set()
+
+    def process_weights_after_loading(self):
+        self.post_load_calls += 1
+
+
 def test_is_model_detects_config_model_type(deepseek_v4_fp8):
     model = OtherForCausalLM()
     model.config = types.SimpleNamespace(model_type="deepseek_v4")
@@ -343,3 +360,80 @@ def test_refit_ignores_unquantized_routed_experts(
     deepseek_v4_fp8.finalize_refit(model)
     assert process_calls == []
     deepseek_v4_fp8.restore_refit(added_skip_tensors)
+
+
+def test_prepare_refit_defers_the_model_post_load_hook_until_finalize(
+    deepseek_v4_fp8, monkeypatch, skip_tensors
+):
+    monkeypatch.setattr(deepseek_v4_fp8, "RoutedExperts", FakeRoutedExpertsLayer)
+    model = PostLoadDeepSeekV4ForCausalLM()
+
+    added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)
+
+    # Buffer-sized load_weights calls stream while layers sit on meta; the
+    # hook must not run until every layer is materialized.
+    model.load_weights([])
+    model.load_weights([])
+    assert model.post_load_calls == 0
+
+    deepseek_v4_fp8.finalize_refit(model)
+    assert model.post_load_calls == 1
+    # The shadow is gone, so a later full load runs the class hook itself.
+    model.load_weights([])
+    assert model.post_load_calls == 2
+
+    deepseek_v4_fp8.restore_refit(added_skip_tensors, model)
+    assert "process_weights_after_loading" not in vars(model)
+
+
+def test_restore_refit_lifts_the_post_load_shadow_after_a_failed_stream(
+    deepseek_v4_fp8, monkeypatch, skip_tensors
+):
+    monkeypatch.setattr(deepseek_v4_fp8, "RoutedExperts", FakeRoutedExpertsLayer)
+    model = PostLoadDeepSeekV4ForCausalLM()
+
+    added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)
+    assert "process_weights_after_loading" in vars(model)
+
+    # No finalize_refit: the stream failed before the lifecycle got there.
+    deepseek_v4_fp8.restore_refit(added_skip_tensors, model)
+
+    assert "process_weights_after_loading" not in vars(model)
+    model.load_weights([])
+    assert model.post_load_calls == 1
+
+
+def test_restore_refit_without_a_model_only_touches_skip_names(
+    deepseek_v4_fp8, monkeypatch, skip_tensors
+):
+    monkeypatch.setattr(deepseek_v4_fp8, "RoutedExperts", FakeRoutedExpertsLayer)
+    model = PostLoadDeepSeekV4ForCausalLM()
+
+    added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)
+    deepseek_v4_fp8.restore_refit(added_skip_tensors)
+
+    assert "attn_sink" not in skip_tensors
+    assert "process_weights_after_loading" in vars(model)
+    deepseek_v4_fp8.resume_model_post_load(model)
+
+
+def test_suspend_model_post_load_ignores_models_without_the_hook(deepseek_v4_fp8):
+    model = DeepSeekV4ForCausalLM()
+
+    deepseek_v4_fp8.suspend_model_post_load(model)
+
+    assert "process_weights_after_loading" not in vars(model)
+    # Nothing to run at the end either; vLLM < 0.29 models have no hook.
+    deepseek_v4_fp8.finalize_refit(model)
+
+
+def test_resume_model_post_load_keeps_a_foreign_instance_override(deepseek_v4_fp8):
+    model = PostLoadDeepSeekV4ForCausalLM()
+    calls = []
+    model.process_weights_after_loading = lambda: calls.append("custom")
+
+    deepseek_v4_fp8.suspend_model_post_load(model)
+    deepseek_v4_fp8.resume_model_post_load(model)
+    model.process_weights_after_loading()
+
+    assert calls == ["custom"]

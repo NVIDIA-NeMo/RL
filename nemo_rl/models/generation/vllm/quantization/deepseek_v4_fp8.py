@@ -33,6 +33,35 @@ _EXPERT_REFIT_PARAMS = (
     "w2_weight_scale_inv",
 )
 
+_MODEL_POST_LOAD_HOOK = "process_weights_after_loading"
+
+
+def _skip_model_post_load() -> None:
+    """Stand-in for the model-level post-load hook while a refit streams."""
+
+
+def suspend_model_post_load(model: torch.nn.Module) -> None:
+    """Shadow the model-level post-load hook until :func:`finalize_refit` runs it.
+
+    Since vLLM 0.29, ``DeepseekV4ForCausalLM.load_weights`` ends with
+    ``self.process_weights_after_loading()``, which recomputes the first
+    layer's hyper-connection broadcast from ``hc_attn_fn``. NeMo-RL streams a
+    refit through buffer-sized ``load_weights`` calls while layerwise reload
+    still holds that parameter on the meta device, so the hook fails with
+    ``Cannot copy out of meta tensor``. An instance attribute shadows the class
+    method until every layer is materialized.
+    """
+    if not callable(getattr(type(model), _MODEL_POST_LOAD_HOOK, None)):
+        return
+    if _MODEL_POST_LOAD_HOOK not in vars(model):
+        setattr(model, _MODEL_POST_LOAD_HOOK, _skip_model_post_load)
+
+
+def resume_model_post_load(model: torch.nn.Module) -> None:
+    """Drop the shadow installed by :func:`suspend_model_post_load`."""
+    if vars(model).get(_MODEL_POST_LOAD_HOOK) is _skip_model_post_load:
+        delattr(model, _MODEL_POST_LOAD_HOOK)
+
 
 def is_model(model: torch.nn.Module) -> bool:
     """Return whether a constructed vLLM model is a DeepSeek V4 causal LM."""
@@ -128,21 +157,39 @@ def prepare_refit(model: torch.nn.Module) -> set[str]:
     except Exception:
         SKIP_TENSORS.difference_update(added_skip_tensors)
         raise
+    suspend_model_post_load(model)
     return added_skip_tensors
 
 
-def restore_refit(added_skip_tensors: set[str]) -> None:
-    """Remove process-global layerwise skip names added for one refit."""
+def restore_refit(
+    added_skip_tensors: set[str], model: torch.nn.Module | None = None
+) -> None:
+    """Undo :func:`prepare_refit` after the layerwise lifecycle, including on failure.
+
+    Removes the process-global skip names added for one refit and, when the
+    model is given, lifts the post-load shadow a failed refit may have left.
+    """
     from vllm.model_executor.model_loader.reload.meta import SKIP_TENSORS
 
     SKIP_TENSORS.difference_update(added_skip_tensors)
+    if model is not None:
+        resume_model_post_load(model)
 
 
 @torch.no_grad()
 def finalize_refit(model: torch.nn.Module) -> None:
-    """Convert immediately loaded expert tensors back to their kernel layout."""
+    """Finish a layerwise refit once every layer is materialized.
+
+    Converts immediately loaded expert tensors back to their kernel layout,
+    then runs the model-level post-load hook that
+    :func:`suspend_model_post_load` kept off while the refit streamed.
+    """
     for layer in _block_fp8_routed_experts(model):
         layer.quant_method.process_weights_after_loading(layer)
         if layer.w13_weight.is_cuda:
             # Requantization uses sizeable per-expert float32 temporaries.
             torch.cuda.empty_cache()
+    resume_model_post_load(model)
+    post_load = getattr(model, _MODEL_POST_LOAD_HOOK, None)
+    if callable(post_load):
+        post_load()

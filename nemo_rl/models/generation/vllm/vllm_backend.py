@@ -1201,7 +1201,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             finally:
                 self._nrl_layerwise_reload_active = False
                 if use_deepseek_v4_fp8:
-                    deepseek_v4_fp8.restore_refit(added_skip_tensors)
+                    deepseek_v4_fp8.restore_refit(added_skip_tensors, model)
 
             return
 
