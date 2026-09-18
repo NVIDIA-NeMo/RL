@@ -86,6 +86,39 @@ cleanup() {
             printf 'core_found=NONE\n' >> "$DIAGNOSTIC_DIR/forensics.txt"
         fi
 
+        # Secure the evidence before doing anything that can hang. Every step
+        # below this point is fallible in a way that takes the whole job with it:
+        # an apt mirror that never answers runs the job into the CI timeout, and
+        # then no artifact is uploaded at all. Ordering the cheap, self-contained
+        # captures first means the worst case is a run with no backtrace rather
+        # than a run with no evidence.
+        #
+        # dmesg leads because it is the one quick source that can name the
+        # faulting library outright ("segfault at .. in libfoo.so").
+        dmesg > "$DIAGNOSTIC_DIR/fx/dmesg.txt" 2>&1
+        for c in "${cores[@]}"; do
+            [[ -f $c ]] || continue
+            base=$(basename "$c")
+            # Best effort, not a guarantee: a core that will not compress, or
+            # will not fit the artifact budget, is reported as lost rather than
+            # quietly dropped. What finally counts is the upload succeeding.
+            if gzip -1 -c "$c" > "$DIAGNOSTIC_DIR/fx/$base.gz" 2>/dev/null; then
+                kept=$(stat -c %s "$DIAGNOSTIC_DIR/fx/$base.gz" 2>/dev/null || printf 0)
+                if [[ "$kept" -gt 0 && "$kept" -le 3000000000 ]]; then
+                    printf 'core_preserved=%s.gz bytes=%s\n' "$base" "$kept" \
+                        >> "$DIAGNOSTIC_DIR/forensics.txt"
+                else
+                    rm -f "$DIAGNOSTIC_DIR/fx/$base.gz"
+                    printf 'core_NOT_PRESERVED=%s compressed_bytes=%s -- exceeds artifact budget, evidence lost on cleanup\n' \
+                        "$base" "$kept" >> "$DIAGNOSTIC_DIR/forensics.txt"
+                fi
+            else
+                rm -f "$DIAGNOSTIC_DIR/fx/$base.gz"
+                printf 'core_NOT_PRESERVED=%s -- compression failed, evidence lost on cleanup\n' \
+                    "$base" >> "$DIAGNOSTIC_DIR/forensics.txt"
+            fi
+        done
+
         # gdb is absent from this image. Installing it now cannot change a crash
         # that already happened, but it can move the libraries gdb would resolve
         # the core against, so the hold is a precondition, not a best effort: if
@@ -99,8 +132,11 @@ cleanup() {
         elif ! apt-mark hold libc6 libc-bin libc6-dev > "$DIAGNOSTIC_DIR/fx/apt-hold.log" 2>&1; then
             printf 'gdb_install=skipped-hold-failed\n' >> "$DIAGNOSTIC_DIR/forensics.txt"
         else
+            # Bounded: an unreachable mirror must cost us a backtrace, not the
+            # job. The core is already archived above either way.
             {
-                apt-get update -qq && apt-get install -y -qq --no-install-recommends gdb
+                timeout 600 apt-get update -qq \
+                    && timeout 900 apt-get install -y -qq --no-install-recommends gdb
             } > "$DIAGNOSTIC_DIR/fx/gdb-install.log" 2>&1
             apt-mark unhold libc6 libc-bin libc6-dev >> "$DIAGNOSTIC_DIR/fx/apt-hold.log" 2>&1
             printf 'gdb_install=attempted\n' >> "$DIAGNOSTIC_DIR/forensics.txt"
@@ -159,27 +195,9 @@ cleanup() {
                 printf 'core_parsed=%s unreliable=%s libs_with_symbols=%s libs_without=%s\n' \
                     "$base" "$parse_note" "$lib_yes" "$lib_no" >> "$DIAGNOSTIC_DIR/forensics.txt"
             fi
-            # Archive unconditionally: this workspace is deleted when the job
-            # ends, and no verdict above is strong enough to justify discarding
-            # the only copy of the crash. Best effort, not a guarantee -- what
-            # counts is the artifact upload succeeding.
-            if gzip -1 -c "$c" > "$DIAGNOSTIC_DIR/fx/$base.gz" 2>/dev/null; then
-                kept=$(stat -c %s "$DIAGNOSTIC_DIR/fx/$base.gz" 2>/dev/null || printf 0)
-                if [[ "$kept" -gt 0 && "$kept" -le 3000000000 ]]; then
-                    printf 'core_preserved=%s.gz bytes=%s\n' "$base" "$kept" \
-                        >> "$DIAGNOSTIC_DIR/forensics.txt"
-                else
-                    rm -f "$DIAGNOSTIC_DIR/fx/$base.gz"
-                    printf 'core_NOT_PRESERVED=%s compressed_bytes=%s -- exceeds artifact budget, evidence lost on cleanup\n' \
-                        "$base" "$kept" >> "$DIAGNOSTIC_DIR/forensics.txt"
-                fi
-            else
-                rm -f "$DIAGNOSTIC_DIR/fx/$base.gz"
-                printf 'core_NOT_PRESERVED=%s -- compression failed, evidence lost on cleanup\n' \
-                    "$base" >> "$DIAGNOSTIC_DIR/forensics.txt"
-            fi
+            # No archiving here: the core was secured before the install, so a
+            # verdict reached at this point can never cost us the evidence.
         done
-        dmesg > "$DIAGNOSTIC_DIR/fx/dmesg.txt" 2>&1
     fi
     if [[ "$exit_code" -ne 0 && -d /tmp/ray/session_latest/logs ]]; then
         mkdir -p "$DIAGNOSTIC_DIR/ray"
