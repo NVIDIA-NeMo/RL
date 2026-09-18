@@ -14,7 +14,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -274,6 +274,32 @@ def test_gae_vapo_decoupled_lambda():
     # because they are computed with different lambda values
     adv_plus_val = advantages + values
     assert not torch.allclose(returns, adv_plus_val, atol=1e-5)
+
+
+def test_gae_equal_explicit_lambdas_compute_once():
+    """Explicit equal policy and value lambdas reuse a single GAE pass."""
+    config = GAEConfig(
+        gae_lambda_value=1.0,
+        gae_lambda_policy=1.0,
+        normalize_advantages=False,
+    )
+    estimator = GeneralizedAdvantageEstimator(config, _make_loss_config(kl_penalty=0.0))
+    mask = torch.ones(2, 4)
+    values = torch.randn(2, 4)
+
+    with patch.object(
+        estimator, "_compute_gae", wraps=estimator._compute_gae
+    ) as compute_gae:
+        advantages, returns = estimator.compute_advantage(
+            prompt_ids=torch.tensor([[0], [1]]),
+            rewards=torch.tensor([1.0, 2.0]),
+            mask=mask,
+            values=values,
+        )
+
+    assert compute_gae.call_count == 1
+    assert compute_gae.call_args.kwargs["gae_lambda"] == 1.0
+    torch.testing.assert_close(returns, advantages + values)
 
 
 def test_gae_length_adaptive_lambda():
