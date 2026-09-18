@@ -150,14 +150,20 @@ tensors themselves travel outside the token rows:
 - The media tensors themselves ride the call row: `TQMegatronTokenStager`
   writes `media_tensors` as extra columns on the call row
   (`MEDIA_STAGING_FIELDS`, a second put onto the same staging key once the token
-  row is durable), the same way routed experts ride the row. They are outside
-  Gym's digest; the digest-covered geometry names them. Receipts stay
-  token-free and no new key exists: cleanup of the call row clears the media.
-- `RolloutReassembler.finalize_rollout` reads the terminal call's staged media
-  geometry; when present it reads that row's media columns, requires the staged
-  `imgs_sizes` / `num_frames` / `num_tiles` to equal the geometry, and
-  rejects the rollout otherwise (`media_columns_missing`, `media_mismatch`,
-  `invalid_media_columns`). The packed-patch layout is handed to the trainer
+  row is durable), the same way routed experts ride the row. Like the token
+  columns they are per-call deltas: every chat request carries the whole
+  conversation, so the engine hands over pixels for every image in the prompt,
+  and the stager drops the items the parent chain already staged
+  (`media_prev_count`, recorded by the preparer next to `compact_prev_len` from
+  the parent rows' geometry; `slice_media_tensors`). They are outside Gym's
+  digest; the digest-covered geometry names what each row holds. Receipts stay
+  token-free and no new key exists: cleanup of the call rows clears the media.
+- `RolloutReassembler.finalize_rollout` walks the terminal chain: for each
+  call whose staged geometry names media it reads that row's media columns,
+  requires the staged `imgs_sizes` / `num_frames` / `num_tiles` to equal the
+  geometry, and rejects the rollout otherwise (`media_columns_missing`,
+  `media_mismatch`, `invalid_media_columns`). The per-call deltas are
+  concatenated in chain order, as the token deltas are. The packed-patch layout is handed to the trainer
   unchanged as `pixel_values` `[total_patches, C*P*P]` per row (the
   Megatron-Bridge Omni model passes already-patchified inputs through), with
   `imgs_sizes` and `num_frames` beside it, so training projects exactly the

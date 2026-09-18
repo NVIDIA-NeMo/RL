@@ -145,6 +145,47 @@ def _media_mismatch(staged: StagedMediaTensors, summary: Any) -> Optional[str]:
     return None
 
 
+def _concat_media(parts: list[StagedMediaTensors]) -> StagedMediaTensors:
+    """Concatenate per-call media deltas along the terminal chain, in order.
+
+    Packed patches (``[1, total_patches, F]``) join along the patch dim; padded
+    pixels (``[N, C, H, W]``) along the row dim; the per-item metadata tensors
+    along their only dim. Optional metadata must be present on every part or on
+    none of them.
+    """
+    if len(parts) == 1:
+        return parts[0]
+    first = parts[0].imgs
+    if first.ndim == 3 and first.shape[0] == 1:
+        imgs = torch.cat([part.imgs for part in parts], dim=1)
+    else:
+        imgs = torch.cat([part.imgs for part in parts], dim=0)
+
+    def _join(name: str) -> torch.Tensor | None:
+        values = [getattr(part, name) for part in parts]
+        present = [value is not None for value in values]
+        if not any(present):
+            return None
+        if not all(present):
+            raise ValueError(
+                f"{name} is staged on some calls of the chain but not others"
+            )
+        return torch.cat(
+            [
+                value.reshape(-1, 2) if name == "imgs_sizes" else value.reshape(-1)
+                for value in values
+            ],
+            dim=0,
+        )
+
+    return StagedMediaTensors(
+        imgs=imgs,
+        imgs_sizes=_join("imgs_sizes"),
+        num_frames=_join("num_frames"),
+        num_tiles=_join("num_tiles"),
+    )
+
+
 def _trainer_media(staged: StagedMediaTensors) -> dict[str, PackedTensor]:
     """Wrap the engine's media tensors as the trainer's one-row PackedTensors.
 
@@ -328,7 +369,7 @@ class RolloutReassembler:
         # Media: the terminal call's staged extras say whether the engine saw
         # media. If so its row also carries the media columns the Megatron
         # worker staged; read them and check they describe the same media.
-        media, media_failure = self._resolve_media(parsed, fetched_by_call)
+        media, media_failure = self._resolve_media(row, fetched_by_call)
         if media_failure is not None:
             return rejected(media_failure, staging_keys)
 
@@ -417,41 +458,49 @@ class RolloutReassembler:
 
     def _resolve_media(
         self,
-        parsed: Any,
+        row: Any,
         fetched_by_call: dict[str, Any],
     ) -> tuple[Optional[dict[str, PackedTensor]], Optional[str]]:
-        """Read and verify the terminal call's media columns when it carried media.
+        """Read and verify the media columns along the terminal chain.
 
-        Returns ``(media, rejection_reason)``; text rollouts return
-        ``(None, None)`` without a fetch. The media columns live on the call row
-        itself, so cleanup needs no extra key.
+        Each call row holds only the media new to that call (the Megatron
+        stager slices at the parent chain's item count), so the chain is
+        concatenated in order, like the token deltas. Returns
+        ``(media, rejection_reason)``; text rollouts return ``(None, None)``
+        without a fetch. The media columns live on the call rows themselves,
+        so cleanup needs no extra key.
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.media import parse_multimodal_extras
 
-        terminal = (
-            fetched_by_call.get(parsed.terminal_model_call_id)
-            if parsed.terminal_model_call_id is not None
-            else None
-        )
-        if terminal is None:
+        parts: list[StagedMediaTensors] = []
+        for call_id, _carry_len, _generation_len in row.link_spans:
+            item = fetched_by_call.get(call_id)
+            if item is None:
+                return None, f"media_chain_identity:{call_id}"
+            try:
+                _, summary = parse_multimodal_extras(item.extras)
+            except (TypeError, ValueError) as error:
+                return None, f"invalid_media_extras:{call_id}:{error}"
+            if summary is None:
+                continue
+            try:
+                staged = self._source.fetch_media(item.staging_key)
+            except KeyError as error:
+                return None, f"media_columns_missing:{error}"
+            except (TypeError, ValueError) as error:
+                return None, f"invalid_media_columns:{error}"
+            problem = _media_mismatch(staged, summary)
+            if problem is not None:
+                return None, f"media_mismatch:{call_id}:{problem}"
+            parts.append(staged)
+        if not parts:
             return None, None
         try:
-            _, summary = parse_multimodal_extras(terminal.extras)
+            combined = _concat_media(parts)
         except (TypeError, ValueError) as error:
-            return None, f"invalid_media_extras:{error}"
-        if summary is None:
-            return None, None
-        try:
-            staged = self._source.fetch_media(terminal.staging_key)
-        except KeyError as error:
-            return None, f"media_columns_missing:{error}"
-        except (TypeError, ValueError) as error:
-            return None, f"invalid_media_columns:{error}"
-        problem = _media_mismatch(staged, summary)
-        if problem is not None:
-            return None, f"media_mismatch:{problem}"
-        return _trainer_media(staged), None
+            return None, f"media_chain_incompatible:{error}"
+        return _trainer_media(combined), None
 
     def _execute_direct_plan(
         self,

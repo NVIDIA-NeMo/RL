@@ -41,6 +41,7 @@ from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
 
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     COMPACT_PREV_LEN_KEY,
+    MEDIA_PREV_COUNT_KEY,
     MINF_CAPTURE_PARAMS_FIELD,
     PREFIX_EOS_TOKEN_ID_FIELD,
     PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
@@ -52,6 +53,7 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     TQTokenSink,
     TQTokenSource,
     resolve_admission_prefix,
+    slice_media_tensors,
 )
 from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
     build_fixture_artifacts,
@@ -245,6 +247,14 @@ def _minf_media_tensors():
     }
 
 
+def _minf_two_image_tensors():
+    """Turn 2's engine tensors: image 1's four patches followed by image 2's four."""
+    return {
+        "imgs": torch.arange(8 * 12, dtype=torch.float32).reshape(1, 8, 12),
+        "imgs_sizes": torch.tensor([[4, 4], [4, 4]], dtype=torch.int32),
+    }
+
+
 def _minf_payload(*, multimodal: bool, media_tensors=...):
     """A finished MInf payload. Multimodal: compact [80, 99, 81] expanded to three 99s."""
     if not multimodal:
@@ -346,7 +356,8 @@ def test_stage_media_rejects_malformed_tensors(
 
 _PREPARER_CASES = {
     # (root payload or None for an inline prefix, prev_len, prompt, template prefix, eos,
-    #  expected prompt, expected required prefix, expected compact_prev_len)
+    #  expected prompt, expected required prefix, expected compact_prev_len,
+    #  expected media_prev_count)
     "staging_chain": (
         SimpleNamespace(
             prompt_token_ids=[10, 11],
@@ -360,6 +371,7 @@ _PREPARER_CASES = {
         [10, 11, 12, 99, 20, 21],
         [10, 11, 12, 99],
         4,
+        0,
     ),
     "capture_admission": (
         None,
@@ -370,20 +382,23 @@ _PREPARER_CASES = {
         [10, 11, 12, 99, 20, 21],
         [10, 11, 12, 99],
         4,
+        0,
     ),
     # Turn 2 of a VLM rollout: the chat endpoint renders the history in compact form
     # (one media token per image, "a cat" retokenized as 13 not 12), so the preparer
     # splices the *compact* chain, hands Gym the *expanded* chain to verify the engine
-    # prompt against, and tells the stager how much of the compact prompt the chain covers.
+    # prompt against, and tells the stager how much of the compact prompt and how many
+    # media items the chain already covers. The new turn adds a second image.
     "multimodal_chain": (
         _minf_payload(multimodal=True),
         7,
-        [80, 99, 81, 13, 2, 20, 21],
+        [80, 99, 81, 13, 2, 20, 99, 21],
         [80, 99, 81, 13, 2],
         2,
-        [80, 99, 81, 12, 2, 20, 21],
+        [80, 99, 81, 12, 2, 20, 99, 21],
         [80, 99, 99, 99, 81, 12, 2],
         5,
+        1,
     ),
 }
 
@@ -401,6 +416,7 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
         expected_prompt,
         expected_required,
         expected_compact_prev_len,
+        expected_media_prev_count,
     ) = _PREPARER_CASES[prefix_source]
     stager = None
     if root_payload is not None:
@@ -443,33 +459,44 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
         == expected_required
     )
     assert result.offload_params[MINF_CAPTURE_PARAMS_FIELD] == {
-        COMPACT_PREV_LEN_KEY: expected_compact_prev_len
+        COMPACT_PREV_LEN_KEY: expected_compact_prev_len,
+        MEDIA_PREV_COUNT_KEY: expected_media_prev_count,
     }
 
     if prefix_source != "multimodal_chain":
         return
-    # The engine expands the spliced compact prompt; the stager cuts the compact
-    # delta at compact_prev_len and Gym verifies the expanded prefix.
+    # The engine expands the spliced compact prompt (both images) and hands the
+    # stager pixels for both; the stager cuts the compact delta at compact_prev_len,
+    # keeps only image 2's pixels (media_prev_count), and Gym verifies the expanded prefix.
+    two_images = _minf_two_image_tensors()
     turn2 = stager.stage(
         "minf-response-2",
         SimpleNamespace(
-            prompt_token_ids=[80, 99, 99, 99, 81, 12, 2, 20, 21],
+            prompt_token_ids=[80, 99, 99, 99, 81, 12, 2, 20, 99, 99, 99, 21],
             generated_token_ids=[30],
             generated_log_probs=[-0.1],
             compact_prompt_token_ids=result.prompt,
-            media_tensors=_minf_media_tensors(),
+            media_tensors=two_images,
         ),
         finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
         offload_params=result.offload_params,
     )
     coords2 = turn2.response_metadata["ng_commit_coords"]
     assert coords2["disposition"] == "staged"
-    assert (coords2["prev_len"], coords2["delta_len"]) == (7, 3)
-    chains = TQTokenSource(
-        tq_client, staging_partition=staging_partition
-    ).fetch_prefix_chains([root_coords["staging_key"], coords2["staging_key"]])
-    assert chains.expanded == [80, 99, 99, 99, 81, 12, 2, 20, 21, 30]
-    assert chains.compact == [80, 99, 81, 12, 2, 20, 21, 30]
+    assert (coords2["prev_len"], coords2["delta_len"]) == (7, 6)
+    source = TQTokenSource(tq_client, staging_partition=staging_partition)
+    chains = source.fetch_prefix_chains(
+        [root_coords["staging_key"], coords2["staging_key"]]
+    )
+    assert chains.expanded == [80, 99, 99, 99, 81, 12, 2, 20, 99, 99, 99, 21, 30]
+    assert chains.compact == [80, 99, 81, 12, 2, 20, 99, 21, 30]
+    assert chains.media_count == 2
+    # Turn 2's row holds only the media new to it.
+    media2 = source.fetch_media(coords2["staging_key"])
+    assert torch.equal(media2.imgs, two_images["imgs"][:, 4:, :])
+    assert media2.imgs_sizes.tolist() == [[4, 4]]
+    [fetched2] = source.fetch_for_finalization([coords2["staging_key"]])
+    assert fetched2.extras["media"]["imgs_sizes"] == [[4, 4]]
 
 
 def test_megatron_stager_stamps_admission_epoch_when_request_spans_refit(
@@ -716,3 +743,85 @@ def test_prefix_field_keys_match_megatron_constants():
         )
     assert PREFIX_TEMPLATE_TOKEN_IDS_FIELD == mcore.PREFIX_TEMPLATE_TOKEN_IDS_FIELD
     assert PREFIX_EOS_TOKEN_ID_FIELD == mcore.PREFIX_EOS_TOKEN_ID_FIELD
+
+
+@pytest.mark.parametrize(
+    ("media_tensors", "prev_count", "expected"),
+    [
+        # Packed patches, two 4x4 images of 4 patches each: drop image 1.
+        (
+            {
+                "imgs": torch.arange(96.0).reshape(1, 8, 12),
+                "imgs_sizes": torch.tensor([[4, 4], [4, 4]]),
+            },
+            1,
+            {
+                "imgs": torch.arange(48.0, 96.0).reshape(1, 4, 12),
+                "imgs_sizes": torch.tensor([[4, 4]]),
+            },
+        ),
+        # Nothing already staged: unchanged.
+        (
+            {
+                "imgs": torch.arange(96.0).reshape(1, 8, 12),
+                "imgs_sizes": torch.tensor([[4, 4], [4, 4]]),
+            },
+            0,
+            {
+                "imgs": torch.arange(96.0).reshape(1, 8, 12),
+                "imgs_sizes": torch.tensor([[4, 4], [4, 4]]),
+            },
+        ),
+        # Everything already staged: no media for this call.
+        (
+            {
+                "imgs": torch.arange(96.0).reshape(1, 8, 12),
+                "imgs_sizes": torch.tensor([[4, 4], [4, 4]]),
+            },
+            2,
+            None,
+        ),
+        # Video: one 2-frame video already staged, one 1-frame video new.
+        (
+            {
+                "imgs": torch.arange(144.0).reshape(1, 12, 12),
+                "imgs_sizes": torch.tensor([[4, 4], [4, 4], [4, 4]]),
+                "num_frames": torch.tensor([2, 1]),
+            },
+            1,
+            {
+                "imgs": torch.arange(96.0, 144.0).reshape(1, 4, 12),
+                "imgs_sizes": torch.tensor([[4, 4]]),
+                "num_frames": torch.tensor([1]),
+            },
+        ),
+        # Padded pixels [N, C, H, W]: one row per image.
+        (
+            {
+                "imgs": torch.arange(2 * 3 * 4 * 4.0).reshape(2, 3, 4, 4),
+                "imgs_sizes": torch.tensor([[4, 4], [4, 4]]),
+            },
+            1,
+            {
+                "imgs": torch.arange(48.0, 96.0).reshape(1, 3, 4, 4),
+                "imgs_sizes": torch.tensor([[4, 4]]),
+            },
+        ),
+    ],
+    ids=["patches", "none-staged", "all-staged", "video", "padded-pixels"],
+)
+def test_slice_media_tensors_keeps_only_new_items(media_tensors, prev_count, expected):
+    sliced = slice_media_tensors(media_tensors, prev_count)
+    if expected is None:
+        assert sliced is None
+        return
+    assert set(sliced) == set(expected)
+    for name, value in expected.items():
+        assert torch.equal(sliced[name], value), name
+
+
+def test_slice_media_tensors_rejects_more_items_than_the_engine_saw():
+    with pytest.raises(ValueError, match="exceeds"):
+        slice_media_tensors(
+            {"imgs": torch.ones(1, 4, 12), "imgs_sizes": torch.tensor([[4, 4]])}, 2
+        )

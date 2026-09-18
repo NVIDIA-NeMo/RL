@@ -90,6 +90,10 @@ MEDIA_EXTRAS_KEY = "media"
 # keys are engine-owned) and never read by Megatron itself.
 MINF_CAPTURE_PARAMS_FIELD = "ng_capture_minf"
 COMPACT_PREV_LEN_KEY = "compact_prev_len"
+# Media items (images, or videos) already staged by the parent chain. The stager
+# slices the engine's media tensors at this boundary so each call row holds only
+# the media new to that call, the same way token columns hold only new tokens.
+MEDIA_PREV_COUNT_KEY = "media_prev_count"
 
 # Media the engine's vision encoder consumed, staged as extra columns on the
 # call row (a second put onto the same staging key, after the token row is
@@ -486,20 +490,39 @@ class PrefixChains:
     prompt must start with and what Gym's capture core verifies. ``compact`` is
     the concatenated compact deltas (falling back to the expanded delta for
     calls that staged none): what a multimodal chat render is spliced against.
-    They are identical for text-only chains.
+    They are identical for text-only chains. ``media_count`` is how many media
+    items (images, or videos) the chain's rows staged, so the next call can
+    stage only the media new to it.
     """
 
     expanded: list[int]
     compact: list[int]
+    media_count: int = 0
 
     def __add__(self, other: "PrefixChains") -> "PrefixChains":
         return PrefixChains(
             expanded=self.expanded + other.expanded,
             compact=self.compact + other.compact,
+            media_count=self.media_count + other.media_count,
         )
 
 
 _EMPTY_CHAINS = PrefixChains(expanded=[], compact=[])
+
+
+def media_item_count(geometry: dict[str, Any] | None) -> int:
+    """Number of media items a staged row's geometry describes.
+
+    Videos count once each (``num_frames`` has one entry per video), static
+    tiling counts images by ``num_tiles`` entries, and stills by ``imgs_sizes``.
+    """
+    if not geometry:
+        return 0
+    for name in ("num_frames", "num_tiles", "imgs_sizes"):
+        value = geometry.get(name)
+        if value is not None:
+            return len(value)
+    return 0
 
 
 class ChainPrefixCache:
@@ -533,7 +556,9 @@ class ChainPrefixCache:
                     miss_start = i + 1
             miss_keys = staging_chain[miss_start:]
         if not miss_keys:
-            return PrefixChains(list(cached.expanded), list(cached.compact))
+            return PrefixChains(
+                list(cached.expanded), list(cached.compact), cached.media_count
+            )
         if source is None:
             raise RuntimeError(
                 "staging source not initialized; call setup_token_capture() first"
@@ -553,7 +578,9 @@ class ChainPrefixCache:
             cache[last_key] = result
             if len(cache) > 256:
                 del cache[next(iter(cache))]
-        return PrefixChains(list(result.expanded), list(result.compact))
+        return PrefixChains(
+            list(result.expanded), list(result.compact), result.media_count
+        )
 
 
 def resolve_admission_prefix(
@@ -644,6 +671,7 @@ class TQMegatronPromptPreparer:
         updated_offload_params[MINF_CAPTURE_PARAMS_FIELD] = {
             **(updated_offload_params.get(MINF_CAPTURE_PARAMS_FIELD) or {}),
             COMPACT_PREV_LEN_KEY: len(chains.compact),
+            MEDIA_PREV_COUNT_KEY: chains.media_count,
         }
 
         template_prefix_token_ids = updated_offload_params.get(
@@ -685,6 +713,83 @@ class TQMegatronPromptPreparer:
         )
 
 
+def slice_media_tensors(
+    media_tensors: dict[str, Any] | None, prev_count: int
+) -> dict[str, Any] | None:
+    """Drop the first ``prev_count`` media items from the engine's media tensors.
+
+    Every chat request carries the whole conversation, so the engine hands the
+    stager pixels for every image in the prompt. The parent chain already
+    staged the first ``prev_count`` of them; this keeps only the rest so media
+    columns are per-call deltas like the token columns.
+
+    Item boundaries come from the tensors themselves: ``num_frames`` (frames per
+    video) or ``num_tiles`` (tiles per image) when present, else one row of
+    ``imgs_sizes`` per image. For packed patches (``imgs`` as
+    ``[1, total_patches, C*P*P]``) the patch count per row is ``h*w/P**2`` with
+    ``P**2`` recovered from the totals.
+    """
+    if not media_tensors or prev_count <= 0:
+        return media_tensors
+    imgs = media_tensors.get("imgs")
+    imgs_sizes = media_tensors.get("imgs_sizes")
+    num_frames = media_tensors.get("num_frames")
+    num_tiles = media_tensors.get("num_tiles")
+    if imgs is None:
+        return media_tensors
+    if imgs_sizes is None and num_tiles is None:
+        raise ValueError("media delta requires imgs_sizes or num_tiles to locate items")
+
+    if num_frames is not None:
+        total_items = int(num_frames.numel())
+    elif num_tiles is not None:
+        total_items = int(num_tiles.numel())
+    else:
+        total_items = int(imgs_sizes.reshape(-1, 2).shape[0])
+    if prev_count > total_items:
+        raise ValueError(
+            f"media_prev_count {prev_count} exceeds the {total_items} media items "
+            "the engine saw"
+        )
+    if prev_count == total_items:
+        return None
+
+    # Rows of imgs_sizes / imgs covered by the parent chain.
+    if num_frames is not None:
+        prev_rows = int(num_frames.reshape(-1)[:prev_count].sum().item())
+    elif num_tiles is not None:
+        prev_rows = int(num_tiles.reshape(-1)[:prev_count].sum().item())
+    else:
+        prev_rows = prev_count
+
+    sliced: dict[str, Any] = {}
+    if imgs.ndim == 3 and imgs.shape[0] == 1 and imgs_sizes is not None:
+        # Packed patches: recover patches-per-row from sizes and the total.
+        sizes = imgs_sizes.reshape(-1, 2).to(torch.int64)
+        areas = sizes[:, 0] * sizes[:, 1]
+        total_area = int(areas.sum().item())
+        total_patches = int(imgs.shape[1])
+        if total_patches == 0 or total_area % total_patches:
+            raise ValueError(
+                f"packed patches {total_patches} do not divide the media area {total_area}"
+            )
+        patch_area = total_area // total_patches
+        prev_area = int(areas[:prev_rows].sum().item())
+        if prev_area % patch_area:
+            raise ValueError("parent media does not end on a patch boundary")
+        sliced["imgs"] = imgs[:, prev_area // patch_area :, :]
+    else:
+        # Padded pixels [N, C, H, W] (or tiles): one row per frame / tile.
+        sliced["imgs"] = imgs[prev_rows:]
+    if imgs_sizes is not None:
+        sliced["imgs_sizes"] = imgs_sizes.reshape(-1, 2)[prev_rows:]
+    if num_frames is not None:
+        sliced["num_frames"] = num_frames.reshape(-1)[prev_count:]
+    if num_tiles is not None:
+        sliced["num_tiles"] = num_tiles.reshape(-1)[prev_count:]
+    return sliced
+
+
 def media_geometry(media_tensors: dict[str, Any] | None) -> dict[str, Any] | None:
     """Gym's digest-covered media geometry, read off the engine's media tensors.
 
@@ -718,29 +823,34 @@ class _MegatronCapturePayload:
     compact_prompt_token_ids: Any
     media: dict[str, Any] | None
     compact_prev_len: int
+    # The engine's media tensors minus what the parent chain already staged.
+    media_tensors: dict[str, Any] | None
 
     @classmethod
     def from_offloaded(
         cls, payload: Any, minf_params: Any
     ) -> "_MegatronCapturePayload":
-        compact_prev_len = 0
-        if (
-            isinstance(minf_params, dict)
-            and minf_params.get(COMPACT_PREV_LEN_KEY) is not None
-        ):
-            compact_prev_len = minf_params[COMPACT_PREV_LEN_KEY]
-            if type(compact_prev_len) is not int or compact_prev_len < 0:
+        def _count(key: str) -> int:
+            value = minf_params.get(key) if isinstance(minf_params, dict) else None
+            if value is None:
+                return 0
+            if type(value) is not int or value < 0:
                 raise ValueError(
-                    "MInf capture request carries an invalid compact_prev_len: "
-                    f"{compact_prev_len!r}"
+                    f"MInf capture request carries an invalid {key}: {value!r}"
                 )
+            return value
+
+        media_tensors = slice_media_tensors(
+            getattr(payload, "media_tensors", None), _count(MEDIA_PREV_COUNT_KEY)
+        )
         return cls(
             prompt_token_ids=getattr(payload, "prompt_token_ids", None),
             generated_token_ids=getattr(payload, "generated_token_ids", None),
             generated_log_probs=getattr(payload, "generated_log_probs", None),
             compact_prompt_token_ids=getattr(payload, "compact_prompt_token_ids", None),
-            media=media_geometry(getattr(payload, "media_tensors", None)),
-            compact_prev_len=compact_prev_len,
+            media=media_geometry(media_tensors),
+            compact_prev_len=_count(COMPACT_PREV_LEN_KEY),
+            media_tensors=media_tensors,
         )
 
 
@@ -873,7 +983,7 @@ class TQMegatronTokenStager:
         # is durable. They are outside Gym's digest; the digest-covered geometry
         # in extras (media_geometry above) names them, and the finalizer checks
         # the columns against it before publishing.
-        media_tensors = getattr(payload, "media_tensors", None)
+        media_tensors = capture_payload_view.media_tensors
         if coords.disposition == "staged" and media_tensors:
             try:
                 self._sink.stage_media(coords.staging_key, media_tensors)
@@ -932,6 +1042,7 @@ class TQTokenSource:
                     "token_ids_delta",
                     COMPACT_TOKEN_IDS_FIELD,
                     COMPACT_LEN_FIELD,
+                    ROUTED_EXTRAS_METADATA_FIELD,
                 ],
             )
         except Exception as error:  # noqa: BLE001 — protocol maps any miss to KeyError
@@ -946,10 +1057,14 @@ class TQTokenSource:
             )
         expanded: list[int] = []
         compact: list[int] = []
+        media_count = 0
         for index in range(n_rows):
             row = _select_row(rows, index)
             delta = [int(t) for t in row["token_ids_delta"].squeeze(0).tolist()]
             expanded.extend(delta)
+            media_count += media_item_count(
+                (_row_extras(row) or {}).get(MEDIA_EXTRAS_KEY)
+            )
             compact_len = _row_scalar_int(row, COMPACT_LEN_FIELD)
             if compact_len > 0:
                 compact_delta = [
@@ -963,7 +1078,7 @@ class TQTokenSource:
                 compact.extend(compact_delta)
             else:
                 compact.extend(delta)
-        return PrefixChains(expanded=expanded, compact=compact)
+        return PrefixChains(expanded=expanded, compact=compact, media_count=media_count)
 
     def fetch_media(self, staging_key: str) -> StagedMediaTensors:
         """Read one call's media columns; ``KeyError`` when the row carries none."""

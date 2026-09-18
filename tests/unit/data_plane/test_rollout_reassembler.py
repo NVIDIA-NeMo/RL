@@ -928,40 +928,12 @@ def _engine_media_tensors():
     }
 
 
-def _stage_vlm_rollout(tq_client, rollout_id: str, *, media_tensors=...):
-    """Stage one VLM root call through the MInf stager and build its receipt."""
-    from types import SimpleNamespace
-
-    from nemo_rl.data_plane.tq_token_sink import TQMegatronTokenStager
-
-    stager = TQMegatronTokenStager(
-        TQTokenSink(tq_client, staging_partition=MEDIA_STAGING_PARTITION)
-    )
-    admission = nemo_gym.CaptureAdmission(
-        rollout_id=rollout_id, model_call_id="c1", mode="text"
-    )
-    result = stager.stage(
-        f"resp-{rollout_id}",
-        SimpleNamespace(
-            prompt_token_ids=[80, 99, 99, 99, 81],
-            generated_token_ids=[12, 2],
-            generated_log_probs=[-0.25, -0.5],
-            compact_prompt_token_ids=[80, 99, 81],
-            media_tensors=(
-                _engine_media_tensors() if media_tensors is ... else media_tensors
-            ),
-        ),
-        finished_metadata=SimpleNamespace(policy_epoch=[(0, 4)]),
-        offload_params={"ng_capture": admission.model_dump(mode="json")},
-    )
-    assert result is not None
-    coords = result.response_metadata["ng_commit_coords"]
-    assert coords["disposition"] == "staged"
-    manifest_row = {
-        "model_call_id": "c1",
-        "parent_call_id": None,
-        "mode": "text",
-        "prev_len": 0,
+def _manifest_row(call_id, coords, *, parent=None, response_id):
+    return {
+        "model_call_id": call_id,
+        "parent_call_id": parent,
+        "mode": "text" if parent is None else "token_in",
+        "prev_len": coords["prev_len"],
         "delta_len": coords["delta_len"],
         "cum_len": coords["cum_len"],
         "weight_version": coords["weight_version"],
@@ -970,12 +942,99 @@ def _stage_vlm_rollout(tq_client, rollout_id: str, *, media_tensors=...):
         "staging_key": coords["staging_key"],
         "chain_hash": coords["chain_hash"],
         "cumulative_hash": coords["cumulative_hash"],
-        "response_id": f"resp-{rollout_id}",
+        "response_id": response_id,
     }
+
+
+def _stage_vlm_rollout(
+    tq_client, rollout_id: str, *, media_tensors=..., second_turn: bool = False
+):
+    """Stage a VLM rollout through the MInf stager and build its receipt.
+
+    Turn 1 carries image 1 (its four patches are the first half of
+    ``_engine_media_tensors``). With ``second_turn`` the engine sees both
+    images on turn 2 and the stager keeps only image 2 (``media_prev_count`` 1),
+    so the two rows together hold exactly ``_engine_media_tensors``.
+    """
+    from types import SimpleNamespace
+
+    from nemo_rl.data_plane.tq_token_sink import (
+        COMPACT_PREV_LEN_KEY,
+        MEDIA_PREV_COUNT_KEY,
+        MINF_CAPTURE_PARAMS_FIELD,
+        TQMegatronTokenStager,
+    )
+
+    stager = TQMegatronTokenStager(
+        TQTokenSink(tq_client, staging_partition=MEDIA_STAGING_PARTITION)
+    )
+    both = _engine_media_tensors()
+    image1 = {"imgs": both["imgs"][:, :4, :], "imgs_sizes": both["imgs_sizes"][:1]}
+    if media_tensors is ...:
+        media_tensors = image1 if second_turn else both
+    admission = nemo_gym.CaptureAdmission(
+        rollout_id=rollout_id, model_call_id="c1", mode="text"
+    )
+    result = stager.stage(
+        f"resp-{rollout_id}-c1",
+        SimpleNamespace(
+            prompt_token_ids=[80, 99, 99, 99, 81],
+            generated_token_ids=[12, 2],
+            generated_log_probs=[-0.25, -0.5],
+            compact_prompt_token_ids=[80, 99, 81],
+            media_tensors=media_tensors,
+        ),
+        finished_metadata=SimpleNamespace(policy_epoch=[(0, 4)]),
+        offload_params={"ng_capture": admission.model_dump(mode="json")},
+    )
+    assert result is not None
+    coords = result.response_metadata["ng_commit_coords"]
+    assert coords["disposition"] == "staged"
+    manifest = [_manifest_row("c1", coords, response_id=f"resp-{rollout_id}-c1")]
+    terminal = "c1"
+    if second_turn:
+        expanded_chain = [80, 99, 99, 99, 81, 12, 2]
+        child = nemo_gym.CaptureAdmission(
+            rollout_id=rollout_id,
+            model_call_id="c2",
+            parent_call_id="c1",
+            prev_len=7,
+            mode="token_in",
+            required_prefix_token_ids=expanded_chain,  # what the preparer fills in
+            staging_chain=[coords["staging_key"]],
+            parent_chain_hash=coords["chain_hash"],
+        )
+        result2 = stager.stage(
+            f"resp-{rollout_id}-c2",
+            SimpleNamespace(
+                prompt_token_ids=expanded_chain + [20, 99, 99, 99, 21],
+                generated_token_ids=[30, 2],
+                generated_log_probs=[-0.1, -0.2],
+                compact_prompt_token_ids=[80, 99, 81, 12, 2, 20, 99, 21],
+                media_tensors=both,  # the engine saw both images again
+            ),
+            finished_metadata=SimpleNamespace(policy_epoch=[(0, 4)]),
+            offload_params={
+                "ng_capture": child.model_dump(mode="json"),
+                # What the preparer records after resolving the chain.
+                MINF_CAPTURE_PARAMS_FIELD: {
+                    COMPACT_PREV_LEN_KEY: 5,
+                    MEDIA_PREV_COUNT_KEY: 1,
+                },
+            },
+        )
+        coords2 = result2.response_metadata["ng_commit_coords"]
+        assert coords2["disposition"] == "staged"
+        manifest.append(
+            _manifest_row(
+                "c2", coords2, parent="c1", response_id=f"resp-{rollout_id}-c2"
+            )
+        )
+        terminal = "c2"
     return {
         "rollout_id": rollout_id,
-        "terminal_model_call_id": "c1",
-        "manifest": [manifest_row],
+        "terminal_model_call_id": terminal,
+        "manifest": manifest,
         "terminal_selection": "declared",
     }
 
@@ -990,13 +1049,19 @@ def _media_finalizer(tq_client):
     )
 
 
-@pytest.mark.parametrize("case", ["attached", "no-media-tensors", "columns-drift"])
+@pytest.mark.parametrize(
+    "case", ["attached", "two-call-chain", "no-media-tensors", "columns-drift"]
+)
 def test_finalize_rollout_media(tq_client, media_partitions, case):
-    """Media on the call row: the terminal call's digest-covered geometry says whether
-    media columns must exist, the columns are read and checked against it, and the
-    packed-patch layout is handed to the trainer unchanged."""
+    """Media on the call rows: each call's digest-covered geometry says whether that
+    row carries media columns, the columns are read and checked against it, the
+    per-call deltas are concatenated along the chain, and the packed-patch layout is
+    handed to the trainer unchanged."""
     receipt = _stage_vlm_rollout(
-        tq_client, "mm", media_tensors=None if case == "no-media-tensors" else ...
+        tq_client,
+        "mm",
+        media_tensors=None if case == "no-media-tensors" else ...,
+        second_turn=case == "two-call-chain",
     )
     engine = _engine_media_tensors()
     if case == "columns-drift":
@@ -1015,9 +1080,12 @@ def test_finalize_rollout_media(tq_client, media_partitions, case):
         assert row.rejection_reason.startswith("media_mismatch"), row.rejection_reason
         return
     assert row.valid, row.rejection_reason
-    assert row.token_ids == [80, 99, 99, 99, 81, 12, 2]
-    # Media rides the call row: no extra staging key to clean up.
-    assert row.staging_keys == [receipt["manifest"][0]["staging_key"]]
+    expected_tokens = [80, 99, 99, 99, 81, 12, 2]
+    if case == "two-call-chain":
+        expected_tokens += [20, 99, 99, 99, 21, 30, 2]
+    assert row.token_ids == expected_tokens
+    # Media rides the call rows: no extra staging key to clean up.
+    assert row.staging_keys == [r["staging_key"] for r in receipt["manifest"]]
     if case == "no-media-tensors":
         assert row.media is None  # no geometry staged -> treated as a text row
         return
