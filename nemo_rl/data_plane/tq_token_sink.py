@@ -56,10 +56,10 @@ if TYPE_CHECKING:
     )
 
 from nemo_rl.data.captured_media import (
-    IMAGE_CAPTURE_FIELD,
-    STAGED_PIXEL_FIELD,
+    MEDIA_CAPTURE_FIELD,
+    MEDIA_STAGING_FIELDS,
     CapturedMedia,
-    attachment_pixels,
+    attachment_tensors,
 )
 from nemo_rl.data_plane.schema import (
     ROUTE_ENCODING_ENVELOPE,
@@ -283,15 +283,16 @@ class TQTokenSink:
                 [routed_encoding], dtype=torch.int64
             )
             field_dict[ROUTED_LEN_FIELD] = torch.tensor([routed_len], dtype=torch.int64)
-            media_metadata = (record.extras or {}).get(IMAGE_CAPTURE_FIELD)
+            media_metadata = (record.extras or {}).get(MEDIA_CAPTURE_FIELD)
             if media_metadata is not None:
-                pixels = attachment_pixels(
+                media_fields = attachment_tensors(
                     CapturedMedia.from_dict(media_metadata), attachments
                 )
-                if pixels is not None:
-                    field_dict[STAGED_PIXEL_FIELD] = pixels.unsqueeze(0)
+                field_dict.update(
+                    {name: tensor.unsqueeze(0) for name, tensor in media_fields.items()}
+                )
             elif attachments:
-                raise ValueError("Tensor attachments require image capture metadata")
+                raise ValueError("Tensor attachments require media capture metadata")
             fields = TensorDict(field_dict, batch_size=[1])
             tags = [
                 {
@@ -375,21 +376,21 @@ class TQTokenSource:
         """Gym ``StagingSource`` conformance: base snapshots only, in order."""
         return [item.snapshot for item in self.fetch_for_finalization(staging_keys)]
 
-    def fetch_pixels(self, staging_key: str) -> torch.Tensor:
-        """Fetch just one call's flattened pixels, never reprocess source images."""
+    def fetch_media(self, staging_key: str) -> dict[str, torch.Tensor]:
+        """Fetch one call's named media columns without processing source media."""
         try:
             rows = _call_dp(
                 self._dp_client,
                 "get_samples",
                 sample_ids=[staging_key],
                 partition_id=self._staging_partition,
-                select_fields=[STAGED_PIXEL_FIELD],
+                select_fields=list(MEDIA_STAGING_FIELDS),
             )
         except Exception as error:  # noqa: BLE001 — map storage failures to a rejected row
-            raise KeyError(f"Missing captured pixels for {staging_key!r}") from error
+            raise KeyError(f"Missing captured media for {staging_key!r}") from error
         if tuple(rows.batch_size) != (1,):
-            raise KeyError(f"Missing captured pixels for {staging_key!r}")
-        return rows[STAGED_PIXEL_FIELD][0]
+            raise KeyError(f"Missing captured media for {staging_key!r}")
+        return {name: rows[name][0] for name in MEDIA_STAGING_FIELDS}
 
     def fetch_prefix_token_ids(self, staging_keys: list[str]) -> list[int]:
         """Bulk-fetch ordered delta chain and concatenate token_ids_delta into a prefix."""

@@ -125,7 +125,7 @@ class RolloutReassembler:
         max_seq_len: int,
         router_replay_enabled: bool = False,
         defer_routed_experts_to_policy: bool = False,
-        capture_images: bool = False,
+        capture_media: bool = False,
     ) -> None:
         self._dp_client = dp_client
         self._partition_id = partition_id
@@ -133,9 +133,9 @@ class RolloutReassembler:
         self._max_seq_len = int(max_seq_len)
         self._router_replay_enabled = router_replay_enabled
         self._defer_routed_experts_to_policy = defer_routed_experts_to_policy
-        self._capture_images = capture_images
-        if capture_images and defer_routed_experts_to_policy:
-            raise ValueError("Image capture requires direct router replay assembly")
+        self._capture_media = capture_media
+        if capture_media and defer_routed_experts_to_policy:
+            raise ValueError("Media capture requires direct router replay assembly")
         if self._defer_routed_experts_to_policy and not self._router_replay_enabled:
             raise ValueError(
                 "defer_routed_experts_to_policy requires router replay to be enabled"
@@ -317,10 +317,10 @@ class RolloutReassembler:
             media = assemble_captured_media(
                 [fetched_by_call[call_id] for call_id in row.model_call_ids],
                 source=self._source,
-                required=self._capture_images,
+                required=self._capture_media,
             )
         except (KeyError, TypeError, ValueError) as error:
-            return rejected(f"image_assembly:{error}", staging_keys)
+            return rejected(f"media_assembly:{error}", staging_keys)
 
         return FinalizedRollout(
             rollout_id=rollout_id,

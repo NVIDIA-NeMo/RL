@@ -77,6 +77,7 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     validate_bootstrap_anchor,
 )
 from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.data.captured_media import MEDIA_STAGING_FIELDS
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS, uses_image_placeholder
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
@@ -348,13 +349,14 @@ def _register_single_controller_partitions(
         from nemo_rl.data_plane.schema import (
             ROUTED_EXPERTS_FIELD as STAGING_ROUTED_EXPERTS_FIELD,
         )
+        from nemo_rl.data.captured_media import MEDIA_STAGING_FIELDS
         from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS
 
         dp_client.register_partition(
             partition_id=token_capture_cfg.staging_partition,
             fields=list(STAGING_FIELDS)
             + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else [])
-            + (["pixel_values"] if capture_media else []),
+            + (list(MEDIA_STAGING_FIELDS) if capture_media else []),
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize", "prev_lp", "train"],
         )
@@ -1199,15 +1201,15 @@ def setup_single_controller(
     # ray_actor_environment_registry.py), so nothing here needs to change the
     # worker's environment.
     token_capture_cfg = master_config.token_capture
-    capture_images = token_capture_cfg.enabled and processor is not None
-    if capture_images:
+    capture_media = token_capture_cfg.enabled and processor is not None
+    if capture_media:
         if not uses_image_placeholder(processor):
             raise ValueError(
-                "VLM token capture currently supports Nemotron dynamic images only"
+                "VLM token capture currently supports Omni dynamic images and native video"
             )
         if not policy_config["megatron_cfg"]["enabled"]:
             raise ValueError(
-                "Dynamic-image token capture currently requires the Megatron learner"
+                "Omni media token capture currently requires the Megatron learner"
             )
         if token_capture_cfg.defer_routed_experts_to_policy:
             raise ValueError("VLM token capture requires direct router replay assembly")
@@ -1905,7 +1907,7 @@ def setup_single_controller(
             master_config=master_config,
             partition_id=partition_id,
             include_multimodal_fields=processor is not None,
-            capture_media=capture_images,
+            capture_media=capture_media,
         )
     if token_capture_cfg.enabled:
         # Host Gym's capture core in every vLLM DP leader (in-worker DP
@@ -1914,7 +1916,7 @@ def setup_single_controller(
         generation.setup_token_capture(
             dp_config,
             token_capture_cfg.staging_partition,
-            capture_images=capture_images,
+            capture_media=capture_media,
         )
         generation.set_rollout_weight_version(0)
 
@@ -1978,7 +1980,7 @@ def setup_single_controller(
                 router_replay_enabled=router_replay_enabled(policy_config),
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
-                capture_images=capture_images,
+                capture_media=capture_media,
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )
@@ -2038,7 +2040,7 @@ def setup_single_controller(
         last_checkpoint_path=recovery_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         partition_includes_multimodal_fields=processor is not None,
-        staging_partition_includes_media=capture_images,
+        staging_partition_includes_media=capture_media,
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
         finalizer_actors=finalizer_actors,

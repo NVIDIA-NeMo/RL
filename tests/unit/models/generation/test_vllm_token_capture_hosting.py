@@ -168,7 +168,7 @@ def test_generation_setup_token_capture_fans_out(monkeypatch):
         "setup_token_capture",
         dp_cfg={"backend": "simple"},
         staging_partition="rollout_staging",
-        capture_images=False,
+        capture_media=False,
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
     )
 
@@ -515,3 +515,43 @@ def test_request_capture_abort_fails_the_call_and_drains_state():
         worker, request, _served_content([3], [-0.1])
     )
     assert "ng_commit_coords" not in out
+
+
+@pytest.mark.parametrize("pruning_rate", [0.0, 0.5])
+def test_omni_capture_setup_rejects_video_pruning(monkeypatch, pruning_rate):
+    from vllm.model_executor.models.nano_nemotron_vl import NanoNemotronVLProcessingInfo
+
+    info = object.__new__(NanoNemotronVLProcessingInfo)
+    monkeypatch.setattr(NanoNemotronVLProcessingInfo, "is_dynamic_tiler", True)
+    monkeypatch.setattr(
+        NanoNemotronVLProcessingInfo,
+        "get_video_pruning_rate",
+        lambda self: pruning_rate,
+    )
+    monkeypatch.setattr(
+        NanoNemotronVLProcessingInfo,
+        "get_hf_processor",
+        lambda self: SimpleNamespace(_img_context_token_ids=[18]),
+    )
+    worker = _fake_worker()
+    worker.llm = SimpleNamespace(
+        renderer=SimpleNamespace(get_mm_processor=lambda: SimpleNamespace(info=info))
+    )
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.build_data_plane_client",
+        lambda dp_cfg, bootstrap: MagicMock(),
+    )
+    if pruning_rate:
+        with pytest.raises(ValueError, match="video token pruning"):
+            asyncio.run(
+                VllmAsyncGenerationWorkerImpl.setup_token_capture(
+                    worker, {}, staging_partition="staging", capture_media=True
+                )
+            )
+    else:
+        assert asyncio.run(
+            VllmAsyncGenerationWorkerImpl.setup_token_capture(
+                worker, {}, staging_partition="staging", capture_media=True
+            )
+        )
+        assert worker._capture_image_token_id == 18
