@@ -652,26 +652,44 @@ def _stub_non_fp32_vllm_patches(monkeypatch, captured_extra_env_vars):
         "_patch_vllm_glm_decoder_sequence_parallel_moe",
     ):
         monkeypatch.setattr(patches, patch_name, lambda _logger: None)
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_moe_routed_experts_capture",
+        lambda _logger, *, required=False: True,
+    )
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_apply_vllm_patches_gates_nemotron_h_fp32_lm_head(monkeypatch, enabled):
+@pytest.mark.parametrize("require_capture", [False, True])
+def test_apply_vllm_patches_gates_nemotron_h_fp32_lm_head(
+    monkeypatch, enabled, require_capture: bool
+):
     _install_fake_vllm_modules(monkeypatch)
     monkeypatch.delenv(patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, raising=False)
     captured_extra_env_vars = []
     fp32_patch_calls = []
+    capture_requirements = []
     _stub_non_fp32_vllm_patches(monkeypatch, captured_extra_env_vars)
     monkeypatch.setattr(
         patches,
         "_patch_vllm_nemotron_h_fp32_lm_head",
         lambda _logger: fp32_patch_calls.append(True) or True,
     )
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_moe_routed_experts_capture",
+        lambda _logger, *, required: capture_requirements.append(required) or True,
+    )
 
     patches._apply_vllm_patches(
-        "py", extra_env_vars=["USER_VAR"], nemotron_h_fp32_lm_head=enabled
+        "py",
+        extra_env_vars=["USER_VAR"],
+        nemotron_h_fp32_lm_head=enabled,
+        require_moe_routed_experts_capture=require_capture,
     )
 
     assert bool(fp32_patch_calls) is enabled
+    assert capture_requirements == [require_capture]
     if enabled:
         assert os.environ[patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR] == "1"
         assert captured_extra_env_vars == [
@@ -715,6 +733,7 @@ def test_apply_vllm_patches_raises_when_nemotron_h_fp32_lm_head_patch_fails(
         patches._apply_vllm_patches("py", nemotron_h_fp32_lm_head=True)
 
 
+@pytest.mark.parametrize("require_capture", [False, True])
 @pytest.mark.parametrize(
     ("vllm_cfg_overrides", "expected_nemotron_h_fp32_lm_head"),
     [
@@ -731,7 +750,10 @@ def test_apply_vllm_patches_raises_when_nemotron_h_fp32_lm_head_patch_fails(
     ],
 )
 def test_vllm_worker_threads_nemotron_h_fp32_lm_head_cfg_into_source_patches(
-    monkeypatch, vllm_cfg_overrides, expected_nemotron_h_fp32_lm_head
+    monkeypatch,
+    vllm_cfg_overrides,
+    expected_nemotron_h_fp32_lm_head,
+    require_capture: bool,
 ):
     from nemo_rl.models.generation.vllm import vllm_worker
 
@@ -739,11 +761,16 @@ def test_vllm_worker_threads_nemotron_h_fp32_lm_head_cfg_into_source_patches(
     monkeypatch.setattr(
         vllm_worker,
         "_apply_vllm_patches",
-        lambda py, *, extra_env_vars, nemotron_h_fp32_lm_head: patch_calls.append(
+        lambda py,
+        *,
+        extra_env_vars,
+        nemotron_h_fp32_lm_head,
+        require_moe_routed_experts_capture: patch_calls.append(
             {
                 "py": py,
                 "extra_env_vars": extra_env_vars,
                 "nemotron_h_fp32_lm_head": nemotron_h_fp32_lm_head,
+                "require_moe_routed_experts_capture": require_moe_routed_experts_capture,
             }
         ),
     )
@@ -751,6 +778,7 @@ def test_vllm_worker_threads_nemotron_h_fp32_lm_head_cfg_into_source_patches(
     vllm_worker.BaseVllmGenerationWorker(
         {
             "model_name": "model",
+            "vllm_kwargs": {"enable_return_routed_experts": require_capture},
             "vllm_cfg": {
                 "tensor_parallel_size": 1,
                 "pipeline_parallel_size": 1,
@@ -768,6 +796,7 @@ def test_vllm_worker_threads_nemotron_h_fp32_lm_head_cfg_into_source_patches(
             "py": sys.executable,
             "extra_env_vars": ["EXPLICIT_VAR"],
             "nemotron_h_fp32_lm_head": expected_nemotron_h_fp32_lm_head,
+            "require_moe_routed_experts_capture": require_capture,
         }
     ]
 

@@ -849,6 +849,8 @@ from torch import nn"""
 
     logger.info("Applied NemotronH fp32 LM head source patch.")
     return True
+
+
 @contextmanager
 def modelopt_moe_amax_aliases(model: "torch.nn.Module") -> Iterator[None]:
     """Temporarily expose nested ModelOpt MoE amax buffers to vLLM's loader.
