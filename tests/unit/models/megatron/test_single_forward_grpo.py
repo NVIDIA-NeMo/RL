@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import partial
 from types import SimpleNamespace
-from unittest.mock import Mock
+from typing import Any
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -255,3 +257,108 @@ def test_fractional_survivor_gradients_match_prefiltering(
     assert sequences.item() == tokens.item() == sample_weight
     torch.testing.assert_close(actual_lp.grad, expected_lp.grad)
     assert normalized[0]["loss"] == pytest.approx(expected_loss.item())
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("in_loss", [False, True])
+def test_train_normalizes_survivors_before_optimizer_step(
+    monkeypatch: pytest.MonkeyPatch, in_loss: bool
+) -> None:
+    """In-loss and prefiltered batches reach the optimizer with equal gradients."""
+    # Optional Megatron imports are available only in the mcore test environment.
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(force_on_policy_ratio=True, reference_policy_kl_penalty=0),
+        seq_logprob_error_threshold=2.0 if in_loss else None,
+    )
+    assert loss_fn.requires_survivor_normalization is in_loss
+    data = {
+        "token_mask": torch.tensor([[0.0, 1.0], [0.0, 1.0]]),
+        "sample_mask": torch.tensor([1.0, 1.0 if in_loss else 0.0]),
+        "generation_logprobs": torch.tensor([[0.0, -1.0], [0.0, -1.0]]),
+        "advantages": torch.ones(2, 2),
+    }
+    logprobs = torch.tensor([[-1.0], [-4.0]], requires_grad=True)
+    original_count = data["sample_mask"].sum()
+    events = []
+
+    def forward_backward(**kwargs: Any) -> list[dict[str, Any]]:
+        loss, metrics = loss_fn(
+            logprobs, data, kwargs["global_valid_seqs"], kwargs["global_valid_toks"]
+        )
+        loss.backward()
+        assert ("seq_logprob_error_valid_tokens" in metrics) is in_loss
+        events.append("backward")
+        return [metrics]
+
+    def scale_gradients(factor: float) -> None:
+        assert factor == 2.0
+        logprobs.grad.mul_(factor)
+        events.append("scale")
+
+    class OptimizerReached(Exception):
+        """Stop at the optimizer boundary without exercising unrelated logging."""
+
+    def optimizer_step() -> None:
+        # Clipping happens inside MegatronOptimizer.step(), so this must already
+        # be the surviving-token-normalized gradient when step() is entered.
+        torch.testing.assert_close(logprobs.grad, torch.tensor([[-1.0], [0.0]]))
+        events.append("step")
+        raise OptimizerReached
+
+    worker = MagicMock()
+    worker.dp_size = 1
+    worker.mtp_enabled = False
+    worker.model.modules.return_value = []
+    worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
+    worker.model.scale_gradients.side_effect = scale_gradients
+    worker.optimizer.step.side_effect = optimizer_step
+    worker._normalize_in_loss_seq_filter = partial(
+        worker_module.MegatronPolicyWorkerImpl._normalize_in_loss_seq_filter, worker
+    )
+    state = MagicMock()
+    state.is_pipeline_last_stage.return_value = True
+    state.get_pipeline_model_parallel_world_size.return_value = 1
+    monkeypatch.setattr(worker_module, "parallel_state", state)
+    monkeypatch.setattr(
+        worker_module,
+        "process_global_batch",
+        lambda *_a, **_kw: {
+            "batch": data,
+            "global_valid_seqs": original_count,
+            "global_valid_toks": original_count,
+        },
+    )
+    monkeypatch.setattr(worker_module, "attach_media_token_validity_mask", Mock())
+    monkeypatch.setattr(
+        worker_module,
+        "get_microbatch_iterator",
+        lambda *_a, **_kw: (iter([]), 1, 2, 2, 2),
+    )
+    monkeypatch.setattr(worker_module, "LossPostProcessor", Mock())
+    rerun = Mock()
+    rerun.should_run_forward_backward.side_effect = [True, False]
+    monkeypatch.setattr(worker_module, "get_rerun_state_machine", lambda: rerun)
+    monkeypatch.setattr(worker_module, "_should_use_router_replay", lambda **_: False)
+    monkeypatch.setattr(worker_module, "megatron_forward_backward", forward_backward)
+    monkeypatch.setattr(torch.distributed, "all_reduce", Mock())
+    monkeypatch.setattr(torch.distributed, "barrier", Mock())
+    monkeypatch.setattr(torch.cuda, "synchronize", Mock())
+    # train() creates the dataset-size scalar on CUDA; keep this state test on CPU.
+    tensor = torch.tensor
+
+    def cpu_tensor(*args: Any, **kwargs: Any) -> torch.Tensor:
+        kwargs.pop("device", None)
+        return tensor(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "tensor", cpu_tensor)
+    with pytest.raises(OptimizerReached):
+        worker_module.MegatronPolicyWorkerImpl.train(
+            worker, SimpleNamespace(size=2), loss_fn, gbs=2, mbs=2
+        )
+    assert events == (
+        ["backward", "scale", "step"] if in_loss else ["backward", "step"]
+    )
+    if not in_loss:
+        worker.model.scale_gradients.assert_not_called()
