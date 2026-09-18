@@ -359,12 +359,9 @@ def test_megatron_stager_writes_canonical_row_and_returns_coords(
         ),
     ],
 )
-def test_stage_media_rejects_malformed_tensors(
-    tq_client, staging_partition, media_tensors, error
-):
-    sink = TQTokenSink(tq_client, staging_partition=staging_partition)
+def test_media_field_dict_rejects_malformed_tensors(media_tensors, error):
     with pytest.raises(ValueError, match=error):
-        sink.stage_media("k", media_tensors)
+        media_field_dict(media_tensors)
 
 
 @pytest.mark.parametrize(

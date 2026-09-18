@@ -1069,8 +1069,10 @@ def test_finalize_rollout_media(tq_client, media_partitions, case):
         tampered = dict(
             engine, imgs_sizes=torch.tensor([[8, 8], [4, 4]], dtype=torch.int32)
         )
-        TQTokenSink(tq_client, staging_partition=MEDIA_STAGING_PARTITION).stage_media(
-            receipt["manifest"][0]["staging_key"], tampered
+        from nemo_rl.data_plane.tq_token_sink import TQStagingStore, media_field_dict
+
+        TQStagingStore(tq_client, staging_partition=MEDIA_STAGING_PARTITION).put(
+            receipt["manifest"][0]["staging_key"], media_field_dict(tampered)
         )
 
     row = _media_finalizer(tq_client).finalize_rollout("mm", receipt, reward=1.0)
@@ -1101,23 +1103,19 @@ def test_finalize_rollout_media(tq_client, media_partitions, case):
 
 
 def test_finalize_rollout_rejects_media_columns_missing(
-    tq_client, media_partitions, monkeypatch, caplog
+    tq_client, media_partitions, monkeypatch
 ):
-    """A failed media put poisons the rollout at finalization, not at staging.
+    """The digest-covered geometry names media the row does not carry.
 
-    The stager swallows ``stage_media`` failures (the token row is already
-    durable and Gym holds staged coords), so the digest-covered summary names
-    media the columns never carried; the finalizer must reject rather than
-    publish an image-blind row.
+    Tokens and pixels land in one put, so this cannot happen through the
+    stager any more; simulate a row whose media columns are absent (for
+    example a schema drift where the columns were never registered) and
+    require the finalizer to reject rather than publish an image-blind row.
     """
+    import nemo_rl.data_plane.tq_token_sink as sink_module
 
-    def _controller_down(self, staging_key, media_tensors):
-        raise RuntimeError("controller down")
-
-    monkeypatch.setattr(TQTokenSink, "stage_media", _controller_down)
-    with caplog.at_level("ERROR", logger="nemo_rl.data_plane.tq_token_sink"):
-        receipt = _stage_vlm_rollout(tq_client, "mm-nomedia")
-    assert any("media staging failed" in r.message for r in caplog.records)
+    monkeypatch.setattr(sink_module, "media_field_dict", lambda media_tensors: {})
+    receipt = _stage_vlm_rollout(tq_client, "mm-nomedia")
 
     row = _media_finalizer(tq_client).finalize_rollout(
         "mm-nomedia", receipt, reward=1.0

@@ -96,8 +96,8 @@ COMPACT_PREV_LEN_KEY = "compact_prev_len"
 MEDIA_PREV_COUNT_KEY = "media_prev_count"
 
 # Media the engine's vision encoder consumed, staged as extra columns on the
-# call row (a second put onto the same staging key, after the token row is
-# durable). ``imgs`` is MInf's packed-patch tensor ``[1, total_patches, C*P*P]``
+# call row in the same put as the token columns (the stager parks them on the
+# sink before Gym stages the record). ``imgs`` is MInf's packed-patch tensor ``[1, total_patches, C*P*P]``
 # (or padded pixels), ``imgs_sizes`` ``[N, 2]``, ``num_frames`` / ``num_tiles``
 # when the request carried them. Each tensor is flattened to one ``[1, numel]``
 # row; ``media_geometry_json`` records shape and dtype per name. Registered on
@@ -259,12 +259,27 @@ class TQTokenSink:
 
     def __init__(self, dp_client: Any, *, staging_partition: str) -> None:
         self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
+        # Media parked by the stager, written by stage() in the same put as the tokens.
+        self._pending_media: dict[str, dict[str, Any]] = {}
+        self._pending_lock = threading.Lock()
+
+    def attach_media(
+        self, staging_key: str, media_tensors: dict[str, Any] | None
+    ) -> None:
+        """Park (or with ``None``, drop) the media tensors for ``staging_key``."""
+        with self._pending_lock:
+            if media_tensors:
+                self._pending_media[staging_key] = media_tensors
+            else:
+                self._pending_media.pop(staging_key, None)
 
     def stage(self, record: StagedCallRecord) -> StageResult:
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.records import StageResult
 
         key = record.staging_key
+        with self._pending_lock:
+            media_tensors = self._pending_media.pop(key, None)
         try:
             field_dict = {
                 "token_ids_delta": torch.tensor(
@@ -410,6 +425,8 @@ class TQTokenSink:
                     "schema_version": record.schema_version,
                 }
             ]
+            if media_tensors:
+                field_dict.update(media_field_dict(media_tensors))
             self._store.put(key, field_dict, tags=tags[0])
         except Exception as error:  # noqa: BLE001 — any failure must poison, not crash serving
             # The reason string is dropped downstream (_failed_coords carries
@@ -429,16 +446,6 @@ class TQTokenSink:
     def clear(self, staging_keys: list[str]) -> None:
         """Drop staged rows (finalizer / eviction cleanup)."""
         self._store.clear(staging_keys)
-
-    def stage_media(self, staging_key: str, media_tensors: dict[str, Any]) -> None:
-        """Add the engine's media tensors to an already-staged call row.
-
-        A second put onto the same key: TQ tracks field readiness per field, so
-        the media columns land beside the token columns without rewriting them.
-        Raises on failure; the caller decides how to report it (the finalizer
-        rejects the rollout as ``media_columns_missing`` either way).
-        """
-        self._store.put(staging_key, media_field_dict(media_tensors))
 
 
 @dataclass(frozen=True)
@@ -995,19 +1002,16 @@ class TQMegatronTokenStager:
         capture_payload_view = _MegatronCapturePayload.from_offloaded(
             payload, minf_params
         )
-        coords = self._capture.complete_call_from_response(call, capture_payload_view)
-        # Media tensors ride the same row as extra columns once the token row
-        # is durable. They are outside Gym's digest; the digest-covered geometry
-        # in extras (media_geometry above) names them, and the finalizer checks
-        # the columns against it before publishing.
-        media_tensors = capture_payload_view.media_tensors
-        if coords.disposition == "staged" and media_tensors:
-            try:
-                self._sink.stage_media(coords.staging_key, media_tensors)
-            except Exception:  # noqa: BLE001 — finalizer rejects media_columns_missing
-                logging.getLogger(__name__).exception(
-                    "MInf media staging failed for %s", coords.staging_key
-                )
+        # Gym's record cannot carry tensors; park them on the sink so stage()
+        # writes them in the same put as the tokens.
+        staging_key = f"{admission.rollout_id}/{admission.model_call_id}"
+        self._sink.attach_media(staging_key, capture_payload_view.media_tensors)
+        try:
+            coords = self._capture.complete_call_from_response(
+                call, capture_payload_view
+            )
+        finally:
+            self._sink.attach_media(staging_key, None)  # drop if Gym never staged
         return MegatronPayloadStageResult(
             response_metadata={
                 "ng_commit_coords": coords.model_dump(mode="json"),

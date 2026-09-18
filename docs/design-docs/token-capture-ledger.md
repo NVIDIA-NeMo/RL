@@ -154,8 +154,9 @@ call row:
   reproduced the same tokens; drift poisons the call.
 - The media tensors themselves ride the call row: `TQMegatronTokenStager`
   writes `media_tensors` as extra columns on the call row
-  (`MEDIA_STAGING_FIELDS`, a second put onto the same staging key once the token
-  row is durable), the same way routed experts ride the row. Like the token
+  (`MEDIA_STAGING_FIELDS`), in the same put as the token columns: the stager
+  parks the tensors on the sink before Gym stages the record, so a call is
+  staged whole or not at all. Routed experts ride the row the same way. Like the token
   columns they are per-call deltas: every chat request carries the whole
   conversation, so the engine hands over pixels for every image in the prompt,
   and the stager drops the items the parent chain already staged
