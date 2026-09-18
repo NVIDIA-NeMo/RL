@@ -301,21 +301,29 @@ class VllmAsyncGenerationWorkerImpl(
             self._start_vllm_metrics_logger()
 
     def _install_engine_input_socket_lock(self) -> None:
-        """Serialise sends on AsyncMPClient.input_socket across OS threads
-        to prevent race conditions that block the vLLM engine (e.g. during
-        in flight weight updates in async grpo).
+        """Protect engine input encoding and socket sends across OS threads.
+
+        HTTP requests and Ray control calls share this client. MsgpackEncoder
+        stores per-message tensor buffers on the instance, so protecting only
+        the socket leaves encode() racing before send_multipart() is reached.
         """
         shadow_sock = self.llm.engine_core.input_socket._shadow_sock
+        encoder = self.llm.engine_core.encoder
 
         lock = threading.Lock()
         original_send_multipart = shadow_sock.send_multipart
+        original_encode = encoder.encode
+
+        def locked_encode(*args: Any, **kwargs: Any) -> Any:
+            with lock:
+                return original_encode(*args, **kwargs)
 
         def locked_send_multipart(*args: Any, **kwargs: Any) -> Any:
             with lock:
                 return original_send_multipart(*args, **kwargs)
 
-        # Replace the bound method on this socket instance only; other zmq
-        # sockets in the process are unaffected.
+        # Instance-local wrappers leave other engines and sockets unaffected.
+        encoder.encode = locked_encode
         shadow_sock.send_multipart = locked_send_multipart  # type: ignore[assignment]
 
     def _start_vllm_metrics_logger(self) -> None:

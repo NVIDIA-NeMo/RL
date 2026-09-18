@@ -657,11 +657,33 @@ class PackedTensor:
             or packed_tensor._row_offsets is not None
             for packed_tensor in from_packed_tensors
         ):
-            assert all(len(p) == 1 for p in from_packed_tensors), (
-                "flattened_concat requires one logical row per input; "
-                "merge_segments only collapses dedup-enabled values"
-            )
-            return cls.concat(from_packed_tensors)
+            rows = []
+            for packed_tensor in from_packed_tensors:
+                if (
+                    packed_tensor.deduplication_enabled
+                    or packed_tensor._row_offsets is not None
+                ):
+                    assert len(packed_tensor) == 1, (
+                        "flattened_concat requires one logical row per compact input"
+                    )
+                    rows.append(packed_tensor)
+                else:
+                    # Legacy merge_segments retains one entry per message's
+                    # media, not per conversation. Collapse that conversation
+                    # into one logical row before mixing with compact rows.
+                    # Keep the physical segments intact; neither materialize
+                    # copies nor infer sharing from equal tensor contents.
+                    count = len(packed_tensor.tensors)
+                    rows.append(
+                        cls(
+                            packed_tensor.tensors,
+                            packed_tensor.dim_to_pack,
+                            pad_to_max_shape=packed_tensor.pad_to_max_shape,
+                            _row_offsets=[0, count],
+                            _segment_indices=list(range(count)),
+                        )
+                    )
+            return cls.concat(rows)
         tensors = [p.as_tensor() for p in from_packed_tensors]
         return cls(
             tensors,

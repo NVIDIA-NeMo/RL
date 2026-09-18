@@ -22,9 +22,10 @@ import numpy as np
 import pytest
 import torch
 import yaml
+from pydantic import TypeAdapter
 
 import nemo_rl.utils.checkpoint as checkpoint_module
-from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 
 
 @pytest.fixture
@@ -1147,6 +1148,31 @@ class TestFTKeepLatestK:
             manager.finalize_checkpoint(tmp)
 
         assert self._remaining_steps(checkpoint_dir) == [1, 2, 3, 4, 5]
+
+    @pytest.mark.parametrize("exclude_latest", [False, True])
+    def test_validated_keep_all_preserves_ft_checkpoints(
+        self, checkpoint_dir, exclude_latest
+    ):
+        """Null policies validate and retain saves not aligned to save_period."""
+        config = TypeAdapter(CheckpointingConfig).validate_python(
+            {
+                "enabled": True,
+                "checkpoint_dir": str(checkpoint_dir),
+                "metric_name": "val:accuracy",
+                "higher_is_better": True,
+                "save_period": 100000,
+                "ft_save_period": 20,
+                "save_optimizer": True,
+                "keep_top_k": None,
+                "ft_keep_latest_k": None,
+            }
+        )
+        manager = CheckpointManager(config)
+        for step in (20, 40, 60):
+            temporary = manager.init_tmp_checkpoint(step, {"val:accuracy": 1.0 / step})
+            manager.finalize_checkpoint(temporary)
+            manager.remove_old_checkpoints(exclude_latest=exclude_latest)
+        assert self._remaining_steps(checkpoint_dir) == [20, 40, 60]
 
     def test_ft_keep_1_only(self, checkpoint_dir):
         """ft_keep_latest_k=1 with no periodic checkpoints keeps only the most recent."""

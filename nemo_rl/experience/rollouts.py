@@ -66,6 +66,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.nemo_gym_metrics import calculate_per_game_mean_reward
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
     GenerationConfig,
@@ -2829,6 +2830,7 @@ def _postprocess_single_nemo_gym_group(
                 )
 
         rollout_metrics.update(per_agent_metrics)
+        rollout_metrics.update(calculate_per_game_mean_reward(nemo_gym_rows, results))
 
     # Necessary for downstream nemo rl logging/printing.
     rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[

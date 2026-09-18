@@ -25,6 +25,7 @@ from typing import Any, Callable, Optional, TypeVar
 
 import torch
 from megatron.bridge import AutoBridge
+from megatron.bridge.models.hybrid.hybrid_provider import HybridModelProvider
 from megatron.bridge.models.model_provider import ModelProviderMixin, get_model
 from megatron.bridge.peft.lora import LoRA
 from megatron.bridge.training import fault_tolerance
@@ -62,11 +63,13 @@ from megatron.bridge.utils.cuda_graph import set_cuda_graph_modules
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.inference.shards import build_inference_pg_collection
+from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_pattern
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import get_model_config
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
@@ -1184,12 +1187,33 @@ def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
         # mtp_use_repeated_layer is False) and the number of times the MTP layer
         # is repeated (when mtp_use_repeated_layer is True).
         model_cfg.mtp_num_layers = megatron_cfg["mtp_num_layers"]
-    if "mtp_loss_scaling_factor" in megatron_cfg and _allowed("mtp_loss_scaling_factor"):
+    if "mtp_loss_scaling_factor" in megatron_cfg and _allowed(
+        "mtp_loss_scaling_factor"
+    ):
         model_cfg.mtp_loss_scaling_factor = megatron_cfg["mtp_loss_scaling_factor"]
     if "mtp_use_repeated_layer" in megatron_cfg and _allowed("mtp_use_repeated_layer"):
         model_cfg.mtp_use_repeated_layer = megatron_cfg["mtp_use_repeated_layer"]
     if "mtp_detach_heads" in megatron_cfg and _allowed("mtp_detach_heads"):
         model_cfg.mtp_detach_heads = megatron_cfg["mtp_detach_heads"]
+
+    if (
+        "mtp_num_layers" in megatron_cfg
+        and _allowed("mtp_num_layers")
+        and model_cfg.mtp_num_layers == 0
+        and isinstance(model_cfg, HybridModelProvider)
+    ):
+        # Cached hybrid providers encode MTP in the pattern as well as its
+        # numeric depth. MCore constructs the head from that pattern even when
+        # the depth is zero, then asserts on the first training forward. Clear
+        # both canonical and legacy patterns, including the reconstruction
+        # source used by finalize(). Leave the independent vision norm intact.
+        model_cfg.hybrid_layer_pattern = parse_hybrid_pattern(
+            model_cfg.hybrid_layer_pattern
+        ).main_pattern
+        model_cfg.hybrid_override_pattern = parse_hybrid_pattern(
+            model_cfg.hybrid_override_pattern
+        ).main_pattern
+        model_cfg.mtp_hybrid_override_pattern = None
 
 
 def _apply_precision_config(
@@ -2315,7 +2339,9 @@ def finalize_megatron_setup(
     """
     _update_model_config_funcs(
         [model],
-        megatron_cfg.model,
+        # Providers such as Nemotron Omni copy their config during model
+        # construction. Bind callbacks where the MCore scheduler reads them.
+        get_model_config(model),
         megatron_cfg.ddp,
         optimizer,
         align_grad_reduce=megatron_cfg.dist.align_grad_reduce,

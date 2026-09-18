@@ -1,0 +1,152 @@
+defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml
+
+# Standalone image-tool GRPO. HSG: 4 learner nodes (16 GPUs), 4 generation
+# nodes (four TP4 replicas). Runtime and real-model qualification still required.
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 8
+  val_num_generations_per_prompt: 1
+  max_rollout_turns: 1
+  max_num_epochs: 1000
+  max_num_steps: 100000
+  val_period: 10
+  val_at_start: false
+  val_at_end: true
+  val_batch_size: 8
+  max_val_samples: null
+  normalize_rewards: false
+  adv_estimator:
+    normalize_rewards: false
+  use_dynamic_sampling: false
+  overlong_filtering: false
+  deduplicate_multimodal_data: true
+  debug_payload_metrics: false
+  seq_logprob_error_threshold: null
+  reward_shaping:
+    enabled: false
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: false
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  truncated_importance_sampling_type: null
+  truncated_importance_sampling_ratio: null
+  truncated_importance_sampling_ratio_min: null
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: ${oc.env:CHECKPOINT_DIR}
+  metric_name: null
+  keep_top_k: 1
+  save_period: 100000
+  ft_save_period: 20
+  ft_keep_latest_k: 1
+  checkpoint_must_save_by: '00:03:40:00'
+
+policy:
+  model_name: ${oc.env:MODEL_CHECKPOINT}
+  train_global_batch_size: 32
+  max_total_sequence_length: 32768
+  tokenizer:
+    name: ${oc.env:VLLM_TOKENIZER}
+    tokenizer_kwargs:
+      fix_mistral_regex: true
+    chat_template: ${oc.env:PROJECT_ROOT}/cluster_inputs/chat_templates/nemotron_super_omni_chat_template.jinja
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  router_replay:
+    enabled: true
+  megatron_cfg:
+    clear_memory_caches_before_refit: true
+  generation:
+    max_new_tokens: 512
+    temperature: 1.0
+    top_p: 1.0
+    vllm_cfg:
+      tensor_parallel_size: 4
+      reset_encoder_cache_after_weight_update: true
+      reasoning_parser_plugin: ${oc.env:PROJECT_ROOT}/nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
+      http_server_serving_chat_kwargs:
+        chat_template: ${policy.tokenizer.chat_template}
+        chat_template_content_format: string
+        default_chat_template_kwargs:
+          enable_thinking: true
+          truncate_history_thinking: false
+    vllm_kwargs:
+      tokenizer: ${oc.env:VLLM_TOKENIZER}
+      limit_mm_per_prompt:
+        image: 21
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 4
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 1
+  train:
+    dataset_name: NemoGymDataset
+    data_path: ${oc.env:TRAIN_MANIFEST}
+    split: ''
+    seed: 20260911
+    split_validation_size: 0.0
+  validation:
+    dataset_name: NemoGymDataset
+    data_path: ${oc.env:EVAL_MANIFEST}
+    split: ''
+    seed: 20260911
+    split_validation_size: 0.0
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    is_trajectory_collection: false
+    num_samples_in_parallel: 32
+    uv_venv_dir: /opt/gym_venvs
+    uv_pip_set_python: true
+    skip_venv_if_present: true
+    pad_dynamic_image_shapes: true
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - environments/image_tools_grpo/config.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          extra_body:
+            chat_template_kwargs:
+              enable_thinking: true
+              truncate_history_thinking: false
+
+logger:
+  log_dir: ${oc.env:RUN_LOG_DIR}
+  wandb_enabled: true
+  tensorboard_enabled: false
+  wandb:
+    entity: nvidia
+    project: games-rlvr-nemotron-super
+    name: ${oc.env:WANDB_RUN_NAME}
+    log_nemo_gym_full_result_tables: false
+
+data_plane: null
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8

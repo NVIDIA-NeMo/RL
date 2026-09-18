@@ -47,6 +47,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym_tool_calls import was_image_tool_call_executed
 from nemo_rl.experience.failures import (
     GymTransportError,
     RolloutDataFailure,
@@ -431,6 +432,7 @@ def _detect_invalid_tool_call_and_malformed_thinking(
     output_item_dict: dict[str, Any],
     invalid_tool_call_patterns: list[str] | None = None,
     thinking_tags: list[str] | None = None,
+    text_tool_call_executed: bool = False,
 ) -> tuple[bool, bool]:
     """Flag a NeMo-Gym output item as an invalid tool call / malformed thinking.
 
@@ -472,7 +474,7 @@ def _detect_invalid_tool_call_and_malformed_thinking(
     has_malformed_thinking = False
     if is_output_message:
         assistant_message_content = output_item_dict["content"][0]["text"]
-        if any(
+        if not text_tool_call_executed and any(
             pattern in assistant_message_content
             for pattern in invalid_tool_call_patterns
         ):
@@ -1186,6 +1188,9 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             is_invalid_tool_call, has_malformed_thinking = (
                 _detect_invalid_tool_call_and_malformed_thinking(
                     output_item_dict,
+                    text_tool_call_executed=was_image_tool_call_executed(
+                        output_item_dict, nemo_gym_row, nemo_gym_result
+                    ),
                     invalid_tool_call_patterns=self.cfg.get(
                         "invalid_tool_call_patterns"
                     ),

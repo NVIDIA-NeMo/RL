@@ -1,0 +1,19 @@
+{
+  "rl_base": "a562db3077ea9e4dc65aaf4902ed810a42c94940",
+  "gym_base": "e978899b7c79f2b90c23af7bfe91a36349360699",
+  "gym_commit": "7ee38197c0c31f7644c34de6a9f38bfbc8d01acf",
+  "branch": "aroshanghias/mixed-visual-grpo",
+  "source_worktree": "visual-games-image-tools-super35",
+  "unmerged_source_prs": [
+    2700,
+    2730
+  ],
+  "gym_prs_observed_open_on": "2026-09-18",
+  "bridge_base": "3961f399ef181bca689de8e984110b85c4df00fe",
+  "bridge_patch": "patches/megatron-bridge-runtime-callbacks.patch",
+  "lightweight_tests": {
+    "rl_passed": 64,
+    "gym_passed": 3
+  },
+  "new_gpu_qualification": false
+}

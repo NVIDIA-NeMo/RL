@@ -1,0 +1,32 @@
+defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-image-tools-8n4g-megatron-tp8ep16cp2-async.v1.yaml
+
+# Match the approved games GPU geometry on HSG's four-GPU nodes:
+# 32 learner GPUs (8 nodes), 128 generation GPUs (32 TP4 replicas/nodes).
+# Existing rows are concatenated without oversampling; shuffle spans all families.
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 16
+  val_batch_size: 32
+policy:
+  train_global_batch_size: 128
+  generation:
+    vllm_kwargs:
+      limit_mm_per_prompt:
+        image: 32
+    colocated:
+      resources:
+        num_nodes: 32
+env:
+  nemo_gym:
+    num_samples_in_parallel: 128
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - environments/visual_games_image_tools/config.yaml
+cluster:
+  num_nodes: 40
+
+# Retain every 20-step recovery checkpoint for the callback-fix rerun.
+checkpointing:
+  ft_save_period: 20
+  ft_keep_latest_k: null
+  keep_top_k: null

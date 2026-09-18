@@ -858,7 +858,9 @@ def test_batched_message_log_to_flat_message_with_packed_images() -> None:
     assert torch.equal(input_lengths, torch.tensor([4, 5], dtype=torch.int32))
 
 
-def test_batched_message_log_rejects_mixed_multiturn_media() -> None:
+@pytest.mark.parametrize("legacy_first", [False, True])
+def test_batched_message_log_accepts_mixed_multiturn_media(legacy_first: bool) -> None:
+    game_images = [torch.randn(1, 3, 4, 4), torch.randn(1, 3, 4, 4)]
     compact_image = PackedTensor(
         torch.randn(1, 3, 4, 4), dim_to_pack=0
     ).enable_deduplication()
@@ -874,21 +876,32 @@ def test_batched_message_log_rejects_mixed_multiturn_media() -> None:
             {
                 "role": "user",
                 "token_ids": torch.tensor([2]),
-                "images": PackedTensor(torch.randn(1, 3, 4, 4), dim_to_pack=0),
+                "images": PackedTensor(game_images[0], dim_to_pack=0),
             },
             {
                 "role": "user",
                 "token_ids": torch.tensor([3]),
-                "images": PackedTensor(torch.randn(1, 3, 4, 4), dim_to_pack=0),
+                "images": PackedTensor(game_images[1], dim_to_pack=0),
             },
         ],
     ]
 
-    with pytest.raises(
-        AssertionError,
-        match="flattened_concat requires one logical row per input",
-    ):
-        batched_message_log_to_flat_message(batch_logs, pad_value_dict={"token_ids": 0})
+    expected = [compact_image.as_tensor(), torch.cat(game_images)]
+    expected_lengths = [1, 2]
+    if legacy_first:
+        batch_logs.reverse()
+        expected.reverse()
+        expected_lengths.reverse()
+    flat, lengths = batched_message_log_to_flat_message(
+        batch_logs, pad_value_dict={"token_ids": 0}
+    )
+    images = flat["images"]
+    assert len(images) == 2
+    assert lengths.tolist() == expected_lengths
+    for index, expected_row in enumerate(expected):
+        torch.testing.assert_close(images.slice([index]).as_tensor(), expected_row)
+    assert any(tensor is game_images[0] for tensor in images.tensors)
+    assert any(tensor is game_images[1] for tensor in images.tensors)
 
 
 @pytest.mark.parametrize("image_first", [True, False])

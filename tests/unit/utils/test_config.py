@@ -273,6 +273,53 @@ def test_nemo_gym_configs_satisfy_current_grpo_contract(config_path):
     CheckpointManager(master_config.checkpointing)
 
 
+def test_mixed_image_tools_keep_all_master_config(monkeypatch, tmp_path):
+    """Validate the complete mixed recipe through the entrypoint's actual schema."""
+    from nemo_rl.algorithms.grpo import MasterConfig
+    from nemo_rl.utils.checkpoint import CheckpointManager
+    from nemo_rl.utils.config import parse_hydra_overrides
+
+    for key in (
+        "MODEL_CHECKPOINT",
+        "VLLM_TOKENIZER",
+        "TRAIN_MANIFEST",
+        "EVAL_MANIFEST",
+        "RUN_LOG_DIR",
+        "WANDB_RUN_NAME",
+    ):
+        monkeypatch.setenv(key, str(tmp_path / key))
+    monkeypatch.setenv("PROJECT_ROOT", str(REPO_ROOT))
+    monkeypatch.setenv("CHECKPOINT_DIR", str(tmp_path / "checkpoints"))
+    register_omegaconf_resolvers()
+    recipe = REPO_ROOT / (
+        "examples/configs/recipes/vlm/"
+        "vlm_grpo-nemotron-super-omni-120ba12b-visual-games-image-tools-"
+        "40n4g-megatron-tp8ep16cp2-async.v1.yaml"
+    )
+    config = parse_hydra_overrides(
+        load_config(recipe),
+        [
+            "logger.wandb_enabled=true",
+            "++logger.wandb.id=keep-all-regression",
+            "++logger.wandb.resume=allow",
+        ],
+    )
+    master = MasterConfig(**OmegaConf.to_container(config, resolve=True))
+    assert master.checkpointing["ft_save_period"] == 20
+    assert master.checkpointing["keep_top_k"] is None
+    assert master.checkpointing["ft_keep_latest_k"] is None
+    manager = CheckpointManager(master.checkpointing)
+    for step in (20, 40, 60):
+        temporary = manager.init_tmp_checkpoint(step, {"current_step": step}, master)
+        manager.finalize_checkpoint(temporary)
+    manager.remove_old_checkpoints(exclude_latest=False)
+    assert sorted(p.name for p in manager.checkpoint_dir.glob("step_*")) == [
+        "step_20",
+        "step_40",
+        "step_60",
+    ]
+
+
 def test_parse_hydra_overrides():
     """Test parsing and applying Hydra overrides."""
     from nemo_rl.utils.config import OverridesError, parse_hydra_overrides

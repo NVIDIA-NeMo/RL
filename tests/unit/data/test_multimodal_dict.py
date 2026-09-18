@@ -548,6 +548,47 @@ def test_packedtensor_dedup_expands_before_dynamic_shape_padding():
     torch.testing.assert_close(materialized[2, :, 0], 2 * torch.ones(2))
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_flattened_concat_mixed_rows_preserves_sharing_empty_rows_and_segments(reverse):
+    seed = PackedTensor(torch.tensor([[1.0]]), 0).enable_deduplication()
+    game_a = torch.tensor([[2.0], [3.0]])
+    game_b = torch.tensor([[2.0], [3.0]])
+    game = PackedTensor([game_a, game_b], 0)
+    missing = PackedTensor.empty_rows_like(seed, 1)
+    rows = [seed, game, missing, deepcopy(seed)]
+    expected = [seed.as_tensor(), torch.cat([game_a, game_b]), None, seed.as_tensor()]
+    counts = [1, 2, 0, 1]
+    if reverse:
+        rows.reverse()
+        expected.reverse()
+        counts.reverse()
+    packed = PackedTensor.flattened_concat(rows)
+    assert len(packed) == 4
+    assert packed.logical_segment_counts_by_row() == counts
+    # Only seed provenance is shared; equal-valued game observations stay distinct.
+    assert len(packed.tensors) == 3
+    assert any(tensor is game_a for tensor in packed.tensors)
+    assert any(tensor is game_b for tensor in packed.tensors)
+    for index, value in enumerate(expected):
+        actual = packed.slice([index]).as_tensor()
+        if value is None:
+            assert actual is None
+        else:
+            torch.testing.assert_close(actual, value)
+    restored = cloudpickle.loads(cloudpickle.dumps(packed))
+    torch.testing.assert_close(restored.as_tensor(), packed.as_tensor())
+    torch.testing.assert_close(
+        restored.slice([3, 1, 0]).as_tensor(), packed.slice([3, 1, 0]).as_tensor()
+    )
+
+
+def test_flattened_concat_does_not_silently_flatten_multiple_compact_rows():
+    compact_batch = PackedTensor([torch.ones(1, 2), torch.zeros(1, 2)], 0)
+    compact_batch.enable_deduplication()
+    with pytest.raises(AssertionError, match="one logical row per compact input"):
+        PackedTensor.flattened_concat([compact_batch])
+
+
 def test_packedtensor_to_dtype_returns_independent_wrapper_when_dtype_matches():
     packed = PackedTensor(
         torch.ones(1, 2, dtype=torch.bfloat16), dim_to_pack=0

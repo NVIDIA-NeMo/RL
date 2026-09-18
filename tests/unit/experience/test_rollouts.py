@@ -2132,7 +2132,9 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
 def test_postprocess_nemo_gym_group_reports_per_agent_live_metrics():
     agent_names = ["agent-a", "agent-a", "agent-b", "agent-b"]
     is_truncated = [True, False, True, True]
-    rows = [{"agent_ref": {"name": name}} for name in agent_names]
+    rows = [
+        {"agent_ref": {"name": name}, "env_id": f"game-{name}"} for name in agent_names
+    ]
     results = []
     for index, truncated in enumerate(is_truncated):
         input_message = {
@@ -2175,6 +2177,11 @@ def test_postprocess_nemo_gym_group_reports_per_agent_live_metrics():
     )
 
     assert rollout_result.rollout_metrics["truncation_rate"] == pytest.approx(0.75)
+    assert {
+        key: value
+        for key, value in rollout_result.rollout_metrics.items()
+        if key.startswith("game/")
+    } == {"game/game-agent-a/reward/mean": 0.5, "game/game-agent-b/reward/mean": 2.5}
     assert rollout_result.rollout_metrics["agent-a/truncation_rate"] == pytest.approx(
         0.5
     )

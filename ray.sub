@@ -100,6 +100,8 @@ CONTAINER=$CONTAINER
 MOUNTS=$MOUNTS
 COMMAND=${COMMAND:-}  # This is a script relative to the SLURM_SUBMIT_DIR. If left empty, it will leave the cluster idle after it's brought up.
 SETUP_COMMAND=${SETUP_COMMAND:-}  # Setup commands to run on all nodes before starting Ray.
+RAY_CLI=${NRL_RAY_CLI:-ray}
+NRL_PATCH_NSIGHT=${NRL_PATCH_NSIGHT:-1}
 ########################################################
 # Ports for all nodes (should be odd numbers since we place head/worker[0] on the same node) so all workers get the odd ports, but the head will get +1 the ports
 NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-1301}
@@ -680,7 +682,7 @@ ray-status-sidecar() {
   set +x
   while true; do
     sleep 10
-    units=\$(ray status 2>/dev/null | grep "worker_units" | awk -F'[/. ]' '{print \$4}' || echo 0)
+    units=\$("$RAY_CLI" status 2>/dev/null | grep "worker_units" | awk -F'[/. ]' '{print \$4}' || echo 0)
     # Write to a temp file, then rename. A plain '>' truncates before writing, so the
     # submit host (reading this over the shared FS from another node) could catch it
     # empty or half-written. rename is atomic: the reader always gets either the old
@@ -693,7 +695,9 @@ ray-status-sidecar() {
 ray-status-sidecar &
 
 # Patch nsight.py before starting Ray head
-sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
+if [[ "$NRL_PATCH_NSIGHT" == 1 ]]; then
+  sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
+fi
 
 # Keeps model, generation, teacher, and Gym GPU actors off the Ray head. The
 # resource JSON itself is built by topology_probe.sh so head and workers keep a
@@ -733,7 +737,7 @@ while [[ \$count -lt $num_retries ]]; do
     bash "$SETUP_COMMAND_FILE"
   fi
   if cat <<EOFINNER | bash; then
-ray start --head \
+"$RAY_CLI" start --head \
     --disable-usage-stats \
     --resources="\$RAY_RESOURCES" \
     \$HEAD_RAY_RESOURCE_ARGS \
@@ -784,7 +788,7 @@ if [[ -n "$DRIVER_COMMAND_FILE" ]]; then
   if [[ -n "$SANDBOX_PORTS_DIR" ]]; then sandbox_ready=0; else sandbox_ready=1; fi
   while true; do
     if [[ "\$workers_ready" -eq 0 ]]; then
-      worker_units=\$(ray status 2>/dev/null | grep "worker_units" | awk -F'[/. ]' '{print \$4}' || echo 0)
+      worker_units=\$("$RAY_CLI" status 2>/dev/null | grep "worker_units" | awk -F'[/. ]' '{print \$4}' || echo 0)
       echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] Number of actors online: \$worker_units/$NUM_ACTORS"
       if [[ "\$worker_units" -eq "$NUM_ACTORS" ]]; then
         workers_ready=1
@@ -906,7 +910,9 @@ log-sync-sidecar() {
 log-sync-sidecar &
 
 # Patch nsight.py before starting Ray worker
-sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
+if [[ "$NRL_PATCH_NSIGHT" == 1 ]]; then
+  sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
+fi
 
 source $LOG_DIR/topology_probe.sh
 
@@ -948,7 +954,7 @@ while [[ \$count -lt $WORKER_NUM_RETRIES ]]; do
   fi
   echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] Worker \$SLURM_PROCID: starting Ray worker (attempt \$((count+1))/$WORKER_NUM_RETRIES)..."
   cat <<EOFINNER | bash
-ray start --address "$ip_head" \
+"$RAY_CLI" start --address "$ip_head" \
           --disable-usage-stats \
           --resources="\$RAY_RESOURCES" \
           --min-worker-port=${MIN_WORKER_PORT} \

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# MCore's Makefile only needs the extension suffix; query the real learner ABI.
+set -euo pipefail
+: "${IMAGE_TOOLS_BUILD_PYTHON:?Expected bundled learner interpreter}"
+if [[ $# != 1 || "$1" != --extension-suffix ]]; then
+  echo 'This image-tool build shim only supports --extension-suffix' >&2
+  exit 2
+fi
+exec "$IMAGE_TOOLS_BUILD_PYTHON" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))'
