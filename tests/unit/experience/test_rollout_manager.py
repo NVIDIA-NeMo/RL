@@ -154,7 +154,7 @@ def test_generate_response_forwards_all_vllm_media_to_generation() -> None:
             ["<stop>"],
             native_generation_data={
                 "vllm_content": "rendered prompt",
-                "vllm_images": [native_image],
+                "vllm_multi_modal_data": {"image": native_image},
             },
         )
     )
@@ -164,7 +164,7 @@ def test_generate_response_forwards_all_vllm_media_to_generation() -> None:
     assert generation_data["input_lengths"].tolist() == [5]
     assert generation_data["stop_strings"] == [["<stop>"]]
     assert generation_data["vllm_content"] == ["rendered prompt"]
-    assert generation_data["vllm_images"] == [[native_image]]
+    assert generation_data["vllm_multi_modal_data"] == [{"image": native_image}]
     assert isinstance(generation_data["pixel_values"], PackedTensor)
     assert isinstance(generation_data["imgs_sizes"], PackedTensor)
     assert torch.equal(
@@ -241,9 +241,13 @@ def test_run_single_rollout_preserves_native_media_across_turns(monkeypatch) -> 
                 "extra_env_info": None,
                 "task_name": "vlm",
                 "vllm_content": "<image><audio><video>",
+                "vllm_multi_modal_data": {
+                    "image": image,
+                    "audio": audio,
+                    "video": video,
+                },
+                # Dropped by #3803's key consolidation: must not be forwarded.
                 "vllm_images": [image],
-                "vllm_audios": [audio],
-                "vllm_videos": [video],
             },
             traj_idx=0,
         )
@@ -252,13 +256,13 @@ def test_run_single_rollout_preserves_native_media_across_turns(monkeypatch) -> 
     assert len(calls) == 2
     assert calls[0]["vllm_content"] == "<image><audio><video>"
     assert calls[1]["vllm_content"] is None
-    for key, expected in (
-        ("vllm_images", image),
-        ("vllm_audios", audio),
-        ("vllm_videos", video),
-    ):
-        assert calls[0][key][0] is expected
-        assert calls[1][key][0] is expected
+    for call in calls:
+        assert call["vllm_multi_modal_data"] == {
+            "image": image,
+            "audio": audio,
+            "video": video,
+        }
+        assert "vllm_images" not in call
 
 
 class _FakeBuffer:
