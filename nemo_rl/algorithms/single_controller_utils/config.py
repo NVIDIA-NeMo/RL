@@ -1410,12 +1410,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         if async_config.rollout_failure.min_step_batch_fraction != 1:
             raise ValueError("context compaction requires min_step_batch_fraction=1")
         validate_cc_objective(master_config.grpo, master_config.loss_fn)
-        if (
-            not isinstance(async_config.sampler, InOrderSamplerConfig)
-            or async_config.sampler.max_lookahead_versions != 0
-            or async_config.sampler.warmup_lookahead_versions is not None
-        ):
-            raise ValueError("CC requires the in_order sampler with zero lookahead")
         if master_config.checkpointing["enabled"]:
             raise ValueError("CC checkpoint/resume is not supported initially")
         if master_config.rollout_checkpointing.snapshot_attempt_interval_s is not None:

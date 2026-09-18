@@ -86,11 +86,19 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
 
 class TestDefaultsAreInert:
     @pytest.mark.parametrize(
+        "sampler",
+        [
+            {"name": "in_order", "max_lookahead_versions": 0},
+            {"name": "in_order", "max_lookahead_versions": 2},
+            {"name": "windowed"},
+            {"name": "ready_first"},
+            {"name": "weight_fifo"},
+        ],
+    )
+    @pytest.mark.parametrize(
         "bad,reason",
         [
             (None, None),
-            ("lookahead", "zero lookahead"),
-            ("sampler", "zero lookahead"),
             ("gbs", "must equal policy.train_global_batch_size"),
             ("checkpoint", "checkpoint/resume"),
             ("rollout_checkpoint", "CC rollout checkpoint/resume"),
@@ -99,10 +107,8 @@ class TestDefaultsAreInert:
             ("packing", "fixed-batch"),
         ],
     )
-    def test_cc_startup_contract(self, bad, reason):
-        config = _master_config(
-            sampler={"name": "in_order", "max_lookahead_versions": 0}
-        )
+    def test_cc_startup_contract(self, bad, reason, sampler):
+        config = _master_config(sampler=sampler)
         config.token_capture = TokenCaptureConfig(enabled=True, context_compaction=True)
         config.async_rl.rollout_failure.min_step_batch_fraction = 1
         config.policy.update(
@@ -117,13 +123,7 @@ class TestDefaultsAreInert:
                 "vllm_cfg": {"async_engine": True, "expose_http_server": True},
             },
         )
-        if bad == "lookahead":
-            config.async_rl.sampler.max_lookahead_versions = 1
-        elif bad == "sampler":
-            config.async_rl.sampler = AsyncRLConfig(
-                sampler={"name": "weight_fifo"}
-            ).sampler
-        elif bad == "gbs":
+        if bad == "gbs":
             config.policy["train_global_batch_size"] -= 1
         elif bad == "checkpoint":
             config.checkpointing["enabled"] = True

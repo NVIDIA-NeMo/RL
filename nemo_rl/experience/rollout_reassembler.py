@@ -1109,16 +1109,6 @@ class RolloutReassembler:
                     }
                 )
         prepared.staging_keys = list(dict.fromkeys(prepared.staging_keys))
-        versions = {
-            value
-            for row in prepared.rows
-            if row.valid
-            for value in (row.min_wv, row.max_wv)
-        }
-        if len(versions) > 1:
-            raise ValueError(
-                "logical capture group must use one generation weight version"
-            )
         return prepared
 
     def _build_routed_experts_tensor(

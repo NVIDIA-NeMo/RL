@@ -7,6 +7,8 @@ import pytest
 import torch
 from tensordict import TensorDict
 
+from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
 from nemo_rl.algorithms.single_controller_utils.config import TokenCaptureConfig
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
@@ -39,12 +41,7 @@ def _setup(
         for tag in meta.tags:
             tag["weight_version"] = 0
             tag.setdefault("uses_borrowed_input", tag["is_execution_padding"])
-    if failure == "later_version":
-        for tag in batches[1][0].tags:
-            tag["weight_version"] = 1
-    elif failure == "mixed_version":
-        batches[0][0].tags[0]["weight_version"] = 1
-    elif failure == "missing_version":
+    if failure == "missing_version":
         del batches[0][0].tags[0]["weight_version"]
     elif failure == "boolean_version":
         batches[0][0].tags[0]["weight_version"] = False
@@ -171,21 +168,78 @@ def test_malformed_input_layout_flag_fails_before_forward(monkeypatch, flag, fie
     ctrl._trainer.finish_train_step.assert_not_called()
 
 
-def test_complete_logical_batch_streams_all_segments_but_steps_once(monkeypatch):
+@pytest.mark.parametrize("async_versions", [False, True])
+def test_complete_logical_batch_streams_all_segments_but_steps_once(
+    monkeypatch, async_versions
+):
     ctrl, metas = _setup(monkeypatch)
-    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
+    if async_versions:
+        ctrl._trainer_version = 3
+        for meta in metas:
+            for index, tag in enumerate(meta.tags):
+                tag["weight_version"] = index % 3
+    versions = [[tag["weight_version"] for tag in meta.tags] for meta in metas]
+
+    def check_advantages(meta: KVBatchMeta, *, train_fields: tuple[str, ...]) -> dict:
+        data = ctrl._dp_client.get_samples(
+            sample_ids=meta.sample_ids,
+            partition_id=meta.partition_id,
+            select_fields=["advantages"],
+        )
+        for index, tag in enumerate(meta.tags):
+            advantage = 0 if tag["is_execution_padding"] else tag["logical_slot"] - 0.5
+            torch.testing.assert_close(
+                data["advantages"][index],
+                torch.full_like(data["advantages"][index], advantage),
+            )
+        return {}
+
+    ctrl._trainer.train_microbatches_from_meta.side_effect = check_advantages
+
+    async def exercise():
+        if not async_versions:
+            await asyncio.wait_for(ctrl._train_pump(), timeout=3)
+            return
+        buffer = TQReplayBuffer(
+            ctrl._dp_client,
+            "train",
+            pad_value_dict={},
+            include_message_violation_fields=False,
+        )
+        buffer.set_data_plane_checkpoint_barrier(ctrl._data_plane_checkpoint_barrier)
+        for meta, row_versions in zip(metas, versions):
+            group_id = meta.tags[0]["dispatch_group_id"]
+            buffer.reserve(
+                weight_version=min(row_versions),
+                target_step=ctrl._trainer_version,
+                group_id=group_id,
+            )
+            async with ctrl._data_plane_checkpoint_barrier.mutation() as cut:
+                await buffer.commit_finalized(
+                    cut, group_id, meta, min(row_versions), max(row_versions)
+                )
+        ctrl._buffer = buffer
+        ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=2)
+        await asyncio.wait_for(ctrl._train_pump(), timeout=3)
+        assert buffer.meta_list == []
+
+    asyncio.run(exercise())
     submitted = [
         call.args[0]
         for call in ctrl._trainer.train_microbatches_from_meta.call_args_list
     ]
-    assert [meta.size for meta in submitted] == [4, 6]
-    assert [meta.sample_ids for meta in submitted] == [
-        meta.sample_ids for meta in metas
+    assert [meta.size for meta in submitted] == ([10] if async_versions else [4, 6])
+    assert [key for meta in submitted for key in meta.sample_ids] == [
+        key for meta in metas for key in meta.sample_ids
     ]
     ctrl._trainer.begin_train_step.assert_called_once_with(None)
     ctrl._trainer.finish_train_step.assert_called_once_with()
     assert ctrl._master_config.policy["train_global_batch_size"] == 4
-    assert ctrl._trainer_version == ctrl._train_steps == 1
+    assert [tag["weight_version"] for meta in submitted for tag in meta.tags] == [
+        value for row_versions in versions for value in row_versions
+    ]
+    assert ctrl._trainer_version == (4 if async_versions else 1)
+    assert ctrl._train_steps == 1
     assert ctrl._consumed_samples == 2  # Existing counter is dataset prompts.
     ctrl._sync_weights.assert_awaited_once()
     assert not ctrl._dp_client.list_sample_ids("train")
@@ -194,10 +248,8 @@ def test_complete_logical_batch_streams_all_segments_but_steps_once(monkeypatch)
 @pytest.mark.parametrize(
     "failure,trained_chunks,reason",
     [
-        ("later_version", 1, "current generation version"),
-        ("mixed_version", 0, "current generation version"),
-        ("missing_version", 0, "current generation version"),
-        ("boolean_version", 0, "current generation version"),
+        ("missing_version", 0, "integer generation versions"),
+        ("boolean_version", 0, "integer generation versions"),
         ("duplicate", 1, "new, complete logical groups"),
         ("short", 1, "before a complete training step"),
         ("group_tally", 0, "new, complete logical groups"),

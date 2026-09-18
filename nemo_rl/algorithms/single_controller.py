@@ -2410,14 +2410,13 @@ class SingleControllerActor:
                                 or len(train_meta.tags or []) != train_meta.size
                                 or any(
                                     type(tag.get("weight_version")) is not int
-                                    or tag["weight_version"] != version_during_step
                                     or type(tag.get("is_execution_padding")) is not bool
                                     or type(tag.get("uses_borrowed_input")) is not bool
                                     for tag in train_meta.tags or []
                                 )
                             ):
                                 raise ValueError(
-                                    "CC optimizer batch requires logical rows with padding flags, borrowed-input flags, and the current generation version"
+                                    "CC optimizer batch requires logical rows with padding flags, borrowed-input flags, and integer generation versions"
                                 )
                             if any(
                                 tag["is_execution_padding"]

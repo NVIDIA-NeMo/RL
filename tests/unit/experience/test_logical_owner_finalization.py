@@ -152,10 +152,20 @@ def test_missing_action_flag_invalidates_owner_and_emits_no_output_penalty_mask(
     assert sum(tag["num_assistant_messages"] for tag in result.meta.tags) == 4
 
 
+@pytest.mark.parametrize("versions", [[7] * 5, [6, 7, 8, 9, 10]])
 def test_unequal_segments_publish_once_with_owner_identity_and_cleanup(
-    owner_stack: tuple,
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, versions: list[int]
 ) -> None:
-    harness, data_plane, finalizer = owner_stack
+    capture_type = gym_harness.RolloutTokenCapture
+    version_iter = iter(versions)
+    monkeypatch.setattr(
+        gym_harness,
+        "RolloutTokenCapture",
+        lambda **kwargs: capture_type(
+            **(kwargs | {"weight_version_fn": lambda: next(version_iter)})
+        ),
+    )
+    harness, data_plane, finalizer = request.getfixturevalue("owner_stack")
     owners = [
         [
             capture_segment(harness, "group_g0_s0", retry=True, child=True),
@@ -166,6 +176,12 @@ def test_unequal_segments_publish_once_with_owner_identity_and_cleanup(
     staged = {key for partition, key in data_plane.rows if partition == "staged"}
     result = finalize(finalizer, owners, mask_sample=[True, False])
     assert result.meta is not None and not result.dropped
+    # Reuse ordinary capture's conservative range over the manifest, including retries.
+    assert (result.group_min_wv, result.group_max_wv) == (
+        min(versions),
+        max(versions),
+    )
+    assert all(tag["weight_version"] == min(versions) for tag in result.meta.tags)
     assert result.metrics["finalize/logical_owner_count"] == 2
     assert result.metrics["finalize/valid_logical_owner_count"] == 2
     assert result.meta.sample_ids == ["group_g0_s0", "group_g0_s1", "group_g1_s0"]
