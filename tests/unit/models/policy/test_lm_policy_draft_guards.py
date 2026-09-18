@@ -33,7 +33,7 @@ def _draft_config(
             "use_fused_linear_logprobs": use_fused_linear_logprobs,
         },
         "dtensor_cfg": {"enabled": False},
-        "draft": {"enabled": True},
+        "draft": {"enabled": True, "speculator_type": "eagle3"},
         "sequence_packing": {"enabled": sequence_packing_enabled},
     }
 

@@ -862,6 +862,7 @@ def test_prepare_refit_info_preserves_fp32_router_correction_bias():
     worker = object.__new__(DTensorPolicyWorkerV2Impl)
     worker.model = RouterModel()
     worker.dtype = torch.bfloat16
+    worker.draft_model = None
 
     refit_info = DTensorPolicyWorkerV2Impl.prepare_refit_info(worker)
 

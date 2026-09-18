@@ -39,6 +39,12 @@ def test_eagle3_draft_config_preserves_legacy_defaults() -> None:
         "loss_weight": 0.1,
         "num_layers": None,
         "aux_layer_indices": None,
+        # DTensor-v2 TTT training options; the Megatron single-step path
+        # ignores these.
+        "learning_rate": 1.0e-4,
+        "ttt_steps": 3,
+        "ttt_step_loss_decay": 1.0,
+        "train_embed_and_head": True,
     }
 
 

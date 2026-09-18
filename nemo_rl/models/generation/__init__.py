@@ -106,12 +106,33 @@ def resolve_generation_class(
     raise ValueError(f"Unknown generation backend: {backend!r}")
 
 
+def draft_full_refit_enabled(policy_cfg: dict) -> bool:
+    """Whether the trainer streams the drafter's FULL weight set on refit.
+
+    True for DTensor-v2 draft co-training (dspark/dflash/eagle3), which
+    exports the drafter's entire state_dict under the ``draft.`` prefix; the
+    megatron eagle3 path streams a partial set instead. Feeds the
+    ``draft_full_refit`` argument of :func:`configure_generation_config`.
+    """
+    from nemo_rl.models.policy.draft_config import coerce_draft_config
+
+    draft_config = coerce_draft_config(policy_cfg.get("draft"))
+    dtensor_cfg = policy_cfg.get("dtensor_cfg") or {}
+    return (
+        draft_config is not None
+        and bool(draft_config.enabled)
+        and bool(dtensor_cfg.get("enabled", False))
+        and bool(dtensor_cfg.get("_v2", False))
+    )
+
+
 def configure_generation_config(
     config: GenerationConfig,
     tokenizer: TokenizerType,
     is_eval: bool = False,
     has_refit_draft_weights: bool = False,
     trains_mtp: bool = False,
+    draft_full_refit: bool = False,
 ) -> GenerationConfig:
     """Apply specific configurations to generation config."""
     if (
@@ -181,6 +202,12 @@ def configure_generation_config(
         # loaded from the checkpoint.
         config["_draft_weights_from_refit"] = has_refit_draft_weights
         config["_mtp_weights_from_refit"] = trains_mtp
+
+        # Whether the trainer streams the drafter's FULL weight set (incl.
+        # embed_tokens/lm_head) on every refit — true for DTensor-v2 draft
+        # co-training. The megatron eagle3 path streams a partial set and
+        # relies on drafter module sharing instead.
+        config["_draft_full_refit"] = draft_full_refit
 
         # Respect the skip_tokenizer_init setting from the config. VLMs for example, require this to be False.
         if "skip_tokenizer_init" not in config["vllm_cfg"]:

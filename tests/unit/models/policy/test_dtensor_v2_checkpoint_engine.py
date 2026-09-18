@@ -34,6 +34,7 @@ def test_dtensor_v2_checkpoint_engine_weight_iterator():
     worker = object.__new__(DTensorPolicyWorkerV2Impl)
     worker.model = nn.Linear(2, 1)
     worker.dtype = torch.float32
+    worker.draft_model = None
 
     weights = list(DTensorPolicyWorkerV2Impl._checkpoint_engine_weight_iterator(worker))
 

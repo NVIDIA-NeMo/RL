@@ -1,0 +1,38 @@
+defaults: grpo-qwen3-8b-4n8g-automodel.yaml
+# Qwen3-8B GRPO math baseline with DFlash draft co-training (DTensor v2
+# backend), 4 nodes x 8 GPUs. DFlash sibling of
+# grpo-qwen3-8b-4n8g-automodel-dspark.yaml: policy-side
+# settings are inherited unchanged (including tp=2 and activation
+# checkpointing); the RedHatAI/Qwen3-8B-speculator.dflash block drafter
+# (markov-free, confidence-free, bonus-anchor supervision layout) trains
+# alongside the policy on rollout data and is refit into vLLM (draft.*
+# weight stream) for speculative-decoding generation. Draft architecture
+# fields (block_size, target_layer_ids, mask_token_id, sample_from_anchor,
+# draft_vocab_size) come from the draft checkpoint's config.json; only
+# training options are set here (confidence loss must be 0: dflash has no
+# confidence head).
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-8b-4n8g-automodel-dflash
+policy:
+  draft:
+    enabled: true
+    model_name: RedHatAI/Qwen3-8B-speculator.dflash
+    speculator_type: "dflash"
+    loss_weight: 1.0
+    num_anchors: 32
+    ce_loss_alpha: 0.1
+    l1_loss_alpha: 0.9
+    loss_decay_gamma: 4.0
+  generation:
+    vllm_kwargs:
+      speculative_config:
+        method: "dflash"
+        model: ${policy.draft.model_name}
+        # The speculators dflash block is 8 slots: 1 unsupervised bonus anchor
+        # + 7 mask-token proposals.
+        num_speculative_tokens: 7
+        attention_backend: "FLASH_ATTN"
+        draft_sample_method: "probabilistic"
+logger:
+  wandb:
+    name: grpo-qwen3-8b-4n8g-automodel-dflash

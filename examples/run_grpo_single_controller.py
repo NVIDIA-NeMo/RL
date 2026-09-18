@@ -43,6 +43,7 @@ from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
 from nemo_rl.models.generation import (
     configure_generation_config,
+    draft_full_refit_enabled,
     maybe_configure_engine_reaping_env,
 )
 from nemo_rl.models.policy.draft_config import draft_refit_enabled
@@ -148,6 +149,7 @@ def main() -> None:
         tokenizer,
         has_refit_draft_weights=has_refit_draft_weights,
         trains_mtp=trains_mtp,
+        draft_full_refit=draft_full_refit_enabled(config.policy),
     )
 
     # NeMo-Gym specific config setup.
