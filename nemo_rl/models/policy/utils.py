@@ -148,9 +148,9 @@ def reject_dtensor_v1(
     """
     if dtensor_cfg.get("_v2") is False:
         message = (
-            f"{config_path}._v2=false selects the DTensor v1 backend, which is being "
-            f"removed and no longer accepts new configs. Set {config_path}._v2=true "
-            f"(v2 is the only supported DTensor backend)"
+            f"{config_path}._v2=false selects the DTensor v1 backend, which has been "
+            f"removed. Set {config_path}._v2=true (v2 is the only supported DTensor "
+            f"backend)"
         )
         if suggest_megatron:
             message += (
