@@ -18,12 +18,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 import torch
+from starlette.responses import JSONResponse, Response
+from starlette.types import Receive, Scope, Send
 
 from nemo_rl.data_plane.gpu_token_payload import BoundGpuTokenSink, GpuTokenPayload
 from nemo_rl.models.generation.vllm.gpu_output_capture import (
@@ -79,6 +81,30 @@ class CapturedModelCall:
     prepare_payload: Callable[[], GpuTokenPayload] | None = None
     export_task: asyncio.Task[GpuOutputLease] | None = None
     release_reply: Future[Any] | None = None
+
+
+class _GpuCaptureResponse(Response):
+    """Keep cleanup in the ASGI request, after sending its rendered JSON body."""
+
+    def __init__(
+        self, response: JSONResponse, cleanup: Callable[[], Awaitable[None]]
+    ) -> None:
+        super().__init__(
+            content=response.body,
+            status_code=response.status_code,
+            media_type=response.media_type,
+            background=response.background,
+        )
+        self.raw_headers = response.raw_headers
+        self._cleanup = cleanup
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Unlike BackgroundTask alone, this also runs if send is cancelled
+            # or fails. The server still owns this task until cleanup completes.
+            await self._cleanup()
 
 
 class GpuCaptureHost:
@@ -234,12 +260,9 @@ class GpuCaptureHost:
         *,
         finalize: Callable[[_Result], Any] | None = None,
     ) -> Any:
-        """Complete PUT before releasing a lease, including HTTP cancellation."""
-        overlap = (
-            self._worker is not None
-            and state.lease is not None
-            and state.export_task is None
-        )
+        """Complete PUT, handing JSON-response cleanup to its ASGI request."""
+        loop = asyncio.get_running_loop()
+        overlap = state.lease is not None and state.export_task is None
 
         def on_device() -> Any:
             prepare = state.prepare_payload
@@ -256,24 +279,33 @@ class GpuCaptureHost:
                         )
                 result = operation()
                 if finalize is not None and overlap:
-                    self._start_release(state)
+                    self._start_release(state, loop)
                     return finalize(result)
                 return result
 
         task = asyncio.create_task(asyncio.to_thread(on_device))
+        response_owns_cleanup = False
         try:
             result = await _await_completion(task)
+            if finalize is not None and overlap and isinstance(result, JSONResponse):
+                response = _GpuCaptureResponse(result, lambda: self.release(state))
+                response_owns_cleanup = True
+                return response
         finally:
-            await self.release(state)
+            # A cancelled PUT/formatter or failed response construction has not
+            # handed ownership to ASGI, so it must finish cleanup here.
+            if not response_owns_cleanup:
+                await self.release(state)
         if finalize is not None and not overlap:
             return finalize(result)
         return result
 
-    def _start_release(self, state: CapturedModelCall) -> None:
+    def _start_release(
+        self, state: CapturedModelCall, loop: asyncio.AbstractEventLoop
+    ) -> None:
         """Fence all allocation users before overlapping ACK with CPU formatting."""
         if state.lease is None or state.release_reply is not None:
             return
-        assert self._worker is not None
         state.prepare_payload = None
         if state.gpu_sink is not None:
             state.gpu_sink.clear()
@@ -284,9 +316,17 @@ class GpuCaptureHost:
                 if state.ipc_handles_consumed
                 else "abandon_unimported_gpu_output_capture"
             )
-            state.release_reply = self._worker.execute_method.remote(
-                method, state.lease.capture_key
-            ).future()
+            if self._worker is not None:
+                state.release_reply = self._worker.execute_method.remote(
+                    method, state.lease.capture_key
+                ).future()
+            else:
+                # on_device runs in a thread while the serving loop is free.
+                # Submit before JSON formatting; the existing client bridges
+                # this call to the engine loop without waiting for its ACK.
+                state.release_reply = asyncio.run_coroutine_threadsafe(
+                    self._call_worker(method, args=(state.lease.capture_key,)), loop
+                )
         except Exception as error:
             # Preserve release()'s warning-only error policy and producer lease.
             # The same cleanup attempt must not fence or dispatch a second time.

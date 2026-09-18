@@ -1355,6 +1355,8 @@ class VllmAsyncGenerationWorkerImpl(
                     # Complete the blocking PUT off-loop before returning coords.
                     # Serialization is also inside the abort boundary: it can
                     # fail after the generator has imported a GPU payload lease.
+                    # A retained GPU lease is released by the ASGI response
+                    # after sending the body, including send failure/cancellation.
                     return await worker_self._complete_request_capture(
                         request,
                         content,

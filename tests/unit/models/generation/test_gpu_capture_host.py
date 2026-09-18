@@ -32,6 +32,8 @@ from unittest.mock import MagicMock
 import fastapi.responses
 import pytest
 import torch
+import uvicorn
+from fastapi import FastAPI
 from starlette.responses import JSONResponse
 
 pytest.importorskip("nemo_gym.token_id_capture.staging")
@@ -50,6 +52,7 @@ from nemo_rl.models.generation.vllm.gpu_output_capture import (  # noqa: E402
     GpuOutputTensors,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
+    _AsyncLLMHTTPClient,
     VllmAsyncGenerationWorkerImpl,
 )
 from tests.unit.models.generation import test_vllm_chat_template_wiring as wiring  # noqa: E402
@@ -403,9 +406,16 @@ async def test_capture_failures_preserve_cpu_put_and_release_ownership(
 
 
 @pytest.mark.parametrize("phase", ["import", "put", "serialize", "serialize_ack_error"])
+@pytest.mark.parametrize("collective", [False, True])
 async def test_cancellation_drains_allocation_users_and_ack(
-    case: _Case, monkeypatch: pytest.MonkeyPatch, cpu_cuda: list[str], phase: str
+    case: _Case,
+    monkeypatch: pytest.MonkeyPatch,
+    cpu_cuda: list[str],
+    phase: str,
+    collective: bool,
 ) -> None:
+    if collective:
+        case.host._worker = None
     started, unblock = asyncio.Event(), threading.Event()
     loop = asyncio.get_running_loop()
     serializing = phase.startswith("serialize")
@@ -571,9 +581,12 @@ async def test_cleanup_failure_preserves_successful_put_and_lease(
     assert attempts == (["fence"] if failure == "fence" else ["fence", "submit"])
 
 
+@pytest.mark.parametrize("collective", [False, True])
 async def test_json_failure_still_waits_for_release_ack(
-    case: _Case, cpu_cuda: list[str]
+    case: _Case, cpu_cuda: list[str], collective: bool
 ) -> None:
+    if collective:
+        case.host._worker = None
     await case.bind()
     reply = case.rpc.pause("release_gpu_output_capture")
     serialized = asyncio.Event()
@@ -595,7 +608,7 @@ async def test_json_failure_still_waits_for_release_ack(
     case.assert_released()
 
 
-@pytest.mark.parametrize("path", ["key_only", "pending_export", "collective"])
+@pytest.mark.parametrize("path", ["key_only", "pending_export"])
 async def test_nonoverlap_cleanup_precedes_finalization(
     case: _Case, cpu_cuda: list[str], path: str
 ) -> None:
@@ -603,9 +616,6 @@ async def test_nonoverlap_cleanup_precedes_finalization(
     if path == "pending_export":
         reply = case.rpc.pause("export_gpu_output_capture")
         case.host.start_export(case.state, generated_token_count=1)
-    elif path == "collective":
-        case.host._worker = None
-        await case.bind()
     finalized = []
 
     def finalize(result: Any) -> Any:
@@ -624,16 +634,8 @@ async def test_nonoverlap_cleanup_precedes_finalization(
     expected = {
         "key_only": "discard_gpu_output_capture",
         "pending_export": "abandon_unimported_gpu_output_capture",
-        "collective": "release_gpu_output_capture",
     }[path]
     assert case.rpc.calls[-1][0] == expected
-    if path == "collective":
-        assert not case.rpc.direct_calls
-        payload = case.sink.payloads["call"]
-        assert payload is not None
-        assert payload.generated_token_ids is case.tensors.generated_token_ids
-        assert cpu_cuda == ["sync"]
-        case.assert_released()
     assert case.state.export_task is case.state.release_reply is None
 
 
@@ -666,7 +668,7 @@ def _endpoint(
     return worker, request, endpoint
 
 
-async def test_endpoint_exports_final_only_and_serializes_before_ack(
+async def test_endpoint_sends_same_json_before_release_ack(
     case: _Case, cpu_cuda: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     exported = case.rpc.pause("export_gpu_output_capture")
@@ -721,14 +723,164 @@ async def test_endpoint_exports_final_only_and_serializes_before_ack(
     worker._finish_request_capture = finish
     task = asyncio.create_task(endpoint(request, None))
     await asyncio.wait_for(serialized.wait(), 5)
-    assert not task.done() and case.state.lease is case.lease
-    released.set_result(None)
-    actual = await task
+    actual = await asyncio.wait_for(task, 5)
     expected = JSONResponse(content)
     assert (actual.body, actual.raw_headers) == (expected.body, expected.raw_headers)
+    body_sent = asyncio.Event()
+
+    async def send(message: dict) -> None:
+        if message["type"] == "http.response.body":
+            assert message["body"] == expected.body
+            body_sent.set()
+
+    serving = asyncio.create_task(actual({"type": "http"}, None, send))
+    await asyncio.wait_for(body_sent.wait(), 5)
+    assert not serving.done() and case.state.lease is case.lease
+    released.set_result(None)
+    await serving
     assert len(case.rpc.calls) == 2 and released.future_calls == 1
     assert not worker._capture_calls
     case.assert_released()
+
+
+@pytest.mark.parametrize("failure", ["send", "cancel_send", "cancel_ack", "ack"])
+async def test_response_failure_drains_cleanup(
+    case: _Case, cpu_cuda: list[str], failure: str
+) -> None:
+    case.host._worker = None
+    await case.bind()
+    reply = case.rpc.pause("release_gpu_output_capture")
+    response = await case.host.finish(
+        case.state, case.put, finalize=lambda _: JSONResponse({"ok": True})
+    )
+    entered_send = asyncio.Event()
+
+    async def send(message: dict) -> None:
+        if message["type"] == "http.response.body":
+            entered_send.set()
+            if failure == "send":
+                raise OSError("client disconnected")
+            if failure == "cancel_send":
+                await asyncio.Event().wait()
+
+    serving = asyncio.create_task(response({"type": "http"}, None, send))
+    await asyncio.wait_for(entered_send.wait(), 5)
+    if failure.startswith("cancel"):
+        for _ in range(2):
+            serving.cancel()
+            await asyncio.sleep(0)
+    assert not serving.done() and not reply.cancelled()
+    assert cpu_cuda == ["sync"] and case.state.gpu_sink._payload is None
+    if failure == "ack":
+        reply.set_exception(RuntimeError("lost ACK"))
+        await serving  # Cleanup remains warning-only after the body was sent.
+        assert case.state.lease is case.lease
+    else:
+        reply.set_result(None)
+        with pytest.raises(
+            asyncio.CancelledError if failure.startswith("cancel") else OSError
+        ):
+            await serving
+        case.assert_released()
+
+
+async def test_real_http_body_and_shutdown_overlap_collective_ack(
+    case: _Case, cpu_cuda: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Use real ASGI/socket IO and separate engine/HTTP loops, with a held ACK."""
+    engine_loop = asyncio.new_event_loop()
+    engine_thread = threading.Thread(target=engine_loop.run_forever)
+    engine_thread.start()
+    release_started = threading.Event()
+    collective_rpc = case.rpc.collective_rpc
+
+    async def on_engine(method: str, *, args: tuple[Any, ...]) -> Any:
+        assert asyncio.get_running_loop() is engine_loop
+        if method == "release_gpu_output_capture":
+            release_started.set()
+        return await collective_rpc(method, args=args)
+
+    monkeypatch.setattr(case.rpc, "collective_rpc", on_engine)
+    for name in ("model_config", "renderer", "input_processor", "vllm_config"):
+        monkeypatch.setattr(case.rpc, name, None, raising=False)
+    case.host._worker = None
+    case.host._rpc = _AsyncLLMHTTPClient(case.rpc, engine_loop)
+    reply = case.rpc.pause("release_gpu_output_capture")
+    app = FastAPI()
+
+    def serialize(result: Any) -> JSONResponse:
+        # Rendering is on the existing PUT thread, leaving both loops runnable.
+        assert release_started.wait(timeout=5)
+        assert cpu_cuda == ["sync"] and case.state.gpu_sink._payload is None
+        assert not reply._future.done()
+        return JSONResponse({"ok": result.ok, "text": "é"})
+
+    @app.get("/capture")
+    async def capture() -> Any:
+        return await case.host.finish(case.state, case.put, finalize=serialize)
+
+    server = uvicorn.Server(
+        uvicorn.Config(app, log_config=None, access_log=False, lifespan="off")
+    )
+    shutdown_waiting = asyncio.Event()
+    wait_tasks = server._wait_tasks_to_complete
+
+    async def wait_for_cleanup() -> None:
+        shutdown_waiting.set()
+        await wait_tasks()
+
+    monkeypatch.setattr(server, "_wait_tasks_to_complete", wait_for_cleanup)
+    server_task = None
+    writer = None
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen()
+        sock.setblocking(False)
+        try:
+            await case.bind()
+            server_task = asyncio.create_task(server.serve(sockets=[sock]))
+
+            async def ready() -> None:
+                while not server.started:
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(ready(), 5)
+            reader, writer = await asyncio.open_connection(*sock.getsockname())
+            writer.write(b"GET /capture HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            await writer.drain()
+            headers = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+            expected = JSONResponse({"ok": True, "text": "é"}).body
+            assert headers.startswith(b"HTTP/1.1 200 OK\r\n")
+            assert f"content-length: {len(expected)}\r\n".encode() in headers.lower()
+            assert (
+                await asyncio.wait_for(reader.readexactly(len(expected)), 5) == expected
+            )
+            assert not reply._future.done() and case.state.lease is case.lease
+            assert not case.rpc.direct_calls
+            assert (
+                case.sink.payloads["call"].generated_token_ids
+                is case.tensors.generated_token_ids
+            )
+
+            writer.close()
+            await writer.wait_closed()
+            server.should_exit = True
+            await asyncio.wait_for(shutdown_waiting.wait(), 5)
+            assert not server_task.done()
+            reply.set_result(None)
+            await asyncio.wait_for(server_task, 5)
+            case.assert_released()
+        finally:
+            if not reply._future.done():
+                reply.set_result(None)
+            if writer is not None:
+                writer.close()
+            server.should_exit = True
+            if server_task is not None:
+                await asyncio.wait_for(server_task, 5)
+            engine_loop.call_soon_threadsafe(engine_loop.stop)
+            await asyncio.to_thread(engine_thread.join)
+            engine_loop.close()
 
 
 @pytest.mark.parametrize(
