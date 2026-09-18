@@ -45,9 +45,9 @@ from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
 from nemo_rl.data_plane.tq_token_sink import (
+    StagedMediaTensors,
     TQTokenSink,
     TQTokenSource,
-    StagedMediaTensors,
 )
 from nemo_rl.experience.payload import pack_payload
 from nemo_rl.experience.route_assembly import (
@@ -85,9 +85,9 @@ class FinalizedRollout:
     routed_experts: Optional[torch.Tensor] = None
     route_plan: Optional[RouteAssemblyPlan] = None
     # Trainer-ready media for this row (one logical row per PackedTensor):
-    # the engine's own vision-encoder inputs read off the terminal call's media
-    # columns and checked against its digest-covered media summary. None for
-    # text rollouts.
+    # the engine's own vision-encoder inputs read off each call row along the
+    # terminal chain, checked against that call's digest-covered media summary,
+    # and concatenated in chain order. None for text rollouts.
     media: Optional[dict[str, PackedTensor]] = None
 
 
@@ -118,8 +118,8 @@ class FinalizedGroup:
 def _media_mismatch(staged: StagedMediaTensors, summary: Any) -> Optional[str]:
     """Check the staged media columns against the digest-covered media summary.
 
-    The tensors are outside Gym's digest; the summary (imgs_sizes, num_frames,
-    num_tiles, embedding count) is inside it. Agreement ties the pixels the
+    The tensors are outside Gym's digest; the summary (modality, imgs_sizes,
+    num_frames, num_tiles) is inside it. Agreement ties the pixels the
     trainer will project to the prompt the policy generated against.
     """
     if staged.imgs.ndim not in (2, 3, 4) or staged.imgs.numel() == 0:
@@ -366,9 +366,10 @@ class RolloutReassembler:
         weight_versions = [record.weight_version for record in parsed.manifest]
         min_wv, max_wv = min(weight_versions), max(weight_versions)
 
-        # Media: the terminal call's staged extras say whether the engine saw
-        # media. If so its row also carries the media columns the Megatron
-        # worker staged; read them and check they describe the same media.
+        # Media: each call's staged extras say whether the engine saw new media
+        # on that call. If so its row also carries the media columns the Megatron
+        # worker staged; read them along the chain, check each against its own
+        # summary, and concatenate in chain order.
         media, media_failure = self._resolve_media(row, fetched_by_call)
         if media_failure is not None:
             return rejected(media_failure, staging_keys)

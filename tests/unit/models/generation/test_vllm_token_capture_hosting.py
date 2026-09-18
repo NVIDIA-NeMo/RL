@@ -40,7 +40,10 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     StageResult,
 )
 
-from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache  # noqa: E402
+from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
+    ChainPrefixCache,
+    PrefixChains,
+)
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
@@ -232,6 +235,11 @@ class _MemoryPrefixSource:
     def fetch_prefix_token_ids(self, staging_keys: list[str]) -> list[int]:
         self.calls.append(list(staging_keys))
         return [token for key in staging_keys for token in self.deltas[key]]
+
+    def fetch_prefix_chains(self, staging_keys: list[str]) -> PrefixChains:
+        # Text-only chains: compact == expanded. One recorded call per fetch.
+        expanded = self.fetch_prefix_token_ids(staging_keys)
+        return PrefixChains(expanded=expanded, compact=list(expanded))
 
 
 def _served_content(gen_ids, logprobs):

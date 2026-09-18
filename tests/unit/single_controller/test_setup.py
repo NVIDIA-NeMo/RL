@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import sys
 import threading
 import types
@@ -2658,11 +2659,12 @@ def test_token_capture_rejects_unsupported_multimodal_combinations(
     patched_factories["_build_clusters"].assert_not_called()
 
 
-def test_token_capture_multimodal_megatron_registers_media_columns(
-    patched_factories,
+@pytest.mark.parametrize("multimodal", [False, True], ids=["text", "multimodal"])
+def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
+    patched_factories, multimodal
 ):
-    """A multimodal Megatron capture run passes the guards and registers the
-    engine-media columns on the staging partition."""
+    """Only a multimodal Megatron capture run registers the engine-media
+    columns on the staging partition; a text run keeps the base schema."""
     from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS
 
     mc = _make_gym_megatron_capture_config()
@@ -2689,7 +2691,9 @@ def test_token_capture_multimodal_megatron_registers_media_columns(
             port_holders,
         )
         setup_single_controller(
-            mc, MagicMock(pad_token_id=0), processor=MagicMock(name="processor")
+            mc,
+            MagicMock(pad_token_id=0),
+            processor=MagicMock(name="processor") if multimodal else None,
         )
 
     assert mock_spinup.call_args.kwargs["token_capture"]["generation_backend"] == (
@@ -2702,4 +2706,28 @@ def test_token_capture_multimodal_megatron_registers_media_columns(
         if call.kwargs.get("partition_id") == mc.token_capture.staging_partition
     ]
     assert len(staging_calls) == 1
-    assert set(MEDIA_STAGING_FIELDS) <= set(staging_calls[0].kwargs["fields"])
+    fields = set(staging_calls[0].kwargs["fields"])
+    if multimodal:
+        assert set(MEDIA_STAGING_FIELDS) <= fields
+    else:
+        assert set(MEDIA_STAGING_FIELDS).isdisjoint(fields)
+
+
+@pytest.mark.mcore
+def test_offloaded_payload_exposes_multimodal_capture_fields():
+    """Pin the engine payload fields the multimodal stager reads with getattr defaults."""
+    # Deferred import: megatron-core is a heavy, optional dependency that the
+    # driver venv may not carry at all.
+    from megatron.core.inference import inference_request
+
+    if not hasattr(inference_request, "RequestPayloadStager"):
+        pytest.skip(
+            "pinned megatron-core predates MInf capture hooks (Megatron-LM #7015)"
+        )
+    names = {
+        field.name
+        for field in dataclasses.fields(inference_request.OffloadedRequestPayload)
+    }
+    # Expected to fail at today's pin; goes green once the Megatron-Bridge pointer
+    # includes tdene/Megatron-LM#20, which adds these two payload fields.
+    assert {"media_tensors", "compact_prompt_token_ids"} <= names

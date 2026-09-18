@@ -1100,6 +1100,37 @@ def test_finalize_rollout_media(tq_client, media_partitions, case):
     assert row.media["num_frames"].as_tensor().tolist() == [1, 1]
 
 
+def test_finalize_rollout_rejects_media_columns_missing(
+    tq_client, media_partitions, monkeypatch, caplog
+):
+    """A failed media put poisons the rollout at finalization, not at staging.
+
+    The stager swallows ``stage_media`` failures (the token row is already
+    durable and Gym holds staged coords), so the digest-covered summary names
+    media the columns never carried; the finalizer must reject rather than
+    publish an image-blind row.
+    """
+
+    def _controller_down(self, staging_key, media_tensors):
+        raise RuntimeError("controller down")
+
+    monkeypatch.setattr(TQTokenSink, "stage_media", _controller_down)
+    with caplog.at_level("ERROR", logger="nemo_rl.data_plane.tq_token_sink"):
+        receipt = _stage_vlm_rollout(tq_client, "mm-nomedia")
+    assert any("media staging failed" in r.message for r in caplog.records)
+
+    row = _media_finalizer(tq_client).finalize_rollout(
+        "mm-nomedia", receipt, reward=1.0
+    )
+
+    assert not row.valid
+    assert (row.rejection_reason or "").startswith("media_columns_missing"), (
+        row.rejection_reason
+    )
+    # Cleanup still covers the call row.
+    assert row.staging_keys == [r["staging_key"] for r in receipt["manifest"]]
+
+
 def test_finalize_group_publishes_media_with_empty_rows_for_text_siblings(
     tq_client, media_partitions
 ):

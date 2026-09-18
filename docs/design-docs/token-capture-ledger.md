@@ -128,8 +128,9 @@ the compact ids, because the engine expands whatever it is handed and would
 otherwise expand the previous turn twice and reject the request on its
 placeholder count.
 
-Capture therefore stages both spaces and the media geometry, and the media
-tensors themselves travel outside the token rows:
+Capture therefore stages both spaces and the media geometry inside the digest,
+and the media tensors themselves as extra, digest-external columns on the same
+call row:
 
 - MInf's `OffloadedRequestPayload` carries `compact_prompt_token_ids` and
   `media_tensors` (the vision-encoder inputs: packed patches `imgs`,
@@ -139,7 +140,11 @@ tensors themselves travel outside the token rows:
   `StagedCallRecord.extras` (`nemo_gym.token_id_capture.staging.media`), so both
   are bound by `extras_digest`. `TQTokenSink` pops the compact delta into its
   own column (`compact_token_ids_delta` / `compact_len`, like `routed_experts`)
-  and keeps the geometry in the extras JSON.
+  and keeps the geometry in the extras JSON. These payload fields come from
+  tdene/Megatron-LM#20 (on top of NVIDIA/Megatron-LM#7015) and the media extras
+  from Gym's `staging/media.py` (lauradang/Gym#1 on top of
+  NVIDIA-NeMo/Gym#2823); neither is in the pinned submodules yet, so this path
+  requires both re-pins.
 - `TQMegatronPromptPreparer` resolves a `staging_chain` in both spaces
   (`TQTokenSource.fetch_prefix_chains`), splices the *compact* chain into the
   render, hands Gym the *expanded* chain as `required_prefix_token_ids`, and

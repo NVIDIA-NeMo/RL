@@ -101,8 +101,8 @@ MEDIA_PREV_COUNT_KEY = "media_prev_count"
 # (or padded pixels), ``imgs_sizes`` ``[N, 2]``, ``num_frames`` / ``num_tiles``
 # when the request carried them. Each tensor is flattened to one ``[1, numel]``
 # row; ``media_geometry_json`` records shape and dtype per name. Registered on
-# the staging partition only for multimodal runs; the finalizer reads them off
-# the terminal call of each rollout.
+# the staging partition only for multimodal runs; each row holds only the media
+# new to its call, and the finalizer concatenates them along the terminal chain.
 MEDIA_IMGS_FIELD = "media_imgs"
 MEDIA_IMGS_SIZES_FIELD = "media_imgs_sizes"
 MEDIA_NUM_FRAMES_FIELD = "media_num_frames"
@@ -438,33 +438,7 @@ class TQTokenSink:
         Raises on failure; the caller decides how to report it (the finalizer
         rejects the rollout as ``media_columns_missing`` either way).
         """
-        imgs = media_tensors.get("imgs")
-        if not isinstance(imgs, torch.Tensor) or imgs.numel() == 0:
-            raise ValueError("media_tensors must carry a non-empty imgs tensor")
-        unknown = sorted(set(media_tensors) - set(MEDIA_TENSOR_COLUMNS))
-        if unknown:
-            raise ValueError(f"unsupported media tensors: {unknown}")
-        geometry: dict[str, Any] = {}
-        field_dict: dict[str, torch.Tensor] = {}
-        for name, column in MEDIA_TENSOR_COLUMNS.items():
-            tensor = media_tensors.get(name)
-            if tensor is None:
-                # Sentinel row: jagged columns cannot be empty; absence is
-                # recorded by the missing geometry entry.
-                field_dict[column] = torch.zeros((1, 1), dtype=torch.int64)
-                continue
-            if not isinstance(tensor, torch.Tensor):
-                raise TypeError(f"media tensor {name!r} must be a torch.Tensor")
-            flat = tensor.detach().cpu().contiguous().reshape(1, -1)
-            field_dict[column] = flat
-            geometry[name] = {
-                "shape": list(tensor.shape),
-                "dtype": str(tensor.dtype).removeprefix("torch."),
-            }
-        field_dict[MEDIA_GEOMETRY_FIELD] = _bytes_tensor(
-            json.dumps(geometry, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        )
-        self._store.put(staging_key, field_dict)
+        self._store.put(staging_key, media_field_dict(media_tensors))
 
 
 @dataclass(frozen=True)
@@ -528,12 +502,12 @@ def media_item_count(geometry: dict[str, Any] | None) -> int:
 class ChainPrefixCache:
     """Worker-local cache of resolved ``staging_chain`` prefixes."""
 
-    def __init__(self, source: Any | None = None) -> None:
-        self._source = source
+    def __init__(self, source: TQTokenSource | None = None) -> None:
+        self._source: TQTokenSource | None = source
         self._cache: dict[str, PrefixChains] = {}
         self._lock = threading.Lock()
 
-    def install(self, source: Any) -> None:
+    def install(self, source: TQTokenSource) -> None:
         """Attach (or replace) the ``TQTokenSource`` and drop cached chains."""
         with self._lock:
             self._source = source
@@ -564,14 +538,7 @@ class ChainPrefixCache:
                 "staging source not initialized; call setup_token_capture() first"
             )
         # TQ read stays outside the lock so concurrent fetches overlap.
-        fetch_chains = getattr(source, "fetch_prefix_chains", None)
-        if fetch_chains is not None:
-            fetched = fetch_chains(miss_keys)
-        else:
-            # A source that predates compact chains (or a text-only test double)
-            # serves one space; the compact chain coincides with it.
-            expanded = list(source.fetch_prefix_token_ids(miss_keys))
-            fetched = PrefixChains(expanded=expanded, compact=list(expanded))
+        fetched = source.fetch_prefix_chains(miss_keys)
         result = cached + fetched
         last_key = staging_chain[-1]
         with self._lock:
@@ -811,6 +778,56 @@ def media_geometry(media_tensors: dict[str, Any] | None) -> dict[str, Any] | Non
         "num_frames": num_frames,
         "num_tiles": as_list("num_tiles"),
     }
+
+
+def media_field_dict(media_tensors: dict[str, Any]) -> dict[str, torch.Tensor]:
+    """Encode the engine's media tensors as the media columns of one call row.
+
+    The encoder half of the media column codec; ``row_to_media_tensors`` is
+    its inverse. Each present tensor is flattened to one ``[1, numel]`` row
+    under its ``MEDIA_TENSOR_COLUMNS`` field, absent tensors get an int64
+    ``zeros((1, 1))`` sentinel (jagged columns cannot be empty), and
+    ``MEDIA_GEOMETRY_FIELD`` records shape and dtype per present name.
+
+    Args:
+        media_tensors: The engine's media tensors keyed by
+            ``MEDIA_TENSOR_COLUMNS`` name; ``imgs`` is mandatory.
+
+    Returns:
+        The field dict to ``put`` onto the call's staging key.
+
+    Raises:
+        ValueError: ``imgs`` is missing / empty, or a key is not a known
+            media tensor name.
+        TypeError: A present value is not a ``torch.Tensor``.
+    """
+    imgs = media_tensors.get("imgs")
+    if not isinstance(imgs, torch.Tensor) or imgs.numel() == 0:
+        raise ValueError("media_tensors must carry a non-empty imgs tensor")
+    unknown = sorted(set(media_tensors) - set(MEDIA_TENSOR_COLUMNS))
+    if unknown:
+        raise ValueError(f"unsupported media tensors: {unknown}")
+    geometry: dict[str, Any] = {}
+    field_dict: dict[str, torch.Tensor] = {}
+    for name, column in MEDIA_TENSOR_COLUMNS.items():
+        tensor = media_tensors.get(name)
+        if tensor is None:
+            # Sentinel row: jagged columns cannot be empty; absence is
+            # recorded by the missing geometry entry.
+            field_dict[column] = torch.zeros((1, 1), dtype=torch.int64)
+            continue
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"media tensor {name!r} must be a torch.Tensor")
+        flat = tensor.detach().cpu().contiguous().reshape(1, -1)
+        field_dict[column] = flat
+        geometry[name] = {
+            "shape": list(tensor.shape),
+            "dtype": str(tensor.dtype).removeprefix("torch."),
+        }
+    field_dict[MEDIA_GEOMETRY_FIELD] = _bytes_tensor(
+        json.dumps(geometry, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    return field_dict
 
 
 @dataclass(frozen=True)
@@ -1092,36 +1109,7 @@ class TQTokenSource:
         n_rows = int(rows.batch_size[0]) if len(rows.batch_size) else 0
         if n_rows != 1:
             raise KeyError(f"media columns for {staging_key!r} missing")
-        row = _select_row(rows, 0)
-        geometry = json.loads(_row_text(row, MEDIA_GEOMETRY_FIELD))
-        if not isinstance(geometry, dict) or "imgs" not in geometry:
-            raise ValueError("staged media geometry must describe imgs")
-        tensors: dict[str, torch.Tensor | None] = {}
-        for name, column in MEDIA_TENSOR_COLUMNS.items():
-            spec = geometry.get(name)
-            if spec is None:
-                tensors[name] = None
-                continue
-            flat = row[column].reshape(-1)
-            dtype = getattr(torch, spec["dtype"], None)
-            if not isinstance(dtype, torch.dtype):
-                raise ValueError(
-                    f"media column {column!r} names unknown dtype {spec['dtype']!r}"
-                )
-            shape = torch.Size(spec["shape"])
-            if flat.numel() != shape.numel():
-                raise ValueError(
-                    f"media column {column!r} holds {flat.numel()} values but its "
-                    f"geometry describes {shape.numel()}"
-                )
-            tensors[name] = flat.to(dtype).reshape(shape)
-        assert tensors["imgs"] is not None
-        return StagedMediaTensors(
-            imgs=tensors["imgs"],
-            imgs_sizes=tensors["imgs_sizes"],
-            num_frames=tensors["num_frames"],
-            num_tiles=tensors["num_tiles"],
-        )
+        return row_to_media_tensors(_select_row(rows, 0))
 
     def fetch_for_finalization(
         self,
@@ -1311,6 +1299,56 @@ def _row_to_route_fragment(row: Any) -> RouteFragment | None:
         extras_metadata_json=_row_text(row, ROUTED_EXTRAS_METADATA_FIELD).encode(
             "utf-8"
         ),
+    )
+
+
+def row_to_media_tensors(row: Any) -> StagedMediaTensors:
+    """Restore one call row's media columns to the engine's media tensors.
+
+    The decoder half of the media column codec; ``media_field_dict`` is its
+    inverse. ``MEDIA_GEOMETRY_FIELD`` names which tensors are present and
+    their shape / dtype; each named ``MEDIA_TENSOR_COLUMNS`` column is cast
+    and reshaped accordingly, unnamed ones (sentinel rows) come back ``None``.
+
+    Args:
+        row: One row as returned by ``_select_row``, holding
+            ``MEDIA_STAGING_FIELDS``.
+
+    Returns:
+        The staged media tensors in their original shapes.
+
+    Raises:
+        ValueError: The geometry does not describe ``imgs``, names an unknown
+            dtype, or disagrees with a column's element count.
+    """
+    geometry = json.loads(_row_text(row, MEDIA_GEOMETRY_FIELD))
+    if not isinstance(geometry, dict) or "imgs" not in geometry:
+        raise ValueError("staged media geometry must describe imgs")
+    tensors: dict[str, torch.Tensor | None] = {}
+    for name, column in MEDIA_TENSOR_COLUMNS.items():
+        spec = geometry.get(name)
+        if spec is None:
+            tensors[name] = None
+            continue
+        flat = row[column].reshape(-1)
+        dtype = getattr(torch, spec["dtype"], None)
+        if not isinstance(dtype, torch.dtype):
+            raise ValueError(
+                f"media column {column!r} names unknown dtype {spec['dtype']!r}"
+            )
+        shape = torch.Size(spec["shape"])
+        if flat.numel() != shape.numel():
+            raise ValueError(
+                f"media column {column!r} holds {flat.numel()} values but its "
+                f"geometry describes {shape.numel()}"
+            )
+        tensors[name] = flat.to(dtype).reshape(shape)
+    assert tensors["imgs"] is not None
+    return StagedMediaTensors(
+        imgs=tensors["imgs"],
+        imgs_sizes=tensors["imgs_sizes"],
+        num_frames=tensors["num_frames"],
+        num_tiles=tensors["num_tiles"],
     )
 
 

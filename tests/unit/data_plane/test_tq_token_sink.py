@@ -24,6 +24,7 @@ protocol edges the kit does not cover (missing keys, stage failure shape).
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 from types import SimpleNamespace
 
@@ -41,7 +42,11 @@ from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
 
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     COMPACT_PREV_LEN_KEY,
+    COMPACT_TOKEN_IDS_EXTRAS_KEY,
+    MEDIA_EXTRAS_KEY,
+    MEDIA_IMGS_FIELD,
     MEDIA_PREV_COUNT_KEY,
+    MEDIA_STAGING_FIELDS,
     MINF_CAPTURE_PARAMS_FIELD,
     PREFIX_EOS_TOKEN_ID_FIELD,
     PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
@@ -52,7 +57,10 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     TQMegatronTokenStager,
     TQTokenSink,
     TQTokenSource,
+    _MegatronCapturePayload,
+    media_field_dict,
     resolve_admission_prefix,
+    row_to_media_tensors,
     slice_media_tensors,
 )
 from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
@@ -319,6 +327,11 @@ def test_megatron_stager_writes_canonical_row_and_returns_coords(
         return
 
     assert fetched.snapshot.token_ids_delta == [80, 99, 99, 99, 81, 12, 2]
+    # Mask and log probs are aligned with the *expanded* delta: every media
+    # token is prompt (mask 0); only the two generated tokens train.
+    assert fetched.snapshot.token_mask_delta == [0.0] * 5 + [1.0, 1.0]
+    assert fetched.snapshot.generation_log_probs_delta == [0.0] * 5 + [-0.25, -0.5]
+    assert (coords["prev_len"], coords["delta_len"]) == (0, 7)
     assert chains.expanded == [80, 99, 99, 99, 81, 12, 2]
     assert chains.compact == [80, 99, 81, 12, 2]
     assert fetched.extras == {
@@ -352,6 +365,68 @@ def test_stage_media_rejects_malformed_tensors(
     sink = TQTokenSink(tq_client, staging_partition=staging_partition)
     with pytest.raises(ValueError, match=error):
         sink.stage_media("k", media_tensors)
+
+
+@pytest.mark.parametrize(
+    "media_tensors",
+    [
+        # Packed patches, one still image.
+        {
+            "imgs": torch.arange(48, dtype=torch.float32).reshape(1, 4, 12),
+            "imgs_sizes": torch.tensor([[4, 4]], dtype=torch.int32),
+        },
+        # Packed patches, bf16 as the engine may hand them over.
+        {
+            "imgs": torch.arange(48, dtype=torch.float32)
+            .reshape(1, 4, 12)
+            .to(torch.bfloat16),
+            "imgs_sizes": torch.tensor([[4, 4]], dtype=torch.int32),
+        },
+        # Video: per-frame sizes plus frames per video.
+        {
+            "imgs": torch.arange(96, dtype=torch.float32).reshape(1, 8, 12),
+            "imgs_sizes": torch.tensor([[4, 4], [4, 4]], dtype=torch.int32),
+            "num_frames": torch.tensor([2], dtype=torch.int32),
+        },
+        # Padded pixels with static tiling.
+        {
+            "imgs": torch.arange(2 * 3 * 4 * 4, dtype=torch.float32).reshape(
+                2, 3, 4, 4
+            ),
+            "num_tiles": torch.tensor([2], dtype=torch.int64),
+        },
+    ],
+    ids=["packed-f32", "packed-bf16", "video", "tiled-pixels"],
+)
+def test_media_column_codec_round_trips_without_a_store(media_tensors):
+    """``row_to_media_tensors`` inverts ``media_field_dict`` exactly, dtype included."""
+    fields = media_field_dict(media_tensors)
+    assert set(fields) == set(MEDIA_STAGING_FIELDS)
+    assert all(tensor.shape[0] == 1 for tensor in fields.values())
+
+    restored = row_to_media_tensors(fields)
+
+    for name in ("imgs", "imgs_sizes", "num_frames", "num_tiles"):
+        expected = media_tensors.get(name)
+        actual = getattr(restored, name)
+        if expected is None:
+            assert actual is None, name
+        else:
+            assert actual.dtype == expected.dtype, name
+            assert torch.equal(actual, expected), name
+
+
+def test_row_to_media_tensors_rejects_geometry_column_disagreement():
+    fields = media_field_dict(
+        {
+            "imgs": torch.ones(1, 4, 12),
+            "imgs_sizes": torch.tensor([[4, 4]], dtype=torch.int32),
+        }
+    )
+    # The columns are outside Gym's digest; a truncated column must not decode.
+    fields[MEDIA_IMGS_FIELD] = fields[MEDIA_IMGS_FIELD][:, :-1]
+    with pytest.raises(ValueError, match="geometry describes"):
+        row_to_media_tensors(fields)
 
 
 _PREPARER_CASES = {
@@ -617,41 +692,35 @@ def test_megatron_stager_declines_ineligible_requests(
 
 
 class _RecordingSource:
-    """Stand-in for TQTokenSource: records fetched keys, returns 2 tokens per key.
+    """Stand-in for TQTokenSource that records fetched keys.
 
-    With ``chains=True`` it also serves the compact space (one token per key), as
-    TQTokenSource does; otherwise only the expanded space, as older sources did.
+    Serves both token spaces: two expanded tokens and one compact token per key.
     """
 
-    def __init__(self, *, chains=False):
+    def __init__(self):
         self.calls = []
-        if chains:
-            self.fetch_prefix_chains = self._fetch_prefix_chains
 
     def fetch_prefix_token_ids(self, keys):
         self.calls.append(list(keys))
         return [int(k[1:]) * 10 + i for k in keys for i in range(2)]
 
-    def _fetch_prefix_chains(self, keys):
+    def fetch_prefix_chains(self, keys):
         return PrefixChains(
             expanded=self.fetch_prefix_token_ids(keys),
             compact=[int(k[1:]) * 10 for k in keys],
         )
 
 
-@pytest.mark.parametrize("chains", [False, True], ids=["expanded-only", "both-spaces"])
-def test_chain_prefix_cache_fetches_only_uncached_suffix(chains):
-    source = _RecordingSource(chains=chains)
+def test_chain_prefix_cache_fetches_only_uncached_suffix():
+    source = _RecordingSource()
     cache = ChainPrefixCache(source)
 
     assert cache.fetch(["k1", "k2"]) == [10, 11, 20, 21]
     assert cache.fetch(["k1", "k2", "k3"]) == [10, 11, 20, 21, 30, 31]
     assert cache.fetch(["k1", "k2"]) == [10, 11, 20, 21]
     assert source.calls == [["k1", "k2"], ["k3"]]
-    # A source without compact chains coincides with the expanded space.
-    expected_compact = [10, 20, 30] if chains else [10, 11, 20, 21, 30, 31]
     assert cache.fetch_chains(["k1", "k2", "k3"]) == PrefixChains(
-        expanded=[10, 11, 20, 21, 30, 31], compact=expected_compact
+        expanded=[10, 11, 20, 21, 30, 31], compact=[10, 20, 30]
     )
     assert source.calls == [["k1", "k2"], ["k3"]]
 
@@ -745,6 +814,32 @@ def test_prefix_field_keys_match_megatron_constants():
     assert PREFIX_EOS_TOKEN_ID_FIELD == mcore.PREFIX_EOS_TOKEN_ID_FIELD
 
 
+def test_extras_and_payload_keys_match_gym_constants():
+    """Pin the Gym extras keys and payload-view attribute names to Gym's constants.
+
+    The sink pops Gym's extras keys, and the stager's payload view feeds Gym's
+    Megatron adapter by attribute name.
+    """
+    media = pytest.importorskip("nemo_gym.token_id_capture.staging.media")
+    adapter = pytest.importorskip("nemo_gym.token_id_capture.adapters.megatron")
+    if not hasattr(adapter, "COMPACT_PREV_LEN_FIELD"):
+        pytest.skip(
+            "pinned nemo_gym predates multimodal Megatron extras (NVIDIA-NeMo/Gym#2823)"
+        )
+    assert COMPACT_TOKEN_IDS_EXTRAS_KEY == media.COMPACT_TOKEN_IDS_DELTA_FIELD
+    assert MEDIA_EXTRAS_KEY == media.MEDIA_FIELD
+    assert COMPACT_PREV_LEN_KEY == adapter.COMPACT_PREV_LEN_FIELD
+    payload_fields = {f.name for f in dataclasses.fields(_MegatronCapturePayload)}
+    assert payload_fields >= {
+        adapter.PROMPT_IDS_FIELD,
+        adapter.GENERATED_IDS_FIELD,
+        adapter.GENERATED_LOGPROBS_FIELD,
+        adapter.COMPACT_PROMPT_IDS_FIELD,
+        adapter.COMPACT_PREV_LEN_FIELD,
+        adapter.MEDIA_FIELD,
+    }
+
+
 @pytest.mark.parametrize(
     ("media_tensors", "prev_count", "expected"),
     [
@@ -820,8 +915,39 @@ def test_slice_media_tensors_keeps_only_new_items(media_tensors, prev_count, exp
         assert torch.equal(sliced[name], value), name
 
 
-def test_slice_media_tensors_rejects_more_items_than_the_engine_saw():
-    with pytest.raises(ValueError, match="exceeds"):
-        slice_media_tensors(
-            {"imgs": torch.ones(1, 4, 12), "imgs_sizes": torch.tensor([[4, 4]])}, 2
-        )
+@pytest.mark.parametrize(
+    ("media_tensors", "prev_count", "error"),
+    [
+        (
+            {"imgs": torch.ones(1, 4, 12), "imgs_sizes": torch.tensor([[4, 4]])},
+            2,
+            "exceeds",
+        ),
+        # No per-item geometry at all: nothing says where image 1 ends.
+        ({"imgs": torch.ones(1, 4, 12)}, 1, "requires imgs_sizes or num_tiles"),
+        # 5 patches cannot tile two 4x4 images (area 32).
+        (
+            {
+                "imgs": torch.ones(1, 5, 12),
+                "imgs_sizes": torch.tensor([[4, 4], [4, 4]]),
+            },
+            1,
+            "do not divide",
+        ),
+        # Area 18 over 2 patches -> 9 per patch; image 1 (area 6) ends mid-patch.
+        (
+            {
+                "imgs": torch.ones(1, 2, 12),
+                "imgs_sizes": torch.tensor([[2, 3], [3, 4]]),
+            },
+            1,
+            "patch boundary",
+        ),
+    ],
+    ids=["exceeds", "no-geometry", "non-dividing", "mid-patch"],
+)
+def test_slice_media_tensors_rejects_inconsistent_geometry(
+    media_tensors, prev_count, error
+):
+    with pytest.raises(ValueError, match=error):
+        slice_media_tensors(media_tensors, prev_count)
