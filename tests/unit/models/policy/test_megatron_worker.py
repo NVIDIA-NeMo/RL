@@ -1764,6 +1764,89 @@ def test_megatron_offload_before_refit_honors_offload_optimizer_for_refit(
     assert moved == (["cpu"] if offload_optimizer else [])
 
 
+def test_reusable_optimizer_cpu_buffer_preserves_storage_and_values() -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _copy_to_reusable_cpu_buffer,
+    )
+
+    destination = None
+    destination_ptr = None
+    for value in (1.0, 2.0, 3.0):
+        source = torch.full((3, 4), value, dtype=torch.float32)
+        destination = _copy_to_reusable_cpu_buffer(source, destination)
+        if destination_ptr is None:
+            destination_ptr = destination.data_ptr()
+        assert destination.data_ptr() == destination_ptr
+        torch.testing.assert_close(destination, source)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        torch.ones(2, 3, dtype=torch.float32),
+        torch.ones(3, 2, dtype=torch.float64),
+        torch.ones(2, 3, dtype=torch.float32).t(),
+    ],
+)
+def test_reusable_optimizer_cpu_buffer_reallocates_for_incompatible_layout(
+    source: torch.Tensor,
+) -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _copy_to_reusable_cpu_buffer,
+    )
+
+    old_destination = torch.empty_strided(
+        (3, 2), (2, 1), dtype=torch.float32, device="cpu"
+    )
+
+    destination = _copy_to_reusable_cpu_buffer(source, old_destination)
+
+    assert destination is not old_destination
+    assert destination.shape == source.shape
+    assert destination.dtype == source.dtype
+    assert destination.stride() == source.stride()
+    torch.testing.assert_close(destination, source)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_megatron_move_optimizer_reuses_pageable_cpu_buffer() -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    state_key = object()
+
+    class _Optimizer:
+        def __init__(self) -> None:
+            self.state = {
+                state_key: {
+                    "exp_avg": torch.arange(12, device="cuda", dtype=torch.float32)
+                }
+            }
+
+        def _get_state(self):
+            return self.state
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.optimizer = _Optimizer()
+    worker.reuse_optimizer_cpu_buffers_for_refit = True
+    worker._optimizer_cpu_buffer_cache = {}
+
+    worker.move_optimizer("cpu")
+    first_cpu = worker.optimizer.state[state_key]["exp_avg"]
+    first_cpu_ptr = first_cpu.data_ptr()
+    assert not first_cpu.is_pinned()
+
+    worker.move_optimizer("cuda")
+    worker.optimizer.state[state_key]["exp_avg"].add_(10)
+    expected = worker.optimizer.state[state_key]["exp_avg"].cpu()
+    worker.move_optimizer("cpu")
+    second_cpu = worker.optimizer.state[state_key]["exp_avg"]
+
+    assert second_cpu.data_ptr() == first_cpu_ptr
+    torch.testing.assert_close(second_cpu, expected)
+
+
 @pytest.mark.parametrize(
     "generation_backend, colocated, has_inference_model, shared_buffer, "
     "expect_move_params, expect_move_grads",
