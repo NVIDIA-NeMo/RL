@@ -28,6 +28,7 @@ from nemo_rl.models.generation.interfaces import GenerationConfig
 VllmRefitTransportName = Literal["s3", "zmq"]
 VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard"]
 VLLM_SPARSE_REFIT_TRANSPORTS = frozenset({"vllm_s3_sparse", "vllm_zmq_sparse"})
+VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR = "NRL_VLLM_FP32_LM_HEAD"
 REFITTABLE_FP8_KV_CACHE_DTYPES = frozenset({"fp8", "fp8_e4m3"})
 
 
@@ -61,6 +62,10 @@ class VllmSpecificArgs(TypedDict):
     # with generation-time processors should request ``raw_logprobs`` when
     # comparing generation and policy logprobs.
     logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
+    # Nemotron-H only: compute vLLM Nemotron-H logits with an fp32 LM head.
+    # Pair this with policy.megatron_cfg.fp32_lm_head when using a Megatron
+    # trainer.
+    fp32_lm_head: NotRequired[bool]
     # Cap each request's generated tokens so the training prompt plus response
     # fits within max_model_len. This is needed when multimodal processing makes
     # the training prompt longer than its text-only representation.
@@ -110,6 +115,13 @@ class VllmSpecificArgs(TypedDict):
     refit_with_reload_api: NotRequired[bool]
     # A filepath that can be imported to register a vLLM reasoning parser
     reasoning_parser_plugin: NotRequired[str]
+
+
+def vllm_nemotron_h_fp32_lm_head_enabled(
+    vllm_cfg: VllmSpecificArgs | dict[str, Any],
+) -> bool:
+    """Return whether vLLM should run Nemotron-H logits with an fp32 head."""
+    return bool(vllm_cfg.get("fp32_lm_head"))
 
 
 class VllmDeltaCompressionConfig(BaseModel, extra="allow"):
