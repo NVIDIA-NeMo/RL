@@ -23,4 +23,5 @@ NEMO_GYM_GRPO_CONFIG="$PROJECT_ROOT/examples/nemo_gym/grpo_sharded_gym_smoke.yam
     bash "$SCRIPT_DIR/grpo_async_gym.sh" \
     +env.nemo_gym.placement_strategy=PACK \
     +policy.megatron_cfg.moe_per_layer_logging=false \
+    policy.generation.vllm_cfg.http_server_serving_chat_kwargs.tool_parser=hermes \
     "$@"
