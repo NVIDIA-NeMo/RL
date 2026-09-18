@@ -111,6 +111,10 @@ from nemo_rl.models.policy.interfaces import (
     ReferenceLogprobOutputSpec,
     TeacherFullPayloadOutputSpec,
 )
+from nemo_rl.models.policy.optimizer_offload import (
+    OptimizerCpuBufferCache,
+    move_optimizer_state,
+)
 from nemo_rl.models.policy.utils import (
     broadcast_hf_buckets_via_distributed_impl,
     connect_rollout_engines_from_distributed,
@@ -149,34 +153,6 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 )
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
-
-
-def _copy_to_reusable_cpu_buffer(
-    source: torch.Tensor,
-    destination: Optional[torch.Tensor],
-) -> torch.Tensor:
-    """Copy a tensor into compatible pageable CPU storage."""
-    can_reuse = (
-        destination is not None
-        and destination.device.type == "cpu"
-        and not destination.is_pinned()
-        and destination.layout == torch.strided
-        and source.layout == torch.strided
-        and destination.shape == source.shape
-        and destination.dtype == source.dtype
-        and destination.stride() == source.stride()
-    )
-    if not can_reuse:
-        if source.layout != torch.strided:
-            return source.to("cpu")
-        destination = torch.empty_strided(
-            source.shape,
-            source.stride(),
-            dtype=source.dtype,
-            device="cpu",
-        )
-    destination.copy_(source)
-    return destination
 
 
 def _should_use_router_replay(
@@ -651,7 +627,7 @@ class MegatronPolicyWorkerImpl(
         self.reuse_optimizer_cpu_buffers_for_refit = bool(
             config.get("reuse_optimizer_cpu_buffers_for_refit", False)
         )
-        self._optimizer_cpu_buffer_cache: dict[tuple[Any, Any], torch.Tensor] = {}
+        self._optimizer_cpu_buffer_cache: OptimizerCpuBufferCache = {}
         # Pinned host staging for the reference-policy swap; only populated when
         # megatron_cfg["pinned_reference_swap"] is enabled. Buffer contents are
         # only live within a single use_reference_model call (every copy
@@ -5358,38 +5334,12 @@ class MegatronPolicyWorkerImpl(
             optimizer_state = self.optimizer.state
         else:
             optimizer_state = self.optimizer._get_state()
-        active_cache_keys: set[tuple[Any, Any]] = set()
-        for state_key, state in optimizer_state.items():
-            # Iterate through the state items (e.g., momentum, variance) for a parameter
-            for k, v in state.items():
-                # Check if the item is a tensor
-                if torch.is_tensor(v):
-                    # Move the tensor to device and update the state dictionary
-                    if device == "cpu":
-                        if v.is_cuda:
-                            if self.reuse_optimizer_cpu_buffers_for_refit:
-                                cache_key = (state_key, k)
-                                state[k] = _copy_to_reusable_cpu_buffer(
-                                    v,
-                                    self._optimizer_cpu_buffer_cache.get(cache_key),
-                                )
-                                self._optimizer_cpu_buffer_cache[cache_key] = state[k]
-                                active_cache_keys.add(cache_key)
-                            else:
-                                state[k] = v.to("cpu")
-                    elif device == "cuda":
-                        if not v.is_cuda:
-                            state[k] = v.to("cuda")
-                    else:
-                        raise ValueError(
-                            f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
-                        )
-        if device == "cpu" and self.reuse_optimizer_cpu_buffers_for_refit:
-            self._optimizer_cpu_buffer_cache = {
-                key: value
-                for key, value in self._optimizer_cpu_buffer_cache.items()
-                if key in active_cache_keys
-            }
+        move_optimizer_state(
+            optimizer_state,
+            device=device,
+            reuse_cpu_buffers=self.reuse_optimizer_cpu_buffers_for_refit,
+            cpu_buffer_cache=self._optimizer_cpu_buffer_cache,
+        )
 
     def save_checkpoint(
         self,
