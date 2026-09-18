@@ -119,31 +119,57 @@ cleanup() {
                 timeout 900 gdb -batch -q -ex 'thread apply all bt' -ex 'info sharedlibrary' \
                     "$PY_EXE_FX" "$c" > "$DIAGNOSTIC_DIR/fx/gdb-$base.txt" 2>&1 || gdb_rc=$?
             fi
-            # Frames alone do not make a backtrace trustworthy: gdb happily
-            # prints them after warning that the core and the binary or its
-            # shared libraries do not match, and those frames describe the wrong
-            # build. Treat any such warning, or a missing library map, the same
-            # as a failed parse -- keep the core and say why.
+            # A backtrace is only trustworthy if the binaries gdb read it
+            # against are the ones the crash actually used. Absence of warnings
+            # does not show that: gdb prints frames happily after saying the
+            # core does not match, and says nothing at all when it silently had
+            # no library map to check. Require positive evidence -- an unchanged
+            # libc across the install, a known libc version, a loaded shared
+            # library map, frames, and a clean gdb -- and call everything else
+            # unreliable.
             parse_note=""
             if [[ "$gdb_rc" -ne 0 ]]; then
-                parse_note="gdb_rc=$gdb_rc"
+                parse_note="gdb-rc-$gdb_rc"
+            elif [[ "$libc6_before_fx" == unknown || "$libc6_after_fx" == unknown ]]; then
+                parse_note="libc-version-unknown"
+            elif [[ "$libc6_before_fx" != "$libc6_after_fx" ]]; then
+                parse_note="libc-moved-during-install"
             elif ! grep -q '^#0 ' "$DIAGNOSTIC_DIR/fx/gdb-$base.txt" 2>/dev/null; then
                 parse_note="no-frames"
             elif grep -qiE 'may not match|No shared library information|could not( be)? read' \
                     "$DIAGNOSTIC_DIR/fx/gdb-$base.txt" 2>/dev/null; then
                 parse_note="binary-or-library-mismatch"
+            elif ! grep -qE '^0x[0-9a-f]+ +0x[0-9a-f]+ +Yes' \
+                    "$DIAGNOSTIC_DIR/fx/gdb-$base.txt" 2>/dev/null; then
+                # info sharedlibrary printed no loaded library: nothing was
+                # matched, so there is no basis for calling the stack verified.
+                parse_note="no-library-map"
             fi
             if [[ -z "$parse_note" ]]; then
                 printf 'core_parsed=%s frames=yes verified=yes\n' "$base" \
                     >> "$DIAGNOSTIC_DIR/forensics.txt"
-            elif [[ "$(stat -c %s "$c")" -le 3000000000 ]]; then
-                printf 'core_parsed=%s unreliable=%s -- preserving raw core\n' \
-                    "$base" "$parse_note" >> "$DIAGNOSTIC_DIR/forensics.txt"
-                cp -a "$c" "$DIAGNOSTIC_DIR/fx/" \
-                    || printf 'core_preserve_FAILED=%s\n' "$base" >> "$DIAGNOSTIC_DIR/forensics.txt"
+                continue
+            fi
+            # Unreliable: the core is the only remaining record, and this
+            # workspace is deleted when the job ends, so the artifact directory
+            # is the one durable destination. Cores are mostly zeroes and
+            # compress heavily, so try that before giving up on keeping it.
+            printf 'core_parsed=%s unreliable=%s\n' "$base" "$parse_note" \
+                >> "$DIAGNOSTIC_DIR/forensics.txt"
+            if gzip -1 -c "$c" > "$DIAGNOSTIC_DIR/fx/$base.gz" 2>/dev/null; then
+                kept=$(stat -c %s "$DIAGNOSTIC_DIR/fx/$base.gz" 2>/dev/null || printf 0)
+                if [[ "$kept" -gt 0 && "$kept" -le 3000000000 ]]; then
+                    printf 'core_preserved=%s.gz bytes=%s\n' "$base" "$kept" \
+                        >> "$DIAGNOSTIC_DIR/forensics.txt"
+                else
+                    rm -f "$DIAGNOSTIC_DIR/fx/$base.gz"
+                    printf 'core_NOT_PRESERVED=%s compressed_bytes=%s -- exceeds artifact budget, evidence lost on cleanup\n' \
+                        "$base" "$kept" >> "$DIAGNOSTIC_DIR/forensics.txt"
+                fi
             else
-                printf 'core_parsed=%s unreliable=%s -- core too large to preserve (%s bytes)\n' \
-                    "$base" "$parse_note" "$(stat -c %s "$c")" >> "$DIAGNOSTIC_DIR/forensics.txt"
+                rm -f "$DIAGNOSTIC_DIR/fx/$base.gz"
+                printf 'core_NOT_PRESERVED=%s -- compression failed, evidence lost on cleanup\n' \
+                    "$base" >> "$DIAGNOSTIC_DIR/forensics.txt"
             fi
         done
         dmesg > "$DIAGNOSTIC_DIR/fx/dmesg.txt" 2>&1
