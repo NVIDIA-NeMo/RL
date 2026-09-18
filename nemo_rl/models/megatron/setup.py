@@ -288,6 +288,10 @@ def _force_sync_model_from_optimizer_fp32(optimizer):
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.distributed.nccl_prewarm import (
+    prewarm_checkpoint_gather,
+    prewarm_expert_alltoall,
+)
 from nemo_rl.models.generation.megatron.config import (
     dedicated_inference_megatron_cfg,
 )
@@ -439,6 +443,11 @@ def setup_distributed(config) -> None:
     destroy_parallel_state()
     # Initialize process group
     torch.distributed.init_process_group("nccl")
+    # Connect the point-to-point transports now, while the cluster is quiet.
+    # Training drives only ring/tree collectives, so the async-checkpoint plan
+    # gather is otherwise the first p2p op on this communicator and pays for the
+    # lazy NCCL preconnect mid-run. See nccl_prewarm for the full rationale.
+    prewarm_checkpoint_gather()
 
 
 def validate_and_set_config(
@@ -2848,6 +2857,16 @@ def finalize_megatron_setup(
             "overlap_param_gather"
         ]
     )
+
+    # MoE token dispatch is the other first-use-is-mid-run p2p op (all_to_all on
+    # the expert group); connect it here rather than inside the first training
+    # step. Returns None uniformly on every rank for dense models, so the branch
+    # stays collective-safe.
+    expert_group = parallel_state.get_expert_model_parallel_group(
+        check_initialized=False
+    )
+    if expert_group is not None:
+        prewarm_expert_alltoall(expert_group)
 
     return megatron_tokenizer, megatron_bridge, should_disable_forward_pre_hook, dp_size
 
