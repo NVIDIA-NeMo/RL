@@ -132,6 +132,21 @@ _NEMOTRON_H_MODEL_TYPES = frozenset({"nemotron_h"})
 _NEMOTRON_H_ARCHITECTURES = frozenset({"NemotronHForCausalLM"})
 
 
+def reject_dtensor_v1(dtensor_cfg: dict[str, Any], config_path: str) -> None:
+    """Fail at setup when a config still selects the removed DTensor v1 backend.
+
+    Args:
+        dtensor_cfg: The resolved dtensor_cfg mapping to inspect.
+        config_path: Dotted path used in the error message, e.g. policy.dtensor_cfg.
+    """
+    if dtensor_cfg.get("_v2") is False:
+        raise ValueError(
+            f"{config_path}._v2=false selects the DTensor v1 backend, which has been "
+            f"removed. Drop the _v2 key ({config_path} is always v2 now) or set the "
+            "matching megatron_cfg.enabled=true to train with Megatron-Core."
+        )
+
+
 def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
     """Return the quantized policy worker FQN if ``quant_cfg`` is set, else ``default_cls``.
 
