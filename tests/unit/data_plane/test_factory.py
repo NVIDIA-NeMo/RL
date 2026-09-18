@@ -110,7 +110,12 @@ def stub_tq_adapter(monkeypatch):
     module = ModuleType("nemo_rl.data_plane.adapters.transfer_queue")
 
     class _StubClient(NoOpDataPlaneClient):
-        def __init__(self, cfg, bootstrap=True):
+        # Takes whatever the factory passes rather than restating the real
+        # constructor's keywords: which of those reach the adapter is checked
+        # against the adapter itself in
+        # test_factory_passes_checkpoint_runtime_mode_to_bootstrap, so a copy
+        # here adds no coverage and breaks every time the adapter gains one.
+        def __init__(self, cfg, **kwargs):
             super().__init__()
 
     module.TQDataPlaneClient = _StubClient
