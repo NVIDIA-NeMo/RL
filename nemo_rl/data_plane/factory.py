@@ -118,7 +118,10 @@ def maybe_configure_data_plane_env(cfg: DataPlaneConfig | None) -> None:
 
 
 def build_data_plane_client(
-    cfg: DataPlaneRuntimeConfig | None, *, bootstrap: bool = True
+    cfg: DataPlaneRuntimeConfig | None,
+    *,
+    bootstrap: bool = True,
+    checkpointing: bool = False,
 ) -> DataPlaneClient:
     """Construct the configured data-plane client.
 
@@ -133,6 +136,9 @@ def build_data_plane_client(
         bootstrap: ``True`` on the driver — bootstraps the TQ
             controller. ``False`` on worker processes — connects to the
             existing controller (avoids creating a second named actor).
+        checkpointing: Prepare storage for saving or restoring data-plane state.
+            Derived by the caller from its existing checkpoint settings and
+            resume path. Only used at bootstrap; workers inherit the mode from TQ.
 
     Returns:
         A configured ``DataPlaneClient``; wrapped in
@@ -160,7 +166,9 @@ def build_data_plane_client(
         from nemo_rl.data_plane.adapters.transfer_queue import TQDataPlaneClient
 
         assert not isinstance(cfg, LocalDataPlaneConfig)
-        client: DataPlaneClient = TQDataPlaneClient(cfg, bootstrap=bootstrap)
+        client: DataPlaneClient = TQDataPlaneClient(
+            cfg, bootstrap=bootstrap, checkpointing=checkpointing
+        )
     elif impl == "local":
         from nemo_rl.data_plane.adapters.local import LocalDataPlaneClient
 
