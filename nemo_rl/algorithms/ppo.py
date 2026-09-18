@@ -51,6 +51,7 @@ from nemo_rl.algorithms.reward_functions import (
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import (
+    check_train_dataloader_not_empty,
     print_efficiency_summary,
     print_performance_metrics,
     set_seed,
@@ -460,6 +461,12 @@ def setup(
         collate_fn=rl_collate_fn,
         drop_last=True,
         num_workers=data_config["num_workers"],
+    )
+    check_train_dataloader_not_empty(
+        dataloader,
+        dataset=dataset,
+        batch_size=dataloader_batch_size,
+        batch_size_source="num_prompts_per_step * batch_multiplier",
     )
     if last_checkpoint_path is not None:
         load_dataloader_state(dataloader, last_checkpoint_path, data_config)
