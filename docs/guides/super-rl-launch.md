@@ -1,5 +1,9 @@
 # Super RL maintenance branch and launch contract
 
+For the short "replace model/data and run" instructions, start with the
+[Super RL quickstart](super-rl-quickstart.md). It assumes a prepared runtime;
+this page explains the setup and remaining launcher limitations.
+
 The deliverable is **this NeMo-RL repository**, on the PR 4136 maintenance
 branch, based on the fixed PR3941 commit
 `ca06137460b7e2edcaf6f1fd67ddbda5ddd6b8e2`. It is not a Research Factory run
