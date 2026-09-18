@@ -68,6 +68,8 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
 
+from nemo_rl.distributed.model_utils import to_local_if_dtensor
+
 
 class RotaryEmbedParallel(SequenceParallel):
     """Custom SequenceParallel class for Qwen2 / Gemma3 rotary embeddings because the input is a tuple."""
@@ -766,15 +768,6 @@ def _parallelize_model(
         offload_policy=offload_policy,
         reshard_after_forward=False,
     )
-
-
-def to_local_if_dtensor(tensor: Union[torch.Tensor, DTensor]) -> torch.Tensor:
-    """Returns the local shard of the given tensor if it is a DTensor.
-
-    Taken and modified from: https://github.com/NVIDIA/Megatron-LM/blob/605f618f237cda8fa80132bc2ccff933512d5a0d/megatron/core/utils.py#L746
-    """
-    with torch.no_grad():
-        return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
 def clip_grad_by_total_norm_(

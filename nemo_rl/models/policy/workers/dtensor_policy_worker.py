@@ -64,6 +64,7 @@ from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
     get_logprobs_from_vocab_parallel_logits,
+    to_local_if_dtensor,
 )
 from nemo_rl.models.automodel.data import (
     check_sequence_dim,
@@ -73,7 +74,6 @@ from nemo_rl.models.dtensor.parallelize import (
     _parallelize_model,
     clip_grad_by_total_norm_,
     get_grad_norm,
-    to_local_if_dtensor,
 )
 from nemo_rl.models.generation.interfaces import RefitPayloadMode
 from nemo_rl.models.huggingface.common import (
