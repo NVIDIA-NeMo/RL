@@ -1176,6 +1176,37 @@ class TestApplyPrecisionConfig:
             _apply_precision_config(model_cfg, config, torch.float32)
             assert model_cfg.pipeline_dtype == expected_dtype
 
+    def test_fp32_lm_head_sets_logit_dtype(self):
+        """The fp32 LM-head knob maps to Megatron-Bridge provider logit_dtype."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace(bf16=False, fp16=False, logit_dtype=None)
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp32_lm_head": True,
+            }
+        }
+
+        _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert model_cfg.logit_dtype is torch.float32
+
+    def test_fp32_lm_head_requires_provider_logit_dtype(self):
+        """Fail loudly when the Bridge provider cannot emit fp32 logits."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp32_lm_head": True,
+            }
+        }
+
+        with pytest.raises(ValueError, match="logit_dtype"):
+            _apply_precision_config(model_cfg, config, torch.bfloat16)
+
     @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
     def test_loads_te_precision_config_when_configured(
         self, mock_load_recipe, tmp_path
@@ -3812,12 +3843,13 @@ class TestDraftSetup:
         )
 
     @patch("nemo_rl.models.megatron.setup.get_pg_collection")
-    @patch("nemo_rl.models.megatron.setup.build_draft_model")
+    @patch("nemo_rl.models.megatron.draft.training.build_draft_model")
     def test_draft_pre_wrap_hook_attaches_only_owner_chunk(
         self, mock_build_draft_model, mock_get_pg_collection
     ):
         """The nested draft model should attach only to the owner post-process chunk."""
         from nemo_rl.models.megatron.setup import _create_draft_pre_wrap_hook
+        from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 
         class DummyChunk(torch.nn.Module):
             def __init__(self, *, post_process: bool = False):
@@ -3834,7 +3866,7 @@ class TestDraftSetup:
         mock_get_pg_collection.return_value = MagicMock()
 
         hook = _create_draft_pre_wrap_hook(
-            policy_cfg={"draft": {"enabled": True, "model_name": None}},
+            policy_cfg={"draft": Eagle3DraftConfig(enabled=True, model_name=None)},
             megatron_cfg=MagicMock(),
             state=MagicMock(),
             preload_policy_from_pretrained=False,
@@ -3851,6 +3883,61 @@ class TestDraftSetup:
             mock_build_draft_model.call_args.kwargs["policy_model_chunk"] is chunks[1]
         )
 
+    @pytest.mark.parametrize(
+        "draft_cfg_kind", ["absent", "dict-disabled", "typed-disabled"]
+    )
+    @patch("nemo_rl.models.megatron.setup._load_checkpoint_from_path")
+    @patch("nemo_rl.models.megatron.setup.get_pg_collection")
+    @patch("nemo_rl.models.megatron.draft.training.build_draft_model")
+    def test_draft_pre_wrap_hook_is_identity_when_draft_disabled(
+        self,
+        mock_build_draft_model,
+        mock_get_pg_collection,
+        mock_load_checkpoint,
+        draft_cfg_kind,
+    ):
+        """A disabled draft config must leave the policy chunks untouched.
+
+        `_create_draft_pre_wrap_hook` resolves the speculator eagerly, so a
+        disabled or absent config has to short-circuit before the builder, the
+        process-group lookup and the pretrained preload run.
+        """
+        from nemo_rl.models.megatron.setup import _create_draft_pre_wrap_hook
+        from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
+
+        class DummyChunk(torch.nn.Module):
+            def __init__(self, *, post_process: bool = False):
+                super().__init__()
+                self.post_process = post_process
+
+        chunks = [
+            DummyChunk(post_process=False),
+            DummyChunk(post_process=True),
+        ]
+        if draft_cfg_kind == "absent":
+            policy_cfg = {}
+        elif draft_cfg_kind == "dict-disabled":
+            policy_cfg = {"draft": {"enabled": False}}
+        else:
+            policy_cfg = {"draft": Eagle3DraftConfig(enabled=False, model_name=None)}
+
+        hook = _create_draft_pre_wrap_hook(
+            policy_cfg=policy_cfg,
+            megatron_cfg=MagicMock(),
+            state=MagicMock(),
+            # True so the preload branch would fire if the disabled config were
+            # not short-circuited.
+            preload_policy_from_pretrained=True,
+        )
+
+        returned_model = hook(chunks)
+
+        assert returned_model is chunks
+        assert all(getattr(chunk, "draft_model", None) is None for chunk in chunks)
+        mock_build_draft_model.assert_not_called()
+        mock_get_pg_collection.assert_not_called()
+        mock_load_checkpoint.assert_not_called()
+
     @patch("nemo_rl.models.megatron.draft.utils.copy_policy_lm_head_to_draft")
     @patch("nemo_rl.models.megatron.draft.utils.load_hf_weights_to_eagle")
     @patch("nemo_rl.models.megatron.draft.eagle.EagleModel")
@@ -3863,7 +3950,8 @@ class TestDraftSetup:
         mock_copy_lm_head,
     ):
         """Missing draft LM-head weights should fall back to the policy LM head."""
-        from nemo_rl.models.megatron.setup import build_draft_model
+        from nemo_rl.models.megatron.draft.utils import build_draft_model
+        from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 
         mock_auto_config.return_value.to_dict.return_value = {
             "num_hidden_layers": 2,
@@ -3888,7 +3976,7 @@ class TestDraftSetup:
 
         returned_model = build_draft_model(
             model_provider=self._build_model_provider(),
-            draft_config={"enabled": True, "model_name": "dummy-draft"},
+            draft_config=Eagle3DraftConfig(enabled=True, model_name="dummy-draft"),
             pg_collection=SimpleNamespace(tp=None),
             policy_model_chunk=policy_model_chunk,
         )
@@ -3926,12 +4014,13 @@ class TestDraftSetup:
             )
 
     @patch("nemo_rl.models.megatron.setup.get_pg_collection")
-    @patch("nemo_rl.models.megatron.setup.build_draft_model")
+    @patch("nemo_rl.models.megatron.draft.training.build_draft_model")
     def test_attached_draft_state_is_serializable(
         self, mock_build_draft_model, mock_get_pg_collection
     ):
         """Attached draft modules should be part of the owner chunk state_dict."""
         from nemo_rl.models.megatron.setup import _create_draft_pre_wrap_hook
+        from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 
         class DummyChunk(torch.nn.Module):
             def __init__(self):
@@ -3944,7 +4033,7 @@ class TestDraftSetup:
         def attach_fresh_draft():
             chunk = DummyChunk()
             hook = _create_draft_pre_wrap_hook(
-                policy_cfg={"draft": {"enabled": True, "model_name": None}},
+                policy_cfg={"draft": Eagle3DraftConfig(enabled=True, model_name=None)},
                 megatron_cfg=MagicMock(),
                 state=MagicMock(),
                 preload_policy_from_pretrained=False,

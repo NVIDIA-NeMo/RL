@@ -74,7 +74,10 @@ from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import managed_span, trace_fn
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
-from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointManager,
+)
 from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
@@ -803,6 +806,9 @@ def _distillation_train_impl(
                             task_to_env=task_to_env,
                             max_seq_len=None,
                             generation_config=generation_config,
+                            num_generations_per_prompt=(
+                                master_config.distillation.num_generations_per_prompt
+                            ),
                             log_full_result_tables=should_log_nemo_gym_full_result_tables(
                                 wandb_enabled=master_config.logger["wandb_enabled"],
                                 wandb_config=master_config.logger["wandb"],
@@ -1078,7 +1084,7 @@ def _distillation_train_impl(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config.checkpointing,
+                            is_final_checkpoint=is_last_step,
                         )
                         torch.save(
                             dataloader.state_dict(),
@@ -1289,6 +1295,7 @@ def validate(
                     task_to_env=val_task_to_env,
                     max_seq_len=None,
                     generation_config=generation_config,
+                    num_generations_per_prompt=1,
                     log_full_result_tables=should_log_nemo_gym_full_result_tables(
                         wandb_enabled=master_config.logger["wandb_enabled"],
                         wandb_config=master_config.logger["wandb"],

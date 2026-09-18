@@ -25,7 +25,7 @@ on:
 
 concurrency:
   group: approve-test-queue
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   approve-test-queue:
