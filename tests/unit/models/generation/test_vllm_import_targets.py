@@ -36,8 +36,46 @@ _SOURCES = sorted(_GENERATION_DIR.rglob("*.py"))
 assert _SOURCES, f"no sources found under {_GENERATION_DIR}"
 
 
+_IMPORT_GUARDS = {"ImportError", "ModuleNotFoundError", "Exception"}
+
+
+def _catches_import_error(handler: ast.ExceptHandler) -> bool:
+    if handler.type is None:
+        return True
+    names = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    return any(
+        isinstance(n, ast.Name)
+        and n.id in _IMPORT_GUARDS
+        or isinstance(n, ast.Attribute)
+        and n.attr in _IMPORT_GUARDS
+        for n in names
+    )
+
+
+def _guarded_import_lines(tree: ast.AST) -> set[int]:
+    """Lines of imports inside a ``try`` that catches ImportError.
+
+    Those are deliberate version fallbacks (``try: new path / except
+    ImportError: old path``); by construction one branch does not resolve on
+    any given vLLM, so only the unguarded imports are checked.
+    """
+    lines: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        if not any(_catches_import_error(h) for h in node.handlers):
+            continue
+        for region in (node.body, *(h.body for h in node.handlers)):
+            for stmt in region:
+                for sub in ast.walk(stmt):
+                    if isinstance(sub, ast.ImportFrom):
+                        lines.add(sub.lineno)
+    return lines
+
+
 def _vllm_import_froms(path: Path) -> list[tuple[int, str, list[str]]]:
     tree = ast.parse(path.read_text())
+    guarded = _guarded_import_lines(tree)
     found = []
     for node in ast.walk(tree):
         if (
@@ -45,6 +83,7 @@ def _vllm_import_froms(path: Path) -> list[tuple[int, str, list[str]]]:
             and node.module
             and node.module.split(".")[0] == "vllm"
             and node.level == 0
+            and node.lineno not in guarded
         ):
             found.append((node.lineno, node.module, [a.name for a in node.names]))
     return found

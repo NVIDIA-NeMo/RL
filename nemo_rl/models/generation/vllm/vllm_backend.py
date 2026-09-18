@@ -465,7 +465,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         self, policy_weights: list[tuple[str, torch.Tensor]]
     ) -> list[tuple[str, torch.Tensor]]:
         """Drop the tied-embedding aliases vLLM would skip (see module helper)."""
-        model = self.model_runner.model
+        model = getattr(self.model_runner, "model", None)
+        if model is None or not hasattr(model, "named_modules"):
+            # vLLM's detector walks the module tree; a stand-in without one
+            # (a bare load_weights callable) has no tied embeddings to drop.
+            return policy_weights
         aliases = _tied_embedding_aliases(model)
         if not aliases:
             return policy_weights
@@ -496,8 +500,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             )
         if _is_gemma4_unified_text_only(model_config):
             weights = _filter_gemma4_unified_multimodal_weights(weights)
-        model = self.model_runner.model
-        aliases = _tied_embedding_aliases(model)
+        model = getattr(self.model_runner, "model", None)
+        aliases = (
+            _tied_embedding_aliases(model)
+            if model is not None and hasattr(model, "named_modules")
+            else {}
+        )
         if aliases:
             weights = _drop_tied_embedding_aliases(
                 weights, aliases, getattr(model, "hf_to_vllm_mapper", None)
@@ -1169,9 +1177,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 else _unquantized_flashinfer_trtllm_modules(model)
             )
             reloaded_module_ids = _reload_target_module_ids(reload_targets)
-            added_skip_tensors: set[str] = set()
+            added_skip_tensors: Any = None
             if use_deepseek_v4_fp8:
                 from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
+
+                added_skip_tensors = deepseek_v4_fp8.SkipNames()
 
             def finalize() -> None:
                 with torch.device(self.device):

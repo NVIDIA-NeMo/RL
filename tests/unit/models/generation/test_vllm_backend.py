@@ -1361,7 +1361,7 @@ def test_weight_update_lifecycle_uses_native_reload_for_dsv4(monkeypatch):
         meta.SKIP_TENSORS.add("attn_sink")
         return {"attn_sink"}
 
-    def restore_refit(added):
+    def restore_refit(added, model=None):
         call_order.append(("restore_experts", added))
         meta.SKIP_TENSORS.difference_update(added)
 

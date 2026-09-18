@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass, field
 from typing import cast
 
 import torch
@@ -132,15 +133,47 @@ def _reset_routed_experts_for_refit(model: torch.nn.Module) -> None:
                 )
 
 
-def prepare_refit(model: torch.nn.Module) -> set[str]:
+@dataclass
+class SkipNames:
+    """Skip-list names one :func:`prepare_refit` call added, per vLLM set."""
+
+    tensors: set[str] = field(default_factory=set)
+    """Names added to ``SKIP_TENSORS`` (kept off the meta device)."""
+    load: set[str] = field(default_factory=set)
+    """Names added to ``SKIP_LOAD_TENSORS`` (kept out of load accounting)."""
+
+
+def _layerwise_skip_sets() -> list[set[str]]:
+    """The process-global skip sets an immediately loaded tensor must be in.
+
+    vLLM 0.25 had one set, ``SKIP_TENSORS``: a listed tensor stays off the meta
+    device *and* its weight loader is neither wrapped nor counted, so the
+    layer is never processed by the layerwise machinery. vLLM 0.29 split that
+    into ``SKIP_LOAD_TENSORS`` (never loaded through ``weight_loader``: not
+    wrapped, not counted) and ``SKIP_TENSORS`` (additionally never moved to
+    meta), and only ``SKIP_LOAD_TENSORS`` keeps a tensor out of the layer's
+    load accounting. The expert tensors below are loaded immediately through
+    their original loaders and converted once in :func:`finalize_refit`; if
+    they were counted, vLLM would run ``process_weights_after_loading`` on the
+    layer as soon as its last expert arrived and :func:`finalize_refit` would
+    convert the already kernel-layout tensors a second time.
+    """
+    from vllm.model_executor.model_loader.reload import meta
+
+    sets = [meta.SKIP_TENSORS]
+    skip_load = getattr(meta, "SKIP_LOAD_TENSORS", None)
+    if isinstance(skip_load, set) and skip_load is not meta.SKIP_TENSORS:
+        sets.append(skip_load)
+    return sets
+
+
+def prepare_refit(model: torch.nn.Module) -> SkipNames:
     """Prepare DeepSeek V4 parameters for layerwise FP8 refit.
 
-    Returns the process-global skip names added by this invocation. The caller
-    must pass them to :func:`restore_refit` after the layerwise lifecycle,
-    including on failure.
+    Returns the process-global skip names added by this invocation, per set.
+    The caller must pass them to :func:`restore_refit` after the layerwise
+    lifecycle, including on failure.
     """
-    from vllm.model_executor.model_loader.reload.meta import SKIP_TENSORS
-
     # DeepSeek V4 loads attn_sink with a direct copy_ instead of its Parameter
     # weight_loader. Keep its kernel storage materialized during reload.
     required_skip_tensors = {"attn_sink"}
@@ -150,28 +183,37 @@ def prepare_refit(model: torch.nn.Module) -> set[str]:
         # expert in layerwise reload until the fused parameter is complete.
         required_skip_tensors.update(_EXPERT_REFIT_PARAMS)
 
-    added_skip_tensors = required_skip_tensors - SKIP_TENSORS
-    SKIP_TENSORS.update(required_skip_tensors)
+    skip_sets = _layerwise_skip_sets()
+    added = SkipNames(
+        tensors=required_skip_tensors - skip_sets[0],
+        load=required_skip_tensors - skip_sets[-1],
+    )
+    for skip_set in skip_sets:
+        skip_set.update(required_skip_tensors)
     try:
         _reset_routed_experts_for_refit(model)
     except Exception:
-        SKIP_TENSORS.difference_update(added_skip_tensors)
+        _remove_skip_names(added)
         raise
     suspend_model_post_load(model)
-    return added_skip_tensors
+    return added
+
+
+def _remove_skip_names(added: SkipNames) -> None:
+    skip_sets = _layerwise_skip_sets()
+    skip_sets[0].difference_update(added.tensors)
+    skip_sets[-1].difference_update(added.load)
 
 
 def restore_refit(
-    added_skip_tensors: set[str], model: torch.nn.Module | None = None
+    added_skip_tensors: SkipNames, model: torch.nn.Module | None = None
 ) -> None:
     """Undo :func:`prepare_refit` after the layerwise lifecycle, including on failure.
 
     Removes the process-global skip names added for one refit and, when the
     model is given, lifts the post-load shadow a failed refit may have left.
     """
-    from vllm.model_executor.model_loader.reload.meta import SKIP_TENSORS
-
-    SKIP_TENSORS.difference_update(added_skip_tensors)
+    _remove_skip_names(added_skip_tensors)
     if model is not None:
         resume_model_post_load(model)
 

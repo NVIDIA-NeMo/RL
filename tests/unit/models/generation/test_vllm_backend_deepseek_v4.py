@@ -285,7 +285,8 @@ def test_deepseek_v4_context_entry_failure_preserves_original_error(
     assert exc_info.value is failure
     assert ext._nrl_layerwise_reload_failure is failure
     assert ext._nrl_layerwise_reload_active is False
-    assert restored == [(set(), ext.model_runner.model)]
+    # prepare_refit never ran, so nothing was added to the skip lists.
+    assert restored == [(deepseek_v4_fp8.SkipNames(), ext.model_runner.model)]
 
 
 def test_weight_update_lifecycle_keeps_full_post_load_for_non_deepseek_models(

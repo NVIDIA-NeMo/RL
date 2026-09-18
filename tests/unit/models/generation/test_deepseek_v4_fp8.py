@@ -29,15 +29,28 @@ def deepseek_v4_fp8():
 
 @pytest.fixture
 def skip_tensors():
-    """Guard the process-global reload skip list that prepare_refit mutates."""
-    from vllm.model_executor.model_loader.reload.meta import SKIP_TENSORS
+    """Guard the process-global reload skip lists that prepare_refit mutates."""
+    from vllm.model_executor.model_loader.reload import meta
 
-    original = set(SKIP_TENSORS)
+    guarded = [meta.SKIP_TENSORS]
+    skip_load = getattr(meta, "SKIP_LOAD_TENSORS", None)
+    if isinstance(skip_load, set) and skip_load is not meta.SKIP_TENSORS:
+        guarded.append(skip_load)
+    originals = [set(s) for s in guarded]
     try:
-        yield SKIP_TENSORS
+        yield meta.SKIP_TENSORS
     finally:
-        SKIP_TENSORS.clear()
-        SKIP_TENSORS.update(original)
+        for skip_set, original in zip(guarded, originals):
+            skip_set.clear()
+            skip_set.update(original)
+
+
+@pytest.fixture
+def skip_load_tensors():
+    """vLLM 0.29's load-accounting skip set (same object as SKIP_TENSORS before it)."""
+    from vllm.model_executor.model_loader.reload import meta
+
+    return getattr(meta, "SKIP_LOAD_TENSORS", meta.SKIP_TENSORS)
 
 
 class DeepSeekV4ForCausalLM(torch.nn.Module):
@@ -299,7 +312,7 @@ def test_prepare_refit_restores_expert_stride_only(
 
 
 def test_prepare_refit_marks_expert_and_sink_tensors_for_immediate_load(
-    deepseek_v4_fp8, monkeypatch, skip_tensors
+    deepseek_v4_fp8, monkeypatch, skip_tensors, skip_load_tensors
 ):
     monkeypatch.setattr(deepseek_v4_fp8, "RoutedExperts", FakeRoutedExpertsLayer)
     layer = FakeRoutedExpertsLayer(weight_block_size=[2, 2])
@@ -308,12 +321,15 @@ def test_prepare_refit_marks_expert_and_sink_tensors_for_immediate_load(
 
     added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)
 
-    assert "attn_sink" in skip_tensors
-    assert {"w13_weight", "w2_weight", "w13_weight_scale_inv"} <= skip_tensors
+    expected = {"attn_sink", "w13_weight", "w2_weight", "w13_weight_scale_inv"}
+    assert expected <= skip_tensors
+    # vLLM 0.29 only keeps a tensor out of the layer's load accounting (so the
+    # layer is not processed online) through SKIP_LOAD_TENSORS.
+    assert expected <= skip_load_tensors
 
     deepseek_v4_fp8.restore_refit(added_skip_tensors)
-    assert "attn_sink" not in skip_tensors
-    assert "w13_weight" not in skip_tensors
+    assert not expected & skip_tensors
+    assert not expected & skip_load_tensors
 
 
 def test_restore_refit_preserves_preexisting_global_skip_names(
@@ -355,7 +371,8 @@ def test_refit_ignores_unquantized_routed_experts(
 
     added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)
 
-    assert added_skip_tensors == {"attn_sink"}
+    assert added_skip_tensors.tensors == {"attn_sink"}
+    assert added_skip_tensors.load == {"attn_sink"}
     assert "w13_weight" not in skip_tensors
     deepseek_v4_fp8.finalize_refit(model)
     assert process_calls == []
