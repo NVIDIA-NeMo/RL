@@ -44,6 +44,8 @@ import torch
 from tensordict import TensorDict
 
 if TYPE_CHECKING:
+    from nemo_gym.token_id_capture.staging.protocols import TensorAttachment
+
     # Deferred: nemo_gym is an optional extra absent in non-gym runs; runtime
     # uses import locally so this module (and the finalizer actor importing
     # it) stays importable without it.
@@ -53,6 +55,12 @@ if TYPE_CHECKING:
         StageResult,
     )
 
+from nemo_rl.data.captured_media import (
+    IMAGE_CAPTURE_FIELD,
+    STAGED_PIXEL_FIELD,
+    CapturedMedia,
+    attachment_pixels,
+)
 from nemo_rl.data_plane.schema import (
     ROUTE_ENCODING_ENVELOPE,
     ROUTE_ENCODING_LIST,
@@ -128,6 +136,7 @@ class FetchedStagedCall:
     snapshot: StagedCallBaseSnapshot
     routed_len: int
     fragment: RouteFragment | None = None
+    extras_metadata_json: bytes = b"null"
 
 
 def _call_dp(dp_client: Any, method_name: str, **kwargs: Any) -> Any:
@@ -158,10 +167,17 @@ class TQTokenSink:
         self._staging_partition = staging_partition
 
     def stage(self, record: StagedCallRecord) -> StageResult:
+        return self.stage_with_attachments(record, attachments=())
+
+    def stage_with_attachments(
+        self, record: StagedCallRecord, *, attachments: tuple[TensorAttachment, ...]
+    ) -> StageResult:
+        """Acknowledge tokens and owned media only after their combined TQ put."""
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.records import StageResult
 
         key = record.staging_key
+        put_started = False
         try:
             field_dict = {
                 "token_ids_delta": torch.tensor(
@@ -267,6 +283,15 @@ class TQTokenSink:
                 [routed_encoding], dtype=torch.int64
             )
             field_dict[ROUTED_LEN_FIELD] = torch.tensor([routed_len], dtype=torch.int64)
+            media_metadata = (record.extras or {}).get(IMAGE_CAPTURE_FIELD)
+            if media_metadata is not None:
+                pixels = attachment_pixels(
+                    CapturedMedia.from_dict(media_metadata), attachments
+                )
+                if pixels is not None:
+                    field_dict[STAGED_PIXEL_FIELD] = pixels.unsqueeze(0)
+            elif attachments:
+                raise ValueError("Tensor attachments require image capture metadata")
             fields = TensorDict(field_dict, batch_size=[1])
             tags = [
                 {
@@ -281,6 +306,7 @@ class TQTokenSink:
                     "schema_version": record.schema_version,
                 }
             ]
+            put_started = True
             _call_dp(
                 self._dp_client,
                 "put_samples",
@@ -290,6 +316,17 @@ class TQTokenSink:
                 tags=tags,
             )
         except Exception as error:  # noqa: BLE001 — any failure must poison, not crash serving
+            # No successful coords can escape this completion claim. Roll back
+            # partial media writes while this worker still owns the call key.
+            # A storage outage can also defeat cleanup; recovery's unreferenced
+            # row sweep remains the backstop for those abandoned keys.
+            if put_started and attachments:
+                try:
+                    self.clear([key])
+                except Exception:  # noqa: BLE001 — preserve the authoritative staging failure
+                    logging.getLogger(__name__).exception(
+                        "Failed to clean incomplete media staging row %s", key
+                    )
             # The reason string is dropped downstream (_failed_coords carries
             # only the disposition) — this log line is the only place the
             # actual stage failure is visible.
@@ -337,6 +374,22 @@ class TQTokenSource:
     def fetch(self, staging_keys: list[str]) -> list[StagedCallBaseSnapshot]:
         """Gym ``StagingSource`` conformance: base snapshots only, in order."""
         return [item.snapshot for item in self.fetch_for_finalization(staging_keys)]
+
+    def fetch_pixels(self, staging_key: str) -> torch.Tensor:
+        """Fetch just one call's flattened pixels, never reprocess source images."""
+        try:
+            rows = _call_dp(
+                self._dp_client,
+                "get_samples",
+                sample_ids=[staging_key],
+                partition_id=self._staging_partition,
+                select_fields=[STAGED_PIXEL_FIELD],
+            )
+        except Exception as error:  # noqa: BLE001 — map storage failures to a rejected row
+            raise KeyError(f"Missing captured pixels for {staging_key!r}") from error
+        if tuple(rows.batch_size) != (1,):
+            raise KeyError(f"Missing captured pixels for {staging_key!r}")
+        return rows[STAGED_PIXEL_FIELD][0]
 
     def fetch_prefix_token_ids(self, staging_keys: list[str]) -> list[int]:
         """Bulk-fetch ordered delta chain and concatenate token_ids_delta into a prefix."""
@@ -449,6 +502,9 @@ class TQTokenSource:
                     fragment=(
                         _row_to_route_fragment(row) if include_route_fragments else None
                     ),
+                    extras_metadata_json=_row_text(
+                        row, ROUTED_EXTRAS_METADATA_FIELD
+                    ).encode("utf-8"),
                 )
             )
         return fetched

@@ -22,7 +22,17 @@ token-in/token-out via ``generate(input_ids)`` and never re-templates messages,
 so it has no retokenization drift to correct.
 """
 
+from dataclasses import dataclass
 from typing import Any
+
+
+@dataclass(frozen=True)
+class PrefixSplice:
+    """Exact token splice and its source coordinates for multimodal ranges."""
+
+    token_ids: list[int]
+    model_cut_end: int
+    template_cut_start: int
 
 
 def replace_prefix_tokens(
@@ -31,6 +41,22 @@ def replace_prefix_tokens(
     template_prefix_token_ids: list[int],
     template_token_ids: list[int],
 ) -> list[int]:
+    """Replace a rendered history with the exact previously generated tokens."""
+    return splice_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    ).token_ids
+
+
+def splice_prefix_tokens(
+    *,
+    tokenizer: Any,
+    model_prefix_token_ids: list[int],
+    template_prefix_token_ids: list[int],
+    template_token_ids: list[int],
+) -> PrefixSplice:
     """This is a subroutine used inside the OpenAI-compatible Chat Completion server.
 
     This function is for fixing up the chat template-tokenized messages history
@@ -90,7 +116,7 @@ def replace_prefix_tokens(
             output => [11,12,13,40,41,220,17,2,21,22,40,41]
     """
     if not model_prefix_token_ids:
-        return template_token_ids
+        return PrefixSplice(template_token_ids, 0, 0)
 
     eos_token_id = tokenizer.eos_token_id
     assert eos_token_id is not None, "Tokenizer must have an EOS token ID"
@@ -124,6 +150,9 @@ def replace_prefix_tokens(
         f"Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"
     )
 
-    return (
-        model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
+    return PrefixSplice(
+        model_prefix_token_ids[:model_cut_end]
+        + template_token_ids[template_cut_start:],
+        model_cut_end,
+        template_cut_start,
     )

@@ -41,6 +41,12 @@ from typing import Any, Optional
 
 import torch
 
+from nemo_rl.data.captured_media import assemble_captured_media
+from nemo_rl.data.multimodal_utils import (
+    PackedTensor,
+    encode_multimodal_for_wire,
+    multimodal_row_tags,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
@@ -79,6 +85,7 @@ class FinalizedRollout:
     # the executed route plan; None when the rollout staged no routes.
     routed_experts: Optional[torch.Tensor] = None
     route_plan: Optional[RouteAssemblyPlan] = None
+    media: dict[str, PackedTensor] = field(default_factory=dict)
 
 
 @dataclass
@@ -118,6 +125,7 @@ class RolloutReassembler:
         max_seq_len: int,
         router_replay_enabled: bool = False,
         defer_routed_experts_to_policy: bool = False,
+        capture_images: bool = False,
     ) -> None:
         self._dp_client = dp_client
         self._partition_id = partition_id
@@ -125,6 +133,9 @@ class RolloutReassembler:
         self._max_seq_len = int(max_seq_len)
         self._router_replay_enabled = router_replay_enabled
         self._defer_routed_experts_to_policy = defer_routed_experts_to_policy
+        self._capture_images = capture_images
+        if capture_images and defer_routed_experts_to_policy:
+            raise ValueError("Image capture requires direct router replay assembly")
         if self._defer_routed_experts_to_policy and not self._router_replay_enabled:
             raise ValueError(
                 "defer_routed_experts_to_policy requires router replay to be enabled"
@@ -302,6 +313,15 @@ class RolloutReassembler:
                 if failure is not None:
                     return rejected(f"route_assembly:{failure}", staging_keys)
 
+        try:
+            media = assemble_captured_media(
+                [fetched_by_call[call_id] for call_id in row.model_call_ids],
+                source=self._source,
+                required=self._capture_images,
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            return rejected(f"image_assembly:{error}", staging_keys)
+
         return FinalizedRollout(
             rollout_id=rollout_id,
             valid=True,
@@ -316,6 +336,7 @@ class RolloutReassembler:
             max_wv=max_wv,
             routed_experts=routed_experts,
             route_plan=route_plan,
+            media=media,
         )
 
     def _execute_direct_plan(
@@ -576,6 +597,25 @@ class RolloutReassembler:
             group_id=group_id,
             prompt_idx=prompt_idx,
         )
+        # #4124's canonical packed-media publication, using ordinary rollout rows.
+        packed_media = {}
+        for key in {key for row in rows if row.valid for key in row.media}:
+            prototype = next(
+                row.media[key] for row in rows if row.valid and key in row.media
+            )
+            packed_media[key] = PackedTensor.concat(
+                [
+                    row.media[key]
+                    if row.valid and key in row.media
+                    else PackedTensor.empty_rows_like(prototype, 1)
+                    for row in rows
+                ]
+            )
+            fields[key] = encode_multimodal_for_wire(key, packed_media[key])
+        media_tags = multimodal_row_tags(packed_media, n)
+        if media_tags is not None:
+            for tag, media_tag in zip(tags, media_tags, strict=True):
+                tag.update(media_tag)
         if self._defer_routed_experts_to_policy:
             encoded_sizes = 0
             span_count = 0
