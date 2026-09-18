@@ -16,7 +16,9 @@ import pytest
 import torch
 from PIL import Image
 
+from nemo_rl.data.multimodal_utils import uses_image_placeholder
 from nemo_rl.environments.nemo_gym import _attach_multimodal_data_to_user_message
+from nemo_rl.environments.nemotron_utils import NEMOTRON_VIDEO_PROCESSOR_NAMES
 
 # --------------------------------------------------------------------------
 # ragged pixel_values path in _attach_multimodal_data_to_user_message
@@ -55,6 +57,13 @@ class NemotronNanoVLV2Processor:
         if self._imgs_sizes is not None:
             processed["imgs_sizes"] = self._imgs_sizes
         return processed
+
+
+def test_super_omni_processor_alias_is_registered_for_image_and_video():
+    processor = type("NemotronH_Super_Omni_Reasoning_V3Processor", (), {})()
+
+    assert uses_image_placeholder(processor)
+    assert type(processor).__name__ in NEMOTRON_VIDEO_PROCESSOR_NAMES
 
 
 def _ragged(*shapes: tuple[int, ...]) -> NemotronNanoVLV2Processor:

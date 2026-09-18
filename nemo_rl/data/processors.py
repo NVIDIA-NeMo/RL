@@ -776,6 +776,30 @@ def multichoice_qa_processor(
     return output
 
 
+def _gym_row_has_video_media(extra_env_info: dict[str, Any]) -> bool:
+    """Return whether a Gym row carries cached frames or native video media."""
+    params = extra_env_info.get("responses_create_params")
+    if not isinstance(params, dict):
+        return False
+    messages = params.get("input")
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("_is_video_frame"):
+                return True
+            if part.get("type") in ("input_video", "video", "video_url"):
+                return True
+    return False
+
+
 def nemo_gym_data_processor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec | None,
@@ -790,7 +814,11 @@ def nemo_gym_data_processor(
     the complete rollout has been collected.
     """
     extra_env_info = json.loads(datum_dict["extra_env_info"])
-    if task_data_spec is not None and task_data_spec.video_sampling_style is not None:
+    if (
+        task_data_spec is not None
+        and task_data_spec.video_sampling_style is not None
+        and _gym_row_has_video_media(extra_env_info)
+    ):
         if not (
             hasattr(tokenizer, "apply_chat_template")
             and hasattr(tokenizer, "tokenizer")
