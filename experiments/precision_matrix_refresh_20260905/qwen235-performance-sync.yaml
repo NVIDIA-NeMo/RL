@@ -3,3 +3,6 @@
 # precision arm. The pinned vLLM overlay handles the gated BF16 expert padding
 # needed by FlashInfer TRTLLM without changing the benchmark topology.
 defaults: ../../examples/configs/recipes/llm/performance/grpo-qwen3-235b-16n4g.yaml
+
+policy:
+  reuse_optimizer_cpu_buffers_for_refit: true
