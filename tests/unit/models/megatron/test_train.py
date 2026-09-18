@@ -945,8 +945,8 @@ class TestForwardWithPostProcessingFn:
 
         mock_pack_input_ids.assert_called_once_with(
             data_dict["input_ids"],
-            packed_seq_params.cu_seqlens_q,
-            packed_seq_params.cu_seqlens_q_padded,
+            (0, 3, 6),
+            (0, 3, 6),
             roll_shift=-1,
         )
         mock_capture.model.embedding.assert_called_once_with(
@@ -1584,8 +1584,9 @@ class TestTopkLogitsPostProcessor:
         "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
     )
     @patch("nemo_rl.models.megatron.train.distributed_vocab_topk")
+    @pytest.mark.parametrize("boundary_type", [torch.tensor, tuple])
     def test_topk_post_processor_with_packing(
-        self, mock_topk, mock_tp_rank, mock_tp_grp
+        self, mock_topk, mock_tp_rank, mock_tp_grp, boundary_type
     ):
         """Test TopkLogitsPostProcessor with sequence packing."""
         from nemo_rl.models.megatron.train import TopkLogitsPostProcessor
@@ -1613,7 +1614,7 @@ class TestTopkLogitsPostProcessor:
         mock_topk_idx = torch.randint(0, 100, (1, 8, k))
         mock_topk.return_value = (mock_topk_vals, mock_topk_idx)
 
-        cu_seqlens_padded = torch.tensor([0, 5])
+        cu_seqlens_padded = boundary_type([0, 8])
 
         wrapped_fn = processor(
             data_dict=mock_data_dict,
@@ -1622,12 +1623,20 @@ class TestTopkLogitsPostProcessor:
         )
 
         output_tensor = torch.randn(1, 8, 100)
-        loss, result = wrapped_fn(output_tensor)
+        with patch.object(
+            torch.Tensor, "item", side_effect=AssertionError("per-sequence item()")
+        ):
+            loss, result = wrapped_fn(output_tensor)
 
         assert "topk_logits" in result
         assert "topk_indices" in result
         # Output should be unpacked to batch shape
-        assert result["topk_logits"].shape[0] == 1
+        expected_vals = torch.zeros_like(mock_topk_vals)
+        expected_idx = torch.zeros_like(mock_topk_idx)
+        expected_vals[:, :5] = mock_topk_vals[:, :5]
+        expected_idx[:, :5] = mock_topk_idx[:, :5]
+        torch.testing.assert_close(result["topk_logits"], expected_vals)
+        torch.testing.assert_close(result["topk_indices"], expected_idx)
 
     @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
@@ -1748,8 +1757,15 @@ class TestTopkLogitsPostProcessor:
         "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
     )
     @patch("nemo_rl.models.megatron.train.distributed_vocab_topk")
+    @pytest.mark.parametrize("boundary_type", [torch.tensor, tuple])
     def test_topk_cp_with_packing_multiple_sequences(
-        self, mock_topk, mock_tp_rank, mock_tp_grp, mock_cp_grp, mock_allgather
+        self,
+        mock_topk,
+        mock_tp_rank,
+        mock_tp_grp,
+        mock_cp_grp,
+        mock_allgather,
+        boundary_type,
     ):
         """Test TopkLogitsPostProcessor with CP > 1, packing, and multiple sequences in batch."""
         from nemo_rl.models.megatron.train import TopkLogitsPostProcessor
@@ -1793,7 +1809,7 @@ class TestTopkLogitsPostProcessor:
 
         mock_allgather.side_effect = fake_allgather
 
-        cu_seqlens_padded = torch.tensor([0, seq1_len, total_packed_len])
+        cu_seqlens_padded = boundary_type([0, seq1_len, total_packed_len])
 
         wrapped_fn = processor(
             data_dict=mock_data_dict,
@@ -1802,7 +1818,10 @@ class TestTopkLogitsPostProcessor:
         )
 
         output_tensor = torch.randn(1, local_packed_len, 100)
-        loss, result = wrapped_fn(output_tensor)
+        with patch.object(
+            torch.Tensor, "item", side_effect=AssertionError("per-sequence item()")
+        ):
+            loss, result = wrapped_fn(output_tensor)
 
         # allgather called 2x per sequence (vals + idx) x 2 sequences = 4 calls
         assert mock_allgather.call_count == 4
@@ -1811,6 +1830,15 @@ class TestTopkLogitsPostProcessor:
         # Output should be unpacked: (batch_size=2, unpacked_seqlen=6, k=3)
         assert result["topk_logits"].shape == (2, unpacked_seqlen, k)
         assert result["topk_indices"].shape == (2, unpacked_seqlen, k)
+
+        for key, local in [
+            ("topk_logits", mock_topk_vals),
+            ("topk_indices", mock_topk_idx),
+        ]:
+            expected = local.new_zeros((2, unpacked_seqlen, k))
+            expected[0, :seq1_len] = local[0, : seq1_len // cp_size].repeat(cp_size, 1)
+            expected[1, :seq2_len] = local[0, seq1_len // cp_size :].repeat(cp_size, 1)
+            torch.testing.assert_close(result[key], expected)
 
 
 class TestAggregateTrainingStatistics:

@@ -105,6 +105,7 @@ from nemo_rl.utils.native_checkpoint import (
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.sequence_lengths import to_cpu_int_tuple
 from nemo_rl.utils.timer import Timer
 
 
@@ -918,11 +919,14 @@ class DTensorPolicyWorkerImpl(
                         )
                         # Wrap loss function for sequence packing if needed
                         if self.enable_seq_packing:
+                            cu_seqlens_q = to_cpu_int_tuple(
+                                flash_attn_kwargs.cu_seqlens_q
+                            )
                             loss_fn_ = SequencePackingLossWrapper(
                                 loss_fn=loss_fn,
                                 prepare_fn=prepare_loss_input_wrapped,
-                                cu_seqlens_q=flash_attn_kwargs.cu_seqlens_q,
-                                cu_seqlens_q_padded=flash_attn_kwargs.cu_seqlens_q,
+                                cu_seqlens_q=cu_seqlens_q,
+                                cu_seqlens_q_padded=cu_seqlens_q,
                             )
                             loss, loss_metrics = loss_fn_(
                                 logits,
@@ -1094,7 +1098,7 @@ class DTensorPolicyWorkerImpl(
             ):
                 step += 1
                 input_ids = lp_batch.get("input_ids").cuda()
-                input_lengths = lp_batch.get("input_lengths")
+                input_lengths = lp_batch["input_lengths"]
                 vlm_kwargs = lp_batch.get_multimodal_dict(
                     as_tensors=True, device=input_ids.device
                 )
@@ -1312,11 +1316,12 @@ class DTensorPolicyWorkerImpl(
                         dtype=token_logprobs.dtype,
                         device=token_logprobs.device,
                     )
-                    cu_seqlens = flash_attn_kwargs.cu_seqlens_q
+                    cu_seqlens = to_cpu_int_tuple(flash_attn_kwargs.cu_seqlens_q)
+                    input_lengths_cpu = to_cpu_int_tuple(input_lengths)
                     for i in range(batch_size):
-                        start = cu_seqlens[i].item() + 1
-                        end = cu_seqlens[i + 1].item()
-                        seq_len_actual = input_lengths[i].item()
+                        start = cu_seqlens[i] + 1
+                        end = cu_seqlens[i + 1]
+                        seq_len_actual = input_lengths_cpu[i]
                         unpacked_logprobs[i, 1:seq_len_actual] = token_logprobs[
                             0, start:end
                         ]
@@ -1535,7 +1540,7 @@ class DTensorPolicyWorkerImpl(
                 itertools.chain(mb_iterator, dummy_iterator)
             ):
                 input_ids = lp_batch.get("input_ids").cuda()
-                input_lengths = lp_batch.get("input_lengths")
+                input_lengths = lp_batch["input_lengths"]
                 vlm_kwargs = lp_batch.get_multimodal_dict(
                     as_tensors=True, device=input_ids.device
                 )
@@ -1717,12 +1722,13 @@ class DTensorPolicyWorkerImpl(
                     )
 
                     # Get cumulative sequence lengths for unpacking
-                    cu_seqlens = flash_attn_kwargs.cu_seqlens_q
+                    cu_seqlens = to_cpu_int_tuple(flash_attn_kwargs.cu_seqlens_q)
+                    input_lengths_cpu = to_cpu_int_tuple(input_lengths)
 
                     for i in range(original_batch_size):
-                        start = cu_seqlens[i].item()
-                        end = cu_seqlens[i + 1].item()
-                        seq_len_actual = input_lengths[i].item()
+                        start = cu_seqlens[i]
+                        end = cu_seqlens[i + 1]
+                        seq_len_actual = input_lengths_cpu[i]
 
                         # Extract the corresponding portion from packed results
                         # Note: vals and idx are [1, packed_seq_len, k] due to packing
