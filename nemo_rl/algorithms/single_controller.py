@@ -176,9 +176,12 @@ from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.telemetry.instrumentation import (
+    RL_IDLE_POLLS_ATTR,
     efficiency_span,
     managed_span,
     per_prompt_scope,
+    safe_set_span_attributes,
+    start_efficiency_span,
     umbrella_span,
 )
 from nemo_rl.telemetry.setup import (
@@ -2737,6 +2740,13 @@ class SingleControllerActor:
                     },
                 ),
             ):
+                # One span for a whole starvation episode, not one per retry. The
+                # loop below polls every 5ms, so a span per iteration turns a
+                # startup wait into thousands of identical spans. Hand-managed
+                # because the span has to outlive the iteration that opened it;
+                # `start_efficiency_span` says why it is not a `with`.
+                starvation_span: Optional[Any] = None
+                starvation_polls = 0
                 # Re-read on every iteration rather than once: a prompt stamped for this
                 # step can be dropped while the pump is already waiting for it, which is
                 # precisely the case that would otherwise wait forever.
@@ -2846,19 +2856,38 @@ class SingleControllerActor:
                                     f"groups with {buffered_groups} group(s) "
                                     f"remaining in the buffer"
                                 )
-                            # The wait only, not the selection above it. That
-                            # selection evicts stale groups, which clears their
-                            # rows through the data plane and so opens an
-                            # overhead-bucketed span; a bucketed parent over
-                            # bucketed children is counted twice by a rollup
-                            # that sums durations by bucket. Async GRPO reports
-                            # this phase under the same category name, and
-                            # wraps a bare sleep there too.
-                            with efficiency_span(
-                                "idle/buffer_starvation", tracer=self._tracer
-                            ):
-                                await asyncio.sleep(0.005)
+                            # Opened on the first starved poll and left open
+                            # across the retries, so one span covers the whole
+                            # wait. Safe to span the selection above it only
+                            # because a *starved* poll never reaches the data
+                            # plane: evict() returns 0 without calling remove()
+                            # when nothing is stale, and select() gives up in
+                            # _finalize_selection before claiming anything. A
+                            # bucketed span over bucketed children would
+                            # otherwise be counted twice by a rollup that sums
+                            # durations by bucket -- the reason async GRPO, whose
+                            # poll is 100x slower and so needs no coalescing,
+                            # still wraps its bare sleep under this same name.
+                            if starvation_span is None:
+                                starvation_span = start_efficiency_span(
+                                    "idle/buffer_starvation", tracer=self._tracer
+                                )
+                                starvation_polls = 0
+                            starvation_polls += 1
+                            await asyncio.sleep(0.005)
                             continue
+
+                        # A batch is selectable, so the wait is over. Closing it
+                        # here rather than after the loop keeps the span on the
+                        # stall itself; the loop can go around again for the next
+                        # chunk, which opens a fresh episode.
+                        if starvation_span is not None:
+                            safe_set_span_attributes(
+                                starvation_span,
+                                {RL_IDLE_POLLS_ATTR: starvation_polls},
+                            )
+                            starvation_span.end()
+                            starvation_span = None
 
                         consumed_metas.append(train_meta)
                         consumed_training_claim_ids.extend(selected_training_claim_ids)
@@ -3125,6 +3154,20 @@ class SingleControllerActor:
                         groups_dispatched,
                         self._algo_cfg.num_prompts_per_step,
                     )
+
+                # The loop can also leave a wait open by breaking on a target that
+                # fell to what is already dispatched, or by its condition going
+                # false while the pump was still polling. Both continue the run,
+                # so an unended span here would stay open over the training that
+                # follows -- and never be exported. The remaining exits (the
+                # `return` on a drained buffer, the invariant `raise`s, task
+                # cancellation) all end the run, where dropping the span costs
+                # nothing, so they are deliberately not covered.
+                if starvation_span is not None:
+                    safe_set_span_attributes(
+                        starvation_span, {RL_IDLE_POLLS_ATTR: starvation_polls}
+                    )
+                    starvation_span.end()
 
                 # ---- 5. Train the policy model -- finish_train_step ----
                 log.info(

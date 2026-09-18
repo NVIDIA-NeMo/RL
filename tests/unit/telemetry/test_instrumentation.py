@@ -24,6 +24,7 @@ from nemo_rl.telemetry.instrumentation import (
     EFFICIENCY_CATEGORY_BUCKET,
     RL_BUCKET_ATTR,
     RL_EFFICIENCY_CATEGORY_ATTR,
+    RL_IDLE_POLLS_ATTR,
     TRACE_CARRIER_KWARG,
     UMBRELLA_GROUPS,
     Bucket,
@@ -39,6 +40,7 @@ from nemo_rl.telemetry.instrumentation import (
     managed_span,
     per_prompt_scope,
     remote_trace_context,
+    start_efficiency_span,
     trace_context_kwargs,
     trace_fn,
 )
@@ -785,6 +787,69 @@ def test_efficiency_span_is_gated_by_span_group():
         pass
     handle.shutdown()
     assert exporter.get_finished_spans() == ()
+
+
+@requires_lens
+def test_start_efficiency_span_covers_a_whole_wait_in_one_span():
+    # The single-controller pump retries every 5ms, so a span per poll buries a
+    # startup stall. One span covers the episode and reports how many retries it
+    # took, without which the duration cannot be read.
+    from nemo_rl.telemetry.instrumentation import safe_set_span_attributes
+
+    handle, exporter = _setup("all")
+    wait = start_efficiency_span("idle/buffer_starvation", tracer=handle.tracer)
+    assert wait is not None
+    safe_set_span_attributes(wait, {RL_IDLE_POLLS_ATTR: 3})
+    wait.end()
+    handle.shutdown()
+
+    spans = exporter.get_finished_spans()
+    assert [s.name for s in spans] == ["rl.idle.buffer_starvation"]
+    assert spans[0].attributes[RL_BUCKET_ATTR] == "idle"
+    assert spans[0].attributes[RL_EFFICIENCY_CATEGORY_ATTR] == "idle/buffer_starvation"
+    assert spans[0].attributes[RL_IDLE_POLLS_ATTR] == 3
+
+
+@requires_lens
+def test_start_efficiency_span_is_gated_by_span_group():
+    # Same gate as efficiency_span, returning None rather than a span. That is
+    # also what makes the caller's `is not None` guards double as the
+    # telemetry-off no-op, so nothing needs a second check.
+    handle, _ = _setup("default")
+    assert start_efficiency_span("idle/buffer_starvation", tracer=handle.tracer) is None
+    handle.shutdown()
+
+
+@requires_lens
+def test_start_efficiency_span_adopts_no_children():
+    # Why this is not a context manager. Held open across a poll loop, a span
+    # that had been made *current* would collect whatever started during the
+    # wait -- and in an asyncio pump that reaches tasks created on unrelated
+    # code paths, since a task copies the context it was created in.
+    from nemo_rl.telemetry.instrumentation import umbrella_span
+
+    handle, exporter = _setup("all")
+    with umbrella_span(RLSpanGroup.U_STEP, "rl.sc.step", tracer=handle.tracer):
+        wait = start_efficiency_span("idle/buffer_starvation", tracer=handle.tracer)
+        assert wait is not None
+        with managed_span(
+            RLSpanGroup.DATA_PLANE, "rl.data_plane.put", tracer=handle.tracer
+        ):
+            pass
+        wait.end()
+    handle.shutdown()
+
+    spans = {s.name: s for s in exporter.get_finished_spans()}
+    step_id = spans["rl.sc.step"].context.span_id
+    idle = spans["rl.idle.buffer_starvation"]
+    during = spans["rl.data_plane.put"]
+    # The wait itself still nests under the step it happened in ...
+    assert idle.parent is not None
+    assert idle.parent.span_id == step_id
+    # ... but work during the wait nests under that step too, not under the wait,
+    # so a rollup summing by bucket cannot count the same interval twice.
+    assert during.parent is not None
+    assert during.parent.span_id == step_id
 
 
 def test_efficiency_group_is_in_per_step_preset():
