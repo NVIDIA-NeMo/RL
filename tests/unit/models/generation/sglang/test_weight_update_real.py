@@ -84,6 +84,7 @@ def _make_sglang_cfg(tp_size, pad_token_id=PAD_TOKEN_ID):
         "stop_strings": None,
         "_pad_token_id": pad_token_id,
         "sglang_cfg": {
+            "use_fault_tolerance": False,
             "model_path": MODEL_PATH,
             "dtype": "bfloat16",
             "random_seed": 42,
@@ -97,6 +98,7 @@ def _make_sglang_cfg(tp_size, pad_token_id=PAD_TOKEN_ID):
             "cuda_graph_backend_prefill": "disabled",
             "disable_cuda_graph": True,
             "mem_fraction_static": 0.3,
+            "quantization": {"scheme": "bf16"},
             "sglang_server_config": {
                 "num_gpus": 2,
                 "num_gpus_per_engine": tp_size,

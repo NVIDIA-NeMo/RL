@@ -14,7 +14,7 @@
 
 """Unit tests for the WeightSynchronizer abstraction and its implementations."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -248,16 +248,28 @@ class TestIPCWeightSynchronizer:
 _SGLANG_RAY = "nemo_rl.weight_sync.sglang_weight_synchronizer.ray"
 
 
-def _mock_sglang_generation(num_new_engines=0, pause_mode="retract", quantization=None):
+def _mock_sglang_generation(
+    num_new_engines: int = 0,
+    pause_mode: str = "retract",
+    quantization: dict[str, str] | None = None,
+    *,
+    use_fault_tolerance: bool = False,
+) -> MagicMock:
     gen = _mock_generation()
     if quantization is None:
         quantization = {"scheme": "bf16"}
-    gen.sglang_cfg = {"sglang_cfg": {"quantization": quantization}}
+    gen.sglang_cfg = {
+        "sglang_cfg": {
+            "quantization": quantization,
+            "sglang_fault_tolerance_config": {
+                "use_fault_tolerance": use_fault_tolerance,
+            },
+        }
+    }
     gen.pause_generation_mode = pause_mode
     gen.invalidate_kv_cache.return_value = True
-    gen.get_updatable_engines_and_lock.return_value = (
+    gen.get_updatable_engines.return_value = (
         [MagicMock(), MagicMock()],
-        MagicMock(),
         num_new_engines,
         [2, 2],
         [0, 2],
@@ -267,6 +279,101 @@ def _mock_sglang_generation(num_new_engines=0, pause_mode="retract", quantizatio
 
 def _megatron_policy():
     return _mock_policy(cfg={"megatron_cfg": {"enabled": True}})
+
+
+@pytest.mark.parametrize(
+    "synchronizer_cls",
+    [SGLangColocatedWeightSynchronizer, SGLangDisaggregatedWeightSynchronizer],
+)
+@patch(_SGLANG_RAY)
+def test_sglang_refit_recovers_before_reading_engine_state(
+    mock_ray: MagicMock,
+    synchronizer_cls: type[
+        SGLangColocatedWeightSynchronizer | SGLangDisaggregatedWeightSynchronizer
+    ],
+) -> None:
+    policy = _megatron_policy()
+    gen = _mock_sglang_generation(use_fault_tolerance=True)
+    lifecycle = MagicMock()
+    lifecycle.attach_mock(policy, "policy")
+    lifecycle.attach_mock(gen, "generation")
+    recovered_engines = [MagicMock(), MagicMock()]
+
+    def recover_engines() -> None:
+        gen.get_updatable_engines.return_value = (
+            recovered_engines,
+            2,
+            [1, 3],
+            [0, 1],
+        )
+
+    gen.recover_updatable_engines.side_effect = recover_engines
+    synchronizer_cls(policy, gen).sync_weights()
+
+    policy.sync_params_before_refit.assert_not_called()
+    gen.recover_updatable_engines.assert_called_once_with()
+    gen.assert_has_calls(
+        [
+            call.recover_updatable_engines(),
+            call.prepare_for_generation(tags=["weights"]),
+            call.get_updatable_engines(),
+        ]
+    )
+    gen.clear_updatable_num_new_engines.assert_called_once_with()
+    if synchronizer_cls is SGLangColocatedWeightSynchronizer:
+        lifecycle.assert_has_calls(
+            [
+                call.policy.offload_before_refit(),
+                call.generation.recover_updatable_engines(),
+                call.generation.prepare_for_generation(tags=["weights"]),
+            ]
+        )
+        policy.connect_sglang_rollout_engines.assert_called_once_with(
+            engine_gpu_counts=[1, 3], engine_gpu_offsets=[0, 1]
+        )
+        transfer = policy.update_weights_to_sglang_colocated
+    else:
+        policy.connect_sglang_rollout_engines_distributed.assert_called_once_with(
+            rollout_engines=recovered_engines, engine_gpu_counts=[1, 3]
+        )
+        transfer = policy.update_weights_to_sglang_distributed
+    assert transfer.call_args.kwargs["rollout_engines"] == recovered_engines
+
+
+@pytest.mark.parametrize(
+    "synchronizer_cls",
+    [SGLangColocatedWeightSynchronizer, SGLangDisaggregatedWeightSynchronizer],
+)
+@patch(_SGLANG_RAY)
+def test_sglang_recovery_failure_stops_refit_before_engine_rpcs(
+    mock_ray: MagicMock,
+    synchronizer_cls: type[
+        SGLangColocatedWeightSynchronizer | SGLangDisaggregatedWeightSynchronizer
+    ],
+) -> None:
+    policy = _megatron_policy()
+    gen = _mock_sglang_generation(use_fault_tolerance=True)
+    gen.recover_updatable_engines.side_effect = RuntimeError("recovery failed")
+    sync = synchronizer_cls(policy, gen)
+
+    with pytest.raises(RuntimeError, match="recovery failed"):
+        sync.sync_weights()
+
+    gen.recover_updatable_engines.assert_called_once_with()
+    gen.get_updatable_engines.assert_not_called()
+    gen.prepare_for_generation.assert_not_called()
+    gen.pause_generation.assert_not_called()
+    gen.begin_weight_update.assert_not_called()
+    gen.continue_generation.assert_not_called()
+    policy.update_weights_to_sglang_colocated.assert_not_called()
+    policy.update_weights_to_sglang_distributed.assert_not_called()
+    if synchronizer_cls is SGLangColocatedWeightSynchronizer:
+        policy.offload_before_refit.assert_called_once_with()
+        policy.offload_after_refit.assert_called_once_with()
+    else:
+        policy.offload_before_refit.assert_not_called()
+        policy.offload_after_refit.assert_not_called()
+    assert sync.is_stale
 
 
 @patch(_SGLANG_RAY)
@@ -279,6 +386,7 @@ class TestSGLangColocatedWeightSynchronizer:
         assert sync.is_stale
         sync.sync_weights()
         assert not sync.is_stale
+        gen.recover_updatable_engines.assert_not_called()
 
         policy.sync_params_before_refit.assert_not_called()
         policy.offload_before_refit.assert_called_once()
@@ -306,6 +414,15 @@ class TestSGLangColocatedWeightSynchronizer:
         sync.sync_weights()
         call_kwargs = policy.update_weights_to_sglang_colocated.call_args.kwargs
         assert call_kwargs["buffer_size_bytes"] == 2 * (1024**3)
+
+    def test_target_precision_comes_from_quantization_cfg(self, mock_ray):
+        policy = _megatron_policy()
+        gen = _mock_sglang_generation(quantization={"scheme": "mxfp8"})
+        SGLangColocatedWeightSynchronizer(policy, gen).sync_weights()
+
+        call_kwargs = policy.update_weights_to_sglang_colocated.call_args.kwargs
+        assert call_kwargs["target_precision"] == "mxfp8"
+        assert call_kwargs["sglang_quantization_cfg"] == {"scheme": "mxfp8"}
 
     @pytest.mark.parametrize("quantization", [None, {}])
     def test_quantization_config_is_required(self, mock_ray, quantization):
@@ -464,6 +581,7 @@ class TestSGLangDisaggregatedWeightSynchronizer:
         assert sync.is_stale
         sync.sync_weights()
         assert not sync.is_stale
+        gen.recover_updatable_engines.assert_not_called()
 
         # The trainer keeps its own GPUs; nothing to offload.
         policy.offload_before_refit.assert_not_called()

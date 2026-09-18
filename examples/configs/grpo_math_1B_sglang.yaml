@@ -8,8 +8,6 @@ policy:
     backend: "sglang"
     use_async_rollouts: false
     sglang_cfg:
-      quantization:
-        scheme: bf16
       model_path: ${policy.model_name}
       dtype: ${policy.precision}
       context_length: 512
@@ -27,6 +25,15 @@ policy:
       # memory saver that needs_offload: true enables below.
       cuda_graph_backend_prefill: disabled
       disable_cuda_graph: false
+      # Weight precision for rollout/refit. scheme=bf16 (default) sends BF16
+      # HF tensors; scheme=mxfp8/nvfp4 boots SGLang from a matching quantized
+      # HF checkpoint and quantizes refit tensors online.
+      quantization:
+        scheme: bf16
+        extra_high_precision_layers_hf: []
+        num_layers_at_start_in_bf16: 0
+        num_layers_at_end_in_bf16: 0
+        modules_to_not_convert: []
       sglang_server_config:
         needs_offload: true
         cpu_weight_backup: true
@@ -37,6 +44,24 @@ policy:
         num_gpus_per_engine: ${policy.generation.sglang_cfg.tp_size}
       sglang_router_config:
         use_external_router: false
+        # Managed-router total attempts per request and worker circuit threshold.
+        # These retain the sglang-router 0.3.2 defaults; external routers own theirs.
+        retry_max_retries: 5
+        cb_failure_threshold: 10
+      sglang_http_client_config:
+        # Total client POST attempts, including the first; also applies with an
+        # external router. Distributed dispatch and local fallback each use it.
+        max_retries: 3
+      # Fault tolerance: probe serving health during generation and check engine
+      # liveness before refit, restarting hung/dead engines at that refit.
+      sglang_fault_tolerance_config:
+        use_fault_tolerance: false
+        rollout_health_check_interval: 60
+        rollout_health_check_timeout: 60
+        rollout_health_check_first_wait: 60
+        # Nonnegative restart limit per logical engine over the run's lifetime.
+        # Abort when exhausted; 0 disables restarts.
+        rollout_max_restart_attempts: 3
     colocated:
       enabled: true
 

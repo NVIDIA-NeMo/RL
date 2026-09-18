@@ -12,32 +12,61 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, TypedDict
+from collections.abc import Mapping
+from typing import Any, Literal, NotRequired, Required, TypedDict, cast
+
+from pydantic import (
+    BaseModel,
+    Field,
+    NonNegativeFloat,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+)
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
-
-class SglangQuantizationConfig(TypedDict):
-    """SGLang weight precision. Only BF16 on this layer."""
-
-    scheme: Literal["bf16"]
+SglangQuantizationScheme = Literal["bf16", "mxfp8", "nvfp4"]
+SUPPORTED_SGLANG_QUANTIZATION_SCHEMES = frozenset({"bf16", "mxfp8", "nvfp4"})
 
 
-SUPPORTED_SGLANG_QUANTIZATION_SCHEMES = frozenset({"bf16"})
+def get_sglang_quantization_scheme(
+    quantization_config: Mapping[str, Any],
+) -> SglangQuantizationScheme:
+    """Return and validate the configured SGLang weight precision.
 
-
-def get_sglang_quantization_scheme(quantization_config: dict[str, Any]) -> str:
-    """Return the configured SGLang weight precision.
-
-    The block must declare a supported ``scheme`` so omissions and typos fail.
+    The block must declare ``scheme`` so omissions and misspellings fail.
     """
     scheme = quantization_config["scheme"]
     if scheme not in SUPPORTED_SGLANG_QUANTIZATION_SCHEMES:
         supported = ", ".join(sorted(SUPPORTED_SGLANG_QUANTIZATION_SCHEMES))
         raise ValueError(
-            f"SGLang quantization.scheme must be one of {{{supported}}}, got {scheme!r}."
+            "SGLang quantization.scheme must be one of "
+            f"{{{supported}}}, got {scheme!r}."
         )
-    return scheme
+    return cast(SglangQuantizationScheme, scheme)
+
+
+class SglangQuantizationConfig(TypedDict, total=False):
+    """SGLang weight-precision config.
+
+    ``scheme="bf16"`` means BF16 rollout/refit. Set
+    ``scheme="mxfp8"`` or ``scheme="nvfp4"`` to boot SGLang from the
+    corresponding quantized HF checkpoint and quantize HF tensors during
+    online refit. High-precision exclusions are shared by conversion and
+    online refit.
+    """
+
+    scheme: Required[SglangQuantizationScheme]
+    # HF module-name substrings that the checkpoint loader and refit both skip.
+    modules_to_not_convert: list[str]
+    # Additional HF weight-name substrings to keep in high precision.
+    extra_high_precision_layers_hf: list[str]
+    # Number of decoder layers at each edge to keep in high precision.
+    num_layers_at_start_in_bf16: int
+    num_layers_at_end_in_bf16: int
+    converted_model_path: str
+    cache_root: str
 
 
 class SGLangServerConfig(TypedDict):
@@ -81,6 +110,75 @@ class SGLangRouterConfig(TypedDict):
     use_distributed_post: NotRequired[bool]
     # Per-request timeout (seconds) the router applies before giving up on a backend.
     sglang_router_request_timeout_secs: NotRequired[int]
+    # Managed-router total attempts per request (including the first); positive.
+    # Omitted values retain the pinned router's default of 5.
+    retry_max_retries: NotRequired[int]
+    # Consecutive worker failures before its circuit opens; positive.
+    # Omitted values retain the pinned router's default of 10.
+    cb_failure_threshold: NotRequired[int]
+
+
+class SGLangHttpClientConfig(BaseModel, extra="allow"):
+    """NeMo-RL HTTP settings, including when the router is externally managed.
+
+    ``max_retries`` counts total POST attempts, including the first attempt.
+    Distributed dispatch and its local fallback each use this same budget.
+    """
+
+    max_retries: PositiveInt = Field(default=3, strict=True)
+
+
+class SGLangFaultToleranceConfig(BaseModel, extra="allow"):
+    """Serving-health and refit-time recovery settings for SGLang engines.
+
+    Durations are seconds. The first-wait grace may be zero; probe intervals
+    and timeouts must be positive. The restart budget applies per logical
+    engine over the generation object's lifetime; zero disables restarts.
+    """
+
+    use_fault_tolerance: bool = Field(default=False, strict=True)
+    rollout_health_check_interval: PositiveFloat = Field(
+        default=60.0, strict=True, allow_inf_nan=False
+    )
+    rollout_health_check_timeout: PositiveFloat = Field(
+        default=60.0, strict=True, allow_inf_nan=False
+    )
+    rollout_health_check_first_wait: NonNegativeFloat = Field(
+        default=60.0, strict=True, allow_inf_nan=False
+    )
+    rollout_max_restart_attempts: NonNegativeInt = Field(default=3, strict=True)
+
+
+def get_sglang_fault_tolerance_config(
+    sglang_cfg: "SglangSpecificArgs",
+) -> SGLangFaultToleranceConfig:
+    """Validate nested FT settings or the legacy flat spelling, without mutation.
+
+    Mixing spellings is rejected instead of silently overriding an inherited
+    value. New configurations should use ``sglang_fault_tolerance_config``.
+    """
+    legacy_values = {
+        key: sglang_cfg[key]
+        for key in (
+            "use_fault_tolerance",
+            "rollout_health_check_interval",
+            "rollout_health_check_timeout",
+            "rollout_health_check_first_wait",
+            "rollout_max_restart_attempts",
+        )
+        if key in sglang_cfg
+    }
+    if "sglang_fault_tolerance_config" in sglang_cfg:
+        if legacy_values:
+            raise ValueError(
+                "Do not mix sglang_fault_tolerance_config with legacy flat "
+                f"fault-tolerance fields: {', '.join(sorted(legacy_values))}. "
+                "Move overrides into sglang_fault_tolerance_config."
+            )
+        return SGLangFaultToleranceConfig.model_validate(
+            sglang_cfg["sglang_fault_tolerance_config"]
+        )
+    return SGLangFaultToleranceConfig.model_validate(legacy_values)
 
 
 class SglangSpecificArgs(TypedDict):
@@ -94,9 +192,19 @@ class SglangSpecificArgs(TypedDict):
     # sites have a single sglang namespace instead of three sibling fields.
     sglang_server_config: SGLangServerConfig
     sglang_router_config: SGLangRouterConfig
+    sglang_http_client_config: NotRequired[SGLangHttpClientConfig]
+    sglang_fault_tolerance_config: NotRequired[SGLangFaultToleranceConfig]
 
-    # Weight precision for rollout/refit.
+    # Weight precision and quantized-checkpoint conversion/refit knobs.
     quantization: SglangQuantizationConfig
+
+    # Legacy flat spellings, accepted only without sglang_fault_tolerance_config.
+    # Defaults and validation live on SGLangFaultToleranceConfig for both forms.
+    use_fault_tolerance: NotRequired[bool]
+    rollout_health_check_interval: NotRequired[float]
+    rollout_health_check_timeout: NotRequired[float]
+    rollout_health_check_first_wait: NotRequired[float]
+    rollout_max_restart_attempts: NotRequired[int]
 
     # Path to model weights (local folder or HF repo id).
     model_path: NotRequired[str]
@@ -164,6 +272,10 @@ class SglangSpecificArgs(TypedDict):
     enable_multimodal: NotRequired[bool]
     # Sampling kernel backend (e.g. "flashinfer", "pytorch"); None = auto.
     sampling_backend: NotRequired[str | None]
+    # MoE runner implementation; "auto" lets SGLang select for the model/device.
+    moe_runner_backend: NotRequired[str]
+    # NVFP4 GEMM runner implementation; "auto" lets SGLang select for the device.
+    fp4_gemm_runner_backend: NotRequired[str]
     # Maximum context length; None = take from model config.json.
     context_length: NotRequired[int | None]
     # Fraction of GPU memory used for static allocation (weights + KV pool). Lower if OOM.
