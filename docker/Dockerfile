@@ -262,6 +262,18 @@ UV_LINK_MODE=hardlink uv sync --frozen --extra automodel --no-install-project
 UV_LINK_MODE=hardlink uv sync --frozen --extra modelopt --no-install-project
 UV_LINK_MODE=hardlink uv sync --frozen --all-groups --no-install-project
 
+# Warm the PEP 517 build backend for nemo-rl into the uv cache. Every
+# sync above deliberately uses --no-install-project, so nemo-rl itself is
+# never built at image time and its build-backend requirements
+# (setuptools>=78.1.1, wheel>=0.46.2; see pyproject.toml [build-system]) are
+# not fetched. Without this, an offline `uv run` that falls back to building
+# nemo-rl (e.g. changed source tree or a forwarded fork with a different lock)
+# fails with "setuptools was not found in the cache" because the network is
+# disabled. Warm JUST the backend without installing the project (keeps the
+# editable-work in the release stage cheap).
+uv cache clean setuptools wheel 2>/dev/null || true
+UV_LINK_MODE=hardlink uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" "setuptools==78.1.1" "wheel>=0.46.2"
+
 # Worker-venv prefetch, phase 1: third-party packages only.
 #
 # Each Ray actor runs in its own venv under NEMO_RL_VENV_DIR. Build them HERE, in the same
