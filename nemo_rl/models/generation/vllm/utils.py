@@ -221,9 +221,10 @@ def format_prompt_for_vllm_generation(
             if not multi_modal_data:
                 prompts.append(_get_regular_prompt(i))
                 continue
-            # Raw processor content is valid only for the initial turn. Later
-            # turns use the updated pre-tokenized conversation plus the same
-            # modality data, preventing vLLM from regenerating the stale prompt.
+            # Later native turns clear the initial content to avoid replaying
+            # a stale prompt, sending updated token IDs with the same media.
+            # vLLM may re-expand image placeholders on that path; the worker's
+            # prompt validation rejects any resulting token-ID mismatch.
             prompt_dict = {"prompt": msg} if msg is not None else _get_regular_prompt(i)
             prompt_dict["multi_modal_data"] = multi_modal_data
             prompts.append(prompt_dict)
