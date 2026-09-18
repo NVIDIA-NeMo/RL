@@ -291,6 +291,9 @@ class AsyncTrajectoryCollector:
             self._debug_payload_metrics = algorithm_config.debug_payload_metrics
             self._max_generation_failures = async_config.max_generation_failures
             self._nemo_gym_stream_retries = async_config.nemo_gym_stream_retries
+            self._nemo_gym_fail_on_retry_exhaustion = (
+                async_config.nemo_gym_fail_on_retry_exhaustion
+            )
         elif isinstance(master_config, PPOMasterConfig):
             algorithm_config = master_config.ppo
             async_config = algorithm_config.async_ppo
@@ -298,6 +301,7 @@ class AsyncTrajectoryCollector:
             self._debug_payload_metrics = False
             self._max_generation_failures = 0
             self._nemo_gym_stream_retries = 1
+            self._nemo_gym_fail_on_retry_exhaustion = False
         else:
             raise TypeError(
                 "master_config must be a GRPO or PPO MasterConfig, got "
@@ -682,16 +686,17 @@ class AsyncTrajectoryCollector:
             traceback.print_exc()
             self._mark_collection_failed(e)
         finally:
-            self.running = False
-            if dataloader_exhausted:
-                self.data_exhausted = True
-                print(
-                    "❌ Trajectory collection stopped: dataloader exhausted "
-                    "(max_num_epochs reached). No more data available for generation. "
-                    "Increase max_num_epochs or use a larger dataset."
-                )
-            else:
-                print("🛑 Trajectory collection stopped")
+            try:
+                if dataloader_exhausted:
+                    self.data_exhausted = True
+                    print("Dataloader exhausted; draining in-flight rollouts")
+                    # EOF ends admission, not collection. Workers still need
+                    # running=True to enqueue the final batch's prompt groups.
+                    self.wait_for_pending_generations()
+                else:
+                    print("🛑 Trajectory collection stopped")
+            finally:
+                self.running = False
 
     def _stamp_task_indices(self, batch: BatchedDataDict[DatumSpec]) -> bool:
         """Assign one stable, monotonic task index to every prompt in a batch.
@@ -1895,7 +1900,12 @@ class AsyncTrajectoryCollector:
             )
             await asyncio.sleep(retry_delay)
 
-        if use_nemo_gym and buffered_group_indices and last_enqueue_error is None:
+        if (
+            use_nemo_gym
+            and buffered_group_indices
+            and last_enqueue_error is None
+            and not self._nemo_gym_fail_on_retry_exhaustion
+        ):
             pending_group_indices = expected_group_indices - buffered_group_indices
             _emit_nemo_gym_collector_failure(
                 "collector_retries_exhausted",

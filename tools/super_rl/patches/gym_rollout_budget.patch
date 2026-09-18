@@ -1,0 +1,146 @@
+diff --git a/responses_api_agents/scicode_agent/app.py b/responses_api_agents/scicode_agent/app.py
+index a6a65c6..f9e3770 100644
+--- a/responses_api_agents/scicode_agent/app.py
++++ b/responses_api_agents/scicode_agent/app.py
+@@ -32,7 +32,7 @@ import statistics
+ from typing import Any, Dict, List
+ 
+ from fastapi import Request, Response
+-from pydantic import ConfigDict
++from pydantic import ConfigDict, Field
+ from step_utils import (
+     OUT_OF_CONTEXT,
+     PREFILLED_STEPS_CODE,
+@@ -56,6 +56,7 @@ from nemo_gym.openai_utils import (
+ )
+ from nemo_gym.prompt import PromptConfig, load_prompt_config
+ from nemo_gym.server_utils import raise_for_status
++from nemo_gym.rollout_budget import OutputTokenBudget
+ 
+ 
+ LOG = logging.getLogger(__name__)
+@@ -70,6 +71,8 @@ class ScicodeAgentConfig(BaseResponsesAPIAgentConfig):
+     prompt_fpath: str
+     # Inject each sub-step's scientific background into the prompt context.
+     with_background: bool = True
++    # One assistant-token budget for the entire problem, not one per sub-step.
++    max_total_output_tokens: int | None = Field(default=None, gt=0, strict=True)
+ 
+ 
+ class ScicodeAgentRunRequest(BaseRunRequest):
+@@ -172,6 +175,7 @@ class ScicodeAgent(SimpleResponsesAPIAgent):
+         previous_llm_code = [None] * total
+         solutions: Dict[str, str] = {}
+         out_of_context = False
++        budget = OutputTokenBudget(self.config.max_total_output_tokens)
+         last_response_json = None
+         response_create_params = body.responses_create_params.model_dump(exclude_unset=True, exclude_none=True)
+         response_create_params.pop("input", None)
+@@ -181,7 +185,7 @@ class ScicodeAgent(SimpleResponsesAPIAgent):
+             if (body.problem_id, cur_step) in PREFILLED_STEPS_CODE:
+                 previous_llm_code[cur_step] = PREFILLED_STEPS_CODE[(body.problem_id, cur_step)]
+                 continue
+-            if out_of_context:
++            if out_of_context or budget.exhausted:
+                 solutions[f"{body.problem_id}.{cur_step + 1}"] = OUT_OF_CONTEXT
+                 continue
+ 
+@@ -194,12 +198,14 @@ class ScicodeAgent(SimpleResponsesAPIAgent):
+                 problem_steps_str=problem_steps_str, next_step_str=next_step_str, dependencies=dependencies
+             )
+ 
++            step_params = dict(response_create_params)
++            step_params["max_output_tokens"] = budget.limit(step_params.get("max_output_tokens"))
+             try:
+                 gen_response = await self.server_client.post(
+                     server_name=self.config.name,
+                     url_path="/v1/responses",
+                     json={
+-                        **response_create_params,
++                        **step_params,
+                         "input": [{"role": "user", "content": user_content}],
+                     },
+                     cookies=cookies,
+@@ -215,7 +221,9 @@ class ScicodeAgent(SimpleResponsesAPIAgent):
+ 
+             cookies = gen_response.cookies
+             last_response_json = await gen_response.json()
+-            generation = NeMoGymResponse.model_validate(last_response_json).output_text
++            parsed_response = NeMoGymResponse.model_validate(last_response_json)
++            budget.consume(parsed_response.usage.output_tokens if parsed_response.usage else None)
++            generation = parsed_response.output_text
+             extracted = extract_python_script(generation)
+             previous_llm_code[cur_step] = extracted
+             solutions[f"{body.problem_id}.{cur_step + 1}"] = f"{previous_code}\n{extracted}"
+@@ -231,7 +239,15 @@ class ScicodeAgent(SimpleResponsesAPIAgent):
+             cookies=cookies,
+         )
+         await raise_for_status(verify_response)
+-        return await verify_response.json()
++        result = await verify_response.json()
++        if budget.total is not None:
++            result.update(
++                profile_output_tokens_total=budget.used,
++                profile_output_token_budget=budget.total,
++                profile_output_budget_exhausted=budget.exhausted,
++                profile_model_calls=budget.calls,
++            )
++        return result
+ 
+     def compute_metrics(self, tasks: List[List[Dict[str, Any]]]) -> Dict[str, Any]:
+         """Headline SciCode metric: sub-step-weighted accuracy = total passed / total over all rollouts."""
+diff --git a/responses_api_agents/simple_agent/app.py b/responses_api_agents/simple_agent/app.py
+index 26a3c5c..8498c89 100644
+--- a/responses_api_agents/simple_agent/app.py
++++ b/responses_api_agents/simple_agent/app.py
+@@ -18,7 +18,7 @@ from time import perf_counter, time
+ from typing import Any, List
+ 
+ from fastapi import Request, Response
+-from pydantic import ConfigDict, ValidationError
++from pydantic import ConfigDict, Field, ValidationError
+ 
+ from nemo_gym.base_resources_server import (
+     AggregateMetrics,
+@@ -51,6 +51,7 @@ from nemo_gym.rollout_observability import (
+     TrajectoryTurn,
+ )
+ from nemo_gym.server_utils import get_response_json, raise_for_status
++from nemo_gym.rollout_budget import OutputTokenBudget
+ 
+ 
+ _INTERNAL_TRAJECTORY_KEY = "_ng_trajectory"
+@@ -60,6 +61,8 @@ class SimpleAgentConfig(BaseResponsesAPIAgentConfig):
+     resources_server: ResourcesServerRef
+     model_server: ModelServerRef
+     max_steps: int = None
++    # Cumulative assistant tokens across all model calls; None preserves legacy behavior.
++    max_total_output_tokens: int | None = Field(default=None, gt=0, strict=True)
+ 
+ 
+ class SimpleAgentRunRequest(BaseRunRequest):
+@@ -102,10 +105,15 @@ class SimpleAgent(SimpleResponsesAPIAgent):
+         step = 0
+         invocation_status = "completed"
+         model_server_cookies = None
++        budget = OutputTokenBudget(self.config.max_total_output_tokens)
+ 
+         while True:
++            if budget.exhausted:
++                invocation_status = "incomplete"
++                break
+             step += 1
+             new_body = body.model_copy(update={"input": body.input + new_outputs})
++            new_body.max_output_tokens = budget.limit(new_body.max_output_tokens)
+             if collect_trajectory:
+                 turn_timestamp = time()
+ 
+@@ -157,7 +165,8 @@ class SimpleAgent(SimpleResponsesAPIAgent):
+                     )
+                 )
+ 
++            budget.consume(model_response.usage.output_tokens if model_response.usage else None)
+             usage = accumulate_response_usage(usage, model_response.usage)
+             model_response.usage = None
+ 
+             if model_response.incomplete_details:

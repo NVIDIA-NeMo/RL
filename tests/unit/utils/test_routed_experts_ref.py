@@ -22,9 +22,11 @@ from nemo_rl.utils.routed_experts_ref import (
     ROUTED_EXPERTS_REF_SCHEMA,
     RoutedExpertsStoreState,
     _assemble_routed_experts_range_results,
+    _assemble_routed_experts_range_rows,
     _normalize_routed_experts_batch,
     _plan_routed_experts_range_reads,
     materialize_routed_experts_refs,
+    materialize_routed_experts_ref_rows,
     routed_experts_ref_lookup_key,
     slice_routed_experts_ref,
 )
@@ -85,6 +87,72 @@ def test_materialize_refs_resolves_one_full_object_for_multiple_message_slices()
     assert torch.equal(
         materialized[0, 5:], torch.full((3, 2, 2), -1, dtype=torch.int16)
     )
+
+
+def test_compact_rows_preserve_multiple_turns_without_rectangular_padding():
+    first = np.arange(5 * 2 * 2, dtype=np.int16).reshape(5, 2, 2)
+    second = first + 100
+    refs = [
+        [
+            slice_routed_experts_ref(_ref(), offset=1, length=2),
+            slice_routed_experts_ref(
+                _ref() | {"request_id": "second"}, offset=4, length=1
+            ),
+        ],
+        [slice_routed_experts_ref(_ref(), offset=0, length=1)],
+    ]
+    calls = []
+
+    def resolve(ref):
+        calls.append(ref["request_id"])
+        return second if ref["request_id"] == "second" else first
+
+    rows = materialize_routed_experts_ref_rows(
+        refs, input_lengths=[3, 1], resolver=resolve
+    )
+    assert [tuple(row.shape) for row in rows] == [(3, 2, 2), (1, 2, 2)]
+    assert torch.equal(
+        rows[0], torch.from_numpy(np.concatenate([first[1:3], second[4:5]]))
+    )
+    assert torch.equal(rows[1], torch.from_numpy(first[:1]))
+    assert calls == ["request-a", "second"]
+
+
+def test_compact_range_scatter_matches_dense_valid_rows():
+    source = np.arange(5 * 2 * 2, dtype=np.int16).reshape(5, 2, 2)
+    refs = [
+        [slice_routed_experts_ref(_ref(), offset=1, length=2)],
+        [slice_routed_experts_ref(_ref(), offset=4, length=1)],
+    ]
+    batch = _normalize_routed_experts_batch(
+        refs, batch_size=2, padded_length=5, input_lengths=[2, 1]
+    )
+    groups, _ = _plan_routed_experts_range_reads(batch)
+    values = np.concatenate([source[1:3], source[4:5]])
+    result = {
+        "values": values,
+        "shape": list(values.shape),
+        "dtype": "int16",
+        "nbytes": values.nbytes,
+    }
+    rows = _assemble_routed_experts_range_rows(batch, groups, [result])
+    dense = _assemble_routed_experts_range_results(batch, groups, [result])
+    for index, length in enumerate([2, 1]):
+        np.testing.assert_array_equal(rows[index], dense[index, :length])
+    with pytest.raises(RuntimeError, match="invalid routed-experts"):
+        _assemble_routed_experts_range_rows(
+            batch, groups, [result | {"dtype": "int32"}]
+        )
+
+
+@pytest.mark.parametrize("dtype", [np.int32, np.float32])
+def test_compact_rows_reject_wrong_source_dtype(dtype):
+    with pytest.raises(RuntimeError, match="does not match its tag"):
+        materialize_routed_experts_ref_rows(
+            [[_ref()]],
+            input_lengths=[5],
+            resolver=lambda ref: np.zeros((5, 2, 2), dtype=dtype),
+        )
 
 
 def test_materialize_single_full_object_preserves_batch_shape_without_copy():

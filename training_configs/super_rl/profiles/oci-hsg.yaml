@@ -1,0 +1,8 @@
+name: oci-hsg
+architecture: aarch64
+gpu_model: GB200
+gpus_per_node: 4
+container_workdir: /opt/nemo-rl
+training_image_hint: nemo-rl:super35_20260902_prefetched_venvs_arm64.squashfs
+filesystem_roots_to_check: [/lustre]
+certified: false

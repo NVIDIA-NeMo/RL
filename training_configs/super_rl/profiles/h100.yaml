@@ -1,0 +1,10 @@
+# Hardware adapter only: H100 does not identify a Slurm site/account/partition.
+# CW-DFW and NB-HEL historical runs used a different source family.
+name: h100
+architecture: x86_64
+gpu_model: H100
+gpus_per_node: 8
+container_workdir: /opt/nemo-rl
+training_image_hint: null
+filesystem_roots_to_check: [/lustre, /scratch]
+certified: false

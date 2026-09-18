@@ -1,0 +1,21 @@
+diff --git a/resources_servers/ns_tools/app.py b/resources_servers/ns_tools/app.py
+--- a/resources_servers/ns_tools/app.py
++++ b/resources_servers/ns_tools/app.py
+@@ -445,8 +445,16 @@ class NSToolsResourcesServer(SimpleResourcesServer):
+             if "reward" not in result:
+                 raise ValueError(f"Verifier did not return 'reward' field. Response: {result}")
+ 
++            # The collector and trainer inspect top-level failure metadata.
++            # Nesting a failed judge response alone would turn its placeholder
++            # zero into a legitimate negative training label.
++            failure_metadata = {
++                key: value for key, value in result.items()
++                if key.startswith("_ng_failure_")
++            }
++            payload = body.model_dump() | failure_metadata
+             return NSToolsVerifyResponse(
+-                **body.model_dump(),
++                **payload,
+                 reward=result["reward"],
+                 delegated_response=result,
+                 **metrics,

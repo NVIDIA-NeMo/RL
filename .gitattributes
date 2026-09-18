@@ -1,0 +1,2 @@
+# Unified patches encode blank context lines as a single space.
+tools/super_rl/patches/*.patch whitespace=-blank-at-eol,-blank-at-eof

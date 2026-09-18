@@ -18,6 +18,20 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
 
+def without_generation_logger_payload(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Exclude raw worker time series from a generic training-metrics update.
+
+    Call after generation/performance summaries have been derived. Keep the
+    original payload intact for those consumers, and preserve all other metrics.
+    Large raw lists can cause W&B to reject the entire update, including scalars.
+    """
+    return {
+        key: value
+        for key, value in metrics.items()
+        if key != "generation_logger_metrics"
+    }
+
+
 @dataclass
 class SetupTimingMetrics:
     """Driver-side per-phase timings collected during setup."""
