@@ -117,17 +117,6 @@ dependencies = [
 
 
 [project.optional-dependencies]
-fsdp = [
-  "transformers==5.12.1",
-  # +cu13 wheels from GitHub match torch cu130; PyPI often resolves to +cu12 (libcudart.so.12).
-  # https://github.com/Dao-AILab/flash-attention/releases/tag/v2.8.1
-  "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
-  "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
-  "mamba-ssm",
-  "causal-conv1d",
-  "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
-]
 automodel = [
   "nemo-automodel[moe]",
   # Automodel's FLA kernels require this TileLang version on Hopper.
@@ -499,11 +488,9 @@ constraint-dependencies = [
 exclude-dependencies = ["nvidia-cutlass-dsl-libs-base"]
 
 conflicts = [
-  [{ extra = "fsdp" }, { extra = "sglang" }],
   [{ extra = "automodel" }, { extra = "sglang" }],
   [{ extra = "mcore" }, { extra = "sglang" }],
   [{ extra = "vllm" }, { extra = "sglang" }],
-  [{ extra = "automodel" }, { extra = "fsdp" }],
   [{ extra = "automodel" }, { extra = "mcore" }],
   [{ extra = "automodel" }, { extra = "vllm" }],
   [{ extra = "vllm" }, { extra = "mcore" }],
@@ -511,7 +498,6 @@ conflicts = [
   [{ extra = "trtllm" }, { extra = "sglang" }],
   [{ extra = "trtllm" }, { extra = "automodel" }],
   [{ extra = "trtllm" }, { extra = "mcore" }],
-  [{ extra = "trtllm" }, { extra = "fsdp" }],
   [{ extra = "trtllm" }, { extra = "modelopt" }],
   [{ extra = "trtllm" }, { extra = "nvrx" }],
   [{ extra = "trtllm" }, { extra = "nemo_gym" }],
