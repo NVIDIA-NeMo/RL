@@ -21,8 +21,10 @@ refactor from silently changing a durable RL checkpoint protocol.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -111,6 +113,8 @@ class GymActorExecutionRegistry:
         self._frozen_checkpoint_id: str | None = None
         self._frozen_membership: tuple[GymActorExecution, ...] = ()
         self._retired_checkpoint_ids: list[str] = []
+        self._dispatch_permitted = asyncio.Event()
+        self._dispatch_permitted.set()
 
     @staticmethod
     def _key(identity: GymExecutionIdentity) -> tuple[str, int]:
@@ -130,6 +134,27 @@ class GymActorExecutionRegistry:
             identity=identity,
             state=GymActorExecutionState.RUNNING,
         )
+
+    async def register_when_permitted(
+        self,
+        identities: Sequence[GymExecutionIdentity],
+    ) -> None:
+        """Register one dispatch batch after the active checkpoint fence opens."""
+        while self._frozen_checkpoint_id is not None:
+            await self._dispatch_permitted.wait()
+
+        # There is deliberately no await between the fence check and these
+        # registrations. NemoGym is a single Ray actor, so the complete batch
+        # joins one source cut or the next; a checkpoint cannot split it.
+        registered: list[GymExecutionIdentity] = []
+        try:
+            for identity in identities:
+                self.register(identity)
+                registered.append(identity)
+        except BaseException:
+            for identity in registered:
+                self.release(identity)
+            raise
 
     def mark_terminal(self, identity: GymExecutionIdentity) -> None:
         """Retain a completed invocation until it crosses the actor boundary."""
@@ -157,6 +182,7 @@ class GymActorExecutionRegistry:
                     "the Gym actor dispatch fence"
                 )
             return self._frozen_membership
+        self._dispatch_permitted.clear()
         self._frozen_checkpoint_id = checkpoint_id
         self._frozen_membership = tuple(self._live[key] for key in sorted(self._live))
         return self._frozen_membership
@@ -177,6 +203,7 @@ class GymActorExecutionRegistry:
         self._frozen_membership = ()
         self._retired_checkpoint_ids.append(checkpoint_id)
         del self._retired_checkpoint_ids[: -self._MAX_RETIRED_CHECKPOINTS]
+        self._dispatch_permitted.set()
 
     def status(self) -> dict[str, int | str | None]:
         """Return bounded diagnostics for tests and checkpoint failures."""

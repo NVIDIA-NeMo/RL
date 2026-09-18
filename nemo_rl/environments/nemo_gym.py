@@ -1705,18 +1705,15 @@ Depending on your data shape, you may want to change these values."""
 
         registered_executions: list[GymExecutionIdentity] = []
         if self._gym_checkpoint_participants:
-            try:
-                for row in nemo_gym_examples:
-                    execution = GymExecutionIdentity(
-                        rollout_id=row[_NG_ROLLOUT_ID_BODY_KEY],
-                        attempt_index=row[_NG_ATTEMPT_INDEX_BODY_KEY],
-                    )
-                    self._gym_execution_registry.register(execution)
-                    registered_executions.append(execution)
-            except (KeyError, TypeError, ValueError, RuntimeError):
-                for execution in registered_executions:
-                    self._gym_execution_registry.release(execution)
-                raise
+            executions = [
+                GymExecutionIdentity(
+                    rollout_id=row[_NG_ROLLOUT_ID_BODY_KEY],
+                    attempt_index=row[_NG_ATTEMPT_INDEX_BODY_KEY],
+                )
+                for row in nemo_gym_examples
+            ]
+            await self._gym_execution_registry.register_when_permitted(executions)
+            registered_executions.extend(executions)
 
         # Normalize local media before shipping requests to vLLM. Helper is a no-op
         # for text-only rows and already-qualified URLs.

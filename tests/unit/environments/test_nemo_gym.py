@@ -38,6 +38,10 @@ from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
+from nemo_rl.environments.gym_checkpoint import (
+    GymActorExecutionRegistry,
+    GymCompletionReceipt,
+)
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
@@ -137,6 +141,103 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
     captured = capsys.readouterr()
     assert "1. resolved_agent: 1" in captured.err
     assert "task-source:test_resources_server" not in captured.err
+
+
+def test_run_rollouts_waits_when_checkpoint_freezes_before_actor_registration() -> None:
+    async def _run() -> None:
+        dispatch_started = asyncio.Event()
+        complete_rollout = asyncio.Event()
+        registration_wait_entered = asyncio.Event()
+
+        class _TrackedRegistry(GymActorExecutionRegistry):
+            async def register_when_permitted(self, identities):
+                registration_wait_entered.set()
+                await super().register_when_permitted(identities)
+
+        registry = _TrackedRegistry()
+        registry.freeze("snapshot-1")
+        row = {
+            "_rowidx": 0,
+            "_ng_rollout_id": "group-1_g0",
+            "_ng_attempt_index": 0,
+            "agent_ref": {"name": "test-agent"},
+            "responses_create_params": {"input": []},
+        }
+
+        class _RolloutCollectionHelper:
+            def run_examples(self, examples, head_server_config):
+                del head_server_config
+                dispatch_started.set()
+
+                async def _completed_result():
+                    await complete_rollout.wait()
+                    return examples[0], {"response": {"output": []}}
+
+                return [_completed_result()]
+
+        class _MockSelf:
+            cfg = {}
+            rch = _RolloutCollectionHelper()
+            head_server_config = object()
+            _token_capture_enabled = False
+            _stable_execution_identity_enabled = True
+            _gym_checkpoint_participants = (object(),)
+            _gym_execution_registry = registry
+            _tokenizer = object()
+
+            def _require_spinup(self):
+                pass
+
+            async def _completion_receipt_for(self, execution, *, agent_name):
+                assert execution.rollout_id == "group-1_g0"
+                assert agent_name == "test-agent"
+                return GymCompletionReceipt(
+                    rollout_id="group-1_g0",
+                    attempt_index=0,
+                    execution_generation=1,
+                    result_identity="result-group-1_g0-0",
+                    result_digest="1" * 64,
+                )
+
+            def _postprocess_nemo_gym_to_nemo_rl_result(
+                self,
+                result_row,
+                result,
+                result_tokenizer,
+                *,
+                include_initial_multimodal_data,
+            ):
+                del (
+                    self,
+                    result_row,
+                    result,
+                    result_tokenizer,
+                    include_initial_multimodal_data,
+                )
+                return {"message_log": []}
+
+        stream = NemoGym.__ray_metadata__.modified_class.run_rollouts(
+            _MockSelf(), [row], "test"
+        )
+        result_task = asyncio.create_task(anext(stream))
+        await asyncio.wait_for(registration_wait_entered.wait(), timeout=1.0)
+        assert not dispatch_started.is_set()
+        assert not result_task.done()
+
+        registry.unfreeze("snapshot-1")
+        await asyncio.wait_for(dispatch_started.wait(), timeout=1.0)
+        frozen = registry.freeze("snapshot-2")
+        assert [execution.identity.rollout_id for execution in frozen] == ["group-1_g0"]
+
+        complete_rollout.set()
+        result = await asyncio.wait_for(result_task, timeout=1.0)
+        assert result[0] == 0
+        assert registry.status()["terminal_unreleased"] == 1
+        await stream.aclose()
+        registry.unfreeze("snapshot-2")
+        assert registry.status()["live"] == 0
+
+    asyncio.run(_run())
 
 
 def test_multimodal_content_types_cover_responses_media_aliases():
