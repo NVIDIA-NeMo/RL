@@ -2,6 +2,11 @@
 
 We provide evaluation tools to assess model capabilities.
 
+## Choose an Evaluation Path
+
+- Use **NeMo RL-native evaluation** for direct model evaluation with NeMo RL's built-in or custom datasets and generation pipeline. This path is well suited to evaluating a local or converted training checkpoint; follow the steps below or see the [detailed evaluation guide](../guides/eval.md).
+- Use [**NeMo Gym evaluation**](https://docs.nvidia.com/nemo/gym/evaluation) when you need environment-native model or agent evaluation with tools, multi-step interactions, reusable verifiers, repeatable benchmarks, or metrics such as pass@k. The same NeMo Gym environment and verifier can provide evaluation metrics and training rewards. To use a NeMo Gym environment during NeMo RL training, see the [NeMo Gym integration guide](../design-docs/nemo-gym-integration.md).
+
 ## Convert Model Format (Optional)
 
 If you have trained a model and saved the checkpoint in the PyTorch DCP format, you first need to convert it to the Hugging Face format before running evaluation:
