@@ -134,6 +134,7 @@ class _InstrumentedNemoGymRolloutImpl:
         fields = {
             "group_id": group.group_id,
             "prompt_idx": int(input_sample["idx"]),
+            "task_source": group.task_source,
             "target_step": group.target_step,
             "generation_indices": indices,
             "rollout_ids": capture_rollout_ids,
