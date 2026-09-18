@@ -13,13 +13,10 @@
 # limitations under the License.
 """TransferQueue implementations of NeMo-Gym's token staging protocols.
 
-``TQTokenSink``/``TQTokenSource`` are NeMo-RL's providers for the
-ledger-authoritative capture design:
-the sink is the worker-side write of one model call's token delta to the
-``rollout_staging`` partition — the design's only heavy token hop — and the
-source is the finalizer's read-back of those rows by staging key. This module
-is the only hot-path file that knows tokens live in TQ; Gym sees opaque
-staging keys.
+``TQStagingStore`` is NeMo RL's single keyed-row transport for token custody.
+Inference workers write canonical Gym call deltas through ``TQTokenSink``.
+This module is the only hot-path file that knows tokens live in TQ; Gym sees
+opaque staging keys.
 
 Each staged row carries three jagged columns (``token_ids_delta``,
 ``token_mask_delta``, ``generation_logprobs_delta``), the complete receipt
@@ -44,23 +41,21 @@ import torch
 from tensordict import TensorDict
 
 if TYPE_CHECKING:
-    from nemo_gym.token_id_capture.staging.protocols import TensorAttachment
+    from nemo_gym.token_id_capture.staging.capture import (
+        ActiveCall,
+        RolloutTokenCapture,
+    )
 
     # Deferred: nemo_gym is an optional extra absent in non-gym runs; runtime
     # uses import locally so this module (and the finalizer actor importing
     # it) stays importable without it.
     from nemo_gym.token_id_capture.staging.records import (
+        CommitCoords,
         StagedCallBaseSnapshot,
         StagedCallRecord,
         StageResult,
     )
 
-from nemo_rl.data.captured_media import (
-    MEDIA_CAPTURE_FIELD,
-    MEDIA_STAGING_FIELDS,
-    CapturedMedia,
-    attachment_tensors,
-)
 from nemo_rl.data_plane.schema import (
     ROUTE_ENCODING_ENVELOPE,
     ROUTE_ENCODING_LIST,
@@ -78,6 +73,27 @@ from nemo_rl.experience.route_assembly import RouteFragment
 # round-trip equality check -- but only for required StagedCallRecord fields. An
 # optional field Gym adds that this sink never stages will default identically
 # on both sides and pass that check silently.
+# Media the engine's vision encoder consumed, staged as extra columns on the
+# call row (a second put onto the same staging key, after the token row is
+# durable). ``imgs`` is the shared packed-patch tensor ``[1, total_patches, C*P*P]``
+# (or padded pixels), ``imgs_sizes`` ``[N, 2]``, ``num_frames`` / ``num_tiles``
+# when the request carried them. Each tensor is flattened to one ``[1, numel]``
+# row; ``media_geometry_json`` records shape and dtype per name. Registered on
+# the staging partition only for multimodal runs; the finalizer reads them off
+# every call on the terminal chain.
+MEDIA_IMGS_FIELD = "media_imgs"
+MEDIA_IMGS_SIZES_FIELD = "media_imgs_sizes"
+MEDIA_NUM_FRAMES_FIELD = "media_num_frames"
+MEDIA_NUM_TILES_FIELD = "media_num_tiles"
+MEDIA_GEOMETRY_FIELD = "media_geometry_json"
+MEDIA_TENSOR_COLUMNS: dict[str, str] = {
+    "imgs": MEDIA_IMGS_FIELD,
+    "imgs_sizes": MEDIA_IMGS_SIZES_FIELD,
+    "num_frames": MEDIA_NUM_FRAMES_FIELD,
+    "num_tiles": MEDIA_NUM_TILES_FIELD,
+}
+MEDIA_STAGING_FIELDS = [*MEDIA_TENSOR_COLUMNS.values(), MEDIA_GEOMETRY_FIELD]
+
 STAGING_FIELDS = [
     "token_ids_delta",
     "token_mask_delta",
@@ -124,6 +140,16 @@ def _optional_digest_fields(value: str | None) -> tuple[torch.Tensor, torch.Tens
 
 
 @dataclass(frozen=True)
+class StagedMediaTensors:
+    """The media tensors one staged call ran on, restored to their original shapes."""
+
+    imgs: torch.Tensor
+    imgs_sizes: torch.Tensor | None
+    num_frames: torch.Tensor | None
+    num_tiles: torch.Tensor | None
+
+
+@dataclass(frozen=True)
 class FetchedStagedCall:
     """One explicitly identified small-column finalization fetch result.
 
@@ -136,7 +162,9 @@ class FetchedStagedCall:
     snapshot: StagedCallBaseSnapshot
     routed_len: int
     fragment: RouteFragment | None = None
-    extras_metadata_json: bytes = b"null"
+    # Decoded extras JSON (minus the columns the sink popped out), None when
+    # the call staged no extras. Carries Gym's media summary for VLM calls.
+    extras: dict[str, Any] | None = None
 
 
 def _call_dp(dp_client: Any, method_name: str, **kwargs: Any) -> Any:
@@ -146,6 +174,51 @@ def _call_dp(dp_client: Any, method_name: str, **kwargs: Any) -> Any:
     if remote is not None:
         return ray.get(remote(**kwargs))
     return method(**kwargs)
+
+
+class TQStagingStore:
+    """Shared keyed-row transport for all token-capture TQ codecs."""
+
+    def __init__(self, dp_client: Any, *, staging_partition: str) -> None:
+        self._dp_client = dp_client
+        self._staging_partition = staging_partition
+
+    def put(
+        self,
+        key: str,
+        field_dict: dict[str, torch.Tensor],
+        *,
+        tags: dict[str, Any] | None = None,
+    ) -> None:
+        _call_dp(
+            self._dp_client,
+            "put_samples",
+            sample_ids=[key],
+            partition_id=self._staging_partition,
+            fields=TensorDict(
+                {name: tensor for name, tensor in field_dict.items()}, batch_size=[1]
+            ),
+            tags=[tags or {}],
+        )
+
+    def get(self, keys: list[str], *, select_fields: list[str]) -> TensorDict:
+        return _call_dp(
+            self._dp_client,
+            "get_samples",
+            sample_ids=list(keys),
+            partition_id=self._staging_partition,
+            select_fields=list(select_fields),
+        )
+
+    def clear(self, keys: list[str]) -> None:
+        if not keys:
+            return
+        _call_dp(
+            self._dp_client,
+            "clear_samples",
+            sample_ids=list(keys),
+            partition_id=self._staging_partition,
+        )
 
 
 class TQTokenSink:
@@ -163,21 +236,13 @@ class TQTokenSink:
     """
 
     def __init__(self, dp_client: Any, *, staging_partition: str) -> None:
-        self._dp_client = dp_client
-        self._staging_partition = staging_partition
+        self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
 
     def stage(self, record: StagedCallRecord) -> StageResult:
-        return self.stage_with_attachments(record, attachments=())
-
-    def stage_with_attachments(
-        self, record: StagedCallRecord, *, attachments: tuple[TensorAttachment, ...]
-    ) -> StageResult:
-        """Acknowledge tokens and owned media only after their combined TQ put."""
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.records import StageResult
 
         key = record.staging_key
-        put_started = False
         try:
             field_dict = {
                 "token_ids_delta": torch.tensor(
@@ -283,17 +348,6 @@ class TQTokenSink:
                 [routed_encoding], dtype=torch.int64
             )
             field_dict[ROUTED_LEN_FIELD] = torch.tensor([routed_len], dtype=torch.int64)
-            media_metadata = (record.extras or {}).get(MEDIA_CAPTURE_FIELD)
-            if media_metadata is not None:
-                media_fields = attachment_tensors(
-                    CapturedMedia.from_dict(media_metadata), attachments
-                )
-                field_dict.update(
-                    {name: tensor.unsqueeze(0) for name, tensor in media_fields.items()}
-                )
-            elif attachments:
-                raise ValueError("Tensor attachments require media capture metadata")
-            fields = TensorDict(field_dict, batch_size=[1])
             tags = [
                 {
                     "rollout_id": record.rollout_id,
@@ -307,27 +361,8 @@ class TQTokenSink:
                     "schema_version": record.schema_version,
                 }
             ]
-            put_started = True
-            _call_dp(
-                self._dp_client,
-                "put_samples",
-                sample_ids=[key],
-                partition_id=self._staging_partition,
-                fields=fields,
-                tags=tags,
-            )
+            self._store.put(key, field_dict, tags=tags[0])
         except Exception as error:  # noqa: BLE001 — any failure must poison, not crash serving
-            # No successful coords can escape this completion claim. Roll back
-            # partial media writes while this worker still owns the call key.
-            # A storage outage can also defeat cleanup; recovery's unreferenced
-            # row sweep remains the backstop for those abandoned keys.
-            if put_started and attachments:
-                try:
-                    self.clear([key])
-                except Exception:  # noqa: BLE001 — preserve the authoritative staging failure
-                    logging.getLogger(__name__).exception(
-                        "Failed to clean incomplete media staging row %s", key
-                    )
             # The reason string is dropped downstream (_failed_coords carries
             # only the disposition) — this log line is the only place the
             # actual stage failure is visible.
@@ -344,14 +379,168 @@ class TQTokenSink:
 
     def clear(self, staging_keys: list[str]) -> None:
         """Drop staged rows (finalizer / eviction cleanup)."""
-        if not staging_keys:
-            return
-        _call_dp(
-            self._dp_client,
-            "clear_samples",
-            sample_ids=list(staging_keys),
-            partition_id=self._staging_partition,
+        self._store.clear(staging_keys)
+
+    def stage_media(self, staging_key: str, media_tensors: dict[str, Any]) -> None:
+        """Add the engine's media tensors to an already-staged call row.
+
+        A second put onto the same key: TQ tracks field readiness per field, so
+        the media columns land beside the token columns without rewriting them.
+        Raises on failure; the caller decides how to report it (the finalizer
+        rejects the rollout as ``media_columns_missing`` either way).
+        """
+        imgs = media_tensors.get("imgs")
+        if not isinstance(imgs, torch.Tensor) or imgs.numel() == 0:
+            raise ValueError("media_tensors must carry a non-empty imgs tensor")
+        unknown = sorted(set(media_tensors) - set(MEDIA_TENSOR_COLUMNS))
+        if unknown:
+            raise ValueError(f"unsupported media tensors: {unknown}")
+        geometry: dict[str, Any] = {}
+        field_dict: dict[str, torch.Tensor] = {}
+        for name, column in MEDIA_TENSOR_COLUMNS.items():
+            tensor = media_tensors.get(name)
+            if tensor is None:
+                # Sentinel row: jagged columns cannot be empty; absence is
+                # recorded by the missing geometry entry.
+                field_dict[column] = torch.zeros((1, 1), dtype=torch.int64)
+                continue
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(f"media tensor {name!r} must be a torch.Tensor")
+            flat = tensor.detach().cpu().contiguous().reshape(1, -1)
+            field_dict[column] = flat
+            geometry[name] = {
+                "shape": list(tensor.shape),
+                "dtype": str(tensor.dtype).removeprefix("torch."),
+            }
+        field_dict[MEDIA_GEOMETRY_FIELD] = _bytes_tensor(
+            json.dumps(geometry, sort_keys=True, separators=(",", ":")).encode("utf-8")
         )
+        self._store.put(staging_key, field_dict)
+
+
+def complete_call_with_media(
+    capture: RolloutTokenCapture,
+    call: ActiveCall,
+    payload: Any,
+    *,
+    sink: TQTokenSink,
+    media_tensors: dict[str, Any] | None,
+) -> CommitCoords:
+    """Stage tokens and optional media on the same call key for either backend.
+
+    Media uses the existing second-write protocol. If that write fails, the
+    shared finalizer rejects the row because its committed geometry has no
+    matching media columns. Completion returns only after the write attempt.
+    """
+    coords = capture.complete_call_from_response(call, payload)
+    if coords.disposition == "staged" and media_tensors:
+        try:
+            sink.stage_media(coords.staging_key, media_tensors)
+        except Exception:  # noqa: BLE001 — finalizer rejects missing media columns
+            logging.getLogger(__name__).exception(
+                "Media staging failed for %s", coords.staging_key
+            )
+    return coords
+
+
+def slice_media_tensors(
+    media_tensors: dict[str, Any] | None, prev_count: int
+) -> dict[str, Any] | None:
+    """Drop the first ``prev_count`` media items from the engine's media tensors.
+
+    Every chat request carries the whole conversation, so the engine hands the
+    stager pixels for every image in the prompt. The parent chain already
+    staged the first ``prev_count`` of them; this keeps only the rest so media
+    columns are per-call deltas like the token columns.
+
+    Item boundaries come from the tensors themselves: ``num_frames`` (frames per
+    video) or ``num_tiles`` (tiles per image) when present, else one row of
+    ``imgs_sizes`` per image. For packed patches (``imgs`` as
+    ``[1, total_patches, C*P*P]``) the patch count per row is ``h*w/P**2`` with
+    ``P**2`` recovered from the totals.
+    """
+    if not media_tensors or prev_count <= 0:
+        return media_tensors
+    imgs = media_tensors.get("imgs")
+    imgs_sizes = media_tensors.get("imgs_sizes")
+    num_frames = media_tensors.get("num_frames")
+    num_tiles = media_tensors.get("num_tiles")
+    if imgs is None:
+        return media_tensors
+    if imgs_sizes is None and num_tiles is None:
+        raise ValueError("media delta requires imgs_sizes or num_tiles to locate items")
+
+    if num_frames is not None:
+        total_items = int(num_frames.numel())
+    elif num_tiles is not None:
+        total_items = int(num_tiles.numel())
+    else:
+        total_items = int(imgs_sizes.reshape(-1, 2).shape[0])
+    if prev_count > total_items:
+        raise ValueError(
+            f"media_prev_count {prev_count} exceeds the {total_items} media items "
+            "the engine saw"
+        )
+    if prev_count == total_items:
+        return None
+
+    # Rows of imgs_sizes / imgs covered by the parent chain.
+    if num_frames is not None:
+        prev_rows = int(num_frames.reshape(-1)[:prev_count].sum().item())
+    elif num_tiles is not None:
+        prev_rows = int(num_tiles.reshape(-1)[:prev_count].sum().item())
+    else:
+        prev_rows = prev_count
+
+    sliced: dict[str, Any] = {}
+    if imgs.ndim == 3 and imgs.shape[0] == 1 and imgs_sizes is not None:
+        # Packed patches: recover patches-per-row from sizes and the total.
+        sizes = imgs_sizes.reshape(-1, 2).to(torch.int64)
+        areas = sizes[:, 0] * sizes[:, 1]
+        total_area = int(areas.sum().item())
+        total_patches = int(imgs.shape[1])
+        if total_patches == 0 or total_area % total_patches:
+            raise ValueError(
+                f"packed patches {total_patches} do not divide the media area {total_area}"
+            )
+        patch_area = total_area // total_patches
+        prev_area = int(areas[:prev_rows].sum().item())
+        if prev_area % patch_area:
+            raise ValueError("parent media does not end on a patch boundary")
+        sliced["imgs"] = imgs[:, prev_area // patch_area :, :]
+    else:
+        # Padded pixels [N, C, H, W] (or tiles): one row per frame / tile.
+        sliced["imgs"] = imgs[prev_rows:]
+    if imgs_sizes is not None:
+        sliced["imgs_sizes"] = imgs_sizes.reshape(-1, 2)[prev_rows:]
+    if num_frames is not None:
+        sliced["num_frames"] = num_frames.reshape(-1)[prev_count:]
+    if num_tiles is not None:
+        sliced["num_tiles"] = num_tiles.reshape(-1)[prev_count:]
+    return sliced
+
+
+def media_geometry(media_tensors: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Gym's digest-covered media geometry, read off the engine's media tensors.
+
+    ``imgs_sizes`` / ``num_frames`` / ``num_tiles`` become plain int lists; the
+    modality is ``video`` when the engine carried frame counts. The finalizer
+    checks the staged media columns against this before publishing a row.
+    """
+    if not media_tensors or media_tensors.get("imgs") is None:
+        return None
+
+    def as_list(name: str) -> list | None:
+        tensor = media_tensors.get(name)
+        return None if tensor is None else tensor.detach().cpu().tolist()
+
+    num_frames = as_list("num_frames")
+    return {
+        "modality": "video" if num_frames is not None else "image",
+        "imgs_sizes": as_list("imgs_sizes"),
+        "num_frames": num_frames,
+        "num_tiles": as_list("num_tiles"),
+    }
 
 
 class TQTokenSource:
@@ -369,28 +558,12 @@ class TQTokenSource:
     """
 
     def __init__(self, dp_client: Any, *, staging_partition: str) -> None:
-        self._dp_client = dp_client
+        self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
         self._staging_partition = staging_partition
 
     def fetch(self, staging_keys: list[str]) -> list[StagedCallBaseSnapshot]:
         """Gym ``StagingSource`` conformance: base snapshots only, in order."""
         return [item.snapshot for item in self.fetch_for_finalization(staging_keys)]
-
-    def fetch_media(self, staging_key: str) -> dict[str, torch.Tensor]:
-        """Fetch one call's named media columns without processing source media."""
-        try:
-            rows = _call_dp(
-                self._dp_client,
-                "get_samples",
-                sample_ids=[staging_key],
-                partition_id=self._staging_partition,
-                select_fields=list(MEDIA_STAGING_FIELDS),
-            )
-        except Exception as error:  # noqa: BLE001 — map storage failures to a rejected row
-            raise KeyError(f"Missing captured media for {staging_key!r}") from error
-        if tuple(rows.batch_size) != (1,):
-            raise KeyError(f"Missing captured media for {staging_key!r}")
-        return {name: rows[name][0] for name in MEDIA_STAGING_FIELDS}
 
     def fetch_prefix_token_ids(self, staging_keys: list[str]) -> list[int]:
         """Bulk-fetch ordered delta chain and concatenate token_ids_delta into a prefix."""
@@ -399,12 +572,8 @@ class TQTokenSource:
         if len(set(staging_keys)) != len(staging_keys):
             raise KeyError("prefix fetch: staging_keys contains duplicates")
         try:
-            rows = _call_dp(
-                self._dp_client,
-                "get_samples",
-                sample_ids=list(staging_keys),
-                partition_id=self._staging_partition,
-                select_fields=["token_ids_delta"],
+            rows = self._store.get(
+                list(staging_keys), select_fields=["token_ids_delta"]
             )
         except Exception as error:  # noqa: BLE001 — protocol maps any miss to KeyError
             raise KeyError(
@@ -422,6 +591,49 @@ class TQTokenSource:
             delta = row["token_ids_delta"].squeeze(0).tolist()
             result.extend(int(t) for t in delta)
         return result
+
+    def fetch_media(self, staging_key: str) -> StagedMediaTensors:
+        """Read one call's media columns; ``KeyError`` when the row carries none."""
+        try:
+            rows = self._store.get([staging_key], select_fields=MEDIA_STAGING_FIELDS)
+        except Exception as error:  # noqa: BLE001 — protocol maps misses to KeyError
+            raise KeyError(
+                f"media columns for {staging_key!r} could not be fetched from "
+                f"{self._staging_partition!r}: {error}"
+            ) from error
+        n_rows = int(rows.batch_size[0]) if len(rows.batch_size) else 0
+        if n_rows != 1:
+            raise KeyError(f"media columns for {staging_key!r} missing")
+        row = _select_row(rows, 0)
+        geometry = json.loads(_row_text(row, MEDIA_GEOMETRY_FIELD))
+        if not isinstance(geometry, dict) or "imgs" not in geometry:
+            raise ValueError("staged media geometry must describe imgs")
+        tensors: dict[str, torch.Tensor | None] = {}
+        for name, column in MEDIA_TENSOR_COLUMNS.items():
+            spec = geometry.get(name)
+            if spec is None:
+                tensors[name] = None
+                continue
+            flat = row[column].reshape(-1)
+            dtype = getattr(torch, spec["dtype"], None)
+            if not isinstance(dtype, torch.dtype):
+                raise ValueError(
+                    f"media column {column!r} names unknown dtype {spec['dtype']!r}"
+                )
+            shape = torch.Size(spec["shape"])
+            if flat.numel() != shape.numel():
+                raise ValueError(
+                    f"media column {column!r} holds {flat.numel()} values but its "
+                    f"geometry describes {shape.numel()}"
+                )
+            tensors[name] = flat.to(dtype).reshape(shape)
+        assert tensors["imgs"] is not None
+        return StagedMediaTensors(
+            imgs=tensors["imgs"],
+            imgs_sizes=tensors["imgs_sizes"],
+            num_frames=tensors["num_frames"],
+            num_tiles=tensors["num_tiles"],
+        )
 
     def fetch_for_finalization(
         self,
@@ -447,29 +659,14 @@ class TQTokenSource:
                 # worker); fall back to the base schema so extras-free rows
                 # keep fetching.
                 try:
-                    rows = _call_dp(
-                        self._dp_client,
-                        "get_samples",
-                        sample_ids=list(staging_keys),
-                        partition_id=self._staging_partition,
+                    rows = self._store.get(
+                        staging_keys,
                         select_fields=STAGING_FIELDS + [ROUTED_EXPERTS_FIELD],
                     )
                 except Exception:  # noqa: BLE001 — field-not-present probe
-                    rows = _call_dp(
-                        self._dp_client,
-                        "get_samples",
-                        sample_ids=list(staging_keys),
-                        partition_id=self._staging_partition,
-                        select_fields=STAGING_FIELDS,
-                    )
+                    rows = self._store.get(staging_keys, select_fields=STAGING_FIELDS)
             else:
-                rows = _call_dp(
-                    self._dp_client,
-                    "get_samples",
-                    sample_ids=list(staging_keys),
-                    partition_id=self._staging_partition,
-                    select_fields=STAGING_FIELDS,
-                )
+                rows = self._store.get(staging_keys, select_fields=STAGING_FIELDS)
         except Exception as error:  # noqa: BLE001 — protocol maps misses to KeyError
             raise KeyError(
                 f"staged rows for {len(staging_keys)} keys could not be "
@@ -503,9 +700,7 @@ class TQTokenSource:
                     fragment=(
                         _row_to_route_fragment(row) if include_route_fragments else None
                     ),
-                    extras_metadata_json=_row_text(
-                        row, ROUTED_EXTRAS_METADATA_FIELD
-                    ).encode("utf-8"),
+                    extras=_row_extras(row),
                 )
             )
         return fetched
@@ -598,6 +793,16 @@ def _row_to_base_snapshot(row: Any) -> StagedCallBaseSnapshot:
             "cumulative_hash_bytes", "cumulative_hash_present"
         ),
     )
+
+
+def _row_extras(row: Any) -> dict[str, Any] | None:
+    """Decode the staged extras JSON (None for ``null`` / absent extras)."""
+    decoded = json.loads(_row_text(row, ROUTED_EXTRAS_METADATA_FIELD))
+    if decoded is None:
+        return None
+    if not isinstance(decoded, dict):
+        raise ValueError("staged extras metadata must be a JSON object or null")
+    return decoded
 
 
 def _row_to_route_fragment(row: Any) -> RouteFragment | None:

@@ -77,7 +77,6 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     validate_bootstrap_anchor,
 )
 from nemo_rl.algorithms.utils import set_seed
-from nemo_rl.data.captured_media import MEDIA_STAGING_FIELDS
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS, uses_image_placeholder
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
@@ -349,8 +348,10 @@ def _register_single_controller_partitions(
         from nemo_rl.data_plane.schema import (
             ROUTED_EXPERTS_FIELD as STAGING_ROUTED_EXPERTS_FIELD,
         )
-        from nemo_rl.data.captured_media import MEDIA_STAGING_FIELDS
-        from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS
+        from nemo_rl.data_plane.tq_token_sink import (
+            MEDIA_STAGING_FIELDS,
+            STAGING_FIELDS,
+        )
 
         dp_client.register_partition(
             partition_id=token_capture_cfg.staging_partition,
@@ -1980,7 +1981,6 @@ def setup_single_controller(
                 router_replay_enabled=router_replay_enabled(policy_config),
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
-                capture_media=capture_media,
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )

@@ -398,24 +398,26 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   rollouts with async vLLM generation and a Megatron learner. With
   `token_capture.enabled: true` and the VLM processor configured, workers capture
   the processed media used for inference together with each call's token delta.
-  Named attachments carry pixels, per-frame `imgs_sizes`, and per-item
-  `num_frames`, with shape, dtype, and content digests bound to versioned
-  `media_capture` extras. A video retains its sampled frames and temporal
-  grouping; timestamp tokens and discontiguous visual-token spans are preserved
-  during prefix replacement. Only newly introduced media occurrences are staged.
-  The finalizer verifies the selected call chain and publishes `pixel_values`,
-  `imgs_sizes`, and `num_frames` without resampling or normalizing source media.
-  Encoder bundles containing packed patches are also accepted; finalization
-  reverses patch layout losslessly into the existing learner's padded frame
-  representation, so the current Megatron-Bridge pin can consume them.
-  Retained media must keep identical pixels, geometry, and placeholder tokens
-  across calls. All attachments are stored with tokens before acknowledging a
-  call, and share its checkpoint/cleanup lifecycle. This path requires the
-  paired Gym tensor-attachment and `media_capture` changes; old image-only
-  capture descriptors must not be mixed with the new capture format.
-  Compaction, native audio, video token pruning, static tiling (`num_tiles`),
-  other processor families, and
-  `token_capture.defer_routed_experts_to_policy: true` are not supported.
+  Gym's shared `media` extras describe the modality, per-frame `imgs_sizes`,
+  and per-video `num_frames`. RL stages owned tensors (`imgs`, `imgs_sizes`,
+  and optional `num_frames`) on the same call key through the shared media sink.
+  vLLM pixels are rearranged losslessly into packed patches; the finalizer
+  publishes `pixel_values`, `imgs_sizes`, and `num_frames` for the existing
+  Megatron learner without resampling or normalizing the media again.
+  Only newly introduced occurrences are staged. vLLM-specific `media_spans`
+  extras retain placeholder positions and token hashes for multi-turn prefix
+  replacement, including video's timestamp-separated visual-token spans.
+  Processor-cache bypass ensures the worker has concrete pixels to capture.
+  Tokens and media use two writes. If the media write is missing or its geometry
+  disagrees with the shared extras, the finalizer rejects the rollout. Tensor
+  contents are not hashed; retained occurrences are checked by geometry and
+  placeholder tokens. Call rows share the existing checkpoint and cleanup lifecycle.
+  Upgrade the paired Gym and RL changes together; checkpoints written with the
+  former `media_capture`/tensor-attachment format are not compatible.
+  This integration does not require Megatron inference capture support or a new
+  Megatron-LM pin. Compaction, mixed image/video conversations, native audio,
+  video token pruning, static tiling (`num_tiles`), other processor families,
+  and `token_capture.defer_routed_experts_to_policy: true` are not supported.
 - Multi-Teacher On-Policy Distillation (MOPD) is supported for text-only NeMo
   Gym rollouts; multimodal/VLM MOPD is not yet supported. See
   [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
