@@ -1899,6 +1899,7 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
                 "task_source": "workplace_assistant",
                 "responses_create_params": {},
                 "_ng_task_index": task_index,
+                "agent_ref": {"name": "agent"},
             }
         )
     original_media = [
@@ -2153,6 +2154,7 @@ def test_run_nemo_gym_rollout_sync_separates_collection_and_identity_groups(
     async def fake_stream(**kwargs):
         assert kwargs["num_generations"] == input_batch.size
         assert kwargs["identity_num_generations"] == 2
+        assert kwargs["routing_group_size"] == 2
         assert kwargs["returns_entire_batch"] is True
         assert kwargs["log_full_result_tables"] is False
         assert kwargs["deduplicate_multimodal_data"] is True
@@ -2220,6 +2222,18 @@ def test_run_async_nemo_gym_rollout_validates_identity_group_size(
 
     with pytest.raises(ValueError, match=error):
         asyncio.run(collect())
+
+
+def test_run_nemo_gym_rollout_sync_requires_explicit_prompt_group_size():
+    with pytest.raises(TypeError, match="num_generations_per_prompt"):
+        run_nemo_gym_rollout_sync(
+            policy_generation=None,
+            input_batch=BatchedDataDict({"loss_multiplier": torch.ones(1)}),
+            tokenizer=None,
+            task_to_env={},
+            generation_config={},
+            log_full_result_tables=False,
+        )
 
 
 def test_rollout_manager_consumes_stream_and_restores_input_order():

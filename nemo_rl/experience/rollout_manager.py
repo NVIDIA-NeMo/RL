@@ -39,10 +39,14 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
-from nemo_rl.data.multimodal_utils import NATIVE_MULTIMODAL_KEYS
+from nemo_rl.data.multimodal_utils import VLLM_CONTENT_KEY, VLLM_PROMPT_KEYS
 from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import (
+    as_nemo_gym_shard_set,
+    get_nemo_gym_route_name,
+)
 from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
@@ -576,7 +580,7 @@ class AsyncRolloutImpl:
         input_sample_data: Mapping[str, Any] = input_sample
         native_generation_data = {
             key: input_sample_data[key]
-            for key in NATIVE_MULTIMODAL_KEYS
+            for key in VLLM_PROMPT_KEYS
             if key in input_sample_data
         }
         current_extra_env_info = copy.deepcopy(input_sample["extra_env_info"])
@@ -609,8 +613,8 @@ class AsyncRolloutImpl:
             turn_native_generation_data = dict(native_generation_data)
             # Raw processor content describes only the original conversation.
             # Later turns keep the media but use the updated pre-tokenized prefix.
-            if turn_count > 1 and "vllm_content" in turn_native_generation_data:
-                turn_native_generation_data["vllm_content"] = None
+            if turn_count > 1 and VLLM_CONTENT_KEY in turn_native_generation_data:
+                turn_native_generation_data[VLLM_CONTENT_KEY] = None
 
             # Generate response for this sample using async generation.
             # A failure here must not be absorbed: returning a partial completion
@@ -1208,9 +1212,12 @@ class AsyncNemoGymRolloutImpl:
         recovery performs one physical Gym dispatch here and delegates a complete
         cohort replacement to the outer recovery loop.
         """
-        nemo_gym_env = self._task_to_env["nemo_gym"]
         if not inputs:
             raise ValueError("NeMo-Gym rollout dispatch requires at least one row")
+        # These rows are all one prompt's generations.
+        # They share one Gym route and must stay on one instance.
+        shard_set = as_nemo_gym_shard_set(self._task_to_env["nemo_gym"])
+        nemo_gym_env = shard_set.pick_handle(get_nemo_gym_route_name(inputs[0]))
         total_rows = self._num_generations_per_prompt
         # Re-dispatch maps NeMo-Gym's echoed _rowidx back onto the original group, so
         # the rows must carry the index _build_inputs stamped on them. Checked here

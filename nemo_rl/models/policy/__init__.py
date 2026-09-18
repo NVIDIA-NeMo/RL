@@ -185,6 +185,15 @@ class MoEParallelizerOptions(TypedDict):
     wrap_outer_model: NotRequired[bool]
 
 
+class AutomodelCheckpointConfig(TypedDict, total=False):
+    """Automodel checkpoint settings used by DTensor v2."""
+
+    model_save_format: Literal["torch_save", "safetensors"] | None
+    save_consolidated: Literal["false", "final", "every"]
+    single_rank_consolidation: bool
+    consolidation_timeout_minutes: int
+
+
 class DTensorConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
@@ -209,6 +218,7 @@ class DTensorConfig(TypedDict):
     automodel_kwargs: NotRequired[AutomodelKwargs]
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]
+    checkpoint: NotRequired[AutomodelCheckpointConfig]
 
 
 class SequencePackingConfigDisabled(TypedDict):
@@ -501,6 +511,12 @@ class MegatronConfig(TypedDict):
     # Number of tokens per chunk when computing fused linear logprobs.
     # Smaller values reduce peak memory further but may decrease throughput.
     fused_linear_logprobs_chunk_size: NotRequired[int]
+    # Emit fp32 logits from Megatron-LM's LM head. Set the matching
+    # generation.vllm_cfg.fp32_lm_head flag for vLLM generation: applying this
+    # to only one engine makes the generation/training logprob mismatch worse.
+    # No effect when use_fused_linear_logprobs is set, which bypasses the
+    # output layer's logits path.
+    fp32_lm_head: NotRequired[bool]
     # When mtp_num_layers=0, Multi-Token Prediction is disabled.
     mtp_num_layers: NotRequired[int]
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
