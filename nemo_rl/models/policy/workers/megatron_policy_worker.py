@@ -1026,6 +1026,12 @@ class MegatronPolicyWorkerImpl(
         # Only replace zero denominators (possible during evaluation).
         token_denominator = torch.where(kept_toks > 0, kept_toks, 1.0)
         sequence_denominator = torch.where(kept_seqs > 0, kept_seqs, 1.0)
+        # Each microbatch loss divides by the original global token count G.
+        # Rejected tokens contribute zero, so accumulation and DP SUM produce
+        # S/G, where S is the sum of surviving tokens' gradient contributions.
+        # Multiplying by G/K, with K the global surviving token count, restores
+        # S/K: the same normalization as filtering before training. Apply this
+        # correction before optimizer.step() so gradient clipping sees S/K.
         token_factor = float((global_valid_toks / token_denominator).item())
         sequence_factor = float((global_valid_seqs / sequence_denominator).item())
         if not eval_mode:
