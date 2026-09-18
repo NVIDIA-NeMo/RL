@@ -139,23 +139,30 @@ cleanup() {
             elif grep -qiE 'may not match|No shared library information|could not( be)? read' \
                     "$DIAGNOSTIC_DIR/fx/gdb-$base.txt" 2>/dev/null; then
                 parse_note="binary-or-library-mismatch"
-            elif ! grep -qE '^0x[0-9a-f]+ +0x[0-9a-f]+ +Yes' \
+            elif ! grep -qE '^0x[0-9a-f]+ +0x[0-9a-f]+ +(Yes|No)' \
                     "$DIAGNOSTIC_DIR/fx/gdb-$base.txt" 2>/dev/null; then
-                # info sharedlibrary printed no loaded library: nothing was
-                # matched, so there is no basis for calling the stack verified.
                 parse_note="no-library-map"
             fi
+            # Even a clean parse is not a verified one. gdb's "Yes" column means
+            # it read symbols, not that the file on disk is the build the crash
+            # used, and a mixed map can show Yes for libc while showing No for
+            # the library the stack actually blames. Deciding that needs
+            # Build-ID matching, which this round does not do -- so report the
+            # stack as obtained with identity unverified, and never let that
+            # verdict skip the archive.
+            lib_yes=$(grep -cE '^0x[0-9a-f]+ +0x[0-9a-f]+ +Yes' "$DIAGNOSTIC_DIR/fx/gdb-$base.txt" 2>/dev/null || printf 0)
+            lib_no=$(grep -cE '^0x[0-9a-f]+ +0x[0-9a-f]+ +No' "$DIAGNOSTIC_DIR/fx/gdb-$base.txt" 2>/dev/null || printf 0)
             if [[ -z "$parse_note" ]]; then
-                printf 'core_parsed=%s frames=yes verified=yes\n' "$base" \
-                    >> "$DIAGNOSTIC_DIR/forensics.txt"
-                continue
+                printf 'core_parsed=%s stack=obtained identity=unverified libs_with_symbols=%s libs_without=%s\n' \
+                    "$base" "$lib_yes" "$lib_no" >> "$DIAGNOSTIC_DIR/forensics.txt"
+            else
+                printf 'core_parsed=%s unreliable=%s libs_with_symbols=%s libs_without=%s\n' \
+                    "$base" "$parse_note" "$lib_yes" "$lib_no" >> "$DIAGNOSTIC_DIR/forensics.txt"
             fi
-            # Unreliable: the core is the only remaining record, and this
-            # workspace is deleted when the job ends, so the artifact directory
-            # is the one durable destination. Cores are mostly zeroes and
-            # compress heavily, so try that before giving up on keeping it.
-            printf 'core_parsed=%s unreliable=%s\n' "$base" "$parse_note" \
-                >> "$DIAGNOSTIC_DIR/forensics.txt"
+            # Archive unconditionally: this workspace is deleted when the job
+            # ends, and no verdict above is strong enough to justify discarding
+            # the only copy of the crash. Best effort, not a guarantee -- what
+            # counts is the artifact upload succeeding.
             if gzip -1 -c "$c" > "$DIAGNOSTIC_DIR/fx/$base.gz" 2>/dev/null; then
                 kept=$(stat -c %s "$DIAGNOSTIC_DIR/fx/$base.gz" 2>/dev/null || printf 0)
                 if [[ "$kept" -gt 0 && "$kept" -le 3000000000 ]]; then
