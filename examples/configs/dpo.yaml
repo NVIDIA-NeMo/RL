@@ -58,10 +58,12 @@ policy:
   offload_optimizer_for_logprob: false
 
   dtensor_cfg:
+    _v2: true
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: ""  # Refers to https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf
     enabled: true
     checkpoint:
+      model_save_format: "safetensors"
       # Canonical Automodel modes: "false", "final", or "every".
       save_consolidated: "false"
       single_rank_consolidation: false
