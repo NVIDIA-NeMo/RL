@@ -12,6 +12,7 @@ policy:
     env_vars:
       NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "8"
   generation:
+    refit_transport: nccl_reshard
     colocated:
       enabled: false
       resources:
