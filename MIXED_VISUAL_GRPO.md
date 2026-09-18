@@ -25,8 +25,8 @@ new GPU qualification of these sharing commits. TMPE remains under investigation
 
 ## Checkout
 
-These branches are currently local. After publication is explicitly authorized,
-colleagues can use:
+The Gym branch is hosted in `aroshanghias-nvd/Gym`; the RL branch is hosted in
+`NVIDIA-NeMo/RL`. The submodule URL selects the fork automatically:
 
 ```bash
 git clone --branch aroshanghias/mixed-visual-grpo https://github.com/NVIDIA-NeMo/RL.git mixed-visual-grpo
@@ -34,7 +34,8 @@ cd mixed-visual-grpo
 git submodule update --init --recursive
 ```
 
-Publish the Gym branch before the RL branch, so its pinned commit is available.
+Gym is published first so the pinned commit is available. For an existing checkout,
+run `git submodule sync -- 3rdparty/Gym-workspace/Gym` before updating submodules.
 Do not update the Gym submodule to main. Gym provenance and the open PR links are
 in `3rdparty/Gym-workspace/Gym/environments/visual_games_image_tools/SHARING.md`.
 

@@ -15,5 +15,7 @@
     "rl_passed": 64,
     "gym_passed": 3
   },
-  "new_gpu_qualification": false
+  "new_gpu_qualification": false,
+  "rl_repository": "https://github.com/NVIDIA-NeMo/RL.git",
+  "gym_repository": "https://github.com/aroshanghias-nvd/Gym.git"
 }
