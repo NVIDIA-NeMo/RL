@@ -51,6 +51,7 @@ from nemo_rl.algorithms.reward_functions import (
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import (
+    finalize_actor_token_metrics,
     print_efficiency_summary,
     print_performance_metrics,
     set_seed,
@@ -1900,6 +1901,7 @@ def ppo_train(
                         metrics[k] = np.mean(v).item()
                     elif isinstance(v, (np.ndarray, list)):
                         metrics[k] = np.sum(v).item()
+                finalize_actor_token_metrics(metrics)
 
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
@@ -2891,6 +2893,7 @@ def async_ppo_train(
                         metrics[k] = np.mean(v).item()
                     elif isinstance(v, (np.ndarray, list)):
                         metrics[k] = np.sum(v).item()
+                finalize_actor_token_metrics(metrics)
 
                 metrics.update(rollout_metrics)
                 if generation_logger_metrics is not None:
