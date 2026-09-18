@@ -6,6 +6,9 @@ grpo:
   max_num_epochs: 1
   max_num_steps: 1000000
   normalize_rewards: true
+  # Prompt-group reward statistics: exclude (default) or include loss-masked rows.
+  # This does not change loss masking or estimator-specific batch whitening.
+  masked_reward_policy: exclude
   use_leave_one_out_baseline: true
   val_period: 10
   val_start_at: -1

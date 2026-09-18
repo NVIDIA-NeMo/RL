@@ -40,6 +40,7 @@ import torch
 
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
+    _advantage_valid_mask,
     _clip_grpo_advantages,
     compute_and_apply_seq_logprob_error_masking,
 )
@@ -429,6 +430,10 @@ class AdvantageComputer:
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
 
         mask = token_mask * final_sample_mask.unsqueeze(-1)
+        advantage_valid_mask = final_sample_mask
+        if not cfg.is_ppo:
+            assert isinstance(cfg.algo, GRPOConfig)
+            advantage_valid_mask = _advantage_valid_mask(final_sample_mask, cfg.algo)
 
         repeated_batch: dict[str, torch.Tensor] = {
             "total_reward": rewards,
@@ -470,10 +475,7 @@ class AdvantageComputer:
                 rewards=rewards,
                 mask=mask,
                 repeated_batch=repeated_batch,
-                # Real validity (token-capture placeholders carry sample_mask 0,
-                # and mask_sample/overlong/seq-logprob-error rows are folded in
-                # via final_sample_mask) instead of the hardwired all-ones.
-                valid_mask=final_sample_mask,
+                valid_mask=advantage_valid_mask,
                 **kwargs,
             )
             if cfg.is_ppo:
