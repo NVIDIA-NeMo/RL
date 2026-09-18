@@ -55,6 +55,7 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     _CheckpointCaptureGate,
     _RequestOutputDeltaAccumulator,
     _RESTORED_PREFIX_TERMINAL_PROMPT_KEY,
+    _RestoredPrefixParser,
     _RestoredPrefixTerminal,
     _classify_restored_prefix_terminal,
     _remaining_generation_limits_after_prefix,
@@ -500,6 +501,42 @@ def test_restored_prefix_below_limits_still_generates_a_tail() -> None:
     )
 
 
+def test_observed_terminal_prefix_does_not_generate_a_tail() -> None:
+    terminal = _classify_restored_prefix_terminal(
+        prompt_token_ids=[1, 2, 3, 4],
+        generation_token_count=2,
+        requested_output_tokens=128,
+        model_max_tokens=256,
+        terminal_finish_reason="stop",
+        terminal_stop_reason="</s>",
+    )
+
+    assert terminal is not None
+    assert terminal.reason == "observed_stop"
+    assert terminal.finish_reason == "stop"
+    assert terminal.stop_reason == "</s>"
+
+
+def test_restored_prefix_parser_receives_complete_generation_token_ids() -> None:
+    delegate = MagicMock()
+    parser = _RestoredPrefixParser(delegate=delegate, prefix_token_ids=(10, 11))
+
+    parser.parse(
+        "restored text and tail",
+        SimpleNamespace(),
+        enable_auto_tools=True,
+        model_output_token_ids=[12, 13],
+    )
+
+    delegate.parse.assert_called_once()
+    assert delegate.parse.call_args.kwargs["model_output_token_ids"] == [
+        10,
+        11,
+        12,
+        13,
+    ]
+
+
 @pytest.mark.parametrize(
     ("prompt_token_ids", "generation_token_count", "output_limit", "match"),
     [
@@ -527,6 +564,7 @@ def test_terminal_restored_prefix_skips_physical_generation(monkeypatch) -> None
         prompt_token_ids=(1, 2, 3, 4),
         generation_token_count=2,
         reason="output_limit",
+        finish_reason="length",
     )
     final_output = object()
     build_output = MagicMock(return_value=final_output)
@@ -670,6 +708,8 @@ def _served_content(gen_ids, logprobs):
         "choices": [
             {
                 "index": 0,
+                "finish_reason": "stop",
+                "stop_reason": "</s>",
                 "message": {"role": "assistant", "content": "x"},
                 "logprobs": {
                     "content": [
@@ -751,6 +791,7 @@ def _begin_captured_request(worker, prompt_token_ids):
     VllmAsyncGenerationWorkerImpl._begin_request_capture(
         worker, request, list(prompt_token_ids)
     )
+    worker._capture_calls[id(request)].effective_output_limit = 128
     return request
 
 
@@ -990,6 +1031,7 @@ def test_generation_cut_stages_latest_prefix_without_completing_live_call():
         stream=False,
     )
     VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11])
+    worker._capture_calls[id(request)].effective_output_limit = 128
     progress = SimpleNamespace(
         outputs=[
             SimpleNamespace(
@@ -1046,6 +1088,82 @@ def test_generation_cut_stages_latest_prefix_without_completing_live_call():
     assert sink.records[0].token_ids_delta == [10, 11, 12, 13, 14]
 
 
+def test_generation_cut_persists_resolved_budget_and_terminal_outcome():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    request = _begin_captured_request(worker, [10, 11])
+    worker._capture_calls[id(request)].effective_output_limit = None
+    # This represents vLLM resolving an implicit request limit from its model
+    # and default sampling configuration.
+    VllmAsyncGenerationWorkerImpl._record_request_effective_output_limit(
+        worker, request, 4096
+    )
+    VllmAsyncGenerationWorkerImpl._observe_request_capture(
+        worker,
+        request,
+        SimpleNamespace(
+            outputs=[
+                SimpleNamespace(
+                    token_ids=[12, 13],
+                    logprobs=[
+                        {12: SimpleNamespace(logprob=-0.1)},
+                        {13: SimpleNamespace(logprob=-0.2)},
+                    ],
+                    finish_reason="stop",
+                    stop_reason="</s>",
+                )
+            ]
+        ),
+    )
+    inventory = GenerationCutInventory.build(
+        checkpoint_id="checkpoint-1",
+        server_name="policy",
+        active_prefixes=[
+            GenerationCutPrefix(
+                ticket_id="ticket-1",
+                rollout_id="r0",
+                attempt_index=0,
+                model_call_id="c1",
+                admitted_at=1.0,
+            )
+        ],
+    )
+
+    receipt = VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(
+        worker, inventory
+    )
+
+    prefix = receipt.prefixes[0]
+    assert prefix.effective_output_limit == 4096
+    assert prefix.terminal_finish_reason == "stop"
+    assert prefix.terminal_stop_reason == "</s>"
+
+
+def test_zero_token_cut_does_not_require_a_resolved_output_budget():
+    worker = _worker_with_capture(_MemorySink())
+    request = _begin_captured_request(worker, [10, 11])
+    worker._capture_calls[id(request)].effective_output_limit = None
+    inventory = GenerationCutInventory.build(
+        checkpoint_id="checkpoint-1",
+        server_name="policy",
+        active_prefixes=[
+            GenerationCutPrefix(
+                ticket_id="ticket-1",
+                rollout_id="r0",
+                attempt_index=0,
+                model_call_id="c1",
+                admitted_at=1.0,
+            )
+        ],
+    )
+
+    receipt = VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(
+        worker, inventory
+    )
+
+    assert receipt.prefixes[0].disposition == "durable_failure"
+
+
 def test_generation_cut_marks_completed_race_as_terminal_completion():
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
@@ -1060,6 +1178,7 @@ def test_generation_cut_marks_completed_race_as_terminal_completion():
         stream=False,
     )
     VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10])
+    worker._capture_calls[id(request)].effective_output_limit = 128
     VllmAsyncGenerationWorkerImpl._finish_request_capture(
         worker,
         request,
@@ -1086,6 +1205,9 @@ def test_generation_cut_marks_completed_race_as_terminal_completion():
     assert receipt.prefixes[0].disposition == "durable_prefix"
     assert receipt.prefixes[0].cut_kind == "terminal_completion"
     assert receipt.prefixes[0].staging_keys == ("r0/c1",)
+    assert receipt.prefixes[0].effective_output_limit == 128
+    assert receipt.prefixes[0].terminal_finish_reason == "stop"
+    assert receipt.prefixes[0].terminal_stop_reason == "</s>"
 
 
 def test_abort_waits_for_generation_cut_before_failing_the_call():
@@ -1230,7 +1352,7 @@ def test_completed_capture_evidence_expires_by_age_not_entry_count(monkeypatch):
     assert list(worker._completed_capture_calls) == ["c2"]
 
 
-def test_generation_cut_recovers_terminal_evidence_from_durable_tq_row():
+def test_terminal_tq_row_without_recovery_metadata_restarts_from_boundary():
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     request = _begin_captured_request(worker, [10])
@@ -1259,9 +1381,9 @@ def test_generation_cut_recovers_terminal_evidence_from_durable_tq_row():
         worker, inventory
     )
 
-    assert receipt.prefixes[0].cut_kind == "terminal_completion"
-    assert receipt.prefixes[0].staging_keys == ("r0/c1",)
-    assert receipt.prefixes[0].prefix_token_count == 2
+    assert receipt.prefixes[0].disposition == "durable_failure"
+    assert receipt.prefixes[0].cut_kind is None
+    assert receipt.prefixes[0].staging_keys == ()
 
 
 def test_capture_observer_rejects_unaligned_delta_output():
@@ -1319,6 +1441,7 @@ def test_generation_cut_swaps_buffer_before_blocking_prefix_write():
         stream=False,
     )
     VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11])
+    worker._capture_calls[id(request)].effective_output_limit = 128
     VllmAsyncGenerationWorkerImpl._observe_request_capture(
         worker,
         request,
@@ -1438,6 +1561,7 @@ def test_generation_cut_swaps_buffer_before_blocking_prefix_write():
             "staging_keys": continuation.staging_keys,
             "generation_token_count": continuation.prefix_token_count,
             "digest": continuation.prefix_digest,
+            "effective_output_limit": continuation.effective_output_limit,
         },
     )
     restored = resumed_worker._resolve_generation_cut(admission, [])
@@ -1472,6 +1596,7 @@ def test_generation_cut_restore_accepts_monotonic_mixed_policy_versions():
             "staging_keys": [first_key],
             "generation_token_count": 2,
             "digest": first_chunk.digest,
+            "effective_output_limit": 128,
         },
     )
     second_capture = RolloutTokenCapture(
@@ -1512,6 +1637,7 @@ def test_generation_cut_restore_accepts_monotonic_mixed_policy_versions():
             "staging_keys": [first_key, second_key],
             "generation_token_count": 4,
             "digest": cumulative.digest,
+            "effective_output_limit": 128,
         },
     )
 
@@ -1540,6 +1666,7 @@ def test_generation_cut_rolls_frozen_buffer_back_after_staging_failure():
         stream=False,
     )
     VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10])
+    worker._capture_calls[id(request)].effective_output_limit = 128
     VllmAsyncGenerationWorkerImpl._observe_request_capture(
         worker,
         request,
@@ -1593,6 +1720,7 @@ def test_generation_cut_validates_ack_before_sealing_state(monkeypatch):
         stream=False,
     )
     VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10])
+    worker._capture_calls[id(request)].effective_output_limit = 128
     VllmAsyncGenerationWorkerImpl._observe_request_capture(
         worker,
         request,
@@ -1665,6 +1793,8 @@ def test_generation_cut_retry_after_later_call_failure_uses_new_chunk_key():
     )
     VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, first_request, [10])
     VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, second_request, [20])
+    worker._capture_calls[id(first_request)].effective_output_limit = 128
+    worker._capture_calls[id(second_request)].effective_output_limit = 128
     VllmAsyncGenerationWorkerImpl._observe_request_capture(
         worker,
         first_request,
@@ -1763,6 +1893,7 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
     VllmAsyncGenerationWorkerImpl._begin_request_capture(
         original_worker, original_request, [10, 11]
     )
+    original_worker._capture_calls[id(original_request)].effective_output_limit = 128
     progress = SimpleNamespace(
         outputs=[
             SimpleNamespace(
@@ -1812,6 +1943,7 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
                 "staging_keys": [cut_key],
                 "generation_token_count": 2,
                 "digest": cut_record.digest,
+                "effective_output_limit": receipt.prefixes[0].effective_output_limit,
             },
         },
         stream=False,
@@ -1893,6 +2025,7 @@ def test_terminal_restored_cut_publishes_canonical_row_with_zero_new_tail():
     VllmAsyncGenerationWorkerImpl._begin_request_capture(
         original_worker, original_request, [10, 11]
     )
+    original_worker._capture_calls[id(original_request)].effective_output_limit = 2
     VllmAsyncGenerationWorkerImpl._observe_request_capture(
         original_worker,
         original_request,
@@ -1943,6 +2076,7 @@ def test_terminal_restored_cut_publishes_canonical_row_with_zero_new_tail():
                 "staging_keys": [cut_key],
                 "generation_token_count": 2,
                 "digest": cut_record.digest,
+                "effective_output_limit": receipt.prefixes[0].effective_output_limit,
             },
         },
         stream=False,
