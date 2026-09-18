@@ -151,7 +151,7 @@ class GymActorExecutionRegistry:
             for identity in identities:
                 self.register(identity)
                 registered.append(identity)
-        except BaseException:
+        except Exception:
             for identity in registered:
                 self.release(identity)
             raise
@@ -1023,12 +1023,16 @@ def _gym_checkpoint_external_storage_references(
             GymExternalStorageReference,
         )
         for raw_record in records:
-            if raw_record.key in references_by_key:
+            previous = references_by_key.get(raw_record.key)
+            if previous is None:
+                references_by_key[raw_record.key] = raw_record
+            elif previous != raw_record:
                 raise ValueError(
-                    "Gym checkpoint repeats an external storage key: "
-                    f"key={raw_record.key!r}"
+                    "Gym checkpoint contains conflicting metadata for the same "
+                    f"external storage key: key={raw_record.key!r}, "
+                    f"first={previous.model_dump()!r}, "
+                    f"second={raw_record.model_dump()!r}"
                 )
-            references_by_key[raw_record.key] = raw_record
     return references_by_key
 
 
