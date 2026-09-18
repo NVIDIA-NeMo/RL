@@ -68,9 +68,6 @@ cleanup() {
             printf 'libc6=%s\n' "$(dpkg-query -W -f='${Version}' libc6 2>/dev/null || printf unknown)"
         } > "$DIAGNOSTIC_DIR/forensics.txt" 2>&1
         mkdir -p "$DIAGNOSTIC_DIR/fx"
-        # Resolved here, not at script start: this arm must leave the pre-training
-        # path byte-identical to the baseline that actually failed.
-        PY_EXE_FX=$(uv run --no-sync python -c 'import sys; print(sys.executable)' 2>/dev/null || printf python3)
 
         # Record what the crash left behind BEFORE touching the package set: an
         # install that fails or drags libraries with it must not be able to
@@ -86,35 +83,45 @@ cleanup() {
             printf 'core_found=NONE\n' >> "$DIAGNOSTIC_DIR/forensics.txt"
         fi
 
-        # Secure the evidence before doing anything that can hang. Every step
+        # Compress the evidence before doing anything that can hang. Every step
         # below this point is fallible in a way that takes the whole job with it:
         # an apt mirror that never answers runs the job into the CI timeout, and
-        # then no artifact is uploaded at all. Ordering the cheap, self-contained
+        # a killed job uploads nothing at all. Ordering the cheap, self-contained
         # captures first means the worst case is a run with no backtrace rather
         # than a run with no evidence.
         #
-        # dmesg leads because it is the one quick source that can name the
-        # faulting library outright ("segfault at .. in libfoo.so").
+        # This is not "the core is safe". Compression only puts it in the
+        # workspace; it survives only if the artifact upload, which runs after
+        # this function returns, succeeds. The key below says awaiting-upload for
+        # that reason.
+        #
+        # dmesg leads because it is the quickest source that can name a faulting
+        # library ("segfault at .. in libfoo.so"). Treat it as a lead, not a
+        # verdict: reading it from inside the container has failed before, and
+        # the library in the message is where the fault surfaced, not
+        # necessarily what is responsible.
         dmesg > "$DIAGNOSTIC_DIR/fx/dmesg.txt" 2>&1
         for c in "${cores[@]}"; do
             [[ -f $c ]] || continue
             base=$(basename "$c")
-            # Best effort, not a guarantee: a core that will not compress, or
-            # will not fit the artifact budget, is reported as lost rather than
-            # quietly dropped. What finally counts is the upload succeeding.
-            if gzip -1 -c "$c" > "$DIAGNOSTIC_DIR/fx/$base.gz" 2>/dev/null; then
+            # Bounded like everything else that can stall: a core that will not
+            # compress in time leaves the remaining evidence and the upload
+            # intact instead of running the job into its limit. A killed gzip
+            # exits non-zero, so the truncated output lands in the failure
+            # branch and is removed rather than passed off as an archive.
+            if timeout -k 60s 900s gzip -1 -c "$c" > "$DIAGNOSTIC_DIR/fx/$base.gz" 2>/dev/null; then
                 kept=$(stat -c %s "$DIAGNOSTIC_DIR/fx/$base.gz" 2>/dev/null || printf 0)
                 if [[ "$kept" -gt 0 && "$kept" -le 3000000000 ]]; then
-                    printf 'core_preserved=%s.gz bytes=%s\n' "$base" "$kept" \
+                    printf 'core_compressed=%s.gz bytes=%s state=awaiting-upload\n' "$base" "$kept" \
                         >> "$DIAGNOSTIC_DIR/forensics.txt"
                 else
                     rm -f "$DIAGNOSTIC_DIR/fx/$base.gz"
-                    printf 'core_NOT_PRESERVED=%s compressed_bytes=%s -- exceeds artifact budget, evidence lost on cleanup\n' \
+                    printf 'core_NOT_COMPRESSED=%s compressed_bytes=%s -- exceeds artifact budget, evidence lost on cleanup\n' \
                         "$base" "$kept" >> "$DIAGNOSTIC_DIR/forensics.txt"
                 fi
             else
                 rm -f "$DIAGNOSTIC_DIR/fx/$base.gz"
-                printf 'core_NOT_PRESERVED=%s -- compression failed, evidence lost on cleanup\n' \
+                printf 'core_NOT_COMPRESSED=%s -- compression failed or timed out, evidence lost on cleanup\n' \
                     "$base" >> "$DIAGNOSTIC_DIR/forensics.txt"
             fi
         done
@@ -133,10 +140,12 @@ cleanup() {
             printf 'gdb_install=skipped-hold-failed\n' >> "$DIAGNOSTIC_DIR/forensics.txt"
         else
             # Bounded: an unreachable mirror must cost us a backtrace, not the
-            # job. The core is already archived above either way.
+            # job. The core is already compressed above either way. -k because
+            # plain timeout only sends TERM, and a process that ignores it goes
+            # on waiting -- the bound has to be enforceable to be worth writing.
             {
-                timeout 600 apt-get update -qq \
-                    && timeout 900 apt-get install -y -qq --no-install-recommends gdb
+                timeout -k 30s 600s apt-get update -qq \
+                    && timeout -k 30s 900s apt-get install -y -qq --no-install-recommends gdb
             } > "$DIAGNOSTIC_DIR/fx/gdb-install.log" 2>&1
             apt-mark unhold libc6 libc-bin libc6-dev >> "$DIAGNOSTIC_DIR/fx/apt-hold.log" 2>&1
             printf 'gdb_install=attempted\n' >> "$DIAGNOSTIC_DIR/forensics.txt"
@@ -146,13 +155,24 @@ cleanup() {
             "$(command -v gdb || printf none)" "$libc6_before_fx" "$libc6_after_fx" \
             >> "$DIAGNOSTIC_DIR/forensics.txt"
 
+        # gdb needs the executable the core came from. Resolving it used to sit
+        # above the compression and had no bound, which was the same defect as
+        # the unbounded install one step further up: a stalled `uv run` meant the
+        # core was never reached at all. It is bounded now, and it runs here
+        # because nothing before this point needs it. An unresolved interpreter
+        # means no backtrace -- reading a core against the wrong executable
+        # produces frames that look real and are not.
+        PY_EXE_FX=$(timeout -k 15s 120s uv run --no-sync python -c 'import sys; print(sys.executable)' 2>/dev/null) \
+            || PY_EXE_FX=""
+        printf 'py_exe=%s\n' "${PY_EXE_FX:-unresolved}" >> "$DIAGNOSTIC_DIR/forensics.txt"
+
         for c in "${cores[@]}"; do
             [[ -f $c ]] || continue
             base=$(basename "$c")
             gdb_rc=127
-            if command -v gdb > /dev/null 2>&1; then
+            if [[ -n "$PY_EXE_FX" ]] && command -v gdb > /dev/null 2>&1; then
                 gdb_rc=0
-                timeout 900 gdb -batch -q -ex 'thread apply all bt' -ex 'info sharedlibrary' \
+                timeout -k 30s 900s gdb -batch -q -ex 'thread apply all bt' -ex 'info sharedlibrary' \
                     "$PY_EXE_FX" "$c" > "$DIAGNOSTIC_DIR/fx/gdb-$base.txt" 2>&1 || gdb_rc=$?
             fi
             # A backtrace is only trustworthy if the binaries gdb read it
@@ -164,7 +184,9 @@ cleanup() {
             # library map, frames, and a clean gdb -- and call everything else
             # unreliable.
             parse_note=""
-            if [[ "$gdb_rc" -ne 0 ]]; then
+            if [[ -z "$PY_EXE_FX" ]]; then
+                parse_note="python-path-unresolved"
+            elif [[ "$gdb_rc" -ne 0 ]]; then
                 parse_note="gdb-rc-$gdb_rc"
             elif [[ "$libc6_before_fx" == unknown || "$libc6_after_fx" == unknown ]]; then
                 parse_note="libc-version-unknown"
@@ -186,8 +208,17 @@ cleanup() {
             # Build-ID matching, which this round does not do -- so report the
             # stack as obtained with identity unverified, and never let that
             # verdict skip the archive.
-            lib_yes=$(grep -cE '^0x[0-9a-f]+ +0x[0-9a-f]+ +Yes' "$DIAGNOSTIC_DIR/fx/gdb-$base.txt" 2>/dev/null || printf 0)
-            lib_no=$(grep -cE '^0x[0-9a-f]+ +0x[0-9a-f]+ +No' "$DIAGNOSTIC_DIR/fx/gdb-$base.txt" 2>/dev/null || printf 0)
+            #
+            # grep -c prints the count for a match (status 0) and for no match
+            # (status 1) alike; only a read error (status 2) leaves it absent.
+            # The `|| printf 0` that used to guard these fired on the no-match
+            # status, appending a second zero to a count grep had already
+            # printed, and the variable became "0\n0" -- which split the
+            # single-line record in two.
+            lib_yes=$(grep -cE '^0x[0-9a-f]+ +0x[0-9a-f]+ +Yes' "$DIAGNOSTIC_DIR/fx/gdb-$base.txt" 2>/dev/null)
+            [[ $? -le 1 ]] || lib_yes=unknown
+            lib_no=$(grep -cE '^0x[0-9a-f]+ +0x[0-9a-f]+ +No' "$DIAGNOSTIC_DIR/fx/gdb-$base.txt" 2>/dev/null)
+            [[ $? -le 1 ]] || lib_no=unknown
             if [[ -z "$parse_note" ]]; then
                 printf 'core_parsed=%s stack=obtained identity=unverified libs_with_symbols=%s libs_without=%s\n' \
                     "$base" "$lib_yes" "$lib_no" >> "$DIAGNOSTIC_DIR/forensics.txt"
