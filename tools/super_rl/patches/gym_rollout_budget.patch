@@ -135,10 +135,12 @@ index 26a3c5c..8498c89 100644
              if collect_trajectory:
                  turn_timestamp = time()
  
-@@ -157,6 +165,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
+@@ -157,7 +165,8 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                      )
                  )
  
 +            budget.consume(model_response.usage.output_tokens if model_response.usage else None)
              usage = accumulate_response_usage(usage, model_response.usage)
              model_response.usage = None
+ 
+             if model_response.incomplete_details:
