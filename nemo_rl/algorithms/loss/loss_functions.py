@@ -244,9 +244,21 @@ class ClippedPGLossFn(LossFunction):
         *,
         seq_logprob_error_threshold: float | None = None,
     ):
-        # Populated by GRPO setup only for the opt-in single-forward path.
-        # The worker must rescale accumulated gradients to the surviving-token
-        # count before clipping/stepping; a per-microbatch denominator is wrong.
+        """Initialize the loss and its worker normalization requirements.
+
+        Args:
+            cfg: Policy-gradient loss configuration.
+            use_fused_linear_logprobs: Whether the model returns precomputed
+                next-token logprobs instead of logits.
+            opd_full: Optional full-vocabulary distillation configuration.
+            seq_logprob_error_threshold: Enables sequence filtering inside the
+                loss when set. The loss emits survivor counts but normalizes by
+                the original global counts. The worker must aggregate survivor
+                counts across all microbatches and data-parallel ranks, then
+                rescale gradients and normalized metrics before clipping or
+                stepping the optimizer. See ``requires_survivor_normalization``.
+                Leave unset when filtering is performed before training.
+        """
         self.seq_logprob_error_threshold = seq_logprob_error_threshold
         if seq_logprob_error_threshold is not None:
             if not cfg.force_on_policy_ratio or not cfg.token_level_loss:
@@ -428,6 +440,15 @@ class ClippedPGLossFn(LossFunction):
                         "opd_full_decomposition_error": MetricNormalizer.NONE,
                     }
                 )
+
+    @property
+    def requires_survivor_normalization(self) -> bool:
+        """Whether the worker must renormalize using in-loss survivor counts.
+
+        Derived from the filtering threshold so filtering and the worker's
+        normalization requirement cannot be configured independently.
+        """
+        return self.seq_logprob_error_threshold is not None
 
     def __call__(
         self,

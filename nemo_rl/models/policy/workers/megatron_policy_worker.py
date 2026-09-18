@@ -1218,7 +1218,7 @@ class MegatronPolicyWorkerImpl(
 
                 if (
                     isinstance(loss_fn, ClippedPGLossFn)
-                    and loss_fn.seq_logprob_error_threshold is not None
+                    and loss_fn.requires_survivor_normalization
                 ):
                     (
                         losses_reduced,
