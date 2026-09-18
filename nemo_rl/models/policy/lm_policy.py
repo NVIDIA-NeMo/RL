@@ -41,6 +41,7 @@ from nemo_rl.models.generation.interfaces import (
     RefitPayloadMode,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.draft_config import coerce_draft_config
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -51,6 +52,7 @@ from nemo_rl.models.policy.interfaces import (
 from nemo_rl.models.policy.utils import (
     aggregate_per_sample_handles,
     resolve_policy_worker_cls,
+    validate_fp32_lm_head_config,
 )
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.flops_tracker import (
@@ -150,12 +152,37 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
-        draft_enabled = bool(config.get("draft", {}).get("enabled", False))
+        # Normalize in place: every downstream reader (workers, setup, train)
+        # accesses draft config by attribute, so a hand-built PolicyConfig has
+        # to be validated here rather than only inside MasterConfig.
+        draft_config = coerce_draft_config(config.get("draft"))
+        if draft_config is not None:
+            config["draft"] = draft_config
+        draft_enabled = bool(draft_config is not None and draft_config.enabled)
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
             )
+        validate_fp32_lm_head_config(
+            config, megatron_enabled=megatron_enable, dtensor_enabled=dtensor_enable
+        )
+        hf_config = None
+        hf_config_overrides = config.get("hf_config_overrides") or {}
+        generation_config = config.get("generation")
+        if generation_config is not None and generation_config["backend"] == "vllm":
+            vllm_cfg = generation_config.get("vllm_cfg")
+            if vllm_cfg is not None and vllm_cfg.get("fp32_lm_head"):
+                hf_config = get_hf_config(
+                    config["model_name"],
+                    **hf_config_overrides,
+                )
+                validate_fp32_lm_head_config(
+                    config,
+                    megatron_enabled=megatron_enable,
+                    dtensor_enabled=dtensor_enable,
+                    model_config=hf_config,
+                )
         if reserved_http_server_ports is not None and not megatron_enable:
             raise ValueError(
                 "reserved_http_server_ports is only supported by the Megatron "
@@ -412,12 +439,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         # initialize FLOPs tracker
         try:
+            if hf_config is None:
+                hf_config = get_hf_config(
+                    config["model_name"],
+                    **hf_config_overrides,
+                )
             self.flops_tracker = FLOPTracker.from_config(
                 config["model_name"],
-                get_hf_config(
-                    config["model_name"],
-                    **(config.get("hf_config_overrides") or {}),
-                ),
+                hf_config,
             )
         except ValueError as e:
             self.flops_tracker = None
