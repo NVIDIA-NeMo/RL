@@ -80,6 +80,7 @@ def _make_sglang_generation_cfg(pad_token_id=PAD_TOKEN_ID, tp_size=1):
         "stop_strings": None,
         "_pad_token_id": pad_token_id,
         "sglang_cfg": {
+            "use_fault_tolerance": False,
             "model_path": MODEL_PATH,
             "dtype": "bfloat16",
             "random_seed": 42,
@@ -216,6 +217,7 @@ def _make_minimal_sglang_gen_for_clamp_test(
 ):
     sglang_gen = SGLangGeneration.__new__(SGLangGeneration)
     sglang_gen.all_engines = []
+    sglang_gen._health_monitor = None
     sglang_gen._router_actor = None
     sglang_gen._http_client = None
     sglang_gen.sglang_cfg = _make_sglang_generation_cfg()
