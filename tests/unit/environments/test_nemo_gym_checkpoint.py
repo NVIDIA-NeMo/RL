@@ -471,7 +471,7 @@ def test_checkpoint_prepare_timeout_resumes_touched_participants() -> None:
     with pytest.raises(TimeoutError, match="remained 'draining'"):
         asyncio.run(env.prepare_checkpoint("snapshot-9", time.time() + 10.0))
 
-    assert resume_order == ["tools", "agent", "policy"]
+    assert resume_order == ["tools", "policy", "agent"]
 
 
 def test_checkpoint_prepare_lost_response_resumes_attempted_participant() -> None:
@@ -1022,6 +1022,6 @@ def test_agent_prepare_timeout_resumes_after_completed_result_blocker() -> None:
     with pytest.raises(TimeoutError, match="participants were resumed"):
         asyncio.run(env.prepare_checkpoint("snapshot-prompt-group", time.time() + 0.01))
 
-    assert resume_order == ["agent", "policy"]
+    assert resume_order == ["policy", "agent"]
     assert env._active_gym_checkpoint_id is None
     assert env._gym_execution_registry.status()["frozen_checkpoint_id"] is None

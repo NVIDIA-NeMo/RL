@@ -1526,15 +1526,15 @@ Depending on your data shape, you may want to change these values."""
         deadline_ts: float,
         participants: tuple[GymDiscoveredParticipant, ...],
     ) -> list[GymParticipantResumeResult]:
-        """Resume a prepared subset, reopening policy admission last."""
+        """Resume a prepared subset after reopening every agent dependency."""
         request = GymCheckpointControlRequest(
             checkpoint_id=checkpoint_id,
             deadline_ts=deadline_ts,
         ).model_dump(mode="json")
         results: list[GymParticipantResumeResult] = []
         component_order = {
-            "responses_api_models": 0,
-            "responses_api_agents": 1,
+            "responses_api_agents": 0,
+            "responses_api_models": 1,
             "resources_servers": 2,
         }
         ordered = sorted(
