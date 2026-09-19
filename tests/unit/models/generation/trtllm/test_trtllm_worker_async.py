@@ -117,7 +117,9 @@ async def test_generate_async_converts_padded_batch_and_logprobs():
 
     output = await worker.generate_async(data, greedy=True)
 
-    worker._build_sampling_params.assert_called_once_with(greedy=True)
+    worker._build_sampling_params.assert_called_once_with(
+        greedy=True, stop_strings=None
+    )
     assert worker.llm.generate_async.await_count == 2
     assert torch.equal(
         output["output_ids"], torch.tensor([[11, 12, 21, 22], [13, 23, 0, 0]])
@@ -162,6 +164,41 @@ async def test_generate_async_empty_batch_does_not_call_engine():
     worker.llm.generate_async.assert_not_awaited()
 
 
+def test_build_sampling_params_forwards_configured_stop_strings():
+    """Configured stop strings must reach TRT-LLM, which spells them ``stop``.
+
+    vLLM, SGLang and Dynamo all honor ``policy.generation.stop_strings``; TRT-LLM
+    passed only ``stop_token_ids``, so the same config stopped generation on the
+    other backends and ran to max_new_tokens here.
+    """
+    worker = _worker()
+    worker.cfg["stop_strings"] = ["</answer>"]
+
+    worker._build_sampling_params(
+        greedy=False, stop_strings=worker._merge_stop_strings(None)
+    )
+
+    assert worker.TrtSamplingParams.call_args.kwargs["stop"] == ["</answer>"]
+
+
+def test_merge_stop_strings_unions_config_and_per_sample():
+    """Same shape as BaseVllmGenerationWorker._merge_stop_strings."""
+    worker = _worker()
+    worker.cfg["stop_strings"] = ["</answer>"]
+
+    merged = worker._merge_stop_strings([["<eot>"], None, ["</answer>", "STOP"]])
+
+    assert merged == ["</answer>", "<eot>", "STOP"]
+
+
+def test_merge_stop_strings_returns_none_when_nothing_configured():
+    """None, not [], so TRT-LLM keeps its own default rather than an empty list."""
+    worker = _worker()
+
+    assert worker._merge_stop_strings(None) is None
+    assert worker._merge_stop_strings([[], None]) is None
+
+
 def test_build_sampling_params_null_top_k_maps_to_zero():
     """null top_k (default) must reach TRT-LLM as 0, its spelling of 'no restriction'."""
     worker = _worker()
@@ -175,6 +212,7 @@ def test_build_sampling_params_null_top_k_maps_to_zero():
         top_k=0,
         max_tokens=4,
         stop_token_ids=[9],
+        stop=None,
         include_stop_str_in_output=True,
         logprobs=True,
         logprobs_simple_format=True,
@@ -191,6 +229,7 @@ def test_build_sampling_params_supports_async_greedy_and_sampling_modes():
         top_k=1,
         max_tokens=4,
         stop_token_ids=[9],
+        stop=None,
         include_stop_str_in_output=True,
         logprobs=True,
         logprobs_simple_format=True,
@@ -204,6 +243,7 @@ def test_build_sampling_params_supports_async_greedy_and_sampling_modes():
         top_k=20,
         max_tokens=4,
         stop_token_ids=[9],
+        stop=None,
         include_stop_str_in_output=True,
         logprobs=True,
         logprobs_simple_format=True,
