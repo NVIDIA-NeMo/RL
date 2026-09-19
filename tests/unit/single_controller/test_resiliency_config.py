@@ -82,6 +82,15 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
     )
 
 
+def test_single_forward_threshold_rejected_before_streaming_setup():
+    cfg = _master_config()
+    cfg.grpo.seq_logprob_error_in_loss = True
+    cfg.grpo.seq_logprob_error_threshold = 2.0
+    cfg.loss_fn.force_on_policy_ratio = True
+    with pytest.raises(ValueError, match="advantage baselines"):
+        validate_single_controller_config(cfg)
+
+
 class TestDefaultsAreInert:
     def test_timeouts_default_to_disabled(self):
         cfg = AsyncRLConfig()

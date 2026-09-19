@@ -1274,6 +1274,12 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     _validate_algo_settings(master_config)
+    if master_config.grpo is not None and master_config.grpo.seq_logprob_error_in_loss:
+        raise ValueError(
+            "grpo.seq_logprob_error_in_loss is not supported by SingleController: "
+            "its advantage baselines depend on the pre-training sequence mask. "
+            "Use the non-streaming GRPO trainer."
+        )
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -53,6 +54,7 @@ from nemo_rl.algorithms.grpo import (
     _save_async_replay_buffer_checkpoint,
     _startup_pipeline_ready,
     _validate_multimodal_dedup_capability,
+    _validate_seq_logprob_error_in_loss,
     _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
     async_grpo_train,
@@ -4277,8 +4279,9 @@ def test_clip_grpo_advantages_respects_config_bounds():
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
+@pytest.mark.parametrize("in_loss", [False, True])
 def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
-    mock_grpo_components, train_func
+    mock_grpo_components, train_func, in_loss
 ):
     """Regression test for PR #2177.
 
@@ -4289,7 +4292,10 @@ def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
     """
     master_config = mock_grpo_components["master_config"]
     master_config.loss_fn.force_on_policy_ratio = True
-    master_config.grpo.seq_logprob_error_threshold = None
+    master_config.grpo.seq_logprob_error_threshold = 2.0 if in_loss else None
+    master_config.grpo.seq_logprob_error_in_loss = in_loss
+    master_config.grpo.skip_reference_policy_logprobs_calculation = True
+    master_config.loss_fn.reference_policy_kl_penalty = 0
     master_config.grpo.max_num_steps = 1
     master_config.grpo.max_num_epochs = 1
     master_config.grpo.val_period = 0
@@ -4362,6 +4368,7 @@ def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
         "policy.get_logprobs was called even though force_on_policy_ratio=True. "
         "This indicates a regression of PR #2177."
     )
+    assert not policy.get_reference_policy_logprobs.called
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
@@ -5744,6 +5751,32 @@ class TestComputeAndApplySeqLogprobErrorMasking:
             }
         )
 
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+    @pytest.mark.parametrize("field", ["prev_logprobs", "generation_logprobs"])
+    @pytest.mark.parametrize("masked_position", [True, False])
+    def test_nonfinite_logprobs_respect_token_mask(
+        self, bad: float, field: str, masked_position: bool
+    ) -> None:
+        """Padding cannot poison a row, but nonfinite response errors reject it."""
+        train_data = self._create_train_data(
+            2,
+            4,
+            torch.zeros(2, 4),
+            torch.zeros(2, 4),
+            token_mask=torch.tensor([[1.0, 1.0, 1.0, 0.0]] * 2),
+        )
+        train_data[field][0, 3 if masked_position else 1] = bad
+        result = compute_and_apply_seq_logprob_error_masking(
+            train_data, torch.ones(2), seq_logprob_error_threshold=2.0
+        )
+        assert result["num_masked_seqs"] == (0 if masked_position else 1)
+        assert train_data["sample_mask"].tolist() == [
+            1.0 if masked_position else 0.0,
+            1.0,
+        ]
+        if masked_position:
+            assert math.isfinite(result["max_seq_mult_prob_error"])
+
     def test_no_threshold_only_computes_metrics(self):
         """Test that when threshold is None, only metrics are computed (no masking)."""
         batch_size, seq_length = 4, 10
@@ -6222,6 +6255,102 @@ def test_resolve_logprob_skip_flags(kw, expected):
             assert _resolve_logprob_skip_flags(_cfg(**kw)) == expected
     else:
         assert _resolve_logprob_skip_flags(_cfg(**kw)) == expected
+
+
+def test_single_forward_sync_dataplane_skips_logprob_dispatch(mock_grpo_components):
+    config = mock_grpo_components["master_config"]
+    config.data_plane = {"enabled": True}
+    config.grpo.seq_logprob_error_in_loss = True
+    config.grpo.seq_logprob_error_threshold = 2.0
+    config.grpo.skip_reference_policy_logprobs_calculation = True
+    config.loss_fn.force_on_policy_ratio = True
+    config.loss_fn.reference_policy_kl_penalty = 0
+    config.grpo.max_num_steps = 1
+    config.grpo.val_period = 0
+    config.grpo.val_at_start = False
+    config.grpo.val_at_end = False
+    policy = mock_grpo_components["policy"]
+    with mock_sync_grpo_infrastructure(policy):
+        grpo_train_sync(
+            policy,
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            config,
+        )
+    policy.get_logprobs_from_meta.assert_not_called()
+    policy.get_reference_policy_logprobs_from_meta.assert_not_called()
+    policy.prepare_for_lp_inference.assert_not_called()
+    policy.train_from_meta.assert_called_once()
+
+
+def test_in_loss_threshold_skips_policy_forward_without_disabling_threshold():
+    config = _cfg(force=True, threshold=2.0, skip_ref=True, kl_penalty=0)
+    config.grpo.seq_logprob_error_in_loss = True
+    assert _resolve_logprob_skip_flags(config) == (True, True)
+    assert config.grpo.seq_logprob_error_threshold == 2.0
+
+
+@pytest.mark.parametrize("include_draft", [True, False])
+def test_validate_single_forward_config(
+    mock_grpo_components, include_draft: bool
+) -> None:
+    config = mock_grpo_components["master_config"]
+    config.grpo.seq_logprob_error_in_loss = True
+    config.grpo.seq_logprob_error_threshold = 2.0
+    config.loss_fn.force_on_policy_ratio = True
+    config.loss_fn.token_level_loss = True
+    config.policy["megatron_cfg"] = {"enabled": True, "mtp_num_layers": 0}
+    if include_draft:
+        config.policy["draft"] = {"enabled": False}
+    else:
+        config.policy.pop("draft", None)
+    _validate_seq_logprob_error_in_loss(config)
+
+    del config.policy["megatron_cfg"]
+    with pytest.raises(ValueError, match="requires the Megatron backend"):
+        _validate_seq_logprob_error_in_loss(config)
+
+
+@pytest.mark.parametrize(
+    "override, message",
+    [
+        ({"grpo": {"seq_logprob_error_threshold": None}}, "requires seq_logprob"),
+        ({"loss_fn": {"force_on_policy_ratio": False}}, "force_on_policy_ratio"),
+        ({"loss_fn": {"token_level_loss": False}}, "token_level_loss"),
+        ({"loss_fn": {"use_kl_in_reward": True}}, "advantage estimator"),
+        ({"loss_fn": {"positive_example_nll_weight": 0.1}}, "NLL"),
+        ({"policy": {"megatron_cfg": {"enabled": False}}}, "Megatron backend"),
+        ({"policy": {"megatron_cfg": {"enabled": True, "mtp_num_layers": 1}}}, "MTP"),
+        ({"policy": {"draft": {"enabled": True}}}, "draft"),
+    ],
+)
+def test_single_forward_rejects_unsupported_configs(
+    mock_grpo_components, override, message
+):
+    config = mock_grpo_components["master_config"]
+    config.grpo.seq_logprob_error_in_loss = True
+    config.grpo.seq_logprob_error_threshold = 2.0
+    config.loss_fn.force_on_policy_ratio = True
+    config.loss_fn.token_level_loss = True
+    config.policy["megatron_cfg"] = {"enabled": True, "mtp_num_layers": 0}
+    config.policy["draft"] = {"enabled": False}
+    for section, values in override.items():
+        obj = getattr(config, section)
+        for key, value in values.items():
+            if isinstance(obj, dict):
+                obj[key] = value
+            else:
+                setattr(obj, key, value)
+    with pytest.raises(ValueError, match=message):
+        _validate_seq_logprob_error_in_loss(config)
 
 
 def test_validate_use_kl_in_reward_rejects_force_on_policy_ratio():

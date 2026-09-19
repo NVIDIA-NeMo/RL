@@ -59,6 +59,7 @@ from nemo_rl.algorithms.reward_functions import (
 from nemo_rl.algorithms.utils import (
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
+    compute_seq_logprob_errors,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_efficiency_summary,
@@ -367,6 +368,10 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Sequence-level logprob error masking for training stability. If set, mask sequences with mult_prob_error exceeding this threshold (same scale as token_mult_prob_error metric, e.g., 1.5)
     # Note that this is slightly different than Masked Importance Sampling (MIS) because this uses the absolute value of the difference between the training and generation logprobs, whereas MIS just uses the difference between the training and generation logprobs.
     seq_logprob_error_threshold: float | None = None
+    # Evaluate the threshold in the training loss and normalize accumulated
+    # gradients afterward, avoiding the separate policy-logprob forward.
+    # Supported for token-level, force-on-policy Megatron GRPO (non-streaming).
+    seq_logprob_error_in_loss: bool = False
     # Advantage value to assign to invalid tool call tokens. When set (e.g. -5.0), overwrites the
     # computed advantage for those tokens to penalize them; absent/None disables the penalty.
     invalid_tool_call_advantage: float | None = None
@@ -453,6 +458,40 @@ class MasterConfig(BaseModel, extra="allow"):
 # ===============================================================================
 # Setup & Initialization
 # ===============================================================================
+
+
+def _validate_seq_logprob_error_in_loss(master_config: MasterConfig) -> None:
+    """Validate the single-forward threshold path before allocating workers."""
+    if not master_config.grpo.seq_logprob_error_in_loss:
+        return
+    if master_config.grpo.seq_logprob_error_threshold is None:
+        raise ValueError(
+            "grpo.seq_logprob_error_in_loss requires seq_logprob_error_threshold"
+        )
+    loss = master_config.loss_fn
+    if not loss.force_on_policy_ratio or not loss.token_level_loss:
+        raise ValueError(
+            "grpo.seq_logprob_error_in_loss requires force_on_policy_ratio=true "
+            "and token_level_loss=true"
+        )
+    if master_config.grpo.adv_estimator.name != "grpo" or loss.use_kl_in_reward:
+        raise ValueError(
+            "grpo.seq_logprob_error_in_loss requires the grpo advantage estimator "
+            "without use_kl_in_reward"
+        )
+    policy = master_config.policy
+    if "megatron_cfg" not in policy or not policy["megatron_cfg"]["enabled"]:
+        raise ValueError("grpo.seq_logprob_error_in_loss requires the Megatron backend")
+    if (
+        policy["megatron_cfg"].get("mtp_num_layers")
+        or ("draft" in policy and policy["draft"]["enabled"])
+        or loss.positive_example_nll_weight != 0
+        or opd_module.is_opd_enabled(master_config)
+    ):
+        raise ValueError(
+            "grpo.seq_logprob_error_in_loss does not support MTP, draft, "
+            "positive-example NLL, or distillation losses"
+        )
 
 
 def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
@@ -567,6 +606,7 @@ def setup(
         generation_config = DynamoConfig.model_validate(generation_config).model_dump()
         policy_config["generation"] = generation_config
     _validate_multimodal_dedup_capability(master_config)
+    _validate_seq_logprob_error_in_loss(master_config)
 
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
     # path; everywhere else validation must sample exactly like training.
@@ -773,7 +813,13 @@ def setup(
         )
 
     loss_fn = ClippedPGLossFn(
-        loss_config, use_fused_linear_logprobs=use_fused_linear_logprobs
+        loss_config,
+        use_fused_linear_logprobs=use_fused_linear_logprobs,
+        seq_logprob_error_threshold=(
+            grpo_config.seq_logprob_error_threshold
+            if grpo_config.seq_logprob_error_in_loss
+            else None
+        ),
     )
 
     # Validate force_on_policy_ratio
@@ -2692,8 +2738,8 @@ def _resolve_logprob_skip_flags(
 ) -> tuple[bool, bool | None]:
     """Return (skip_prev_logprobs, skip_reference_logprobs); warn on incompatible combos.
 
-    Skip prev_logprobs when force_on_policy_ratio=True unless
-    seq_logprob_error_threshold is set (which requires prev_logprobs).
+    Skip prev_logprobs when force_on_policy_ratio=True unless the sequence
+    threshold is evaluated before training rather than inside the loss.
     Skip reference_policy_logprobs when
     ``grpo.skip_reference_policy_logprobs_calculation`` is set.
     """
@@ -2701,6 +2747,7 @@ def _resolve_logprob_skip_flags(
     if (
         master_config.loss_fn.force_on_policy_ratio
         and master_config.grpo.seq_logprob_error_threshold is not None
+        and not master_config.grpo.seq_logprob_error_in_loss
     ):
         warnings.warn(
             "force_on_policy_ratio=True but seq_logprob_error_threshold is set. "
@@ -2741,27 +2788,13 @@ def compute_and_apply_seq_logprob_error_masking(
     sample_mask = train_data["sample_mask"]
     prev_logprobs = train_data["prev_logprobs"][:, 1:]
     generation_logprobs = train_data["generation_logprobs"][:, 1:]
-    lp_error = torch.abs(generation_logprobs - prev_logprobs)
-
-    # Use combined mask exactly as in loss function
-    mask = token_mask * sample_mask.unsqueeze(-1)
-
-    # Calculate sequence-level multiplicative prob error.
-    #
-    # NOTE: When a sequence is fully masked (mask.sum == 0), it should not contribute to
-    # min/mean/max statistics; otherwise, it would yield a spurious 0 due to denominator
-    # clamping and incorrectly drag min_seq_mult_prob_error to 0.
-    denom = mask.sum(dim=-1)
-    valid_seq_mask = denom > 0
-
-    # EXACT same calculation as token_mult_prob_error but per-sequence (for valid sequences)
-    seq_mult_prob_error = torch.zeros_like(denom, dtype=lp_error.dtype)
+    seq_mult_prob_error, valid_seq_mask = compute_seq_logprob_errors(
+        policy_logprobs=prev_logprobs,
+        generation_logprobs=generation_logprobs,
+        token_mask=token_mask,
+        sample_mask=sample_mask,
+    )
     if valid_seq_mask.any():
-        num = (torch.exp(lp_error * mask) * mask).sum(dim=-1)
-        seq_mult_prob_error[valid_seq_mask] = num[valid_seq_mask] / denom[
-            valid_seq_mask
-        ].clamp(min=1)
-
         valid_errors = seq_mult_prob_error[valid_seq_mask]
         max_seq_mult_prob_error = valid_errors.max().item()
         mean_seq_mult_prob_error = valid_errors.mean().item()
@@ -3518,10 +3551,18 @@ def _grpo_train_impl(
                     del logprob_data
                     del extra_multimodal_data
 
-                # Seq-level logprob error metrics/masking require real prev_logprobs
+                # Separate-pass seq-level metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
-                    # Cannot compute seq-level metrics with placeholder prev_logprobs
-                    seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
+                    # In-loss filtering reports counts through all_mb_metrics.
+                    # Use {} so placeholder zeros cannot overwrite those counts
+                    # when seq_logprob_error_metrics is merged after training.
+                    # Otherwise, placeholder prev_logprobs cannot provide
+                    # sequence-error metrics.
+                    seq_logprob_error_metrics = (
+                        {}
+                        if master_config.grpo.seq_logprob_error_in_loss
+                        else _placeholder_seq_logprob_error_metrics()
+                    )
                 else:
                     seq_error_result = compute_and_apply_seq_logprob_error_masking(
                         train_data=train_data,
@@ -5313,10 +5354,18 @@ def async_grpo_train(
                             train_data["prev_logprobs"]
                         )
 
-                # Seq-level logprob error metrics/masking require real prev_logprobs
+                # Separate-pass seq-level metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
-                    # Cannot compute seq-level metrics with placeholder prev_logprobs
-                    seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
+                    # In-loss filtering reports counts through all_mb_metrics.
+                    # Use {} so placeholder zeros cannot overwrite those counts
+                    # when seq_logprob_error_metrics is merged after training.
+                    # Otherwise, placeholder prev_logprobs cannot provide
+                    # sequence-error metrics.
+                    seq_logprob_error_metrics = (
+                        {}
+                        if master_config.grpo.seq_logprob_error_in_loss
+                        else _placeholder_seq_logprob_error_metrics()
+                    )
                 else:
                     seq_error_result = compute_and_apply_seq_logprob_error_masking(
                         train_data=train_data,
