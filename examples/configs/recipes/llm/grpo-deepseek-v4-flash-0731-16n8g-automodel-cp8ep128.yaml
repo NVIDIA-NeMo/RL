@@ -78,7 +78,7 @@ policy:
         linear: torch
         rms_norm: torch_fp32
         experts: torch_mm
-        dispatcher: deepep
+        dispatcher: hybridep
         fake_balanced_gate: false
         rope_fusion: false
         enable_hf_state_dict_adapter: true
