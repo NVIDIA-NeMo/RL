@@ -38,7 +38,9 @@ import torch
 
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, backend_config
+from nemo_rl.data_plane.observability import is_metrics_client
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
     GLOBAL_FORWARD_PAD_SEQLEN,
@@ -116,7 +118,8 @@ def _broadcast_batched_data_dict(
                                 "empty_packed",
                                 len(v),
                                 v.dim_to_pack,
-                                v.pad_to_max_shape,
+                                v.preprocess_mode,
+                                v.preprocess_kwargs,
                             )
                         )
                         continue
@@ -130,7 +133,8 @@ def _broadcast_batched_data_dict(
                             str(values.device),
                             nested.offsets().tolist(),
                             shapes,
-                            v.pad_to_max_shape,
+                            v.preprocess_mode,
+                            v.preprocess_kwargs,
                         )
                     )
                 elif (
@@ -206,7 +210,14 @@ def _broadcast_batched_data_dict(
             ):
                 out[key] = tensor.to(src_device)
         elif kind == "packed_wire":
-            dtype_str, src_device, offsets, shapes, pad_to_max_shape = entry[2:]
+            (
+                dtype_str,
+                src_device,
+                offsets,
+                shapes,
+                preprocess_mode,
+                preprocess_kwargs,
+            ) = entry[2:]
             if is_leader:
                 flat = leader_flat[key].to(bcast_device)
             else:
@@ -224,17 +235,21 @@ def _broadcast_batched_data_dict(
                 if torch.device(src_device).type != torch.device(bcast_device).type:
                     nested = nested.to(src_device)
                 out[key] = PackedTensor.from_wire(
-                    nested, shapes, pad_to_max_shape=pad_to_max_shape
+                    nested,
+                    shapes,
+                    preprocess_mode=preprocess_mode,
+                    preprocess_kwargs=preprocess_kwargs,
                 )
         elif kind == "empty_packed":
             # Structural only: no payload, so followers rebuild from the
             # geometry and land on the leader's key set.
-            n_rows, dim_to_pack, pad_to_max_shape = entry[2:]
+            n_rows, dim_to_pack, preprocess_mode, preprocess_kwargs = entry[2:]
             if not is_leader:
                 out[key] = PackedTensor(
                     [None] * n_rows,
                     dim_to_pack,
-                    pad_to_max_shape=pad_to_max_shape,
+                    preprocess_mode=preprocess_mode,
+                    preprocess_kwargs=preprocess_kwargs,
                 )
         else:
             if not is_leader:
@@ -344,6 +359,10 @@ class TQWorkerMixin:
         # controller actor; this process attaches as a client.
         self._dp_client = build_data_plane_client(cfg, bootstrap=False)
 
+    def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
+        """Run an owner-local checkpoint command; return metadata, never payloads."""
+        return run_checkpoint_command(body)
+
     def _require_dp_client(self) -> DataPlaneClient:
         if self._dp_client is None:
             raise RuntimeError(
@@ -383,6 +402,23 @@ class TQWorkerMixin:
     def _forward_pad_seqlen(self, meta: "KVBatchMeta") -> int:
         """Cross-DP forward pad target, minted by :meth:`TQPolicy._stamp_pad_seqlen`."""
         return int((meta.extra_info or {}).get(GLOBAL_FORWARD_PAD_SEQLEN, 0))
+
+    def get_data_plane_snapshot(self) -> "dict[str, Any] | None":
+        """This rank's data-plane counters, for cluster-wide aggregation.
+
+        Returns ``None`` when observability is off or no client exists, so
+        the driver can filter rather than special-case. The payload is
+        counters only (about 1 kB), not tensors.
+
+        Closes this rank's step window (``step_wall_ms``, ``step_max_ms``) as
+        it reads, since the driver calls this once per step. Neither a sum
+        the cluster reduces with a max nor a max itself can be differenced
+        out of a cumulative counter, so without the reset the cluster's
+        per-step figures would latch at the worst call ever seen.
+        """
+        if not is_metrics_client(self._dp_client):
+            return None
+        return self._dp_client.snapshot(reset_step_window=True)
 
     def _fetch(
         self,

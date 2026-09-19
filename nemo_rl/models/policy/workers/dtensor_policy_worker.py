@@ -792,7 +792,7 @@ class DTensorPolicyWorkerImpl(
 
                         # add vlm kwargs to model call
                         vlm_kwargs = mb.get_multimodal_dict(
-                            as_tensors=True, device=input_ids.device
+                            True, input_ids.device, None, "pad_to_max_shape"
                         )
                         vlm_kwargs = filter_multimodal_kwargs_for_model(
                             self.model, vlm_kwargs
@@ -1096,7 +1096,7 @@ class DTensorPolicyWorkerImpl(
                 input_ids = lp_batch.get("input_ids").cuda()
                 input_lengths = lp_batch.get("input_lengths")
                 vlm_kwargs = lp_batch.get_multimodal_dict(
-                    as_tensors=True, device=input_ids.device
+                    True, input_ids.device, None, "pad_to_max_shape"
                 )
                 vlm_kwargs = filter_multimodal_kwargs_for_model(self.model, vlm_kwargs)
 
@@ -1537,7 +1537,7 @@ class DTensorPolicyWorkerImpl(
                 input_ids = lp_batch.get("input_ids").cuda()
                 input_lengths = lp_batch.get("input_lengths")
                 vlm_kwargs = lp_batch.get_multimodal_dict(
-                    as_tensors=True, device=input_ids.device
+                    True, input_ids.device, None, "pad_to_max_shape"
                 )
                 vlm_kwargs = filter_multimodal_kwargs_for_model(self.model, vlm_kwargs)
                 batch_size, seq_len = input_ids.shape

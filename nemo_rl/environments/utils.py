@@ -144,7 +144,7 @@ def register_env(env_name: str, actor_class_fqn: str) -> None:
 
 def shutdown_environments(
     *env_maps: Optional[Dict[str, EnvironmentInterface]],
-    timeout: float = DEFAULT_ENV_SHUTDOWN_TIMEOUT_SECONDS,
+    timeout: float | None = DEFAULT_ENV_SHUTDOWN_TIMEOUT_SECONDS,
 ) -> None:
     """Gracefully shut down every distinct environment actor in the given maps.
 
@@ -156,10 +156,15 @@ def shutdown_environments(
     in-flight HTTP requests to the vLLM endpoints, and killing generation first
     leaves them retrying dead connections.
 
+    An entry is either a Ray actor handle or a local object that owns actors of
+    its own (a NeMo-Gym shard set); the latter is asked to shut itself down
+    rather than killed, since only it knows what it holds.
+
     Args:
         env_maps: Task-name to environment mappings. ``None`` and empty
             mappings are skipped.
-        timeout: Seconds to wait for each actor's ``shutdown()`` before killing it.
+        timeout: Seconds to wait for each actor's ``shutdown()`` before killing
+            it. ``None`` waits until graceful shutdown finishes.
     """
     seen: set[int] = set()
     for env_map in env_maps:
@@ -170,10 +175,18 @@ def shutdown_environments(
                 continue
             seen.add(id(env))
             print(f"🛑 Shutting down environment {task_name}...")
+            is_actor_handle = isinstance(env, ray.actor.ActorHandle)
             try:
-                ray.get(env.shutdown.remote(), timeout=timeout)
+                if is_actor_handle:
+                    ray.get(env.shutdown.remote(), timeout=timeout)
+                else:
+                    env.shutdown(timeout=timeout)
             except Exception as e:
                 print(f"Graceful shutdown of environment {task_name} failed: {e}")
+                if not is_actor_handle:
+                    # Nothing to kill: the failure came from an owner object
+                    # that already tried, and reported, its own teardown.
+                    continue
                 try:
                     ray.kill(env)
                 except Exception as kill_error:

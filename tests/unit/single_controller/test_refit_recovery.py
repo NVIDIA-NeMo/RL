@@ -48,6 +48,7 @@ from nemo_rl.models.generation.fleet_health import (
     GenerationFleetHealth,
     ShardState,
 )
+from nemo_rl.utils.timer import Timer
 
 
 async def _completed(value=None):
@@ -157,6 +158,8 @@ def _make_controller(
     )
     ctrl._inflight_by_group_id = {}
     ctrl._rollout_recovery_enabled = False
+    ctrl._trainer = SimpleNamespace(sync_params_before_refit=MagicMock())
+    ctrl._timer = Timer()
     return ctrl, monitor, sync
 
 
@@ -168,12 +171,13 @@ def test_failed_pause_recovers_and_pauses_survivors_before_refit(failure):
     ctrl, monitor, sync = _make_controller(failure)
     ctrl._async_cfg.generation_fleet_health.refit_timeout_s = 1.0
     events = []
+    ctrl._trainer.sync_params_before_refit.side_effect = lambda: events.append("params")
     serving_at_pause = []
 
     def pause(**kwargs):
         events.append("pause")
         serving_at_pause.append(monitor.serving_shards())
-        if events == ["pause"]:
+        if len(serving_at_pause) == 1:
             raise failure
         assert monitor.absent_shards() == [0]
         return True
@@ -183,7 +187,8 @@ def test_failed_pause_recovers_and_pauses_survivors_before_refit(failure):
 
     asyncio.run(ctrl._sync_weights())
 
-    assert events == ["pause", "pause", "sync"]
+    assert events == ["params", "pause", "pause", "sync"]
+    ctrl._trainer.sync_params_before_refit.assert_called_once_with()
     assert serving_at_pause == [[0, 1], [1]]
     assert ctrl._gen.pause_generation_for_refit.call_args_list == [
         mock.call(clear_cache=False, timeout_s=61.0),
@@ -273,6 +278,7 @@ class TestDeathInsideTheCollective:
         asyncio.run(ctrl._sync_weights())
         assert sync.sync_calls == 2
         assert sync.absent_at_retry == [0]
+        ctrl._trainer.sync_params_before_refit.assert_called_once_with()
 
     def test_generation_stays_paused_across_the_recovery_retry(self):
         ctrl, _, sync = _make_controller(ABORTED)

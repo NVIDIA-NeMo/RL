@@ -33,10 +33,17 @@ The two port patches ship their own suites. These cover the remaining patches:
 import ast
 import logging
 import os
+import sys
+import types
 
 import pytest
+import torch
 
 from nemo_rl.models.generation.vllm import patches
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
+    vllm_nemotron_h_fp32_lm_head_enabled,
+)
 from tests.unit.models.generation.vllm_patch_source_utils import (
     write_unpatched_copy,
 )
@@ -50,6 +57,82 @@ _RADIO_MARKER = "initializer_factor = self.config.initializer_factor"
 _GLM_DSA_SOURCE = "model_executor/models/deepseek_v2.py"
 _GLM_DSA_PATCH_FN = "_patch_vllm_glm_decoder_sequence_parallel_moe"
 _GLM_DSA_MARKER = 'getattr(config, "model_type", None) != "glm_moe_dsa"'
+_NEMOTRON_H_SOURCE = """import torch
+from torch import nn
+
+
+def maybe_prefix(prefix, name):
+    return f"{prefix}.{name}"
+
+
+class LogitsProcessor:
+    def __init__(self, vocab_size):
+        self.vocab_size = vocab_size
+
+    def __call__(self, lm_head, hidden_states):
+        return lm_head.quant_method.apply(lm_head, hidden_states)
+
+
+class QuantMethod:
+    def __init__(self):
+        self.seen_dtypes = []
+
+    def apply(self, lm_head, hidden_states, bias=None):
+        self.seen_dtypes.append(
+            (
+                hidden_states.dtype,
+                lm_head.weight.dtype,
+                None if bias is None else bias.dtype,
+            )
+        )
+        logits = hidden_states @ lm_head.weight.t()
+        if bias is not None:
+            logits = logits + bias
+        return logits
+
+
+class ParallelLMHead(nn.Module):
+    def __init__(
+        self,
+        vocab_size,
+        hidden_size,
+        params_dtype=None,
+        quant_config=None,
+        prefix="",
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.params_dtype = params_dtype
+        self.quant_config = quant_config
+        self.prefix = prefix
+        self.weight = nn.Parameter(
+            torch.ones(vocab_size, hidden_size, dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        self.bias = None
+        self.quant_method = QuantMethod()
+
+    def forward(self, input_):
+        del input_
+        raise RuntimeError("LMHead's weights should be used in the sampler.")
+
+
+class NemotronHForCausalLM:
+    def __init__(self, config, prefix):
+        self.quant_config = object()
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=self.quant_config,
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+
+    def compute_logits(self, hidden_states):
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        return logits
+"""
 
 
 @pytest.fixture
@@ -79,6 +162,15 @@ def patched_glm_dsa_source(tmp_path, monkeypatch):
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
     patches._patch_vllm_glm_decoder_sequence_parallel_moe(logging.getLogger(__name__))
     return copied
+
+
+@pytest.fixture
+def patched_nemotron_h_source(tmp_path, monkeypatch):
+    source = tmp_path / "nemotron_h.py"
+    source.write_text(_NEMOTRON_H_SOURCE)
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
+    patches._patch_vllm_nemotron_h_fp32_lm_head(logging.getLogger(__name__))
+    return source
 
 
 @pytest.mark.vllm
@@ -210,6 +302,262 @@ def test_glm_decoder_sp_moe_patch_warns_on_unknown_source(
 
     assert model_source.read_text() == "class DeepseekV2DecoderLayer:\n    pass\n"
     assert "vLLM 0.25.1 source shape was not found" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("vllm_cfg", "expected"),
+    [
+        ({}, False),
+        ({"fp32_lm_head": False}, False),
+        ({"fp32_lm_head": True}, True),
+        ({"env_vars": {VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR: "1"}}, False),
+        ({"env_vars": {VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR: "0"}}, False),
+    ],
+)
+def test_vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg, expected):
+    assert vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg) is expected
+
+
+@pytest.mark.parametrize("env_value", [None, "0", "1"])
+def test_nemotron_h_fp32_lm_head_patch_is_env_gated(
+    patched_nemotron_h_source, monkeypatch, env_value
+):
+    if env_value is None:
+        monkeypatch.delenv(VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, env_value)
+
+    namespace = {}
+    source = patched_nemotron_h_source.read_text()
+    exec(compile(source, str(patched_nemotron_h_source), "exec"), namespace)
+    config = types.SimpleNamespace(vocab_size=16, hidden_size=8)
+    model = namespace["NemotronHForCausalLM"](config, "model")
+    hidden_states = torch.ones(2, 8, dtype=torch.bfloat16)
+
+    logits = model.compute_logits(hidden_states)
+
+    if env_value == "1":
+        assert model._nrl_fp32_lm_head is True
+        assert model.lm_head.params_dtype is None
+        assert model.lm_head.quant_config is model.quant_config
+        assert model.lm_head.weight.dtype is torch.bfloat16
+        assert logits.dtype is torch.float32
+        assert model.lm_head(hidden_states).dtype is torch.float32
+        assert model.lm_head.quant_method.seen_dtypes == []
+    else:
+        assert model._nrl_fp32_lm_head is False
+        assert model.lm_head.params_dtype is None
+        assert model.lm_head.quant_config is model.quant_config
+        assert model.lm_head.weight.dtype is torch.bfloat16
+        assert logits.dtype is torch.bfloat16
+        assert model.lm_head.quant_method.seen_dtypes == [
+            (torch.bfloat16, torch.bfloat16, None)
+        ]
+
+    assert "deepcopy" not in source
+    assert "params_dtype=torch.float32" not in source
+    assert "NemotronH vLLM lm_head.forward casts " in source
+    assert "input and weight to fp32" in source
+    assert "torch.matmul(" in source
+    ast.parse(source)
+
+
+def test_nemotron_h_fp32_lm_head_patch_is_idempotent(
+    patched_nemotron_h_source, monkeypatch
+):
+    before = patched_nemotron_h_source.read_text()
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(patched_nemotron_h_source)
+    )
+
+    patches._patch_vllm_nemotron_h_fp32_lm_head(logging.getLogger(__name__))
+
+    assert patched_nemotron_h_source.read_text() == before
+
+
+def test_nemotron_h_fp32_lm_head_patch_warns_on_unknown_source(
+    tmp_path, monkeypatch, caplog
+):
+    source = tmp_path / "nemotron_h.py"
+    source.write_text("class NemotronHForCausalLM:\n    pass\n")
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
+
+    with caplog.at_level(logging.WARNING):
+        applied = patches._patch_vllm_nemotron_h_fp32_lm_head(
+            logging.getLogger(__name__)
+        )
+
+    assert applied is False
+    assert source.read_text() == "class NemotronHForCausalLM:\n    pass\n"
+    assert "NemotronH fp32 LM head import anchor not found exactly once" in caplog.text
+
+
+@pytest.mark.vllm
+def test_nemotron_h_fp32_lm_head_patch_anchor_still_matches_installed_vllm(
+    tmp_path, monkeypatch
+):
+    """Pin the vLLM 0.25.1 Nemotron-H source shape used by the patch."""
+    copied = tmp_path / "nemotron_h.py"
+    with open(patches._get_vllm_file("model_executor/models/nemotron_h.py")) as f:
+        copied.write_text(f.read())
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+
+    applied = patches._patch_vllm_nemotron_h_fp32_lm_head(logging.getLogger(__name__))
+
+    assert applied is True
+    content = copied.read_text()
+    assert "self._nrl_fp32_lm_head = (" in content
+    assert "def _nrl_fp32_lm_head_forward(" in content
+    assert content.index("import os\n") < content.index("import torch\n")
+    ast.parse(content)
+
+
+def _install_fake_vllm_modules(monkeypatch):
+    vllm_module = types.ModuleType("vllm")
+    envs_module = types.ModuleType("vllm.envs")
+    envs_module.VLLM_USE_RAY_V2_EXECUTOR_BACKEND = True
+    logger_module = types.ModuleType("vllm.logger")
+    logger_module.init_logger = lambda name: logging.getLogger(name)
+    vllm_module.envs = envs_module
+    vllm_module.logger = logger_module
+    monkeypatch.setitem(sys.modules, "vllm", vllm_module)
+    monkeypatch.setitem(sys.modules, "vllm.envs", envs_module)
+    monkeypatch.setitem(sys.modules, "vllm.logger", logger_module)
+
+
+def _stub_non_fp32_vllm_patches(monkeypatch, captured_extra_env_vars):
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_init_workers_ray",
+        lambda _py, extra: captured_extra_env_vars.append(extra) or False,
+    )
+    for patch_name in (
+        "_patch_vllm_llama_eagle3_own_lm_head",
+        "_patch_vllm_tool_parser_namespace_tool",
+        "_patch_vllm_ray_executor_v2_tcpstore_port",
+        "_patch_vllm_shm_broadcast_bind_retry",
+        "_patch_vllm_radio_layerscale_loader",
+        "_patch_vllm_glm_decoder_sequence_parallel_moe",
+    ):
+        monkeypatch.setattr(patches, patch_name, lambda _logger: None)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_apply_vllm_patches_gates_nemotron_h_fp32_lm_head(monkeypatch, enabled):
+    _install_fake_vllm_modules(monkeypatch)
+    monkeypatch.delenv(patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, raising=False)
+    captured_extra_env_vars = []
+    fp32_patch_calls = []
+    _stub_non_fp32_vllm_patches(monkeypatch, captured_extra_env_vars)
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_nemotron_h_fp32_lm_head",
+        lambda _logger: fp32_patch_calls.append(True) or True,
+    )
+
+    patches._apply_vllm_patches(
+        "py", extra_env_vars=["USER_VAR"], nemotron_h_fp32_lm_head=enabled
+    )
+
+    assert bool(fp32_patch_calls) is enabled
+    if enabled:
+        assert os.environ[patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR] == "1"
+        assert captured_extra_env_vars == [
+            ["USER_VAR", patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR]
+        ]
+    else:
+        assert patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR not in os.environ
+        assert captured_extra_env_vars == [["USER_VAR"]]
+
+
+def test_apply_vllm_patches_ignores_ambient_fp32_lm_head_env_toggle(monkeypatch):
+    _install_fake_vllm_modules(monkeypatch)
+    monkeypatch.setenv(patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, "1")
+    captured_extra_env_vars = []
+    fp32_patch_calls = []
+    _stub_non_fp32_vllm_patches(monkeypatch, captured_extra_env_vars)
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_nemotron_h_fp32_lm_head",
+        lambda _logger: fp32_patch_calls.append(True) or True,
+    )
+
+    patches._apply_vllm_patches("py")
+
+    assert fp32_patch_calls == []
+    assert patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR not in os.environ
+    assert captured_extra_env_vars == [None]
+
+
+def test_apply_vllm_patches_raises_when_nemotron_h_fp32_lm_head_patch_fails(
+    monkeypatch,
+):
+    _install_fake_vllm_modules(monkeypatch)
+    monkeypatch.delenv(patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, raising=False)
+    _stub_non_fp32_vllm_patches(monkeypatch, [])
+    monkeypatch.setattr(
+        patches, "_patch_vllm_nemotron_h_fp32_lm_head", lambda _logger: False
+    )
+
+    with pytest.raises(RuntimeError, match="could not be applied"):
+        patches._apply_vllm_patches("py", nemotron_h_fp32_lm_head=True)
+
+
+@pytest.mark.parametrize(
+    ("vllm_cfg_overrides", "expected_nemotron_h_fp32_lm_head"),
+    [
+        ({"env_vars": {"USER_VAR": "value"}, "fp32_lm_head": True}, True),
+        (
+            {
+                "env_vars": {
+                    "USER_VAR": "value",
+                    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR: "1",
+                }
+            },
+            False,
+        ),
+    ],
+)
+def test_vllm_worker_threads_nemotron_h_fp32_lm_head_cfg_into_source_patches(
+    monkeypatch, vllm_cfg_overrides, expected_nemotron_h_fp32_lm_head
+):
+    from nemo_rl.models.generation.vllm import vllm_worker
+
+    patch_calls = []
+    monkeypatch.setattr(
+        vllm_worker,
+        "_apply_vllm_patches",
+        lambda py, *, extra_env_vars, nemotron_h_fp32_lm_head: patch_calls.append(
+            {
+                "py": py,
+                "extra_env_vars": extra_env_vars,
+                "nemotron_h_fp32_lm_head": nemotron_h_fp32_lm_head,
+            }
+        ),
+    )
+
+    vllm_worker.BaseVllmGenerationWorker(
+        {
+            "model_name": "model",
+            "vllm_cfg": {
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 1,
+                "expert_parallel_size": 1,
+                "gpu_memory_utilization": 0.6,
+                "precision": "bfloat16",
+                **vllm_cfg_overrides,
+            },
+        },
+        extra_env_vars=["EXPLICIT_VAR"],
+    )
+
+    assert patch_calls == [
+        {
+            "py": sys.executable,
+            "extra_env_vars": ["EXPLICIT_VAR"],
+            "nemotron_h_fp32_lm_head": expected_nemotron_h_fp32_lm_head,
+        }
+    ]
 
 
 @pytest.mark.parametrize(

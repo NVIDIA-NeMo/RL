@@ -50,6 +50,7 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
     _AsyncLLMHTTPClient,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
+from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
 model_name = "Qwen/Qwen3-0.6B"
@@ -1291,7 +1292,7 @@ def get_basic_megatron_test_config(
                 "data_parallel_sharding_strategy": "optim_grads_params",
             },
         },
-        "draft": {"enabled": False},
+        "draft": Eagle3DraftConfig(enabled=False),
         "optimizer": None,  # Remove default FSDP optimizer
         "scheduler": None,  # Remove default scheduler
         "max_grad_norm": 1.0,
@@ -2079,6 +2080,11 @@ async def test_vllm_generation_with_hf_training_colocated(
     dtensor_config = deepcopy(basic_dtensor_test_config)
     dtensor_config["dtensor_cfg"]["cpu_offload"] = cpu_offload
     dtensor_config["dtensor_cfg"]["_v2"] = enable_lora
+    if enable_lora:
+        dtensor_config["dtensor_cfg"]["checkpoint"] = {
+            "model_save_format": "safetensors",
+            "save_consolidated": "false",
+        }
     dtensor_config["dtensor_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
     dtensor_config["dtensor_cfg"]["lora_cfg"]["enabled"] = enable_lora
     dtensor_config["train_global_batch_size"] = 4
@@ -2167,6 +2173,11 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     dtensor_config["train_global_batch_size"] = 4
     # lora must use dtensor v2
     dtensor_config["dtensor_cfg"]["_v2"] = enable_lora
+    if enable_lora:
+        dtensor_config["dtensor_cfg"]["checkpoint"] = {
+            "model_save_format": "safetensors",
+            "save_consolidated": "false",
+        }
     dtensor_config["dtensor_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
     dtensor_config["dtensor_cfg"]["lora_cfg"]["enabled"] = enable_lora
     lm_policy = Policy(policy_cluster_separate, dtensor_config, tokenizer)
@@ -2953,6 +2964,10 @@ def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
     elif train_backend == "dtensor_v2":
         train_config = deepcopy(basic_dtensor_test_config)
         train_config["dtensor_cfg"]["_v2"] = True
+        train_config["dtensor_cfg"]["checkpoint"] = {
+            "model_save_format": "safetensors",
+            "save_consolidated": "false",
+        }
     elif train_backend == "megatron":
         train_config = get_basic_megatron_test_config(tp=1, pp=1, precision="float32")
     else:
