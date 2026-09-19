@@ -45,6 +45,7 @@ from nemo_rl.algorithms.grpo import (
     _get_grpo_save_state,
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
+    _mask_sample_valid_mask,
     _maybe_restore_async_replay_buffer_checkpoint,
     _needs_hf_refit_handshake,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
@@ -315,6 +316,48 @@ def test_refit_returns_empty_metrics_when_synchronizer_returns_none() -> None:
 
     assert refit_policy_generation(policy, generation, colocated_inference=False) == {}
     policy.sync_params_before_refit.assert_called_once_with()
+
+
+class TestMaskSampleValidMask:
+    def test_flagged_rows_do_not_vote_in_group_statistics(self):
+        repeated_batch = BatchedDataDict(
+            {
+                "total_reward": torch.tensor([1.0, 0.0, 1.0, 0.0]),
+                "mask_sample": torch.tensor([False, True, False, False]),
+            }
+        )
+
+        valid_mask = _mask_sample_valid_mask(repeated_batch)
+
+        assert torch.equal(valid_mask, torch.tensor([1.0, 0.0, 1.0, 1.0]))
+        # The excluded row's reward must not move its siblings' baseline.
+        prompt_ids = torch.tensor([[7, 7], [7, 7], [7, 7], [7, 7]])
+        baseline, _ = calculate_baseline_and_std_per_prompt(
+            prompt_ids,
+            repeated_batch["total_reward"],
+            valid_mask,
+            leave_one_out_baseline=False,
+        )
+        assert torch.allclose(baseline[[0, 2, 3]], torch.full((3,), 2.0 / 3.0))
+
+    def test_list_valued_mask_sample(self):
+        repeated_batch = BatchedDataDict(
+            {
+                "total_reward": torch.tensor([0.5, 0.5, 0.5]),
+                "mask_sample": [True, False, True],
+            }
+        )
+
+        assert torch.equal(
+            _mask_sample_valid_mask(repeated_batch), torch.tensor([0.0, 1.0, 0.0])
+        )
+
+    def test_missing_mask_sample_is_all_valid(self):
+        repeated_batch = BatchedDataDict({"total_reward": torch.tensor([0.5, 0.5])})
+
+        assert torch.equal(
+            _mask_sample_valid_mask(repeated_batch), torch.tensor([1.0, 1.0])
+        )
 
 
 class TestMaskSampleFilter:
@@ -4254,6 +4297,31 @@ def test_grpo_train_preserves_advantages_when_clipping_disabled(
     policy.train.assert_called_once()
     advantages = policy.train.call_args[0][0]["advantages"]
     assert torch.equal(advantages, extreme_advantages)
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
+def test_grpo_train_passes_final_sample_mask_as_valid_mask(
+    mock_grpo_components, train_func, monkeypatch
+):
+    """Rows dropped from the loss must not vote in their siblings' baseline.
+
+    Both legacy loops hand the estimator the same ``sample_mask`` that reaches
+    ``policy.train`` (mask_sample / overlong / seq-logprob-error masking already
+    applied), mirroring the SingleController's ``valid_mask`` contract.
+    """
+    mock_adv_estimator = MagicMock()
+    mock_adv_estimator.compute_advantage.return_value = torch.zeros(1, 2)
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.grpo._create_advantage_estimator",
+        lambda _cfg: mock_adv_estimator,
+    )
+
+    _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch)
+
+    mock_adv_estimator.compute_advantage.assert_called_once()
+    valid_mask = mock_adv_estimator.compute_advantage.call_args.kwargs["valid_mask"]
+    trained = mock_grpo_components["policy"].train.call_args[0][0]
+    assert torch.equal(valid_mask, trained["sample_mask"])
 
 
 def test_clip_grpo_advantages_respects_config_bounds():
