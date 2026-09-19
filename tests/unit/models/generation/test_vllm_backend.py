@@ -2271,6 +2271,7 @@ class _FakeHfToVllmMapper:
         return self._renames.get(key, key)
 
 
+@pytest.mark.vllm
 def test_drop_tied_embedding_aliases_removes_only_aliases_without_mapper():
     from nemo_rl.models.generation.vllm.vllm_backend import (
         _drop_tied_embedding_aliases,
@@ -2289,6 +2290,7 @@ def test_drop_tied_embedding_aliases_removes_only_aliases_without_mapper():
     assert kept == [weights[0], weights[2]]
 
 
+@pytest.mark.vllm
 def test_drop_tied_embedding_aliases_matches_on_vllm_names_via_mapper():
     """Gemma-style models alias `language_model.lm_head.weight` in vLLM names."""
     from nemo_rl.models.generation.vllm.vllm_backend import (
@@ -2318,6 +2320,7 @@ def test_drop_tied_embedding_aliases_matches_on_vllm_names_via_mapper():
     assert [name for name, _ in kept] == ["unused.weight", "model.embed_tokens.weight"]
 
 
+@pytest.mark.vllm
 def test_drop_tied_embedding_aliases_is_passthrough_without_aliases():
     from nemo_rl.models.generation.vllm.vllm_backend import (
         _drop_tied_embedding_aliases,
@@ -2327,6 +2330,7 @@ def test_drop_tied_embedding_aliases_is_passthrough_without_aliases():
     assert list(_drop_tied_embedding_aliases(weights, {}, mapper=None)) == weights
 
 
+@pytest.mark.vllm
 def test_load_weights_drops_tied_lm_head_before_vllm_load(monkeypatch):
     """The alias never reaches load_weights; the MTP drafter still sees it."""
     from nemo_rl.models.generation.vllm import vllm_backend
@@ -2361,6 +2365,7 @@ def test_load_weights_drops_tied_lm_head_before_vllm_load(monkeypatch):
     ext._maybe_refit_mtp_drafter.assert_called_once_with(weights)
 
 
+@pytest.mark.vllm
 def test_load_weights_keeps_everything_when_vllm_reports_no_aliases(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
     from nemo_rl.models.generation.vllm.quantization import fp8
@@ -2386,6 +2391,7 @@ def test_load_weights_keeps_everything_when_vllm_reports_no_aliases(monkeypatch)
     assert loaded == weights
 
 
+@pytest.mark.vllm
 def test_prepare_reload_weight_iterator_drops_tied_aliases(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
     from nemo_rl.models.generation.vllm.quantization import fp8
