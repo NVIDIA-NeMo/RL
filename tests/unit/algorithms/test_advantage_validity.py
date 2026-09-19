@@ -323,14 +323,17 @@ def test_reinforce_pp_uses_independent_token_statistics(
     )
 
 
+@pytest.mark.parametrize("mask_dtype", [torch.bool, torch.float32])
 @pytest.mark.parametrize("name", ["gdpo", "reinforce_plus_plus"])
 @pytest.mark.parametrize("num_valid", [0, 1])
 @pytest.mark.parametrize("include", [False, True])
-def test_masked_estimators_handle_empty_and_singleton_groups(name, num_valid, include):
+def test_masked_estimators_handle_empty_and_singleton_groups(
+    name, num_valid, include, mask_dtype
+):
     prompt_ids = torch.zeros(3, 1, dtype=torch.long)
     rewards = torch.tensor([1.0, 2.0, 4.0])
     loss_weights = (torch.arange(3) < num_valid).float()
-    loss_mask = loss_weights[:, None].expand(3, 2)
+    loss_mask = loss_weights[:, None].expand(3, 2).to(mask_dtype)
     valid = torch.ones(3) if include else loss_weights
     if name == "gdpo":
         estimator = _gdpo_estimator()
@@ -344,6 +347,7 @@ def test_masked_estimators_handle_empty_and_singleton_groups(name, num_valid, in
         normalization_mask=valid[:, None].expand(3, 2),
         repeated_batch={"reward/a": rewards, "reward/b": rewards.square()},
     )
+    assert actual.dtype == rewards.dtype
     assert torch.isfinite(actual).all()
     assert (actual * loss_mask)[~loss_weights.bool()].count_nonzero() == 0
     if not include:

@@ -218,7 +218,7 @@ class GDPOAdvantageEstimator:
         # Use the same participants for the final normalization as for each
         # reward component; otherwise excluded rewards still rescale valid rows.
         if valid.sum() <= 1:
-            return torch.zeros_like(mask)
+            return torch.zeros_like(advantages).expand(mask.shape)
         batch_mask = valid.unsqueeze(-1)
         adv_mean = masked_mean(advantages, batch_mask)
         adv_std = masked_var(advantages, batch_mask, mean=adv_mean).sqrt()
