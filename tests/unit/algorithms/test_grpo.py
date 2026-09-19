@@ -74,6 +74,7 @@ from nemo_rl.data.dataloader import CyclingDataLoader
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
@@ -532,10 +533,12 @@ def mock_grpo_components():
                 "checkpoint_must_save_by": None,
                 "save_period": 10,
             },
-            "cluster": {
-                "num_nodes": 1,
-                "gpus_per_node": 2,
-            },
+            "cluster": ClusterConfig.model_validate(
+                {
+                    "num_nodes": 1,
+                    "gpus_per_node": 2,
+                }
+            ),
             "logger": {
                 "num_val_samples_to_print": 5,
             },

@@ -98,6 +98,7 @@ from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerAct
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
@@ -725,7 +726,7 @@ def _actor_master_config(
             "mlflow_enabled": False,
             "monitor_gpus": False,
         },
-        cluster={"num_nodes": 1, "gpus_per_node": 1},
+        cluster=ClusterConfig.model_validate({"num_nodes": 1, "gpus_per_node": 1}),
         checkpointing={
             "enabled": enabled,
             "checkpoint_dir": str(tmp_path / "checkpoints"),
