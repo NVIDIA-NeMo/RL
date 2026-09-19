@@ -997,7 +997,12 @@ def _init_v2_worker_mocked(
     config = {
         "model_name": "base-model",
         "tokenizer": {},
-        "dtensor_cfg": {},
+        "dtensor_cfg": {
+            "checkpoint": {
+                "model_save_format": "safetensors",
+                "save_consolidated": "false",
+            },
+        },
         "generation": {},
     }
     worker = object.__new__(DTensorPolicyWorkerV2Impl)
