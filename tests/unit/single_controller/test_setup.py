@@ -2476,6 +2476,63 @@ class TestNativeTQRecoverySetup:
                 sampler_name="in_order",
             )
 
+    @pytest.mark.parametrize(
+        ("saved", "current"),
+        [
+            # Same teachers, renumbered: every buffered row's teacher_index now
+            # names the other checkpoint.
+            (["ckpt-a", "ckpt-b"], ["ckpt-b", "ckpt-a"]),
+            # A teacher dropped, so index 1 no longer resolves at all.
+            (["ckpt-a", "ckpt-b"], ["ckpt-a"]),
+            # Written before opd_full tagged rows, resumed into a run that
+            # expects tags.
+            (None, ["ckpt-a"]),
+            # Written with tags, resumed into a run that would ignore them.
+            (["ckpt-a"], None),
+        ],
+    )
+    def test_rejects_tq_checkpoint_written_under_another_teacher_set(
+        self, tmp_path, saved, current
+    ):
+        checkpoint_path = tmp_path / "step_3"
+        (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)
+        (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+        metadata = _native_tq_metadata()
+        if saved is not None:
+            metadata["opd_full_teacher_checkpoints"] = saved
+        policy = MagicMock()
+        policy.load_data_plane_checkpoint.return_value = metadata
+
+        with pytest.raises(ValueError, match="different opd_full teacher set"):
+            sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
+                load_checkpoint=policy.load_data_plane_checkpoint,
+                last_checkpoint_path=str(checkpoint_path),
+                save_state=_save_state(),
+                partition_id="rollout_data",
+                sampler_name="in_order",
+                opd_full_teacher_checkpoints=current,
+            )
+
+    def test_accepts_tq_checkpoint_with_the_same_teacher_numbering(self, tmp_path):
+        checkpoint_path = tmp_path / "step_3"
+        (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)
+        (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+        metadata = _native_tq_metadata()
+        metadata["opd_full_teacher_checkpoints"] = ["ckpt-a", "ckpt-b"]
+        policy = MagicMock()
+        policy.load_data_plane_checkpoint.return_value = metadata
+
+        restored = sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
+            load_checkpoint=policy.load_data_plane_checkpoint,
+            last_checkpoint_path=str(checkpoint_path),
+            save_state=_save_state(),
+            partition_id="rollout_data",
+            sampler_name="in_order",
+            opd_full_teacher_checkpoints=["ckpt-a", "ckpt-b"],
+        )
+
+        assert restored == metadata
+
 
 # ── Full-vocabulary MOPD (on_policy_distillation.full) ──────────────────────
 
