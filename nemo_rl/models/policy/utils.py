@@ -142,9 +142,10 @@ def reject_dtensor_v1(dtensor_cfg: dict[str, Any], config_path: str) -> None:
     if dtensor_cfg.get("_v2") is False:
         raise ValueError(
             f"{config_path}._v2=false selects the DTensor v1 backend, which is being "
-            f"removed and no longer accepts new configs. Drop the _v2 key "
-            f"({config_path} is v2 only) or set the matching megatron_cfg.enabled=true "
-            "to train with Megatron-Core."
+            f"removed and no longer accepts new configs. Set {config_path}._v2=true "
+            f"(v2 is the only supported DTensor backend), or set "
+            f"{config_path.rsplit('.', 1)[0]}.megatron_cfg.enabled=true together with "
+            f"{config_path}.enabled=false to train with Megatron-Core."
         )
 
 
