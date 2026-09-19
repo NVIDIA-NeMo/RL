@@ -18,12 +18,26 @@
 
 import contextlib
 import json
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 import torch
 from safetensors.torch import save_file
+
+
+@pytest.mark.vllm
+def test_sparse_delta_sync_method_does_not_conflict_with_vllm_worker() -> None:
+    from vllm.v1.worker.gpu_worker import Worker
+
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    method_name = "synchronize_sparse_delta_device"
+    assert method_name in vars(VllmInternalWorkerExtension)
+    assert not hasattr(Worker, method_name)
 
 
 def _make_collective_update_extension(backend):
@@ -45,6 +59,78 @@ def _make_collective_update_extension(backend):
     ext.model_config = object()
     ext.device = object()
     return ext, state_info
+
+
+@pytest.mark.vllm
+def test_initialize_model_express_uses_unwrapped_vllm_model(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    model = torch.nn.Module()
+    model_runner = MagicMock()
+    model_runner.get_model.return_value = model
+    model_runner.vllm_config = object()
+    model_runner.model_config.model = "/resolved/test/model"
+    model_runner.model_config.served_model_name = "test/model"
+
+    context = MagicMock()
+    config = MagicMock()
+    client = MagicMock()
+    client.initialize.return_value = object()
+    weight_source = SimpleNamespace(TRAINER=object())
+    modelexpress_rl = ModuleType("modelexpress_rl")
+    modelexpress_rl.ModelExpressGeneratorClient = client
+    modelexpress_rl.ModelExpressGeneratorConfig = config
+    modelexpress_rl.VllmGeneratorContext = context
+    modelexpress_rl.WeightSource = weight_source
+    monkeypatch.setitem(sys.modules, "modelexpress_rl", modelexpress_rl)
+
+    worker = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    worker.model_runner = model_runner
+    worker._model_express_bootstrap = object()
+    worker.initialize_model_express(server_url="mx-server:8000")
+
+    model_runner.get_model.assert_called_once_with()
+    context.assert_called_once_with(
+        model=model,
+        vllm_config=model_runner.vllm_config,
+    )
+    config.assert_called_once_with(
+        engine_context=context.return_value,
+        model_name="test/model",
+        server_url="mx-server:8000",
+        source_order=(weight_source.TRAINER,),
+        bootstrap=worker._model_express_bootstrap,
+    )
+
+
+@pytest.mark.vllm
+def test_model_express_update_reconstructs_version_ref(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    class WeightVersionRef:
+        def __init__(self, version_id):
+            self.version_id = version_id
+
+    modelexpress_rl = ModuleType("modelexpress_rl")
+    modelexpress_rl.WeightVersionRef = WeightVersionRef
+    monkeypatch.setitem(sys.modules, "modelexpress_rl", modelexpress_rl)
+
+    staged = MagicMock()
+    client = MagicMock()
+    client.stage_weight.return_value = staged
+    worker = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    worker._model_express = client
+
+    assert worker.update_weights_from_model_express("version-1") is True
+
+    version = client.stage_weight.call_args.kwargs["version"]
+    assert isinstance(version, WeightVersionRef)
+    assert version.version_id == "version-1"
+    staged.release.assert_called_once_with()
 
 
 @pytest.mark.vllm
