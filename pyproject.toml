@@ -29,7 +29,7 @@ dependencies = [
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
   "ray[default]>=2.55.1",
-  "wandb>=0.28.0",
+  "wandb>=0.30.0",                                                                                       # Address dependency vulnerabilities in bundled wandb-core
   "numpy",
   "datasets>=4.0.0",
   "rich",
@@ -112,7 +112,12 @@ dependencies = [
   # build-container runner is aarch64 (uv reports aarch64-unknown-linux-gnu),
   # so the marker must include aarch64 — otherwise mooncake is silently
   # excluded from the resolution during the Docker build.
-  "mooncake-transfer-engine-cuda13==0.3.11.post1 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  # NOTE: 0.3.13.post1 is the latest release on PyPI as of this bump, but still
+  # vendors golang.org/x/net v0.55.0 (confirmed via strings on libetcd_wrapper.so) --
+  # one version behind the fix for a known dependency vulnerability. This bump
+  # narrows the gap (v0.48.0 -> v0.55.0) but does not fully close it; re-check
+  # when a newer release ships.
+  "mooncake-transfer-engine-cuda13==0.3.13.post1 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
 ]
 
 
