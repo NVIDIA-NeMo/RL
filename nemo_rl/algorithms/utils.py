@@ -132,9 +132,13 @@ def calculate_baseline_and_std_per_prompt(
                                   shaped reward.
 
     Returns:
-    tensor (b,), tensor (b,), tensor (b,) of baselines, std, and a boolean mask
-    identifying samples whose std comparison set contains one unique reward value.
-    All tensors are on the same device as 'rewards'.
+    tensor (b,), tensor (b,), bool tensor (b,) of baselines, std, and a per-sample
+    boolean that is True if the sample group distribution associated with the sample
+    is trivial, i.e. all the rewards are a single value.
+
+    Any non-zero std computed from a trivial distribution is float32 rounding noise
+    which can create explosive advantages during normalization that should not be
+    used for GRPO training.
     """
     if std_rewards is None:
         std_rewards = rewards
@@ -221,7 +225,7 @@ def calculate_baseline_and_std_per_prompt(
     return baseline, std, is_trivial_distribution
 
 
-def calculate_is_trivial_prompt_distribution(
+def calculate_trivial_reward_distributions(
     prompts: torch.Tensor,
     rewards: torch.Tensor,
     valid_mask: torch.Tensor,

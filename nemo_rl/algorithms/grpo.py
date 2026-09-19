@@ -59,7 +59,7 @@ from nemo_rl.algorithms.reward_functions import (
 from nemo_rl.algorithms.utils import (
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
-    calculate_is_trivial_prompt_distribution,
+    calculate_trivial_reward_distributions,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_efficiency_summary,
@@ -1959,11 +1959,13 @@ def dynamic_sampling(
         with timer.time("dynamic_sampling"):
             # Exact reward equality, rather than floating-point std noise, decides
             # whether a prompt has useful reward variation.
-            non_trivial_reward_mask = (
-                std != 0.0
-                if is_trivial_prompt_distribution is None
-                else ~is_trivial_prompt_distribution
-            )
+            if is_trivial_prompt_distribution is None:
+                raise ValueError(
+                    "dynamic_sampling: is_trivial_prompt_distribution is None -- "
+                    "the caller must compute it before this call when "
+                    "use_dynamic_sampling is set."
+                )
+            non_trivial_reward_mask = ~is_trivial_prompt_distribution
 
             keep_prompt_indices = torch.arange(
                 len(non_trivial_reward_mask), device=std.device
@@ -3300,7 +3302,7 @@ def _grpo_train_impl(
                         else None
                     )
                     is_trivial_prompt_distribution = (
-                        calculate_is_trivial_prompt_distribution(
+                        calculate_trivial_reward_distributions(
                             input_ids,
                             std_rewards if std_rewards is not None else rewards,
                             torch.ones_like(rewards),

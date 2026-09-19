@@ -335,13 +335,13 @@ def test_apply_dynamic_sampling_keeps_entire_mixed_loo_group():
     """A full-prompt mask retains every row in a mixed [y, x, ...] group."""
     from nemo_rl.algorithms.grpo_sync import _apply_dynamic_sampling
     from nemo_rl.algorithms.utils import (
-        calculate_is_trivial_prompt_distribution,
+        calculate_trivial_reward_distributions,
     )
 
     client = NoOpDataPlaneClient()
     meta = _seed_meta(client, "u", n=8)
     rewards = torch.tensor([0.0] + [0.95] * 7)
-    prompt_is_trivial = calculate_is_trivial_prompt_distribution(
+    prompt_is_trivial = calculate_trivial_reward_distributions(
         torch.zeros(8, 1, dtype=torch.long),
         rewards,
         torch.ones_like(rewards),

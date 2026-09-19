@@ -70,7 +70,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
-    calculate_is_trivial_prompt_distribution,
+    calculate_trivial_reward_distributions,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_performance_metrics,
@@ -808,7 +808,7 @@ def grpo_train_sync(
                             else driver_carry["total_reward"]
                         )
                         is_trivial_prompt_distribution = (
-                            calculate_is_trivial_prompt_distribution(
+                            calculate_trivial_reward_distributions(
                                 driver_carry["prompt_ids_for_adv"],
                                 dynamic_sampling_rewards,
                                 torch.ones_like(dynamic_sampling_rewards),
