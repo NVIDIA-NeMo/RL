@@ -4414,6 +4414,10 @@ def test_grpo_train_passes_configured_advantage_mask(
         torch.ones_like(valid_mask) if policy == "include" else trained["sample_mask"]
     )
     assert torch.equal(valid_mask, expected)
+    torch.testing.assert_close(
+        mock_adv_estimator.compute_advantage.call_args.kwargs["normalization_mask"],
+        trained["token_mask"] * expected.unsqueeze(-1),
+    )
     assert (
         mock_adv_estimator.compute_advantage.call_args.kwargs["mask"].count_nonzero()
         == 0

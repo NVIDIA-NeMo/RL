@@ -526,11 +526,15 @@ class _MaskRecordingAdvantageEstimator:
     def __init__(self) -> None:
         self.mask: torch.Tensor | None = None
         self.valid_mask: torch.Tensor | None = None
+        self.normalization_mask: torch.Tensor | None = None
 
-    def compute_advantage(self, *, rewards, mask, valid_mask, **kwargs) -> torch.Tensor:
+    def compute_advantage(
+        self, *, rewards, mask, valid_mask, normalization_mask, **kwargs
+    ) -> torch.Tensor:
         del kwargs
         self.mask = mask.clone()
         self.valid_mask = valid_mask.clone()
+        self.normalization_mask = normalization_mask.clone()
         return rewards.unsqueeze(-1).expand_as(mask).clone()
 
 
@@ -634,6 +638,10 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
         else torch.tensor([1.0, 0.0, 0.0, 0.0])
     )
     assert torch.equal(estimator.valid_mask, expected_valid_mask)
+    torch.testing.assert_close(
+        estimator.normalization_mask,
+        data["token_mask"] * expected_valid_mask.unsqueeze(-1),
+    )
     assert ctrl._step_log_dict["num_mask_sample_filtered"] == [1]
     metrics = ctrl._step_log_dict["seq_logprob_error_metrics"]
     assert len(metrics) == 1

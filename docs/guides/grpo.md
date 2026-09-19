@@ -368,15 +368,20 @@ GRPO uses temperature, top-p (nucleus sampling), and top-k sampling during rollo
 ### Masked rewards in advantage statistics
 
 `grpo.masked_reward_policy` controls whether loss-masked rewards participate in
-prompt-group baselines and standard deviations. It applies to GRPO, GDPO's
-per-reward statistics, and Reinforce++'s optional group baseline, across synchronous
-GRPO, asynchronous GRPO, and SingleController:
+advantage statistics across synchronous GRPO, asynchronous GRPO, and
+SingleController. It covers GRPO's group baseline/std, GDPO's per-reward
+baseline/std and final batch normalization, and Reinforce++'s optional group
+baseline and token-level batch normalization:
 
 - `exclude` (default): use the final sample loss mask for reward participation.
 - `include`: let every reward in the group participate, including loss-masked rows.
 
 Both options preserve the sample and token loss masks, so masked rows have no
-direct loss. Estimator-specific batch whitening is unchanged. For example, with
+direct loss. Reinforce++ uses response tokens from participating samples for
+normalization, always excluding prompt and padding tokens; this also applies when
+`minus_baseline=false`. GDPO retains sample-level normalization with an unbiased
+standard deviation, and Reinforce++ retains token-level population variance.
+For example, with
 rewards `[1, 1, 0]`, a masked last row, and leave-one-out disabled, the valid rows'
 baseline is `1` under `exclude` and `2/3` under `include`.
 
@@ -390,9 +395,16 @@ Synchronous dynamic sampling uses the same policy for its reward standard
 deviation, applying the environment, pre-existing loss, and overlong masks
 available at that stage. Sequence-logprob-error masking happens later and therefore
 affects final advantage statistics but cannot affect this earlier admission step.
-With `exclude`, groups with at most one participating reward retain the existing
-zero group-relative signal behavior. SingleController still skips advantage
-computation when a whole chunk has no trainable tokens, under either policy.
+Groups with at most one participating reward retain the existing zero
+group-relative reward difference before batch normalization. GDPO returns zeros
+when the entire batch has at most one participating sample; Reinforce++ returns
+zeros when normalization has no participating tokens. Batch normalization and
+Reinforce++'s optional token-level KL penalty still apply otherwise.
+SingleController skips advantage computation when a whole chunk has no trainable
+tokens, under either policy.
+
+This setting does not change PPO, OPD, DPO, SFT, or reward-model training. They do
+not use these group-relative reward estimators.
 
 ## Performance Optimizations
 

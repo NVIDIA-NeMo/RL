@@ -4955,6 +4955,7 @@ class SingleControllerActor:
                 mask=mask,
                 repeated_batch=repeated_batch,
                 valid_mask=advantage_valid_mask,
+                normalization_mask=token_mask * advantage_valid_mask.unsqueeze(-1),
                 **kwargs,
             )
             if self._is_ppo:

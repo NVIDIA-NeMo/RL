@@ -315,8 +315,8 @@ class GRPOConfig(BaseModel, extra="allow"):
     max_num_steps: int = 1000000
     max_rollout_turns: int = 1
     normalize_rewards: bool = True
-    # Participation of loss-masked rewards in prompt-group baseline/std.
-    # "exclude" preserves validity-aware statistics; "include" enables ablations.
+    # Participation of loss-masked rewards in group and batch advantage statistics.
+    # "exclude" omits them from statistics; "include" enables ablations.
     # Neither value changes the loss mask.
     masked_reward_policy: Literal["exclude", "include"] = "exclude"
     # Clipping bounds for normalized advantages to prevent extreme values
@@ -3600,6 +3600,9 @@ def _grpo_train_impl(
                     token_mask = train_data["token_mask"]
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
+                    advantage_valid_mask = _advantage_valid_mask(
+                        sample_mask, master_config.grpo
+                    )
 
                     train_data["advantages"] = adv_estimator.compute_advantage(
                         prompt_ids=prompt_ids_for_adv,
@@ -3608,9 +3611,9 @@ def _grpo_train_impl(
                         repeated_batch=repeated_batch,
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
-                        valid_mask=_advantage_valid_mask(
-                            sample_mask, master_config.grpo
-                        ),
+                        valid_mask=advantage_valid_mask,
+                        normalization_mask=token_mask
+                        * advantage_valid_mask.unsqueeze(-1),
                     )
                     del prompt_ids_for_adv
 
@@ -5402,6 +5405,9 @@ def async_grpo_train(
                     token_mask = train_data["token_mask"]
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
+                    advantage_valid_mask = _advantage_valid_mask(
+                        sample_mask, master_config.grpo
+                    )
 
                     train_data["advantages"] = adv_estimator.compute_advantage(
                         prompt_ids=prompt_ids_for_adv,
@@ -5410,9 +5416,9 @@ def async_grpo_train(
                         repeated_batch=repeated_batch,
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
-                        valid_mask=_advantage_valid_mask(
-                            sample_mask, master_config.grpo
-                        ),
+                        valid_mask=advantage_valid_mask,
+                        normalization_mask=token_mask
+                        * advantage_valid_mask.unsqueeze(-1),
                         # OPD kwargs (ignored by non-OPD estimators via **kwargs)
                         teacher_logprobs=trajectory_teacher_logprobs.to(
                             train_data["prev_logprobs"].device
