@@ -374,6 +374,12 @@ set +e
 # and churning it here would copy files up into this layer.
 # The throwaway venv must be symlink-mode: hardlinks to files in the dependency layer's uv
 # cache make overlayfs copy them up into this layer, and the copies outlive the rm -rf below.
+# TRTLLM_WHEEL_CACHE_MIRROR_DIR keeps a copy of the wheel in this image layer.
+# CI creates a fresh buildx builder for every job, so the cache mount above only
+# lives for the duration of one build: when a later build reuses this layer from
+# the registry cache and re-executes the release stage (any NeMo-RL source
+# change does that), the mount is empty there. The release stage re-seeds it
+# from this mirror instead of failing on TRTLLM_REQUIRE_CACHED_WHEEL.
 UV_CACHE_DIR=/root/.cache/uv \
     TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
     TRTLLM_WHEEL_CACHE_MIRROR_DIR=/opt/trtllm_wheels \

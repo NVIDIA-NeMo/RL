@@ -24,6 +24,13 @@ the rank-0 worker dies with ``EADDRINUSE``.
 That failure needs a >= 2-node engine to show up at runtime, and no nightly test
 has one. These tests pin the port arithmetic instead, which needs no GPU and no
 second node, so the whole class of failure is covered by the unit suite.
+
+vLLM 0.29 fixed the race upstream (vllm-project/vllm#53666, #50969): the rank-0
+actor binds the TCPStore on a kernel-assigned port and holds it until
+``init_process_group`` reuses it, and ``_select_tcpstore_port`` is gone. Against
+such a vLLM the port-arithmetic tests have nothing to exercise and are skipped;
+``test_patch_recognizes_upstream_fix_and_leaves_source_alone`` covers what the
+patch must do there instead.
 """
 
 import ast
@@ -42,6 +49,25 @@ pytestmark = pytest.mark.vllm
 
 _VLLM_EXECUTOR_SOURCE = "v1/executor/ray_executor_v2.py"
 _WINDOW = 32
+# What vLLM >= 0.29 leaves behind after binding the TCPStore itself; the patch
+# keys off the same line.
+_UPSTREAM_FIX_MARKER = "self._dist_init_store = store"
+_UPSTREAM_FIXED_SOURCE = """\
+class RayWorkerV2(WorkerProc):
+    def create_dist_init_method(self) -> str:
+        host = ray.util.get_node_ip_address()
+        store = TCPStore(
+            host_name=host,
+            port=0,
+            world_size=self._parallel_config.world_size,
+            is_master=True,
+            wait_for_workers=False,
+            multi_tenant=True,
+        )
+        # Keep the bound server alive until init_process_group reuses it.
+        self._dist_init_store = store
+        return get_distributed_init_method(host, store.port)
+"""
 # What ``ParallelConfig`` hands a plain non-DP engine: it takes the offline-SPMD
 # path and copies VLLM_DP_RANK_LOCAL / VLLM_DP_MASTER_PORT, which default to 0.
 # So ``local_dp_rank`` is 0 rather than None -- the reason a fix placed inside
@@ -109,6 +135,12 @@ def pristine_source(tmp_path) -> Path:
     site-packages in place as soon as any earlier test builds a generation
     worker. Reversing it keeps this fixture honest whatever the test order.
     """
+    installed = Path(patches._get_vllm_file(_VLLM_EXECUTOR_SOURCE)).read_text()
+    if _UPSTREAM_FIX_MARKER in installed:
+        pytest.skip(
+            "installed vLLM binds the RayExecutorV2 TCPStore before publishing "
+            "its port (vllm-project/vllm#50969); the band-offset patch is a no-op"
+        )
     return write_unpatched_copy(
         _VLLM_EXECUTOR_SOURCE,
         "_patch_vllm_ray_executor_v2_tcpstore_port",
@@ -222,3 +254,24 @@ def test_patch_is_idempotent(patched_source, monkeypatch):
     )
     patches._patch_vllm_ray_executor_v2_tcpstore_port(logging.getLogger(__name__))
     assert patched_source.read_text() == before
+
+
+def test_patch_recognizes_upstream_fix_and_leaves_source_alone(
+    tmp_path, monkeypatch, caplog
+):
+    """vLLM >= 0.29 binds the TCPStore itself; the patch must not warn or edit.
+
+    The anchor snippet is gone from that source, so without this branch the
+    patch would log its "may fail with EADDRINUSE" warning on every worker
+    start for a bug that no longer exists.
+    """
+    source = tmp_path / "ray_executor_v2.py"
+    source.write_text(_UPSTREAM_FIXED_SOURCE)
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
+
+    with caplog.at_level(logging.INFO, logger=__name__):
+        patches._patch_vllm_ray_executor_v2_tcpstore_port(logging.getLogger(__name__))
+
+    assert source.read_text() == _UPSTREAM_FIXED_SOURCE
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], caplog.text
+    assert any("50969" in r.getMessage() for r in caplog.records), caplog.text

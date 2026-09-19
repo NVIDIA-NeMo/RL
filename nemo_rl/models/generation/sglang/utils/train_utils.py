@@ -20,6 +20,8 @@ import pybase64
 import torch
 from torch.multiprocessing import reductions
 
+from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
+
 
 class MultiprocessingSerializer:  # pragma: no cover
     """Serialize/deserialize Python objects using ForkingPickler for IPC.
@@ -85,6 +87,7 @@ def monkey_patch_torch_reductions():
 # The signature has not been changed for years, and we will not need this when the next version is released,
 # so it looks safe to use a constant.
 _REDUCE_TENSOR_ARG_DEVICE_INDEX = 6
+_REDUCE_TENSOR_ARG_STORAGE_HANDLE_INDEX = 7
 
 
 def _reduce_tensor_modified(*args, **kwargs):
@@ -103,6 +106,11 @@ def _reduce_tensor_modified(*args, **kwargs):
 
 def _rebuild_cuda_tensor_modified(*args):
     args = _modify_tuple(args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_from_maybe_uuid)
+    # The training venv that produced the handle may run a newer torch than
+    # this sglang venv; see nemo_rl.utils.cuda_ipc for the version-byte rewrite.
+    args = _modify_tuple(
+        args, _REDUCE_TENSOR_ARG_STORAGE_HANDLE_INDEX, normalize_cuda_ipc_handle
+    )
     return reductions._rebuild_cuda_tensor_original(*args)
 
 

@@ -242,9 +242,14 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         )
         mirror_dir.mkdir(parents=True, exist_ok=True)
         mirror = mirror_dir / wheel.name
-        if wheel.resolve() != mirror.resolve():
+        # The directory is content-addressed, so an existing mirror is this
+        # wheel already; skipping the copy keeps a stage that inherits the
+        # mirror from an earlier layer from duplicating it into its own.
+        if mirror.exists():
+            print(f"[trtllm-backend] Mirror already present: {mirror}", flush=True)
+        else:
             shutil.copy2(wheel, mirror)
-        print(f"[trtllm-backend] Mirrored cached wheel to: {mirror}", flush=True)
+            print(f"[trtllm-backend] Mirrored cached wheel to: {mirror}", flush=True)
 
     destination = Path(wheel_directory) / wheel.name
     shutil.copy2(wheel, destination)
