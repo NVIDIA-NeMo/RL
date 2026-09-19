@@ -262,6 +262,31 @@ UV_LINK_MODE=hardlink uv sync --frozen --extra automodel --no-install-project
 UV_LINK_MODE=hardlink uv sync --frozen --extra modelopt --no-install-project
 UV_LINK_MODE=hardlink uv sync --frozen --all-groups --no-install-project
 
+# Warm the PEP 517 build backend for nemo-rl into the uv cache. Every
+# sync above deliberately uses --no-install-project, so nemo-rl itself is
+# never built at image time and its build-backend requirements
+# (setuptools>=78.1.1, wheel>=0.46.2; see pyproject.toml [build-system]) are
+# never resolved into the cache. Offline, a `uv sync`/`uv run` that builds
+# nemo-rl (changed source tree, or a forwarded fork whose lock differs) fails
+# with "setuptools was not found in the cache" because the network is disabled
+# and uv must create the build environment for setuptools.build_meta from the
+# cache. nemo-rl is NOT built here: this layer deliberately has no source tree
+# (see the COPY above and the prefetch comment below), and setuptools.build_meta
+# resolves the dynamic version by importing nemo_rl/__init__.py, which imports
+# nemo_rl/transformers_compat -- absent here. Instead, warm the build backend
+# environment directly: resolve the exact build-system.requires into the cache
+# as a standalone build env, pinned to the locked versions (uv.lock:
+# setuptools==83.0.0, wheel==0.47.0) so it byte-matches the offline resolution.
+# An offline `uv sync`/`uv run` that later builds
+# nemo-rl then finds setuptools.build_meta in the cache and succeeds.
+rm -rf /tmp/nemo_rl_backend && uv venv /tmp/nemo_rl_backend
+UV_LINK_MODE=hardlink VIRTUAL_ENV=/tmp/nemo_rl_backend uv pip install --python /tmp/nemo_rl_backend/bin/python "setuptools==83.0.0" "wheel==0.47.0"
+# Self-test: creating the nemo-rl build backend env fully offline MUST succeed
+# from the warmed cache, or the image still cannot build nemo-rl air-gapped.
+rm -rf /tmp/nemo_rl_backend_off && uv venv /tmp/nemo_rl_backend_off
+UV_LINK_MODE=hardlink VIRTUAL_ENV=/tmp/nemo_rl_backend_off uv pip install --offline --python /tmp/nemo_rl_backend_off/bin/python "setuptools==83.0.0" "wheel==0.47.0"
+rm -rf /tmp/nemo_rl_backend /tmp/nemo_rl_backend_off
+
 # Worker-venv prefetch, phase 1: third-party packages only.
 #
 # Each Ray actor runs in its own venv under NEMO_RL_VENV_DIR. Build them HERE, in the same

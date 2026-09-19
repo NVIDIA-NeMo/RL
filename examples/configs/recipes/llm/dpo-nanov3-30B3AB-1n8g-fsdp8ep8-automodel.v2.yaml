@@ -17,9 +17,9 @@ policy:
     # router_aux_loss_coef as float and rejects YAML's integer 0.
     router_aux_loss_coef: 0.0
   dtensor_cfg:
-    checkpoint:
-      model_save_format: safetensors
     _v2: true
+    checkpoint:
+      model_save_format: "safetensors"
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
     expert_parallel_size: 8
