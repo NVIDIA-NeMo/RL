@@ -2346,7 +2346,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
         "completion_count": 2,
         "agent": "agent",
         "remote_time": 2.0,
-        "timing/test/routing/groups/nemo_gym": 1,
+        "timing/test/routing/group_share/nemo_gym": 1,
     }
 
 
