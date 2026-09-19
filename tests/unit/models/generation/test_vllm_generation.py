@@ -2491,12 +2491,14 @@ async def test_vllm_generation_with_hf_training_colocated(
 @pytest.mark.parametrize(
     ("async_engine", "cpu_offload", "vllm_precision", "enable_lora"),
     [
+        # cpu_offload stays off here: the policy gets 1 GPU and automodel rejects
+        # world_size=1 + cpu_offload (automodel/setup.py).
         (True, False, "bfloat16", False),
-        (False, True, "bfloat16", False),
+        (False, False, "bfloat16", False),
         # NOTE: non-colocated FP8 tests fail on main as of 3/9/2026 with
         # avg_prob_mult_error=1.13 > 1.08 threshold. Left unskipped to match main.
         (True, False, "fp8", False),
-        (False, True, "fp8", False),
+        (False, False, "fp8", False),
         (False, False, "bfloat16", True),
         (True, False, "bfloat16", True),
     ],

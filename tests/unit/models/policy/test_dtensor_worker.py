@@ -635,8 +635,9 @@ class TestTwoGPUCluster:
             # ("tiny_nemotron5_h_model_path", 1, 1, True, True, False),
             # ("tiny_nemotron5_h_model_path", 1, 1, True, False, True),
             # ("tiny_nemotron5_h_model_path", 1, 1, True, True, True),
-            ("tiny_nemotron5_h_model_path", 1, 1, False, False, False),
-            ("tiny_nemotron5_h_model_path", 1, 1, False, True, True),
+            # Disabled until https://github.com/NVIDIA-NeMo/RL/issues/4211 is fixed
+            # ("tiny_nemotron5_h_model_path", 1, 1, False, False, False),
+            # ("tiny_nemotron5_h_model_path", 1, 1, False, True, True),
             # nemotron5_h doesn't support cp
             # TP2, SP=True
             ("tiny_llama_model_path", 2, 1, True, False, False),
