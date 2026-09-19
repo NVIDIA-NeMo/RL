@@ -52,6 +52,7 @@ from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
     format_prompt_for_vllm_generation,
     pad_and_align_routed_expert_indices,
+    validate_rollout_prompt,
 )
 from nemo_rl.models.generation.vllm.video_utils import (
     register_torchcodec_vllm_video_loader,
@@ -1061,6 +1062,9 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         for i, output in enumerate(outputs):
             # Extract generated tokens
             sequence_length = input_lengths[i]
+            validate_rollout_prompt(
+                input_ids[i, :sequence_length].tolist(), output.prompt_token_ids
+            )
             generation = output.outputs[0]
             generated_tokens = list(generation.token_ids)
 
