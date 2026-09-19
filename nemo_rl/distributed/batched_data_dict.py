@@ -1035,17 +1035,16 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             # count is smaller than the seqlen). The in-memory
             # ``PackedTensor`` form is skipped by ``torch.is_tensor``
             # below, but the data-plane wire form is a nested tensor, so
-            # name it here. opd_full's teacher payload fields
-            # (OPD_FULL_FIELDS) are exempt for the same reason: they are
-            # never fed through the model forward pass, so their own
-            # (possibly shorter) natural length doesn't need to track the
-            # microbatch's token seqlen -- see codec.py::materialize's
-            # pad_to_seqlen skip and megatron/data.py's
-            # get_and_validate_seqlen skip for the same fields.
-            if k in PACKED_MULTIMODAL_FIELDS or k in OPD_FULL_FIELDS:
+            # name it here.
+            if k in PACKED_MULTIMODAL_FIELDS:
                 continue
             if torch.is_tensor(v) and len(v.shape) >= dim + 1:
-                self.data[k] = torch.narrow(v, dim=dim, start=0, length=truncated_len)
+                length = truncated_len
+                if k in OPD_FULL_FIELDS:
+                    # materialize() leaves the payload at its natural width,
+                    # which can already be shorter than this microbatch's seqlen.
+                    length = min(truncated_len, int(v.shape[dim]))
+                self.data[k] = torch.narrow(v, dim=dim, start=0, length=length)
 
     def make_microbatch_iterator_with_dynamic_shapes(
         self,

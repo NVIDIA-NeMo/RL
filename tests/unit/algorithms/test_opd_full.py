@@ -573,7 +573,7 @@ def test_reconstruct_routes_each_row_through_its_own_teachers_lm_head():
 
 @pytest.mark.parametrize("teacher_index", [None, torch.tensor([0, 0])])
 def test_reconstruct_uses_the_only_loaded_head_for_a_single_teacher_run(teacher_index):
-    """One loaded shard needs no routing, with or without the column present."""
+    """One loaded shard, with the column absent or naming that shard."""
     payload = torch.randn(2, 3, 3)
     head = torch.randn(5, 3)
 
@@ -604,6 +604,20 @@ def test_reconstruct_rejects_a_row_tagged_with_an_unloaded_teacher():
                 1: torch.randn(5, 3),
             },
             teacher_index=torch.tensor([0, 7]),
+        )
+
+
+def test_reconstruct_rejects_an_unloaded_tag_even_with_one_head():
+    """A shrunk teacher set must fail loud, not take the only head."""
+    with pytest.raises(ValueError, match="no teacher LM"):
+        reconstruct_opd_full_teacher_logits(
+            torch.randn(2, 3, 3),
+            teacher_payload="hidden_states",
+            student_logits=torch.zeros(2, 3, 5),
+            vocab_parallel_rank=0,
+            context_parallel_group=None,
+            teacher_output_layer_weight_by_index={0: torch.randn(5, 3)},
+            teacher_index=torch.tensor([1, 1]),
         )
 
 

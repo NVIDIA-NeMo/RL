@@ -187,6 +187,7 @@ def _maybe_restore_native_data_plane_checkpoint(
     save_state: GRPOSaveState,
     partition_id: str,
     sampler_name: str,
+    opd_full_teacher_checkpoints: Optional[list[str]] = None,
 ) -> Optional[DataPlaneCheckpointMetadata]:
     """Load and validate an authoritative native TQ checkpoint when present.
 
@@ -257,6 +258,16 @@ def _maybe_restore_native_data_plane_checkpoint(
         raise ValueError(
             "Native TQ checkpoint metadata does not match the trainer "
             f"checkpoint: {mismatches}"
+        )
+    # The buffered rows carry a teacher_index each, and nothing re-tags them on
+    # restore: a config that renumbers the teachers would silently project them
+    # through the wrong LM head.
+    if opd_full_teacher_checkpoints != metadata.get("opd_full_teacher_checkpoints"):
+        raise ValueError(
+            "Native TQ checkpoint was written under a different opd_full "
+            "teacher set: its rows are tagged with "
+            f"{metadata.get('opd_full_teacher_checkpoints')!r}, this run would "
+            f"number them {opd_full_teacher_checkpoints!r}."
         )
     manifest_digest = metadata.get("replay_manifest_digest")
     if not isinstance(manifest_digest, str) or not manifest_digest:
@@ -1619,6 +1630,9 @@ def setup_single_controller(
         save_state=save_state,
         partition_id=partition_id,
         sampler_name=master_config.async_rl.sampler.name,
+        opd_full_teacher_checkpoints=(
+            opd_module.opd_full_teacher_checkpoints_by_index(master_config)
+        ),
     )
 
     if use_nemo_gym:

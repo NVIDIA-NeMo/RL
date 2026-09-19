@@ -233,13 +233,12 @@ def reconstruct_opd_full_teacher_logits(
         context_parallel_group: Context-parallel process group, if any.
         teacher_output_layer_weight_by_index: ``[V_local, H_teacher]`` teacher
             LM-head shards for the hidden-state path, keyed by the stable index
-            rows are tagged with. With more than one entry, ``teacher_index``
-            selects each row's teacher; with exactly one entry it is used
-            directly.
+            rows are tagged with. Routed by ``teacher_index`` whenever that
+            column is present.
         teacher_index: ``[B]`` int, this microbatch's per-row teacher index
             (see ``OPD_FULL_TEACHER_INDEX_FIELD``). Required once
             ``teacher_output_layer_weight_by_index`` holds more than one entry,
-            and ignored when it holds exactly one.
+            and validated against the loaded heads whenever present.
 
     Returns:
         Teacher logits ``[B, S_local, V_local]`` aligned with ``student_logits``.
@@ -327,8 +326,9 @@ def reconstruct_opd_full_teacher_logits(
     if teacher_payload == "hidden_states":
         # Validated above, before any narrowing ran.
         assert teacher_output_layer_weight_by_index is not None
-        if len(teacher_output_layer_weight_by_index) > 1:
-            assert teacher_index is not None
+        if teacher_index is not None:
+            # Route by tag whenever the column is present: a tag naming an
+            # unloaded teacher must fail loud, not take the only head.
             teacher_logits = _project_hidden_states_per_teacher(
                 payload, teacher_output_layer_weight_by_index, teacher_index
             )

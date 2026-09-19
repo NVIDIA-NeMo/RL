@@ -343,4 +343,8 @@ def test_materialize_skips_pad_to_seqlen_for_opd_full_fields() -> None:
     out = materialize(td, layout="padded", pad_to_seqlen=6)[OPD_FULL_LOGITS_FIELD]
 
     assert out.shape == (2, 4, 3)
-    assert torch.equal(out, payload)
+    # Row 0 carries only 2 real tokens: the codec zero-fills the rest of its
+    # row up to the batch's own natural max (4), never out to pad_to_seqlen.
+    assert torch.equal(out[0, :2], payload[0, :2])
+    assert torch.equal(out[0, 2:], torch.zeros(2, 3))
+    assert torch.equal(out[1], payload[1])
