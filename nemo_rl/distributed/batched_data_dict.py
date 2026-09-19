@@ -33,9 +33,9 @@ from typing_extensions import Self
 
 from nemo_rl.data.multimodal_utils import (
     MULTIMODAL_CONTENT_TYPES,
-    NATIVE_MULTIMODAL_KEYS,
     PACKED_MULTIMODAL_FIELDS,
     PER_TOKEN_MULTIMODAL_FIELDS,
+    VLLM_PROMPT_KEYS,
     PackedTensor,
 )
 from nemo_rl.data.packing import get_packer
@@ -62,7 +62,7 @@ def _prepare_multimodal_sharing(
 ) -> dict[int, Any]:
     """Enable PackedTensor provenance and return deepcopy memo entries.
 
-    PackedTensor is an explicit multimodal type. Raw native-vLLM payloads are
+    PackedTensor is an explicit multimodal type. Raw vLLM-ready payloads are
     shared only under named media keys or typed content parts. Containers are
     still deep-copied so rollout rows may diverge safely.
     """
@@ -78,7 +78,7 @@ def _prepare_multimodal_sharing(
             for key, child in item.items():
                 visit(
                     child,
-                    in_media_context or typed_media or key in NATIVE_MULTIMODAL_KEYS,
+                    in_media_context or typed_media or key in VLLM_PROMPT_KEYS,
                 )
             return
         if isinstance(item, (list, tuple)):
@@ -142,6 +142,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         as_tensors: bool = False,
         device: Optional[torch.device] = None,
         pixel_dtype: Optional[torch.dtype] = None,
+        pixel_preprocess_mode: Optional[str] = None,
     ) -> dict[str, Any]:
         """Return the multimodal fields as a dict.
 
@@ -192,7 +193,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 # unwrapping via as_tensor).
                 if pixel_dtype is not None and k in self._PIXEL_DTYPE_CAST_KEYS:
                     v = v.to_dtype(pixel_dtype)
-                result[k] = v.as_tensor(device=device) if as_tensors else v
+                preprocess_mode = pixel_preprocess_mode if k == "pixel_values" else None
+                result[k] = v.as_tensor(device, preprocess_mode) if as_tensors else v
             elif k in PER_TOKEN_MULTIMODAL_FIELDS:
                 # Plain per-token tensor: emit as-is.
                 result[k] = v
@@ -1015,7 +1017,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     shared_leaves = (
                         _prepare_multimodal_sharing(
                             item,
-                            media_context=k in NATIVE_MULTIMODAL_KEYS,
+                            media_context=k in VLLM_PROMPT_KEYS,
                         )
                         if share_immutable_media
                         else {}
