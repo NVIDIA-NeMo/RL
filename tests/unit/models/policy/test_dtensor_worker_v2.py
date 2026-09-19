@@ -339,7 +339,7 @@ def test_dtensor_v2_checkpoint_save_and_load(
                 model_name=tiny_llama_model_path,
                 tp=2,
                 cp=1,
-                )
+            )
 
             # Shutdown original policy first to free GPU memory
             policy.shutdown()

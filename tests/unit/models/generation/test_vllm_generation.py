@@ -2427,28 +2427,17 @@ async def run_hf_train_process(
 
 
 @pytest.mark.asyncio
+@pytest.mark.automodel
+@pytest.mark.timeout(200)
 @pytest.mark.parametrize(
     ("async_engine", "cpu_offload", "vllm_precision", "enable_lora"),
     [
-        pytest.param(True, False, "bfloat16", False, marks=pytest.mark.timeout(900)),
-        pytest.param(False, True, "bfloat16", False, marks=pytest.mark.timeout(900)),
-        pytest.param(True, False, "fp8", False, marks=pytest.mark.timeout(900)),
-        pytest.param(False, True, "fp8", False, marks=pytest.mark.timeout(900)),
-        # LoRA tests require dtensor v2 / automodel and take longer in CI.
-        pytest.param(
-            False,
-            False,
-            "bfloat16",
-            True,
-            marks=[pytest.mark.automodel, pytest.mark.timeout(900)],
-        ),
-        pytest.param(
-            True,
-            False,
-            "bfloat16",
-            True,
-            marks=[pytest.mark.automodel, pytest.mark.timeout(900)],
-        ),
+        (True, False, "bfloat16", False),
+        (False, True, "bfloat16", False),
+        (True, False, "fp8", False),
+        (False, True, "fp8", False),
+        (False, False, "bfloat16", True),
+        (True, False, "bfloat16", True),
     ],
 )
 async def test_vllm_generation_with_hf_training_colocated(
@@ -2497,30 +2486,19 @@ async def test_vllm_generation_with_hf_training_colocated(
 
 
 @pytest.mark.asyncio
+@pytest.mark.automodel
+@pytest.mark.timeout(200)
 @pytest.mark.parametrize(
     ("async_engine", "cpu_offload", "vllm_precision", "enable_lora"),
     [
-        pytest.param(True, False, "bfloat16", False, marks=pytest.mark.timeout(900)),
-        pytest.param(False, True, "bfloat16", False, marks=pytest.mark.timeout(900)),
+        (True, False, "bfloat16", False),
+        (False, True, "bfloat16", False),
         # NOTE: non-colocated FP8 tests fail on main as of 3/9/2026 with
         # avg_prob_mult_error=1.13 > 1.08 threshold. Left unskipped to match main.
-        pytest.param(True, False, "fp8", False, marks=pytest.mark.timeout(900)),
-        pytest.param(False, True, "fp8", False, marks=pytest.mark.timeout(900)),
-        # LoRA tests require dtensor v2 / automodel and take longer in CI.
-        pytest.param(
-            False,
-            False,
-            "bfloat16",
-            True,
-            marks=[pytest.mark.automodel, pytest.mark.timeout(900)],
-        ),
-        pytest.param(
-            True,
-            False,
-            "bfloat16",
-            True,
-            marks=[pytest.mark.automodel, pytest.mark.timeout(900)],
-        ),
+        (True, False, "fp8", False),
+        (False, True, "fp8", False),
+        (False, False, "bfloat16", True),
+        (True, False, "bfloat16", True),
     ],
 )
 async def test_vllm_generation_with_hf_training_non_colocated(
