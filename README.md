@@ -498,14 +498,14 @@ To run x-token distillation on a single node using `meta-llama/Llama-3.2-1B` as 
 
 ```sh
 uv run python examples/run_xtoken_off_policy_distillation.py \
-  teachers.0.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt
+  teachers.0.aligner.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt
 ```
 
 By default, this uses the configuration in `examples/configs/xtoken_off_policy_distillation.yaml`. The projection matrix path (per teacher) is the only required override. You can customize other parameters with command-line overrides. For example:
 
 ```sh
 uv run python examples/run_xtoken_off_policy_distillation.py \
-  teachers.0.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt \
+  teachers.0.aligner.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt \
   policy.model_name="meta-llama/Llama-3.2-1B" \
   teachers.0.model_name="Qwen/Qwen3-4B" \
   cluster.gpus_per_node=8
@@ -517,7 +517,7 @@ uv run python examples/run_xtoken_off_policy_distillation.py \
 # Run from the root of NeMo RL repo
 NUM_ACTOR_NODES=2
 
-COMMAND="uv run ./examples/run_xtoken_off_policy_distillation.py --config examples/configs/xtoken_off_policy_distillation.yaml teachers.0.projection_matrix_path='cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt' cluster.num_nodes=2 cluster.gpus_per_node=8 checkpointing.checkpoint_dir='results/xtoken_distill_2nodes' logger.wandb_enabled=True logger.wandb.name='xtoken-distill-2nodes'" \
+COMMAND="uv run ./examples/run_xtoken_off_policy_distillation.py --config examples/configs/xtoken_off_policy_distillation.yaml teachers.0.aligner.projection_matrix_path='cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt' cluster.num_nodes=2 cluster.gpus_per_node=8 checkpointing.checkpoint_dir='results/xtoken_distill_2nodes' logger.wandb_enabled=True logger.wandb.name='xtoken-distill-2nodes'" \
 CONTAINER=YOUR_CONTAINER \
 MOUNTS="$PWD:$PWD" \
 sbatch \

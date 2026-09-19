@@ -45,7 +45,7 @@ fi
 uv run examples/run_xtoken_off_policy_distillation.py \
     --config $CONFIG_PATH \
     distillation.max_num_steps=$MAX_STEPS \
-    teachers.0.projection_matrix_path=$PROJ_PATH \
+    teachers.0.aligner.projection_matrix_path=$PROJ_PATH \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
     logger.wandb.project=nemo-rl \

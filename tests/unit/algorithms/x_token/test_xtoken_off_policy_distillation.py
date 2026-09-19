@@ -45,6 +45,7 @@ import nemo_rl.algorithms.xtoken_off_policy_distillation as xt_mod
 from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
 from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     MasterConfig,
+    TeacherAlignerConfig,
     TeacherConfig,
     _default_off_policy_distillation_save_state,
     export_teacher_logits_and_pack,
@@ -170,7 +171,9 @@ def _make_master_config(
             "teachers": [
                 TeacherConfig(
                     **{
-                        "projection_matrix_path": "/tmp/dummy-projection.pt",
+                        "aligner": {
+                            "projection_matrix_path": "/tmp/dummy-projection.pt"
+                        },
                         "weight": 1.0,
                         "dtensor_cfg": {
                             "enabled": True,
@@ -290,7 +293,7 @@ def _patched_setup_call(master_config, *, student_vocab=32, teacher_vocab=24):
         patch.object(xt_mod, "Logger"),
         patch.object(xt_mod, "CheckpointManager") as mock_cp_cls,
         patch.object(xt_mod, "TokenAligner"),
-        patch.object(xt_mod, "CrossTokenizerCollator"),
+        patch.object(xt_mod, "CrossTokenizerCollator") as mock_collator_cls,
         patch.object(xt_mod, "CrossTokenizerDistillationLossFn") as mock_loss_cls,
         patch.object(xt_mod, "StatefulDataLoader") as mock_dl_cls,
         patch.object(xt_mod, "assert_teacher_student_batch_grid"),
@@ -313,8 +316,59 @@ def _patched_setup_call(master_config, *, student_vocab=32, teacher_vocab=24):
             "cluster": mock_cluster,
             "policy": mock_policy_cls,
             "loss": mock_loss_cls,
+            "collator": mock_collator_cls,
             "checkpointer": mock_cp_cls,
         }
+
+
+def test_teacher_aligner_config_defaults():
+    teacher = TeacherConfig(model_name="teacher")
+
+    assert isinstance(teacher.aligner, TeacherAlignerConfig)
+    assert teacher.aligner.projection_matrix_path is None
+    assert teacher.aligner.drop_first_assistant_chunk_kl is False
+
+
+def test_teacher_aligner_config_explicit_values_serialize_and_stay_out_of_policy():
+    teacher = TeacherConfig(
+        model_name="teacher",
+        aligner={
+            "projection_matrix_path": "/tmp/projection.pt",
+            "drop_first_assistant_chunk_kl": True,
+        },
+    )
+
+    dumped = teacher.model_dump()
+    assert dumped["aligner"] == {
+        "projection_matrix_path": "/tmp/projection.pt",
+        "drop_first_assistant_chunk_kl": True,
+    }
+    assert "projection_matrix_path" not in dumped
+    assert "aligner" not in teacher.policy_config()
+
+
+def test_legacy_teacher_projection_path_migrates_and_warns():
+    with pytest.warns(FutureWarning, match="aligner.projection_matrix_path"):
+        teacher = TeacherConfig(projection_matrix_path="/tmp/legacy.pt")
+
+    assert teacher.aligner.projection_matrix_path == "/tmp/legacy.pt"
+    assert "projection_matrix_path" not in teacher.model_dump()
+
+
+def test_conflicting_legacy_and_nested_projection_paths_fail():
+    with pytest.raises(ValidationError, match="conflicting projection matrix paths"):
+        TeacherConfig(
+            projection_matrix_path="/tmp/legacy.pt",
+            aligner={"projection_matrix_path": "/tmp/nested.pt"},
+        )
+
+
+def test_shared_drop_first_assistant_chunk_kl_is_rejected():
+    with pytest.raises(
+        ValidationError,
+        match=r"teachers\[i\]\.aligner\.drop_first_assistant_chunk_kl",
+    ):
+        MasterConfig.model_validate({"data": {"drop_first_assistant_chunk_kl": True}})
 
 
 def test_empty_teachers_list_rejected_at_config_load():
@@ -374,6 +428,9 @@ def test_setup_injects_vocab_sizes_into_loss_config():
     assert injected_cfg["teacher_vocab_sizes"] == [256]
     assert injected_cfg["projection_matrix_paths"] == ["/tmp/dummy-projection.pt"]
     assert injected_cfg["teacher_weights"] == [1.0]
+    assert mocks["collator"].call_args.kwargs[
+        "drop_first_assistant_chunk_kl_by_teacher"
+    ] == [False]
     # Original master_config not mutated by the injection.
     assert cfg.loss_fn == original_loss_cfg
 
@@ -742,13 +799,13 @@ def test_export_teacher_logits_packs_indexed_keys_and_runs_serially():
     )
 
 
-def test_setup_builds_one_policy_per_teacher():
+def test_setup_preserves_aligner_config_across_interleaved_teacher_types():
     cfg = _make_master_config()
-    # Add a second (same-vocab) teacher.
+    # Interleave a same-vocab teacher between two cross-tokenizer teachers.
     cfg.teachers.append(
         TeacherConfig(
             **{
-                "projection_matrix_path": None,
+                "aligner": {"projection_matrix_path": None},
                 "weight": 0.5,
                 "dtensor_cfg": {
                     "enabled": True,
@@ -764,8 +821,30 @@ def test_setup_builds_one_policy_per_teacher():
             }
         )
     )
+    cfg.teachers.append(
+        TeacherConfig(
+            **{
+                "aligner": {
+                    "projection_matrix_path": "/tmp/dummy-projection-2.pt",
+                    "drop_first_assistant_chunk_kl": True,
+                },
+                "weight": 0.25,
+                "dtensor_cfg": {
+                    "enabled": True,
+                    "_v2": True,
+                    "tensor_parallel_size": 1,
+                    "context_parallel_size": 1,
+                },
+                "max_total_sequence_length": 64,
+                "make_sequence_length_divisible_by": 8,
+                "train_global_batch_size": 1,
+                "train_micro_batch_size": 1,
+                "tokenizer": {"name": "teacher-2-tok"},
+            }
+        )
+    )
     student_tok = _make_tokenizer(32)
-    teacher_toks = [_make_tokenizer(24), _make_tokenizer(32)]
+    teacher_toks = [_make_tokenizer(24), _make_tokenizer(32), _make_tokenizer(28)]
     train_ds = MagicMock()
     train_ds.__len__ = MagicMock(return_value=4)
 
@@ -774,8 +853,8 @@ def test_setup_builds_one_policy_per_teacher():
         patch.object(xt_mod, "Policy") as mock_policy_cls,
         patch.object(xt_mod, "Logger"),
         patch.object(xt_mod, "CheckpointManager") as mock_cp_cls,
-        patch.object(xt_mod, "TokenAligner"),
-        patch.object(xt_mod, "CrossTokenizerCollator"),
+        patch.object(xt_mod, "TokenAligner") as mock_aligner_cls,
+        patch.object(xt_mod, "CrossTokenizerCollator") as mock_collator_cls,
         patch.object(xt_mod, "CrossTokenizerDistillationLossFn") as mock_loss_cls,
         patch.object(xt_mod, "StatefulDataLoader") as mock_dl_cls,
         patch.object(xt_mod, "assert_teacher_student_batch_grid"),
@@ -797,14 +876,24 @@ def test_setup_builds_one_policy_per_teacher():
 
     # One teacher Policy per entry (+ the student), and the colocation cap
     # accounts for all teacher groups + the student.
-    assert isinstance(teachers, list) and len(teachers) == 2
-    assert mock_policy_cls.call_count == 3  # 2 teachers + 1 student
-    assert mock_cluster.call_args.kwargs["max_colocated_worker_groups"] == 3
+    assert isinstance(teachers, list) and len(teachers) == 3
+    assert mock_policy_cls.call_count == 4  # 3 teachers + 1 student
+    assert mock_cluster.call_args.kwargs["max_colocated_worker_groups"] == 4
+    assert mock_aligner_cls.call_count == 2
+    aligners = mock_collator_cls.call_args.kwargs["aligners"]
+    assert aligners[0] is not None and aligners[1] is None and aligners[2] is not None
+    assert mock_collator_cls.call_args.kwargs[
+        "drop_first_assistant_chunk_kl_by_teacher"
+    ] == [False, False, True]
     # Per-teacher metadata injected as parallel lists.
     injected_cfg = mock_loss_cls.call_args.args[0]
-    assert injected_cfg["projection_matrix_paths"] == ["/tmp/dummy-projection.pt", None]
-    assert injected_cfg["teacher_weights"] == [1.0, 0.5]
-    assert injected_cfg["teacher_vocab_sizes"] == [24, 32]
+    assert injected_cfg["projection_matrix_paths"] == [
+        "/tmp/dummy-projection.pt",
+        None,
+        "/tmp/dummy-projection-2.pt",
+    ]
+    assert injected_cfg["teacher_weights"] == [1.0, 0.5, 0.25]
+    assert injected_cfg["teacher_vocab_sizes"] == [24, 32, 28]
 
 
 def test_setup_rejects_same_vocab_teacher_with_mismatched_vocab():
@@ -814,7 +903,7 @@ def test_setup_rejects_same_vocab_teacher_with_mismatched_vocab():
     # in setup() (the right place — it has the real tokenizers; tokenizer
     # *names* would wrongly flag Llama-3.2-3B vs -1B, which share a vocab).
     cfg = _make_master_config()
-    cfg.teachers[0].projection_matrix_path = None  # mark same-vocab
+    cfg.teachers[0].aligner.projection_matrix_path = None  # mark same-vocab
     student_tok = _make_tokenizer(32)
     teacher_toks = [_make_tokenizer(24)]  # 24 != 32 -> mismatch
     with (
