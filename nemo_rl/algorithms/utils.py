@@ -114,7 +114,7 @@ def calculate_baseline_and_std_per_prompt(
     valid_mask: torch.Tensor,
     leave_one_out_baseline: bool = True,
     std_rewards: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Function to compute a baseline for each (prompt, response) pair in the batch.
 
     The same baseline is calculated for each prompt. Samples set to 0 in 'valid_mask'
@@ -132,7 +132,9 @@ def calculate_baseline_and_std_per_prompt(
                                   shaped reward.
 
     Returns:
-    tensor (b,), tensor (b,) of baselines and std on the same device as 'rewards'
+    tensor (b,), tensor (b,), tensor (b,) of baselines, std, and a boolean mask
+    identifying samples whose std comparison set contains one unique reward value.
+    All tensors are on the same device as 'rewards'.
     """
     if std_rewards is None:
         std_rewards = rewards
@@ -141,6 +143,7 @@ def calculate_baseline_and_std_per_prompt(
     baseline = torch.zeros_like(rewards)
     sq_baseline = torch.zeros_like(rewards)
     std = torch.zeros_like(rewards)
+    is_trivial_distribution = torch.ones_like(rewards, dtype=torch.bool)
     device_ordinal = rewards.get_device()
     if device_ordinal == -1:
         reward_device = torch.device("cpu")
@@ -190,9 +193,22 @@ def calculate_baseline_and_std_per_prompt(
                 )
                 / num_valid
             )
+            comparison_mask = baseline_mask_matrix.bool() & valid_mask[
+                prompt_idx
+            ].bool().unsqueeze(0)
+            comparison_rewards = (
+                std_rewards[prompt_idx].unsqueeze(0).expand(len(prompt_idx), -1)
+            )
+            comparison_min = comparison_rewards.masked_fill(
+                ~comparison_mask, torch.inf
+            ).amin(dim=1)
+            comparison_max = comparison_rewards.masked_fill(
+                ~comparison_mask, -torch.inf
+            ).amax(dim=1)
 
             baseline[prompt_idx] = prompt_baseline
             sq_baseline[prompt_idx] = std_prompt_baseline_square
+            is_trivial_distribution[prompt_idx] = comparison_min == comparison_max
             std[prompt_idx] = (
                 (
                     (std_prompt_baseline_square - std_prompt_baseline.square())
@@ -202,7 +218,31 @@ def calculate_baseline_and_std_per_prompt(
                 .nan_to_num(0)
             )
 
-    return baseline, std
+    return baseline, std, is_trivial_distribution
+
+
+def calculate_is_trivial_prompt_distribution(
+    prompts: torch.Tensor,
+    rewards: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return an all-or-nothing exact-equality mask for each prompt group.
+
+    Unlike the per-sample mask returned by
+    ``calculate_baseline_and_std_per_prompt``, this always compares the full
+    valid reward group. It is therefore independent of leave-one-out baseline
+    semantics and safe to use for prompt-level dynamic sampling.
+    """
+    is_trivial_prompt_distribution = torch.ones_like(rewards, dtype=torch.bool)
+    for prompt in torch.unique(prompts, dim=0):
+        prompt_mask = (prompts == prompt).all(1)
+        valid_rewards = rewards[prompt_mask & valid_mask.bool()]
+        is_trivial = valid_rewards.numel() <= 1 or (
+            valid_rewards.amin() == valid_rewards.amax()
+        )
+        is_trivial_prompt_distribution[prompt_mask] = is_trivial
+
+    return is_trivial_prompt_distribution
 
 
 def surpress_user_warnings(f):  # type: ignore

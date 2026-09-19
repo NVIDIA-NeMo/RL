@@ -241,11 +241,21 @@ def _seed_meta(client: NoOpDataPlaneClient, prefix: str, n: int) -> KVBatchMeta:
     )
 
 
-def _stamp_filter_tags(meta: KVBatchMeta, stds: list[float]) -> KVBatchMeta:
-    """Mirror the driver's post-baseline/std step: stamp ``std`` into
-    ``meta.tags`` so ``_apply_dynamic_sampling`` can read the filter
-    criterion from the meta alone."""
-    meta.tags = [{"std": float(s)} for s in stds]
+def _stamp_filter_tags(
+    meta: KVBatchMeta,
+    stds: list[float],
+    is_trivial_prompt_distribution: list[bool] | None = None,
+) -> KVBatchMeta:
+    """Mirror the driver's exact reward-variation filter into ``meta.tags``."""
+    if is_trivial_prompt_distribution is None:
+        is_trivial_prompt_distribution = [std == 0.0 for std in stds]
+    meta.tags = [
+        {
+            "std": float(std),
+            "is_trivial_prompt_distribution": is_trivial_prompt,
+        }
+        for std, is_trivial_prompt in zip(stds, is_trivial_prompt_distribution)
+    ]
     return meta
 
 
@@ -294,6 +304,72 @@ def test_apply_dynamic_sampling_filters_zero_std():
         select_fields=["input_ids"],
     )
     assert survivors["input_ids"].shape == (2, 8)
+
+
+def test_apply_dynamic_sampling_filters_trivial_float_noise():
+    """Exact reward equality wins over a tiny positive std caused by roundoff."""
+    from nemo_rl.algorithms.grpo_sync import _apply_dynamic_sampling
+
+    client = NoOpDataPlaneClient()
+    meta = _seed_meta(client, "u", n=2)
+    _stamp_filter_tags(meta, [1e-7, 1e-7], [True, True])
+    driver_carry = _make_driver_carry([1.0, 1.0], [1e-7, 1e-7])
+
+    pending_meta, _, _, complete, _, _ = _apply_dynamic_sampling(
+        meta=meta,
+        driver_carry=driver_carry,
+        pending_meta=None,
+        pending_carry=None,
+        pending_unfiltered_rewards=[],
+        train_prompts_size=2,
+        num_gen_batches=1,
+        max_gen_batches=10,
+        policy=_fake_policy(client),
+    )
+
+    assert pending_meta is None
+    assert complete is False
+
+
+def test_apply_dynamic_sampling_keeps_entire_mixed_loo_group():
+    """A full-prompt mask retains every row in a mixed [y, x, ...] group."""
+    from nemo_rl.algorithms.grpo_sync import _apply_dynamic_sampling
+    from nemo_rl.algorithms.utils import (
+        calculate_is_trivial_prompt_distribution,
+    )
+
+    client = NoOpDataPlaneClient()
+    meta = _seed_meta(client, "u", n=8)
+    rewards = torch.tensor([0.0] + [0.95] * 7)
+    prompt_is_trivial = calculate_is_trivial_prompt_distribution(
+        torch.zeros(8, 1, dtype=torch.long),
+        rewards,
+        torch.ones_like(rewards),
+    )
+    assert prompt_is_trivial.tolist() == [False] * 8
+    _stamp_filter_tags(
+        meta,
+        [0.0004567453] + [0.36] * 7,
+        prompt_is_trivial.tolist(),
+    )
+    driver_carry = _make_driver_carry(rewards.tolist(), [0.0004567453] + [0.36] * 7)
+
+    pending_meta, pending_carry, _, complete, _, _ = _apply_dynamic_sampling(
+        meta=meta,
+        driver_carry=driver_carry,
+        pending_meta=None,
+        pending_carry=None,
+        pending_unfiltered_rewards=[],
+        train_prompts_size=8,
+        num_gen_batches=1,
+        max_gen_batches=10,
+        policy=_fake_policy(client),
+    )
+
+    assert complete is True
+    assert pending_meta is not None and len(pending_meta.sample_ids) == 8
+    assert pending_carry is not None
+    torch.testing.assert_close(pending_carry["filtered_reward"], rewards)
 
 
 def test_apply_dynamic_sampling_completes_when_train_size_reached():

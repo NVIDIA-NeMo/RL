@@ -69,7 +69,10 @@ from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
 )
-from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
+from nemo_rl.algorithms.utils import (
+    calculate_baseline_and_std_per_prompt,
+    calculate_is_trivial_prompt_distribution,
+)
 from nemo_rl.data.dataloader import CyclingDataLoader
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.multimodal_utils import PackedTensor
@@ -2438,11 +2441,13 @@ def test_dapo_dynamic_sampling_filters_zero_std(mock_grpo_components):
         ]
     )
 
-    # First prompt has zero std (all rewards are 1.0)
+    # The first prompt's rewards are identical, but its computed std contains
+    # tiny positive floating-point noise.
     # Second prompt has non-zero std (rewards: 0.5, 0.5, 0.0)
-    std = torch.tensor(
-        [0.0, 0.0, 0.0, 0.25, 0.25, 0.25]
-    )  # First prompt has zero std, second has non-zero
+    std = torch.tensor([1e-7, 1e-7, 1e-7, 0.25, 0.25, 0.25])
+    is_trivial_prompt_distribution = torch.tensor(
+        [True, True, True, False, False, False]
+    )
     baseline = torch.tensor([1.0, 1.0, 1.0, 0.33, 0.33, 0.33])
 
     master_config = mock_grpo_components["master_config"]
@@ -2462,6 +2467,7 @@ def test_dapo_dynamic_sampling_filters_zero_std(mock_grpo_components):
         dynamic_sampling_num_gen_batches,
         master_config,
         timer,
+        is_trivial_prompt_distribution=is_trivial_prompt_distribution,
     )
 
     # Only the second prompt (indices 3,4,5) should be selected since first has zero std
@@ -2487,6 +2493,54 @@ def test_dapo_dynamic_sampling_filters_zero_std(mock_grpo_components):
         ]
     )
     assert torch.allclose(result_batch["filtered_reward"], expected_filtered_rewards)
+
+
+def test_dapo_dynamic_sampling_keeps_entire_mixed_loo_group(mock_grpo_components):
+    """A mixed prompt stays intact even when one rollout's LOO peers are identical."""
+    batch_size = 8
+    message_logs = [
+        [
+            {"role": "user", "content": "prompt_0"},
+            {"role": "assistant", "content": f"response_{i}"},
+        ]
+        for i in range(batch_size)
+    ]
+    repeated_batch = create_mock_batch(batch_size, ["math"] * batch_size, message_logs)
+    rewards = torch.tensor([0.0] + [0.95] * 7)
+    repeated_batch["total_reward"] = rewards
+    prompts = torch.zeros(batch_size, 1, dtype=torch.long)
+
+    baseline, std, loo_is_trivial = calculate_baseline_and_std_per_prompt(
+        prompts,
+        rewards,
+        torch.ones_like(rewards),
+        leave_one_out_baseline=True,
+    )
+    prompt_is_trivial = calculate_is_trivial_prompt_distribution(
+        prompts, rewards, torch.ones_like(rewards)
+    )
+
+    assert loo_is_trivial.tolist() == [True] + [False] * 7
+    assert prompt_is_trivial.tolist() == [False] * 8
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.use_dynamic_sampling = True
+    master_config.grpo.num_prompts_per_step = 1
+    master_config.grpo.num_generations_per_prompt = batch_size
+
+    result_batch, is_batch_complete, _, _ = dynamic_sampling(
+        repeated_batch,
+        std,
+        baseline,
+        dynamic_sampling_num_gen_batches=1,
+        master_config=master_config,
+        timer=Timer(),
+        is_trivial_prompt_distribution=prompt_is_trivial,
+    )
+
+    assert is_batch_complete is True
+    assert result_batch.size == batch_size
+    torch.testing.assert_close(result_batch["filtered_reward"], rewards)
 
 
 def test_dapo_dynamic_sampling_preserves_mask_sample_alignment(mock_grpo_components):
@@ -2772,12 +2826,17 @@ def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping(
     # call site.
     input_ids = torch.stack([m[0]["token_ids"] for m in repeated_batch["message_log"]])
     rewards = repeated_batch["total_reward"]
-    baseline, raw_std = calculate_baseline_and_std_per_prompt(
+    baseline, raw_std, _ = calculate_baseline_and_std_per_prompt(
         input_ids,
         rewards,
         torch.ones_like(rewards),
         leave_one_out_baseline=False,
         std_rewards=repeated_batch["unshaped_total_reward"],
+    )
+    is_trivial_prompt_distribution = calculate_is_trivial_prompt_distribution(
+        input_ids,
+        repeated_batch["unshaped_total_reward"],
+        torch.ones_like(rewards),
     )
 
     # Raw std is 0 for the homogeneous group, non-zero for the mixed group.
@@ -2797,6 +2856,7 @@ def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping(
         dynamic_sampling_num_gen_batches=1,
         master_config=master_config,
         timer=Timer(),
+        is_trivial_prompt_distribution=is_trivial_prompt_distribution,
     )
 
     # Only the second group should survive — the first group's raw rewards are
@@ -3725,7 +3785,11 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
     monkeypatch.setattr(
         grpo_mod,
         "calculate_baseline_and_std_per_prompt",
-        lambda *_args, **_kwargs: (torch.tensor([0.1]), torch.tensor([1.0])),
+        lambda *_args, **_kwargs: (
+            torch.tensor([0.1]),
+            torch.tensor([1.0]),
+            torch.tensor([False]),
+        ),
     )
     monkeypatch.setattr(
         grpo_mod,
@@ -5217,6 +5281,26 @@ def test_grpo_advantage_estimator_zero_std_and_zero_advantage():
     # All advantages should be exactly 0
     expected = torch.zeros(4, 3)
     assert torch.allclose(result, expected, rtol=1e-5)
+
+
+def test_grpo_advantage_estimator_skips_trivial_leave_one_out_normalization():
+    """Do not amplify FP32 variance noise from an identical leave-one-out set."""
+    estimator_config = AdvEstimatorConfig.model_construct(
+        use_leave_one_out_baseline=True,
+        normalize_rewards=True,
+    )
+    estimator = GRPOAdvantageEstimator(estimator_config, ClippedPGLossConfig())
+    prompt_ids = torch.zeros(8, 1, dtype=torch.long)
+    rewards = torch.tensor([0.0] + [0.95] * 7)
+
+    result = estimator.compute_advantage(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=torch.ones(8, 3),
+    )
+
+    torch.testing.assert_close(result[0], torch.full((3,), -0.95))
+    assert torch.isfinite(result).all()
 
 
 def test_grpo_advantage_estimator_small_nonzero_std():
