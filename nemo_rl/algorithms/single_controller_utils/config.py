@@ -611,6 +611,14 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # Hard deadline per control-plane call (S5 finding: control-plane death must
     # surface as a failed dispatch, not a silent retry stall).
     control_timeout_s: float = 60.0
+    # Attempts per control-plane call (manifest reads are idempotent). Each
+    # attempt gets ``control_timeout_s`` for request and body; only after the
+    # last one fails does the rollout finalize as a missing-receipt row.
+    control_retries: PositiveInt = 3
+    # Connections in the NemoGym actor's private pool for control-plane calls
+    # (manifest reads). Kept separate from Gym's global aiohttp pool so
+    # manifests never queue behind rollout-long ``/run`` requests.
+    control_pool_size: PositiveInt = 64
     # Root for Gym's per-rollout capture ledgers and base capture layer. None =
     # derived at setup
     # under the run's log dir.

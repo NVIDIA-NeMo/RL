@@ -21,6 +21,7 @@ from collections.abc import AsyncGenerator, Mapping
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, Optional, Protocol, TypedDict
 
+import aiohttp
 import ray
 import torch
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -482,6 +483,10 @@ Depending on your data shape, you may want to change these values."""
         self._server_client = None
         self._control_headers: Dict[str, str] = {}
         self._control_timeout_s = 60.0
+        self._control_retries = 3
+        self._control_pool_size = 64
+        self._control_http: Optional[aiohttp.ClientSession] = None
+        self._control_base: Optional[str] = None
         if self._token_capture_enabled:
             policy_overrides = (
                 initial_global_config_dict.setdefault("policy_model", {})
@@ -514,6 +519,8 @@ Depending on your data shape, you may want to change these values."""
             self._control_timeout_s = float(
                 token_capture.get("control_timeout_s") or 60.0
             )
+            self._control_retries = int(token_capture.get("control_retries") or 3)
+            self._control_pool_size = int(token_capture.get("control_pool_size") or 64)
 
         self.rh = RunHelper()
         self.rh.start(
@@ -568,30 +575,89 @@ Depending on your data shape, you may want to change these values."""
             )
         return self._server_client
 
-    async def _control(self, method: str, path: str, **kwargs: Any) -> dict:
+    def _control_base_url(self) -> str:
+        """Policy proxy base URL, resolved once through Gym's server registry."""
+        if self._control_base is None:
+            self._control_base = (
+                self._control_client()
+                ._resolve_base_url(_POLICY_SERVER_NAME)
+                .rstrip("/")
+            )
+        return self._control_base
+
+    def _control_session(self) -> aiohttp.ClientSession:
+        """Dedicated HTTP pool for ledger control calls.
+
+        Control calls used to go through Gym's process-global aiohttp session,
+        whose connector (``global_aiohttp_connector_limit``, 4096 in the Nano
+        recipes) is held by up to 4096 concurrent ``/run`` requests that each
+        last a whole rollout. A manifest GET then waited for a free connection
+        behind them: ~2.5 ms server-side against a round trip of minutes, which
+        the 60 s deadline turned into a lost training row (581 lost rows over
+        16 steps on job 3857738). A small private pool
+        (``token_capture.control_pool_size``) removes the head-of-line blocking.
+        """
+        if self._control_http is None:
+            connector = aiohttp.TCPConnector(
+                limit=self._control_pool_size,
+                limit_per_host=self._control_pool_size,
+                keepalive_timeout=60.0,
+            )
+            self._control_http = aiohttp.ClientSession(connector=connector)
+        return self._control_http
+
+    async def _control_once(self, method: str, path: str, **kwargs: Any) -> dict:
+        """One control-plane request; the caller bounds it with a deadline."""
         headers = {**kwargs.pop("headers", {}), **self._control_headers}
-        try:
-            response = await asyncio.wait_for(
-                self._control_client().request(
-                    server_name=_POLICY_SERVER_NAME,
-                    url_path=path,
-                    method=method,
-                    headers=headers,
-                    **kwargs,
-                ),
-                timeout=self._control_timeout_s,
-            )
-        except asyncio.TimeoutError:
-            raise RuntimeError(
-                f"ledger control call {method} {path} exceeded "
-                f"{self._control_timeout_s}s (control plane unreachable or stalled)"
-            ) from None
-        if response.status != 200:
-            raise RuntimeError(
-                f"ledger control call {method} {path} failed: "
-                f"HTTP {response.status} {await response.text()}"
-            )
-        return await response.json()
+        url = f"{self._control_base_url()}{path}"
+        async with self._control_session().request(
+            method, url, headers=headers, **kwargs
+        ) as response:
+            if response.status != 200:
+                raise RuntimeError(
+                    f"ledger control call {method} {path} failed: "
+                    f"HTTP {response.status} {await response.text()}"
+                )
+            # Read the body inside the caller's deadline: a stalled body read
+            # used to sit outside ``wait_for`` and had no bound at all.
+            return await response.json(content_type=None)
+
+    async def _control(self, method: str, path: str, **kwargs: Any) -> dict:
+        """Bounded, retried control-plane call.
+
+        Each attempt gets ``control_timeout_s`` for request *and* body. A
+        timeout or transport error is retried up to ``control_retries`` times
+        with a short backoff before the manifest is declared unfetchable
+        (which costs a training row). Manifest reads are idempotent, so
+        retrying is always safe. HTTP errors are answers, not transients, and
+        are raised immediately.
+        """
+        attempts = max(1, self._control_retries)
+        last_error: Optional[RuntimeError] = None
+        for attempt in range(attempts):
+            try:
+                return await asyncio.wait_for(
+                    self._control_once(method, path, **dict(kwargs)),
+                    timeout=self._control_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                last_error = RuntimeError(
+                    f"ledger control call {method} {path} exceeded "
+                    f"{self._control_timeout_s}s (control plane unreachable or stalled)"
+                )
+            except (OSError, aiohttp.ClientError) as error:
+                last_error = RuntimeError(
+                    f"ledger control call {method} {path} transport error: {error}"
+                )
+            if attempt + 1 < attempts:
+                print(
+                    f"control call {method} {path} attempt {attempt + 1}/{attempts} "
+                    f"failed ({last_error}); retrying",
+                    flush=True,
+                )
+                await asyncio.sleep(min(2.0 * (attempt + 1), 10.0))
+        assert last_error is not None
+        raise last_error
 
     async def run_rollouts(
         self,
@@ -628,43 +694,78 @@ Depending on your data shape, you may want to change these values."""
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
         num_results = 0
-        for task in nemo_gym_result_iterator:
-            with timer.time(label=f"{timer_prefix}/await_results"):
-                try:
-                    nemo_gym_row, nemo_gym_result = await task
-                except Exception as error:
-                    if hasattr(error, "response_content"):
-                        print(
-                            "EXCEPTION RESULT",
-                            error.response_content,
-                            file=sys.stderr,
-                        )
-                    typed = _typed_gym_failure(error)
-                    if typed is not None:
-                        # `from None`, deliberately: chaining the original would put the
-                        # unpicklable exception back on the wire as __cause__ and undo
-                        # the whole point. The status and message are already in `detail`.
-                        raise typed from None
-                    raise
 
-            with timer.time(label=f"{timer_prefix}/postprocess_results"):
+        async def _receipt_task(row: dict, result: dict) -> tuple[dict, dict]:
+            return row, await self._postprocess_receipt_mode(row, result)
+
+        async def _completed_results() -> AsyncGenerator[tuple[dict, dict], None]:
+            """Yield ``(row, nemo_rl_result)`` as siblings finish.
+
+            Capture mode used to fetch each sibling's manifest inline before
+            taking the next completed sibling, serialising up to 16
+            control-plane round trips per group (and, on timeouts, 16 x
+            ``control_timeout_s``). Manifest fetches now run as tasks so
+            siblings overlap; the echo path is unchanged and stays inline.
+            """
+            pending: set[asyncio.Task] = set()
+            for task in nemo_gym_result_iterator:
+                with timer.time(label=f"{timer_prefix}/await_results"):
+                    try:
+                        nemo_gym_row, nemo_gym_result = await task
+                    except Exception as error:
+                        for pending_task in pending:
+                            pending_task.cancel()
+                        if hasattr(error, "response_content"):
+                            print(
+                                "EXCEPTION RESULT",
+                                error.response_content,
+                                file=sys.stderr,
+                            )
+                        typed = _typed_gym_failure(error)
+                        if typed is not None:
+                            # `from None`, deliberately: chaining the original would put the
+                            # unpicklable exception back on the wire as __cause__ and undo
+                            # the whole point. The status and message are already in `detail`.
+                            raise typed from None
+                        raise
+
                 if self._token_capture_enabled:
                     # Receipt mode: fetch the ledger manifest and assemble the
                     # receipt locally; token-free result. The canonical row is
                     # rebuilt by the finalizer, so no message_log walk (and no
                     # NaN check) applies here.
-                    nemo_rl_result = await self._postprocess_receipt_mode(
-                        nemo_gym_row, nemo_gym_result
+                    pending.add(
+                        asyncio.create_task(
+                            _receipt_task(nemo_gym_row, nemo_gym_result)
+                        )
                     )
+                    done = {t for t in pending if t.done()}
+                    for finished in done:
+                        pending.discard(finished)
+                        with timer.time(label=f"{timer_prefix}/postprocess_results"):
+                            item = finished.result()
+                        yield item
                 else:
-                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                        nemo_gym_row,
-                        nemo_gym_result,
-                        tokenizer,
-                        include_initial_multimodal_data=not deduplicate_multimodal_data,
+                    with timer.time(label=f"{timer_prefix}/postprocess_results"):
+                        nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                            nemo_gym_row,
+                            nemo_gym_result,
+                            tokenizer,
+                            include_initial_multimodal_data=not deduplicate_multimodal_data,
+                        )
+                        if _has_nan_generation_logprobs(nemo_rl_result):
+                            raise RuntimeError("Generation logprobs contain NaN")
+                    yield nemo_gym_row, nemo_rl_result
+            while pending:
+                with timer.time(label=f"{timer_prefix}/postprocess_results"):
+                    done, pending = await asyncio.wait(
+                        pending, return_when=asyncio.FIRST_COMPLETED
                     )
-                    if _has_nan_generation_logprobs(nemo_rl_result):
-                        raise RuntimeError("Generation logprobs contain NaN")
+                    items = [finished.result() for finished in done]
+                for item in items:
+                    yield item
+
+        async for nemo_gym_row, nemo_rl_result in _completed_results():
             num_results += 1
             timing_metrics = None
             if num_results == len(nemo_gym_examples):

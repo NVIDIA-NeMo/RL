@@ -398,3 +398,87 @@ def test_postprocess_passes_the_scored_response_to_attribution() -> None:
     receipt = result["receipt"]
     assert receipt["terminal_model_call_id"] == "c2"
     assert receipt["terminal_selection"] == "response_id"
+
+
+# ── control-plane call: private pool, bounded body read, retries ──────────────
+
+
+class _FakeResponse:
+    def __init__(self, status: int, payload: dict, delay_s: float = 0.0):
+        self.status = status
+        self._payload = payload
+        self._delay_s = delay_s
+
+    async def __aenter__(self):
+        if self._delay_s:
+            await asyncio.sleep(self._delay_s)
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def json(self, content_type=None):
+        return self._payload
+
+    async def text(self):
+        return str(self._payload)
+
+
+class _FakeSession:
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls: list[tuple[str, str]] = []
+
+    def request(self, method, url, **kwargs):
+        self.calls.append((method, url))
+        return self._responses.pop(0)
+
+
+def _control_env(session, *, timeout_s=0.2, retries=3) -> NemoGym:
+    env = _capture_env()
+    env._control_headers = {"Authorization": "Bearer t"}
+    env._control_timeout_s = timeout_s
+    env._control_retries = retries
+    env._control_pool_size = 4
+    env._control_http = session
+    env._control_base = "http://policy:1234"
+    return env
+
+
+def test_control_call_uses_private_session_and_returns_json() -> None:
+    session = _FakeSession([_FakeResponse(200, {"rollout_id": "r0", "records": []})])
+    env = _control_env(session)
+    manifest = asyncio.run(env._control("GET", "/x/rollouts/r0/manifest"))
+    assert manifest == {"rollout_id": "r0", "records": []}
+    assert session.calls == [("GET", "http://policy:1234/x/rollouts/r0/manifest")]
+
+
+def test_control_call_retries_after_a_timeout_then_succeeds() -> None:
+    session = _FakeSession(
+        [
+            _FakeResponse(200, {"late": True}, delay_s=5.0),  # exceeds 0.2 s deadline
+            _FakeResponse(200, {"ok": True}),
+        ]
+    )
+    env = _control_env(session, timeout_s=0.2, retries=2)
+    manifest = asyncio.run(env._control("GET", "/m"))
+    assert manifest == {"ok": True}
+    assert len(session.calls) == 2
+
+
+def test_control_call_does_not_retry_http_errors() -> None:
+    session = _FakeSession([_FakeResponse(503, {"detail": "busy"}) for _ in range(3)])
+    env = _control_env(session, retries=3)
+    with pytest.raises(RuntimeError, match="HTTP 503"):
+        asyncio.run(env._control("GET", "/m"))
+    assert len(session.calls) == 1
+
+
+def test_control_call_gives_up_after_the_last_timeout() -> None:
+    session = _FakeSession(
+        [_FakeResponse(200, {"late": True}, delay_s=5.0) for _ in range(2)]
+    )
+    env = _control_env(session, timeout_s=0.2, retries=2)
+    with pytest.raises(RuntimeError, match="exceeded 0.2s"):
+        asyncio.run(env._control("GET", "/m"))
+    assert len(session.calls) == 2
