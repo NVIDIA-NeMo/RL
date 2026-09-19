@@ -30,6 +30,7 @@ from nemo_rl.models.generation.vllm.config import (
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.utils import reject_dtensor_v1
 
 
 def test_shutdown_succeeds_before_worker_group_is_initialized(capsys) -> None:
@@ -639,29 +640,30 @@ def test_world_size_validation_dtensor(
 
 
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
-def test_v1_model_save_format_guard_runs_only_when_saving(mock_ray_worker_group):
-    """DTensor v1 construction succeeds; an unsupported actual save fails."""
+def test_dtensor_v2_false_is_rejected_at_setup(mock_ray_worker_group):
+    """An explicit _v2=false fails before any worker is built."""
     config = create_dtensor_config("test/model", tp=1)
     config["dtensor_cfg"]["_v2"] = False
-    config["dtensor_cfg"]["checkpoint"] = {"model_save_format": "safetensors"}
 
-    with (
-        patch("nemo_rl.models.policy.lm_policy.RayQueue"),
-        patch("nemo_rl.models.policy.lm_policy.get_hf_config"),
-        patch("nemo_rl.models.policy.lm_policy.FLOPTracker.from_config"),
-    ):
-        policy = Policy(
+    with pytest.raises(ValueError, match="_v2=false selects the DTensor v1 backend"):
+        Policy(
             cluster=create_mock_cluster(world_size=1),
             config=config,
             tokenizer=create_mock_tokenizer(),
         )
 
-    mock_ray_worker_group.assert_called_once()
-    with pytest.raises(ValueError, match="model_save_format must be None"):
-        policy.save_checkpoint(
-            weights_path="/tmp/test-checkpoint",
-            is_final_checkpoint=False,
-        )
+    mock_ray_worker_group.assert_not_called()
+
+
+def test_reject_dtensor_v1_accepts_absent_and_true():
+    """Only an explicit false is rejected; an absent key means v2."""
+    reject_dtensor_v1({}, "value.dtensor_cfg")
+    reject_dtensor_v1({"_v2": True}, "value.dtensor_cfg")
+
+
+def test_reject_dtensor_v1_names_the_value_config_path():
+    with pytest.raises(ValueError, match=r"value\.dtensor_cfg\._v2=false"):
+        reject_dtensor_v1({"_v2": False}, "value.dtensor_cfg")
 
 
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
@@ -750,23 +752,6 @@ def test_dtensor_hsdp_dispatches_distinct_batches(
             "check_dim_skip_keys": None,
         },
     )
-
-
-@patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
-def test_dtensor_dp_replicate_size_requires_v2(
-    mock_ray_worker_group,
-    tiny_llama_model_path,
-):
-    """Test that HSDP requires the Automodel DTensor v2 worker."""
-    cluster = create_mock_cluster(world_size=8)
-    tokenizer = create_mock_tokenizer()
-    config = create_dtensor_config(tiny_llama_model_path, tp=1)
-    config["dtensor_cfg"]["dp_replicate_size"] = 2
-
-    with pytest.raises(ValueError, match="_v2: true"):
-        Policy(cluster=cluster, config=config, tokenizer=tokenizer)
-
-    mock_ray_worker_group.assert_not_called()
 
 
 @pytest.mark.parametrize(

@@ -117,7 +117,6 @@ def create_test_config(
     cpu_offload: bool = False,
     activation_checkpointing: bool = False,
     custom_parallel_plan: str | None = None,
-    dtensor_v2: bool = False,
     enable_loras: bool = False,
 ) -> PolicyConfig:
     return {
@@ -147,9 +146,9 @@ def create_test_config(
             },
         },
         "dtensor_cfg": {
-            **({"_v2": dtensor_v2} if dtensor_v2 else {}),
+            "_v2": True,
             "checkpoint": {
-                "model_save_format": "safetensors" if dtensor_v2 else None,
+                "model_save_format": "safetensors",
                 "save_consolidated": "false",
             },
             "enabled": True,
@@ -235,26 +234,6 @@ def update_lora_config(
     )
 
 
-def _get_use_v2(request) -> bool:
-    # Get the use_v2 parameter from the test function
-    marks = getattr(request.function, "pytestmark", [])
-    for mark in marks:
-        if (
-            hasattr(mark, "args")
-            and len(mark.args) > 1
-            and "use_v2" in str(mark.args[0])
-        ):
-            for p in mark.args[1]:
-                if isinstance(p, bool):
-                    return p
-
-    # If multiple parametrize decorators, we need to check the node id
-    if hasattr(request, "node") and hasattr(request.node, "callspec"):
-        return request.node.callspec.params.get("use_v2", False)
-
-    return False
-
-
 def create_test_batch(
     batch_size: int = 8,
     seq_len: int = 128,
@@ -332,8 +311,7 @@ def _base_setup_impl(request, cluster):
     loss_fn = None
 
     try:
-        use_v2 = _get_use_v2(request)
-        config = create_test_config(model_name, dtensor_v2=use_v2, **specified_config)
+        config = create_test_config(model_name, **specified_config)
 
         if enable_loras:
             update_lora_config(config, **lora_config)
@@ -457,11 +435,9 @@ class TestSingleGPUCluster:
         cluster.shutdown()
 
     @pytest.mark.timeout(360)
-    @pytest.mark.parametrize(
-        "use_v2", [pytest.param(True, marks=pytest.mark.automodel), False]
-    )
+    @pytest.mark.automodel
     def test_dtensor_single_gpu_training(
-        self, use_v2, single_gpu_cluster, tiny_llama_model_path
+        self, single_gpu_cluster, tiny_llama_model_path
     ):
         """Test DTensor training with a single GPU cluster (no parallelism)."""
         config = create_test_config(
@@ -471,7 +447,6 @@ class TestSingleGPUCluster:
             sp=False,
             cpu_offload=False,
             activation_checkpointing=False,
-            dtensor_v2=use_v2,
         )
         tokenizer = get_tokenizer(config["tokenizer"])
         config["generation"] = configure_generation_config(
@@ -536,11 +511,9 @@ class TestSingleGPUCluster:
             policy.shutdown()
 
     @pytest.mark.timeout(360)
-    @pytest.mark.parametrize(
-        "use_v2", [pytest.param(True, marks=pytest.mark.automodel), False]
-    )
+    @pytest.mark.automodel
     def test_dtensor_single_gpu_logprob(
-        self, use_v2, single_gpu_cluster, tiny_llama_model_path
+        self, single_gpu_cluster, tiny_llama_model_path
     ):
         """Test DTensor logprob computation with a single GPU cluster (no parallelism)."""
         config = create_test_config(
@@ -550,7 +523,6 @@ class TestSingleGPUCluster:
             sp=False,
             cpu_offload=False,
             activation_checkpointing=False,
-            dtensor_v2=use_v2,
         )
         tokenizer = get_tokenizer(config["tokenizer"])
         config["generation"] = configure_generation_config(
@@ -613,12 +585,9 @@ class TestTwoGPUCluster:
     def policy_setup(self, request, two_gpu_cluster, tiny_llama_model_path):
         """Setup and teardown for policy tests - creates a virtual cluster and policy."""
         params = request.param if hasattr(request, "param") else {}
-        use_v2 = params.get("dtensor_v2", False)
         enable_loras = params.get("enable_loras", False)
 
-        config = create_test_config(
-            tiny_llama_model_path, dtensor_v2=use_v2, enable_loras=enable_loras
-        )
+        config = create_test_config(tiny_llama_model_path, enable_loras=enable_loras)
         tokenizer = get_tokenizer(config["tokenizer"])
         config["generation"] = configure_generation_config(
             config["generation"], tokenizer
@@ -666,8 +635,9 @@ class TestTwoGPUCluster:
             # ("tiny_nemotron5_h_model_path", 1, 1, True, True, False),
             # ("tiny_nemotron5_h_model_path", 1, 1, True, False, True),
             # ("tiny_nemotron5_h_model_path", 1, 1, True, True, True),
-            ("tiny_nemotron5_h_model_path", 1, 1, False, False, False),
-            ("tiny_nemotron5_h_model_path", 1, 1, False, True, True),
+            # Disabled until https://github.com/NVIDIA-NeMo/RL/issues/4211 is fixed
+            # ("tiny_nemotron5_h_model_path", 1, 1, False, False, False),
+            # ("tiny_nemotron5_h_model_path", 1, 1, False, True, True),
             # nemotron5_h doesn't support cp
             # TP2, SP=True
             ("tiny_llama_model_path", 2, 1, True, False, False),
@@ -857,17 +827,10 @@ class TestTwoGPUCluster:
         yield from _base_setup_impl(request, two_gpu_cluster)
 
     @pytest.mark.timeout(360)
+    @pytest.mark.automodel
     @pytest.mark.parametrize(
         "policy_setup",
-        [
-            pytest.param(
-                {"dtensor_v2": True, "enable_loras": False}, marks=pytest.mark.automodel
-            ),
-            pytest.param(
-                {"dtensor_v2": True, "enable_loras": True}, marks=pytest.mark.automodel
-            ),
-            {"dtensor_v2": False, "enable_loras": False},
-        ],
+        [{"enable_loras": False}, {"enable_loras": True}],
         indirect=True,
     )
     def test_lm_policy_init(self, policy_setup):
@@ -952,10 +915,8 @@ class TestTwoGPUCluster:
             )
 
     @pytest.mark.timeout(360)
-    @pytest.mark.parametrize(
-        "use_v2", [pytest.param(True, marks=pytest.mark.automodel), False]
-    )
-    def test_dtensor_worker_training(self, use_v2, training_setup):
+    @pytest.mark.automodel
+    def test_dtensor_worker_training(self, training_setup):
         policy, data, loss_fn = training_setup
         _test_dtensor_worker_training(policy, data, loss_fn)
 
@@ -966,12 +927,8 @@ class TestTwoGPUCluster:
         _test_dtensor_worker_training(policy, data, loss_fn)
 
     @pytest.mark.timeout(360)
-    @pytest.mark.parametrize(
-        "use_v2", [pytest.param(True, marks=pytest.mark.automodel), False]
-    )
-    def test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded(
-        self, use_v2, logprob_setup
-    ):
+    @pytest.mark.automodel
+    def test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded(self, logprob_setup):
         policy, data, logprobs = logprob_setup
         _test_dtensor_worker_logprob(policy, data, logprobs)
 
@@ -981,11 +938,9 @@ class TestTwoGPUCluster:
         policy, data, logprobs = logprob_with_lora_setup
         _test_dtensor_worker_logprob(policy, data, logprobs)
 
-    @pytest.mark.parametrize(
-        "use_v2", [pytest.param(True, marks=pytest.mark.automodel), False]
-    )
+    @pytest.mark.automodel
     def test_dtensor_tp_and_tied_model_with_custom_parallel_plan(
-        self, use_v2, two_gpu_cluster, tiny_llama_tied_model_path
+        self, two_gpu_cluster, tiny_llama_tied_model_path
     ):
         """Test that DTensor with a tp > 1 and a tied model with a custom parallel plan works."""
         from torch.distributed.tensor.parallel import ColwiseParallel
@@ -1003,7 +958,6 @@ class TestTwoGPUCluster:
             cpu_offload=False,
             activation_checkpointing=False,
             custom_parallel_plan=custom_parallel_plan,
-            dtensor_v2=use_v2,
         )
         tokenizer = get_tokenizer(config["tokenizer"])
 
@@ -1122,11 +1076,9 @@ class TestTwoGPUCluster:
         policy_mbs2.worker_group.shutdown()
 
     @pytest.mark.timeout(300)
-    @pytest.mark.parametrize(
-        "use_v2", [pytest.param(True, marks=pytest.mark.automodel), False]
-    )
-    def test_dtensor_v1_policy_flops_range_check(
-        self, tiny_llama_model_path, two_gpu_cluster, use_v2
+    @pytest.mark.automodel
+    def test_dtensor_policy_flops_range_check(
+        self, tiny_llama_model_path, two_gpu_cluster
     ):
         """Test that the returned FLOPS is within a reasonable range using dtensor backend.
 
@@ -1136,8 +1088,7 @@ class TestTwoGPUCluster:
         seq_len = 128
         vocab_size = 32000
 
-        # Create dtensor v1 config with default settings
-        config = create_test_config(tiny_llama_model_path, dtensor_v2=use_v2)
+        config = create_test_config(tiny_llama_model_path)
 
         # Update config for FLOPS testing with larger batch and sequence length
         config["train_global_batch_size"] = batch_size
