@@ -129,14 +129,15 @@ class TeacherWorkerGroup:
         cluster: RayVirtualCluster,
         policy_config: dict[str, Any],
         tokenizer: PreTrainedTokenizerBase,
-        teacher_index: int = 0,
+        teacher_index: int,
     ):
         self.alias = teacher_cfg.alias
         self.model_name = teacher_cfg.model_name
         self.teacher_cfg = teacher_cfg
         # Stable per-checkpoint index assigned by create_teacher_worker_groups
-        # (sorted by alias). Tags every payload row this group writes so the
-        # student can select the matching teacher LM head at training time.
+        # (ordered by checkpoint, so an alias edit does not renumber). Tags every
+        # payload row this group writes so the student can select the matching
+        # teacher LM head at training time.
         self.teacher_index = teacher_index
 
         # Build a policy config for inference-only use.

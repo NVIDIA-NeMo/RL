@@ -145,6 +145,7 @@ def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
         cluster,
         policy_config,
         MagicMock(),
+        teacher_index=0,
     )
 
     assert captured["cfg"]["router_replay"]["enabled"] is False
@@ -206,6 +207,7 @@ def test_teacher_worker_group_drops_the_student_pretrained_checkpoint(monkeypatc
         cluster,
         policy_config,
         MagicMock(),
+        teacher_index=0,
     )
 
     assert "pretrained_checkpoint" not in captured["cfg"]
