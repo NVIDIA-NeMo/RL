@@ -84,6 +84,17 @@ def create_weight_synchronizer(
             f"Supported backends: {sorted(_SUPPORTED_BACKENDS)}"
         )
 
+    if generation.cfg.get("refit_transport") == "model_express":
+        from nemo_rl.weight_sync.model_express import ModelExpressWeightSynchronizer
+
+        refit_cfg = generation.cfg.get("refit_cfg")
+        model_express_cfg = refit_cfg.model_express if refit_cfg is not None else None
+        return ModelExpressWeightSynchronizer(
+            policy=policy,
+            generation=generation,
+            server_url=(model_express_cfg.server_url if model_express_cfg else None),
+        )
+
     # Megatron owns its refit selectors (including "mcore"); the vLLM-oriented
     # checkpoint-engine normalization rejects that valid Megatron value.
     checkpoint_engine_config = (

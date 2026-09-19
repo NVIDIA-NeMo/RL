@@ -46,6 +46,7 @@ def _nixl_config() -> dict:
     [
         {},
         {"refit_transport": "vllm_zmq_sparse"},
+        {"refit_transport": "model_express"},
         {
             "refit_transport": "custom.module:Engine",
             "refit_cfg": {"custom.module:Engine": {}},
@@ -61,7 +62,6 @@ def test_configure_nixl_worker_ignores_other_configs(generation_config):
 
 
 def test_configure_nixl_worker_uses_vllm_extension_points():
-    checkpoint_config = _nixl_config()
     vllm_kwargs = {"additional_config": {"existing": True}}
 
     configure_nixl_worker(
@@ -80,7 +80,7 @@ def test_configure_nixl_worker_uses_vllm_extension_points():
     assert vllm_kwargs["worker_cls"] == NIXL_VLLM_WORKER
     assert vllm_kwargs["additional_config"] == {
         "existing": True,
-        "nemo_rl_checkpoint_engine": checkpoint_config,
+        "nemo_rl_checkpoint_engine": _nixl_config(),
     }
 
 
