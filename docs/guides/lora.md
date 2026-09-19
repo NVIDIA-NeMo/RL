@@ -18,7 +18,7 @@ LoRA is implemented on two training backends, each with its own config schema:
 
 | Backend | Config path | Notes |
 | --- | --- | --- |
-| **DTensor (Automodel)** | `policy.dtensor_cfg.lora_cfg` | Requires DTensor v2 (`policy.dtensor_cfg._v2=true`). DTensor v1 does **not** support LoRA. This is the default backend. |
+| **DTensor (Automodel)** | `policy.dtensor_cfg.lora_cfg` | This is the default backend. |
 | **Megatron Core** | `policy.megatron_cfg.peft` | Requires `policy.megatron_cfg.enabled=true` (and `policy.dtensor_cfg.enabled=false`). |
 
 LoRA is supported across the SFT, GRPO, and DPO algorithms on both backends.
@@ -60,7 +60,6 @@ LoRA settings live under `policy.dtensor_cfg.lora_cfg`:
 ```yaml
 policy:
   dtensor_cfg:
-    _v2: true                   # LoRA requires DTensor v2
     lora_cfg:
       enabled: False            # Set to True to enable LoRA fine-tuning
       target_modules: []        # List of module names to apply LoRA

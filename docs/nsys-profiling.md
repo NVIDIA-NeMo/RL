@@ -59,7 +59,7 @@ payload raises at startup so misconfiguration surfaces immediately.
 ### Supported Workers
 
 The supported worker types are:
-- **DTensorPolicyWorker**: Pattern matched against `"dtensor_policy_worker"`
+- **DTensorPolicyWorkerV2**: Pattern matched against `"dtensor_policy_worker"`
 - **VllmGenerationWorker**: Pattern matched against `"vllm_generation_worker"`
 - **TrtllmAsyncGenerationWorker**: Pattern matched against `"trtllm_async_generation_worker"`
 

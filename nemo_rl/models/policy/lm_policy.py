@@ -148,7 +148,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         tp_size = 1
         pp_size = 1
         cp_size = 1
-        use_v2 = False
 
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
@@ -257,37 +256,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 )
 
             reject_dtensor_v1(config["dtensor_cfg"], "policy.dtensor_cfg")
-            use_v2 = True
-            if use_v2:
-                worker_builder_cls_fqn = resolve_policy_worker_cls(
-                    "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2",
-                    config,
-                )
-                if "TORCH_CUDA_ARCH_LIST" not in os.environ:
-                    warnings.warn(
-                        "TORCH_CUDA_ARCH_LIST is not set. This is needed if using DeepEP in DTensorPolicyWorker V2. This variable is set in our container, but "
-                        "if you are running a custom container or baremetal, you may need to set this variable manually. Example: export TORCH_CUDA_ARCH_LIST='9.0 10.0'"
-                    )
-            else:
-                assert (
-                    config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
-                    is False
-                ), "LoRA is not supported for DTensorPolicyWorker V1"
-                if (config.get("generation") or {}).get("backend") == "sglang":
-                    raise ValueError(
-                        "policy.generation.backend='sglang' requires "
-                        "policy.dtensor_cfg._v2=true or policy.megatron_cfg.enabled=true; "
-                        "DTensorPolicyWorker V1 does not implement the SGLang refit path."
-                    )
-                if config["dtensor_cfg"].get("dp_replicate_size", 1) > 1:
-                    raise ValueError(
-                        "dp_replicate_size > 1 requires policy.dtensor_cfg._v2: true "
-                        "(Automodel DTensor v2 backend). HSDP is not supported with the "
-                        "V1 DTensor worker."
-                    )
-                worker_builder_cls_fqn = resolve_policy_worker_cls(
-                    "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker",
-                    config,
+            worker_builder_cls_fqn = resolve_policy_worker_cls(
+                "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2",
+                config,
+            )
+            if "TORCH_CUDA_ARCH_LIST" not in os.environ:
+                warnings.warn(
+                    "TORCH_CUDA_ARCH_LIST is not set. This is needed if using DeepEP in DTensorPolicyWorker V2. This variable is set in our container, but "
+                    "if you are running a custom container or baremetal, you may need to set this variable manually. Example: export TORCH_CUDA_ARCH_LIST='9.0 10.0'"
                 )
 
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
@@ -376,8 +352,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if reserved_http_server_ports is not None:
             worker_kwargs["reserved_http_server_ports"] = reserved_http_server_ports
 
-        if use_v2:
-            # DTensor v2 workers reconstruct tokenizer/processor locally to avoid
+        if dtensor_enable:
+            # DTensor workers reconstruct tokenizer/processor locally to avoid
             # pickling across incompatible transformers versions (v4 head → v5 worker).
             config["tokenizer"]["use_processor"] = processor is not None
         else:
@@ -1394,16 +1370,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         With Megatron async_save=True, this returns after D2H staging. The caller
         must call finalize_async_save() before renaming the checkpoint directory.
 
-        DTensor v2 checkpoint resources are configured when the Policy is
+        DTensor checkpoint resources are configured when the Policy is
         constructed. ``weights_path`` selects the destination for each save.
         """
-        dtensor_cfg = self.cfg.get("dtensor_cfg", {})
-        checkpoint_cfg = dtensor_cfg.get("checkpoint", {})
-        use_v2 = bool(dtensor_cfg.get("enabled", False)) and bool(
-            dtensor_cfg.get("_v2", False)
-        )
-
-        if use_v2:
+        if bool(self.cfg.get("dtensor_cfg", {}).get("enabled", False)):
             futures = self.worker_group.run_all_workers_single_data(
                 "save_checkpoint",
                 weights_path=weights_path,
@@ -1412,14 +1382,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 is_final_checkpoint=is_final_checkpoint,
             )
         else:
-            if (
-                self.cfg.get("dtensor_cfg", {}).get("enabled", False)
-                and checkpoint_cfg.get("model_save_format", None) is not None
-            ):
-                raise ValueError(
-                    "policy.dtensor_cfg.checkpoint.model_save_format must be None or "
-                    "omitted when using DTensorPolicyWorker (_v2=False)."
-                )
             futures = self.worker_group.run_all_workers_single_data(
                 "save_checkpoint",
                 weights_path=weights_path,

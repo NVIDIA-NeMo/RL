@@ -124,7 +124,6 @@ class IPCProtocol(Enum):
 # worker classes.
 POLICY_WORKER_OVERRIDES = {
     "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": "nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker.MegatronQuantPolicyWorker",
-    "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker.DTensorQuantPolicyWorker",
     "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2",
 }
 
@@ -133,7 +132,7 @@ _NEMOTRON_H_ARCHITECTURES = frozenset({"NemotronHForCausalLM"})
 
 
 def reject_dtensor_v1(dtensor_cfg: dict[str, Any], config_path: str) -> None:
-    """Fail at setup when a config still selects the DTensor v1 backend.
+    """Fail at setup when a config still selects the removed DTensor v1 backend.
 
     Args:
         dtensor_cfg: The resolved dtensor_cfg mapping to inspect.
@@ -141,9 +140,8 @@ def reject_dtensor_v1(dtensor_cfg: dict[str, Any], config_path: str) -> None:
     """
     if dtensor_cfg.get("_v2") is False:
         raise ValueError(
-            f"{config_path}._v2=false selects the DTensor v1 backend, which is being "
-            f"removed and no longer accepts new configs. Set {config_path}._v2=true "
-            f"(v2 is the only supported DTensor backend), or set "
+            f"{config_path}._v2=false selects the DTensor v1 backend, which has been "
+            f"removed. Drop the _v2 key ({config_path} is always v2 now) or set "
             f"{config_path.rsplit('.', 1)[0]}.megatron_cfg.enabled=true together with "
             f"{config_path}.enabled=false to train with Megatron-Core."
         )
