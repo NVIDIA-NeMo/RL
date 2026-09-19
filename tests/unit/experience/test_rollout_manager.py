@@ -1959,6 +1959,7 @@ class TestGenerateForFinalizationFlow:
         assert request.mask_sample == (False, False)
         assert request.loss_multiplier == 0.25
         assert request.fallback_weight_version == 7
+        assert request.end_weight_version == 7
         assert pending_acknowledgement_history == [
             [
                 (
@@ -1998,6 +1999,22 @@ class TestGenerateForFinalizationFlow:
         # Finalization and commit are exclusively owned by the controller's
         # actor-pool path; the manager leaves the reservation unready.
         assert buf.commit_calls == []
+
+    def test_finalization_request_bounds_a_live_weight_update(self):
+        buf = _FakeCaptureBuffer()
+        mgr = None
+
+        async def _bump_weight_mid_rollout(_sample):
+            assert mgr is not None
+            mgr.set_weight_version(9)
+
+        mgr = _make_capture_manager(buf, on_run=_bump_weight_mid_rollout)
+
+        request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+
+        assert request is not None
+        assert request.fallback_weight_version == 7
+        assert request.end_weight_version == 9
 
     def test_failed_dispatch_aborts_the_reservation(self):
         buf = _FakeCaptureBuffer()

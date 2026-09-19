@@ -29,7 +29,8 @@ from typing import Any, Literal, Mapping, Optional, get_args
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 from nemo_rl.environments.gym_checkpoint import GymCheckpointCommitResult
 
-ROLLOUT_SNAPSHOT_SCHEMA_VERSION = 4
+ROLLOUT_SNAPSHOT_SCHEMA_VERSION = 6
+_SUPPORTED_ROLLOUT_SNAPSHOT_SCHEMA_VERSIONS = frozenset({4, 5, 6})
 BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION = 7
 BOOTSTRAP_DIRNAME = "bootstrap"
 BOOTSTRAP_MANIFEST_FILENAME = "manifest.json"
@@ -250,6 +251,7 @@ class RolloutSnapshotManifest:
     bootstrap_fingerprint: Optional[str]
     gym_topology_fingerprint: Optional[str] = None
     gym_checkpoint: Optional[GymCheckpointCommitResult] = None
+    gym_generation_cut_proofs: tuple[dict[str, object], ...] = ()
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> RolloutSnapshotManifest:
@@ -289,6 +291,13 @@ class RolloutSnapshotManifest:
             if raw_gym_checkpoint is None
             else GymCheckpointCommitResult.model_validate(raw_gym_checkpoint)
         )
+        raw_generation_cut_proofs = raw.get("gym_generation_cut_proofs", [])
+        if not isinstance(raw_generation_cut_proofs, list) or any(
+            not isinstance(proof, dict) for proof in raw_generation_cut_proofs
+        ):
+            raise ValueError(
+                "rollout snapshot gym_generation_cut_proofs must be a list of objects"
+            )
         manifest = cls(
             schema_version=raw["schema_version"],
             base_train_step=raw["base_train_step"],
@@ -300,11 +309,22 @@ class RolloutSnapshotManifest:
             bootstrap_fingerprint=fingerprint,
             gym_topology_fingerprint=gym_topology_fingerprint,
             gym_checkpoint=gym_checkpoint,
+            gym_generation_cut_proofs=tuple(
+                dict(proof) for proof in raw_generation_cut_proofs
+            ),
         )
-        if manifest.schema_version != ROLLOUT_SNAPSHOT_SCHEMA_VERSION:
+        if manifest.schema_version not in _SUPPORTED_ROLLOUT_SNAPSHOT_SCHEMA_VERSIONS:
             raise ValueError(
                 "unsupported rollout snapshot schema version: "
                 f"{manifest.schema_version}"
+            )
+        if manifest.schema_version < 5 and manifest.gym_generation_cut_proofs:
+            raise ValueError(
+                "rollout snapshot generation-cut proofs require schema version 5"
+            )
+        if manifest.schema_version >= 6 and manifest.gym_generation_cut_proofs:
+            raise ValueError(
+                "rollout snapshot schema version 6 stores generation cuts in Gym lineage"
             )
         if (
             min(
@@ -333,6 +353,8 @@ class RolloutSnapshotManifest:
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
+        if self.schema_version >= 6:
+            payload.pop("gym_generation_cut_proofs", None)
         payload["gym_checkpoint"] = (
             self.gym_checkpoint.model_dump(mode="json")
             if self.gym_checkpoint is not None

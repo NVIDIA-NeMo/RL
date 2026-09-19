@@ -29,8 +29,12 @@ from nemo_rl.environments.nemo_gym import (
 from nemo_rl.environments.gym_checkpoint import (
     GymActorExecutionRegistry,
     GymAgentExecutionStatus,
+    GymCheckpointPrepareResult,
     GymExecutionIdentity,
     GymResourcesPrepareResponse,
+    gym_generation_cut_proofs,
+    gym_generation_cut_receipts,
+    gym_generation_cut_staging_keys,
 )
 
 
@@ -52,6 +56,27 @@ def test_agent_status_accepts_external_wait_frozen_boundary() -> None:
 
     assert status.state == "external_wait_frozen"
     assert status.parked_boundary_state == "external_wait_frozen"
+
+
+def test_agent_execution_status_accepts_frozen_model_wait() -> None:
+    status = GymAgentExecutionStatus.model_validate(
+        {
+            "rollout_id": "rollout-1",
+            "attempt_index": 0,
+            "generation": 1,
+            "state": "model_wait_frozen",
+            "parked_boundary_state": "model_wait_frozen",
+            "boundary_index": 2,
+            "turn_index": 1,
+            "boundary_kind": "pending_model",
+            "resource_state_revisions": {"tools": 3},
+            "completion_receipt": None,
+            "age_seconds": 0.5,
+        }
+    )
+
+    assert status.state == "model_wait_frozen"
+    assert status.parked_boundary_state == "model_wait_frozen"
 
 
 def _capability(component: str, name: str, **overrides):
@@ -94,6 +119,70 @@ def _completion_receipt(
         "result_identity": f"result-{rollout_id}-{attempt_index}",
         "result_digest": f"{attempt_index + 1:064x}",
     }
+
+
+def test_generation_cut_proof_exposes_durable_tq_prefix_keys() -> None:
+    proof = {
+        "checkpoint_id": "checkpoint-1",
+        "generation_cut_receipt": {
+            "prefixes": [
+                {
+                    "disposition": "durable_prefix",
+                    "staging_keys": ["__generation_cut__/checkpoint-1/r0/c1"],
+                },
+                {"disposition": "durable_failure"},
+            ]
+        },
+    }
+    prepare = GymCheckpointPrepareResult.model_validate(
+        {
+            "checkpoint_id": "checkpoint-1",
+            "ready": True,
+            "participants": [
+                {
+                    "participant": {
+                        "server_name": "policy",
+                        "component": "responses_api_models",
+                        "participant_name": "policy",
+                    },
+                    "ready": True,
+                    "payload": {
+                        "state": "paused",
+                        "workers": {"acknowledged": 1, "expected": 1},
+                        "inflight_total": 1,
+                        "response_inflight_total": 1,
+                        "generation_pending_total": 0,
+                        "generation_cut_proof": proof,
+                        "waiters_total": 0,
+                    },
+                }
+            ],
+        }
+    )
+
+    assert gym_generation_cut_proofs(prepare) == (proof,)
+    assert gym_generation_cut_staging_keys(prepare) == {
+        "__generation_cut__/checkpoint-1/r0/c1"
+    }
+
+
+def test_generation_cut_receipts_are_filtered_by_model_server() -> None:
+    policy_receipt = {
+        "checkpoint_id": "checkpoint-1",
+        "cut_id": "policy-cut",
+        "inventory": {"server_name": "policy"},
+    }
+    other_receipt = {
+        "checkpoint_id": "checkpoint-1",
+        "cut_id": "other-cut",
+        "inventory": {"server_name": "other-policy"},
+    }
+    proofs = (
+        {"generation_cut_receipt": policy_receipt},
+        {"workers": [{"generation_cut_receipt": other_receipt}]},
+    )
+
+    assert gym_generation_cut_receipts(proofs, server_name="policy") == [policy_receipt]
 
 
 @pytest.mark.parametrize(
@@ -252,6 +341,7 @@ def test_checkpoint_prepare_fans_out_using_component_routes() -> None:
             "workers": {"acknowledged": 1, "expected": 1},
             "inflight_total": 0,
             "waiters_total": 0,
+            "generation_cut_proof": {"proof_digest": "a" * 64},
         },
         "agent": {
             "state": "preparing",
@@ -286,11 +376,14 @@ def test_checkpoint_prepare_fans_out_using_component_routes() -> None:
         assert method == "POST"
         assert path.endswith("/prepare") or path.endswith("/pause")
         assert timeout_s > 0
-        assert json == {
+        expected_request = {
             "schema_version": 1,
             "checkpoint_id": "snapshot-7",
             "deadline_ts": deadline_ts,
         }
+        if server_name == "agent":
+            expected_request["allow_model_wait_boundary"] = True
+        assert json == expected_request
         return responses[server_name]
 
     env._control = AsyncMock(side_effect=prepare_control)
@@ -336,6 +429,7 @@ def test_checkpoint_prepare_waits_for_draining_policy_model() -> None:
     env._control = AsyncMock(side_effect=discover_control)
     asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
     calls = []
+    agent_requests = []
 
     async def prepare_control(method, path, *, server_name, **_kwargs):
         calls.append((method, path, server_name))
@@ -357,15 +451,17 @@ def test_checkpoint_prepare_waits_for_draining_policy_model() -> None:
                         "future_worker_metric": 7,
                     }
                 },
-                "inflight_total": 0,
+                "inflight_total": 1,
                 "response_inflight_total": 0,
                 "generation_pending_total": 0,
+                "generation_cut_proof": {"proof_digest": "b" * 64},
                 "waiters_total": 0,
                 "inflight": [],
                 "tombstones": [],
                 "future_status_metric": 9,
             }
         if server_name == "agent":
+            agent_requests.append(_kwargs["json"])
             return {
                 "state": "preparing",
                 "ready_to_commit": True,
@@ -385,10 +481,28 @@ def test_checkpoint_prepare_waits_for_draining_policy_model() -> None:
 
     env._control = AsyncMock(side_effect=prepare_control)
 
-    result = asyncio.run(env.prepare_checkpoint("snapshot-8", time.time() + 10.0))
+    deadline_ts = time.time() + 10.0
+    result = asyncio.run(env.prepare_checkpoint("snapshot-8", deadline_ts))
 
     assert result["ready"] is True
     assert any(path.endswith("/status") for _method, path, _server in calls)
+    assert agent_requests == [
+        {
+            "schema_version": 1,
+            "checkpoint_id": "snapshot-8",
+            "deadline_ts": deadline_ts,
+            "allow_model_wait_boundary": True,
+        }
+    ]
+    assert next(
+        index
+        for index, (_method, path, _server) in enumerate(calls)
+        if path.endswith("/status")
+    ) < next(
+        index
+        for index, (_method, path, server) in enumerate(calls)
+        if server == "agent"
+    )
 
 
 def test_checkpoint_prepare_timeout_resumes_touched_participants() -> None:
@@ -471,7 +585,8 @@ def test_checkpoint_prepare_timeout_resumes_touched_participants() -> None:
     with pytest.raises(TimeoutError, match="remained 'draining'"):
         asyncio.run(env.prepare_checkpoint("snapshot-9", time.time() + 10.0))
 
-    assert resume_order == ["tools", "policy", "agent"]
+    # Policy reconciliation now happens before later participants are touched.
+    assert resume_order == ["policy"]
 
 
 def test_checkpoint_prepare_lost_response_resumes_attempted_participant() -> None:
@@ -613,6 +728,18 @@ def test_checkpoint_commit_restore_and_resume_fan_out() -> None:
             123.0,
             "/tmp/snapshot-7",
             source_checkpoint_id="snapshot-7",
+            generation_cut_proofs=(
+                {
+                    "generation_cut_receipt": {
+                        "checkpoint_id": "snapshot-7",
+                        "cut_id": "policy-cut",
+                        "inventory": {"server_name": "policy"},
+                    }
+                },
+            ),
+            generation_cut_exclusions=(
+                {"rollout_id": "rollout-1", "attempt_index": 1},
+            ),
         )
     )
     resumed = asyncio.run(env.resume_checkpoint("restore-7", 123.0))
@@ -643,6 +770,16 @@ def test_checkpoint_commit_restore_and_resume_fan_out() -> None:
     assert commit_calls[1][2]["continuation_indexes"] == [continuation_index]
     restore_calls = calls[3:6]
     assert "include_storage_reference_index" not in restore_calls[0][2]
+    assert restore_calls[0][2]["generation_cut_receipts"] == [
+        {
+            "checkpoint_id": "snapshot-7",
+            "cut_id": "policy-cut",
+            "inventory": {"server_name": "policy"},
+        }
+    ]
+    assert restore_calls[0][2]["generation_cut_exclusions"] == [
+        {"rollout_id": "rollout-1", "attempt_index": 1}
+    ]
     assert "include_continuation_index" not in restore_calls[1][2]
 
 

@@ -52,6 +52,7 @@ def _request() -> ReassemblyRequest:
         rewards=(1.0,),
         mask_sample=(False,),
         fallback_weight_version=4,
+        end_weight_version=6,
     )
 
 
@@ -97,6 +98,7 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         [1.0],
         mask_sample=[False],
         fallback_weight_version=4,
+        latest_weight_version=6,
         prompt_idx=17,
         loss_multiplier=0.25,
         canonical_sample_ids=["group_g0"],
@@ -131,6 +133,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "receipts",
         "rewards",
         "fallback_weight_version",
+        "end_weight_version",
         "prompt_idx",
         "mask_sample",
         "loss_multiplier",
