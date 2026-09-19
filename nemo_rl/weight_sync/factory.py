@@ -38,6 +38,33 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 
+def validate_release_grads_before_refit(
+    *,
+    enabled: bool,
+    megatron_enabled: bool,
+    generation_backend: str,
+    colocated: bool,
+    refit_transport: Optional[str],
+) -> None:
+    """Validate the topology supported by trainer memory release."""
+    if not enabled:
+        return
+    if not megatron_enabled:
+        raise ValueError(
+            "release_grads_before_refit requires the Megatron policy backend."
+        )
+    if colocated or generation_backend != VLLM_BACKEND:
+        raise ValueError(
+            "release_grads_before_refit is supported only by non-colocated vLLM "
+            "collective or nccl_reshard refit transports."
+        )
+    if refit_transport not in (None, "nccl_reshard"):
+        raise ValueError(
+            "release_grads_before_refit is supported only by non-colocated vLLM "
+            "collective or nccl_reshard refit transports."
+        )
+
+
 def create_weight_synchronizer(
     policy: Any,
     generation: Any,
@@ -83,6 +110,18 @@ def create_weight_synchronizer(
             f"Unknown generation backend {generation_backend!r}. "
             f"Supported backends: {sorted(_SUPPORTED_BACKENDS)}"
         )
+
+    policy_cfg = getattr(policy, "cfg", {})
+    release_grads_before_refit = policy_cfg.get("release_grads_before_refit") is True
+    validate_release_grads_before_refit(
+        enabled=release_grads_before_refit,
+        megatron_enabled=bool(
+            (policy_cfg.get("megatron_cfg") or {}).get("enabled", False)
+        ),
+        generation_backend=generation_backend,
+        colocated=colocated,
+        refit_transport=generation.cfg.get("refit_transport"),
+    )
 
     # Megatron owns its refit selectors (including "mcore"); the vLLM-oriented
     # checkpoint-engine normalization rejects that valid Megatron value.
@@ -181,6 +220,7 @@ def create_weight_synchronizer(
                 train_cluster=train_cluster,
                 inference_cluster=inference_cluster,
                 refit_timeout_s=refit_timeout_s,
+                release_grads_before_refit=release_grads_before_refit,
             )
 
         from nemo_rl.weight_sync.collective_weight_synchronizer import (
@@ -193,6 +233,7 @@ def create_weight_synchronizer(
             train_cluster=train_cluster,
             inference_cluster=inference_cluster,
             refit_timeout_s=refit_timeout_s,
+            release_grads_before_refit=release_grads_before_refit,
         )
 
     from nemo_rl.weight_sync.ipc_weight_synchronizer import (
