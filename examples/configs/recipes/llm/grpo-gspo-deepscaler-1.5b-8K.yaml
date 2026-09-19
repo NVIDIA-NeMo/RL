@@ -19,6 +19,8 @@ policy:
     cpu_offload: true
     sequence_parallel: true
     activation_checkpointing: true
+    checkpoint:
+      model_save_format: "torch_save"
   sequence_packing:
     enabled: false
   optimizer:
