@@ -61,6 +61,7 @@ from nemo_rl.models.automodel.data import (
     ProcessedMicrobatch,
     filter_multimodal_kwargs_for_model,
 )
+from nemo_rl.models.automodel.window_controls import collect_window_controls
 from nemo_rl.models.policy import PolicyConfig
 
 # Union type for any post-processing function
@@ -467,77 +468,129 @@ def automodel_forward_backward(
     Returns:
         List of (result, metrics) tuples from each microbatch
     """
-    results = []
-
-    for mb_idx, processed_mb in enumerate(data_iterator):
-        # Call optional callback at start of microbatch
-        if on_microbatch_start is not None:
-            on_microbatch_start(mb_idx)
-
-        prepared = prepare_model_forward(
-            model,
-            processed_mb.processed_inputs,
-            device_mesh=device_mesh,
-            cp_size=cp_size,
-            padding_token_id=padding_token_id,
-            is_reward_model=is_reward_model,
-            allow_flash_attn_args=allow_flash_attn_args,
-        )
-
-        with prepared.model_context_factory(), autocast_context_factory():
-            # Forward pass with post-processing
-            result, metrics, _ = forward_with_post_processing_fn(
+    # Use the same forward/postprocessing route to collect statistics, then replay.
+    # The helper restores RNG and registered buffers; no optimizer is advanced.
+    loss_fn = (
+        post_processing_fn.loss_fn
+        if isinstance(post_processing_fn, LossPostProcessor)
+        else None
+    )
+    if (
+        not forward_only
+        and getattr(loss_fn, "logical_window_controls", False)
+        and (loss_fn.dynamic_loss_scaling or loss_fn.kd_loss_mode == "select_teacher")
+    ):
+        if dp_size != 1 or cp_size != 1 or torch.distributed.get_world_size() != 1:
+            raise NotImplementedError(
+                "Window controls currently support DP1/TP1/CP1 only"
+            )
+        data_iterator = list(data_iterator)
+        collect_window_controls(
+            model=model,
+            data=data_iterator,
+            loss_fn=loss_fn,
+            forward=lambda replay: automodel_forward_backward(
                 model=model,
-                prepared=prepared,
+                data_iterator=iter(replay),
                 post_processing_fn=post_processing_fn,
-                processed_mb=processed_mb,
+                device_mesh=device_mesh,
+                padding_token_id=padding_token_id,
+                autocast_context_factory=autocast_context_factory,
+                forward_only=True,
+                is_reward_model=is_reward_model,
+                allow_flash_attn_args=allow_flash_attn_args,
                 global_valid_seqs=global_valid_seqs,
                 global_valid_toks=global_valid_toks,
                 sampling_params=sampling_params,
                 sequence_dim=sequence_dim,
+                dp_size=dp_size,
+                cp_size=cp_size,
+                num_global_batches=num_global_batches,
+                num_valid_microbatches=num_valid_microbatches,
+                on_microbatch_start=None,
+            ),
+            num_valid_microbatches=num_valid_microbatches,
+        )
+    results = []
+
+    try:
+        for mb_idx, processed_mb in enumerate(data_iterator):
+            # Call optional callback at start of microbatch
+            if on_microbatch_start is not None:
+                on_microbatch_start(mb_idx)
+
+            prepared = prepare_model_forward(
+                model,
+                processed_mb.processed_inputs,
+                device_mesh=device_mesh,
+                cp_size=cp_size,
+                padding_token_id=padding_token_id,
+                is_reward_model=is_reward_model,
+                allow_flash_attn_args=allow_flash_attn_args,
             )
 
-            # Check if this is a dummy batch
-            is_dummy = (
-                num_valid_microbatches is not None and mb_idx >= num_valid_microbatches
-            )
+            with prepared.model_context_factory(), autocast_context_factory():
+                # Forward pass with post-processing
+                result, metrics, _ = forward_with_post_processing_fn(
+                    model=model,
+                    prepared=prepared,
+                    post_processing_fn=post_processing_fn,
+                    processed_mb=processed_mb,
+                    global_valid_seqs=global_valid_seqs,
+                    global_valid_toks=global_valid_toks,
+                    sampling_params=sampling_params,
+                    sequence_dim=sequence_dim,
+                )
 
-            # Scale metrics for aggregation (only for loss)
-            if isinstance(post_processing_fn, LossPostProcessor):
-                # skip the update for dummy batches
-                if not is_dummy:
-                    ## scale by the number of global batches so we get the correct
-                    ## value when summing metrics across all microbatches
-                    for k in metrics.keys():
-                        if "_min" in k or "_max" in k:
-                            continue
+                # Check if this is a dummy batch
+                is_dummy = (
+                    num_valid_microbatches is not None
+                    and mb_idx >= num_valid_microbatches
+                )
 
-                        metrics[k] /= num_global_batches
-                else:
-                    # Zero out loss for dummy batches
-                    result = result * 0
+                # Scale metrics for aggregation (only for loss)
+                if isinstance(post_processing_fn, LossPostProcessor):
+                    # skip the update for dummy batches
+                    if not is_dummy:
+                        ## scale by the number of global batches so we get the correct
+                        ## value when summing metrics across all microbatches
+                        for k in metrics.keys():
+                            if "_min" in k or "_max" in k:
+                                continue
 
-                # Backward pass if training
-                if not forward_only:
-                    ## NOTE: invalid samples should be multiplied
-                    ## by zero in the loss function to prevent them
-                    ## from affecting the gradient calculation
+                            metrics[k] /= num_global_batches
+                    else:
+                        # Zero out loss for dummy batches
+                        result = result * 0
 
-                    # FSDP averages gradients over its DP mesh (dp_size * cp_size),
-                    # while loss normalization expects their sum, so cancel that
-                    # average here. Replicated CP losses send each local model
-                    # contribution to cp_size loss consumers; divide by that fanout
-                    # to avoid overcounting. Partitioned losses have a fanout of 1.
-                    loss = (
-                        result
-                        * dp_size
-                        * cp_size
-                        / post_processing_fn.cp_gradient_fanout
-                    )
-                    loss.backward()
+                    # Backward pass if training
+                    if not forward_only:
+                        ## NOTE: invalid samples should be multiplied
+                        ## by zero in the loss function to prevent them
+                        ## from affecting the gradient calculation
 
-        results.append((result, metrics))
+                        # FSDP averages gradients over its DP mesh (dp_size * cp_size),
+                        # while loss normalization expects their sum, so cancel that
+                        # average here. Replicated CP losses send each local model
+                        # contribution to cp_size loss consumers; divide by that fanout
+                        # to avoid overcounting. Partitioned losses have a fanout of 1.
+                        loss = (
+                            result
+                            * dp_size
+                            * cp_size
+                            / post_processing_fn.cp_gradient_fanout
+                        )
+                        loss.backward()
 
+            results.append((result, metrics))
+
+    finally:
+        if (
+            loss_fn is not None
+            and getattr(loss_fn, "_window_phase", None) == "apply"
+            and not forward_only
+        ):
+            loss_fn.end_logical_window_control()
     return results
 
 
