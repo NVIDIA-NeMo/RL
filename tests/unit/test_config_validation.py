@@ -24,7 +24,6 @@ from pydantic import TypeAdapter, ValidationError
 
 from nemo_rl.algorithms.distillation import MasterConfig as DistillationMasterConfig
 from nemo_rl.algorithms.dpo import MasterConfig as DPOMasterConfig
-from nemo_rl.algorithms.flow_grpo import MasterConfig as FlowGRPOMasterConfig
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     RewardPenaltyConfig,
@@ -159,9 +158,6 @@ def test_all_config_files_have_required_keys(config_file):
     elif "sft" in config_dict:
         master_config_class = SFTMasterConfig
         config_type = "sft"
-    elif "flow_grpo" in config_dict:
-        master_config_class = FlowGRPOMasterConfig
-        config_type = "flow_grpo"
     elif "grpo" in config_dict:
         master_config_class = GRPOMasterConfig
         config_type = "grpo"

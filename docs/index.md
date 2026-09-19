@@ -324,7 +324,6 @@ guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md
 guides/grpo-audio.md
 guides/grpo-audio-visual.md
-guides/flow-grpo.md
 guides/rm.md
 guides/environments.md
 guides/eval.md

@@ -252,12 +252,6 @@ nvrx = [
   "nvidia-resiliency-ext==0.6.0",
 ] # for ft_launcher (fault-tolerant training launcher)
 nemo_gym = ["nemo_gym"]
-diffusion = [
-  "diffusers>=0.37",
-  # OCR reward (CPU inference; swap in paddlepaddle-gpu for GPU scoring)
-  "paddleocr>=2.9,<3.0",
-  "paddlepaddle>=2.6",
-]
 
 [dependency-groups]
 
@@ -356,6 +350,7 @@ members = [
   # nemo-rl's uv.lock you'll see it's 1.X b/c megatron mandates 1.X in the optional dependencies, so
   # globally we must choose 1.X otherwise we run into pickle issues from ray.
   "research/template_project",
+  "research/flow_grpo",
 ]
 
 [[tool.uv.index]]
@@ -741,6 +736,7 @@ convention = "google"
 [tool.ruff.lint.per-file-ignores]
 # Ignore all directories named `tests`.
 "tests/**" = ["D"]
+"research/*/tests/**" = ["D"]
 # Ignore all files that end in `_test.py`.
 "*_test.py" = ["D"]
 # Ignore F401 (import but unused) in __init__.py

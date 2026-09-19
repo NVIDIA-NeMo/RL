@@ -95,13 +95,6 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
     ],
     "nemo_rl.environments.tools.retriever.RAGEnvironment": None,
     "nemo_rl.environments.nemo_gym.NemoGym": ["nemo_gym"],
-    # Flow-GRPO policy worker: nemo-automodel (pipeline loading, LoRA,
-    # checkpointing) + the diffusion extra (diffusers, OCR reward deps).
-    "nemo_rl.models.diffusion.workers.flow_grpo_worker.FlowGRPOPolicyWorker": [
-        "automodel",
-        "diffusion",
-    ],
-    "nemo_rl.environments.image_reward_environment._RewardWorker": None,
     # ModelOpt quantization-aware workers
     "nemo_rl.modelopt.models.generation.vllm_quant_worker.VllmQuantGenerationWorker": [
         "modelopt",
