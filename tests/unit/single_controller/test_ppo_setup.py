@@ -645,9 +645,12 @@ class TestSetupBuildsTheCritic:
 
 
 class TestValueWarmStart:
-    def test_fresh_run_builds_the_critic_from_the_warm_start(
+    def test_fresh_run_takes_warm_start_weights_but_not_its_optimizer(
         self, patched_ppo_factories, tmp_path
     ):
+        """The seed's Adam state and scheduler step count belong to the run that
+        produced it, so a warm start rebuilds both and only the weights carry
+        over."""
         seed = tmp_path / "critic_pretrain" / "step_370"
         (seed / "value" / "weights").mkdir(parents=True)
         (seed / "value" / "optimizer").mkdir()
@@ -664,7 +667,7 @@ class TestValueWarmStart:
 
         value_kwargs = patched_ppo_factories["_build_value"].call_args.kwargs
         assert value_kwargs["weights_path"] == seed / "value" / "weights"
-        assert value_kwargs["optimizer_path"] == seed / "value" / "optimizer"
+        assert value_kwargs["optimizer_path"] is None
         # The policy is untouched by a warm start: pi_0 comes from the base model.
         trainer_kwargs = patched_ppo_factories["_build_trainer"].call_args.kwargs
         assert trainer_kwargs["weights_path"] is None

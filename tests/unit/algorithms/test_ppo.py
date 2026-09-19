@@ -33,6 +33,7 @@ from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.utils.checkpoint import CheckpointManager
 
 
 def _make_loss_config(
@@ -1539,8 +1540,10 @@ def _patch_ppo_setup_prerequisites(monkeypatch):
         def load_training_info(self, _path):
             return None
 
-        def get_resume_paths(self, _path, *, model_component="policy"):
-            return None, None
+        # The real resolver: a warm-start test needs the seed's subtree to
+        # resolve. It still returns (None, None) when there is no checkpoint,
+        # which is what every other test here relies on.
+        get_resume_paths = staticmethod(CheckpointManager.get_resume_paths)
 
     class DummyLoader:
         def __init__(self, *_args, **_kwargs):
@@ -2130,6 +2133,24 @@ def test_ppo_setup_rejects_a_warm_start_that_does_not_resolve(monkeypatch, tmp_p
 
     with pytest.raises(ValueError, match="would silently start cold"):
         _run_noncolocated_setup(monkeypatch, config)
+
+
+def test_ppo_setup_warm_start_takes_weights_but_not_the_seeds_optimizer(
+    monkeypatch, tmp_path
+):
+    """The seed's Adam state and LR-scheduler step count belong to the run that
+    produced it, so a warm start rebuilds both and only the weights carry over."""
+    seed = tmp_path / "critic_pretrain" / "step_370"
+    (seed / "value" / "weights").mkdir(parents=True)
+    (seed / "value" / "optimizer").mkdir()
+    config = _make_noncolocated_setup_config()
+    config.ppo.warm_start_value_checkpoint = str(seed)
+
+    *_, value_factory, _, _ = _run_noncolocated_setup(monkeypatch, config)
+
+    value_kwargs = value_factory.call_args.kwargs
+    assert value_kwargs["weights_path"] == seed / "value" / "weights"
+    assert value_kwargs["optimizer_path"] is None
 
 
 def test_colocated_setup_keeps_single_cluster_and_skips_collective(monkeypatch):

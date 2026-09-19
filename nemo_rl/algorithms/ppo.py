@@ -744,14 +744,20 @@ def setup(
     weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
     # Only a fresh run reads this; a resume ignores it and restores the critic from
     # its own checkpoint, so the key can stay in the config.
-    warm_start = ppo_config.warm_start_value_checkpoint
-    if last_checkpoint_path is None and warm_start is not None:
+    warm_start = (
+        ppo_config.warm_start_value_checkpoint if last_checkpoint_path is None else None
+    )
+    if warm_start is not None:
         validate_warm_start_checkpoint(warm_start)
-        print(f"🔥 Warm-starting the value model from {warm_start}")
+        print(f"🔥 Warm-starting the value model from {warm_start} (weights only)")
     value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
         last_checkpoint_path or warm_start,
         model_component="value",
     )
+    if warm_start is not None:
+        # The seed's Adam state and LR-scheduler step count belong to the run that
+        # produced it, so the critic rebuilds both -- only the weights carry over.
+        value_optimizer_path = None
 
     # train_iters is the total scheduler-tick budget. Each Megatron worker
     # ticks once per train() call, so policy and value need separate budgets
