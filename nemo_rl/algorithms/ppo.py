@@ -372,6 +372,18 @@ def setup(
                 "default collective path. Set policy.generation.refit_transport=null. "
                 "Tracked in https://github.com/NVIDIA-NeMo/RL/issues/3275."
             )
+    elif generation_config.get("refit_transport") is not None:
+        # The block above only runs for vLLM, but PPO also supports SGLang, so
+        # a transport set there used to be dropped without a word. GRPO rejects
+        # the same pairing at grpo.py's setup; this mirrors it.
+        raise ValueError(
+            f"policy.generation.refit_transport="
+            f"{generation_config['refit_transport']!r} is not yet supported by "
+            f"PPO on the {generation_config['backend']!r} generation backend; "
+            "PPO refits over the default collective path. Set "
+            "policy.generation.refit_transport=null. Tracked in "
+            "https://github.com/NVIDIA-NeMo/RL/issues/3275."
+        )
 
     if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
         policy_megatron_config = cast(MegatronConfig, policy_config["megatron_cfg"])
