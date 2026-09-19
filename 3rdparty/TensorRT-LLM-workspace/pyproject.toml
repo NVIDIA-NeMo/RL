@@ -153,4 +153,4 @@ backend-path = ["."]
 # "HTTP Basic: Access denied". Callers holding a bare token add their own
 # username (build-custom-trtllm.sh's caller does).
 url = "https://${GITLAB_CLONE_ACCESS_TOKEN}@gitlab-master.nvidia.com/ftp/tekit.git"
-ref = "d0404ea6e0ec2c2449b5a2be3c552e7a6147581e"   # pragma: allowlist secret
+ref = "600768313c3c746e3dc5458b90c8d5a9f5b20745"   # pragma: allowlist secret
