@@ -120,9 +120,14 @@ class TQPolicy(TQDriverMixin, Policy):
     the driver and forwards ``setup_data_plane(dp_cfg)`` to every worker
     so they can attach as clients (``bootstrap=False``).
 
+    ``checkpointing`` is an internal bootstrap mode derived from the existing
+    checkpoint settings and resume path, not another user-facing switch. For
+    Mooncake it enables hard-pinned memory, disables offload, and keeps the
+    driver out of the storage topology; workers inherit the controller's mode.
+
     The partition lifecycle (``register_partition`` / ``clear_samples``) is
     the trainer's responsibility — this class assumes the partition
-    named ``self.tq_partition_id`` (default ``"train"``) is open with a
+    named by ``tq_partition_id`` (default ``"train"``) is open with a
     schema covering ``DP_TRAIN_FIELDS`` (the bulk schema written by the
     rollout actor at first put + driver-/worker-written deltas).
     """
@@ -131,6 +136,7 @@ class TQPolicy(TQDriverMixin, Policy):
         self,
         *args: Any,
         dp_cfg: DataPlaneRuntimeConfig,
+        checkpointing: bool = False,
         tq_partition_id: str = "train",
         **kwargs: Any,
     ) -> None:
@@ -147,7 +153,9 @@ class TQPolicy(TQDriverMixin, Policy):
                 f"TP/PP/CP/EP sizes."
             )
         self.dp_cfg = dp_cfg
-        self.dp_client = build_data_plane_client(dp_cfg, bootstrap=True)
+        self.dp_client = build_data_plane_client(
+            dp_cfg, bootstrap=True, checkpointing=checkpointing
+        )
         self.tq_partition_id = tq_partition_id
         self._router_replay_enabled = bool(
             (self.cfg.get("router_replay") or {}).get("enabled", False)

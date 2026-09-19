@@ -64,12 +64,12 @@ def filter_multimodal_kwargs_for_model(
     accepted_kwargs = _accepted_forward_kwargs(type(model))
     if accepted_kwargs is None:
         return multimodal_kwargs
-    # A forward that cannot consume imgs_sizes also cannot crop the per-image
-    # pad_to_max_shape padding, so mixed-resolution batches would feed padded
-    # pixels to the vision encoder and mismatch the placeholder count. This is
+    # AutoModel materializes pixels with pad_to_max_shape. A forward that cannot
+    # consume imgs_sizes cannot crop that padding, so mixed-resolution batches
+    # would mismatch the placeholder count. This is
     # the AutoModel Nemotron Omni path (nvidia/Nemotron-3-Nano-Omni-30B-A3B-
     # Reasoning-BF16), whose HF forward takes pixel_values but not imgs_sizes,
-    # unlike the mcore NemotronOmniModel which crops via imgs_sizes.
+    # unlike mcore, which consumes native-resolution pre-patchified pixels.
     imgs_sizes = multimodal_kwargs.get("imgs_sizes")
     if (
         imgs_sizes is not None
@@ -298,7 +298,9 @@ def process_microbatch(
         flash_attn_kwargs = {}
 
     # Add vlm kwargs to model call
-    vlm_kwargs = mb.get_multimodal_dict(as_tensors=True, device=input_ids.device)
+    vlm_kwargs = mb.get_multimodal_dict(
+        True, input_ids.device, None, "pad_to_max_shape"
+    )
     if len(vlm_kwargs) > 0:
         # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
         position_ids = None

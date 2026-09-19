@@ -75,6 +75,9 @@ from megatron.core.utils import get_model_config
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
+from nemo_rl.models.megatron.draft.optimizer import (
+    build_draft_optimizer_override_provider,
+)
 
 _HF_CONFIG_PATCHED = False
 
@@ -1475,6 +1478,15 @@ def _apply_precision_config(
         "float16": torch.float16,
     }
     model_cfg.pipeline_dtype = dtype_map[config["megatron_cfg"]["pipeline_dtype"]]
+    if config["megatron_cfg"].get("fp32_lm_head"):
+        if not hasattr(model_cfg, "logit_dtype"):
+            raise ValueError(
+                "policy.megatron_cfg.fp32_lm_head requires a Megatron-Bridge "
+                "provider that exposes logit_dtype; "
+                f"{type(model_cfg).__name__} does not."
+            )
+        # Megatron-LM emits fp32 logits from a bf16 x bf16 tensor-core GEMM.
+        model_cfg.logit_dtype = torch.float32
 
     te_precision_config_file = config["megatron_cfg"].get("te_precision_config_file")
     if te_precision_config_file is not None:
@@ -2356,6 +2368,9 @@ def setup_model_and_optimizer(
             scheduler_config=megatron_cfg.scheduler,
             model=model,
             use_gloo_process_groups=megatron_cfg.dist.use_gloo_process_groups,
+            optimizer_config_override_provider=build_draft_optimizer_override_provider(
+                policy_cfg.get("draft")
+            ),
         )
     else:
         optimizer = None
