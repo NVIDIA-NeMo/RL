@@ -30,6 +30,7 @@ from nemo_rl.models.generation.vllm.config import (
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.utils import reject_dtensor_v1
 
 
 def test_shutdown_succeeds_before_worker_group_is_initialized(capsys) -> None:
@@ -655,6 +656,33 @@ def test_world_size_validation_dtensor(
             )
         # For failing cases, worker group should not be created
         mock_ray_worker_group.assert_not_called()
+
+
+@patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
+def test_dtensor_v2_false_is_rejected_at_setup(mock_ray_worker_group):
+    """An explicit _v2=false fails before any worker is built."""
+    config = create_dtensor_config("test/model", tp=1)
+    config["dtensor_cfg"]["_v2"] = False
+
+    with pytest.raises(ValueError, match="_v2=false selects the DTensor v1 backend"):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+        )
+
+    mock_ray_worker_group.assert_not_called()
+
+
+def test_reject_dtensor_v1_accepts_absent_and_true():
+    """Only an explicit false is rejected; an absent key means v2."""
+    reject_dtensor_v1({}, "value.dtensor_cfg")
+    reject_dtensor_v1({"_v2": True}, "value.dtensor_cfg")
+
+
+def test_reject_dtensor_v1_names_the_value_config_path():
+    with pytest.raises(ValueError, match=r"value\.dtensor_cfg\._v2=false"):
+        reject_dtensor_v1({"_v2": False}, "value.dtensor_cfg")
 
 
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
