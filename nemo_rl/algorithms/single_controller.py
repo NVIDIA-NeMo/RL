@@ -3602,18 +3602,19 @@ class SingleControllerActor:
             # exhaustion check for the rest of the run.
             self._recovering_from_refit = False
 
-    async def _recover_from_failed_refit(self, failure: BaseException) -> None:
+    async def _recover_from_failed_refit(
+        self, failure: BaseException, *, refit_started: bool
+    ) -> None:
         """Drop whatever stopped participating, rebuild the communicator, allow a retry.
 
         Two failures arrive here and they are not the same event:
 
-        ``RefitAborted`` -- a rank went silent *inside* the collective and a worker's
-        watchdog broke it. Every engine that was receiving is left holding a mix of old
-        and new weights, so none of them may serve until a refit completes.
+        ``RefitAborted`` -- pausing timed out, or a rank went silent inside the
+        collective and a watchdog broke it. Only the latter leaves receiving engines
+        holding partial weights; those cannot serve until a refit completes.
 
-        ``RayActorError`` -- the collective finished and a shard died in the epilogue,
-        before its RPC returned. Nothing is partial; the survivors have complete weights.
-        Left uncaught this killed a run whose data transfer had *already succeeded*.
+        ``RayActorError`` -- a shard died before transfer, or in the epilogue after
+        the collective finished. Nothing is partial; survivors have complete weights.
 
         Both need the same repair, because both leave a communicator that no longer
         matches the fleet, and in the abort case no communicator at all.
@@ -3632,10 +3633,9 @@ class SingleControllerActor:
         # 1. Establish who is actually gone, now, rather than on the probe's clock.
         await self._probe_generation_fleet()
 
-        # 2. Only an abort leaves partial weights behind. Marking survivors stale after
-        #    a completed broadcast would pull a healthy fleet out of service over a
-        #    transfer that succeeded.
-        if isinstance(failure, RefitAborted):
+        # 2. Only an interrupted transfer leaves partial weights. A pause failure
+        #    before the transfer, like a death after it completed, does not.
+        if refit_started and isinstance(failure, RefitAborted):
             for shard_idx in self._gen_fleet.serving_shards():
                 self._gen_fleet.mark_weights_partial(shard_idx)
 
@@ -4676,6 +4676,8 @@ class SingleControllerActor:
     # and have Ray deliver it -- seconds, not minutes. If this fires first we lose their
     # diagnosis and report only "the refit never came back", which is true but less useful.
     _REFIT_UNWIND_GRACE_S = 60.0
+    # Pause/resume remain bounded even when the collective watchdog is disabled.
+    _GENERATION_CONTROL_TIMEOUT_S = 360.0
 
     def _refit_await_budget_s(self) -> Optional[float]:
         """How long to wait for the refit before giving up, or None to wait forever."""
@@ -4751,18 +4753,23 @@ class SingleControllerActor:
         *,
         calibration_data: Optional[BatchedDataDict[Any]] = None,
     ) -> int:
-        """Pause new rollout dispatches, synchronize weights, resume.
+        """Pause rollout dispatch and generation, synchronize weights, resume.
 
-        SC owns the pause gate. vLLM serves through the refit; it supports live weight updates.
-        A colocated engine is instead already stood down: the synchronizer's sync is the wake,
-        and step 4 resumes dispatch.
+        SC owns the rollout-dispatch gate and asks every generation backend to
+        pause in-flight work through the common refit lifecycle hooks. Backends
+        without native pause support warn and retain their existing in-flight
+        update behavior. Continuous-serving vLLM preserves request state while
+        paused. A colocated engine is already stood down before training; the
+        synchronizer's sync remains its weight-carrying wake.
 
         Flow:
           1. _rollout_permitted.clear()  — no new dispatches
-          2. Optionally calibrate FP8 KV-cache scales.
+          2. Reconcile refit membership and optionally calibrate FP8 KV-cache scales.
           3. Materialize deferred policy parameter all-gathers.
-          4. weight_synchronizer.sync_weights(kv_scales=...)
-          5. _rollout_permitted.set()   — resume
+          4. generation.pause_generation_for_refit(clear_cache=...)
+          5. weight_synchronizer.sync_weights(kv_scales=...)
+          6. generation.resume_generation_after_refit()
+          7. _rollout_permitted.set()   — resume dispatch
 
         Args:
             calibration_data: Optional data used to calibrate FP8 KV-cache
@@ -4826,7 +4833,25 @@ class SingleControllerActor:
         with self._timer.time("prepare_for_generation/sync_policy_params"):
             await asyncio.to_thread(self._trainer.sync_params_before_refit)
 
+        clear_cache = self._async_cfg.recompute_kv_cache_after_weight_updates
+        timeout_s = self._refit_await_budget_s()
+        if timeout_s is None:
+            timeout_s = self._GENERATION_CONTROL_TIMEOUT_S
+        generation_paused_for_refit = False
+        refit_started = False
+        print("⏸️ Requesting generation pause before refit", flush=True)
         try:
+            generation_paused_for_refit = await asyncio.to_thread(
+                self._gen.pause_generation_for_refit,
+                clear_cache=clear_cache,
+                timeout_s=timeout_s,
+            )
+            if generation_paused_for_refit:
+                print(
+                    f"   {len(self._inflight_by_group_id)} in-flight rollout group(s) paused",
+                    flush=True,
+                )
+            refit_started = True
             await self._sync_weights_within(kv_scales, "first")
         except (RefitAborted, RayActorError) as failure:
             # DETECT AND FAIL FAST, because this one cannot be recovered from.
@@ -4853,12 +4878,17 @@ class SingleControllerActor:
                 )
                 raise
             with self._recovery_window():
-                await self._recover_from_failed_refit(failure)
-                # Re-read: the recovery condemns the silent participant and rebuilds over
-                # the survivors, so the retry's membership is not the first attempt's. This
-                # is the likelier of the two windows -- the shard is restarting precisely
-                # because this refit just failed.
+                await self._recover_from_failed_refit(
+                    failure, refit_started=refit_started
+                )
                 participants = self._refit_participants()
+                # A restarted engine may have joined the rebuilt membership without
+                # receiving the initial pause, even if it reuses the same shard index.
+                generation_paused_for_refit = await asyncio.to_thread(
+                    self._gen.pause_generation_for_refit,
+                    clear_cache=clear_cache,
+                    timeout_s=timeout_s,
+                )
                 # Once only: a second failure is a real fault, not a membership problem,
                 # and retrying forever would recreate the wedge this exists to remove.
                 await self._sync_weights_within(kv_scales, "retry")
@@ -4872,12 +4902,28 @@ class SingleControllerActor:
             # promoted inside its window, and everything below this must still run on
             # both paths.
             self._record_refit_landed(participants)
-        if self._async_cfg.recompute_kv_cache_after_weight_updates:
-            # to_thread, like every other call into the workers here. Run directly on
-            # the loop this is a blocking Ray call, and a wedged generation worker would
-            # freeze the event loop itself -- taking the watchdog, which is an asyncio
-            # task on that same loop, down with it.
-            await asyncio.to_thread(self._gen.invalidate_kv_cache)
+
+        print("▶️ Requesting generation resume after refit", flush=True)
+        generation_resumed_after_refit = await asyncio.to_thread(
+            self._gen.resume_generation_after_refit, timeout_s=timeout_s
+        )
+        if generation_paused_for_refit and not generation_resumed_after_refit:
+            raise RuntimeError(
+                "Failed to resume generation after a successful refit pause"
+            )
+
+        if clear_cache and not generation_paused_for_refit:
+            # A backend that paused natively already received clear_cache=True at pause
+            # time. Other backends must explicitly confirm equivalent engine-side cache
+            # handling; merely clearing reusable prefix entries does not invalidate KV
+            # blocks still owned by running requests.
+            invalidated = await asyncio.to_thread(self._gen.invalidate_kv_cache)
+            if not invalidated:
+                raise NotImplementedError(
+                    "recompute_kv_cache_after_weight_updates=True requires the "
+                    "generation backend to clear active-request KV state during a "
+                    "native refit pause or confirm equivalent engine-side handling"
+                )
         elapsed = time.monotonic() - t0
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
