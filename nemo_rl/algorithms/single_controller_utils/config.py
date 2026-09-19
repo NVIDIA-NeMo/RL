@@ -615,10 +615,12 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # attempt gets ``control_timeout_s`` for request and body; only after the
     # last one fails does the rollout finalize as a missing-receipt row.
     control_retries: PositiveInt = 3
-    # Connections in the NemoGym actor's private pool for control-plane calls
-    # (manifest reads). Kept separate from Gym's global aiohttp pool so
-    # manifests never queue behind rollout-long ``/run`` requests.
-    control_pool_size: PositiveInt = 64
+    # 0 (default) = control-plane calls use Gym's shared aiohttp session.
+    # >0 = a private aiohttp pool of this many connections. The private pool
+    # avoids queuing manifest GETs behind rollout-long ``/run`` requests but a
+    # second ClientSession in the NemoGym actor has twice killed 86-node runs
+    # with a uvloop fd-collision SIGABRT (jobs 3844530, 3864764); leave at 0.
+    control_pool_size: NonNegativeInt = 0
     # Root for Gym's per-rollout capture ledgers and base capture layer. None =
     # derived at setup
     # under the run's log dir.

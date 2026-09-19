@@ -482,3 +482,32 @@ def test_control_call_gives_up_after_the_last_timeout() -> None:
     with pytest.raises(RuntimeError, match="exceeded 0.2s"):
         asyncio.run(env._control("GET", "/m"))
     assert len(session.calls) == 2
+
+
+class _FakeServerClient:
+    """Stands in for Gym's ServerClient (shared-session path, pool_size=0)."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls: list[tuple[str, str]] = []
+
+    async def request(self, *, server_name, url_path, method, headers, **kwargs):
+        self.calls.append((method, url_path))
+        response = self._responses.pop(0)
+        async with response as r:
+            return r
+
+
+def test_control_call_defaults_to_the_shared_gym_session_with_retries() -> None:
+    client = _FakeServerClient(
+        [
+            _FakeResponse(200, {"late": True}, delay_s=5.0),  # exceeds deadline
+            _FakeResponse(200, {"ok": True}),
+        ]
+    )
+    env = _control_env(None, timeout_s=0.2, retries=2)
+    env._control_pool_size = 0
+    env._server_client = client
+    manifest = asyncio.run(env._control("GET", "/m"))
+    assert manifest == {"ok": True}
+    assert client.calls == [("GET", "/m"), ("GET", "/m")]

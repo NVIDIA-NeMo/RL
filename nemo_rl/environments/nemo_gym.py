@@ -484,7 +484,7 @@ Depending on your data shape, you may want to change these values."""
         self._control_headers: Dict[str, str] = {}
         self._control_timeout_s = 60.0
         self._control_retries = 3
-        self._control_pool_size = 64
+        self._control_pool_size = 0
         self._control_http: Optional[aiohttp.ClientSession] = None
         self._control_base: Optional[str] = None
         if self._token_capture_enabled:
@@ -520,7 +520,7 @@ Depending on your data shape, you may want to change these values."""
                 token_capture.get("control_timeout_s") or 60.0
             )
             self._control_retries = int(token_capture.get("control_retries") or 3)
-            self._control_pool_size = int(token_capture.get("control_pool_size") or 64)
+            self._control_pool_size = int(token_capture.get("control_pool_size") or 0)
 
         self.rh = RunHelper()
         self.rh.start(
@@ -586,16 +586,20 @@ Depending on your data shape, you may want to change these values."""
         return self._control_base
 
     def _control_session(self) -> aiohttp.ClientSession:
-        """Dedicated HTTP pool for ledger control calls.
+        """Dedicated HTTP pool for ledger control calls (opt-in; see warning).
 
-        Control calls used to go through Gym's process-global aiohttp session,
-        whose connector (``global_aiohttp_connector_limit``, 4096 in the Nano
-        recipes) is held by up to 4096 concurrent ``/run`` requests that each
-        last a whole rollout. A manifest GET then waited for a free connection
-        behind them: ~2.5 ms server-side against a round trip of minutes, which
-        the 60 s deadline turned into a lost training row (581 lost rows over
-        16 steps on job 3857738). A small private pool
-        (``token_capture.control_pool_size``) removes the head-of-line blocking.
+        Gym's process-global aiohttp session has its connector
+        (``global_aiohttp_connector_limit``, 4096 in the Nano recipes) held by
+        up to 4096 concurrent ``/run`` requests that each last a whole rollout,
+        so a 2 ms manifest GET can wait minutes for a free connection. A
+        private pool sidesteps that head-of-line blocking.
+
+        WARNING: a second ``aiohttp.ClientSession`` inside this actor has twice
+        ended an 86-node run with a uvloop ``epoll_ctl`` SIGABRT ("File
+        descriptor N is used by transport"; jobs 3844530 and 3864764): the two
+        connectors' sockets collide in the actor's uvloop fd table. It is off
+        by default (``control_pool_size: 0``); the retried, fully bounded
+        ``_control`` on the shared session recovers the rows on its own.
         """
         if self._control_http is None:
             connector = aiohttp.TCPConnector(
@@ -609,6 +613,24 @@ Depending on your data shape, you may want to change these values."""
     async def _control_once(self, method: str, path: str, **kwargs: Any) -> dict:
         """One control-plane request; the caller bounds it with a deadline."""
         headers = {**kwargs.pop("headers", {}), **self._control_headers}
+        if self._control_pool_size <= 0:
+            # Default: Gym's shared session. Its retry loop only covers
+            # transport errors, so the caller's deadline is the only clock.
+            response = await self._control_client().request(
+                server_name=_POLICY_SERVER_NAME,
+                url_path=path,
+                method=method,
+                headers=headers,
+                **kwargs,
+            )
+            if response.status != 200:
+                raise RuntimeError(
+                    f"ledger control call {method} {path} failed: "
+                    f"HTTP {response.status} {await response.text()}"
+                )
+            # Read the body inside the caller's deadline: a stalled body read
+            # used to sit outside ``wait_for`` and had no bound at all.
+            return await response.json(content_type=None)
         url = f"{self._control_base_url()}{path}"
         async with self._control_session().request(
             method, url, headers=headers, **kwargs
@@ -618,8 +640,6 @@ Depending on your data shape, you may want to change these values."""
                     f"ledger control call {method} {path} failed: "
                     f"HTTP {response.status} {await response.text()}"
                 )
-            # Read the body inside the caller's deadline: a stalled body read
-            # used to sit outside ``wait_for`` and had no bound at all.
             return await response.json(content_type=None)
 
     async def _control(self, method: str, path: str, **kwargs: Any) -> dict:
