@@ -161,6 +161,9 @@ Generation = Union[VllmGeneration, SGLangGeneration, MegatronGeneration]
 log = logging.getLogger(__name__)
 
 _MAX_CONSECUTIVE_ROLLOUT_CHECKPOINT_FAILURES = 3
+# Observed healthy saves on a 48-node run: 13.8s, 23.4s, 34.9s, growing with the
+# replay buffer. This is a liveness bound, not a performance budget.
+_DATA_PLANE_CHECKPOINT_SAVE_TIMEOUT_S = 300.0
 
 
 @dataclass(frozen=True)
@@ -1251,12 +1254,19 @@ class SingleControllerActor:
         started = time.monotonic()
         print(f"data-plane checkpoint save started: {checkpoint_dir}", flush=True)
         try:
-            await call_data_plane(
-                self._dp_client,
-                "save_checkpoint",
-                offload_sync=True,
-                checkpoint_dir=checkpoint_dir,
-                metadata=metadata,
+            # A data-plane controller that dies mid-save never answers, and the
+            # underlying Ray await is unbounded: that wedges _checkpoint_save_lock
+            # for the rest of the run and silently disables all checkpointing.
+            # Bound it so the pump sees a TimeoutError it can count and act on.
+            await asyncio.wait_for(
+                call_data_plane(
+                    self._dp_client,
+                    "save_checkpoint",
+                    offload_sync=True,
+                    checkpoint_dir=checkpoint_dir,
+                    metadata=metadata,
+                ),
+                timeout=_DATA_PLANE_CHECKPOINT_SAVE_TIMEOUT_S,
             )
         except Exception as error:
             print(
@@ -3661,7 +3671,7 @@ class SingleControllerActor:
             deadline_due = self._train_steps == 0 and self._timeout.would_save()
             try:
                 saved = await self._save_rollout_checkpoint(force=deadline_due)
-            except (OSError, TimeoutError) as error:
+            except (OSError, TimeoutError, RuntimeError) as error:
                 if deadline_due:
                     raise RuntimeError(
                         "failed to save the required pre-step rollout checkpoint"
