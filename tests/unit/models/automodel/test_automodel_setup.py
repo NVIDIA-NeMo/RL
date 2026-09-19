@@ -144,6 +144,26 @@ class TestValidateAndPrepareConfig:
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
     @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_fsdp_output_dtype_validation_invalid(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+    ):
+        """Test that an invalid fsdp_output_dtype raises ValueError."""
+        mock_config["dtensor_cfg"]["fsdp_output_dtype"] = "invalid_dtype"
+
+        with pytest.raises(ValueError, match="Unknown FSDP output dtype"):
+            validate_and_prepare_config(
+                config=mock_config,
+                processor=None,
+                rank=0,
+            )
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
     def test_sequence_packing_with_vlm_raises_error(
         self,
         mock_dynamo,
@@ -713,6 +733,45 @@ class TestSetupDistributed:
         assert result.moe_mesh == mock_moe_mesh
         assert result.fsdp2_config == mock_fsdp2_config_instance
         assert result.moe_config == mock_moe_config_instance
+
+    @pytest.mark.parametrize(
+        "configured_dtype,expected_output_dtype",
+        [
+            (None, torch.float32),
+            ("float32", torch.float32),
+            ("bfloat16", torch.bfloat16),
+            ("float16", torch.float16),
+        ],
+    )
+    @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
+    @patch("nemo_rl.models.automodel.setup.MeshContext")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed")
+    def test_setup_distributed_fsdp_output_dtype(
+        self,
+        mock_torch_dist,
+        mock_mesh_context,
+        mock_moe_config,
+        mock_config,
+        mock_runtime_config,
+        mock_device_mesh,
+        configured_dtype,
+        expected_output_dtype,
+    ):
+        """fsdp_output_dtype only changes output_dtype; params/reductions are untouched."""
+        mock_torch_dist.get_world_size.return_value = 8
+        mock_moe_config.return_value = MagicMock()
+        mock_mesh_context.build.return_value = SimpleNamespace(
+            device_mesh=mock_device_mesh, moe_mesh=None
+        )
+        if configured_dtype is not None:
+            mock_config["dtensor_cfg"]["fsdp_output_dtype"] = configured_dtype
+
+        result = setup_distributed(mock_config, mock_runtime_config)
+
+        mp_policy = result.fsdp2_config.mp_policy
+        assert mp_policy.param_dtype == torch.bfloat16
+        assert mp_policy.reduce_dtype == torch.float32
+        assert mp_policy.output_dtype == expected_output_dtype
 
     @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
     @patch("nemo_rl.models.automodel.setup.MeshContext")
