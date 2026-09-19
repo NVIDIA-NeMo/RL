@@ -138,6 +138,10 @@ class AsyncPPOConfig(BaseModel, extra="allow"):
     # Number of future target steps generation may fill during critic warmup.
     # None uses max_trajectory_age_steps as the generation lead.
     warmup_generation_lead_steps: int | None = Field(default=None, ge=1)
+    # Generation-worker failures tolerated before the AsyncTrajectoryCollector
+    # aborts the run. A successful batch worker resets the count.
+    # 0 makes the very first worker exception fatal.
+    max_generation_failures: int = Field(default=0, ge=0)
     # Allows weight updates while rollout requests are still in flight.
     in_flight_weight_updates: bool = False
     # Recomputes the KV cache after weight updates.
@@ -192,6 +196,11 @@ class PPOConfig(BaseModel, extra="allow"):
     batch_multiplier: float = 1.0
     # Number of actor (policy) passes over each rollout batch.
     ppo_epochs: int = 4
+    # Share and compact immutable image/video/audio payload segments across
+    # logical PPO rows. Prompt identity is never used as proof of equality.
+    deduplicate_multimodal_data: bool = False
+    # Emit exact-boundary and logical-vs-physical payload metrics.
+    debug_payload_metrics: bool = False
     # Number of critic (value) passes over each rollout batch. Defaults to
     # ppo_epochs (see validate_epoch) unless explicitly set.
     critic_ppo_epochs: int = 4
