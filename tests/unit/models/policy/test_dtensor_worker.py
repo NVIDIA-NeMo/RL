@@ -826,12 +826,10 @@ class TestTwoGPUCluster:
         yield from _base_setup_impl(request, two_gpu_cluster)
 
     @pytest.mark.timeout(360)
+    @pytest.mark.automodel
     @pytest.mark.parametrize(
         "policy_setup",
-        [
-            pytest.param({"enable_loras": False}, marks=pytest.mark.automodel),
-            pytest.param({"enable_loras": True}, marks=pytest.mark.automodel),
-        ],
+        [{"enable_loras": False}, {"enable_loras": True}],
         indirect=True,
     )
     def test_lm_policy_init(self, policy_setup):
