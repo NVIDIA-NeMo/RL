@@ -264,6 +264,7 @@ project-includes = [
   "nemo_rl/models/megatron/draft/dspark_provider.py",
   "nemo_rl/models/megatron/alignment.py",
   "nemo_rl/models/megatron/draft/__init__.py",
+  "nemo_rl/models/megatron/draft/optimizer.py",
   "nemo_rl/models/megatron/draft/training.py",
   "nemo_rl/models/megatron/draft/utils.py",
   "nemo_rl/models/megatron/hybridep.py",

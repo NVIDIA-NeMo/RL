@@ -325,6 +325,7 @@ policy:
     num_layers: null
     aux_layer_indices: null
     token_chunk_size: 4096
+    optimizer: null
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md
   # for more details on dynamic batching and sequence packing.

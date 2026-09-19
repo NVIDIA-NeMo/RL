@@ -320,7 +320,7 @@ class NemoGymConfig(TypedDict):
     ]  # For processor reconstruction inside the actor
     pad_dynamic_image_shapes: NotRequired[
         bool
-    ]  # Normalize heterogeneous image tensors while retaining exact imgs_sizes
+    ]  # Preserve heterogeneous shapes for native-resolution patchification
     # Ledger-authoritative token capture (token_capture.enabled): the dumped
     # TokenCaptureConfig. Turns on external staging in Gym's policy model
     # server, switches run_rollouts to receipt mode, and assembles receipts
