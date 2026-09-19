@@ -2696,17 +2696,19 @@ def load_teacher_output_layer_weight(
     vocabulary entries, so the objective is unaffected in practice -- but this
     is a silent fallback, not a re-sharding mechanism.
 
-    ``dist_checkpointing.load`` is a whole-world collective, so under student
-    pipeline parallelism the stages that own no ``output_layer`` must still call
-    it. They pass ``local_vocab_size=None`` to request nothing: the load runs
-    with an empty sharded state dict, which keeps the collective balanced
-    without materializing a shard those stages would never read.
-    ``validate_access_integrity=False`` is what makes the partial request legal.
+    Resolving the checkpoint iteration from a checkpoint root goes through
+    Megatron-Bridge's ``read_train_state``, a ``broadcast_object_list`` over the
+    whole student world, so under student pipeline parallelism the stages that
+    own no ``output_layer`` must still call this function. They pass
+    ``local_vocab_size=None`` to request nothing: the load then runs with an
+    empty sharded state dict and returns only the checkpoint's common state.
+    ``dist_checkpointing.load`` itself is rank-local here --
+    ``validate_access_integrity=False`` skips its only all-gather.
 
     Args:
         teacher_pretrained_path: Megatron checkpoint root of the teacher.
         local_vocab_size: This rank's vocabulary shard width, or ``None`` to
-            take part in the collective without requesting a shard.
+            request nothing.
         dtype: Dtype to materialize the shard in. Unused, and expected to be
             ``None``, when ``local_vocab_size`` is ``None``.
 
@@ -2724,8 +2726,8 @@ def load_teacher_output_layer_weight(
     if (local_vocab_size is None) != (dtype is None):
         raise ValueError(
             "load_teacher_output_layer_weight takes local_vocab_size and dtype "
-            "together: pass both to request a shard, or neither to join the "
-            f"collective without one. Got local_vocab_size={local_vocab_size!r}, "
+            "together: pass both to request a shard, or neither to request "
+            f"nothing. Got local_vocab_size={local_vocab_size!r}, "
             f"dtype={dtype!r}."
         )
     from megatron.bridge.training.utils.checkpoint_utils import (

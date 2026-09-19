@@ -843,7 +843,8 @@ class MegatronPolicyWorkerImpl(
         self._opd_full_teacher_checkpoint_paths: dict[int, str] = {}
         # Whether the ``evict`` lifecycle has dropped the shards and the next
         # training phase must reload them. Tracked explicitly because the reload
-        # is a whole-world collective and ``_opd_full_teacher_lm_heads`` cannot
+        # resolves the checkpoint through Megatron-Bridge's ``read_train_state``,
+        # a whole-world broadcast, and ``_opd_full_teacher_lm_heads`` cannot
         # stand in for it: ranks off the last pipeline stage own no shard, so
         # that dict is empty there whether or not an eviction happened.
         self._opd_full_lm_head_evicted = False
@@ -2223,9 +2224,9 @@ class MegatronPolicyWorkerImpl(
 
         Megatron builds ``output_layer`` only on the last pipeline stage, and
         that is also the only stage where the opd_full loss runs, so the earlier
-        stages legitimately have nothing to project with. They still take part
-        in the LM-head load collective; see
-        ``_load_opd_full_teacher_lm_head_from_path``.
+        stages legitimately have nothing to project with. They still resolve the
+        checkpoint through Megatron-Bridge's ``read_train_state``, a whole-world
+        broadcast; see ``_load_opd_full_teacher_lm_head_from_path``.
 
         Returns:
             The module owning ``output_layer``, or ``None`` when this rank is
@@ -2254,7 +2255,7 @@ class MegatronPolicyWorkerImpl(
         )
 
     def load_opd_full_teacher_lm_head(
-        self, teacher_path_config: PolicyConfig, teacher_index: int = 0
+        self, teacher_path_config: PolicyConfig, teacher_index: int
     ) -> str:
         """Resolve and load one teacher's LM head for full-vocabulary MOPD.
 
@@ -2287,11 +2288,12 @@ class MegatronPolicyWorkerImpl(
 
         Under student pipeline parallelism only the last stage owns an
         ``output_layer``, and only there does the opd_full loss run. The earlier
-        stages request no shard, but must still enter the load because
-        ``dist_checkpointing.load`` is a whole-world collective -- skipping it
-        would hang the last stage. They record the checkpoint path all the same,
-        so the ``evict`` lifecycle re-enters the collective in lockstep with the
-        stage that actually reloads a shard.
+        stages request no shard, but must still call the loader because
+        resolving the teacher's checkpoint iteration (Megatron-Bridge's
+        ``read_train_state``) broadcasts over the whole student world --
+        skipping it would hang the last stage. They record the checkpoint path
+        all the same, so the ``evict`` lifecycle re-enters that broadcast in
+        lockstep with the stage that actually reloads a shard.
 
         Raises:
             ValueError: If this teacher's hidden size disagrees with a teacher

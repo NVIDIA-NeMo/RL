@@ -141,10 +141,12 @@ class TQPolicy(TQDriverMixin, Policy):
         # plus (on the hidden-state path) a per-sample teacher-identity column.
         # Resolved by the driver in setup; absent means the feature is off and
         # the columns must stay out of every fetch.
-        _opd_full_cfg = self.cfg.get("on_policy_distillation_full") or {}
-        self._opd_full_field: Optional[str] = _opd_full_cfg.get("payload_field")
-        self._opd_full_teacher_index_field: Optional[str] = _opd_full_cfg.get(
-            "teacher_index_field"
+        _opd_full_cfg = self.cfg.get("on_policy_distillation_full")
+        self._opd_full_field: Optional[str] = (
+            _opd_full_cfg["payload_field"] if _opd_full_cfg else None
+        )
+        self._opd_full_teacher_index_field: Optional[str] = (
+            _opd_full_cfg["teacher_index_field"] if _opd_full_cfg else None
         )
 
         # Forward to workers (replaces ``Policy.setup_data_plane`` call
