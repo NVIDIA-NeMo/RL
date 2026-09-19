@@ -24,7 +24,6 @@ This test:
 5. Asserts that the converted DCP and Megatron checkpoints are identical and match the original HF checkpoint
 """
 
-import copy
 import gc
 import importlib.util
 import os
@@ -88,8 +87,12 @@ def create_test_config() -> Dict[str, Any]:
             "precision": "bfloat16",
             "offload_optimizer_for_logprob": False,
             "dtensor_cfg": {
-                "_v2": False,
+                "_v2": True,
                 "enabled": True,
+                "checkpoint": {
+                    "model_save_format": "torch_save",
+                    "save_consolidated": "false",
+                },
                 "cpu_offload": False,
                 "sequence_parallel": False,
                 "activation_checkpointing": False,
@@ -236,10 +239,7 @@ def create_dcp_checkpoint(
     )
 
     # Save checkpoint without any training
-    use_v2 = config["policy"]["dtensor_cfg"]["_v2"]
-    dcp_checkpoint_path = os.path.join(
-        temp_dir, "dcp_checkpoint" + ("_v2" if use_v2 else "_v1")
-    )
+    dcp_checkpoint_path = os.path.join(temp_dir, "dcp_checkpoint")
     policy.save_checkpoint(
         dcp_checkpoint_path,
         is_final_checkpoint=False,
@@ -298,8 +298,7 @@ def convert_dcp_to_hf_checkpoint(dcp_path: str, model_name: str, temp_dir: str) 
     """Convert DCP checkpoint to HF format."""
     print("Converting DCP to HF format...")
 
-    use_v2 = dcp_path.endswith("_v2")
-    hf_path = os.path.join(temp_dir, "dcp_to_hf" + ("_v2" if use_v2 else "_v1"))
+    hf_path = os.path.join(temp_dir, "dcp_to_hf")
     convert_dcp_to_hf(
         dcp_ckpt_path=dcp_path,
         hf_ckpt_path=hf_path,
@@ -474,65 +473,46 @@ def main():
 
         # Step 2: Create DCP checkpoint
         print("\n" + "=" * 60)
-        print("STEP 2: Creating Dtensor V1 DCP checkpoint")
+        print("STEP 2: Creating DTensor DCP checkpoint")
         print("=" * 60)
-        config_v1 = create_test_config()
-        dcp_checkpoint_path_v1 = create_dcp_checkpoint(model_name, config_v1, temp_dir)
+        dcp_checkpoint_path = create_dcp_checkpoint(
+            model_name, create_test_config(), temp_dir
+        )
 
-        # Step 3: Create Dtensor V2 DCP checkpoint
+        # Step 3: Create Megatron checkpoint
         print("\n" + "=" * 60)
-        print("STEP 3: Creating Dtensor V2 DCP checkpoint")
-        print("=" * 60)
-        config_v2 = copy.deepcopy(config_v1)
-        config_v2["policy"]["dtensor_cfg"]["_v2"] = True
-        config_v2["policy"]["dtensor_cfg"]["checkpoint"] = {
-            "model_save_format": "torch_save",
-            "save_consolidated": "false",
-        }
-        dcp_checkpoint_path_v2 = create_dcp_checkpoint(model_name, config_v2, temp_dir)
-
-        # Step 4: Create Megatron checkpoint
-        print("\n" + "=" * 60)
-        print("STEP 4: Creating Megatron checkpoint")
+        print("STEP 3: Creating Megatron checkpoint")
         print("=" * 60)
         megatron_checkpoint_path = create_megatron_checkpoint(model_name, temp_dir)
 
-        # Step 5: Convert Dtensor V1 DCP to HF
+        # Step 4: Convert DTensor DCP to HF
         print("\n" + "=" * 60)
-        print("STEP 5: Converting Dtensor V1 DCP to HF format")
+        print("STEP 4: Converting DTensor DCP to HF format")
         print("=" * 60)
-        dcp_to_hf_path_v1 = convert_dcp_to_hf_checkpoint(
-            dcp_checkpoint_path_v1, model_name, temp_dir
+        dcp_to_hf_path = convert_dcp_to_hf_checkpoint(
+            dcp_checkpoint_path, model_name, temp_dir
         )
 
-        # Step 6: Convert Dtensor V2 DCP to HF
+        # Step 5: Convert Megatron to HF
         print("\n" + "=" * 60)
-        print("STEP 6: Converting Dtensor V2 DCP to HF format")
-        print("=" * 60)
-        dcp_to_hf_path_v2 = convert_dcp_to_hf_checkpoint(
-            dcp_checkpoint_path_v2, model_name, temp_dir
-        )
-
-        # Step 7: Convert Megatron to HF
-        print("\n" + "=" * 60)
-        print("STEP 7: Converting Megatron to HF format")
+        print("STEP 5: Converting Megatron to HF format")
         print("=" * 60)
         megatron_to_hf_path = convert_megatron_to_hf_checkpoint(
             megatron_checkpoint_path, model_name, temp_dir
         )
 
-        # Step 7b: Create LoRA adapter checkpoint on top of the Megatron base
+        # Step 5b: Create LoRA adapter checkpoint on top of the Megatron base
         print("\n" + "=" * 60)
-        print("STEP 7b: Creating Megatron LoRA adapter checkpoint")
+        print("STEP 5b: Creating Megatron LoRA adapter checkpoint")
         print("=" * 60)
         lora_adapter_path = create_megatron_lora_checkpoint(
             model_name, megatron_checkpoint_path, temp_dir
         )
 
-        # Step 7c: Merge LoRA adapter + base and export to HF
+        # Step 5c: Merge LoRA adapter + base and export to HF
         # Calls the actual merge_lora_to_hf function from the converter script.
         print("\n" + "=" * 60)
-        print("STEP 7c: Merging LoRA adapter with base and exporting to HF")
+        print("STEP 5c: Merging LoRA adapter with base and exporting to HF")
         print("=" * 60)
         lora_merged_hf_path = os.path.join(temp_dir, "lora_merged_hf")
         merge_lora_to_hf(
@@ -542,9 +522,9 @@ def main():
             hf_ckpt_path=lora_merged_hf_path,
         )
 
-        # Step 7d: Export LoRA adapter only in HuggingFace PEFT format
+        # Step 5d: Export LoRA adapter only in HuggingFace PEFT format
         print("\n" + "=" * 60)
-        print("STEP 7d: Exporting LoRA adapter only (PEFT format)")
+        print("STEP 5d: Exporting LoRA adapter only (PEFT format)")
         print("=" * 60)
         lora_adapter_hf_path = os.path.join(temp_dir, "lora_adapter_hf")
         export_lora_adapter_to_hf(
@@ -554,22 +534,16 @@ def main():
             hf_ckpt_path=lora_adapter_hf_path,
         )
 
-        # Step 8: Load converted models and compare
+        # Step 6: Load converted models and compare
         print("\n" + "=" * 60)
-        print("STEP 8: Loading converted models and comparing")
+        print("STEP 6: Loading converted models and comparing")
         print("=" * 60)
 
-        # Load Dtensor V1 DCP-converted model
-        dcp_converted_model_v1 = AutoModelForCausalLM.from_pretrained(
-            dcp_to_hf_path_v1, torch_dtype=torch.bfloat16, trust_remote_code=True
+        # Load DTensor DCP-converted model
+        dcp_converted_model = AutoModelForCausalLM.from_pretrained(
+            dcp_to_hf_path, torch_dtype=torch.bfloat16, trust_remote_code=True
         )
-        dcp_converted_state_dict_v1 = get_model_state_dict(dcp_converted_model_v1)
-
-        # Load Dtensor V2 DCP-converted model
-        dcp_converted_model_v2 = AutoModelForCausalLM.from_pretrained(
-            dcp_to_hf_path_v2, torch_dtype=torch.bfloat16, trust_remote_code=True
-        )
-        dcp_converted_state_dict_v2 = get_model_state_dict(dcp_converted_model_v2)
+        dcp_converted_state_dict = get_model_state_dict(dcp_converted_model)
 
         # Load Megatron-converted model
         megatron_converted_model = AutoModelForCausalLM.from_pretrained(
@@ -577,26 +551,17 @@ def main():
         )
         megatron_converted_state_dict = get_model_state_dict(megatron_converted_model)
 
-        # Step 9: Assertions
+        # Step 7: Assertions
         print("\n" + "=" * 60)
-        print("STEP 9: Running assertions")
+        print("STEP 7: Running assertions")
         print("=" * 60)
 
-        # Compare Dtensor V1 DCP-converted vs Original HF model
-        print("Comparing Dtensor V1 DCP-converted HF model with Original HF model...")
+        # Compare DTensor DCP-converted vs Original HF model
+        print("Comparing DTensor DCP-converted HF model with Original HF model...")
         assert_state_dicts_equal(
-            dcp_converted_state_dict_v1,
+            dcp_converted_state_dict,
             original_state_dict,
-            "Dtensor V1 DCP-converted HF model",
-            "Original HF model",
-        )
-
-        # Compare Dtensor V2 DCP-converted vs Original HF model
-        print("Comparing Dtensor V2 DCP-converted HF model with Original HF model...")
-        assert_state_dicts_equal(
-            dcp_converted_state_dict_v2,
-            original_state_dict,
-            "Dtensor V2 DCP-converted HF model",
+            "DTensor DCP-converted HF model",
             "Original HF model",
         )
 
@@ -702,15 +667,11 @@ def main():
 
         # Verify that both converted models have the expected structure
         expected_keys = set(original_state_dict.keys())
-        dcp_keys_v1 = set(dcp_converted_state_dict_v1.keys())
-        dcp_keys_v2 = set(dcp_converted_state_dict_v2.keys())
+        dcp_keys = set(dcp_converted_state_dict.keys())
         megatron_keys = set(megatron_converted_state_dict.keys())
 
-        assert dcp_keys_v1 == expected_keys, (
-            f"Dtensor V1 DCP converted model missing keys: {expected_keys - dcp_keys_v1}"
-        )
-        assert dcp_keys_v2 == expected_keys, (
-            f"Dtensor V2 DCP converted model missing keys: {expected_keys - dcp_keys_v2}"
+        assert dcp_keys == expected_keys, (
+            f"DTensor DCP converted model missing keys: {expected_keys - dcp_keys}"
         )
         assert megatron_keys == expected_keys, (
             f"Megatron converted model missing keys: {expected_keys - megatron_keys}"
@@ -723,12 +684,11 @@ def main():
         test_input = torch.randint(0, 1000, (1, 10))
 
         with torch.no_grad():
-            dcp_output_v1 = dcp_converted_model_v1(test_input)
-            dcp_output_v2 = dcp_converted_model_v2(test_input)
+            dcp_output = dcp_converted_model(test_input)
             megatron_output = megatron_converted_model(test_input)
 
         print(
-            "✓ Dtensor V1 and Dtensor V2 DCP, Megatron, and LoRA merged models can perform forward passes"
+            "✓ DTensor DCP, Megatron, and LoRA merged models can perform forward passes"
         )
 
         print("\n" + "=" * 80)
