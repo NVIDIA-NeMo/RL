@@ -682,6 +682,28 @@ def test_teacher_worker_presharded_entrypoint_tags_every_row_with_its_teacher():
     assert torch.equal(tags, torch.tensor([2, 2]))
 
 
+def test_teacher_worker_presharded_entrypoint_rejects_an_index_column_without_an_index():
+    """A configured routing column with no index would tag every row as teacher 0.
+
+    Guarded on every rank before the forward runs, so nothing is computed or
+    written.
+    """
+    worker = _full_payload_worker_class()(torch.randn(2, 3, 4))
+
+    with pytest.raises(ValueError, match="requires opd_full_teacher_index"):
+        worker.get_teacher_logprobs_presharded(
+            _presharded_meta(),
+            opd_full_payload="hidden_states",
+            opd_full_payload_dtype="bfloat16",
+            opd_full_payload_field=OPD_FULL_HIDDEN_STATES_FIELD,
+            opd_full_teacher_index=None,
+            opd_full_teacher_index_field=OPD_FULL_TEACHER_INDEX_FIELD,
+        )
+
+    assert worker.full_payload_call is None
+    assert worker.stage_local_writes == []
+
+
 def test_teacher_worker_presharded_entrypoint_skips_the_payload_off_the_last_stage():
     """A stage that produced no payload must not write an empty column."""
     worker = _full_payload_worker_class()(None)

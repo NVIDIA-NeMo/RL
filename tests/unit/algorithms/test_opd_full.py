@@ -638,6 +638,44 @@ def test_reconstruct_rejects_a_teacher_whose_hidden_size_disagrees():
         )
 
 
+def test_reconstruct_refuses_to_guess_when_several_heads_are_loaded_without_an_index():
+    """Two shards and no routing column: raise, never fall back to one shard."""
+    with pytest.raises(ValueError, match="no per-row teacher index"):
+        reconstruct_opd_full_teacher_logits(
+            torch.randn(2, 3, 3),
+            teacher_payload="hidden_states",
+            student_logits=torch.zeros(2, 3, 5),
+            vocab_parallel_rank=0,
+            context_parallel_group=None,
+            teacher_output_layer_weight_by_index={
+                0: torch.randn(5, 3),
+                1: torch.randn(5, 3),
+            },
+            teacher_index=None,
+        )
+
+
+def test_reconstruct_rejects_an_index_column_with_the_wrong_row_count():
+    """A ``[1]`` index against a ``[2, S, H]`` payload must fail loud.
+
+    Without the check the single-teacher fast path would silently project both
+    rows through the one head the short index names.
+    """
+    with pytest.raises(ValueError, match="one entry per payload row"):
+        reconstruct_opd_full_teacher_logits(
+            torch.randn(2, 3, 3),
+            teacher_payload="hidden_states",
+            student_logits=torch.zeros(2, 3, 5),
+            vocab_parallel_rank=0,
+            context_parallel_group=None,
+            teacher_output_layer_weight_by_index={
+                0: torch.randn(5, 3),
+                1: torch.randn(5, 3),
+            },
+            teacher_index=torch.tensor([0]),
+        )
+
+
 @pytest.mark.parametrize("vocab_parallel_rank", [0, 1, 2])
 def test_reconstruct_slices_this_ranks_vocabulary_window(vocab_parallel_rank):
     """A window off by one shard distills against another rank's vocabulary."""
@@ -981,3 +1019,32 @@ def test_prepare_opd_full_loss_input_routes_rows_by_the_teacher_index_column(
     assert divergence.shape == (batch_size, seq_len - 1)
     torch.testing.assert_close(divergence, expected[:, :-1], rtol=1e-5, atol=1e-6)
     assert divergence.requires_grad
+
+
+def test_prepare_opd_full_loss_input_requires_the_index_column_for_two_teachers(
+    _single_rank_collectives,
+):
+    """Two heads loaded but the microbatch carries no index column: fail loud."""
+    batch_size, seq_len, hidden, vocab = 2, 4, 3, 6
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(batch_size, seq_len, dtype=torch.long),
+            OPD_FULL_HIDDEN_STATES_FIELD: torch.randn(batch_size, seq_len, hidden),
+        }
+    )
+
+    with pytest.raises(ValueError, match="no per-row teacher index"):
+        prepare_opd_full_loss_input(
+            torch.randn(batch_size, seq_len, vocab, requires_grad=True),
+            data,
+            _loss_fn(),
+            vocab_parallel_rank=0,
+            vocab_parallel_group=object(),
+            context_parallel_group=None,
+            sampling_params=None,
+            chunk_size=None,
+            teacher_output_layer_weight_by_index={
+                0: torch.randn(vocab, hidden),
+                1: torch.randn(vocab, hidden),
+            },
+        )
