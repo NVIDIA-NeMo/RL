@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -35,8 +36,169 @@ from nemo_rl.models.generation.vllm.utils import (
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
+    remap_multimodal_placeholders,
 )
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
+
+
+@dataclass(frozen=True)
+class _PlaceholderRange:
+    offset: int
+    length: int
+    is_embed: object | None = None
+
+
+def test_remap_multimodal_placeholders_handles_accumulated_per_item_shift():
+    embed_mask = object()
+    media_tokens = [19, 18, 18, 20]
+    template_token_ids = [1, *media_tokens, 13, 2, *media_tokens, 13, 3, 21, 21, 22]
+    final_token_ids = [1, *media_tokens, 2, *media_tokens, 3, 21, 21, 22]
+    placeholders = {
+        # Deliberately list modalities in the opposite order from prompt order.
+        "audio": [_PlaceholderRange(offset=13, length=3)],
+        "image": [
+            _PlaceholderRange(offset=1, length=4),
+            _PlaceholderRange(offset=7, length=4, is_embed=embed_mask),
+        ],
+    }
+
+    result = remap_multimodal_placeholders(
+        template_token_ids=template_token_ids,
+        final_token_ids=final_token_ids,
+        mm_placeholders=placeholders,
+    )
+
+    assert [item.offset for item in result["image"]] == [1, 6]
+    assert result["image"][1].is_embed is embed_mask
+    assert result["audio"] == [_PlaceholderRange(offset=11, length=3)]
+
+
+def test_remap_multimodal_placeholders_reuses_a_span_shared_by_two_modalities():
+    """Coincident ranges must both land on the one span they describe.
+
+    vLLM's Qwen2.5-Omni use_audio_in_video path derives the audio range from
+    its paired video range, reusing start_idx and tokens and differing only in
+    is_embed -- so the two ranges are identical. Consuming the span for the
+    first would leave the second unfindable.
+    """
+    media_tokens = [19, 18, 18]
+    template_token_ids = [1, 2, *media_tokens, 9]
+    final_token_ids = [1, *media_tokens, 9]
+    embed_mask = object()
+
+    result = remap_multimodal_placeholders(
+        template_token_ids=template_token_ids,
+        final_token_ids=final_token_ids,
+        mm_placeholders={
+            "video": [_PlaceholderRange(offset=2, length=3)],
+            "audio": [_PlaceholderRange(offset=2, length=3, is_embed=embed_mask)],
+        },
+    )
+
+    assert [item.offset for item in result["video"]] == [1]
+    assert [item.offset for item in result["audio"]] == [1]
+    assert result["audio"][0].is_embed is embed_mask
+
+
+def test_remap_multimodal_placeholders_without_media_returns_empty():
+    """The shortcut also covers a changed prompt that carries no media."""
+    assert (
+        remap_multimodal_placeholders(
+            template_token_ids=[1, 2, 3],
+            final_token_ids=[9, 9, 1, 2, 3],
+            mm_placeholders={},
+        )
+        == {}
+    )
+
+
+def test_remap_multimodal_placeholders_fails_closed_when_span_is_missing():
+    with pytest.raises(ValueError, match="Could not locate image placeholder range 0"):
+        remap_multimodal_placeholders(
+            template_token_ids=[1, 18, 18, 2],
+            final_token_ids=[1, 2],
+            mm_placeholders={"image": [_PlaceholderRange(offset=1, length=2)]},
+        )
+
+
+def test_remap_multimodal_placeholders_noop_returns_detached_containers():
+    """The unchanged-prompt shortcut must still hand back its own lists.
+
+    Returning the caller's lists aliases them into engine_prompt, so a later
+    in-place edit of one silently rewrites the other.
+    """
+    original = _PlaceholderRange(offset=1, length=2)
+    placeholders = {"image": [original]}
+
+    result = remap_multimodal_placeholders(
+        template_token_ids=[1, 18, 18, 2],
+        final_token_ids=[1, 18, 18, 2],
+        mm_placeholders=placeholders,
+    )
+
+    assert result == placeholders
+    assert result["image"] is not placeholders["image"]
+    assert result["image"][0] is original
+
+
+@pytest.mark.parametrize(
+    "offset,length",
+    [(-1, 2), (1, 0), (2, 3)],
+    ids=["negative-offset", "zero-length", "runs-past-template"],
+)
+def test_remap_multimodal_placeholders_rejects_out_of_range_input(offset, length):
+    """A range vLLM never could have produced is a bug, not something to remap.
+
+    Without the guard, ``template_token_ids[offset : offset + length]`` slices
+    silently short (or wraps for a negative offset) and the span is then
+    matched -- and moved -- against the wrong tokens.
+    """
+    with pytest.raises(ValueError, match="Invalid image placeholder range 0"):
+        remap_multimodal_placeholders(
+            template_token_ids=[1, 18, 18, 2],
+            final_token_ids=[1, 18, 18],
+            mm_placeholders={"image": [{"offset": offset, "length": length}]},
+        )
+
+
+def test_remap_multimodal_placeholders_rejects_unsupported_range_type():
+    """Only mappings and dataclasses can be rebuilt with a new offset."""
+
+    class _OpaqueRange:
+        offset = 1
+        length = 2
+
+    with pytest.raises(TypeError, match="got _OpaqueRange"):
+        remap_multimodal_placeholders(
+            template_token_ids=[1, 18, 18, 2],
+            final_token_ids=[9, 1, 18, 18, 2],
+            mm_placeholders={"image": [_OpaqueRange()]},
+        )
+
+
+@pytest.mark.vllm
+def test_remap_multimodal_placeholders_rebuilds_real_vllm_placeholder_range():
+    """Guard the stand-in above against vLLM's actual PlaceholderRange.
+
+    ``dataclasses.replace`` is what moves a dataclass range, and it breaks if
+    vLLM ever adds an ``init=False`` field or ``__slots__``; is_embed is a real
+    tensor there, and it must survive the move untouched.
+    """
+    from vllm.multimodal.inputs import PlaceholderRange
+
+    is_embed = torch.tensor([True, False, True])
+    result = remap_multimodal_placeholders(
+        template_token_ids=[1, 18, 18, 18, 2],
+        final_token_ids=[9, 9, 1, 18, 18, 18, 2],
+        mm_placeholders={
+            "image": [PlaceholderRange(offset=1, length=3, is_embed=is_embed)]
+        },
+    )
+
+    moved = result["image"][0]
+    assert isinstance(moved, PlaceholderRange)
+    assert (moved.offset, moved.length) == (3, 3)
+    assert moved.is_embed is is_embed
 
 
 def _decoded_routes(payload: str) -> list:
