@@ -141,6 +141,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         as_tensors: bool = False,
         device: Optional[torch.device] = None,
         pixel_dtype: Optional[torch.dtype] = None,
+        pixel_preprocess_mode: Optional[str] = None,
     ) -> dict[str, Any]:
         """Return the multimodal fields as a dict.
 
@@ -191,7 +192,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 # unwrapping via as_tensor).
                 if pixel_dtype is not None and k in self._PIXEL_DTYPE_CAST_KEYS:
                     v = v.to_dtype(pixel_dtype)
-                result[k] = v.as_tensor(device=device) if as_tensors else v
+                preprocess_mode = pixel_preprocess_mode if k == "pixel_values" else None
+                result[k] = v.as_tensor(device, preprocess_mode) if as_tensors else v
             elif k in PER_TOKEN_MULTIMODAL_FIELDS:
                 # Plain per-token tensor: emit as-is.
                 result[k] = v
