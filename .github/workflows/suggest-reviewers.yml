@@ -1,0 +1,54 @@
+name: Suggest Reviewers
+
+# Advisory only: requests reviewers on the PR based on `# suggest:` comment
+# lines in .github/CODEOWNERS. This uses the same "request a reviewer" GitHub
+# API/UI as CODEOWNERS-driven requests, but is NOT a merge requirement — only
+# the real (non-comment) CODEOWNERS lines are enforced by branch protection.
+# `# suggest:` entries are invisible to GitHub's own CODEOWNERS parser, since
+# it ignores comment lines entirely, so they can never become required.
+#
+# This repo's .github/CODEOWNERS currently has no `# suggest:` lines, so
+# this workflow is a no-op until some are added -- see that file's header
+# for the convention. It's safe to merge ahead of any actual suggestions
+# since a `# suggest:`-less run just does nothing.
+#
+# Triggers the same way cicd-main.yml does: on a push to the pull-request/N
+# mirror branch NVIDIA's copy-pr-bot creates only after a vetter has approved
+# the PR ("ok to test"). This is a deliberate human gate against prompt
+# injection via PR content (a crafted filename or CODEOWNERS entry) running
+# unreviewed. _suggest_reviewers.yml resolves the real PR number/base/head
+# sha from this branch name via nv-gha-runners/get-pr-info.
+#
+# Implementation lives in NVIDIA-NeMo/FW-CI-templates so any NeMo repo with a
+# CODEOWNERS file can reuse it the same way. See that repo's
+# .github/workflows/_suggest_reviewers.yml and .github/scripts/
+# codeowners_suggestions.py (+ its unit tests) for the matching logic. No
+# JS/actions-github-script anywhere in the call chain -- every inline
+# script is Python (stdlib only), and no PAT is used: individual
+# suggestions use the default GITHUB_TOKEN, team suggestions use a
+# short-lived GitHub App token.
+
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  suggest-reviewers:
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_suggest_reviewers.yml@b0a3760374f50b3d6a7d5f8629e826dddca3b931 # v1.10.1
+    with:
+      workflow_ref: b0a3760374f50b3d6a7d5f8629e826dddca3b931  # pragma: allowlist secret
+      # Same App community-bot.yml already uses in this repo for
+      # team-reviewer resolution. No PAT needed.
+      app-id: ${{ vars.BOT_ID }}
+    secrets:
+      BOT_KEY: ${{ secrets.BOT_KEY }}
+      SLACK_TEAM_CHANNEL_WEBHOOK: ${{ secrets.SLACK_TEAM_CHANNEL_WEBHOOK }}
