@@ -41,6 +41,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import importlib
+from dataclasses import dataclass
 from typing import (
     Annotated,
     Callable,
@@ -63,6 +64,18 @@ from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 
 # Poll interval for the rollout-pump admission gate.
 _GATE_POLL_SECONDS = 0.005
+
+
+@dataclass(frozen=True)
+class SamplerSelection:
+    """One sampler selection and the metadata needed to diagnose it."""
+
+    meta: Optional[KVBatchMeta]
+    num_groups: int
+    trajectory_ages: tuple[int, ...]
+
+
+SamplerSelectionResult = SamplerSelection | tuple[Optional[KVBatchMeta], int]
 
 
 @runtime_checkable
@@ -97,12 +110,13 @@ class PromptGroupSampler(Protocol):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[Optional[KVBatchMeta], int]:
-        """Pick up to ``max_prompt_groups`` eligible groups for training.
+    ) -> SamplerSelectionResult:
+        """Pick eligible groups and optionally return trajectory-age metadata.
 
-        Claim-aware samplers transfer the groups from ordinary replay-buffer
-        selection into training ownership until the controller releases them.
-        Legacy custom samplers may still remove selected groups immediately.
+        Built-in samplers return ``SamplerSelection`` and transfer selected
+        groups into training ownership until the controller releases them.
+        Legacy custom samplers may still return the two-tuple contract and
+        remove selected groups immediately.
         """
         ...
 
@@ -226,7 +240,7 @@ class BaseSampler(abc.ABC):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[Optional[KVBatchMeta], int]: ...
+    ) -> SamplerSelection: ...
 
     async def evict(self, *, current_train_weight: int) -> int:
         """Default: drop *ready* groups below the weight window.
@@ -282,15 +296,17 @@ class BaseSampler(abc.ABC):
         valid_idxs: list[int],
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[Optional[KVBatchMeta], int]:
+        *,
+        current_train_weight: int,
+    ) -> SamplerSelection:
         """Cap, drop from the buffer, and concat the chosen groups.
 
         Greedy without waiting: returns all currently-eligible groups up to
         ``max_prompt_groups`` (never fewer on purpose, never waits to fill it),
-        or ``(None, 0)`` below ``min_prompt_groups``.
+        or an empty selection below ``min_prompt_groups``.
         """
         if len(valid_idxs) < min_prompt_groups:
-            return None, 0
+            return SamplerSelection(meta=None, num_groups=0, trajectory_ages=())
         requested_groups = min(len(valid_idxs), max_prompt_groups)
         selected_idxs = valid_idxs[:requested_groups]
         selected_metas = [self._buffer.meta_list[i] for i in selected_idxs]
@@ -299,10 +315,22 @@ class BaseSampler(abc.ABC):
             for meta in selected_metas
             for metrics in meta.extra_info.get(ROLLOUT_METRICS, [])  # type: ignore[union-attr]
         ]
+        # Read before claiming: the indices leave the ready inventory. start_weight is
+        # the version that generated the tokens, so this is the age of the data
+        # the next gradient step consumes -- the off-policyness the importance
+        # ratio has to correct for.
+        trajectory_ages = tuple(
+            current_train_weight - self._buffer.start_weight_list[i]
+            for i in selected_idxs
+        )
         selected_meta = selected_metas[0].concat(*selected_metas[1:])  # type: ignore[union-attr]
         selected_meta.extra_info[ROLLOUT_METRICS] = selected_rollout_metrics
         await self._buffer.claim_for_training(selected_idxs)
-        return selected_meta, len(selected_idxs)
+        return SamplerSelection(
+            meta=selected_meta,
+            num_groups=len(selected_idxs),
+            trajectory_ages=trajectory_ages,
+        )
 
 
 class WindowedSampler(BaseSampler):
@@ -375,7 +403,7 @@ class WindowedSampler(BaseSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[Optional[KVBatchMeta], int]:
+    ) -> SamplerSelection:
         self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
         min_valid_version = max(0, current_train_weight - self.max_staleness_versions)
         valid_idxs = [
@@ -392,7 +420,10 @@ class WindowedSampler(BaseSampler):
                 )
             )
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups
+            valid_idxs,
+            min_prompt_groups,
+            max_prompt_groups,
+            current_train_weight=current_train_weight,
         )
 
 
@@ -486,7 +517,7 @@ class ReadyFirstSampler(_GatedSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[Optional[KVBatchMeta], int]:
+    ) -> SamplerSelection:
         self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
         valid_idxs = [
             i
@@ -494,7 +525,10 @@ class ReadyFirstSampler(_GatedSampler):
             if weight <= current_train_weight and self._buffer.ready_list[i]
         ]
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups
+            valid_idxs,
+            min_prompt_groups,
+            max_prompt_groups,
+            current_train_weight=current_train_weight,
         )
 
     async def evict(self, *, current_train_weight: int) -> int:
@@ -522,7 +556,7 @@ class WeightFifoSampler(_GatedSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[Optional[KVBatchMeta], int]:
+    ) -> SamplerSelection:
         self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
         min_valid_version = max(0, current_train_weight - self.max_staleness_versions)
         in_window = [
@@ -531,7 +565,7 @@ class WeightFifoSampler(_GatedSampler):
             if min_valid_version <= weight <= current_train_weight
         ]
         if not in_window:
-            return None, 0
+            return SamplerSelection(meta=None, num_groups=0, trajectory_ages=())
         target_version = min(in_window)
         valid_idxs = [
             i
@@ -539,7 +573,10 @@ class WeightFifoSampler(_GatedSampler):
             if weight == target_version and self._buffer.ready_list[i]
         ]
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups
+            valid_idxs,
+            min_prompt_groups,
+            max_prompt_groups,
+            current_train_weight=current_train_weight,
         )
 
 
@@ -592,7 +629,7 @@ class InOrderSampler(_GatedSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[Optional[KVBatchMeta], int]:
+    ) -> SamplerSelection:
         self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
         valid_idxs = [
             i
@@ -600,7 +637,10 @@ class InOrderSampler(_GatedSampler):
             if target == current_train_weight and self._buffer.ready_list[i]
         ]
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups
+            valid_idxs,
+            min_prompt_groups,
+            max_prompt_groups,
+            current_train_weight=current_train_weight,
         )
 
     async def evict(self, *, current_train_weight: int) -> int:
