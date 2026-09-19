@@ -52,10 +52,12 @@ from nemo_rl.models.generation.vllm.gpu_output_capture import (  # noqa: E402
     GpuOutputTensors,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
-    _AsyncLLMHTTPClient,
     VllmAsyncGenerationWorkerImpl,
+    _AsyncLLMHTTPClient,
 )
-from tests.unit.models.generation import test_vllm_chat_template_wiring as wiring  # noqa: E402
+from tests.unit.models.generation import (
+    test_vllm_chat_template_wiring as wiring,  # noqa: E402
+)
 
 pytestmark = [pytest.mark.nemo_gym, pytest.mark.asyncio]
 

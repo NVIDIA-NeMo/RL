@@ -14,7 +14,10 @@
 
 from typing import Any, Literal, NotRequired, TypedDict, Union
 
+from pydantic import BaseModel
+
 from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 
 
@@ -184,6 +187,15 @@ class MoEParallelizerOptions(TypedDict):
     wrap_outer_model: NotRequired[bool]
 
 
+class AutomodelCheckpointConfig(TypedDict, total=False):
+    """Automodel checkpoint settings used by DTensor v2."""
+
+    model_save_format: Literal["torch_save", "safetensors"] | None
+    save_consolidated: Literal["false", "final", "every"]
+    single_rank_consolidation: bool
+    consolidation_timeout_minutes: int
+
+
 class DTensorConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
@@ -208,6 +220,7 @@ class DTensorConfig(TypedDict):
     automodel_kwargs: NotRequired[AutomodelKwargs]
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]
+    checkpoint: NotRequired[AutomodelCheckpointConfig]
 
 
 class SequencePackingConfigDisabled(TypedDict):
@@ -326,6 +339,15 @@ class Fp8Config(TypedDict):
     # cycle. Useful for FP8 training runs that observe growing reserved GPU memory
     # after offload.
     force_clear_fp8_caches: NotRequired[bool]
+
+
+class Fp4Config(BaseModel, extra="forbid"):
+    """Transformer Engine NVFP4 training configuration."""
+
+    enabled: bool
+    fp4: str | None = None
+    fp4_recipe: str = "nvfp4"
+    fp4_param: bool = False
 
 
 # Type exists to be lax if not specified
@@ -500,6 +522,12 @@ class MegatronConfig(TypedDict):
     # Number of tokens per chunk when computing fused linear logprobs.
     # Smaller values reduce peak memory further but may decrease throughput.
     fused_linear_logprobs_chunk_size: NotRequired[int]
+    # Emit fp32 logits from Megatron-LM's LM head. Set the matching
+    # generation.vllm_cfg.fp32_lm_head flag for vLLM generation: applying this
+    # to only one engine makes the generation/training logprob mismatch worse.
+    # No effect when use_fused_linear_logprobs is set, which bypasses the
+    # output layer's logits path.
+    fp32_lm_head: NotRequired[bool]
     # When mtp_num_layers=0, Multi-Token Prediction is disabled.
     mtp_num_layers: NotRequired[int]
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
@@ -518,6 +546,13 @@ class MegatronConfig(TypedDict):
     clear_memory_caches_before_refit: NotRequired[bool]
     # FP8 quantization settings for the Megatron training backend.
     fp8_cfg: NotRequired[Fp8Config]
+    # TE NVFP4 training settings. Unknown keys are rejected by Fp4Config so
+    # misspelled precision controls cannot silently fall back to defaults.
+    fp4_cfg: NotRequired[Fp4Config]
+    # Keep the first/last N transformer blocks in BF16 under FP8/FP4 training.
+    first_last_layers_bf16: NotRequired[bool]
+    num_layers_at_start_in_bf16: NotRequired[int]
+    num_layers_at_end_in_bf16: NotRequired[int]
     # Path to a per-module Transformer Engine precision recipe loaded into
     # Megatron quant_recipe.
     te_precision_config_file: NotRequired[str]
@@ -525,22 +560,6 @@ class MegatronConfig(TypedDict):
     # Supported keys are model-specific, such as freeze_vision_model,
     # freeze_vision_projection, and freeze_language_model.
     freeze_config: NotRequired[dict[str, Any]]
-
-
-class DraftConfigDisabled(TypedDict):
-    """Configuration shape for the disabled draft-model training path."""
-
-    enabled: Literal[False]
-
-
-class DraftConfig(TypedDict):
-    """Configuration for Eagle draft-model training alongside the policy model."""
-
-    enabled: Literal[True]
-    model_name: NotRequired[str | None]
-    loss_weight: NotRequired[float]
-    num_layers: NotRequired[int | None]
-    aux_layer_indices: NotRequired[list[int] | None]
 
 
 class TokenizerConfig(TypedDict):
@@ -639,7 +658,7 @@ class PolicyConfig(TypedDict):
     reward_model_cfg: NotRequired[RewardModelConfig]
     dtensor_cfg: DTensorConfig | DTensorConfigDisabled
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
-    draft: NotRequired[DraftConfig | DraftConfigDisabled]
+    draft: NotRequired[Eagle3DraftConfig]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
     # Resolved once by the driver and carried to the student workers and (via
     # deepcopy) to the teacher group. Absent means full-vocabulary MOPD is off.

@@ -60,7 +60,9 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     _validate_gpu_route_history,
 )
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts  # noqa: E402
-from tests.unit.models.generation import test_vllm_chat_template_wiring as wiring  # noqa: E402
+from tests.unit.models.generation import (
+    test_vllm_chat_template_wiring as wiring,  # noqa: E402
+)
 
 pytestmark = pytest.mark.nemo_gym
 

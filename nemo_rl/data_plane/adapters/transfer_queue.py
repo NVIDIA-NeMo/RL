@@ -50,6 +50,7 @@ import transfer_queue as tq
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.adapters.transfer_queue_env import rail_link_layers
+from nemo_rl.data_plane.codec import timed_codec
 from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
     DataPlaneConfig,
@@ -760,7 +761,7 @@ def _bind_mooncake_cuda_device() -> None:
         )
 
 
-def _init_tq(cfg: DataPlaneConfig) -> None:
+def _init_tq(cfg: DataPlaneConfig, *, checkpointing: bool = False) -> None:
     """Driver-process path: bootstrap the TQ controller for the chosen backend."""
     from omegaconf import OmegaConf
 
@@ -846,12 +847,21 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
                     # mooncake_master + the metadata server bind to.
                     "metadata_server": f"{local_ip}:{metadata_port}",
                     "master_server_address": f"{local_ip}:{master_port}",
+                    # Runtime mode derived from the existing trainer settings,
+                    # not a second user-facing checkpoint switch.
+                    "checkpoint": {"enabled": checkpointing},
                     **_mooncake_transport_config(),
                     "use_gdr": bool(mooncake_cfg.use_gdr),
                     "gdr_staging_buffer_mb": int(mooncake_cfg.gdr_staging_buffer_mb),
                 },
             },
         }
+        if checkpointing:
+            # Establish owner-local checkpoint requirements before any client
+            # attaches. Non-checkpointing jobs keep TQ's storage defaults.
+            overlay["backend"]["MooncakeStore"].update(
+                hard_pin=True, offload={"enabled": False}
+            )
     else:
         raise ValueError(f"unknown TQ backend: {backend!r}")
 
@@ -903,7 +913,7 @@ def _from_wire(td: TensorDict) -> TensorDict:
     ``codec.materialize`` applies the same exclusion.
     """
     # NonTensorData / NonTensorStack leaves are only visible via td.keys(),
-    # not keys(leaves_only=True) — iterating the latter would silently drop
+    # not keys(leaves_only=True) -- iterating the latter would silently drop
     # them from the rebuilt dict.
     # Deferred: ``multimodal_utils`` pulls PIL, requests and a few hundred
     # transformers submodules, and this adapter is imported by every process
@@ -911,26 +921,28 @@ def _from_wire(td: TensorDict) -> TensorDict:
     # for the same reason.
     from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
 
-    new_dict: dict[str, Any] = {}
-    changed = False
-    for k in td.keys():
-        v = td.get(k)
-        field_name = str(k)
-        if (
-            isinstance(v, torch.Tensor)
-            and v.is_nested
-            and field_name not in PACKED_MULTIMODAL_FIELDS
-        ):
-            rows = list(v.unbind())
-            if rows and all(row.shape == rows[0].shape for row in rows[1:]):
-                v = torch.stack(rows)
-                changed = True
-        new_dict[field_name] = v
-    if not changed:
-        return td
-    new_td = TensorDict(new_dict, batch_size=td.batch_size)
-    _assert_no_key_loss(new_dict, new_td, "_from_wire")
-    return new_td
+    with timed_codec("unpack"):
+        new_dict: dict[str, Any] = {}
+        changed = False
+        for k in td.keys():
+            v = td.get(k)
+            field_name = str(k)
+            if (
+                isinstance(v, torch.Tensor)
+                and v.is_nested
+                and field_name not in PACKED_MULTIMODAL_FIELDS
+            ):
+                rows = list(v.unbind())
+                if rows and all(row.shape == rows[0].shape for row in rows[1:]):
+                    v = torch.stack(rows)
+                    changed = True
+            new_dict[field_name] = v
+        if not changed:
+            # The traversal still ran; only the rebuild was skipped.
+            return td
+        new_td = TensorDict(new_dict, batch_size=td.batch_size)
+        _assert_no_key_loss(new_dict, new_td, "_from_wire")
+        return new_td
 
 
 class TQDataPlaneClient(DataPlaneClient):
@@ -943,7 +955,13 @@ class TQDataPlaneClient(DataPlaneClient):
     _gdr_put_required: bool = False
     _gdr_put_confirmed: bool = False
 
-    def __init__(self, cfg: DataPlaneConfig, *, bootstrap: bool = True) -> None:
+    def __init__(
+        self,
+        cfg: DataPlaneConfig,
+        *,
+        bootstrap: bool = True,
+        checkpointing: bool = False,
+    ) -> None:
         """Construct a TQ-backed client.
 
         Args:
@@ -953,7 +971,13 @@ class TQDataPlaneClient(DataPlaneClient):
                 already-running named controller actor in the Ray
                 cluster — ``cfg`` is then only consulted for client-side
                 knobs (poll interval).
+            checkpointing: Whether the caller will save or restore data-plane
+                state. Used only at bootstrap; workers inherit the mode from TQ.
         """
+        # Ray serializes this driver-built client into the SingleController
+        # actor; retain the config so process-local hooks can be reinstalled.
+        self._cfg = cfg
+
         # mooncake_cpu setup must run BEFORE _init_tq / _connect_existing
         # — once tq.init/connect runs, Mooncake's engine.so reads the
         # env vars and they can't be changed. MC_TCP_BIND_ADDRESS is
@@ -986,6 +1010,13 @@ class TQDataPlaneClient(DataPlaneClient):
             mooncake_cfg = backend_config(cfg)
             if mooncake_cfg.reuse_registered_buffers:
                 _patch_mooncake_staging_buffers(mooncake_cfg.staging_buffer_size)
+            # Install before attaching; TQ's controller supplies the resolved
+            # checkpoint mode to each process-local storage manager.
+            from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
+                install_tq_mooncake_checkpoint_plugin,
+            )
+
+            install_tq_mooncake_checkpoint_plugin()
 
         self._backend = cfg["backend"]
         self._supports_checkpointing = data_plane_supports_checkpointing(cfg)
@@ -1000,7 +1031,7 @@ class TQDataPlaneClient(DataPlaneClient):
         self._gdr_put_confirmed = False
 
         if bootstrap:
-            _init_tq(cfg)
+            _init_tq(cfg, checkpointing=checkpointing)
         else:
             _connect_existing()
         if self._gdr_put_required:
@@ -1015,6 +1046,35 @@ class TQDataPlaneClient(DataPlaneClient):
         # The controller's field map is append-only, so each field only needs
         # warming once for the lifetime of this client.
         self._warmed_fields: dict[str, set[str]] = {}
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Serialize the config needed to rebuild a process-local TQ client."""
+        return {"cfg": self._cfg}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Rebuild process-local TQ state after Ray deserialization."""
+        cfg = state.get("cfg")
+        if cfg is None:
+            raise RuntimeError(
+                "Cannot deserialize TQDataPlaneClient without its data-plane config"
+            )
+        self.__init__(cast(DataPlaneConfig, cfg), bootstrap=False)
+
+    @staticmethod
+    def _read_complete_checkpoint_metadata(
+        checkpoint_dir: str | Path,
+    ) -> dict[str, Any]:
+        """Read TQ metadata and require a complete storage payload."""
+        metadata_path = Path(checkpoint_dir) / "metadata.json"
+        with metadata_path.open() as metadata_file:
+            checkpoint_metadata = json.load(metadata_file)
+        if not isinstance(checkpoint_metadata, dict):
+            raise ValueError("TQ checkpoint metadata must be a dictionary")
+        if checkpoint_metadata.get("storage_saved") is not True:
+            raise RuntimeError(
+                "TQ checkpoint is incomplete: metadata.json storage_saved must be true"
+            )
+        return checkpoint_metadata
 
     def _require_checkpointing_support(self) -> None:
         """Reject backends that cannot round-trip all data-plane state."""
@@ -1323,6 +1383,7 @@ class TQDataPlaneClient(DataPlaneClient):
         self._require_checkpointing_support()
         _connect_existing()
         tq.save_checkpoint(checkpoint_dir, metadata=metadata)
+        self._read_complete_checkpoint_metadata(checkpoint_dir)
 
     def load_checkpoint(self, checkpoint_dir: str | Path) -> dict[str, Any]:
         """Restore TQ state after initialization and before data operations.
@@ -1335,9 +1396,7 @@ class TQDataPlaneClient(DataPlaneClient):
         self._require_clean_for_load()
         # Validate the adapter-owned metadata before starting TQ's
         # non-transactional storage/controller restore.
-        metadata_path = Path(checkpoint_dir) / "metadata.json"
-        with metadata_path.open() as metadata_file:
-            checkpoint_metadata = json.load(metadata_file)
+        checkpoint_metadata = self._read_complete_checkpoint_metadata(checkpoint_dir)
         user_metadata = checkpoint_metadata.get("user_metadata", {})
         if not isinstance(user_metadata, dict):
             raise ValueError("TQ checkpoint user_metadata must be a dictionary")

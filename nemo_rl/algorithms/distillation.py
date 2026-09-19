@@ -65,6 +65,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
+    normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
 )
 from nemo_rl.models.policy import PolicyConfig
@@ -74,7 +75,10 @@ from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import managed_span, trace_fn
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
-from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointManager,
+)
 from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
@@ -240,6 +244,9 @@ def setup(
     )
     checkpoint_engine_config = None
     if generation_config["backend"] == "vllm":
+        normalize_nvfp4_pertoken_policy_config(
+            policy_config, entry_point="distillation"
+        )
         vllm_config = cast(VllmConfig, generation_config)
         normalize_vllm_refit_config(vllm_config)
         refit_transport = vllm_config.get("refit_transport")
@@ -803,6 +810,9 @@ def _distillation_train_impl(
                             task_to_env=task_to_env,
                             max_seq_len=None,
                             generation_config=generation_config,
+                            num_generations_per_prompt=(
+                                master_config.distillation.num_generations_per_prompt
+                            ),
                             log_full_result_tables=should_log_nemo_gym_full_result_tables(
                                 wandb_enabled=master_config.logger["wandb_enabled"],
                                 wandb_config=master_config.logger["wandb"],
@@ -1078,7 +1088,7 @@ def _distillation_train_impl(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config.checkpointing,
+                            is_final_checkpoint=is_last_step,
                         )
                         torch.save(
                             dataloader.state_dict(),
@@ -1289,6 +1299,7 @@ def validate(
                     task_to_env=val_task_to_env,
                     max_seq_len=None,
                     generation_config=generation_config,
+                    num_generations_per_prompt=1,
                     log_full_result_tables=should_log_nemo_gym_full_result_tables(
                         wandb_enabled=master_config.logger["wandb_enabled"],
                         wandb_config=master_config.logger["wandb"],

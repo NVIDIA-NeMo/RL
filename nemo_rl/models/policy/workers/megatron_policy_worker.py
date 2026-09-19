@@ -65,7 +65,14 @@ from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationRefitMixin,
     _configure_inference_optimized_layer_spec,
 )
-from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.config import (
+    VllmConfig,
+    parse_nvfp4_pertoken_rollout,
+)
+from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
+    NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS,
+    NvFp4PerTokenRolloutConfig,
+)
 from nemo_rl.models.megatron.common import (
     get_aux_loss_track_names,
     get_moe_metrics,
@@ -687,7 +694,9 @@ class MegatronPolicyWorkerImpl(
             "defer_fp32_logits", None
         ) and (runtime_config.model_cfg.fp16 or runtime_config.model_cfg.bf16)
 
-        # Store FP8 config for later use
+        # Store FP8 config for later use. NVTE recipe environment variables are
+        # import-time settings in Transformer Engine, so they must be supplied
+        # process-wide through megatron_cfg.env_vars before this actor imports TE.
         self.fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
 
         # Full-iteration CUDA graphs cannot be interrupted, so disable the
@@ -1103,7 +1112,7 @@ class MegatronPolicyWorkerImpl(
                     self._set_mtp_grad_scale_func(lambda: mtp_scale)
 
                     # Forward pass.
-                    draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
+                    draft_enabled = "draft" in self.cfg and self.cfg["draft"].enabled
                     use_router_replay = _should_use_router_replay(
                         enabled=self._router_replay_enabled,
                         data=batch,
@@ -1736,7 +1745,7 @@ class MegatronPolicyWorkerImpl(
         # hooks. The 1/N rescale happens once at finish.
         placeholder_n = torch.tensor(1.0, device="cuda")
 
-        draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
+        draft_enabled = "draft" in self.cfg and self.cfg["draft"].enabled
         use_router_replay = _should_use_router_replay(
             enabled=self._router_replay_enabled,
             data=data,
@@ -2977,6 +2986,24 @@ class MegatronPolicyWorkerImpl(
                 else task
             )
 
+    def _nvfp4_pertoken_rollout_cfg(
+        self,
+    ) -> NvFp4PerTokenRolloutConfig | None:
+        """Return validated per-token rollout config when the mode is enabled."""
+        generation_cfg = self.cfg.get("generation")
+        if not generation_cfg or generation_cfg.get("backend") != "vllm":
+            return None
+        return parse_nvfp4_pertoken_rollout(cast(VllmConfig, generation_cfg))
+
+    def maybe_init_zmq(self) -> None:
+        """Allow extra time for the first quantized refit and kernel autotune."""
+        super().maybe_init_zmq()
+        if self._nvfp4_pertoken_rollout_cfg() is not None:
+            import zmq
+
+            self.zmq_socket.setsockopt(zmq.SNDTIMEO, NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS)
+            self.zmq_socket.setsockopt(zmq.RCVTIMEO, NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS)
+
     def _iter_params_with_optional_kv_scales(
         self,
         kv_scales: Optional[dict[str, float]] = None,
@@ -4120,35 +4147,33 @@ class MegatronPolicyWorkerImpl(
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/sync_params_before_refit")
     def sync_params_before_refit(self) -> None:
-        """Materialize optimizer updates before a refit reads model parameters."""
-        # With MXFP8 overlap, the optimizer updates FP32 master shards and the
-        # next parameter all-gather requantizes them into the model weights. A
-        # refit happens between optimizer steps, before that next training
-        # forward, so force the gather now. This both gives generation the
-        # latest weights and leaves hooks disabled while the shared param/grad
-        # buffer is held across refit. The normal train-step transition
-        # re-enables them.
-        # Deliberately conditional on the hooks being enabled. Every state in
-        # which they are already off is one where the weights are current
-        # anyway: before the first train step the buffer holds the checkpoint;
-        # eval entry already forced a sync via disable_forward_pre_hook(
-        # param_sync=True) and runs no optimizer step; a skipped step leaves the
-        # masters unchanged; and a successful step re-enables the hooks before
-        # returning. If a stale case is ever found, note that staging alone does
-        # NOT fix it - with reuse_grad_buf_for_mxfp8_param_ag param_data aliases
-        # grad_data, so zero_grad_buffer() wipes the parameters and
-        # _copy_main_params_to_param_buffer restores only this rank's shard,
-        # leaving every other DP rank at zero. Upstream pairs that staging with a
-        # following start_param_sync (DistributedOptimizer.
-        # prepare_model_params_for_param_sync); any fix needs the sync too.
+        """Materialize optimizer updates before a refit reads model parameters.
+
+        ``overlap_param_gather`` defers this work to the next training forward,
+        but refit reads the parameters first. Megatron-FSDP handles this in its
+        own module hooks and is intentionally not handled here.
+        """
         if (
-            self._uses_mxfp8_overlap_shared_param_buffer()
-            and self._forward_pre_hook_enabled()
+            not isinstance(self.model, DistributedDataParallel)
+            or not self.model.ddp_config.overlap_param_gather
+            or not self._forward_pre_hook_enabled()
         ):
-            # An in-flight async checkpoint may still read these tensors, so settle it
-            # before the explicit gather mutates the shared parameter buffer.
+            # Disabled hooks mean no optimizer update is waiting to be gathered.
+            return
+
+        if self._uses_mxfp8_overlap_shared_param_buffer():
+            # This path requantizes updated master shards into the shared buffer.
+            # Hold that buffer materialized until the next training step.
             self.finalize_async_save()
             self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
+            return
+
+        # BF16 master shards are already in the DDP parameter buffer; only the
+        # all-gather remains. Settle checkpoint reads before rewriting it.
+        self.finalize_async_save()
+        self.model.start_param_sync(force_sync=True)
+        # Ensure exporters cannot observe a partially gathered buffer.
+        torch.cuda.synchronize()
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
