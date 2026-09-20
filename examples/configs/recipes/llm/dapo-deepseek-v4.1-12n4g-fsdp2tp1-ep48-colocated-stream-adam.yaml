@@ -1,0 +1,198 @@
+# BF16CPUAdamW automatically retains/scales/clips GPU gradients and streams CPU updates.
+# Requires compatible CUDA/AutoModel/vLLM dependencies and the integrated source.
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 24
+  num_generations_per_prompt: 8
+  batch_multiplier: 1
+  max_rollout_turns: 1
+  max_num_epochs: 100
+  max_num_steps: 1000
+  normalize_rewards: false
+  use_leave_one_out_baseline: false
+  adv_estimator:
+    name: grpo
+    normalize_rewards: false
+    use_leave_one_out_baseline: false
+    minus_baseline: true
+  val_period: 10
+  max_val_samples: 30
+  val_num_generations_per_prompt: 8
+  val_batch_size: 30
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 1
+  reward_scaling:
+    enabled: true
+    source_min: 0.0
+    source_max: 1.0
+    target_min: -1.0
+    target_max: 1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 256
+    max_response_length: 2048
+loss_fn:
+  token_level_loss: false
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+checkpointing:
+  enabled: true
+  keep_top_k: 1
+  save_period: 2
+  checkpoint_must_save_by: 00:03:40:00
+  model_save_format: null
+  checkpoint_dir: results/dapo-deepseek-v4.1-12n4g-fsdp2tp1-ep48-colocated-stream-adam/checkpoints
+policy:
+  model_name: ${oc.env:DS41_FULL_CHECKPOINT}
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: deepseek_v4
+    chat_template_kwargs:
+      enable_thinking: false
+  train_global_batch_size: 192
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  precision: bfloat16
+  max_total_sequence_length: 3072
+  logprob_chunk_size: 128
+  offload_optimizer_for_logprob: false
+  make_sequence_length_divisible_by: 64
+  max_grad_norm: 1.0
+  refit_buffer_size_gb: 1
+  optimizer:
+    name: nemo_rl.optimizers.bf16_cpu_adamw.BF16CPUAdamW
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+      betas:
+      - 0.9
+      - 0.999
+      eps: 1.0e-08
+      chunk_numel: 1048576
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 0.01
+      end_factor: 1.0
+      total_iters: 5
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 5
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: true
+    sequence_parallel: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    expert_parallel_size: 48
+    activation_checkpointing: true
+    env_vars:
+      NRL_REFIT_SERIAL_COLLECTIVES: '1'
+      NRL_REFIT_BUFFER_MEMORY_RATIO: '0.3'
+      NRL_REFIT_BUFFER_MAX_GB: '4'
+    moe_parallelizer:
+      reshard_after_forward: true
+      lm_head_precision: float32
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.BackendConfig
+        attn: tilelang
+        linear: torch
+        rms_norm: torch_fp32
+        experts: torch_mm
+        dispatcher: torch
+        rope_fusion: false
+        gate_precision: float32
+        enable_hf_state_dict_adapter: true
+        enable_fsdp_optimizations: true
+      freeze_config:
+        freeze_modules: []
+  megatron_cfg:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: true
+  hf_config_overrides:
+    vision_config:
+      num_hidden_layers: 0
+    text_config:
+      engram_host_checkpoint: ${policy.model_name}
+      compressed_kv_format: mxfp8
+  router_replay:
+    enabled: true
+  generation:
+    max_new_tokens: 2048
+    temperature: 1.0
+    vllm_cfg:
+      skip_tokenizer_init: false
+      precision: bfloat16
+      kv_cache_dtype: auto
+      tensor_parallel_size: 8
+      expert_parallel_size: 8
+      gpu_memory_utilization: 0.75
+      enforce_eager: true
+      max_model_len: ${policy.max_total_sequence_length}
+      enable_prefix_caching: false
+      use_deep_gemm: true
+      load_format: dummy
+      refit_with_reload_api: false
+      frozen_engram_checkpoint: ${policy.model_name}
+      env_vars:
+        NRL_REFIT_SERIAL_COLLECTIVES: '1'
+        NRL_REFIT_BUFFER_MEMORY_RATIO: '0.3'
+        NRL_REFIT_BUFFER_MAX_GB: '4'
+      sleep_level: 2
+    vllm_kwargs:
+      hf_overrides:
+        quantization_config: null
+        expert_dtype: bf16
+      kernel_config:
+        moe_backend: triton
+      language_model_only: true
+      max_num_batched_tokens: 2048
+      enable_chunked_prefill: true
+      max_num_seqs: 8
+    colocated:
+      enabled: true
+      resources:
+        num_nodes: 12
+        gpus_per_node: 4
+data:
+  max_input_seq_length: 1024
+  filter_overlong_prompts: true
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024Deduplicated
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  wandb_enabled: true
+  monitor_gpus: true
+  num_val_samples_to_print: 2
+  num_train_samples_to_print: 2
+  wandb:
+    project: nemorl-grpo-dsv41
+    name: dapo-deepseek-v4.1-12n4g-fsdp2tp1-ep48-colocated-stream-adam
+  tensorboard_enabled: true
+  tensorboard:
+    log_dir: tb_logs/dapo-deepseek-v4.1-12n4g-fsdp2tp1-ep48-colocated-stream-adam
+  mlflow:
+    run_name: dapo-deepseek-v4.1-12n4g-fsdp2tp1-ep48-colocated-stream-adam
+cluster:
+  num_nodes: 12
+  gpus_per_node: 4
+  segment_size: 2
