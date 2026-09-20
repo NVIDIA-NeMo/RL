@@ -2850,6 +2850,8 @@ def test_vllm_http_server(cluster, tokenizer):
 
         # Remove version-dependent fields that vLLM may or may not include
         d.pop("ec_transfer_params", None)
+        # vLLM 0.29 added `completion_tokens_details` to UsageInfo.
+        d.get("usage", {}).pop("completion_tokens_details", None)
         message = d["choices"][0]["message"]
         for key in ("reasoning", "reasoning_content"):
             message.pop(key, None)
