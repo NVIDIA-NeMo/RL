@@ -60,7 +60,7 @@ def test_disabled_scope_does_not_install_hook(monkeypatch):
         "install_gradient_stash_hook",
         lambda: pytest.fail("disabled hook"),
     )
-    with deferred_grad.backward_scope(enabled=False):
+    with deferred_grad.backward_scope(None):
         assert not deferred_grad._active
 
 
@@ -68,20 +68,8 @@ def test_stash_outside_scope_is_noop():
     assert deferred_grad.stash(None, torch.ones(1), None) is False
 
 
-@pytest.mark.parametrize(
-    "flags,cpu,error",
-    [
-        (("0", "1", "0"), True, "requires"),
-        (("1", "0", "1"), True, "requires"),
-        (("1", "1", "1"), False, "CPU parameter"),
-    ],
-)
-def test_invalid_switches_fail_early(monkeypatch, flags, cpu, error):
-    for key, value in zip(
-        ("DS41_DEFER_GRAD_OFFLOAD", "DS41_GPU_GRAD_NORM", "DS41_STREAM_ADAM"), flags
-    ):
-        monkeypatch.setenv(key, value)
-    opt = BF16CPUAdamW(
+def cpu_optimizer():
+    return BF16CPUAdamW(
         [torch.nn.Parameter(torch.ones(3))],
         lr=0.01,
         betas=(0.9, 0.95),
@@ -89,8 +77,68 @@ def test_invalid_switches_fail_early(monkeypatch, flags, cpu, error):
         weight_decay=0.1,
         chunk_numel=2,
     )
-    with pytest.raises(ValueError, match=error):
-        deferred_grad.validate_configuration(cpu, opt)
+
+
+def test_cpu_optimizer_requires_offloaded_parameters():
+    opt = cpu_optimizer()
+    deferred_grad.validate_configuration(True, opt)
+    with pytest.raises(ValueError, match="CPU parameter"):
+        deferred_grad.validate_configuration(False, opt)
+
+
+def test_optimizer_selects_complete_lifecycle_without_environment(monkeypatch):
+    from nemo_rl.models import fsdp_gradient_compat
+
+    opt = cpu_optimizer()
+    installed = []
+    monkeypatch.setattr(
+        fsdp_gradient_compat,
+        "install_gradient_stash_hook",
+        lambda: installed.append(True),
+    )
+    # Old environment variables no longer select any stage, even if set to zero.
+    for key in ("DS41_DEFER_GRAD_OFFLOAD", "DS41_GPU_GRAD_NORM", "DS41_STREAM_ADAM"):
+        monkeypatch.setenv(key, "0")
+    with deferred_grad.backward_scope(opt):
+        assert deferred_grad._active
+    assert installed == [True]
+    assert not deferred_grad._active
+
+    monkeypatch.setattr(deferred_grad, "gpu_scale_and_clip", lambda *a, **kw: 7)
+    monkeypatch.setattr(
+        deferred_grad, "streamed_optimizer_step", lambda optimizer: optimizer
+    )
+    assert deferred_grad.scale_grads_and_clip_grad_norm(1, [], optimizer=opt) == 7
+    assert deferred_grad.optimizer_step(opt) is opt
+
+
+def test_regular_optimizer_uses_original_backward_and_step(monkeypatch):
+    from nemo_rl.models import fsdp_gradient_compat
+
+    parameter = torch.nn.Parameter(torch.ones(3))
+    opt = torch.optim.SGD([parameter], lr=0.1)
+    monkeypatch.setattr(
+        fsdp_gradient_compat,
+        "install_gradient_stash_hook",
+        lambda: pytest.fail("unexpected hook"),
+    )
+    deferred_grad.validate_configuration(False, opt)
+    with deferred_grad.backward_scope(opt):
+        parameter.sum().backward()
+    deferred_grad.optimizer_step(opt)
+    torch.testing.assert_close(parameter, torch.full((3,), 0.9))
+
+
+def test_streaming_scope_restores_active_flag_on_failure(monkeypatch):
+    from nemo_rl.models import fsdp_gradient_compat
+
+    monkeypatch.setattr(
+        fsdp_gradient_compat, "install_gradient_stash_hook", lambda: None
+    )
+    with pytest.raises(RuntimeError, match="failed backward"):
+        with deferred_grad.backward_scope(cpu_optimizer()):
+            raise RuntimeError("failed backward")
+    assert not deferred_grad._active
 
 
 def test_streaming_rejects_unclipped_gradients():

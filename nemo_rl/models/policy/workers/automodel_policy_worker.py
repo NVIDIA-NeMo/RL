@@ -26,7 +26,11 @@ from nemo_automodel.components.distributed.tensor_utils import (
     to_local_if_dtensor,
 )
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
-from nemo_rl.models.deferred_grad import optimizer_step, scale_grads_and_clip_grad_norm
+from nemo_rl.models.deferred_grad import (
+    backward_scope,
+    optimizer_step,
+    scale_grads_and_clip_grad_norm,
+)
 from torch import nn
 from torch.distributed.tensor import DTensor
 
@@ -851,26 +855,27 @@ class AutomodelPolicyWorkerImpl(
                 )
 
                 # Use automodel_forward_backward for the training loop
-                mb_results = automodel_forward_backward(
-                    model=self.model,
-                    data_iterator=processed_iterator,
-                    post_processing_fn=loss_post_processor,
-                    device_mesh=self.device_mesh,
-                    padding_token_id=self.tokenizer.pad_token_id or 0,
-                    autocast_context_factory=self._autocast_context,
-                    forward_only=eval_mode,
-                    allow_flash_attn_args=self.allow_flash_attn_args,
-                    global_valid_seqs=global_valid_seqs,
-                    global_valid_toks=global_valid_toks,
-                    sampling_params=self.sampling_params,
-                    sequence_dim=sequence_dim,
-                    dp_size=self.dp_size,
-                    cp_size=self.cp_size,
-                    num_global_batches=num_global_batches,
-                    num_valid_microbatches=iterator_len,
-                    on_microbatch_start=on_microbatch_start,
-                    router_replay_gates=self._router_replay_gates,
-                )
+                with backward_scope(None if eval_mode else self.optimizer):
+                    mb_results = automodel_forward_backward(
+                        model=self.model,
+                        data_iterator=processed_iterator,
+                        post_processing_fn=loss_post_processor,
+                        device_mesh=self.device_mesh,
+                        padding_token_id=self.tokenizer.pad_token_id or 0,
+                        autocast_context_factory=self._autocast_context,
+                        forward_only=eval_mode,
+                        allow_flash_attn_args=self.allow_flash_attn_args,
+                        global_valid_seqs=global_valid_seqs,
+                        global_valid_toks=global_valid_toks,
+                        sampling_params=self.sampling_params,
+                        sequence_dim=sequence_dim,
+                        dp_size=self.dp_size,
+                        cp_size=self.cp_size,
+                        num_global_batches=num_global_batches,
+                        num_valid_microbatches=iterator_len,
+                        on_microbatch_start=on_microbatch_start,
+                        router_replay_gates=self._router_replay_gates,
+                    )
 
                 # Extract losses and metrics from results
                 mb_losses = []
@@ -908,6 +913,7 @@ class AutomodelPolicyWorkerImpl(
                     grad_norm = scale_grads_and_clip_grad_norm(
                         self.max_grad_norm,
                         [self.model],
+                        optimizer=self.optimizer,
                         norm_type=2.0,
                         pp_enabled=False,
                         device_mesh=self.device_mesh,
