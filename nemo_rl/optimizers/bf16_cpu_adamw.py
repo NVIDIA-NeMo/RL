@@ -167,7 +167,12 @@ class BF16CPUAdamW(torch.optim.Optimizer):
         This is same-layout restore; distributed checkpoint resharding is not
         provided by this method. Incompatible optimizer states fail explicitly.
         """
-        if state_dict.get("bf16_cpu_adamw_version") != 1:
+        # DCP's get/set_optimizer_state_dict reconstructs only state and
+        # param_groups, dropping custom top-level keys. Existing flattened
+        # checkpoints therefore have no version marker. Accept that form with
+        # the same strict group, step, BF16 dtype and layout checks below;
+        # still reject explicitly incompatible native checkpoint versions.
+        if state_dict.get("bf16_cpu_adamw_version", 1) != 1:
             raise ValueError("Expected a BF16CPUAdamW version 1 checkpoint")
         saved_groups = state_dict["param_groups"]
         if len(saved_groups) != len(self.param_groups):

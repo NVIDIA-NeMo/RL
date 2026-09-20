@@ -143,3 +143,133 @@ def test_streaming_rejects_foreign_or_cpu_gradients_without_update():
     with pytest.raises(ValueError, match="mix"):
         opt.step(gradient_shards={id(p): torch.ones(7)})
     assert not opt.state
+
+
+def test_dcp_roundtrip_preserves_bf16_moments_and_next_update(tmp_path):
+    """Exercise the flattened DCP path used by AutoModel, not native state_dict."""
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.state_dict import (
+        StateDictOptions,
+        get_optimizer_state_dict,
+        set_optimizer_state_dict,
+    )
+
+    torch.manual_seed(41)
+    model = torch.nn.Linear(5, 3)
+    opt = BF16CPUAdamW(model.parameters(), **ARGS, chunk_numel=7)
+    for _ in range(8):
+        for p in model.parameters():
+            p.grad = torch.randn_like(p)
+        opt.step()
+    options = StateDictOptions(flatten_optimizer_state_dict=True)
+    saved = get_optimizer_state_dict(model, opt, options=options)
+    assert not any('bf16_cpu_adamw_version' in key for key in saved)
+    dcp.save({'optim': saved}, checkpoint_id=tmp_path / 'optim')
+    resumed = copy.deepcopy(model)
+    loaded = BF16CPUAdamW(resumed.parameters(), **ARGS, chunk_numel=7)
+    skeleton = {'optim': get_optimizer_state_dict(resumed, loaded, options=options)}
+    dcp.load(skeleton, checkpoint_id=tmp_path / 'optim')
+    set_optimizer_state_dict(resumed, loaded, skeleton['optim'], options=options)
+    for p, q in zip(model.parameters(), resumed.parameters(), strict=True):
+        assert loaded.state[q]['step'] == 8
+        for key in ('exp_avg', 'exp_avg_sq'):
+            assert loaded.state[q][key].dtype == torch.bfloat16
+            assert torch.equal(opt.state[p][key], loaded.state[q][key])
+        p.grad = torch.randn_like(p)
+        q.grad = p.grad.clone()
+    opt.step()
+    loaded.step()
+    for p, q in zip(model.parameters(), resumed.parameters(), strict=True):
+        assert torch.equal(p, q)
+        assert loaded.state[q]['step'] == 9
+        for key in ('exp_avg', 'exp_avg_sq'):
+            assert torch.equal(opt.state[p][key], loaded.state[q][key])
+
+
+def test_unknown_checkpoint_version_rejected():
+    p = torch.nn.Parameter(torch.ones(3))
+    opt = BF16CPUAdamW([p], **ARGS, chunk_numel=2)
+    saved = opt.state_dict()
+    saved['bf16_cpu_adamw_version'] = 2
+    with pytest.raises(ValueError, match='version 1'):
+        opt.load_state_dict(saved)
+
+
+def _dcp_dtensor_worker(rank, checkpoint_dir):
+    import torch.distributed as dist
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.state_dict import (
+        StateDictOptions,
+        get_optimizer_state_dict,
+        set_optimizer_state_dict,
+    )
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import distribute_tensor, Shard
+
+    dist.init_process_group(
+        'gloo', init_method=f'file://{checkpoint_dir}/rendezvous', rank=rank, world_size=2
+    )
+    try:
+        mesh = init_device_mesh('cpu', (2,))
+        model = torch.nn.Module()
+        # Exercise both regular and empty local shards.
+        for name, size in [('weight', 5), ('tiny', 1)]:
+            model.register_parameter(name, torch.nn.Parameter(
+                distribute_tensor(torch.arange(size).float(), mesh, [Shard(0)])
+            ))
+        opt = BF16CPUAdamW(model.parameters(), **ARGS, chunk_numel=2)
+        for _ in range(8):
+            for p in model.parameters():
+                p.grad = torch.ones_like(p)
+            opt.step()
+        options = StateDictOptions(flatten_optimizer_state_dict=True)
+        saved = {'optim': get_optimizer_state_dict(model, opt, options=options)}
+        dcp.save(saved, checkpoint_id=f'{checkpoint_dir}/optim')
+        resumed = copy.deepcopy(model)
+        loaded = BF16CPUAdamW(resumed.parameters(), **ARGS, chunk_numel=2)
+        # AutoModel materializes Adam state for every parameter before DCP,
+        # including empty local shards that DCP's generic initializer skips.
+        for p in resumed.parameters():
+            p.grad = torch.zeros_like(p)
+        loaded.step()
+        loaded.zero_grad(set_to_none=True)
+        resumed.load_state_dict(model.state_dict())
+        skeleton = {'optim': get_optimizer_state_dict(resumed, loaded, options=options)}
+        dcp.load(skeleton, checkpoint_id=f'{checkpoint_dir}/optim')
+        set_optimizer_state_dict(resumed, loaded, skeleton['optim'], options=options)
+        for p, q in zip(model.parameters(), resumed.parameters(), strict=True):
+            assert loaded.state[q]['step'] == 8
+            for key in ('exp_avg', 'exp_avg_sq'):
+                state = loaded.state[q][key]
+                assert state.dtype == torch.bfloat16
+                assert state.placements == p.placements
+                assert torch.equal(state.to_local(), opt.state[p][key].to_local())
+            p.grad = torch.full_like(p, 0.25)
+            q.grad = torch.full_like(q, 0.25)
+        opt.step()
+        loaded.step()
+        for p, q in zip(model.parameters(), resumed.parameters(), strict=True):
+            assert loaded.state[q]['step'] == 9
+            assert torch.equal(p.to_local(), q.to_local())
+            for key in ('exp_avg', 'exp_avg_sq'):
+                assert torch.equal(opt.state[p][key].to_local(), loaded.state[q][key].to_local())
+    finally:
+        dist.destroy_process_group()
+
+
+def test_dcp_dtensor_roundtrip_and_empty_shard(tmp_path):
+    import torch.multiprocessing as mp
+
+    mp.spawn(_dcp_dtensor_worker, args=(str(tmp_path),), nprocs=2, join=True)
+
+
+def test_markerless_dcp_state_still_rejects_fp32_moments():
+    p = torch.nn.Parameter(torch.ones(3))
+    opt = BF16CPUAdamW([p], **ARGS, chunk_numel=2)
+    p.grad = torch.ones_like(p)
+    opt.step()
+    saved = copy.deepcopy(opt.state_dict())
+    del saved['bf16_cpu_adamw_version']
+    saved['state'][0]['exp_avg'] = saved['state'][0]['exp_avg'].float()
+    with pytest.raises(ValueError, match='Moment dtype'):
+        opt.load_state_dict(saved)
