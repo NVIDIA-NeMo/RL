@@ -542,10 +542,7 @@ def automodel_forward_backward(
                         * cp_size
                         / post_processing_fn.cp_gradient_fanout
                     )
-                    from nemo_rl.models.deferred_grad import backward_scope
-
-                    with backward_scope():
-                        loss.backward()
+                    loss.backward()
 
         results.append((result, metrics))
 

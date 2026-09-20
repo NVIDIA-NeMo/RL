@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Experimental post-backward gradient offload; CPU parameters remain untouched."""
+"""Streaming CPU Adam gradient lifecycle; CPU parameters remain untouched."""
 
 from __future__ import annotations
 
@@ -17,6 +17,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
+
+from nemo_rl.optimizers.bf16_cpu_adamw import BF16CPUAdamW
 
 logger = logging.getLogger(__name__)
 
@@ -55,44 +57,18 @@ def stash(param: FSDPParam, gradient: torch.Tensor, stream: torch.cuda.Stream) -
     return True
 
 
-def flush() -> None:
-    # Called after autograd has returned, before caller's gradient scaling/clipping.
-    # Keep tensors alive until their producer events and CPU copies complete.
-    with _lock:
-        logger.info(
-            f"GPU_GRAD_FLUSH_BEGIN time={time.time()} peak_allocated={torch.cuda.max_memory_allocated()}"
-        )
-        count = len(_pending)
-        gpu_bytes = sum(
-            e.gradient.numel() * e.gradient.element_size() for e in _pending.values()
-        )
-        for entry in _pending.values():
-            entry.event.synchronize()
-            host = entry.gradient.to("cpu", non_blocking=False)
-            param = entry.param
-            if param.sharded_param.grad is None:
-                param.sharded_param.grad = param.to_sharded_dtensor(host)
-            else:
-                param.sharded_param.grad.to_local().add_(host)
-        _pending.clear()
-        logger.info(
-            f"DEFERRED_GRAD_FLUSH rank={os.environ.get('RANK', '?')} shards={count} bytes={gpu_bytes}"
-        )
-
-
 @contextmanager
-def backward_scope(
-    enabled: bool | None = None, keep_on_gpu: bool | None = None
-) -> Iterator[None]:
+def backward_scope(optimizer: torch.optim.Optimizer | None) -> Iterator[None]:
+    """Keep reduced gradients on GPU for the streaming CPU optimizer.
+
+    The optimizer selects this complete lifecycle; there are no independently
+    configurable offload, norm, or streaming modes. None denotes forward-only.
+    """
     global _active
-    if enabled is None:
-        enabled = os.environ.get("DS41_DEFER_GRAD_OFFLOAD", "0") == "1"
-    if not enabled:
+    if not isinstance(optimizer, BF16CPUAdamW):
         yield
         return
-    if keep_on_gpu is None:
-        keep_on_gpu = os.environ.get("DS41_GPU_GRAD_NORM", "0") == "1"
-    if _ready_for_optimizer or _active or (_pending and not keep_on_gpu):
+    if _ready_for_optimizer or _active:
         raise RuntimeError("Deferred offload scope reentered or stale gradients exist")
     from nemo_rl.models.fsdp_gradient_compat import install_gradient_stash_hook
 
@@ -100,12 +76,8 @@ def backward_scope(
     _active = True
     try:
         yield
-        if not keep_on_gpu:
-            flush()
-    except BaseException:
-        # A failed backward is fatal to this worker; never silently reuse gradients.
-        raise
     finally:
+        # Failure remains fatal: an optimizer may have partially updated weights.
         _active = False
 
 
@@ -130,7 +102,6 @@ class GradientModelView:
 def gpu_scale_and_clip(
     max_grad_norm: float | None,
     model_parts: list[torch.nn.Module],
-    stream_to_optimizer: bool | None = None,
     **kwargs: Any,
 ) -> torch.Tensor | float:
     global _ready_for_optimizer
@@ -175,24 +146,23 @@ def gpu_scale_and_clip(
     norm = scale_grads_and_clip_grad_norm(max_grad_norm, views, **kwargs)
     if isinstance(norm, torch.Tensor):
         norm = norm.detach().cpu()
-    if stream_to_optimizer is None:
-        stream_to_optimizer = os.environ.get("DS41_STREAM_ADAM", "0") == "1"
-    if stream_to_optimizer:
-        # Record readiness after scaling/clipping even if norm computation disabled.
-        ready = stream.record_event()
-        for entry in _pending.values():
-            entry.event = ready
-        _ready_for_optimizer = True
-    else:
-        flush()
+    # Record readiness after scaling/clipping even if norm computation disabled.
+    ready = stream.record_event()
+    for entry in _pending.values():
+        entry.event = ready
+    _ready_for_optimizer = True
     logger.info(f"GPU_GRAD_NORM_END rank={os.environ.get('RANK', '?')} norm={norm}")
     return norm
 
 
 def scale_grads_and_clip_grad_norm(
-    max_grad_norm: float | None, model_parts: list[torch.nn.Module], **kwargs: Any
+    max_grad_norm: float | None,
+    model_parts: list[torch.nn.Module],
+    *,
+    optimizer: torch.optim.Optimizer,
+    **kwargs: Any,
 ) -> torch.Tensor | float:
-    if os.environ.get("DS41_GPU_GRAD_NORM", "0") == "1":
+    if isinstance(optimizer, BF16CPUAdamW):
         return gpu_scale_and_clip(max_grad_norm, model_parts, **kwargs)
     from nemo_automodel.components.training.utils import (
         scale_grads_and_clip_grad_norm as original,
@@ -224,23 +194,12 @@ def streamed_optimizer_step(optimizer: torch.optim.Optimizer) -> Any:
 
 
 def optimizer_step(optimizer: torch.optim.Optimizer) -> Any:
-    if os.environ.get("DS41_STREAM_ADAM", "0") == "1":
+    if isinstance(optimizer, BF16CPUAdamW):
         return streamed_optimizer_step(optimizer)
     return optimizer.step()
 
 
 def validate_configuration(cpu_offload: bool, optimizer: torch.optim.Optimizer) -> None:
-    """Reject incompatible switches before entering a large distributed backward."""
-    from nemo_rl.optimizers.bf16_cpu_adamw import BF16CPUAdamW
-
-    defer = os.environ.get("DS41_DEFER_GRAD_OFFLOAD", "0") == "1"
-    gpu_norm = os.environ.get("DS41_GPU_GRAD_NORM", "0") == "1"
-    streaming = os.environ.get("DS41_STREAM_ADAM", "0") == "1"
-    if (gpu_norm and not defer) or (streaming and not gpu_norm):
-        raise ValueError(
-            "Streaming Adam requires GPU norm and deferred gradient offload"
-        )
-    if defer and not cpu_offload:
-        raise ValueError("Deferred gradients require FSDP CPU parameter offload")
-    if streaming and not isinstance(optimizer, BF16CPUAdamW):
-        raise ValueError("Streaming GPU gradients require BF16CPUAdamW")
+    """Require CPU parameter offload for AutoModel's streaming CPU optimizer."""
+    if isinstance(optimizer, BF16CPUAdamW) and not cpu_offload:
+        raise ValueError("BF16CPUAdamW requires FSDP CPU parameter offload")

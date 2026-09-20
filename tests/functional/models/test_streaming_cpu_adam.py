@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Two-rank GPU parity: singleton and sharded FSDP, accumulation, two updates."""
 
+from contextlib import nullcontext
+from functools import partial
 from datetime import timedelta
 import gc
 import json
-import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -18,8 +19,8 @@ from torch.distributed.fsdp import fully_shard, CPUOffloadPolicy, MixedPrecision
 from nemo_rl.models.deferred_grad import (
     backward_scope,
     _pending,
-    gpu_scale_and_clip,
-    streamed_optimizer_step,
+    scale_grads_and_clip_grad_norm as streaming_scale_and_clip,
+    optimizer_step,
 )
 from nemo_rl.optimizers.bf16_cpu_adamw import BF16CPUAdamW
 
@@ -104,23 +105,25 @@ def run(mesh, enabled, rank, max_norm, mixed=False):
     memory = []
     for step in range(2):
         opt.zero_grad(set_to_none=True)
-        for micro in range(2):
-            torch.manual_seed(200 + 10 * step + micro + rank)
-            x = torch.randn(8, input_dim, device="cuda", dtype=torch.bfloat16)
-            with backward_scope(enabled, keep_on_gpu=enabled):
+        with backward_scope(opt) if enabled else nullcontext():
+            for micro in range(2):
+                torch.manual_seed(200 + 10 * step + micro + rank)
+                x = torch.randn(8, input_dim, device="cuda", dtype=torch.bfloat16)
                 model(x).float().square().mean().backward()
                 if enabled:
                     assert _pending, "No GPU gradients were captured"
                     assert all(v.gradient.is_cuda for v in _pending.values())
-            if enabled:
-                assert _pending
-            else:
-                assert not _pending
+                else:
+                    assert not _pending
         from nemo_automodel.components.training.utils import (
             scale_grads_and_clip_grad_norm,
         )
 
-        clipper = gpu_scale_and_clip if enabled else scale_grads_and_clip_grad_norm
+        clipper = (
+            partial(streaming_scale_and_clip, optimizer=opt)
+            if enabled
+            else scale_grads_and_clip_grad_norm
+        )
         norm = clipper(
             max_norm,
             [model],
@@ -150,7 +153,7 @@ def run(mesh, enabled, rank, max_norm, mixed=False):
         assert any(g.count_nonzero() for g in grads)
         assert all(g.device.type == "cpu" for g in grads)
         if enabled:
-            streamed_optimizer_step(opt)
+            optimizer_step(opt)
             assert opt.last_streamed_chunk_bytes == 8192 * 4
             assert not _pending and all(p.grad is None for p in model.parameters())
         else:
@@ -176,9 +179,6 @@ def run(mesh, enabled, rank, max_norm, mixed=False):
 
 
 def worker(rank, rendezvous):
-    os.environ["DS41_DEFER_GRAD_OFFLOAD"] = "1"
-    os.environ["DS41_GPU_GRAD_NORM"] = "1"
-    os.environ["DS41_STREAM_ADAM"] = "1"
     from nemo_automodel.shared.torch_patches import apply_torch_patches
 
     apply_torch_patches()
