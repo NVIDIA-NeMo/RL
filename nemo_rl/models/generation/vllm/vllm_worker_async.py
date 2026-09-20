@@ -704,11 +704,17 @@ class VllmAsyncGenerationWorkerImpl(
         coords = self.token_capture.complete_call_from_response(call, payload)
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
-            # The delta-aligned routes were staged to TQ above; the served
-            # full-length copy is dead weight the gate strips on arrival.
+            # Token arrays and delta-aligned routes were staged to TQ above;
+            # remove the serializer's message fields before the worker->gate hop.
             message = choice.get("message")
             if isinstance(message, dict):
-                message.pop("routed_experts", None)
+                for field in (
+                    "prompt_token_ids",
+                    "generation_token_ids",
+                    "generation_log_probs",
+                    "routed_experts",
+                ):
+                    message.pop(field, None)
         content["ng_commit_coords"] = coords.model_dump()
         return content
 
