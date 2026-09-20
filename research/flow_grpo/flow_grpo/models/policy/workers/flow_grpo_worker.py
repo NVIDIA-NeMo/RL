@@ -122,6 +122,39 @@ def build_checkpointer(*, is_peft: bool, dp_rank: int) -> Any:
     return Checkpointer(config, dp_rank=dp_rank, tp_rank=0, pp_rank=0)
 
 
+def prepare_optimizer_for_checkpoint_load(
+    model: Any, optimizer: Any, optimizer_path: str
+) -> None:
+    """Match replicated AdamW's lazy state to the saved optimizer metadata.
+
+    Qwen-Image's final text projections receive no gradients. AdamW leaves their
+    state empty, but DCP initializes every parameter when inspecting a fresh
+    optimizer and would then request nonexistent checkpoint keys. Clear only
+    wholly absent state for parameters present in the saved parameter groups;
+    partially missing state is an error, not permission to reset trained moments.
+    """
+    # Keep torch imports out of module scope so Ray can serialize the worker.
+    from torch.distributed.checkpoint import FileSystemReader
+    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+
+    metadata = FileSystemReader(optimizer_path).read_metadata().state_dict_metadata
+    # Use the same public initialization path as Automodel's OptimizerState.
+    get_optimizer_state_dict(model, optimizer)
+    for name, param in model.named_parameters():
+        state = optimizer.state.get(param)
+        if not state:
+            continue
+        keys = {f"optim.state.{name}.{field}" for field in state}
+        missing = keys - metadata.keys()
+        if missing == keys and f"optim.param_groups.{name}.lr" in metadata:
+            # Keep an empty entry so DCP does not initialize the optimizer again.
+            state.clear()
+        elif missing:
+            raise ValueError(
+                f"Incomplete optimizer checkpoint for {name}: missing {sorted(missing)}"
+            )
+
+
 def build_peft_config(lora_cfg: dict[str, Any]) -> Any:
     """Map the worker LoRA schema onto Automodel's `PeftConfig`.
 
@@ -775,6 +808,9 @@ class FlowGRPOPolicyWorker:  # pragma: no cover
         ckpt = self._get_checkpointer()
         ckpt.load_model(self.transformer, os.path.join(path, "model"))
         if os.path.isdir(os.path.join(path, "optim")):
+            prepare_optimizer_for_checkpoint_load(
+                self.transformer, self.optimizer, os.path.join(path, "optim")
+            )
             ckpt.load_optimizer(self.optimizer, self.transformer, path)
         return True
 

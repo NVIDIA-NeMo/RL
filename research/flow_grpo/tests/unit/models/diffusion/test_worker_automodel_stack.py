@@ -20,6 +20,7 @@ how the diffusers-dependent tests handle minimal installs.
 """
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -27,6 +28,7 @@ import torch
 pytest.importorskip("nemo_automodel")
 
 from flow_grpo.models.policy.workers.flow_grpo_worker import (
+    FlowGRPOPolicyWorker,
     load_diffusion_pipeline,
 )
 
@@ -311,14 +313,27 @@ def _lora_model_and_optimizer(seed: int):
     return model, optimizer, peft_cfg
 
 
-def test_checkpointer_lora_round_trip_and_layout(tmp_path, single_process_group):
-    from flow_grpo.models.policy.workers.flow_grpo_worker import build_checkpointer
+def _checkpoint_worker(model, optimizer, peft_cfg, rank=0):
+    worker = object.__new__(FlowGRPOPolicyWorker.__ray_metadata__.modified_class)
+    worker.transformer = model
+    worker.optimizer = optimizer
+    worker._pipe = SimpleNamespace(_peft_config=peft_cfg)
+    worker._lora_enabled = True
+    worker._checkpointer = None
+    worker.rank = rank
+    return worker
 
+
+@pytest.mark.parametrize("unused_params", [False, True])
+def test_checkpointer_lora_round_trip_and_layout(
+    tmp_path, single_process_group, unused_params
+):
     model, optimizer, peft_cfg = _lora_model_and_optimizer(seed=0)
     # One real step so LoRA weights and Adam moments are all nonzero.
     x = torch.randn(4, 4)
     loss = sum(
-        b.attn.to_q(x).square().mean() + b.attn.to_k(x).square().mean()
+        b.attn.to_q(x).square().mean()
+        + (0 if unused_params else b.attn.to_k(x).square().mean())
         for b in model.transformer_blocks
     )
     loss.backward()
@@ -328,20 +343,19 @@ def test_checkpointer_lora_round_trip_and_layout(tmp_path, single_process_group)
     optimizer.step()
 
     path = str(tmp_path / "step_1")
-    ckpt = build_checkpointer(is_peft=True, dp_rank=0)
-    ckpt.save_model(model, path, peft_config=peft_cfg)
-    ckpt.save_optimizer(optimizer, model, path)
+    worker = _checkpoint_worker(model, optimizer, peft_cfg)
+    worker.save_checkpoint(path)
 
     # Layout contract for FlowGRPOPolicyWorker.save_checkpoint / load_checkpoint.
     assert os.path.isfile(os.path.join(path, "model", "adapter_model.safetensors"))
     assert os.path.isfile(os.path.join(path, "model", "adapter_config.json"))
     assert os.path.isfile(os.path.join(path, "optim", ".metadata"))
 
-    # Fresh model with different base weights: only the adapter is restored.
-    model2, optimizer2, _ = _lora_model_and_optimizer(seed=1)
-    ckpt2 = build_checkpointer(is_peft=True, dp_rank=0)
-    ckpt2.load_model(model2, os.path.join(path, "model"))
-    ckpt2.load_optimizer(optimizer2, model2, path)
+    # Same frozen base, fresh adapters and empty Adam state, as in a new job.
+    model2, optimizer2, peft_cfg2 = _lora_model_and_optimizer(seed=0)
+    optimizer2.param_groups[0]["lr"] = 0.3
+    worker2 = _checkpoint_worker(model2, optimizer2, peft_cfg2)
+    worker2.load_checkpoint(path)
 
     lora1 = {k: v for k, v in model.state_dict().items() if "lora_" in k}
     lora2 = {k: v for k, v in model2.state_dict().items() if "lora_" in k}
@@ -349,12 +363,47 @@ def test_checkpointer_lora_round_trip_and_layout(tmp_path, single_process_group)
     for k in lora1:
         assert torch.equal(lora1[k], lora2[k]), k
 
-    state1 = optimizer.state_dict()["state"]
-    state2 = optimizer2.state_dict()["state"]
+    state1 = {k: v for k, v in optimizer.state_dict()["state"].items() if v}
+    state2 = {k: v for k, v in optimizer2.state_dict()["state"].items() if v}
     assert len(state1) == len(state2) > 0
     for pid in state1:
+        assert torch.equal(state1[pid]["step"], state2[pid]["step"])
         assert torch.allclose(state1[pid]["exp_avg"], state2[pid]["exp_avg"])
         assert torch.allclose(state1[pid]["exp_avg_sq"], state2[pid]["exp_avg_sq"])
+
+    # Continue with all parameters active, including previously unused ones.
+    # Their first Adam update must match uninterrupted training (step starts at 0).
+    for m, opt in [(model, optimizer), (model2, optimizer2)]:
+        opt.zero_grad(set_to_none=True)
+        sum(
+            b.attn.to_q(x).square().mean() + b.attn.to_k(x).square().mean()
+            for b in m.transformer_blocks
+        ).backward()
+        opt.step()
+    for name, param in model.named_parameters():
+        assert torch.equal(param, dict(model2.named_parameters())[name]), name
+
+
+def test_checkpoint_rejects_partially_missing_adam_state(
+    tmp_path, single_process_group
+):
+    from nemo_automodel.components.checkpoint.stateful_wrappers import OptimizerState
+    from torch.distributed.checkpoint import save
+
+    model, optimizer, peft_cfg = _lora_model_and_optimizer(seed=0)
+    worker = _checkpoint_worker(model, optimizer, peft_cfg)
+    path = str(tmp_path / "incomplete")
+    worker.save_checkpoint(path, save_optimizer=False)
+    state = OptimizerState(model, optimizer, is_peft=True).state_dict()
+    # A missing moment for a parameter with saved state must remain an error.
+    missing = "state.transformer_blocks.0.attn.to_q.lora_A.weight.exp_avg"
+    del state["optim"][missing]
+    save(state, checkpoint_id=os.path.join(path, "optim"))
+
+    model2, optimizer2, peft_cfg2 = _lora_model_and_optimizer(seed=0)
+    worker2 = _checkpoint_worker(model2, optimizer2, peft_cfg2)
+    with pytest.raises(ValueError, match="Incomplete optimizer checkpoint.*exp_avg"):
+        worker2.load_checkpoint(path)
 
 
 # ---------------------------------------------------------------------------
