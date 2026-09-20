@@ -563,6 +563,16 @@ def setup(
         )
         generation_config = DynamoConfig.model_validate(generation_config).model_dump()
         policy_config["generation"] = generation_config
+    text_overrides = (policy_config.get("hf_config_overrides") or {}).get("text_config") or {}
+    host_engram = text_overrides.get("engram_host_checkpoint")
+    rollout_engram = (generation_config.get("vllm_cfg") or {}).get("frozen_engram_checkpoint")
+    if host_engram is not None or rollout_engram is not None:
+        if generation_config["backend"] != "vllm" or host_engram != rollout_engram:
+            raise ValueError("Trainer and vLLM frozen Engram must use the same checkpoint path")
+        if generation_config["vllm_cfg"]["precision"] != "bfloat16":
+            raise ValueError("Frozen Engram currently requires BF16 rollout")
+        if generation_config["vllm_cfg"].get("refit_with_reload_api"):
+            raise ValueError("Frozen Engram requires refit_with_reload_api=false")
     _validate_multimodal_dedup_capability(master_config)
 
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
@@ -1530,8 +1540,12 @@ def setup(
         configure_vllm_for_router_replay(policy_config)
         vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
 
-        ## make vllm hf overrides match the training policy
-        vllm_kwargs["hf_overrides"] = policy_config.get("hf_config_overrides", {})
+        # Inherit policy overrides while preserving explicit rollout settings
+        # (e.g. BF16 rollout storage for a quantized training checkpoint).
+        vllm_kwargs["hf_overrides"] = {
+            **(policy_config.get("hf_config_overrides") or {}),
+            **(vllm_kwargs.get("hf_overrides") or {}),
+        }
 
         if enable_nemo_gym:
             # ---- NeMo Gym: reserve vLLM ports up-front so we can hand the

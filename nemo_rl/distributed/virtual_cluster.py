@@ -82,14 +82,6 @@ class PY_EXECUTABLES:
     # Use NeMo-Gym dependencies
     NEMO_GYM = f"uv run --locked --extra nemo_gym --directory {git_root}"
 
-    # Default env for the vLLM generation workers (see
-    # ray_actor_environment_registry.py). It carries nemo_gym so the worker can
-    # host Gym's token capture (token_capture.enabled) without swapping the
-    # worker's env at runtime: worker venvs are cached by actor class name, so
-    # a venv prebuilt with plain `--extra vllm` would be reused as-is and the
-    # nemo_gym import would fail.
-    VLLM_GYM = f"uv run --locked --extra vllm --extra nemo_gym --directory {git_root}"
-
     # Use NeMo-RL direct dependencies and SGLang.
     SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
 

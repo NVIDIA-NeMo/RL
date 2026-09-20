@@ -67,7 +67,11 @@ def packed_broadcast_producer(
     )
 
     num_buffers = get_num_buffers() if num_buffers is None else num_buffers
-    streams = [torch.cuda.Stream() for _ in range(num_buffers)]
+    if os.environ.get("NRL_REFIT_SERIAL_COLLECTIVES") == "1":
+        num_buffers = 1
+        streams = [torch.cuda.current_stream()]
+    else:
+        streams = [torch.cuda.Stream() for _ in range(num_buffers)]
     buffer_idx = 0
 
     packing_tensor_list = [[] for _ in range(num_buffers)]
@@ -178,7 +182,11 @@ def _packed_broadcast_consumer_batches(
 
     if num_buffers is None:
         num_buffers = get_num_buffers()
-    streams = [torch.cuda.Stream() for _ in range(num_buffers)]
+    if os.environ.get("NRL_REFIT_SERIAL_COLLECTIVES") == "1":
+        num_buffers = 1
+        streams = [torch.cuda.current_stream()]
+    else:
+        streams = [torch.cuda.Stream() for _ in range(num_buffers)]
     buffer_idx = 0
 
     packing_tensor_meta_data = [[] for _ in range(num_buffers)]

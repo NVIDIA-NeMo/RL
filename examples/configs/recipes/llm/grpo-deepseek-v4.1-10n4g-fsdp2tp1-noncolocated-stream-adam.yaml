@@ -1,0 +1,113 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 2
+  max_num_steps: 2
+  max_num_epochs: 2
+  val_period: -1
+  val_at_start: false
+  val_at_end: false
+  use_leave_one_out_baseline: false
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+checkpointing:
+  enabled: false
+policy:
+  tokenizer:
+    chat_template: null
+  model_name: ${oc.env:DS41_FULL_CHECKPOINT}
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  logprob_chunk_size: 128
+  refit_buffer_size_gb: 1
+  dtensor_cfg:
+    expert_parallel_size: 32
+    activation_checkpointing: true
+    moe_parallelizer:
+      reshard_after_forward: true
+      lm_head_precision: float32
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.BackendConfig
+        attn: tilelang
+        linear: torch
+        rms_norm: torch_fp32
+        experts: torch_mm
+        dispatcher: torch
+        rope_fusion: false
+        gate_precision: float32
+        enable_hf_state_dict_adapter: true
+        enable_fsdp_optimizations: true
+      freeze_config:
+        freeze_modules: []
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    cpu_offload: true
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: true
+  make_sequence_length_divisible_by: 64
+  optimizer:
+    name: nemo_rl.optimizers.bf16_cpu_adamw.BF16CPUAdamW
+    kwargs: '${oc.create:''{lr: 1.0e-6, weight_decay: 0.1, betas: [0.9, 0.95], eps:
+      1.0e-8, chunk_numel: 1048576}''}'
+  generation:
+    max_new_tokens: 1024
+    vllm_cfg:
+      skip_tokenizer_init: false
+      tensor_parallel_size: 8
+      expert_parallel_size: 8
+      gpu_memory_utilization: 0.9
+      max_model_len: 2048
+      enforce_eager: true
+      enable_prefix_caching: false
+      precision: bfloat16
+      load_format: dummy
+      kv_cache_dtype: auto
+      use_deep_gemm: true
+      refit_with_reload_api: false
+      frozen_engram_checkpoint: ${policy.model_name}
+    vllm_kwargs:
+      hf_overrides:
+        quantization_config: null
+        expert_dtype: bf16
+      kernel_config:
+        moe_backend: triton
+      language_model_only: true
+      max_num_batched_tokens: 2048
+      max_num_seqs: 8
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 2
+        gpus_per_node: 4
+  hf_config_overrides:
+    vision_config:
+      num_hidden_layers: 0
+    text_config:
+      engram_host_checkpoint: ${policy.model_name}
+      compressed_kv_format: mxfp8
+  router_replay:
+    enabled: true
+data:
+  max_input_seq_length: 1024
+  train:
+    dataset_name: ResponseDataset
+    data_path: ${oc.env:DS41_SMOKE_DATA}
+    input_key: input
+    output_key: output
+    split_validation_size: 0
+  default:
+    prompt_file: null
+logger:
+  monitor_gpus: false
+  wandb_enabled: false
+  tensorboard_enabled: false
+cluster:
+  num_nodes: 10
+  gpus_per_node: 4
+  segment_size: 2

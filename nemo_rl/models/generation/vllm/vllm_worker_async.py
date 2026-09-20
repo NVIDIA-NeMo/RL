@@ -438,6 +438,11 @@ class VllmAsyncGenerationWorkerImpl(
                 "configure_mtp_drafter_weight_source",
                 args=(self._mtp_weights_from_refit,),
             )
+        frozen_engram_checkpoint = self.cfg["vllm_cfg"].get("frozen_engram_checkpoint")
+        if frozen_engram_checkpoint is not None:
+            await self.llm.collective_rpc(
+                "load_frozen_engram_tables", args=(frozen_engram_checkpoint,)
+            )
         if self._mtp_load_from_disk:
             await self.llm.collective_rpc(
                 "load_mtp_weights_from_disk", args=(self.model_name,)
@@ -2059,7 +2064,7 @@ class VllmAsyncGenerationWorkerImpl(
         # the receiver and sends data=None, causing an assertion error.
         if hasattr(self.llm, "reset_mm_cache"):
             await self.llm.reset_mm_cache()
-        await self.llm.sleep(level=1)
+        await self.llm.sleep(level=self.cfg["vllm_cfg"].get("sleep_level", 1))
 
         gc.collect()
         torch.cuda.empty_cache()

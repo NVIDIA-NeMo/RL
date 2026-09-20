@@ -93,7 +93,6 @@ def test_registry_matches_py_executables():
     """The generated py_executable is the string the worker actually needs."""
     expected = {
         ("vllm",): PY_EXECUTABLES.VLLM,
-        ("vllm", "nemo_gym"): PY_EXECUTABLES.VLLM_GYM,
         ("sglang",): PY_EXECUTABLES.SGLANG,
         ("fsdp",): PY_EXECUTABLES.FSDP,
         ("automodel",): PY_EXECUTABLES.AUTOMODEL,
@@ -114,12 +113,8 @@ def test_registry_matches_py_executables():
 def test_every_extras_py_executable_is_wired_to_an_actor():
     """A PY_EXECUTABLES constant naming extras must be used by some actor.
 
-    This branch builds ACTOR_ENVIRONMENT_REGISTRY from ACTOR_ENVIRONMENTS instead of
-    the literal dict main keeps in ray_actor_environment_registry.py. When main changes
-    which extras an actor needs -- as #4009 did, moving the vLLM workers onto
-    PY_EXECUTABLES.VLLM_GYM so token capture can import nemo_gym -- a rebase drops the
-    literal dict and the change is silently lost. A new constant that no actor uses is
-    the signature of exactly that miss.
+    The registry is generated from ACTOR_ENVIRONMENTS. A constant without a
+    matching actor usually means an actor's dependency change was missed.
 
     PY_EXECUTABLES.BASE is excluded: it names no extra and is not an actor environment.
     """

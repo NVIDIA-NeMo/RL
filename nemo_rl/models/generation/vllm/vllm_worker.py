@@ -152,6 +152,47 @@ def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
     return enable_prefix_caching
 
 
+def _strip_training_engram_override(vllm_kwargs: dict[str, Any]) -> None:
+    """Remove the trainer-only host path from copied rollout HF overrides.
+
+    vLLM treats a nested text_config dict as a replacement, so forwarding only
+    this path would erase the checkpoint's attention and architecture fields.
+    Rollout table initialization uses vllm_cfg.frozen_engram_checkpoint instead.
+    """
+    overrides = vllm_kwargs.get("hf_overrides")
+    if not isinstance(overrides, dict):
+        return
+    text = overrides.get("text_config")
+    if isinstance(text, dict) and "engram_host_checkpoint" in text:
+        text.pop("engram_host_checkpoint")
+        if not text:
+            overrides.pop("text_config")
+
+
+def _complete_deepseek_v41_text_override(
+    vllm_kwargs: dict[str, Any], hf_config: Any
+) -> None:
+    """Preserve checkpoint structure when vLLM replaces a V4.1 text config."""
+    if getattr(hf_config, "model_type", None) != "deepseek_v41":
+        return
+    overrides = vllm_kwargs.get("hf_overrides")
+    if not isinstance(overrides, dict):
+        return
+    text = overrides.get("text_config")
+    if not isinstance(text, dict):
+        return
+    base = getattr(hf_config, "text_config", None)
+    if base is None:
+        # vLLM's DeepseekV41Config flattens checkpoint text fields onto itself.
+        # Adding text_config back would shadow these fields in get_text_config().
+        overrides.pop("text_config")
+        for key, value in text.items():
+            overrides.setdefault(key, copy.deepcopy(value))
+        return
+    base_dict = base if isinstance(base, dict) else base.to_dict()
+    overrides["text_config"] = {**copy.deepcopy(base_dict), **copy.deepcopy(text)}
+
+
 def _merge_fp8_kwargs(vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]) -> None:
     """Merge fp8 init kwargs into ``vllm_kwargs`` in place, preserving user overrides.
 
@@ -485,6 +526,7 @@ class BaseVllmGenerationWorker:
                 "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
             )
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
+        _strip_training_engram_override(vllm_kwargs)
         checkpoint_engine_config = checkpoint_engine_refit_config(self.cfg)
         if checkpoint_engine_config is not None:
             from nemo_rl.models.generation.vllm.checkpoint_engine import (
@@ -556,6 +598,12 @@ class BaseVllmGenerationWorker:
             os.environ["VLLM_DP_MASTER_IP"] = addr_list[leader_rank]
             os.environ["VLLM_DP_MASTER_PORT"] = str(port_list[leader_rank])
 
+        # Register backend-owned configs before Transformers-only model flags
+        # inspect them (e.g. DeepSeek V4.1 is supplied by vLLM, not Transformers).
+        from vllm.transformers_utils.config import get_config
+
+        hf_config = get_config(self.model_name, trust_remote_code=True)
+        _complete_deepseek_v41_text_override(vllm_kwargs, hf_config)
         load_format = self.cfg["vllm_cfg"]["load_format"]
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
@@ -609,7 +657,6 @@ class BaseVllmGenerationWorker:
 
         # Override HF config for gpt-oss models to ensure compatibility with megatron
         # The megatron --> hf export is done in bf16, so we disable quantization
-        hf_config = AutoConfig.from_pretrained(self.model_name, trust_remote_code=True)
         self.routed_experts_dtype = resolve_routed_experts_dtype(
             get_num_routed_experts(hf_config)
         )
@@ -926,6 +973,11 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             self.llm.collective_rpc(
                 "configure_mtp_drafter_weight_source",
                 args=(self._mtp_weights_from_refit,),
+            )
+        frozen_engram_checkpoint = self.cfg["vllm_cfg"].get("frozen_engram_checkpoint")
+        if frozen_engram_checkpoint is not None:
+            self.llm.collective_rpc(
+                "load_frozen_engram_tables", args=(frozen_engram_checkpoint,)
             )
         if self._mtp_load_from_disk:
             self.llm.collective_rpc(
@@ -1444,7 +1496,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             self.llm.renderer, "clear_mm_cache"
         ):
             self.llm.renderer.clear_mm_cache()
-        self.llm.sleep(level=1)
+        self.llm.sleep(level=self.cfg["vllm_cfg"].get("sleep_level", 1))
 
         gc.collect()
         torch.cuda.empty_cache()

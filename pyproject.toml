@@ -25,7 +25,8 @@ dependencies = [
   "setuptools",
   "pip",                                                                                                 # Required for frozen environments; uv venv --seed may not reliably install pip
   "ninja",                                                                                               # for flash-attn parallel build
-  "torch==2.11.0",
+  # Worker extras pin torch independently; the RC vLLM wheel needs 2.13.
+  "torch>=2.11.0,<=2.13.0",
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
   "ray[default]>=2.55.1",
@@ -49,12 +50,12 @@ dependencies = [
   "plotly",
   "sympy>=1.14.0",
   "pillow>=12.3.0",                                                                                      # Address CVE (Pillow 12.3.0)
-  "torchvision==0.26.0",
-  # torchaudio and torchcodec are NOT installed in the container image.
-  # Run tools/install_audio_deps.sh before using audio features or audio tests.
+  "torchvision>=0.26.0,<=0.28.0",
+  # The vLLM RC wheel pulls its own torchaudio/torchcodec dependencies.
+  # Other backends use tools/install_audio_deps.sh for audio features.
   # Keep the base range compatible with backend-specific pins while selecting 5.12.1
-  # for the base and compatible backend environments in uv.lock.
-  "transformers>=5.5.0,<=5.12.1",
+  # for existing backends; Automodel main requires 5.15.1.
+  "transformers>=5.5.0,<=5.15.1",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
   "timm",
   "open-clip-torch>=3.2.0",
@@ -85,7 +86,7 @@ dependencies = [
   # gated-chunk backward with a RuntimeError pointing at this exact pip install.
   # Keep the base range broad for both supported Linux architectures; backend
   # extras tighten the version as required.
-  "tilelang>=0.1.9,<0.1.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "tilelang>=0.1.9,<=0.1.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Data-plane stack — promoted to base so worker venvs (built by
   # nemo_rl.utils.venvs.create_local_venv via bare `uv sync`, no extras)
   # automatically include them. Removes the need for a `[data-plane]`
@@ -118,6 +119,8 @@ dependencies = [
 
 [project.optional-dependencies]
 fsdp = [
+  "torch==2.11.0",
+  "torchvision==0.26.0",
   "transformers==5.12.1",
   # +cu13 wheels from GitHub match torch cu130; PyPI often resolves to +cu12 (libcudart.so.12).
   # https://github.com/Dao-AILab/flash-attention/releases/tag/v2.8.1
@@ -129,9 +132,11 @@ fsdp = [
   "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 automodel = [
+  "torch==2.11.0",
+  "torchvision==0.26.0",
   "nemo-automodel[moe]",
   # Automodel's FLA kernels require this TileLang version on Hopper.
-  # Keep this scoped to the automodel fork; sglang intentionally pins TileLang 0.1.8.
+  # Keep this scoped to the automodel fork; vLLM requires TileLang 0.1.12.
   "tilelang==0.1.11; sys_platform == 'linux' and platform_machine == 'x86_64'",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
@@ -139,8 +144,8 @@ automodel = [
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
-  # Mirrors nemo-automodel's own `transformers==5.12.1` pin (Automodel r0.6.0).
-  "transformers==5.12.1",
+  # Mirrors the pinned Automodel main commit.
+  "transformers==5.15.1",
   "mistral-common>=1.11.0",
   "mamba-ssm",
   "causal-conv1d",
@@ -149,26 +154,29 @@ automodel = [
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
 ]
 vllm = [
-  "transformers==5.12.1",
-  "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "torch==2.13.0",
+  "torchvision==0.28.0",
+  "transformers==5.15.1",
+  "tilelang==0.1.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "cuda-python",
   "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
   # deep_ep also needs libibverbs-dev
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
-  # Default wheels on GitHub are cu130. See v0.25.1 release assets:
-  # https://github.com/vllm-project/vllm/releases/tag/v0.25.1
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1-cp38-abi3-manylinux_2_28_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1-cp38-abi3-manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "vllm==0.25.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
+  # Nightly wheels for tag v0.29.1rc0, commit 7ee8a6dd013819838da8012ca549d724bee7c6c6.
+  # Upstream wheel metadata reports 0.1.1.dev75+g7ee8a6dd0; pin by commit URL.
+  "vllm @ https://wheels.vllm.ai/7ee8a6dd013819838da8012ca549d724bee7c6c6/vllm-0.1.1.dev75%2Bg7ee8a6dd0-cp38-abi3-manylinux_2_28_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+  "vllm @ https://wheels.vllm.ai/7ee8a6dd013819838da8012ca549d724bee7c6c6/vllm-0.1.1.dev75%2Bg7ee8a6dd0-cp38-abi3-manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.13",
-  "flashinfer-cubin==0.6.13",
-  "flashinfer-jit-cache==0.6.13",
-  "nvidia-cutlass-dsl[cu13]==4.5.2",
+  "flashinfer-python==0.6.18.post1",
+  "flashinfer-cubin==0.6.18.post1",
+  "flashinfer-jit-cache==0.6.18.post1",
+  "nvidia-cutlass-dsl[cu13]==4.7.1",
 ]
 sglang = [
+  "torch==2.11.0",
+  "torchvision==0.26.0",
   # sgl-project/sglang branch `sglang-miles` (based on v0.5.16). Needed for the
   # begin_weight_update / end_weight_update refit session: quantized weights
   # carry derived scales (swizzled blockscales, g1/g2 alphas) that have to be
@@ -185,6 +193,8 @@ sglang = [
   "tilelang==0.1.11; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 mcore = [
+  "torch==2.11.0",
+  "torchvision==0.26.0",
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
   # wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
   # sudo dpkg -i cuda-keyring_1.1-1_all.deb
@@ -236,6 +246,8 @@ mcore = [
 # without compiling (prepare_metadata_for_build_wheel returns static metadata).
 # The actual ~60-min wheel build is triggered by `uv sync --extra trtllm`.
 trtllm = [
+  "torch==2.11.0",
+  "torchvision==0.26.0",
   "tensorrt-llm==1.3.0rc21",
   "transformers==5.5.4",
   "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
@@ -251,7 +263,7 @@ nemo_gym = ["nemo_gym"]
 # This is a default group so that we install these even with bare `uv sync`
 build = [
   # Build requirement for TE
-  "torch==2.11.0",
+  "torch>=2.11.0,<=2.13.0",
   # Build requirement for TE
   "setuptools",
   "packaging",
@@ -332,7 +344,7 @@ nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v
 flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA", rev = "b7643bd54521f563b839b98289b5cd048c062ba2" }
 nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "c3b913b9cc1d82d5a0af9fa77b4db87829e6f158" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.6.0" }
-flashinfer-cubin = { index = "flashinfer", extra = "sglang" }
+flashinfer-cubin = { index = "flashinfer" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
 
 [tool.uv.workspace]
@@ -405,7 +417,7 @@ override-dependencies = [
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.15",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
-  "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "nvidia-cudnn-frontend==1.27.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous;
   # 2.30.7 additionally fixes hangs in the NCCL m2n reshard (<link to NCCL release note / internal bug>).
   # An override is required because torch 2.11.0+cu130 pins nvidia-nccl-cu13==2.28.9.
@@ -415,7 +427,6 @@ override-dependencies = [
   "timm<=1.0.22",
   "fastapi[standard]>=0.133.0,<0.137.0",
   "nvidia-modelopt[torch]>=0.44.0a0",
-  "torch==2.11.0",
   # Floor only: trtllm (<1.4.0) and vllm (>=1.7.0) are incompatible, and the
   # universal lock resolves 1.3.0 either way. Pre-existing on main.
   "llguidance>=1.3.0",
@@ -507,6 +518,7 @@ conflicts = [
   [{ extra = "automodel" }, { extra = "mcore" }],
   [{ extra = "automodel" }, { extra = "vllm" }],
   [{ extra = "vllm" }, { extra = "mcore" }],
+  [{ extra = "vllm" }, { extra = "fsdp" }],
   [{ extra = "trtllm" }, { extra = "vllm" }],
   [{ extra = "trtllm" }, { extra = "sglang" }],
   [{ extra = "trtllm" }, { extra = "automodel" }],
@@ -520,6 +532,8 @@ conflicts = [
   # Spelled nemo_gym (the raw extras-table key): uv < 0.12 compares conflict
   # entries against unnormalized extra names and rejects "nemo-gym".
   [{ extra = "nemo_gym" }, { extra = "sglang" }],
+  # Gym requires MCP 1.x; the v0.29.1rc0 vLLM wheel requires MCP 2.x.
+  [{ extra = "nemo_gym" }, { extra = "vllm" }],
 ]
 
 
@@ -555,7 +569,7 @@ requires-dist = []
 [[tool.uv.dependency-metadata]]
 name = "causal-conv1d"
 # This version has to match the version in the commit/rev/tag used
-version = "1.5.4"
+version = "1.6.2.post1"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
@@ -566,7 +580,7 @@ requires-dist = ["torch", "packaging", "ninja"]
 [[tool.uv.dependency-metadata]]
 name = "mamba-ssm"
 # This version has to match the version in the commit/rev/tag used
-version = "2.2.6.post3"
+version = "2.3.2.post1"
 requires-dist = ["torch", "packaging", "ninja", "causal-conv1d"]
 
 [[tool.uv.dependency-metadata]]

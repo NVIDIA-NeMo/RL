@@ -167,6 +167,19 @@ def processed_inputs_multimodal():
 # =====================
 @pytest.mark.automodel
 class TestModelForward:
+    def test_training_model_without_kv_cache_argument(self, processed_inputs_no_flash):
+        class TrainingModel(torch.nn.Module):
+            def forward(self, input_ids, attention_mask, position_ids):
+                return (input_ids + position_ids) * attention_mask
+
+        model = TrainingModel()
+        prepared = _prepare_cp1(model, processed_inputs_no_flash)
+        output = model_forward(model, prepared.model_batch)
+        expected = (
+            processed_inputs_no_flash.input_ids + processed_inputs_no_flash.position_ids
+        ) * processed_inputs_no_flash.attention_mask
+        torch.testing.assert_close(output, expected)
+
     def test_basic_forward(self, mock_model, processed_inputs_no_flash):
         prepared = _prepare_cp1(mock_model, processed_inputs_no_flash)
         model_forward(mock_model, prepared.model_batch)

@@ -51,9 +51,15 @@ class VllmSpecificArgs(TypedDict):
     # Additional arguments for vLLM inserted by nemo rl based on the context of when vllm is used
     skip_tokenizer_init: bool
     async_engine: bool
+    # Level 2 discards weights instead of backing them up on CPU. Requires a
+    # complete refit before the next generation; do not use with delta refits.
+    sleep_level: NotRequired[Literal[1, 2]]
     # Optional video contract. When present, NeMo RL registers its TorchCodec
     # loader and uses these exact sampling values on both sides of GRPO.
     video: NotRequired[VllmVideoConfig]
+    # Local immutable native MXFP8 source for frozen DeepSeek V4.1 tables.
+    # None/absent keeps tables in the trainer refit stream.
+    frozen_engram_checkpoint: NotRequired[str | None]
     load_format: NotRequired[str]
     precision: NotRequired[str]
     # Whether vLLM returns logprobs before or after generation-time logit

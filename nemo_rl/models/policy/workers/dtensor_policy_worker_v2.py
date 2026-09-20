@@ -24,7 +24,7 @@ from nemo_automodel.components.distributed.tensor_utils import (
     get_cpu_state_dict,
     to_local_if_dtensor,
 )
-from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
+from nemo_rl.models.deferred_grad import optimizer_step, scale_grads_and_clip_grad_norm
 from torch import nn
 from torch.distributed.tensor import DTensor
 
@@ -37,6 +37,10 @@ from nemo_rl.models.automodel.data import (
     check_sequence_dim,
     get_microbatch_iterator,
     process_global_batch,
+)
+from nemo_rl.models.automodel.router_replay import (
+    configure_router_replay,
+    router_replay_context,
 )
 from nemo_rl.models.automodel.setup import (
     setup_distributed,
@@ -83,10 +87,30 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.timer import Timer
 
 
+def _forced_refit_dtypes(
+    model: nn.Module, state_dict: dict[str, torch.Tensor]
+) -> dict[str, str]:
+    """Honor the adapter's inference-critical HF export dtype contract."""
+    adapter = getattr(model, "state_dict_adapter", None)
+    forced_dtype_mapping = getattr(adapter, "forced_hf_dtype_mapping", None)
+    if callable(forced_dtype_mapping):
+        return forced_dtype_mapping(state_dict)
+    return {}
+
+
 def _refit_tensor_dtype(
-    fqn: str, tensor: torch.Tensor, default_dtype: torch.dtype
+    fqn: str,
+    tensor: torch.Tensor,
+    default_dtype: torch.dtype,
+    forced_dtype: Optional[str] = None,
 ) -> torch.dtype:
-    """Preserve the FP32 dtype used by inference-critical MoE router state."""
+    """Preserve adapter-specified dtypes and inference-critical MoE router state."""
+    if forced_dtype is not None:
+        from nemo_automodel.components.checkpoint._backports.hf_utils import DTYPE_MAP
+
+        if forced_dtype in DTYPE_MAP:
+            return DTYPE_MAP[forced_dtype]
+        return getattr(torch, forced_dtype)
     is_router_correction_bias = fqn.rsplit(".", maxsplit=1)[-1] == (
         "e_score_correction_bias"
     )
@@ -95,8 +119,36 @@ def _refit_tensor_dtype(
     return default_dtype
 
 
+def _is_owner_engram(model: nn.Module, name: str) -> bool:
+    adapter = getattr(model, "state_dict_adapter", None)
+    return name.endswith(".engram.embed.weight") and (
+        ".deepseek_v41." in type(adapter).__module__
+    )
+
+
+def _refit_staging_dtype(model, name, tensor, target_dtype, forced_dtypes):
+    """Cast layout-only V4.1 exports before gathering, preserving forced FP32."""
+    adapter = getattr(model, "state_dict_adapter", None)
+    if ".deepseek_v41." not in type(adapter).__module__:
+        return tensor.dtype
+    # LoRA merging performs arithmetic; keep its original precision.
+    if any(isinstance(module, LinearLoRA) for module in model.modules()):
+        return tensor.dtype
+    metadata = torch.empty(tensor.shape, dtype=tensor.dtype, device="meta")
+    dtypes = [
+        _refit_tensor_dtype(key, value, target_dtype, forced_dtypes.get(key))
+        for key, value in _maybe_adapt_tensor_to_hf(model, name, metadata)
+    ]
+    if not dtypes:
+        return tensor.dtype
+    dtype = dtypes[0]
+    for other in dtypes[1:]:
+        dtype = torch.promote_types(dtype, other)
+    return dtype
+
+
 def dtensor_params_generator(
-    model: nn.Module, target_dtype: torch.dtype
+    model: nn.Module, target_dtype: torch.dtype, *, stage_cpu_parameters: bool = False
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Generator that yields (name, tensor) pairs, converting DTensors to local tensors and adapting to HF format.
 
@@ -110,15 +162,45 @@ def dtensor_params_generator(
         the refit dtype and made contiguous.
     """
     module_map = dict(model.named_modules())
-    for name, tensor in model.state_dict().items():
+    state_dict = model.state_dict()
+    forced_dtypes = _forced_refit_dtypes(model, state_dict)
+    for name, tensor in state_dict.items():
         if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
             continue
-        full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+        if _is_owner_engram(model, name):
+            from nemo_rl.models.engram_refit import stream_rows
+
+            for hf_name, logical_table in _maybe_adapt_tensor_to_hf(
+                model, name, tensor
+            ):
+                yield from stream_rows(hf_name, logical_table, target_dtype)
+            continue
+        staged_tensor = tensor
+        if stage_cpu_parameters and tensor.device.type == "cpu":
+            # DTensor.to preserves the CUDA mesh/placements while copying only
+            # its local shard. Never mutate the FSDP parameter or optimizer state.
+            staging_dtype = _refit_staging_dtype(
+                model, name, tensor, target_dtype, forced_dtypes
+            )
+            staged_tensor = tensor.to(
+                device=torch.device("cuda", torch.cuda.current_device()),
+                dtype=staging_dtype,
+            )
+        full_tensor = (
+            staged_tensor.full_tensor()
+            if isinstance(staged_tensor, DTensor)
+            else staged_tensor
+        )
         merged_tensor = _maybe_merge_lora_weight(module_map, name, full_tensor)
 
         adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
         for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-            refit_dtype = _refit_tensor_dtype(adapted_fqn, adapted_tensor, target_dtype)
+            refit_dtype = _refit_tensor_dtype(
+                adapted_fqn,
+                adapted_tensor,
+                target_dtype,
+                forced_dtypes.get(adapted_fqn),
+            )
             yield (
                 adapted_fqn,
                 adapted_tensor.to(refit_dtype, non_blocking=True).contiguous(),
@@ -127,6 +209,7 @@ def dtensor_params_generator(
         del adapted_fqn_tensors
         del merged_tensor
         del full_tensor
+        del staged_tensor
 
 
 @torch.no_grad()
@@ -295,9 +378,9 @@ class DTensorPolicyWorkerV2Impl(
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # Initialize checkpoint manager now that distributed is set up
-        requires_synchronous_checkpoint = (
-            getattr(runtime_config.model_config, "model_type", None) == "deepseek_v4"
-        )
+        requires_synchronous_checkpoint = getattr(
+            runtime_config.model_config, "model_type", None
+        ) in ("deepseek_v4", "deepseek_v41", "deepseek_v41_text")
         self._init_checkpoint_manager(
             config_updates={
                 "model_repo_id": config["model_name"],
@@ -305,9 +388,9 @@ class DTensorPolicyWorkerV2Impl(
                     "dequantize_base_checkpoint", False
                 ),
                 "is_peft": self.lora_enabled,
-                # Automodel's process-based async DCP cannot serialize the
-                # HF-adapted DeepSeek-V4 DTensor/view state. Other v2 models keep
-                # the pre-existing async checkpoint path.
+                # Use synchronous saves for DeepSeek V4/V4.1 HF-adapted
+                # DTensor/view state; process-based async DCP cannot serialize
+                # the V4 state. Keep V4.1 on the same conservative path.
                 "is_async": not requires_synchronous_checkpoint,
             },
         )
@@ -352,6 +435,10 @@ class DTensorPolicyWorkerV2Impl(
             self.peft_config,
             self.autocast_enabled,
         ) = model_and_optimizer_state
+
+        configure_router_replay(self.model, self.cfg)
+        if init_reference_model and (self.cfg.get("router_replay") or {}).get("enabled"):
+            raise ValueError("AutoModel router replay does not yet support a reference policy")
 
         # Initialize reference model if requested. With deferred loading the
         # model still holds the base (model_name) weights here, so the KL
@@ -546,7 +633,7 @@ class DTensorPolicyWorkerV2Impl(
                     warn_if_inf_grad_norm(grad_norm)
 
                     # Update parameters and the non-gradient MoE routing bias.
-                    self.optimizer.step()
+                    optimizer_step(self.optimizer)
                     self._update_moe_gate_bias_if_supported()
 
                 losses.append(torch.tensor(mb_losses).sum().item())
@@ -631,7 +718,11 @@ class DTensorPolicyWorkerV2Impl(
                     allow_flash_attn_args=self.allow_flash_attn_args,
                 )
 
-                with prepared.model_context_factory(), self._autocast_context():
+                with (
+                    router_replay_context(self.model, processed_mb),
+                    prepared.model_context_factory(),
+                    self._autocast_context(),
+                ):
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     token_logprobs, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
@@ -1054,18 +1145,40 @@ class DTensorPolicyWorkerV2Impl(
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         del refit_payload_mode
         state_dict_info = {}
-        for name, tensor in self.model.state_dict().items():
+        state_dict = self.model.state_dict()
+        forced_dtypes = _forced_refit_dtypes(self.model, state_dict)
+        for name, tensor in state_dict.items():
             if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
                 continue
-            full_tensor = (
-                tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+            if _is_owner_engram(self.model, name):
+                from nemo_rl.models.engram_refit import row_chunks
+
+                for hf_name, logical_table in _maybe_adapt_tensor_to_hf(
+                    self.model, name, tensor
+                ):
+                    for wire_name, _, _, count in row_chunks(
+                        hf_name, logical_table, self.dtype
+                    ):
+                        state_dict_info[wire_name] = (
+                            torch.Size((count, logical_table.shape[1])),
+                            self.dtype,
+                        )
+                continue
+            # DTensor.shape is global: adapters only need shape/dtype here.
+            # Materializing full_tensor() would all-gather real weights on every
+            # rank, including enormous CPU copies when CPU offload is enabled.
+            metadata_tensor = torch.empty(
+                tensor.shape, dtype=tensor.dtype, device="meta"
             )
             adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(
-                self.model, name, full_tensor
+                self.model, name, metadata_tensor
             )
             for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
                 refit_dtype = _refit_tensor_dtype(
-                    adapted_fqn, adapted_tensor, self.dtype
+                    adapted_fqn,
+                    adapted_tensor,
+                    self.dtype,
+                    forced_dtypes.get(adapted_fqn),
                 )
                 state_dict_info[adapted_fqn] = (adapted_tensor.shape, refit_dtype)
 
@@ -1099,15 +1212,19 @@ class DTensorPolicyWorkerV2Impl(
             )
 
         self.maybe_init_zmq()
-        # Manually move model to cuda for cpu offload case
-        if self.cpu_offload:
+        # CPU-offloaded parameters are staged individually by the iterator.
+        # Whole-model onload overlaps every trainer shard with vLLM's weights.
+        # Keep LoRA's existing merge/onload path until it has staging coverage.
+        stage_cpu_parameters = self.cpu_offload and not self.lora_enabled
+        if self.cpu_offload and not stage_cpu_parameters:
             self.model = self.move_to_cuda(self.model)
-
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
 
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(
-            params_generator=dtensor_params_generator(self.model, self.dtype),
+            params_generator=dtensor_params_generator(
+                self.model, self.dtype, stage_cpu_parameters=stage_cpu_parameters
+            ),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
@@ -1376,9 +1493,9 @@ class DTensorPolicyWorkerV2Impl(
     def finalize_async_save(self) -> None:
         """Block until this worker's in-flight async checkpoint writes complete.
 
-        Overrides the base no-op: this worker initializes the checkpoint manager
-        with ``is_async=True``, so the caller-side rename of ``tmp_step_N`` to
-        ``step_N`` must wait for the staged writes to land.
+        Overrides the base no-op: when the checkpoint manager uses async saves,
+        the caller-side rename of ``tmp_step_N`` to ``step_N`` must wait for
+        the staged writes to land.
         """
         if self.checkpoint_manager is None:
             return

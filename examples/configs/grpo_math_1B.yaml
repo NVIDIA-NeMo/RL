@@ -451,6 +451,9 @@ policy:
       expose_http_server: false  # Start an OpenAI-compatible HTTP server alongside the persistent engine. Required for NeMo-Gym.
       http_server_num_replicas: 8  # HTTP frontend event loops per model-parallel coordinator.
     vllm_cfg:
+      # Optional local native MXFP8 tables for frozen DeepSeek V4.1 Engram.
+      # Must match policy.hf_config_overrides.text_config.engram_host_checkpoint.
+      frozen_engram_checkpoint: null
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"

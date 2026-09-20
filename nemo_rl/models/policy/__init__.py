@@ -43,6 +43,12 @@ def _patch_transformers_tokenizer_class_set():
     import transformers
     from packaging.version import Version as PkgVersion
 
+    # Transformers 5.15.1 checks auto_map before applying the tokenizer-class
+    # fallback and honors explicit trust_remote_code. Leave its loader intact.
+    # https://github.com/huggingface/transformers/blob/v5.15.1/src/transformers/models/auto/tokenization_auto.py
+    if PkgVersion(transformers.__version__) >= PkgVersion("5.15.1"):
+        return
+
     # Transformers 5.12.1 still ships both registry entries, so the patch remains
     # load-bearing across the currently supported backend environments.
     # TODO: remove this patch (and the assert below) once the deepseek_v3

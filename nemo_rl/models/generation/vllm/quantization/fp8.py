@@ -35,6 +35,7 @@ from vllm.v1.engine.utils import CoreEngineProcManager
 
 from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
 from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
+from nemo_rl.models.generation.vllm.quantization import deepseek_v41_fp8
 from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
     assign_or_replace_parameter,
     flashinfer_mxfp8_moe_padding_plan,
@@ -72,6 +73,7 @@ class FP8Config:
     use_fp8_weights: bool = True  # Whether model weights are quantized to FP8
     is_mx: bool = False
     is_deepseek_v4: bool = False
+    is_deepseek_v41: bool = False
     refit_with_reload_api: bool = False
 
 
@@ -324,6 +326,8 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         "kv_cache_dtype": kv_cache_dtype,
         "use_fp8_weights": use_fp8_weights,
         "is_deepseek_v4": getattr(config, "model_type", None) == "deepseek_v4",
+        "is_deepseek_v41": getattr(config, "model_type", None)
+        in ("deepseek_v41", "deepseek_v41_text"),
         "refit_with_reload_api": bool(vllm_cfg.get("refit_with_reload_api")),
     }
     if is_mx:
@@ -496,6 +500,7 @@ def _get_params_in_layers(param_names, layers):
 
 def _get_module_from_param_name(model, name: str):
     name = deepseek_v4_fp8.map_checkpoint_name(model, name)
+    name = deepseek_v41_fp8.map_checkpoint_name(model, name)
 
     # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
     # The module path is all but the last part (the parameter's own name)
@@ -512,6 +517,7 @@ def _get_module_from_param_name(model, name: str):
         module_path[-1] = reversed_mapping[module_path[-1]]
 
     module_path = deepseek_v4_fp8.remap_packed_module_path(model, module_path)
+    module_path = deepseek_v41_fp8.remap_packed_module_path(model, module_path)
 
     if hasattr(model, "hf_to_vllm_mapper") and hasattr(
         model.hf_to_vllm_mapper, "orig_to_new_prefix"
@@ -1168,7 +1174,7 @@ def process_weights_after_loading_moe(self, layer) -> None:
     the weight_loader attribute which we need for refit.
 
     Updated for vLLM 0.25 which passes a RoutedExperts module as `layer` and
-    sets up the MoE kernel via make_fp8_moe_kernel(routing_tables=..., layer=...).
+    sets up the MoE kernel via make_fp8_moe_kernel(routing_tables=...).
     """
     from vllm.model_executor.layers.quantization.fp8 import (
         convert_to_fp8_moe_kernel_format,
@@ -1194,7 +1200,7 @@ def process_weights_after_loading_moe(self, layer) -> None:
         w2_input_scale=w2_input_scale,
     )
 
-    if global_fp8_config.is_deepseek_v4:
+    if global_fp8_config.is_deepseek_v4 or global_fp8_config.is_deepseek_v41:
         # DSV4 restores checkpoint layouts before refit. Preserve compatible
         # storage and retain loaders when converting to a different layout.
         replace_parameter(layer, "w13_weight", w13, prefer_copy=True)
@@ -1227,7 +1233,6 @@ def process_weights_after_loading_moe(self, layer) -> None:
             fp8_backend=self.fp8_backend,
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
-            layer=layer,
         )
 
 
@@ -1556,7 +1561,6 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
             fp8_backend=self.mxfp8_backend,
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
-            layer=layer,
         )
 
 
