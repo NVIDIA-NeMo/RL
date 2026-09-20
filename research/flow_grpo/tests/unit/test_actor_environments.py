@@ -6,11 +6,20 @@ from flow_grpo.actor_environments import (
     REWARD_WORKER,
     register_actor_environments,
 )
+from flow_grpo.models.policy.workers.flow_grpo_worker import FlowGRPOPolicyWorker
 
 from nemo_rl.distributed.ray_actor_environment_registry import (
     ACTOR_ENVIRONMENT_REGISTRY,
 )
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+
+
+def test_policy_worker_accepts_builder_topology():
+    # RayWorkerBuilder passes all three keywords when creating a policy actor.
+    resources, _, _, _ = FlowGRPOPolicyWorker.configure_worker(
+        num_gpus=1, bundle_indices=(0, [0]), num_gpus_per_node=8
+    )
+    assert resources["num_gpus"] == 1
 
 
 def test_actors_select_research_project(monkeypatch):
