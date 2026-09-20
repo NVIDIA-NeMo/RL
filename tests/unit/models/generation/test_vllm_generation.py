@@ -641,6 +641,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.entrypoints.openai.engine",
         "vllm.entrypoints.openai.models",
         "vllm.entrypoints.serve",
+        "vllm.entrypoints.serve.engine",
         "vllm.entrypoints.serve.tokenize",
         "vllm.reasoning",
         "vllm.renderers",
@@ -726,6 +727,11 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     )
     make_module(
         "vllm.entrypoints.openai.engine.protocol",
+        ErrorResponse=type("ErrorResponse", (), {}),
+    )
+    # vLLM 0.29 location of the engine protocol (vllm-project/vllm#54492).
+    make_module(
+        "vllm.entrypoints.serve.engine.protocol",
         ErrorResponse=type("ErrorResponse", (), {}),
     )
     make_module(

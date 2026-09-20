@@ -294,8 +294,12 @@ def _tied_embedding_aliases(model: torch.nn.Module) -> dict[str, str]:
 
     Uses vLLM's own detector so this set is exactly what ``AutoWeightsLoader``
     skips. Empty on a vLLM without the helper, which also has no alias check,
-    so the filter below becomes a no-op there.
+    so the filter below becomes a no-op there. Also empty for a stand-in that
+    is not a module tree (a bare ``load_weights`` callable), which has no tied
+    embeddings for the detector to walk.
     """
+    if model is None or not hasattr(model, "named_modules"):
+        return {}
     try:
         from vllm.model_executor.models.utils import _get_tied_embedding_params
     except ImportError:
@@ -466,10 +470,6 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     ) -> list[tuple[str, torch.Tensor]]:
         """Drop the tied-embedding aliases vLLM would skip (see module helper)."""
         model = getattr(self.model_runner, "model", None)
-        if model is None or not hasattr(model, "named_modules"):
-            # vLLM's detector walks the module tree; a stand-in without one
-            # (a bare load_weights callable) has no tied embeddings to drop.
-            return policy_weights
         aliases = _tied_embedding_aliases(model)
         if not aliases:
             return policy_weights
@@ -501,11 +501,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         if _is_gemma4_unified_text_only(model_config):
             weights = _filter_gemma4_unified_multimodal_weights(weights)
         model = getattr(self.model_runner, "model", None)
-        aliases = (
-            _tied_embedding_aliases(model)
-            if model is not None and hasattr(model, "named_modules")
-            else {}
-        )
+        aliases = _tied_embedding_aliases(model)
         if aliases:
             weights = _drop_tied_embedding_aliases(
                 weights, aliases, getattr(model, "hf_to_vllm_mapper", None)
