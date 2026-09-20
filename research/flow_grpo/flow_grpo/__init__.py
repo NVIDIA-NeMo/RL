@@ -11,3 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Preserve NeMo-RL's runtime initialization in standalone research actors.
+# In particular, tensors serialized after importing Megatron reference
+# megatron.core.safe_globals; NeMo-RL makes that vendored module importable.
+import nemo_rl  # noqa: F401
