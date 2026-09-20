@@ -331,6 +331,19 @@ policy:
       fp8_recipe: "blockwise"
       fp8_param: false
 
+    # Transformer Engine FP4 training; disabled by default.
+    fp4_cfg:
+      enabled: false
+      fp4: "e2m1"
+      fp4_recipe: "nvfp4"
+      fp4_param: false
+
+    # Keep boundary transformer layers in BF16 during FP8 or FP4 training.
+    # The layer counts apply only when first_last_layers_bf16 is true.
+    first_last_layers_bf16: false
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
+
     env_vars: null
 
   draft:
@@ -345,6 +358,9 @@ policy:
     # tile (token_chunk_size x vocab, in fp32) is too large for the device;
     # raise it if the GPU is launch-bound.
     token_chunk_size: 4096
+    # Optional draft-only optimizer schedule. Set a mapping with `lr` and
+    # optional `min_lr`/`weight_decay` to enable it.
+    optimizer: null
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
   # for more details on dynamic batching and sequence packing.
