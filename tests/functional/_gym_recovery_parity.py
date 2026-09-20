@@ -56,15 +56,24 @@ _APPROXIMATE_TRAIN_FIELDS = (
 
 def _published_snapshots(checkpoint_dir: Path) -> list[Path]:
     # Snapshot counters restart per anchor directory, so order by publication
-    # time. The live retention pass can remove a candidate during this scan.
+    # time. Only bootstrap and atomically published step_N trainer anchors are
+    # restorable; tmp_step_N and old_step_N are incomplete/replaced checkpoints.
+    # The live retention pass can remove a candidate during this scan.
     ranked: list[tuple[int, str, Path]] = []
-    for path in checkpoint_dir.glob("**/rollout_snapshots/snapshot_[0-9]*"):
-        try:
-            if not (path / "manifest.json").is_file():
+    anchors = [checkpoint_dir / "bootstrap"]
+    anchors.extend(
+        path
+        for path in checkpoint_dir.glob("step_*")
+        if path.name.removeprefix("step_").isdigit()
+    )
+    for anchor in anchors:
+        for path in (anchor / "rollout_snapshots").glob("snapshot_[0-9]*"):
+            try:
+                if not (path / "manifest.json").is_file():
+                    continue
+                ranked.append((path.stat().st_mtime_ns, str(path), path))
+            except OSError:
                 continue
-            ranked.append((path.stat().st_mtime_ns, str(path), path))
-        except OSError:
-            continue
     ranked.sort(reverse=True)
     return [path for _, _, path in ranked]
 
