@@ -266,19 +266,45 @@ timeout --signal=TERM --kill-after=30s "${RUN_TIMEOUT_S}s" \
         "$@"
 cp "$BASE_RUN_LOG" "$TEST_DIR/recovery-final.log"
 
+restored_prefixes=0
+restarted_prefixes=0
 for selection_and_log in \
     "$FIRST_SELECTION:$TEST_DIR/recovery-crash-2.log" \
     "$SECOND_SELECTION:$TEST_DIR/recovery-final.log"; do
     selection=${selection_and_log%%:*}
     run_log=${selection_and_log#*:}
     source_model_call_id=$(jq -r .model_call_id "$selection")
-    grep -Eq \
-        "generation prefix restored: .*source_model_call_id=$source_model_call_id " \
-        "$run_log"
-    grep -Eq \
-        "generation prefix completed: .*source_model_call_id=$source_model_call_id " \
-        "$run_log"
+    restored_pattern="generation prefix restored: .*source_model_call_id=$source_model_call_id "
+    completed_pattern="generation prefix completed: .*source_model_call_id=$source_model_call_id "
+    restarted_pattern="generation prefix restart: .*source_model_call_id=$source_model_call_id "
+    restored=0
+    completed=0
+    restarted=0
+    grep -Eq "$restored_pattern" "$run_log" && restored=1
+    grep -Eq "$completed_pattern" "$run_log" && completed=1
+    grep -Eq "$restarted_pattern" "$run_log" && restarted=1
+
+    if [[ "$restored" -eq 1 && "$completed" -eq 1 && "$restarted" -eq 0 ]]; then
+        restored_prefixes=$((restored_prefixes + 1))
+        continue
+    fi
+    if [[ "$restored" -eq 0 && "$completed" -eq 0 && "$restarted" -eq 1 ]]; then
+        restarted_prefixes=$((restarted_prefixes + 1))
+        continue
+    fi
+    echo "[ERROR] selected cut has an inconsistent recovery outcome: " \
+        "source_model_call_id=$source_model_call_id restored=$restored " \
+        "completed=$completed restarted=$restarted log=$run_log"
+    exit 1
 done
+if [[ "$restored_prefixes" -lt 1 ]]; then
+    echo "[ERROR] recovery parity test did not restore any safe generation prefix"
+    exit 1
+fi
+if [[ "$restarted_prefixes" -lt 1 ]]; then
+    echo "[ERROR] recovery parity test did not exercise structured-prefix fallback"
+    exit 1
+fi
 grep -q "train step $MAX_STEPS/$MAX_STEPS" "$TEST_DIR/recovery-final.log"
 
 echo "=== Reference: run $MAX_STEPS uninterrupted steps ==="
