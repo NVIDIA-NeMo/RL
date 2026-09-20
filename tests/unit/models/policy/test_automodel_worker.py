@@ -726,6 +726,31 @@ class TestAutomodelParamsGenerator:
                 f"Tensor {name} should be converted to {target_dtype}"
             )
 
+    @pytest.mark.parametrize("forced_dtype", ["float32", "F32"])
+    def test_adapter_fp32_contract_matches_payload_and_metadata(self, forced_dtype):
+        class Adapter:
+            def forced_hf_dtype_mapping(self, state_dict):
+                return {"weight": forced_dtype}
+
+            def convert_single_tensor_to_hf(self, fqn, tensor, **kwargs):
+                return [(fqn, tensor)]
+
+        model = nn.Linear(2, 2)
+        with torch.no_grad():
+            model.weight.fill_(0.1234567)
+        model.state_dict_adapter = Adapter()
+        payload = dict(automodel_params_generator(model, torch.bfloat16))
+        worker = object.__new__(AutomodelPolicyWorkerImpl)
+        worker.model = model
+        worker.dtype = torch.bfloat16
+        worker.draft_model = None
+        worker.lora_enabled = False
+        metadata = worker.prepare_refit_info()
+        torch.testing.assert_close(payload["weight"], model.weight, rtol=0, atol=0)
+        assert payload["bias"].dtype == torch.bfloat16
+        for name, value in payload.items():
+            assert metadata[name] == (value.shape, value.dtype)
+
     def test_preserves_fp32_router_correction_bias(self):
         """FP32 MoE router state must not be downcast during refit."""
 
@@ -844,7 +869,7 @@ class TestAutomodelParamsGenerator:
         """Test that adapter is used when present on model."""
         # Arrange
         model = nn.Linear(10, 5)
-        adapter_mock = Mock()
+        adapter_mock = Mock(spec=["convert_single_tensor_to_hf"])
         # Mock adapter to return multiple tensors for a single input
         adapter_mock.convert_single_tensor_to_hf.return_value = [
             ("adapted.weight.1", torch.randn(5, 10)),
@@ -1189,6 +1214,36 @@ def test_prepare_refit_info_preserves_fp32_router_correction_bias():
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_prepare_refit_info_uses_global_meta_without_gather():
+    """A full-size expert tensor must never be materialized for metadata."""
+    from torch.distributed.tensor import DTensor
+
+    tensor = Mock(spec=DTensor)
+    tensor.shape = torch.Size((384, 5120, 4608))
+    tensor.dtype = torch.float32
+    tensor.full_tensor.side_effect = AssertionError("Metadata must not gather weights")
+    model = nn.Module()
+    model.state_dict = Mock(return_value={"experts.gate_and_up_projs": tensor})
+    worker = object.__new__(AutomodelPolicyWorkerImpl)
+    worker.model = model
+    worker.dtype = torch.bfloat16
+    worker.draft_model = None
+    worker.lora_enabled = False
+
+    def adapt(model, name, value):
+        assert value.device.type == "meta"
+        assert value.shape == tensor.shape
+        # Exercise shape-changing adapter operations without allocating storage.
+        return [("expert.weight", value[383, :, :2304].t().contiguous())]
+
+    with patch.object(worker_mod, "_maybe_adapt_tensor_to_hf", side_effect=adapt):
+        metadata = worker.prepare_refit_info()
+    assert metadata == {"expert.weight": (torch.Size((2304, 5120)), torch.bfloat16)}
+    tensor.full_tensor.assert_not_called()
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
 class TestAutocastContext:
     """Tests for the precision context retained by the policy worker."""
 
@@ -1332,7 +1387,12 @@ def _init_v2_worker_mocked(
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
 @pytest.mark.parametrize(
     ("model_type", "expected_async"),
-    [("deepseek_v4", False), ("deepseek_v3", True)],
+    [
+        ("deepseek_v4", False),
+        ("deepseek_v41", False),
+        ("deepseek_v41_text", False),
+        ("deepseek_v3", True),
+    ],
 )
 def test_scopes_synchronous_checkpointing_to_dsv4(
     monkeypatch, model_type, expected_async

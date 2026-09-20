@@ -65,6 +65,7 @@ from nemo_rl.distributed.model_utils import (
 from nemo_rl.models.automodel.data import (
     ProcessedInputs,
     ProcessedMicrobatch,
+    _accepted_forward_kwargs,
     drop_explicit_only_kwargs_not_in_forward,
     filter_multimodal_kwargs_for_model,
 )
@@ -105,8 +106,10 @@ def _build_model_batch(
     """Build a model-facing batch from canonical inputs."""
     model_batch: dict[str, Any] = {
         "input_ids": processed_inputs.input_ids,
-        "use_cache": False,
     }
+    accepted_kwargs = _accepted_forward_kwargs(type(model))
+    if accepted_kwargs is None or "use_cache" in accepted_kwargs:
+        model_batch["use_cache"] = False
     if processed_inputs.attention_mask is not None:
         model_batch["attention_mask"] = processed_inputs.attention_mask
     if processed_inputs.position_ids is not None:
@@ -593,7 +596,10 @@ def automodel_forward_backward(
                             * cp_size
                             / post_processing_fn.cp_gradient_fanout
                         )
-                        loss.backward()
+                        from nemo_rl.models.deferred_grad import backward_scope
+
+                        with backward_scope():
+                            loss.backward()
 
             results.append((result, metrics))
 

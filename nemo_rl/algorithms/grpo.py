@@ -806,6 +806,16 @@ def setup(
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="grpo")
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
+    text_overrides = (policy_config.get("hf_config_overrides") or {}).get("text_config") or {}
+    host_engram = text_overrides.get("engram_host_checkpoint")
+    rollout_engram = (generation_config.get("vllm_cfg") or {}).get("frozen_engram_checkpoint")
+    if host_engram is not None or rollout_engram is not None:
+        if generation_config["backend"] != "vllm" or host_engram != rollout_engram:
+            raise ValueError("Trainer and vLLM frozen Engram must use the same checkpoint path")
+        if generation_config["vllm_cfg"]["precision"] != "bfloat16":
+            raise ValueError("Frozen Engram currently requires BF16 rollout")
+        if generation_config["vllm_cfg"].get("refit_with_reload_api"):
+            raise ValueError("Frozen Engram requires refit_with_reload_api=false")
 
     # generation.disaggregation is written in backend-agnostic terms, but only
     # the TRT-LLM backend implements it today: every other backend would
@@ -1821,8 +1831,12 @@ def setup(
         configure_vllm_for_router_replay(policy_config)
         vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
 
-        ## make vllm hf overrides match the training policy
-        vllm_kwargs["hf_overrides"] = policy_config.get("hf_config_overrides", {})
+        # Inherit policy overrides while preserving explicit rollout settings
+        # (e.g. BF16 rollout storage for a quantized training checkpoint).
+        vllm_kwargs["hf_overrides"] = {
+            **(policy_config.get("hf_config_overrides") or {}),
+            **(vllm_kwargs.get("hf_overrides") or {}),
+        }
 
         if enable_nemo_gym:
             # ---- NeMo Gym: reserve vLLM ports up-front so we can hand the

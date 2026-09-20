@@ -542,15 +542,21 @@ def setup_distributed(
     # Build tp_plan from custom_parallel_plan config if set, else None (auto-select)
     tp_plan = config["automodel_cfg"].get("custom_parallel_plan", None)
 
+    # mHC carries FP32 mixing coefficients between BF16 compute blocks.
+    # FSDP must preserve each input/output tensor's own dtype at that boundary.
+    uses_mhc = runtime_config.model_config.model_type == "deepseek_v41"
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=dtype,
+        reduce_dtype=torch.float32,
+        output_dtype=None if uses_mhc else STRING_TO_DTYPE[fsdp_output_dtype],
+        cast_forward_inputs=not uses_mhc,
+    )
+
     # Create FSDP2Config
     fsdp2_config = FSDP2Config(
         sequence_parallel=sequence_parallel_enabled,
         tp_plan=tp_plan,
-        mp_policy=MixedPrecisionPolicy(
-            param_dtype=dtype,
-            reduce_dtype=torch.float32,
-            output_dtype=STRING_TO_DTYPE[fsdp_output_dtype],
-        ),
+        mp_policy=mp_policy,
         offload_policy=CPUOffloadPolicy(pin_memory=False) if cpu_offload else None,
         activation_checkpointing=config["automodel_cfg"]["activation_checkpointing"],
         defer_fsdp_grad_sync=config["automodel_cfg"].get("defer_fsdp_grad_sync", True),
@@ -559,6 +565,8 @@ def setup_distributed(
     # Create MoEParallelizerConfig from nested moe_parallelizer options
     moe_parallelizer_cfg = config["automodel_cfg"].get("moe_parallelizer", {})
     moe_config = MoEParallelizerConfig(**moe_parallelizer_cfg)
+    if uses_mhc:
+        moe_config.mp_policy = mp_policy
 
     # Handle world_size=1 + cpu_offload
     if world_size == 1 and cpu_offload:
@@ -994,7 +1002,8 @@ def setup_model_and_optimizer(
     if cpu_offload:
         # Move buffers to CPU for FSDP modules
         for v in model.buffers():
-            v.data = v.data.to("cpu")
+            # Preserve DTensor wrapper metadata together with its local storage.
+            torch.utils.swap_tensors(v, v.to("cpu"))
         model = model.to("cpu")
 
     # Build the DSpark draft model before optimizer construction so its params
@@ -1099,6 +1108,9 @@ def setup_model_and_optimizer(
                 (p for p in model.parameters() if p.requires_grad),
                 **optimizer_kwargs,
             )
+        from nemo_rl.models.deferred_grad import validate_configuration
+
+        validate_configuration(cpu_offload, optimizer)
 
     # Initialize scheduler
     scheduler = None

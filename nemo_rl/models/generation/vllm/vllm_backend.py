@@ -674,6 +674,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     _mtp_drafter_weights_from_refit: bool = True
     # Each worker reports a missing drafter for a co-trained MTP head at most once.
     _warned_missing_mtp_drafter: bool = False
+    _frozen_engram_initialized: bool = False
     # Each worker logs the Gemma 4 Unified multimodal filtering at most once.
     _logged_gemma4_unified_drop: bool = False
     _sparse_delta_applier: Any = None
@@ -1022,6 +1023,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.connect(self.get_zmq_address())
 
+    def load_frozen_engram_tables(self, checkpoint: str) -> None:
+        from nemo_rl.models.generation.vllm.engram_refit import load_frozen_engram_tables
+
+        load_frozen_engram_tables(self.model_runner.model, checkpoint)
+        self._frozen_engram_initialized = True
+
     def prepare_refit_info(
         self,
         state_dict_info: dict[str, Any],
@@ -1057,6 +1064,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         # Reject before storing any refit state. The draft check needs this
         # refit's manifest, so it runs again once the manifest exists.
         self._validate_native_layerwise_refit()
+        if self._frozen_engram_initialized and any(".engram.embed." in name for name in state_dict_info):
+            raise ValueError("Frozen Engram tables must be excluded from the trainer refit stream")
         pp_group = get_pp_group()
         pp_rank = int(getattr(pp_group, "rank_in_group", 0))
         pp_size = int(getattr(pp_group, "world_size", 1))
@@ -1464,6 +1473,38 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     num_dropped,
                 )
 
+        if "DeepseekV41ForCausalLM" in model_config.architectures:
+            if self.model_runner.vllm_config.quant_config is not None:
+                config = model_config.hf_config
+                if config.expert_dtype != "fp8":
+                    raise ValueError(
+                        "DeepSeek v4.1 quantized refit supports block FP8 experts only; "
+                        "set generation.vllm_cfg.precision=fp8 and "
+                        "hf_overrides.expert_dtype=fp8. FP4 refit is not supported."
+                    )
+            from nemo_rl.models.generation.vllm.quantization.fp8 import (
+                quantize_mxfp8_weight,
+            )
+
+            # Engram stores its table in MXFP8 even in an otherwise BF16 model.
+            # Refit both the values and row/32 scales from the trained table.
+            from nemo_rl.models.generation.vllm.engram_refit import load_engram_rows
+
+            converted_weights = []
+            for key, weight in weights:
+                if load_engram_rows(self.model_runner.model, key, weight):
+                    continue
+                if key.endswith(".engram.embed.weight"):
+                    value, scale = quantize_mxfp8_weight(weight.to(torch.bfloat16))
+                    converted_weights.extend(
+                        [(key, value), (key.removesuffix("weight") + "scale", scale)]
+                    )
+                else:
+                    converted_weights.append((key, weight))
+            weights = converted_weights
+            if not weights:
+                return
+
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
         self._load_hf_weights(self._without_tied_embedding_aliases(policy_weights))
         if coverage is not None:
@@ -1664,7 +1705,13 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         # through prepare-time parameter specs that a full-model reload replaces.
         return (
             self._uses_unquantized_flashinfer_trtllm()
-            or (transport != "nccl_reshard" and self._uses_deepseek_v4_fp8_refit())
+            or (
+                transport != "nccl_reshard"
+                and (
+                    self._uses_deepseek_v4_fp8_refit()
+                    or self._uses_deepseek_v41_fp8_refit()
+                )
+            )
             or bool(self._get_mxfp8_linear_reload_roots())
         )
 
@@ -1673,6 +1720,20 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         model = self.model_runner.model
         config = getattr(model, "config", None)
         if getattr(config, "model_type", None) != "deepseek_v4":
+            return False
+
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        return fp8.is_fp8_model(self.model_runner.vllm_config)
+
+    def _uses_deepseek_v41_fp8_refit(self) -> bool:
+        """Return whether the realized rollout model needs DSV4 FP8 reload hooks."""
+        model = self.model_runner.model
+        config = getattr(model, "config", None)
+        if getattr(config, "model_type", None) not in (
+            "deepseek_v41",
+            "deepseek_v41_text",
+        ):
             return False
 
         from nemo_rl.models.generation.vllm.quantization import fp8
@@ -1773,9 +1834,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 "TRTLLM MoE backend yet because it bypasses vLLM's native "
                 "layerwise reload lifecycle"
             )
-        if self._uses_deepseek_v4_fp8_refit():
+        if self._uses_deepseek_v4_fp8_refit() or self._uses_deepseek_v41_fp8_refit():
+            model_label = (
+                "DeepSeek V4.1" if self._uses_deepseek_v41_fp8_refit() else "DeepSeek V4"
+            )
             raise RuntimeError(
-                f"{label} refit does not support DeepSeek V4 FP8 because it "
+                f"{label} refit does not support {model_label} FP8 because it "
                 "bypasses the model's prepare/finalize refit hooks. Use IPC "
                 "or collective refit with refit_with_reload_api=False."
             )
@@ -1814,6 +1878,10 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         if self._uses_native_layerwise_refit(transport):
             self._validate_native_layerwise_refit(transport)
             use_deepseek_v4_fp8 = self._uses_deepseek_v4_fp8_refit()
+            use_deepseek_v41_fp8 = self._uses_deepseek_v41_fp8_refit()
+            if use_deepseek_v41_fp8 and self._frozen_engram_initialized:
+                raise ValueError("Frozen Engram does not support full-model FP8 layerwise reload")
+            use_deepseek_fp8 = use_deepseek_v4_fp8 or use_deepseek_v41_fp8
             previous_failure = self._nrl_layerwise_reload_failure
             if previous_failure is not None:
                 raise RuntimeError(
@@ -1830,11 +1898,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             )
 
             model = self.model_runner.model
-            # DSV4 needs a full-model reload. Other mixed models reload the
+            # DSV4/DSV4.1 need a full-model reload. Other mixed models reload the
             # union of realized BF16 TRTLLM experts and native MXFP8 linears.
             # Keeping one lifecycle prevents one target family from restoring
             # checkpoint storage after the other has installed runtime layout.
-            if use_deepseek_v4_fp8:
+            if use_deepseek_fp8:
                 reload_targets = [model]
             else:
                 reload_targets = []
@@ -1850,16 +1918,23 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             reloaded_module_ids = _reload_target_module_ids(reload_targets)
             initialized_targets: list[torch.nn.Module] = []
             added_skip_tensors: Any = None
-            if use_deepseek_v4_fp8:
-                from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
+            if use_deepseek_fp8:
+                if use_deepseek_v41_fp8:
+                    from nemo_rl.models.generation.vllm.quantization import (
+                        deepseek_v41_fp8 as deepseek_fp8,
+                    )
+                else:
+                    from nemo_rl.models.generation.vllm.quantization import (
+                        deepseek_v4_fp8 as deepseek_fp8,
+                    )
 
-                added_skip_tensors = deepseek_v4_fp8.SkipNames()
+                added_skip_tensors = deepseek_fp8.SkipNames()
 
             def finalize() -> None:
                 with torch.device(self.device):
                     finalize_layerwise_reload(model, self.model_config)
-                    if use_deepseek_v4_fp8:
-                        deepseek_v4_fp8.finalize_refit(model)
+                    if use_deepseek_fp8:
+                        deepseek_fp8.finalize_refit(model)
                     else:
                         _process_mxfp8_modules_after_native_reload(
                             model, reloaded_module_ids
@@ -1874,8 +1949,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             try:
                 with set_current_vllm_config(self.model_runner.vllm_config):
                     with torch.device(self.device):
-                        if use_deepseek_v4_fp8:
-                            added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)
+                        if use_deepseek_fp8:
+                            added_skip_tensors = deepseek_fp8.prepare_refit(model)
                         for reload_target in reload_targets:
                             initialized_targets.append(reload_target)
                             initialize_layerwise_reload(reload_target)
@@ -1894,8 +1969,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 raise
             finally:
                 self._nrl_layerwise_reload_active = False
-                if use_deepseek_v4_fp8:
-                    deepseek_v4_fp8.restore_refit(added_skip_tensors, model)
+                if use_deepseek_fp8:
+                    deepseek_fp8.restore_refit(added_skip_tensors, model)
 
             return
 
@@ -1967,6 +2042,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         return (
             self._uses_unquantized_flashinfer_trtllm()
             or bool(self._get_mxfp8_linear_reload_roots())
+            or self._uses_deepseek_v41_fp8_refit()
             or self._nrl_layerwise_reload_failure is not None
         )
 
@@ -2325,6 +2401,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         return result
 
     def _update_weights_from_collective(self, refit_with_reload_api: bool) -> bool:
+        if refit_with_reload_api and self._uses_deepseek_v41_fp8_refit():
+            raise ValueError("DeepSeek v4.1 FP8 requires refit_with_reload_api=False")
         assert self.state_dict_info is not None, (
             "state_dict_info is not prepared. "
             "Please call prepare_refit_info when initializing the worker."
