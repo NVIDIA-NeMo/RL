@@ -55,16 +55,18 @@ _APPROXIMATE_TRAIN_FIELDS = (
 
 
 def _published_snapshots(checkpoint_dir: Path) -> list[Path]:
-    snapshots = [
-        path
-        for path in checkpoint_dir.glob("**/rollout_snapshots/snapshot_[0-9]*")
-        if path.is_dir() and (path / "manifest.json").is_file()
-    ]
-    return sorted(
-        snapshots,
-        key=lambda path: (path.stat().st_mtime_ns, str(path)),
-        reverse=True,
-    )
+    # Snapshot counters restart per anchor directory, so order by publication
+    # time. The live retention pass can remove a candidate during this scan.
+    ranked: list[tuple[int, str, Path]] = []
+    for path in checkpoint_dir.glob("**/rollout_snapshots/snapshot_[0-9]*"):
+        try:
+            if not (path / "manifest.json").is_file():
+                continue
+            ranked.append((path.stat().st_mtime_ns, str(path), path))
+        except OSError:
+            continue
+    ranked.sort(reverse=True)
+    return [path for _, _, path in ranked]
 
 
 def _matching_group(
@@ -255,7 +257,8 @@ def _logical_dispatches(events: list[dict[str, Any]]) -> list[tuple[Any, ...]]:
 
 def _logical_completions(
     events: list[dict[str, Any]],
-) -> dict[tuple[Any, ...], float]:
+) -> tuple[list[tuple[Any, ...]], dict[tuple[Any, ...], float]]:
+    ordered: list[tuple[Any, ...]] = []
     completed: dict[tuple[Any, ...], float] = {}
     for event in events:
         if event.get("event") != "completion_forwarded":
@@ -268,8 +271,183 @@ def _logical_completions(
         )
         if identity in completed:
             raise AssertionError(f"logical completion was forwarded twice: {identity}")
+        ordered.append(identity)
         completed[identity] = float(event["reward"])
-    return completed
+    return ordered, completed
+
+
+def _effective_completions(
+    stages: list[list[dict[str, Any]]],
+) -> tuple[list[tuple[Any, ...]], dict[tuple[Any, ...], float]]:
+    """Select each logical completion's last stage after checkpoint pruning.
+
+    A crashed process can forward a result after the selected snapshot was
+    published. That result is absent from the restored ledger and legitimately
+    appears again in a later stage. Duplicate forwarding within one stage is
+    still an error; a later stage supersedes an earlier discarded attempt.
+    """
+    effective: dict[tuple[Any, ...], tuple[int, int, float]] = {}
+    for stage_index, events in enumerate(stages):
+        ordered, completed = _logical_completions(events)
+        for position, identity in enumerate(ordered):
+            effective[identity] = (stage_index, position, completed[identity])
+    ordered = sorted(
+        effective,
+        key=lambda identity: (effective[identity][0], effective[identity][1]),
+    )
+    return ordered, {identity: effective[identity][2] for identity in ordered}
+
+
+def _trained_step_events(
+    events: list[dict[str, Any]], *, steps: int
+) -> list[dict[str, Any]]:
+    """Keep hook events belonging to steps the trainer is expected to consume."""
+    return [
+        event
+        for event in events
+        if isinstance(event.get("target_step"), int)
+        and 0 <= event["target_step"] < steps
+    ]
+
+
+def _rollout_timeline(
+    stages: list[list[dict[str, Any]]],
+    *,
+    effective_order: list[tuple[Any, ...]],
+) -> list[dict[str, Any]]:
+    timestamped = [
+        event
+        for events in stages
+        for event in events
+        if "timestamp_ns" in event
+    ]
+    if not timestamped:
+        return []
+    origin_ns = min(int(event["timestamp_ns"]) for event in timestamped)
+    entries: dict[tuple[Any, ...], dict[str, Any]] = {}
+    effective_ranks = {
+        identity: rank for rank, identity in enumerate(effective_order)
+    }
+
+    def entry_for(identity: tuple[Any, ...]) -> dict[str, Any]:
+        return entries.setdefault(
+            identity,
+            {
+                "target_step": identity[0],
+                "prompt_idx": identity[1],
+                "task_source": identity[2],
+                "generation_index": identity[3],
+                "dispatches": [],
+                "arrivals": [],
+                "forwarded_completions": [],
+                "effective_completion_rank": effective_ranks.get(identity),
+            },
+        )
+
+    for stage_index, events in enumerate(stages):
+        for event in events:
+            if "timestamp_ns" not in event:
+                continue
+            elapsed_s = (int(event["timestamp_ns"]) - origin_ns) / 1_000_000_000
+            if event.get("event") == "dispatch":
+                generation_indices = event.get("generation_indices", [])
+                rollout_ids = event.get("rollout_ids", [])
+                if len(generation_indices) != len(rollout_ids):
+                    raise AssertionError(
+                        "dispatch event has mismatched generation indices and "
+                        "rollout IDs"
+                    )
+                for generation_index, rollout_id in zip(
+                    generation_indices, rollout_ids, strict=True
+                ):
+                    identity = (
+                        event.get("target_step"),
+                        event.get("prompt_idx"),
+                        event.get("task_source"),
+                        generation_index,
+                    )
+                    entry_for(identity)["dispatches"].append(
+                        {
+                            "stage": stage_index,
+                            "rollout_id": rollout_id,
+                            "elapsed_s": elapsed_s,
+                        }
+                    )
+                continue
+            if event.get("event") not in (
+                "completion_arrived",
+                "completion_forwarded",
+            ):
+                continue
+            identity = (
+                event.get("target_step"),
+                event.get("prompt_idx"),
+                event.get("task_source"),
+                event.get("generation_index"),
+            )
+            field = (
+                "arrivals"
+                if event["event"] == "completion_arrived"
+                else "forwarded_completions"
+            )
+            entry_for(identity)[field].append(
+                {
+                    "stage": stage_index,
+                    "rollout_id": event.get("rollout_id"),
+                    "elapsed_s": elapsed_s,
+                    "reward": event.get("reward"),
+                }
+            )
+
+    for identity, entry in entries.items():
+        if identity not in effective_ranks:
+            continue
+        forwarded = entry["forwarded_completions"]
+        if forwarded:
+            entry["effective_completion"] = forwarded[-1]
+
+    return sorted(
+        entries.values(),
+        key=lambda entry: (
+            entry["effective_completion_rank"] is None,
+            entry["effective_completion_rank"]
+            if entry["effective_completion_rank"] is not None
+            else 0,
+            entry["target_step"],
+            entry["prompt_idx"],
+            entry["generation_index"],
+        ),
+    )
+
+
+def _write_rollout_timeline(
+    path: Path,
+    *,
+    baseline_stages: list[list[dict[str, Any]]],
+    recovery_stages: list[list[dict[str, Any]]],
+    baseline_order: list[tuple[Any, ...]],
+    recovery_order: list[tuple[Any, ...]],
+    completion_order_matches: bool,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "completion_order_matches": completion_order_matches,
+                "baseline_completion_order": baseline_order,
+                "recovery_completion_order": recovery_order,
+                "baseline": _rollout_timeline(
+                    baseline_stages, effective_order=baseline_order
+                ),
+                "recovery": _rollout_timeline(
+                    recovery_stages, effective_order=recovery_order
+                ),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
 
 
 def _assert_nested_close(
@@ -307,16 +485,22 @@ def _assert_nested_close(
         raise AssertionError(f"{path} differs: {baseline!r} != {recovery!r}")
 
 
-def _step_files(log_dir: Path) -> dict[int, Path]:
-    result: dict[int, Path] = {}
+def _step_files(log_dir: Path, *, allow_restarts: bool = False) -> dict[int, Path]:
+    candidates: dict[int, list[Path]] = {}
     for path in log_dir.glob("**/train_data_step*.jsonl"):
         step = int(path.stem.removeprefix("train_data_step"))
-        if step in result:
+        candidates.setdefault(step, []).append(path)
+    result: dict[int, Path] = {}
+    for step, paths in candidates.items():
+        if len(paths) > 1 and not allow_restarts:
             raise AssertionError(
                 f"multiple training payloads found for step {step}: "
-                f"{result[step]} and {path}"
+                f"{sorted(paths)!r}"
             )
-        result[step] = path
+        result[step] = max(
+            paths,
+            key=lambda path: (path.stat().st_mtime_ns, str(path)),
+        )
     return result
 
 
@@ -329,7 +513,7 @@ def _compare_training_payloads(
     atol: float,
 ) -> None:
     baseline_files = _step_files(baseline_dir)
-    recovery_files = _step_files(recovery_dir)
+    recovery_files = _step_files(recovery_dir, allow_restarts=True)
     expected_steps = set(range(1, steps + 1))
     if set(baseline_files) != expected_steps:
         raise AssertionError(
@@ -410,12 +594,12 @@ def _compare_metrics(
 
 def _verify_workplace_audit(
     baseline_path: Path,
-    recovery_path: Path,
+    recovery_paths: list[Path],
     *,
     expected_mutations: int,
 ) -> None:
     baseline = _read_jsonl(baseline_path)
-    recovery = _read_jsonl(recovery_path)
+    recovery = [record for path in recovery_paths for record in _read_jsonl(path)]
     baseline_mutations = [
         event for event in baseline if event.get("event") == "mutation_applied"
     ]
@@ -427,10 +611,14 @@ def _verify_workplace_audit(
             f"baseline applied {len(baseline_mutations)} Workplace mutations; "
             f"expected {expected_mutations}"
         )
-    if len(recovery_mutations) != expected_mutations:
+    # Discarded post-snapshot executions can legitimately mutate an isolated
+    # resource instance before the process is killed. The restored execution
+    # uses checkpointed state, so require every trained mutation plus the
+    # per-instance exactly-once sentinel invariant below.
+    if len(recovery_mutations) < expected_mutations:
         raise AssertionError(
             f"recovery applied {len(recovery_mutations)} Workplace mutations; "
-            f"expected {expected_mutations}"
+            f"expected at least {expected_mutations}"
         )
     if any(event.get("sentinel_count") != 1 for event in recovery_mutations):
         raise AssertionError("a recovered Workplace mutation executed more than once")
@@ -440,8 +628,14 @@ def _verify_workplace_audit(
 
 
 def compare_runs(args: argparse.Namespace) -> None:
-    baseline_events = _read_jsonl(args.baseline_events)
-    recovery_events = _read_jsonl(args.recovery_events)
+    baseline_events = _trained_step_events(
+        _read_jsonl(args.baseline_events), steps=args.steps
+    )
+    recovery_stages = [
+        _trained_step_events(_read_jsonl(path), steps=args.steps)
+        for path in args.recovery_events
+    ]
+    recovery_events = [event for stage in recovery_stages for event in stage]
     baseline_dispatches = _logical_dispatches(baseline_events)
     recovery_dispatches = _logical_dispatches(recovery_events)
     if baseline_dispatches != recovery_dispatches:
@@ -456,8 +650,34 @@ def compare_runs(args: argparse.Namespace) -> None:
             f"expected {expected_groups}"
         )
 
-    baseline_completions = _logical_completions(baseline_events)
-    recovery_completions = _logical_completions(recovery_events)
+    baseline_completion_order, baseline_completions = _effective_completions(
+        [baseline_events]
+    )
+    recovery_completion_order, recovery_completions = _effective_completions(
+        recovery_stages
+    )
+    completion_order_matches = baseline_completion_order == recovery_completion_order
+    if args.timeline_output is not None:
+        _write_rollout_timeline(
+            args.timeline_output,
+            baseline_stages=[baseline_events],
+            recovery_stages=recovery_stages,
+            baseline_order=baseline_completion_order,
+            recovery_order=recovery_completion_order,
+            completion_order_matches=completion_order_matches,
+        )
+    if args.require_completion_order_match and not completion_order_matches:
+        raise AssertionError(
+            "logical completion order differs between uninterrupted and recovery runs: "
+            f"baseline={baseline_completion_order!r}, "
+            f"recovery={recovery_completion_order!r}"
+        )
+    print(
+        "logical rollout completion order "
+        + ("matches" if completion_order_matches else "differs")
+        + " between uninterrupted and recovery runs",
+        flush=True,
+    )
     if baseline_completions != recovery_completions:
         raise AssertionError(
             "logical completion rewards differ between uninterrupted and recovery runs"
@@ -525,13 +745,19 @@ def _parser() -> argparse.ArgumentParser:
 
     compare = commands.add_parser("compare")
     compare.add_argument("--baseline-events", type=Path, required=True)
-    compare.add_argument("--recovery-events", type=Path, required=True)
+    compare.add_argument(
+        "--recovery-events", type=Path, action="append", required=True
+    )
     compare.add_argument("--baseline-log-dir", type=Path, required=True)
     compare.add_argument("--recovery-log-dir", type=Path, required=True)
     compare.add_argument("--baseline-metrics", type=Path, required=True)
     compare.add_argument("--recovery-metrics", type=Path, required=True)
     compare.add_argument("--baseline-audit", type=Path, required=True)
-    compare.add_argument("--recovery-audit", type=Path, required=True)
+    compare.add_argument(
+        "--recovery-audit", type=Path, action="append", required=True
+    )
+    compare.add_argument("--timeline-output", type=Path)
+    compare.add_argument("--require-completion-order-match", action="store_true")
     compare.add_argument("--steps", type=int, required=True)
     compare.add_argument("--prompts-per-step", type=int, required=True)
     compare.add_argument("--generations-per-prompt", type=int, required=True)

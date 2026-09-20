@@ -15,6 +15,7 @@
 import argparse
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -112,6 +113,29 @@ def test_inspect_cut_candidate_selects_requested_agent(
     assert selected["prefix_token_count"] == 12
 
 
+def test_published_snapshots_skips_snapshot_retired_mid_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_dir = tmp_path / "checkpoints"
+    survivor = checkpoint_dir / "bootstrap/rollout_snapshots/snapshot_000001"
+    retired = checkpoint_dir / "bootstrap/rollout_snapshots/snapshot_000002"
+    for path in (survivor, retired):
+        path.mkdir(parents=True)
+        (path / "manifest.json").write_text("{}")
+
+    real_stat = Path.stat
+
+    def _stat(self: Path, **kwargs: object) -> os.stat_result:
+        if self == retired:
+            raise FileNotFoundError(2, "No such file or directory", str(self))
+        return real_stat(self, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", _stat)
+
+    assert _HELPER._published_snapshots(checkpoint_dir) == [survivor]
+
+
 def test_prune_to_selection_removes_only_newer_progress(tmp_path: Path) -> None:
     checkpoint_dir = tmp_path / "checkpoints"
     selected = checkpoint_dir / "step_2/rollout_snapshots/snapshot_000002"
@@ -153,24 +177,31 @@ def _events(*, retried: bool) -> list[dict]:
         records.append(
             {
                 "event": "dispatch",
+                "timestamp_ns": (len(records) + 1) * 1_000_000_000,
                 "group_id": f"random-{target_step}-{prompt_idx}",
                 "target_step": target_step,
                 "prompt_idx": prompt_idx,
                 "task_source": task_source,
-                "rollout_ids": [f"r{prompt_idx}{suffix}"],
+                "generation_indices": [0, 1],
+                "rollout_ids": [
+                    f"r{prompt_idx}_g0{suffix}",
+                    f"r{prompt_idx}_g1{suffix}",
+                ],
             }
         )
-        records.extend(
-            {
-                "event": "completion_forwarded",
-                "target_step": target_step,
-                "prompt_idx": prompt_idx,
-                "task_source": task_source,
-                "generation_index": generation_index,
-                "reward": float(prompt_idx),
-            }
-            for generation_index in range(2)
-        )
+        for generation_index in range(2):
+            records.append(
+                {
+                    "event": "completion_forwarded",
+                    "timestamp_ns": (len(records) + 1) * 1_000_000_000,
+                    "target_step": target_step,
+                    "prompt_idx": prompt_idx,
+                    "task_source": task_source,
+                    "generation_index": generation_index,
+                    "reward": float(prompt_idx),
+                    "rollout_id": f"r{prompt_idx}_g{generation_index}{suffix}",
+                }
+            )
     return records
 
 
@@ -230,19 +261,21 @@ def _write_compare_fixture(tmp_path: Path) -> argparse.Namespace:
     )
     return argparse.Namespace(
         baseline_events=baseline_events,
-        recovery_events=recovery_events,
+        recovery_events=[recovery_events],
         baseline_log_dir=baseline_logs,
         recovery_log_dir=recovery_logs,
         baseline_metrics=baseline_metrics,
         recovery_metrics=recovery_metrics,
         baseline_audit=baseline_audit,
-        recovery_audit=recovery_audit,
+        recovery_audit=[recovery_audit],
         steps=1,
         prompts_per_step=2,
         generations_per_prompt=2,
         required_retried_task_source=["simple", "workplace"],
         rtol=1e-5,
         atol=1e-6,
+        timeline_output=None,
+        require_completion_order_match=False,
     )
 
 
@@ -252,12 +285,71 @@ def test_compare_runs_accepts_logically_identical_multi_crash_run(
     _HELPER.compare_runs(_write_compare_fixture(tmp_path))
 
 
+def test_compare_runs_accepts_stage_replayed_after_prune(tmp_path: Path) -> None:
+    args = _write_compare_fixture(tmp_path)
+    crashed_events = _events(retried=False)
+    for record in crashed_events:
+        if record["event"] == "completion_forwarded":
+            record["reward"] = 99.0
+    crashed_stage = tmp_path / "recovery-events-stage0.jsonl"
+    _write_jsonl(crashed_stage, crashed_events)
+    args.recovery_events.insert(0, crashed_stage)
+
+    crashed_audit = tmp_path / "recovery-audit-stage0.jsonl"
+    _write_jsonl(
+        crashed_audit,
+        [{"event": "mutation_applied", "sentinel_count": 1}],
+    )
+    args.recovery_audit.insert(0, crashed_audit)
+
+    stale = args.recovery_log_dir / "exp_001/train_data_step1.jsonl"
+    stale_record = _training_record()
+    stale_record["token_ids"][-1] = 4
+    _write_jsonl(stale, [stale_record])
+    survivor = args.recovery_log_dir / "exp_002/train_data_step1.jsonl"
+    os.utime(stale, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(survivor, ns=(2_000_000_000, 2_000_000_000))
+
+    _HELPER.compare_runs(args)
+
+
+def test_compare_runs_ignores_untrained_lookahead_events(tmp_path: Path) -> None:
+    args = _write_compare_fixture(tmp_path)
+    records = _events(retried=True)
+    records.extend(
+        [
+            {
+                "event": "dispatch",
+                "timestamp_ns": 20_000_000_000,
+                "target_step": 1,
+                "prompt_idx": 2,
+                "task_source": "simple",
+                "generation_indices": [0],
+                "rollout_ids": ["lookahead_g0"],
+            },
+            {
+                "event": "completion_forwarded",
+                "timestamp_ns": 21_000_000_000,
+                "target_step": 1,
+                "prompt_idx": 2,
+                "task_source": "simple",
+                "generation_index": 0,
+                "rollout_id": "lookahead_g0",
+                "reward": 123.0,
+            },
+        ]
+    )
+    _write_jsonl(args.recovery_events[0], records)
+
+    _HELPER.compare_runs(args)
+
+
 def test_compare_runs_rejects_changed_prompt_order(tmp_path: Path) -> None:
     args = _write_compare_fixture(tmp_path)
     records = _events(retried=True)
     first = records.pop(0)
     records.insert(3, first)
-    _write_jsonl(args.recovery_events, records)
+    _write_jsonl(args.recovery_events[0], records)
 
     with pytest.raises(AssertionError, match="logical prompt order differs"):
         _HELPER.compare_runs(args)
@@ -267,10 +359,86 @@ def test_compare_runs_rejects_duplicate_completion(tmp_path: Path) -> None:
     args = _write_compare_fixture(tmp_path)
     records = _events(retried=True)
     records.append(dict(records[1]))
-    _write_jsonl(args.recovery_events, records)
+    _write_jsonl(args.recovery_events[0], records)
 
     with pytest.raises(AssertionError, match="forwarded twice"):
         _HELPER.compare_runs(args)
+
+
+def test_compare_runs_rejects_changed_completion_order(tmp_path: Path) -> None:
+    args = _write_compare_fixture(tmp_path)
+    args.require_completion_order_match = True
+    records = _events(retried=True)
+    records[1], records[2] = records[2], records[1]
+    _write_jsonl(args.recovery_events[0], records)
+
+    with pytest.raises(AssertionError, match="logical completion order differs"):
+        _HELPER.compare_runs(args)
+
+
+def test_compare_runs_reports_changed_completion_order_by_default(
+    tmp_path: Path,
+) -> None:
+    args = _write_compare_fixture(tmp_path)
+    args.timeline_output = tmp_path / "rollout-timeline.json"
+    records = _events(retried=True)
+    records[1], records[2] = records[2], records[1]
+    _write_jsonl(args.recovery_events[0], records)
+
+    _HELPER.compare_runs(args)
+
+    timeline = json.loads(args.timeline_output.read_text())
+    assert timeline["completion_order_matches"] is False
+
+
+def test_compare_runs_writes_rollout_timeline(tmp_path: Path) -> None:
+    args = _write_compare_fixture(tmp_path)
+    args.timeline_output = tmp_path / "rollout-timeline.json"
+
+    _HELPER.compare_runs(args)
+
+    timeline = json.loads(args.timeline_output.read_text())
+    assert timeline["completion_order_matches"] is True
+    assert [
+        entry["effective_completion_rank"] for entry in timeline["baseline"]
+    ] == [
+        0,
+        1,
+        2,
+        3,
+    ]
+    assert timeline["recovery"][0]["dispatches"][0]["rollout_id"] == "r0_g0-a1"
+
+
+def test_rollout_timeline_accepts_subset_redispatch() -> None:
+    stages = [
+        [
+            {
+                "event": "dispatch",
+                "timestamp_ns": 1,
+                "target_step": 0,
+                "prompt_idx": 0,
+                "task_source": "simple",
+                "generation_indices": [1],
+                "rollout_ids": ["r0_g1-a1"],
+            },
+            {
+                "event": "completion_forwarded",
+                "timestamp_ns": 2,
+                "target_step": 0,
+                "prompt_idx": 0,
+                "task_source": "simple",
+                "generation_index": 1,
+                "rollout_id": "r0_g1-a1",
+                "reward": 1.0,
+            },
+        ]
+    ]
+    order, _ = _HELPER._effective_completions(stages)
+
+    timeline = _HELPER._rollout_timeline(stages, effective_order=order)
+
+    assert timeline[0]["dispatches"][0]["rollout_id"] == "r0_g1-a1"
 
 
 def test_compare_runs_rejects_changed_tokens(tmp_path: Path) -> None:
