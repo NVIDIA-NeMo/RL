@@ -851,6 +851,90 @@ SingleController, however, each individual tensor must currently fit because
 the CPU PUT path does not create the chunk metadata required by an oversized
 GDR GET.
 
+### Experimental Mooncake storage checkpoints
+
+The existing `checkpointing.enabled=true` and
+`checkpointing.save_data_plane=true` settings enable Mooncake storage save/load
+support through TQ's existing explicit checkpoint API. Resuming a checkpoint
+also prepares this storage mode, even when saving new checkpoints is disabled.
+No additional Mooncake-specific checkpoint setting is needed. Ordinary PUTs
+remain in Mooncake memory and perform no checkpoint-related filesystem I/O.
+
+On `tq.save_checkpoint(...)`, existing workers query disjoint slices of the
+controller's object keys and group their ownership metadata by destination.
+Ray object references route those groups directly to the owners; the
+coordinator forwards references, not per-object addresses or sizes. Each owner
+writes directly from its own hard-pinned CPU memory into one packed shard and
+an offset/size index. SAVE performs no native GET, staging-buffer copy, or
+buffer registration. Only metadata moves between processes. For multiple
+complete replicas, a canonical live owner is selected; this prioritizes
+locality, not global byte balancing. The coordinator publishes the small shard
+manifest after every owner has flushed, fsynced, and acknowledged its shard.
+
+SingleController supplies its existing policy/value/teacher, generation
+DP-leader (when token capture is enabled), and finalizer actor handles. Their
+Ray methods carry checkpoint commands and completion metadata only; each method
+uses its process's existing Mooncake store. No checkpoint actors, registry,
+listener threads, or additional socket protocol are created. The calling actor
+handles its own shard directly, so constructor-time restore never waits for an
+RPC back to itself.
+
+For runs that save or resume checkpoints, non-actor clients (including the driver) mount
+zero storage capacity: they can still PUT/GET through Mooncake, but cannot own
+payload that the controller has no actor endpoint to command. Actors retain
+their configured segment sizes. This removes the driver's segment from the
+available capacity; it does not add storage workers. Other callers of the
+plugin must supply their existing owner handles with
+`configure_checkpoint_workers(...)` before save/load. Unreachable owners fail
+the checkpoint rather than silently falling back to centralized copying.
+
+On `tq.load_checkpoint(...)`, the plugin balances saved shards over currently
+connected clients. In one restore round, each client reads its indexes, checks
+its destination keys are absent, and loads its slices from the shared
+filesystem. There is no separate preflight round or extra controller-key scan.
+Each client requests its own Mooncake segment as the preferred
+destination, but Mooncake may place an object on another current participant
+when that segment lacks capacity. Saved process and segment identities are
+provenance only and are not reused after restart. TQ restores controller
+metadata only after every object has a complete, correctly sized memory replica
+on a current checkpoint participant. No separate Mooncake `storage_root` is
+configured; the explicit TQ checkpoint destination is the persistent location.
+
+Checkpoints use checksum-free format v3: no payload or index hashes are computed
+or verified. Earlier development formats are not supported. File/size and
+native-operation errors still fail the checkpoint.
+Each control-plane Ray wait uses a 200-second timeout, matching TQ Simple's
+default storage-request timeout. This is not a deadline for the whole checkpoint.
+
+This module supplies storage capability only. A caller such as Single
+Controller remains responsible for choosing the checkpoint boundary. Objects
+selected by the controller snapshot must remain unchanged until all SAVE
+acknowledgements complete. Generation may keep writing unrelated fresh keys,
+while commits and destructive clears wait at the existing checkpoint barrier.
+Direct SAVE supports the TCP/RDMA CPU segments created by TQ's Mooncake client,
+including when GDR staging is enabled. Overwrites, replica movement, segment
+unmount and store close
+affecting selected objects must also wait until SAVE finishes: hard pinning
+prevents eviction, not explicit mutation, and the writer borrows local addresses
+rather than acquiring a new native memory lease. Same-host peer addresses are
+not local process addresses. The checkpoint contains every controller-referenced
+TQ field as encoded raw objects, including log probabilities, router indices,
+non-tensor values, and GDR chunks. It does
+not contain model weights, unfinished generations, vLLM KV cache, or Gym state.
+
+Restore requires a fresh, empty Mooncake/TQ system. Attach every client that
+contributes Mooncake memory capacity first, keep the saved GDR mode and staging
+size unchanged, call `tq.load_checkpoint` before starting producers, and restart
+from an empty master before retrying a failed load. Multi-node validation must
+exercise save, process restart, load, and read on the intended training topology.
+The adapter internally enables hard-pinned memory replicas and disables Mooncake
+offload for runs that save or resume checkpoints; these are not additional user
+configuration knobs. Workers inherit this storage mode from TQ's controller.
+Other jobs keep TQ's storage defaults. This version supports NeMo-RL's HTTP
+metadata mode and rejects `P2PHANDSHAKE`,
+whose public Mooncake API does not expose the local transfer endpoint needed for
+exact owner matching.
+
 Capacity rule of thumb (any backend):
 
 ```
