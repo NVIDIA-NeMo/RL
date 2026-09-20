@@ -17,8 +17,8 @@ cd "$(dirname "$0")/../.."
 
 # --extra diffusion: diffusers lives behind the optional extra and is not
 # part of the base CI environment. The policy worker itself launches in the
-# automodel+diffusion venv via the actor registry
-# (PY_EXECUTABLES.AUTOMODEL_DIFFUSION). Other environments can inject an
+# automodel+diffusion venv declared for it in
+# nemo_rl/distributed/actor_environments.py. Other environments can inject an
 # interpreter via NRL_PYTHON.
 PY=${NRL_PYTHON:-uv run --frozen --extra diffusion python}
 export PATH="$HOME/.local/bin:$PATH"
