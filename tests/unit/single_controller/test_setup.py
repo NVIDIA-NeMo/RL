@@ -598,6 +598,36 @@ def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
 class TestSetup:
     """setup arg validation + actor_args assembly."""
 
+    @pytest.mark.parametrize("colocated", [False, True])
+    def test_nvfp4_pertoken_rejected_before_setup_factories(
+        self, patched_factories: dict[str, Any], colocated: bool
+    ) -> None:
+        mc = _make_master_config(colocated=colocated, megatron_enabled=True)
+        mc.policy["generation"]["nvfp4_pertoken_rollout"] = {"enabled": True}
+
+        with pytest.raises(
+            ValueError,
+            match="SingleController does not support generation.nvfp4_pertoken_rollout",
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        for factory in (
+            "setup_response_data",
+            "_build_clusters",
+            "_build_generation",
+            "_build_trainer",
+        ):
+            patched_factories[factory].assert_not_called()
+
+    @pytest.mark.parametrize("rollout", [None, {"enabled": False}])
+    def test_nvfp4_pertoken_off_preserves_single_controller_validation(
+        self, rollout: dict[str, bool] | None
+    ) -> None:
+        mc = _make_master_config()
+        if rollout is not None:
+            mc.policy["generation"]["nvfp4_pertoken_rollout"] = rollout
+        validate_single_controller_config(mc)
+
     def test_reward_penalties_are_typed(self):
         assert isinstance(_make_master_config().reward_penalties, RewardPenaltyConfig)
 

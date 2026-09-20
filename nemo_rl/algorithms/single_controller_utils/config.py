@@ -59,6 +59,10 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
+from nemo_rl.models.generation.vllm.config import (
+    VllmConfig,
+    parse_nvfp4_pertoken_rollout,
+)
 from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.value import ValueConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
@@ -1136,6 +1140,17 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
     async_config = master_config.async_rl
     generation_config = master_config.policy["generation"]
+    if (
+        generation_config["backend"] == "vllm"
+        and parse_nvfp4_pertoken_rollout(cast(VllmConfig, generation_config))
+        is not None
+    ):
+        raise ValueError(
+            "SingleController does not support generation.nvfp4_pertoken_rollout: "
+            "the mode requires colocated vLLM rollout, while SingleController "
+            "requires non-colocated vLLM rollout. Disable nvfp4_pertoken_rollout "
+            "or use the supported GRPO entry point examples/run_grpo.py."
+        )
     if generation_config["colocated"]["enabled"]:
         if generation_config["backend"] != "megatron":
             raise ValueError(

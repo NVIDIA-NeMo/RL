@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from datasets import Dataset
+from datasets import Dataset, Features, Value
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 
@@ -35,12 +35,20 @@ class NemoGymDataset(RawDataset):
         with open(data_path) as f:
             self.dataset = [raw_line for raw_line in f]
 
-        # format the dataset
+        # Datasets 5.0.1 combines Arrow chunks when computing the fingerprint.
+        # Raw JSON columns can exceed the ~2 GiB limit of string's 32-bit offsets;
+        # large_string uses 64-bit offsets so fingerprinting does not overflow.
         self.dataset = Dataset.from_dict(
             {
                 "extra_env_info": self.dataset,
                 "task_name": [self.task_name] * len(self.dataset),
-            }
+            },
+            features=Features(
+                {
+                    "extra_env_info": Value("large_string"),
+                    "task_name": Value("string"),
+                }
+            ),
         )
 
         # repeat the dataset
