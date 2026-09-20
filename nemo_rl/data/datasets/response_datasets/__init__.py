@@ -24,6 +24,7 @@ from nemo_rl.data.datasets.response_datasets.daily_omni import DailyOmniDataset
 from nemo_rl.data.datasets.response_datasets.dapo_math import (
     DAPOMath17KDataset,
     DAPOMathAIME2024Dataset,
+    DAPOMathAIME2024DeduplicatedDataset,
 )
 from nemo_rl.data.datasets.response_datasets.deepscaler import DeepScalerDataset
 from nemo_rl.data.datasets.response_datasets.general_conversations_dataset import (
@@ -72,6 +73,7 @@ DATASET_REGISTRY = {
     "general-conversation-jsonl": GeneralConversationsJsonlDataset,
     "DAPOMath17K": DAPOMath17KDataset,
     "DAPOMathAIME2024": DAPOMathAIME2024Dataset,
+    "DAPOMathAIME2024Deduplicated": DAPOMathAIME2024DeduplicatedDataset,
     "DeepScaler": DeepScalerDataset,
     "GSM8K": GSM8KDataset,
     "geometry3k": Geometry3KDataset,
@@ -151,6 +153,7 @@ __all__ = [
     "GeneralConversationsJsonlDataset",
     "DAPOMath17KDataset",
     "DAPOMathAIME2024Dataset",
+    "DAPOMathAIME2024DeduplicatedDataset",
     "GSM8KDataset",
     "DeepScalerDataset",
     "Geometry3KDataset",

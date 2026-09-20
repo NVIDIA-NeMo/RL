@@ -63,3 +63,24 @@ class DAPOMathAIME2024Dataset(DAPOMath17KDataset):
             self.format_data,
             remove_columns=self.dataset.column_names,
         )
+
+
+class DAPOMathAIME2024DeduplicatedDataset(DAPOMathAIME2024Dataset):
+    """Keep the first occurrence of each prompt, requiring consistent answers."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        answers = {}
+        indices = []
+        for index, messages in enumerate(self.dataset["messages"]):
+            prompt = messages[0]["content"]
+            answer = messages[1]["content"]
+            if prompt in answers:
+                if answers[prompt] != answer:
+                    raise ValueError(
+                        "Duplicate AIME prompt has conflicting ground-truth answers"
+                    )
+            else:
+                answers[prompt] = answer
+                indices.append(index)
+        self.dataset = self.dataset.select(indices)
