@@ -136,6 +136,26 @@ def test_published_snapshots_skips_snapshot_retired_mid_scan(
     assert _HELPER._published_snapshots(checkpoint_dir) == [survivor]
 
 
+def test_published_snapshots_ignores_uncommitted_trainer_anchors(
+    tmp_path: Path,
+) -> None:
+    checkpoint_dir = tmp_path / "checkpoints"
+    bootstrap = checkpoint_dir / "bootstrap/rollout_snapshots/snapshot_000001"
+    published = checkpoint_dir / "step_2/rollout_snapshots/snapshot_000001"
+    temporary = checkpoint_dir / "tmp_step_3/rollout_snapshots/snapshot_000001"
+    replaced = checkpoint_dir / "old_step_4/rollout_snapshots/snapshot_000001"
+    for path in (bootstrap, published, temporary, replaced):
+        path.mkdir(parents=True)
+        (path / "manifest.json").write_text("{}")
+
+    os.utime(bootstrap, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(published, ns=(2_000_000_000, 2_000_000_000))
+    os.utime(temporary, ns=(4_000_000_000, 4_000_000_000))
+    os.utime(replaced, ns=(3_000_000_000, 3_000_000_000))
+
+    assert _HELPER._published_snapshots(checkpoint_dir) == [published, bootstrap]
+
+
 def test_prune_to_selection_removes_only_newer_progress(tmp_path: Path) -> None:
     checkpoint_dir = tmp_path / "checkpoints"
     selected = checkpoint_dir / "step_2/rollout_snapshots/snapshot_000002"
