@@ -354,21 +354,18 @@ nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v
 # FlashMLA derives its version from the Git revision in setup.py. Keep this pin
 # synchronized with the static dependency metadata below.
 flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA", rev = "b7643bd54521f563b839b98289b5cd048c062ba2" }
-# Pinned to exactly 5dde396bd (2026-08-04, "Fix vLLM 0.24+ compatibility"): it is the
-# first commit whose vLLM plugin survives vLLM 0.28 (the older plugin registers on
-# `fused_moe.layer.FusedMoE`, which 0.28 removed; ModelOpt swallows that AttributeError in
-# `import_plugin`, and NeMo-RL's explicit re-import then fails with "RowParallelLinear
-# already registered"). Do NOT move past 2ded5aba3 (#1550, 2026-08-07) without porting
-# nemo_rl/modelopt: it introduces per-expert `GroupedQuantizer` modules that break the
-# Megatron fakequant DDP hook bookkeeping (`KeyError: GroupedQuantizer(...)` in
-# `disable_forward_pre_hook`) and real-quant dist-checkpoint sharding validation
-# (`Invalid access pattern for ShardedTensor(... experts.N.linear_fc1.weight_quantizer._amax`).
-nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "5dde396bdf29c13636162840669d3f69002af9e6" }
+# Pinned to 43fd41a58 (2026-08-15, release cherry-pick branch). It carries #2054 ("Fix vLLM
+# 0.24+ compatibility": the vLLM plugin registers on `RoutedExperts`; the older plugin
+# registered on `fused_moe.layer.FusedMoE`, which vLLM >= 0.28 removed, and NeMo-RL's explicit
+# re-import then failed with "RowParallelLinear already registered") but NOT 2ded5aba3
+# (#1550, 2026-08-07). Do not move to a revision that contains #1550 without porting
+# nemo_rl/modelopt: its per-expert `GroupedQuantizer` modules break the Megatron fakequant
+# DDP hook bookkeeping (`KeyError: GroupedQuantizer(...)` in `disable_forward_pre_hook`) and
+# real-quant dist-checkpoint sharding validation (`Invalid access pattern for
+# ShardedTensor(... experts.N.linear_fc1.weight_quantizer._amax`).
+nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "43fd41a58d52c4e6e5dec1d1ff5989ecc737ae1a" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.6.0" }
-flashinfer-cubin = [
-  { index = "flashinfer", extra = "sglang" },
-  { index = "flashinfer", extra = "vllm" },
-]
+flashinfer-cubin = { index = "flashinfer" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
 
 [tool.uv.workspace]
@@ -410,7 +407,6 @@ environments = [
 preview = true # Enable preview features like extra-build-dependencies
 no-build-isolation-package = [
   "transformer-engine-torch",
-  "transformer-engine",
   "flash-attn",
   "mamba-ssm",
   "causal-conv1d",
@@ -438,7 +434,7 @@ link-mode = "copy"
 # vllm defaults to opencv for video IO but falls back to torchcodec.
 # The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
-  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.15",
+  "transformer-engine[pytorch,core_cu13]==2.18.0",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
   "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
@@ -574,7 +570,6 @@ flash-attn = [{ requirement = "torch", match-runtime = true }]
 # Git-sourced packages CAN use match-runtime = true if we provide dependency-metadata
 deep_ep = [{ requirement = "torch", match-runtime = true }]
 deep_gemm = [{ requirement = "torch", match-runtime = true }]
-transformer-engine = [{ requirement = "torch", match-runtime = true }]
 transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
@@ -593,6 +588,42 @@ torch-memory-saver = { TMS_CUDA_MAJOR = "13" }
 # `Killed "$CICC_PATH/cicc"`) on both x86 and aarch64. 4 jobs x 4 threads built cleanly on
 # both architectures (2h47m aarch64, ~2h x86 alongside TE/flash-mla).
 flash-attn = { MAX_JOBS = "4" }
+
+# CUTLASS DSL 4.5.x publishes overlapping base and cu13 wheels. Override the
+# affected metadata so those versions use the self-contained cu13 wheel, while
+# 4.6.x retains libs-base/libs-core for its common Python and MLIR modules.
+[[tool.uv.dependency-metadata]]
+name = "nvidia-cutlass-dsl"
+version = "4.5.0"
+requires-dist = ["nvidia-cutlass-dsl-libs-cu13==4.5.0; extra == 'cu13'"]
+provides-extras = ["cu13"]
+
+[[tool.uv.dependency-metadata]]
+name = "nvidia-cutlass-dsl"
+version = "4.5.1"
+requires-dist = ["nvidia-cutlass-dsl-libs-cu13==4.5.1; extra == 'cu13'"]
+provides-extras = ["cu13"]
+
+[[tool.uv.dependency-metadata]]
+name = "nvidia-cutlass-dsl"
+version = "4.5.2"
+requires-dist = ["nvidia-cutlass-dsl-libs-cu13==4.5.2; extra == 'cu13'"]
+provides-extras = ["cu13"]
+
+[[tool.uv.dependency-metadata]]
+name = "nvidia-cutlass-dsl-libs-cu13"
+version = "4.5.0"
+requires-dist = ["numpy", "typing-extensions", "cuda-python>=12.8"]
+
+[[tool.uv.dependency-metadata]]
+name = "nvidia-cutlass-dsl-libs-cu13"
+version = "4.5.1"
+requires-dist = ["numpy", "typing-extensions", "cuda-python>=12.8"]
+
+[[tool.uv.dependency-metadata]]
+name = "nvidia-cutlass-dsl-libs-cu13"
+version = "4.5.2"
+requires-dist = ["numpy", "typing-extensions", "cuda-python>=12.8"]
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
@@ -632,16 +663,6 @@ name = "deep_gemm"
 # This version has to match the version in the commit/rev/tag used
 version = "2.5.0"
 requires-dist = ["torch", "packaging", "ninja"]
-
-[[tool.uv.dependency-metadata]]
-name = "transformer-engine"
-version = "2.15.0+42b8400"
-requires-dist = ["torch", "pydantic", "importlib-metadata>=1.0", "packaging"]
-
-[[tool.uv.dependency-metadata]]
-name = "transformer-engine-torch"
-version = "2.15.0+42b8400"
-requires-dist = ["torch", "transformer-engine"]
 
 [[tool.uv.dependency-metadata]]
 name = "nv-grouped-gemm"

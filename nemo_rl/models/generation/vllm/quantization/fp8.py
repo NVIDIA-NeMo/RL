@@ -26,7 +26,6 @@ from transformers import AutoConfig, AutoModel
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
-from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.utils import replace_parameter
 from vllm.triton_utils import tl, triton
@@ -34,13 +33,15 @@ from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
 
 from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
-from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
 from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
     assign_or_replace_parameter,
     flashinfer_mxfp8_moe_padding_plan,
     pad_flashinfer_scale_k,
     pad_tensor_dim,
     pad_w13_intermediate,
+)
+from nemo_rl.models.generation.vllm.quantization.utils import (
+    resolve_module_from_param_name,
 )
 from nemo_rl.models.generation.vllm.utils import is_grouped_moe_expert_weight_name
 
@@ -494,79 +495,19 @@ def _get_params_in_layers(param_names, layers):
     return params
 
 
-def _get_module_from_param_name(model, name: str):
-    name = deepseek_v4_fp8.map_checkpoint_name(model, name)
+def get_module_from_param_name(model, name: str):
+    """Resolve the vLLM submodule owning an HF-named parameter.
 
-    # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
-    # The module path is all but the last part (the parameter's own name)
-    path_parts = name.split(".")
-    module_path = path_parts[:-1]
-    # Replace with the fused model name. A shard name that several fused
-    # modules share (vLLM >= 0.29's DeepSeek V4 lists ``wkv`` under both
-    # ``fused_wqa_wkv`` and ``fused_wkv_wgate``) cannot be resolved from the
-    # leaf alone; leave it for the parent-aware DeepSeek V4 remap below instead
-    # of picking whichever fused module happened to come last.
-    packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
-    reversed_mapping: dict[str, str] = {}
-    ambiguous_shards: set[str] = set()
-    for fused_name, original_names_list in packed_modules_mapping.items():
-        for original_name in original_names_list:
-            if reversed_mapping.setdefault(original_name, fused_name) != fused_name:
-                ambiguous_shards.add(original_name)
-    leaf = module_path[-1]
-    if leaf in reversed_mapping and leaf not in ambiguous_shards:
-        module_path[-1] = reversed_mapping[leaf]
-
-    module_path = deepseek_v4_fp8.remap_packed_module_path(model, module_path)
-
-    if hasattr(model, "hf_to_vllm_mapper") and hasattr(
-        model.hf_to_vllm_mapper, "orig_to_new_prefix"
-    ):
-        if module_path[0] in model.hf_to_vllm_mapper.orig_to_new_prefix:
-            module_path[0] = model.hf_to_vllm_mapper.orig_to_new_prefix[module_path[0]]
-    if hasattr(model, "hf_to_vllm_mapper") and hasattr(
-        model.hf_to_vllm_mapper, "orig_to_new_substr"
-    ):
-        for i in range(len(module_path)):
-            if module_path[i] in model.hf_to_vllm_mapper.orig_to_new_substr:
-                module_path[i] = model.hf_to_vllm_mapper.orig_to_new_substr[
-                    module_path[i]
-                ]
-
-    current_module = model
-    try:
-        # Traverse the model hierarchy
-        for part in module_path:
-            # vLLM 0.25 split the old FusedMoE module into a MoERunner that
-            # delegates to a RoutedExperts submodule owning the expert weights
-            # (w13_weight/w2_weight), so stop at either and return the
-            # weight-owning module.
-            if isinstance(current_module, MoERunner):
-                return current_module.routed_experts
-            if isinstance(current_module, RoutedExperts):
-                return current_module
-            if part == "model" and not hasattr(current_module, part):
-                # Some HF/vLLM model classes expose the decoder directly (for
-                # example ``language_model``) while parameter names still carry
-                # vLLM's synthetic ``model.`` prefix.
-                continue
-            if part == "layers" and not hasattr(current_module, part):
-                # Qwen3.5-MoE VL exposes ``language_model`` as a CausalLM
-                # wrapper; its decoder stack lives under ``language_model.model``.
-                wrapped_model = getattr(current_module, "model", None)
-                if wrapped_model is not None and hasattr(wrapped_model, part):
-                    current_module = wrapped_model
-            if isinstance(current_module, torch.nn.ModuleList):
-                current_module = current_module[int(part)]
-            else:
-                current_module = getattr(current_module, part)
-    except (AttributeError, IndexError, ValueError) as e:
-        print(f"Warning: Could not find module for parameter '{name}'. Error: {e}")
-    # Fused param names (e.g. "...experts.w13_weight") end the traversal on the
-    # MoERunner itself; normalize to the weight-owning RoutedExperts submodule.
-    if isinstance(current_module, MoERunner):
-        return current_module.routed_experts
-    return current_module
+    Walks ``name``'s dotted path through ``model``, remapping fused/renamed
+    prefixes via ``packed_modules_mapping`` and ``hf_to_vllm_mapper``, and
+    stopping early at a ``RoutedExperts`` (or its owning ``MoERunner``) since
+    per-expert path components below that point do not exist as submodules.
+    """
+    resolution = resolve_module_from_param_name(model, name)
+    if resolution is None:
+        print(f"Warning: Could not find module for parameter '{name}'.")
+        return None
+    return resolution.module
 
 
 def _is_fp8_weight(name, model):
@@ -574,7 +515,7 @@ def _is_fp8_weight(name, model):
         fp8_state.seen_params.add(name)
         # Filter out bias params
         if name.endswith("weight"):
-            module = _get_module_from_param_name(model, name)
+            module = get_module_from_param_name(model, name)
             # We currently only quantize linear layers
             if (
                 isinstance(module, LinearBase)
@@ -590,7 +531,7 @@ def _is_fp8_weight(name, model):
 
 
 def _is_fp8_grouped_moe_expert(name: str, model: Any) -> bool:
-    experts_module = _get_module_from_param_name(model, name)
+    experts_module = get_module_from_param_name(model, name)
     return (
         isinstance(experts_module, RoutedExperts)
         and experts_module.w13_weight.dtype == torch.float8_e4m3fn
