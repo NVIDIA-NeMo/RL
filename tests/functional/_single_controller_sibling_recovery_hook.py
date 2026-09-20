@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -65,7 +66,13 @@ class _InstrumentedNemoGymRolloutImpl:
     def _append_event(self, event: str, **fields: Any) -> None:
         self._events_path.parent.mkdir(parents=True, exist_ok=True)
         with self._events_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"event": event, **fields}, sort_keys=True) + "\n")
+            stream.write(
+                json.dumps(
+                    {"event": event, "timestamp_ns": time.time_ns(), **fields},
+                    sort_keys=True,
+                )
+                + "\n"
+            )
 
     def _find_group(self, rollout_ids: list[str]) -> Any:
         rollout_id_set = set(rollout_ids)
@@ -137,7 +144,10 @@ class _InstrumentedNemoGymRolloutImpl:
             "task_source": group.task_source,
             "target_step": group.target_step,
             "generation_indices": indices,
-            "rollout_ids": capture_rollout_ids,
+            # ``rollout_ids`` and ``attempt_indices`` cover the complete logical
+            # group, while ``generation_indices`` may contain only the siblings
+            # redispatched after recovery. Keep the event fields positional.
+            "rollout_ids": [capture_rollout_ids[index] for index in indices],
         }
         self._append_event("dispatch", **fields)
 
@@ -163,6 +173,11 @@ class _InstrumentedNemoGymRolloutImpl:
                 "generation_index": generation_index,
                 "rollout_id": capture_rollout_ids[generation_index],
             }
+            self._append_event(
+                "completion_arrived",
+                **completion_fields,
+                reward=float(completion.reward),
+            )
             if selected:
                 if not sealed_in_selected_call:
                     await on_completion(generation_index, completion)

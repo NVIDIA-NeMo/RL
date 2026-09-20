@@ -15,11 +15,18 @@ RECOVERY_CHECKPOINT_DIR=$TEST_DIR/recovery-checkpoints
 BASELINE_LOG_DIR=$TEST_DIR/baseline-logs
 RECOVERY_LOG_DIR=$TEST_DIR/recovery-logs
 BASELINE_EVENTS=$TEST_DIR/baseline-events.jsonl
-RECOVERY_EVENTS=$TEST_DIR/recovery-events.jsonl
 BASELINE_AUDIT=$TEST_DIR/baseline-resource-audit.jsonl
-RECOVERY_AUDIT=$TEST_DIR/recovery-resource-audit.jsonl
+# Keep recovery stages separate: work completed after a selected snapshot but
+# before the hard kill is intentionally replayed from that snapshot.
+RECOVERY_EVENTS_STAGE1=$TEST_DIR/recovery-events-stage1.jsonl
+RECOVERY_EVENTS_STAGE2=$TEST_DIR/recovery-events-stage2.jsonl
+RECOVERY_EVENTS_STAGE3=$TEST_DIR/recovery-events-stage3.jsonl
+RECOVERY_AUDIT_STAGE1=$TEST_DIR/recovery-resource-audit-stage1.jsonl
+RECOVERY_AUDIT_STAGE2=$TEST_DIR/recovery-resource-audit-stage2.jsonl
+RECOVERY_AUDIT_STAGE3=$TEST_DIR/recovery-resource-audit-stage3.jsonl
 BASELINE_METRICS=$TEST_DIR/baseline-metrics.json
 RECOVERY_METRICS=$TEST_DIR/recovery-metrics.json
+ROLLOUT_TIMELINE=$TEST_DIR/rollout-timeline.json
 FIRST_SELECTION=$TEST_DIR/workplace-prefix-cut.json
 SECOND_SELECTION=$TEST_DIR/simple-agent-prefix-cut.json
 TEST_DATA=$TEST_DIR/test-data.jsonl
@@ -35,6 +42,7 @@ CUT_INTERVAL_S=${SC_GYM_RECOVERY_PARITY_CUT_INTERVAL_S:-0.25}
 FINAL_INTERVAL_S=${SC_GYM_RECOVERY_PARITY_FINAL_INTERVAL_S:-600}
 CUT_TIMEOUT_S=${SC_GYM_RECOVERY_PARITY_CUT_TIMEOUT_S:-3600}
 RUN_TIMEOUT_S=${SC_GYM_RECOVERY_PARITY_RUN_TIMEOUT_S:-7200}
+REQUIRE_COMPLETION_ORDER_MATCH=${SC_GYM_RECOVERY_PARITY_REQUIRE_COMPLETION_ORDER_MATCH:-0}
 TRAIN_GLOBAL_BATCH_SIZE=$((NUM_PROMPTS * NUM_GENERATIONS))
 
 if [[ "$NUM_PROMPTS" -ne 2 ]]; then
@@ -43,6 +51,12 @@ if [[ "$NUM_PROMPTS" -ne 2 ]]; then
 fi
 if [[ "$MAX_STEPS" -lt 3 ]]; then
     echo "[ERROR] SC_GYM_RECOVERY_PARITY_STEPS must be at least 3."
+    exit 2
+fi
+if [[ "$REQUIRE_COMPLETION_ORDER_MATCH" != "0" ]] && \
+    [[ "$REQUIRE_COMPLETION_ORDER_MATCH" != "1" ]]; then
+    echo "[ERROR] SC_GYM_RECOVERY_PARITY_REQUIRE_COMPLETION_ORDER_MATCH " \
+        "must be 0 or 1."
     exit 2
 fi
 if [[ ! -f "$GYM_ROOT/nemo_gym/_checkpoint/model_control_contracts.py" ]]; then
@@ -172,7 +186,10 @@ COMMON_OVERRIDES=(
     policy.max_total_sequence_length="$MAX_TOTAL_SEQUENCE_LENGTH"
     policy.generation.max_new_tokens="$MIN_GENERATION_TOKENS"
     policy.train_global_batch_size="$TRAIN_GLOBAL_BATCH_SIZE"
-    policy.generation.temperature=0.0
+    # Keep train-time logit scaling finite while making generation effectively
+    # greedy, including the tail regenerated after a restored prefix.
+    policy.generation.temperature=1.0
+    policy.generation.top_p=0.000001
     "env.nemo_gym.config_paths=$GYM_CONFIG_PATHS"
     env.should_log_nemo_gym_responses=false
     '~env.nemo_gym.code_gen'
@@ -191,8 +208,8 @@ echo "=== Recovery stage 1/3: cut a Workplace second-turn prefix ==="
 command -v setsid >/dev/null
 setsid env \
     "${run_environment[@]}" \
-    NEMO_GYM_CHECKPOINT_TEST_EVENTS="$RECOVERY_AUDIT" \
-    SC_SIBLING_RECOVERY_TEST_EVENTS="$RECOVERY_EVENTS" \
+    NEMO_GYM_CHECKPOINT_TEST_EVENTS="$RECOVERY_AUDIT_STAGE1" \
+    SC_SIBLING_RECOVERY_TEST_EVENTS="$RECOVERY_EVENTS_STAGE1" \
     bash "$BASE_TEST" \
     "${COMMON_OVERRIDES[@]}" \
     checkpointing.checkpoint_dir="$RECOVERY_CHECKPOINT_DIR" \
@@ -214,8 +231,8 @@ uv run --directory "$PROJECT_ROOT" --no-sync python "$PARITY_HELPER" \
 echo "=== Recovery stage 2/3: restore, train two steps, cut the simple agent ==="
 setsid env \
     "${run_environment[@]}" \
-    NEMO_GYM_CHECKPOINT_TEST_EVENTS="$RECOVERY_AUDIT" \
-    SC_SIBLING_RECOVERY_TEST_EVENTS="$RECOVERY_EVENTS" \
+    NEMO_GYM_CHECKPOINT_TEST_EVENTS="$RECOVERY_AUDIT_STAGE2" \
+    SC_SIBLING_RECOVERY_TEST_EVENTS="$RECOVERY_EVENTS_STAGE2" \
     bash "$BASE_TEST" \
     "${COMMON_OVERRIDES[@]}" \
     checkpointing.checkpoint_dir="$RECOVERY_CHECKPOINT_DIR" \
@@ -238,8 +255,8 @@ echo "=== Recovery stage 3/3: restore again and finish all $MAX_STEPS steps ==="
 timeout --signal=TERM --kill-after=30s "${RUN_TIMEOUT_S}s" \
     env \
         "${run_environment[@]}" \
-        NEMO_GYM_CHECKPOINT_TEST_EVENTS="$RECOVERY_AUDIT" \
-        SC_SIBLING_RECOVERY_TEST_EVENTS="$RECOVERY_EVENTS" \
+        NEMO_GYM_CHECKPOINT_TEST_EVENTS="$RECOVERY_AUDIT_STAGE3" \
+        SC_SIBLING_RECOVERY_TEST_EVENTS="$RECOVERY_EVENTS_STAGE3" \
         bash "$BASE_TEST" \
         "${COMMON_OVERRIDES[@]}" \
         checkpointing.checkpoint_dir="$RECOVERY_CHECKPOINT_DIR" \
@@ -284,19 +301,30 @@ uv run --directory "$PROJECT_ROOT" --no-sync python tests/json_dump_tb_logs.py \
 uv run --directory "$PROJECT_ROOT" --no-sync python tests/json_dump_tb_logs.py \
     "$RECOVERY_LOG_DIR" --output_path "$RECOVERY_METRICS"
 
+completion_order_args=()
+if [[ "$REQUIRE_COMPLETION_ORDER_MATCH" == "1" ]]; then
+    completion_order_args+=(--require-completion-order-match)
+fi
+
 uv run --directory "$PROJECT_ROOT" --no-sync python "$PARITY_HELPER" compare \
     --baseline-events "$BASELINE_EVENTS" \
-    --recovery-events "$RECOVERY_EVENTS" \
+    --recovery-events "$RECOVERY_EVENTS_STAGE1" \
+    --recovery-events "$RECOVERY_EVENTS_STAGE2" \
+    --recovery-events "$RECOVERY_EVENTS_STAGE3" \
     --baseline-log-dir "$BASELINE_LOG_DIR" \
     --recovery-log-dir "$RECOVERY_LOG_DIR" \
     --baseline-metrics "$BASELINE_METRICS" \
     --recovery-metrics "$RECOVERY_METRICS" \
     --baseline-audit "$BASELINE_AUDIT" \
-    --recovery-audit "$RECOVERY_AUDIT" \
+    --recovery-audit "$RECOVERY_AUDIT_STAGE1" \
+    --recovery-audit "$RECOVERY_AUDIT_STAGE2" \
+    --recovery-audit "$RECOVERY_AUDIT_STAGE3" \
+    --timeline-output "$ROLLOUT_TIMELINE" \
     --steps "$MAX_STEPS" \
     --prompts-per-step "$NUM_PROMPTS" \
     --generations-per-prompt "$NUM_GENERATIONS" \
     --required-retried-task-source example_session_state_mgmt_simple_agent \
-    --required-retried-task-source workplace_assistant_prefix_checkpoint_test_agent
+    --required-retried-task-source workplace_assistant_prefix_checkpoint_test_agent \
+    "${completion_order_args[@]}"
 
 echo "Single-controller Gym uninterrupted-vs-multi-crash recovery parity test passed"
