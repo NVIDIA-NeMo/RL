@@ -35,6 +35,8 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any
 
+import msgspec
+
 if TYPE_CHECKING:
     from fastapi import FastAPI
 
@@ -511,7 +513,13 @@ def create_app(
         # Timeline: this frontend's own receipt boundary. Distinct from vLLM's
         # arrival semantics -- see _tl_timing_fields.
         _tl_arrival_ts_us = time.time_ns() // 1_000
-        body: dict = await request.json()
+        # TRT-LLM's disagg relay sends msgpack bodies with a misleading
+        # Content-Type: application/json; X-TRTLLM-Msgpack is the real
+        # format signal (tensorrt_llm.serve.openai_client.MSGPACK_HEADERS).
+        if request.headers.get("x-trtllm-msgpack") == "1":
+            body: dict = msgspec.msgpack.decode(await request.body())
+        else:
+            body: dict = await request.json()
         messages: list[dict] = body.get("messages", [])
         tools: list[dict] | None = body.get("tools")
         logprobs_requested = body.get("logprobs", False)
