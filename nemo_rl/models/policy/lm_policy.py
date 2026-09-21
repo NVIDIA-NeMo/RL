@@ -1445,6 +1445,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         pp_stages: list[int],
         sub_world_size: int,
         ranks_in_group: list[int],
+        layout_index: int = 0,
     ) -> list[ray.ObjectRef]:
         """Initialize the nccl_reshard bulk-path comm group on all train workers."""
         futures = self.worker_group.run_all_workers_multiple_data(
@@ -1456,6 +1457,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "pp_ports": pp_ports,
                 "pp_size": pp_size,
                 "sub_world_size": sub_world_size,
+                "layout_index": layout_index,
             },
         )
         # co-works with vllm; wait for all futures to complete outside
@@ -1467,6 +1469,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         gen_parallelism: dict[str, Any],
         train_world_size: int,
         gen_world_size: int,
+        layout_index: int = 0,
     ) -> dict[str, Any]:
         """Prepare per-layer param metadata for nccl_reshard refit."""
         futures = self.worker_group.run_all_workers_single_data(
@@ -1475,6 +1478,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             gen_parallelism=gen_parallelism,
             train_world_size=train_world_size,
             gen_world_size=gen_world_size,
+            layout_index=layout_index,
         )
         results = ray.get(futures)
         return results[0]
