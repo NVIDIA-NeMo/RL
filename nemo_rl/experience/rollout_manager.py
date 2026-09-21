@@ -678,7 +678,12 @@ class AsyncRolloutImpl:
             prompt_idx=input_sample["idx"],
             prompt=input_sample["message_log"],
             extra_env_info=input_sample["extra_env_info"],
-            metadata={"task_name": input_sample["task_name"]},
+            metadata={
+                "task_name": input_sample["task_name"],
+                "rollout_environment": _rollout_environment_metric_component(
+                    input_sample["task_name"]
+                ),
+            },
             completions=completions,
             rollout_metrics=rollout_metrics,
             loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
@@ -1214,7 +1219,12 @@ class AsyncNemoGymRolloutImpl:
             prompt_idx=input_sample["idx"],
             prompt=prompt_message_log,
             extra_env_info=record_extra_env_info,
-            metadata={"task_name": "nemo_gym"},
+            metadata={
+                "task_name": "nemo_gym",
+                "rollout_environment": _rollout_environment_metric_component(
+                    _nemo_gym_metric_namespace(rollout_inputs[0])
+                ),
+            },
             completions=completions,
             rollout_metrics=rollout_metrics,
             loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
@@ -2981,6 +2991,9 @@ class RolloutManager:
         )
         pending_group_results: dict[int, SiblingSealResult] = {}
         rollout_metrics: dict[str, Any] = {}
+        rollout_environment = _rollout_environment_metric_component(
+            _nemo_gym_metric_namespace(input_sample.get("extra_env_info") or {})
+        )
 
         async def _record_streamed_completion(
             generation_index: int, completion: Completion
@@ -3128,6 +3141,9 @@ class RolloutManager:
                     # the group, so keep metrics only when every sibling ran.
                     if len(pending_indices) == recovery_group.expected_generations:
                         rollout_metrics = dict(record.rollout_metrics)
+                    rollout_environment = record.metadata.get(
+                        "rollout_environment", rollout_environment
+                    )
             finally:
                 if inflight_registry is not None:
                     inflight_registry.pop(group_id, None)
@@ -3169,6 +3185,7 @@ class RolloutManager:
                 attribution_key=self._recovery_ledger.get_group(
                     group_id
                 ).attribution_key,
+                rollout_environment=rollout_environment,
             )
             assert_metadata_only(request)
             return request, rollout_metrics

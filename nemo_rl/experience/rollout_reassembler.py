@@ -831,6 +831,7 @@ class RolloutReassembler:
         fallback_weight_version: int,
         prompt_idx: int,
         loss_multiplier: float = 1.0,
+        rollout_environment: str = "unknown",
         canonical_sample_ids: Optional[list[str]] = None,
         logical_selections: Optional[list[RolloutSelection]] = None,
         execution_row_multiple: int = 1,
@@ -1281,6 +1282,7 @@ class RolloutReassembler:
             "sample_mask": sample_mask,
             "prompt_ids_for_adv": prompt_ids_for_adv,
             "total_reward": rewards_t,
+            "rollout_environment": rollout_environment,
             MASK_SAMPLE: torch.tensor(mask_sample, dtype=torch.bool),
             TRUNCATED: torch.tensor(
                 self._truncated_flags(rows, logical), dtype=torch.bool

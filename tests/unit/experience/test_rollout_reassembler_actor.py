@@ -96,7 +96,7 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         drop_reason="test",
     )
     actor._finalizer.finalize_group.return_value = result
-    request = replace(_request(), loss_multiplier=0.25)
+    request = replace(_request(), loss_multiplier=0.25, rollout_environment="swe")
 
     assert actor.finalize(request) is result
     actor._finalizer.finalize_group.assert_called_once_with(
@@ -108,6 +108,7 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         fallback_weight_version=4,
         prompt_idx=17,
         loss_multiplier=0.25,
+        rollout_environment="swe",
         canonical_sample_ids=["group_g0"],
         logical_selections=None,
         execution_row_multiple=1,
@@ -201,6 +202,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "attribution_key",
         "reward_checks",
         "reward_log_contexts",
+        "rollout_environment",
     }
     assert {f.name for f in fields(FinalizedGroup)} == {
         "meta",

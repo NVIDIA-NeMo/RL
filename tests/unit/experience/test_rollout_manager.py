@@ -2516,7 +2516,13 @@ class TestGenerateForFinalizationFlow:
 
         request, rollout_metrics = _run(
             mgr.generate_for_finalization(
-                {"prompt": "p", "idx": 0, "loss_multiplier": 0.25}, target_step=5
+                {
+                    "prompt": "p",
+                    "idx": 0,
+                    "loss_multiplier": 0.25,
+                    "extra_env_info": {"agent_ref": {"name": "swe"}},
+                },
+                target_step=5,
             )
         )
 
@@ -2539,6 +2545,7 @@ class TestGenerateForFinalizationFlow:
         assert request.rewards == (0.5, 0.5)
         assert request.mask_sample == (False, False)
         assert request.loss_multiplier == 0.25
+        assert request.rollout_environment == "swe"
         assert request.fallback_weight_version == 7
         # The group's rollout metrics travel next to the request.
         assert rollout_metrics == {"agent/rollout_time_taken/mean": 12.5}

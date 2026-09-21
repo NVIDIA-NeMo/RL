@@ -67,6 +67,7 @@ class ReassemblyRequest:
     resolved_agent_name: Optional[str] = None
     # Taskset or flat-agent attribution, persisted with sealed receipts.
     attribution_key: Optional[str] = None
+    rollout_environment: str = "unknown"
 
     @property
     def capture_receipts(self) -> tuple[Optional[dict[str, Any]], ...]:
@@ -226,6 +227,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             fallback_weight_version=request.fallback_weight_version,
             prompt_idx=request.prompt_idx,
             loss_multiplier=request.loss_multiplier,
+            rollout_environment=request.rollout_environment,
             canonical_sample_ids=list(request.canonical_sample_ids),
             logical_selections=(
                 list(request.logical_selections)

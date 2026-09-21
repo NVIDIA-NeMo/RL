@@ -68,6 +68,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
     apply_message_level_advantage_penalties,
+    environment_sample_counts,
     fields_for_put,
     squeeze_trailing_unit_dim,
     tensor_field,
@@ -290,6 +291,7 @@ class AdvantageOutcome:
     num_mask_sample_filtered: int
     reward_partial: RewardPartial
     advantage_partial: AdvantagePartial
+    environment_counts: dict[str, float]
     seq_logprob_error_metrics: Optional[dict[str, float]] = None
     # Per-reason masked-row counts for this call's rows; the step-close
     # reduction sums each key across calls.
@@ -534,6 +536,12 @@ class AdvantageComputer:
         ):
             participation = sample_mask
         advantage_valid_mask = _binary_participation(participation)
+        environment_counts = environment_sample_counts(
+            meta.tags,
+            mask_sample=mask_sample,
+            final_sample_mask=final_sample_mask,
+            final_token_mask=mask,
+        )
 
         repeated_batch: dict[str, torch.Tensor] = {
             "total_reward": rewards,
@@ -733,6 +741,7 @@ class AdvantageComputer:
             num_mask_sample_filtered=num_mask_sample_filtered,
             reward_partial=reward_partial,
             advantage_partial=advantage_partial,
+            environment_counts=environment_counts,
             seq_logprob_error_metrics=seq_error_metrics,
             # The reason counts are per physical row, but a Forest batch masks
             # owners whole and its execution padding arrives masked, so they
