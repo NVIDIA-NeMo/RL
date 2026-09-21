@@ -50,7 +50,7 @@ if TYPE_CHECKING:
     )
 
 
-def prepare_opd_full_loss_input(
+def _prepare_opd_full_loss_input(
     logits: torch.Tensor,
     data: BatchedDataDict[Any],
     loss_fn: LossFunction,
@@ -295,7 +295,7 @@ def prepare_loss_input(
         loss_input = {"next_token_logprobs": logprobs}
 
     elif loss_fn.input_type == LossInputType.OPD_FULL:
-        loss_input = prepare_opd_full_loss_input(
+        loss_input = _prepare_opd_full_loss_input(
             logits,
             data,
             loss_fn,

@@ -13,8 +13,8 @@
 # limitations under the License.
 """Full-vocabulary MOPD (``on_policy_distillation.full``) config and loss.
 
-Everything here is CPU-only, and process-group free except for
-``prepare_opd_full_loss_input``, whose TP collectives are neutralized the way
+Everything here is CPU-only, and process-group free except for the ``opd_full``
+branch of ``prepare_loss_input``, whose TP collectives are neutralized the way
 ``tests/unit/distributed/test_model_utils.py`` does. The divergence kernels
 themselves are covered there, and ``_opd_full_call`` only masks and normalizes a
 divergence tensor that ``prepare_loss_input`` has already produced.
@@ -25,9 +25,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+from nemo_rl.algorithms.loss import (
+    ClippedPGLossConfig,
+    ClippedPGLossFn,
+    prepare_loss_input,
+)
 from nemo_rl.algorithms.loss.interfaces import LossInputType, MetricNormalizer
-from nemo_rl.algorithms.loss.loss_input import prepare_opd_full_loss_input
 from nemo_rl.algorithms.loss.utils import reconstruct_opd_full_teacher_logits
 from nemo_rl.algorithms.loss.wrapper import _SEQ_METRIC_MAX, _SEQ_METRIC_MIN
 from nemo_rl.algorithms.opd import (
@@ -903,7 +906,7 @@ def test_opd_full_normalizes_by_the_global_counts_not_the_microbatch():
     assert loss.item() == pytest.approx((2.0 + 6.0) / 8)
 
 
-# ── prepare_opd_full_loss_input ────────────────────────────────────────────
+# ── prepare_loss_input, opd_full branch ────────────────────────────────────
 # TP=1 limit with the kernels' collectives neutralized, as in test_model_utils.py.
 
 
@@ -920,7 +923,7 @@ def _single_rank_collectives(monkeypatch):
     monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
 
 
-def test_prepare_opd_full_loss_input_projects_the_payload_and_drops_the_last_position(
+def test_prepare_loss_input_projects_the_payload_and_drops_the_last_position(
     _single_rank_collectives,
 ):
     """The [B, S-1] divergence pairs position t with token t+1, like LOGPROB.
@@ -940,7 +943,7 @@ def test_prepare_opd_full_loss_input_projects_the_payload_and_drops_the_last_pos
         }
     )
 
-    loss_input = prepare_opd_full_loss_input(
+    loss_input, _ = prepare_loss_input(
         student_logits,
         data,
         _loss_fn(),

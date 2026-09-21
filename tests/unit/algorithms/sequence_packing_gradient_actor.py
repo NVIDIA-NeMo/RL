@@ -27,8 +27,8 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossFn,
     SequencePackingLossWrapper,
+    prepare_loss_input,
 )
-from nemo_rl.algorithms.loss.loss_input import prepare_loss_input
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
