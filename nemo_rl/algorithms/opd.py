@@ -24,7 +24,8 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from typing import Any, Literal, Optional
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import ray
 import torch
@@ -35,6 +36,7 @@ from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.data_plane.schema import (
     OPD_FULL_HIDDEN_STATES_FIELD,
     OPD_FULL_LOGITS_FIELD,
+    OPD_FULL_TEACHER_INDEX_FIELD,
     TEACHER_LP_FIELDS,
 )
 from nemo_rl.distributed.virtual_cluster import (
@@ -42,6 +44,11 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.experience.interfaces import PromptGroupRecord
+
+if TYPE_CHECKING:
+    # Imported for typing only: teacher_worker_group imports this module's
+    # config schemas at runtime.
+    from nemo_rl.models.policy.teacher_worker_group import TeacherConfig
 
 # ---------------------------------------------------------------------------
 # Config schemas
@@ -198,6 +205,48 @@ def opd_full_payload_field(full_cfg: OnPolicyDistillationFullConfig) -> str:
     return OPD_FULL_LOGITS_FIELD
 
 
+def opd_full_teacher_index_field(
+    full_cfg: OnPolicyDistillationFullConfig,
+) -> Optional[str]:
+    """Return the per-sample teacher-identity column, or ``None`` if unneeded.
+
+    Only the ``hidden_states`` payload needs it: the student loads a teacher
+    LM-head shard per unique checkpoint and must know which one projects each
+    row. The ``logits`` payload ships an already-projected distribution, so no
+    per-sample routing is needed at training time.
+    """
+    if full_cfg.teacher_payload == "hidden_states":
+        return OPD_FULL_TEACHER_INDEX_FIELD
+    return None
+
+
+def teacher_configs_by_index(
+    teacher_configs: Iterable["TeacherConfig"],
+) -> list["TeacherConfig"]:
+    """Deduplicated teacher configs in ``teacher_index`` order."""
+    return sorted(teacher_configs, key=lambda cfg: (cfg.model_name, cfg.alias))
+
+
+def opd_full_teacher_checkpoints_by_index(
+    master_config: Any,
+) -> Optional[list[str]]:
+    """Checkpoint path per ``teacher_index``, or None when rows carry no tag.
+
+    A list, not a map: the metadata round trips through JSON.
+    """
+    full_cfg = get_opd_full_config(master_config)
+    if full_cfg is None or opd_full_teacher_index_field(full_cfg) is None:
+        return None
+    # Imported lazily to break the cycle: teacher_worker_group imports the OPD
+    # config schemas defined in this module.
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    teacher_configs = create_teacher_configs_from_opd_config(_opd_cfg(master_config))
+    return [cfg.model_name for cfg in teacher_configs_by_index(teacher_configs)]
+
+
 def _skip_prev_logprobs(master_config: Any) -> bool:
     """Whether the training loop will zero ``prev_logprobs`` instead of computing it.
 
@@ -320,11 +369,14 @@ class TQTeacherLogprobCoordinator:
         # Set when full-vocabulary MOPD is on: the teacher then writes a second,
         # per-token payload column the training fetch must also see.
         full_cfg = self._opd_cfg.get("full")
-        self._opd_full_field: Optional[str] = (
-            opd_full_payload_field(OnPolicyDistillationFullConfig(**full_cfg))
-            if full_cfg and full_cfg.get("enabled")
-            else None
-        )
+        self._opd_full_field: Optional[str] = None
+        self._opd_full_teacher_index_field: Optional[str] = None
+        if full_cfg and full_cfg.get("enabled"):
+            resolved_full_cfg = OnPolicyDistillationFullConfig(**full_cfg)
+            self._opd_full_field = opd_full_payload_field(resolved_full_cfg)
+            self._opd_full_teacher_index_field = opd_full_teacher_index_field(
+                resolved_full_cfg
+            )
         self._teacher_full_payload_tokens = 0
         # Physical (deduplicated) groups own locks, not routing aliases. Two
         # aliases sharing one checkpoint therefore share one collective FIFO.
@@ -508,6 +560,8 @@ class TQTeacherLogprobCoordinator:
         enriched_fields = [self.teacher_logprobs_field]
         if self._opd_full_field is not None:
             enriched_fields.append(self._opd_full_field)
+        if self._opd_full_teacher_index_field is not None:
+            enriched_fields.append(self._opd_full_teacher_index_field)
         return meta.with_fields(enriched_fields)
 
     def drain_metrics(self) -> dict[str, float]:
@@ -542,6 +596,20 @@ class TQTeacherLogprobCoordinator:
         self._teacher_full_payload_tokens = 0
         self._aliases_seen.clear()
         return metrics
+
+    def teacher_checkpoints_by_index(self) -> Optional[list[str]]:
+        """Checkpoint path per ``teacher_index``, or None when rows carry no tag.
+
+        Read off the live worker groups, so it records what actually tagged the
+        rows rather than what the config would produce now.
+        """
+        if self._opd_full_teacher_index_field is None:
+            return None
+        by_index = {
+            group.teacher_index: group.model_name
+            for group in self._teacher_worker_groups.values()
+        }
+        return [by_index[index] for index in sorted(by_index)]
 
 
 # ---------------------------------------------------------------------------
@@ -737,6 +805,16 @@ def create_teacher_worker_groups(
             f"got {sorted(teacher_clusters)}."
         )
 
+    # Stable, config-derived index for each physical (deduplicated) teacher.
+    # This is the single source of truth for "which teacher wrote this row":
+    # the same index is what TeacherWorkerGroup tags every payload row with
+    # (see OPD_FULL_TEACHER_INDEX_FIELD) and what setup.py's opd_full teacher
+    # LM-head loading uses to key the student's per-teacher weight dict.
+    # Numbered by the deduplicated checkpoint, not by alias: the index outlives
+    # a run inside a data-plane checkpoint, so an alias edit must not renumber.
+    ordered = teacher_configs_by_index(teacher_configs)
+    alias_to_teacher_index = {cfg.alias: idx for idx, cfg in enumerate(ordered)}
+
     teacher_worker_groups: dict[str, Any] = {}
     for teacher_config in teacher_configs:
         alias = teacher_config.alias
@@ -745,6 +823,7 @@ def create_teacher_worker_groups(
             cluster=teacher_clusters[alias],
             policy_config=policy_config,
             tokenizer=tokenizer,
+            teacher_index=alias_to_teacher_index[alias],
         )
         teacher_worker_groups[alias] = twg
         print(
