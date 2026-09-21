@@ -75,7 +75,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
-from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS, PackedTensor
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -2192,7 +2192,8 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
     """
     backfill_missing_routed_experts(message_logs)
     has_multimodal_payload = any(
-        key == "media_token_validity_mask" or isinstance(value, PackedTensor)
+        key == "media_token_validity_mask"
+        or (key in PACKED_MULTIMODAL_FIELDS and isinstance(value, PackedTensor))
         for message_log in message_logs
         for message in message_log
         for key, value in message.items()
@@ -2218,7 +2219,10 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
                     message["media_token_validity_mask"] = existing_media_mask.bool()
                 else:
                     owns_media = any(
-                        isinstance(value, PackedTensor) for value in message.values()
+                        key in PACKED_MULTIMODAL_FIELDS
+                        and isinstance(value, PackedTensor)
+                        and any(value.logical_segment_counts_by_row())
+                        for key, value in message.items()
                     )
                     message["media_token_validity_mask"] = torch.full_like(
                         token_ids,

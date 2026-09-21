@@ -267,12 +267,33 @@ def attach_static_multimodal_payload(
         )
     for source, target in zip(source_users, target_users):
         for key, value in source.items():
-            if (
-                isinstance(value, PackedTensor)
-                or key in VLLM_PROMPT_KEYS
-                or key == "media_token_validity_mask"
-            ):
+            if isinstance(value, PackedTensor) or key in VLLM_PROMPT_KEYS:
                 target[key] = value
+
+        # Create a target media validity mask based on the media tokens
+        # specified by the source mask.
+        source_mask = source.get("media_token_validity_mask")
+        source_token_ids = source.get("token_ids")
+        target_token_ids = target.get("token_ids")
+        if (
+            isinstance(source_mask, torch.Tensor)
+            and isinstance(source_token_ids, torch.Tensor)
+            and isinstance(target_token_ids, torch.Tensor)
+        ):
+            if source_mask.shape != source_token_ids.shape:
+                raise ValueError(
+                    "Source media_token_validity_mask must align with source token_ids "
+                    f"during static media reattachment: mask={tuple(source_mask.shape)}, "
+                    f"token_ids={tuple(source_token_ids.shape)}."
+                )
+            media_token_ids = torch.unique(source_token_ids[source_mask.bool()]).to(
+                target_token_ids.device
+            )
+            target["media_token_validity_mask"] = (
+                torch.isin(target_token_ids, media_token_ids)
+                if media_token_ids.numel()
+                else torch.zeros_like(target_token_ids, dtype=torch.bool)
+            )
 
 
 def _add_r3_fallback_metrics(

@@ -484,10 +484,10 @@ class MegatronGenerationMixin:
         if self._inference_engine_initialized:
             return
 
+        from megatron.core.inference.config import MultimodalPromptConfig
         from megatron.core.inference.contexts.dynamic_context import (
             DynamicInferenceContext,
         )
-        from megatron.core.inference.config import MultimodalPromptConfig
         from megatron.core.inference.engines.dynamic_engine import (
             DynamicInferenceEngine,
         )
