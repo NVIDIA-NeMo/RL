@@ -130,6 +130,42 @@ Two metrics make it visible: `invalid_generation_logprob_rate` per rollout
 step, and `num_invalid_generation_logprobs_filtered` per training step. The
 worker also warns once per process on the first failure.
 
+#### When the worker gives up
+
+Masking invalid samples keeps a bad rollout out of the loss, but if the engine
+keeps producing them there is nothing left worth training on. The workers
+therefore also track failures and stop the run on either of two independent
+triggers:
+
+- the failure rate over the **last 1000 samples** exceeds
+  `policy.generation.vllm_cfg.max_generation_logprob_failure_rate`. The window
+  is the point: a cumulative rate is diluted by history, so after 100k clean
+  samples a 1% threshold would need ~1000 consecutive failures to trip. The
+  rate is only judged once the window holds enough samples to resolve it — at
+  least `max(ceil(1/rate), 100)` — so neither an early failure nor a very
+  permissive threshold makes the check hair-trigger.
+- **32 consecutive failures**, which catches an abrupt onset before the window
+  can establish a rate.
+
+```yaml
+policy:
+  generation:
+    vllm_cfg:
+      strict_generation_logprobs: true          # default
+      max_generation_logprob_failure_rate: 0.01 # 0.0 fails immediately; 1.0 never
+```
+
+`max_generation_logprob_failure_rate: 1.0` tolerates everything and disables
+both triggers, including the consecutive one. `strict_generation_logprobs:
+false` turns the accounting off entirely. Neither disables the per-sample
+masking above — that is always on.
+
+Note that the raise happens inside a generation worker, so it discards the
+shard that worker was producing, and because each data-parallel replica keeps
+its own counters it can fire on one replica while the others keep going. Treat
+it as a stop signal for the run, not as a per-sample recovery mechanism; that
+is what `logprobs_valid` is for.
+
 ### Custom VLLM Extensions
 
 The {py:class}`UpdatableVllmInternalWorker <nemo_rl.models.generation.vllm_backend.UpdatableVllmInternalWorker>` class in `vllm_backend.py` extends the VLLM worker with additional capabilities:

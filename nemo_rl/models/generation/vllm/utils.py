@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import math
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -33,6 +34,8 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.telemetry.metrics import warn_once
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
+
+logger = logging.getLogger(__name__)
 
 R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
 VLLM_LOGPROB_FLOOR = -9999.0
@@ -792,3 +795,222 @@ def extract_sampled_logprobs(
         )
 
     return SampledLogprobs(values=values, error=error)
+
+
+# The failure rate is measured over a sliding window rather than over the whole
+# run. A cumulative rate is diluted by history: after 100k clean samples a 1%
+# threshold would need ~1,000 consecutive failures to trip, so corruption that
+# starts mid-run is effectively unbounded.
+GENERATION_LOGPROB_FAILURE_WINDOW = 1000
+
+# A rate is not meaningful until the window holds enough samples to resolve it,
+# but a very permissive threshold must not make the check hair-trigger either
+# (at 50%, ceil(1/rate) is 2). Never judge a rate on fewer than this many
+# samples.
+GENERATION_LOGPROB_MIN_RATE_SAMPLES = 100
+
+# Independent trigger for corruption that starts abruptly. This many failures
+# in a row is not a rate question -- something is wrong now -- and it fires
+# well before the window has enough samples to establish a rate. Set
+# vllm_cfg.max_generation_logprob_failure_rate to 1.0 to disable both triggers.
+GENERATION_LOGPROB_CONSECUTIVE_FAILURE_LIMIT = 32
+
+
+def resolve_generation_logprob_settings(
+    vllm_cfg: Mapping[str, Any],
+) -> tuple[bool, float]:
+    """Resolve and validate the generation log-prob abort policy.
+
+    Args:
+        vllm_cfg: The ``policy.generation.vllm_cfg`` mapping. Both keys are
+            required and carry their defaults in the exemplar YAML; an
+            explicit ``None`` means "use the built-in behavior" (strict, and
+            the default rate) rather than False / a TypeError.
+
+    Returns:
+        ``(strict, max_failure_rate)``.
+
+    Raises:
+        ValueError: If the failure rate is not a number in [0, 1].
+    """
+    strict = vllm_cfg["strict_generation_logprobs"]
+    strict = True if strict is None else bool(strict)
+
+    rate = vllm_cfg["max_generation_logprob_failure_rate"]
+    if rate is None:
+        rate = 1.0
+    try:
+        rate = float(rate)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "policy.generation.vllm_cfg.max_generation_logprob_failure_rate "
+            f"must be a number between 0.0 and 1.0, got {rate!r}."
+        ) from None
+    if math.isnan(rate) or not 0.0 <= rate <= 1.0:
+        raise ValueError(
+            "policy.generation.vllm_cfg.max_generation_logprob_failure_rate "
+            f"must be between 0.0 and 1.0, got {rate}."
+        )
+    return strict, rate
+
+
+def validate_generation_logprob_settings(config: Mapping[str, Any]) -> None:
+    """Driver-side pre-flight for the abort-policy settings.
+
+    The worker reads these keys directly -- they are required, and the
+    exemplar YAML is their source of truth. This is only a pre-flight so a bad
+    value surfaces before any engine starts rather than as a Ray actor death,
+    so it checks presence explicitly and stays quiet for a config that
+    predates the keys (or has no ``vllm_cfg`` at all); such a config fails
+    loudly in the worker instead.
+    """
+    vllm_cfg = config.get("vllm_cfg") or {}
+    required = {"strict_generation_logprobs", "max_generation_logprob_failure_rate"}
+    if not required <= set(vllm_cfg):
+        return
+    resolve_generation_logprob_settings(vllm_cfg)
+
+
+class GenerationLogprobValidator:
+    """Per-worker accounting for generation log-prob extraction failures.
+
+    Every invalid sample is already masked out of the loss by the training
+    paths, so this layer answers a different question: at what point is the
+    engine broken enough that continuing is worse than stopping? Failures are
+    counted and warned about on a backoff schedule, and the worker raises on
+    either of two independent triggers:
+
+    * the failure rate over the last ``GENERATION_LOGPROB_FAILURE_WINDOW``
+      samples exceeds ``max_failure_rate`` (a sliding window, so corruption
+      that starts mid-run is not diluted by earlier clean history), or
+    * ``GENERATION_LOGPROB_CONSECUTIVE_FAILURE_LIMIT`` samples fail in a row,
+      which catches an abrupt onset before the window fills.
+
+    A ``max_failure_rate`` of 1.0 means "tolerate anything" and disables both
+    triggers; 0.0 aborts on the first failure.
+
+    Not thread-safe; each worker touches its own instance from its own loop.
+    """
+
+    def __init__(self, *, strict: bool, max_failure_rate: float) -> None:
+        self.strict = strict
+        self.max_failure_rate = max_failure_rate
+        self.samples = 0
+        self.failures = 0
+        self.consecutive_failures = 0
+        self._window: deque[bool] = deque(maxlen=GENERATION_LOGPROB_FAILURE_WINDOW)
+
+    @classmethod
+    def from_config(cls, vllm_cfg: Mapping[str, Any]) -> "GenerationLogprobValidator":
+        """Build a validator from ``policy.generation.vllm_cfg``."""
+        strict, max_failure_rate = resolve_generation_logprob_settings(vllm_cfg)
+        return cls(strict=strict, max_failure_rate=max_failure_rate)
+
+    @property
+    def failure_rate(self) -> float:
+        """Failure rate over the sliding window."""
+        if not self._window:
+            return 0.0
+        return sum(self._window) / len(self._window)
+
+    @property
+    def cumulative_failure_rate(self) -> float:
+        """Failure rate over the whole run, for reporting only."""
+        return self.failures / self.samples if self.samples else 0.0
+
+    def extract(
+        self,
+        generated_token_ids: Sequence[int],
+        logprobs: Sequence[Any] | None,
+        *,
+        sample_label: str,
+    ) -> SampledLogprobs:
+        """Extract one sample's log-probs and fold the outcome into the totals.
+
+        Raises:
+            RuntimeError: In strict mode, once either abort trigger fires.
+        """
+        result = extract_sampled_logprobs(
+            generated_token_ids, logprobs, sample_label=sample_label
+        )
+        self._record(result)
+        return result
+
+    def _record(self, result: SampledLogprobs) -> None:
+        self.samples += 1
+        self._window.append(not result.valid)
+
+        if result.valid:
+            self.consecutive_failures = 0
+            return
+
+        self.failures += 1
+        self.consecutive_failures += 1
+        if _is_backoff_step(self.failures):
+            logger.warning(
+                "Generation log-prob validation failed for %d of the last %d "
+                "samples (%.3f%%; tolerating up to %.3f%%), %d of %d overall, "
+                "%d in a row. First failure in this sample: %s",
+                sum(self._window),
+                len(self._window),
+                100.0 * self.failure_rate,
+                100.0 * self.max_failure_rate,
+                self.failures,
+                self.samples,
+                self.consecutive_failures,
+                result.error,
+            )
+
+        trigger = self._abort_trigger()
+        if trigger is not None:
+            raise RuntimeError(
+                f"Generation log-prob validation gave up: {trigger}. These "
+                "log-probs are the behavior-policy term of the importance "
+                "ratios, so training on them is not meaningful. Overall "
+                f"{self.failures} of {self.samples} samples failed. Set "
+                "policy.generation.vllm_cfg.strict_generation_logprobs=false "
+                "to keep going without this check, or raise "
+                "policy.generation.vllm_cfg.max_generation_logprob_failure_rate "
+                f"(1.0 disables it). Most recent failure: {result.error}"
+            )
+
+    def _abort_trigger(self) -> str | None:
+        """Which abort condition fired, if any."""
+        if not self.strict or self.max_failure_rate >= 1.0:
+            # 100% tolerated: nothing can exceed it, including a run of
+            # consecutive failures.
+            return None
+        if self.consecutive_failures >= GENERATION_LOGPROB_CONSECUTIVE_FAILURE_LIMIT:
+            return (
+                f"{self.consecutive_failures} consecutive samples failed "
+                f"(limit {GENERATION_LOGPROB_CONSECUTIVE_FAILURE_LIMIT})"
+            )
+        if self.max_failure_rate <= 0.0:
+            # 0% tolerated: any failure aborts.
+            return "a sample failed and the tolerated failure rate is 0"
+        min_samples = min(
+            max(
+                math.ceil(1.0 / self.max_failure_rate),
+                GENERATION_LOGPROB_MIN_RATE_SAMPLES,
+            ),
+            GENERATION_LOGPROB_FAILURE_WINDOW,
+        )
+        if (
+            len(self._window) >= min_samples
+            and self.failure_rate > self.max_failure_rate
+        ):
+            return (
+                f"{100.0 * self.failure_rate:.3f}% of the last "
+                f"{len(self._window)} samples failed, above the tolerated "
+                f"{100.0 * self.max_failure_rate:.3f}%"
+            )
+        return None
+
+
+def _is_backoff_step(count: int) -> bool:
+    """Whether to emit a warning for the ``count``-th failure.
+
+    Warns on the 1st, 2nd, 4th, 8th, ... failure so a systemic problem stays
+    visible without one log line per sample.
+    """
+    return count > 0 and (count & (count - 1)) == 0

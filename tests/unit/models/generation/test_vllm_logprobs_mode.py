@@ -26,16 +26,25 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 def _sync_worker(monkeypatch, generation, vllm_cfg=None):
     """A sync vLLM worker wired up enough to run ``generate`` on fake output."""
     from nemo_rl.models.generation.vllm import vllm_worker
+    from nemo_rl.models.generation.vllm.utils import GenerationLogprobValidator
 
     worker = vllm_worker.VllmGenerationWorkerImpl.__new__(
         vllm_worker.VllmGenerationWorkerImpl
     )
     worker.cfg = {
         "_pad_token_id": 0,
-        "vllm_cfg": {"use_tqdm": False, **(vllm_cfg or {})},
+        "vllm_cfg": {
+            "use_tqdm": False,
+            "strict_generation_logprobs": True,
+            "max_generation_logprob_failure_rate": 0.01,
+            **(vllm_cfg or {}),
+        },
         "vllm_kwargs": {},
     }
     worker.routed_experts_dtype = torch.int32
+    worker._logprob_validator = GenerationLogprobValidator.from_config(
+        worker.cfg["vllm_cfg"]
+    )
     worker.llm = SimpleNamespace(
         generate=MagicMock(return_value=[SimpleNamespace(outputs=[generation])]),
         llm_engine=SimpleNamespace(
@@ -402,6 +411,7 @@ def _async_worker(monkeypatch, generation, vllm_cfg=None):
     import asyncio
 
     from nemo_rl.models.generation.vllm import vllm_worker_async
+    from nemo_rl.models.generation.vllm.utils import GenerationLogprobValidator
 
     worker = vllm_worker_async.VllmAsyncGenerationWorkerImpl.__new__(
         vllm_worker_async.VllmAsyncGenerationWorkerImpl
@@ -409,10 +419,19 @@ def _async_worker(monkeypatch, generation, vllm_cfg=None):
     worker.cfg = {
         "_pad_token_id": 0,
         "max_new_tokens": 8,
-        "vllm_cfg": {"async_engine": True, "max_model_len": 16, **(vllm_cfg or {})},
+        "vllm_cfg": {
+            "async_engine": True,
+            "max_model_len": 16,
+            "strict_generation_logprobs": True,
+            "max_generation_logprob_failure_rate": 0.01,
+            **(vllm_cfg or {}),
+        },
         "vllm_kwargs": {},
     }
     worker.routed_experts_dtype = torch.int32
+    worker._logprob_validator = GenerationLogprobValidator.from_config(
+        worker.cfg["vllm_cfg"]
+    )
     worker._merge_stop_strings = lambda _stop_strings: []
     worker._build_sampling_params = lambda **_kwargs: object()
     worker._return_routed_experts_enabled = lambda: False
@@ -483,3 +502,35 @@ def test_async_worker_generate_flags_a_missing_sampled_token_logprob(monkeypatch
 
     _, batch = results[0]
     assert batch["logprobs_valid"].tolist() == [False]
+
+
+@pytest.mark.vllm
+def test_worker_generate_aborts_when_the_threshold_is_zero(monkeypatch):
+    sampled_token_id = 880
+    worker = _sync_worker(
+        monkeypatch,
+        _generation([{512: SimpleNamespace(logprob=-0.10, rank=1)}], sampled_token_id),
+        vllm_cfg={"max_generation_logprob_failure_rate": 0.0},
+    )
+
+    with pytest.raises(RuntimeError, match="Generation log-prob validation gave up"):
+        worker.generate(_input_batch())
+
+
+@pytest.mark.vllm
+def test_worker_generate_keeps_going_when_the_policy_is_off(monkeypatch):
+    """The sample is still flagged; only the abort is disabled."""
+    sampled_token_id = 880
+    worker = _sync_worker(
+        monkeypatch,
+        _generation([{512: SimpleNamespace(logprob=-0.10, rank=1)}], sampled_token_id),
+        vllm_cfg={
+            "strict_generation_logprobs": False,
+            "max_generation_logprob_failure_rate": 0.0,
+        },
+    )
+
+    result = worker.generate(_input_batch())
+
+    assert result["logprobs_valid"].tolist() == [False]
+    assert worker._logprob_validator.failures == 1

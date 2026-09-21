@@ -54,6 +54,7 @@ from nemo_rl.models.generation.vllm.utils import (
     assert_reload_refit_config_supported,
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
+    validate_generation_logprob_settings,
 )
 from nemo_rl.telemetry.instrumentation import trace_fn
 from nemo_rl.telemetry.metrics import warn_once
@@ -113,6 +114,7 @@ class VllmGeneration(GenerationInterface):
     def validate_settings(cls, master_config: "MasterConfig") -> None:
         """Reject pure-config vLLM settings the SC entrypoint cannot honor."""
         generation_config = cast(VllmConfig, master_config.policy["generation"])
+        validate_generation_logprob_settings(generation_config)
         assert_reload_refit_config_supported(generation_config)
 
     @staticmethod
@@ -241,6 +243,10 @@ class VllmGeneration(GenerationInterface):
         if extension_fqn is not None:
             # Validate registration before allocating workers or placement groups.
             get_actor_python_env(extension_fqn)
+
+        # Surfaced here rather than from inside a Ray worker, where a config
+        # error would arrive as an actor death after the engines are up.
+        validate_generation_logprob_settings(self.cfg)
 
         self.sharding_annotations = NamedSharding(
             layout=np.arange(cluster.world_size()).reshape(

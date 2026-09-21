@@ -466,6 +466,14 @@ policy:
       num_first_layers_in_bf16: 0
       enable_vllm_metrics_logger: true # Set to true to enable vLLM internal metrics logger, turn off for better performance
       vllm_metrics_logger_interval: 0.5 # Interval in seconds to collect vLLM logger metrics
+      # Stop the run when the generation backend keeps returning per-token log-probs
+      # that fail validation. Invalid samples are always masked out of the loss; this
+      # decides when to give up instead. null keeps the check on.
+      strict_generation_logprobs: true
+      # Share of samples, over a sliding window of the last 1000, whose generation
+      # log-probs may fail validation before the worker stops the run. 0.0 fails on
+      # the first bad sample; 1.0 (or null) never fails.
+      max_generation_logprob_failure_rate: 0.01
       http_refit_api_key_env_var: null # Optional env var containing the internal refit API key.
       reset_encoder_cache_after_weight_update: false # Invalidate cached multimodal encoder outputs after a successful async refit. Only safe when generation is quiesced (grpo.async_grpo.in_flight_weight_updates=false).
       http_refit_server_port: null # Optional fixed port for Kubernetes targetPorts.

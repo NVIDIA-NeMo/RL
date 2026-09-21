@@ -52,7 +52,7 @@ from nemo_rl.models.generation.vllm.config import (
 )
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
-    extract_sampled_logprobs,
+    GenerationLogprobValidator,
     format_prompt_for_vllm_generation,
     pad_and_align_routed_expert_indices,
 )
@@ -476,6 +476,8 @@ class BaseVllmGenerationWorker:
         self.py_executable = sys.executable
 
         vllm_cfg = self.cfg["vllm_cfg"]
+        # Accumulates generation log-prob validation outcomes for this worker.
+        self._logprob_validator = GenerationLogprobValidator.from_config(vllm_cfg)
         _apply_vllm_patches(
             self.py_executable,
             extra_env_vars=extra_env_vars,
@@ -1136,7 +1138,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
 
             output_ids_list.append(full_output)
             full_logprobs = torch.zeros(total_length, dtype=torch.float32)
-            sampled_logprobs = extract_sampled_logprobs(
+            sampled_logprobs = self._logprob_validator.extract(
                 generated_tokens,
                 getattr(generation, "logprobs", None),
                 sample_label=f"request_idx={i}",

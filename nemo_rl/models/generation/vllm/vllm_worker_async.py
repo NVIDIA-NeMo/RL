@@ -52,7 +52,6 @@ from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
-    extract_sampled_logprobs,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
@@ -1613,7 +1612,7 @@ class VllmAsyncGenerationWorkerImpl(
                 dtype=torch.float32,
                 device=original_input_ids_single_row.device,
             )
-            sampled_logprobs = extract_sampled_logprobs(
+            sampled_logprobs = self._logprob_validator.extract(
                 generated_token_ids,
                 getattr(generation_details, "logprobs", None),
                 sample_label=f"sample_idx={sample_idx}",
