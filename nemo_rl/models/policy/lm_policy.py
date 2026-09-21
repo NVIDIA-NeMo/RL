@@ -158,10 +158,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if draft_config is not None:
             config["draft"] = draft_config
         draft_enabled = bool(draft_config is not None and draft_config.enabled)
+        generation_config = config.get("generation") or {}
+        nvfp4_pertoken_rollout = generation_config.get("nvfp4_pertoken_rollout") or {}
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
+            )
+        if nvfp4_pertoken_rollout.get("enabled", False) and not megatron_enable:
+            raise ValueError(
+                "generation.nvfp4_pertoken_rollout requires the Megatron "
+                "training backend (policy.megatron_cfg.enabled=true); DTensor "
+                "does not implement TE NVFP4 training."
             )
         validate_fp32_lm_head_config(
             config, megatron_enabled=megatron_enable, dtensor_enabled=dtensor_enable
