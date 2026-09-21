@@ -66,11 +66,10 @@ REQUIRES: list[str] = _META["project"].get("dependencies", [])
 # There is no env-var override — to build a different fork/ref, edit
 # [tool.trtllm].
 #
-# The url may embed ``${VAR}`` placeholders (tekit is a private GitLab repo and
-# needs a clone token, which must not be committed). The raw string is what gets
-# folded into the wheel cache key; only the value handed to the build script is
-# expanded, so a rotated token never invalidates the cache and never lands in a
-# cache path. See _expanded_trtllm_url.
+# The url may embed ``${VAR}`` placeholders when a private fork is used. The raw
+# string is folded into the wheel cache key; only the value handed to the build
+# script is expanded, so a rotated token never invalidates the cache or lands in
+# a cache path. See _expanded_trtllm_url.
 _TRTLLM: dict[str, str] = _META["tool"]["trtllm"]
 TRTLLM_URL: str = _TRTLLM["url"]
 TRTLLM_REF: str = _TRTLLM["ref"]
@@ -95,8 +94,7 @@ def _expanded_trtllm_url(env: dict[str, str]) -> str:
         raise RuntimeError(
             f"[tool.trtllm].url references {', '.join(missing)}, which "
             f"{'is' if len(missing) == 1 else 'are'} unset or empty. "
-            "Pass it into the build environment (e.g. --build-arg "
-            "GITLAB_CLONE_ACCESS_TOKEN=... promoted to ENV in the Dockerfile)."
+            "Pass the value into the build environment before building."
         )
     return re.sub(r"\$\{(\w+)\}", lambda m: env[m.group(1)], TRTLLM_URL)
 

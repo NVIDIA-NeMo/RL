@@ -144,13 +144,6 @@ backend-path = ["."]
 # be reused across ref and uv-version changes. When bumping `ref`, also re-sync
 # [project].dependencies against the new requirements.txt.
 #
-# tekit is a private GitLab repo, so the url carries a ${GITLAB_CLONE_ACCESS_TOKEN}
-# placeholder that _backend.py expands from the build environment (the token is
-# never committed, and the cache key uses this raw string, not the expanded one).
-# No "user:" prefix here: CI passes the token already as "user:token", and
-# prefixing would give "oauth2:user:token" -- URL userinfo splits on the first
-# colon, so the password becomes "user:token" and the fetch fails with
-# "HTTP Basic: Access denied". Callers holding a bare token add their own
-# username (build-custom-trtllm.sh's caller does).
-url = "https://${GITLAB_CLONE_ACCESS_TOKEN}@gitlab-master.nvidia.com/ftp/tekit.git"
-ref = "600768313c3c746e3dc5458b90c8d5a9f5b20745"   # pragma: allowlist secret
+# Public TensorRT-LLM feat/rl_rc tip at the time of this pin.
+url = "https://github.com/NVIDIA/TensorRT-LLM.git"
+ref = "f94eeb3738aeacb4bdf9676ba06f620499cdb357"   # pragma: allowlist secret
