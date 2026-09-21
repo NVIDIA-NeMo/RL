@@ -1,5 +1,8 @@
 defaults: ./dapo-gemma4-26ba4b-it-4n8g-fsdp2-automodel.yaml
 policy:
+  make_sequence_length_divisible_by: 128
+  dynamic_batching:
+    sequence_length_round: 128
   dtensor_cfg:
     expert_parallel_size: 16
     context_parallel_size: 2

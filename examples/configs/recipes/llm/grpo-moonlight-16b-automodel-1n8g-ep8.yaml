@@ -22,6 +22,7 @@ policy:
         attn: te
         linear: te
         rms_norm: te
+        experts: torch_mm
         dispatcher: hybridep
         fake_balanced_gate: false
         rope_fusion: false
@@ -32,7 +33,7 @@ policy:
     enabled: true
   sequence_packing:
     enabled: false
-  make_sequence_length_divisible_by: 4
+  make_sequence_length_divisible_by: 64
   optimizer:
     kwargs:
       lr: 3.0e-07

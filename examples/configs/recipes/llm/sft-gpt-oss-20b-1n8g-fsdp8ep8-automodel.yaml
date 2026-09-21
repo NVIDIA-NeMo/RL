@@ -2,6 +2,7 @@ defaults: ../../sft.yaml
 cluster:
   gpus_per_node: 8
 policy:
+  make_sequence_length_divisible_by: 64
   model_name: openai/gpt-oss-20b
   train_global_batch_size: 128
   train_micro_batch_size: 8
