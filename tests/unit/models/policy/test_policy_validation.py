@@ -20,10 +20,13 @@ the world_size compatibility validation that prevents confusing reshape errors
 when the cluster size is insufficient for the specified parallelism configuration.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
@@ -59,6 +62,41 @@ def create_mock_tokenizer():
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
     return tokenizer
+
+
+def test_dynamic_cp_score_keeps_complete_training_sized_steps() -> None:
+    policy = Policy.__new__(Policy)
+    policy.cfg = {"train_global_batch_size": 2}
+    policy.sharding_annotations = object()
+    policy._dynamic_cp_schedule = None
+    policy.worker_group = MagicMock()
+    policy.worker_group.run_all_workers_sharded_data.return_value = "futures"
+    policy.worker_group.get_all_worker_results.return_value = ["worker-results"]
+    data = BatchedDataDict(input_ids=torch.zeros(4, 8, dtype=torch.long))
+    schedule = object()
+    dispatch = SimpleNamespace(
+        schedule=schedule,
+        data="sharded-data",
+        plans="rank-plans",
+        output_rows=[],
+    )
+    expected = BatchedDataDict(logprobs=torch.zeros(4, 8))
+
+    with (
+        patch(
+            "nemo_rl.models.policy.lm_policy.build_cp_dispatch",
+            return_value=dispatch,
+        ) as build_dispatch,
+        patch(
+            "nemo_rl.models.policy.lm_policy.collect_cp_outputs",
+            return_value=expected,
+        ),
+    ):
+        result = Policy._get_dynamic_cp_outputs(policy, "get_logprobs", data)
+
+    assert result is expected
+    assert policy._dynamic_cp_schedule is schedule
+    assert build_dispatch.call_args.kwargs["batch_size"] == 2
 
 
 def create_dtensor_config(

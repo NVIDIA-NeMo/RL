@@ -38,3 +38,11 @@ def test_tensor_payload_detaches_autograd():
     restored = tensor_from_payload(tensor_to_payload(tensor))
     assert restored.item() == 2.0
     assert not restored.requires_grad
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_tensor_payload_stages_cuda_tensor_to_cpu():
+    tensor = torch.arange(6, device="cuda", dtype=torch.float32).reshape(2, 3)
+    restored = tensor_from_payload(tensor_to_payload(tensor))
+    assert restored.device.type == "cpu"
+    torch.testing.assert_close(restored, tensor.cpu())

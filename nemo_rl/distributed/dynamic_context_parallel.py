@@ -317,14 +317,27 @@ def plan_cp_phases(
                 raise ValueError(
                     f"Sample {index} of length {length} exceeds the dynamic CP token budget"
                 )
-        size_bins = bins.setdefault(size, [])
-        for bin_index, (members, used, factor) in enumerate(size_bins):
-            if used + padded <= tokens_per_rank * size:
-                members.append(index)
-                size_bins[bin_index] = (members, used + padded, factor)
+        # Fill already-required larger-CP calls before opening another call.
+        # Keeping separate size buckets strands space: e.g. [6000, 2000] at
+        # 4096 tokens/rank used to require two calls instead of one CP2 pack.
+        # The destination determines alignment; CP1 padding is not sufficient
+        # when the short sequence joins a CP2+ task.
+        placed = False
+        for target_size in sorted(bins, reverse=True):
+            if target_size < size:
+                continue
+            size_bins = bins[target_size]
+            for bin_index, (members, used, factor) in enumerate(size_bins):
+                target_padded = (length + factor - 1) // factor * factor
+                if used + target_padded <= tokens_per_rank * target_size:
+                    members.append(index)
+                    size_bins[bin_index] = (members, used + target_padded, factor)
+                    placed = True
+                    break
+            if placed:
                 break
-        else:
-            size_bins.append(([index], padded, multiple))
+        if not placed:
+            bins.setdefault(size, []).append(([index], padded, multiple))
 
     pending = [
         CPAssignment(tuple(members), 0, size, factor, used)

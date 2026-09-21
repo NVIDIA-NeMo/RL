@@ -163,6 +163,53 @@ def test_dynamic_cp_metrics_use_one_fixed_sum_group(monkeypatch):
 
 
 @pytest.mark.mcore
+def test_dynamic_cp_avg_group_metrics_use_rank_participation_scale(monkeypatch):
+    """z-loss must reproduce MCore's AVG over every participating rank."""
+    from nemo_rl.models import megatron as megatron_module
+    from nemo_rl.models.megatron.common import get_moe_metrics
+
+    aux_entry = SimpleNamespace(values=torch.tensor([1.0, 3.0]), avg_group=None)
+    # Padding-only lanes have a pre-initialized z entry whose avg_group was
+    # never populated by record(); the name must still select AVG semantics.
+    z_entry = SimpleNamespace(values=torch.tensor([2.0, 4.0]), avg_group=None)
+    live_tracker = SimpleNamespace(
+        metrics={"load_balancing_loss": aux_entry, "z_loss": z_entry}
+    )
+    fixed_group = object()
+    reductions = []
+
+    def _all_reduce(values, *, group):
+        reductions.append(group)
+        values.mul_(2.0)
+
+    monkeypatch.setattr(
+        megatron_module.common, "get_moe_metrics_tracker", lambda: live_tracker
+    )
+    monkeypatch.setattr(
+        megatron_module.common,
+        "get_moe_layer_wise_logging_tracker",
+        lambda: {
+            "load_balancing_loss": {"values": aux_entry.values},
+            "z_loss": {"values": z_entry.values},
+        },
+    )
+    monkeypatch.setattr(megatron_module.common.dist, "all_reduce", _all_reduce)
+    monkeypatch.setattr(
+        megatron_module.common, "clear_aux_losses_tracker", lambda: None
+    )
+
+    metrics = get_moe_metrics(
+        loss_scale=0.25,
+        dynamic_parallel_group=fixed_group,
+        dynamic_avg_loss_scale=0.125,
+    )
+
+    assert reductions == [fixed_group, fixed_group]
+    assert metrics["load_balancing_loss"] == pytest.approx(1.0)
+    assert metrics["z_loss"] == pytest.approx(0.75)
+
+
+@pytest.mark.mcore
 @pytest.mark.parametrize(
     "routing_type,aux_loss_coeff,z_loss_coeff,expected",
     [

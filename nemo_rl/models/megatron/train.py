@@ -68,6 +68,7 @@ from nemo_rl.models.megatron.draft.hidden_capture import (
 from nemo_rl.models.megatron.dynamic_cp import (
     RuntimeCPContext,
     bind_attention_cp_group,
+    configure_dynamic_moe_loss_scaling,
     preserve_attention_cp_groups,
     runtime_cp_from_packed,
 )
@@ -116,6 +117,13 @@ def _prepare_padding_mask_for_model(
     if isinstance(core_model, GPTModel) and core_model.pre_process:
         return padding_mask
 
+    return _scatter_padding_mask_to_sequence_parallel_region(padding_mask)
+
+
+def _scatter_padding_mask_to_sequence_parallel_region(
+    padding_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Scatter a batch-first mask exactly like MCore's GPT preprocessing."""
     return (
         tensor_parallel.scatter_to_sequence_parallel_region(
             padding_mask.transpose(0, 1).contiguous(),
@@ -124,6 +132,25 @@ def _prepare_padding_mask_for_model(
         .transpose(0, 1)
         .contiguous()
     )
+
+
+def _prepare_padding_mask_for_router_scaling(
+    model: GPTModel,
+    padding_mask: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Return the TP-local mask seen by the router for token normalization."""
+    if padding_mask is None or not get_model_config(model).sequence_parallel:
+        return padding_mask
+
+    core_model = unwrap_model(model)
+    if isinstance(core_model, GPTModel) and core_model.pre_process:
+        # GPTModel scatters its forward mask internally. Reproduce that scatter
+        # here so the dynamic MoE scale counts this TP rank's actual tokens.
+        return _scatter_padding_mask_to_sequence_parallel_region(padding_mask)
+
+    # Other models and non-embedding GPT stages received a mask already prepared
+    # by _prepare_padding_mask_for_model.
+    return padding_mask
 
 
 @contextmanager
@@ -227,6 +254,12 @@ def model_forward(
     padding_mask = _prepare_padding_mask_for_model(model, padding_mask)
     if padding_mask is not None:
         additional_kwargs["padding_mask"] = padding_mask
+    if packed_seq_params is not None and isinstance(
+        getattr(packed_seq_params, "local_cp_size", None), int
+    ):
+        configure_dynamic_moe_loss_scaling(
+            model, _prepare_padding_mask_for_router_scaling(model, padding_mask)
+        )
 
     # Only sent when the model advertises the parameter, so it never reaches a
     # forward that would swallow it into **kwargs and quietly ignore it.

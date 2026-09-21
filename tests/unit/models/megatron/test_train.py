@@ -226,6 +226,40 @@ class TestModelForward:
         mock_scatter.assert_not_called()
         assert result is padding_mask
 
+    def test_first_gpt_stage_router_scaling_uses_sequence_parallel_mask(self):
+        """Count the same TP-local tokens that the first-stage router receives."""
+        from nemo_rl.models.megatron import train
+
+        class FakeGPTModel:
+            def __init__(self):
+                self.config = SimpleNamespace(sequence_parallel=True)
+                self.pre_process = True
+
+        model = FakeGPTModel()
+        padding_mask = torch.tensor([[False, True, False, True]])
+        scattered = torch.tensor([[False], [False]])
+        tp_group = MagicMock()
+
+        with (
+            patch.object(train, "GPTModel", FakeGPTModel),
+            patch.object(
+                train.tensor_parallel,
+                "scatter_to_sequence_parallel_region",
+                return_value=scattered,
+            ) as mock_scatter,
+            patch.object(
+                train, "get_tensor_model_parallel_group", return_value=tp_group
+            ),
+        ):
+            result = train._prepare_padding_mask_for_router_scaling(
+                model, padding_mask
+            )
+
+        mock_scatter.assert_called_once()
+        assert torch.equal(mock_scatter.call_args.args[0], padding_mask.transpose(0, 1))
+        assert mock_scatter.call_args.kwargs["group"] is tp_group
+        assert torch.equal(result, scattered.transpose(0, 1))
+
     def test_model_forward_with_defer_fp32_logits(self):
         """Test model_forward passes fp32_output when defer_fp32_logits is True."""
         from nemo_rl.models.megatron.train import model_forward

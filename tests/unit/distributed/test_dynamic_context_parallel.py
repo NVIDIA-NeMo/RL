@@ -112,6 +112,60 @@ def test_padding_drives_cp_selection():
     assert task.cp_size == 2
 
 
+def test_short_sequences_fill_existing_large_cp_packs():
+    lengths = [6000, 2000]
+    phases = make_plan(lengths, lanes=2, budget=4096, sp=4)
+    tasks = [task for phase in phases for task in phase.assignments]
+    assert len(tasks) == 1
+    assert tasks[0].sample_indices == (0, 1)
+    assert tasks[0].cp_size == 2
+    assert tasks[0].padded_tokens == 8000
+    check_plan(phases, lengths, 2, 4096, 4)
+
+
+def test_cross_size_packing_uses_destination_padding_and_budget():
+    # 4089 fits beside 4100 with CP1 padding (4100+4092), but not with
+    # CP2's required multiple of 16 (4112+4096). Do not overfill that pack.
+    lengths = [4100, 4089, 4000, 4000]
+    phases = make_plan(lengths, lanes=2, budget=4096, sp=4)
+    tasks = [task for phase in phases for task in phase.assignments]
+    long_task = next(task for task in tasks if 0 in task.sample_indices)
+    assert 1 not in long_task.sample_indices
+    assert len(long_task.sample_indices) == 2
+    assert long_task.padded_tokens == 8112
+    check_plan(phases, lengths, 2, 4096, 4)
+
+
+def test_cross_size_packing_preserves_small_cp_for_remaining_work():
+    lengths = [8192, 4000, 4000]
+    phases = make_plan(lengths, lanes=2, budget=4096, sp=4)
+    tasks = [task for phase in phases for task in phase.assignments]
+    assert sorted(task.cp_size for task in tasks) == [1, 1, 2]
+    check_plan(phases, lengths, 2, 4096, 4)
+
+
+def test_cross_size_packing_respects_expert_minimum():
+    lengths = [24000, 8000, 16000, 16000]
+    phases = make_plan(lengths, lanes=8, minimum=4, budget=4096, sp=2)
+    assert all(task.cp_size >= 4 for phase in phases for task in phase.assignments)
+    long_task = next(
+        task
+        for phase in phases
+        for task in phase.assignments
+        if 0 in task.sample_indices
+    )
+    assert long_task.sample_indices == (0, 1)
+    check_plan(phases, lengths, 8, 4096, 2)
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+def test_gpu_parity_fixture_still_exercises_cp1_after_cross_size_packing(tp):
+    lengths = [7, 45, 101, 11, 55, 9, 29, 29, 29, 29]
+    phases = make_plan(lengths, lanes=4 // tp, budget=32 * tp, sp=tp)
+    sizes = {task.cp_size for phase in phases for task in phase.assignments}
+    assert sizes == ({1, 2, 4} if tp == 1 else {1, 2})
+
+
 def test_moe_minimum_expands_real_work_to_fill_lanes():
     phases = make_plan([3, 7], minimum=4)
     assert all(a.cp_size >= 4 for p in phases for a in p.assignments)

@@ -1766,6 +1766,26 @@ def test_compute_moe_grad_scale_normalizes_by_valid_tokens():
     assert torch.allclose(scale_fn(), torch.tensor(0.25))
 
 
+def test_compute_moe_grad_scale_applies_dynamic_task_correction(monkeypatch):
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+    model_config = SimpleNamespace()
+    worker.model = SimpleNamespace(config=model_config)
+    monkeypatch.setattr(
+        worker_module,
+        "dynamic_moe_grad_scale_correction",
+        lambda config: 1.5 if config is model_config else 1.0,
+    )
+
+    scale_fn = worker_module.MegatronPolicyWorkerImpl._compute_moe_grad_scale(
+        worker, torch.tensor(4.0)
+    )
+
+    assert torch.allclose(scale_fn(), torch.tensor(0.375))
+
+
 def test_compute_moe_grad_scale_clamps_zero_valid_tokens():
     """clamp(min=1) must guard against division by zero when no valid tokens."""
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
@@ -1779,6 +1799,71 @@ def test_compute_moe_grad_scale_clamps_zero_valid_tokens():
         worker, torch.tensor(0.0)
     )
     assert torch.allclose(scale_fn(), torch.tensor(1.0))
+
+
+def test_dynamic_cp_get_logprobs_runs_every_score_step(monkeypatch):
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+    worker.timer = MagicMock()
+    worker.cfg = {
+        "logprob_batch_size": 1,
+        "megatron_cfg": {"use_fused_linear_logprobs": False},
+    }
+    worker.model = MagicMock()
+    worker.sampling_params = None
+    worker.defer_fp32_logits = False
+    worker.mcore_state = SimpleNamespace(straggler_timer=None)
+    worker.delegate_pack_to_model = False
+    worker.delegate_mtp_loss_mask_to_model = False
+    worker.model_slices_context_parallel_inputs = False
+    worker.media_placeholder_token_id = None
+    worker._router_replay_enabled = False
+    data = BatchedDataDict(input_ids=torch.zeros(2, 4, dtype=torch.long))
+    first_step = object()
+    second_step = object()
+    cp_plan = SimpleNamespace(steps=(first_step, second_step))
+    iterator_calls = []
+    forward_calls = []
+
+    def _get_iterator(*args, cp_step, **kwargs):
+        iterator_calls.append(cp_step)
+        return iter(()), 1, 1, 4, 4
+
+    def _forward_backward(**kwargs):
+        forward_calls.append(kwargs["data_iterator"])
+        value = float(len(forward_calls))
+        return [{"logprobs": torch.full((1, 4), value)}]
+
+    monkeypatch.setattr(
+        worker_module, "attach_media_token_validity_mask", lambda *_: None
+    )
+    monkeypatch.setattr(worker_module, "get_microbatch_iterator", _get_iterator)
+    monkeypatch.setattr(worker_module, "megatron_forward_backward", _forward_backward)
+    monkeypatch.setattr(worker_module, "_should_use_router_replay", lambda **_: False)
+    monkeypatch.setattr(worker_module, "LogprobsPostProcessor", MagicMock())
+    monkeypatch.setattr(
+        worker_module.parallel_state,
+        "is_pipeline_last_stage",
+        lambda **_: True,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "broadcast_tensors_from_last_stage",
+        lambda tensors: tensors,
+    )
+
+    result = worker_module.MegatronPolicyWorkerImpl.get_logprobs(
+        worker, data=data, cp_plan=cp_plan
+    )
+
+    assert iterator_calls == [first_step, second_step]
+    assert len(forward_calls) == 2
+    torch.testing.assert_close(
+        result["logprobs"],
+        torch.tensor([[1.0, 1.0, 1.0, 1.0], [2.0, 2.0, 2.0, 2.0]]),
+    )
 
 
 @pytest.mark.parametrize(

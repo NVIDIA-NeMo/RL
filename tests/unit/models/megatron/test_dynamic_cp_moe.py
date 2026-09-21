@@ -73,6 +73,7 @@ _GatedDelta.__module__ = "megatron.core.ssm.gated_delta_net"
 class _Router(torch.nn.Module):
     def __init__(self, group, config):
         super().__init__()
+        self.cp_group = group
         self.tp_cp_group = group
         self.config = config
 
@@ -108,6 +109,7 @@ def test_dynamic_binding_updates_router_and_ssm_then_restores(monkeypatch):
     with dynamic_cp.preserve_attention_cp_groups(model):
         model_packed = dynamic_cp.bind_attention_cp_group(model, packed)
         assert model_packed.cp_group is active_cp
+        assert model.router.cp_group is active_cp
         assert model.router.tp_cp_group is active_tp_cp
         assert model.mamba.pg_collection.cp is active_cp
         assert model.mamba.cp is not original_mamba_helper
@@ -117,6 +119,7 @@ def test_dynamic_binding_updates_router_and_ssm_then_restores(monkeypatch):
         assert config.moe_aux_loss_coeff == [0.0, 0.0]
         assert config.moe_z_loss_coeff is None
 
+    assert model.router.cp_group is original_tp_cp
     assert model.router.tp_cp_group is original_tp_cp
     assert model.mamba.pg_collection.cp is original_cp
     assert model.mamba.cp is original_mamba_helper
@@ -124,3 +127,51 @@ def test_dynamic_binding_updates_router_and_ssm_then_restores(monkeypatch):
     assert model.gdn.cp_size == 1
     assert config.moe_aux_loss_coeff == [0.1, 0.2]
     assert config.moe_z_loss_coeff == 0.01
+
+
+@pytest.mark.parametrize(
+    ("active_size", "group_tokens"),
+    [(1, 3), (4, 10)],
+)
+def test_dynamic_moe_scaling_uses_exact_active_group_token_count(
+    monkeypatch, active_size, group_tokens
+):
+    from nemo_rl.models.megatron import dynamic_cp
+
+    active_tp_cp = _Group(active_size)
+    config = SimpleNamespace(moe_aux_loss_coeff=0.1, moe_z_loss_coeff=0.02)
+    model = torch.nn.Module()
+    model.add_module("router", _Router(active_tp_cp, config))
+    padding_mask = torch.tensor([[False, False, False, True]])
+
+    monkeypatch.setattr(dynamic_cp, "Router", _Router)
+
+    def _all_reduce(value, *, group):
+        assert group is active_tp_cp
+        value.fill_(group_tokens)
+
+    monkeypatch.setattr(dynamic_cp.torch.distributed, "all_reduce", _all_reduce)
+
+    with dynamic_cp.preserve_attention_cp_groups(model):
+        dynamic_cp.configure_dynamic_moe_loss_scaling(model, padding_mask)
+        correction = group_tokens / (3 * active_size)
+        assert dynamic_cp.dynamic_moe_grad_scale_correction(config) == pytest.approx(
+            correction
+        )
+        assert config.moe_z_loss_coeff == pytest.approx(0.02 / correction)
+
+    assert dynamic_cp.dynamic_moe_grad_scale_correction(config) == 1.0
+    assert config.moe_aux_loss_coeff == 0.1
+    assert config.moe_z_loss_coeff == 0.02
+
+
+def test_dynamic_moe_scaling_is_noop_for_dense_model(monkeypatch):
+    from nemo_rl.models.megatron import dynamic_cp
+
+    monkeypatch.setattr(
+        dynamic_cp.torch.distributed,
+        "all_reduce",
+        lambda *_args, **_kwargs: pytest.fail("dense model performed MoE reduction"),
+    )
+
+    dynamic_cp.configure_dynamic_moe_loss_scaling(torch.nn.Linear(2, 2), None)

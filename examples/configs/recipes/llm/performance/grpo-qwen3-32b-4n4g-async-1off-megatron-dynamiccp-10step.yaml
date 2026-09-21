@@ -1,0 +1,55 @@
+defaults: ./grpo-qwen3-32b-8n4g-async-1off.yaml
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 32
+  max_num_steps: 10
+  val_period: 1000
+  val_at_start: false
+  val_at_end: false
+checkpointing:
+  enabled: false
+policy:
+  train_global_batch_size: 512
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 16384
+  make_sequence_length_divisible_by: 2
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_model_parallel_size: 1
+    sequence_parallel: true
+    activation_checkpointing: true
+    dynamic_context_parallel:
+      enabled: true
+      min_size: 1
+      max_size: 4
+      tokens_per_rank: 4096
+    fp8_cfg:
+      enabled: false
+  sequence_packing:
+    enabled: true
+  dynamic_batching:
+    enabled: false
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 2
+        gpus_per_node: 4
+    vllm_cfg:
+      tensor_parallel_size: 2
+logger:
+  log_dir: logs/grpo-qwen3-32b-4n4g-async-dynamiccp-10step
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl-cp-comparison
+    name: qwen3-32b-4n4g-async-dynamiccp-10step
+cluster:
+  num_nodes: 4
+  gpus_per_node: 4
+  segment_size: 2
+data_plane:
+  enabled: false

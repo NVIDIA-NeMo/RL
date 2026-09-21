@@ -80,13 +80,14 @@ def main() -> None:
     dist.init_process_group("nccl")
     rank, world = dist.get_rank(), dist.get_world_size()
     assert world == 4
-    lengths = torch.tensor([7, 45, 101, 11, 55, 9])
-    ids = (torch.arange(6 * 112).reshape(6, 112) % 31 + 1).long()
+    # Preserve CP1 coverage even when short samples fill larger-CP packs.
+    lengths = torch.tensor([7, 45, 101, 11, 55, 9, 29, 29, 29, 29])
+    ids = (torch.arange(len(lengths) * 112).reshape(len(lengths), 112) % 31 + 1).long()
     data = BatchedDataDict(
         input_ids=ids,
         input_lengths=lengths,
         token_mask=(torch.arange(112)[None, :] < lengths[:, None]).long(),
-        sample_mask=torch.tensor([1, 1, 1, 0, 1, 1]),
+        sample_mask=torch.tensor([1, 1, 1, 0, 1, 1, 1, 1, 1, 1]),
     )
     for tp, base_cp in ((1, 1), (1, 2), (2, 1), (2, 2)):
         parallel_state.initialize_model_parallel(
@@ -150,7 +151,18 @@ def main() -> None:
                 },
             },
         }
-        dispatch = build_cp_dispatch(data, cfg, mesh, batch_size=6, training=True)
+        dispatch = build_cp_dispatch(
+            data, cfg, mesh, batch_size=data.size, training=True
+        )
+        active_sizes = {
+            task.cp_size
+            for dp_plans in dispatch.plans
+            for rank_plan in dp_plans
+            for rank_step in rank_plan.steps
+            for task in rank_step.assignments
+            if task.sample_indices
+        }
+        assert active_sizes == ({1, 2, 4} if tp == 1 else {1, 2}), active_sizes
         lane = rank // tp
         plan = dispatch.plans[lane // base_cp][lane % base_cp]
         payload = dispatch.data[lane // base_cp][lane % base_cp]

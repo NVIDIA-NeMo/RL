@@ -29,6 +29,8 @@ from nemo_rl.models.policy.dynamic_cp import (
     collect_cp_outputs,
     cp_schedule_matches,
     owned_real_task_count,
+    real_task_participation_count,
+    validate_dynamic_cp,
 )
 
 
@@ -133,11 +135,63 @@ class TestDynamicCPDispatch(unittest.TestCase):
                 }
             )
         )
+        self.assertTrue(
+            _enabled_global_aux_loss(
+                {
+                    "model_overrides": {
+                        "moe_router_load_balancing_type": "global_aux_loss"
+                    }
+                }
+            )
+        )
         self.assertFalse(
             _enabled_global_aux_loss(
                 {"moe_router_load_balancing_type": "seq_aux_loss"}
             )
         )
+
+    def _validation_cfg(self) -> dict:
+        return {
+            "make_sequence_length_divisible_by": 1,
+            "sequence_packing": {"enabled": True, "pair_grouping_key": None},
+            "dynamic_batching": {"enabled": False},
+            "draft": {"enabled": False},
+            "megatron_cfg": {
+                "enabled": True,
+                "pipeline_model_parallel_size": 1,
+                "tensor_model_parallel_size": 1,
+                "expert_model_parallel_size": 1,
+                "expert_tensor_parallel_size": 1,
+                "sequence_parallel": False,
+                "dynamic_context_parallel": {
+                    "enabled": True,
+                    "tokens_per_rank": 8,
+                    "max_size": 4,
+                },
+            },
+        }
+
+    def test_dynamic_cp_validation_requires_pp_one(self):
+        cfg = self._validation_cfg()
+        cfg["megatron_cfg"]["pipeline_model_parallel_size"] = 2
+        with self.assertRaisesRegex(ValueError, "PP=1"):
+            validate_dynamic_cp(cfg, lanes=4)
+
+    def test_dynamic_cp_validation_rejects_quantile_router(self):
+        cfg = self._validation_cfg()
+        cfg["megatron_cfg"]["model_overrides"] = {
+            "moe_router_load_balancing_type": "quantile_balancing"
+        }
+        with self.assertRaisesRegex(ValueError, "quantile_balancing"):
+            validate_dynamic_cp(cfg, lanes=4)
+
+    def test_dynamic_cp_validation_rejects_moe_microbatch_overlap(self):
+        cfg = self._validation_cfg()
+        cfg["megatron_cfg"]["model_overrides"] = {
+            "overlap_moe_expert_parallel_comm": True
+        }
+        with self.assertRaisesRegex(ValueError, "overlap_moe_expert_parallel_comm"):
+            validate_dynamic_cp(cfg, lanes=4)
 
     def test_outputs_from_nonzero_static_cp_are_preserved(self):
         dispatch = build_cp_dispatch(
@@ -310,6 +364,20 @@ class TestDynamicCPDispatch(unittest.TestCase):
                 for plan in dp_plans
             ),
             unique_real_tasks,
+        )
+        real_task_participations = sum(
+            task.cp_size
+            for group in dispatch.schedule.groups_by_batch[0]
+            for task in group.assignments
+            if task.sample_indices
+        )
+        self.assertEqual(
+            sum(
+                real_task_participation_count(plan)
+                for dp_plans in dispatch.plans
+                for plan in dp_plans
+            ),
+            real_task_participations,
         )
         self.assertTrue(
             all(

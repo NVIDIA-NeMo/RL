@@ -30,19 +30,28 @@ from nemo_rl.distributed.named_sharding import NamedSharding
 logger = logging.getLogger(__name__)
 
 
+def _model_setting(megatron_cfg: dict[str, Any], name: str) -> Any:
+    """Resolve a model field after applying the Bridge override layer."""
+    overrides = megatron_cfg.get("model_overrides") or {}
+    return overrides[name] if name in overrides else megatron_cfg.get(name)
+
+
+def _routing_types(megatron_cfg: dict[str, Any]) -> list[Any]:
+    routing_type = _model_setting(megatron_cfg, "moe_router_load_balancing_type")
+    return (
+        list(routing_type)
+        if isinstance(routing_type, (list, tuple))
+        else [routing_type]
+    )
+
+
 def _enabled_global_aux_loss(megatron_cfg: dict[str, Any]) -> bool:
     """Return whether a full-DP global aux collective is configured.
 
     The coefficient can originate in the HF model provider rather than this
     dictionary, so the routing type itself must be rejected.
     """
-    routing_type = megatron_cfg.get("moe_router_load_balancing_type")
-    routing_types = (
-        list(routing_type)
-        if isinstance(routing_type, (list, tuple))
-        else [routing_type]
-    )
-    return "global_aux_loss" in routing_types
+    return "global_aux_loss" in _routing_types(megatron_cfg)
 
 
 def _minimum_cp_size_for_experts(
@@ -59,9 +68,7 @@ def _minimum_cp_size_for_experts(
     tensor_parallel = megatron_cfg["tensor_model_parallel_size"]
     expert_tensor_parallel = megatron_cfg.get("expert_tensor_parallel_size", 1)
     if expert_tensor_parallel != 1:
-        raise ValueError(
-            "Dynamic CP MoE requires expert_tensor_parallel_size=1"
-        )
+        raise ValueError("Dynamic CP MoE requires expert_tensor_parallel_size=1")
     if expert_parallel <= 1:
         return configured_minimum
     minimum = configured_minimum
@@ -103,8 +110,14 @@ def validate_dynamic_cp(cfg: dict[str, Any], *, lanes: int) -> None:
         )
     if mc.get("cuda_graph_impl") not in (None, "none"):
         raise ValueError("Dynamic CP does not support CUDA graph capture")
-    if mc.get("mtp_num_layers") or mc.get("moe_hybridep_prepad_packed_inputs"):
+    if _model_setting(mc, "mtp_num_layers") or _model_setting(
+        mc, "moe_hybridep_prepad_packed_inputs"
+    ):
         raise ValueError("Dynamic CP does not support MTP or HybridEP input prepadding")
+    if _model_setting(mc, "overlap_moe_expert_parallel_comm"):
+        raise ValueError(
+            "Dynamic CP does not support overlap_moe_expert_parallel_comm"
+        )
     if cfg["sequence_packing"].get("pair_grouping_key"):
         raise ValueError("Dynamic CP does not yet schedule atomic preference pairs")
     if _enabled_global_aux_loss(mc):
@@ -112,6 +125,11 @@ def validate_dynamic_cp(cfg: dict[str, Any], *, lanes: int) -> None:
             "Dynamic CP does not support global_aux_loss: its per-forward "
             "TP*DP*CP collective cannot be called by uneven CP task lists. "
             "Use aux_loss or seq_aux_loss instead."
+        )
+    if "quantile_balancing" in _routing_types(mc):
+        raise ValueError(
+            "Dynamic CP does not support quantile_balancing because its router "
+            "rejects the packed padding mask required for correct token counts"
         )
     # Probe even empty plans, so invalid domains/bounds fail at initialization.
     tp = mc["tensor_model_parallel_size"]
@@ -166,6 +184,16 @@ def owned_real_task_count(plan: CPRankPlan) -> int:
         for step in plan.steps
         for task in step.assignments
         if task.sample_indices and plan.lane == task.lane_start
+    )
+
+
+def real_task_participation_count(plan: CPRankPlan) -> int:
+    """Count real task calls made by this lane across all optimizer steps."""
+    return sum(
+        1
+        for step in plan.steps
+        for task in step.assignments
+        if task.sample_indices
     )
 
 
@@ -341,9 +369,16 @@ def build_cp_dispatch(
         else:
             valid_sequences = valid_tokens = 0.0
         samples_by_cp = Counter()
+        tasks_by_cp = Counter()
+        packed_tokens = 0
+        packed_capacity = 0
         for group in groups:
             for task in group.assignments:
                 samples_by_cp[task.cp_size] += len(task.sample_indices)
+                if task.sample_indices:
+                    tasks_by_cp[task.cp_size] += 1
+                    packed_tokens += task.padded_tokens
+                    packed_capacity += task.cp_size * schedule.tokens_per_rank
         group_task_ranges = [
             (
                 min(len(assignments_for_lane(group, lane)) for lane in range(lanes)),
@@ -354,7 +389,7 @@ def build_cp_dispatch(
         logger.info(
             "Dynamic CP %s: samples=%d groups=%d uneven_groups=%d "
             "local_tasks=[%d,%d] "
-            "samples_by_cp=%s "
+            "samples_by_cp=%s tasks_by_cp=%s packing_utilization=%.4f "
             "valid_sequences=%s valid_tokens=%s schedule=%s",
             "train" if training else "score",
             gbs,
@@ -369,6 +404,8 @@ def build_cp_dispatch(
                 for lane in range(lanes)
             ),
             dict(sorted(samples_by_cp.items())),
+            dict(sorted(tasks_by_cp.items())),
+            packed_tokens / packed_capacity if packed_capacity else 0.0,
             valid_sequences,
             valid_tokens,
             "reused" if reused_schedule else "new",

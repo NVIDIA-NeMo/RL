@@ -45,13 +45,14 @@ def main() -> None:
         context_parallel_size=1,
         hybrid_context_parallel=True,
     )
-    lengths = torch.tensor([7, 45, 101, 11, 55, 9])
-    ids = (torch.arange(6 * 112).reshape(6, 112) % 31 + 1).long()
+    # Leave enough short work after filling long packs to exercise CP1 too.
+    lengths = torch.tensor([7, 45, 101, 11, 55, 9, 29, 29, 29, 29])
+    ids = (torch.arange(len(lengths) * 112).reshape(len(lengths), 112) % 31 + 1).long()
     data = BatchedDataDict(
         input_ids=ids,
         input_lengths=lengths,
         token_mask=(torch.arange(112)[None, :] < lengths[:, None]).long(),
-        sample_mask=torch.tensor([1, 1, 1, 0, 1, 1]),
+        sample_mask=torch.tensor([1, 1, 1, 0, 1, 1, 1, 1, 1, 1]),
     )
     mesh = NamedSharding(
         np.arange(world).reshape(1, world, 1, 1),
@@ -85,7 +86,18 @@ def main() -> None:
             mesh = NamedSharding(
                 np.arange(world).reshape(1, world // base_cp, base_cp, 1), mesh.names
             )
-        dispatch = build_cp_dispatch(data, cfg, mesh, batch_size=6, training=True)
+        dispatch = build_cp_dispatch(
+            data, cfg, mesh, batch_size=data.size, training=True
+        )
+        active_sizes = {
+            task.cp_size
+            for dp_plans in dispatch.plans
+            for rank_plan in dp_plans
+            for rank_step in rank_plan.steps
+            for task in rank_step.assignments
+            if task.sample_indices
+        }
+        assert active_sizes == {1, 2, 4}, active_sizes
         plan = dispatch.plans[rank // base_cp][rank % base_cp]
         payload = dispatch.data[rank // base_cp][rank % base_cp]
         step = plan.steps[0]

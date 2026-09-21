@@ -674,10 +674,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self, method: str, data: BatchedDataDict, **kwargs: Any
     ) -> BatchedDataDict:
         schedule_batch_size = self.cfg["train_global_batch_size"]
-        if data.size != schedule_batch_size:
-            # The score worker currently consumes one CPRankStep. Standalone
-            # scoring can therefore use dynamic CP as one schedule batch, but
-            # it will not reuse a multi-global-batch training schedule.
+        if data.size % schedule_batch_size:
+            # A standalone score batch need not be a multiple of training GBS.
+            # In that case plan it as one batch; otherwise preserve every
+            # training-sized step so score and train can share the schedule.
             schedule_batch_size = data.size
         schedule = self._matching_dynamic_cp_schedule(data, schedule_batch_size)
         dispatch = build_cp_dispatch(

@@ -17,14 +17,15 @@ TensorPayload = tuple[np.ndarray, torch.dtype, tuple[int, ...]]
 
 
 def tensor_to_payload(tensor: torch.Tensor) -> TensorPayload:
-    """Encode a CPU RPC tensor without invoking Torch's storage pickler.
+    """Encode an RPC tensor without invoking Torch's storage pickler.
 
     MCore can replace that pickler's loader with a Megatron function, which
     cannot be imported in the Ray driver. Byte arrays also preserve BF16.
+    CUDA tensors are staged to host memory and, like all actor return tensors
+    using this transport, are restored as CPU tensors in the driver.
     """
-    if tensor.device.type != "cpu":
-        raise ValueError("Policy RPC tensors must be moved to CPU before serialization")
-    data = tensor.detach().contiguous().reshape(-1).view(torch.uint8).numpy()
+    host_tensor = tensor.detach().to(device="cpu").contiguous()
+    data = host_tensor.reshape(-1).view(torch.uint8).numpy()
     return data, tensor.dtype, tuple(tensor.shape)
 
 

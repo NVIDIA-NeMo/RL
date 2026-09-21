@@ -202,6 +202,7 @@ def get_moe_metrics(
     mtp_num_layers: Optional[int] = None,
     track_names: Optional[list[str]] = None,
     dynamic_parallel_group: Optional[dist.ProcessGroup] = None,
+    dynamic_avg_loss_scale: Optional[float] = None,
 ) -> dict[str, Any]:
     """Returns Mixture of Experts (MoE) auxiliary-loss metrics.
 
@@ -227,6 +228,12 @@ def get_moe_metrics(
             Dynamic lanes can execute different numbers of microbatches and the
             router's per-forward TP*CP group changes with each task, so its last
             recorded reduction group is not safe for end-of-step metric sync.
+        dynamic_avg_loss_scale: Scale for dynamic metrics recorded with
+            ``avg_group`` (currently z-loss). These values have one contribution
+            per participating TP*CP rank rather than one partial sum per task.
+            The caller supplies the reciprocal of the global real-task rank
+            participation count. Required with ``dynamic_parallel_group`` when
+            an averaged metric is present.
 
     Returns:
         dict[str, Any]: A flat dict of aggregated metrics. For each aux loss name,
@@ -264,6 +271,7 @@ def get_moe_metrics(
             mcore_tracker.ensure_initialized(name, tracker_num_layers)
 
     dynamic_names: Optional[list[str]] = None
+    dynamic_avg_names: set[str] = set()
     if dynamic_parallel_group is None:
         reduce_aux_losses_tracker_across_ranks()
     else:
@@ -278,6 +286,11 @@ def get_moe_metrics(
         for name in dynamic_names:
             entry = mcore_tracker.metrics.get(name)
             if entry is not None:
+                # Padding-only lanes receive a pre-initialized z-loss entry but
+                # never call record(), so its avg_group remains None locally.
+                # z_loss is nevertheless an averaged metric on every lane.
+                if name == "z_loss" or getattr(entry, "avg_group", None) is not None:
+                    dynamic_avg_names.add(name)
                 dist.all_reduce(entry.values, group=dynamic_parallel_group)
     tracker = get_moe_layer_wise_logging_tracker()
     if dynamic_names is not None:
@@ -285,7 +298,24 @@ def get_moe_metrics(
 
     metrics: dict[str, Any] = {}
     if len(tracker) > 0:
-        aux_losses = {k: v["values"].float() * loss_scale for k, v in tracker.items()}
+        if dynamic_avg_names and dynamic_avg_loss_scale is None:
+            raise ValueError(
+                "Dynamic averaged MoE metrics require a rank-participation scale"
+            )
+        resolved_dynamic_avg_loss_scale = (
+            dynamic_avg_loss_scale
+            if dynamic_avg_loss_scale is not None
+            else loss_scale
+        )
+        aux_losses = {
+            name: value["values"].float()
+            * (
+                resolved_dynamic_avg_loss_scale
+                if name in dynamic_avg_names
+                else loss_scale
+            )
+            for name, value in tracker.items()
+        }
         for name, loss_list in aux_losses.items():
             # Megatron-LM aggregates aux losses across layers and normalizes by number of MoE layers
             num_tracked_layers = int(loss_list.numel()) if loss_list.numel() > 0 else 1

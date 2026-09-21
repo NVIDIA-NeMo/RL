@@ -76,6 +76,7 @@ from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
     process_global_batch,
 )
+from nemo_rl.models.megatron.dynamic_cp import dynamic_moe_grad_scale_correction
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
     broadcast_obj_from_pp_rank,
@@ -106,7 +107,11 @@ from nemo_rl.models.megatron.train import (
     megatron_forward_backward,
 )
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.dynamic_cp import dynamic_cp_config, owned_real_task_count
+from nemo_rl.models.policy.dynamic_cp import (
+    dynamic_cp_config,
+    owned_real_task_count,
+    real_task_participation_count,
+)
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -789,16 +794,38 @@ class MegatronPolicyWorkerImpl(
             if _model_accepts_media_token_validity_mask(self.model)
             else None
         )
-        # MCore installs a Megatron-specific torch storage loader process-wide.
-        # Every Megatron policy result therefore needs the portable CPU-tensor
-        # serializer, even when dynamic context parallelism is disabled; the
-        # Ray driver intentionally does not have Megatron on its import path.
-        register_policy_tensor_serializer()
         if dynamic_cp_config(self.cfg) is not None:
+            # Dynamic dispatch collects every DP*CP result rather than Ray's
+            # usual replicated-rank subset. Keep the serializer scoped to these
+            # workers so unrelated Megatron RPCs retain Ray's CUDA behavior.
+            register_policy_tensor_serializer()
             if self.delegate_pack_to_model or self.model_slices_context_parallel_inputs:
                 raise ValueError("Dynamic CP requires NeMo-owned text-model packing")
-            if getattr(self._get_model_config(), "mtp_num_layers", None):
+            model_config = self._get_model_config()
+            if getattr(model_config, "mtp_num_layers", None):
                 raise ValueError("Dynamic CP does not yet support MTP")
+            if getattr(
+                model_config,
+                "overlap_moe_expert_parallel_comm",
+                False,
+            ):
+                raise ValueError(
+                    "Dynamic CP does not support overlap_moe_expert_parallel_comm"
+                )
+            if getattr(model_config, "moe_hybridep_prepad_packed_inputs", False):
+                raise ValueError("Dynamic CP does not support HybridEP input prepadding")
+            routing_type = getattr(
+                model_config, "moe_router_load_balancing_type", None
+            )
+            routing_types = (
+                list(routing_type)
+                if isinstance(routing_type, (list, tuple))
+                else [routing_type]
+            )
+            if "global_aux_loss" in routing_types:
+                raise ValueError("Dynamic CP does not support global_aux_loss")
+            if "quantile_balancing" in routing_types:
+                raise ValueError("Dynamic CP does not support quantile_balancing")
 
         if self.model_slices_context_parallel_inputs:
             if self.delegate_pack_to_model:
@@ -1114,13 +1141,10 @@ class MegatronPolicyWorkerImpl(
                         self._copy_main_params_to_param_buffer()
 
                     # Set moe_grad_scale_func for MoE aux-loss gradient scaling.
-                    # With calculate_per_token_loss=True, the router pre-multiplies
-                    # the aux loss by (num_local_tokens * tp_cp_group.size()), and
-                    # MoEAuxLossAutoScaler applies loss_scale to the gradient. Setting
-                    # loss_scale = 1/global_valid_toks (G = global valid token count)
-                    # normalizes the aux gradient consistently with the main per-token
-                    # SFT loss:
-                    #   (1/G) * N_local * tp_cp_size * aux_grad -> DDP SUM -> aux_grad / G
+                    # Dynamic CP corrects MCore's local_tokens * TP*CP factor to
+                    # the exact active-task token count. Static CP has correction 1.
+                    # Dividing by global_valid_toks then gives the same global
+                    # per-token normalization as the main loss.
                     self._set_moe_grad_scale_func(  # pragma: no cover
                         self._compute_moe_grad_scale(global_valid_toks)
                     )
@@ -1307,10 +1331,10 @@ class MegatronPolicyWorkerImpl(
             "grad_norm": torch.tensor([grad_norm]),
             "train_elapsed_seconds": metrics_train_elapsed,  # pragma: no cover
         }
-        # Read "config" via getattr-by-string so the token stays out of
-        # train.__code__.co_names; with torch 2.11 cloudpickle otherwise
-        # matches torch.distributed.config (a non-pickleable ConfigModuleInstance).
-        model_config = getattr(self.model, "config", None)
+        # Keep config lookup in a helper so train.__code__.co_names does not
+        # include "config" (which torch 2.11 cloudpickle can mistake for
+        # torch.distributed.config), while still unwrapping Float16Module.
+        model_config = self._get_model_config()
         num_moe_experts = getattr(model_config, "num_moe_experts", None)
         if num_moe_experts is not None and num_moe_experts > 1:
             dynamic_moe_group = None
@@ -1328,13 +1352,23 @@ class MegatronPolicyWorkerImpl(
                     ),
                 )
                 moe_loss_scale = 1.0 / max(1, int(global_real_tasks.item()))
-                dynamic_moe_group = (
-                    parallel_state.get_tensor_and_data_parallel_group(
-                        with_context_parallel=True
-                    )
+                dynamic_moe_group = parallel_state.get_tensor_and_data_parallel_group(
+                    with_context_parallel=True
+                )
+                local_participations = real_task_participation_count(cp_plan)
+                global_participations = torch.tensor(
+                    local_participations, dtype=torch.int64, device="cuda"
+                )
+                torch.distributed.all_reduce(
+                    global_participations,
+                    group=dynamic_moe_group,
+                )
+                dynamic_avg_loss_scale = 1.0 / max(
+                    1, int(global_participations.item())
                 )
             else:
                 moe_loss_scale = 1.0 / max(1, total_num_microbatches)
+                dynamic_avg_loss_scale = None
             moe_metrics = get_moe_metrics(
                 loss_scale=moe_loss_scale,
                 per_layer_logging=self.cfg["megatron_cfg"]["moe_per_layer_logging"],
@@ -1346,6 +1380,7 @@ class MegatronPolicyWorkerImpl(
                 mtp_num_layers=getattr(model_config, "mtp_num_layers", None),
                 track_names=get_aux_loss_track_names(model_config),
                 dynamic_parallel_group=dynamic_moe_group,
+                dynamic_avg_loss_scale=dynamic_avg_loss_scale,
             )
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
@@ -1386,13 +1421,17 @@ class MegatronPolicyWorkerImpl(
     def _compute_moe_grad_scale(self, global_valid_toks):
         """Build a moe_grad_scale_func that normalizes the aux-loss gradient.
 
-        Returns a callable yielding loss_scale = 1/global_valid_toks (clamped to
-        avoid division by zero) so the MoE aux gradient is normalized consistently
-        with the main per-token SFT loss. See the call site in train() for the
-        full derivation.
+        The base scale is 1/global_valid_toks (clamped to avoid division by
+        zero). Dynamic CP additionally supplies the current task's exact-token
+        correction; static CP and dense models retain a correction of one.
         """
         moe_scale = 1.0 / global_valid_toks.clamp(min=1).float()
-        return lambda: moe_scale
+
+        def _scale() -> torch.Tensor:
+            model_config = self._get_model_config() if hasattr(self, "model") else None
+            return moe_scale * dynamic_moe_grad_scale_correction(model_config)
+
+        return _scale
 
     def _set_moe_grad_scale_func(self, func):
         """Set moe_grad_scale_func on the model config for MOE aux loss scaling."""
@@ -2208,24 +2247,6 @@ class MegatronPolicyWorkerImpl(
         # against a different media alignment than the one trained on.
         attach_media_token_validity_mask(data, self.media_placeholder_token_id)
 
-        (
-            mb_iterator,
-            num_microbatches,
-            micro_batch_size,
-            seq_length,
-            padded_seq_length,
-        ) = get_microbatch_iterator(
-            data,
-            self.cfg,
-            logprob_batch_size,
-            straggler_timer=self.mcore_state.straggler_timer,
-            delegate_pack_to_model=self.delegate_pack_to_model,
-            delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
-            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
-            cp_plan=cp_plan,
-            cp_step=cp_plan.steps[0] if cp_plan is not None else None,
-        )
-
         use_fused_linear_logprobs = self.cfg["megatron_cfg"].get(
             "use_fused_linear_logprobs", False
         )
@@ -2241,22 +2262,47 @@ class MegatronPolicyWorkerImpl(
             require=require_router_replay,
         )
 
+        cp_steps = cp_plan.steps if cp_plan is not None else (None,)
+        if not cp_steps:
+            raise ValueError("Dynamic CP score plan must contain at least one step")
+        list_of_logprobs = []
+        seq_length = data["input_ids"].shape[1]
         with maybe_r3_trace_stage("prev-logprob", enabled=use_router_replay):
-            list_of_logprobs = megatron_forward_backward(
-                model=self.model,
-                data_iterator=mb_iterator,
-                seq_length=padded_seq_length,
-                mbs=micro_batch_size,
-                num_microbatches=num_microbatches,
-                post_processing_fn=logprobs_post_processor,
-                forward_only=True,
-                defer_fp32_logits=self.defer_fp32_logits,
-                sampling_params=self.sampling_params,
-                straggler_timer=self.mcore_state.straggler_timer,
-                use_fused_linear_logprobs=use_fused_linear_logprobs,
-                use_router_replay=use_router_replay,
-                router_replay_train=False,
-            )
+            for cp_step in cp_steps:
+                (
+                    mb_iterator,
+                    num_microbatches,
+                    step_micro_batch_size,
+                    seq_length,
+                    padded_seq_length,
+                ) = get_microbatch_iterator(
+                    data,
+                    self.cfg,
+                    logprob_batch_size,
+                    straggler_timer=self.mcore_state.straggler_timer,
+                    delegate_pack_to_model=self.delegate_pack_to_model,
+                    delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+                    model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+                    cp_plan=cp_plan,
+                    cp_step=cp_step,
+                )
+                list_of_logprobs.extend(
+                    megatron_forward_backward(
+                        model=self.model,
+                        data_iterator=mb_iterator,
+                        seq_length=padded_seq_length,
+                        mbs=step_micro_batch_size,
+                        num_microbatches=num_microbatches,
+                        post_processing_fn=logprobs_post_processor,
+                        forward_only=True,
+                        defer_fp32_logits=self.defer_fp32_logits,
+                        sampling_params=self.sampling_params,
+                        straggler_timer=self.mcore_state.straggler_timer,
+                        use_fused_linear_logprobs=use_fused_linear_logprobs,
+                        use_router_replay=use_router_replay,
+                        router_replay_train=False,
+                    )
+                )
 
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             all_log_probs_padded = []
@@ -2678,36 +2724,43 @@ class MegatronPolicyWorkerImpl(
 
         attach_media_token_validity_mask(data, self.media_placeholder_token_id)
 
-        (
-            mb_iterator,
-            num_microbatches,
-            micro_batch_size,
-            seq_length,
-            padded_seq_length,
-        ) = get_microbatch_iterator(
-            data,
-            self.cfg,
-            logprob_batch_size,
-            straggler_timer=self.mcore_state.straggler_timer,
-            delegate_pack_to_model=self.delegate_pack_to_model,
-            delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
-            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
-            cp_plan=cp_plan,
-            cp_step=cp_plan.steps[0] if cp_plan is not None else None,
-        )
-
-        list_of_outputs = megatron_forward_backward(
-            model=self.model,
-            data_iterator=mb_iterator,
-            seq_length=padded_seq_length,
-            mbs=micro_batch_size,
-            num_microbatches=num_microbatches,
-            post_processing_fn=TopkLogitsPostProcessor(cfg=self.cfg, k=k),
-            forward_only=True,
-            defer_fp32_logits=self.defer_fp32_logits,
-            sampling_params=self.sampling_params,
-            straggler_timer=self.mcore_state.straggler_timer,
-        )
+        cp_steps = cp_plan.steps if cp_plan is not None else (None,)
+        if not cp_steps:
+            raise ValueError("Dynamic CP score plan must contain at least one step")
+        list_of_outputs = []
+        seq_length = data["input_ids"].shape[1]
+        for cp_step in cp_steps:
+            (
+                mb_iterator,
+                num_microbatches,
+                step_micro_batch_size,
+                seq_length,
+                padded_seq_length,
+            ) = get_microbatch_iterator(
+                data,
+                self.cfg,
+                logprob_batch_size,
+                straggler_timer=self.mcore_state.straggler_timer,
+                delegate_pack_to_model=self.delegate_pack_to_model,
+                delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+                model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+                cp_plan=cp_plan,
+                cp_step=cp_step,
+            )
+            list_of_outputs.extend(
+                megatron_forward_backward(
+                    model=self.model,
+                    data_iterator=mb_iterator,
+                    seq_length=padded_seq_length,
+                    mbs=step_micro_batch_size,
+                    num_microbatches=num_microbatches,
+                    post_processing_fn=TopkLogitsPostProcessor(cfg=self.cfg, k=k),
+                    forward_only=True,
+                    defer_fp32_logits=self.defer_fp32_logits,
+                    sampling_params=self.sampling_params,
+                    straggler_timer=self.mcore_state.straggler_timer,
+                )
+            )
 
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             logits_chunks = []

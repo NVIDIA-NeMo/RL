@@ -47,7 +47,9 @@ lanes contribute, matching the balanced hybrid-CP behavior.
 This path currently supports PP=1 and the standard Ray policy data path.
 TransferQueue, split execution, model-owned multimodal packing, atomic preference
 pairs, MTP, draft training, fused linear logprobs, and training CUDA graphs are
-not supported. Omit or disable the configuration for existing static behavior.
+not supported. Dynamic batching and HybridEP input prepadding are also disabled
+because the driver plan must remain the sole owner of packing and microbatch
+boundaries. Omit or disable the configuration for existing static behavior.
 
 For MoE, the minimum active size is raised until `active_CP * TP >= EP`. Workers
 also check that each actual expert communication group is contained within its
@@ -55,12 +57,18 @@ task's ranks. This keeps every EP collective inside one active-CP task and preve
 experts from communicating across independently scheduled CP blocks. Router
 auxiliary losses and per-layer MoE metrics stay attached to the real microbatch
 that produced them; placeholder tasks carry zero valid tokens and do not affect
-loss normalization.
+loss normalization. `global_aux_loss`, expert tensor parallelism, quantile
+balancing, and overlapped MoE microbatch execution are rejected because their
+collective or scheduling domains cannot follow the active task safely.
 
 ## Dispatch and execution
 
-One scheduling lane contains a complete TP replica. The driver packs sequences
-of the same required CP size and assigns each packed task to an aligned,
+One scheduling lane contains a complete TP replica. The driver visits sequences
+in descending length order. Before opening a task at a sample's minimum CP size,
+it tries spare capacity in already-required larger-CP tasks, then existing tasks
+of the same size. Each admission uses the destination task's padding and token
+budget. This avoids leaving holes beside long samples while making extra model
+calls for short samples. It assigns each packed task to an aligned,
 contiguous group of lanes. The worker verifies those lane IDs against MCore's
 initialized DP × CP group and resolves the active attention group using MCore's
 hybrid-group API. TP ranks receive the same task payload. EP is a constraint on
@@ -105,8 +113,8 @@ collection. The model receives a shallow copy of packed metadata with a real
 singleton group for CP=1, because RoPE interprets `None` as a static-group
 fallback. Loss and logprob code retain the explicit size-one/None convention.
 
-During worker setup, dynamic-CP Megatron actors register a Ray serializer for
-CPU tensor results. Importing MCore in the worker replaces
+During worker setup, only dynamic-CP Megatron actors register a Ray serializer
+for tensor results. Importing MCore in the worker replaces
 `torch.storage._load_from_bytes` with MCore's safe loader. A tensor does not
 store a Megatron object, but PyTorch's normal storage pickle records that loader
 function by module name; deserializing such a result would therefore make the
@@ -118,8 +126,9 @@ the worker has copied result tensors to CPU and before the driver's
 that return value. In the GRPO recipe this includes the full policy-logprob and
 reference-logprob result rounds and the small loss/gradient metric tensors from
 each training step. It encodes contiguous bytes, dtype, and shape in a NumPy
-payload, including BF16 and empty tensors, then reconstructs an independent,
-writable CPU tensor in the driver. It does not modify MCore's checkpoint loader
+payload, including BF16 and empty tensors. Any unexpected CUDA result is staged
+to host memory instead of failing serialization, and the driver reconstructs an
+independent, writable CPU tensor. It does not modify MCore's checkpoint loader
 or serialize model parameters and GPU activations.
 
 ## Packing, outputs, and normalization
@@ -137,6 +146,11 @@ rows. The driver keeps those rows once and restores original sample order,
 checking for missing or duplicate sample IDs. A static CP-rank-zero filter would
 discard valid results.
 
+Score workers execute every step in a multi-global-batch plan and concatenate
+their task outputs before owner-row selection. They do not assume
+`plan.steps[0]`; this keeps policy, reference, and top-k scoring aligned with the
+training-sized schedule batches cached by the driver.
+
 The driver computes valid sequence and token denominators from the unique
 global batch before replication, separately for every optimizer step. The
 differentiable CP logprob gather replicates the loss over the active CP group.
@@ -153,6 +167,17 @@ over the fixed DP × CP domain. Metrics are retained only on task owners before
 global aggregation. `tests/unit/models/megatron/test_dynamic_cp_scaling.py`
 checks this multiplier against the installed MCore loss callback. A future
 MCore pin must pass that contract test and distributed parity before adoption.
+
+For MoE load balancing, MCore's per-token path assumes
+`local_valid_tokens * TP_CP_size` equals the active task's token count. Dynamic
+packing can leave different valid-token counts on participating shards, so the
+worker sums the exact valid count over the active TP×CP group and applies a
+per-shard correction through `moe_grad_scale_func`. MCore's z-loss coefficient
+and attachment factors already cancel to form each rank's valid-token sum; its
+temporary coefficient is inversely adjusted so the shared autograd scaler does
+not change that gradient. For reporting, ordinary aux
+metrics are divided by unique real tasks, while z-loss reproduces MCore's
+average over every real TP×CP rank participation.
 
 ## GB200 five-step smoke test
 
@@ -244,7 +269,8 @@ run stays at CP2.
 
 The default workload has an 8192-token ceiling, 4096 tokens per rank, and a
 global batch of 512 formed from 16 prompts times 32 generations. The launcher
-uses the batch QoS and a six-hour limit. Use different `CP_RUN_NAME` values so
+uses partition `batch`, inherits the account's default QoS, and requests four
+hours by default (`TIME_LIMIT` overrides it). Use different `CP_RUN_NAME` values so
 the W&B runs and local logs remain distinct.
 
 The launcher also accepts `CP_NUM_STEPS`, `CP_TRAIN_GLOBAL_BATCH_SIZE`,
@@ -254,6 +280,12 @@ The launcher also accepts `CP_NUM_STEPS`, `CP_TRAIN_GLOBAL_BATCH_SIZE`,
 A static CP1 run remains useful as an unconstrained throughput and CP1 sanity
 reference when it fits in memory, but it is not the capacity-matched baseline
 for 8192 tokens at the 4096-token budget.
+
+This is a match to the configured memory budget, not proof that CP is necessary
+on GB200. Measure peak memory and test static CP1 before concluding that 8192
+tokens require CP2. If CP1 fits and performs better, use that as the practical
+baseline; increase `CP_TOKENS_PER_RANK` to the measured training-safe budget.
+Do not reduce the budget just to make the scheduler report more CP sizes.
 
 The correctness smoke keeps the original TP1/EP8 topology and is therefore
 forced to CP8. The performance pair uses TP4/EP4 specifically to expose an
@@ -265,3 +297,70 @@ After each run, `perf_runs/analyze_cp_sequence_lengths.py` writes
 `sequence_length_distribution.json` beside the driver log. It reports length
 percentiles, how many samples stopped exactly at the configured ceiling, and
 the CP size each sample required before optional idle-lane expansion.
+
+Dynamic schedule logs also report `tasks_by_cp` and `packing_utilization`.
+Required CP for an individual sample can differ from its scheduled CP when it
+fills an existing larger task or when spare lanes help process a task. Performance
+runs do not require a fixed mixture of sizes. For an explicit coverage test, set
+`CP_REQUIRE_SIZES="1 2"` (or `"1 2 4"`). The correctness checks still require all
+steps, finite metrics, score/train agreement, and schedule reuse.
+
+Both comparison modes run four-GPU loss and attention parity checks before
+training. These tests explicitly retain CP1 coverage after cross-size packing,
+including a model initialized at static CP2. Set `CP_GPU_PREFLIGHT=0` only when
+reusing validation of the same code/container. Preflight time is outside the
+reported training-step timings.
+
+### Qwen30B packing regression: jobs 7202770 and 7203284
+
+Both ten-step jobs passed their smoke checks and processed approximately 26.6M
+tokens. Excluding step one, the dynamic job averaged 525.65 seconds per step;
+static CP2 averaged 483.72 seconds, so dynamic took 8.67% longer. Training took
+390.62 versus 357.51 seconds and policy/reference scoring took 130.03 versus
+121.26 seconds. These are independent async rollouts, not identical token batches.
+
+The old scheduler packed each required CP size separately. At 4096 tokens/rank,
+`[6000, 2000]` became two calls even though both samples fit in one 8192-token CP2
+pack. The cross-size packing fix admits the 2000-token sequence into that
+already-required call, checks CP2 alignment, and still leaves independent CP1
+tasks when there is remaining short work. EP containment and loss scaling are
+unchanged; the worker derives its microbatch count from the resulting plan.
+
+CPU replay of the ten saved dynamic batches changes the sum of local calls per
+lane from 3630 to 3330; static MFFD packing of those same lengths needs 3322.
+That is an 8.26% reduction in model calls, not a measured GPU speedup. Rerun the
+pair to measure actual performance. A near-zero gain remains possible because
+most work in this workload still executes at CP2 after efficient packing.
+
+Reproduce the recorded timings and replay the current planner:
+
+```bash
+uv run --no-sync python perf_runs/analyze_cp_comparison.py \
+  logs/qwen30-gbs512-seq8192-dyncp-20260916T220850Z \
+  logs/qwen30-gbs512-seq8192-staticcp2-20260916T220850Z \
+  --lanes 2 --tp 4 --tokens-per-rank 4096
+```
+
+### Dense Qwen3-32B comparison
+
+Set `CP_MODEL=qwen32b` to select the new dense recipes. They use four nodes total:
+two policy nodes (TP2/PP1/EP1, four CP scheduling lanes) and two generation nodes
+(vLLM TP2). Defaults are 16384 total tokens, 4096 tokens/rank, GBS512, ten steps,
+activation checkpointing, W&B online, dynamic CP1/2/4 versus static CP4. Both
+modes inherit the same workload, optimizer, precision, and generation settings.
+
+```bash
+PAIR_TAG=$(date -u +%Y%m%dT%H%M%SZ)
+CP_MODEL=qwen32b CP_MODE=dynamic TIME_LIMIT=06:00:00 \
+  CP_RUN_NAME="qwen32-gbs512-seq16384-dynamic-${PAIR_TAG}" DRY_RUN=0 \
+  bash perf_runs/run_gb200_cp_comparison.sh
+CP_MODEL=qwen32b CP_MODE=static STATIC_CP_SIZE=4 TIME_LIMIT=06:00:00 \
+  CP_RUN_NAME="qwen32-gbs512-seq16384-static4-${PAIR_TAG}" DRY_RUN=0 \
+  bash perf_runs/run_gb200_cp_comparison.sh
+```
+
+For a smaller first validation set `CP_NUM_STEPS=2 CP_NUM_PROMPTS_PER_STEP=2
+CP_TRAIN_GLOBAL_BATCH_SIZE=64 QOS=short TIME_LIMIT=01:00:00` and use a distinct
+run name. Ten steps are an initial performance sample, not
+convergence validation. Report training/scoring separately from total step time
+and repeat close results before claiming a speedup.

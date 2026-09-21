@@ -25,6 +25,7 @@ from nemo_rl.distributed.dynamic_context_parallel import CPRankPlan, CPRankStep
 
 _DYNAMIC_TP_CP_GROUPS: dict[int, Any] = {}
 _ROUTER_CONFIG_BASELINES: dict[int, tuple[Any, Any]] = {}
+_DYNAMIC_MOE_GRAD_SCALE_CORRECTIONS: dict[int, float] = {}
 
 
 @dataclass(frozen=True)
@@ -155,20 +156,21 @@ def preserve_attention_cp_groups(model: torch.nn.Module) -> Iterator[None]:
         if _is_gated_delta_net(module)
     ]
     saved_routers = [
-        (module, module.tp_cp_group)
+        (module, module.cp_group, module.tp_cp_group)
         for module in model.modules()
         if isinstance(module, Router)
     ]
     router_configs: dict[int, Any] = {}
     for module, collection in saved_collections:
         module.pg_collection = copy(collection)
-    for module, _ in saved_routers:
+    for module, _, _ in saved_routers:
         config = module.config
         router_configs[id(config)] = config
         _ROUTER_CONFIG_BASELINES[id(config)] = (
             config.moe_aux_loss_coeff,
             config.moe_z_loss_coeff,
         )
+        _DYNAMIC_MOE_GRAD_SCALE_CORRECTIONS[id(config)] = 1.0
     try:
         yield
     finally:
@@ -178,10 +180,12 @@ def preserve_attention_cp_groups(model: torch.nn.Module) -> Iterator[None]:
             module.cp = cp
         for module, cp_size in saved_gdn:
             module.cp_size = cp_size
-        for module, group in saved_routers:
-            module.tp_cp_group = group
+        for module, cp_group, tp_cp_group in saved_routers:
+            module.cp_group = cp_group
+            module.tp_cp_group = tp_cp_group
         for config_id, config in router_configs.items():
             aux_coeff, z_coeff = _ROUTER_CONFIG_BASELINES.pop(config_id)
+            _DYNAMIC_MOE_GRAD_SCALE_CORRECTIONS.pop(config_id, None)
             config.moe_aux_loss_coeff = aux_coeff
             config.moe_z_loss_coeff = z_coeff
 
@@ -201,6 +205,74 @@ def _bind_router_config(router: Router, *, padding_only: bool) -> None:
         z_coeff = None
     router.config.moe_aux_loss_coeff = aux_coeff
     router.config.moe_z_loss_coeff = z_coeff
+    _DYNAMIC_MOE_GRAD_SCALE_CORRECTIONS[id(router.config)] = 1.0
+
+
+def _has_positive_coefficient(value: Any) -> bool:
+    """Return whether a scalar or coefficient list enables an aux loss."""
+    values = value if isinstance(value, (list, tuple)) else (value,)
+    return any(isinstance(item, (int, float)) and item > 0 for item in values)
+
+
+def configure_dynamic_moe_loss_scaling(
+    model: torch.nn.Module, padding_mask: torch.Tensor | None
+) -> None:
+    """Correct MCore's fixed-shard aux-loss scaling for the active task.
+
+    MCore multiplies each rank's load-balancing loss by
+    ``local_valid_tokens * tp_cp_group.size()``. That equals the task-wide token
+    count only when every TP*CP shard contains the same number of valid tokens.
+    Packed dynamic tasks do not have that invariant. Compute the exact active
+    group token count and expose a per-rank correction through MCore's existing
+    ``moe_grad_scale_func`` hook.
+
+    The same autograd scaler carries z-loss. MCore's z-loss coefficient and
+    attachment factors already cancel to produce each rank's valid-token sum,
+    so inversely adjust the temporary coefficient to keep that gradient
+    unchanged when the shared scaler applies the aux correction.
+    """
+    routers = [module for module in model.modules() if isinstance(module, Router)]
+    if not routers:
+        return
+
+    configs = {id(router.config): router.config for router in routers}
+    for config_id in configs:
+        _DYNAMIC_MOE_GRAD_SCALE_CORRECTIONS[config_id] = 1.0
+
+    if not model.training or not torch.is_grad_enabled():
+        return
+    if not any(
+        _has_positive_coefficient(router.config.moe_aux_loss_coeff)
+        for router in routers
+    ):
+        return
+    if padding_mask is None:
+        raise ValueError("Dynamic CP MoE aux loss requires a packed padding mask")
+
+    tp_cp_group = routers[0].tp_cp_group
+    if any(router.tp_cp_group is not tp_cp_group for router in routers[1:]):
+        raise ValueError("Dynamic CP routers disagree on the active TP*CP group")
+    active_size = tp_cp_group.size()
+    local_valid_tokens = (~padding_mask).sum()
+    group_valid_tokens = local_valid_tokens.clone()
+    torch.distributed.all_reduce(group_valid_tokens, group=tp_cp_group)
+    local_count = int(local_valid_tokens.item())
+    correction = (
+        float(group_valid_tokens.item()) / (local_count * active_size)
+        if local_count > 0
+        else 1.0
+    )
+
+    for config_id, config in configs.items():
+        _DYNAMIC_MOE_GRAD_SCALE_CORRECTIONS[config_id] = correction
+        _, baseline_z_coeff = _ROUTER_CONFIG_BASELINES[config_id]
+        if isinstance(baseline_z_coeff, (int, float)):
+            config.moe_z_loss_coeff = baseline_z_coeff / correction
+
+
+def dynamic_moe_grad_scale_correction(model_config: Any) -> float:
+    """Return the active task's aux-loss correction, or the static default."""
+    return _DYNAMIC_MOE_GRAD_SCALE_CORRECTIONS.get(id(model_config), 1.0)
 
 
 def bind_attention_cp_group(model: torch.nn.Module, packed_seq_params: Any) -> Any:
@@ -233,6 +305,7 @@ def bind_attention_cp_group(model: torch.nn.Module, packed_seq_params: Any) -> A
         if isinstance(module, Attention):
             module.pg_collection.cp = group
         if isinstance(module, Router):
+            module.cp_group = group
             module.tp_cp_group = tp_cp_group
             _bind_router_config(module, padding_only=padding_only)
         if _is_mamba_mixer(module):
