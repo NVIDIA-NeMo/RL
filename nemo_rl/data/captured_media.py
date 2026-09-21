@@ -238,7 +238,8 @@ def capture_processed_media(
     corrected = {name: [] for name in placeholders}
     previous_end = 0
     pixel_dtype = None
-    for _, modality, span, item in occurrences:
+    for _, occurrence_modality, span, item in occurrences:
+        modality: Literal["image", "video"] = occurrence_modality
         if item is None:
             raise ValueError(
                 "Media capture requires processor data, not cache references"

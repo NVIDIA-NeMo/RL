@@ -770,15 +770,16 @@ class TQTokenSource:
                 raise ValueError(
                     f"media imgs column must be [total_patches, F], got {tuple(imgs.shape)}"
                 )
-            parts.append(
-                validate_media_tensors(
-                    {
-                        "imgs": imgs.unsqueeze(0),
-                        "imgs_sizes": column("imgs_sizes"),
-                        "num_frames": column("num_frames") if has_frames else None,
-                    }
-                )
+            media = validate_media_tensors(
+                {
+                    "imgs": imgs.unsqueeze(0),
+                    "imgs_sizes": column("imgs_sizes"),
+                    "num_frames": column("num_frames") if has_frames else None,
+                }
             )
+            if media is None:  # a mapping never validates to None; typing guard
+                raise ValueError("media columns decoded to no media bundle")
+            parts.append(media)
         return parts
 
     def fetch_for_finalization(
