@@ -265,7 +265,7 @@ def _build_draft_batch(draft_vocab_size, d2t):
 )
 def test_packed_draft_loss_matches_unpacked(draft_vocab_size, d2t):
     """The packed draft CE must equal the unpacked reference on the same batch."""
-    from nemo_rl.algorithms.loss.utils import prepare_loss_input
+    from nemo_rl.algorithms.loss.loss_input import prepare_loss_input
     from nemo_rl.algorithms.loss.wrapper import DraftLossWrapper
 
     batch = _build_draft_batch(draft_vocab_size, d2t)

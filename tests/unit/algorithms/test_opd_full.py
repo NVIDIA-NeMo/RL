@@ -27,10 +27,8 @@ import torch
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import LossInputType, MetricNormalizer
-from nemo_rl.algorithms.loss.utils import (
-    prepare_opd_full_loss_input,
-    reconstruct_opd_full_teacher_logits,
-)
+from nemo_rl.algorithms.loss.loss_input import prepare_opd_full_loss_input
+from nemo_rl.algorithms.loss.utils import reconstruct_opd_full_teacher_logits
 from nemo_rl.algorithms.loss.wrapper import _SEQ_METRIC_MAX, _SEQ_METRIC_MIN
 from nemo_rl.algorithms.opd import (
     OnPolicyDistillationFullConfig,
