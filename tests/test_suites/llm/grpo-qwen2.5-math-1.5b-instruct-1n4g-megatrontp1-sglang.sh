@@ -8,7 +8,9 @@ GPUS_PER_NODE=4
 STEPS_PER_RUN=450
 MAX_STEPS=450
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=150
+NUM_MINUTES=240  # validation only: 450 steps at the ~23 s/step this recipe has
+                 # measured needs about 172 minutes plus startup. Not a proposed
+                 # change to the recipe.
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
