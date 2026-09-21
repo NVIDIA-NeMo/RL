@@ -584,7 +584,7 @@ Measure end-to-end step time and reward/gradient-norm trajectories on the target
 
 The following Qwen2.5-Math-1.5B comparison shows both modes over 450 steps with seed 42 on eight GB300 GPUs (two nodes). The reward curves closely track, with a 17.8% reduction in mean step time over steps 51–450 (6.69 seconds with in-loss filtering versus 8.14 seconds with separate-forward filtering).
 
-![Train reward, token multiplicative probability error, and step time for single-forward versus separate-forward sequence-logprob filtering.](../assets/grpo-qwen-single-forward-comparison.png)
+![Train reward, token multiplicative probability error, step time, and gradient norm for single-forward versus separate-forward sequence-logprob filtering.](../assets/grpo-qwen-single-forward-comparison.png)
 
 #### Overlong Filtering
 
