@@ -265,7 +265,15 @@ validate_external_vllm_submission() {
       echo "ERROR: ${variable_name} is required for external vLLM submission" >&2
       return 2
     fi
-    _external_vllm_require_shared_path "${variable_name}" "${path}" || return
+    if [[ "${variable_name}" == "EXTERNAL_VLLM_TOOLS_DIR_HOST" ]]; then
+      # Code may live on shared /home; run_in_allocation.sh binds it explicitly.
+      if [[ "${path}" != /* || ! -d "${path}" ]]; then
+        echo "ERROR: ${variable_name} must be an existing absolute directory" >&2
+        return 2
+      fi
+    else
+      _external_vllm_require_shared_path "${variable_name}" "${path}" || return
+    fi
   done
   for required_file in vllm_backend_registry.sh vllm_pool_lb.py lb_watchdog.sh serve_vllm_on_ray.py; do
     if [[ ! -f "${EXTERNAL_VLLM_TOOLS_DIR_HOST}/${required_file}" ]]; then

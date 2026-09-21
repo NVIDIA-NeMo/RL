@@ -773,15 +773,19 @@ def test_pool_registration_rejects_partial_nodes_and_unsafe_group_id():
     assert "TEST_GROUP_ID may contain only" in unsafe_group.stderr
 
 
-def test_submission_validation_checks_placeholders_paths_and_node_total():
+@pytest.mark.parametrize("tools_outside_shared_root", [False, True])
+def test_submission_validation_checks_placeholders_paths_and_node_total(
+    tmp_path, tools_outside_shared_root
+):
     script = REPO_ROOT / "tools/external_gym_vllm/pool_config.sh"
     tools_dir = REPO_ROOT / "tools/external_gym_vllm"
+    shared_root = tmp_path if tools_outside_shared_root else REPO_ROOT
     program = textwrap.dedent(
         f"""
         set -euo pipefail
         source {script}
-        EXTERNAL_VLLM_SHARED_ROOT={REPO_ROOT}
-        BASE_LOG_DIR={REPO_ROOT}/logs
+        EXTERNAL_VLLM_SHARED_ROOT={shared_root}
+        BASE_LOG_DIR={shared_root}/logs
         EXTERNAL_VLLM_TOOLS_DIR_HOST={tools_dir}
         register_external_vllm_pool TEST \\
           --model model --container image --python /opt/python \\
@@ -828,6 +832,21 @@ def test_submission_validation_checks_placeholders_paths_and_node_total():
     assert (
         "skipping external hetgroup node-count validation" in missing_node_count.stderr
     )
+    if tools_outside_shared_root:
+        bad_logs = subprocess.run(
+            [
+                "bash",
+                "-c",
+                program.replace(
+                    f"BASE_LOG_DIR={shared_root}/logs",
+                    f"BASE_LOG_DIR={REPO_ROOT}/logs",
+                ),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert bad_logs.returncode == 2
+        assert "BASE_LOG_DIR" in bad_logs.stderr
 
 
 def _run_lightning_launcher(**overrides):

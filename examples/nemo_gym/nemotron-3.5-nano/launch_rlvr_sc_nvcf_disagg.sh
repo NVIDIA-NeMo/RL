@@ -107,7 +107,9 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # Both failures below surface late and expensively: a missing NVCF key reaches
 # the judges only once rollouts start, and a missing sandbox setting kills the
 # ns_tools server after the allocation is up. Check them here.
-: "${NVIDIA_API_KEY:?NVIDIA_API_KEY is required: the NVCF key for all three hosted judges}"
+if [[ "${DRY_RUN:-0}" != "1" ]]; then
+  : "${NVIDIA_API_KEY:?Export your own NVIDIA_API_KEY (or set CREDS_FILE): required for all three NVCF-hosted judges}"
+fi
 
 # DISAGG_SANDBOX=0 keeps the NVCF judges but puts ns_tools back on the per-node
 # sidecar, leaving judge placement as the ONLY difference from the local-judge

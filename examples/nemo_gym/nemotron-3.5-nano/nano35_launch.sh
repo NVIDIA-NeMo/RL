@@ -557,14 +557,17 @@ fi
 # =============================================================================
 WANDB_PROJ="${WANDB_PROJ:-nemotron-3.5-nano}"
 WANDB_NAME="${EXP_NAME}"
-WANDB_ENABLED=False
-if [[ -n "${WANDB_API_KEY:-}" ]]; then
+WANDB_ENABLED="${WANDB_ENABLED:-True}"
+if [[ "${WANDB_ENABLED,,}" == "false" || "${WANDB_ENABLED}" == "0" ]]; then
+  WANDB_ENABLED=False
+elif [[ -n "${WANDB_API_KEY:-}" ]]; then
   export WANDB_API_KEY
   WANDB_ENABLED=True
   if [[ -n "${WANDB_ENTITY:-}" ]]; then
     export WANDB_ENTITY
   fi
 else
+  WANDB_ENABLED=False
   echo "[WARN] WANDB_API_KEY is not set — W&B logging will be disabled." >&2
 fi
 
@@ -844,9 +847,15 @@ _mount_if_populated() {
 }
 
 _mount_if_populated "${OVERLAY_SOURCE}/nemo_rl" "/opt/nemo-rl/nemo_rl" "nemo_rl"
-_mount_if_populated "${OVERLAY_SOURCE}/examples/configs" "/opt/nemo-rl/examples/configs" "configs"
-_mount_if_populated "${OVERLAY_SOURCE}/examples/nemo_gym/nemotron-3.5-nano" "/opt/nemo-rl/examples/nemo_gym/nemotron-3.5-nano" "Nano 3.5 recipes"
+_mount_if_populated "${OVERLAY_SOURCE}/examples" "/opt/nemo-rl/examples" "examples (including SingleController entrypoint)"
+if [[ -f "${PROJECT_ROOT}/3rdparty/Gym-workspace/Gym/nemo_gym/__init__.py" &&
+      ! -f "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym/nemo_gym/__init__.py" ]]; then
+  echo "ERROR: snapshot omitted the local Gym checkout. Register it with git submodule init -- 3rdparty/Gym-workspace/Gym, then use a fresh EXP_NAME." >&2
+  exit 1
+fi
 _mount_if_populated "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym" "/opt/nemo-rl/3rdparty/Gym-workspace/Gym" "Gym"
+_append_mount "${OVERLAY_SOURCE}/pyproject.toml:/opt/nemo-rl/pyproject.toml:ro"
+_append_mount "${OVERLAY_SOURCE}/uv.lock:/opt/nemo-rl/uv.lock:ro"
 
 if [[ "${USE_SNAPSHOT}" == "1" ]]; then
   _append_mount "${SNAPSHOT_DIR}:${SNAPSHOT_DIR}"

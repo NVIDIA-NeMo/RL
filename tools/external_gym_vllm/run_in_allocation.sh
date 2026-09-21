@@ -202,7 +202,13 @@ for pool in "${pool_names[@]}"; do
   fi
 done
 
-shared_paths=("${BASE_LOG_DIR}" "${EXTERNAL_VLLM_TOOLS_DIR_HOST}")
+# Source on shared /home is mounted separately below. Models and state still
+# must live under the shared runtime root; do not widen that mount to /.
+if [[ "${EXTERNAL_VLLM_TOOLS_DIR_HOST}" != /* ]]; then
+  echo "[FATAL] EXTERNAL_VLLM_TOOLS_DIR_HOST must be absolute" >&2
+  exit 1
+fi
+shared_paths=("${BASE_LOG_DIR}")
 for pool in "${pool_names[@]}"; do
   if [[ "${models[${pool}]}" == /* ]]; then
     shared_paths+=("${models[${pool}]}")
@@ -510,6 +516,7 @@ bash -n <(printf '%s' "${VLLM_SERVER_BODY}") || {
 ray_head_node="${ray_nodes[0]}"
 lb_mounts="${MOUNTS},${EXTERNAL_VLLM_TOOLS_DIR_HOST}:/opt/external-vllm-tools:ro"
 external_service_mount="${EXTERNAL_VLLM_SHARED_ROOT}:${EXTERNAL_VLLM_SHARED_ROOT}"
+external_service_mount+=",${EXTERNAL_VLLM_TOOLS_DIR_HOST}:${EXTERNAL_VLLM_TOOLS_DIR_HOST}:ro"
 for pool in "${pool_names[@]}"; do
   lb_mounts+=",${state_dirs[${pool}]}:${lb_state_dirs[${pool}]}"
 done
