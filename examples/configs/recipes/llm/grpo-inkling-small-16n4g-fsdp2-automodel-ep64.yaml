@@ -65,6 +65,16 @@ policy:
     enabled: true
   generation:
     max_new_tokens: 8192
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 2
+        gpus_per_node: 4
+    refit_transport: nixl
+    refit_cfg:
+      nixl:
+        device: cpu
+        update_weights_bucket_memory_ratio: 0.01
     vllm_cfg:
       tensor_parallel_size: 8
       skip_tokenizer_init: false
@@ -95,4 +105,4 @@ logger:
     name: grpo-inkling-small-16n4g-fsdp2-automodel-ep64
 cluster:
   gpus_per_node: 4
-  num_nodes: 16
+  num_nodes: 18
