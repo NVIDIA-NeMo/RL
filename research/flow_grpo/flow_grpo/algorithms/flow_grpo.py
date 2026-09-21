@@ -37,14 +37,14 @@ from flow_grpo.environments.image_reward_environment import (
     ImageRewardEnvConfig,
     ImageRewardEnvironment,
 )
-from flow_grpo.models.policy.flow_grpo_policy import (
-    FlowGRPOPolicy,
-    aggregate_worker_metrics,
-)
 from flow_grpo.models.interfaces import (
     DiffusionPolicyConfig,
     DiffusionTrainDataSpec,
     DiffusionTrajectorySpec,
+)
+from flow_grpo.models.policy.flow_grpo_policy import (
+    FlowGRPOPolicy,
+    aggregate_worker_metrics,
 )
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
