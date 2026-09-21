@@ -36,13 +36,23 @@ sequence lengths, batch sizes, evaluation and checkpoint settings.
 
 ### 1. Prepare the Environment and Checkpoint
 
-Use the dependency lock and AutoModel submodule recorded by the NeMo RL
-revision containing this guide. From the repository root:
+This early-access support requires the
+[`deepseek-v4.1-support` branch](https://github.com/NVIDIA-NeMo/RL/tree/deepseek-v4.1-support).
+Switch to that branch before initializing submodules or installing dependencies.
+For a clone of `NVIDIA-NeMo/RL` with the upstream repository named `origin`,
+run from the repository root:
 
 ```bash
+git fetch origin deepseek-v4.1-support
+git switch deepseek-v4.1-support
+git merge --ff-only origin/deepseek-v4.1-support
 git submodule update --init --recursive
 uv sync --locked
 ```
+
+Use the dependency lock and AutoModel submodule pinned by this branch.
+If `origin` points to a fork, use your upstream remote in the fetch and merge
+commands, and create a local tracking branch from it on the first checkout.
 
 For distributed execution, use a matching CUDA environment on every node.
 See [Installation](../../../about/installation.md),
