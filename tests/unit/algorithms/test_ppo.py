@@ -1102,6 +1102,62 @@ def _run_mock_ppo_train(
     )
 
 
+def test_ppo_dynamic_sampling_uses_whole_prompt_triviality():
+    """PPO must keep a mixed prompt intact even when one rollout has zero LOO std."""
+    from nemo_rl.algorithms import ppo as ppo_mod
+    from nemo_rl.algorithms.utils import (
+        calculate_baseline_and_std_per_prompt,
+        calculate_trivial_reward_distributions,
+    )
+
+    rewards = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0])
+    prompt_ids = torch.tensor([[0]] * 4 + [[1]] * 4)
+    repeated_batch = BatchedDataDict(
+        {
+            "message_log": [
+                [{"role": "user", "content": f"prompt-{i // 4}"}] for i in range(8)
+            ],
+            "total_reward": rewards,
+        }
+    )
+    baseline, std, loo_is_trivial = calculate_baseline_and_std_per_prompt(
+        prompt_ids,
+        rewards,
+        torch.ones_like(rewards),
+        leave_one_out_baseline=True,
+    )
+    prompt_is_trivial = calculate_trivial_reward_distributions(
+        prompt_ids, rewards, torch.ones_like(rewards)
+    )
+
+    assert loo_is_trivial.tolist()[:4] == [True, False, False, False]
+    assert prompt_is_trivial.tolist() == [False] * 4 + [True] * 4
+
+    timer = MagicMock()
+    timer.time.return_value = nullcontext()
+    master_config = SimpleNamespace(
+        ppo=SimpleNamespace(
+            use_dynamic_sampling=True,
+            num_prompts_per_step=1,
+            num_generations_per_prompt=4,
+            dynamic_sampling_max_gen_batches=2,
+        )
+    )
+    result, is_batch_complete, _, _ = ppo_mod.dynamic_sampling(
+        repeated_batch,
+        std,
+        baseline,
+        dynamic_sampling_num_gen_batches=1,
+        master_config=master_config,
+        timer=timer,
+        is_trivial_prompt_distribution=prompt_is_trivial,
+    )
+
+    assert is_batch_complete is True
+    assert result.size == 4
+    torch.testing.assert_close(result["filtered_reward"], rewards[:4])
+
+
 def test_ppo_train_noncolocated_refit_offload_lifecycle(monkeypatch):
     harness = _run_mock_ppo_train(
         monkeypatch,
