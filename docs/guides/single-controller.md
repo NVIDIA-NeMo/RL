@@ -347,6 +347,17 @@ Do not carry `max_num_epochs: -1` across either. [ppo.md](./ppo.md#asynchronous-
 | *(no legacy equivalent — matches legacy `max_trajectory_age + 1` batches in flight)* | `max_inflight_prompts: num_prompts_per_step × (max_lookahead_versions + 1)` |
 | *(no legacy equivalent — legacy sizes its buffer to `num_prompts_per_step × max_trajectory_age_steps × 2`)* | `max_buffered_rollouts: num_prompts_per_step × (max_lookahead_versions + 1)` (tight; see the [Config → behavior map](#config--behavior-map) for per-sampler values) |
 
+### Per-environment sample accounting
+
+`train/environment/<name>/` logs counts for the groups selected for each step:
+`num_samples` (before filtering), `num_mask_sample_filtered` (Gym flags),
+`num_valid_samples` (sum of final sample weights, matching async GRPO loss), and
+`num_valid_tokens` (weighted next-token targets after filtering). Counts sum across
+streaming chunks; overlapping filters are not added together. These are distinct
+from rollout reward/token distributions, which include flagged samples. Ordinary
+and token-capture rollouts carry environment tags; older replay rows without tags
+are reported under `unknown`. Logging does not change training masks or advantages.
+
 ## Known Missing Features
 
 The SC path is still under active development. Feature gaps are tracked in [issue #2625](https://github.com/NVIDIA-NeMo/RL/issues/2625). Notable items:

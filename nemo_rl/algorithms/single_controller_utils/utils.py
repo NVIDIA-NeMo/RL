@@ -107,6 +107,7 @@ def reduce_advantage_pump_metrics(
     sample_masks: list[torch.Tensor] | None = None,
     seq_logprob_error_metrics: list[dict[str, float]] | None = None,
     num_mask_sample_filtered: list[int] | None = None,
+    environment_counts: list[dict[str, float]] | None = None,
     num_invalid_tool_calls: list[int] | None = None,
     num_malformed_thinking: list[int] | None = None,
     num_assistant_messages: list[int] | None = None,
@@ -127,6 +128,7 @@ def reduce_advantage_pump_metrics(
             counts, one record per streaming chunk.
         num_mask_sample_filtered: Environment-flagged sample counts, one per
             streaming chunk.
+        environment_counts: Per-environment training counts for selected chunks.
         num_invalid_tool_calls: Per-sample invalid tool-call counts.
         num_malformed_thinking: Per-sample malformed-thinking counts.
         num_assistant_messages: Per-sample assistant message counts (rate denominator).
@@ -164,6 +166,9 @@ def reduce_advantage_pump_metrics(
         out["total_num_tokens"] = float(sum(sequence_lengths))
     if num_mask_sample_filtered is not None:
         out["num_mask_sample_filtered"] = float(sum(num_mask_sample_filtered))
+    for counts in environment_counts or []:
+        for key, value in counts.items():
+            out[key] = out.get(key, 0.0) + value
     if seq_logprob_error_metrics:
         out.update(_reduce_seq_logprob_error_metrics(seq_logprob_error_metrics))
     n_asst = sum(num_assistant_messages or [])
@@ -182,6 +187,47 @@ def reduce_advantage_pump_metrics(
         out["routed_experts_backfilled_rate"] = n_backfilled / n_asst
         out["num_routed_experts_backfilled"] = float(n_backfilled)
     return out
+
+
+def environment_sample_counts(
+    tags: list[dict[str, Any]] | None,
+    *,
+    mask_sample: torch.Tensor,
+    final_sample_mask: torch.Tensor,
+    final_token_mask: torch.Tensor,
+) -> dict[str, float]:
+    """Count selected rows and trainable next-token targets by environment.
+
+    Older replay checkpoints lack environment tags and are reported as unknown.
+    Environment flags count independently of other, potentially overlapping filters.
+    Valid samples sum the final sample weights, as in the policy loss; valid tokens
+    sum the weighted next-token mask, excluding the first sequence position.
+    """
+    size = mask_sample.numel()
+    if tags is not None and len(tags) != size:
+        raise ValueError("Environment tags must align with selected samples")
+    environments = (
+        [tag.get("rollout_environment", "unknown") for tag in tags]
+        if tags is not None
+        else ["unknown"] * size
+    )
+    valid_tokens = final_token_mask[:, 1:].sum(dim=-1).detach().cpu().tolist()
+    valid_samples = final_sample_mask.detach().cpu().tolist()
+    flagged = mask_sample.detach().cpu().tolist()
+    counts: dict[str, float] = {}
+    for environment, tokens, valid, masked in zip(
+        environments, valid_tokens, valid_samples, flagged, strict=True
+    ):
+        prefix = f"environment/{environment}"
+        for name, value in (
+            ("num_samples", 1),
+            ("num_mask_sample_filtered", int(masked)),
+            ("num_valid_samples", valid),
+            ("num_valid_tokens", tokens),
+        ):
+            key = f"{prefix}/{name}"
+            counts[key] = counts.get(key, 0.0) + value
+    return counts
 
 
 def _reduce_seq_logprob_error_metrics(

@@ -1843,7 +1843,13 @@ class TestGenerateForFinalizationFlow:
 
         request = _run(
             mgr.generate_for_finalization(
-                {"prompt": "p", "idx": 0, "loss_multiplier": 0.25}, target_step=5
+                {
+                    "prompt": "p",
+                    "idx": 0,
+                    "loss_multiplier": 0.25,
+                    "extra_env_info": {"agent_ref": {"name": "swe"}},
+                },
+                target_step=5,
             )
         )
         assert request is not None
@@ -1867,6 +1873,7 @@ class TestGenerateForFinalizationFlow:
         assert request.rewards == (0.5, 0.5)
         assert request.mask_sample == (False, False)
         assert request.loss_multiplier == 0.25
+        assert request.rollout_environment == "swe"
         assert request.fallback_weight_version == 7
         # Finalization and commit are exclusively owned by the controller's
         # actor-pool path; the manager leaves the reservation unready.

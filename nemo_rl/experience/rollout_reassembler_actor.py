@@ -66,6 +66,7 @@ class ReassemblyRequest:
     mask_sample: tuple[bool, ...]
     # Dataset-level loss weight shared by every completion in this prompt group.
     loss_multiplier: float = 1.0
+    rollout_environment: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -157,6 +158,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             fallback_weight_version=request.fallback_weight_version,
             prompt_idx=request.prompt_idx,
             loss_multiplier=request.loss_multiplier,
+            rollout_environment=request.rollout_environment,
             canonical_sample_ids=list(request.canonical_sample_ids),
         )
         assert_metadata_only(result)

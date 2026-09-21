@@ -110,6 +110,7 @@ from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerAct
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
     apply_message_level_advantage_penalties,
+    environment_sample_counts,
     fields_for_put,
     reduce_advantage_pump_metrics,
     squeeze_trailing_unit_dim,
@@ -502,6 +503,7 @@ class SingleControllerActor:
             "sample_masks": [],
             "masked_advantages": [],
             "num_mask_sample_filtered": [],
+            "environment_counts": [],
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
@@ -4254,6 +4256,14 @@ class SingleControllerActor:
             self._step_log_dict["seq_logprob_error_metrics"].append(seq_error_metrics)
 
         mask = token_mask * final_sample_mask.unsqueeze(-1)
+        self._step_log_dict.setdefault("environment_counts", []).append(
+            environment_sample_counts(
+                meta.tags,
+                mask_sample=mask_sample,
+                final_sample_mask=final_sample_mask,
+                final_token_mask=mask,
+            )
+        )
 
         repeated_batch: dict[str, torch.Tensor] = {
             "total_reward": rewards,

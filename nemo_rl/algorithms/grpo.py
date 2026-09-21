@@ -4328,14 +4328,10 @@ def aggregate_rollout_metrics(
             if k.startswith("environment/") and k.endswith("/histogram"):
                 metric_name = k.removesuffix("/histogram")
                 if observations:
-                    aggregated[f"{metric_name}/mean"] = float(
-                        np.mean(observations)
-                    )
+                    aggregated[f"{metric_name}/mean"] = float(np.mean(observations))
                     aggregated[f"{metric_name}/min"] = min(observations)
                     aggregated[f"{metric_name}/max"] = max(observations)
-                    aggregated[f"{metric_name}/median"] = float(
-                        np.median(observations)
-                    )
+                    aggregated[f"{metric_name}/median"] = float(np.median(observations))
                     aggregated[f"{metric_name}/p50"] = float(
                         np.percentile(observations, 50)
                     )
