@@ -13,10 +13,10 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from nemo_rl.experience.metric_utils import RolloutTelemetry
 from typing import Any, Optional
 
 from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
+from nemo_rl.experience.metric_utils import RolloutTelemetry
 
 NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
 NEMO_GYM_GROUP_ID_KEY = "_ng_group_id"
