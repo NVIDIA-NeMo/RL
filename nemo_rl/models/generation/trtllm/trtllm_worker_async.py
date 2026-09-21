@@ -647,6 +647,73 @@ class TrtllmAsyncGenerationWorkerImpl:
             traceback.print_exc()
             return False
 
+    # ---- nccl_reshard (shard-to-shard) refit ------------------------------
+    async def init_nccl_reshard_comm_group_async(
+        self,
+        rank_prefix: int,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> None:
+        assert self.llm is not None
+        await self.llm.collective_rpc(
+            "init_nccl_reshard_comm_group",
+            args=(
+                rank_prefix,
+                pp_ips,
+                pp_ports,
+                pp_size,
+                train_ranks_per_stage,
+                sub_world_size,
+            ),
+        )
+
+    async def prepare_nccl_reshard_refit_info_async(self, refit_info: dict) -> None:
+        assert self.llm is not None
+        await self.llm.collective_rpc(
+            "prepare_nccl_reshard_refit_info", args=(refit_info,)
+        )
+
+    async def nccl_reshard_refit_async(
+        self,
+        refit_timeout_s: Optional[float] = None,
+        *,
+        drain: bool = True,
+        recompute_kv: bool = False,
+    ) -> bool:
+        """Receive one refit shard-to-shard on every GPU worker of this engine."""
+        assert self.llm is not None
+        try:
+            results = await self.llm.collective_rpc(
+                "nccl_reshard_refit",
+                kwargs={
+                    "refit_timeout_s": refit_timeout_s,
+                    "drain": drain,
+                    "recompute_kv": recompute_kv,
+                },
+            )
+            if not results:
+                print("Error: TRT-LLM nccl_reshard refit returned no worker results.")
+                return False
+            failed_workers = [
+                (rank, result) for rank, result in enumerate(results) if not result
+            ]
+            if failed_workers:
+                print(
+                    "Error: TRT-LLM workers failed the nccl_reshard refit. "
+                    f"Results: {failed_workers}"
+                )
+                return False
+            return True
+        except Exception as e:
+            print(f"Exception during TRT-LLM nccl_reshard refit: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
+
     async def report_device_id_async(self) -> list[str]:
         assert self.llm is not None
         return await self.llm.collective_rpc("report_device_id")

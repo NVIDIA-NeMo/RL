@@ -541,29 +541,63 @@ def _convert_fused_expert_weight(
         tensor = tensor.index_select(
             0, torch.as_tensor(expert_ids, dtype=torch.long, device=tensor.device)
         )
+    if projection == "gate_up_proj":
+        intermediate_size = tensor.shape[1] // 2
+        projections = (
+            ("gate_proj", tensor[:, :intermediate_size, :]),
+            ("up_proj", tensor[:, intermediate_size:, :]),
+        )
+    else:
+        projections = (("down_proj", tensor),)
+    for projection_name, projection_tensor in projections:
+        convert_expert_projection_stack(
+            output,
+            prefix=prefix,
+            projection=projection_name,
+            tensor=projection_tensor,
+            expert_ids=expert_ids,
+            is_mx=is_mx,
+        )
+
+
+def convert_expert_projection_stack(
+    output: dict[str, torch.Tensor],
+    *,
+    prefix: str,
+    projection: str,
+    tensor: torch.Tensor,
+    expert_ids: Sequence[int],
+    is_mx: bool = False,
+) -> None:
+    """Convert one routed-expert projection stack into per-expert HF entries.
+
+    ``tensor`` is ``[len(expert_ids), out, in]`` in the canonical HF layout of
+    ``projection`` (``gate_proj`` / ``up_proj`` / ``down_proj``), one expert per
+    leading index in ``expert_ids`` order. Experts are cast in chunks of
+    ``FP8_EXPERT_CHUNK_SIZE`` and emitted as
+    ``{prefix}.{expert_id}.{projection}.weight`` plus the matching
+    ``weight_scale_inv``. Shared by the fused-stack conversion above and by the
+    shard-to-shard (nccl_reshard) refit, which receives exactly such stacks.
+    """
+    if projection not in ("gate_proj", "up_proj", "down_proj"):
+        raise ValueError(f"Unsupported routed-expert projection {projection!r}")
+    if tensor.dim() != 3 or tensor.shape[0] != len(expert_ids):
+        raise ValueError(
+            f"Expert stack for {prefix}.{projection} must be [{len(expert_ids)}, out, in], "
+            f"got {tuple(tensor.shape)}"
+        )
+    expert_ids = list(expert_ids)
     for start in range(0, len(expert_ids), FP8_EXPERT_CHUNK_SIZE):
         end = min(start + FP8_EXPERT_CHUNK_SIZE, len(expert_ids))
-        if projection == "gate_up_proj":
-            intermediate_size = tensor.shape[1] // 2
-            projections = (
-                ("gate_proj", tensor[start:end, :intermediate_size, :]),
-                ("up_proj", tensor[start:end, intermediate_size:, :]),
-            )
+        if is_mx:
+            fp8_data, scale_inv = cast_tensor_to_mxfp8_blockwise(tensor[start:end])
         else:
-            projections = (("down_proj", tensor[start:end]),)
-
-        for projection_name, projection_tensor in projections:
-            if is_mx:
-                fp8_data, scale_inv = cast_tensor_to_mxfp8_blockwise(
-                    projection_tensor
-                )
-            else:
-                fp8_data, scale_inv = cast_tensor_to_fp8_blockwise(projection_tensor)
-            for chunk_index, expert_index in enumerate(expert_ids[start:end]):
-                weight_name = f"{prefix}.{expert_index}.{projection_name}.weight"
-                scale_name = weight_name.removesuffix(".weight") + ".weight_scale_inv"
-                _insert_unique(output, weight_name, fp8_data[chunk_index])
-                _insert_unique(output, scale_name, scale_inv[chunk_index])
+            fp8_data, scale_inv = cast_tensor_to_fp8_blockwise(tensor[start:end])
+        for chunk_index, expert_index in enumerate(expert_ids[start:end]):
+            weight_name = f"{prefix}.{expert_index}.{projection}.weight"
+            scale_name = weight_name.removesuffix(".weight") + ".weight_scale_inv"
+            _insert_unique(output, weight_name, fp8_data[chunk_index])
+            _insert_unique(output, scale_name, scale_inv[chunk_index])
 
 
 def load_weights(

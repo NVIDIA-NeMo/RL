@@ -170,12 +170,16 @@ def test_collective_refit_runs_at_async_engine_boundary(
         allow_partial_loading=True,
     )
     assert convert.call_count == int(fp8)
+    # _reload_bucket brackets each bucket's reload with stream syncs so the
+    # ``[refit-timing]`` convert/reload split is measured, not enqueued.
     assert call_order == [
         "cuda_sync",
         "begin",
         "pre",
         "broadcast",
+        "stream_sync",
         "reload",
+        "stream_sync",
         "finalize",
         "process",
         "post",

@@ -167,7 +167,7 @@ def test_check_nccl_reshard_refit_support_rejects_blockwise_fp8_to_mxfp8() -> No
         ),
         (
             {"backend": "sglang"},
-            "policy.generation.backend must be 'vllm' or 'megatron' (got 'sglang')",
+            "policy.generation.backend must be 'vllm', 'megatron' or 'trtllm' (got 'sglang')",
         ),
     ],
 )

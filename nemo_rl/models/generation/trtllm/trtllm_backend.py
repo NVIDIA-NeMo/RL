@@ -282,23 +282,13 @@ class NcclExtension(WorkerExtension):
         model = model_engine.model
         self._ensure_refit_usable()
 
-        def load_model_weight_func(weight_list):
-            if fp8_quantization.is_quantized_expert_refit(model.model_config.quant_config):
-                weights = fp8_quantization.load_weights(
-                    weight_list,
-                    is_mx=fp8_quantization.is_mxfp8_model(
-                        model.model_config.quant_config
-                    ),
-                    local_experts=getattr(self, "_local_expert_lookup", None),
-                )
-            else:
-                weights = dict(weight_list)
-            model_engine.model_loader.reload(
-                model,
-                weights,
-                allow_partial_loading=True,
-            )
+        load_model_weight_func = self._reload_bucket
 
+        import time
+
+        self._reset_refit_stats()
+        phases: dict = {}
+        t_start = time.perf_counter()
         with self.engine.control_action(drain=drain):
             try:
                 # TRT-LLM uses the overlap scheduler by default: control_action
@@ -306,6 +296,7 @@ class NcclExtension(WorkerExtension):
                 # iter is enqueued, but its GPU forward may still be in flight.
                 # Block here so we don't overwrite weights mid-forward
                 torch.cuda.synchronize()
+                phases["drain"] = time.perf_counter() - t_start
                 # Must precede any weight loading: while a torch.compile
                 # wrapper is installed, parameter paths carry "_orig_mod" and
                 # load_weights silently matches nothing.
@@ -318,21 +309,31 @@ class NcclExtension(WorkerExtension):
                         module, "_weights_removed", False
                     ):
                         module.pre_reload_weights()
+                t = time.perf_counter()
                 packed_broadcast_consumer(
                     iterator=iter(self.state_dict_info.items()),
                     group=self.model_update_group,
                     src=0,
                     post_unpack_func=load_model_weight_func,
                 )
+                phases["transfer_and_load"] = time.perf_counter() - t
+                t = time.perf_counter()
                 self._finalize_weight_update()
                 torch.cuda.current_stream().synchronize()
+                phases["finalize"] = time.perf_counter() - t
 
+                t = time.perf_counter()
                 self.engine.recompute_active_requests()
+                phases["recompute"] = time.perf_counter() - t
                 # After recompute_active_requests, not before: with the full
                 # TRT-LLM lifecycle this replays warmup batches, and doing that
                 # once the in-flight requests have released their KV keeps the
                 # cache state clean.
+                t = time.perf_counter()
                 self._restore_compiled_model_after_refit()
+                phases["restore"] = time.perf_counter() - t
+                phases["total"] = time.perf_counter() - t_start
+                self._log_refit_timing("collective", phases)
             except Exception as e:
                 self._abort_weight_update_after_failure(
                     model, model_engine.model_loader, e
@@ -483,3 +484,433 @@ class NcclExtension(WorkerExtension):
         from tensorrt_llm._torch.utils import get_device_uuid
 
         return get_device_uuid(self.device_id)
+
+    # ------------------------------------------------------------------ #
+    #  Per-bucket reload shared by the collective and nccl_reshard paths
+    # ------------------------------------------------------------------ #
+    def _reload_bucket(self, weight_list) -> None:
+        """Convert routed experts if the engine is FP8/MXFP8, then reload."""
+        import time
+
+        model_engine = self.engine.model_engine
+        model = model_engine.model
+        quant_config = model.model_config.quant_config
+        stats = self._refit_stats
+        t0 = time.perf_counter()
+        if fp8_quantization.is_quantized_expert_refit(quant_config):
+            weights = fp8_quantization.load_weights(
+                weight_list,
+                is_mx=fp8_quantization.is_mxfp8_model(quant_config),
+                local_experts=getattr(self, "_local_expert_lookup", None),
+            )
+        else:
+            weights = dict(weight_list)
+        torch.cuda.current_stream().synchronize()
+        t1 = time.perf_counter()
+        model_engine.model_loader.reload(
+            model,
+            weights,
+            allow_partial_loading=True,
+        )
+        torch.cuda.current_stream().synchronize()
+        stats["convert_s"] += t1 - t0
+        stats["reload_s"] += time.perf_counter() - t1
+        stats["buckets"] += 1
+        stats["tensors"] += len(weights)
+
+    @property
+    def _refit_stats(self) -> dict:
+        stats = getattr(self, "_refit_stats_dict", None)
+        if stats is None:
+            stats = self._reset_refit_stats()
+        return stats
+
+    def _reset_refit_stats(self) -> dict:
+        self._refit_stats_dict = {
+            "convert_s": 0.0,
+            "reload_s": 0.0,
+            "buckets": 0,
+            "tensors": 0,
+        }
+        return self._refit_stats_dict
+
+    def _log_refit_timing(self, path: str, phases: dict) -> None:
+        """One rank-0 line per refit: where this engine's wall time went."""
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        stats = self._refit_stats
+        parts = " ".join(f"{k}={v:.2f}s" for k, v in phases.items())
+        print(
+            f"[refit-timing] path={path} {parts} "
+            f"convert={stats['convert_s']:.2f}s reload={stats['reload_s']:.2f}s "
+            f"buckets={stats['buckets']} tensors={stats['tensors']}",
+            flush=True,
+        )
+
+    # ------------------------------------------------------------------ #
+    #  nccl_reshard (shard-to-shard) refit
+    # ------------------------------------------------------------------ #
+    # The trainer reshards the routed experts straight into each engine's
+    # EP-local slots over one communicator per PP stage (that stage's train
+    # ranks + this engine layout's ranks); everything else rides the misc
+    # packed broadcast on model_update_group, loaded by _reload_bucket.
+    @control_action_decorator
+    def init_nccl_reshard_comm_group(
+        self,
+        rank_prefix: int,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> None:
+        """Join the bulk-path communicator of every PP stage.
+
+        Parked at a step boundary for the same reason as ``init_collective``:
+        ncclCommInitRank across train + inference ranks deadlocks against the
+        executor loop's own NCCL object collectives.
+        """
+        from nemo_rl.distributed.refit_watchdog import RELEASE_GRACE_S, release_within
+        from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
+
+        assert torch.distributed.is_initialized(), (
+            "TRT-LLM backend requires torch.distributed to be initialized before "
+            "init_nccl_reshard_comm_group"
+        )
+        gen_rank_in_group = (
+            train_ranks_per_stage + rank_prefix + torch.distributed.get_rank()
+        )
+        stale_groups = list((getattr(self, "pp_comm_groups", None) or {}).values())
+        self.pp_comm_groups = {}
+        torch.cuda.empty_cache()
+        for stage in range(pp_size):
+            print(
+                f"  refit: reshard rendezvous [gen] stage={stage} "
+                f"addr={pp_ips[stage]}:{pp_ports[stage]} "
+                f"rank={gen_rank_in_group} world_size={sub_world_size}",
+                flush=True,
+            )
+            group = StatelessProcessGroup(
+                master_address=pp_ips[stage],
+                port=pp_ports[stage],
+                rank=gen_rank_in_group,
+                world_size=sub_world_size,
+            )
+            group.init_nccl_communicator(device=self.device_id)
+            self.pp_comm_groups[stage] = group
+        for previous in stale_groups:
+            release_within(
+                previous.abort, RELEASE_GRACE_S, "a previous reshard bulk communicator"
+            )
+        refit_info = getattr(self, "nccl_reshard_refit_info", None)
+        if refit_info is not None:
+            self.hf_to_local_param_map = self._build_expert_local_param_map(refit_info)
+
+    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
+        """Keep the per-layer transfer plan and map its bulk params to local slots."""
+        from nemo_rl.weight_sync.nccl_reshard_utils import (
+            _STR_TO_DTYPE,
+            restore_refit_info_placements,
+        )
+
+        self.nccl_reshard_refit_info = restore_refit_info_placements(refit_info)
+        model = self.engine.model_engine.model
+        quant_config = model.model_config.quant_config
+        # The local-expert lookup doubles as the slot oracle for the bulk
+        # specs, so build it for bf16 engines too.
+        self._local_expert_lookup = fp8_quantization.build_local_expert_lookup(model)
+        if self._local_expert_lookup is None:
+            raise RuntimeError(
+                "nccl_reshard refit needs the MoE modules' initial_local_expert_ids "
+                "(none found, or an expert load balancer is active)"
+            )
+        if fp8_quantization.is_quantized_expert_refit(quant_config):
+            _require_fp8_refit_hooks(self.engine.model_engine.model_loader)
+        misc_meta = self.nccl_reshard_refit_info.get("misc_meta", {}) or {}
+        misc_state_dict_info = {}
+        for name, meta in misc_meta.items():
+            if isinstance(meta, dict):
+                shape, dtype = meta["shape"], meta["dtype"]
+            else:
+                shape, dtype = meta[0], meta[1]
+            dtype = _STR_TO_DTYPE[str(dtype)] if not isinstance(dtype, torch.dtype) else dtype
+            misc_state_dict_info[name] = (torch.Size(shape), dtype)
+        self.misc_state_dict_info = misc_state_dict_info
+        # The misc consumer reuses the collective path's per-bucket reload.
+        self.state_dict_info = misc_state_dict_info
+        if getattr(self, "pp_comm_groups", None):
+            self.hf_to_local_param_map = self._build_expert_local_param_map(
+                self.nccl_reshard_refit_info
+            )
+
+    @staticmethod
+    def _local_shard_slices(param_info: dict, rank: int) -> tuple:
+        """This rank's slices of the HF-global tensor under the dst placements."""
+        from nemo_rl.weight_sync.xferdtensor_python import _compute_shard_slices
+
+        dst_mesh = param_info["dst_mesh_info"]
+        mesh_tensor = getattr(dst_mesh, "mesh", None)
+        if mesh_tensor is None:
+            mesh_tensor = getattr(dst_mesh, "_mesh", None)
+        if mesh_tensor is None:
+            raise ValueError("Destination mesh does not expose its ranks")
+        coordinates = (mesh_tensor == rank).nonzero(as_tuple=False)
+        if coordinates.numel() == 0:
+            raise ValueError(f"Rank {rank} is absent from the destination mesh")
+        return tuple(
+            _compute_shard_slices(
+                param_info["global_shape"],
+                list(mesh_tensor.shape),
+                coordinates[0].tolist(),
+                param_info["dst_placements"],
+            )
+        )
+
+    def _build_expert_local_param_map(self, refit_info: dict):
+        """One LocalParamSpec per grouped routed-expert projection.
+
+        ``pre`` allocates a canonical ``[E_local, out, in]`` bf16 staging
+        buffer for this rank's EP slice, ``post`` turns it into per-expert HF
+        entries (FP8/MXFP8 for quantized engines) and hands them to TRT-LLM's
+        reload. The EP slice must be the slots TRT-LLM loads
+        (``initial_local_expert_ids``); a mismatch is an error, never a
+        silent partial update.
+        """
+        from torch.distributed._tensor import Shard
+
+        from nemo_rl.weight_sync.nccl_reshard_utils import (
+            _STR_TO_DTYPE,
+            HFToLocalParamMap,
+            LocalParamSpec,
+            RefitCtx,
+        )
+
+        pp_comm_groups = getattr(self, "pp_comm_groups", None)
+        if not pp_comm_groups:
+            raise RuntimeError(
+                "nccl_reshard refit mapping needs the per-PP-stage communicators"
+            )
+        lookup = getattr(self, "_local_expert_lookup", None)
+        assert lookup is not None, "prepare_nccl_reshard_refit_info must run first"
+        device = torch.device("cuda", self.device_id)
+        specs = {}
+        for layer_name in refit_info["layer_names"]:
+            for param_info in refit_info["per_layer_params"][layer_name]:
+                name = param_info["name"]
+                projection = param_info.get("grouped_expert_proj")
+                if projection is None:
+                    raise NotImplementedError(
+                        "TRT-LLM nccl_reshard refit moves grouped routed experts only; "
+                        f"bulk param {name!r} would need this engine's TP layout"
+                    )
+                bad_dims = [
+                    placement.dim
+                    for placement in param_info["dst_placements"]
+                    if isinstance(placement, Shard) and placement.dim != 0
+                ]
+                if bad_dims:
+                    raise ValueError(
+                        f"{name!r}: TRT-LLM experts shard on EP only (dst Shard dims "
+                        f"{bad_dims} unsupported)"
+                    )
+                stage = param_info.get("pp_stage", 0)
+                if stage not in pp_comm_groups:
+                    raise RuntimeError(f"no reshard communicator for PP stage {stage}")
+                rank = pp_comm_groups[stage].rank
+                slices = self._local_shard_slices(param_info, rank)
+                global_shape = tuple(param_info["global_shape"])
+                local_shape = []
+                for size, sl in zip(global_shape, slices):
+                    start = 0 if sl.start is None else sl.start
+                    stop = size if sl.stop is None else sl.stop
+                    local_shape.append(stop - start)
+                local_shape = tuple(local_shape)
+                expert_start = 0 if slices[0].start is None else slices[0].start
+                expert_ids = list(range(expert_start, expert_start + local_shape[0]))
+                prefix = name.rsplit(f".{projection}.weight", 1)[0]
+                expected = lookup(prefix)
+                if expected is None:
+                    raise RuntimeError(
+                        f"{name!r}: no MoE module for expert prefix {prefix!r} on this rank"
+                    )
+                if list(expected) != expert_ids:
+                    raise RuntimeError(
+                        f"{name!r}: reshard EP slice {expert_ids[0]}..{expert_ids[-1]} "
+                        f"differs from TRT-LLM's local slots "
+                        f"{list(expected)[0]}..{list(expected)[-1]}"
+                    )
+                dtype_value = param_info.get("dtype")
+                dtype = (
+                    dtype_value
+                    if isinstance(dtype_value, torch.dtype)
+                    else _STR_TO_DTYPE.get(str(dtype_value))
+                )
+                if dtype is None:
+                    raise ValueError(f"{name!r}: unsupported wire dtype {dtype_value!r}")
+
+                def pre(_base, shape=local_shape, dtype=dtype):
+                    return RefitCtx(buf=torch.empty(shape, dtype=dtype, device=device))
+
+                def post(
+                    ctx, prefix=prefix, projection=projection, expert_ids=expert_ids
+                ):
+                    self._load_received_experts(prefix, projection, expert_ids, ctx.buf)
+
+                specs[name] = LocalParamSpec(base=None, pre=pre, post=post)
+        return HFToLocalParamMap(specs=specs)
+
+    def _load_received_experts(
+        self, prefix: str, projection: str, expert_ids: list[int], stack: torch.Tensor
+    ) -> None:
+        """Load one received ``[E_local, out, in]`` projection stack."""
+        model_engine = self.engine.model_engine
+        model = model_engine.model
+        quant_config = model.model_config.quant_config
+        if fp8_quantization.is_quantized_expert_refit(quant_config):
+            weights: dict = {}
+            fp8_quantization.convert_expert_projection_stack(
+                weights,
+                prefix=prefix,
+                projection=projection,
+                tensor=stack,
+                expert_ids=expert_ids,
+                is_mx=fp8_quantization.is_mxfp8_model(quant_config),
+            )
+        else:
+            weights = {
+                f"{prefix}.{expert_id}.{projection}.weight": expert
+                for expert_id, expert in zip(expert_ids, stack.unbind(0))
+            }
+        model_engine.model_loader.reload(model, weights, allow_partial_loading=True)
+
+    def _recv_bulk_params(self) -> None:
+        """Receive every bulk param of every PP stage into its local slots."""
+        from collections import OrderedDict
+
+        from nemo_rl.weight_sync.nccl_reshard_utils import RefitCtx
+        from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
+
+        refit_info = self.nccl_reshard_refit_info
+        pp_comm_groups = self.pp_comm_groups
+        param_map = self.hf_to_local_param_map
+        stage_params = OrderedDict()
+        for layer_name in refit_info["layer_names"]:
+            for param_info in refit_info["per_layer_params"][layer_name]:
+                stage_params.setdefault(param_info.get("pp_stage", 0), []).append(
+                    param_info
+                )
+        num_streams = max(
+            1, min(int(os.environ.get("NRL_REFIT_NUM_STREAMS", "2")), len(stage_params))
+        )
+        streams = [torch.cuda.Stream() for _ in range(num_streams)]
+        events = {}
+        for idx, (stage, params) in enumerate(stage_params.items()):
+            if (idx - num_streams) in events:
+                events[idx - num_streams].synchronize()
+            stream = streams[idx % num_streams]
+            with torch.cuda.stream(stream):
+                group = pp_comm_groups[stage]
+                for param_info in params:
+                    spec = param_map.get(param_info["name"])
+                    assert spec is not None, (
+                        f"nccl_reshard_refit: {param_info['name']!r} has no local spec "
+                        "(its weights would be discarded)"
+                    )
+                    ctx = spec.pre(spec.base) if spec.pre is not None else RefitCtx(buf=spec.base)
+                    xferdtensor(
+                        None,
+                        param_info["src_mesh_info"],
+                        param_info["src_placements"],
+                        DTensorRef(ctx.buf, param_info["global_shape"]),
+                        param_info["dst_mesh_info"],
+                        param_info["dst_placements"],
+                        group,
+                        stream,
+                    )
+                    if spec.post is not None:
+                        spec.post(ctx)
+                    del ctx
+                event = torch.cuda.Event()
+                event.record()
+                events[idx] = event
+        torch.cuda.synchronize()
+
+    def _receive_and_load_misc_params(self) -> None:
+        """Misc params: the collective path's packed broadcast + per-bucket reload."""
+        misc_state_dict_info = getattr(self, "misc_state_dict_info", None) or {}
+        if not misc_state_dict_info:
+            return
+        packed_broadcast_consumer(
+            iterator=iter(misc_state_dict_info.items()),
+            group=self.model_update_group,
+            src=0,
+            post_unpack_func=self._reload_bucket,
+        )
+
+    def nccl_reshard_refit(
+        self, refit_timeout_s=None, *, drain: bool = True, recompute_kv: bool = False
+    ) -> bool:
+        """Receive a refit shard-to-shard, then the misc broadcast, then finalize.
+
+        Same engine bracket as ``update_weights_from_collective``: ``drain``
+        picks exclusive access at a step boundary (True) or the in-flight
+        weight update (False, ``recompute_kv`` as there); torch.compile is
+        unwrapped around the loads, deferred weight processing and the
+        KV-cache reset run in ``_finalize_weight_update`` /
+        ``recompute_active_requests``.
+        """
+        refit_info = getattr(self, "nccl_reshard_refit_info", None)
+        if refit_info is None:
+            raise RuntimeError("prepare_nccl_reshard_refit_info must run before the refit")
+        if not getattr(self, "pp_comm_groups", None):
+            raise RuntimeError("init_nccl_reshard_comm_group must run before the refit")
+        if getattr(self, "hf_to_local_param_map", None) is None:
+            self.hf_to_local_param_map = self._build_expert_local_param_map(refit_info)
+        model_engine = self.engine.model_engine
+        model = model_engine.model
+        self._ensure_refit_usable()
+        import time
+
+        self._reset_refit_stats()
+        phases: dict = {}
+        t_start = time.perf_counter()
+        with self.engine.control_action(drain=drain):
+            try:
+                torch.cuda.synchronize()
+                phases["drain"] = time.perf_counter() - t_start
+                self._unwrap_compiled_model_for_refit()
+                _call_model_loader_hook_if_available(
+                    model_engine.model_loader, "begin_update_weights"
+                )
+                for module in model.modules():
+                    if hasattr(module, "pre_reload_weights") and not getattr(
+                        module, "_weights_removed", False
+                    ):
+                        module.pre_reload_weights()
+                t = time.perf_counter()
+                self._recv_bulk_params()
+                torch.cuda.empty_cache()
+                phases["bulk"] = time.perf_counter() - t
+                t = time.perf_counter()
+                self._receive_and_load_misc_params()
+                phases["misc"] = time.perf_counter() - t
+                t = time.perf_counter()
+                self._finalize_weight_update()
+                torch.cuda.current_stream().synchronize()
+                phases["finalize"] = time.perf_counter() - t
+                t = time.perf_counter()
+                self.engine.recompute_active_requests()
+                phases["recompute"] = time.perf_counter() - t
+                t = time.perf_counter()
+                self._restore_compiled_model_after_refit()
+                phases["restore"] = time.perf_counter() - t
+                phases["total"] = time.perf_counter() - t_start
+                self._log_refit_timing("nccl_reshard", phases)
+            except Exception as e:
+                self._abort_weight_update_after_failure(
+                    model, model_engine.model_loader, e
+                )
+                print(f"Error in NcclExtension.nccl_reshard_refit: {e}")
+                traceback.print_exc()
+                return False
+        return True
