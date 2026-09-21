@@ -118,6 +118,7 @@ def reduce_advantage_pump_metrics(
     num_routed_experts_backfilled: list[int] | None = None,
     num_groups: list[int] | None = None,
     num_groups_mixed_rewards: list[int] | None = None,
+    num_gen_tokens: list[int] | None = None,
 ) -> dict[str, float]:
     """Reduce per-step accumulators from _advantage_stage into step scalars.
 
@@ -143,6 +144,9 @@ def reduce_advantage_pump_metrics(
             these produce non-zero advantage and contribute gradient; the rest
             are dead weight in the batch. Chunks hold whole groups, so these
             sum exactly over a step.
+        num_gen_tokens: Response tokens trained on per streaming chunk, already
+            gated by row validity. Unlike ``sequence_lengths`` (full input
+            lengths, prompt included) this is generation output only.
 
     Returns:
         Step-level reward, advantage, token-count, optional sequence
@@ -165,6 +169,20 @@ def reduce_advantage_pump_metrics(
         out["groups/frac_mixed_rewards"] = (
             float(mixed_groups) / total_groups if total_groups else 0.0
         )
+    if num_gen_tokens:
+        total_gen_tokens = int(sum(num_gen_tokens))
+        out["num_gen_tokens/total"] = float(total_gen_tokens)
+        # Per trained sample, so it is comparable across steps that shrank under
+        # on_dropped_prompt="shrink". sample_masks is the same row validity the
+        # per-chunk counts were already gated by, so numerator and denominator
+        # agree; without it the mean would be diluted by dropped rows.
+        if sample_masks:
+            num_valid_rows = float(
+                torch.cat([m.flatten() for m in sample_masks]).sum()
+            )
+            out["num_gen_tokens/mean"] = (
+                total_gen_tokens / num_valid_rows if num_valid_rows > 0 else 0.0
+            )
     if rewards:
         cat_rewards = torch.cat([r.flatten() for r in rewards])
         if sample_masks:

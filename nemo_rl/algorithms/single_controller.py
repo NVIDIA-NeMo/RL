@@ -512,6 +512,8 @@ class SingleControllerActor:
             # the ones that contribute gradient. One int per streaming chunk.
             "num_groups": [],
             "num_groups_mixed_rewards": [],
+            # Response tokens trained on, one int per streaming chunk.
+            "num_gen_tokens": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
         }
         self._opd_stat_sum = 0.0
@@ -4355,6 +4357,13 @@ class SingleControllerActor:
         # A chunk always holds whole prompt groups (see this method's docstring),
         # so summing these per-chunk counts over a step is exact.
         with torch.no_grad():
+            # Generated (response) tokens in this chunk. `mask` is token_mask
+            # gated by final_sample_mask, so rows dropped by mask_sample,
+            # overlong filtering or seq-logprob error contribute 0 and this
+            # counts only what the step actually trains on. Distinct from
+            # total_num_tokens, which sums full input lengths (prompt included).
+            self._step_log_dict["num_gen_tokens"].append(int(mask.sum().item()))
+
             _, group_index = torch.unique(prompt_ids, dim=0, return_inverse=True)
             num_groups = int(group_index.max().item()) + 1 if group_index.numel() else 0
             valid_rows = final_sample_mask.bool()
