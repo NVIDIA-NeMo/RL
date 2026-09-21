@@ -27,8 +27,8 @@ import torch
 import nemo_rl.experience.rollout_reassembler_actor as actor_module
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS
-from nemo_rl.experience.metric_utils import RolloutTelemetry
 from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS
+from nemo_rl.experience.metric_utils import RolloutTelemetry
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_reassembler_actor import (
     _FORBIDDEN_RPC_KEYS,

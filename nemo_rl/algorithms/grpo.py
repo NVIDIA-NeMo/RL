@@ -4458,13 +4458,21 @@ def aggregate_rollout_metrics(
         if is_histogram_metric(k):
             observations = [observation for group in v for observation in group]
             aggregated[k] = observations
+        elif k == "per_worker_token_counts":
+            counts = {}
+            for group in v:
+                for worker, count in group.items():
+                    counts[worker] = counts.get(worker, 0) + count
+            aggregated[k] = counts
         elif not isinstance(v[0], (int, float)):
             aggregated[k] = v
         elif k.endswith("/min") or (k.startswith("min_") and not k.endswith("_rate")):
             aggregated[k] = min(v)
         elif k.endswith("/max") or (k.startswith("max_") and not k.endswith("_rate")):
             aggregated[k] = max(v)
-        elif k == "total_turns":
+        elif k == "total_turns" or (
+            k.startswith("environment/") and k.endswith("/total_turns")
+        ):
             aggregated[k] = sum(v)
         elif k.startswith("environment/") and k.endswith("/sample_count"):
             aggregated[k] = sum(v)
@@ -4480,12 +4488,33 @@ def aggregate_rollout_metrics(
             aggregated[k] = sum(v) / len(v)
     # Reduce distributions last: dictionary insertion order must not allow a
     # per-group median/stddev to overwrite the selected-cohort statistic.
+    aliases = {
+        "turns_per_sample": {
+            "avg_turns_per_sample": "mean",
+            "max_turns_per_sample": "max",
+        },
+        "gen_tokens_per_sample": {
+            "mean_gen_tokens_per_sample": "mean",
+            "max_gen_tokens_per_sample": "max",
+        },
+        "total_tokens_per_sample": {"mean_total_tokens_per_sample": "mean"},
+        "env_tokens_per_sample": {"mean_env_tokens_per_sample": "mean"},
+        "total_reward": {
+            "mean_total_reward": "mean",
+            "max_total_reward": "max",
+            "min_total_reward": "min",
+        },
+        "terminated": {"natural_termination_rate": "mean"},
+        "truncated": {"truncation_rate": "mean"},
+        "max_turns_reached": {"max_turns_reached_rate": "mean"},
+    }
     for key, observations in list(aggregated.items()):
         if not key.endswith("/histogram"):
             continue
         metric_name = key.removesuffix("/histogram")
         if not (
             key.startswith("environment/")
+            or key.startswith("capture/")
             or metric_name
             in {
                 "turns_per_sample",
@@ -4494,6 +4523,9 @@ def aggregate_rollout_metrics(
                 "env_tokens_per_sample",
                 "max_gen_tokens_per_turn",
                 "total_reward",
+                "truncated",
+                "terminated",
+                "max_turns_reached",
             }
         ):
             continue
@@ -4515,6 +4547,24 @@ def aggregate_rollout_metrics(
         # Match V1's discrete percentile convention, not numpy interpolation.
         aggregated[f"{metric_name}/p95"] = pct(observations, 95)
         aggregated[f"{metric_name}/p99"] = pct(observations, 99)
+        # Preserve V1 native aliases, including their per-environment versions,
+        # using the same pooled population as the distribution metrics.
+        scope, _, family = metric_name.rpartition("/")
+        for alias, statistic in aliases.get(family, {}).items():
+            alias_key = f"{scope}/{alias}" if scope else alias
+            if alias_key in aggregated:
+                aggregated[alias_key] = aggregated[f"{metric_name}/{statistic}"]
+        prefix = f"{scope}/" if scope else ""
+        if (
+            family == "truncated"
+            and f"{prefix}terminated/histogram" not in aggregated
+            and f"{prefix}natural_termination_rate" in aggregated
+        ):
+            # Gym defines natural termination as not length-capped; native
+            # environments report a separate terminal signal and keep it.
+            aggregated[f"{prefix}natural_termination_rate"] = (
+                1.0 - aggregated[f"{metric_name}/mean"]
+            )
     if (
         "gen_tokens_per_sample/histogram" in aggregated
         and aggregated["gen_tokens_per_sample/histogram"]

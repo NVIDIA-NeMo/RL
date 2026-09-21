@@ -29,7 +29,6 @@ import json
 import tempfile
 import uuid
 from copy import deepcopy
-from nemo_rl.experience.metric_utils import RolloutTelemetry
 from types import SimpleNamespace
 
 import pytest
@@ -39,6 +38,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneCheckpointBarrier,
     PostWriteEnrichmentError,
 )
+from nemo_rl.algorithms.grpo import aggregate_rollout_metrics
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets.response_datasets import NemoGymDataset
@@ -55,6 +55,7 @@ from nemo_rl.experience.interfaces import (
     Completion,
     PromptGroupRecord,
 )
+from nemo_rl.experience.metric_utils import RolloutTelemetry
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     AsyncRolloutImpl,
@@ -70,6 +71,7 @@ from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
 )
 from nemo_rl.experience.rollouts import (
+    _aggregate_multi_turn_rollout_metrics,
     _postprocess_single_nemo_gym_group,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
@@ -96,6 +98,69 @@ from tests.unit.test_envs import MultiStepCalcMetadata
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+@pytest.mark.parametrize("environment", [None, "calculator/tool"])
+def test_native_telemetry_retains_every_v1_metric(environment):
+    samples = [
+        {
+            "turn_count": turns,
+            "total_tokens": 5 + turns * 3,
+            "assistant_tokens": turns * 2,
+            "env_tokens": turns,
+            "terminated": index == 0,
+            "truncated": index == 1,
+            "max_turns_reached": index == 2,
+            "total_reward": float(index - 1),
+            "turn_gen_tokens": [2] * turns,
+            "turn_input_tokens": [5] * turns,
+            "turn_total_tokens": [7] * turns,
+            "max_gen_tokens_per_turn": 2 if turns else 0,
+            "per_worker_token_counts": {index % 2: 2 * turns},
+        }
+        for index, turns in enumerate((1, 3, 0))
+    ]
+    completions = [
+        Completion([], None, row["truncated"], row["total_reward"]) for row in samples
+    ]
+    impl = object.__new__(AsyncRolloutImpl)
+    actual = impl._aggregate_rollout_metrics(
+        completions, samples, environment=environment
+    )
+    expected = _aggregate_multi_turn_rollout_metrics(samples)
+    # Enumerate V1's actual output keys rather than a hand-picked subset.
+    for name, value in expected.items():
+        assert actual[name] == value, name
+        if (
+            environment is not None
+            and name != "per_worker_token_counts"
+            and not name.startswith("histogram/")
+        ):
+            prefix = f"environment/{_rollout_environment_metric_component(environment)}"
+            assert actual[f"{prefix}/{name}"] == value, name
+    if environment is not None:
+        assert actual[f"{prefix}/sample_count"] == 3
+        assert actual[f"{prefix}/gen_tokens_per_turn/histogram"] == [2, 2, 2, 2]
+        assert actual[f"{prefix}/turns_per_sample/histogram"] == [1, 3, 0]
+
+    # Selected groups need not have equal populations. Compare all V1 keys
+    # again after the same step reducer used by the controller.
+    group_metrics = {}
+    for start, stop in ((0, 1), (1, 3)):
+        metrics = impl._aggregate_rollout_metrics(
+            completions[start:stop], samples[start:stop], environment=environment
+        )
+        for name, value in metrics.items():
+            group_metrics.setdefault(name, []).append(value)
+    pooled = aggregate_rollout_metrics(group_metrics)
+    for name, value in expected.items():
+        assert pooled[name] == pytest.approx(value), name
+        if (
+            environment is not None
+            and name != "per_worker_token_counts"
+            and not name.startswith("histogram/")
+        ):
+            assert pooled[f"{prefix}/{name}"] == pytest.approx(value), name
 
 
 def _with_cut(buffer, callback):
@@ -1060,6 +1125,29 @@ def test_receipt_completion_keeps_mask_flag_when_gate_on():
     assert completion.truncated is False
 
 
+def test_capture_proxy_metrics_cannot_be_confused_with_v1_messages():
+    result = _mask_gate_receipt_result()
+    result["receipt"]["manifest"] = [
+        {"cum_len": 11, "delta_len": 4},
+        {"cum_len": 20, "delta_len": 9},
+    ]
+    impl = _nemo_gym_impl(True)
+    completions, _ = impl._results_to_completions([result])
+    metrics = impl._compute_rollout_metrics(completions, "swe")
+    for scope in ("", "environment/swe/"):
+        assert metrics[f"{scope}capture/calls_per_sample/histogram"] == [2]
+        assert metrics[f"{scope}capture/delta_tokens_per_sample/histogram"] == [13]
+        assert metrics[f"{scope}capture/deepest_chain_tokens_per_sample/histogram"] == [
+            20
+        ]
+        assert metrics[f"{scope}capture/max_delta_tokens_per_call/histogram"] == [9]
+        assert f"{scope}turns_per_sample/histogram" not in metrics
+        assert f"{scope}gen_tokens_per_sample/histogram" not in metrics
+    assert "mean_gen_tokens_per_sample" not in metrics
+    assert "mean_prompt_length" not in metrics
+    assert metrics["total_reward/mean"] == 1.0
+
+
 def test_receipt_completion_drops_mask_flag_when_gate_off():
     completion = _nemo_gym_impl(False)._results_to_completions(
         [_mask_gate_receipt_result()]
@@ -1234,6 +1322,11 @@ def test_nemo_gym_telemetry_matches_v1_postprocessing(mask_env_flagged_samples):
         mask_env_flagged_samples=mask_env_flagged_samples,
     )
     legacy = legacy_result.rollout_metrics
+    # Guard the complete V1 producer output, including existing agent names,
+    # rather than only the distributions named below.
+    for name, value in legacy.items():
+        assert name in actual, name
+        assert actual[name] == pytest.approx(value, nan_ok=True), name
     assert (
         actual["mean_prompt_length"]
         == legacy_result.final_batch["length"].float().mean().item()

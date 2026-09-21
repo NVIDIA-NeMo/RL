@@ -6294,6 +6294,33 @@ class TestComputeAndApplySeqLogprobErrorMasking:
 class TestAggregateRolloutMetrics:
     """Tests for aggregate_rollout_metrics which aggregates per-group metrics by semantic type."""
 
+    def test_worker_accounting_sums_by_worker(self):
+        result = aggregate_rollout_metrics(
+            {"per_worker_token_counts": [{0: 3, 1: 5}, {0: 7, 2: 4}]}
+        )
+        assert result["per_worker_token_counts"] == {0: 10, 1: 5, 2: 4}
+
+    @pytest.mark.parametrize("prefix", ["", "environment/calculator/"])
+    def test_native_aliases_follow_pooled_population(self, prefix):
+        result = aggregate_rollout_metrics(
+            {
+                f"{prefix}turns_per_sample/histogram": [[1], [2, 3, 6]],
+                f"{prefix}avg_turns_per_sample": [1, 11 / 3],
+                f"{prefix}max_turns_per_sample": [1, 6],
+                f"{prefix}total_turns": [1, 11],
+                f"{prefix}terminated/histogram": [[False], [True, False, False]],
+                f"{prefix}natural_termination_rate": [0, 1 / 3],
+                f"{prefix}truncated/histogram": [[False], [True, False, True]],
+                f"{prefix}truncation_rate": [0, 2 / 3],
+            }
+        )
+        assert result[f"{prefix}avg_turns_per_sample"] == 3
+        assert result[f"{prefix}max_turns_per_sample"] == 6
+        assert result[f"{prefix}total_turns"] == 12
+        assert result[f"{prefix}truncation_rate"] == 0.5
+        # Native termination is not assumed to be the complement of truncation.
+        assert result[f"{prefix}natural_termination_rate"] == 0.25
+
     @pytest.fixture(autouse=True)
     def reset_env_calls(self):
         """Pure metric reductions do not need the module's Ray environment actors."""
