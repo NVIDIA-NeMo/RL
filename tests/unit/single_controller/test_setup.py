@@ -2415,7 +2415,7 @@ class TestNativeTQRecoverySetup:
             patch.object(sc_setup_mod, "load_dataloader_state") as load_dataloader,
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
-                sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
+                sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
             ),
             patch(
                 "nemo_rl.experience.rollout_reassembler_actor."
