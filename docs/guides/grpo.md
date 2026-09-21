@@ -387,8 +387,8 @@ rewards `[1, 1, 0]`, a masked last row, and leave-one-out disabled, the valid ro
 baseline is `1` under `exclude` and `2/3` under `include`.
 
 To compare the policies, use the paired
-[exclude recipe](../../examples/configs/recipes/llm/grpo-qwen2.5-1.5b-1n1g-dtensor2tp1-masked-reward-exclude.yaml)
-and [include recipe](../../examples/configs/recipes/llm/grpo-qwen2.5-1.5b-1n1g-dtensor2tp1-masked-reward-include.yaml),
+[exclude experiment config](../../examples/configs/experiments/grpo-qwen2.5-1.5b-1n1g-dtensor2tp1-masked-reward-exclude.yaml)
+and [include experiment config](../../examples/configs/experiments/grpo-qwen2.5-1.5b-1n1g-dtensor2tp1-masked-reward-include.yaml),
 which differ only in `grpo.masked_reward_policy`, or override that key on your
 existing config. Keep the revisions and all other settings identical.
 
