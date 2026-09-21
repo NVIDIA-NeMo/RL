@@ -211,7 +211,7 @@ class SyncRolloutActor:
         """
         # Lazy imports keep rollout-specific dependencies off the actor startup path.
         # ``_policy_dtype`` sizes the VLM pixel tensors below.
-        from nemo_rl.algorithms.grpo import _policy_dtype
+        from nemo_rl.algorithms.grpo import _mask_sample_valid_mask, _policy_dtype
         from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
         from nemo_rl.data.llm_message_utils import decompose_message_log
         from nemo_rl.environments.nemo_gym import should_use_nemo_gym
@@ -315,7 +315,7 @@ class SyncRolloutActor:
                 "input_lengths": input_lengths,
                 "generation_logprobs": flat["generation_logprobs"],
                 "token_mask": flat["token_loss_mask"],
-                "sample_mask": fb["loss_multiplier"],
+                "sample_mask": fb["loss_multiplier"] * _mask_sample_valid_mask(fb),
             }
         )
         if ROUTED_EXPERTS_FIELD in flat:
@@ -363,6 +363,10 @@ class SyncRolloutActor:
         # ran); feeds the driver's baseline_reward/pct_* diagnostics.
         if "env_reward" in fb:
             driver_carry["env_reward"] = fb["env_reward"]
+        if "mask_sample" in fb:
+            driver_carry["mask_sample"] = torch.as_tensor(
+                fb["mask_sample"], dtype=torch.bool
+            )
         # GDPO multi-reward components: scale_rewards iterates these
         # keys driver-side and the GDPO advantage estimator reads them
         # from ``adv_inputs``. Plumb them through ``driver_carry``
