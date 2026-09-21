@@ -265,6 +265,13 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     # aborts the run. A successful batch worker resets the count.
     # 0 makes the very first worker exception fatal.
     max_generation_failures: int = 0
+    # Stamp each arriving prompt group onto the earliest live training step
+    # that still lacks a full batch (inside the group's age window) instead of
+    # the step its rollout batch was reserved for, so groups that finish out of
+    # batch order form the next step's batch in arrival order. Pair with
+    # max_trajectory_age_steps >= 2 so a group may move one step ahead of its
+    # reservation; with an age window of 1 there is nowhere for it to go.
+    fifo_target_assignment: bool = False
     # Does the weight synchronization as soon as the training is done
     # without waiting for the pending generations to finish.
     in_flight_weight_updates: bool = False
@@ -4640,6 +4647,9 @@ def async_grpo_train(
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
         max_size=optimal_buffer_size,
         drop_incomplete_targets_on_restore=False,
+        fifo_target_assignment=master_config.grpo.async_grpo.fifo_target_assignment,
+        num_prompts_per_step=num_prompts_per_step,
+        max_age_steps=max_trajectory_age_steps,
     )
 
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
