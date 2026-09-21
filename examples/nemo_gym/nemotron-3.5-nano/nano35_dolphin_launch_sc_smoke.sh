@@ -95,6 +95,7 @@ export EXP_NAME="${EXP_NAME:-${USER}-nano35-sc-pipeclean-n8}"
 export NRL_MAX_STEPS="${NRL_MAX_STEPS:-3}"
 export WALLTIME="${WALLTIME:-2:00:00}"
 export SLURM_QOS="${SLURM_QOS:-short}"
+export ROLLOUT_CHECKPOINT_INTERVAL_S="${ROLLOUT_CHECKPOINT_INTERVAL_S:-180}"
 # Run the live worktree rather than a submission-time copy, so a fix can be
 # retried without re-snapshotting between attempts.
 export USE_SNAPSHOT="${USE_SNAPSHOT:-0}"

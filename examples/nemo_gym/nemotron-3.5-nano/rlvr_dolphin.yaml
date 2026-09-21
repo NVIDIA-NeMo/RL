@@ -154,6 +154,11 @@ env:
   nemo_gym:
     num_gpu_nodes: 16
 
+    # The inherited Ultra recipe configures this agent separately from
+    # config_paths. Clear that override as well as omitting its config path so
+    # checkpoint capability discovery does not see a hostless participant.
+    math_formal_lean_refinement_agent: null
+
     # -------------------------------------------------------------------------
     # Env blend. Identical to the base except rdkit_chemistry, which the base
     # lists but the pinned Gym submodule (473f446) does not ship — it would fail
@@ -175,7 +180,6 @@ env:
       - resources_servers/reasoning_gym/configs/reasoning_gym.yaml
       - resources_servers/terminus_judge/configs/terminus_judge_string_only.yaml
       - resources_servers/ns_tools/configs/ns_tools.yaml
-      - resources_servers/math_formal_lean/configs/math_formal_lean_multi_turn.yaml
       - resources_servers/multichallenge/configs/multichallenge.yaml
       - resources_servers/inverse_if/configs/inverse_if.yaml
       - resources_servers/single_step_tool_use_with_argument_comparison/configs/search_pivot_single_step_tool_use_with_argument_comparison.yaml

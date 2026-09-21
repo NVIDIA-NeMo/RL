@@ -284,9 +284,9 @@ async_rl:
 # =============================================================================
 env:
   nemo_gym:
-    # Include inner-server response details when Gym turns them into HTTP 500s.
-    # Without this, the outer /run error hides which dependency failed and why.
-    global_aiohttp_client_request_debug: true
+    # Avoid high-volume per-request diagnostics in scale runs. Checkpoint
+    # refusals and failures remain visible through their dedicated events.
+    global_aiohttp_client_request_debug: false
 
     genrm_model:
       responses_api_models:
@@ -308,14 +308,14 @@ env:
     policy_model:
       responses_api_models:
         vllm_model:
-          # Gym participant checkpointing currently requires one managed
-          # process per participant.
-          num_workers: 1
+          # Gym's checkpoint coordinator now supports multiple managed
+          # processes for a policy-model participant.
+          num_workers: 2
           num_groups_nemo_rl: 2
     policy_model_reasoning_off:
       responses_api_models:
         vllm_model:
-          num_workers: 1
+          num_workers: 2
           num_groups_nemo_rl: 2
 
 # =============================================================================
@@ -364,7 +364,7 @@ token_capture:
 rollout_checkpointing:
   # Keep this short enough for a small-scale run to capture an unfinished
   # generation prefix before the run completes.
-  snapshot_attempt_interval_s: 60
+  snapshot_attempt_interval_s: 180
   telemetry_interval_s: 120
   keep_latest_k: 2
   restore_mode: latest
@@ -373,7 +373,7 @@ rollout_checkpointing:
     participant_checkpointing_enabled: true
     generation_prefix_cuts_enabled: true
     generation_chunk_flush_tokens: 0  # good first scale run
-    prepare_timeout_s: 60
+    prepare_timeout_s: 600
 
 # Recovery policy for unfinished token-capture prompt groups. The agent-level
 # override takes precedence over task_name when both match.
