@@ -344,3 +344,42 @@ def test_all_config_no_tp_size_accuracy_issues(config_file):
             f"Config file {config_file} has TP size >= 4 accuracy issues. "
             "Please set policy.train_micro_batch_size and policy.logprob_batch_size to be the same value."
         )
+
+
+@pytest.mark.parametrize("config_file", config_files)
+def test_all_config_dtensor_selects_v2(config_file):
+    """Test that no config file in examples/configs selects the DTensor v1 backend.
+
+    v1 is being removed, so every dtensor_cfg that is enabled must pin _v2: true. An absent
+    _v2 is also a failure while the schema default is still False, since that silently
+    resolves to v1.
+    """
+
+    print(f"\nValidating config file: {config_file}")
+
+    config = load_config_with_inheritance(config_file)
+    config_dict = OmegaConf.to_container(config, resolve=True)
+
+    for section in ("policy", "value"):
+        section_dict = config_dict.get(section)
+        if not isinstance(section_dict, dict):
+            continue
+
+        dtensor_cfg = section_dict.get("dtensor_cfg")
+        if not isinstance(dtensor_cfg, dict):
+            continue
+
+        v2 = dtensor_cfg.get("_v2", "<absent>")
+
+        # Mirrors reject_dtensor_v1, which fires on an explicit false regardless of enabled.
+        if v2 is False:
+            raise AssertionError(
+                f"Config file {config_file} sets {section}.dtensor_cfg._v2: false, which "
+                "selects the removed DTensor v1 backend. Set it to true."
+            )
+
+        if dtensor_cfg.get("enabled") and v2 is not True:
+            raise AssertionError(
+                f"Config file {config_file} enables {section}.dtensor_cfg but does not set "
+                f"_v2: true (found {v2!r}). DTensor v2 is the only supported backend."
+            )
