@@ -261,11 +261,11 @@ class TrtllmGeneration(GenerationInterface):
             )
         return tied_groups
 
-    def _report_dp_openai_server_base_urls(self) -> list[Optional[str]]:
+    def _report_dp_openai_server_base_urls(self) -> list[str]:
         """Collect HTTP server base URLs from each DP-rank-0 worker."""
         if not self.cfg["trtllm_cfg"].get("expose_http_server"):
-            urls = [cast(Optional[str], None)] * self.dp_size
-            return urls
+            # No server on any rank, so there is no per-rank slot to hold open.
+            return []
         futures = self.worker_group.run_all_workers_single_data(
             "report_dp_openai_server_base_url",
             run_rank_0_only_axes=["tensor_parallel"],

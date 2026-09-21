@@ -534,7 +534,7 @@ def setup(
             def init_nemo_gym():
                 shard_set = build_nemo_gym_actors(
                     env_configs,
-                    base_urls=cast(list[str], deferred_vllm.dp_openai_server_base_urls),
+                    base_urls=deferred_vllm.dp_openai_server_base_urls,
                     model_name=generation_config["model_name"],
                     tokenizer=tokenizer,
                     # Distillation does not configure vLLM for router replay.
