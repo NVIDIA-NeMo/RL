@@ -362,10 +362,10 @@ class TrtllmAsyncGenerationWorkerImpl:
                 "update_weights_from_collective",
                 kwargs={"drain": drain, "recompute_kv": recompute_kv},
             )
-            worker_result = results[0] if results else True
-            if not worker_result:
+            if not results or not all(result is True for result in results):
                 print(
-                    f"Error: TRT-LLM worker failed to update weights. Result: {worker_result}"
+                    "Error: TRT-LLM worker failed to update weights. "
+                    f"Results: {results}"
                 )
                 return False
             return True
@@ -380,10 +380,10 @@ class TrtllmAsyncGenerationWorkerImpl:
         assert self.llm is not None
         try:
             results = await self.llm.collective_rpc("update_weights_via_ipc_zmq")
-            worker_result = results[0] if results else True
-            if not worker_result:
+            if not results or not all(result is True for result in results):
                 print(
-                    f"Error: TRT-LLM worker failed to update weights via IPC. Result: {worker_result}"
+                    "Error: TRT-LLM worker failed to update weights via IPC. "
+                    f"Results: {results}"
                 )
                 return False
             return True
