@@ -205,7 +205,7 @@ class DTensorConfig(TypedDict):
     tensor_parallel_size: int
     context_parallel_size: int
     expert_parallel_size: NotRequired[int]
-    # Size of the HSDP replicate dimension within the data-parallel axis (DTensor v2 only).
+    # Size of the HSDP replicate dimension within the data-parallel axis.
     dp_replicate_size: NotRequired[int]
     # Distributed config options (mirrors Automodel's FSDP2Config)
     sequence_parallel: bool

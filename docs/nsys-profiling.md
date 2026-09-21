@@ -59,7 +59,7 @@ payload raises at startup so misconfiguration surfaces immediately.
 ### Supported Workers
 
 The supported worker types are:
-- **DTensorPolicyWorkerV2**: Pattern matched against `"dtensor_policy_worker"`
+- **DTensorPolicyWorkerV2**: Pattern matched against `"dtensor_policy_worker_v2"`
 - **VllmGenerationWorker**: Pattern matched against `"vllm_generation_worker"`
 - **TrtllmAsyncGenerationWorker**: Pattern matched against `"trtllm_async_generation_worker"`
 
@@ -79,7 +79,7 @@ NRL_NSYS_PROFILE_STEP_RANGE=1:2 NRL_NSYS_WORKER_PATTERNS="*policy*,*vllm*" uv ru
 ### Profile Workers with Exact Names
 
 ```bash
-NRL_NSYS_PROFILE_STEP_RANGE=3:10 NRL_NSYS_WORKER_PATTERNS="dtensor_policy_worker,vllm_generation_worker" uv run examples/run_grpo.py grpo.max_num_steps=5
+NRL_NSYS_PROFILE_STEP_RANGE=3:10 NRL_NSYS_WORKER_PATTERNS="dtensor_policy_worker_v2,vllm_generation_worker" uv run examples/run_grpo.py grpo.max_num_steps=5
 ```
 
 ### Profile Megatron Workers
@@ -106,12 +106,12 @@ When profiling is enabled, it generates the following logs and files:
 
 1. **Logging**: You'll see log messages indicating which workers have profiling enabled:
    ```
-   Nsight profiling enabled for worker 'dtensor_policy_worker' (matched pattern '*policy*')
+   Nsight profiling enabled for worker 'dtensor_policy_worker_v2' (matched pattern '*policy*')
    ```
 
 2. **Profile Files**: Each profiled worker generates a `.nsys-rep` file with naming pattern:
    ```
-   dtensor_policy_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
+   dtensor_policy_worker_v2_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
    vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
    trtllm_async_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
    worker_process_<PID>.nsys-rep
