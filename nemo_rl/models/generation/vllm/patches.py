@@ -724,6 +724,100 @@ def _patch_vllm_moe_routed_experts_capture(logger, *, required: bool = False) ->
     return True
 
 
+def _patch_vllm_routed_experts_capture_router_fallback(
+    logger, *, required: bool = False
+) -> bool:
+    """Let monolithic MoE kernels without in-kernel capture use the router hook.
+
+    vLLM 0.29 moved the routed-experts binding into
+    ``routed_experts_capturer.bind_routed_experts_capturer``. For a monolithic
+    kernel it requires ``fused_experts.supports_routing_replay_capture()`` and
+    binds the capture function to that experts *object* (the kernel then writes
+    ``routing_replay_out`` itself); any other monolithic kernel is rejected with
+    ``ValueError``. Two things make the object binding unusable for NeMo-RL's
+    NVFP4 per-token method: the kernel is rebuilt on every refit, so the bound
+    capture function is dropped after the first weight update and the returned
+    routes go back to all-zero; and the per-token kernel is the one FlashInfer
+    launch that has not been validated with a replay buffer attached. Kernels
+    that report no in-kernel capture (see ``nvfp4_pertoken.host_captured_experts_cls``)
+    therefore fall back to ``router.set_capture_fn`` — the hook that
+    ``_patch_vllm_moe_routed_experts_capture`` fires on the monolithic branch
+    and the path vLLM 0.26 used for every monolithic kernel.
+    """
+    try:
+        file_to_patch = _get_vllm_file(
+            "model_executor/layers/fused_moe/routed_experts_capturer.py"
+        )
+    except RuntimeError:
+        message = (
+            "Could not locate routed_experts_capturer.py for the routed-experts "
+            "capture router-fallback patch."
+        )
+        if required:
+            raise RuntimeError(message) from None
+        logger.warning(message)
+        return False
+
+    marker = "NeMo-RL patch (router fallback for monolithic routed-experts capture)"
+    old_snippet = (
+        "        if quant_method.is_monolithic:\n"
+        "            if not (\n"
+        "                isinstance(fused_experts, FusedMoEExpertsMonolithic)\n"
+        "                and fused_experts.supports_routing_replay_capture()\n"
+        "            ):\n"
+        "                raise ValueError(\n"
+        '                    "Routed-experts capture is not supported with monolithic "\n'
+        '                    f"MoE kernel {type(fused_experts).__name__}."\n'
+        "                )\n"
+        "            fused_experts.set_capture_fn(capture_fn)\n"
+        "            num_bound += 1\n"
+    )
+    new_snippet = (
+        "        if quant_method.is_monolithic:\n"
+        "            # NeMo-RL patch (router fallback for monolithic routed-experts capture):\n"
+        "            # a monolithic kernel that does not capture routing itself is\n"
+        "            # captured through the router; NeMo-RL's moe_runner patch fires\n"
+        "            # router.select_experts on the monolithic branch when capture_fn is set.\n"
+        "            if (\n"
+        "                isinstance(fused_experts, FusedMoEExpertsMonolithic)\n"
+        "                and fused_experts.supports_routing_replay_capture()\n"
+        "            ):\n"
+        "                fused_experts.set_capture_fn(capture_fn)\n"
+        "                num_bound += 1\n"
+        "            elif isinstance(module.router, BaseRouter):\n"
+        "                module.router.set_capture_fn(capture_fn)\n"
+        "                num_bound += 1\n"
+        "            else:\n"
+        "                raise ValueError(\n"
+        '                    "Routed-experts capture is not supported with monolithic "\n'
+        '                    f"MoE kernel {type(fused_experts).__name__}."\n'
+        "                )\n"
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if marker in content:
+            logger.info("Routed-experts capture router-fallback patch already applied.")
+            return True
+        if old_snippet not in content:
+            message = (
+                "Could not apply the routed-experts capture router-fallback patch: "
+                f"expected code snippet not found in {file_to_patch}. The vLLM "
+                "version may have changed."
+            )
+            if required:
+                raise RuntimeError(message)
+            logger.warning(message)
+            return False
+        content = content.replace(old_snippet, new_snippet, 1)
+        write_back(content)
+
+    logger.info(
+        "Successfully patched routed-experts capture (router fallback for "
+        "monolithic kernels)."
+    )
+    return True
+
+
 def _patch_vllm_nemotron_h_fp32_lm_head(logger) -> bool:
     """Compute NemotronH logits with an fp32 LM head (MiniMax-M1-style).
 
@@ -1006,5 +1100,8 @@ def _apply_vllm_patches(
             "for this vLLM version."
         )
     _patch_vllm_moe_routed_experts_capture(
+        patch_logger, required=require_moe_routed_experts_capture
+    )
+    _patch_vllm_routed_experts_capture_router_fallback(
         patch_logger, required=require_moe_routed_experts_capture
     )

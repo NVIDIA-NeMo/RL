@@ -832,3 +832,62 @@ def test_prequantized_extension_uses_native_ipc_reload(
     assert not extension._quantizer._pending
     printed = capsys.readouterr().out
     assert "[nvfp4_pertoken] refit: quantized 1 expert weight groups" in printed
+
+
+def test_host_captured_experts_cls_disables_in_kernel_capture_for_monolithic(
+    nvfp4_module,
+):
+    """vLLM 0.29 binds routed-experts capture to the experts object of monolithic
+    kernels; the per-token method rebuilds that object on every refit, so it must
+    report no in-kernel capture and let the router hook (vLLM 0.26's path) capture."""
+    M = nvfp4_module
+
+    class Monolithic:
+        @staticmethod
+        def is_monolithic() -> bool:
+            return True
+
+        def supports_routing_replay_capture(self) -> bool:
+            return True
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    wrapped = M.host_captured_experts_cls(Monolithic)
+    assert wrapped is not Monolithic
+    assert issubclass(wrapped, Monolithic)
+    assert wrapped.is_monolithic()
+    assert wrapped.__name__ == "HostCapturedMonolithic"
+    instance = wrapped(moe_config="cfg", per_token_activation=True)
+    assert instance.supports_routing_replay_capture() is False
+    assert instance.kwargs == {"moe_config": "cfg", "per_token_activation": True}
+    # Cached so repeated kernel rebuilds keep one class identity.
+    assert M.host_captured_experts_cls(Monolithic) is wrapped
+
+
+def test_host_captured_experts_cls_leaves_modular_kernels_alone(nvfp4_module):
+    M = nvfp4_module
+
+    class Modular:
+        @staticmethod
+        def is_monolithic() -> bool:
+            return False
+
+        def supports_routing_replay_capture(self) -> bool:
+            return True
+
+    assert M.host_captured_experts_cls(Modular) is Modular
+
+
+def test_per_token_method_uses_host_captured_experts(nvfp4_module):
+    """The real vLLM TRT-LLM monolithic experts class is what the wrapper wraps."""
+    M = nvfp4_module
+    from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
+        TrtLlmNvFp4ExpertsMonolithic,
+    )
+
+    wrapped = M.host_captured_experts_cls(TrtLlmNvFp4ExpertsMonolithic)
+    assert issubclass(wrapped, TrtLlmNvFp4ExpertsMonolithic)
+    assert wrapped.is_monolithic()
+    assert "TrtLlmNvFp4ExpertsMonolithic" in wrapped.__name__
+    assert wrapped.supports_routing_replay_capture(object.__new__(wrapped)) is False

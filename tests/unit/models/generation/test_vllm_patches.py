@@ -140,6 +140,11 @@ class NemotronHForCausalLM:
 _MOE_SOURCE = "model_executor/layers/fused_moe/runner/moe_runner.py"
 _MOE_PATCH_FN = "_patch_vllm_moe_routed_experts_capture"
 _MOE_MARKER = "NeMo-RL patch (routed-experts capture for router replay)"
+_CAPTURER_SOURCE = "model_executor/layers/fused_moe/routed_experts_capturer.py"
+_CAPTURER_PATCH_FN = "_patch_vllm_routed_experts_capture_router_fallback"
+_CAPTURER_MARKER = (
+    "NeMo-RL patch (router fallback for monolithic routed-experts capture)"
+)
 
 
 @pytest.fixture
@@ -516,6 +521,131 @@ def test_moe_routed_experts_patch_fails_closed_when_required(monkeypatch, tmp_pa
         )
 
 
+@pytest.fixture
+def patched_capturer_source(tmp_path, monkeypatch):
+    """The installed routed-experts binder, unpatched then patched in tmp."""
+    copied = write_unpatched_copy(
+        _CAPTURER_SOURCE, _CAPTURER_PATCH_FN, tmp_path / "routed_experts_capturer.py"
+    )
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+    assert patches._patch_vllm_routed_experts_capture_router_fallback(
+        logging.getLogger(__name__), required=True
+    )
+    return copied
+
+
+@pytest.mark.vllm
+def test_capture_router_fallback_patch_anchor_still_matches_installed_vllm(
+    patched_capturer_source,
+):
+    content = patched_capturer_source.read_text()
+    assert _CAPTURER_MARKER in content
+    # The patched monolithic block runs from the marker to the original raise.
+    monolithic_branch = content.split(_CAPTURER_MARKER, 1)[1]
+    monolithic_branch = monolithic_branch.split("not supported with monolithic", 1)[0]
+    # In-kernel capture still wins when the kernel supports it ...
+    assert "fused_experts.set_capture_fn(capture_fn)" in monolithic_branch
+    # ... and a kernel without it now falls back to the router instead of raising.
+    assert "module.router.set_capture_fn(capture_fn)" in monolithic_branch
+    assert monolithic_branch.index(
+        "fused_experts.set_capture_fn"
+    ) < monolithic_branch.index("module.router.set_capture_fn")
+    ast.parse(content)
+
+
+@pytest.mark.vllm
+def test_capture_router_fallback_patch_is_idempotent(
+    patched_capturer_source, monkeypatch
+):
+    before = patched_capturer_source.read_text()
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(patched_capturer_source)
+    )
+
+    assert patches._patch_vllm_routed_experts_capture_router_fallback(
+        logging.getLogger(__name__), required=True
+    )
+    assert patched_capturer_source.read_text() == before
+
+
+def test_capture_router_fallback_patch_fails_closed_when_required(
+    monkeypatch, tmp_path
+):
+    source = tmp_path / "routed_experts_capturer.py"
+    source.write_text("def bind_routed_experts_capturer(model, capturer):\n    pass\n")
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
+
+    with pytest.raises(RuntimeError, match="expected code snippet not found"):
+        patches._patch_vllm_routed_experts_capture_router_fallback(
+            logging.getLogger(__name__), required=True
+        )
+    assert source.read_text().startswith("def bind_routed_experts_capturer")
+
+
+def test_capture_router_fallback_patch_binds_router_for_unsupported_kernel(
+    monkeypatch, tmp_path
+):
+    """Execute the patched binder body against stand-ins for both kernel kinds."""
+    from tests.unit.models.generation.vllm_patch_source_utils import patch_snippets
+
+    old_snippet, _new_snippet = patch_snippets(_CAPTURER_PATCH_FN)
+    source = tmp_path / "routed_experts_capturer.py"
+    source.write_text(
+        "def bind(module, quant_method, fused_experts, capture_fn, "
+        "FusedMoEExpertsMonolithic, BaseRouter):\n"
+        "    num_bound = 0\n"
+        "    if True:\n" + old_snippet + "        return num_bound\n"
+    )
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
+    assert patches._patch_vllm_routed_experts_capture_router_fallback(
+        logging.getLogger(__name__), required=True
+    )
+    namespace: dict = {}
+    exec(compile(source.read_text(), str(source), "exec"), namespace)
+
+    class Monolithic:
+        def __init__(self, supports):
+            self.supports = supports
+            self.bound = None
+
+        def supports_routing_replay_capture(self):
+            return self.supports
+
+        def set_capture_fn(self, fn):
+            self.bound = fn
+
+    class Router:
+        def __init__(self):
+            self.bound = None
+
+        def set_capture_fn(self, fn):
+            self.bound = fn
+
+    capture_fn = object()
+    quant_method = SimpleNamespace(is_monolithic=True)
+
+    kernel, router = Monolithic(True), Router()
+    module = SimpleNamespace(router=router)
+    assert (
+        namespace["bind"](module, quant_method, kernel, capture_fn, Monolithic, Router)
+        == 1
+    )
+    assert kernel.bound is capture_fn and router.bound is None
+
+    kernel, router = Monolithic(False), Router()
+    module = SimpleNamespace(router=router)
+    assert (
+        namespace["bind"](module, quant_method, kernel, capture_fn, Monolithic, Router)
+        == 1
+    )
+    assert kernel.bound is None and router.bound is capture_fn
+
+    kernel = Monolithic(False)
+    module = SimpleNamespace(router=object())
+    with pytest.raises(ValueError, match="not supported with monolithic"):
+        namespace["bind"](module, quant_method, kernel, capture_fn, Monolithic, Router)
+
+
 @pytest.mark.parametrize(
     ("vllm_cfg", "expected"),
     [
@@ -657,6 +787,11 @@ def _stub_non_fp32_vllm_patches(monkeypatch, captured_extra_env_vars):
         "_patch_vllm_moe_routed_experts_capture",
         lambda _logger, *, required=False: True,
     )
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_routed_experts_capture_router_fallback",
+        lambda _logger, *, required=False: True,
+    )
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -680,6 +815,12 @@ def test_apply_vllm_patches_gates_nemotron_h_fp32_lm_head(
         "_patch_vllm_moe_routed_experts_capture",
         lambda _logger, *, required: capture_requirements.append(required) or True,
     )
+    fallback_requirements = []
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_routed_experts_capture_router_fallback",
+        lambda _logger, *, required: fallback_requirements.append(required) or True,
+    )
 
     patches._apply_vllm_patches(
         "py",
@@ -690,6 +831,8 @@ def test_apply_vllm_patches_gates_nemotron_h_fp32_lm_head(
 
     assert bool(fp32_patch_calls) is enabled
     assert capture_requirements == [require_capture]
+    # The router fallback is required exactly when the capture patch is.
+    assert fallback_requirements == [require_capture]
     if enabled:
         assert os.environ[patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR] == "1"
         assert captured_extra_env_vars == [
