@@ -1964,14 +1964,23 @@ def test_dsv4_module_lookup_maps_checkpoint_attention_to_fused_vllm_module(
             layer.attn.fused_wqa_wkv = torch.nn.Linear(2, 2, bias=False)
             self.model.layers = torch.nn.ModuleList([layer])
             self.hf_to_vllm_mapper = types.SimpleNamespace(
+                orig_to_new_prefix={"model.": "model.model."},
                 apply_list=lambda names: [f"model.{names[0]}"],
             )
 
     model = DeepSeekV4ForCausalLM()
 
-    module = fp8._get_module_from_param_name(model, "layers.0.attn.wq_a.weight")
+    module = fp8.get_module_from_param_name(model, "layers.0.attn.wq_a.weight")
 
     assert module is model.model.layers[0].attn.fused_wqa_wkv
+
+    resolution = fp8.resolve_module_from_param_name(model, "layers.0.attn.wq_a.weight")
+    assert resolution is not None
+    assert resolution.module is module
+    # Bypassing the full DeepSeek mapper loses the prefix; applying the generic
+    # mapper afterward duplicates it. Check the path because the module walker
+    # tolerates missing or repeated model wrappers.
+    assert resolution.mapped_path == ("model", "layers", "0", "attn", "fused_wqa_wkv")
 
 
 def test_module_lookup_preserves_base_packed_and_mapper_handling(fp8_module):
@@ -1996,7 +2005,7 @@ def test_module_lookup_preserves_base_packed_and_mapper_handling(fp8_module):
 
     model = Model()
 
-    module = fp8._get_module_from_param_name(
+    module = fp8.get_module_from_param_name(
         model, "transformer.layers.0.self_attn.q_proj.weight"
     )
 
@@ -2464,14 +2473,20 @@ def _grouped_expert_model(fp8, monkeypatch, experts_dtype, wrap_language_model=F
     """
     import torch
 
-    class _RoutedExperts:
-        pass
+    class _RoutedExperts(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
 
-    class _MoERunner:
-        pass
+    class _MoERunner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+
+    from nemo_rl.models.generation.vllm.quantization import utils as quant_utils
 
     monkeypatch.setattr(fp8, "RoutedExperts", _RoutedExperts)
-    monkeypatch.setattr(fp8, "MoERunner", _MoERunner)
+    monkeypatch.setattr(fp8, "MoERunner", _MoERunner, raising=False)
+    monkeypatch.setattr(quant_utils, "RoutedExperts", _RoutedExperts)
+    monkeypatch.setattr(quant_utils, "MoERunner", _MoERunner)
 
     experts = _RoutedExperts()
     experts.w13_weight = torch.zeros(2, 4, 4, dtype=experts_dtype)
@@ -2558,7 +2573,7 @@ def test_load_weights_passes_grouped_experts_through_for_ignored_bf16_layers(
     # Pass-through is also what a failed lookup produces, so pin that the
     # bf16 RoutedExperts was actually resolved.
     assert isinstance(
-        fp8._get_module_from_param_name(
+        fp8.get_module_from_param_name(
             model, f"{layers_prefix}.0.mlp.experts.gate_up_proj"
         ),
         fp8.RoutedExperts,

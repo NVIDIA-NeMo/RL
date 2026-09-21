@@ -717,7 +717,7 @@ def _actor_master_config(
         policy={
             # One optimizer.step per RL step: prompts * generations == gbs.
             "train_global_batch_size": num_prompts_per_step * 2,
-            "generation": {"colocated": {"enabled": False}},
+            "generation": {"backend": "vllm", "colocated": {"enabled": False}},
         },
         loss_fn=ClippedPGLossConfig(),
         env={},
@@ -2717,7 +2717,7 @@ class TestSetupResumeWiring:
                 return_value=True,
             ),
             patch(
-                "nemo_rl.algorithms.single_controller_utils.setup.spinup_nemo_gym_actor",
+                "nemo_rl.algorithms.single_controller_utils.setup.build_nemo_gym_actors",
                 return_value=MagicMock(),
             ),
             patch(

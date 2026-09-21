@@ -131,6 +131,7 @@ def test_modelopt_policy_worker_uses_real_quant_refit_timeout(monkeypatch):
 
     worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
     worker = object.__new__(worker_cls)
+    worker.cfg = {}
     worker._use_real_quant_refit = lambda: True
     worker.get_zmq_address = lambda: "ipc:///tmp/modelopt-test.sock"
     monkeypatch.setattr(megatron_quant_policy_worker.zmq, "Context", FakeContext)
