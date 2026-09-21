@@ -99,18 +99,220 @@ def test_inspect_cut_candidate_selects_requested_agent(
             },
         ],
     )
+    monkeypatch.setattr(
+        _HELPER,
+        "_matching_agent_boundary",
+        lambda *_args, **_kwargs: {
+            "boundary_kind": "turn_complete",
+            "boundary_index": 0,
+            "pending_model": None,
+            "last_committed_model_call_id": None,
+            "resource_state_revisions": {"resources": 1},
+        },
+    )
 
     selected = _HELPER.inspect_cut_candidate(
         snapshot,
         min_train_step=2,
         task_source="simple",
         max_generation_tokens=256,
+        boundary_requirement="root",
     )
 
     assert selected["task_source"] == "simple"
     assert selected["rollout_id"] == "simple-group_g0"
     assert selected["attempt_index"] == 1
     assert selected["prefix_token_count"] == 12
+    assert selected["boundary_requirement"] == "root"
+
+
+def test_inspect_cut_candidate_honors_max_train_step(tmp_path: Path) -> None:
+    snapshot = tmp_path / "step_2/rollout_snapshots/snapshot_000001"
+    snapshot.mkdir(parents=True)
+    (snapshot / "manifest.json").write_text(json.dumps({"base_train_step": 2}))
+
+    with pytest.raises(AssertionError, match="train step 2 exceeds 1"):
+        _HELPER.inspect_cut_candidate(
+            snapshot,
+            min_train_step=0,
+            max_train_step=1,
+            task_source="simple",
+            max_generation_tokens=256,
+        )
+
+
+def test_inspect_cut_candidate_skips_terminal_and_exhausted_cuts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = tmp_path / "step_2/rollout_snapshots/snapshot_000001"
+    snapshot.mkdir(parents=True)
+    (snapshot / "manifest.json").write_text(
+        json.dumps(
+            {
+                "base_train_step": 2,
+                "gym_checkpoint": {"checkpoint_id": "checkpoint-2"},
+            }
+        )
+    )
+    torch.save(
+        {
+            "groups": [
+                {
+                    "group_id": "simple-group",
+                    "task_source": "simple",
+                    "siblings": [
+                        {
+                            "generation_index": 0,
+                            "attempts": [{"attempt_index": 0}],
+                        }
+                    ],
+                }
+            ]
+        },
+        snapshot / "rollout_recovery.pt",
+    )
+    monkeypatch.setattr(
+        _HELPER,
+        "_active_prefixes",
+        lambda *_: [
+            {
+                "rollout_id": "simple-group_g0",
+                "attempt_index": 0,
+                "model_call_id": "terminal-call",
+                "prefix_token_count": 20,
+                "prefix_digest": "1" * 64,
+                "staging_keys": ["terminal-key"],
+                "effective_output_limit": 64,
+                "terminal_finish_reason": "stop",
+            },
+            {
+                "rollout_id": "simple-group_g0",
+                "attempt_index": 0,
+                "model_call_id": "exhausted-call",
+                "prefix_token_count": 32,
+                "prefix_digest": "2" * 64,
+                "staging_keys": ["exhausted-key"],
+                "effective_output_limit": 32,
+                "terminal_finish_reason": None,
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        _HELPER,
+        "_matching_agent_boundary",
+        lambda *_args, **_kwargs: {
+            "boundary_kind": "turn_complete",
+            "pending_model": None,
+            "last_committed_model_call_id": None,
+        },
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="no recoverable nonterminal active prefix",
+    ):
+        _HELPER.inspect_cut_candidate(
+            snapshot,
+            min_train_step=2,
+            task_source="simple",
+            max_generation_tokens=256,
+        )
+
+
+def test_matching_agent_boundary_requires_a_completed_saved_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = {
+        "participants": [
+            {
+                "participant": {
+                    "component": "responses_api_agents",
+                    "participant_name": "simple",
+                }
+            }
+        ]
+    }
+    record = {
+        "rollout_id": "group_g0",
+        "attempt_index": 0,
+        "boundary_kind": "turn_complete",
+        "pending_model": None,
+    }
+    monkeypatch.setattr(_HELPER, "_agent_records", lambda *_: [record])
+
+    assert (
+        _HELPER._matching_agent_boundary(
+            tmp_path,
+            checkpoint,
+            rollout_id="group_g0",
+            attempt_index=0,
+        )
+        == record
+    )
+
+    record["boundary_kind"] = "pending_model"
+    record["pending_model"] = {"model_call_id": "call-1"}
+    with pytest.raises(
+        AssertionError,
+        match="not anchored by a completed agent boundary",
+    ):
+        _HELPER._matching_agent_boundary(
+            tmp_path,
+            checkpoint,
+            rollout_id="group_g0",
+            attempt_index=0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("requirement", "boundary", "expected"),
+    [
+        (
+            "root",
+            {
+                "boundary_index": 0,
+                "last_committed_model_call_id": None,
+                "resource_state_revisions": {"resources": 1},
+            },
+            True,
+        ),
+        (
+            "root",
+            {
+                "boundary_index": 3,
+                "last_committed_model_call_id": "call-1",
+                "resource_state_revisions": {"resources": 2},
+            },
+            False,
+        ),
+        (
+            "post_mutation",
+            {
+                "boundary_index": 3,
+                "last_committed_model_call_id": "call-1",
+                "resource_state_revisions": {"resources": 2},
+            },
+            True,
+        ),
+        (
+            "post_mutation",
+            {
+                "boundary_index": 0,
+                "last_committed_model_call_id": None,
+                "resource_state_revisions": {"resources": 1},
+            },
+            False,
+        ),
+    ],
+)
+def test_boundary_satisfies_requirement(
+    requirement: str,
+    boundary: dict,
+    expected: bool,
+) -> None:
+    assert _HELPER._boundary_satisfies_requirement(boundary, requirement) is expected
 
 
 def test_published_snapshots_skips_snapshot_retired_mid_scan(
@@ -419,9 +621,7 @@ def test_compare_runs_writes_rollout_timeline(tmp_path: Path) -> None:
 
     timeline = json.loads(args.timeline_output.read_text())
     assert timeline["completion_order_matches"] is True
-    assert [
-        entry["effective_completion_rank"] for entry in timeline["baseline"]
-    ] == [
+    assert [entry["effective_completion_rank"] for entry in timeline["baseline"]] == [
         0,
         1,
         2,

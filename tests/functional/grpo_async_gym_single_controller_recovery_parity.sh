@@ -72,8 +72,9 @@ rm -rf "$TEST_DIR"
 mkdir -p "$TEST_DIR"
 
 # Every step consumes one deterministic two-turn counter episode and one
-# deterministic two-turn Workplace episode. The checkpoint test agent forces
-# turn two to be a long, tool-free decode, making both agent types cuttable.
+# deterministic two-turn Workplace episode. The counter's constrained first
+# call exercises structured-prefix restart. The checkpoint test agent makes
+# Workplace's post-mutation second call a long, tool-free prefix restore.
 jq -n -c \
     --slurpfile simple "$GYM_ROOT/resources_servers/example_session_state_mgmt/data/example.jsonl" \
     --slurpfile workplace "$GYM_ROOT/resources_servers/workplace_assistant/data/example.jsonl" \
@@ -87,18 +88,25 @@ jq -n -c \
         | .expected_count = (10 * $step + 1)
         | .responses_create_params.input = [{
             "role": "user",
-            "content": ("Call increment_counter exactly once with count 1, then report the result. Case " + ($step | tostring))
+            "content": ("Call increment_counter exactly once with count 1 and checkpoint_proof containing every integer from 0 through 63 in order, then report the result. Case " + ($step | tostring))
           }]
         | .responses_create_params.tools = [
             .responses_create_params.tools[]
             | select(.name == "increment_counter")
+            | .parameters.properties.checkpoint_proof = {
+                "type": "array",
+                "items": {"type": "integer"},
+                "minItems": 64,
+                "maxItems": 64
+              }
+            | .parameters.required += ["checkpoint_proof"]
           ]
         | .responses_create_params.tool_choice = {
             "type": "function",
             "name": "increment_counter"
           }
         | .responses_create_params.parallel_tool_calls = false
-        | .responses_create_params.max_output_tokens = 64
+        | .responses_create_params.max_output_tokens = 256
       ),
       (
         $workplace[0]
@@ -222,7 +230,9 @@ ACTIVE_PID=$!
 uv run --directory "$PROJECT_ROOT" --no-sync python "$PARITY_HELPER" select-cut \
     "$RECOVERY_CHECKPOINT_DIR" "$FIRST_SELECTION" "$ACTIVE_PID" \
     "$BASE_RUN_LOG" "$CUT_TIMEOUT_S" 0 \
-    workplace_assistant_prefix_checkpoint_test_agent "$MIN_GENERATION_TOKENS"
+    workplace_assistant_prefix_checkpoint_test_agent "$MIN_GENERATION_TOKENS" \
+    --max-train-step 0 \
+    --boundary-requirement post_mutation --expected-outcome restore
 stop_active_run
 cp "$BASE_RUN_LOG" "$TEST_DIR/recovery-crash-1.log"
 uv run --directory "$PROJECT_ROOT" --no-sync python "$PARITY_HELPER" \
@@ -245,7 +255,8 @@ ACTIVE_PID=$!
 uv run --directory "$PROJECT_ROOT" --no-sync python "$PARITY_HELPER" select-cut \
     "$RECOVERY_CHECKPOINT_DIR" "$SECOND_SELECTION" "$ACTIVE_PID" \
     "$BASE_RUN_LOG" "$CUT_TIMEOUT_S" 2 \
-    example_session_state_mgmt_simple_agent "$MIN_GENERATION_TOKENS"
+    example_session_state_mgmt_simple_agent "$MIN_GENERATION_TOKENS" \
+    --boundary-requirement root --expected-outcome restart
 stop_active_run
 cp "$BASE_RUN_LOG" "$TEST_DIR/recovery-crash-2.log"
 uv run --directory "$PROJECT_ROOT" --no-sync python "$PARITY_HELPER" \
@@ -266,45 +277,59 @@ timeout --signal=TERM --kill-after=30s "${RUN_TIMEOUT_S}s" \
         "$@"
 cp "$BASE_RUN_LOG" "$TEST_DIR/recovery-final.log"
 
-restored_prefixes=0
-restarted_prefixes=0
+recovery_log_contains() {
+    local pattern=$1
+    local run_log=$2
+    if grep -Eq "$pattern" "$run_log"; then
+        return 0
+    fi
+    if [[ ! -d "$TEST_DIR/recovery-gym-logs" ]]; then
+        return 1
+    fi
+    grep -ERq "$pattern" "$TEST_DIR/recovery-gym-logs"
+}
+
 for selection_and_log in \
     "$FIRST_SELECTION:$TEST_DIR/recovery-crash-2.log" \
     "$SECOND_SELECTION:$TEST_DIR/recovery-final.log"; do
     selection=${selection_and_log%%:*}
     run_log=${selection_and_log#*:}
     source_model_call_id=$(jq -r .model_call_id "$selection")
+    expected_outcome=$(jq -r .expected_outcome "$selection")
     restored_pattern="generation prefix restored: .*source_model_call_id=$source_model_call_id "
     completed_pattern="generation prefix completed: .*source_model_call_id=$source_model_call_id "
     restarted_pattern="generation prefix restart: .*source_model_call_id=$source_model_call_id "
     restored=0
     completed=0
     restarted=0
-    grep -Eq "$restored_pattern" "$run_log" && restored=1
-    grep -Eq "$completed_pattern" "$run_log" && completed=1
-    grep -Eq "$restarted_pattern" "$run_log" && restarted=1
+    recovery_log_contains "$restored_pattern" "$run_log" && restored=1
+    recovery_log_contains "$completed_pattern" "$run_log" && completed=1
+    recovery_log_contains "$restarted_pattern" "$run_log" && restarted=1
 
-    if [[ "$restored" -eq 1 && "$completed" -eq 1 && "$restarted" -eq 0 ]]; then
-        restored_prefixes=$((restored_prefixes + 1))
-        continue
-    fi
-    if [[ "$restored" -eq 0 && "$completed" -eq 0 && "$restarted" -eq 1 ]]; then
-        restarted_prefixes=$((restarted_prefixes + 1))
-        continue
-    fi
+    case "$expected_outcome" in
+        restore)
+            if [[ "$restored" -eq 1 && "$completed" -eq 1 && "$restarted" -eq 0 ]]; then
+                continue
+            fi
+            ;;
+        restart)
+            if [[ "$restored" -eq 0 && "$completed" -eq 0 && "$restarted" -eq 1 ]]; then
+                continue
+            fi
+            ;;
+        *)
+            echo "[ERROR] selected cut has unknown expected outcome: " \
+                "source_model_call_id=$source_model_call_id " \
+                "expected_outcome=$expected_outcome"
+            exit 1
+            ;;
+    esac
     echo "[ERROR] selected cut has an inconsistent recovery outcome: " \
-        "source_model_call_id=$source_model_call_id restored=$restored " \
+        "source_model_call_id=$source_model_call_id " \
+        "expected_outcome=$expected_outcome restored=$restored " \
         "completed=$completed restarted=$restarted log=$run_log"
     exit 1
 done
-if [[ "$restored_prefixes" -lt 1 ]]; then
-    echo "[ERROR] recovery parity test did not restore any safe generation prefix"
-    exit 1
-fi
-if [[ "$restarted_prefixes" -lt 1 ]]; then
-    echo "[ERROR] recovery parity test did not exercise structured-prefix fallback"
-    exit 1
-fi
 grep -q "train step $MAX_STEPS/$MAX_STEPS" "$TEST_DIR/recovery-final.log"
 
 echo "=== Reference: run $MAX_STEPS uninterrupted steps ==="
