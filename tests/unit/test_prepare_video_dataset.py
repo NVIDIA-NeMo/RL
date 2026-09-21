@@ -67,7 +67,7 @@ def test_converter_skips_missing_local_videos_when_requested(
     content = converted_rows[0]["responses_create_params"]["input"][0]["content"]
     assert content[0]["video_url"] == str(existing_video.resolve())
     metadata = converted_rows[0]["responses_create_params"]["metadata"]
-    assert metadata["chat_template_kwargs"] == {"enable_thinking": True}
+    assert json.loads(metadata["chat_template_kwargs"]) == {"enable_thinking": True}
     assert "extra_body" not in metadata
     assert "extraction_mode" not in converted_rows[0]
     assert "Skipped 1 non-video or duplicate rows" in capsys.readouterr().out

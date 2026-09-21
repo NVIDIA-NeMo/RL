@@ -14,10 +14,14 @@
 
 from PIL import Image
 
-from nemo_rl.data.multimodal_utils import image_to_data_url
-from nemo_rl.environments.nemo_gym import (
+from nemo_rl.data.multimodal_utils import (
+    extract_input_media_sources_from_responses_messages,
+    image_to_data_url,
+)
+from nemo_rl.environments.nemo_gym_multimodal import (
     _extract_input_images_from_message,
     _index_per_turn_images,
+    _without_initial_media_sources,
 )
 
 
@@ -176,3 +180,67 @@ def test_index_per_turn_images_flushes_on_function_call_trainable_item():
     assert len(per_turn) == 2
     assert [img.size for img in per_turn[0]] == [(2, 2)]
     assert [img.size for img in per_turn[1]] == [(5, 5)]
+
+
+def test_without_initial_media_sources_strips_videos_and_images_in_order():
+    """Video parts must be de-duplicated alongside images, in encounter order."""
+    image_url = _image((2, 2))
+    video_url = "data:video/mp4;base64,dG95"
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_video", "video_url": video_url},
+                {"type": "input_image", "image_url": image_url},
+                {"type": "input_text", "text": "What is shown?"},
+            ],
+        }
+    ]
+    initial_sources = extract_input_media_sources_from_responses_messages(messages)
+    assert initial_sources == [("video", video_url), ("image", image_url)]
+
+    filtered, fully_consumed = _without_initial_media_sources(messages, initial_sources)
+
+    assert fully_consumed is True
+    assert filtered[0]["content"] == [{"type": "input_text", "text": "What is shown?"}]
+    # The caller's messages must not be mutated in place.
+    assert len(messages[0]["content"]) == 3
+
+
+def test_without_initial_media_sources_keeps_media_the_agent_added():
+    """Only the ordered prefix of initial sources is removed; extras survive."""
+    initial_image = _image((2, 2))
+    agent_image = _image((4, 4))
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "input_image", "image_url": initial_image}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "input_image", "image_url": agent_image}],
+        },
+    ]
+
+    filtered, fully_consumed = _without_initial_media_sources(
+        messages, [("image", initial_image)]
+    )
+
+    assert fully_consumed is True
+    assert filtered[0]["content"] == []
+    assert filtered[1]["content"] == [{"type": "input_image", "image_url": agent_image}]
+
+
+def test_without_initial_media_sources_reports_unconsumed_sources():
+    """A source that never appears leaves the consumed flag False."""
+    filtered, fully_consumed = _without_initial_media_sources(
+        [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        [("image", "data:image/png;base64,AA")],
+    )
+
+    assert fully_consumed is False
+    assert filtered[0]["content"] == [{"type": "input_text", "text": "hi"}]
+
+
+def test_without_initial_media_sources_passes_through_non_list_messages():
+    assert _without_initial_media_sources("not-a-list", []) == ("not-a-list", False)

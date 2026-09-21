@@ -14,7 +14,7 @@
 
 import copy
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -274,6 +274,12 @@ def test_distillation_train_max_steps(mock_components):
     )
 
     assert mock_components["student_policy"].train.call_count == 5
+    final_timing_call = [
+        call
+        for call in mock_components["logger"].log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "timing/train"
+    ][-1]
+    assert final_timing_call.kwargs["step_finished"] is True
 
 
 def test_ft_save_period_triggers_periodic_saves(mock_components):
@@ -368,15 +374,23 @@ def test_distillation_train_uses_nemo_gym_rollout_when_enabled(mock_components):
     assert train_metric_calls[-1].args[0]["mean_gen_tokens_per_sample"] == 3.0
 
 
-def test_exit_on_timeout(mock_components, capsys):
+def test_exit_on_timeout(mock_components, capsys, tmp_path):
     """Test that training loop exits when timeout is reached"""
     # Set max steps to large number
     mock_components["master_config"].distillation.max_num_steps = 100
+    mock_components["master_config"].checkpointing["enabled"] = True
+    mock_components["master_config"].checkpointing["metric_name"] = None
+    mock_components["checkpointer"].init_tmp_checkpoint.return_value = str(
+        tmp_path / "tmp_step"
+    )
 
     distillation_save_state = _initial_distillation_save_state()
 
     # Mock TimeoutChecker to return False for first 7 checks, then True (timeout)
-    with patch("nemo_rl.algorithms.distillation.TimeoutChecker") as mock_timeout_class:
+    with (
+        patch("nemo_rl.algorithms.distillation.torch.save"),
+        patch("nemo_rl.algorithms.distillation.TimeoutChecker") as mock_timeout_class,
+    ):
         mock_timeout_instance = MagicMock()
         # Create a side_effect that returns False 7 times, then True
         check_results = [False] * 7 + [True]
@@ -402,6 +416,12 @@ def test_exit_on_timeout(mock_components, capsys):
 
         # Verify training stopped at 8 steps (when check_save returned True)
         assert mock_components["student_policy"].train.call_count == 8
+        assert (
+            mock_components["student_policy"].save_checkpoint.call_args.kwargs[
+                "is_final_checkpoint"
+            ]
+            is False
+        )
 
         # Verify the timeout message was printed and training actually stopped
         captured = capsys.readouterr()
@@ -917,6 +937,64 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
         setup(master_config, tokenizer, dataset, None)
 
 
+def test_distillation_train_shuts_down_environments_after_failure():
+    task_to_env = {"nemo_gym": MagicMock()}
+    val_task_to_env = task_to_env
+
+    with (
+        patch.object(
+            distil_mod,
+            "_distillation_train_impl",
+            side_effect=RuntimeError("rollout failed"),
+        ),
+        patch.object(distil_mod, "shutdown_environments") as shutdown,
+        pytest.raises(RuntimeError, match="rollout failed"),
+    ):
+        distillation_train(
+            student_policy=MagicMock(),
+            teacher_policy=MagicMock(),
+            student_generation=MagicMock(),
+            dataloader=MagicMock(),
+            val_dataloader=None,
+            tokenizer=MagicMock(),
+            loss_fn=MagicMock(),
+            task_to_env=task_to_env,
+            val_task_to_env=val_task_to_env,
+            logger=MagicMock(),
+            checkpointer=MagicMock(),
+            distillation_save_state=MagicMock(),
+            master_config=MagicMock(),
+        )
+
+    shutdown.assert_called_once_with(task_to_env, val_task_to_env)
+
+
+def test_distillation_train_shuts_down_environments_after_success():
+    task_to_env = {"nemo_gym": MagicMock()}
+
+    with (
+        patch.object(distil_mod, "_distillation_train_impl"),
+        patch.object(distil_mod, "shutdown_environments") as shutdown,
+    ):
+        distillation_train(
+            student_policy=MagicMock(),
+            teacher_policy=MagicMock(),
+            student_generation=MagicMock(),
+            dataloader=MagicMock(),
+            val_dataloader=None,
+            tokenizer=MagicMock(),
+            loss_fn=MagicMock(),
+            task_to_env=task_to_env,
+            val_task_to_env=task_to_env,
+            logger=MagicMock(),
+            checkpointer=MagicMock(),
+            distillation_save_state=MagicMock(),
+            master_config=MagicMock(),
+        )
+
+    shutdown.assert_called_once_with(task_to_env, task_to_env)
+
+
 @pytest.mark.parametrize("refit_transport", [None, "nixl"])
 def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
     """Smoke test: calling setup with a non-colocated config should succeed."""
@@ -1004,7 +1082,7 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
         def __init__(self, *args, **kwargs):
             pass
 
-        def prepare_refit_info(self):
+        def prepare_refit_info(self, *, refit_payload_mode):
             return {}
 
         def offload_after_refit(self):
@@ -1027,6 +1105,9 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
         def prepare_refit_info(self, *args, **kwargs):
             return None
 
+        def get_refit_payload_mode(self):
+            return "hf_export"
+
         def init_collective(self, *args, **kwargs):
             self.collective_calls.append((args, kwargs))
             return [MagicMock()]
@@ -1041,8 +1122,7 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
         patch.object(
             distil_mod, "create_weight_synchronizer"
         ) as mock_create_synchronizer,
-        patch.object(distil_mod, "get_nemo_gym_uv_cache_dir") as mock_uv_cache_dir,
-        patch.object(distil_mod, "get_nemo_gym_venv_dir") as mock_uv_venv_dir,
+        patch.object(distil_mod, "build_nemo_gym_actors") as mock_spinup_nemo_gym,
         patch.object(distil_mod, "ray") as mock_ray,
     ):
         mock_ckpt_mgr.return_value.get_latest_checkpoint_path.return_value = None
@@ -1055,8 +1135,7 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
         # Basic shape check of returned tuple
         assert isinstance(result, tuple)
         assert result[3] is None
-        mock_uv_cache_dir.assert_not_called()
-        mock_uv_venv_dir.assert_not_called()
+        mock_spinup_nemo_gym.assert_not_called()
         if refit_transport == "nixl":
             mock_create_synchronizer.assert_called_once()
             mock_create_synchronizer.return_value.init_communicator.assert_called_once()
@@ -1068,35 +1147,8 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
             assert DummyVllmGeneration.collective_calls
 
 
-@pytest.mark.parametrize(
-    (
-        "configured_uv_cache_dir",
-        "configured_uv_venv_dir",
-        "expected_uv_cache_dir",
-        "expected_uv_venv_dir",
-    ),
-    [
-        (
-            None,
-            None,
-            "/opt/nemo-gym/.uv-cache",
-            "/opt/nemo-gym/venvs",
-        ),
-        (
-            "/custom/cache",
-            "/custom/venvs",
-            "/custom/cache",
-            "/custom/venvs",
-        ),
-    ],
-)
-def test_distillation_setup_nemo_gym_uses_deferred_vllm(
-    monkeypatch,
-    configured_uv_cache_dir,
-    configured_uv_venv_dir,
-    expected_uv_cache_dir,
-    expected_uv_venv_dir,
-):
+@pytest.mark.parametrize("vllm_start_fails", [False, True])
+def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_fails):
     import nemo_rl.algorithms.distillation as distil_mod
 
     nemo_gym_config = {
@@ -1105,10 +1157,6 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
         "thinking_tags": ["<think>"],
         "config_paths": ["gym.yaml"],
     }
-    if configured_uv_cache_dir is not None:
-        nemo_gym_config["uv_cache_dir"] = configured_uv_cache_dir
-    if configured_uv_venv_dir is not None:
-        nemo_gym_config["uv_venv_dir"] = configured_uv_venv_dir
 
     master_config = MasterConfig.model_construct(
         **{
@@ -1187,7 +1235,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
         def offload_after_refit(self):
             return None
 
-        def prepare_refit_info(self):
+        def prepare_refit_info(self, *, refit_payload_mode):
             return {}
 
     class DummyVllmGeneration:
@@ -1202,6 +1250,8 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
 
         def load_and_start(self):
             self.load_and_start_called = True
+            if vllm_start_fails:
+                raise RuntimeError("vLLM startup failed")
 
         def finish_generation(self):
             self.finish_generation_called = True
@@ -1209,17 +1259,10 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
         def prepare_refit_info(self, *args, **kwargs):
             self.prepare_refit_info_called = True
 
+        def get_refit_payload_mode(self):
+            return "hf_export"
+
     nemo_gym_actor = MagicMock()
-    nemo_gym_actor._spinup.remote.return_value = "spinup-ref"
-    nemo_gym_cls = MagicMock()
-    nemo_gym_cls.options.return_value.remote.return_value = nemo_gym_actor
-    runtime_env = {
-        "py_executable": "/venv/bin/python",
-        "env_vars": {
-            "VIRTUAL_ENV": "/venv",
-            "UV_PROJECT_ENVIRONMENT": "/venv",
-        },
-    }
 
     with (
         patch.object(distil_mod, "RayVirtualCluster", DummyCluster),
@@ -1228,22 +1271,9 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
         patch.object(distil_mod, "StatefulDataLoader"),
         patch.object(distil_mod, "Policy", DummyPolicy),
         patch.object(distil_mod, "VllmGeneration", DummyVllmGeneration),
-        patch.object(distil_mod, "NemoGym", nemo_gym_cls),
         patch.object(
-            distil_mod,
-            "make_actor_runtime_env",
-            return_value=runtime_env,
-        ) as mock_runtime_env,
-        patch.object(
-            distil_mod,
-            "get_nemo_gym_uv_cache_dir",
-            return_value="/opt/nemo-gym/.uv-cache",
-        ),
-        patch.object(
-            distil_mod,
-            "get_nemo_gym_venv_dir",
-            return_value="/opt/nemo-gym/venvs",
-        ),
+            distil_mod, "build_nemo_gym_actors", return_value=nemo_gym_actor
+        ) as mock_spinup_nemo_gym,
         patch.object(distil_mod, "ray") as mock_ray,
     ):
         mock_ckpt_mgr.return_value.get_latest_checkpoint_path.return_value = None
@@ -1251,43 +1281,37 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
         mock_ray.get_runtime_context.return_value.get_node_id.return_value = "a" * 56
         mock_ray.get.return_value = None
 
-        result = distil_mod.setup(master_config, tokenizer, dataset, None)
+        if vllm_start_fails:
+            with pytest.raises(RuntimeError, match="vLLM startup failed"):
+                distil_mod.setup(master_config, tokenizer, dataset, None)
+        else:
+            result = distil_mod.setup(master_config, tokenizer, dataset, None)
 
     assert created_vllm
     assert created_vllm[0].defer_model_load is True
     assert created_vllm[0].load_and_start_called
+    if vllm_start_fails:
+        nemo_gym_actor.shutdown.assert_called_once_with()
+        return
+
     assert created_vllm[0].finish_generation_called
     assert created_vllm[0].prepare_refit_info_called
     assert result[2] is created_vllm[0]
     assert result[3] is nemo_gym_actor
 
-    mock_runtime_env.assert_called_once_with("nemo_rl.environments.nemo_gym.NemoGym")
-    nemo_gym_options_kwargs = nemo_gym_cls.options.call_args.kwargs
-    assert nemo_gym_options_kwargs["runtime_env"] == runtime_env
-    assert isinstance(
-        nemo_gym_options_kwargs["scheduling_strategy"],
-        distil_mod.NodeAffinitySchedulingStrategy,
+    # The gym actor must target the deferred vLLM's servers, and distillation
+    # must not require routed experts (it never configures vLLM to emit them).
+    # The tokenizer is installed on the actor at spinup, inside the factory,
+    # rather than passed per rollout call.
+    mock_spinup_nemo_gym.assert_called_once_with(
+        master_config.env,
+        base_urls=["http://reserved-vllm"],
+        model_name="test-policy",
+        tokenizer=tokenizer,
+        enable_router_replay=False,
+        use_fastokens=False,
     )
-    nemo_gym_cfg = nemo_gym_cls.options.return_value.remote.call_args.args[0]
-    assert nemo_gym_cfg["model_name"] == "test-policy"
-    assert nemo_gym_cfg["base_urls"] == ["http://reserved-vllm"]
-    assert nemo_gym_cfg["invalid_tool_call_patterns"] == ["bad_call"]
-    assert nemo_gym_cfg["thinking_tags"] == ["<think>"]
-    assert nemo_gym_cfg["initial_global_config_dict"] == {
-        "num_gpu_nodes": 1,
-        "config_paths": ["gym.yaml"],
-        "uv_cache_dir": expected_uv_cache_dir,
-        "uv_venv_dir": expected_uv_venv_dir,
-    }
     assert master_config.env["nemo_gym"] == nemo_gym_env_before
-    nemo_gym_actor._spinup.remote.assert_called_once_with()
-    # Two waits, in order: the spinup, then the tokenizer install. Distillation
-    # builds its actor inline rather than through spinup_nemo_gym_actor, so it
-    # is the one call site that has to set the tokenizer itself -- passing it
-    # per rollout is what made the actor deserialize it once per prompt.
-    assert mock_ray.get.call_args_list[0] == call("spinup-ref")
-    assert mock_ray.get.call_count == 2
-    nemo_gym_actor.set_tokenizer.remote.assert_called_once_with(tokenizer)
 
 
 def test_nemo_gym_distillation_runner_uses_setup_actor():

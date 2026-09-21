@@ -8,7 +8,7 @@
 # spun, with no exception raised anywhere. The pass condition here is therefore not
 # "training succeeds"; it is "the job stops, quickly, with an attributable error".
 #
-# Registered in the SingleController L1 lane (full mode). It was originally kept out as
+# Registered in the SingleController L1 lane (fast mode too). It was originally kept out as
 # "timing-sensitive", but that no longer justifies exclusion: the death deadline is now
 # 600s against an observed 222s, and the victim selection is asserted rather than assumed.
 # (The shard-recovery harness added in part 3/4 of this series kills processes the same

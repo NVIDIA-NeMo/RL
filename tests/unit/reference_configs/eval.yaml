@@ -22,12 +22,15 @@ generation:
   vllm_cfg:
     async_engine: false
     precision: "bfloat16"
+    fp32_lm_head: false
     tensor_parallel_size: 1
     pipeline_parallel_size: 1
     expert_parallel_size: 1
     gpu_memory_utilization: 0.9
     max_model_len: 2048
     enforce_eager: False
+    # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
+    refit_with_reload_api: false
   colocated:
     # true: generation shares training GPUs
     # false: uses dedicated generation resources

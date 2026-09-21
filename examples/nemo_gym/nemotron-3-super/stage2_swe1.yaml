@@ -6,8 +6,6 @@ checkpointing:
   keep_top_k: 100
   save_period: 5
   checkpoint_must_save_by: null
-  model_save_format: "safetensors"
-  save_consolidated: false
   save_optimizer: true
 
 grpo:
@@ -237,6 +235,7 @@ policy:
       enable_prefix_caching: true
       async_engine: true
       precision: ${policy.precision}
+      refit_with_reload_api: false
       kv_cache_dtype: "auto"
       tensor_parallel_size: 8
       pipeline_parallel_size: 1

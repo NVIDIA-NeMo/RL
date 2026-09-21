@@ -72,7 +72,11 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
         # consume the legacy refit metadata.  Gathering it would needlessly
         # materialize every sharded policy tensor on every training rank.
         if not self._is_sglang():
-            self._generation.prepare_refit_info(self._policy.prepare_refit_info())
+            self._generation.prepare_refit_info(
+                self._policy.prepare_refit_info(
+                    refit_payload_mode=self._generation.get_refit_payload_mode()
+                )
+            )
         self._ensure_checkpoint_engine_ready()
 
     @property

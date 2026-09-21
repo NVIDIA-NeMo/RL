@@ -16,6 +16,11 @@ import pytest
 import torch
 
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data_plane.schema import (
+    OPD_FULL_HIDDEN_STATES_FIELD,
+    OPD_FULL_LOGITS_FIELD,
+    OPD_FULL_TEACHER_INDEX_FIELD,
+)
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
@@ -679,28 +684,48 @@ def test_repeat_interleave_shares_only_flagged_multimodal_segments():
     assert flag_on["message_log"][0] is not flag_on["message_log"][1]
 
 
-def test_repeat_interleave_shares_native_image_video_and_audio_leaves():
+def test_repeat_interleave_shares_vllm_multimodal_data_leaves():
     image = torch.ones(1, 2)
     video = np.ones((2, 2), dtype=np.float32)
     audio = np.ones(16, dtype=np.float32)
     batch = BatchedDataDict(
         {
-            "vllm_images": [[image]],
-            "vllm_videos": [[video]],
-            "vllm_audios": [[(audio, 16_000)]],
+            "vllm_multi_modal_data": [
+                {"image": image, "video": video, "audio": (audio, 16_000)}
+            ],
         }
     )
 
     flag_off = batch.repeat_interleave(2)
-    assert flag_off["vllm_images"][0][0] is not flag_off["vllm_images"][1][0]
-    assert flag_off["vllm_videos"][0][0] is not flag_off["vllm_videos"][1][0]
-    assert flag_off["vllm_audios"][0][0][0] is not flag_off["vllm_audios"][1][0][0]
+    assert (
+        flag_off["vllm_multi_modal_data"][0]["image"]
+        is not flag_off["vllm_multi_modal_data"][1]["image"]
+    )
+    assert (
+        flag_off["vllm_multi_modal_data"][0]["video"]
+        is not flag_off["vllm_multi_modal_data"][1]["video"]
+    )
+    assert (
+        flag_off["vllm_multi_modal_data"][0]["audio"][0]
+        is not flag_off["vllm_multi_modal_data"][1]["audio"][0]
+    )
 
     flag_on = batch.repeat_interleave(2, share_immutable_media=True)
-    assert flag_on["vllm_images"][0] is not flag_on["vllm_images"][1]
-    assert flag_on["vllm_images"][0][0] is flag_on["vllm_images"][1][0]
-    assert flag_on["vllm_videos"][0][0] is flag_on["vllm_videos"][1][0]
-    assert flag_on["vllm_audios"][0][0][0] is flag_on["vllm_audios"][1][0][0]
+    assert (
+        flag_on["vllm_multi_modal_data"][0] is not flag_on["vllm_multi_modal_data"][1]
+    )
+    assert (
+        flag_on["vllm_multi_modal_data"][0]["image"]
+        is flag_on["vllm_multi_modal_data"][1]["image"]
+    )
+    assert (
+        flag_on["vllm_multi_modal_data"][0]["video"]
+        is flag_on["vllm_multi_modal_data"][1]["video"]
+    )
+    assert (
+        flag_on["vllm_multi_modal_data"][0]["audio"][0]
+        is flag_on["vllm_multi_modal_data"][1]["audio"][0]
+    )
 
 
 @pytest.mark.parametrize("share_immutable_media", [False, True])
@@ -1382,3 +1407,92 @@ def test_sequence_packing_microbatch_boundaries(pad_to_multiple_of):
     assert torch.all(
         reconstructed["sequence_lengths"] == batch_data["sequence_lengths"]
     )
+
+
+def test_sequence_packing_keeps_preference_pairs_atomic():
+    """Pair grouping happens before Megatron converts each microbatch to THD."""
+    sequence_lengths = torch.tensor([50, 60, 55, 65, 45, 70, 40, 75])
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(8, 128, dtype=torch.long),
+            "sequence_lengths": sequence_lengths,
+            "pair_index": torch.tensor([0, 0, 1, 1, 2, 2, 3, 3]),
+            "is_chosen": torch.tensor(
+                [True, False, True, False, True, False, True, False]
+            ),
+        }
+    )
+    packing_args = SequencePackingArgs(
+        max_tokens_per_microbatch=1024,
+        input_key="input_ids",
+        input_lengths_key="sequence_lengths",
+        algorithm="modified_first_fit_decreasing",
+        sequence_length_pad_multiple=1,
+        pair_grouping_key="pair_index",
+        max_sequences_per_bin=1,
+    )
+
+    shards, _ = batch.shard_by_batch_size(shards=2, sequence_packing_args=packing_args)
+
+    seen_pairs = set()
+    for shard in shards:
+        for microbatch in shard.make_microbatch_iterator_for_packable_sequences():
+            pair_ids = torch.unique(microbatch["pair_index"]).tolist()
+            assert len(pair_ids) == 1
+            pair_id = pair_ids[0]
+            roles = microbatch["is_chosen"][
+                microbatch["pair_index"] == pair_id
+            ].tolist()
+            assert sorted(roles) == [False, True]
+            seen_pairs.add(pair_id)
+    assert seen_pairs == {0, 1, 2, 3}
+
+
+def test_sequence_packing_rejects_oversized_preference_pair():
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(4, 800, dtype=torch.long),
+            "sequence_lengths": torch.tensor([600, 600, 100, 100]),
+            "pair_index": torch.tensor([0, 0, 1, 1]),
+        }
+    )
+    packing_args = SequencePackingArgs(
+        max_tokens_per_microbatch=1024,
+        input_key="input_ids",
+        input_lengths_key="sequence_lengths",
+        algorithm="modified_first_fit_decreasing",
+        sequence_length_pad_multiple=1,
+        pair_grouping_key="pair_index",
+    )
+
+    with pytest.raises(ValueError, match="pair group 0 requires 1200 tokens"):
+        batch.shard_by_batch_size(shards=2, sequence_packing_args=packing_args)
+
+
+def test_truncate_tensors_narrows_opd_full_payloads_but_never_widens_them():
+    """The teacher payload follows the microbatch seqlen, but only downwards.
+
+    ``materialize`` leaves it at its natural width, which can already be
+    shorter than the microbatch's, so the narrow has to clamp.
+    """
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.arange(12).reshape(2, 6),
+            # Wider than the microbatch seqlen: narrow it.
+            OPD_FULL_HIDDEN_STATES_FIELD: torch.randn(2, 6, 3),
+            # Already shorter than the microbatch seqlen: leave it alone.
+            OPD_FULL_LOGITS_FIELD: torch.randn(2, 3, 5),
+            OPD_FULL_TEACHER_INDEX_FIELD: torch.tensor([1, 0]),
+        }
+    )
+    hidden_before = batch[OPD_FULL_HIDDEN_STATES_FIELD].clone()
+    logits_before = batch[OPD_FULL_LOGITS_FIELD].clone()
+
+    batch.truncate_tensors(dim=1, truncated_len=4)
+
+    assert batch["input_ids"].shape == (2, 4)
+    assert batch[OPD_FULL_HIDDEN_STATES_FIELD].shape == (2, 4, 3)
+    assert torch.equal(batch[OPD_FULL_HIDDEN_STATES_FIELD], hidden_before[:, :4])
+    assert batch[OPD_FULL_LOGITS_FIELD].shape == (2, 3, 5)
+    assert torch.equal(batch[OPD_FULL_LOGITS_FIELD], logits_before)
+    assert batch[OPD_FULL_TEACHER_INDEX_FIELD].shape == (2,)

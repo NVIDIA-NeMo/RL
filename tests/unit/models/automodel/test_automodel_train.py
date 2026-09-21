@@ -870,6 +870,38 @@ class TestCheckSequenceDim:
         assert seq_dim == 1
         assert seq_dim_size == 64
 
+    def test_ignores_packed_multimodal_wire_fields(self):
+        """A packed multimodal field has patch/image count on dim 1, not
+        seqlen. Without the skip every VLM step through the data plane trips
+        this assert."""
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 64)),
+                # [B, max_patches, C, H, W] — dim 1 is 7 patches, not 64 tokens.
+                "pixel_values": torch.randn(4, 7, 3, 2, 2),
+                "image_grid_thw": torch.zeros(4, 2, 3, dtype=torch.long),
+            }
+        )
+
+        seq_dim, seq_dim_size = check_sequence_dim(data)
+
+        assert seq_dim == 1
+        assert seq_dim_size == 64
+
+    def test_per_token_multimodal_is_still_checked(self):
+        """Only the *packed* registry is exempt. Per-token maps like
+        ``mm_token_type_ids`` are ``[B, S]`` and a seqlen mismatch there is a
+        real bug that must keep failing."""
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 64)),
+                "mm_token_type_ids": torch.zeros(4, 32, dtype=torch.long),
+            }
+        )
+
+        with pytest.raises(AssertionError, match="Dim 1 must be the sequence dim"):
+            check_sequence_dim(data)
+
 
 # =====================
 # Test ProcessedInputs properties

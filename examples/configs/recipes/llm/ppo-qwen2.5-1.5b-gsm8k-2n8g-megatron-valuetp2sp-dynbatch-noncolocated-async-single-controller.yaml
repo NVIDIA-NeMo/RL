@@ -14,9 +14,6 @@ ppo:
   # SC does not support validation yet.
   val_period: 0
   val_at_start: false
-  # SC does not implement it, so leaving it enabled would describe filtering
-  # this run does not do.
-  overlong_filtering: false
   # override from the inherited recipe.
   num_prompts_per_step: 256
   max_num_epochs: 1000
@@ -58,6 +55,9 @@ data_plane:
     local_buffer_size:    4294967296
     reuse_registered_buffers: true
     staging_buffer_size:   268435456
+  observability:
+    enabled: true
+    verify_tensor_hash: false
 
 # SC async-RL runtime knobs, replacing the nulled ppo.async_ppo block.
 async_rl:
