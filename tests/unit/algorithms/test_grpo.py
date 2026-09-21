@@ -5409,7 +5409,7 @@ def test_grpo_advantage_estimator_skips_trivial_leave_one_out_normalization():
         prompt_ids=prompt_ids,
         rewards=rewards,
         mask=torch.ones(8, 3),
-    )
+    ).advantages
 
     torch.testing.assert_close(result[0], torch.full((3,), -0.95))
     assert torch.isfinite(result).all()
