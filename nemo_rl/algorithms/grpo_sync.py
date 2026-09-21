@@ -59,6 +59,7 @@ from nemo_rl.algorithms.grpo import (
     _resolve_logprob_skip_flags,
     _should_log_nemo_gym_responses,
     _validation_early_stop_message,
+    apply_invalid_generation_logprobs_filter,
     compute_and_apply_seq_logprob_error_masking,
     refit_policy_generation,
     scale_rewards,
@@ -844,6 +845,12 @@ def grpo_train_sync(
                     lm[driver_carry["truncated"]] = 0
                     driver_carry["loss_multiplier"] = lm
 
+                # Always applied: a sample whose generation log-probs could not
+                # be extracted has no usable behavior-policy term.
+                num_invalid_generation_logprobs_filtered = (
+                    apply_invalid_generation_logprobs_filter(driver_carry)
+                )
+
                 # ── Unpack slice (small per-sample tensors) ────────────
                 rewards = (
                     driver_carry["filtered_reward"]
@@ -1126,6 +1133,9 @@ def grpo_train_sync(
                     **metrics,
                     "loss": train_results["loss"].numpy(),
                     "grad_norm": train_results["grad_norm"].numpy(),
+                    "num_invalid_generation_logprobs_filtered": (
+                        num_invalid_generation_logprobs_filtered
+                    ),
                     "reward": rewards.numpy(),
                     "mean_prompt_length": length.numpy(),
                     "total_num_tokens": input_lengths.numpy(),

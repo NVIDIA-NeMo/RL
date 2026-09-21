@@ -23,34 +23,21 @@ import torch
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
-@pytest.mark.vllm
-def test_worker_generate_records_sampled_token_logprob(monkeypatch):
+def _sync_worker(monkeypatch, generation, vllm_cfg=None):
+    """A sync vLLM worker wired up enough to run ``generate`` on fake output."""
     from nemo_rl.models.generation.vllm import vllm_worker
-
-    sampled_token_id = 880
-    generation = SimpleNamespace(
-        token_ids=[sampled_token_id],
-        logprobs=[
-            {
-                512: SimpleNamespace(logprob=-0.10, rank=1),
-                sampled_token_id: SimpleNamespace(logprob=-2.30, rank=2),
-            }
-        ],
-        finish_reason="stop",
-    )
-    raw_output = SimpleNamespace(outputs=[generation])
 
     worker = vllm_worker.VllmGenerationWorkerImpl.__new__(
         vllm_worker.VllmGenerationWorkerImpl
     )
     worker.cfg = {
         "_pad_token_id": 0,
-        "vllm_cfg": {"use_tqdm": False},
+        "vllm_cfg": {"use_tqdm": False, **(vllm_cfg or {})},
         "vllm_kwargs": {},
     }
     worker.routed_experts_dtype = torch.int32
     worker.llm = SimpleNamespace(
-        generate=MagicMock(return_value=[raw_output]),
+        generate=MagicMock(return_value=[SimpleNamespace(outputs=[generation])]),
         llm_engine=SimpleNamespace(
             model_config=SimpleNamespace(max_model_len=16, model="test-model")
         ),
@@ -74,18 +61,45 @@ def test_worker_generate_records_sampled_token_logprob(monkeypatch):
             {"missing_routes": 0, "expected_routes": 0, "actual_routes": 0},
         ),
     )
+    return worker
 
-    result = worker.generate(
-        BatchedDataDict(
-            {
-                "input_ids": torch.tensor([[101, 102, 0]]),
-                "input_lengths": torch.tensor([2]),
-            }
-        )
+
+def _generation(logprobs, sampled_token_id=880):
+    return SimpleNamespace(
+        token_ids=[sampled_token_id], logprobs=logprobs, finish_reason="stop"
     )
+
+
+def _input_batch():
+    return BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[101, 102, 0]]),
+            "input_lengths": torch.tensor([2]),
+        }
+    )
+
+
+@pytest.mark.vllm
+def test_worker_generate_records_sampled_token_logprob(monkeypatch):
+    sampled_token_id = 880
+    worker = _sync_worker(
+        monkeypatch,
+        _generation(
+            [
+                {
+                    512: SimpleNamespace(logprob=-0.10, rank=1),
+                    sampled_token_id: SimpleNamespace(logprob=-2.30, rank=2),
+                }
+            ],
+            sampled_token_id,
+        ),
+    )
+
+    result = worker.generate(_input_batch())
 
     assert result["output_ids"][0].tolist() == [101, 102, sampled_token_id, 0]
     assert result["logprobs"][0].tolist() == pytest.approx([0.0, 0.0, -2.30, 0.0])
+    assert result["logprobs_valid"].tolist() == [True]
 
 
 @pytest.mark.vllm
@@ -364,3 +378,108 @@ def test_apply_top_k_top_p_matches_vllm_upstream(top_k, top_p, test_name):
         msg=f"Our apply_top_k_top_p doesn't match vLLM upstream ({test_name})",
     )
     print(f"✓ Results match for {test_name}")
+
+
+@pytest.mark.vllm
+def test_worker_generate_flags_a_missing_sampled_token_logprob(monkeypatch):
+    """One bad sample is flagged, not fatal, and is never zero-filled silently."""
+    sampled_token_id = 880
+    # The mapping carries a different token than the one that was sampled.
+    worker = _sync_worker(
+        monkeypatch,
+        _generation([{512: SimpleNamespace(logprob=-0.10, rank=1)}], sampled_token_id),
+    )
+
+    result = worker.generate(_input_batch())
+
+    assert result["logprobs_valid"].tolist() == [False]
+    # The failed position is zeroed; nothing else is touched.
+    assert result["logprobs"][0].tolist() == pytest.approx([0.0, 0.0, 0.0, 0.0])
+
+
+def _async_worker(monkeypatch, generation, vllm_cfg=None):
+    """An async vLLM worker wired up enough to run ``generate_async``."""
+    import asyncio
+
+    from nemo_rl.models.generation.vllm import vllm_worker_async
+
+    worker = vllm_worker_async.VllmAsyncGenerationWorkerImpl.__new__(
+        vllm_worker_async.VllmAsyncGenerationWorkerImpl
+    )
+    worker.cfg = {
+        "_pad_token_id": 0,
+        "max_new_tokens": 8,
+        "vllm_cfg": {"async_engine": True, "max_model_len": 16, **(vllm_cfg or {})},
+        "vllm_kwargs": {},
+    }
+    worker.routed_experts_dtype = torch.int32
+    worker._merge_stop_strings = lambda _stop_strings: []
+    worker._build_sampling_params = lambda **_kwargs: object()
+    worker._return_routed_experts_enabled = lambda: False
+
+    async def fake_generate(prompt, sampling_params, request_id):
+        yield SimpleNamespace(outputs=[generation])
+
+    worker.llm = SimpleNamespace(generate=fake_generate)
+
+    monkeypatch.setattr(
+        vllm_worker_async, "verify_right_padding", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        vllm_worker_async,
+        "format_prompt_for_vllm_generation",
+        lambda _data, _idx=None: "prompt",
+    )
+    monkeypatch.setattr(
+        vllm_worker_async,
+        "pad_and_align_routed_expert_indices",
+        lambda *_args, **_kwargs: (
+            None,
+            {"missing_routes": 0, "expected_routes": 0, "actual_routes": 0},
+        ),
+    )
+
+    async def collect():
+        return [item async for item in worker.generate_async(_input_batch())]
+
+    return worker, lambda: asyncio.run(collect())
+
+
+@pytest.mark.vllm
+def test_async_worker_generate_records_sampled_token_logprob(monkeypatch):
+    sampled_token_id = 880
+    generation = SimpleNamespace(
+        token_ids=[sampled_token_id],
+        logprobs=[
+            {
+                512: SimpleNamespace(logprob=-0.10, rank=1),
+                sampled_token_id: SimpleNamespace(logprob=-2.30, rank=2),
+            }
+        ],
+        finish_reason="stop",
+    )
+    _worker, run = _async_worker(monkeypatch, generation)
+
+    results = run()
+
+    assert len(results) == 1
+    _, batch = results[0]
+    assert batch["output_ids"][0].tolist() == [101, 102, sampled_token_id]
+    assert batch["logprobs"][0].tolist() == pytest.approx([0.0, 0.0, -2.30])
+    assert batch["logprobs_valid"].tolist() == [True]
+
+
+@pytest.mark.vllm
+def test_async_worker_generate_flags_a_missing_sampled_token_logprob(monkeypatch):
+    sampled_token_id = 880
+    generation = SimpleNamespace(
+        token_ids=[sampled_token_id],
+        logprobs=[{512: SimpleNamespace(logprob=-0.10, rank=1)}],
+        finish_reason="stop",
+    )
+    _worker, run = _async_worker(monkeypatch, generation)
+
+    results = run()
+
+    _, batch = results[0]
+    assert batch["logprobs_valid"].tolist() == [False]

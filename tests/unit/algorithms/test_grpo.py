@@ -55,6 +55,7 @@ from nemo_rl.algorithms.grpo import (
     _validate_multimodal_dedup_capability,
     _validate_use_kl_in_reward_compat,
     aggregate_rollout_metrics,
+    apply_invalid_generation_logprobs_filter,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
     dynamic_sampling,
@@ -315,6 +316,68 @@ def test_refit_returns_empty_metrics_when_synchronizer_returns_none() -> None:
 
     assert refit_policy_generation(policy, generation, colocated_inference=False) == {}
     policy.sync_params_before_refit.assert_called_once_with()
+
+
+class TestInvalidGenerationLogprobsFilter:
+    """Samples whose generation log-probs were substituted must not train."""
+
+    def test_masks_samples_flagged_by_the_generation_backend(self):
+        repeated_batch = BatchedDataDict(
+            {
+                "loss_multiplier": torch.tensor([1.0, 0.5, 1.0]),
+                "logprobs_valid": torch.tensor([True, False, False]),
+            }
+        )
+
+        num_masked = apply_invalid_generation_logprobs_filter(repeated_batch)
+
+        assert num_masked == 2
+        assert torch.equal(
+            repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.0, 0.0])
+        )
+
+    def test_masks_list_valued_logprobs_valid(self):
+        repeated_batch = BatchedDataDict(
+            {
+                "loss_multiplier": torch.tensor([1.0, 0.5, 1.0]),
+                "logprobs_valid": [False, True, False],
+            }
+        )
+
+        num_masked = apply_invalid_generation_logprobs_filter(repeated_batch)
+
+        assert num_masked == 2
+        assert torch.equal(
+            repeated_batch["loss_multiplier"], torch.tensor([0.0, 0.5, 0.0])
+        )
+
+    def test_missing_logprobs_valid_is_noop(self):
+        """Backends other than vLLM do not report the field."""
+        repeated_batch = BatchedDataDict(
+            {"loss_multiplier": torch.tensor([1.0, 0.5, 1.0])}
+        )
+
+        num_masked = apply_invalid_generation_logprobs_filter(repeated_batch)
+
+        assert num_masked == 0
+        assert torch.equal(
+            repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5, 1.0])
+        )
+
+    def test_all_valid_leaves_the_multiplier_untouched(self):
+        repeated_batch = BatchedDataDict(
+            {
+                "loss_multiplier": torch.tensor([1.0, 0.5, 1.0]),
+                "logprobs_valid": torch.tensor([True, True, True]),
+            }
+        )
+
+        num_masked = apply_invalid_generation_logprobs_filter(repeated_batch)
+
+        assert num_masked == 0
+        assert torch.equal(
+            repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5, 1.0])
+        )
 
 
 class TestMaskSampleFilter:

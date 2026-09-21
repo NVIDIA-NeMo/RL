@@ -2371,6 +2371,46 @@ def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int
     return num_masked
 
 
+def apply_invalid_generation_logprobs_filter(
+    repeated_batch: BatchedDataDict[DatumSpec],
+) -> int:
+    """Zero loss_multiplier where the generation log-probs are untrustworthy.
+
+    A generation backend that could not extract a log-prob for every sampled
+    token reports the sample as invalid via ``logprobs_valid``. Those
+    log-probs are the behavior-policy term of the importance ratios, so a
+    sample carrying substituted values must not contribute to the loss.
+
+    Unlike overlong filtering this is not a policy choice, so it is always
+    applied. Backends that do not report the field are treated as valid.
+
+    Returns:
+        The number of samples that were masked out.
+    """
+    if "logprobs_valid" not in repeated_batch:
+        return 0
+
+    logprobs_valid = repeated_batch["logprobs_valid"]
+    if isinstance(logprobs_valid, list):
+        logprobs_valid = torch.tensor(logprobs_valid, dtype=torch.bool)
+    invalid = ~logprobs_valid.bool()
+
+    num_masked = int(invalid.sum().item())
+    if num_masked:
+        loss_multiplier = repeated_batch["loss_multiplier"].clone()
+        loss_multiplier[invalid] = 0
+        repeated_batch["loss_multiplier"] = loss_multiplier
+        if float(loss_multiplier.sum().item()) == 0.0:
+            warnings.warn(
+                f"All {invalid.numel()} samples in this batch were masked out "
+                "because their generation log-probs failed validation: this "
+                "step will contribute no gradient. The generation backend is "
+                "returning log-probs that cannot be trained on.",
+                stacklevel=2,
+            )
+    return num_masked
+
+
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     """Whether NeMo Gym is responsible for full response logging.
 
@@ -3389,6 +3429,10 @@ def _grpo_train_impl(
 
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
+
+                    metrics["num_invalid_generation_logprobs_filtered"] = (
+                        apply_invalid_generation_logprobs_filter(repeated_batch)
+                    )
 
                     num_mask_sample_filtered = _apply_mask_sample_filter(repeated_batch)
                     metrics["num_mask_sample_filtered"] = num_mask_sample_filtered
@@ -4994,6 +5038,7 @@ def async_grpo_train(
                 ),
             ):
                 num_mask_sample_filtered = 0
+                num_invalid_generation_logprobs_filtered = 0
 
                 # Sample trajectories from replay buffer
                 print("📦 Sampling from replay buffer...")
@@ -5222,6 +5267,11 @@ def async_grpo_train(
 
                             loss_multiplier[truncated] = 0
                             repeated_batch["loss_multiplier"] = loss_multiplier
+
+                    with timer.time("invalid_generation_logprobs_filter"):
+                        num_invalid_generation_logprobs_filtered = (
+                            apply_invalid_generation_logprobs_filter(repeated_batch)
+                        )
 
                     with timer.time("mask_sample_filter"):
                         num_mask_sample_filtered = _apply_mask_sample_filter(
@@ -5610,6 +5660,9 @@ def async_grpo_train(
                     "loss": train_results["loss"].numpy(),
                     "reward": rewards.numpy(),
                     "num_mask_sample_filtered": num_mask_sample_filtered,
+                    "num_invalid_generation_logprobs_filtered": (
+                        num_invalid_generation_logprobs_filtered
+                    ),
                     "grad_norm": train_results["grad_norm"].numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),

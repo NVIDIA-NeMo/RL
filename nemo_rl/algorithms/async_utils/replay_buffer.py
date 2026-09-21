@@ -51,6 +51,7 @@ from nemo_rl.data_plane.schema import (
     ROUTE_PLAN_TAG,
     ROUTED_EXPERTS_FIELD,
 )
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
@@ -376,6 +377,22 @@ class DataPlaneCheckpointBarrier:
 
 class PostWriteEnrichmentError(RuntimeError):
     """A rollout reached TQ but failed in required post-write processing."""
+
+
+def _backfill_logprobs_valid(trajectory: dict[str, Any]) -> dict[str, Any]:
+    """Add ``logprobs_valid`` to a trajectory checkpointed before it existed.
+
+    Restored trajectories are concatenated with freshly generated ones via
+    ``BatchedDataDict.from_batches``, which raises when a key is present in
+    some batches and missing from others. A checkpoint written before
+    ``logprobs_valid`` existed has no such key, so backfill it as all-valid
+    here -- the one place every restored trajectory passes through.
+    """
+    batch = trajectory.get("batch") if isinstance(trajectory, dict) else None
+    if not isinstance(batch, BatchedDataDict) or "logprobs_valid" in batch:
+        return trajectory
+    batch["logprobs_valid"] = torch.ones(batch.size, dtype=torch.bool)
+    return trajectory
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -804,7 +821,10 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             if missing_keys:
                 raise ValueError(f"Checkpoint missing required keys: {missing_keys}")
 
-            trajectories = list(state["trajectories"])
+            trajectories = [
+                _backfill_logprobs_valid(trajectory)
+                for trajectory in state["trajectories"]
+            ]
             trajectory_versions = list(state["trajectory_versions"])
             target_weight_versions = list(state["target_weight_versions"])
             if not (
