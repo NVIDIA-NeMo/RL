@@ -236,6 +236,35 @@ flowchart TB
 
 For `CP=1`, the worker keeps the direct fast path without constructing a sharder.
 
+#### Memory of the "TP target logprob" step
+
+The `TP target logprob` box above is `_tp_target_logprobs`. It has two branches, and only
+the vocabulary-parallel one is driven by `policy.logprob_chunk_size`:
+
+| Layout | `policy.logprob_chunk_size` | Kernel |
+| --- | --- | --- |
+| `TP > 1` (DTensor logits) | set | `ChunkedDistributedLogprob` — chunked |
+| `TP > 1` (DTensor logits) | unset | `DistributedLogprob` — unchunked |
+| `TP = 1` (plain logits) | set or unset | `LocalChunkedLogprob` — always chunked, falling back to `DEFAULT_LOCAL_LOGPROB_CHUNK_SIZE` (1024) |
+
+The chunked kernels (`ChunkedDistributedLogprob`, `LocalChunkedLogprob`) save only the
+input logits in their own dtype and rematerialize the softmax per chunk in backward, so the
+largest float32 tensor alive is one chunk. The unchunked `DistributedLogprob` instead casts
+the whole tensor to float32 and saves a full `[B, S, V_local]` float32 softmax for backward.
+Backward additionally allocates a full-size gradient buffer, in the logits' dtype for the
+chunked kernels and in float32 for the unchunked one. At 20k tokens per GPU with a
+131k-entry vocabulary, the unchunked float32 activation and its float32 gradient are two
+~10 GiB tensors.
+
+The `TP = 1` branch always chunks because running it unchunked has no upside: unlike the
+vocabulary-parallel kernels it needs no collectives, so chunking costs nothing but a Python
+loop.
+
+For the same reason, `get_next_token_logprobs_from_logits` must not pre-cast the whole
+logits tensor to float32 before dispatching to a chunked kernel: those kernels cast per
+chunk, and the pre-cast would reintroduce exactly the tensor the chunking exists to avoid.
+It still pre-casts on the paths whose kernel materializes float32 itself.
+
 ### 3.5 X-Token Distillation Workflow Before and After
 
 The outer algorithm is unchanged: tokenize and align fixed text, export teacher full-vocab

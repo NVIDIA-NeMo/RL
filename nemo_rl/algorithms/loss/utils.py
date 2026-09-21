@@ -586,7 +586,11 @@ def prepare_loss_input(
                     vocab_parallel_group=vocab_parallel_group,
                     context_parallel_group=context_parallel_group,
                     sampling_params=None,  # no filtering
-                    # Only reachable with top-k/top-p sampling active that has its own kernel path so don't chunk here
+                    # Only reachable with top-k/top-p sampling active, whose own
+                    # kernel path owns chunking for the filtered call above.
+                    # Without filtering here the vocabulary-parallel kernels run
+                    # unchunked; the full-vocabulary one still chunks at its own
+                    # default (see nemo_rl.distributed.model_utils).
                     chunk_size=None,
                     cp_sharder=cp_sharder,
                 )
