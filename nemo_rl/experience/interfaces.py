@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
+from nemo_rl.experience.metric_utils import RolloutTelemetry
 from typing import Any, Optional
 
 from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
@@ -49,6 +50,7 @@ class Completion:
     env_extras: Optional[dict[str, Any]]
     truncated: bool
     reward: float
+    telemetry: Optional[RolloutTelemetry] = None
 
 
 @dataclass

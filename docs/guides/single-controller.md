@@ -414,11 +414,21 @@ V1's discrete `pct` convention; singleton stddev is NaN. Optional numeric extras
 keep V1's mean denominator (all selected samples in that environment), while their
 histograms and distribution summaries use the observations present.
 
-The table describes message-log rollouts. Token-capture finalization carries
-environment tags for sample accounting, but does not yet retain the producer's
-rollout distributions with selected training groups. Its manifest-based producer
-diagnostics (call count, deepest cumulative length, and delta lengths) are proxies,
-not V1 message-log turn/token definitions.
+The table describes message-log rollouts. Token-capture finalization retains
+numeric producer observations per logical sibling in the recovery ledger, then
+attaches them to the selected canonical group's metadata. Fully sealed restored
+groups keep their resolved environment without redispatch; partial retries retain
+sealed observations and replace only unfinished siblings. Recovery schema 3 reads
+schema 2 sidecars, which lack these observations: incomplete populations produce
+a warning and omit producer distributions rather than fabricate a partial result.
+Selected-row validity accounting is unaffected. No tokens or full-result tables
+are added to the recovery/RPC payload. Truncation telemetry uses the rebuilt row's
+length-cap flag, not the dispatcher's token-free placeholder.
+
+Capture's manifest-derived diagnostics (call count, deepest cumulative length,
+and delta lengths) remain proxies, not V1 message-log turn/token definitions.
+Preserving these observations does not establish semantic parity of capture
+proxies with message-log metrics, or reconstruct missing input-message lengths.
 
 ### Per-environment sample accounting
 

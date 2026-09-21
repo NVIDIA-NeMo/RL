@@ -29,6 +29,7 @@ import json
 import tempfile
 import uuid
 from copy import deepcopy
+from nemo_rl.experience.metric_utils import RolloutTelemetry
 from types import SimpleNamespace
 
 import pytest
@@ -1114,6 +1115,12 @@ def test_streamed_receipt_callback_uses_current_completion_conversion():
     generation_index, completion = streamed[0]
     assert generation_index == 0
     assert completion.env_extras["ng_rollout_id"] == "r0"
+    assert completion.telemetry is not None
+    assert completion.telemetry.environment == "resolved-agent"
+    assert (
+        completion.telemetry.to_metrics()["environment/resolved-agent/sample_count"]
+        == 1
+    )
     assert "mask_sample" not in completion.env_extras["instance_config"]
 
 
@@ -2008,6 +2015,7 @@ def _make_capture_manager(
     retry_policy: RolloutRetryPolicy | None = None,
     instance_configs=None,
     recovery_config: RolloutRecoveryConfig | None = None,
+    telemetry_environment: str | None = None,
 ):
     mgr = object.__new__(RolloutManager)
     mgr._tokenizer = None
@@ -2072,6 +2080,16 @@ def _make_capture_manager(
             )
             if on_completion is not None:
                 for generation_index, completion in zip(indices, record.completions):
+                    if telemetry_environment is not None:
+                        completion.telemetry = RolloutTelemetry(
+                            telemetry_environment,
+                            {
+                                f"environment/{telemetry_environment}/turns_per_sample": float(
+                                    generation_index + 1
+                                )
+                            },
+                            {f"environment/{telemetry_environment}/sample_count": 1.0},
+                        )
                     await on_completion(generation_index, completion)
             return record
 
@@ -2080,6 +2098,54 @@ def _make_capture_manager(
 
 
 class TestGenerateForFinalizationFlow:
+    @pytest.mark.parametrize("partial", [False, True])
+    def test_restored_groups_keep_sealed_sibling_observations(self, partial):
+        first = _make_capture_manager(
+            _FakeCaptureBuffer(), telemetry_environment="resolved"
+        )
+        prompt = {"prompt": "p", "idx": 9}
+        original = _run(first.generate_for_finalization(prompt, target_step=7))
+        state = first.recovery_ledger.state_dict()
+        if partial:
+            state["groups"][0]["status"] = "generating"
+            state["groups"][0]["siblings"][1]["attempts"][0].update(
+                status="dispatched",
+                receipt=None,
+                reward=None,
+                mask_sample=None,
+                staging_keys=[],
+                telemetry=None,
+            )
+        restored = _make_capture_manager(
+            _FakeCaptureBuffer(), telemetry_environment="resolved"
+        )
+        _with_cut(
+            restored._tq_buffer,
+            lambda cut: restored.recovery_ledger.load_state_dict(cut, state),
+        )
+        _with_cut(
+            restored._tq_buffer,
+            lambda cut: restored.recovery_ledger.bind_runtime_prompt(
+                cut, original.group_id, prompt
+            ),
+        )
+        _with_cut(
+            restored._tq_buffer,
+            lambda cut: restored.recovery_ledger.prepare_for_restart(cut),
+        )
+        request = _run(
+            restored.generate_for_finalization(
+                prompt, target_step=7, lineage_group_id=original.group_id
+            )
+        )
+        assert request.telemetry == original.telemetry
+        assert request.rollout_environment == "resolved"
+        assert restored._impl.seen_generation_indices == ([1] if partial else None)
+        assert [
+            s.observations["environment/resolved/turns_per_sample"]
+            for s in request.telemetry
+        ] == [1.0, 2.0]
+
     def test_request_carries_env_mask_flags(self):
         buf = _FakeCaptureBuffer()
         mgr = _make_capture_manager(

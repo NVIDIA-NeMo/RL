@@ -17,6 +17,70 @@
 import math
 import statistics
 from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Any, Self
+
+
+@dataclass(frozen=True)
+class RolloutTelemetry:
+    """Token-free observations for one completed sibling, safe to checkpoint.
+
+    Store observations rather than derived statistics (a singleton's standard
+    deviation is NaN). This also keeps duplicate-seal comparisons deterministic.
+    Arbitrary numeric environment diagnostics remain supported by metric name.
+    """
+
+    environment: str
+    observations: dict[str, float]
+    scalars: dict[str, float]
+
+    @classmethod
+    def from_metrics(cls, environment: str, metrics: dict[str, Any]) -> Self:
+        """Snapshot singleton distributions, excluding tables and payloads."""
+        observations: dict[str, float] = {}
+        scalars: dict[str, float] = {}
+        summaries = {"mean", "min", "max", "median", "stddev"}
+        for key, value in metrics.items():
+            if key.endswith("/histogram"):
+                if not isinstance(value, list) or len(value) != 1:
+                    raise ValueError("Sibling telemetry requires singleton histograms")
+                observations[key.removesuffix("/histogram")] = float(value[0])
+            elif isinstance(value, (int, float)) and not (
+                key.rsplit("/", 1)[-1] in summaries
+                and f"{key.rsplit('/', 1)[0]}/histogram" in metrics
+            ):
+                scalars[key] = float(value)
+        return cls(environment, observations, scalars)
+
+    def to_metrics(self) -> dict[str, Any]:
+        """Recreate reducer input; selected-step aggregation pools observations."""
+        metrics: dict[str, Any] = dict(self.scalars)
+        for name, value in self.observations.items():
+            metrics.update(calculate_single_metric([value], 1, name))
+        return metrics
+
+    @classmethod
+    def from_state(cls, state: dict[str, Any]) -> Self:
+        """Validate a primitive-only recovery snapshot, without loading tokens."""
+        if not isinstance(state, dict) or set(state) != {
+            "environment",
+            "observations",
+            "scalars",
+        }:
+            raise ValueError("Invalid rollout telemetry snapshot fields")
+        environment = state["environment"]
+        if not isinstance(environment, str) or not environment:
+            raise ValueError("Rollout telemetry requires an environment name")
+        for name in ("observations", "scalars"):
+            values = state[name]
+            if not isinstance(values, dict) or not all(
+                isinstance(key, str) and isinstance(value, (int, float))
+                for key, value in values.items()
+            ):
+                raise ValueError(
+                    f"Rollout telemetry {name} must contain numeric scalars"
+                )
+        return cls(environment, dict(state["observations"]), dict(state["scalars"]))
 
 
 def is_histogram_metric(name: str) -> bool:

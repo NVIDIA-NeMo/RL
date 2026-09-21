@@ -162,6 +162,7 @@ from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
+    SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS,
     ROLLOUT_RECOVERY_STATE_FILENAME,
     PromptGroupPhase,
     RolloutRecoveryState,
@@ -1006,12 +1007,13 @@ class SingleControllerActor:
         expected_schema_version = metadata.get("rollout_recovery_schema_version")
         if (
             isinstance(expected_schema_version, bool)
-            or expected_schema_version != ROLLOUT_RECOVERY_SCHEMA_VERSION
+            or not isinstance(expected_schema_version, int)
+            or expected_schema_version not in SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
         ):
             raise ValueError(
                 "native TQ checkpoint rollout recovery schema mismatch: "
                 f"checkpoint={expected_schema_version!r}, "
-                f"expected={ROLLOUT_RECOVERY_SCHEMA_VERSION}"
+                f"supported={sorted(SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS)}"
             )
         expected_group_count = metadata.get("rollout_recovery_group_count")
         if (
@@ -1043,6 +1045,10 @@ class SingleControllerActor:
             weights_only=True,
         )
         parsed_state = parse_rollout_recovery_state(state)
+        if parsed_state.ledger_state["schema_version"] != expected_schema_version:
+            raise ValueError(
+                "Rollout recovery sidecar schema does not match native TQ metadata"
+            )
         if len(parsed_state.ledger_state["groups"]) != expected_group_count:
             raise ValueError(
                 "rollout recovery sidecar group count does not match native "
