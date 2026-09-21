@@ -33,6 +33,15 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 logger = logging.getLogger(__name__)
 
 
+def _validate_router_retry_options(router_cfg: SGLangRouterConfig) -> None:
+    """Reject invalid managed-router attempt and circuit-breaker budgets."""
+    for key in ("retry_max_retries", "cb_failure_threshold"):
+        if key in router_cfg:
+            value = router_cfg[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{key} must be a positive integer, got {value!r}")
+
+
 def run_router(args):
     from sglang_router.launch_router import launch_router
 
@@ -49,6 +58,7 @@ class RouterActor:
     """
 
     def init(self, router_cfg: SGLangRouterConfig) -> tuple[str, int]:
+        _validate_router_retry_options(router_cfg)
         from sglang_router.launch_router import RouterArgs
 
         router_ip = _wrap_ipv6(get_host_info()[1])
@@ -72,6 +82,10 @@ class RouterActor:
         request_timeout_secs = router_cfg.get("sglang_router_request_timeout_secs")
         if request_timeout_secs is not None:
             router_args.request_timeout_secs = request_timeout_secs
+        if "retry_max_retries" in router_cfg:
+            router_args.retry_max_retries = router_cfg["retry_max_retries"]
+        if "cb_failure_threshold" in router_cfg:
+            router_args.cb_failure_threshold = router_cfg["cb_failure_threshold"]
 
         self.start(router_args)
         return router_ip, router_port
@@ -120,6 +134,7 @@ def _start_router(
         )
         return router_cfg["sglang_router_ip"], router_cfg["sglang_router_port"], None
 
+    _validate_router_retry_options(router_cfg)
     router_actor = RouterActor.options(
         runtime_env=make_actor_runtime_env(
             "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker"
