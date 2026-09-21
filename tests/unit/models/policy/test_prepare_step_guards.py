@@ -11,10 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import ast
+from pathlib import Path
+
 import pytest
 import torch
 from torch import nn
 
+import nemo_rl.models.policy.workers as policy_workers
 from nemo_rl.models.policy.workers.base_policy_worker import (
     AbstractPolicyWorker,
     first_parameter_device,
@@ -95,3 +99,85 @@ def test_allows_model_without_parameters():
     worker = FakePolicyWorker(nn.Identity())
 
     worker._assert_model_onloaded("train", "prepare_for_training")
+
+
+def test_fresh_worker_is_not_parked():
+    assert FakePolicyWorker(_cpu_model())._training_state_parked is False
+
+
+def test_training_state_check_passes_when_not_parked():
+    worker = FakePolicyWorker(nn.Linear(2, 2, device="meta"))
+
+    worker._assert_training_state_restored("train")
+
+
+def test_raises_when_training_state_was_parked():
+    """prepare_for_lp_inference leaves params on GPU but parks grads/optimizer.
+
+    The device check cannot see that, so it is the flag that has to.
+    """
+    worker = FakePolicyWorker(nn.Linear(2, 2, device="meta"))
+    # What prepare_for_lp_inference(keep_train_buffers=False) records.
+    worker._training_state_parked = True
+
+    # The device check still passes: parameters are not on CPU.
+    worker._assert_model_onloaded("train", "prepare_for_training")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        worker._assert_training_state_restored("train")
+
+    message = str(excinfo.value)
+    assert "FakePolicyWorker.train()" in message
+    assert "prepare_for_lp_inference()" in message
+    assert "prepare_for_training()" in message
+
+
+def test_restoring_training_state_clears_the_error():
+    worker = FakePolicyWorker(nn.Linear(2, 2, device="meta"))
+    worker._training_state_parked = True
+    # What prepare_for_training() records once it has onloaded everything.
+    worker._training_state_parked = False
+
+    worker._assert_training_state_restored("train")
+
+
+@pytest.mark.parametrize(
+    "worker_module",
+    [
+        "dtensor_policy_worker",
+        "dtensor_policy_worker_v2",
+        "megatron_policy_worker",
+    ],
+)
+def test_every_worker_that_parks_also_restores(worker_module):
+    """A worker that sets the parked flag must also clear it.
+
+    Forgetting the clear is the dangerous asymmetry: the flag would stay set for
+    the life of the worker and every later train step would raise. Checked
+    structurally because the real workers are Ray actors that need a GPU.
+    """
+    workers_dir = Path(policy_workers.__file__).parent
+    source = (workers_dir / f"{worker_module}.py").read_text()
+    tree = ast.parse(source)
+
+    setters = {"True": set(), "False": set()}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for sub in ast.walk(node):
+            if (
+                isinstance(sub, ast.Assign)
+                and len(sub.targets) == 1
+                and isinstance(sub.targets[0], ast.Attribute)
+                and sub.targets[0].attr == "_training_state_parked"
+            ):
+                setters[str(sub.value.value)].add(node.name)
+
+    assert setters["True"] == {"prepare_for_lp_inference"}, (
+        f"{worker_module}: the parked flag should only be set where "
+        f"prepare_for_lp_inference parks training state, got {setters['True']}"
+    )
+    assert setters["False"] == {"prepare_for_training"}, (
+        f"{worker_module}: prepare_for_training must clear the parked flag, "
+        f"got {setters['False']}"
+    )
