@@ -211,6 +211,11 @@ class DTensorConfig(TypedDict):
     sequence_parallel: bool
     activation_checkpointing: bool
     cpu_offload: bool
+    # FSDP2 MixedPrecisionPolicy.output_dtype: "float32" (default; every FSDP
+    # unit returns fp32 hidden states and the LM head fp32 logits) or "param"
+    # (keep the compute dtype, halving block-boundary activations and the
+    # logits tensor). Explicit "bfloat16" / "float16" are also accepted.
+    fsdp_output_dtype: NotRequired[str | None]
     custom_parallel_plan: NotRequired[str | None]
     defer_fsdp_grad_sync: NotRequired[bool]
     # MoE parallelizer config

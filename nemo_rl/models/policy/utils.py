@@ -132,6 +132,54 @@ _NEMOTRON_H_MODEL_TYPES = frozenset({"nemotron_h"})
 _NEMOTRON_H_ARCHITECTURES = frozenset({"NemotronHForCausalLM"})
 
 
+_FSDP_OUTPUT_DTYPES: dict[str, torch.dtype] = {
+    "float32": torch.float32,
+    "fp32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float16": torch.float16,
+    "fp16": torch.float16,
+}
+
+
+def resolve_fsdp_output_dtype(
+    setting: str | None, param_dtype: torch.dtype
+) -> torch.dtype | None:
+    """Resolve ``policy.dtensor_cfg.fsdp_output_dtype`` to an FSDP2 ``output_dtype``.
+
+    FSDP2's ``MixedPrecisionPolicy.output_dtype`` casts every FSDP unit's forward
+    output. The historical (and default) setting is ``float32``: each wrapped
+    block returns fp32 hidden states and the language-model head returns fp32
+    logits. ``"param"`` keeps outputs in ``param_dtype`` (``None`` for FSDP2),
+    which halves the activations kept alive between blocks and the logits
+    tensor; the per-chunk fp32 casts inside the log-prob kernels are unchanged.
+
+    Args:
+        setting: ``"float32"`` (the exemplar-YAML default and the historical
+            behavior; ``None`` from a config that predates the key is treated the
+            same), ``"param"``, or an explicit dtype name (``"bfloat16"`` /
+            ``"bf16"``, ``"float16"`` / ``"fp16"``).
+        param_dtype: The compute/param dtype of the policy (for the docstring's
+            ``"param"`` semantics; FSDP2 receives ``None`` in that case).
+
+    Returns:
+        The dtype to pass as ``output_dtype``, or ``None`` to keep ``param_dtype``.
+    """
+    if setting is None:
+        return torch.float32
+    key = str(setting).strip().lower()
+    if key == "param":
+        return None
+    if key in _FSDP_OUTPUT_DTYPES:
+        resolved = _FSDP_OUTPUT_DTYPES[key]
+        # Same as the param dtype: let FSDP skip the cast entirely.
+        return None if resolved == param_dtype else resolved
+    raise ValueError(
+        "policy.dtensor_cfg.fsdp_output_dtype must be one of 'float32' (default), "
+        f"'param', 'bfloat16'/'bf16' or 'float16'/'fp16'; got {setting!r}."
+    )
+
+
 def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
     """Return the quantized policy worker FQN if ``quant_cfg`` is set, else ``default_cls``.
 
