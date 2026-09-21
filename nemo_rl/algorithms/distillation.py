@@ -528,7 +528,7 @@ def setup(
             def init_nemo_gym():
                 return spinup_nemo_gym_actor(
                     env_configs,
-                    base_urls=cast(list[str], deferred_vllm.dp_openai_server_base_urls),
+                    base_urls=deferred_vllm.dp_openai_server_base_urls,
                     model_name=generation_config["model_name"],
                     tokenizer=tokenizer,
                     # Distillation does not configure vLLM for router replay.
