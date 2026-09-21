@@ -1,0 +1,93 @@
+defaults: vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video.v1.yaml
+
+# One-step PivotRL from an immutable SpatialClaw main-policy state. The expert
+# prefix is prompt context and remains masked; only the newly sampled action is
+# optimized. The companion Gym resource owns pivot validation and scoring.
+grpo:
+  max_rollout_turns: 1
+  max_num_epochs: 1000000000
+  max_num_steps: 1000000000
+  overlong_filtering: false
+  use_dynamic_sampling: false
+  seq_logprob_error_threshold: null
+  deduplicate_multimodal_data: true
+  async_grpo:
+    enabled: true
+    in_flight_weight_updates: true
+
+loss_fn:
+  # Set a positive value to reproduce the reference-policy KL term used by a
+  # particular PivotRL experiment. Zero preserves the NeMo RL recipe default.
+  reference_policy_kl_penalty: 0.0
+
+policy:
+  max_total_sequence_length: 49152
+  logprob_chunk_size: 2048
+  tokenizer:
+    chat_template_kwargs:
+      enable_thinking: false
+      truncate_history_thinking: false
+  generation:
+    # PivotRL samples one local decision rather than a complete trajectory.
+    max_new_tokens: 4096
+    vllm_cfg:
+      video:
+        sampling_style: nemotron_vl
+        num_frames: 256
+        temporal_patch_size: 2
+      http_server_serving_chat_kwargs:
+        chat_template: null
+        chat_template_content_format: string
+        reasoning_parser: null
+    vllm_kwargs:
+      allowed_local_media_path: ${oc.env:SPATIALCLAW_VIDEO_ROOT,/path/to/spatialclaw-videos}
+      max_num_batched_tokens: ${policy.max_total_sequence_length}
+      max_num_seqs: 1
+      limit_mm_per_prompt:
+        # Capacity includes the initial keyframes and images introduced by the
+        # immutable prefix's earlier tool observations.
+        image: 512
+        video:
+          count: 1
+          num_frames: 256
+      mm_processor_cache_gb: 0
+      enable_chunked_prefill: false
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  num_workers: 0
+  train:
+    data_path: ${oc.env:SPATIALCLAW_PIVOT_DATA_PATH}
+  validation:
+    data_path: ${oc.env:SPATIALCLAW_PIVOT_DATA_PATH}
+  default:
+    num_frames: 256
+    video_sampling_style: nemotron_vl
+    video_temporal_patch_size: 2
+    video_target_num_patches: 1024
+    video_maintain_aspect_ratio: true
+
+env:
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    skip_venv_if_present: true
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/spatialclaw_pivot/configs/spatialclaw_pivot.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          max_input_tokens: ${policy.max_total_sequence_length}
+          uses_reasoning_parser: false
+          chat_template_kwargs:
+            enable_thinking: false
+          extra_body:
+            bad_words:
+              - <image>
+              - <img>
+              - </img>
+              - <so_embedding>
+              - <so_start>
+              - <so_end>
+            chat_template_kwargs:
+              enable_thinking: false

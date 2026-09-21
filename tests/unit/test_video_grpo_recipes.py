@@ -5,12 +5,17 @@ from pathlib import Path
 import pytest
 from omegaconf import OmegaConf
 
+from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.models.generation.vllm.config import materialize_vllm_video_config
-from nemo_rl.utils.config import load_config
+from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
 pytestmark = pytest.mark.run_first
 
 RECIPE_DIR = Path(__file__).parents[2] / "examples" / "configs" / "recipes" / "vlm"
+PIVOTRL_RECIPE = (
+    "vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-"
+    "spatialclaw-pivotrl.v1.yaml"
+)
 
 
 def _load_recipe(name: str) -> dict:
@@ -74,3 +79,40 @@ def test_video_recipe_materializes_one_sampling_contract_for_all_consumers():
     assert recipe["policy"]["generation"]["vllm_kwargs"]["media_io_kwargs"] == {
         "video": {"num_frames": 32}
     }
+
+
+def test_spatialclaw_pivotrl_recipe_is_one_step_async_and_schema_valid(monkeypatch):
+    monkeypatch.setenv("SPATIALCLAW_PIVOT_DATA_PATH", "/tmp/pivots.jsonl")
+    register_omegaconf_resolvers()
+    config = load_config(RECIPE_DIR / PIVOTRL_RECIPE)
+    resolved = OmegaConf.to_container(config, resolve=True)
+    assert isinstance(resolved, dict)
+    MasterConfig.model_validate(resolved)
+
+    grpo = resolved["grpo"]
+    policy = resolved["policy"]
+    data = resolved["data"]
+    materialize_vllm_video_config(policy, data)
+
+    assert grpo["max_rollout_turns"] == 1
+    assert grpo["async_grpo"] == {
+        "enabled": True,
+        "max_trajectory_age_steps": 1,
+        "max_generation_failures": 0,
+        "in_flight_weight_updates": True,
+    }
+    assert policy["generation"]["max_new_tokens"] == 4096
+    assert policy["max_total_sequence_length"] == 49152
+    assert policy["tokenizer"]["chat_template_kwargs"]["enable_thinking"] is False
+    assert data["default"]["num_frames"] == 256
+    assert policy["generation"]["vllm_cfg"]["video"] == {
+        "sampling_style": "nemotron_vl",
+        "num_frames": 256,
+        "temporal_patch_size": 2,
+    }
+    assert policy["generation"]["vllm_kwargs"]["media_io_kwargs"] == {
+        "video": {"num_frames": 256}
+    }
+    assert resolved["env"]["nemo_gym"]["config_paths"][-1] == (
+        "resources_servers/spatialclaw_pivot/configs/spatialclaw_pivot.yaml"
+    )

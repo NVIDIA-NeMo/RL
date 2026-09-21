@@ -320,6 +320,7 @@ guides/prorlv2.md
 guides/swe-rl-qwen3.md
 guides/grpo.md
 guides/spatialclaw.md
+guides/pivotrl.md
 guides/ppo.md
 guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md
