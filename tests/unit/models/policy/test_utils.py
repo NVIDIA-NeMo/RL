@@ -104,6 +104,10 @@ def test_resolve_model_class_routes_gemma4_unified_to_image_text_model():
     assert "ImageTextToText" in resolve_model_class("gemma4_unified").__name__
 
 
+def test_resolve_model_class_routes_inkling_to_image_text_model():
+    assert "ImageTextToText" in resolve_model_class("inkling_mm_model").__name__
+
+
 class TestGetMegatronCheckpointDir:
     """Test cases for the get_megatron_checkpoint_dir function."""
 
