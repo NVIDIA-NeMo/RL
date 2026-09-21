@@ -29,7 +29,11 @@ import yaml
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.data.datasets import extract_necessary_env_names
-from nemo_rl.data.utils import get_train_dataset_name, load_dataloader_state
+from nemo_rl.data.utils import (
+    _combine_agent_name_sources,
+    get_train_dataset_name,
+    load_dataloader_state,
+)
 
 # ---------------------------------------------------------------------------
 # Test fixtures / helpers
@@ -51,6 +55,10 @@ class _RangeDataset:
         if idx < 0 or idx >= self.n:
             raise IndexError(f"{self.name}: idx={idx} out of range [0, {self.n})")
         return f"{self.name}-{idx:04d}"
+
+
+def test_custom_dataset_without_agent_name_sources_is_supported():
+    assert _combine_agent_name_sources([object()]) is None
 
 
 def _id_collate(batch: list[Any]) -> list[Any]:
