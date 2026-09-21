@@ -511,7 +511,7 @@ class SingleControllerActor:
             # Those are exactly the groups with non-zero GRPO advantage, i.e.
             # the ones that contribute gradient. One int per streaming chunk.
             "num_groups": [],
-            "num_groups_mixed_reward": [],
+            "num_groups_mixed_rewards": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
         }
         self._opd_stat_sum = 0.0
@@ -4374,7 +4374,7 @@ class SingleControllerActor:
             else:
                 num_mixed = 0
         self._step_log_dict["num_groups"].append(num_groups)
-        self._step_log_dict["num_groups_mixed_reward"].append(num_mixed)
+        self._step_log_dict["num_groups_mixed_rewards"].append(num_mixed)
 
         response_advantages = torch.masked_select(advantages, mask.bool())
         self._step_log_dict["rewards"].append(rewards.detach().cpu())
