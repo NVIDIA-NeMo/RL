@@ -33,6 +33,16 @@ grpo:
     overlong_buffer_penalty: 1
     max_response_length: ${policy.max_total_sequence_length}
     stop_properly_penalty_coef: null
+    # Context-cost shaping for multi-turn rollouts: scales the reward of each
+    # correct rollout in a prompt group by
+    #   d + (1 - d) * exp(-beta * (ctx - ctx_min_correct) / ref_tokens)
+    # (d = group failure rate, ctx = total tokens of the rollout). Independent
+    # of `enabled` above.
+    context_cost:
+      enabled: false
+      correct_reward_threshold: 1.0
+      beta: 0.5
+      ref_tokens: 32768
 
   # Advantage Estimator Configuration
   # Options: "grpo" (default) or "reinforce_plus_plus"

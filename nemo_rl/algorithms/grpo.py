@@ -54,6 +54,7 @@ from nemo_rl.algorithms.metric_utils import (
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
+    apply_context_cost_shaping,
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import (
@@ -3263,6 +3264,12 @@ def _grpo_train_impl(
                     repeated_batch = apply_reward_shaping(
                         repeated_batch, master_config.grpo.reward_shaping
                     )
+                if master_config.grpo.reward_shaping.context_cost.enabled:
+                    repeated_batch = apply_context_cost_shaping(
+                        repeated_batch,
+                        master_config.grpo.reward_shaping.context_cost,
+                        master_config.grpo.num_generations_per_prompt,
+                    )
 
                 # Calculate rewards & advantages
                 memory_tracker.snapshot_start_of_stage("Processing rewards", dir())
@@ -3282,10 +3289,15 @@ def _grpo_train_impl(
                     # groups on the raw task metric (e.g. acc) instead of on
                     # length-dependent shaped reward variance. Baseline
                     # (which drives advantages) stays on the shaped reward.
+                    # Context-cost shaping is the exception: an all-correct
+                    # group has zero raw variance but carries the efficiency
+                    # signal the shaping exists for, so filter on the shaped
+                    # reward while it is enabled.
                     std_rewards = (
                         repeated_batch["unshaped_total_reward"]
                         if master_config.grpo.use_dynamic_sampling
                         and "unshaped_total_reward" in repeated_batch
+                        and not master_config.grpo.reward_shaping.context_cost.enabled
                         else None
                     )
                     if master_config.grpo.calculate_advantages_on_gpu:
@@ -5195,6 +5207,12 @@ def async_grpo_train(
                     del initial_prompt_message_logs
                     del prompt_batched_flat
 
+                    if master_config.grpo.reward_shaping.context_cost.enabled:
+                        repeated_batch = apply_context_cost_shaping(
+                            repeated_batch,
+                            master_config.grpo.reward_shaping.context_cost,
+                            master_config.grpo.num_generations_per_prompt,
+                        )
                     rewards = repeated_batch["total_reward"]
 
                     print(
