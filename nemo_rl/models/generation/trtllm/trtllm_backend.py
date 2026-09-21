@@ -142,9 +142,13 @@ class NcclExtension(WorkerExtension):
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         self.state_dict_info = state_dict_info
         model = self.engine.model_engine.model
+        self._local_expert_lookup = None
         if fp8_quantization.is_quantized_expert_refit(model.model_config.quant_config):
             fp8_quantization.validate_fused_expert_layout(state_dict_info)
             _require_fp8_refit_hooks(self.engine.model_engine.model_loader)
+            # Every rank receives the full expert stacks but loads only its
+            # own slots; convert just those (EP16: 32 of 512 experts).
+            self._local_expert_lookup = fp8_quantization.build_local_expert_lookup(model)
 
     def _unwrap_compiled_model_for_refit(self) -> bool:
         """Unwrap torch.compile before weights are loaded.
@@ -285,6 +289,7 @@ class NcclExtension(WorkerExtension):
                     is_mx=fp8_quantization.is_mxfp8_model(
                         model.model_config.quant_config
                     ),
+                    local_experts=getattr(self, "_local_expert_lookup", None),
                 )
             else:
                 weights = dict(weight_list)
@@ -332,7 +337,10 @@ class NcclExtension(WorkerExtension):
                 self._abort_weight_update_after_failure(
                     model, model_engine.model_loader, e
                 )
+                import traceback
+
                 print(f"Error in NcclExtension.update_weights_from_collective: {e}")
+                traceback.print_exc()
                 return False
 
         return True
@@ -420,6 +428,7 @@ class NcclExtension(WorkerExtension):
                         is_mx=fp8_quantization.is_mxfp8_model(
                             model.model_config.quant_config
                         ),
+                        local_experts=getattr(self, "_local_expert_lookup", None),
                     )
                     # Qwen3.5's mapper may retain split QKVZ/BA tensors until a
                     # later IPC chunk completes the fusion group. Detach those

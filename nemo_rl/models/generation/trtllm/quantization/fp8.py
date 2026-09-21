@@ -17,7 +17,7 @@
 import math
 import re
 from collections.abc import Iterable, Sequence
-from typing import Any
+from typing import Any, Callable, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -85,13 +85,76 @@ _FUSED_EXPERT_RE = re.compile(
     r"(?P<projection>gate_up_proj|down_proj)$"
 )
 _SPLIT_EXPERT_RE = re.compile(
-    rf"^(?P<prefix>{_QWEN35_PREFIX})\.\d+\."
+    rf"^(?P<prefix>{_QWEN35_PREFIX})\.(?P<expert>\d+)\."
     r"(?:gate_proj|up_proj|down_proj)\.weight$"
 )
 _SPLIT_LINEAR_ATTN_RE = re.compile(
     r"^(?:.*\.)?layers\.\d+\.linear_attn\."
     r"in_proj_(?:qkv|q|k|v|z|a|b)\..+$"
 )
+
+# Routed-expert prefix -> layer index for the local-expert lookup.
+_EXPERT_PREFIX_LAYER_RE = re.compile(
+    r"^(?:(?:model\.)?(?:language_model\.)?)layers\.(?P<layer>\d+)\.mlp\.experts$"
+)
+_MTP_EXPERT_PREFIX_LAYER_RE = re.compile(
+    r"^mtp\.layers\.(?P<layer>\d+)\.mlp\.experts$"
+)
+
+# Returns the expert ids this rank holds for a routed-expert checkpoint prefix,
+# or None when every expert must be converted.
+LocalExpertLookup = Callable[[str], Optional[Sequence[int]]]
+
+
+def build_local_expert_lookup(model: Any) -> Optional[LocalExpertLookup]:
+    """Map Qwen3.5 routed-expert prefixes to the expert ids this rank stores.
+
+    The refit broadcast hands every rank the full ``[E, ...]`` expert stacks,
+    but TRT-LLM only loads the slots in each MoE module's
+    ``initial_local_expert_ids`` (EP16 keeps 32 of 512). Converting the other
+    experts to FP8/MXFP8 is wasted work on the refit critical path, so this
+    reads the same attribute the loader uses and lets ``load_weights`` skip
+    them. Decoder layers are keyed by ``layer_idx``; the MTP layer's experts
+    are named ``mtp.layers.<i>`` in the checkpoint but carry
+    ``layer_idx = num_hidden_layers + i`` at runtime.
+
+    Returns None (convert everything) when the model has no MoE modules with
+    that attribute, or when an expert load balancer is active, because the
+    balancer moves experts between slots and the loader may then need experts
+    outside the initial assignment.
+    """
+    by_layer: dict[int, list[int]] = {}
+    for _name, module in model.named_modules():
+        local_ids = getattr(module, "initial_local_expert_ids", None)
+        layer_idx = getattr(module, "layer_idx", None)
+        if local_ids is None or layer_idx is None:
+            continue
+        if getattr(module, "layer_load_balancer", None) is not None:
+            return None
+        ids = sorted({int(i) for i in local_ids})
+        previous = by_layer.setdefault(int(layer_idx), ids)
+        if previous != ids:
+            raise ValueError(
+                f"MoE modules of layer {layer_idx} disagree on their local experts: "
+                f"{previous[:4]}... vs {ids[:4]}..."
+            )
+    if not by_layer:
+        return None
+    pretrained_config = getattr(
+        getattr(model, "model_config", None), "pretrained_config", None
+    )
+    num_hidden_layers = getattr(pretrained_config, "num_hidden_layers", None)
+
+    def lookup(prefix: str) -> Optional[Sequence[int]]:
+        match = _EXPERT_PREFIX_LAYER_RE.fullmatch(prefix)
+        if match is not None:
+            return by_layer.get(int(match.group("layer")))
+        match = _MTP_EXPERT_PREFIX_LAYER_RE.fullmatch(prefix)
+        if match is not None and num_hidden_layers is not None:
+            return by_layer.get(int(num_hidden_layers) + int(match.group("layer")))
+        return None
+
+    return lookup
 
 
 def validate_fused_expert_layout(
@@ -448,6 +511,7 @@ def _convert_fused_expert_weight(
     prefix: str,
     projection: str,
     is_mx: bool = False,
+    local_expert_ids: Optional[Sequence[int]] = None,
 ) -> None:
     if tensor.dim() != 3:
         raise ValueError(
@@ -460,8 +524,25 @@ def _convert_fused_expert_weight(
             f"Qwen3.5 gate_up_proj dimension must be even, got {tuple(tensor.shape)}"
         )
 
-    for start in range(0, num_experts, FP8_EXPERT_CHUNK_SIZE):
-        end = min(start + FP8_EXPERT_CHUNK_SIZE, num_experts)
+    # Expert ids in stack order; with a local lookup only this rank's experts
+    # are gathered (one small copy) and converted, the rest of the stack is
+    # never read.
+    expert_ids: Sequence[int] = range(num_experts)
+    if local_expert_ids is not None:
+        expert_ids = sorted({int(i) for i in local_expert_ids})
+        out_of_range = [i for i in expert_ids if i < 0 or i >= num_experts]
+        if out_of_range:
+            raise ValueError(
+                f"Local expert ids for {name} fall outside [0, {num_experts}): "
+                f"{out_of_range[:4]}"
+            )
+        if not expert_ids:
+            return
+        tensor = tensor.index_select(
+            0, torch.as_tensor(expert_ids, dtype=torch.long, device=tensor.device)
+        )
+    for start in range(0, len(expert_ids), FP8_EXPERT_CHUNK_SIZE):
+        end = min(start + FP8_EXPERT_CHUNK_SIZE, len(expert_ids))
         if projection == "gate_up_proj":
             intermediate_size = tensor.shape[1] // 2
             projections = (
@@ -478,7 +559,7 @@ def _convert_fused_expert_weight(
                 )
             else:
                 fp8_data, scale_inv = cast_tensor_to_fp8_blockwise(projection_tensor)
-            for chunk_index, expert_index in enumerate(range(start, end)):
+            for chunk_index, expert_index in enumerate(expert_ids[start:end]):
                 weight_name = f"{prefix}.{expert_index}.{projection_name}.weight"
                 scale_name = weight_name.removesuffix(".weight") + ".weight_scale_inv"
                 _insert_unique(output, weight_name, fp8_data[chunk_index])
@@ -489,12 +570,15 @@ def load_weights(
     weight_list: Iterable[tuple[str, torch.Tensor]],
     *,
     is_mx: bool = False,
+    local_experts: Optional[LocalExpertLookup] = None,
 ) -> dict[str, torch.Tensor]:
     """Convert only Qwen3.5 routed experts from BF16 to HF block-FP8 or MXFP8.
 
     Fused Transformers/Megatron expert tensors are expanded into the standard
     per-expert HF names consumed by TRT-LLM's Qwen3.5 mapper. All non-routed
-    weights pass through unchanged.
+    weights pass through unchanged. With ``local_experts`` (see
+    ``build_local_expert_lookup``) only the experts this rank stores are
+    converted and emitted; experts of unknown prefixes are converted in full.
     """
     output: dict[str, torch.Tensor] = {}
     for name, tensor in weight_list:
@@ -509,20 +593,29 @@ def load_weights(
             )
         )
         if fused_match is not None:
+            prefix = fused_match.group("prefix")
             _convert_fused_expert_weight(
                 output,
                 name=weight_name,
                 tensor=tensor,
-                prefix=fused_match.group("prefix"),
+                prefix=prefix,
                 projection=fused_match.group("projection"),
                 is_mx=is_mx,
+                local_expert_ids=(
+                    local_experts(prefix) if local_experts is not None else None
+                ),
             )
         elif (
-            _SPLIT_EXPERT_RE.fullmatch(  # pyrefly: ignore[no-matching-overload]
+            split_match := _SPLIT_EXPERT_RE.fullmatch(  # pyrefly: ignore[no-matching-overload]
                 weight_name
             )
-            is not None
-        ):
+        ) is not None:
+            if local_experts is not None:
+                local_ids = local_experts(split_match.group("prefix"))
+                if local_ids is not None and int(split_match.group("expert")) not in {
+                    int(i) for i in local_ids
+                }:
+                    continue
             _insert_quantized_projection(output, weight_name, tensor, is_mx=is_mx)
         else:
             _insert_unique(output, weight_name, tensor)
