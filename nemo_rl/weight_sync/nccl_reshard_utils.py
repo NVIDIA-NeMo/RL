@@ -629,9 +629,9 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
 
     # Generation backends with a destination-side HFToLocalParamMap adapter.
     backend = generation.get("backend")
-    if backend not in ("vllm", "megatron"):
+    if backend not in ("vllm", "megatron", "trtllm"):
         violations.append(
-            f"policy.generation.backend must be 'vllm' or 'megatron' (got {backend!r})."
+            f"policy.generation.backend must be 'vllm', 'megatron' or 'trtllm' (got {backend!r})."
         )
 
     if backend == "vllm" and vllm_kwargs.get("enable_eplb"):
@@ -810,6 +810,40 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
                     "policy.megatron_cfg.model_overrides, so copy those keys into it."
                 )
 
+    if backend == "trtllm":
+        # Experts must be pure expert-parallel: the reshard writes EP slices of
+        # the HF expert stacks, and TRT-LLM's expert-TP layouts (interleaved
+        # gate/up, swizzled scales) are not HF slices. Both engine roles of a
+        # disaggregated deployment are checked.
+        from nemo_rl.models.generation.trtllm.config import (
+            resolve_disagg_layout,
+            resolve_role_overrides,
+            role_engine_config,
+        )
+
+        if resolve_disagg_layout(generation).enabled:
+            # Idempotent, so an already-resolved config passes through as is.
+            resolved = resolve_role_overrides(generation)
+            roles = {
+                f"trtllm_cfg.{role}_engine": role_engine_config(resolved, role)
+                for role in ("prefill", "decode")
+            }
+        else:
+            roles = {"trtllm_cfg": generation.get("trtllm_cfg", {}) or {}}
+        for label, kwargs in roles.items():
+            tp = int(kwargs.get("tensor_parallel_size", 1) or 1)
+            ep = int(kwargs.get("moe_expert_parallel_size", 1) or 1)
+            if ep != tp:
+                violations.append(
+                    f"policy.generation.{label}: "
+                    f"moe_expert_parallel_size ({ep}) must equal tensor_parallel_size "
+                    f"({tp}) for nccl_reshard_refit (pure expert parallelism)."
+                )
+            if int(kwargs.get("pipeline_parallel_size", 1) or 1) != 1:
+                violations.append(
+                    f"policy.generation.{label}: pipeline_parallel_size must be 1 "
+                    "for nccl_reshard_refit (this initial version)."
+                )
     # Gen-backend restrictions. The reshard supports gen-side TP, DP, EP, and
     # Megatron ETP. The vLLM backend shards experts by index across
     # its TP ranks, so its EP is either 1 (TP-sharded experts) or equal to TP
