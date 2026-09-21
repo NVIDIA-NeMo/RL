@@ -125,8 +125,7 @@ PER_TOKEN_MULTIMODAL_FIELDS = frozenset(
     {
         "token_type_ids",  # gemma3: which tokens are image
         "mm_token_type_ids",  # qwen2.5-vl (transformers>=5.3): text(0)/image(1)/video(2) for 3D RoPE
-        # Exact message-owned media provenance. This is minted before message
-        # flattening and follows input_ids through padding, TQ, and packing.
+        # Which tokens are allowed to be replaced by multimodal embeddings.
         "media_token_validity_mask",
     }
 )
@@ -1692,6 +1691,12 @@ def attach_processor_media_token_validity_mask(
     media_token_id = convert_token(image_token)
     if isinstance(media_token_id, bool) or not isinstance(media_token_id, int):
         return
+    if media_token_id == getattr(tokenizer, "unk_token_id", None):
+        # An unknown-token fallback does not prove that the processor owns
+        # those positions; masking every literal UNK as media would corrupt text.
+        return
+    # Construct the media placeholder token validity mask, which represents
+    # which tokens are permitted substitutes of multimodal embeddings.
     message["media_token_validity_mask"] = token_ids.eq(media_token_id)
 
 
