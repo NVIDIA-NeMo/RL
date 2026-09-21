@@ -68,6 +68,9 @@ grpo:
     # when transient generation errors are expected and acceptable to drop.
     max_generation_failures: 0
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
+    # Yield finished prompt groups to the replay buffer as they complete instead
+    # of after the whole rollout batch (native multi-turn rollouts).
+    stream_prompt_groups: false
     recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after weight updates.
 
 # Reward-zeroing penalties applied to NeMo-Gym rollout results.
