@@ -116,9 +116,11 @@ def wrap_with_nvtx_name(name: str):
     def decorator(func):
         def wrapper(*args, **kwargs):
             torch.cuda.nvtx.range_push(name)
-            ret = func(*args, **kwargs)
-            torch.cuda.nvtx.range_pop()
-            return ret
+            try:
+                return func(*args, **kwargs)
+            finally:
+                # Pop even when the call raises so the NVTX range stays balanced.
+                torch.cuda.nvtx.range_pop()
 
         return wrapper
 
