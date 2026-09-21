@@ -3278,6 +3278,7 @@ class MegatronPolicyWorkerImpl(
         # Yield the original parameters first.
         for name, tensor in base_iter:
             yield name, tensor
+            del tensor
 
         if include_draft and self.draft_model is not None:
             from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
