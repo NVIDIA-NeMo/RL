@@ -1828,6 +1828,28 @@ class NemoGymRolloutResult:
     task_index: Optional[int]
 
 
+def _nemo_gym_request_input_ids(
+    results: list[dict[str, Any]], pad_token_id: int
+) -> torch.Tensor:
+    """Pack request-prefix token IDs without flattening multimodal payloads.
+
+    ``input_ids`` is consumed by the synchronous GRPO caller only. Flattening
+    complete request messages here would also concatenate every multimodal
+    payload after the rollout has finished. Full message logs, including media
+    introduced by tools, remain untouched in the returned training batch and
+    are flattened by the trainer later.
+    """
+    token_only_message_logs = [
+        get_keys_from_message_log(result["input_message_log"], ["token_ids"])
+        for result in results
+    ]
+    batched_flat, _ = batched_message_log_to_flat_message(
+        token_only_message_logs,
+        pad_value_dict={"token_ids": pad_token_id},
+    )
+    return batched_flat["token_ids"]
+
+
 @dataclass(frozen=True)
 class _CompletedNemoGymGroup:
     """One complete Gym prompt group restored to input-row order."""
@@ -3134,17 +3156,7 @@ def _postprocess_single_nemo_gym_group(
         "gen_tokens_per_sample/mean"
     ]
 
-    # Convert LLMMessageLogType to FlatMessagesType for generation
-    input_batch_for_input_ids = BatchedDataDict[DatumSpec](
-        {
-            "message_log": [r["input_message_log"] for r in results],
-        }
-    )
-    batched_flat, _ = batched_message_log_to_flat_message(
-        input_batch_for_input_ids["message_log"],
-        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-    )
-    input_ids = batched_flat["token_ids"]
+    input_ids = _nemo_gym_request_input_ids(results, tokenizer.pad_token_id)
 
     final_batch = BatchedDataDict[DatumSpec](
         {

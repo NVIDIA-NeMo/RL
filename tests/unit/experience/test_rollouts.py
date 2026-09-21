@@ -19,6 +19,7 @@ import tempfile
 from copy import deepcopy
 from dataclasses import asdict
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import ray
@@ -60,6 +61,7 @@ from nemo_rl.experience.rollout_manager import (
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.experience.rollouts import (
     _add_multimodal_generation_payload,
+    _nemo_gym_request_input_ids,
     _reattach_original_multimodal_payloads,
     async_generate_response_for_sample_turn,
     generate_responses_async,
@@ -88,6 +90,45 @@ from tests.unit.test_envs import (
     MultiStepCalculatorEnv,
     _MultiStepCalculatorLogic,
 )
+
+
+def test_nemo_gym_request_input_ids_ignores_multimodal_payloads():
+    """Packing request IDs must not concatenate repeated video tensors."""
+    frames = PackedTensor(
+        [torch.ones((4, 3, 2, 2), dtype=torch.float32)],
+        dim_to_pack=0,
+    )
+    results = [
+        {
+            "input_message_log": [
+                {
+                    "role": "user",
+                    "content": "first",
+                    "token_ids": torch.tensor([1, 2], dtype=torch.long),
+                    "pixel_values": frames,
+                }
+            ]
+        },
+        {
+            "input_message_log": [
+                {
+                    "role": "user",
+                    "content": "second",
+                    "token_ids": torch.tensor([3, 4, 5], dtype=torch.long),
+                    "pixel_values": frames,
+                }
+            ]
+        },
+    ]
+
+    with patch.object(
+        PackedTensor,
+        "flattened_concat",
+        side_effect=AssertionError("multimodal payload was flattened"),
+    ):
+        input_ids = _nemo_gym_request_input_ids(results, pad_token_id=0)
+
+    assert input_ids.tolist() == [[1, 2, 0], [3, 4, 5]]
 
 
 def _initial_gym_image_batch() -> BatchedDataDict:
