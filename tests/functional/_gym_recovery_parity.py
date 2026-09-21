@@ -25,7 +25,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-from _gym_prefix_recovery_snapshot import _active_prefixes, _read_json
+from _gym_prefix_recovery_snapshot import (
+    _active_prefixes,
+    _agent_records,
+    _is_recoverable_active_prefix,
+    _read_json,
+)
 
 
 _SEMANTIC_METRICS = (
@@ -98,12 +103,77 @@ def _matching_group(
     return None
 
 
+def _matching_agent_boundary(
+    snapshot: Path,
+    gym_checkpoint: dict[str, Any],
+    *,
+    rollout_id: str,
+    attempt_index: int,
+) -> dict[str, Any]:
+    matches: list[dict[str, Any]] = []
+    for participant in gym_checkpoint.get("participants", []):
+        if (
+            not isinstance(participant, dict)
+            or participant.get("participant", {}).get("component")
+            != "responses_api_agents"
+        ):
+            continue
+        matches.extend(
+            record
+            for record in _agent_records(snapshot, participant)
+            if record.get("rollout_id") == rollout_id
+            and record.get("attempt_index") == attempt_index
+        )
+    if len(matches) != 1:
+        raise AssertionError(
+            "active generation cut has no unique saved agent continuation boundary"
+        )
+    boundary = matches[0]
+    if (
+        boundary.get("boundary_kind") != "turn_complete"
+        or boundary.get("pending_model") is not None
+    ):
+        raise AssertionError(
+            "active generation cut is not anchored by a completed agent boundary"
+        )
+    return boundary
+
+
+def _boundary_satisfies_requirement(
+    boundary: dict[str, Any],
+    requirement: str,
+) -> bool:
+    if requirement == "any":
+        return True
+    boundary_index = boundary.get("boundary_index")
+    last_committed_model_call_id = boundary.get("last_committed_model_call_id")
+    if requirement == "root":
+        return boundary_index == 0 and last_committed_model_call_id is None
+    if requirement == "post_mutation":
+        resource_revisions = boundary.get("resource_state_revisions")
+        return (
+            isinstance(boundary_index, int)
+            and boundary_index > 0
+            and isinstance(last_committed_model_call_id, str)
+            and bool(last_committed_model_call_id)
+            and isinstance(resource_revisions, dict)
+            and bool(resource_revisions)
+            and all(
+                isinstance(revision, int) for revision in resource_revisions.values()
+            )
+            and max(resource_revisions.values()) >= 2
+        )
+    raise ValueError(f"unknown agent boundary requirement: {requirement!r}")
+
+
 def inspect_cut_candidate(
     snapshot: Path,
     *,
     min_train_step: int,
+    max_train_step: int | None = None,
     task_source: str,
     max_generation_tokens: int,
+    boundary_requirement: str = "any",
 ) -> dict[str, Any]:
     """Return one active cut for ``task_source`` or reject this snapshot."""
     # The parity comparator does not need the heavyweight training dependency.
@@ -115,6 +185,10 @@ def inspect_cut_candidate(
         raise AssertionError(
             f"snapshot train step {base_train_step!r} precedes {min_train_step}"
         )
+    if max_train_step is not None and base_train_step > max_train_step:
+        raise AssertionError(
+            f"snapshot train step {base_train_step} exceeds {max_train_step}"
+        )
     gym_checkpoint = manifest.get("gym_checkpoint")
     if not isinstance(gym_checkpoint, dict):
         raise AssertionError("snapshot has no Gym participant checkpoint")
@@ -122,13 +196,11 @@ def inspect_cut_candidate(
     if not isinstance(recovery, dict):
         raise TypeError("rollout recovery sidecar is not a mapping")
 
-    matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    matches: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
     for prefix in _active_prefixes(snapshot, manifest, gym_checkpoint):
-        token_count = prefix.get("prefix_token_count")
-        if (
-            not isinstance(token_count, int)
-            or token_count <= 0
-            or token_count >= max_generation_tokens
+        if not _is_recoverable_active_prefix(
+            prefix,
+            max_generation_tokens=max_generation_tokens,
         ):
             continue
         group = _matching_group(
@@ -136,14 +208,28 @@ def inspect_cut_candidate(
             rollout_id=prefix["rollout_id"],
             attempt_index=prefix["attempt_index"],
         )
-        if group is not None and group.get("task_source") == task_source:
-            matches.append((prefix, group))
+        if group is None or group.get("task_source") != task_source:
+            continue
+        boundary = _matching_agent_boundary(
+            snapshot,
+            gym_checkpoint,
+            rollout_id=prefix["rollout_id"],
+            attempt_index=prefix["attempt_index"],
+        )
+        if prefix["model_call_id"] == boundary.get("last_committed_model_call_id"):
+            continue
+        if not _boundary_satisfies_requirement(boundary, boundary_requirement):
+            continue
+        matches.append((prefix, group, boundary))
     if not matches:
         raise AssertionError(
-            f"snapshot has no non-empty active prefix for task_source={task_source!r}"
+            "snapshot has no recoverable nonterminal active prefix for "
+            f"task_source={task_source!r}"
         )
 
-    prefix, group = max(matches, key=lambda pair: pair[0]["prefix_token_count"])
+    prefix, group, boundary = max(
+        matches, key=lambda match: match[0]["prefix_token_count"]
+    )
     return {
         "snapshot_path": str(snapshot.resolve()),
         "checkpoint_id": gym_checkpoint["checkpoint_id"],
@@ -156,6 +242,10 @@ def inspect_cut_candidate(
         "prefix_token_count": prefix["prefix_token_count"],
         "prefix_digest": prefix["prefix_digest"],
         "staging_keys": prefix["staging_keys"],
+        "boundary_requirement": boundary_requirement,
+        "boundary_index": boundary.get("boundary_index"),
+        "last_committed_model_call_id": boundary.get("last_committed_model_call_id"),
+        "resource_state_revisions": boundary.get("resource_state_revisions", {}),
     }
 
 
@@ -168,8 +258,10 @@ def select_cut(args: argparse.Namespace) -> None:
                 selection = inspect_cut_candidate(
                     snapshot,
                     min_train_step=args.min_train_step,
+                    max_train_step=args.max_train_step,
                     task_source=args.task_source,
                     max_generation_tokens=args.max_generation_tokens,
+                    boundary_requirement=args.boundary_requirement,
                 )
             except (
                 AssertionError,
@@ -180,6 +272,7 @@ def select_cut(args: argparse.Namespace) -> None:
             ) as error:
                 last_error = f"{snapshot}: {type(error).__name__}: {error}"
                 continue
+            selection["expected_outcome"] = args.expected_outcome
             args.selection.parent.mkdir(parents=True, exist_ok=True)
             args.selection.write_text(
                 json.dumps(selection, indent=2, sort_keys=True) + "\n"
@@ -189,6 +282,7 @@ def select_cut(args: argparse.Namespace) -> None:
                 f"step={selection['base_train_step']} "
                 f"task_source={selection['task_source']} "
                 f"tokens={selection['prefix_token_count']} "
+                f"expected_outcome={selection['expected_outcome']} "
                 f"rollout={selection['rollout_id']}",
                 flush=True,
             )
@@ -325,18 +419,13 @@ def _rollout_timeline(
     effective_order: list[tuple[Any, ...]],
 ) -> list[dict[str, Any]]:
     timestamped = [
-        event
-        for events in stages
-        for event in events
-        if "timestamp_ns" in event
+        event for events in stages for event in events if "timestamp_ns" in event
     ]
     if not timestamped:
         return []
     origin_ns = min(int(event["timestamp_ns"]) for event in timestamped)
     entries: dict[tuple[Any, ...], dict[str, Any]] = {}
-    effective_ranks = {
-        identity: rank for rank, identity in enumerate(effective_order)
-    }
+    effective_ranks = {identity: rank for rank, identity in enumerate(effective_order)}
 
     def entry_for(identity: tuple[Any, ...]) -> dict[str, Any]:
         return entries.setdefault(
@@ -503,8 +592,7 @@ def _step_files(log_dir: Path, *, allow_restarts: bool = False) -> dict[int, Pat
     for step, paths in candidates.items():
         if len(paths) > 1 and not allow_restarts:
             raise AssertionError(
-                f"multiple training payloads found for step {step}: "
-                f"{sorted(paths)!r}"
+                f"multiple training payloads found for step {step}: {sorted(paths)!r}"
             )
         result[step] = max(
             paths,
@@ -745,6 +833,17 @@ def _parser() -> argparse.ArgumentParser:
     select.add_argument("min_train_step", type=int)
     select.add_argument("task_source")
     select.add_argument("max_generation_tokens", type=int)
+    select.add_argument("--max-train-step", type=int)
+    select.add_argument(
+        "--boundary-requirement",
+        choices=("root", "post_mutation"),
+        required=True,
+    )
+    select.add_argument(
+        "--expected-outcome",
+        choices=("restore", "restart"),
+        required=True,
+    )
     select.set_defaults(func=select_cut)
 
     prune = commands.add_parser("prune-to-selection")
@@ -754,25 +853,19 @@ def _parser() -> argparse.ArgumentParser:
 
     compare = commands.add_parser("compare")
     compare.add_argument("--baseline-events", type=Path, required=True)
-    compare.add_argument(
-        "--recovery-events", type=Path, action="append", required=True
-    )
+    compare.add_argument("--recovery-events", type=Path, action="append", required=True)
     compare.add_argument("--baseline-log-dir", type=Path, required=True)
     compare.add_argument("--recovery-log-dir", type=Path, required=True)
     compare.add_argument("--baseline-metrics", type=Path, required=True)
     compare.add_argument("--recovery-metrics", type=Path, required=True)
     compare.add_argument("--baseline-audit", type=Path, required=True)
-    compare.add_argument(
-        "--recovery-audit", type=Path, action="append", required=True
-    )
+    compare.add_argument("--recovery-audit", type=Path, action="append", required=True)
     compare.add_argument("--timeline-output", type=Path)
     compare.add_argument("--require-completion-order-match", action="store_true")
     compare.add_argument("--steps", type=int, required=True)
     compare.add_argument("--prompts-per-step", type=int, required=True)
     compare.add_argument("--generations-per-prompt", type=int, required=True)
-    compare.add_argument(
-        "--required-retried-task-source", action="append", default=[]
-    )
+    compare.add_argument("--required-retried-task-source", action="append", default=[])
     compare.add_argument("--rtol", type=float, default=1e-5)
     compare.add_argument("--atol", type=float, default=1e-6)
     compare.set_defaults(func=compare_runs)

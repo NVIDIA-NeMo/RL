@@ -38,6 +38,37 @@ def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+@pytest.mark.parametrize(
+    ("updates", "expected"),
+    [
+        ({}, True),
+        ({"terminal_finish_reason": "stop"}, False),
+        ({"terminal_stop_reason": 128001}, False),
+        ({"prefix_token_count": 64}, False),
+        ({"effective_output_limit": 16}, False),
+    ],
+)
+def test_is_recoverable_active_prefix(
+    updates: dict[str, object],
+    expected: bool,
+) -> None:
+    prefix = {
+        "prefix_token_count": 16,
+        "effective_output_limit": 64,
+        "terminal_finish_reason": None,
+        "terminal_stop_reason": None,
+        **updates,
+    }
+
+    assert (
+        _HELPER._is_recoverable_active_prefix(
+            prefix,
+            max_generation_tokens=64,
+        )
+        is expected
+    )
+
+
 def test_agent_records_reads_archive_only_checkpoint(tmp_path: Path) -> None:
     directory = tmp_path / "gym" / "agent"
     directory.mkdir(parents=True)

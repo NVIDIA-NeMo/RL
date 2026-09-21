@@ -214,6 +214,26 @@ def _active_prefixes(
     return _lineage_active_prefixes(snapshot, gym_checkpoint)
 
 
+def _is_recoverable_active_prefix(
+    prefix: dict[str, Any],
+    *,
+    max_generation_tokens: int,
+) -> bool:
+    token_count = prefix.get("prefix_token_count")
+    effective_output_limit = prefix.get("effective_output_limit")
+    output_limit = (
+        min(max_generation_tokens, effective_output_limit)
+        if isinstance(effective_output_limit, int) and effective_output_limit > 0
+        else max_generation_tokens
+    )
+    return (
+        isinstance(token_count, int)
+        and 0 < token_count < output_limit
+        and prefix.get("terminal_finish_reason") is None
+        and prefix.get("terminal_stop_reason") is None
+    )
+
+
 def _matching_attempt(
     recovery: dict[str, Any], rollout_id: str, attempt_index: int
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -359,11 +379,15 @@ def inspect_snapshot(
     prefixes = [
         prefix
         for prefix in prefixes
-        if prefix["prefix_token_count"] < max_generation_tokens
+        if _is_recoverable_active_prefix(
+            prefix,
+            max_generation_tokens=max_generation_tokens,
+        )
     ]
     if not prefixes:
         raise AssertionError(
-            "active generation prefixes already exhaust the request output limit"
+            "active generation prefixes are terminal or already exhaust the "
+            "request output limit"
         )
     prefix = sorted(
         prefixes,
