@@ -49,7 +49,7 @@ def _enabled_global_aux_loss(megatron_cfg: dict[str, Any]) -> bool:
     """Return whether a full-DP global aux collective is configured.
 
     The coefficient can originate in the HF model provider rather than this
-    dictionary, so the routing type itself must be rejected.
+    dictionary, so the routing type is the stable scheduling signal.
     """
     return "global_aux_loss" in _routing_types(megatron_cfg)
 
@@ -57,27 +57,27 @@ def _enabled_global_aux_loss(megatron_cfg: dict[str, Any]) -> bool:
 def _minimum_cp_size_for_experts(
     megatron_cfg: dict[str, Any], configured_minimum: int
 ) -> int:
-    """Keep every EP collective inside one dynamically scheduled task.
+    """Keep every joint ETP*EP block inside one dynamically scheduled task.
 
     Dynamic CP tasks contain ``CP * TP`` contiguous model ranks.  The pinned
-    MCore rank order puts a complete EP group inside such a block once it is at
-    least EP ranks wide.  ETP changes that layout, so support it only after it
-    has a dedicated topology implementation.
+    MCore rank order makes expert TP the fastest expert-grid axis followed by
+    EP.  A task is therefore closed over all expert collectives once its rank
+    block is a multiple of ``ETP * EP``.
     """
     expert_parallel = megatron_cfg["expert_model_parallel_size"]
     tensor_parallel = megatron_cfg["tensor_model_parallel_size"]
     expert_tensor_parallel = megatron_cfg.get("expert_tensor_parallel_size", 1)
-    if expert_tensor_parallel != 1:
-        raise ValueError("Dynamic CP MoE requires expert_tensor_parallel_size=1")
-    if expert_parallel <= 1:
+    expert_block = expert_parallel * expert_tensor_parallel
+    if expert_block <= 1:
         return configured_minimum
     minimum = configured_minimum
-    while minimum * tensor_parallel < expert_parallel:
+    while minimum * tensor_parallel < expert_block:
         minimum *= 2
-    if (minimum * tensor_parallel) % expert_parallel:
+    if (minimum * tensor_parallel) % expert_block:
         raise ValueError(
-            "Dynamic CP requires expert_model_parallel_size to divide "
-            "min_dynamic_cp_size * tensor_model_parallel_size"
+            "Dynamic CP requires expert_tensor_parallel_size * "
+            "expert_model_parallel_size to divide min_dynamic_cp_size * "
+            "tensor_model_parallel_size"
         )
     return minimum
 
@@ -110,22 +110,8 @@ def validate_dynamic_cp(cfg: dict[str, Any], *, lanes: int) -> None:
         )
     if mc.get("cuda_graph_impl") not in (None, "none"):
         raise ValueError("Dynamic CP does not support CUDA graph capture")
-    if _model_setting(mc, "mtp_num_layers") or _model_setting(
-        mc, "moe_hybridep_prepad_packed_inputs"
-    ):
-        raise ValueError("Dynamic CP does not support MTP or HybridEP input prepadding")
     if _model_setting(mc, "overlap_moe_expert_parallel_comm"):
-        raise ValueError(
-            "Dynamic CP does not support overlap_moe_expert_parallel_comm"
-        )
-    if cfg["sequence_packing"].get("pair_grouping_key"):
-        raise ValueError("Dynamic CP does not yet schedule atomic preference pairs")
-    if _enabled_global_aux_loss(mc):
-        raise ValueError(
-            "Dynamic CP does not support global_aux_loss: its per-forward "
-            "TP*DP*CP collective cannot be called by uneven CP task lists. "
-            "Use aux_loss or seq_aux_loss instead."
-        )
+        raise ValueError("Dynamic CP does not support overlap_moe_expert_parallel_comm")
     if "quantile_balancing" in _routing_types(mc):
         raise ValueError(
             "Dynamic CP does not support quantile_balancing because its router "
@@ -137,8 +123,8 @@ def validate_dynamic_cp(cfg: dict[str, Any], *, lanes: int) -> None:
     maximum = dynamic.max_size or lanes
     if minimum > maximum:
         raise ValueError(
-            "Dynamic CP cannot contain an EP group: effective min_size "
-            f"{minimum} exceeds max_size {maximum} (CP*TP must be >= EP)"
+            "Dynamic CP cannot contain a joint ETP*EP group: effective min_size "
+            f"{minimum} exceeds max_size {maximum} (CP*TP must be >= ETP*EP)"
         )
     plan_cp_phases(
         [],
@@ -174,6 +160,8 @@ class CPBatchSchedule:
     sequence_parallel_size: int
     user_pad_multiple: int
     token_alignment: int
+    pair_grouping: tuple[int, ...] | None
+    align_full_domain_collectives: bool
     groups_by_batch: tuple[tuple[CPSyncGroup, ...], ...]
 
 
@@ -190,10 +178,7 @@ def owned_real_task_count(plan: CPRankPlan) -> int:
 def real_task_participation_count(plan: CPRankPlan) -> int:
     """Count real task calls made by this lane across all optimizer steps."""
     return sum(
-        1
-        for step in plan.steps
-        for task in step.assignments
-        if task.sample_indices
+        1 for step in plan.steps for task in step.assignments if task.sample_indices
     )
 
 
@@ -242,6 +227,36 @@ def _input_lengths(data: BatchedDataDict) -> tuple[int, ...]:
     return tuple(int(value) for value in values)
 
 
+def _pair_grouping(
+    data: BatchedDataDict, cfg: dict[str, Any]
+) -> tuple[int, ...] | None:
+    """Return stable atomic-group ids requested by sequence packing."""
+    grouping_key = cfg["sequence_packing"].get("pair_grouping_key")
+    if grouping_key is None:
+        return None
+    if grouping_key not in data:
+        raise KeyError(
+            f"sequence_packing pair_grouping_key={grouping_key!r} is not present in the batch"
+        )
+    values = data[grouping_key]
+    if hasattr(values, "tolist"):
+        values = values.tolist()
+    if len(values) != data.size:
+        raise ValueError("Dynamic CP pair-group ids must have one value per sample")
+    return tuple(int(value) for value in values)
+
+
+def _atomic_groups_for_batch(
+    grouping: tuple[int, ...] | None, *, start: int, batch_size: int
+) -> list[tuple[int, ...]] | None:
+    if grouping is None:
+        return None
+    members_by_group: dict[int, list[int]] = {}
+    for index, group_id in enumerate(grouping[start : start + batch_size]):
+        members_by_group.setdefault(group_id, []).append(index)
+    return [tuple(members) for _, members in sorted(members_by_group.items())]
+
+
 def build_cp_schedule(
     data: BatchedDataDict,
     cfg: dict[str, Any],
@@ -261,6 +276,22 @@ def build_cp_schedule(
         user_pad_multiple,
         alignment,
     ) = _schedule_parameters(cfg, sharding)
+    pair_grouping = _pair_grouping(data, cfg)
+    if pair_grouping is not None:
+        batches_by_group: dict[int, set[int]] = {}
+        for index, group_id in enumerate(pair_grouping):
+            batches_by_group.setdefault(group_id, set()).add(index // gbs)
+        split_groups = [
+            group_id
+            for group_id, batch_ids in batches_by_group.items()
+            if len(batch_ids) > 1
+        ]
+        if split_groups:
+            raise ValueError(
+                "Dynamic CP atomic groups cannot cross optimizer-step batch "
+                f"boundaries; split group ids: {split_groups[:8]}"
+            )
+    align_full_domain_collectives = _enabled_global_aux_loss(cfg["megatron_cfg"])
     groups_by_batch = tuple(
         plan_cp_phases(
             list(lengths[start : start + gbs]),
@@ -271,6 +302,10 @@ def build_cp_schedule(
             sequence_parallel_size=sequence_parallel_size,
             user_pad_multiple=user_pad_multiple,
             token_alignment=alignment,
+            atomic_groups=_atomic_groups_for_batch(
+                pair_grouping, start=start, batch_size=gbs
+            ),
+            align_full_domain_collectives=align_full_domain_collectives,
         )
         for start in range(0, len(lengths), gbs)
     )
@@ -284,6 +319,8 @@ def build_cp_schedule(
         sequence_parallel_size,
         user_pad_multiple,
         alignment,
+        pair_grouping,
+        align_full_domain_collectives,
         groups_by_batch,
     )
 
@@ -304,6 +341,9 @@ def cp_schedule_matches(
         return False
     return (
         schedule.input_lengths == _input_lengths(data)
+        and schedule.pair_grouping == _pair_grouping(data, cfg)
+        and schedule.align_full_domain_collectives
+        == _enabled_global_aux_loss(cfg["megatron_cfg"])
         and schedule.batch_size == gbs
         and (
             schedule.lanes,

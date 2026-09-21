@@ -130,10 +130,11 @@ def test_get_mtp_metrics_default_loss_scale_is_identity(monkeypatch):
     assert get_mtp_metrics()["mtp_1_loss"] == pytest.approx(3.0)
 
 
-def _fake_worker(mtp_num_layers):
+def _fake_worker(mtp_num_layers, cfg=None):
     """A minimal stand-in for MegatronPolicyWorkerImpl for calling _collect_mtp_metrics."""
     return SimpleNamespace(
-        model=SimpleNamespace(config=SimpleNamespace(mtp_num_layers=mtp_num_layers))
+        model=SimpleNamespace(config=SimpleNamespace(mtp_num_layers=mtp_num_layers)),
+        cfg=cfg or {},
     )
 
 
@@ -191,6 +192,49 @@ def test_collect_mtp_metrics_omits_grad_norm_when_none(monkeypatch):
         mtp_grad_norm=None,
     )
     assert "grad_norm" not in metrics["mtp_metrics"]
+
+
+@pytest.mark.mcore
+def test_collect_mtp_metrics_uses_dynamic_token_weighted_tracker(monkeypatch):
+    """Dynamic CP bypasses MCore's stale fixed-group mean-of-means tracker."""
+    from nemo_rl.models.policy.workers import megatron_policy_worker as mpw
+
+    fixed_group = object()
+    monkeypatch.setattr(
+        mpw.parallel_state,
+        "get_data_parallel_group",
+        lambda *, with_context_parallel: fixed_group,
+    )
+    captured = {}
+
+    def fake_dynamic_metrics(*, parallel_group):
+        captured["parallel_group"] = parallel_group
+        return {"mtp_1_loss": 0.25}
+
+    monkeypatch.setattr(
+        "nemo_rl.models.megatron.dynamic_cp.get_dynamic_mtp_metrics",
+        fake_dynamic_metrics,
+    )
+    monkeypatch.setattr(mpw, "broadcast_loss_metrics_from_last_stage", lambda d: d)
+    cfg = {
+        "megatron_cfg": {
+            "dynamic_context_parallel": {
+                "enabled": True,
+                "tokens_per_rank": 1024,
+            }
+        }
+    }
+
+    metrics: dict = {}
+    mpw.MegatronPolicyWorkerImpl._collect_mtp_metrics(
+        _fake_worker(mtp_num_layers=1, cfg=cfg),
+        metrics,
+        total_num_microbatches=99,
+        mtp_grad_norm=None,
+    )
+
+    assert captured["parallel_group"] is fixed_group
+    assert metrics["mtp_metrics"]["mtp_1_loss"] == pytest.approx(0.25)
 
 
 @pytest.mark.mcore

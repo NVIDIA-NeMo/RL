@@ -21,6 +21,31 @@ import torch
 
 
 @pytest.mark.mcore
+def test_hybridep_mtp_prepad_requires_dynamic_cp():
+    from nemo_rl.models.megatron.hybridep import (
+        configure_hybridep_packed_input_padding,
+    )
+
+    megatron_cfg = {
+        "moe_flex_dispatcher_backend": "hybridep",
+        "moe_token_dispatcher_type": "flex",
+        "moe_hybridep_prepad_packed_inputs": True,
+        "pipeline_model_parallel_size": 1,
+        "mtp_num_layers": 1,
+    }
+    config = {
+        "megatron_cfg": megatron_cfg,
+        "sequence_packing": {"enabled": True},
+    }
+
+    with pytest.raises(ValueError, match="requires Dynamic CP"):
+        configure_hybridep_packed_input_padding(None, config)
+
+    megatron_cfg["dynamic_context_parallel"] = {"enabled": True}
+    configure_hybridep_packed_input_padding(None, config)
+
+
+@pytest.mark.mcore
 def test_hybridep_prepads_packed_inputs_before_model_forward():
     from megatron.core.packed_seq_params import PackedSeqParams
 
@@ -30,10 +55,11 @@ def test_hybridep_prepads_packed_inputs_before_model_forward():
         target.fill_(14)
 
     input_ids = torch.tensor([[11, 12, 13, 0, 21, 22, 23, 24, 25, 0, 0, 0]])
+    cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
     cu_seqlens_padded = torch.tensor([0, 4, 12], dtype=torch.int32)
     packed_seq_params = PackedSeqParams(
-        cu_seqlens_q=cu_seqlens_padded,
-        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
         cu_seqlens_q_padded=cu_seqlens_padded,
         cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=8,
@@ -82,9 +108,54 @@ def test_hybridep_prepads_packed_inputs_before_model_forward():
     assert torch.equal(padded_input_ids[:, :12], input_ids)
     assert torch.count_nonzero(padded_input_ids[:, 12:]) == 0
     assert torch.equal(padded_cu_seqlens, torch.tensor([0, 4, 16]))
+    assert torch.equal(padded_params.cu_seqlens_q, cu_seqlens)
+    assert torch.equal(padded_params.cu_seqlens_kv, cu_seqlens)
+    assert torch.equal(padded_params.cu_seqlens_q_padded, torch.tensor([0, 4, 16]))
     assert padded_params.total_tokens == 16
     mock_get_group.assert_called_once_with(check_initialized=False)
     mock_all_reduce.assert_called_once()
+
+
+@pytest.mark.mcore
+def test_hybridep_prepadding_extends_mtp_mask_and_keeps_logical_boundary():
+    from nemo_rl.models.megatron.data import process_microbatch
+
+    data = {
+        "input_ids": torch.tensor([[11, 12, 13, 0, 0, 0], [21, 22, 23, 24, 25, 0]]),
+        "input_lengths": torch.tensor([3, 5]),
+        "mtp_loss_mask": torch.tensor([[1, 1, 0, 0, 0, 0], [1, 1, 1, 1, 0, 0]]),
+    }
+
+    with (
+        patch(
+            "nemo_rl.models.megatron.data.get_context_parallel_rank",
+            return_value=0,
+        ),
+        patch(
+            "nemo_rl.models.megatron.data.get_context_parallel_world_size",
+            return_value=1,
+        ),
+        patch(
+            "nemo_rl.models.megatron.hybridep._get_hybridep_aligned_seq_len",
+            return_value=24,
+        ),
+    ):
+        result = process_microbatch(
+            data,
+            seq_length_key="input_lengths",
+            pad_individual_seqs_to_multiple_of=4,
+            pad_packed_seq_to_multiple_of=8,
+            pack_sequences=True,
+            create_packed_seq_padding_mask=True,
+            prepad_packed_seq_for_hybridep=True,
+        )
+
+    assert result.input_ids_cp_sharded.shape == (1, 24)
+    assert result.mtp_loss_mask.shape == (1, 24)
+    assert torch.count_nonzero(result.mtp_loss_mask[:, 16:]) == 0
+    assert torch.all(result.padding_mask[:, 16:])
+    assert result.packed_seq_params.cu_seqlens_q[-1].item() == 16
+    assert result.packed_seq_params.cu_seqlens_q_padded[-1].item() == 24
 
 
 @pytest.mark.mcore

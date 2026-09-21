@@ -91,7 +91,7 @@ class TestDynamicCPDispatch(unittest.TestCase):
             ),
             8,
         )
-        with self.assertRaisesRegex(ValueError, "expert_tensor_parallel_size=1"):
+        self.assertEqual(
             _minimum_cp_size_for_experts(
                 {
                     "tensor_model_parallel_size": 2,
@@ -99,8 +99,10 @@ class TestDynamicCPDispatch(unittest.TestCase):
                     "expert_model_parallel_size": 8,
                 },
                 1,
-            )
-        with self.assertRaisesRegex(ValueError, "expert_tensor_parallel_size=1"):
+            ),
+            8,
+        )
+        self.assertEqual(
             _minimum_cp_size_for_experts(
                 {
                     "tensor_model_parallel_size": 2,
@@ -108,7 +110,9 @@ class TestDynamicCPDispatch(unittest.TestCase):
                     "expert_model_parallel_size": 1,
                 },
                 1,
-            )
+            ),
+            1,
+        )
         with self.assertRaisesRegex(ValueError, "to divide"):
             _minimum_cp_size_for_experts(
                 {
@@ -119,7 +123,7 @@ class TestDynamicCPDispatch(unittest.TestCase):
                 1,
             )
 
-    def test_global_aux_loss_is_rejected_even_with_provider_coefficient(self):
+    def test_global_aux_loss_is_detected_even_with_provider_coefficient(self):
         self.assertTrue(
             _enabled_global_aux_loss(
                 {"moe_router_load_balancing_type": "global_aux_loss"}
@@ -145,9 +149,39 @@ class TestDynamicCPDispatch(unittest.TestCase):
             )
         )
         self.assertFalse(
-            _enabled_global_aux_loss(
-                {"moe_router_load_balancing_type": "seq_aux_loss"}
-            )
+            _enabled_global_aux_loss({"moe_router_load_balancing_type": "seq_aux_loss"})
+        )
+
+    def test_global_aux_loss_aligns_full_domain_collective_rounds(self):
+        data = BatchedDataDict(
+            input_ids=torch.zeros(5, 12, dtype=torch.long),
+            input_lengths=torch.full((5,), 10),
+            sample_mask=torch.ones(5, dtype=torch.long),
+            token_mask=torch.ones(5, 12, dtype=torch.long),
+        )
+        cfg = self._validation_cfg()
+        cfg["megatron_cfg"].update(
+            {
+                "moe_router_load_balancing_type": "global_aux_loss",
+                "dynamic_context_parallel": {
+                    "enabled": True,
+                    "tokens_per_rank": 10,
+                    "max_size": 1,
+                },
+            }
+        )
+
+        validate_dynamic_cp(cfg, lanes=4)
+        dispatch = build_cp_dispatch(data, cfg, self.mesh, batch_size=5, training=True)
+        local_counts = [
+            len(plan.steps[0].assignments) for plans in dispatch.plans for plan in plans
+        ]
+        assert local_counts == [2, 2, 2, 2]
+        assert any(
+            not task.sample_indices
+            for plans in dispatch.plans
+            for plan in plans
+            for task in plan.steps[0].assignments
         )
 
     def _validation_cfg(self) -> dict:
@@ -192,6 +226,70 @@ class TestDynamicCPDispatch(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "overlap_moe_expert_parallel_comm"):
             validate_dynamic_cp(cfg, lanes=4)
+
+    def test_dynamic_cp_validation_allows_mtp_and_hybridep_prepad_separately(self):
+        mtp_cfg = self._validation_cfg()
+        mtp_cfg["megatron_cfg"]["mtp_num_layers"] = 1
+        validate_dynamic_cp(mtp_cfg, lanes=4)
+
+        hybridep_cfg = self._validation_cfg()
+        hybridep_cfg["megatron_cfg"].update(
+            {
+                "moe_token_dispatcher_type": "flex",
+                "moe_flex_dispatcher_backend": "hybridep",
+                "moe_hybridep_prepad_packed_inputs": True,
+            }
+        )
+        validate_dynamic_cp(hybridep_cfg, lanes=4)
+
+    def test_dynamic_cp_validation_allows_mtp_with_hybridep_prepad(self):
+        cfg = self._validation_cfg()
+        cfg["megatron_cfg"].update(
+            {
+                "mtp_num_layers": 1,
+                "moe_hybridep_prepad_packed_inputs": True,
+            }
+        )
+        validate_dynamic_cp(cfg, lanes=4)
+
+    def test_dynamic_cp_keeps_preference_pairs_atomic(self):
+        data = BatchedDataDict(
+            input_ids=torch.arange(4 * 16).reshape(4, 16),
+            input_lengths=torch.tensor([9, 3, 8, 4]),
+            pair_index=torch.tensor([10, 10, 20, 20]),
+            sample_mask=torch.ones(4, dtype=torch.long),
+            token_mask=torch.ones(4, 16, dtype=torch.long),
+        )
+        cfg = self._validation_cfg()
+        cfg["sequence_packing"]["pair_grouping_key"] = "pair_index"
+
+        validate_dynamic_cp(cfg, lanes=4)
+        dispatch = build_cp_dispatch(data, cfg, self.mesh, batch_size=4, training=True)
+
+        real_assignments = [
+            task.sample_indices
+            for group in dispatch.schedule.groups_by_batch[0]
+            for task in group.assignments
+            if task.sample_indices
+        ]
+        for pair in ((0, 1), (2, 3)):
+            assert any(
+                set(pair).issubset(assignment) for assignment in real_assignments
+            )
+
+    def test_dynamic_cp_rejects_atomic_pair_split_across_steps(self):
+        data = BatchedDataDict(
+            input_ids=torch.arange(4 * 16).reshape(4, 16),
+            input_lengths=torch.tensor([9, 3, 8, 4]),
+            pair_index=torch.tensor([10, 20, 10, 20]),
+            sample_mask=torch.ones(4, dtype=torch.long),
+            token_mask=torch.ones(4, 16, dtype=torch.long),
+        )
+        cfg = self._validation_cfg()
+        cfg["sequence_packing"]["pair_grouping_key"] = "pair_index"
+
+        with self.assertRaisesRegex(ValueError, "cannot cross"):
+            build_cp_dispatch(data, cfg, self.mesh, batch_size=2, training=True)
 
     def test_outputs_from_nonzero_static_cp_are_preserved(self):
         dispatch = build_cp_dispatch(

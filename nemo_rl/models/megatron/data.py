@@ -281,9 +281,19 @@ def get_microbatch_iterator(
                 "Dynamic CP iterator requires an explicit optimizer-step plan"
             )
         width = data["input_ids"].shape[1]
+        prepad_packed_seq_for_hybridep = bool(
+            uses_hybridep_flex_dispatcher(cfg["megatron_cfg"])
+            and cfg["megatron_cfg"].get("moe_hybridep_prepad_packed_inputs")
+        )
         return (
             RerunDataIterator(
-                planned_microbatches(data, cp_plan, cp_step, straggler_timer)
+                planned_microbatches(
+                    data,
+                    cp_plan,
+                    cp_step,
+                    straggler_timer,
+                    prepad_packed_seq_for_hybridep=prepad_packed_seq_for_hybridep,
+                )
             ),
             len(cp_step.assignments),
             1,
@@ -703,6 +713,19 @@ def process_microbatch(
                         if model_slices_context_parallel_inputs
                         else local_mtp_loss_mask
                     )
+                    if prepad_packed_seq_for_hybridep:
+                        target_length = input_ids_cp_sharded.shape[1]
+                        current_length = mtp_loss_mask.shape[1]
+                        if current_length > target_length:
+                            raise ValueError(
+                                "HybridEP-prepadded MTP mask exceeds the model input"
+                            )
+                        if current_length < target_length:
+                            mtp_loss_mask = torch.nn.functional.pad(
+                                mtp_loss_mask,
+                                (0, target_length - current_length),
+                                value=0,
+                            )
 
                 # Pack the media-token validity mask the same way as input_ids.
                 # The mask answers a per-token question, so it only means
@@ -740,6 +763,19 @@ def process_microbatch(
                         if model_slices_context_parallel_inputs
                         else local_media_mask
                     ).bool()
+                    if prepad_packed_seq_for_hybridep:
+                        target_length = input_ids_cp_sharded.shape[1]
+                        current_length = media_token_validity_mask.shape[1]
+                        if current_length > target_length:
+                            raise ValueError(
+                                "HybridEP-prepadded media mask exceeds the model input"
+                            )
+                        if current_length < target_length:
+                            media_token_validity_mask = torch.nn.functional.pad(
+                                media_token_validity_mask,
+                                (0, target_length - current_length),
+                                value=False,
+                            )
 
                 # For packed sequences, position_ids and attention_mask are typically None
                 # The PackedSeqParams handles all necessary sequence information

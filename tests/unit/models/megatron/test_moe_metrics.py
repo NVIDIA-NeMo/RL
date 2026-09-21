@@ -210,6 +210,39 @@ def test_dynamic_cp_avg_group_metrics_use_rank_participation_scale(monkeypatch):
 
 
 @pytest.mark.mcore
+def test_dynamic_cp_global_aux_uses_aligned_round_scale(monkeypatch):
+    from nemo_rl.models import megatron as megatron_module
+    from nemo_rl.models.megatron.common import get_moe_metrics
+
+    entry = SimpleNamespace(values=torch.tensor([2.0]), avg_group=None)
+    live_tracker = SimpleNamespace(metrics={"global_load_balancing_loss": entry})
+    monkeypatch.setattr(
+        megatron_module.common, "get_moe_metrics_tracker", lambda: live_tracker
+    )
+    monkeypatch.setattr(
+        megatron_module.common,
+        "get_moe_layer_wise_logging_tracker",
+        lambda: {"global_load_balancing_loss": {"values": entry.values}},
+    )
+    monkeypatch.setattr(
+        megatron_module.common.dist,
+        "all_reduce",
+        lambda values, *, group: values.mul_(2.0),
+    )
+    monkeypatch.setattr(
+        megatron_module.common, "clear_aux_losses_tracker", lambda: None
+    )
+
+    metrics = get_moe_metrics(
+        loss_scale=0.1,
+        dynamic_parallel_group=object(),
+        dynamic_global_loss_scale=0.25,
+    )
+
+    assert metrics["global_load_balancing_loss"] == pytest.approx(1.0)
+
+
+@pytest.mark.mcore
 @pytest.mark.parametrize(
     "routing_type,aux_loss_coeff,z_loss_coeff,expected",
     [

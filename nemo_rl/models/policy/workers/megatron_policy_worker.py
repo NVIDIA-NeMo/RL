@@ -108,6 +108,7 @@ from nemo_rl.models.megatron.train import (
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.dynamic_cp import (
+    _enabled_global_aux_loss,
     dynamic_cp_config,
     owned_real_task_count,
     real_task_participation_count,
@@ -802,8 +803,6 @@ class MegatronPolicyWorkerImpl(
             if self.delegate_pack_to_model or self.model_slices_context_parallel_inputs:
                 raise ValueError("Dynamic CP requires NeMo-owned text-model packing")
             model_config = self._get_model_config()
-            if getattr(model_config, "mtp_num_layers", None):
-                raise ValueError("Dynamic CP does not yet support MTP")
             if getattr(
                 model_config,
                 "overlap_moe_expert_parallel_comm",
@@ -812,20 +811,25 @@ class MegatronPolicyWorkerImpl(
                 raise ValueError(
                     "Dynamic CP does not support overlap_moe_expert_parallel_comm"
                 )
-            if getattr(model_config, "moe_hybridep_prepad_packed_inputs", False):
-                raise ValueError("Dynamic CP does not support HybridEP input prepadding")
-            routing_type = getattr(
-                model_config, "moe_router_load_balancing_type", None
-            )
+            routing_type = getattr(model_config, "moe_router_load_balancing_type", None)
             routing_types = (
                 list(routing_type)
                 if isinstance(routing_type, (list, tuple))
                 else [routing_type]
             )
-            if "global_aux_loss" in routing_types:
-                raise ValueError("Dynamic CP does not support global_aux_loss")
+            if "global_aux_loss" in routing_types and not _enabled_global_aux_loss(
+                self.cfg["megatron_cfg"]
+            ):
+                raise ValueError(
+                    "The model provider enabled global_aux_loss without exposing it "
+                    "in megatron_cfg; Dynamic CP needs the routing type before "
+                    "dispatch so it can align collective rounds"
+                )
             if "quantile_balancing" in routing_types:
                 raise ValueError("Dynamic CP does not support quantile_balancing")
+            from nemo_rl.models.megatron.dynamic_cp import validate_dynamic_cp_model
+
+            validate_dynamic_cp_model(self.model)
 
         if self.model_slices_context_parallel_inputs:
             if self.delegate_pack_to_model:
@@ -1363,12 +1367,16 @@ class MegatronPolicyWorkerImpl(
                     global_participations,
                     group=dynamic_moe_group,
                 )
-                dynamic_avg_loss_scale = 1.0 / max(
-                    1, int(global_participations.item())
+                dynamic_avg_loss_scale = 1.0 / max(1, int(global_participations.item()))
+                dynamic_global_loss_scale = (
+                    1.0 / max(1, total_num_microbatches)
+                    if _enabled_global_aux_loss(self.cfg["megatron_cfg"])
+                    else None
                 )
             else:
                 moe_loss_scale = 1.0 / max(1, total_num_microbatches)
                 dynamic_avg_loss_scale = None
+                dynamic_global_loss_scale = None
             moe_metrics = get_moe_metrics(
                 loss_scale=moe_loss_scale,
                 per_layer_logging=self.cfg["megatron_cfg"]["moe_per_layer_logging"],
@@ -1381,6 +1389,7 @@ class MegatronPolicyWorkerImpl(
                 track_names=get_aux_loss_track_names(model_config),
                 dynamic_parallel_group=dynamic_moe_group,
                 dynamic_avg_loss_scale=dynamic_avg_loss_scale,
+                dynamic_global_loss_scale=dynamic_global_loss_scale,
             )
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
@@ -2889,20 +2898,32 @@ class MegatronPolicyWorkerImpl(
             metrics: Metrics dict to populate with MTP metrics (under "mtp_metrics").
             total_num_microbatches: Microbatches accumulated this step. The MTP loss
                 logging helper sums the per-microbatch loss without dividing, so we pass
-                1/total_num_microbatches to recover the mean (mirroring the MoE path).
+                1/total_num_microbatches to recover the static mean. Dynamic CP instead
+                reduces raw loss sums and token counts over its fixed lane group.
             mtp_grad_norm: The MTP parameter group's gradient norm, already reduced across
                 the model-parallel group, or None when unavailable (e.g. clip_grad == 0 or
                 mtp_detach_heads=False). Logged under "mtp_metrics" as "grad_norm".
         """
         mtp_num_layers = getattr(self.model.config, "mtp_num_layers", None)
         if mtp_num_layers is not None and mtp_num_layers > 0:
-            from nemo_rl.models.megatron.common import get_mtp_metrics
-
             # MTP layers live only on the last pipeline stage, so the tracker is
             # populated there alone. Broadcast to all stages so downstream metric
             # aggregation (which reads rank 0's results) sees them when PP > 1.
-            mtp_loss_scale = 1.0 / max(1, total_num_microbatches)
-            mtp_metrics = get_mtp_metrics(loss_scale=mtp_loss_scale)
+            if dynamic_cp_config(getattr(self, "cfg", {})) is not None:
+                from nemo_rl.models.megatron.dynamic_cp import (
+                    get_dynamic_mtp_metrics,
+                )
+
+                mtp_metrics = get_dynamic_mtp_metrics(
+                    parallel_group=parallel_state.get_data_parallel_group(
+                        with_context_parallel=True
+                    )
+                )
+            else:
+                from nemo_rl.models.megatron.common import get_mtp_metrics
+
+                mtp_loss_scale = 1.0 / max(1, total_num_microbatches)
+                mtp_metrics = get_mtp_metrics(loss_scale=mtp_loss_scale)
             mtp_metrics = broadcast_loss_metrics_from_last_stage(mtp_metrics)
             # mtp_grad_norm is already MP-reduced (same value on every rank); expose it
             # under the "mtp/" namespace so it logs as train/mtp/grad_norm.

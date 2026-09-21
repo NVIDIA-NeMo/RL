@@ -57,9 +57,10 @@ def configure_hybridep_packed_input_padding(
             raise ValueError(
                 "HybridEP input prepadding currently requires pipeline parallel size 1."
             )
-        if megatron_cfg.get("mtp_num_layers"):
+        dynamic_cp = megatron_cfg.get("dynamic_context_parallel") or {}
+        if megatron_cfg.get("mtp_num_layers") and not dynamic_cp.get("enabled", False):
             raise ValueError(
-                "HybridEP input prepadding currently requires MTP disabled."
+                "HybridEP input prepadding with MTP currently requires Dynamic CP."
             )
 
 
@@ -180,10 +181,11 @@ def pad_packed_seq_for_hybridep(
 
     max_last_sequence_len = int(cu_seqlens_padded[-1] - cu_seqlens_padded[-2])
     max_seqlen = max(int(packed_seq_params.max_seqlen_q), max_last_sequence_len)
+    # Preserve the pre-padding sequence boundaries. MTP must not reinterpret
+    # the new HybridEP-only tail as tokens; the *_padded boundaries describe
+    # the enlarged physical buffer consumed by attention and HybridEP.
     packed_seq_params = replace(
         packed_seq_params,
-        cu_seqlens_q=cu_seqlens_padded,
-        cu_seqlens_kv=cu_seqlens_padded,
         cu_seqlens_q_padded=cu_seqlens_padded,
         cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=max_seqlen,

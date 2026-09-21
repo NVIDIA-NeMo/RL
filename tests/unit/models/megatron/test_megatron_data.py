@@ -1348,6 +1348,37 @@ class TestGetMicrobatchIterator:
             is True
         )
 
+    @patch("nemo_rl.models.megatron.data.planned_microbatches")
+    def test_dynamic_cp_forwards_hybridep_prepadding(self, mock_planned):
+        """Dynamic tasks opt into the same pre-forward HybridEP alignment."""
+        from nemo_rl.models.megatron.data import get_microbatch_iterator
+
+        mock_planned.return_value = iter([])
+        data = {"input_ids": torch.zeros(1, 128, dtype=torch.long)}
+        cp_plan = MagicMock()
+        cp_step = MagicMock()
+        cp_step.assignments = (MagicMock(),)
+        cfg = {
+            "sequence_packing": {"enabled": True},
+            "dynamic_batching": {"enabled": False},
+            "megatron_cfg": {
+                "moe_token_dispatcher_type": "flex",
+                "moe_flex_dispatcher_backend": "hybridep",
+                "moe_hybridep_prepad_packed_inputs": True,
+            },
+        }
+
+        get_microbatch_iterator(
+            data=data,
+            cfg=cfg,
+            mbs=1,
+            straggler_timer=MagicMock(),
+            cp_plan=cp_plan,
+            cp_step=cp_step,
+        )
+
+        assert mock_planned.call_args.kwargs["prepad_packed_seq_for_hybridep"] is True
+
     @patch("nemo_rl.models.megatron.data.get_and_validate_seqlen")
     @patch("nemo_rl.models.megatron.data.make_processed_microbatch_iterator")
     def test_get_microbatch_iterator_regular(

@@ -203,6 +203,7 @@ def get_moe_metrics(
     track_names: Optional[list[str]] = None,
     dynamic_parallel_group: Optional[dist.ProcessGroup] = None,
     dynamic_avg_loss_scale: Optional[float] = None,
+    dynamic_global_loss_scale: Optional[float] = None,
 ) -> dict[str, Any]:
     """Returns Mixture of Experts (MoE) auxiliary-loss metrics.
 
@@ -234,6 +235,9 @@ def get_moe_metrics(
             The caller supplies the reciprocal of the global real-task rank
             participation count. Required with ``dynamic_parallel_group`` when
             an averaged metric is present.
+        dynamic_global_loss_scale: Scale for ``global_load_balancing_loss``.
+            Its full-domain collective produces one complete value per aligned
+            call round, rather than one value per independently packed task.
 
     Returns:
         dict[str, Any]: A flat dict of aggregated metrics. For each aux loss name,
@@ -303,16 +307,19 @@ def get_moe_metrics(
                 "Dynamic averaged MoE metrics require a rank-participation scale"
             )
         resolved_dynamic_avg_loss_scale = (
-            dynamic_avg_loss_scale
-            if dynamic_avg_loss_scale is not None
-            else loss_scale
+            dynamic_avg_loss_scale if dynamic_avg_loss_scale is not None else loss_scale
         )
         aux_losses = {
             name: value["values"].float()
             * (
                 resolved_dynamic_avg_loss_scale
                 if name in dynamic_avg_names
-                else loss_scale
+                else (
+                    dynamic_global_loss_scale
+                    if name == "global_load_balancing_loss"
+                    and dynamic_global_loss_scale is not None
+                    else loss_scale
+                )
             )
             for name, value in tracker.items()
         }

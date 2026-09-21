@@ -267,6 +267,40 @@ def _merge_compatible_phases(
     return tuple(merged)
 
 
+def _align_sync_group_tasks(group: CPSyncGroup) -> CPSyncGroup:
+    """Pad each CP subgroup to the same call count for domain-wide collectives."""
+    slots: list[tuple[int, int]] = []
+    tasks_by_slot: dict[tuple[int, int], list[CPAssignment]] = {}
+    for task in group.assignments:
+        slot = (task.lane_start, task.cp_size)
+        if slot not in tasks_by_slot:
+            slots.append(slot)
+            tasks_by_slot[slot] = []
+        tasks_by_slot[slot].append(task)
+
+    round_count = max(len(tasks) for tasks in tasks_by_slot.values())
+    aligned: list[CPAssignment] = []
+    for slot in slots:
+        tasks = tasks_by_slot[slot]
+        aligned.extend(tasks)
+        template = tasks[0]
+        for _ in range(round_count - len(tasks)):
+            aligned.append(
+                CPAssignment(
+                    sample_indices=(),
+                    lane_start=template.lane_start,
+                    cp_size=template.cp_size,
+                    pad_multiple=template.pad_multiple,
+                    padded_tokens=(
+                        (2 + template.pad_multiple - 1)
+                        // template.pad_multiple
+                        * template.pad_multiple
+                    ),
+                )
+            )
+    return CPSyncGroup(tuple(aligned))
+
+
 def plan_cp_phases(
     lengths: list[int],
     *,
@@ -277,6 +311,8 @@ def plan_cp_phases(
     sequence_parallel_size: int,
     user_pad_multiple: int,
     token_alignment: int = 1,
+    atomic_groups: list[tuple[int, ...]] | None = None,
+    align_full_domain_collectives: bool = False,
 ) -> tuple[CPSyncGroup, ...]:
     """Pack sequences and form MCore-style synchronization groups.
 
@@ -296,11 +332,23 @@ def plan_cp_phases(
         < 1
     ):
         raise ValueError("Token budgets and padding factors must be positive")
+    if atomic_groups is None:
+        atomic_groups = [(index,) for index in range(len(lengths))]
+    flattened_indices = [index for group in atomic_groups for index in group]
+    if sorted(flattened_indices) != list(range(len(lengths))):
+        raise ValueError(
+            "Dynamic CP atomic groups must contain every sample exactly once"
+        )
+    if any(not group for group in atomic_groups):
+        raise ValueError("Dynamic CP atomic groups cannot be empty")
+    if any(length < 2 for length in lengths):
+        raise ValueError("Dynamic CP requires at least two input tokens per sample")
+
     bins: dict[int, list[tuple[list[int], int, int]]] = {}
-    for index in sorted(range(len(lengths)), key=lambda i: (-lengths[i], i)):
-        length = lengths[index]
-        if length < 2:
-            raise ValueError("Dynamic CP requires at least two input tokens per sample")
+    for group in sorted(
+        atomic_groups,
+        key=lambda members: (-sum(lengths[index] for index in members), members),
+    ):
         size = min_size
         while True:
             multiple = _padding_for_cp(
@@ -309,13 +357,16 @@ def plan_cp_phases(
                 user_pad_multiple=user_pad_multiple,
                 token_alignment=token_alignment,
             )
-            padded = (length + multiple - 1) // multiple * multiple
+            padded = sum(
+                (lengths[index] + multiple - 1) // multiple * multiple
+                for index in group
+            )
             if padded <= tokens_per_rank * size:
                 break
             size *= 2
             if size > max_size:
                 raise ValueError(
-                    f"Sample {index} of length {length} exceeds the dynamic CP token budget"
+                    f"Atomic sample group {group} exceeds the dynamic CP token budget"
                 )
         # Fill already-required larger-CP calls before opening another call.
         # Keeping separate size buckets strands space: e.g. [6000, 2000] at
@@ -328,16 +379,18 @@ def plan_cp_phases(
                 continue
             size_bins = bins[target_size]
             for bin_index, (members, used, factor) in enumerate(size_bins):
-                target_padded = (length + factor - 1) // factor * factor
+                target_padded = sum(
+                    (lengths[index] + factor - 1) // factor * factor for index in group
+                )
                 if used + target_padded <= tokens_per_rank * target_size:
-                    members.append(index)
+                    members.extend(group)
                     size_bins[bin_index] = (members, used + target_padded, factor)
                     placed = True
                     break
             if placed:
                 break
         if not placed:
-            bins.setdefault(size, []).append(([index], padded, multiple))
+            bins.setdefault(size, []).append((list(group), padded, multiple))
 
     pending = [
         CPAssignment(tuple(members), 0, size, factor, used)
@@ -381,7 +434,10 @@ def plan_cp_phases(
             cursor += min_size
         phases.append(tuple(phase))
         pending = remaining
-    return _merge_compatible_phases(phases, lengths)
+    merged = _merge_compatible_phases(phases, lengths)
+    if align_full_domain_collectives:
+        merged = tuple(_align_sync_group_tasks(group) for group in merged)
+    return merged
 
 
 def assignments_for_lane(group: CPSyncGroup, lane: int) -> tuple[CPAssignment, ...]:
