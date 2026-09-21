@@ -180,12 +180,12 @@ def test_config_v2_same_as_v1(config_file):
     )
 
 
-def test_masked_reward_policy_recipes_differ_only_in_policy() -> None:
-    recipes = []
+def test_masked_reward_policy_experiments_differ_only_in_policy() -> None:
+    configs = []
     for policy in ("exclude", "include"):
         path = (
             real_configs_dir
-            / "recipes/llm"
+            / "experiments"
             / f"grpo-qwen2.5-1.5b-1n1g-dtensor2tp1-masked-reward-{policy}.yaml"
         )
         resolved = OmegaConf.to_container(load_config(path), resolve=True)
@@ -193,5 +193,5 @@ def test_masked_reward_policy_recipes_differ_only_in_policy() -> None:
         assert config.grpo.masked_reward_policy == policy
         values = config.model_dump()
         del values["grpo"]["masked_reward_policy"]
-        recipes.append(values)
-    assert recipes[0] == recipes[1]
+        configs.append(values)
+    assert configs[0] == configs[1]
