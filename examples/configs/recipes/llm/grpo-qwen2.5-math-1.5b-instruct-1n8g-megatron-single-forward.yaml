@@ -2,9 +2,9 @@ defaults: ../../grpo_math_1B.yaml
 grpo:
   max_num_steps: 450
   seq_logprob_error_threshold: 2.0
-  seq_logprob_error_in_loss: true
   skip_reference_policy_logprobs_calculation: true
 loss_fn:
+  seq_logprob_error_in_loss: true
   force_on_policy_ratio: true
   reference_policy_kl_penalty: 0.0
 checkpointing:

@@ -1159,12 +1159,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
     if not is_ppo_run(master_config):
-        if algo_cfg.seq_logprob_error_in_loss:
-            raise ValueError(
-                "grpo.seq_logprob_error_in_loss is not supported by SingleController: "
-                "its advantage baselines depend on the pre-training sequence mask. "
-                "Use the non-streaming GRPO trainer."
-            )
         # A value block without `ppo` is inert -- nothing builds the critic --
         # and a config carrying one is asking for PPO by every reading except
         # the one the code uses. Say so rather than training GRPO silently.
@@ -1267,6 +1261,12 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
+    if master_config.loss_fn.seq_logprob_error_in_loss:
+        raise ValueError(
+            "loss_fn.seq_logprob_error_in_loss is not supported by SingleController: "
+            "its advantage baselines depend on the pre-training sequence mask. "
+            "Use the non-streaming GRPO trainer."
+        )
     _validate_algo_settings(master_config)
 
     async_config = master_config.async_rl

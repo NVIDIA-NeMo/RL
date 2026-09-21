@@ -4462,7 +4462,7 @@ def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
     master_config = mock_grpo_components["master_config"]
     master_config.loss_fn.force_on_policy_ratio = True
     master_config.grpo.seq_logprob_error_threshold = 2.0 if in_loss else None
-    master_config.grpo.seq_logprob_error_in_loss = in_loss
+    master_config.loss_fn.seq_logprob_error_in_loss = in_loss
     master_config.grpo.skip_reference_policy_logprobs_calculation = True
     master_config.loss_fn.reference_policy_kl_penalty = 0
     master_config.grpo.max_num_steps = 1
@@ -6473,7 +6473,7 @@ def test_resolve_logprob_skip_flags(kw, expected):
 def test_single_forward_sync_dataplane_skips_logprob_dispatch(mock_grpo_components):
     config = mock_grpo_components["master_config"]
     config.data_plane = {"enabled": True}
-    config.grpo.seq_logprob_error_in_loss = True
+    config.loss_fn.seq_logprob_error_in_loss = True
     config.grpo.seq_logprob_error_threshold = 2.0
     config.grpo.skip_reference_policy_logprobs_calculation = True
     config.loss_fn.force_on_policy_ratio = True
@@ -6506,7 +6506,7 @@ def test_single_forward_sync_dataplane_skips_logprob_dispatch(mock_grpo_componen
 
 def test_in_loss_threshold_skips_policy_forward_without_disabling_threshold():
     config = _cfg(force=True, threshold=2.0, skip_ref=True, kl_penalty=0)
-    config.grpo.seq_logprob_error_in_loss = True
+    config.loss_fn.seq_logprob_error_in_loss = True
     assert _resolve_logprob_skip_flags(config) == (True, True)
     assert config.grpo.seq_logprob_error_threshold == 2.0
 
@@ -6516,7 +6516,7 @@ def test_validate_single_forward_config(
     mock_grpo_components, include_draft: bool
 ) -> None:
     config = mock_grpo_components["master_config"]
-    config.grpo.seq_logprob_error_in_loss = True
+    config.loss_fn.seq_logprob_error_in_loss = True
     config.grpo.seq_logprob_error_threshold = 2.0
     config.loss_fn.force_on_policy_ratio = True
     config.loss_fn.token_level_loss = True
@@ -6549,7 +6549,7 @@ def test_single_forward_rejects_unsupported_configs(
     mock_grpo_components, override, message
 ):
     config = mock_grpo_components["master_config"]
-    config.grpo.seq_logprob_error_in_loss = True
+    config.loss_fn.seq_logprob_error_in_loss = True
     config.grpo.seq_logprob_error_threshold = 2.0
     config.loss_fn.force_on_policy_ratio = True
     config.loss_fn.token_level_loss = True

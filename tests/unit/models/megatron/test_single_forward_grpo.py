@@ -110,6 +110,7 @@ def test_survivor_normalization_reduces_dp_counts_on_every_pipeline_stage(
     model = Mock()
     loss_fn = ClippedPGLossFn(
         ClippedPGLossConfig(
+            seq_logprob_error_in_loss=True,
             force_on_policy_ratio=True,
             reference_policy_kl_penalty=0,
             use_importance_sampling_correction=True,
@@ -176,7 +177,8 @@ def test_empty_survivor_batch_never_scales_gradients(
         }
     ]
     loss_fn = ClippedPGLossFn(
-        ClippedPGLossConfig(force_on_policy_ratio=True), seq_logprob_error_threshold=2.0
+        ClippedPGLossConfig(seq_logprob_error_in_loss=True, force_on_policy_ratio=True),
+        seq_logprob_error_threshold=2.0,
     )
     kwargs = dict(
         global_valid_seqs=torch.tensor(2.0),
@@ -239,7 +241,10 @@ def test_fractional_survivor_gradients_match_prefiltering(
         expected_lp, expected_data, surviving_weight, surviving_weight
     )
     expected_loss.backward()
-    loss_fn = ClippedPGLossFn(cfg, seq_logprob_error_threshold=1.5)
+    loss_fn = ClippedPGLossFn(
+        cfg.model_copy(update={"seq_logprob_error_in_loss": True}),
+        seq_logprob_error_threshold=1.5,
+    )
     loss, metrics = loss_fn(actual_lp, data, original_weight, original_weight)
     loss.backward()
     model = Mock()
@@ -269,8 +274,12 @@ def test_train_normalizes_survivors_before_optimizer_step(
     from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
 
     loss_fn = ClippedPGLossFn(
-        ClippedPGLossConfig(force_on_policy_ratio=True, reference_policy_kl_penalty=0),
-        seq_logprob_error_threshold=2.0 if in_loss else None,
+        ClippedPGLossConfig(
+            seq_logprob_error_in_loss=in_loss,
+            force_on_policy_ratio=True,
+            reference_policy_kl_penalty=0,
+        ),
+        seq_logprob_error_threshold=2.0,
     )
     assert loss_fn.requires_survivor_normalization is in_loss
     data = {

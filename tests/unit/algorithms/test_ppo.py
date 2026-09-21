@@ -1724,6 +1724,21 @@ def test_ppo_rejects_explicit_vllm_refit_transport_before_cluster_creation(
     cluster_cls.assert_not_called()
 
 
+def test_ppo_rejects_in_loss_filter_before_cluster_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config()
+    config.loss_fn.seq_logprob_error_in_loss = True
+
+    with pytest.raises(ValueError, match="seq_logprob_error_in_loss.*PPO"):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
 def test_noncolocated_sglang_is_rejected_before_cluster_creation(monkeypatch):
     """SGLang has no cross-cluster refit path, so setup must reject it early."""
     from unittest.mock import MagicMock

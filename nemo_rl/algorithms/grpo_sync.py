@@ -971,7 +971,7 @@ def grpo_train_sync(
                     # sequence-error metrics.
                     seq_logprob_error_metrics = (
                         {}
-                        if master_config.grpo.seq_logprob_error_in_loss
+                        if master_config.loss_fn.seq_logprob_error_in_loss
                         else _placeholder_seq_logprob_error_metrics()
                     )
                 else:

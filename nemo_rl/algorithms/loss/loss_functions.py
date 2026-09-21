@@ -181,6 +181,11 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # NOTE: This should only be used when doing exactly one update per rollout
     # (i.e., num_prompts_per_step * num_generations_per_prompt == train_global_batch_size)
     force_on_policy_ratio: bool = False
+    # Evaluate grpo.seq_logprob_error_threshold in the training loss, then
+    # normalize accumulated gradients over survivors before the optimizer step.
+    # Opt-in; supported only for token-level, force-on-policy Megatron GRPO
+    # with the non-streaming trainer.
+    seq_logprob_error_in_loss: bool = False
     # If True, use CISPO (Clipped IS-weight Policy Optimization) from MiniMax-M1.
     use_cispo: bool = False
     # VAPO: weight μ for positive-example NLL loss on correct samples.
@@ -265,16 +270,21 @@ class ClippedPGLossFn(LossFunction):
             use_fused_linear_logprobs: Whether the model returns precomputed
                 next-token logprobs instead of logits.
             opd_full: Optional full-vocabulary distillation configuration.
-            seq_logprob_error_threshold: Enables sequence filtering inside the
-                loss when set. The loss emits survivor counts but normalizes by
+            seq_logprob_error_threshold: Required when
+                ``cfg.seq_logprob_error_in_loss`` is enabled; otherwise unused.
+                The loss emits survivor counts but normalizes by
                 the original global counts. The worker must aggregate survivor
                 counts across all microbatches and data-parallel ranks, then
                 rescale gradients and normalized metrics before clipping or
                 stepping the optimizer. See ``requires_survivor_normalization``.
-                Leave unset when filtering is performed before training.
         """
+        self.seq_logprob_error_in_loss = cfg.seq_logprob_error_in_loss
         self.seq_logprob_error_threshold = seq_logprob_error_threshold
-        if seq_logprob_error_threshold is not None:
+        if self.seq_logprob_error_in_loss:
+            if seq_logprob_error_threshold is None:
+                raise ValueError(
+                    "loss_fn.seq_logprob_error_in_loss requires seq_logprob_error_threshold"
+                )
             if not cfg.force_on_policy_ratio or not cfg.token_level_loss:
                 raise ValueError(
                     "In-loss sequence filtering requires force_on_policy_ratio "
@@ -459,10 +469,9 @@ class ClippedPGLossFn(LossFunction):
     def requires_survivor_normalization(self) -> bool:
         """Whether the worker must renormalize using in-loss survivor counts.
 
-        Derived from the filtering threshold so filtering and the worker's
-        normalization requirement cannot be configured independently.
+        Uses the same switch as filtering so the loss and worker agree.
         """
-        return self.seq_logprob_error_threshold is not None
+        return self.seq_logprob_error_in_loss
 
     def __call__(
         self,
@@ -536,7 +545,8 @@ class ClippedPGLossFn(LossFunction):
             prev_logprobs = curr_logprobs.detach()
 
         seq_error_metrics = {}
-        if self.seq_logprob_error_threshold is not None:
+        if self.seq_logprob_error_in_loss:
+            assert self.seq_logprob_error_threshold is not None
             errors, _ = compute_seq_logprob_errors(
                 policy_logprobs=curr_logprobs.detach(),
                 generation_logprobs=generation_logprobs,

@@ -29,6 +29,7 @@ from pydantic import ValidationError
 from nemo_rl.algorithms.async_utils.staleness_sampler import SamplerConfig
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     FleetHealthConfig,
@@ -82,11 +83,18 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
     )
 
 
-def test_single_forward_threshold_rejected_before_streaming_setup():
+@pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
+def test_single_forward_threshold_rejected_before_streaming_setup(
+    algorithm: str,
+) -> None:
     cfg = _master_config()
-    cfg.grpo.seq_logprob_error_in_loss = True
+    cfg.loss_fn.seq_logprob_error_in_loss = True
     cfg.grpo.seq_logprob_error_threshold = 2.0
     cfg.loss_fn.force_on_policy_ratio = True
+    if algorithm == "ppo":
+        # The loss flag must be rejected even without a GRPO block.
+        cfg.ppo = PPOConfig.model_construct()
+        cfg.grpo = None
     with pytest.raises(ValueError, match="advantage baselines"):
         validate_single_controller_config(cfg)
 

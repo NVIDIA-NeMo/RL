@@ -49,9 +49,6 @@ grpo:
   skip_reference_policy_logprobs_calculation: false
   calculate_advantages_on_gpu: false
   seq_logprob_error_threshold: null
-  # Opt-in single-forward Megatron GRPO: apply the threshold during training
-  # and normalize gradients over survivors before the optimizer step.
-  seq_logprob_error_in_loss: false
   # Advantage value assigned to invalid tool call tokens (e.g. -5.0 to penalize). null disables.
   invalid_tool_call_advantage: null
   # Advantage value assigned to tokens with malformed <think>/</think> tags (e.g. -5.0). null disables.
@@ -110,6 +107,9 @@ loss_fn:
   sequence_level_importance_ratios: false
   token_level_loss: true
   force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
+  # Opt-in single-forward Megatron GRPO: apply the threshold during training
+  # and normalize gradients over survivors before the optimizer step.
+  seq_logprob_error_in_loss: false
   use_kl_in_reward: false  # Reinforce++: add KL penalty to reward instead of loss
   # Disable PPO ratio (curr_logprobs - prev_logprobs).exp(); falls back to REINFORCE-style
   # surrogate loss. Used by REINFORCE/RLOO. See https://arxiv.org/abs/2402.14740

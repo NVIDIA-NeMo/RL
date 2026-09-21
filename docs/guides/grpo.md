@@ -559,7 +559,7 @@ To enable the importance sampling correction, set the config `use_importance_sam
 
 #### Single-forward sequence-logprob filtering
 
-For non-streaming Megatron GRPO, enable `grpo.seq_logprob_error_in_loss`
+For non-streaming Megatron GRPO, enable `loss_fn.seq_logprob_error_in_loss`
 to apply the absolute sequence-logprob error threshold inside the training
 loss. This avoids the standalone policy-logprob forward even when
 `grpo.seq_logprob_error_threshold` is set:
@@ -567,9 +567,9 @@ loss. This avoids the standalone policy-logprob forward even when
 ```yaml
 grpo:
   seq_logprob_error_threshold: 2.0
-  seq_logprob_error_in_loss: true
   skip_reference_policy_logprobs_calculation: true
 loss_fn:
+  seq_logprob_error_in_loss: true
   force_on_policy_ratio: true
   token_level_loss: true
   reference_policy_kl_penalty: 0.0
@@ -592,7 +592,7 @@ The [Qwen2.5-Math-1.5B single-forward recipe](../../examples/configs/recipes/llm
 provides a complete configuration for one node with eight GPUs. Its nightly
 test checks finite training metrics and positive survivor counts. For a
 separate-forward baseline, run the same recipe with
-`grpo.seq_logprob_error_in_loss=false`; keep the other settings unchanged.
+`loss_fn.seq_logprob_error_in_loss=false`; keep the other settings unchanged.
 
 The loss computes the same mean `exp(abs(policy_logprob - generation_logprob))`
 over valid response tokens, using detached logprobs from the training forward.

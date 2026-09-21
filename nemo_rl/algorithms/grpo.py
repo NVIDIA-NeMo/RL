@@ -375,10 +375,6 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Sequence-level logprob error masking for training stability. If set, mask sequences with mult_prob_error exceeding this threshold (same scale as token_mult_prob_error metric, e.g., 1.5)
     # Note that this is slightly different than Masked Importance Sampling (MIS) because this uses the absolute value of the difference between the training and generation logprobs, whereas MIS just uses the difference between the training and generation logprobs.
     seq_logprob_error_threshold: float | None = None
-    # Evaluate the threshold in the training loss and normalize accumulated
-    # gradients afterward, avoiding the separate policy-logprob forward.
-    # Supported for token-level, force-on-policy Megatron GRPO (non-streaming).
-    seq_logprob_error_in_loss: bool = False
     # Advantage value to assign to invalid tool call tokens. When set (e.g. -5.0), overwrites the
     # computed advantage for those tokens to penalize them; absent/None disables the penalty.
     invalid_tool_call_advantage: float | None = None
@@ -469,26 +465,28 @@ class MasterConfig(BaseModel, extra="allow"):
 
 def _validate_seq_logprob_error_in_loss(master_config: MasterConfig) -> None:
     """Validate the single-forward threshold path before allocating workers."""
-    if not master_config.grpo.seq_logprob_error_in_loss:
+    if not master_config.loss_fn.seq_logprob_error_in_loss:
         return
     if master_config.grpo.seq_logprob_error_threshold is None:
         raise ValueError(
-            "grpo.seq_logprob_error_in_loss requires seq_logprob_error_threshold"
+            "loss_fn.seq_logprob_error_in_loss requires seq_logprob_error_threshold"
         )
     loss = master_config.loss_fn
     if not loss.force_on_policy_ratio or not loss.token_level_loss:
         raise ValueError(
-            "grpo.seq_logprob_error_in_loss requires force_on_policy_ratio=true "
+            "loss_fn.seq_logprob_error_in_loss requires force_on_policy_ratio=true "
             "and token_level_loss=true"
         )
     if master_config.grpo.adv_estimator.name != "grpo" or loss.use_kl_in_reward:
         raise ValueError(
-            "grpo.seq_logprob_error_in_loss requires the grpo advantage estimator "
+            "loss_fn.seq_logprob_error_in_loss requires the grpo advantage estimator "
             "without use_kl_in_reward"
         )
     policy = master_config.policy
     if "megatron_cfg" not in policy or not policy["megatron_cfg"]["enabled"]:
-        raise ValueError("grpo.seq_logprob_error_in_loss requires the Megatron backend")
+        raise ValueError(
+            "loss_fn.seq_logprob_error_in_loss requires the Megatron backend"
+        )
     if (
         policy["megatron_cfg"].get("mtp_num_layers")
         or ("draft" in policy and policy["draft"]["enabled"])
@@ -496,7 +494,7 @@ def _validate_seq_logprob_error_in_loss(master_config: MasterConfig) -> None:
         or opd_module.is_opd_enabled(master_config)
     ):
         raise ValueError(
-            "grpo.seq_logprob_error_in_loss does not support MTP, draft, "
+            "loss_fn.seq_logprob_error_in_loss does not support MTP, draft, "
             "positive-example NLL, or distillation losses"
         )
 
@@ -835,11 +833,7 @@ def setup(
     loss_fn = ClippedPGLossFn(
         loss_config,
         use_fused_linear_logprobs=use_fused_linear_logprobs,
-        seq_logprob_error_threshold=(
-            grpo_config.seq_logprob_error_threshold
-            if grpo_config.seq_logprob_error_in_loss
-            else None
-        ),
+        seq_logprob_error_threshold=grpo_config.seq_logprob_error_threshold,
     )
 
     # Validate force_on_policy_ratio
@@ -2808,7 +2802,7 @@ def _resolve_logprob_skip_flags(
     if (
         master_config.loss_fn.force_on_policy_ratio
         and master_config.grpo.seq_logprob_error_threshold is not None
-        and not master_config.grpo.seq_logprob_error_in_loss
+        and not master_config.loss_fn.seq_logprob_error_in_loss
     ):
         warnings.warn(
             "force_on_policy_ratio=True but seq_logprob_error_threshold is set. "
@@ -3641,7 +3635,7 @@ def _grpo_train_impl(
                     # sequence-error metrics.
                     seq_logprob_error_metrics = (
                         {}
-                        if master_config.grpo.seq_logprob_error_in_loss
+                        if master_config.loss_fn.seq_logprob_error_in_loss
                         else _placeholder_seq_logprob_error_metrics()
                     )
                 else:
@@ -5444,7 +5438,7 @@ def async_grpo_train(
                     # sequence-error metrics.
                     seq_logprob_error_metrics = (
                         {}
-                        if master_config.grpo.seq_logprob_error_in_loss
+                        if master_config.loss_fn.seq_logprob_error_in_loss
                         else _placeholder_seq_logprob_error_metrics()
                     )
                 else:

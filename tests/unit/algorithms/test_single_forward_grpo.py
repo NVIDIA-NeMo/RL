@@ -35,8 +35,10 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 def test_in_loss_filter_rejects_incompatible_loss_configuration(
     overrides: dict[str, bool | float], message: str
 ) -> None:
-    """Passing a threshold cannot silently enable filtering for ordinary PPO."""
-    cfg = ClippedPGLossConfig(force_on_policy_ratio=True)
+    """Opting in requires a loss compatible with survivor normalization."""
+    cfg = ClippedPGLossConfig(
+        force_on_policy_ratio=True, seq_logprob_error_in_loss=True
+    )
     cfg = cfg.model_copy(update=overrides)
     with pytest.raises(ValueError, match=message):
         ClippedPGLossFn(cfg, seq_logprob_error_threshold=2.0)
@@ -106,7 +108,10 @@ def test_accumulated_loss_and_gradients_match_upstream_mask(chunks, kl_penalty):
     )
     expected_loss.backward()
 
-    loss_fn = ClippedPGLossFn(cfg, seq_logprob_error_threshold=2.0)
+    loss_fn = ClippedPGLossFn(
+        cfg.model_copy(update={"seq_logprob_error_in_loss": True}),
+        seq_logprob_error_threshold=2.0,
+    )
     actual_lp = values.clone().requires_grad_()
     metrics = []
     start = 0
@@ -156,7 +161,11 @@ def test_rejected_nonfinite_logprobs_do_not_poison_loss(bad_value):
     values[1, :2] = bad_value
     lp = values.requires_grad_()
     loss_fn = ClippedPGLossFn(
-        ClippedPGLossConfig(force_on_policy_ratio=True, reference_policy_kl_penalty=0),
+        ClippedPGLossConfig(
+            seq_logprob_error_in_loss=True,
+            force_on_policy_ratio=True,
+            reference_policy_kl_penalty=0,
+        ),
         seq_logprob_error_threshold=2.0,
     )
     loss, metrics = loss_fn(
@@ -186,6 +195,7 @@ def test_rejected_nonfinite_logprobs_stay_contained_under_reference_kl(
     lp = values.requires_grad_()
     loss_fn = ClippedPGLossFn(
         ClippedPGLossConfig(
+            seq_logprob_error_in_loss=True,
             force_on_policy_ratio=True,
             token_level_loss=True,
             reference_policy_kl_penalty=0.1,
@@ -230,7 +240,11 @@ def test_all_rejected_loss_reports_zero_survivors_and_zero_gradient():
     data, values = _batch()
     lp = values.requires_grad_()
     loss, metrics = ClippedPGLossFn(
-        ClippedPGLossConfig(force_on_policy_ratio=True, reference_policy_kl_penalty=0),
+        ClippedPGLossConfig(
+            seq_logprob_error_in_loss=True,
+            force_on_policy_ratio=True,
+            reference_policy_kl_penalty=0,
+        ),
         seq_logprob_error_threshold=0.5,
     )(
         next_token_logprobs=lp,
@@ -245,25 +259,58 @@ def test_all_rejected_loss_reports_zero_survivors_and_zero_gradient():
     assert metrics["num_masked_seqs_by_logprob_error"] == 3
 
 
-def test_no_threshold_keeps_existing_loss_contract():
+def test_in_loss_filter_requires_threshold() -> None:
+    cfg = ClippedPGLossConfig(
+        force_on_policy_ratio=True, seq_logprob_error_in_loss=True
+    )
+    with pytest.raises(ValueError, match="requires seq_logprob_error_threshold"):
+        ClippedPGLossFn(cfg)
+
+
+@pytest.mark.parametrize("threshold", [None, 2.0])
+@pytest.mark.parametrize("force_on_policy_ratio", [False, True])
+def test_disabled_in_loss_filter_keeps_existing_loss_contract(
+    threshold: float | None, force_on_policy_ratio: bool
+) -> None:
     data, values = _batch()
-    _, metrics = ClippedPGLossFn(
-        ClippedPGLossConfig(force_on_policy_ratio=True, reference_policy_kl_penalty=0)
-    )(
-        next_token_logprobs=values,
+    data["prev_logprobs"] = torch.cat([torch.zeros(4, 1), values], dim=1)
+    cfg = ClippedPGLossConfig(
+        force_on_policy_ratio=force_on_policy_ratio, reference_policy_kl_penalty=0
+    )
+    loss_fn = ClippedPGLossFn(cfg, seq_logprob_error_threshold=threshold)
+    assert not loss_fn.requires_survivor_normalization
+    actual_values = values.clone().requires_grad_()
+    expected_values = values.clone().requires_grad_()
+    loss, metrics = loss_fn(
+        next_token_logprobs=actual_values,
+        data=data,
+        global_valid_seqs=torch.tensor(3.0),
+        global_valid_toks=torch.tensor(6.0),
+    )
+    expected_loss, expected_metrics = ClippedPGLossFn(cfg)(
+        next_token_logprobs=expected_values,
         data=data,
         global_valid_seqs=torch.tensor(3.0),
         global_valid_toks=torch.tensor(6.0),
     )
     assert metrics["num_valid_samples"] == 3
     assert "seq_logprob_error_valid_tokens" not in metrics
+    assert metrics == expected_metrics
+    loss.backward()
+    expected_loss.backward()
+    torch.testing.assert_close(loss, expected_loss)
+    torch.testing.assert_close(actual_values.grad, expected_values.grad)
 
 
 def test_packed_loss_preserves_sequence_decisions_and_survivor_counts():
     """Per-sequence packing must sum counts, never normalize each sequence alone."""
     data, values = _batch()
     loss_fn = ClippedPGLossFn(
-        ClippedPGLossConfig(force_on_policy_ratio=True, reference_policy_kl_penalty=0),
+        ClippedPGLossConfig(
+            seq_logprob_error_in_loss=True,
+            force_on_policy_ratio=True,
+            reference_policy_kl_penalty=0,
+        ),
         seq_logprob_error_threshold=2.0,
     )
     expected_lp = values.clone().requires_grad_()
