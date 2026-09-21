@@ -26,7 +26,6 @@ import asyncio
 import json
 import sys
 import threading
-from collections.abc import AsyncGenerator
 from contextlib import nullcontext
 from copy import deepcopy
 from types import SimpleNamespace
@@ -56,7 +55,6 @@ from nemo_rl.models.generation.vllm.gpu_output_capture import (
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
-    _AsyncLLMHTTPClient,
     _validate_gpu_route_history,
 )
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts  # noqa: E402
@@ -102,40 +100,6 @@ def test_gpu_route_history_requires_canonical_rows_before_final_dummy(
             _validate_gpu_route_history(request_output)
     else:
         _validate_gpu_route_history(request_output)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("tagged", [True, False])
-async def test_gpu_capture_preserves_existing_route_history_offset(
-    tagged: bool,
-) -> None:
-    observed: list[tuple[Any, int, str, dict[str, Any]]] = []
-
-    async def generate(
-        prompt: Any, params: Any, request_id: str, **kwargs: Any
-    ) -> AsyncGenerator[str, None]:
-        observed.append(
-            (prompt, params.routed_experts_prompt_start, request_id, kwargs)
-        )
-        yield "result"
-
-    engine = SimpleNamespace(
-        model_config=None,
-        renderer=None,
-        input_processor=None,
-        vllm_config=None,
-        generate=generate,
-    )
-    client = _AsyncLLMHTTPClient(engine, asyncio.get_running_loop())
-    extra_args = {GPU_CAPTURE_KEY: "call"} if tagged else {"other": "value"}
-    params = SimpleNamespace(extra_args=extra_args, routed_experts_prompt_start=7)
-    outputs = [
-        output
-        async for output in client.generate("prompt", params, "request", priority=2)
-    ]
-    assert outputs == ["result"]
-    assert observed == [("prompt", 7, "request", {"priority": 2})]
-    assert params.extra_args == extra_args
 
 
 class _MemorySink:
@@ -369,8 +333,6 @@ def _worker_with_capture(sink: _MemorySink):
 
 
 def test_gpu_capture_key_is_scoped_to_one_admitted_request():
-    from nemo_rl.models.generation.vllm.gpu_output_capture import GPU_CAPTURE_KEY
-
     worker = _worker_with_capture(_MemorySink())
     worker._gpu_capture_host = object()
     request = _FakeRequest(

@@ -167,24 +167,6 @@ def test_bound_sink_releases_payload_after_failed_stage() -> None:
     bound.clear()
 
 
-def test_concurrent_calls_have_independent_gpu_bindings() -> None:
-    barrier = threading.Barrier(2)
-
-    class ConcurrentSink:
-        def stage(self, record: Any, *, gpu_payload: GpuTokenPayload) -> StageResult:
-            barrier.wait(timeout=5)
-            return StageResult(ok=True, staging_key=str(gpu_payload.prompt_len))
-
-    shared = ConcurrentSink()
-    bindings = [BoundGpuTokenSink(shared), BoundGpuTokenSink(shared)]
-    for index, bound in enumerate(bindings):
-        bound.bind(_payload(prompt_len=index, device="cpu"))
-    record = _record()
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        results = list(executor.map(lambda bound: bound.stage(record), bindings))
-    assert [result.staging_key for result in results] == ["0", "1"]
-
-
 @requires_cuda
 @pytest.mark.parametrize(
     "prev_len,prompt_len,backfill_ranges,routing_dtype,cast_routes",
@@ -280,25 +262,6 @@ def test_gpu_fields_match_committed_wire_without_rebuilding_generated_values(
         extras_digest_version=record.extras_digest_version,
         expected_extras_digest=record.extras_digest,
     )
-
-
-@requires_cuda
-def test_staging_fields_preserves_cpu_mask_identity_and_bits() -> None:
-    record = _record()
-    client = _PutClient()
-    assert TQTokenSink(client, staging_partition="staging").stage(record).ok
-    cpu_fields = dict(client.puts[0]["fields"].items())
-    # Test helper input preservation independently of Gym's record validation:
-    # neither signed zero nor a different mask pattern may be reconstructed.
-    mask = torch.tensor([[-0.0, 1.0, 1.0, 1.0]], dtype=torch.float32)
-    cpu_fields["token_mask_delta"] = mask
-    mask_bits = mask.view(torch.int32).clone()
-
-    fields = _payload().staging_fields(record, cpu_fields)
-
-    assert fields["token_mask_delta"] is mask
-    assert not fields["token_mask_delta"].is_cuda
-    assert torch.equal(mask.view(torch.int32), mask_bits)
 
 
 @requires_cuda

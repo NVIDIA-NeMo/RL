@@ -21,7 +21,7 @@ import socket
 from collections.abc import Awaitable, Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, TypeVar
+from typing import Any, Protocol, TypeVar
 
 import torch
 from starlette.responses import JSONResponse, Response
@@ -33,9 +33,6 @@ from nemo_rl.models.generation.vllm.gpu_output_capture import (
     GpuOutputLease,
     import_gpu_output_lease,
 )
-
-if TYPE_CHECKING:
-    from ray.actor import ActorHandle
 
 _Result = TypeVar("_Result")
 LOGGER = logging.getLogger(__name__)
@@ -114,11 +111,8 @@ class GpuCaptureHost:
         self,
         rpc: CaptureRpcClient,
         device: torch.device,
-        *,
-        worker: ActorHandle | None = None,
     ) -> None:
         self._rpc = rpc
-        self._worker = worker
         if device.type != "cuda" or device.index is None:
             raise ValueError("GPU capture requires an explicit CUDA device ordinal")
         self._device_index = device.index
@@ -143,25 +137,13 @@ class GpuCaptureHost:
                 # TP workers and the frontend can use different CUDA ordinals.
                 # TQ binds its transfer threads to this device when attaching.
                 for index in range(torch.cuda.device_count()):
-                    if (
-                        str(torch.cuda.get_device_properties(index).uuid)
-                        == owners[0].gpu_uuid
-                    ):
-                        return cls(
-                            rpc, torch.device("cuda", index), worker=owners[0].worker
-                        )
+                    if str(torch.cuda.get_device_properties(index).uuid) == owners[0]:
+                        return cls(rpc, torch.device("cuda", index))
         except Exception as error:
             LOGGER.debug(
                 "GPU output reuse unavailable; using existing CPU PUT: %s", error
             )
         return None
-
-    async def _call_worker(self, method: str, *, args: tuple[Any, ...]) -> Any:
-        if self._worker is not None:
-            # The Ray wrapper already exposes execute_method. Calling its owner
-            # directly avoids the engine utility queue and other TP workers.
-            return [await self._worker.execute_method.remote(method, *args)]
-        return await self._rpc.collective_rpc(method, args=args)
 
     def start_export(
         self,
@@ -183,23 +165,10 @@ class GpuCaptureHost:
             len(state.prompt_token_ids),
             routed_experts_start,
         )
-        # Submit and register result retrieval before the formatter blocks the
-        # event loop; the owned task below adopts this same Ray reply once.
-        reply = (
-            self._worker.execute_method.remote(
-                "export_gpu_output_capture", *args
-            ).future()
-            if self._worker is not None
-            else None
-        )
 
         async def export() -> GpuOutputLease:
-            leases = (
-                [await asyncio.wrap_future(reply)]
-                if reply is not None
-                else await self._rpc.collective_rpc(
-                    "export_gpu_output_capture", args=args
-                )
+            leases = await self._rpc.collective_rpc(
+                "export_gpu_output_capture", args=args
             )
             owned = [lease for lease in leases if lease is not None]
             if len(owned) != 1 or not isinstance(owned[0], GpuOutputLease):
@@ -256,10 +225,10 @@ class GpuCaptureHost:
     async def finish(
         self,
         state: CapturedModelCall,
-        operation: Callable[[], _Result],
+        operation: Callable[[], dict],
         *,
-        finalize: Callable[[_Result], Any] | None = None,
-    ) -> Any:
+        finalize: Callable[[dict], JSONResponse],
+    ) -> Response:
         """Complete PUT, handing JSON-response cleanup to its ASGI request."""
         loop = asyncio.get_running_loop()
         overlap = state.lease is not None and state.export_task is None
@@ -278,7 +247,7 @@ class GpuCaptureHost:
                             error,
                         )
                 result = operation()
-                if finalize is not None and overlap:
+                if overlap:
                     self._start_release(state, loop)
                     return finalize(result)
                 return result
@@ -287,7 +256,7 @@ class GpuCaptureHost:
         response_owns_cleanup = False
         try:
             result = await _await_completion(task)
-            if finalize is not None and overlap and isinstance(result, JSONResponse):
+            if overlap:
                 response = _GpuCaptureResponse(result, lambda: self.release(state))
                 response_owns_cleanup = True
                 return response
@@ -296,9 +265,7 @@ class GpuCaptureHost:
             # handed ownership to ASGI, so it must finish cleanup here.
             if not response_owns_cleanup:
                 await self.release(state)
-        if finalize is not None and not overlap:
-            return finalize(result)
-        return result
+        return finalize(result)
 
     def _start_release(
         self, state: CapturedModelCall, loop: asyncio.AbstractEventLoop
@@ -316,17 +283,12 @@ class GpuCaptureHost:
                 if state.ipc_handles_consumed
                 else "abandon_unimported_gpu_output_capture"
             )
-            if self._worker is not None:
-                state.release_reply = self._worker.execute_method.remote(
-                    method, state.lease.capture_key
-                ).future()
-            else:
-                # on_device runs in a thread while the serving loop is free.
-                # Submit before JSON formatting; the existing client bridges
-                # this call to the engine loop without waiting for its ACK.
-                state.release_reply = asyncio.run_coroutine_threadsafe(
-                    self._call_worker(method, args=(state.lease.capture_key,)), loop
-                )
+            # on_device runs in a thread while the serving loop is free.
+            # Submit before JSON formatting; the existing client bridges
+            # this call to the engine loop without waiting for its ACK.
+            state.release_reply = asyncio.run_coroutine_threadsafe(
+                self._rpc.collective_rpc(method, args=(state.lease.capture_key,)), loop
+            )
         except Exception as error:
             # Preserve release()'s warning-only error policy and producer lease.
             # The same cleanup attempt must not fence or dispatch a second time.
@@ -367,12 +329,14 @@ class GpuCaptureHost:
                     if state.ipc_handles_consumed
                     else "abandon_unimported_gpu_output_capture"
                 )
-                await self._call_worker(release_method, args=(state.lease.capture_key,))
+                await self._rpc.collective_rpc(
+                    release_method, args=(state.lease.capture_key,)
+                )
             state.lease = None
             state.capture_key = None
             state.ipc_handles_consumed = False
         if state.capture_key is not None:
-            await self._call_worker(
+            await self._rpc.collective_rpc(
                 "discard_gpu_output_capture", args=(state.capture_key,)
             )
             state.capture_key = None

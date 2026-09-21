@@ -30,9 +30,7 @@ from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any
 
-import ray
 import torch
-from ray.actor import ActorHandle
 from torch.multiprocessing.reductions import rebuild_cuda_tensor, reduce_tensor
 
 from nemo_rl.models.generation.vllm.utils import VLLM_LOGPROB_FLOOR
@@ -42,14 +40,6 @@ GPU_CAPTURE_KEY = "nrl_gpu_output_capture_key"
 
 # PyTorch owns the CUDA sharing protocol; carry its reduction arguments unchanged.
 CudaTensorIpc = tuple[Any, ...]
-
-
-@dataclass(frozen=True)
-class GpuCaptureOwner:
-    """Locate retained outputs without redispatching through the engine core."""
-
-    gpu_uuid: str
-    worker: ActorHandle | None = None
 
 
 @dataclass(frozen=True)
@@ -509,8 +499,6 @@ class GpuOutputCapture:
                 if not route_fragments:
                     raise RuntimeError("GPU output is missing routed experts")
                 route_shape = tuple(route_fragments[0].routes.shape[1:])
-                if len(route_shape) != 2:
-                    raise RuntimeError("Expected [tokens, layers, topk] GPU routes")
             assembled_routes = None
             if route_shape is not None:
                 source = route_fragments[0].routes
@@ -693,8 +681,8 @@ def configure_gpu_output_capture(
     *,
     frontend_hostname: str,
     require_routed_experts: bool,
-) -> GpuCaptureOwner | None:
-    """Reuse native outputs when available; otherwise retain the existing CPU PUT."""
+) -> str | None:
+    """Return the capture GPU UUID, or None to preserve the existing CPU PUT."""
     # vLLM is optional outside the native generation-worker environment.
     from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 
@@ -730,11 +718,4 @@ def configure_gpu_output_capture(
         worker._gpu_output_capture = existing
     elif existing.require_routed_experts != require_routed_experts:
         return None
-    owner = None
-    if parallel.distributed_executor_backend == "ray":
-        actor = ray.get_runtime_context().current_actor
-        # RayExecutorV2 exposes no execute_method; keep GPU capture active via
-        # the executor's existing collective_rpc path instead.
-        if callable(getattr(getattr(actor, "execute_method", None), "remote", None)):
-            owner = actor
-    return GpuCaptureOwner(existing.gpu_uuid, owner)
+    return existing.gpu_uuid

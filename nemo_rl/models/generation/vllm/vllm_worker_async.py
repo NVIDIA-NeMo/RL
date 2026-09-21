@@ -27,6 +27,7 @@ import ray
 import torch
 import uvicorn
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse, Response
 
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.data_plane.gpu_token_payload import BoundGpuTokenSink
@@ -818,8 +819,8 @@ class VllmAsyncGenerationWorkerImpl(
         request: Any,
         content: dict,
         *,
-        finalize: Callable[[dict], Any] | None = None,
-    ) -> Any:
+        finalize: Callable[[dict], JSONResponse],
+    ) -> Response:
         """Keep the original device allocations alive through the blocking PUT."""
         state = self._capture_calls.get(id(request))
         operation = lambda: self._finish_request_capture(request, content)
@@ -829,7 +830,7 @@ class VllmAsyncGenerationWorkerImpl(
                 state, operation, finalize=finalize
             )
         result = await asyncio.to_thread(operation)
-        return finalize(result) if finalize is not None else result
+        return finalize(result)
 
     async def _abort_request_capture(self, request: Any, *, reason: str) -> None:
         """Drop the in-flight capture state for a request that errored."""
@@ -851,7 +852,7 @@ class VllmAsyncGenerationWorkerImpl(
         from typing import List, Optional, Union
 
         from fastapi import Request
-        from fastapi.responses import JSONResponse, StreamingResponse
+        from fastapi.responses import StreamingResponse
         from vllm.entrypoints.chat_utils import load_chat_template
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
