@@ -75,6 +75,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -2176,6 +2177,10 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
     generated assistant messages have generation_logprobs, so use that field as the
     trainable-token marker. This function mutates each message in-place by adding a
     token_loss_mask and, when missing, a zero-valued generation_logprobs tensor.
+    Multimodal batches also receive a per-token media-validity field. Exact masks
+    minted by the multimodal processor are preserved; legacy messages fall back
+    to PackedTensor ownership. Every other message, including generated assistant
+    text, is invalid.
     Router-replay routes get the same treatment via
     :func:`backfill_missing_routed_experts`, so every per-token field is defined
     for every tokenized message before the batch is flattened.
@@ -2186,6 +2191,12 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
             ``generation_logprobs`` are treated as rollout-generated messages.
     """
     backfill_missing_routed_experts(message_logs)
+    has_multimodal_payload = any(
+        key == "media_token_validity_mask" or isinstance(value, PackedTensor)
+        for message_log in message_logs
+        for message in message_log
+        for key, value in message.items()
+    )
     for message_log in message_logs:
         for message in message_log:
             role = cast(str, message["role"])
@@ -2200,6 +2211,20 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
                 message["generation_logprobs"] = torch.zeros_like(
                     token_ids, dtype=torch.float32
                 )
+
+            if has_multimodal_payload:
+                existing_media_mask = message.get("media_token_validity_mask")
+                if isinstance(existing_media_mask, torch.Tensor):
+                    message["media_token_validity_mask"] = existing_media_mask.bool()
+                else:
+                    owns_media = any(
+                        isinstance(value, PackedTensor) for value in message.values()
+                    )
+                    message["media_token_validity_mask"] = torch.full_like(
+                        token_ids,
+                        fill_value=owns_media,
+                        dtype=torch.bool,
+                    )
 
 
 def _resolve_message_level_advantage_penalties(

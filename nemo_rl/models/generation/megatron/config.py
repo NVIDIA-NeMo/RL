@@ -131,6 +131,9 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # attributes gate which modalities are preprocessed. Not media preprocessing
     # itself, and used on the direct generate path as well as the HTTP endpoint.
     megatron_inference_wrapper: NotRequired[str]
+    # Partial MultimodalPromptConfig overrides applied on top of the wrapper's
+    # default image/video prompt contracts.
+    multimodal_prompt_config: NotRequired[dict[str, Any]]
 
     # KV cache lifecycle across suspend/resume:
     # - "persist": cache stays allocated; CUDA graphs remain valid (default)

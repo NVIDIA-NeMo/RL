@@ -178,6 +178,10 @@ def test_attach_image_model_inputs_keeps_rollout_tokens_and_packs_media():
     class _TextTokenizer:
         model_input_names = ["input_ids"]
 
+        def convert_tokens_to_ids(self, token):
+            assert token == "<image>"
+            return 8
+
     class _Processor:
         image_token = "<image>"
         image_processor = _ImageProcessor()
@@ -208,6 +212,9 @@ def test_attach_image_model_inputs_keeps_rollout_tokens_and_packs_media():
     # token_ids remain authoritative.
     assert message["token_ids"] is rollout_tokens
     assert "input_ids" not in message
+    torch.testing.assert_close(
+        message["media_token_validity_mask"], torch.tensor([False, True, False])
+    )
 
 
 def test_attach_image_model_inputs_is_a_noop_without_images_or_processor():
@@ -224,12 +231,14 @@ def test_attach_image_model_inputs_is_a_noop_without_images_or_processor():
 def test_reattach_original_multimodal_payloads_is_media_only_and_turn_aligned():
     first_image = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0)
     second_image = PackedTensor(torch.tensor([[2.0]]), dim_to_pack=0)
+    first_media_mask = torch.tensor([False, True])
     original_logs = [
         [
             {
                 "role": "user",
                 "content": "first",
                 "pixel_values": first_image,
+                "media_token_validity_mask": first_media_mask,
                 "request_metadata": {"must_not": "reattach"},
             },
             {"role": "assistant", "content": "answer"},
@@ -268,6 +277,7 @@ def test_reattach_original_multimodal_payloads_is_media_only_and_turn_aligned():
             message for message in results[0][log_key] if message["role"] == "user"
         ]
         assert user_messages[0]["pixel_values"] is first_image
+        assert user_messages[0]["media_token_validity_mask"] is first_media_mask
         assert user_messages[1]["pixel_values"] is second_image
         assert user_messages[1]["vllm_multi_modal_data"] == {"video": "video.mp4"}
         assert "request_metadata" not in user_messages[0]

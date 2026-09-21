@@ -31,6 +31,7 @@ from nemo_rl.data.multimodal_utils import (
     IMAGE_CONTENT_TYPES,
     VIDEO_CONTENT_TYPES,
     PackedTensor,
+    attach_processor_media_token_validity_mask,
     extract_input_media_sources_from_responses_messages,
     extract_multimodal_model_inputs,
     get_responses_content_part_url,
@@ -823,6 +824,7 @@ def nemo_gym_example_to_video_datum_spec(
     if "imgs_sizes" in processed and "num_frames" not in processed:
         processed["num_frames"] = torch.tensor([len(frame_items)], dtype=torch.int32)
     user_message.update(extract_multimodal_model_inputs(processor, processed))
+    attach_processor_media_token_validity_mask(user_message, processor)
 
     length = len(user_message["token_ids"])
     loss_multiplier = 1.0
