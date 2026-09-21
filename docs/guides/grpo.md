@@ -625,6 +625,28 @@ When top-p or top-k filtering is enabled, the following conventions apply:
 
 Under tensor parallelism (TP), enabling top-p or top-k adds communication overhead. The vocabulary is sharded across GPUs (vocab-parallel), while top-p and top-k require full-vocabulary probabilities. A naive all-gather of logits would require large additional memory. The implementation therefore switches to a batch–sequence-parallel layout via all-to-all communication, applies filtering over the full vocabulary, then switches back, avoiding materialization of the full vocabulary on any single rank.
 
+## Reward Shaping for Multi-Turn Rollouts: Context Cost
+
+Multi-turn agent rollouts pay for context: the prompt, every assistant turn and every tool result are re-read on each turn, so a correct rollout that read one file and one that read the whole corpus earn the same reward while costing very different amounts of compute (and, at inference time, latency). `grpo.reward_shaping.context_cost` scales the reward of each **correct** rollout in a prompt group by
+
+```
+d + (1 - d) * exp(-beta * max(0, ctx - ctx_min_correct) / ref_tokens)
+```
+
+where `ctx` is the rollout's total token count (all messages of its `message_log`), `ctx_min_correct` the smallest such count among the correct rollouts of the same prompt group, and `d` the group's failure rate. Correctness is judged on the raw task reward (`unshaped_total_reward` if DAPO shaping ran first), incorrect rollouts keep their reward, and a shaped correct rollout is never pushed below the best incorrect rollout of its group, so correctness always dominates; prompts the policy mostly fails (`d -> 1`) are barely shaped, prompts it already solves reliably (`d -> 0`) get the full efficiency pressure. With `use_dynamic_sampling`, group filtering switches to the shaped reward while this is enabled, because an all-correct group has zero raw variance but carries exactly the efficiency signal the shaping exists for. The idea follows OTC-PO (https://arxiv.org/abs/2504.14870) and efficiency-aware policy optimization (EAPO-style) methods, applied to context tokens rather than tool-call counts.
+
+```yaml
+grpo:
+  reward_shaping:
+    context_cost:
+      enabled: true
+      correct_reward_threshold: 1.0   # reward >= threshold counts as correct
+      beta: 0.5                        # decay per ref_tokens above the group minimum
+      ref_tokens: 32768
+```
+
+The shaping runs in `grpo_train` and `async_grpo_train` after DAPO-style shaping and is independent of `reward_shaping.enabled`. It needs `message_log` in the batch, so it is not available in the data-plane (`grpo_sync`) loop or in PPO; enabling it there raises. On a document-QA agent with 60-turn episodes we saw mean factors of 0.92 to 0.95 on correct rollouts with a minimum around 0.5, with mean episode context around 24k tokens.
+
 ## Metrics
 This feature is controlled by the parameters `wandb_name` and `tb_name`. We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
 

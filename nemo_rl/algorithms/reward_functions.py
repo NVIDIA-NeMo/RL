@@ -11,21 +11,58 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import TypeVar
+import math
+from typing import Any, TypeVar
 
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
 
+class ContextCostShapingConfig(BaseModel, extra="allow"):
+    """Multiplicative context-cost shaping for correct rollouts in a prompt group.
+
+    Multi-turn agent rollouts pay for context (prompt, every assistant turn and
+    every tool result), and the reward alone does not distinguish a correct
+    rollout that read one sheet from one that read the whole data room. This
+    shaping scales the reward of each *correct* rollout by
+
+        d + (1 - d) * exp(-beta * max(0, ctx - ctx_min_correct) / ref_tokens)
+
+    where ``ctx`` is the rollout's total token count, ``ctx_min_correct`` the
+    smallest such count among the correct rollouts of the same prompt group and
+    ``d`` the group's failure rate. Correctness is judged on the raw task reward
+    (``unshaped_total_reward`` when an earlier shaping step saved it), incorrect
+    rollouts keep their reward, and a shaped correct rollout is never pushed
+    below the best incorrect rollout of its group, so correctness always
+    dominates; prompts the policy mostly fails (``d -> 1``) are barely shaped,
+    prompts it already solves reliably (``d -> 0``) get the full efficiency
+    pressure. Follows the efficiency-shaping idea of OTC-PO
+    (https://arxiv.org/abs/2504.14870) and the EAPO family of efficiency-aware
+    policy optimization methods, applied to context tokens rather than
+    tool-call counts. GRPO rollout loops only: the shaping needs
+    ``message_log`` in the batch.
+    """
+
+    enabled: bool = False
+    # A rollout counts as correct when its raw reward is at least this value.
+    correct_reward_threshold: float = 1.0
+    # Decay strength per ``ref_tokens`` of context above the group minimum.
+    beta: float = 0.5
+    # Token scale of the decay.
+    ref_tokens: int = 32768
+
+
 class RewardShapingConfig(BaseModel, extra="allow"):
     """Configuration for reward function processing.
 
     This configuration enables custom reward shaping, currently supporting DAPO-style
-    penalties for responses that exceed the maximum response length threshold.
+    penalties for responses that exceed the maximum response length threshold, and
+    context-cost shaping for multi-turn rollouts (see ``context_cost``). The two are
+    independent: ``context_cost`` applies whenever its own ``enabled`` is set.
     """
 
     enabled: bool = False
@@ -45,6 +82,11 @@ class RewardShapingConfig(BaseModel, extra="allow"):
     # When set to 0, truncated responses get zero reward.
     # When set to 1, no penalty is applied (default behavior).
     stop_properly_penalty_coef: float | None = None
+
+    # Context-cost shaping for multi-turn rollouts (independent of ``enabled``).
+    context_cost: ContextCostShapingConfig = Field(
+        default_factory=ContextCostShapingConfig
+    )
 
 
 def apply_reward_shaping(
@@ -169,4 +211,108 @@ def apply_reward_shaping(
     # Update the rewards in the batch
     batch["total_reward"] = updated_rewards
 
+    return batch
+
+
+def _message_log_token_count(message_log: list[dict[str, Any]]) -> int:
+    """Total tokens a rollout put through the model: prompt, turns and tool results."""
+    total = 0
+    for message in message_log:
+        token_ids = message.get("token_ids")
+        if token_ids is None:
+            continue
+        total += (
+            int(token_ids.numel()) if hasattr(token_ids, "numel") else len(token_ids)
+        )
+    return total
+
+
+def apply_context_cost_shaping(
+    batch: BatchedDataDict, cfg: ContextCostShapingConfig, num_generations: int
+) -> BatchedDataDict:
+    """Scale the rewards of correct rollouts by their context cost within each prompt group.
+
+    ``batch`` is ordered by prompt group: every ``num_generations`` consecutive
+    samples share a prompt, as produced by both the synchronous rollout path
+    (before dynamic sampling) and the async replay buffer, which concatenates
+    whole groups. GRPO's own baseline groups by identical prompt tokens, so two
+    sampled groups with the same prompt are one group there and two here.
+    Context is measured from ``message_log`` as the total number of tokens
+    across all messages. Correctness is judged on the raw task reward:
+    ``unshaped_total_reward`` when an earlier shaping step saved it, otherwise
+    ``total_reward``, which this function then saves as
+    ``unshaped_total_reward`` so dynamic-sampling filters can keep using the raw
+    task metric. A shaped correct rollout is floored at the best incorrect
+    rollout of its group so correctness still dominates for non-binary rewards.
+
+    Raises:
+        ValueError: On a bad ``num_generations`` / ``ref_tokens``, a batch that
+            is not a whole number of groups, or a batch without ``message_log``
+            (e.g. the driver-carry batch of the data-plane loop, which this
+            shaping does not support).
+    """
+    if not cfg.enabled:
+        return batch
+    if num_generations <= 0:
+        raise ValueError(f"num_generations must be positive, got {num_generations}")
+    if cfg.ref_tokens <= 0:
+        raise ValueError(
+            f"context_cost.ref_tokens must be positive, got {cfg.ref_tokens}"
+        )
+
+    if "message_log" not in batch:
+        raise ValueError(
+            "reward_shaping.context_cost needs `message_log` in the batch to "
+            "measure context; it is only supported in the GRPO rollout loops."
+        )
+
+    rewards = batch["total_reward"]
+    message_logs = batch["message_log"]
+    num_samples = len(message_logs)
+    if num_samples % num_generations != 0:
+        raise ValueError(
+            f"batch size {num_samples} is not a multiple of num_generations={num_generations}"
+        )
+
+    if "unshaped_total_reward" not in batch:
+        batch["unshaped_total_reward"] = rewards.clone()
+    raw_rewards = batch["unshaped_total_reward"]
+
+    context = [_message_log_token_count(log) for log in message_logs]
+    shaped = rewards.detach().clone().to(torch.float32)
+    factors: list[float] = []
+    num_groups = num_samples // num_generations
+    for group in range(num_groups):
+        indices = range(group * num_generations, (group + 1) * num_generations)
+        correct = [
+            i for i in indices if float(raw_rewards[i]) >= cfg.correct_reward_threshold
+        ]
+        if not correct:
+            continue
+        # Correctness must dominate: never push a correct rollout below the best
+        # incorrect one of its group (a no-op for binary rewards, where it is 0).
+        floor = max(
+            (float(rewards[i]) for i in indices if i not in correct),
+            default=-math.inf,
+        )
+        failure_rate = 1.0 - len(correct) / num_generations
+        min_context = min(context[i] for i in correct)
+        for i in correct:
+            factor = failure_rate + (1.0 - failure_rate) * math.exp(
+                -cfg.beta * max(0, context[i] - min_context) / cfg.ref_tokens
+            )
+            shaped[i] = max(float(rewards[i]) * factor, floor)
+            factors.append(factor)
+
+    batch["total_reward"] = shaped.to(dtype=rewards.dtype, device=rewards.device)
+    sorted_context = sorted(context)
+    p90 = sorted_context[int(0.9 * (num_samples - 1))] if num_samples else 0
+    print(
+        f"[INFO] context-cost shaping: groups={num_groups} samples={num_samples} "
+        f"correct={len(factors)} factor_mean={sum(factors) / len(factors) if factors else 1.0:.3f} "
+        f"factor_min={min(factors) if factors else 1.0:.3f} "
+        f"ctx_mean={sum(context) / max(num_samples, 1):.0f} ctx_p90={p90} "
+        f"ctx_max={max(context) if context else 0} beta={cfg.beta} ref_tokens={cfg.ref_tokens}",
+        flush=True,
+    )
     return batch
