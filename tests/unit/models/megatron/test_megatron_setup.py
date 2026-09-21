@@ -1351,6 +1351,7 @@ matchers:
                 "num_layers_at_end_in_bf16": 8,
                 "fp8_cfg": {
                     "enabled": True,
+                    "fp8": "e4m3",
                     "fp8_recipe": "mxfp8",
                     "fp8_param": True,
                 },
@@ -1513,6 +1514,7 @@ matchers:
                 "te_precision_config_file": str(recipe_file),
                 "fp8_cfg": {
                     "enabled": True,
+                    "fp8": "e4m3",
                     "fp8_recipe": "mxfp8",
                     "fp8_param": True,
                 },
@@ -1550,6 +1552,7 @@ matchers:
                 "te_precision_config_file": str(recipe_file),
                 "fp8_cfg": {
                     "enabled": True,
+                    "fp8": "e4m3",
                     "fp8_recipe": "mxfp8",
                     "fp8_param": False,
                 },
