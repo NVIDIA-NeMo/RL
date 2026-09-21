@@ -39,3 +39,4 @@ logger:
     name: grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-forward
 cluster:
   gpus_per_node: 8
+  num_nodes: 1
