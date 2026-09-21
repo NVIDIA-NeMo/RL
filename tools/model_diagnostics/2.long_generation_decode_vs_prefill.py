@@ -289,6 +289,15 @@ def calculate_error(a, b) -> float:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.8,
+        help=(
+            "vLLM gpu_memory_utilization (default 0.8). Lower it when a MoE "
+            "backend allocates its workspace lazily after vLLM's profiling."
+        ),
+    )
+    parser.add_argument(
         "--model", type=str, nargs="?", default="nvidia/Nemotron-H-8B-Base-8K"
     )
     parser.add_argument(
@@ -353,7 +362,7 @@ def main():
         enable_chunked_prefill=False,
         tensor_parallel_size=args.tensor_parallel_size,
         seed=seed,
-        gpu_memory_utilization=0.8,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         # This diagnostic only submits a handful of prompts. vLLM >= 0.25
         # hard-fails when the default max_num_seqs (1024) exceeds the
         # available Mamba cache blocks on hybrid models (one block per

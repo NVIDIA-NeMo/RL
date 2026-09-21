@@ -12,3 +12,4 @@ uv run --extra vllm coverage run -a --data-file="$PROJECT_ROOT/tests/.coverage" 
     --max-tokens 8192 \
     --num-batches 4 \
     --tensor-parallel-size 2 \
+    --gpu-memory-utilization 0.7 \

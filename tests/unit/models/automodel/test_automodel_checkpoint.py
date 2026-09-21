@@ -1233,3 +1233,68 @@ def test_qwen_vl_vision_key_mapping_workaround_still_needed():
             "workaround in nemo_rl/models/automodel/checkpoint.py is obsolete - remove it "
             "and this test."
         )
+
+
+def _manager_with_stub_config(monkeypatch):
+    """A manager whose Automodel config build is stubbed out (no process groups)."""
+    from nemo_rl.models.automodel import checkpoint as ckpt_mod
+
+    built = {}
+
+    class _StubConfig:
+        def __init__(self, **kwargs):
+            built["kwargs"] = kwargs
+
+        def build(self, **kwargs):
+            return object()
+
+    monkeypatch.setattr(ckpt_mod, "AutomodelCheckpointingConfig", _StubConfig)
+    manager = ckpt_mod.AutomodelCheckpointManager.__new__(
+        ckpt_mod.AutomodelCheckpointManager
+    )
+    manager.checkpointer = None
+    manager.moe_mesh = None
+    manager._get_dp_rank = lambda: 0
+    manager._get_tp_rank = lambda: 0
+    return manager, built
+
+
+def test_init_checkpointer_opts_async_daemons_into_the_prefix_store(monkeypatch):
+    """With the training store's address known, the DCP daemons must reuse it.
+
+    torch's process-based async checkpointer otherwise has rank 0 bind a
+    freshly probed port for the daemons' GLOO group, which raced with other
+    port users on the CI nodes (EADDRINUSE at the first save).
+    """
+    monkeypatch.setenv("MASTER_ADDR", "10.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "1401")
+    monkeypatch.delenv("DCP_USE_PREFIX_STORE", raising=False)
+    manager, _ = _manager_with_stub_config(monkeypatch)
+
+    manager.init_checkpointer(config_updates={"is_async": True})
+
+    assert os.environ["DCP_USE_PREFIX_STORE"] == "1"
+
+
+def test_init_checkpointer_leaves_prefix_store_alone_without_master_env(monkeypatch):
+    monkeypatch.delenv("MASTER_ADDR", raising=False)
+    monkeypatch.delenv("MASTER_PORT", raising=False)
+    monkeypatch.delenv("DCP_USE_PREFIX_STORE", raising=False)
+    manager, _ = _manager_with_stub_config(monkeypatch)
+
+    manager.init_checkpointer(config_updates={"is_async": True})
+
+    # torch asserts on MASTER_ADDR/MASTER_PORT in prefix-store mode; without them
+    # the default get_free_port path is the only one that can work.
+    assert "DCP_USE_PREFIX_STORE" not in os.environ
+
+
+def test_init_checkpointer_respects_an_explicit_prefix_store_choice(monkeypatch):
+    monkeypatch.setenv("MASTER_ADDR", "10.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "1401")
+    monkeypatch.setenv("DCP_USE_PREFIX_STORE", "0")
+    manager, _ = _manager_with_stub_config(monkeypatch)
+
+    manager.init_checkpointer(config_updates={"is_async": True})
+
+    assert os.environ["DCP_USE_PREFIX_STORE"] == "0"
