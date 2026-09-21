@@ -95,8 +95,8 @@ WHEEL_OUTPUT_DIR=${WHEEL_OUTPUT_DIR:-/opt/trtllm_wheels}
 mkdir -p "$WHEEL_OUTPUT_DIR"
 
 echo "Building TensorRT-LLM from:"
-# Redact any embedded credentials: the tekit url carries a clone token and this
-# output ends up in build logs / CI artifacts.
+# Redact embedded credentials if a private source URL is supplied; this output
+# ends up in build logs / CI artifacts.
 echo "  TRT-LLM Git URL: $(sed -E 's#://[^/@]*@#://<redacted>@#' <<<"$GIT_URL")"
 echo "  TRT-LLM Git ref: $GIT_REF"
 
