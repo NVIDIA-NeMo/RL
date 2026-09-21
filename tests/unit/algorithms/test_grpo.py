@@ -5547,7 +5547,7 @@ def test_gdpo_advantage_estimator_skips_trivial_leave_one_out_normalization():
 
     result = estimator.compute_advantage(
         prompt_ids, None, torch.ones(8, 3), repeated_batch
-    )
+    ).advantages
 
     # Samples 1 and 2 differ only in reward/format, so that component has to
     # still move them apart after aggregation.

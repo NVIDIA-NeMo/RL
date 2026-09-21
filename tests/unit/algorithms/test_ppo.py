@@ -301,7 +301,7 @@ def test_gae_equal_explicit_lambdas_compute_once():
     with patch.object(
         estimator, "_compute_gae", wraps=estimator._compute_gae
     ) as compute_gae:
-        advantages, returns = estimator.compute_advantage(
+        result = estimator.compute_advantage(
             prompt_ids=torch.tensor([[0], [1]]),
             rewards=torch.tensor([1.0, 2.0]),
             mask=mask,
@@ -310,7 +310,7 @@ def test_gae_equal_explicit_lambdas_compute_once():
 
     assert compute_gae.call_count == 1
     assert compute_gae.call_args.kwargs["gae_lambda"] == 1.0
-    torch.testing.assert_close(returns, advantages + values)
+    torch.testing.assert_close(result.returns, result.advantages + values)
 
 
 def test_gae_length_adaptive_lambda():
