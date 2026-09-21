@@ -1,0 +1,4 @@
+defaults: ../../grpo_math_1B.yaml
+
+grpo:
+  masked_reward_policy: include
