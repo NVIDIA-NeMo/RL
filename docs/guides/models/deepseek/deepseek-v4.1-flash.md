@@ -4,16 +4,17 @@ This guide describes text-only DAPO training of DeepSeek V4.1 Flash through the
 GRPO entry point, using AutoModel for training and vLLM for generation.
 
 > [!IMPORTANT]
-> This is development support for the configuration described below. Functional
-> training support does not establish long-run convergence or performance across
-> other configurations. Use the pinned dependencies and review
+> **Early access.** Text-only, single-turn training has undergone short-run
+> stability validation for approximately 50 steps at a 3K-token context length
+> (3,072 tokens). This does not establish long-run convergence or performance
+> across other configurations. Use the pinned dependencies and review
 > [Known Limitations](#known-limitations) before changing the recipe.
 
 ## Support Status
 
 | Model | Training backend | Training parallelism | Generation backend | Status |
 | --- | --- | --- | --- | --- |
-| DeepSeek V4.1 Flash | AutoModel / FSDP2 | TP1 + CP1 + EP | vLLM with TP + EP | Development support |
+| DeepSeek V4.1 Flash | AutoModel / FSDP2 | TP1 + CP1 + EP | vLLM with TP + EP | Functionally Ready |
 
 ## Supported Scope
 
@@ -118,8 +119,22 @@ settings. The launcher does not allocate nodes or start the cluster for you.
   optimizer state, but not the external frozen Engram table. Restore requires
   the same table source and compatible optimizer shard layout.
 
+## Reference Training Curves
+
+The following panels show raw, unsmoothed W&B metrics through training step 47
+for the text-only, single-turn recipe with a 3,072-token context limit.
+They illustrate short-run behavior rather than long-run convergence.
+
+![DeepSeek V4.1 Flash DAPO training reward, AIME validation accuracy, response length, entropy, generation KL error and gradient norm through step 47](../../../assets/deepseek/deepseek-v4.1-flash-dapo-training.png)
+
+For repeated training steps after resume, the last logged value is shown.
+Validation markers show the recorded evaluation points only.
+
 ## Known Limitations
 
+- Validation is limited to text-only, single-turn short runs of approximately
+  50 steps at a 3K-token context length. Multi-turn training, longer contexts
+  and long-run stability have not been established by this validation.
 - This guide covers text-only AutoModel training with synchronous, colocated
   vLLM generation. It does not establish support for Megatron training,
   SGLang generation, multimodal inputs or other deployment layouts.
