@@ -28,7 +28,12 @@ from gdpo import (
     masked_diffusion_config_from_policy,
     resolve_mask_id,
 )
-from gdpo.denoise import block_denoise, build_canvas, unpack_generations
+from gdpo.denoise import (
+    block_denoise,
+    build_canvas,
+    context_capped_generation_lengths,
+    unpack_generations,
+)
 from gdpo.train_gdpo import gdpo_forward_backward
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.train import (
@@ -215,11 +220,18 @@ class DTensorGDPOPolicyWorker(DTensorPolicyWorkerV2Impl):
 
         device = torch.cuda.current_device()
         pad_id = generation_cfg.get("_pad_token_id", self.tokenizer.pad_token_id)
+        input_lengths = data["input_lengths"].to(device)
+        generation_lengths = context_capped_generation_lengths(
+            input_lengths,
+            configured_max_new_tokens=generation_cfg["max_new_tokens"],
+            max_sequence_length=self.cfg["max_total_sequence_length"],
+            block_length=self.denoise_cfg.block_length,
+        )
         self.model.eval()
         canvas, attention_mask = build_canvas(
             data["input_ids"].to(device),
-            data["input_lengths"].to(device),
-            gen_length=generation_cfg["max_new_tokens"],
+            input_lengths,
+            gen_length=generation_lengths,
             mask_id=self.elbo_estimator.mask_id,
             pad_id=pad_id,
         )
@@ -234,30 +246,34 @@ class DTensorGDPOPolicyWorker(DTensorPolicyWorkerV2Impl):
             ).logits
             return logits.full_tensor() if isinstance(logits, DTensor) else logits
 
-        denoised = block_denoise(
-            logits_fn,
-            canvas,
-            attention_mask,
-            gen_start=data["input_ids"].shape[1],
-            mask_id=self.elbo_estimator.mask_id,
-            steps=self.denoise_cfg.diffusion_steps,
-            block_length=self.denoise_cfg.block_length,
-            temperature=0.0 if greedy else generation_cfg["temperature"],
-            top_k=None if greedy else generation_cfg["top_k"],
-            top_p=1.0 if greedy else generation_cfg["top_p"],
-            cfg_scale=self.denoise_cfg.cfg_scale,
-            generator=generator,
-        )
+        gen_start = data["input_ids"].shape[1]
+        denoised = canvas
+        if canvas.shape[1] > gen_start:
+            denoised = block_denoise(
+                logits_fn,
+                canvas,
+                attention_mask,
+                gen_start=gen_start,
+                mask_id=self.elbo_estimator.mask_id,
+                steps=self.denoise_cfg.diffusion_steps,
+                block_length=self.denoise_cfg.block_length,
+                temperature=0.0 if greedy else generation_cfg["temperature"],
+                top_k=None if greedy else generation_cfg["top_k"],
+                top_p=1.0 if greedy else generation_cfg["top_p"],
+                cfg_scale=self.denoise_cfg.cfg_scale,
+                generator=generator,
+            )
 
         stop_token_ids = generation_cfg["stop_token_ids"] or [
             self.tokenizer.eos_token_id
         ]
         outputs = unpack_generations(
             denoised,
-            data["input_lengths"].to(device),
-            gen_start=data["input_ids"].shape[1],
+            input_lengths,
+            gen_start=gen_start,
             eos_token_ids=stop_token_ids,
             pad_id=pad_id,
+            max_generation_lengths=generation_lengths,
         )
         outputs["logprobs"] = torch.zeros_like(
             outputs["output_ids"], dtype=torch.float32

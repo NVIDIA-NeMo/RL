@@ -36,6 +36,19 @@ LogitsFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 _UNIFORM_EPS = 1e-20
 
 
+def context_capped_generation_lengths(
+    input_lengths: torch.Tensor,
+    *,
+    configured_max_new_tokens: int,
+    max_sequence_length: int,
+    block_length: int,
+) -> torch.Tensor:
+    """Returns per-sample generation budgets that fit whole denoising blocks."""
+    remaining = (max_sequence_length - input_lengths).clamp_min(0)
+    capped = remaining.clamp_max(configured_max_new_tokens)
+    return capped - capped.remainder(block_length)
+
+
 def get_num_transfer_tokens(mask_index: torch.Tensor, steps: int) -> torch.Tensor:
     """Splits each row's masked positions into a per-step unmasking budget.
 
@@ -64,7 +77,7 @@ def build_canvas(
     input_ids: torch.Tensor,
     input_lengths: torch.Tensor,
     *,
-    gen_length: int,
+    gen_length: int | torch.Tensor,
     mask_id: int,
     pad_id: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -80,7 +93,9 @@ def build_canvas(
     Args:
         input_ids: Right-padded ``[B, P]`` prompt token ids.
         input_lengths: ``[B]`` unpadded prompt lengths.
-        gen_length: Width of the region to denoise.
+        gen_length: Width of the region to denoise, either shared by the batch
+            or specified per sample. Per-sample budgets use the maximum width
+            for the canvas and pad each shorter row's unused suffix.
         mask_id: Token id of ``[MASK]``.
         pad_id: Token id to write into the inert left padding.
 
@@ -100,14 +115,37 @@ def build_canvas(
     is_prompt = positions >= offsets
     prompt = torch.where(is_prompt, prompt, torch.full_like(prompt, pad_id))
 
-    generation = torch.full(
-        (batch_size, gen_length), mask_id, dtype=input_ids.dtype, device=device
+    if isinstance(gen_length, torch.Tensor):
+        generation_lengths = gen_length.to(device).view(batch_size, 1)
+        generation_width = int(generation_lengths.max().item())
+    else:
+        generation_width = gen_length
+        generation_lengths = torch.full(
+            (batch_size, 1), generation_width, dtype=torch.long, device=device
+        )
+
+    generation_positions = torch.arange(generation_width, device=device).view(
+        1, generation_width
+    )
+    is_generation = generation_positions < generation_lengths
+    generation = torch.where(
+        is_generation,
+        torch.full(
+            (batch_size, generation_width),
+            mask_id,
+            dtype=input_ids.dtype,
+            device=device,
+        ),
+        torch.full(
+            (batch_size, generation_width),
+            pad_id,
+            dtype=input_ids.dtype,
+            device=device,
+        ),
     )
     canvas = torch.cat([prompt, generation], dim=1)
 
-    attention_mask = torch.cat(
-        [is_prompt, torch.ones_like(generation, dtype=torch.bool)], dim=1
-    )
+    attention_mask = torch.cat([is_prompt, is_generation], dim=1)
     return canvas, attention_mask
 
 
@@ -278,6 +316,7 @@ def unpack_generations(
     gen_start: int,
     eos_token_ids: list[int],
     pad_id: int,
+    max_generation_lengths: Optional[torch.Tensor] = None,
 ) -> dict[str, torch.Tensor]:
     """Repacks a denoised canvas into right-padded generation outputs.
 
@@ -292,6 +331,8 @@ def unpack_generations(
         eos_token_ids: Token ids that terminate a response. The stop token
             itself is kept in the output.
         pad_id: Token id to right-pad the outputs with.
+        max_generation_lengths: Optional per-sample generation budgets. When
+            omitted, every row may use the full generated region.
 
     Returns:
         A dict with ``output_ids``, ``generation_lengths``,
@@ -305,15 +346,28 @@ def unpack_generations(
 
     generated = canvas[:, gen_start:]
     positions = torch.arange(gen_length, device=device).view(1, gen_length)
+    if max_generation_lengths is None:
+        max_generation_lengths = torch.full(
+            (batch_size,), gen_length, dtype=torch.long, device=device
+        )
+    else:
+        max_generation_lengths = max_generation_lengths.to(device)
+    is_generation = positions < max_generation_lengths.view(batch_size, 1)
 
     is_stop = torch.zeros_like(generated, dtype=torch.bool)
     for token_id in eos_token_ids:
         is_stop |= generated == token_id
+    is_stop &= is_generation
 
-    # First stop index per row, or gen_length when the row has none.
-    first_stop = torch.where(
-        is_stop, positions.expand_as(generated), torch.full_like(generated, gen_length)
-    ).min(dim=1)[0]
+    # First stop index per row, or that row's generation budget when none exists.
+    if gen_length == 0:
+        first_stop = max_generation_lengths
+    else:
+        first_stop = torch.where(
+            is_stop,
+            positions.expand_as(generated),
+            max_generation_lengths.view(batch_size, 1).expand_as(generated),
+        ).min(dim=1)[0]
     truncated = ~is_stop.any(dim=1)
     generation_lengths = torch.where(truncated, first_stop, first_stop + 1)
 

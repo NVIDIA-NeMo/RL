@@ -662,27 +662,11 @@ class DTensorPolicyWorkerV2Impl(
             )
 
             for batch_idx, processed_mb in enumerate(processed_iterator):
-                processed_inputs = processed_mb.processed_inputs
-                prepared = prepare_model_forward(
-                    self.model,
-                    processed_inputs,
-                    device_mesh=self.device_mesh,
-                    cp_size=self.cp_size,
-                    padding_token_id=self.tokenizer.pad_token_id or 0,
-                    is_reward_model=False,
-                    allow_flash_attn_args=self.allow_flash_attn_args,
+                token_logprobs = self._logprobs_for_microbatch(
+                    processed_mb=processed_mb,
+                    post_processing_fn=logprobs_post_processor,
+                    sequence_dim=sequence_dim,
                 )
-
-                with prepared.model_context_factory(), self._autocast_context():
-                    # Use forward_with_post_processing_fn for forward pass and post-processing
-                    token_logprobs, _metrics, _ = forward_with_post_processing_fn(
-                        model=self.model,
-                        prepared=prepared,
-                        post_processing_fn=logprobs_post_processor,
-                        processed_mb=processed_mb,
-                        sampling_params=self.sampling_params,
-                        sequence_dim=sequence_dim,
-                    )
 
                 # skip keeping the logprobs for the dummy batches
                 if batch_idx >= iterator_len:

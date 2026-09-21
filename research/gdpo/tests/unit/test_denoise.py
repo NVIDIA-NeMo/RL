@@ -19,6 +19,7 @@ import torch
 from gdpo.denoise import (
     block_denoise,
     build_canvas,
+    context_capped_generation_lengths,
     get_num_transfer_tokens,
     unpack_generations,
 )
@@ -138,6 +139,45 @@ class TestBuildCanvas:
             input_ids, torch.tensor([4]), gen_length=1, mask_id=MASK_ID, pad_id=PAD_ID
         )
         assert canvas[0, 1:5].tolist() == [11, 12, 13, 14]
+
+    def test_per_sample_budgets_keep_every_output_within_context(self):
+        input_ids = torch.tensor([[5, 6, PAD_ID, PAD_ID, PAD_ID], [7, 8, 9, 10, 11]])
+        input_lengths = torch.tensor([2, 5])
+        generation_lengths = context_capped_generation_lengths(
+            input_lengths,
+            configured_max_new_tokens=4,
+            max_sequence_length=8,
+            block_length=2,
+        )
+        canvas, attention_mask = build_canvas(
+            input_ids,
+            input_lengths,
+            gen_length=generation_lengths,
+            mask_id=MASK_ID,
+            pad_id=PAD_ID,
+        )
+
+        denoised = block_denoise(
+            constant_logits_fn(3),
+            canvas,
+            attention_mask,
+            gen_start=input_ids.shape[1],
+            mask_id=MASK_ID,
+            steps=4,
+            block_length=2,
+        )
+        output = unpack_generations(
+            denoised,
+            input_lengths,
+            gen_start=input_ids.shape[1],
+            eos_token_ids=[11],
+            pad_id=PAD_ID,
+            max_generation_lengths=generation_lengths,
+        )
+
+        assert generation_lengths.tolist() == [4, 2]
+        assert output["generation_lengths"].tolist() == [4, 2]
+        assert (output["unpadded_sequence_lengths"] <= 8).all()
 
 
 class TestBlockDenoise:
