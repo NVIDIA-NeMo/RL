@@ -135,10 +135,16 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
+        import time
+
+        refit_t0 = time.perf_counter()
         if self._sync_policy_params:
             self._policy.sync_params_before_refit()
+        sync_params_s = time.perf_counter() - refit_t0
+        t_offload = time.perf_counter()
         if self._release_grads_before_refit:
             self._policy.offload_before_refit()
+        offload_s = time.perf_counter() - t_offload
 
         timer_context = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
@@ -174,6 +180,14 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
                 )
                 raise
             results = ray.get(futures_inference)
+            print(
+                f"[refit-timing] controller sync_params={sync_params_s:.2f}s "
+                f"offload_before_refit={offload_s:.2f}s "
+                f"transfer_and_update="
+                f"{time.perf_counter() - refit_t0 - sync_params_s - offload_s:.2f}s "
+                f"total={time.perf_counter() - refit_t0:.2f}s",
+                flush=True,
+            )
             update_success = all(result for result in results if result is not None)
 
             if not update_success:

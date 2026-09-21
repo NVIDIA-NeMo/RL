@@ -112,6 +112,7 @@ class AbstractPolicyWorker:
         my_pp_stage: int,
         sub_world_size: int,
         my_rank_in_group: int,
+        layout_index: int = 0,
     ) -> None:
         """Bootstrap this train worker's nccl_reshard comm group.
 
@@ -126,7 +127,15 @@ class AbstractPolicyWorker:
         # _build re-runs both communicator families on every reconcile, so without this
         # each recovery strands a NCCL communicator and a bound TCPStore per PP stage for
         # the life of the worker. Deferred past the rendezvous and bounded, same as there.
-        stale_group, self.pp_comm_group = self.pp_comm_group, None
+        # One bulk communicator per generation *layout* (e.g. disaggregated
+        # TRT-LLM context vs generation engines); layout 0 stays on
+        # ``pp_comm_group`` for the single-layout callers.
+        groups_by_layout = getattr(self, "pp_comm_groups_by_layout", None) or {}
+        stale_group = groups_by_layout.pop(layout_index, None)
+        if layout_index == 0:
+            stale_group = stale_group or self.pp_comm_group
+            self.pp_comm_group = None
+        self.pp_comm_groups_by_layout = groups_by_layout
 
         # Printed on both sides of this rendezvous, because a mismatch here is invisible
         # otherwise: the party that got it wrong just waits, and the other reports a 300s
@@ -140,7 +149,7 @@ class AbstractPolicyWorker:
             f"rank={my_rank_in_group} world_size={sub_world_size}",
             flush=True,
         )
-        self.pp_comm_group = StatelessProcessGroup(
+        group = StatelessProcessGroup(
             master_address=pp_ips[my_pp_stage],
             port=pp_ports[my_pp_stage],
             rank=my_rank_in_group,
@@ -149,7 +158,10 @@ class AbstractPolicyWorker:
         device = torch.cuda.current_device()
         # Free cached blocks so NCCL P2P buffers have headroom (see init_collective).
         torch.cuda.empty_cache()
-        self.pp_comm_group.init_nccl_communicator(device=device)
+        group.init_nccl_communicator(device=device)
+        self.pp_comm_groups_by_layout[layout_index] = group
+        if layout_index == 0:
+            self.pp_comm_group = group
         self.my_pp_stage = my_pp_stage
 
         if stale_group is not None:

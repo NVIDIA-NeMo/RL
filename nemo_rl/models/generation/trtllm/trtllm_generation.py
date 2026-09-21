@@ -903,6 +903,184 @@ class TrtllmGeneration(GenerationInterface):
             print(f"Error in finish_generation: {e}")
             return False
 
+    # ------------------------------------------------------------------ #
+    #  nccl_reshard (shard-to-shard) refit
+    # ------------------------------------------------------------------ #
+    # The trainer reshards routed experts straight into each engine's EP slots.
+    # xferdtensor needs one destination mesh per transfer, so engines are grouped
+    # by *layout* (same TP/EP/PP); under disaggregation the context and
+    # generation engines are two layouts and the bulk pass runs once per layout,
+    # each over its own per-PP-stage communicators. The misc packed broadcast
+    # still rides the shared model_update_group once.
+    def get_nccl_reshard_layouts(self) -> list[dict[str, Any]]:
+        """Destination layouts, engines in engine order within each.
+
+        ``rank_prefixes`` are the engines' first ranks inside the layout's
+        rollout block (cumulative TP widths), which is where they sit in the
+        layout's bulk communicator after that stage's train ranks.
+        """
+        layouts: dict[str, dict[str, Any]] = {}
+        for engine_idx, (role, tp) in enumerate(zip(self._engine_roles, self._engine_tps)):
+            if self._disagg_cfg.get("enabled"):
+                kwargs = self._role_kwargs("ctx" if role == "context" else "gen")
+            else:
+                kwargs = self.cfg["trtllm_cfg"]
+            ep = int(kwargs.get("moe_expert_parallel_size") or 1)
+            pp = int(kwargs.get("pipeline_parallel_size") or 1)
+            if tp % ep != 0:
+                raise ValueError(
+                    f"{role} engine: moe_expert_parallel_size {ep} must divide "
+                    f"tensor_parallel_size {tp}"
+                )
+            layout = layouts.setdefault(
+                role,
+                {
+                    "role": role,
+                    "tp_size": int(tp),
+                    "ep_size": ep,
+                    # TRT-LLM's expert TP split (moe_tensor_parallel_size)
+                    "etp_size": int(tp) // ep,
+                    "pp_size": pp,
+                    "engine_indices": [],
+                    "rank_prefixes": [],
+                    "world_size": 0,
+                },
+            )
+            if layout["tp_size"] != int(tp):
+                raise ValueError(
+                    f"{role} engines have different TP widths ({layout['tp_size']} vs {tp})"
+                )
+            layout["engine_indices"].append(engine_idx)
+            layout["rank_prefixes"].append(layout["world_size"])
+            layout["world_size"] += int(tp)
+        return list(layouts.values())
+
+    def _run_on_engine_subset(
+        self,
+        method_name: str,
+        engine_indices: list[int],
+        per_engine: Optional[dict[str, list[Any]]] = None,
+        **common: Any,
+    ) -> list[ray.ObjectRef]:
+        """``_run_on_engines`` for the given engines only (per_engine lists align)."""
+        futures = []
+        for position, engine_idx in enumerate(engine_indices):
+            worker_idx = self._engine_owner_indices[engine_idx]
+            kwargs = dict(common)
+            for key, values in (per_engine or {}).items():
+                kwargs[key] = values[position]
+            futures.append(
+                self.worker_group.run_single_worker_single_data(
+                    method_name=method_name, worker_idx=worker_idx, **kwargs
+                )
+            )
+        return futures
+
+    def set_refit_membership(self, membership: Any) -> None:
+        """Record the fleet the refit communicators were built over.
+
+        TRT-LLM replicas cannot drop out of a refit today; a membership that
+        excludes a shard is rejected rather than silently loading a subset.
+        """
+        if len(membership.shard_prefixes) != self.dp_size:
+            raise RuntimeError(
+                f"TRT-LLM refit needs every replica: membership has "
+                f"{len(membership.shard_prefixes)} of {self.dp_size} shards"
+            )
+        self._refit_membership = membership
+
+    def rebuild_collective(self, membership: Any, ip: str, port: int) -> list[ray.ObjectRef]:
+        """Rebuild model_update_group over the full fleet (see set_refit_membership)."""
+        return self.init_collective(
+            ip, port, membership.world_size, train_world_size=membership.train_world_size
+        )
+
+    def init_nccl_reshard_comm_group(
+        self,
+        layout_index: int,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> list[ray.ObjectRef]:
+        """Join one layout's per-PP-stage bulk communicators (all its engines)."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group not initialised")
+        layout = self.get_nccl_reshard_layouts()[layout_index]
+        assert train_ranks_per_stage + layout["world_size"] == sub_world_size, (
+            f"reshard group for layout {layout['role']}: sub_world_size {sub_world_size} "
+            f"!= train {train_ranks_per_stage} + layout {layout['world_size']}"
+        )
+        return self._run_on_engine_subset(
+            "init_nccl_reshard_comm_group_async",
+            layout["engine_indices"],
+            per_engine={"rank_prefix": layout["rank_prefixes"]},
+            pp_ips=pp_ips,
+            pp_ports=pp_ports,
+            pp_size=pp_size,
+            train_ranks_per_stage=train_ranks_per_stage,
+            sub_world_size=sub_world_size,
+        )
+
+    def rebuild_nccl_reshard_comm_group(
+        self,
+        membership: Any,
+        layout_index: int,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> list[ray.ObjectRef]:
+        self.set_refit_membership(membership)
+        return self.init_nccl_reshard_comm_group(
+            layout_index,
+            pp_ips,
+            pp_ports,
+            pp_size,
+            train_ranks_per_stage,
+            sub_world_size,
+        )
+
+    def prepare_nccl_reshard_refit_info(self, refit_infos: Any) -> None:
+        """One refit plan per layout (a single dict is accepted for one layout)."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group not initialised")
+        layouts = self.get_nccl_reshard_layouts()
+        if isinstance(refit_infos, dict):
+            refit_infos = [refit_infos]
+        if len(refit_infos) != len(layouts):
+            raise ValueError(
+                f"got {len(refit_infos)} refit plans for {len(layouts)} engine layouts"
+            )
+        futures = []
+        for layout, refit_info in zip(layouts, refit_infos):
+            futures.extend(
+                self._run_on_engine_subset(
+                    "prepare_nccl_reshard_refit_info_async",
+                    layout["engine_indices"],
+                    refit_info=refit_info,
+                )
+            )
+        ray.get(futures)
+
+    def nccl_reshard_refit(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
+        reject_unenforceable_refit_deadline("TensorRT-LLM", refit_timeout_s)
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group not initialised")
+        trtllm_cfg = self.cfg["trtllm_cfg"]
+        in_flight = bool(trtllm_cfg.get("in_flight_weight_updates"))
+        recompute_kv = bool(trtllm_cfg.get("recompute_kv_cache_after_weight_updates"))
+        return self._run_on_engines(
+            "nccl_reshard_refit_async",
+            refit_timeout_s=refit_timeout_s,
+            drain=not in_flight,
+            recompute_kv=recompute_kv,
+        )
+
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         futures = self._run_on_engines(
             "prepare_refit_info_async",

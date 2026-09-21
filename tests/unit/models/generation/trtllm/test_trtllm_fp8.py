@@ -22,6 +22,7 @@ from nemo_rl.models.generation.trtllm.quantization.fp8 import (
     configure_fp8_moe_backend,
     load_weights,
     validate_fused_expert_layout,
+    build_local_expert_lookup,
 )
 
 pytestmark = pytest.mark.trtllm
@@ -252,3 +253,125 @@ def test_routed_expert_conversion():
     for name, tensor in passthrough.items():
         assert converted[name] is tensor
         assert name.removesuffix(".weight") + ".weight_scale_inv" not in converted
+
+
+def _fused_expert_stacks(num_experts: int):
+    gate = torch.stack([_block_matrix([[float(2 * e + 1), 2.0]]) for e in range(num_experts)])
+    up = torch.stack([_block_matrix([[5.0, float(e + 1)]]) for e in range(num_experts)])
+    down = torch.stack(
+        [_block_matrix([[9.0], [float(10 + e)]]) for e in range(num_experts)]
+    )
+    gate_up = torch.cat((gate, up), dim=1).to(torch.bfloat16)
+    return gate, up, down.to(torch.bfloat16), gate_up
+
+
+@pytest.mark.parametrize("is_mx", [False, True])
+def test_local_expert_lookup_converts_only_local_experts(is_mx):
+    prefix = "model.language_model.layers.3.mlp.experts"
+    gate, up, down, gate_up = _fused_expert_stacks(4)
+    local_ids = [3, 1]
+
+    full = load_weights(
+        [(f"{prefix}.gate_up_proj", gate_up), (f"{prefix}.down_proj", down)],
+        is_mx=is_mx,
+    )
+    local = load_weights(
+        [(f"{prefix}.gate_up_proj", gate_up), (f"{prefix}.down_proj", down)],
+        is_mx=is_mx,
+        local_experts=lambda p: local_ids if p == prefix else None,
+    )
+
+    expected_names = {
+        f"{prefix}.{e}.{proj}.{leaf}"
+        for e in local_ids
+        for proj in ("gate_proj", "up_proj", "down_proj")
+        for leaf in ("weight", "weight_scale_inv")
+    }
+    assert set(local) == expected_names
+    for name, tensor in local.items():
+        assert torch.equal(tensor.float(), full[name].float())
+        assert tensor.dtype == full[name].dtype
+    assert f"{prefix}.0.gate_proj.weight" not in local
+    assert f"{prefix}.2.down_proj.weight" not in local
+
+
+def test_local_expert_lookup_unknown_prefix_converts_everything():
+    prefix = "model.layers.0.mlp.experts"
+    _gate, _up, down, gate_up = _fused_expert_stacks(3)
+    converted = load_weights(
+        [(f"{prefix}.gate_up_proj", gate_up), (f"{prefix}.down_proj", down)],
+        local_experts=lambda p: None,
+    )
+    assert {f"{prefix}.{e}.down_proj.weight" for e in range(3)} <= set(converted)
+
+
+def test_local_expert_lookup_filters_split_expert_names():
+    prefix = "mtp.layers.0.mlp.experts"
+    weights = [
+        (f"{prefix}.{e}.down_proj.weight", torch.randn(128, 128, dtype=torch.bfloat16))
+        for e in range(3)
+    ]
+    passthrough = ("model.layers.0.mlp.gate.weight", torch.randn(2, 256))
+    converted = load_weights(
+        weights + [passthrough],
+        local_experts=lambda p: [2] if p == prefix else None,
+    )
+    assert f"{prefix}.2.down_proj.weight" in converted
+    assert f"{prefix}.2.down_proj.weight_scale_inv" in converted
+    assert f"{prefix}.0.down_proj.weight" not in converted
+    assert f"{prefix}.1.down_proj.weight" not in converted
+    assert converted[passthrough[0]] is passthrough[1]
+
+
+def test_local_expert_lookup_rejects_out_of_range_ids():
+    prefix = "model.layers.0.mlp.experts"
+    _gate, _up, down, gate_up = _fused_expert_stacks(2)
+    with pytest.raises(ValueError, match="outside"):
+        load_weights(
+            [(f"{prefix}.gate_up_proj", gate_up), (f"{prefix}.down_proj", down)],
+            local_experts=lambda p: [0, 5],
+        )
+
+
+class _MoeStub(torch.nn.Module):
+    def __init__(self, layer_idx, local_ids, load_balancer=None):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.initial_local_expert_ids = list(local_ids)
+        self.layer_load_balancer = load_balancer
+
+
+class _ModelStub(torch.nn.Module):
+    def __init__(self, layers, num_hidden_layers=None):
+        super().__init__()
+        self.blocks = torch.nn.ModuleList(layers)
+        pretrained = type("Pretrained", (), {"num_hidden_layers": num_hidden_layers})()
+        self.model_config = type("ModelConfig", (), {"pretrained_config": pretrained})()
+
+
+def test_build_local_expert_lookup_maps_decoder_and_mtp_layers():
+    # The owner module and its backend both carry the attributes (same ids).
+    owner = _MoeStub(3, [32, 33, 34, 35])
+    owner.backend = _MoeStub(3, [35, 34, 33, 32])
+    mtp = _MoeStub(60, [0, 1])
+    lookup = build_local_expert_lookup(_ModelStub([owner, mtp], num_hidden_layers=60))
+
+    assert lookup is not None
+    assert list(lookup("model.language_model.layers.3.mlp.experts")) == [32, 33, 34, 35]
+    assert list(lookup("model.layers.3.mlp.experts")) == [32, 33, 34, 35]
+    assert list(lookup("mtp.layers.0.mlp.experts")) == [0, 1]
+    assert lookup("model.layers.7.mlp.experts") is None
+    assert lookup("model.layers.3.mlp.shared_expert") is None
+
+
+def test_build_local_expert_lookup_without_moe_or_with_load_balancer():
+    assert build_local_expert_lookup(_ModelStub([torch.nn.Linear(2, 2)])) is None
+    balanced = _MoeStub(0, [0, 1], load_balancer=object())
+    assert build_local_expert_lookup(_ModelStub([balanced])) is None
+
+
+def test_build_local_expert_lookup_rejects_disagreeing_modules():
+    owner = _MoeStub(1, [0, 1])
+    owner.backend = _MoeStub(1, [2, 3])
+    with pytest.raises(ValueError, match="disagree"):
+        build_local_expert_lookup(_ModelStub([owner]))
