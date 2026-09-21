@@ -574,6 +574,9 @@ class LossPostProcessor:
         self.dp_size = dp_size
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
+        # Same knob the logprob path reads; without it the training forward runs
+        # the log-prob computation unchunked (see LogprobsPostProcessor).
+        self.logprob_chunk_size = cfg.get("logprob_chunk_size", None)
         self._cp_gradient_fanout = (
             cp_size
             if cp_size > 1
@@ -645,6 +648,7 @@ class LossPostProcessor:
                 self.cp_mesh.get_group() if self.cp_size > 1 else None
             ),
             cp_sharder=token_layout,
+            chunk_size=self.logprob_chunk_size,
         )
         # Wrap loss function for sequence packing if needed
         if self.enable_seq_packing:

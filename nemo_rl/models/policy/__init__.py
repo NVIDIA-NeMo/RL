@@ -648,7 +648,9 @@ class PolicyConfig(TypedDict):
     logprob_batch_size: NotRequired[int]
     # If set, log probability computation is chunked along the sequence dimension to avoid GPU OOM (especially during backward pass).
     # Within each chunk loop, logits casting (from float16/bfloat16 to float32) is done to prevent holding the entire float32 logits tensor in memory.
-    # If None, chunking is disabled and the full sequence is processed at once.
+    # If None, chunking is disabled and the full sequence is processed at once, except on the
+    # full-vocabulary (tensor-parallel-size 1) log-prob path, which always chunks and falls back to
+    # nemo_rl.distributed.model_utils.DEFAULT_LOCAL_LOGPROB_CHUNK_SIZE.
     logprob_chunk_size: NotRequired[int | None]
     generation: NotRequired[GenerationConfig]
     generation_batch_size: NotRequired[

@@ -600,6 +600,52 @@ class TestLossPostProcessor:
         assert processor.cfg is base_cfg
         assert processor.cp_size == 2
         assert processor.dp_size == 4
+        assert processor.logprob_chunk_size is None
+
+    @pytest.mark.parametrize("logprob_chunk_size", [None, 16])
+    @patch("nemo_rl.models.automodel.train.prepare_loss_input")
+    def test_logprob_chunk_size_reaches_prepare_loss_input(
+        self,
+        mock_prepare_loss_input,
+        logprob_chunk_size,
+        base_cfg,
+        mock_loss_fn,
+        mock_cp_mesh,
+        processed_inputs_no_flash,
+    ):
+        """The training forward must chunk too, not only ``get_logprobs``."""
+        mock_prepare_loss_input.return_value = ({}, BatchedDataDict({}))
+        processor = LossPostProcessor(
+            loss_fn=mock_loss_fn,
+            cfg={**base_cfg, "logprob_chunk_size": logprob_chunk_size},
+            cp_mesh=mock_cp_mesh,
+            cp_size=1,
+            dp_size=1,
+        )
+
+        batch_size = 4
+        seq_len = 64
+        vocab_size = 32000
+        data_dict = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, vocab_size, (batch_size, seq_len)),
+                "sample_mask": torch.ones(batch_size, dtype=torch.bool),
+            }
+        )
+
+        processor(
+            logits=torch.randn(batch_size, seq_len, vocab_size),
+            data_dict=data_dict,
+            processed_inputs=processed_inputs_no_flash,
+            global_valid_seqs=torch.tensor(8),
+            global_valid_toks=torch.tensor(512),
+            cp_sharder=None,
+        )
+
+        mock_prepare_loss_input.assert_called_once()
+        assert (
+            mock_prepare_loss_input.call_args.kwargs["chunk_size"] == logprob_chunk_size
+        )
 
 
 # =====================
