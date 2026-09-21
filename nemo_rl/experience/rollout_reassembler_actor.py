@@ -56,6 +56,7 @@ class ReassemblyRequest:
     reward_log_contexts: tuple[RewardLogContext | None, ...] | None = None
     # Resolved by Gym and persisted with the sealed receipts for teacher routing.
     resolved_agent_name: Optional[str] = None
+    rollout_environment: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -146,6 +147,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             fallback_weight_version=request.fallback_weight_version,
             prompt_idx=request.prompt_idx,
             loss_multiplier=request.loss_multiplier,
+            rollout_environment=request.rollout_environment,
             canonical_sample_ids=list(request.canonical_sample_ids),
             reward_checks=list(request.reward_checks)
             if request.reward_checks is not None
