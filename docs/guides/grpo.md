@@ -625,6 +625,51 @@ When top-p or top-k filtering is enabled, the following conventions apply:
 
 Under tensor parallelism (TP), enabling top-p or top-k adds communication overhead. The vocabulary is sharded across GPUs (vocab-parallel), while top-p and top-k require full-vocabulary probabilities. A naive all-gather of logits would require large additional memory. The implementation therefore switches to a batch–sequence-parallel layout via all-to-all communication, applies filtering over the full vocabulary, then switches back, avoiding materialization of the full vocabulary on any single rank.
 
+## Advantage Estimation
+
+### Leave-one-out baseline and reward normalization
+
+For a prompt with $N$ rollouts and rewards $r_1 \dots r_N$, `use_leave_one_out_baseline: true`
+gives rollout $i$ the baseline
+
+$$
+b_i = \frac{1}{N-1} \sum_{j \neq i} r_j
+$$
+
+and `normalize_rewards: true` divides by the spread of that same set:
+
+$$
+A_i = \frac{r_i - b_i}{\sigma_i + \epsilon}
+$$
+
+where:
+
+- $\sigma_i$ is the sample standard deviation of $\{ r_j \}_{j \neq i}$
+- $\epsilon = 10^{-6}$
+- both $b_i$ and $\sigma_i$ use the other $N-1$ rollouts, never $r_i$
+
+If those $N-1$ rewards are all equal, their true standard deviation is zero and there
+is no meaningful scale for normalization. NeMo RL skips the division for that rollout:
+
+$$
+A_i = r_i - b_i \quad \text{when} \quad \min_{j \neq i} r_j = \max_{j \neq i} r_j
+$$
+
+So for $r = [0,\ 0.95,\ 0.95,\ 0.95,\ 0.95,\ 0.95,\ 0.95,\ 0.95]$, rollout 1 gets
+$A_1 = -0.95$. The `std` division is manually skipped to avoid dividing by FP32
+rounding errors from computing the difference between the square of the mean and
+the mean of the square.
+
+Two consequences:
+
+- $A_i$ is on the raw reward scale while its peers are on the normalized scale.
+- Only groups that have exactly the same reward (after LOO) will skip normalization.
+Small `std` that is not a consequence of rounding errors will not be skipped.
+
+Dynamic sampling uses a separate whole-group test, $\min_j r_j = \max_j r_j$ over all $N$,
+so a prompt group is kept or dropped together, independently of leave-one-out baseline
+semantics.
+
 ## Metrics
 This feature is controlled by the parameters `wandb_name` and `tb_name`. We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
 

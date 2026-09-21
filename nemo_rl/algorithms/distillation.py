@@ -49,9 +49,11 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
+    build_nemo_gym_actors,
     should_use_nemo_gym,
-    spinup_nemo_gym_actor,
+    validate_dataset_agent_coverage,
 )
+from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
@@ -64,6 +66,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
+    normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
 )
 from nemo_rl.models.policy import PolicyConfig
@@ -73,7 +76,10 @@ from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import managed_span, trace_fn
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
-from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointManager,
+)
 from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
@@ -239,6 +245,9 @@ def setup(
     )
     checkpoint_engine_config = None
     if generation_config["backend"] == "vllm":
+        normalize_nvfp4_pertoken_policy_config(
+            policy_config, entry_point="distillation"
+        )
         vllm_config = cast(VllmConfig, generation_config)
         normalize_vllm_refit_config(vllm_config)
         refit_transport = vllm_config.get("refit_transport")
@@ -518,7 +527,7 @@ def setup(
                 return deferred_vllm
 
             def init_nemo_gym():
-                return spinup_nemo_gym_actor(
+                shard_set = build_nemo_gym_actors(
                     env_configs,
                     base_urls=cast(list[str], deferred_vllm.dp_openai_server_base_urls),
                     model_name=generation_config["model_name"],
@@ -527,6 +536,15 @@ def setup(
                     enable_router_replay=False,
                     use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
                 )
+                try:
+                    validate_dataset_agent_coverage(
+                        shard_set,
+                        {"training": train_dataset, "validation": val_dataset},
+                    )
+                except BaseException:
+                    shard_set.shutdown()
+                    raise
+                return shard_set
 
             init_tasks = {
                 "vllm": init_vllm_deferred,
@@ -537,9 +555,20 @@ def setup(
                 f"  ⚡ Init tasks: {', '.join(init_tasks.keys())}",
                 flush=True,
             )
-            with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
-                submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
-                results = {k: f.result() for k, f in submitted.items()}
+            submitted = {}
+            try:
+                with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
+                    submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
+                    results = {k: f.result() for k, f in submitted.items()}
+            except BaseException:
+                if "nemo_gym" in submitted:
+                    try:
+                        completed_shard_set = submitted["nemo_gym"].result()
+                    except BaseException:
+                        pass
+                    else:
+                        completed_shard_set.shutdown()
+                raise
 
             student_generation = cast(GenerationInterface, results["vllm"])
             nemo_gym_actor = cast(EnvironmentInterface, results["nemo_gym"])
@@ -592,7 +621,9 @@ def setup(
         )
         student_generation.weight_synchronizer.init_communicator()
     elif student_generation is not None:
-        state_dict_info = student_policy.prepare_refit_info()
+        state_dict_info = student_policy.prepare_refit_info(
+            refit_payload_mode=student_generation.get_refit_payload_mode()
+        )
         student_generation.prepare_refit_info(state_dict_info)
 
     # if it is not colocated inference, initialize collective communication for update weights
@@ -638,8 +669,7 @@ def setup(
 # ===============================================================================
 
 
-@trace_fn(RLSpanGroup.JOB, "rl.distillation.job")
-def distillation_train(
+def _distillation_train_impl(
     student_policy: ColocatablePolicyInterface,
     teacher_policy: ColocatablePolicyInterface,
     student_generation: Optional[GenerationInterface],
@@ -801,6 +831,9 @@ def distillation_train(
                             task_to_env=task_to_env,
                             max_seq_len=None,
                             generation_config=generation_config,
+                            num_generations_per_prompt=(
+                                master_config.distillation.num_generations_per_prompt
+                            ),
                             log_full_result_tables=should_log_nemo_gym_full_result_tables(
                                 wandb_enabled=master_config.logger["wandb_enabled"],
                                 wandb_config=master_config.logger["wandb"],
@@ -1076,7 +1109,7 @@ def distillation_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config.checkpointing,
+                            is_final_checkpoint=is_last_step,
                         )
                         torch.save(
                             dataloader.state_dict(),
@@ -1154,7 +1187,12 @@ def distillation_train(
                 metrics["global_valid_toks"] / total_time / total_num_gpus
             )
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
-            logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
+            logger.log_metrics(
+                timing_metrics,
+                total_steps + 1,
+                prefix="timing/train",
+                step_finished=True,
+            )
 
             timer.reset()
             current_step += 1
@@ -1181,6 +1219,43 @@ def distillation_train(
     # without this the daemon finalization thread could be killed before the
     # final tmp_step_N is renamed.
     checkpointer.shutdown()
+
+
+@trace_fn(RLSpanGroup.JOB, "rl.distillation.job")
+def distillation_train(
+    student_policy: ColocatablePolicyInterface,
+    teacher_policy: ColocatablePolicyInterface,
+    student_generation: Optional[GenerationInterface],
+    dataloader: StatefulDataLoader,
+    val_dataloader: Optional[StatefulDataLoader],
+    tokenizer: TokenizerType,
+    loss_fn: DistillationLossFn,
+    task_to_env: dict[str, EnvironmentInterface],
+    val_task_to_env: Optional[dict[str, EnvironmentInterface]],
+    logger: Logger,
+    checkpointer: CheckpointManager,
+    distillation_save_state: DistillationSaveState,
+    master_config: MasterConfig,
+) -> None:
+    """Run distillation training and always tear down its environments."""
+    try:
+        _distillation_train_impl(
+            student_policy=student_policy,
+            teacher_policy=teacher_policy,
+            student_generation=student_generation,
+            dataloader=dataloader,
+            val_dataloader=val_dataloader,
+            tokenizer=tokenizer,
+            loss_fn=loss_fn,
+            task_to_env=task_to_env,
+            val_task_to_env=val_task_to_env,
+            logger=logger,
+            checkpointer=checkpointer,
+            distillation_save_state=distillation_save_state,
+            master_config=master_config,
+        )
+    finally:
+        shutdown_environments(task_to_env, val_task_to_env)
 
 
 def validate(
@@ -1245,6 +1320,7 @@ def validate(
                     task_to_env=val_task_to_env,
                     max_seq_len=None,
                     generation_config=generation_config,
+                    num_generations_per_prompt=1,
                     log_full_result_tables=should_log_nemo_gym_full_result_tables(
                         wandb_enabled=master_config.logger["wandb_enabled"],
                         wandb_config=master_config.logger["wandb"],

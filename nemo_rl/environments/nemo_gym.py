@@ -12,20 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import json
 import math
 import os
 import subprocess
 import sys
+import threading
 from collections import Counter
 from collections.abc import AsyncGenerator, Mapping
+from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
+from time import monotonic
 from typing import Any, Dict, List, NotRequired, Optional, Protocol, TypedDict
 
 import ray
 import torch
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+from ray.util.placement_group import (
+    PlacementGroup,
+    placement_group,
+    remove_placement_group,
+)
+from ray.util.scheduling_strategies import (
+    NodeAffinitySchedulingStrategy,
+    PlacementGroupSchedulingStrategy,
+)
 from transformers import PreTrainedTokenizerBase
 
+from nemo_rl.data.interfaces import NemoGymSourceIdentity
 from nemo_rl.data.multimodal_utils import (
     attach_image_model_inputs_to_message,
     extract_input_media_sources_from_responses_messages,
@@ -45,6 +59,19 @@ from nemo_rl.environments.nemo_gym_multimodal import (
     _without_initial_media_sources,
     normalize_media_in_examples,
 )
+from nemo_rl.environments.nemo_gym_shards import (
+    DEFAULT_PLACEMENT_STRATEGY,
+    SHARDING_CONFIG_KEYS,
+    ShardConfigError,
+    ShardPlan,
+    ShardSetupError,
+    ShardSpec,
+    apply_shard_log_dir,
+    apply_shard_overlay,
+    build_route_shard_map,
+    parse_shard_plan,
+)
+from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.failures import (
     GymTransportError,
     RolloutDataFailure,
@@ -62,6 +89,36 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 NEMO_GYM_ACTOR_FQN = "nemo_rl.environments.nemo_gym.NemoGym"
 NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S = 120
 
+# The three server-type keys Gym nests under a top-level config entry. Gym's
+# constant is private (nemo_gym.discovery._SERVER_GROUP_KEYS), and the literal
+# list also appears in global_config.py, config_types.py, and cli/env.py.
+GYM_SERVER_TYPE_KEYS = (
+    "responses_api_agents",
+    "responses_api_models",
+    "resources_servers",
+)
+
+# Shard name used when the job is unsharded, so a single actor and a sharded
+# set have the same shape and callers need only one code path.
+DEFAULT_SHARD_NAME = "nemo_gym"
+
+# Logical CPUs reserved per shard bundle. This is a scheduling reservation, not
+# a limit: it decides whether a node can host a shard and steers Ray away from
+# stacking other CPU work there. Gym's subprocesses are not metered against it,
+# so a shard can use more than it reserves. Override per shard for known-heavy
+# stacks (e.g. code_gen and its sandbox pool).
+DEFAULT_SHARD_CPUS = 8
+
+# Waiting for STRICT_SPREAD bundles. Failing here means the allocation has
+# fewer usable nodes than the plan needs, which is worth reporting quickly.
+DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS = 180.0
+
+# Waiting for a shard to finish _spinup. Generous because a node that has never
+# run Gym builds every server's venv first; with venvs baked into the image
+# this is far shorter.
+DEFAULT_SHARD_SPINUP_TIMEOUT_SECONDS = 1800.0
+DEFAULT_SHARD_DRAIN_TIMEOUT_SECONDS = NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S
+
 # Kept local so the Gym actor does not depend on model-config dtype resolution.
 # Must cover every name resolve_routed_experts_dtype can produce.
 _ROUTED_EXPERTS_DTYPES = {
@@ -77,6 +134,50 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+
+
+def _require_resolved_agent_refs(nemo_gym_examples: list[dict]) -> None:
+    """Fail readably when Gym did not stamp an agent_ref onto every row.
+
+    ``run_examples`` resolves ``task_source`` to ``agent_ref`` in place before it returns,
+    and every read after that point -- this module's counters, and Gym's own dispatch,
+    which posts to ``row["agent_ref"]["name"]`` -- assumes it happened. Unguarded, a row
+    that was not resolved surfaces as ``KeyError: 'agent_ref'`` inside a Ray TaskError
+    inside an ExceptionGroup, forty lines from anything that names the cause.
+
+    The cause worth naming is a version skew rather than a bad row. ``task_source`` routing
+    is new: an older Gym has no resolver, so a dataset prepared with a current Gym -- which
+    strips ``agent_ref`` and stamps ``task_source`` instead -- arrives unroutable. That
+    happens when the Gym actor's venv is older than the checkout that prepared the data,
+    which is what ``NRL_FORCE_REBUILD_VENVS=true`` exists to correct.
+    """
+    unresolved = [
+        index
+        for index, row in enumerate(nemo_gym_examples)
+        if not (row.get("agent_ref") or {}).get("name")
+    ]
+    if not unresolved:
+        return
+    task_sources = sorted(
+        {
+            source
+            for index in unresolved
+            if (source := nemo_gym_examples[index].get("task_source")) is not None
+        }
+    )
+    raise RuntimeError(
+        f"{len(unresolved)} of {len(nemo_gym_examples)} rollout rows have no agent_ref "
+        "after run_examples(), so Gym cannot route them and neither can this actor. "
+        + (
+            f"They carry task_source {task_sources}, which a current Gym resolves and an "
+            "older one ignores -- the Gym in this actor's venv is most likely older than "
+            "the checkout that prepared the data. Rebuild the actor venvs "
+            "(NRL_FORCE_REBUILD_VENVS=true) so both come from the same Gym."
+            if task_sources
+            else "They carry no task_source either, so nothing can route them: the "
+            "dataset was prepared without routing information."
+        )
+    )
 
 
 class NemoGymCompatibleConfig(Protocol):
@@ -223,7 +324,7 @@ class NemoGymConfig(TypedDict):
     ]  # For processor reconstruction inside the actor
     pad_dynamic_image_shapes: NotRequired[
         bool
-    ]  # Normalize heterogeneous image tensors while retaining exact imgs_sizes
+    ]  # Preserve heterogeneous shapes for native-resolution patchification
     # Ledger-authoritative token capture (token_capture.enabled): the dumped
     # TokenCaptureConfig. Turns on external staging in Gym's policy model
     # server, switches run_rollouts to receipt mode, and assembles receipts
@@ -324,7 +425,11 @@ def get_pad_dynamic_image_shapes(env_config: Mapping[str, Any]) -> bool:
     return bool(nemo_gym_config.get("pad_dynamic_image_shapes"))
 
 
-@ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
+# Fail fast rather than restart. The servers this actor owns are started in
+# _spinup, which Ray does not re-run after a restart, so a restarted actor is
+# permanently broken: _require_spinup() rejects every later rollout call, and
+# the caller never sees the RayActorError it is waiting for.
+@ray.remote(max_restarts=0, max_task_retries=0)  # pragma: no cover
 class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
 
@@ -375,16 +480,19 @@ class NemoGym(EnvironmentInterface):
                 "serve rollouts until it is spun up again."
             )
 
-    def health_check(self) -> None:
+    async def health_check(self) -> None:
         """Raise if the Gym head server or any subprocess server has died.
 
         Thin wrapper over NeMo-Gym's own ``RunHelper.poll``, which is what ``gym env
         start`` calls every 60s from ``run_forever``. NeMo-RL only calls ``rh.start``,
         so without this the check Gym already implements never runs and a dead tool
         server surfaces as unexplained rollout timeouts instead of a named process.
+
+        Run the synchronous poll in a worker thread so this probe does not block
+        concurrent rollouts on the actor's event loop.
         """
         self._require_spinup()
-        self.rh.poll()
+        await asyncio.to_thread(self.rh.poll)
 
     def _spinup(self) -> None:
         """Start the NeMo-Gym head server and rollout collection helper.
@@ -586,6 +694,51 @@ Depending on your data shape, you may want to change these values."""
             )
         return await response.json()
 
+    def list_entries(self) -> Dict[str, List[str]]:
+        """Report which config entries this actor actually spawned.
+
+        Returns ``{entry_name: [server_type_keys]}`` read from Gym's *resolved*
+        config, so entries that arrived via ``config_paths`` are included. The
+        config NeMo RL passed in is not a substitute: it still holds
+        ``config_paths`` as file paths and none of the entries they expand
+        into, so reading it would miss every agent and judge loaded from a
+        path.
+
+        Entries whose server config has no ``entrypoint`` are omitted because
+        Gym does not start a process for them.
+
+        Callers compare these names across actors to build the agent->shard map
+        and to catch an entry duplicated across shards. Names are all that is
+        interpreted; what an entry *means* is Gym's business.
+        """
+        if self.rh is None:
+            raise RuntimeError(
+                "list_entries() needs a running Gym stack; call _spinup() first."
+            )
+
+        from nemo_gym.global_config import get_global_config_dict
+        from omegaconf import DictConfig
+
+        resolved = get_global_config_dict()
+        entries: Dict[str, List[str]] = {}
+        for name, entry in resolved.items():
+            if not isinstance(entry, (dict, DictConfig)):
+                continue
+            # Fixed key order so the map is stable across actors and runs.
+            types = []
+            for key in GYM_SERVER_TYPE_KEYS:
+                server_group = entry.get(key)
+                if not isinstance(server_group, (dict, DictConfig)):
+                    continue
+                if any(
+                    isinstance(server, (dict, DictConfig)) and "entrypoint" in server
+                    for server in server_group.values()
+                ):
+                    types.append(key)
+            if types:
+                entries[str(name)] = types
+        return entries
+
     async def run_rollouts(
         self,
         nemo_gym_examples: list[dict],
@@ -618,6 +771,7 @@ Depending on your data shape, you may want to change these values."""
         )
         # Gym resolves task_source to agent_ref synchronously in run_examples().
         # Build the counter afterward so completion rows use the resolved identity.
+        _require_resolved_agent_refs(nemo_gym_examples)
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
         num_results = 0
@@ -1145,13 +1299,16 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
         return result
 
     def shutdown(self) -> None:
-        # Teardown runs in a finally block, so it must not turn a real training error
-        # into a confusing AttributeError from a never-spun-up (e.g. restarted) actor.
-        if self.rh is None:
-            return
-        run_helper = self.rh
-        self.rh = None
-        run_helper.shutdown()
+        """Stop the Gym servers. Safe to call more than once, and before spinup.
+
+        Teardown runs in a finally block and may be requested more than once.
+        RunHelper.shutdown() is not idempotent, so the handle is cleared before
+        it is used. A failure therefore cannot leave a live handle that a later
+        cleanup attempt invokes again.
+        """
+        rh, self.rh = self.rh, None
+        if rh is not None:
+            rh.shutdown()
 
     def step(self, message_log_batch, metadata):
         # This is not used since NeMo-Gym will handle the rollouts entirely.
@@ -1272,7 +1429,7 @@ def build_nemo_gym_config(
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
 ) -> NemoGymConfig:
-    """Build the ``NemoGymConfig`` for a NeMo-Gym actor.
+    """Build the ``NemoGymConfig`` for a single, unsharded NeMo-Gym actor.
 
     Splits ``env_configs["nemo_gym"]`` into the NeMo-RL-side fields the actor
     reads directly and the remainder, which is forwarded verbatim as NeMo-Gym's
@@ -1293,14 +1450,63 @@ def build_nemo_gym_config(
         A ``NemoGymConfig`` with NeMo-RL fields at the top level and the
         remaining ``env_configs["nemo_gym"]`` keys under
         ``initial_global_config_dict``. The caller's ``env_configs`` is not mutated.
+
+    Raises:
+        ShardConfigError: The config is sharded. One config cannot describe
+            several shards; use :func:`build_nemo_gym_actors`.
     """
     nemo_gym_dict = dict(env_configs["nemo_gym"])
+
+    shard_plan = parse_shard_plan(nemo_gym_dict)
+    if shard_plan is not None:
+        raise ShardConfigError(
+            f"env.nemo_gym.shards defines {len(shard_plan.shards)} shards "
+            f"({', '.join(s.name for s in shard_plan.shards)}), so it does not "
+            f"describe a single actor. Use build_nemo_gym_actors() instead."
+        )
+
+    return _build_gym_actor_config(
+        nemo_gym_dict,
+        base_urls=base_urls,
+        model_name=model_name,
+        enable_router_replay=enable_router_replay,
+        use_fastokens=use_fastokens,
+        token_capture=token_capture,
+    )
+
+
+def _build_gym_actor_config(
+    nemo_gym_dict: dict[str, Any],
+    *,
+    base_urls: list[str],
+    model_name: str,
+    enable_router_replay: bool,
+    use_fastokens: bool,
+    token_capture: Optional[dict[str, Any]] = None,
+) -> NemoGymConfig:
+    """Turn one already-resolved Gym config mapping into a ``NemoGymConfig``.
+
+    Shared by the unsharded path and by each shard, so every actor gets the
+    same treatment of NeMo-RL-side keys regardless of how it was composed.
+    """
+    nemo_gym_dict = dict(nemo_gym_dict)
+
+    # NeMo-RL-only keys are consumed here and must never reach Gym: the merged
+    # config is serialized into every Gym child process, and unrecognized
+    # dict-shaped top-level keys are parsed as server instance configs.
+    for key in SHARDING_CONFIG_KEYS:
+        nemo_gym_dict.pop(key, None)
 
     # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
     # (where the detector reads them), not part of Gym's global config.
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    port_range = {
+        key: value
+        for key in ("port_range_low", "port_range_high")
+        if (value := nemo_gym_dict.pop(key, None)) is not None
+    }
     # Same treatment for the multimodal knobs: NemoGymConfig declares them as
     # top-level fields, so populate them here instead of leaving the actor to
     # read them back out of Gym's global config dict.
@@ -1336,8 +1542,496 @@ def build_nemo_gym_config(
         use_fastokens=use_fastokens,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=token_capture,
+        **port_range,
         **multimodal_flags,
     )
+
+
+def get_nemo_gym_route_name(row: Mapping[str, Any]) -> str:
+    """Return the entry name Gym uses to route a row."""
+    agent_ref = row.get("agent_ref")
+    if isinstance(agent_ref, Mapping):
+        agent_name = agent_ref.get("name")
+        if isinstance(agent_name, str) and agent_name:
+            return agent_name
+
+    task_source = row.get("task_source")
+    if isinstance(task_source, str) and task_source:
+        return task_source
+
+    raise ValueError(
+        "A NeMo-Gym row must contain a non-empty agent_ref.name or task_source"
+    )
+
+
+@dataclass
+class NemoGymShardSet:
+    """The live actors behind one NeMo-Gym stack, sharded or not.
+
+    An unsharded job is the one-shard, one-replica case, so callers do not need
+    a separate code path for it.
+
+    Attributes:
+        handles: Shard name to its replica handles, in replica order.
+        route_to_shard: Agent or task-source entry name to the shard hosting
+            it. Empty when unsharded, where every row goes to the only actor.
+        placement_group: The STRICT_SPREAD group pinning shards to distinct
+            nodes, or None when unsharded.
+    """
+
+    handles: Dict[str, List[ray.actor.ActorHandle]]
+    route_to_shard: Dict[str, str] = field(default_factory=dict)
+    placement_group: Optional[PlacementGroup] = None
+    _next_replica: Dict[str, int] = field(default_factory=dict, repr=False)
+    _replica_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        repr=False,
+        compare=False,
+    )
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state.pop("_replica_lock", None)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._replica_lock = threading.Lock()
+
+    @property
+    def is_sharded(self) -> bool:
+        return self.placement_group is not None
+
+    @property
+    def all_handles(self) -> List[Any]:
+        return [handle for replicas in self.handles.values() for handle in replicas]
+
+    @property
+    def hosted_routes(self) -> frozenset[str]:
+        """Agent and task-source entry names this set can route to."""
+        return frozenset(self.route_to_shard)
+
+    def shard_for_route(self, route_name: str) -> str:
+        """Name the shard hosting an agent or task source.
+
+        Unsharded jobs have one actor and no map, so every route resolves to it;
+        nothing was discovered because nothing could have conflicted.
+
+        Raises:
+            ShardSetupError: No shard hosts the route, so its rows have nowhere
+                to go.
+        """
+        if not self.route_to_shard:
+            return next(iter(self.handles))
+        try:
+            return self.route_to_shard[route_name]
+        except KeyError:
+            raise ShardSetupError(
+                f"No NeMo-Gym shard hosts route '{route_name}'. Hosted routes: "
+                f"{sorted(self.route_to_shard)}."
+            ) from None
+
+    def pick_handle(self, route_name: str) -> Any:
+        """Choose the actor instance to serve a route's next prompt group.
+
+        The shard is fixed by the data; the replica rotates round-robin. Round
+        robin is deterministic and easy to reason about, which matters more
+        than adaptivity here: within a synchronous step there is no completion
+        feedback to adapt on, so an even split is the best available policy.
+        Least-in-flight would pay off on the async path, where dispatch is
+        continuous, and can replace this without touching callers.
+        """
+        shard_name = self.shard_for_route(route_name)
+        replicas = self.handles[shard_name]
+        if len(replicas) == 1:
+            return replicas[0]
+        with self._replica_lock:
+            index = self._next_replica.get(shard_name, 0)
+            self._next_replica[shard_name] = (index + 1) % len(replicas)
+        return replicas[index]
+
+    def instance_label(self, handle: Any) -> str:
+        """Name one actor instance for error messages and metric keys."""
+        for shard_name, replicas in self.handles.items():
+            for index, replica in enumerate(replicas):
+                if replica is handle:
+                    return shard_name if len(replicas) == 1 else f"{shard_name}/{index}"
+        raise ShardSetupError("Handle does not belong to this NeMo-Gym shard set")
+
+    def sole_handle(self) -> Any:
+        """The only actor, for callers that predate routing.
+
+        Raises:
+            ShardSetupError: There is more than one actor, so picking one would
+                silently drop the rest.
+        """
+        handles = self.all_handles
+        if len(handles) != 1:
+            raise ShardSetupError(
+                f"Expected a single NeMo-Gym actor but this set has "
+                f"{len(handles)} across shards {sorted(self.handles)}. The "
+                f"caller needs the shard-aware rollout router."
+            )
+        return handles[0]
+
+    def shutdown(
+        self,
+        *,
+        timeout: float | None = NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+        force_kill: bool = True,
+    ) -> None:
+        """Stop every actor, then release the bundles they were pinned to."""
+        handles = self.all_handles
+        try:
+            shutdown_environments(
+                {
+                    f"nemo_gym[{shard}][{replica}]": handle
+                    for shard, replicas in self.handles.items()
+                    for replica, handle in enumerate(replicas)
+                },
+                timeout=timeout,
+            )
+        except Exception as error:
+            print(f"Failed to shut down NeMo-Gym actors: {error}")
+        if force_kill:
+            for handle in handles:
+                try:
+                    ray.kill(handle)
+                except Exception as error:
+                    print(f"Failed to kill NeMo-Gym actor after shutdown: {error}")
+        if self.placement_group is not None:
+            try:
+                remove_placement_group(self.placement_group)
+            except Exception as error:
+                print(f"Failed to release the NeMo-Gym placement group: {error}")
+            self.placement_group = None
+
+
+def _shard_instances(plan: ShardPlan) -> List[tuple[ShardSpec, int]]:
+    """Expand shards into one (shard, replica_index) entry per actor."""
+    return [
+        (shard, replica) for shard in plan.shards for replica in range(shard.replicas)
+    ]
+
+
+def as_nemo_gym_shard_set(environment: Any) -> NemoGymShardSet:
+    """Read the NeMo-Gym entry of ``task_to_env`` as a shard set either way.
+
+    Call sites that predate sharding put a bare actor handle there. Rather than
+    make every one of them build a set first, treat a lone handle as the
+    one-shard, one-replica case it already is, so the routing path is identical
+    whether or not the job is sharded.
+    """
+    if isinstance(environment, NemoGymShardSet):
+        return environment
+    return NemoGymShardSet(handles={DEFAULT_SHARD_NAME: [environment]})
+
+
+def build_nemo_gym_actors(
+    env_configs: dict[str, Any],
+    *,
+    base_urls: list[str],
+    model_name: str,
+    tokenizer: PreTrainedTokenizerBase,
+    enable_router_replay: bool,
+    use_fastokens: bool,
+    token_capture: Optional[dict[str, Any]] = None,
+    pg_ready_timeout: float = DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS,
+    spinup_timeout: float = DEFAULT_SHARD_SPINUP_TIMEOUT_SECONDS,
+) -> NemoGymShardSet:
+    """Create and spin up every NeMo-Gym actor this job needs.
+
+    Without ``shards`` this makes exactly one actor, scheduled as before. With
+    ``shards`` it makes one actor per replica, each pinned by a STRICT_SPREAD
+    placement group to a distinct node, each holding its own complete Gym
+    stack. Actors are spun up concurrently, so the wall-clock cost is roughly
+    the slowest shard rather than the sum.
+
+    Args:
+        tokenizer: Installed on every actor once it is up, rather than passed
+            per rollout call. See ``NemoGym.set_tokenizer`` for why.
+
+    Returns:
+        A :class:`NemoGymShardSet` whose actors are all running and validated.
+
+    Raises:
+        ShardSetupError: The bundles could not be placed, a shard failed to
+            start, or the shards' entries did not pass the startup checks. Any
+            actors already created are torn down first.
+    """
+    nemo_gym_dict = dict(env_configs["nemo_gym"])
+    plan = parse_shard_plan(nemo_gym_dict)
+
+    if plan is None:
+        return _build_single_gym_actor(
+            nemo_gym_dict,
+            base_urls=base_urls,
+            model_name=model_name,
+            tokenizer=tokenizer,
+            enable_router_replay=enable_router_replay,
+            use_fastokens=use_fastokens,
+            token_capture=token_capture,
+        )
+
+    return _build_sharded_gym_actors(
+        nemo_gym_dict,
+        plan,
+        base_urls=base_urls,
+        model_name=model_name,
+        tokenizer=tokenizer,
+        enable_router_replay=enable_router_replay,
+        use_fastokens=use_fastokens,
+        token_capture=token_capture,
+        pg_ready_timeout=pg_ready_timeout,
+        spinup_timeout=spinup_timeout,
+    )
+
+
+def _build_single_gym_actor(
+    nemo_gym_dict: dict[str, Any],
+    *,
+    base_urls: list[str],
+    model_name: str,
+    tokenizer: PreTrainedTokenizerBase,
+    enable_router_replay: bool,
+    use_fastokens: bool,
+    token_capture: Optional[dict[str, Any]],
+) -> NemoGymShardSet:
+    """The pre-sharding path: one actor, no placement group, no discovery.
+
+    Discovery is skipped rather than merely unused. Its checks compare entry
+    names *between* shards, so with one shard there is nothing they could find.
+    """
+    actor_config = _build_gym_actor_config(
+        nemo_gym_dict,
+        base_urls=base_urls,
+        model_name=model_name,
+        enable_router_replay=enable_router_replay,
+        use_fastokens=use_fastokens,
+        token_capture=token_capture,
+    )
+
+    actor_options: dict[str, Any] = {
+        "runtime_env": make_actor_runtime_env(NEMO_GYM_ACTOR_FQN)
+    }
+    if nemo_gym_dict.get("num_gpu_nodes", 0):
+        actor_options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
+            node_id=ray.get_runtime_context().get_node_id(),
+            soft=True,
+        )
+
+    actor = NemoGym.options(**actor_options).remote(actor_config)
+    shard_set = NemoGymShardSet(handles={DEFAULT_SHARD_NAME: [actor]})
+    try:
+        ray.get(actor._spinup.remote())
+        ray.get(actor.set_tokenizer.remote(tokenizer))
+    except BaseException:
+        shard_set.shutdown(
+            timeout=NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+            force_kill=True,
+        )
+        raise
+    return shard_set
+
+
+def _build_sharded_gym_actors(
+    nemo_gym_dict: dict[str, Any],
+    plan: ShardPlan,
+    *,
+    base_urls: list[str],
+    model_name: str,
+    tokenizer: PreTrainedTokenizerBase,
+    enable_router_replay: bool,
+    use_fastokens: bool,
+    token_capture: Optional[dict[str, Any]],
+    pg_ready_timeout: float,
+    spinup_timeout: float,
+) -> NemoGymShardSet:
+    instances = _shard_instances(plan)
+
+    # num_gpu_nodes normally pins the single actor to the driver node. Under
+    # sharding that is the opposite of what we want, so the placement group
+    # wins; num_gpu_nodes keeps its other job of sizing the allocation.
+    if nemo_gym_dict.get("num_gpu_nodes", 0):
+        print(
+            "env.nemo_gym.shards is set, so the num_gpu_nodes affinity hint is "
+            f"superseded by {plan.placement_strategy} placement across "
+            f"{len(instances)} bundles."
+        )
+    if plan.placement_strategy != DEFAULT_PLACEMENT_STRATEGY:
+        print(
+            f"env.nemo_gym.placement_strategy is {plan.placement_strategy}, not "
+            f"{DEFAULT_PLACEMENT_STRATEGY}, so shards may share a node and the "
+            f"per-node capacity isolation sharding exists for does not hold."
+        )
+
+    base_gym_dict = {
+        key: value
+        for key, value in nemo_gym_dict.items()
+        if key not in SHARDING_CONFIG_KEYS
+    }
+    # One merge per shard; replicas are identical stamps of it apart from the
+    # log directory, so they must not re-run the merge.
+    merged_by_shard = {
+        shard.name: apply_shard_overlay(base_gym_dict, plan, shard)
+        for shard in plan.shards
+    }
+
+    # This may create a temporary all-node placement group while materializing
+    # the actor venv. Finish it before the shard group reserves those CPUs.
+    actor_runtime_env = make_actor_runtime_env(NEMO_GYM_ACTOR_FQN)
+
+    pg = placement_group(
+        bundles=[
+            {
+                "CPU": float(
+                    shard.actor_cpus
+                    if shard.actor_cpus is not None
+                    else DEFAULT_SHARD_CPUS
+                )
+            }
+            for shard, _ in instances
+        ],
+        strategy=plan.placement_strategy,
+    )
+    try:
+        ray.get(pg.ready(), timeout=pg_ready_timeout)
+    except BaseException as error:
+        remove_placement_group(pg)
+        raise ShardSetupError(
+            f"Could not place {len(instances)} NeMo-Gym shard instances with "
+            f"strategy {plan.placement_strategy} within {pg_ready_timeout}s. "
+            f"Every instance needs the requested CPUs free, and "
+            f"{DEFAULT_PLACEMENT_STRATEGY} needs them on distinct nodes; the "
+            f"allocation may be too small or its nodes too busy."
+        ) from error
+
+    shard_set = NemoGymShardSet(handles={}, placement_group=pg)
+    try:
+        for bundle_index, (shard, replica) in enumerate(instances):
+            instance_gym_dict = apply_shard_log_dir(
+                merged_by_shard[shard.name],
+                shard.name,
+                replica_index=replica if shard.replicas > 1 else None,
+            )
+            actor = NemoGym.options(
+                runtime_env=actor_runtime_env,
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_bundle_index=bundle_index,
+                ),
+            ).remote(
+                _build_gym_actor_config(
+                    instance_gym_dict,
+                    base_urls=base_urls,
+                    model_name=model_name,
+                    enable_router_replay=enable_router_replay,
+                    use_fastokens=use_fastokens,
+                    token_capture=token_capture,
+                )
+            )
+            shard_set.handles.setdefault(shard.name, []).append(actor)
+
+        _spinup_shards_concurrently(shard_set, spinup_timeout, tokenizer=tokenizer)
+        shard_set.route_to_shard = _discover_route_shard_map(shard_set, plan)
+    except BaseException:
+        # A ray.get timeout does not cancel the actor-side work, so a
+        # half-started stack would keep running with nothing left to stop it.
+        shard_set.shutdown(
+            timeout=NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+            force_kill=True,
+        )
+        raise
+
+    print(f"NeMo-Gym shard map (route -> shard): {shard_set.route_to_shard}")
+    return shard_set
+
+
+def _spinup_shards_concurrently(
+    shard_set: NemoGymShardSet,
+    spinup_timeout: float,
+    *,
+    tokenizer: PreTrainedTokenizerBase,
+) -> None:
+    """Start every shard at once, naming the shard behind any failure.
+
+    Config faults surface inside ``_spinup`` -- a server ref pointing at an
+    entry that is missing from *this* shard's slice raises Gym's
+    ``ServerRefNotFoundError`` there. Gym names the entry and field but has no
+    concept of a shard, so the shard name is added here.
+
+    The tokenizer install is a second pass rather than a call queued behind
+    each ``_spinup``. Queuing both up front would mean waiting on the install
+    to learn the spinup failed, which loses the message above.
+    """
+    instance_handles = [
+        (shard_name, replica, handle)
+        for shard_name, replicas in shard_set.handles.items()
+        for replica, handle in enumerate(replicas)
+    ]
+    deadline = monotonic() + spinup_timeout
+
+    pending = [
+        (shard_name, replica, handle._spinup.remote())
+        for shard_name, replica, handle in instance_handles
+    ]
+    for shard_name, replica, reference in pending:
+        try:
+            ray.get(reference, timeout=max(0.0, deadline - monotonic()))
+        except BaseException as error:
+            # A timed-out ray.get does not cancel actor work. Let every startup
+            # task briefly try to leave RunHelper.start() before teardown.
+            # A permanently wedged startup must not defeat the startup timeout.
+            drain_deadline = monotonic() + DEFAULT_SHARD_DRAIN_TIMEOUT_SECONDS
+            for _, _, pending_reference in pending:
+                try:
+                    ray.get(
+                        pending_reference,
+                        timeout=max(0.0, drain_deadline - monotonic()),
+                    )
+                except Exception:
+                    pass
+            raise ShardSetupError(
+                f"NeMo-Gym shard '{shard_name}' (replica {replica}) failed to "
+                f"start. A reference to an entry that is not in this shard's "
+                f"config_paths is the usual cause: {error}"
+            ) from error
+
+    installs = [
+        (shard_name, replica, handle.set_tokenizer.remote(tokenizer))
+        for shard_name, replica, handle in instance_handles
+    ]
+    for shard_name, replica, reference in installs:
+        remaining = max(0.0, deadline - monotonic())
+        try:
+            ray.get(reference, timeout=remaining)
+        except BaseException as error:
+            if remaining <= 0.0:
+                raise ShardSetupError(
+                    f"NeMo-Gym shards used the whole {spinup_timeout}s startup "
+                    f"budget before the tokenizer reached every replica. Raise "
+                    f"env.nemo_gym.spinup_timeout, or bake the Gym venvs into "
+                    f"the image so a cold node starts faster."
+                ) from error
+            raise ShardSetupError(
+                f"NeMo-Gym shard '{shard_name}' (replica {replica}) did not "
+                f"accept the tokenizer: {error}"
+            ) from error
+
+
+def _discover_route_shard_map(
+    shard_set: NemoGymShardSet, plan: ShardPlan
+) -> Dict[str, str]:
+    """Ask one replica per shard what it spawned, then build routing metadata.
+
+    Replicas of a shard are stamped from one merge, so they host identical
+    entries and only the first needs to be asked.
+    """
+    entries_by_shard = {
+        shard.name: ray.get(shard_set.handles[shard.name][0].list_entries.remote())
+        for shard in plan.shards
+    }
+    return build_route_shard_map(entries_by_shard, plan.allowed_duplicate_entries)
 
 
 def spinup_nemo_gym_actor(
@@ -1350,7 +2044,7 @@ def spinup_nemo_gym_actor(
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
 ) -> Any:
-    """Spin up the NeMo-Gym actor against the given generation server URLs.
+    """Spin up a single NeMo-Gym actor against the given generation server URLs.
 
     When ``env_configs["nemo_gym"]["num_gpu_nodes"] > 0``, the actor is
     scheduled with soft NodeAffinity to the caller's Ray node so its colocated
@@ -1367,47 +2061,135 @@ def spinup_nemo_gym_actor(
 
     Returns:
         The spun-up ``NemoGym`` Ray actor handle (``_spinup`` already awaited).
+
+    Raises:
+        ShardConfigError: The config is sharded. Callers that dispatch to a
+            single handle cannot serve several shards; they need the router.
     """
-    nemo_gym_cfg = build_nemo_gym_config(
+    plan = parse_shard_plan(dict(env_configs["nemo_gym"]))
+    if plan is not None:
+        raise ShardConfigError(
+            f"env.nemo_gym.shards defines {len(plan.shards)} shards "
+            f"({', '.join(shard.name for shard in plan.shards)}), but this "
+            f"entrypoint dispatches rollouts to one actor handle. Shard-aware "
+            f"rollout routing is not wired up yet."
+        )
+
+    return build_nemo_gym_actors(
         env_configs,
         base_urls=base_urls,
         model_name=model_name,
+        tokenizer=tokenizer,
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
         token_capture=token_capture,
-    )
+    ).sole_handle()
 
-    nemo_gym_opts: dict[str, Any] = {
-        "runtime_env": make_actor_runtime_env(NEMO_GYM_ACTOR_FQN)
-    }
-    if env_configs["nemo_gym"].get("num_gpu_nodes", 0):
-        nemo_gym_opts["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
-            node_id=ray.get_runtime_context().get_node_id(),
-            soft=True,
+
+def validate_dataset_agent_coverage(
+    shard_set: NemoGymShardSet,
+    datasets: Mapping[str, Any],
+) -> None:
+    """Fail at setup if any row names a route no shard hosts.
+
+    Rows can name a legacy ``agent_ref`` or a current Gym ``task_source``.
+    Without this scan, a rare route can sit unseen for hours of training before
+    its first dispatch fails.
+
+    Unsharded jobs are skipped: there is one actor, every route resolves to it,
+    and there is nothing a scan could discover.
+
+    Args:
+        shard_set: The running actors, carrying the route map built at setup.
+        datasets: Split name to dataset, for the error message. ``None`` values
+            and datasets without gym rows are skipped.
+
+    Raises:
+        ShardSetupError: A split references routes no shard hosts.
+    """
+    if not shard_set.is_sharded:
+        return
+
+    hosted = shard_set.hosted_routes
+    for split, dataset in datasets.items():
+        unhosted = sorted(_iter_dataset_agent_names(dataset) - hosted)
+        if unhosted:
+            raise ShardSetupError(
+                f"The {split} dataset references routes that no shard hosts: "
+                f"{unhosted}. Hosted routes: {sorted(hosted)}."
+            )
+
+
+def _iter_dataset_agent_names(dataset: Any) -> set[str]:
+    """Collect the agent or task-source names a dataset's rows reference.
+
+    Sharded jobs lazily scan each stable source file once.
+    Unsharded jobs never call this function.
+    Custom or changed sources retain the row-scan fallback.
+    """
+    if dataset is None:
+        return set()
+    if isinstance(dataset, Mapping):
+        return set().union(
+            *(_iter_dataset_agent_names(nested) for nested in dataset.values())
         )
+    agent_name_sources = getattr(dataset, "agent_name_sources", None)
+    if agent_name_sources is not None:
+        source_agent_names: set[str] = set()
+        for source in agent_name_sources:
+            names = _load_agent_names_from_source(source)
+            if names is None:
+                break
+            source_agent_names.update(names)
+        else:
+            return source_agent_names
 
-    actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
+    # AllTaskProcessedDataset wraps the raw rows; a plain sequence is also fine.
+    rows = getattr(dataset, "dataset", dataset)
+
+    names: set[str] = set()
+    for row in rows:
+        extra_env_info = row.get("extra_env_info") if hasattr(row, "get") else None
+        if isinstance(extra_env_info, str):
+            extra_env_info = json.loads(extra_env_info)
+        agent_name = _get_agent_name(extra_env_info)
+        if agent_name is not None:
+            names.add(agent_name)
+    return names
+
+
+@lru_cache(maxsize=128)
+def _load_agent_names_from_source(
+    source: NemoGymSourceIdentity,
+) -> frozenset[str] | None:
+    """Read a stable Gym source once per controller process."""
     try:
-        ray.get(actor._spinup.remote())
-        ray.get(actor.set_tokenizer.remote(tokenizer))
-    except Exception:
-        # _spinup can fail after RunHelper has started some Gym subprocesses.
-        # Ask the actor to reap anything it owns, then force-stop the actor as a
-        # final safety net. Cleanup errors must not hide the startup failure.
-        try:
-            ray.get(
-                actor.shutdown.remote(),
-                timeout=NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S,
-            )
-        except Exception as cleanup_error:
-            print(
-                f"Warning: NeMo-Gym actor cleanup after startup failure failed: {cleanup_error}"
-            )
-        try:
-            ray.kill(actor)
-        except Exception as kill_error:
-            print(
-                f"Warning: NeMo-Gym actor kill after startup failure failed: {kill_error}"
-            )
-        raise
-    return actor
+        source_stat = os.stat(source.path)
+        if not source.matches(source_stat):
+            return None
+
+        names: set[str] = set()
+        with open(source.path) as source_file:
+            for raw_row in source_file:
+                agent_name = _get_agent_name(json.loads(raw_row))
+                if agent_name is not None:
+                    names.add(agent_name)
+
+        source_stat_after_read = os.stat(source.path)
+        if not source.matches(source_stat_after_read):
+            return None
+    except (OSError, json.JSONDecodeError):
+        return None
+    return frozenset(names)
+
+
+def _get_agent_name(row: object) -> str | None:
+    if not isinstance(row, dict):
+        return None
+    agent_ref = row.get("agent_ref")
+    if isinstance(agent_ref, dict) and agent_ref.get("name"):
+        return str(agent_ref["name"])
+    task_source = row.get("task_source")
+    if isinstance(task_source, str) and task_source:
+        return task_source
+    return None

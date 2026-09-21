@@ -39,6 +39,7 @@ run_test      bash ./tests/functional/test_frozen_env.sh
 
 run_test fast uv run --no-sync bash ./tests/functional/test_converters.sh
 run_test      uv run --no-sync bash ./tests/functional/test_decode_vs_prefill.sh
+run_test      uv run --no-sync bash ./tests/functional/vllm_nemotron_h_fp32_lm_head.sh
 run_test      uv run --no-sync bash ./tests/functional/test_mcore_extra_installed_correctly.sh
 
 # Research functional tests (self-discovery)

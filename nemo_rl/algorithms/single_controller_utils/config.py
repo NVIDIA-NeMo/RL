@@ -18,7 +18,7 @@ import math
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Annotated, Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional, cast
 
 from pydantic import (
     BaseModel,
@@ -59,7 +59,11 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.generation.vllm.config import (
+    VllmConfig,
+    parse_nvfp4_pertoken_rollout,
+)
+from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.value import ValueConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 
@@ -296,18 +300,10 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     # shard from re-entering rotation on one lucky probe.
     healthy_threshold: PositiveInt = 2
     # How a shard is chosen. least_outstanding steers away from a slow or wedged shard
-    # without needing that diagnosed first. A Literal of one, like on_dead_shard below:
-    # nothing dispatches on this value, so accepting "round_robin" would silently give
-    # the caller least_outstanding anyway.
+    # without needing that diagnosed first. A Literal of one: nothing dispatches on this
+    # value, so accepting "round_robin" would silently give the caller least_outstanding
+    # anyway.
     selection: Literal["least_outstanding"] = "least_outstanding"
-    # What to do once a shard is quarantined, for the case that cannot be recovered from.
-    #
-    # "Recovery modes arrive with the communicator rebuild" used to sit here as a forward
-    # reference. The rebuild has since landed, and recovery is not selected through this
-    # field at all: the reconcile rebuilds over the survivors whenever a shard becomes
-    # absent, whatever this says. A Literal of one for the same reason as selection above
-    # -- nothing dispatches on the value, so a second option would be a lie.
-    on_dead_shard: Literal["fail_fast"] = "fail_fast"
     # Attempts to bring a shard back before retiring it permanently, counted across the
     # whole run rather than per incident.
     max_restart_attempts_per_shard: PositiveInt = 5
@@ -342,6 +338,35 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     # measurement, so a frontier-scale model needs this raised or it will abort a healthy
     # refit. Set it explicitly there; set it to None to disarm the watchdog entirely.
     refit_timeout_s: Optional[PositiveFloat] = 300.0
+    # Restart dead shards and re-admit them at the next refit. Off by default: without
+    # it the fleet only ever shrinks, which is safe but means a long run ends smaller
+    # than it started. Recreating a vLLM worker mid-run is the most invasive thing this
+    # feature does, so it is opt-in rather than implied by fleet_health.enabled.
+    restart_dead_shards: bool = False
+    # Budget for one restart attempt. Deliberately not refit_timeout_s: a refit is a
+    # bandwidth-bound transfer between processes that are already up, while this recreates
+    # a Ray actor and loads a model from disk. 300s would abort healthy restarts.
+    #
+    # Needed because nothing under restart_shard has a bound of its own -- it ends in
+    # ray.get calls with no timeout, and create_worker returns before the actor is
+    # scheduled, so a placement-group bundle that can never be filled (a lost node) blocks
+    # in post_init rather than raising. Unbounded, that shard stays RESTARTING for the rest
+    # of the run: never retried, because it is no longer DEAD, and never retired, because
+    # retirement is driven by restart attempts. The timeout is what turns a silent park
+    # into a failed attempt that eventually retires the shard.
+    #
+    # 1800s is generous on purpose. Firing early costs a restart that was merely slow;
+    # firing late costs only that a lost shard is written off later than it could have been.
+    restart_timeout_s: PositiveFloat = 1800.0
+    # Wait after a failed restart before the shard is eligible again.
+    #
+    # Without it the attempts are not spaced at all: a failed restart returns the shard to
+    # DEAD and the next probe tick picks it straight back up, so at the default 5s probe
+    # interval the whole max_restart_attempts_per_shard budget can be spent inside 25s, on
+    # one cause, with none of the attempts having waited for it to clear. The motivating
+    # failure has exactly that shape -- an orphaned EngineCore held its GPU for 370s, so
+    # every attempt inside that window failed on placement for the same reason.
+    restart_backoff_s: PositiveFloat = 60.0
 
     @model_validator(mode="after")
     def _check_consistent(self) -> "FleetHealthConfig":
@@ -741,9 +766,20 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     ``val:<name>`` settings are rejected during setup. Unknown keys are
     forbidden because a misspelled interval, retention, or restore option can
     silently disable the durability behavior the operator intended.
+
+    ``telemetry_interval_s=None`` disables the independent wall-clock sampler
+    for rollout/checkpoint benchmark metrics. It does not enable checkpointing
+    and may be configured without ``snapshot_attempt_interval_s``.
+
+    ``max_consecutive_failures`` controls how many consecutive retryable
+    periodic-checkpoint failures are tolerated before the controller aborts the
+    run. A successful or skipped attempt resets the counter; checkpoint
+    invariant failures still fail immediately.
     """
 
     snapshot_attempt_interval_s: Annotated[Optional[float], Field(gt=0)] = None
+    telemetry_interval_s: Annotated[Optional[float], Field(gt=0)] = None
+    max_consecutive_failures: Annotated[int, Field(ge=1)] = 3
     keep_latest_k: Annotated[int, Field(ge=1)] = 2
     restore_mode: Literal["latest", "trainer_checkpoint"] = "latest"
     extra_fingerprint_excluded_paths: list[str] = Field(default_factory=list)
@@ -846,6 +882,83 @@ def validate_sampler_buffer_capacity(
             f"the {sampler_name} sampler's required capacity "
             f"({required_capacity}); the rollout pump would deadlock waiting for "
             f"buffer slots."
+        )
+
+
+def _validate_opd_full_config(
+    master_config: MasterConfig, opd_config: OnPolicyDistillationConfig
+) -> None:
+    """Validate the full-vocabulary MOPD block against the rest of the run.
+
+    Args:
+        master_config: Full SingleController config, already known to have OPD on.
+        opd_config: The resolved ``on_policy_distillation`` block.
+
+    Raises:
+        ValueError: If ``opd_full`` is enabled with an unsupported backend, an
+            incompatible logprob path, a fused packing path that never reaches
+            the opd_full branch, or a sampling temperature the hidden-state
+            payload cannot honor.
+    """
+    full_cfg = opd_module.get_opd_full_config(master_config)
+    if full_cfg is None:
+        return
+
+    policy_config = master_config.policy
+    if not policy_config.get("megatron_cfg", {}).get("enabled", False):
+        raise ValueError(
+            "on_policy_distillation.full requires the Megatron backend: the "
+            "teacher payload and the distributed reverse-KL kernels both run on "
+            "the vocabulary-parallel logit path."
+        )
+    # Narrowed by the check above: megatron_cfg.enabled true means this is a
+    # MegatronConfig, so its parallelism fields can be read directly.
+    megatron_cfg = cast(MegatronConfig, policy_config["megatron_cfg"])
+    if megatron_cfg.get("use_fused_linear_logprobs", False):
+        raise ValueError(
+            "on_policy_distillation.full is incompatible with "
+            "megatron_cfg.use_fused_linear_logprobs: the fused forward bypasses "
+            "output_layer, so the teacher hidden-state hook never fires and the "
+            "student never exposes full-vocabulary logits."
+        )
+
+    sequence_packing_config = policy_config.get("sequence_packing", {})
+    if sequence_packing_config.get("enabled", False) and sequence_packing_config.get(
+        "fuse_loss", False
+    ):
+        raise ValueError(
+            "on_policy_distillation.full is incompatible with "
+            "policy.sequence_packing.fuse_loss: the fused packing path routes "
+            "through prepare_packed_loss_input, which only supports "
+            "LossInputType.LOGPROB and never reaches the opd_full branch. "
+            "Without this check the run fails inside the first training forward, "
+            "after the whole cluster and every teacher have already come up. "
+            "Set sequence_packing.fuse_loss=false."
+        )
+
+    generation_config = policy_config.get("generation")
+    temperature = 1.0 if generation_config is None else generation_config["temperature"]
+    if full_cfg.teacher_payload == "hidden_states" and temperature != 1.0:
+        raise ValueError(
+            "on_policy_distillation.full.teacher_payload='hidden_states' does not "
+            f"support policy.generation.temperature != 1.0 (got {temperature}). "
+            "Temperature scaling divides the training logits in place, but the "
+            "capture hook reads output_layer's input, which is upstream of that "
+            "division -- so the student would be scaled while the teacher logits "
+            "reconstructed from its hidden states would not, silently optimizing a "
+            "mismatched objective. Use teacher_payload='logits', where both sides "
+            "come from the same scaled tensor."
+        )
+
+    if full_cfg.teacher_payload == "logits":
+        # The logits payload is vocab_size wide, so a production-scale run would
+        # move tens of GB per teacher batch. Advisory, not an error: a small
+        # vocabulary or a short-sequence cross-check is a legitimate use.
+        print(
+            "  ! on_policy_distillation.full.teacher_payload='logits' transports "
+            "the full vocabulary per token. This is a numerical-reference path; "
+            "prefer 'hidden_states' for production runs.",
+            flush=True,
         )
 
 
@@ -1000,6 +1113,17 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
     async_config = master_config.async_rl
     generation_config = master_config.policy["generation"]
+    if (
+        generation_config["backend"] == "vllm"
+        and parse_nvfp4_pertoken_rollout(cast(VllmConfig, generation_config))
+        is not None
+    ):
+        raise ValueError(
+            "SingleController does not support generation.nvfp4_pertoken_rollout: "
+            "the mode requires colocated vLLM rollout, while SingleController "
+            "requires non-colocated vLLM rollout. Disable nvfp4_pertoken_rollout "
+            "or use the supported GRPO entry point examples/run_grpo.py."
+        )
     if generation_config["colocated"]["enabled"]:
         if generation_config["backend"] != "megatron":
             raise ValueError(
@@ -1370,6 +1494,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "at least one teacher mapping."
             )
         opd_module.assert_prev_logprobs_available(master_config)
+        _validate_opd_full_config(master_config, opd_config)
 
     if (
         reference_policy_kl_penalty == 0

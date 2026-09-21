@@ -25,9 +25,11 @@ import pytest
 import torch
 
 from nemo_rl.distributed.model_utils import (
+    ChunkedDistributedCrossEntropyToFixedLogits,
     ChunkedDistributedEntropy,
     ChunkedDistributedGatherLogprob,
     ChunkedDistributedLogprob,
+    ChunkedDistributedReverseKLToFixedLogits,
     DistributedLogprob,
     _compute_distributed_log_softmax,
     get_next_token_logprobs_from_logits,
@@ -519,4 +521,83 @@ def test_get_next_token_logprobs_chunk_equivalence(
     distributed_test_runner, tp_size, dtype
 ):
     test_fn = functools.partial(_run_chunk_equivalence, tp_size=tp_size, dtype=dtype)
+    distributed_test_runner(test_fn, world_size=tp_size)
+
+
+# ---------------------------------------------------------------------------
+# opd_full student/teacher divergence kernels
+# ---------------------------------------------------------------------------
+
+
+def _run_student_teacher_divergence(rank, world_size, tp_size, chunk_size, kernel_name):
+    """Both opd_full kernels against a single-GPU baseline at real TP.
+
+    The CPU tests in test_model_utils.py neutralize the collectives, so they
+    only pin the TP=1 limit, where the teacher-side log-softmax needs no
+    cross-shard reduction at all. The nightly recipes self-distill, so every
+    per-vocabulary weight is zero there and a shard-local reduction is
+    indistinguishable from the global one. A teacher distinct from the student
+    at TP>1 is the only place the teacher-side normalization is observable.
+    """
+    kernel = {
+        "reverse_kl": ChunkedDistributedReverseKLToFixedLogits,
+        "cross_entropy": ChunkedDistributedCrossEntropyToFixedLogits,
+    }[kernel_name]
+    tp_group = torch.distributed.new_group(ranks=list(range(tp_size)))
+
+    batch_size, seq_len, vocab_size = 2, 16, 256
+    vocab_part_size = vocab_size // tp_size
+    vocab_start_index = rank * vocab_part_size
+    vocab_end_index = (rank + 1) * vocab_part_size
+
+    torch.manual_seed(1337)
+    student_logits = torch.randn(batch_size, seq_len, vocab_size, device="cuda")
+    teacher_logits = torch.randn(batch_size, seq_len, vocab_size, device="cuda")
+    grad_output = torch.randn(batch_size, seq_len, device="cuda")
+
+    baseline_student = student_logits.clone().detach().requires_grad_(True)
+    baseline_student_log_probs = torch.nn.functional.log_softmax(
+        baseline_student, dim=-1
+    )
+    baseline_teacher_log_probs = torch.nn.functional.log_softmax(teacher_logits, dim=-1)
+    baseline_probs = baseline_student_log_probs.exp()
+    if kernel_name == "reverse_kl":
+        baseline = (
+            baseline_probs * (baseline_student_log_probs - baseline_teacher_log_probs)
+        ).sum(dim=-1)
+    else:
+        baseline = (-baseline_probs * baseline_teacher_log_probs).sum(dim=-1)
+    baseline.backward(grad_output)
+    baseline_grad = baseline_student.grad[
+        :, :, vocab_start_index:vocab_end_index
+    ].clone()
+
+    local_student = (
+        student_logits[:, :, vocab_start_index:vocab_end_index]
+        .clone()
+        .detach()
+        .requires_grad_(True)
+    )
+    local_teacher = (
+        teacher_logits[:, :, vocab_start_index:vocab_end_index].clone().detach()
+    )
+
+    divergence = kernel.apply(local_student, local_teacher, chunk_size, tp_group, False)
+    torch.testing.assert_close(divergence, baseline.detach(), rtol=1e-4, atol=1e-4)
+
+    divergence.backward(grad_output)
+    torch.testing.assert_close(local_student.grad, baseline_grad, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("kernel_name", ["reverse_kl", "cross_entropy"])
+@pytest.mark.parametrize("tp_size, chunk_size", [(1, 5), (2, 4)])
+def test_student_teacher_divergence_kernels(
+    distributed_test_runner, tp_size, chunk_size, kernel_name
+):
+    test_fn = functools.partial(
+        _run_student_teacher_divergence,
+        tp_size=tp_size,
+        chunk_size=chunk_size,
+        kernel_name=kernel_name,
+    )
     distributed_test_runner(test_fn, world_size=tp_size)
