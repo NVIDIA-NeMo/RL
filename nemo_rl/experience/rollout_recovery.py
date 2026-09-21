@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Optional, Self, TypeAlias
 
+from nemo_rl.experience.metric_utils import RolloutTelemetry
 from nemo_rl.experience.reward_penalties import (
     CaptureRewardSettings,
     FinalizedReward,
@@ -43,7 +44,9 @@ if TYPE_CHECKING:
     from nemo_rl.data.interfaces import DatumSpec
 
 ROLLOUT_RECOVERY_SCHEMA_VERSION = 3
-SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {2, ROLLOUT_RECOVERY_SCHEMA_VERSION}
+SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = frozenset(
+    {2, ROLLOUT_RECOVERY_SCHEMA_VERSION}
+)
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
 
@@ -87,6 +90,7 @@ _ATTEMPT_STATE_FIELDS = frozenset(
         "reward_checks",
         "reward_log_context",
         "staging_keys",
+        "telemetry",
     }
 )
 
@@ -194,6 +198,7 @@ class RolloutAttemptRecord:
     reward_checks: RewardChecks | None = None
     reward_log_context: RewardLogContext | None = None
     staging_keys: list[str] = field(default_factory=list)
+    telemetry: Optional[RolloutTelemetry] = None
 
     @property
     def attempt_id(self) -> str:
@@ -307,6 +312,7 @@ class SiblingSealResult:
     reward_checks: RewardChecks | None = None
     reward_log_context: RewardLogContext | None = None
     resolved_agent_name: Optional[str] = field(default=None, kw_only=True)
+    telemetry: Optional[RolloutTelemetry] = None
 
 
 def _new_attempt() -> RolloutAttemptRecord:
@@ -609,6 +615,7 @@ class RolloutRecoveryLedger:
         resolved_agent_name: Optional[str] = None,
         reward_checks: RewardChecks | None = None,
         reward_log_context: RewardLogContext | None = None,
+        telemetry: Optional[RolloutTelemetry] = None,
     ) -> None:
         """Record one streamed sibling receipt as soon as the row arrives."""
         cut.require_live()
@@ -640,6 +647,7 @@ class RolloutRecoveryLedger:
                 and attempt.reward_checks == reward_checks
                 and attempt.reward_log_context == reward_log_context
                 and attempt.staging_keys == staging_keys
+                and attempt.telemetry == telemetry
             ):
                 return
             raise ValueError(
@@ -660,6 +668,7 @@ class RolloutRecoveryLedger:
         attempt.reward_checks = reward_checks
         attempt.reward_log_context = reward_log_context
         attempt.staging_keys = staging_keys
+        attempt.telemetry = copy.deepcopy(telemetry)
         attempt.status = RolloutAttemptStatus.SEALED
         if all(
             item.current_attempt.status == RolloutAttemptStatus.SEALED
@@ -738,6 +747,7 @@ class RolloutRecoveryLedger:
             attempt.reward_checks = result.reward_checks
             attempt.reward_log_context = result.reward_log_context
             attempt.staging_keys = staging_keys
+            attempt.telemetry = copy.deepcopy(result.telemetry)
             attempt.status = RolloutAttemptStatus.SEALED
         record.status = PromptGroupStatus.READY_TO_FINALIZE
 
@@ -946,6 +956,11 @@ class RolloutRecoveryLedger:
                                     if attempt.reward_log_context is not None
                                     else None,
                                     "staging_keys": list(attempt.staging_keys),
+                                    "telemetry": (
+                                        dataclasses.asdict(attempt.telemetry)
+                                        if attempt.telemetry is not None
+                                        else None
+                                    ),
                                 }
                                 for attempt in sibling.attempts
                             ],
@@ -1149,6 +1164,12 @@ class RolloutRecoveryLedger:
                     attempt_state.get("reward_log_context")
                 )
                 staging_keys = attempt_state.get("staging_keys")
+                telemetry_state = attempt_state.get("telemetry")
+                telemetry = (
+                    RolloutTelemetry.from_state(telemetry_state)
+                    if telemetry_state is not None
+                    else None
+                )
                 if not isinstance(staging_keys, list) or not all(
                     isinstance(key, str) for key in staging_keys
                 ):
@@ -1181,6 +1202,7 @@ class RolloutRecoveryLedger:
                     or checks is not None
                     or log_context is not None
                     or staging_keys
+                    or telemetry is not None
                 ):
                     raise ValueError("only sealed attempts may retain receipt data")
                 attempts.append(
@@ -1193,6 +1215,7 @@ class RolloutRecoveryLedger:
                         reward_checks=checks,
                         reward_log_context=log_context,
                         staging_keys=list(staging_keys),
+                        telemetry=telemetry,
                     )
                 )
             siblings.append(
