@@ -55,6 +55,41 @@ class AbstractPolicyWorker:
         # parameter all-gather (MXFP8 shared-buffer and plain BF16 alike).
         pass
 
+    # Set where prepare_for_lp_inference actually parks training state (Megatron
+    # grad-buffer storage released, optimizer state moved to CPU) and cleared by
+    # prepare_for_training, which is what restores it. Declared at class level so a
+    # worker that has never parked anything still answers the question.
+    _training_state_parked: bool = False
+
+    def _assert_training_state_restored(self, api_name: str) -> None:
+        """Fail if a logprob detour parked training state that was never restored.
+
+        ``prepare_for_lp_inference`` leaves parameters on CUDA, so the device check
+        in :meth:`_assert_model_onloaded` passes, while releasing Megatron
+        grad-buffer storage and moving optimizer state to CPU. Training from there
+        silently drops the accumulated gradients or trips over a CPU-resident
+        optimizer, so name the call that puts the worker back together.
+
+        The flag is set only where the parking actually happens, so a configuration
+        that offloads nothing never trips this, and ``keep_train_buffers=True``
+        leaves training state alone and never sets it — an already-open train step
+        is unaffected.
+
+        Args:
+            api_name: Name of the compute API being entered, used in the message.
+        """
+        if not self._training_state_parked:
+            return
+
+        raise RuntimeError(
+            f"{type(self).__name__}.{api_name}() was called after "
+            f"prepare_for_lp_inference() parked the training state and before "
+            f"prepare_for_training() restored it. The model parameters are on GPU, "
+            f"but the gradient buffers and/or optimizer state are not, so training "
+            f"from here would drop gradients or fail on a CPU-resident optimizer. "
+            f"Call prepare_for_training() before {api_name}()."
+        )
+
     def _assert_model_onloaded(
         self,
         api_name: str,

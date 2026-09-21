@@ -11,10 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import ast
+from pathlib import Path
+
 import pytest
 import torch
 from torch import nn
 
+import nemo_rl.models.policy.workers as policy_workers
 from nemo_rl.models.policy.workers.base_policy_worker import (
     AbstractPolicyWorker,
     first_parameter_device,
@@ -95,3 +99,95 @@ def test_allows_model_without_parameters():
     worker = FakePolicyWorker(nn.Identity())
 
     worker._assert_model_onloaded("train", "prepare_for_training")
+
+
+def test_fresh_worker_is_not_parked():
+    assert FakePolicyWorker(_cpu_model())._training_state_parked is False
+
+
+def test_training_state_check_passes_when_not_parked():
+    worker = FakePolicyWorker(nn.Linear(2, 2, device="meta"))
+
+    worker._assert_training_state_restored("train")
+
+
+def test_raises_when_training_state_was_parked():
+    """prepare_for_lp_inference leaves params on GPU but parks grads/optimizer.
+
+    The device check cannot see that, so it is the flag that has to.
+    """
+    worker = FakePolicyWorker(nn.Linear(2, 2, device="meta"))
+    # What prepare_for_lp_inference(keep_train_buffers=False) records.
+    worker._training_state_parked = True
+
+    # The device check still passes: parameters are not on CPU.
+    worker._assert_model_onloaded("train", "prepare_for_training")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        worker._assert_training_state_restored("train")
+
+    message = str(excinfo.value)
+    assert "FakePolicyWorker.train()" in message
+    assert "prepare_for_lp_inference()" in message
+    assert "prepare_for_training()" in message
+
+
+def test_restoring_training_state_clears_the_error():
+    worker = FakePolicyWorker(nn.Linear(2, 2, device="meta"))
+    worker._training_state_parked = True
+    # What prepare_for_training() records once it has onloaded everything.
+    worker._training_state_parked = False
+
+    worker._assert_training_state_restored("train")
+
+
+def _policy_worker_sources():
+    """Every policy-worker module, discovered rather than listed.
+
+    A hardcoded list goes stale the moment a backend is added or removed — this
+    test previously named the DTensor v1 worker, which has since been deleted.
+    """
+    workers_dir = Path(policy_workers.__file__).parent
+    return sorted(
+        path
+        for path in workers_dir.glob("*_worker*.py")
+        if not path.name.startswith("_")
+    )
+
+
+@pytest.mark.parametrize(
+    "worker_source", _policy_worker_sources(), ids=lambda path: path.stem
+)
+def test_every_worker_that_parks_also_restores(worker_source):
+    """A worker that sets the parked flag must also clear it.
+
+    Forgetting the clear is the dangerous asymmetry: the flag would stay set for
+    the life of the worker and every later train step would raise. Checked
+    structurally because the real workers are Ray actors that need a GPU.
+    """
+    tree = ast.parse(worker_source.read_text())
+
+    setters = {"True": set(), "False": set()}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for sub in ast.walk(node):
+            if (
+                isinstance(sub, ast.Assign)
+                and len(sub.targets) == 1
+                and isinstance(sub.targets[0], ast.Attribute)
+                and sub.targets[0].attr == "_training_state_parked"
+            ):
+                setters[str(sub.value.value)].add(node.name)
+
+    if not setters["True"] and not setters["False"]:
+        pytest.skip(f"{worker_source.stem} does not park training state")
+
+    assert setters["True"] == {"prepare_for_lp_inference"}, (
+        f"{worker_source.stem}: the parked flag should only be set where "
+        f"prepare_for_lp_inference parks training state, got {setters['True']}"
+    )
+    assert setters["False"] == {"prepare_for_training"}, (
+        f"{worker_source.stem}: prepare_for_training must clear the parked flag, "
+        f"got {setters['False']}"
+    )

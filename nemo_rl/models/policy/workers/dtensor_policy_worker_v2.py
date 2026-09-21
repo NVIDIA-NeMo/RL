@@ -420,6 +420,8 @@ class DTensorPolicyWorkerV2Impl(
             "prepare_for_training",
             params_may_be_offloaded=self.cpu_offload,
         )
+        if not eval_mode:
+            self._assert_training_state_restored("train")
         self.timer.start("train")
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
@@ -1290,6 +1292,9 @@ class DTensorPolicyWorkerV2Impl(
             and self.offload_optimizer_for_logprob
         ):
             self.move_optimizer_to_device("cpu")
+            # Parameters stay on CUDA, so only this flag records that a
+            # prepare_for_training() is now required before the next train step.
+            self._training_state_parked = True
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -1310,6 +1315,7 @@ class DTensorPolicyWorkerV2Impl(
         # when the state is already resident.
         if self.optimizer is not None and not self.cpu_offload:
             self.move_optimizer_to_device("cuda")
+        self._training_state_parked = False
 
         torch.cuda.empty_cache()
 
