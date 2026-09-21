@@ -2688,7 +2688,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
                             {
                                 "value": "second",
                                 "input_message_log": [
-                                    {"role": "user", "token_ids": [1]}
+                                    {"role": "user", "token_ids": [1, 2]}
                                 ],
                                 "reasoning_token_count": 4,
                                 "response_token_count": 5,
@@ -2760,10 +2760,21 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
         {},
     )
     manager._compute_reward_penalty_metrics = lambda counts, num_results: {}
-    manager._compute_rollout_metrics = lambda completions, agent, **_kwargs: {
-        "completion_count": len(completions),
-        "agent": agent,
-    }
+
+    def _compute_metrics(
+        completions: list[str],
+        agent: str,
+        *,
+        prompt_lengths: list[int] | None = None,
+        full_results: list[dict[str, object]] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "completion_count": len(completions),
+            "agent": agent,
+            "prompt_lengths": prompt_lengths,
+        }
+
+    manager._compute_rollout_metrics = _compute_metrics
 
     completions, prompt_message_log, metrics = asyncio.run(
         manager._run_rollouts(
@@ -2789,6 +2800,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     torch.testing.assert_close(prompt_message_log[0]["token_ids"], torch.tensor([1]))
     assert metrics["completion_count"] == 2
     assert metrics["agent"] == "agent"
+    assert metrics["prompt_lengths"] == [1, 2]
     assert metrics["remote_time"] == 2.0
     assert metrics["timing/test/routing/group_share/nemo_gym"] == 1
     assert metrics["reward_score_raw/mean"] == pytest.approx(1.5)
