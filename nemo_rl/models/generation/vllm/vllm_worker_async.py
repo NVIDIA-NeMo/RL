@@ -223,7 +223,6 @@ class VllmAsyncGenerationWorkerImpl(
         self._capture_calls: dict[int, CapturedRequest] = {}
         self._capture_media = False
         self._capture_patch_size: int | None = None
-        self._staging_sink = None
         self._capture_image_token_id: int | None = None
         self._staging_source: Any | None = None
         # Guarded by _prefix_cache_lock: _fetch_chain_prefix runs on executor
@@ -527,7 +526,9 @@ class VllmAsyncGenerationWorkerImpl(
         from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 
         dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
-        sink = TQTokenSink(dp_client, staging_partition=staging_partition)
+        sink = TQTokenSink(
+            dp_client, staging_partition=staging_partition, capture_media=capture_media
+        )
         if capture_media:
             # Optional engine/Gym capabilities are checked only on VLM workers.
             from vllm.model_executor.models.nano_nemotron_vl import (
@@ -553,10 +554,9 @@ class VllmAsyncGenerationWorkerImpl(
                 )
             self._capture_image_token_id = int(context_ids[0])
             self._capture_patch_size = int(info.get_hf_config().patch_size)
-        self._staging_sink = sink
         self._capture_media = capture_media
         self._staging_source = TQTokenSource(
-            dp_client, staging_partition=staging_partition
+            dp_client, staging_partition=staging_partition, capture_media=capture_media
         )
         self._prefix_cache.clear()
         install_capture(
@@ -818,11 +818,11 @@ class VllmAsyncGenerationWorkerImpl(
     def _finish_request_capture(self, request: Any, content: dict) -> dict:
         """Stage the finished call and ride its coords on the response.
 
-        Token failures produce capture_failed coords. Media is staged on the
-        same key before returning; the finalizer rejects missing media if that
-        second write fails. Token ids and logprobs are stripped: the staged delta is
-        the only token store on this path, so the worker->gate hop carries
-        text + delta ids + coords only.
+        Tokens and the call's new media tensors go to TQ in one write (the
+        media ride as opaque attachments beside the record), so ``staged``
+        coords vouch for both and any failure is ``capture_failed`` at call
+        time. Token ids, logprobs, and routes are stripped after staging, so
+        the worker->gate hop carries the completion and coords only.
         """
         state = self._capture_calls.pop(id(request), None)
         if state is None:
@@ -834,9 +834,8 @@ class VllmAsyncGenerationWorkerImpl(
         # nemo_gym.token_id_capture.adapters.vllm.extract_prompt_ids).
         payload["prompt_token_ids"] = prompt_token_ids
         if state.media is not None:
-            from nemo_rl.data_plane.tq_token_sink import media_geometry
-
-            payload["media"] = media_geometry(state.media.tensors)
+            # Placeholder metadata (offsets, token hashes, sizes) rides the
+            # digest-covered extras; the pixels themselves are attachments.
             payload[MEDIA_SPANS_FIELD] = [item.to_dict() for item in state.media.items]
         adapter = self.token_capture.adapter
         if adapter is not None:
@@ -850,14 +849,10 @@ class VllmAsyncGenerationWorkerImpl(
                 prompt_len=len(prompt_token_ids),
                 generated_len=len(generated_token_ids),
             )
-        from nemo_rl.data_plane.tq_token_sink import complete_call_with_media
-
-        coords = complete_call_with_media(
-            self.token_capture,
+        coords = self.token_capture.complete_call_from_response(
             call,
             payload,
-            sink=self._staging_sink,
-            media_tensors=state.media.tensors if state.media is not None else None,
+            attachments=state.media.tensors if state.media is not None else None,
         )
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)

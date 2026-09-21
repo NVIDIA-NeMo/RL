@@ -37,6 +37,9 @@ from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
 )
 
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
+    MEDIA_FLAG_FIELDS,
+    MEDIA_STAGING_FIELDS,
+    MEDIA_TENSOR_COLUMNS,
     STAGING_FIELDS,
     TQTokenSink,
     TQTokenSource,
@@ -59,36 +62,236 @@ def test_gym_staging_package_is_importable_in_the_nemo_gym_lane():
     import nemo_gym.token_id_capture.staging  # noqa: F401
 
 
-def test_image_pixels_round_trip_with_tokens_through_live_tq(tq_client):
-    from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS
-    from tests.unit.data.test_captured_media import Span, engine_prompt, packed, stage
+class _RecordingClient:
+    """Pass-through DataPlaneClient that records put/get/clear traffic."""
 
-    partition = "worker_media_capture_test"
+    def __init__(self, client, *, fail_put: Exception | None = None, fail_clear=None):
+        self.client = client
+        self.puts: list[list[str]] = []
+        self.gets: list[list[str]] = []
+        self.clears: list[list[str]] = []
+        self.fail_put = fail_put
+        self.fail_clear = fail_clear
+
+    def register_partition(self, **kwargs):
+        return self.client.register_partition(**kwargs)
+
+    def put_samples(self, **kwargs):
+        self.puts.append(list(kwargs["fields"].keys()))
+        if self.fail_put is not None:
+            raise self.fail_put
+        return self.client.put_samples(**kwargs)
+
+    def get_samples(self, **kwargs):
+        self.gets.append(list(kwargs["select_fields"]))
+        return self.client.get_samples(**kwargs)
+
+    def clear_samples(self, **kwargs):
+        self.clears.append(list(kwargs["sample_ids"] or []))
+        if self.fail_clear is not None:
+            raise self.fail_clear
+        return self.client.clear_samples(**kwargs)
+
+
+MEDIA_PARTITION = "rollout_staging_media_test"
+
+
+@pytest.fixture()
+def media_partition(tq_client):
     tq_client.register_partition(
-        partition_id=partition,
+        partition_id=MEDIA_PARTITION,
         fields=STAGING_FIELDS + list(MEDIA_STAGING_FIELDS),
-        num_samples=4,
+        num_samples=64,
         consumer_tasks=["finalize"],
     )
-    pixels = torch.arange(18, dtype=torch.float32).reshape(3, 2, 3)
-    try:
-        record, _ = stage(
-            tq_client,
-            engine_prompt([10, 18, 18], [(Span(1, 2), pixels)]),
-            partition=partition,
-        )
-        source = TQTokenSource(tq_client, staging_partition=partition)
-        [call] = source.fetch_for_finalization([record.staging_key])
-        assert call.snapshot.token_ids_delta == [10, 18, 18, 31, 2]
-        assert call.extras["media"]["imgs_sizes"] == [[2, 3]]
-        torch.testing.assert_close(
-            source.fetch_media(record.staging_key).imgs[0],
-            packed(pixels),
-            rtol=0,
-            atol=0,
-        )
-    finally:
-        tq_client.clear_samples(sample_ids=None, partition_id=partition)
+    yield MEDIA_PARTITION
+    tq_client.clear_samples(sample_ids=None, partition_id=MEDIA_PARTITION)
+
+
+def _still(*, dtype=torch.bfloat16, sizes=((2, 4), (4, 2)), patch_size=2):
+    """Packed-patch still images: ``sizes`` are (h, w) per image."""
+    sizes_t = torch.tensor(sizes, dtype=torch.int32)
+    patches = int((sizes_t[:, 0] * sizes_t[:, 1]).sum()) // patch_size**2
+    feature = 3 * patch_size**2
+    imgs = torch.arange(patches * feature, dtype=torch.float32).reshape(
+        1, patches, feature
+    )
+    return {"imgs": imgs.to(dtype), "imgs_sizes": sizes_t}
+
+
+def _video(*, frames=(1,), patch_size=2):
+    per_frame = [(2, 2)] * sum(frames)
+    bundle = _still(dtype=torch.float16, sizes=per_frame, patch_size=patch_size)
+    bundle["num_frames"] = torch.tensor(frames, dtype=torch.int32)
+    return bundle
+
+
+def _assert_same_tensor(actual, expected):
+    assert actual.dtype == expected.dtype
+    assert tuple(actual.shape) == tuple(expected.shape)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_media_rows_round_trip_in_a_single_put(tq_client, media_partition):
+    client = _RecordingClient(tq_client)
+    sink = TQTokenSink(client, staging_partition=media_partition, capture_media=True)
+    source = TQTokenSource(
+        client, staging_partition=media_partition, capture_media=True
+    )
+    chain, _, _ = build_fixture_artifacts("worked_example")
+    single, _, _ = build_fixture_artifacts("single_call")
+    records = [*chain[:2], single[0]]
+    still, video = _still(), _video(frames=(1,))
+    bundles = [still, video, None]  # bf16 still, one-frame video, text call
+    for record, bundle in zip(records, bundles, strict=True):
+        assert sink.stage(record, attachments=bundle).ok
+    # One put per call, each carrying token, flag, and tensor columns.
+    assert len(client.puts) == 3
+    for fields in client.puts:
+        assert set(MEDIA_STAGING_FIELDS) <= set(fields)
+        assert set(STAGING_FIELDS) <= set(fields)
+
+    keys = [record.staging_key for record in records]
+    fetched = source.fetch_for_finalization(keys)
+    assert client.gets[-1] == STAGING_FIELDS + MEDIA_FLAG_FIELDS
+    assert [item.media_present for item in fetched] == [True, True, False]
+    assert [item.media_has_frames for item in fetched] == [False, True, False]
+
+    [got_still] = source.fetch_media([fetched[0]])
+    _assert_same_tensor(got_still.imgs, still["imgs"])
+    _assert_same_tensor(got_still.imgs_sizes, still["imgs_sizes"])
+    assert got_still.num_frames is None
+    [got_video] = source.fetch_media([fetched[1]])
+    _assert_same_tensor(got_video.imgs, video["imgs"])
+    _assert_same_tensor(got_video.num_frames, video["num_frames"])
+    assert client.gets[-1] == list(MEDIA_TENSOR_COLUMNS.values())
+    # Rows that cannot share one nested column are rejected before the read.
+    reads = len(client.gets)
+    with pytest.raises(ValueError, match="uniform media_has_frames"):
+        source.fetch_media([fetched[0], fetched[1]])
+    with pytest.raises(ValueError, match="media_present=True"):
+        source.fetch_media([fetched[2]])
+    assert len(client.gets) == reads
+    assert source.fetch_media([]) == []
+
+
+def test_batched_media_read_returns_ragged_rows_in_request_order(
+    tq_client, media_partition
+):
+    client = _RecordingClient(tq_client)
+    sink = TQTokenSink(client, staging_partition=media_partition, capture_media=True)
+    source = TQTokenSource(
+        client, staging_partition=media_partition, capture_media=True
+    )
+    records, _, _ = build_fixture_artifacts("worked_example")
+    small = _still(sizes=((2, 2),))
+    large = _still(sizes=((4, 4), (2, 6)))
+    assert sink.stage(records[0], attachments=small).ok
+    assert sink.stage(records[1], attachments=large).ok
+    fetched = source.fetch_for_finalization([r.staging_key for r in records[:2]])
+    reads = len(client.gets)
+    parts = source.fetch_media([fetched[1], fetched[0]])
+    assert len(client.gets) == reads + 1  # one batched tensor read
+    _assert_same_tensor(parts[0].imgs, large["imgs"])
+    _assert_same_tensor(parts[1].imgs, small["imgs"])
+    _assert_same_tensor(parts[0].imgs_sizes, large["imgs_sizes"])
+
+
+def test_text_only_partition_never_touches_media_columns(tq_client, staging_partition):
+    client = _RecordingClient(tq_client)
+    sink = TQTokenSink(client, staging_partition=staging_partition)
+    source = TQTokenSource(client, staging_partition=staging_partition)
+    records, _, _ = build_fixture_artifacts("single_call")
+    assert sink.stage(records[0]).ok
+    assert not (set(MEDIA_STAGING_FIELDS) & set(client.puts[0]))
+    [item] = source.fetch_for_finalization([records[0].staging_key])
+    assert client.gets[-1] == STAGING_FIELDS
+    assert (item.media_present, item.media_has_frames) == (False, False)
+    with pytest.raises(ValueError, match="media-enabled"):
+        source.fetch_media([item])
+    # A text-only sink must reject attachments rather than drop them.
+    result = sink.stage(records[0], attachments=_still())
+    assert not result.ok and "media-enabled" in (result.error or "")
+    assert len(client.puts) == 1
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda b: {},
+        lambda b: {"imgs": b["imgs"]},  # missing imgs_sizes
+        lambda b: {**b, "extra": torch.ones(1)},
+        lambda b: {**b, "imgs": b["imgs"].tolist()},
+        lambda b: {**b, "imgs": b["imgs"][:, :0]},
+        lambda b: {**b, "imgs": b["imgs"].to(torch.int64)},
+        lambda b: {**b, "imgs": b["imgs"][0]},  # 2-D
+        lambda b: {**b, "imgs": b["imgs"][:, :, :11]},  # not 3*P*P
+        lambda b: {**b, "imgs_sizes": b["imgs_sizes"].to(torch.float32)},
+        lambda b: {**b, "imgs_sizes": b["imgs_sizes"] + 1},  # not patch aligned
+        lambda b: {**b, "imgs_sizes": b["imgs_sizes"][:1]},  # patch total mismatch
+        lambda b: {**b, "imgs_sizes": b["imgs_sizes"] * 0},
+        lambda b: {**b, "num_frames": torch.tensor([1], dtype=torch.int32)},  # sum != N
+        lambda b: {**b, "num_frames": torch.tensor([[2]], dtype=torch.int32)},
+        lambda b: {**b, "num_frames": torch.tensor([2.0])},
+        lambda b: {**b, "num_frames": torch.tensor([2**31], dtype=torch.int64)},
+        lambda b: "not a mapping",
+    ],
+)
+def test_malformed_media_fails_before_any_put(tq_client, media_partition, mutate):
+    client = _RecordingClient(tq_client)
+    sink = TQTokenSink(client, staging_partition=media_partition, capture_media=True)
+    records, _, _ = build_fixture_artifacts("single_call")
+    result = sink.stage(records[0], attachments=mutate(_still()))
+    assert not result.ok
+    assert client.puts == []
+    assert client.clears == []
+
+
+def test_validate_media_tensors_preserves_dtypes():
+    from nemo_rl.data_plane.tq_token_sink import validate_media_tensors
+
+    assert validate_media_tensors(None) is None
+    for dtype in (torch.float16, torch.bfloat16, torch.float32):
+        media = validate_media_tensors(_still(dtype=dtype))
+        assert media.imgs.dtype is dtype
+        assert media.imgs_sizes.dtype is torch.int32
+    video = validate_media_tensors(_video(frames=(2, 1)))
+    assert video.num_frames.dtype is torch.int32
+    assert video.patch_size == 2
+    sizes64 = _still()
+    sizes64["imgs_sizes"] = sizes64["imgs_sizes"].to(torch.int64)
+    assert validate_media_tensors(sizes64).imgs_sizes.dtype is torch.int64
+
+
+def test_failed_combined_write_discards_the_attempted_key(tq_client, media_partition):
+    client = _RecordingClient(tq_client, fail_put=RuntimeError("storage down"))
+    sink = TQTokenSink(client, staging_partition=media_partition, capture_media=True)
+    records, _, _ = build_fixture_artifacts("single_call")
+    result = sink.stage(records[0], attachments=_still())
+    assert not result.ok and "storage down" in (result.error or "")
+    assert client.clears == [[records[0].staging_key]]
+    source = TQTokenSource(
+        tq_client, staging_partition=media_partition, capture_media=True
+    )
+    with pytest.raises(KeyError):
+        source.fetch([records[0].staging_key])
+
+
+def test_cleanup_failure_still_reports_the_stage_failure(
+    tq_client, media_partition, caplog
+):
+    client = _RecordingClient(
+        tq_client,
+        fail_put=RuntimeError("storage down"),
+        fail_clear=RuntimeError("cleanup down"),
+    )
+    sink = TQTokenSink(client, staging_partition=media_partition, capture_media=True)
+    records, _, _ = build_fixture_artifacts("single_call")
+    with caplog.at_level("ERROR", logger="nemo_rl.data_plane.tq_token_sink"):
+        result = sink.stage(records[0], attachments=_still())
+    assert not result.ok and "storage down" in (result.error or "")
+    assert client.clears == [[records[0].staging_key]]
+    assert any("orphaned" in message for message in caplog.messages)
 
 
 def test_tq_sink_source_passes_gym_golden_vectors():

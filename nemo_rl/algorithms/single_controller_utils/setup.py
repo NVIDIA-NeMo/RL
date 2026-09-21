@@ -1981,6 +1981,7 @@ def setup_single_controller(
                 router_replay_enabled=router_replay_enabled(policy_config),
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
+                capture_media=capture_media,
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )

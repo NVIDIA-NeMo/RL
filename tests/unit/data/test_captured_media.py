@@ -40,16 +40,16 @@ from nemo_rl.data.multimodal_utils import reassemble_packed_multimodal
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 from nemo_rl.data_plane.tq_token_sink import (
-    MEDIA_GEOMETRY_FIELD,
+    MEDIA_HAS_FRAMES_FIELD,
     MEDIA_IMGS_FIELD,
     MEDIA_IMGS_SIZES_FIELD,
     MEDIA_NUM_FRAMES_FIELD,
+    MEDIA_PRESENT_FIELD,
     MEDIA_STAGING_FIELDS,
+    MEDIA_TENSOR_COLUMNS,
     STAGING_FIELDS,
     TQTokenSink,
     TQTokenSource,
-    complete_call_with_media,
-    media_geometry,
 )
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler
 from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
@@ -127,8 +127,9 @@ def stage(
     routes=False,
     partition="staging",
     sink=None,
+    expect="staged",
 ):
-    sink = sink or TQTokenSink(dp, staging_partition=partition)
+    sink = sink or TQTokenSink(dp, staging_partition=partition, capture_media=True)
     capture = RolloutTokenCapture(
         sink=sink, weight_version_fn=lambda: 3, adapter=VLLMCaptureAdapter()
     )
@@ -151,23 +152,47 @@ def stage(
     payload = {
         "prompt_token_ids": prompt["prompt_token_ids"],
         "choices": [{"message": message}],
-        "media": media_geometry(media.tensors),
         MEDIA_SPANS_FIELD: [item.to_dict() for item in media.items],
     }
-    coords = complete_call_with_media(
-        capture,
-        capture.begin_call(admission),
-        payload,
-        sink=sink,
-        media_tensors=media.tensors,
+    # Pixels ride beside the record as opaque attachments: one sink write.
+    coords = capture.complete_call_from_response(
+        capture.begin_call(admission), payload, attachments=media.tensors
     )
-    assert coords.disposition == "staged"
+    assert coords.disposition == expect
+    if expect != "staged":
+        return coords, media
     record = CallRecord(
         **coords.model_dump(exclude={"rollout_id", "disposition"}),
         mode=admission.mode,
         response_id=f"response-{call_id}",
     )
     return record, media
+
+
+def staged_media(dp, *keys, partition="staging"):
+    """Read the media of the given call rows the way the finalizer does."""
+    source = TQTokenSource(dp, staging_partition=partition, capture_media=True)
+    items = source.fetch_for_finalization(list(keys))
+    return source.fetch_media(items)
+
+
+class RecordingClient:
+    """NoOp client wrapper recording which columns each read selected."""
+
+    def __init__(self, client):
+        self.client = client
+        self.gets = []
+
+    def __getattr__(self, name):
+        return getattr(self.client, name)
+
+    def get_samples(self, *args, **kwargs):
+        select = kwargs.get("select_fields", args[2] if len(args) > 2 else None)
+        self.gets.append(list(select))
+        return self.client.get_samples(*args, **kwargs)
+
+    def tensor_reads(self):
+        return [g for g in self.gets if set(g) & set(MEDIA_TENSOR_COLUMNS.values())]
 
 
 def receipt(*records, rollout_id="r0", terminal=None):
@@ -180,6 +205,7 @@ def receipt(*records, rollout_id="r0", terminal=None):
 
 
 def finalizer(dp, **kwargs):
+    kwargs.setdefault("capture_media", True)
     return RolloutReassembler(
         dp,
         partition_id="train",
@@ -202,9 +228,9 @@ def test_two_turn_images_are_captured_once_and_survive_restart(dp, tmp_path):
         retained=media.items,
         call_id="c2",
     )
-    source = TQTokenSource(dp, staging_partition="staging")
-    assert source.fetch_media(root.staging_key).imgs.numel() == a.numel()
-    assert source.fetch_media(child.staging_key).imgs.numel() == b.numel()
+    [root_media, child_media] = staged_media(dp, root.staging_key, child.staging_key)
+    assert root_media.imgs.numel() == a.numel()
+    assert child_media.imgs.numel() == b.numel()
     # Both the descriptor and pixels are restored with the ordinary call rows.
     dp.save_checkpoint(tmp_path / "checkpoint")
     restored = NoOpDataPlaneClient()
@@ -253,21 +279,36 @@ def test_publication_packs_mixed_rows_and_cleans_all_call_media(dp):
     assert dp.list_sample_ids("staging") == []
 
 
-@pytest.mark.parametrize("corruption", ["missing", "geometry"])
-def test_missing_or_corrupt_media_rejects_rollout(dp, corruption):
+@pytest.mark.parametrize(
+    "corruption, reason",
+    [
+        ("missing", "invalid_media_columns:"),
+        ("geometry", "invalid_media_columns:"),
+        ("dtype", "invalid_media_columns:"),
+        ("frames_flag", "invalid_media_columns:"),
+        ("orphan_frames_flag", "invalid_staging_row:"),
+    ],
+)
+def test_missing_or_corrupt_media_rejects_rollout(dp, corruption, reason):
     root, _ = stage(
         dp, engine_prompt([10, 18, 18, 11], [(Span(1, 2), torch.ones(3, 2, 3))])
     )
     stored = dp._partitions["staging"].rows[root.staging_key]
     if corruption == "missing":
         del stored[MEDIA_IMGS_FIELD]
-    else:
+    elif corruption == "geometry":
         stored[MEDIA_IMGS_SIZES_FIELD][0] += 1
+    elif corruption == "dtype":
+        stored[MEDIA_IMGS_FIELD] = stored[MEDIA_IMGS_FIELD].to(torch.int64)
+    elif corruption == "frames_flag":
+        # A still flagged as video reads the int64 sentinel as frame counts.
+        stored[MEDIA_HAS_FRAMES_FIELD] = torch.tensor(True)
+    else:
+        stored[MEDIA_PRESENT_FIELD] = torch.tensor(False)
+        stored[MEDIA_HAS_FRAMES_FIELD] = torch.tensor(True)
     row = finalizer(dp).finalize_rollout("r0", receipt(root), reward=1.0)
     assert not row.valid
-    assert row.rejection_reason.startswith(
-        ("media_columns_missing:", "media_mismatch:")
-    )
+    assert row.rejection_reason.startswith(reason), row.rejection_reason
     assert row.media is None
 
 
@@ -282,10 +323,17 @@ def test_image_free_continuation_has_no_pixel_column(dp):
         call_id="c2",
     )
     assert descriptor.items == ()
-    assert MEDIA_IMGS_FIELD not in dp._partitions["staging"].rows[child.staging_key]
-    row = finalizer(dp).finalize_rollout("r0", receipt(root, child), reward=1.0)
+    child_row = dp._partitions["staging"].rows[child.staging_key]
+    # Every row of a media partition carries the columns; this one is flagged
+    # empty and holds sentinels, so the finalizer never reads its tensors.
+    assert child_row[MEDIA_PRESENT_FIELD].item() is False
+    assert child_row[MEDIA_IMGS_FIELD].dtype is torch.int64
+    client = RecordingClient(dp)
+    row = finalizer(client).finalize_rollout("r0", receipt(root, child), reward=1.0)
     assert row.valid, row.rejection_reason
     assert row.media["imgs_sizes"].as_tensor().tolist() == [[2, 3]]
+    [tensor_read] = client.tensor_reads()
+    assert tensor_read == list(MEDIA_TENSOR_COLUMNS.values())
 
 
 def test_repeated_asset_occurrences_remain_distinct(dp):
@@ -415,19 +463,122 @@ def test_span_mask_is_preserved_on_remap():
     assert prompt["mm_placeholders"]["image"][0].is_embed is mask
 
 
-def test_failed_media_write_is_rejected_by_shared_finalizer(dp, monkeypatch):
-    sink = TQTokenSink(dp, staging_partition="staging")
+def test_failed_combined_write_is_capture_failed_and_leaves_no_row(dp, monkeypatch):
+    """Tokens and pixels share one write: a failure is reported at call time
+    (no ``staged`` coords for a row the finalizer would have to reject) and the
+    attempted key is discarded."""
+    sink = TQTokenSink(dp, staging_partition="staging", capture_media=True)
+    cleared = []
 
-    def fail(*args):
+    def fail(*args, **kwargs):
         raise OSError("media write failed")
 
-    monkeypatch.setattr(sink, "stage_media", fail)
-    record, _ = stage(
-        dp, engine_prompt([18, 18], [(Span(0, 2), torch.ones(3, 2, 3))]), sink=sink
+    monkeypatch.setattr(sink._store, "put", fail)
+    monkeypatch.setattr(sink._store, "clear", lambda keys: cleared.append(list(keys)))
+    coords, _ = stage(
+        dp,
+        engine_prompt([18, 18], [(Span(0, 2), torch.ones(3, 2, 3))]),
+        sink=sink,
+        expect="capture_failed",
     )
-    row = finalizer(dp).finalize_rollout("r0", receipt(record), reward=1.0)
+    assert coords.staging_key is None
+    assert cleared == [["r0/c1"]]
+    assert dp.list_sample_ids("staging") == []
+
+
+def test_media_chain_reads_present_rows_once_in_chain_order(dp):
+    """Media on calls one and two, none on three: one batched tensor read for
+    the two present keys, in chain order, concatenated for the learner."""
+    a, b = torch.ones(3, 2, 3), torch.full((3, 4, 2), 2.0)
+    c1, media1 = stage(dp, engine_prompt([10, 18, 18, 11], [(Span(1, 2), a)]))
+    p1 = [10, 18, 18, 11, 31, 2]
+    c2, media2 = stage(
+        dp,
+        engine_prompt(p1 + [12, 18, 18, 11], [(Span(1, 2), a), (Span(7, 2), b)]),
+        parent=c1,
+        retained=media1.items,
+        call_id="c2",
+    )
+    p2 = p1 + [12, 18, 18, 11, 31, 2]
+    c3, media3 = stage(
+        dp,
+        engine_prompt(p2 + [50], [(Span(1, 2), a), (Span(7, 2), b)]),
+        parent=c2,
+        retained=media1.items + media2.items,
+        call_id="c3",
+    )
+    assert media3.tensors is None
+    client = RecordingClient(dp)
+    row = finalizer(client).finalize_rollout("r0", receipt(c1, c2, c3), reward=1.0)
+    assert row.valid, row.rejection_reason
+    assert len(client.tensor_reads()) == 1
+    assert row.media["imgs_sizes"].as_tensor().tolist() == [[2, 3], [4, 2]]
+    pixels = row.media["pixel_values"].as_tensor()
+    torch.testing.assert_close(pixels[:6], packed(a), rtol=0, atol=0)
+    torch.testing.assert_close(pixels[6:], packed(b), rtol=0, atol=0)
+
+
+def test_text_rollout_in_media_partition_issues_no_tensor_read(dp):
+    root, _ = stage(dp, engine_prompt([10, 11]))
+    child, _ = stage(dp, engine_prompt([10, 11, 31, 2, 12]), parent=root, call_id="c2")
+    client = RecordingClient(dp)
+    row = finalizer(client).finalize_rollout("r0", receipt(root, child), reward=1.0)
+    assert row.valid, row.rejection_reason
+    assert row.media is None
+    assert client.tensor_reads() == []
+    # The base read still carried the presence flags.
+    assert all(MEDIA_PRESENT_FIELD in read for read in client.gets[:1])
+
+
+def test_mixed_image_and_video_chain_is_rejected_before_any_tensor_read(dp):
+    a = torch.ones(3, 2, 3)
+    root, media = stage(dp, engine_prompt([10, 18, 18, 11], [(Span(1, 2), a)]))
+    child, _ = stage(
+        dp,
+        engine_prompt(
+            [10, 18, 18, 11, 31, 2, 18, 18], [(Span(1, 2), a), (Span(6, 2), a)]
+        ),
+        parent=root,
+        retained=media.items,
+        call_id="c2",
+    )
+    # Forge the child into a (well-formed) one-frame video row.
+    child_row = dp._partitions["staging"].rows[child.staging_key]
+    child_row[MEDIA_HAS_FRAMES_FIELD] = torch.tensor(True)
+    child_row[MEDIA_NUM_FRAMES_FIELD] = torch.tensor([1], dtype=torch.int32)
+    client = RecordingClient(dp)
+    row = finalizer(client).finalize_rollout("r0", receipt(root, child), reward=1.0)
     assert not row.valid
-    assert row.rejection_reason.startswith("media_columns_missing:")
+    assert row.rejection_reason.startswith("media_chain_incompatible:mixed")
+    assert client.tensor_reads() == []
+
+
+def test_text_only_partition_finalizes_without_media_columns():
+    client = NoOpDataPlaneClient()
+    client.register_partition(
+        partition_id="staging",
+        fields=list(STAGING_FIELDS),
+        num_samples=8,
+        consumer_tasks=["finalize"],
+    )
+    client.register_partition(
+        partition_id="train",
+        fields=list(DP_TRAIN_FIELDS),
+        num_samples=8,
+        consumer_tasks=["train"],
+    )
+    sink = TQTokenSink(client, staging_partition="staging", capture_media=False)
+    record, _ = stage(client, engine_prompt([10, 11]), sink=sink)
+    assert not (
+        set(MEDIA_STAGING_FIELDS) & set(client._partitions["staging"].rows["r0/c1"])
+    )
+    recording = RecordingClient(client)
+    row = finalizer(recording, capture_media=False).finalize_rollout(
+        "r0", receipt(record), reward=1.0
+    )
+    assert row.valid, row.rejection_reason
+    assert row.media is None
+    assert all(not (set(MEDIA_STAGING_FIELDS) & set(read)) for read in recording.gets)
 
 
 def test_media_and_routes_share_extras_integrity(dp):
@@ -449,7 +600,7 @@ def test_worker_restart_recovers_retained_geometry_without_fetching_pixels(
 ):
     a = torch.ones(3, 2, 3)
     root, _ = stage(dp, engine_prompt([10, 18, 18, 11], [(Span(1, 2), a)]))
-    source = TQTokenSource(dp, staging_partition="staging")
+    source = TQTokenSource(dp, staging_partition="staging", capture_media=True)
     monkeypatch.setattr(
         source, "fetch_media", lambda _: pytest.fail("prefix lookup fetched pixels")
     )
@@ -490,9 +641,8 @@ def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(dp
 
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
     worker._capture_calls = {}
-    worker._staging_sink = TQTokenSink(dp, staging_partition="staging")
     worker.token_capture = RolloutTokenCapture(
-        sink=TQTokenSink(dp, staging_partition="staging"),
+        sink=TQTokenSink(dp, staging_partition="staging", capture_media=True),
         weight_version_fn=lambda: 0,
         adapter=VLLMCaptureAdapter(),
     )
@@ -519,10 +669,8 @@ def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(dp
     assert response["ng_commit_coords"]["disposition"] == "staged"
     assert "media" not in response and MEDIA_SPANS_FIELD not in response
     assert worker._capture_calls == {}
-    torch.testing.assert_close(
-        TQTokenSource(dp, staging_partition="staging").fetch_media("r0/c1").imgs,
-        torch.ones(1, 6, 3),
-    )
+    [media] = staged_media(dp, "r0/c1")
+    torch.testing.assert_close(media.imgs, torch.ones(1, 6, 3))
 
 
 def video_prompt(tokens, videos, images=()):
@@ -575,12 +723,9 @@ def test_video_frame_groups_survive_checkpoint(dp, tmp_path):
         retained=media.items,
         call_id="c2",
     )
-    assert (
-        TQTokenSource(dp, staging_partition="staging")
-        .fetch_media(child.staging_key)
-        .imgs.numel()
-        == frames_b.numel()
-    )
+    [child_media] = staged_media(dp, child.staging_key)
+    assert child_media.imgs.numel() == frames_b.numel()
+    assert child_media.num_frames.tolist() == [4]
     dp.save_checkpoint(tmp_path / "video")
     restored = NoOpDataPlaneClient()
     restored.load_checkpoint(tmp_path / "video")
@@ -660,21 +805,26 @@ def test_video_placeholder_remap_preserves_all_timestamp_tokens():
 
 
 @pytest.mark.parametrize(
-    "column",
+    "column, reason",
     [
-        MEDIA_IMGS_FIELD,
-        MEDIA_IMGS_SIZES_FIELD,
-        MEDIA_NUM_FRAMES_FIELD,
-        MEDIA_GEOMETRY_FIELD,
+        (MEDIA_IMGS_FIELD, "invalid_media_columns:"),
+        (MEDIA_IMGS_SIZES_FIELD, "invalid_media_columns:"),
+        (MEDIA_NUM_FRAMES_FIELD, "invalid_media_columns:"),
+        (MEDIA_PRESENT_FIELD, "missing_staging_row:"),
+        (MEDIA_HAS_FRAMES_FIELD, "missing_staging_row:"),
     ],
 )
-def test_video_requires_every_committed_tensor(dp, column):
+def test_video_requires_every_committed_column(dp, column, reason):
+    """A missing column in a media-enabled partition is an error, never
+    evidence that media capture was off."""
     record, _ = stage(
         dp, video_prompt([90, 18, 91, 18], [(Span(0, 4), torch.ones(4, 3, 2, 2))])
     )
     del dp._partitions["staging"].rows[record.staging_key][column]
     row = finalizer(dp).finalize_rollout("r0", receipt(record), reward=1.0)
-    assert not row.valid and row.rejection_reason.startswith("media_columns_missing:")
+    assert not row.valid and row.rejection_reason.startswith(reason), (
+        row.rejection_reason
+    )
 
 
 def test_native_video_rejects_inconsistent_frame_count():

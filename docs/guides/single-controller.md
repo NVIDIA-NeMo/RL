@@ -398,22 +398,34 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   rollouts with async vLLM generation and a Megatron learner. With
   `token_capture.enabled: true` and the VLM processor configured, workers capture
   the processed media used for inference together with each call's token delta.
-  Gym's shared `media` extras describe the modality, per-frame `imgs_sizes`,
-  and per-video `num_frames`. RL stages owned tensors (`imgs`, `imgs_sizes`,
-  and optional `num_frames`) on the same call key through the shared media sink.
+  RL hands the owned tensors (`imgs`, `imgs_sizes`, and optional `num_frames`)
+  to Gym's `complete_call_from_response` as opaque attachments, and the TQ sink
+  writes them in the same `put` as the token columns, so `staged` coordinates
+  acknowledge tokens and pixels together and a failed write is `capture_failed`
+  at call time. Tensors keep their native shapes and dtypes on the wire; two
+  per-row flags (`media_present`, `media_has_frames`) mark which rows carry
+  pixels and whether they are video. Media-enabled staging partitions carry
+  these columns on every row; text-only runs register and read none of them.
   vLLM pixels are rearranged losslessly into packed patches; the finalizer
+  reads the presence flags with the base columns, then issues one batched read
+  of the tensor columns for the terminal-chain calls that carry media, and
   publishes `pixel_values`, `imgs_sizes`, and `num_frames` for the existing
   Megatron learner without resampling or normalizing the media again.
   Only newly introduced occurrences are staged. vLLM-specific `media_spans`
   extras retain placeholder positions and token hashes for multi-turn prefix
   replacement, including video's timestamp-separated visual-token spans.
   Processor-cache bypass ensures the worker has concrete pixels to capture.
-  Tokens and media use two writes. If the media write is missing or its geometry
-  disagrees with the shared extras, the finalizer rejects the rollout. Tensor
-  contents are not hashed; retained occurrences are checked by geometry and
-  placeholder tokens. Call rows share the existing checkpoint and cleanup lifecycle.
+  Media bundles are structurally validated before writing and after reading
+  (required tensors, patch geometry, frame grouping); malformed or missing
+  columns reject the rollout as `invalid_media_columns`, incompatible parts
+  along a chain as `media_chain_incompatible`. Tensor contents are not hashed;
+  retained occurrences are checked by geometry and placeholder tokens. Call
+  rows share the existing checkpoint and cleanup lifecycle. TQ has no
+  transactional rollback: a failed combined write is discarded best-effort by
+  the sink, and a failed discard is logged at ERROR.
   Upgrade the paired Gym and RL changes together; checkpoints written with the
-  former `media_capture`/tensor-attachment format are not compatible.
+  former `media_capture`/tensor-attachment format or with the two-write
+  `media_geometry_json` layout are not compatible.
   This integration does not require Megatron inference capture support or a new
   Megatron-LM pin. Compaction, mixed image/video conversations, native audio,
   video token pruning, static tiling (`num_tiles`), other processor families,

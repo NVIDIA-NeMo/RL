@@ -53,9 +53,13 @@ pytestmark = pytest.mark.nemo_gym
 class _MemorySink:
     def __init__(self) -> None:
         self.records: list[StagedCallRecord] = []
+        self.attachments: list[dict | None] = []
 
-    def stage(self, record: StagedCallRecord) -> StageResult:
+    def stage(
+        self, record: StagedCallRecord, *, attachments: dict | None = None
+    ) -> StageResult:
         self.records.append(record)
+        self.attachments.append(attachments)
         return StageResult(ok=True, staging_key=record.staging_key)
 
 
@@ -83,7 +87,7 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
-        lambda dp_client, *, staging_partition: sink,
+        lambda dp_client, *, staging_partition, capture_media: sink,
     )
     worker = _fake_worker()
 
@@ -122,7 +126,7 @@ def test_weight_version_is_stamped_from_worker_state(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
-        lambda dp_client, *, staging_partition: sink,
+        lambda dp_client, *, staging_partition, capture_media: sink,
     )
     worker = _fake_worker()
     asyncio.run(
@@ -207,7 +211,6 @@ def _worker_with_capture(sink: _MemorySink):
 
     worker = _fake_worker()
     worker._capture_calls = {}
-    worker._staging_sink = sink
     worker._prefix_cache = {}
     worker._prefix_cache_lock = threading.Lock()
     worker._staging_source = None
