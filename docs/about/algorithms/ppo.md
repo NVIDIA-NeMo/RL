@@ -69,6 +69,7 @@ ppo:
     gae_lambda: 0.95
     gae_gamma: 1.0
   ppo_epochs: 4
+  critic_ppo_epochs: ${ppo.ppo_epochs}
   policy_training_start_step: 0
 
 value_loss_fn:
@@ -78,6 +79,10 @@ value_loss_fn:
 value:
   model_name: "Qwen/Qwen2.5-1.5B"
 ```
+
+`ppo_epochs` and `critic_ppo_epochs` are independent positive integers. The
+example uses interpolation so the critic follows the actor epoch count unless
+you explicitly override it.
 
 ## Additional Resources
 

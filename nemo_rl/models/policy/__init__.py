@@ -14,7 +14,10 @@
 
 from typing import Any, Literal, NotRequired, TypedDict, Union
 
+from pydantic import BaseModel
+
 from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 
 
@@ -101,6 +104,13 @@ class LoRAConfig(TypedDict):
     dropout_position: Literal["pre", "post"]
     lora_A_init: str
     use_triton: NotRequired[bool]
+    # Warm start: path to a PEFT adapter checkpoint (a directory containing
+    # adapter_model.safetensors + adapter_config.json, e.g. a previous run's
+    # step_*/policy/weights or step_*/policy/weights/model directory) whose
+    # adapter weights initialize this run's LoRA modules. Ignored when resuming
+    # from a NeMo RL training checkpoint (resumed weights take precedence for
+    # the policy; the reference policy still anchors to the restored adapters).
+    restore_from: NotRequired[str | None]
 
 
 class AutomodelBackendConfig(TypedDict):
@@ -177,6 +187,15 @@ class MoEParallelizerOptions(TypedDict):
     wrap_outer_model: NotRequired[bool]
 
 
+class AutomodelCheckpointConfig(TypedDict, total=False):
+    """Automodel checkpoint settings used by DTensor v2."""
+
+    model_save_format: Literal["torch_save", "safetensors"] | None
+    save_consolidated: Literal["false", "final", "every"]
+    single_rank_consolidation: bool
+    consolidation_timeout_minutes: int
+
+
 class DTensorConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
@@ -201,6 +220,7 @@ class DTensorConfig(TypedDict):
     automodel_kwargs: NotRequired[AutomodelKwargs]
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]
+    checkpoint: NotRequired[AutomodelCheckpointConfig]
 
 
 class SequencePackingConfigDisabled(TypedDict):
@@ -216,6 +236,9 @@ class SequencePackingConfig(TypedDict):
     # Preserve the packer's order (or omit for backward compatibility), or
     # execute each DP rank's assigned bins largest-first for allocator reuse.
     microbatch_order: NotRequired[Literal["packer", "largest_first"]]
+    fuse_loss: NotRequired[bool]
+    pair_grouping_key: NotRequired[Literal["pair_index"]]
+    max_sequences_per_bin: NotRequired[int]
 
 
 class RewardModelConfig(TypedDict):
@@ -239,6 +262,14 @@ class MegatronPeftConfig(TypedDict):
     lora_B_init_method: str
     a2a_experimental: bool
     lora_dtype: str | None
+    # Warm start: path to a native Megatron-Bridge PEFT checkpoint (an
+    # iter_XXXXXXX directory, or a checkpoint root resolving to one) whose
+    # adapter weights initialize this run's LoRA modules. The donor checkpoint
+    # must have been saved with a matching peft configuration (dim and alpha
+    # are validated against its run_config.yaml). Ignored when resuming from a
+    # NeMo RL training checkpoint (resumed weights take precedence for the
+    # policy; the reference policy still anchors to the restored adapters).
+    restore_from: NotRequired[str | None]
 
 
 class MegatronOptimizerConfig(TypedDict):
@@ -265,6 +296,10 @@ class MegatronOptimizerConfig(TypedDict):
     optimizer_offload_fraction: float
     # overlap optimizer state transfers with CPU optimizer updates
     overlap_cpu_optimizer_d2h_h2d: NotRequired[bool]
+    # Precision-aware Adam moment / remainder dtypes (YAML strings resolved in setup).
+    exp_avg_dtype: NotRequired[str]
+    exp_avg_sq_dtype: NotRequired[str]
+    store_param_remainders: NotRequired[bool]
 
 
 class MegatronSchedulerConfig(TypedDict):
@@ -295,6 +330,8 @@ class Fp8Config(TypedDict):
     # When True, keep parameters in FP8. Can cause NaN token_mult_prob_error;
     # use with caution (see https://github.com/NVIDIA-NeMo/RL/issues/1164).
     fp8_param: NotRequired[bool]
+    # Python import path for a Transformer Engine custom recipe quantizer factory.
+    fp8_quantizer_factory: NotRequired[str]
     # When True, clear Transformer Engine's per-module _fp8_workspaces scratch
     # buffers in offload_before_refit (before weight transfer to the inference
     # engine). These FP8 workspace tensors anchor large CUDA segments and
@@ -302,6 +339,15 @@ class Fp8Config(TypedDict):
     # cycle. Useful for FP8 training runs that observe growing reserved GPU memory
     # after offload.
     force_clear_fp8_caches: NotRequired[bool]
+
+
+class Fp4Config(BaseModel, extra="forbid"):
+    """Transformer Engine NVFP4 training configuration."""
+
+    enabled: bool
+    fp4: str | None = None
+    fp4_recipe: str = "nvfp4"
+    fp4_param: bool = False
 
 
 # Type exists to be lax if not specified
@@ -362,6 +408,16 @@ class MegatronConfig(TypedDict):
     pipeline_dtype: str
     sequence_parallel: bool
     freeze_moe_router: bool
+    # Optional multimodal provider controls. These map legacy Omni recipe
+    # names onto the canonical NemotronOmniModel provider fields.
+    freeze_vision_encoder: NotRequired[bool]
+    freeze_vision_projector: NotRequired[bool]
+    freeze_audio_encoder: NotRequired[bool]
+    freeze_audio_projector: NotRequired[bool]
+    moe_router_dtype: str | None
+    moe_router_load_balancing_type: str | list[str]
+    moe_router_bias_update_rate: float
+    moe_permute_fusion: bool
     expert_tensor_parallel_size: int
     expert_model_parallel_size: int
     # If True, defer the casting of logits to float32 until the backward pass.
@@ -440,6 +496,9 @@ class MegatronConfig(TypedDict):
     # See: https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep
     moe_flex_dispatcher_backend: NotRequired[str]
     moe_hybridep_num_sms: NotRequired[int]
+    # Align packed inputs once before the model forward instead of padding in every
+    # MoE layer. Currently requires NeMo-owned packing, PP=1, and MTP disabled.
+    moe_hybridep_prepad_packed_inputs: NotRequired[bool]
     # Number of HybridEP ranks per NVLink domain (default: min(expert_model_parallel_size, 64))
     hybridep_num_ranks_per_nvlink_domain: NotRequired[int]
     # Enable multi-node NVLink support (default: expert_model_parallel_size > 4)
@@ -463,10 +522,18 @@ class MegatronConfig(TypedDict):
     # Number of tokens per chunk when computing fused linear logprobs.
     # Smaller values reduce peak memory further but may decrease throughput.
     fused_linear_logprobs_chunk_size: NotRequired[int]
+    # Emit fp32 logits from Megatron-LM's LM head. Set the matching
+    # generation.vllm_cfg.fp32_lm_head flag for vLLM generation: applying this
+    # to only one engine makes the generation/training logprob mismatch worse.
+    # No effect when use_fused_linear_logprobs is set, which bypasses the
+    # output layer's logits path.
+    fp32_lm_head: NotRequired[bool]
     # When mtp_num_layers=0, Multi-Token Prediction is disabled.
     mtp_num_layers: NotRequired[int]
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
     mtp_loss_scaling_factor: NotRequired[float]
+    # Populated by the algorithm before Megatron setup to size the LR scheduler.
+    train_iters: NotRequired[int]
     # When True, repeat a single MTP layer mtp_num_layers times instead of using distinct layers.
     mtp_use_repeated_layer: NotRequired[bool]
     # When True, detach MTP heads from the main model so MTP loss does not affect main-model gradients.
@@ -479,6 +546,13 @@ class MegatronConfig(TypedDict):
     clear_memory_caches_before_refit: NotRequired[bool]
     # FP8 quantization settings for the Megatron training backend.
     fp8_cfg: NotRequired[Fp8Config]
+    # TE NVFP4 training settings. Unknown keys are rejected by Fp4Config so
+    # misspelled precision controls cannot silently fall back to defaults.
+    fp4_cfg: NotRequired[Fp4Config]
+    # Keep the first/last N transformer blocks in BF16 under FP8/FP4 training.
+    first_last_layers_bf16: NotRequired[bool]
+    num_layers_at_start_in_bf16: NotRequired[int]
+    num_layers_at_end_in_bf16: NotRequired[int]
     # Path to a per-module Transformer Engine precision recipe loaded into
     # Megatron quant_recipe.
     te_precision_config_file: NotRequired[str]
@@ -486,22 +560,6 @@ class MegatronConfig(TypedDict):
     # Supported keys are model-specific, such as freeze_vision_model,
     # freeze_vision_projection, and freeze_language_model.
     freeze_config: NotRequired[dict[str, Any]]
-
-
-class DraftConfigDisabled(TypedDict):
-    """Configuration shape for the disabled draft-model training path."""
-
-    enabled: Literal[False]
-
-
-class DraftConfig(TypedDict):
-    """Configuration for Eagle draft-model training alongside the policy model."""
-
-    enabled: Literal[True]
-    model_name: NotRequired[str | None]
-    loss_weight: NotRequired[float]
-    num_layers: NotRequired[int | None]
-    aux_layer_indices: NotRequired[list[int] | None]
 
 
 class TokenizerConfig(TypedDict):
@@ -516,8 +574,8 @@ class TokenizerConfig(TypedDict):
     audio: NotRequired[dict[str, Any]]
     video: NotRequired[dict[str, Any]]
     use_processor: NotRequired[bool]
-    # Opt-in fastokens Rust-backed BPE tokenizer (~10x faster encode). Defaults to
-    # off when absent; NRL_USE_FASTOKENS overrides at runtime when set.
+    # Opt-in fastokens Rust-backed BPE tokenizer for NeMo-RL tokenization.
+    # Defaults to off when absent; NRL_USE_FASTOKENS overrides this and also sets VLLM_USE_FASTOKENS.
     use_fastokens: NotRequired[bool]
 
 
@@ -562,11 +620,35 @@ class RouterReplayConfig(TypedDict):
     enabled: Literal[True]
 
 
+class OnPolicyDistillationFullTransport(TypedDict):
+    """Resolved full-vocabulary MOPD settings carried to the policy workers.
+
+    A ``model_dump`` of ``OnPolicyDistillationFullConfig`` plus the resolved
+    ``payload_field`` and ``teacher_index_field``. That BaseModel remains the
+    authoritative schema and the only place defaults are declared, so readers
+    must take these keys as required rather than supplying their own fallbacks.
+    """
+
+    enabled: bool
+    teacher_payload: Literal["hidden_states", "logits"]
+    divergence: Literal["reverse_kl"]
+    payload_dtype: Literal["bfloat16", "float16", "float32"]
+    chunk_size: int | None
+    teacher_lm_head_lifecycle: Literal["none", "offload", "evict"]
+    validate_decomposition: bool
+    payload_field: str
+    # Per-sample teacher-identity column, routing each row's payload to the
+    # right teacher LM-head shard. Only the hidden-state path needs it; the
+    # logits payload ships an already-projected distribution, so it is None.
+    teacher_index_field: str | None
+
+
 class PolicyConfig(TypedDict):
     model_name: str
     tokenizer: TokenizerConfig
     train_global_batch_size: int
     train_micro_batch_size: int
+    offload_optimizer_for_logprob: bool
     logprob_batch_size: NotRequired[int]
     # If set, log probability computation is chunked along the sequence dimension to avoid GPU OOM (especially during backward pass).
     # Within each chunk loop, logits casting (from float16/bfloat16 to float32) is done to prevent holding the entire float32 logits tensor in memory.
@@ -580,8 +662,11 @@ class PolicyConfig(TypedDict):
     reward_model_cfg: NotRequired[RewardModelConfig]
     dtensor_cfg: DTensorConfig | DTensorConfigDisabled
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
-    draft: NotRequired[DraftConfig | DraftConfigDisabled]
+    draft: NotRequired[Eagle3DraftConfig]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
+    # Resolved once by the driver and carried to the student workers and (via
+    # deepcopy) to the teacher group. Absent means full-vocabulary MOPD is off.
+    on_policy_distillation_full: NotRequired[OnPolicyDistillationFullTransport]
     router_replay: NotRequired[RouterReplayConfig | RouterReplayConfigDisabled]
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
@@ -609,3 +694,9 @@ class PolicyConfig(TypedDict):
     disable_modelopt_layer_spec: NotRequired[bool]
 
     is_vlm: NotRequired[bool]
+
+    # FQN of a worker extension class to use instead of the resolved default
+    # policy worker. Must be a subclass of the resolved worker and cannot be
+    # combined with quant_cfg. Its runtime environment must already be in
+    # ACTOR_ENVIRONMENT_REGISTRY.
+    worker_extension_cls_fqn: NotRequired[str | None]

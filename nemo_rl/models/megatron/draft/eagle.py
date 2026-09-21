@@ -14,12 +14,15 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 from typing import Optional, Tuple
 
 import torch
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.common.embeddings import RotaryEmbedding
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import MegatronModule, TransformerConfig
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     sharded_state_dict_default,
@@ -105,12 +108,34 @@ class EagleModel(MegatronModule):
 
         return sd
 
+    @contextmanager
+    def _thd_attention_mask_type(self):
+        """Temporarily run the eagle layers with a padding_causal mask type.
+
+        modelopt builds the eagle decoder with ``AttnMaskType.arbitrary`` (its
+        own multi-step training manipulates masks explicitly), but TE's THD
+        kernels only accept ``padding``/``padding_causal``, and mcore's
+        auto-conversion covers only ``causal``/``no_mask``. The packed draft
+        forward wants plain block-diagonal causal attention, which is exactly
+        ``padding_causal`` + ``cu_seqlens``.
+        """
+        layers = self.eagle_module.decoder.layers
+        original_mask_types = [layer.self_attention.attn_mask_type for layer in layers]
+        for layer in layers:
+            layer.self_attention.attn_mask_type = AttnMaskType.padding_causal
+        try:
+            yield
+        finally:
+            for layer, mask_type in zip(layers, original_mask_types):
+                layer.self_attention.attn_mask_type = mask_type
+
     def forward(
         self,
         hidden_states: Tensor,
         input_embeds: Tensor,
         attention_mask: Optional[Tensor] = None,
         bootstrap_hidden_states: bool = True,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> Tensor:
         if bootstrap_hidden_states:
             hidden_states = self.eagle_module.fc(hidden_states)[0]
@@ -120,11 +145,21 @@ class EagleModel(MegatronModule):
                 f"`bootstrap_hidden_states=False`, got {hidden_states.shape[-1]}."
             )
 
-        hidden_states, _ = self.eagle_module(
-            embeddings=input_embeds,
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
+        # packed_seq_params drives the draft decoder's THD attention (segment
+        # boundaries + per-sequence RoPE restarts) when the trainer runs with
+        # sequence packing; None keeps the dense [s, b, h] path.
+        mask_type_ctx = (
+            self._thd_attention_mask_type()
+            if packed_seq_params is not None
+            else nullcontext()
         )
+        with mask_type_ctx:
+            hidden_states, _ = self.eagle_module(
+                embeddings=input_embeds,
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                packed_seq_params=packed_seq_params,
+            )
         logits, _ = self.eagle_module.eagle_output_layer(hidden_states)
         logits = logits.transpose(0, 1).contiguous()
         return logits

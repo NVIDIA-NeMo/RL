@@ -172,12 +172,16 @@ def _build_server(monkeypatch, serving_chat_kwargs):
         "vllm_cfg": {"http_server_serving_chat_kwargs": serving_chat_kwargs},
     }
     worker.llm = MagicMock(model_config="model-config", renderer="renderer")
+    worker._http_engine_client = MagicMock(
+        model_config="http-model-config", renderer="http-renderer"
+    )
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
         served_model_name="served-model", model="model-path"
     )
 
     worker._setup_vllm_openai_api_server(_FakeApp())
+    assert _BUILT["chat"][0].kwargs["engine_client"] is worker._http_engine_client
     return _BUILT["renderer"], _BUILT["chat"], _BUILT["tokenize"]
 
 

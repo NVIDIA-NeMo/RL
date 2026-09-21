@@ -133,7 +133,8 @@ def test_get_mtp_metrics_default_loss_scale_is_identity(monkeypatch):
 def _fake_worker(mtp_num_layers):
     """A minimal stand-in for MegatronPolicyWorkerImpl for calling _collect_mtp_metrics."""
     return SimpleNamespace(
-        model=SimpleNamespace(config=SimpleNamespace(mtp_num_layers=mtp_num_layers))
+        mtp_enabled=mtp_num_layers > 0,
+        model=SimpleNamespace(config=SimpleNamespace(mtp_num_layers=mtp_num_layers)),
     )
 
 

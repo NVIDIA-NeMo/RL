@@ -32,6 +32,15 @@ ULTRA_CONFIG_PATHS = [
 NEMO_GYM_CONFIG_PATHS = ULTRA_CONFIG_PATHS + [
     "examples/nemo_gym/nemotron-3.5-lightning/rlvr.yaml",
 ]
+# Select by content: every example that pins a service port range must stay
+# inside the layout in virtual_cluster.py. Configs without a port key inherit
+# the defaults and cannot violate the invariant themselves.
+PORT_ISOLATION_CONFIG_PATHS = sorted(
+    str(path.relative_to(REPO_ROOT))
+    for path in (REPO_ROOT / "examples").rglob("*.yaml")
+    if "port_range" in path.read_text()
+)
+assert PORT_ISOLATION_CONFIG_PATHS, "port-isolation config selection matched nothing"
 
 
 @pytest.fixture
@@ -271,6 +280,89 @@ def test_nemo_gym_configs_satisfy_current_grpo_contract(config_path):
     # schema and the checkpointing block is accepted by CheckpointManager.
     master_config = MasterConfig.model_validate(resolved)
     CheckpointManager(master_config.checkpointing)
+
+
+@pytest.mark.parametrize("config_path", PORT_ISOLATION_CONFIG_PATHS)
+def test_example_service_port_ranges_are_isolated(config_path):
+    """Resolved example configs must not bypass the below-9000 port layout."""
+    from nemo_rl.distributed.virtual_cluster import (
+        DEFAULT_GENERATION_PORT_RANGE_HIGH,
+        DEFAULT_GENERATION_PORT_RANGE_LOW,
+        DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+        DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
+        DEFAULT_GYM_PORT_RANGE_HIGH,
+        DEFAULT_GYM_PORT_RANGE_LOW,
+        DEFAULT_MASTER_PORT_RANGE_HIGH,
+        DEFAULT_MASTER_PORT_RANGE_LOW,
+    )
+
+    config = load_config(REPO_ROOT / config_path)
+
+    def select_int(path: str, default: int) -> int:
+        value = OmegaConf.select(config, path, default=default)
+        assert isinstance(value, int)
+        return value
+
+    def effective_range(
+        prefix: str, default_low: int, default_high: int
+    ) -> tuple[int, int]:
+        return (
+            select_int(f"{prefix}.port_range_low", default_low),
+            select_int(f"{prefix}.port_range_high", default_high),
+        )
+
+    router_range = effective_range(
+        "async_rl.generation_router",
+        DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
+        DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+    )
+    generation_range = effective_range(
+        "policy.generation",
+        DEFAULT_GENERATION_PORT_RANGE_LOW,
+        DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    )
+    gym_range = effective_range(
+        "env.nemo_gym",
+        DEFAULT_GYM_PORT_RANGE_LOW,
+        DEFAULT_GYM_PORT_RANGE_HIGH,
+    )
+
+    # cluster uses master_port_range_low/high rather than a nested master block.
+    master_range = (
+        select_int(
+            "cluster.master_port_range_low",
+            DEFAULT_MASTER_PORT_RANGE_LOW,
+        ),
+        select_int(
+            "cluster.master_port_range_high",
+            DEFAULT_MASTER_PORT_RANGE_HIGH,
+        ),
+    )
+
+    assert (
+        DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW
+        <= router_range[0]
+        < router_range[1]
+        <= DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH
+    )
+    assert DEFAULT_MASTER_PORT_RANGE_LOW <= master_range[0] < master_range[1]
+    assert master_range[1] <= DEFAULT_MASTER_PORT_RANGE_HIGH
+    assert (
+        DEFAULT_GENERATION_PORT_RANGE_LOW
+        <= generation_range[0]
+        < generation_range[1]
+        <= DEFAULT_GENERATION_PORT_RANGE_HIGH
+    )
+    assert (
+        DEFAULT_GYM_PORT_RANGE_LOW
+        <= gym_range[0]
+        < gym_range[1]
+        <= DEFAULT_GYM_PORT_RANGE_HIGH
+    )
+    assert router_range[1] <= master_range[0]
+    assert master_range[1] <= generation_range[0]
+    assert generation_range[1] <= gym_range[0]
+    assert gym_range[1] < 9000
 
 
 def test_parse_hydra_overrides():

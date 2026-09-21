@@ -90,6 +90,9 @@ policy:
       max_tokens: ${policy.max_total_sequence_length}
       expose_http_server: true
       enable_prefix_caching: true
+      image_dynamic_resolution: true
+      logprobs_mode: raw_logprobs
+      megatron_inference_wrapper: megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper.NemotronOmniInferenceWrapper
       parsers:
       - deepseek-r1-reasoning
       - qwen3-coder-tool

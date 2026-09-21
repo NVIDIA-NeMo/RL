@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any, Optional
 
+from nemo_rl.data.multimodal_utils import present_multimodal_fields
 from nemo_rl.data_plane.column_io import read_columns, round_up, write_columns
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN
@@ -77,6 +78,7 @@ class TQDriverMixin:
         *,
         fields: list[str],
         task_name: str,
+        include_multimodal: bool = True,
     ) -> KVBatchMeta:
         """Narrow ``meta`` for one model's dispatch and mint it a fresh pad target.
 
@@ -84,12 +86,30 @@ class TQDriverMixin:
         whichever model dispatches first decide the forward pad for the rest --
         and with ppo_epochs > 1 the caller's meta is already stamped when the
         critic dispatches again.
+
+        ``fields`` is the dispatch's *static* column list; the multimodal
+        columns the rollout actually wrote are unioned in here rather than at
+        each call site. Every forward-running dispatch of the *policy* needs
+        them -- omitting them runs a VLM forward image-blind while the sibling
+        dispatches saw the images -- and nothing in a static list forces the
+        next caller to remember. The union is a no-op for text-only runs, since
+        ``present_multimodal_fields`` intersects with ``meta.fields``.
+
+        ``include_multimodal=False`` opts a dispatch out. A value model is the
+        case that exists: its inputs are a fixed list and it never consumes
+        pixels, so unioning them in would fetch and broadcast a column the
+        forward discards.
         """
         extra_info = dict(meta.extra_info)
         extra_info.pop(GLOBAL_FORWARD_PAD_SEQLEN, None)
+        multimodal = (
+            [f for f in present_multimodal_fields(meta) if f not in fields]
+            if include_multimodal
+            else []
+        )
         isolated = replace(
             meta,
-            fields=fields,
+            fields=[*fields, *multimodal],
             task_name=task_name,
             extra_info=extra_info,
         )

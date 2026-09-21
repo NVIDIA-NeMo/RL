@@ -79,6 +79,13 @@ from nemo_rl.package_info import (
 
 os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
 os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
+# Reaping a dead generation worker's EngineCore needs a raylet setting too
+# (RAY_process_group_cleanup_enabled), but it is NOT set here: it is a raylet-wide
+# behaviour change and importing nemo_rl is not consent to it. It also would not work from
+# here on a cluster -- the raylet is already running by then. It belongs wherever the
+# raylet is launched: ray.sub for Slurm, and
+# nemo_rl.models.generation.maybe_configure_engine_reaping_env for a driver that starts its
+# own.
 
 
 def _is_build_isolation():
@@ -331,3 +338,15 @@ def patch_transformers_module_dir(
 
 
 patch_transformers_module_dir(os.environ, apply_to_current_interpreter=True)
+
+
+# Transformers 5.11 and 5.12 follow cached snapshot symlinks into blobs/ while
+# hashing trust_remote_code modules. Install the version-gated upstream fix
+# before model configurations are loaded in this interpreter. Remove this
+# bootstrap after the minimum Transformers version is upgraded to 5.13.0.
+from nemo_rl.transformers_compat import (  # noqa: E402
+    _patch_transformers_dynamic_module_symlink_cache,
+)
+
+_patch_transformers_dynamic_module_symlink_cache()
+del _patch_transformers_dynamic_module_symlink_cache
