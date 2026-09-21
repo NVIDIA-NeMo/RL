@@ -4370,11 +4370,22 @@ class SingleControllerActor:
             if num_groups and bool(valid_rows.any()):
                 flat_rewards = rewards.flatten()[valid_rows]
                 idx = group_index[valid_rows]
+                # device= is required, not defensive: scatter_reduce_ rejects an
+                # index on cuda against accumulators on cpu, and torch.full
+                # defaults to cpu. Verified against the run container
+                # (torch 2.11.0+cu130) -- without this it raises
+                # "Expected all tensors to be on the same device".
                 gmin = torch.full(
-                    (num_groups,), float("inf"), dtype=flat_rewards.dtype
+                    (num_groups,),
+                    float("inf"),
+                    dtype=flat_rewards.dtype,
+                    device=flat_rewards.device,
                 )
                 gmax = torch.full(
-                    (num_groups,), float("-inf"), dtype=flat_rewards.dtype
+                    (num_groups,),
+                    float("-inf"),
+                    dtype=flat_rewards.dtype,
+                    device=flat_rewards.device,
                 )
                 gmin.scatter_reduce_(0, idx, flat_rewards, reduce="amin")
                 gmax.scatter_reduce_(0, idx, flat_rewards, reduce="amax")
