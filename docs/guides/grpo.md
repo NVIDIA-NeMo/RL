@@ -582,7 +582,7 @@ Loss-local filtering does not alter the rollout tensors or reward-group advantag
 
 Measure end-to-end step time and reward/gradient-norm trajectories on the target recipe when comparing the modes. The avoided policy-logprob forward must be weighed against the device synchronization before gradient rescaling and the forward/backward work on rejected sequences. The rescaling restores normalization over surviving tokens before clipping; it does not introduce a different clipping threshold.
 
-The following Qwen2.5-Math-1.5B snapshot compares the two modes with seed 42 on eight GB300 GPUs (two nodes). The reward curves closely track over the shared steps. Mean step time over steps 51–381 is 6.67 seconds with in-loss filtering versus 8.05 seconds with separate-forward filtering, a 17.1% reduction. The timing axis is zoomed to 4–11 seconds; all spikes remain in the averages. This snapshot includes 450 steps for `true` and 381 for `false` and is a single-seed comparison, not a guarantee of equivalent convergence.
+The following Qwen2.5-Math-1.5B comparison shows both modes over 450 steps with seed 42 on eight GB300 GPUs (two nodes). The reward curves closely track, with a 17.8% reduction in mean step time over steps 51–450 (6.69 seconds with in-loss filtering versus 8.14 seconds with separate-forward filtering).
 
 ![Train reward, token multiplicative probability error, and step time for single-forward versus separate-forward sequence-logprob filtering.](../assets/grpo-qwen-single-forward-comparison.png)
 
