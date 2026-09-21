@@ -77,6 +77,65 @@ The {py:class}`VllmGeneration <nemo_rl.models.generation.vllm.VllmGeneration>` c
 3. Distributes inputs to workers and collects outputs.
 4. Handles weight updates and synchronization.
 
+#### Scheduler batch sizes and the vLLM usage context
+
+vLLM resolves `max_num_batched_tokens` and `max_num_seqs` from a *usage
+context* whenever the user has not set them. `vllm.LLM` declares
+`UsageContext.LLM_CLASS`; `AsyncLLM.from_engine_args` defaults to
+`UsageContext.ENGINE_CONTEXT`, which has no entry in vLLM's defaults table and
+falls back to the `SchedulerConfig` class defaults. On CUDA GPUs:
+
+| unset knob | `ENGINE_CONTEXT` | `LLM_CLASS` |
+| --- | --- | --- |
+| `max_num_batched_tokens` | 2048 | 16384 (≥70 GiB, non-A100) / 8192 |
+| `max_num_seqs` | 128 | 1024 (≥70 GiB, non-A100) / 256 |
+
+(These are the CUDA-GPU values; vLLM overrides the token column again on
+TPU, with lower values per chip generation.)
+
+2048 tokens per engine step is a poor fit for RL rollouts, where each turn
+re-prefills the whole conversation so far: a 30k-token prompt is split across
+~15 prefill steps that interleave with decode for every running sequence. NeMo
+RL therefore declares `UsageContext.LLM_CLASS` for the async engine too, so the
+synchronous and asynchronous workers schedule the same way.
+
+The usage context moves both knobs, but only the token budget is the point
+here, and raising the concurrency ceiling 8x would change KV-cache pressure and
+preemption behavior for every existing recipe. So when
+`policy.generation.vllm_kwargs.max_num_seqs` is unset, the async worker pins it
+to the value that context previously resolved (`SchedulerConfig.DEFAULT_MAX_NUM_SEQS`,
+128). Raise it deliberately if you want more concurrent sequences.
+
+Two exceptions to that pin, because vLLM only applies them to values it chose
+itself:
+
+- Under `vllm_kwargs.performance_mode: throughput` vLLM doubles both knobs.
+  Pinning `max_num_seqs` would double the token budget while leaving
+  concurrency flat, so the pin is skipped entirely in that mode.
+- vLLM otherwise caps `max_num_seqs` at `max_num_batched_tokens`. The pin opts
+  out of that clamp; it only bites if you also set a token budget below 128.
+
+Independently of the usage context, vLLM forces `max_num_batched_tokens` to
+`DEFAULT_MAX_NUM_BATCHED_TOKENS_FOR_BATCHED_DP` (256) when batched
+data-parallel MoE is enabled, so this change does not affect those engines.
+
+**This raises the default scheduler token budget from 2048 to 16384 for every
+async vLLM engine NeMo RL starts** (8192 on smaller or A100 GPUs). That is a
+real increase in per-step activation memory during prefill. It is the point of
+the change, and it matches what the synchronous worker has always done, but if
+an existing recipe is tight on memory, set
+`policy.generation.vllm_kwargs.max_num_batched_tokens` explicitly — there is no
+new NeMo RL knob to learn.
+
+The token budget is deliberately *not* implemented by injecting a value. vLLM
+applies several adjustments only to a batch size it chose itself — raising the
+floor to `max_model_len` when chunked prefill is off, raising it again so a
+single multimodal item fits for prefix-LM models, and capping it at
+`max_num_seqs * max_model_len`. Passing an explicit value opts out of all of
+them. An explicit `policy.generation.vllm_kwargs.max_num_batched_tokens` is
+still honored verbatim, and the async worker logs the values vLLM resolved when
+the engine starts.
+
 ### VllmGenerationWorker
 
 The {py:class}`VllmGenerationWorker <nemo_rl.models.generation.vllm.VllmGenerationWorker>` is a Ray actor that:

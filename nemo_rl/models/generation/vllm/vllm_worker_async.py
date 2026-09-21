@@ -272,10 +272,28 @@ class VllmAsyncGenerationWorkerImpl(
         self._load_model(self._deferred_bundle_indices, self._deferred_seed)
 
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
-        from vllm.config import CompilationConfig
+        from vllm.config import CompilationConfig, SchedulerConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
+        from vllm.usage.usage_lib import UsageContext
         from vllm.v1.engine.async_llm import AsyncLLM
         from vllm.v1.metrics.loggers import PrometheusStatLogger
+
+        # The usage context below also drives vLLM's default max_num_seqs, and
+        # changing the concurrency ceiling is not what this is for. Pin it to
+        # the value the async engine resolved before, so the batched-token
+        # budget is the only thing that moves. An explicit
+        # vllm_kwargs.max_num_seqs (already merged into llm_kwargs) wins.
+        #
+        # Not pinned under performance_mode="throughput": vLLM doubles both
+        # knobs there, but only the ones it chose itself, so pinning would
+        # double the token budget while leaving concurrency flat. Leave that
+        # mode entirely to vLLM.
+        pin_max_num_seqs = (
+            llm_kwargs.get("max_num_seqs") is None
+            and llm_kwargs.get("performance_mode") is None
+        )
+        if pin_max_num_seqs:
+            llm_kwargs["max_num_seqs"] = SchedulerConfig.DEFAULT_MAX_NUM_SEQS
 
         # Workaround: convert compilation_config dict to CompilationConfig object
         # since AsyncEngineArgs doesn't handle the dict-to-pydantic conversion.
@@ -304,15 +322,56 @@ class VllmAsyncGenerationWorkerImpl(
             if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False)
             else []
         )
+        # AsyncLLM.from_engine_args defaults to UsageContext.ENGINE_CONTEXT, for
+        # which vLLM has no batch-size defaults table, so unset knobs fall back
+        # to SchedulerConfig.DEFAULT_MAX_NUM_BATCHED_TOKENS (2048) -- far below
+        # what RL rollouts want, and below what the same engine gets through the
+        # synchronous vllm.LLM class. NeMo RL drives this engine like an offline
+        # batch engine, so declare that usage context and let vLLM apply its own
+        # hardware-aware defaults (and its own downstream adjustments, which it
+        # only applies to values it chose itself).
         self.llm = AsyncLLM.from_engine_args(
-            self.llm_async_engine_args, stat_loggers=self.stat_loggers
+            self.llm_async_engine_args,
+            usage_context=UsageContext.LLM_CLASS,
+            stat_loggers=self.stat_loggers,
         )
+        self._log_effective_batching_config(pinned_max_num_seqs=pin_max_num_seqs)
 
         # vLLM Metrics Logger
         # Metrics logger only enabled for per-actor, model-owner only
         self._vllm_metrics_lock = threading.Lock()
         if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             self._start_vllm_metrics_logger()
+
+    def _log_effective_batching_config(self, *, pinned_max_num_seqs: bool) -> None:
+        """Log the scheduler batch sizes vLLM actually resolved for this engine.
+
+        These are the knobs that decide how many prefill steps a long prompt is
+        split into, and they are resolved from the usage context when the user
+        has not set them, so log what the engine ended up with rather than what
+        was requested, and where each value came from.
+        """
+        scheduler_config = self.llm.vllm_config.scheduler_config
+        explicit = self.cfg.get("vllm_kwargs") or {}
+        if explicit.get("max_num_seqs") is not None:
+            max_num_seqs_source = "from vllm_kwargs"
+        elif pinned_max_num_seqs:
+            max_num_seqs_source = (
+                "pinned by NeMo RL to SchedulerConfig.DEFAULT_MAX_NUM_SEQS"
+            )
+        else:
+            max_num_seqs_source = "vLLM default for the LLM_CLASS usage context"
+        LOGGER.info(
+            "vLLM async engine scheduler: max_num_batched_tokens=%s (%s), "
+            "max_num_seqs=%s (%s), max_model_len=%s",
+            scheduler_config.max_num_batched_tokens,
+            "from vllm_kwargs"
+            if explicit.get("max_num_batched_tokens") is not None
+            else "vLLM default for the LLM_CLASS usage context",
+            scheduler_config.max_num_seqs,
+            max_num_seqs_source,
+            self.cfg["vllm_cfg"]["max_model_len"],
+        )
 
     def _start_vllm_metrics_logger(self) -> None:
         """Start a background thread that periodically collects vLLM logger metrics.
