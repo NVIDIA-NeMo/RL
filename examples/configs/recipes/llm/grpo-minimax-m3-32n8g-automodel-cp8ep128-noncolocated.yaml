@@ -5,11 +5,6 @@ grpo:
   use_leave_one_out_baseline: false
   max_val_samples: 240
   val_batch_size: 240
-  reward_scaling:
-    target_min: -1.0
-  reward_shaping:
-    overlong_buffer_length: 512
-    max_response_length: 6144
 loss_fn:
   reference_policy_kl_penalty: 0.0
   use_importance_sampling_correction: true

@@ -114,6 +114,10 @@ class TestValidateAndPrepareConfig:
         # Verify result is a RuntimeConfig named tuple
         assert isinstance(result, RuntimeConfig)
         assert result.dtype == torch.bfloat16
+        assert (
+            mock_autoconfig_class.from_pretrained.call_args.kwargs["torch_dtype"]
+            == torch.bfloat16
+        )
         assert result.cpu_offload is False
         assert result.offload_optimizer_for_logprob is False
         assert result.max_grad_norm == 1.0

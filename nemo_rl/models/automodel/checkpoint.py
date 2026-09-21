@@ -435,6 +435,10 @@ class AutomodelCheckpointManager:
                             f"Cannot resume optimizer master weights: {key} has "
                             f"checkpoint dtype {saved.properties.dtype}, but the "
                             f"current optimizer expects {value.dtype}. "
+                            "Check policy.precision and policy.optimizer.kwargs "
+                            "(especially store_param_remainders and master_weight_dtype) "
+                            "against the configuration and code used to save the checkpoint, "
+                            "or start a fresh run without restoring optimizer state."
                         )
                 del expected_state, optimizer_state
             self.checkpointer.load_optimizer(
