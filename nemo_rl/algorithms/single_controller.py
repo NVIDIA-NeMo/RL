@@ -507,6 +507,11 @@ class SingleControllerActor:
             "num_mask_sample_filtered": [],
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
+            # Prompt groups whose valid samples do not all share one reward.
+            # Those are exactly the groups with non-zero GRPO advantage, i.e.
+            # the ones that contribute gradient. One int per streaming chunk.
+            "num_groups": [],
+            "num_groups_mixed_reward": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
         }
         self._opd_stat_sum = 0.0
@@ -4340,6 +4345,36 @@ class SingleControllerActor:
                     self._algo_cfg.malformed_thinking_advantage
                 ),
             )
+
+        # Count prompt groups that carry a learning signal. GRPO's baseline is
+        # group-relative, so a group whose valid samples all share one reward
+        # gets advantage 0 for every sample and contributes no gradient. That is
+        # equivalent to std == 0 in calculate_baseline_and_std_per_prompt, but
+        # computed here as min != max over the valid rows: same answer, fully
+        # vectorized, and without repeating that helper's per-prompt Python loop.
+        # A chunk always holds whole prompt groups (see this method's docstring),
+        # so summing these per-chunk counts over a step is exact.
+        with torch.no_grad():
+            _, group_index = torch.unique(prompt_ids, dim=0, return_inverse=True)
+            num_groups = int(group_index.max().item()) + 1 if group_index.numel() else 0
+            valid_rows = final_sample_mask.bool()
+            if num_groups and bool(valid_rows.any()):
+                flat_rewards = rewards.flatten()[valid_rows]
+                idx = group_index[valid_rows]
+                gmin = torch.full(
+                    (num_groups,), float("inf"), dtype=flat_rewards.dtype
+                )
+                gmax = torch.full(
+                    (num_groups,), float("-inf"), dtype=flat_rewards.dtype
+                )
+                gmin.scatter_reduce_(0, idx, flat_rewards, reduce="amin")
+                gmax.scatter_reduce_(0, idx, flat_rewards, reduce="amax")
+                # Groups with no valid row keep inf/-inf and compare False.
+                num_mixed = int((gmax > gmin).sum().item())
+            else:
+                num_mixed = 0
+        self._step_log_dict["num_groups"].append(num_groups)
+        self._step_log_dict["num_groups_mixed_reward"].append(num_mixed)
 
         response_advantages = torch.masked_select(advantages, mask.bool())
         self._step_log_dict["rewards"].append(rewards.detach().cpu())

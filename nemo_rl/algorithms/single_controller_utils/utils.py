@@ -116,6 +116,8 @@ def reduce_advantage_pump_metrics(
     num_malformed_thinking: list[int] | None = None,
     num_assistant_messages: list[int] | None = None,
     num_routed_experts_backfilled: list[int] | None = None,
+    num_groups: list[int] | None = None,
+    num_groups_mixed_reward: list[int] | None = None,
 ) -> dict[str, float]:
     """Reduce per-step accumulators from _advantage_stage into step scalars.
 
@@ -135,6 +137,12 @@ def reduce_advantage_pump_metrics(
         num_invalid_tool_calls: Per-sample invalid tool-call counts.
         num_malformed_thinking: Per-sample malformed-thinking counts.
         num_assistant_messages: Per-sample assistant message counts (rate denominator).
+        num_groups: Prompt groups seen per streaming chunk.
+        num_groups_mixed_reward: Prompt groups per chunk whose valid samples did
+            not all share one reward. GRPO's baseline is group-relative, so only
+            these produce non-zero advantage and contribute gradient; the rest
+            are dead weight in the batch. Chunks hold whole groups, so these
+            sum exactly over a step.
 
     Returns:
         Step-level reward, advantage, token-count, optional sequence
@@ -143,6 +151,15 @@ def reduce_advantage_pump_metrics(
 
     """
     out: dict[str, float] = {}
+    if num_groups:
+        total_groups = int(sum(num_groups))
+        mixed_groups = int(sum(num_groups_mixed_reward or []))
+        out["groups/total"] = float(total_groups)
+        out["groups/mixed_reward"] = float(mixed_groups)
+        # The headline number: how much of the batch actually trains anything.
+        out["groups/frac_mixed_reward"] = (
+            float(mixed_groups) / total_groups if total_groups else 0.0
+        )
     if rewards:
         cat_rewards = torch.cat([r.flatten() for r in rewards])
         if sample_masks:
