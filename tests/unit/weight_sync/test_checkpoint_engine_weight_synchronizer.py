@@ -539,7 +539,8 @@ class TestCheckpointEngineFactory:
             (VLLM_BACKEND, False, CheckpointEngineWeightSynchronizer),
             (VLLM_BACKEND, True, ValueError),
             (SGLANG_BACKEND, False, CheckpointEngineWeightSynchronizer),
-            (MEGATRON_BACKEND, False, NotImplementedError),
+            # Main now supports this route but requires both cluster handles.
+            (MEGATRON_BACKEND, False, ValueError),
         ],
     )
     def test_checkpoint_engine_factory_routing(self, backend, colocated, expected):
