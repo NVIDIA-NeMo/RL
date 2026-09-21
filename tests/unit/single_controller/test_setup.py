@@ -71,6 +71,7 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
 from nemo_rl.data_plane.schema import SC_ROLLOUT_SCHEMA_FIELDS
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
@@ -187,7 +188,9 @@ def _make_master_config(
             "save_optimizer": False,
         },
         logger={"wandb_enabled": False, "wandb": {}},
-        cluster={"num_nodes": 2, "gpus_per_node": 8, "segment_size": None},
+        cluster=ClusterConfig.model_validate(
+            {"num_nodes": 2, "gpus_per_node": 8, "segment_size": None}
+        ),
         loss_fn=loss_cfg if loss_cfg is not None else ClippedPGLossConfig(),
         env=env if env is not None else {},
         async_rl=AsyncRLConfig(

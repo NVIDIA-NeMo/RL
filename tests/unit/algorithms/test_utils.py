@@ -36,6 +36,7 @@ from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.data.deepseek_v4_tokenizer import get_deepseek_v4_tokenizer
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 
 
 @pytest.fixture
@@ -379,7 +380,7 @@ def test_maybe_pad_last_batch_preserves_multimodal_rows():
 
 def _base_master_config(colocated: bool):
     return MasterConfig.model_construct(
-        cluster={"num_nodes": 2, "gpus_per_node": 8},
+        cluster=ClusterConfig.model_validate({"num_nodes": 2, "gpus_per_node": 8}),
         policy={
             "generation": {
                 "temperature": 1.0,
@@ -399,7 +400,7 @@ def _base_master_config(colocated: bool):
 
 def _base_ppo_master_config(colocated: bool):
     return PPOMasterConfig.model_construct(
-        cluster={"num_nodes": 2, "gpus_per_node": 8},
+        cluster=ClusterConfig.model_validate({"num_nodes": 2, "gpus_per_node": 8}),
         policy={
             "generation": {
                 "temperature": 1.0,
