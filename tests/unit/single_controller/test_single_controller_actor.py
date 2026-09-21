@@ -27,7 +27,12 @@ from tensordict import TensorDict
 import nemo_rl.algorithms.single_controller as single_controller
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler
-from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
+from nemo_rl.algorithms.grpo import (
+    AdvEstimatorConfig,
+    GRPOConfig,
+    _create_advantage_estimator,
+    _initial_grpo_save_state,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.ppo import PPOConfig
@@ -2387,3 +2392,89 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     )
     assert "returns" in (result_meta.fields or [])
     assert "advantages" in (result_meta.fields or [])
+
+
+@pytest.mark.parametrize("policy", ["exclude", "include"])
+@pytest.mark.parametrize("estimator_name", ["grpo", "gdpo", "reinforce_plus_plus"])
+def test_advantage_stage_placeholders_never_vote(
+    policy: str, estimator_name: str
+) -> None:
+    """Adding invalid sibling and all-placeholder groups cannot change real advantages."""
+    cfg = GRPOConfig(
+        masked_reward_policy=policy,
+        seq_logprob_error_threshold=None,
+        adv_estimator=AdvEstimatorConfig(
+            name=estimator_name,
+            use_leave_one_out_baseline=False,
+            normalize_rewards=False,
+            minus_baseline=True,
+        ),
+    )
+    master = SimpleNamespace(
+        grpo=cfg, loss_fn=ClippedPGLossConfig(use_kl_in_reward=False)
+    )
+
+    def compute(*, placeholders: bool) -> torch.Tensor:
+        # Three real rows, one environment-masked. Invalid siblings share prompt 1;
+        # the two wholly invalid groups share the pad prompt 0, as in reassembly.
+        n = 8 if placeholders else 3
+        tokens = torch.tensor([[0.0, 1.0, 1.0]] * 3 + [[0.0, 0.0, 0.0]] * (n - 3))
+        rewards = torch.tensor([1.0, 3.0, 9.0] + [0.0] * (n - 3))
+        data = TensorDict(
+            {
+                "prompt_ids_for_adv": torch.tensor(
+                    [[1]] * min(4, n) + [[0]] * max(0, n - 4)
+                ),
+                "total_reward": rewards,
+                "reward/a": rewards.clone(),
+                "reward/b": 2 * rewards,
+                "token_mask": tokens,
+                "sample_mask": torch.tensor([1.0] * 3 + [0.0] * (n - 3)),
+                "mask_sample": torch.tensor([False, False, True] + [False] * (n - 3)),
+                "truncated": torch.zeros(n, dtype=torch.bool),
+            },
+            batch_size=[n],
+        )
+        plane = _AdvantageDataPlane(data)
+        ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+        ctrl._dp_client = plane
+        ctrl._advantage_cfg = AdvantageConfig(
+            repeated_batch_fields=["reward/a", "reward/b"]
+        )
+        ctrl._advantage_estimator = _create_advantage_estimator(master)
+        ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        ctrl._policy_logprobs_required = False
+        ctrl._reference_logprobs_required = False
+        ctrl._teacher_logprobs_required = False
+        ctrl._is_ppo = False
+        ctrl._master_config = master
+        ctrl._algo_cfg = cfg
+        ctrl._message_level_advantage_penalties_enabled = False
+        ctrl._step_log_dict = {
+            key: []
+            for key in (
+                "rewards",
+                "sample_masks",
+                "masked_advantages",
+                "sequence_lengths",
+                "num_mask_sample_filtered",
+                "seq_logprob_error_metrics",
+            )
+        }
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=[f"sample-{i}" for i in range(n)],
+            fields=list(data.keys()),
+        )
+        _, trainable = asyncio.run(ctrl._advantage_stage(meta))
+        assert trainable
+        assert plane.written_fields is not None
+        torch.testing.assert_close(
+            plane.written_fields["sample_mask"],
+            torch.tensor([1.0, 1.0] + [0.0] * (n - 2)),
+        )
+        assert torch.isfinite(plane.written_fields["advantages"]).all()
+        return plane.written_fields["advantages"][:2]
+
+    torch.testing.assert_close(compute(placeholders=True), compute(placeholders=False))

@@ -27,6 +27,7 @@ from omegaconf import OmegaConf
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms import grpo as grpo_mod
+from nemo_rl.algorithms import grpo_sync as grpo_sync_mod
 from nemo_rl.algorithms.advantage_estimator import (
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
@@ -76,12 +77,14 @@ from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data.dataloader import CyclingDataLoader
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data_plane.column_io import read_columns
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.experience import sync_rollout_actor as sync_rollout_mod
 from nemo_rl.experience.interfaces import (
     FRONTIER_ORDINAL_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
@@ -6467,3 +6470,158 @@ def test_grpo_train_shuts_down_environments_after_success():
         )
 
     shutdown.assert_called_once_with(task_to_env, task_to_env)
+
+
+@pytest.mark.parametrize("reward_policy", ["exclude", "include"])
+@pytest.mark.parametrize("estimator_name", ["grpo", "gdpo", "reinforce_plus_plus"])
+@pytest.mark.parametrize(
+    "filter_source", ["environment", "overlong", "preexisting", "seq_error"]
+)
+def test_tq_rollout_and_trainer_masked_rewards(
+    mock_grpo_components,
+    monkeypatch: pytest.MonkeyPatch,
+    reward_policy: str,
+    estimator_name: str,
+    filter_source: str,
+) -> None:
+    """Exercise real actor payloads, driver statistics, and estimator inputs."""
+    components = mock_grpo_components
+    cfg = components["master_config"]
+    cfg.data_plane = {"enabled": True}
+    cfg.grpo.max_num_steps = 1
+    cfg.grpo.val_period = 0
+    cfg.grpo.num_generations_per_prompt = 4
+    cfg.grpo.masked_reward_policy = reward_policy
+    cfg.grpo.overlong_filtering = True
+    cfg.grpo.seq_logprob_error_threshold = 2.0
+    cfg.grpo.adv_estimator.name = estimator_name
+    cfg.grpo.adv_estimator.minus_baseline = True
+    cfg.grpo.adv_estimator.use_leave_one_out_baseline = False
+    cfg.loss_fn.use_kl_in_reward = False
+    batch = next(iter(components["train_dataloader"])).repeat_interleave(4)
+    batch["total_reward"] = torch.tensor([1.0, 1.0, 1.0, 0.0])
+    batch["reward/a"] = batch["total_reward"].clone()
+    batch["reward/b"] = 2 * batch["total_reward"]
+    batch["mask_sample"] = [False, False, False, filter_source == "environment"]
+    batch["truncated"] = torch.tensor(
+        [False, False, False, filter_source == "overlong"]
+    )
+    if filter_source == "preexisting":
+        batch["loss_multiplier"][-1] = 0
+    for row in batch["message_log"]:
+        row.append(
+            {
+                "role": "assistant",
+                "content": "answer",
+                "token_ids": torch.tensor([4, 5]),
+                "generation_logprobs": torch.zeros(2),
+            }
+        )
+    monkeypatch.setattr(
+        sync_rollout_mod,
+        "run_async_multi_turn_rollout",
+        lambda **kwargs: (batch, {"mean_gen_tokens_per_sample": 2.0}),
+    )
+    monkeypatch.setattr(
+        sync_rollout_mod,
+        "run_multi_turn_rollout",
+        lambda **kwargs: (batch, {"mean_gen_tokens_per_sample": 2.0}),
+    )
+    actor = object.__new__(
+        sync_rollout_mod.SyncRolloutActor.__ray_metadata__.modified_class
+    )
+    actor.master_config = cfg
+    actor.policy_generation = None
+    actor.tokenizer = components["tokenizer"]
+    actor.task_to_env = components["task_to_env"]
+    actor._dp_client = MagicMock()
+    meta, carry, rollout_metrics, _ = actor.rollout_to_tq(
+        batch, partition_id="train", group_size=4
+    )
+    actor._dp_client.get_samples.side_effect = (
+        lambda select_fields, **kwargs: actor._dp_client.put_samples.call_args.kwargs[
+            "fields"
+        ].select(*select_fields)
+    )
+    actor_data = read_columns(
+        actor._dp_client,
+        meta,
+        ["sample_mask", "token_mask", "generation_logprobs", "input_ids", "content"],
+    )
+    expected_actor_mask = torch.ones(4)
+    if filter_source in {"environment", "preexisting"}:
+        expected_actor_mask[-1] = 0
+    torch.testing.assert_close(actor_data["sample_mask"], expected_actor_mask)
+    assert carry["mask_sample"].tolist() == batch["mask_sample"]
+    # Filtering the published loss mask must not lose the raw flag/weight.
+    torch.testing.assert_close(carry["loss_multiplier"], batch["loss_multiplier"])
+    actor_data["prev_logprobs"] = torch.zeros_like(actor_data["generation_logprobs"])
+    actor_data["reference_policy_logprobs"] = torch.zeros_like(
+        actor_data["generation_logprobs"]
+    )
+    if filter_source == "seq_error":
+        actor_data["generation_logprobs"][-1, -2:] = 1.0
+    estimator = MagicMock(wraps=grpo_mod._create_advantage_estimator(cfg))
+    real_seq_masking = grpo_sync_mod._compute_seq_logprob_error_metrics
+    policy = components["policy"]
+    with mock_sync_grpo_infrastructure(policy):
+        grpo_sync_mod.SyncRolloutActor.options.return_value.remote.return_value.rollout_to_tq.remote.return_value = (
+            meta,
+            carry,
+            rollout_metrics,
+            {},
+        )
+        policy.read_from_dataplane.side_effect = (
+            lambda meta, select_fields, **kwargs: BatchedDataDict(
+                {k: actor_data[k] for k in select_fields}
+            )
+        )
+        with (
+            patch.object(
+                grpo_sync_mod, "_create_advantage_estimator", return_value=estimator
+            ),
+            patch.object(
+                grpo_sync_mod, "_compute_seq_logprob_error_metrics", real_seq_masking
+            ),
+        ):
+            grpo_train_sync(
+                policy,
+                _mock_policy_generation(),
+                components["train_dataloader"],
+                components["val_dataloader"],
+                components["tokenizer"],
+                components["loss_fn"],
+                components["task_to_env"],
+                components["val_task_to_env"],
+                components["logger"],
+                components["checkpointer"],
+                _initial_grpo_save_state(),
+                cfg,
+            )
+
+    policy.train_from_meta.assert_called_once()
+    fields = policy.write_to_dataplane.call_args.kwargs["fields"]
+    loss_mask = torch.tensor([1.0, 1.0, 1.0, 0.0])
+    torch.testing.assert_close(fields["sample_mask"], loss_mask)
+    args = estimator.compute_advantage.call_args.kwargs
+    valid_mask = torch.ones(4) if reward_policy == "include" else loss_mask
+    torch.testing.assert_close(args["valid_mask"], valid_mask)
+    torch.testing.assert_close(
+        args["normalization_mask"], actor_data["token_mask"] * valid_mask[:, None]
+    )
+    torch.testing.assert_close(
+        args["mask"], actor_data["token_mask"] * loss_mask[:, None]
+    )
+    assert torch.isfinite(fields["advantages"]).all()
+    if reward_policy == "exclude":
+        torch.testing.assert_close(
+            fields["advantages"][:3], torch.zeros_like(fields["advantages"][:3])
+        )
+    else:
+        assert fields["advantages"][:3, -2:].abs().sum() > 0
+    # These tags drive TQ dynamic sampling. Sequence masking is only available later.
+    std = torch.tensor([tag["std"] for tag in meta.tags])
+    if reward_policy == "exclude" and filter_source != "seq_error":
+        assert std.count_nonzero() == 0
+    else:
+        assert (std > 0).all()

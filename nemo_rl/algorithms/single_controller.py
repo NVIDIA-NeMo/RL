@@ -92,7 +92,6 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     GRPOSaveState,
-    _advantage_valid_mask,
     _clip_grpo_advantages,
     _write_latest_checkpoint_status,
     aggregate_rollout_metrics,
@@ -4908,11 +4907,13 @@ class SingleControllerActor:
 
         mask = token_mask * final_sample_mask.unsqueeze(-1)
         advantage_valid_mask = final_sample_mask
-        if not self._is_ppo:
-            assert isinstance(self._algo_cfg, GRPOConfig)
-            advantage_valid_mask = _advantage_valid_mask(
-                final_sample_mask, self._algo_cfg
-            )
+        if (
+            not self._is_ppo
+            and cast(GRPOConfig, self._algo_cfg).masked_reward_policy == "include"
+        ):
+            # Include policy-filtered rewards, but retain the data-plane validity
+            # mask: token-capture placeholders must never vote in statistics.
+            advantage_valid_mask = sample_mask
 
         repeated_batch: dict[str, torch.Tensor] = {
             "total_reward": rewards,
