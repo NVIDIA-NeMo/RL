@@ -849,10 +849,17 @@ def nemo_gym_example_to_video_datum_spec(
         _inject_vllm_mm_processor_kwargs(extra_env_info, mm_processor_kwargs)
 
     if max_seq_length is not None and length >= max_seq_length:
+        # Don't train on rows that exceed the max sequence length.
         for key, value in list(user_message.items()):
             if isinstance(value, PackedTensor):
+                # Empty the data.
                 user_message[key] = PackedTensor.empty_like(value)
         user_message["token_ids"] = user_message["token_ids"][: min(4, max_seq_length)]
+        # Zero out the media validity mask, none of these dummy tokens are
+        # associated with injected multimodal embeddings.
+        user_message["media_token_validity_mask"] = torch.zeros_like(
+            user_message["token_ids"], dtype=torch.bool
+        )
         length = len(user_message["token_ids"])
         loss_multiplier = 0.0
         extra_env_info = _make_overlength_filtered_video_example(nemo_gym_example)
