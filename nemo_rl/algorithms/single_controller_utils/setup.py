@@ -191,6 +191,7 @@ def _maybe_restore_native_data_plane_checkpoint(
     save_state: GRPOSaveState,
     partition_id: str,
     sampler_name: str,
+    opd_full_teacher_checkpoints: Optional[list[str]] = None,
 ) -> Optional[DataPlaneCheckpointMetadata]:
     """Load and validate an authoritative native TQ checkpoint when present.
 
@@ -261,6 +262,16 @@ def _maybe_restore_native_data_plane_checkpoint(
         raise ValueError(
             "Native TQ checkpoint metadata does not match the trainer "
             f"checkpoint: {mismatches}"
+        )
+    # The buffered rows carry a teacher_index each, and nothing re-tags them on
+    # restore: a config that renumbers the teachers would silently project them
+    # through the wrong LM head.
+    if opd_full_teacher_checkpoints != metadata.get("opd_full_teacher_checkpoints"):
+        raise ValueError(
+            "Native TQ checkpoint was written under a different opd_full "
+            "teacher set: its rows are tagged with "
+            f"{metadata.get('opd_full_teacher_checkpoints')!r}, this run would "
+            f"number them {opd_full_teacher_checkpoints!r}."
         )
     manifest_digest = metadata.get("replay_manifest_digest")
     if not isinstance(manifest_digest, str) or not manifest_digest:
@@ -961,7 +972,13 @@ def _load_opd_full_teacher_lm_heads(
     trainer: Any,
     teacher_worker_groups: dict[str, Any],
 ) -> None:
-    """Load the teacher LM head onto every student worker for full-vocabulary MOPD.
+    """Load every unique teacher's LM head onto each student worker.
+
+    One RPC per unique checkpoint (``TeacherWorkerGroup.teacher_index``,
+    assigned by ``create_teacher_worker_groups``), so the student ends up with
+    one LM-head shard per teacher, keyed by that same index -- the key every
+    row's ``OPD_FULL_TEACHER_INDEX_FIELD`` tag resolves against at training
+    time (see ``reconstruct_opd_full_teacher_logits``).
 
     Callers gate this on the ``hidden_states`` payload; the ``logits`` payload
     ships the projected distribution and needs no teacher LM head.
@@ -969,33 +986,31 @@ def _load_opd_full_teacher_lm_heads(
     Args:
         trainer: The driver-side policy whose workers hold the student model.
         teacher_worker_groups: Deduplicated teacher groups, keyed by primary alias.
-
-    Raises:
-        ValueError: If the run does not resolve to exactly one teacher checkpoint.
     """
-    teacher_checkpoints = {
-        teacher.model_name for teacher in teacher_worker_groups.values()
+    # teacher_worker_groups already holds one entry per physical teacher
+    # (aliases sharing a checkpoint were deduplicated upstream), so this only
+    # re-keys it by the index rows are tagged with, to walk the teachers in a
+    # stable index order below.
+    teachers_by_index: dict[int, Any] = {
+        teacher.teacher_index: teacher for teacher in teacher_worker_groups.values()
     }
-    if len(teacher_checkpoints) != 1:
-        raise ValueError(
-            "on_policy_distillation.full currently supports exactly one teacher "
-            f"checkpoint, got {sorted(teacher_checkpoints)}."
+    for teacher_index in sorted(teachers_by_index):
+        teacher = teachers_by_index[teacher_index]
+        # Resolution happens on the student workers, not here: validate_model_paths
+        # imports megatron.bridge at module scope, and only the Megatron worker
+        # actors get the mcore extra.
+        results = ray.get(
+            trainer.worker_group.run_all_workers_single_data(
+                "load_opd_full_teacher_lm_head",
+                teacher_path_config=cast(PolicyConfig, teacher.cfg),
+                teacher_index=teacher_index,
+            )
         )
-
-    teacher = next(iter(teacher_worker_groups.values()))
-    # Resolution happens on the student workers, not here: validate_model_paths
-    # imports megatron.bridge at module scope, and only the Megatron worker
-    # actors get the mcore extra.
-    results = ray.get(
-        trainer.worker_group.run_all_workers_single_data(
-            "load_opd_full_teacher_lm_head",
-            teacher_path_config=cast(PolicyConfig, teacher.cfg),
+        print(
+            f"  ✓ Loaded opd_full teacher LM head [index={teacher_index}, "
+            f"alias={teacher.alias!r}] from {results[0]}",
+            flush=True,
         )
-    )
-    print(
-        f"  ✓ Loaded opd_full teacher LM head from {results[0]}",
-        flush=True,
-    )
 
 
 def setup_single_controller(
@@ -1254,6 +1269,9 @@ def setup_single_controller(
             {
                 **opd_full_config.model_dump(),
                 "payload_field": opd_module.opd_full_payload_field(opd_full_config),
+                "teacher_index_field": opd_module.opd_full_teacher_index_field(
+                    opd_full_config
+                ),
             },
         )
 
@@ -1275,14 +1293,23 @@ def setup_single_controller(
     if is_ppo_run(master_config):
         # Only a fresh run reads this; a resume ignores it and restores the critic
         # from its own checkpoint, so the key can stay in the config.
-        warm_start = master_config.ppo.warm_start_value_checkpoint
-        if trainer_checkpoint_path is None and warm_start is not None:
+        warm_start = (
+            master_config.ppo.warm_start_value_checkpoint
+            if trainer_checkpoint_path is None
+            else None
+        )
+        if warm_start is not None:
             validate_warm_start_checkpoint(warm_start)
-            print(f"🔥 Warm-starting the value model from {warm_start}")
+            print(f"🔥 Warm-starting the value model from {warm_start} (weights only)")
         value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
             trainer_checkpoint_path or warm_start,
             model_component="value",
         )
+        if warm_start is not None:
+            # The seed's Adam state and LR-scheduler step count belong to the run
+            # that produced it, so the critic rebuilds both -- only the weights
+            # carry over.
+            value_optimizer_path = None
 
     restore_mode = rollout_checkpoint_cfg.restore_mode
     recovery_checkpoint_path = trainer_checkpoint_path
@@ -1753,6 +1780,9 @@ def setup_single_controller(
             save_state=save_state,
             partition_id=partition_id,
             sampler_name=master_config.async_rl.sampler.name,
+            opd_full_teacher_checkpoints=(
+                opd_module.opd_full_teacher_checkpoints_by_index(master_config)
+            ),
         )
         if rollout_checkpoint_load_metrics is not None:
             rollout_checkpoint_load_metrics["tq_load_seconds"] = (
