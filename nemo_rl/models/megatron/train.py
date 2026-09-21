@@ -194,6 +194,10 @@ def model_forward(
     multimodal_data = data_dict.get_multimodal_dict(
         as_tensors=True, device=input_ids_cp_sharded.device
     )
+    # This field uses the multimodal registry for transport, but its model-layout
+    # version is packed/CP-selected alongside input_ids by the data iterator.
+    # Never pass the unprocessed rectangular copy from data_dict.
+    multimodal_data.pop("media_token_validity_mask", None)
     # Energon boundaries use PackedTensor for transport, but they are packing
     # metadata rather than model inputs. PackedSeqParams carries them forward.
     multimodal_data.pop("cu_seqlens", None)
