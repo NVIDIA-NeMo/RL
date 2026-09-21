@@ -3906,7 +3906,12 @@ class MegatronPolicyWorkerImpl(
         per_layout = {
             idx: bulk_start.elapsed_time(layout_done[idx]) / 1e3 for idx in layout_indices
         }
-        torch.cuda.empty_cache()
+        # Same trade-off as offload_before_refit: releasing the cached segments
+        # here costs seconds on the critical path and the misc broadcast's packed
+        # buffers come out of the caching allocator anyway. This is the reshard
+        # path, so the default is to keep them; the env override still applies.
+        if os.environ.get("NRL_OFFLOAD_BEFORE_REFIT_EMPTY_CACHE", "0") != "0":
+            torch.cuda.empty_cache()
         misc_t0 = time.perf_counter()
         self._broadcast_misc_params_packed(kv_scales=kv_scales)
         sync_stream_within(
@@ -4035,12 +4040,35 @@ class MegatronPolicyWorkerImpl(
             conversion_tasks=self._misc_conversion_tasks,
         )
 
+        # Split the misc phase between producing the full tensors (PP broadcast
+        # + TP gather per param) and the packed broadcast itself.
+        produce_s = [0.0]
+        n_params = [0]
+
+        def _timed(it):
+            while True:
+                t0 = time.perf_counter()
+                try:
+                    item = next(it)
+                except StopIteration:
+                    produce_s[0] += time.perf_counter() - t0
+                    return
+                produce_s[0] += time.perf_counter() - t0
+                n_params[0] += 1
+                yield item
+
         packed_broadcast_producer(
-            iterator=misc_iter,
+            iterator=_timed(iter(misc_iter)),
             group=self.model_update_group,
             src=0,
             post_iter_func=lambda x: x[1].contiguous(),
         )
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[nccl_reshard_refit] misc produce (train side): {produce_s[0]:.2f}s "
+                f"over {n_params[0]} params (PP broadcast + TP gather, host wall)",
+                flush=True,
+            )
 
     def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
         """Put the model in eval mode for logprob inference.
@@ -4249,6 +4277,27 @@ class MegatronPolicyWorkerImpl(
         torch.cuda.synchronize()
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
+    def _refit_uses_nccl_reshard(self) -> bool:
+        """Whether this policy refits its generation engines shard-to-shard."""
+        generation_cfg = self.cfg.get("generation") or {}
+        return generation_cfg.get("refit_transport") == "nccl_reshard"
+
+    def _offload_before_refit_release(self, env_name: str) -> bool:
+        """Run gc.collect() / torch.cuda.empty_cache() in the refit offload?
+
+        The collective transport packs the whole model through 5 GB buckets
+        and wants every freed byte back first. nccl_reshard sends the routed
+        experts shard-to-shard and only 19 GiB of misc through the buckets, so
+        the seconds spent on gc and on returning ~150 GB of freed segments to
+        the driver were pure refit bubble; the caching allocator reuses them on
+        the next step anyway. Default: run them unless the transport is
+        nccl_reshard; NRL_OFFLOAD_BEFORE_REFIT_GC / _EMPTY_CACHE = 0|1 override.
+        """
+        value = os.environ.get(env_name)
+        if value is not None:
+            return value != "0"
+        return not self._refit_uses_nccl_reshard()
+
     def offload_before_refit(self):
         """Offload optimizer state and buffers that are safe to release."""
         # Host-side phase timings; rank 0 prints them as ``[offload-timing]`` so the
@@ -4361,9 +4410,15 @@ class MegatronPolicyWorkerImpl(
             self.move_optimizer("cpu")
             _mark("move_optimizer")
 
-        gc.collect()
+        # gc.collect() over a trainer-sized Python heap costs 0.4-1.8 s per rank and
+        # sits inside the refit bubble; see _offload_before_refit_release.
+        if self._offload_before_refit_release("NRL_OFFLOAD_BEFORE_REFIT_GC"):
+            gc.collect()
         _mark("gc_collect")
-        torch.cuda.empty_cache()
+        # Returning the freed grad/activation segments to the driver costs 0.3-3 s
+        # per rank right after a training step; see _offload_before_refit_release.
+        if self._offload_before_refit_release("NRL_OFFLOAD_BEFORE_REFIT_EMPTY_CACHE"):
+            torch.cuda.empty_cache()
         _mark("empty_cache")
 
         # Print memory stats after offloading
