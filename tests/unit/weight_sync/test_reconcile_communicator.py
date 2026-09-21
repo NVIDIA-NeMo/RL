@@ -140,6 +140,9 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
         # asks the backend which one that is. A stand-in has to carry every hook the code
         # under test reads, or it tests a shape the product never has.
         get_collective_sender_spec=lambda: SimpleNamespace(nccl_peer="nemo"),
+        # Same reason: the policy is asked for refit metadata in the backend's payload
+        # representation, so the stand-in has to answer which one that is.
+        get_refit_payload_mode=lambda: "hf_export",
     )
     from nemo_rl.models.generation.vllm import vllm_generation
 
@@ -150,14 +153,23 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
     # update_weights_from_collective asserts on it.
     refit_info_pushes = []
     generation.prepare_refit_info = lambda info: refit_info_pushes.append(info)
+    generation.refit_info_pushes = refit_info_pushes
     generation.rebuild_collective = (
         lambda membership, ip, port: vllm_generation.VllmGeneration.rebuild_collective(
             generation, membership, ip, port
         )
     )
     policy_calls = []
+    refit_payload_modes = []
     policy = SimpleNamespace(
-        prepare_refit_info=lambda: {"model.weight": object()},
+        # Keyword-only, exactly as Policy.prepare_refit_info has been since #3739. A
+        # stand-in that accepted a bare call is how the rebuild shipped without the
+        # argument: every test here passed while every collective-transport recovery on
+        # hardware died at this line with a TypeError before touching NCCL.
+        prepare_refit_info=lambda *, refit_payload_mode: (
+            refit_payload_modes.append(refit_payload_mode) or {"model.weight": object()}
+        ),
+        refit_payload_modes=refit_payload_modes,
         init_collective=lambda ip,
         port,
         world_size,
@@ -200,6 +212,24 @@ class TestRebuildDispatch:
         # _FakeWorker raises if touched, so reaching here is the assertion; confirm the
         # survivors really were called.
         assert [w.idx for w in workers if w.calls] == [0, 1, 3]
+
+    def test_refit_info_is_regenerated_in_the_backend_s_payload_mode(self, monkeypatch):
+        """The rebuild asks the policy for refit metadata the way init_communicator does.
+
+        Policy.prepare_refit_info takes a keyword-only refit_payload_mode (#3739) and the
+        backend decides which one; a rebuild that omits it does not degrade, it raises,
+        and it does so on the recovery path -- so a run that lost a shard died in the
+        rebuild that was meant to save it (PR #3929 validation, CW-DFW job 18689836).
+        """
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        sync, _, _ = _rebuildable(dead_shards=(2,))
+
+        assert sync.reconcile_communicator([2]) is True
+
+        assert sync._policy.refit_payload_modes == ["hf_export"]
+        assert len(sync._generation.refit_info_pushes) == 1, (
+            "the metadata must reach every shard after the rebuild"
+        )
 
     def test_survivors_get_compacted_prefixes(self, monkeypatch):
         monkeypatch.setattr("ray.get", lambda futures: futures)
