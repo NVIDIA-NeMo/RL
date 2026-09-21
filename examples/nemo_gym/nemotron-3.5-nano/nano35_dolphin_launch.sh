@@ -244,12 +244,11 @@ fi
 # nvl72126-T05/T17) — node exclusion cannot fix it.
 #
 # Only three Gym servers use the sandbox: competitive_coding_challenges (not in
-# our blend), math_formal_lean and ns_tools. Both of the latter are in
-# config_paths and are LEFT THERE deliberately: they construct their sandbox
-# client lazily (math_formal_lean/app.py:387 builds it, :444 uses it inside a
-# request handler; ns_tools only holds sandbox_host/port as config), so they
-# boot fine without a sandbox and only contact it if a request routes to them.
-# The dolphin blend routes to neither, so the sandbox is never needed.
+# our blend), math_formal_lean and ns_tools. math_formal_lean is disabled in the
+# recipe because its proof-refinement agent does not support checkpoint
+# continuation indexes. ns_tools remains configured, but constructs its sandbox
+# client lazily and the dolphin blend does not route to it, so the sandbox is
+# never needed.
 #
 # ray.sub gates everything sandbox-related on SANDBOX_CONTAINER && SANDBOX_COMMAND
 # both being non-empty (ray.sub:559) — the ports dir, the 64-instance ready wait,
