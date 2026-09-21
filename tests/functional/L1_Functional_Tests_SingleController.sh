@@ -35,15 +35,19 @@ run_test() {
 }
 
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller.sh
+# Same non-colocated vLLM SingleController smoke, but install refitted weights
+# through vLLM's native reload_weights API.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_reload_refit.sh
 run_test fast uv run --no-sync bash ./tests/functional/ppo_async_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_gym_single_controller.sh
-# Full mode only (~10 min): SIGKILLs a generation worker and asserts the job fails fast
+run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated_reshard_gym_single_controller.sh
+# Fast mode too (~10 min): SIGKILLs a generation worker and asserts the job fails fast
 # and attributably instead of wedging. This is the ONLY end-to-end check of the
 # containment behaviour -- without it, a regression that restores the silent wedge is
 # caught by nothing, because a wedged job produces no exception and no failing assertion
 # anywhere else.
-run_test      uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chaos.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_chaos.sh
 # Full mode only: the same Gym run, but with NeMo-Gym pointed at the NeMo-RL-owned router.
 # Without this the router has no functional coverage at all -- the default Gym run above
 # leaves it disabled, so a regression in the proxy would ship silently.
@@ -121,6 +125,10 @@ run_test      env KILL_DURING_REFIT=true uv run --no-sync bash ./tests/functiona
 # reached -- job 6405953 passed it with RefitAborted appearing zero times. Only the frozen
 # reshard variant below makes a reshard refit actually abort.
 run_test      env REFIT_TRANSPORT=nccl_reshard KILL_DURING_REFIT=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
+# Restart and re-admission, which is a strictly stronger claim than surviving on a
+# smaller fleet: the engine is recreated and returns to the serving set. This is the only
+# coverage RayWorkerGroup.recreate_worker has -- it cannot be reached without GPUs.
+run_test      env RESTART_DEAD_SHARDS=true uv run --no-sync bash ./tests/functional/grpo_sc_generation_shard_recovery.sh
 
 # The only variant that reaches the refit watchdog. The two above kill the victim, and a
 # killed actor produces ActorDiedError within milliseconds -- which recovers the run off
@@ -175,9 +183,21 @@ run_test      env VICTIM_STATE=serving uv run --no-sync bash ./tests/functional/
 run_test      uv run --no-sync bash ./tests/functional/grpo_checkpoint_single_controller.sh
 # Native TQ + metadata-only completed replay recovery (#3480).
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_tq_recovery.sh
+# Same recovery flow with Mooncake CPU storage; skips without an RDMA device.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_mooncake_tq_recovery.sh
 # Deterministic process restart with an admitted group held before canonical TQ
 # commit, followed by exact-once redispatch at its stable group ID.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_unfinished_recovery.sh
+
+# Token-capture (gate-authoritative) path: same SC+Gym smoke with the gate
+# custodying token lineage and the finalizer publishing training rows.
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true
+# Two-process token-capture recovery: preserve one sealed sibling in TQ and
+# redispatch only its unfinished peer after restoring the step checkpoint.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_sibling_recovery.sh
+# Periodic native-TQ snapshot while a streamed step owns only part of its
+# rollout batch, followed by SIGKILL and rollback to the durable trainer anchor.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_streaming_recovery.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

@@ -21,7 +21,6 @@ hour three of a run.
 """
 
 import warnings
-from types import SimpleNamespace
 from typing import get_args
 
 import pytest
@@ -29,6 +28,7 @@ from pydantic import ValidationError
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import SamplerConfig
 from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     FleetHealthConfig,
@@ -39,6 +39,10 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import _build_retry_policy
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
+)
 
 
 def _all_sampler_names() -> list[str]:
@@ -66,11 +70,9 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
         ),
         policy={
             "train_global_batch_size": num_prompts_per_step * 4,
-            "generation": {"colocated": {"enabled": False}},
+            "generation": {"backend": "vllm", "colocated": {"enabled": False}},
         },
-        # The last two are read only on the ready_first branch, which rejects a run
-        # without them before it reaches anything under test here.
-        loss_fn=SimpleNamespace(
+        loss_fn=ClippedPGLossConfig(
             reference_policy_kl_penalty=0,
             use_importance_sampling_correction=True,
             force_on_policy_ratio=False,
@@ -294,10 +296,31 @@ class TestFleetHealthValidation:
         with pytest.raises(ValidationError, match="probe_timeout_s"):
             FleetHealthConfig(probe_interval_s=2.0, probe_timeout_s=2.0)
 
-    def test_unimplemented_recovery_modes_are_rejected(self):
-        """They need the communicator rebuild; accepting them would do nothing."""
-        with pytest.raises(ValidationError):
-            FleetHealthConfig(on_dead_shard="degrade_and_restore")
+    def test_restarting_dead_shards_is_off_by_default(self):
+        """Recreating a vLLM worker mid-run is the most invasive thing this does, so it
+        is opt-in rather than implied by enabling fleet health."""
+        assert AsyncRLConfig().generation_fleet_health.restart_dead_shards is False
+
+    def test_restarting_can_be_enabled(self):
+        assert FleetHealthConfig(restart_dead_shards=True).restart_dead_shards is True
+
+    def test_the_restart_budget_defaults_are_armed(self):
+        """Both bounds are what stop a restart failing silently rather than loudly.
+
+        Without restart_timeout_s a bundle that can never be filled leaves the shard in
+        RESTARTING for the rest of the run -- never retried, never retired. Without
+        restart_backoff_s the whole attempt budget can burn inside 25s at the default
+        probe interval, none of the attempts having waited for the cause to clear.
+        """
+        cfg = FleetHealthConfig()
+        assert cfg.restart_timeout_s == 1800.0
+        assert cfg.restart_backoff_s == 60.0
+
+    def test_the_restart_budget_is_not_the_refit_deadline(self):
+        """A refit moves bytes between live processes; a restart reloads a model from
+        disk. Reusing refit_timeout_s here would abort healthy restarts."""
+        cfg = FleetHealthConfig()
+        assert cfg.restart_timeout_s > (cfg.refit_timeout_s or 0)
 
 
 class TestTheRefitDeadlineIsArmedByDefault:
@@ -407,9 +430,9 @@ class TestWrongPathFaultToleranceIsRejected:
             ),
             policy={
                 "train_global_batch_size": 8,
-                "generation": {"colocated": {"enabled": False}},
+                "generation": {"backend": "vllm", "colocated": {"enabled": False}},
             },
-            loss_fn=SimpleNamespace(reference_policy_kl_penalty=0),
+            loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0),
             env={"should_use_nemo_gym": use_nemo_gym},
             # Read by the metric_name check upstream #3429 added to this same
             # validator, which runs before the wrong-path check under test.
@@ -476,14 +499,20 @@ class TestWrongPathFaultToleranceIsRejected:
 
 
 class TestGenerationRouterPortAndTimeoutValidation:
+    def test_default_port_range_uses_the_reserved_router_band(self):
+        cfg = GenerationRouterConfig()
+
+        assert cfg.port_range_low == DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW
+        assert cfg.port_range_high == DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH
+
     def test_a_transposed_port_range_is_rejected(self):
         """Otherwise it surfaces as 'empty range for randrange()' far from the typo."""
         with pytest.raises(ValidationError, match="port_range_low"):
-            GenerationRouterConfig(port_range_low=6099, port_range_high=6000)
+            GenerationRouterConfig(port_range_low=1300, port_range_high=1202)
 
     def test_an_equal_port_range_is_rejected(self):
         with pytest.raises(ValidationError, match="port_range_low"):
-            GenerationRouterConfig(port_range_low=6000, port_range_high=6000)
+            GenerationRouterConfig(port_range_low=1202, port_range_high=1202)
 
     def test_the_connect_timeout_defaults_well_below_the_backend_timeout(self):
         """A handshake to a local vLLM is ms-or-never; the generation is minutes."""
@@ -499,8 +528,7 @@ class TestGenerationRouterPortAndTimeoutValidation:
 class TestFleetHealthSelectionIsNotAdvertisedBeyondWhatItDoes:
     def test_an_unimplemented_selection_mode_is_rejected(self):
         """Nothing dispatches on this value, so accepting round_robin would silently
-        hand the caller least_outstanding anyway -- the failure mode on_dead_shard's
-        Literal already exists to prevent."""
+        hand the caller least_outstanding anyway."""
         with pytest.raises(ValidationError):
             FleetHealthConfig(selection="round_robin")
 

@@ -22,12 +22,15 @@ generation:
   vllm_cfg:
     async_engine: false
     precision: "bfloat16"
+    fp32_lm_head: false # Compute Nemotron-H logits with an fp32 LM head.
     tensor_parallel_size: 1
     pipeline_parallel_size: 1
     expert_parallel_size: 1
     gpu_memory_utilization: 0.9
     max_model_len: 2048
     enforce_eager: False
+    # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
+    refit_with_reload_api: false
   colocated:
     # true: generation shares training GPUs
     # false: uses dedicated generation resources
@@ -44,7 +47,7 @@ tokenizer:
   chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
 
 data:
-  max_input_seq_length: ${generation.vllm_cfg.max_model_len} # useless since we directly use prompts in evaluation
+  max_input_seq_length: ${generation.vllm_cfg.max_model_len} # Input length limit passed to data processors, including VLM truncation
   prompt_file: null
   system_prompt_file: null
   dataset_name: "AIME2024" # reuses the response dataset registry (RawDataset path)

@@ -12,19 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import contextlib
 import importlib.util
 import json
 import os
 import sys
+import threading
 import types
+import warnings
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import ray
 import requests
 import torch
+from pydantic import ValidationError
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
 from nemo_rl.algorithms.loss import NLLLossFn
@@ -37,6 +43,11 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.config import (
+    NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS,
+    normalize_nvfp4_pertoken_policy_config,
+    normalize_vllm_refit_config,
+)
 from nemo_rl.models.generation.vllm.vllm_worker import (
     VllmGenerationWorkerImpl,
     _context_capped_max_new_tokens,
@@ -44,8 +55,10 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
+    _AsyncLLMHTTPClient,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
+from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
 model_name = "Qwen/Qwen3-0.6B"
@@ -95,6 +108,95 @@ basic_vllm_test_config: VllmConfig = {
     "vllm_kwargs": {},
 }
 
+
+def _make_nvfp4_pertoken_generation_config() -> VllmConfig:
+    config = deepcopy(basic_vllm_test_config)
+    config["nvfp4_pertoken_rollout"] = {"enabled": True}
+    return config
+
+
+def _deep_update(target: dict, update: dict) -> None:
+    for key, value in update.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _deep_update(target[key], value)
+        else:
+            target[key] = value
+
+
+def test_normalize_vllm_refit_config_validates_nvfp4_pertoken_schema_first():
+    """Direct refit normalization must not accept a typoed per-token config."""
+    with pytest.raises(ValidationError, match="unknown_key"):
+        normalize_vllm_refit_config(
+            {
+                "nvfp4_pertoken_rollout": {"enabled": True, "unknown_key": 1},
+                "refit_transport": None,
+            }
+        )
+
+
+def test_normalize_vllm_refit_config_rejects_nvfp4_with_explicit_transport():
+    """Direct normalization must enforce the per-token null-transport contract."""
+    with pytest.raises(ValueError, match="refit_transport=null"):
+        normalize_vllm_refit_config(
+            {
+                "nvfp4_pertoken_rollout": {"enabled": True},
+                "refit_transport": "nixl",
+            }
+        )
+
+
+def test_nvfp4_pertoken_normalization_is_silent_when_the_mode_is_off():
+    """A run that never asked for NVFP4 must not warn, whatever the entry point.
+
+    The early return also keeps the HF config load off the path of every
+    ordinary PPO/distillation run.
+    """
+    policy_config = {"generation": {"backend": "vllm"}, "megatron_cfg": {}}
+    for entry_point in ("grpo", "ppo", "distillation", "some_future_algorithm"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            normalize_nvfp4_pertoken_policy_config(
+                dict(policy_config), entry_point=entry_point
+            )
+
+
+def test_nvfp4_pertoken_warns_on_an_entry_point_without_end_to_end_coverage():
+    """PPO and distillation reuse GRPO's worker and refit path but are unvalidated.
+
+    The warning has to precede the HF config load so it is emitted even when
+    boundary resolution later fails, which is why the model name below never
+    has to resolve.
+    """
+    assert "grpo" in NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS
+    policy_config = {
+        "model_name": "nvfp4-pertoken-entry-point-probe",
+        "generation": {
+            "backend": "vllm",
+            "nvfp4_pertoken_rollout": {"enabled": True},
+        },
+        "megatron_cfg": {
+            "first_last_layers_bf16": True,
+            "num_layers_at_start_in_bf16": 2,
+            "num_layers_at_end_in_bf16": 4,
+        },
+    }
+
+    for entry_point in ("ppo", "distillation"):
+        with pytest.warns(UserWarning, match="has end-to-end coverage"):
+            with contextlib.suppress(Exception):
+                normalize_nvfp4_pertoken_policy_config(
+                    dict(policy_config), entry_point=entry_point
+                )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with contextlib.suppress(Exception):
+            normalize_nvfp4_pertoken_policy_config(
+                dict(policy_config), entry_point="grpo"
+            )
+    assert not [w for w in caught if "has end-to-end coverage" in str(w.message)]
+
+
 basic_dtensor_test_config: PolicyConfig = {
     "model_name": basic_vllm_test_config["model_name"],
     "tokenizer": {
@@ -143,6 +245,120 @@ basic_dtensor_test_config: PolicyConfig = {
 }
 
 
+@pytest.mark.parametrize("async_engine", [False, True])
+def test_vllm_generation_selects_worker_extension(
+    async_engine,
+) -> None:
+    config = deepcopy(basic_vllm_test_config)
+    config["vllm_cfg"]["async_engine"] = async_engine
+    extension_fqn = "tests.extensions.CustomGenerationWorker"
+    config["worker_extension_cls_fqn"] = extension_fqn
+
+    cluster = MagicMock()
+    cluster.world_size.return_value = 1
+    cluster.num_gpus_per_node = 1
+
+    with (
+        patch.dict(
+            "nemo_rl.distributed.ray_actor_environment_registry.ACTOR_ENVIRONMENT_REGISTRY",
+            {extension_fqn: "python"},
+        ),
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.RayWorkerBuilder"
+        ) as worker_builder,
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.RayWorkerGroup"
+        ) as worker_group,
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
+            return_value=[None],
+        ),
+    ):
+        worker_group.return_value.dp_size = 1
+        VllmGeneration(cluster, config, defer_model_load=True)
+
+    assert worker_builder.call_args.args[:2] == (extension_fqn, config)
+    assert worker_builder.call_args.kwargs == (
+        {"defer_model_load": True} if async_engine else {}
+    )
+
+
+def test_vllm_generation_rejects_worker_extension_with_quantization() -> None:
+    config = deepcopy(basic_vllm_test_config)
+    config["worker_extension_cls_fqn"] = "tests.extensions.CustomGenerationWorker"
+    config["quant_cfg"] = "NVFP4"
+    cluster = MagicMock()
+    cluster.world_size.return_value = 1
+    cluster.num_gpus_per_node = 1
+
+    with pytest.raises(
+        ValueError,
+        match="worker_extension_cls_fqn and quant_cfg are mutually exclusive",
+    ):
+        VllmGeneration(cluster, config, defer_model_load=True)
+
+    cluster._init_placement_groups.assert_not_called()
+
+
+@pytest.mark.parametrize("async_engine", [False, True])
+def test_vllm_generation_rejects_unregistered_worker_extension(
+    async_engine: bool,
+) -> None:
+    config = deepcopy(basic_vllm_test_config)
+    config["vllm_cfg"]["async_engine"] = async_engine
+    config["worker_extension_cls_fqn"] = "tests.extensions.UnregisteredGenerationWorker"
+    cluster = MagicMock()
+    cluster.world_size.return_value = 1
+    cluster.num_gpus_per_node = 1
+
+    with (
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.RayWorkerGroup"
+        ) as worker_group,
+        pytest.raises(ValueError, match="No actor environment registered"),
+    ):
+        VllmGeneration(cluster, config, defer_model_load=True)
+
+    worker_group.assert_not_called()
+    cluster._init_placement_groups.assert_not_called()
+
+
+@pytest.mark.parametrize("backend", ["sglang", "megatron", "trtllm", "dynamo"])
+def test_generation_config_rejects_worker_extension_for_other_backends(
+    backend: str,
+) -> None:
+    config = deepcopy(basic_vllm_test_config)
+    config["backend"] = backend
+    config["worker_extension_cls_fqn"] = "tests.extensions.CustomGenerationWorker"
+
+    with pytest.raises(ValueError, match="only supported by the vLLM backend"):
+        configure_generation_config(config, MagicMock())
+
+
+@pytest.mark.parametrize("backend", ["vllm", "sglang", "megatron", "trtllm", "dynamo"])
+@pytest.mark.parametrize("include_null", [False, True])
+def test_generation_config_allows_no_worker_extension(
+    backend: str,
+    include_null: bool,
+) -> None:
+    config = deepcopy(basic_vllm_test_config)
+    config["backend"] = backend
+    if include_null:
+        config["worker_extension_cls_fqn"] = None
+
+    configure_generation_config(config, MagicMock())
+
+
+def test_generation_config_allows_vllm_worker_extension() -> None:
+    config = deepcopy(basic_vllm_test_config)
+    extension_fqn = "tests.extensions.CustomGenerationWorker"
+    config["worker_extension_cls_fqn"] = extension_fqn
+
+    configured = configure_generation_config(config, MagicMock())
+
+    assert configured["worker_extension_cls_fqn"] == extension_fqn
+
+
 def test_context_capped_max_new_tokens():
     assert (
         _context_capped_max_new_tokens(
@@ -182,6 +398,196 @@ async def test_async_vllm_worker_uses_native_keep_pause_and_resume() -> None:
 
     worker.llm.pause_generation.assert_awaited_once_with(mode="keep", clear_cache=False)
     worker.llm.resume_generation.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_async_vllm_http_client_runs_generation_on_owner_loop() -> None:
+    engine_loop = asyncio.get_running_loop()
+    engine_thread = threading.get_ident()
+    calls = []
+
+    class FakeEngine:
+        model_config = "model-config"
+        renderer = "renderer"
+        input_processor = "input-processor"
+        vllm_config = "vllm-config"
+
+        @property
+        def errored(self):
+            calls.append(("errored", asyncio.get_running_loop(), threading.get_ident()))
+            return False
+
+        @property
+        def dead_error(self):
+            return RuntimeError("engine dead")
+
+        async def is_tracing_enabled(self):
+            calls.append(
+                (
+                    "is_tracing_enabled",
+                    asyncio.get_running_loop(),
+                    threading.get_ident(),
+                )
+            )
+            return False
+
+        async def generate(self, *args, **kwargs):
+            calls.append(
+                ("generate", asyncio.get_running_loop(), threading.get_ident())
+            )
+            yield "first"
+            yield "second"
+
+        async def abort(self, _request_id: str) -> None:
+            calls.append(("abort", asyncio.get_running_loop(), threading.get_ident()))
+
+    client = _AsyncLLMHTTPClient(FakeEngine(), engine_loop)
+    assert (
+        await client._run_on_engine_loop(
+            lambda: asyncio.sleep(0, result="same-loop-result")
+        )
+        == "same-loop-result"
+    )
+
+    def use_client_from_http_thread():
+        async def use_client():
+            tracing_enabled = await client.is_tracing_enabled()
+            outputs = [
+                output async for output in client.generate(None, None, "request")
+            ]
+            errored = client.errored
+            return (
+                tracing_enabled,
+                outputs,
+                errored,
+                asyncio.get_running_loop(),
+                threading.get_ident(),
+            )
+
+        return asyncio.run(use_client())
+
+    tracing_enabled, outputs, errored, http_loop, http_thread = await asyncio.to_thread(
+        use_client_from_http_thread
+    )
+
+    assert tracing_enabled is False
+    assert outputs == ["first", "second"]
+    assert errored is False
+    assert client.model_config == "model-config"
+    assert client.renderer == "renderer"
+    assert client.input_processor == "input-processor"
+    assert client.vllm_config == "vllm-config"
+    assert str(client.dead_error) == "engine dead"
+    assert not hasattr(client, "check_health")
+    assert http_loop is not engine_loop
+    assert http_thread != engine_thread
+    assert [call[0] for call in calls] == [
+        "is_tracing_enabled",
+        "generate",
+        "errored",
+    ]
+    assert calls[0][1:] == (http_loop, http_thread)
+    assert calls[1][1:] == (engine_loop, engine_thread)
+    assert calls[2][1:] == (http_loop, http_thread)
+
+
+@pytest.mark.parametrize(
+    "abort_error",
+    [None, RuntimeError("abort failed")],
+    ids=["success", "failure"],
+)
+@pytest.mark.asyncio
+async def test_async_vllm_http_client_aborts_cancelled_generation(
+    abort_error: RuntimeError | None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    engine_loop = asyncio.get_running_loop()
+    started = threading.Event()
+    aborts = []
+
+    class FakeEngine:
+        model_config = None
+        renderer = None
+        input_processor = None
+        vllm_config = None
+
+        async def generate(self, *args, **kwargs):
+            started.set()
+            await asyncio.Event().wait()
+            yield None
+
+        async def abort(self, request_id):
+            aborts.append((request_id, asyncio.get_running_loop()))
+            if abort_error is not None:
+                raise abort_error
+
+    client = _AsyncLLMHTTPClient(FakeEngine(), engine_loop)
+
+    def cancel_from_http_thread():
+        async def cancel():
+            async def consume():
+                async for _ in client.generate(None, None, "cancelled-request"):
+                    pass
+
+            task = asyncio.create_task(consume())
+            await asyncio.to_thread(started.wait)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(cancel())
+
+    await asyncio.to_thread(cancel_from_http_thread)
+
+    assert aborts == [("cancelled-request", engine_loop)]
+    if abort_error is not None:
+        assert "Failed to abort vLLM request cancelled-request" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_async_vllm_worker_stops_http_server_before_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    class ServerThread:
+        def join(self) -> None:
+            calls.append("server")
+
+    class SparseRefitReceiver:
+        def shutdown(self) -> None:
+            calls.append("sparse-refit")
+
+    class Engine:
+        async def collective_rpc(self, *args, **kwargs) -> None:
+            calls.append("engine-cleanup")
+
+        def shutdown(self) -> None:
+            calls.append("engine-shutdown")
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.server_thread = ServerThread()
+    worker.http_server = MagicMock()
+    worker._sparse_refit_receiver = SparseRefitReceiver()
+    worker.llm = Engine()
+    worker.tokenizer = MagicMock()
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.shutdown_telemetry",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.gc.collect", lambda: None
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.torch.cuda.empty_cache",
+        lambda: None,
+    )
+
+    assert await worker.shutdown()
+    assert calls == ["server", "sparse-refit", "engine-cleanup", "engine-shutdown"]
+    assert worker.http_server.should_exit is True
+    assert worker.server_thread is None
+    assert worker.llm is None
 
 
 def test_vllm_generation_broadcasts_native_refit_pause_and_resume(
@@ -252,6 +658,30 @@ def test_sampling_params_preserve_bad_words():
     )
 
     assert sampling_params["bad_words"] == ["<image>", "<img>"]
+
+
+def test_vllm_latest_metric_drain_prunes_worker_histories():
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"enable_vllm_metrics_logger": True}}
+    worker._vllm_metrics_lock = threading.Lock()
+    worker.inflight_batch_sizes = [1, 2]
+    worker.num_pending_samples = [3, 4]
+    worker.kv_cache_usage_perc = [0.2, 0.6]
+    worker.generation_tokens = [10, 30]
+
+    latest = worker.drain_latest_vllm_logger_metrics()
+
+    assert latest == {
+        "inflight_batch_sizes": [2],
+        "num_pending_samples": [4],
+        "kv_cache_usage_perc": [0.6],
+        "generation_tokens": [30],
+    }
+    assert worker.inflight_batch_sizes == [2]
+    assert worker.num_pending_samples == [4]
+    assert worker.kv_cache_usage_perc == [0.6]
+    assert worker.generation_tokens == [30]
+    assert latest["generation_tokens"] is not worker.generation_tokens
 
 
 def test_resolve_enable_prefix_caching_respects_explicit_config(monkeypatch):
@@ -353,8 +783,23 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.kwargs = kwargs
             self.instances.append(self)
 
-    class VLLMValidationError(Exception):
-        pass
+    class VLLMValidationError(ValueError):
+        def __init__(self, message, *, parameter=None, value=None):
+            super().__init__(message)
+            self.parameter = parameter
+            self.value = value
+
+        def __str__(self):
+            base = super().__str__()
+            extras = [
+                f"{name}={value}"
+                for name, value in (
+                    ("parameter", self.parameter),
+                    ("value", self.value),
+                )
+                if value is not None
+            ]
+            return f"{base} ({', '.join(extras)})" if extras else base
 
     class ToolParserManager:
         import_tool_parser = MagicMock()
@@ -448,6 +893,7 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
         },
     }
     worker.llm = MagicMock(model_config="model-config", renderer="renderer")
+    worker._http_engine_client = worker.llm
     model_config = MagicMock(served_model_name="served-model", model="model-path")
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = model_config
@@ -464,6 +910,78 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
     assert openai_serving_chat.instances[0].kwargs["reasoning_parser"] == "nano_v3"
     # make sure that the config attribute does not leak into `http_server_serving_chat_kwargs`
     assert "reasoning_parser_plugin" not in openai_serving_chat.instances[0].kwargs
+
+
+def _nemo_gym_recognizes_context_overflow(
+    *, status: int, response_content: str
+) -> bool:
+    """Mirror responses_api_models/vllm_model/app.py overflow detection."""
+    return status == 400 and (
+        "context length" in response_content or "max_tokens" in response_content
+    )
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
+    """Overflow from _clamp_max_tokens must be HTTP 400 that NeMo Gym recognizes."""
+    _, _, openai_serving_chat = _install_fake_vllm_openai_modules(monkeypatch)
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "val_temperature": 0.0,
+        "val_top_p": 1.0,
+        "vllm_cfg": {},
+    }
+    worker.llm = MagicMock(model_config="model-config", renderer="renderer")
+    worker._http_engine_client = worker.llm
+    worker._capture_calls = {}
+    worker.token_capture = None
+    worker.llm_async_engine_args = MagicMock()
+    worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
+        served_model_name="served-model", model="model-path"
+    )
+
+    app = _FakeFastAPIApp()
+    worker._setup_vllm_openai_api_server(app)
+
+    max_model_len = 128
+    renderer = openai_serving_chat.instances[0].kwargs["online_renderer"]
+    renderer.model_config = types.SimpleNamespace(max_model_len=max_model_len)
+    serving_chat = openai_serving_chat.instances[0]
+    chat_handler = next(
+        handler for path, handler in app.routes if path == "/v1/chat/completions"
+    )
+    overflow_prompt = [0] * max_model_len
+
+    async def create_chat_completion(request, _raw_request):
+        renderer._clamp_max_tokens(request, request.max_tokens, overflow_prompt)
+
+    serving_chat.create_chat_completion = create_chat_completion
+    response = await chat_handler(
+        types.SimpleNamespace(
+            top_k=-1,
+            top_p=1.0,
+            temperature=1.0,
+            max_tokens=1,
+            max_completion_tokens=None,
+        ),
+        MagicMock(),
+    )
+
+    response_content = response.body.decode()
+    assert response.status_code == 400
+    assert "maximum context length" in response_content
+    assert "(parameter=input_tokens, value=128)" in response_content
+    assert _nemo_gym_recognizes_context_overflow(
+        status=response.status_code,
+        response_content=response_content,
+    )
+    error = json.loads(response_content)["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["param"] == "input_tokens"
+    assert error["code"] == 400
 
 
 def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(
@@ -567,6 +1085,7 @@ def test_configure_generation_config_uses_real_startup_weights_without_draft_ref
         )
 
     assert configured["vllm_cfg"]["load_format"] == "auto"
+    assert configured["_draft_weights_from_refit"] is False
 
 
 @pytest.mark.parametrize("transport", ["vllm_s3_sparse", "vllm_zmq_sparse"])
@@ -592,6 +1111,345 @@ def test_configure_generation_config_keeps_dummy_startup_weights_for_nixl():
     assert configured["vllm_cfg"]["load_format"] == "dummy"
 
 
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ({"quant_cfg": "recipe.yaml"}, "quant_cfg"),
+        ({"real_quant": True}, "real_quant"),
+        ({"refit_transport": "nixl"}, "refit_transport"),
+        (
+            {
+                "vllm_kwargs": {
+                    "speculative_config": {
+                        "method": "mtp",
+                        "num_speculative_tokens": 1,
+                    }
+                }
+            },
+            "speculative decoding",
+        ),
+    ],
+)
+def test_nvfp4_pertoken_rejects_incompatible_generation_modes(mutation, message):
+    """Reject modes whose startup/refit contracts cannot carry per-token NVFP4."""
+    config = _make_nvfp4_pertoken_generation_config()
+    config.update(mutation)
+    with pytest.raises(ValueError, match=message):
+        configure_generation_config(
+            config, MagicMock(pad_token_id=0, eos_token_id=1), is_eval=False
+        )
+
+
+def test_nvfp4_pertoken_rejects_standalone_eval():
+    """Per-token rollout requires a refit before generation and cannot evaluate alone."""
+    with pytest.raises(ValueError, match="standalone evaluation"):
+        configure_generation_config(
+            _make_nvfp4_pertoken_generation_config(),
+            MagicMock(pad_token_id=0, eos_token_id=1),
+            is_eval=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"colocated": {"enabled": False}},
+        {"vllm_cfg": {"pipeline_parallel_size": 2}},
+        {"vllm_cfg": {"expert_parallel_size": 2}},
+        {"vllm_cfg": {"kv_cache_dtype": "fp8"}},
+        {"vllm_cfg": {"precision": "fp8"}},
+    ],
+)
+def test_nvfp4_pertoken_rejects_unsupported_topology(mutation):
+    """The fused refit stream requires colocated rollout and vLLM EP=1."""
+    config = _make_nvfp4_pertoken_generation_config()
+    _deep_update(config, mutation)
+    with pytest.raises(ValueError, match="nvfp4_pertoken_rollout"):
+        configure_generation_config(
+            config, MagicMock(pad_token_id=0, eos_token_id=1), is_eval=False
+        )
+
+
+@pytest.mark.parametrize("async_engine", [False, True])
+@pytest.mark.parametrize("tensor_parallel_size", [1, 2])
+def test_nvfp4_pertoken_validation_accepts_vllm_tensor_parallelism(
+    async_engine: bool, tensor_parallel_size: int
+) -> None:
+    """TP remains configurable with either engine mode and PP=1."""
+    config = _make_nvfp4_pertoken_generation_config()
+    config["vllm_cfg"].update(
+        tensor_parallel_size=tensor_parallel_size, async_engine=async_engine
+    )
+    configure_generation_config(
+        config, MagicMock(pad_token_id=0, eos_token_id=1), is_eval=False
+    )
+
+
+@pytest.mark.parametrize("async_engine", [False, True])
+def test_nvfp4_pertoken_rejects_pipeline_parallel_refit(async_engine: bool) -> None:
+    config = _make_nvfp4_pertoken_generation_config()
+    config["vllm_cfg"].update(pipeline_parallel_size=2, async_engine=async_engine)
+    with pytest.raises(ValueError, match="does not support vLLM PP>1.*refit"):
+        configure_generation_config(
+            config, MagicMock(pad_token_id=0, eos_token_id=1), is_eval=False
+        )
+
+
+@pytest.mark.parametrize("rollout", [None, {"enabled": False}])
+def test_disabled_nvfp4_preserves_async_pipeline_parallelism(
+    rollout: dict[str, bool] | None,
+) -> None:
+    config = deepcopy(basic_vllm_test_config)
+    if rollout is not None:
+        config["nvfp4_pertoken_rollout"] = rollout
+    config["vllm_cfg"].update(pipeline_parallel_size=2, async_engine=True)
+    configure_generation_config(
+        config, MagicMock(pad_token_id=0, eos_token_id=1), is_eval=False
+    )
+
+
+@pytest.mark.parametrize("architecture", ["LlamaForCausalLM", "Qwen3_8ForCausalLM"])
+def test_nvfp4_pertoken_rejects_dense_models(architecture):
+    from nemo_rl.models.generation.vllm.config import (
+        validate_nvfp4_pertoken_model,
+    )
+
+    hf_config = types.SimpleNamespace(architectures=[architecture])
+    with pytest.raises(ValueError, match="requires a model with routed experts"):
+        validate_nvfp4_pertoken_model(hf_config)
+
+
+@pytest.mark.parametrize(
+    ("architecture", "expert_field"),
+    [
+        ("Qwen3MoeForCausalLM", {"num_experts": 128}),
+        ("Qwen3_5MoeForConditionalGeneration", {"num_experts": 256}),
+        ("DeepseekV2ForCausalLM", {"n_routed_experts": 64}),
+    ],
+)
+def test_nvfp4_pertoken_accepts_generic_moe_layouts(architecture, expert_field):
+    from nemo_rl.models.generation.vllm.config import (
+        validate_nvfp4_pertoken_model,
+    )
+
+    hf_config = types.SimpleNamespace(architectures=[architecture], **expert_field)
+    validate_nvfp4_pertoken_model(hf_config)
+
+
+def test_nvfp4_policy_boundary_normalization_uses_megatron_as_source(
+    monkeypatch,
+):
+    from nemo_rl.models.generation.vllm import config as vllm_config
+
+    monkeypatch.setattr(
+        "transformers.AutoConfig.from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=48),
+    )
+    policy_config = {
+        "model_name": "dummy-moe",
+        "generation": {
+            "backend": "vllm",
+            "nvfp4_pertoken_rollout": {"enabled": True},
+        },
+        "megatron_cfg": {
+            "first_last_layers_bf16": True,
+            "num_layers_at_start_in_bf16": 2,
+            "num_layers_at_end_in_bf16": 4,
+        },
+    }
+
+    vllm_config.normalize_nvfp4_pertoken_policy_config(policy_config)
+
+    assert policy_config["generation"]["nvfp4_pertoken_rollout"][
+        "additional_ignore"
+    ] == [
+        "*.layers.0.mlp.experts*",
+        "*.layers.1.mlp.experts*",
+        "*.layers.44.mlp.experts*",
+        "*.layers.45.mlp.experts*",
+        "*.layers.46.mlp.experts*",
+        "*.layers.47.mlp.experts*",
+    ]
+
+
+def test_nvfp4_policy_boundary_normalization_uses_mcore_count_defaults(
+    monkeypatch,
+):
+    from nemo_rl.models.generation.vllm import config as vllm_config
+
+    monkeypatch.setattr(
+        "transformers.AutoConfig.from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=48),
+    )
+    policy_config = {
+        "model_name": "dummy-moe",
+        "generation": {
+            "backend": "vllm",
+            "nvfp4_pertoken_rollout": {"enabled": True},
+        },
+        "megatron_cfg": {"first_last_layers_bf16": True},
+    }
+
+    vllm_config.normalize_nvfp4_pertoken_policy_config(policy_config)
+
+    assert policy_config["generation"]["nvfp4_pertoken_rollout"][
+        "additional_ignore"
+    ] == [
+        "*.layers.0.mlp.experts*",
+        "*.layers.47.mlp.experts*",
+    ]
+
+
+def test_main_worker_configures_nvfp4_pertoken_engine_kwargs(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_worker
+    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
+        DEFAULT_NVFP4_PERTOKEN_IGNORE,
+    )
+
+    module_name = "nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken"
+    fake_vllm_module = types.ModuleType(module_name)
+    captured = {}
+
+    def configure(llm_kwargs, ignore, explicit_engine_kwargs):
+        captured["kwargs"] = llm_kwargs
+        captured["ignore"] = ignore
+        captured["explicit_engine_kwargs"] = explicit_engine_kwargs
+        llm_kwargs["quantization"] = "nvfp4_pertoken"
+
+    fake_vllm_module.configure_nvfp4_pertoken_engine_kwargs = configure
+    monkeypatch.setitem(sys.modules, module_name, fake_vllm_module)
+
+    llm_kwargs = {"hf_overrides": {"max_position_embeddings": 4096}}
+    layer_ignore = "*.layers.0.mlp.experts*"
+    vllm_worker._configure_nvfp4_pertoken_engine_kwargs(
+        {
+            "nvfp4_pertoken_rollout": {
+                "enabled": True,
+                "additional_ignore": [layer_ignore],
+            },
+            "vllm_kwargs": {"hf_overrides": {"max_position_embeddings": 4096}},
+        },
+        llm_kwargs,
+    )
+
+    assert captured == {
+        "kwargs": llm_kwargs,
+        "ignore": [*DEFAULT_NVFP4_PERTOKEN_IGNORE, layer_ignore],
+        "explicit_engine_kwargs": {"hf_overrides": {"max_position_embeddings": 4096}},
+    }
+    assert llm_kwargs["quantization"] == "nvfp4_pertoken"
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    "explicit_kwargs", [{}, {"kernel_config": {"enable_flashinfer_autotune": False}}]
+)
+def test_main_worker_accepts_nvfp4_pertoken_over_framework_defaults(
+    explicit_kwargs: dict[str, Any],
+) -> None:
+    """Framework defaults must not look like explicit user conflicts."""
+    pytest.importorskip("vllm")
+    from vllm.model_executor.layers.quantization import get_quantization_config
+
+    from nemo_rl.models.generation.vllm import vllm_worker
+    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken import (
+        DEFAULT_NVFP4_PERTOKEN_IGNORE,
+        NVFP4_PER_TOKEN_METHOD,
+        NvFp4PerTokenConfig,
+        build_nvfp4_pertoken_hf_quant_config,
+    )
+
+    llm_kwargs = {
+        "quantization": "fp8",
+        "load_format": "dummy",
+        "hf_overrides": {"max_position_embeddings": 4096},
+        **deepcopy(explicit_kwargs),
+    }
+    vllm_worker._configure_nvfp4_pertoken_engine_kwargs(
+        {"nvfp4_pertoken_rollout": {"enabled": True}, "vllm_kwargs": explicit_kwargs},
+        llm_kwargs,
+    )
+
+    assert llm_kwargs["quantization"] == NVFP4_PER_TOKEN_METHOD
+    assert get_quantization_config(NVFP4_PER_TOKEN_METHOD) is NvFp4PerTokenConfig
+    assert llm_kwargs["load_format"] == "dummy"
+    assert llm_kwargs["kernel_config"]["enable_flashinfer_autotune"] is False
+    assert llm_kwargs["worker_extension_cls"].endswith(".NvFp4PerTokenWorkerExtension")
+    assert llm_kwargs["hf_overrides"]["quantization_config"] == (
+        build_nvfp4_pertoken_hf_quant_config(DEFAULT_NVFP4_PERTOKEN_IGNORE)
+    )
+    assert llm_kwargs["hf_overrides"]["max_position_embeddings"] == 4096
+
+
+@pytest.mark.vllm
+def test_main_worker_rejects_explicit_quantization_for_nvfp4_pertoken():
+    pytest.importorskip("vllm")
+    from nemo_rl.models.generation.vllm import vllm_worker
+
+    with pytest.raises(ValueError, match="quantization"):
+        vllm_worker._configure_nvfp4_pertoken_engine_kwargs(
+            {
+                "nvfp4_pertoken_rollout": {"enabled": True},
+                "vllm_kwargs": {"quantization": "fp8"},
+            },
+            {"quantization": "fp8", "load_format": "dummy"},
+        )
+
+
+@pytest.mark.parametrize(
+    "llm_kwargs",
+    [
+        {"worker_extension_cls": "pkg.CustomExtension"},
+        {"quantization": "fp8"},
+        {"load_format": "auto"},
+        {"hf_overrides": {"quantization_config": {}}},
+        {"enable_flashinfer_autotune": True},
+        {"enable_flashinfer_autotune": False},
+        {"enable_flashinfer_autotune": None},
+        {"kernel_config": {"enable_flashinfer_autotune": True}},
+    ],
+)
+@pytest.mark.vllm
+def test_nvfp4_pertoken_rejects_conflicting_engine_kwargs(llm_kwargs):
+    pytest.importorskip("vllm")
+    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken import (
+        DEFAULT_NVFP4_PERTOKEN_IGNORE,
+        configure_nvfp4_pertoken_engine_kwargs,
+    )
+
+    with pytest.raises(ValueError, match="nvfp4_pertoken"):
+        configure_nvfp4_pertoken_engine_kwargs(
+            llm_kwargs, ignore=DEFAULT_NVFP4_PERTOKEN_IGNORE
+        )
+
+
+def test_main_worker_without_nvfp4_pertoken_keeps_engine_kwargs():
+    from nemo_rl.models.generation.vllm import vllm_worker
+
+    llm_kwargs = {
+        "quantization": "fp8",
+        "load_format": "auto",
+        "worker_extension_cls": (
+            "nemo_rl.models.generation.vllm.vllm_backend.VllmInternalWorkerExtension"
+        ),
+    }
+    expected = dict(llm_kwargs)
+
+    vllm_worker._configure_nvfp4_pertoken_engine_kwargs({}, llm_kwargs)
+
+    assert llm_kwargs == expected
+
+
+def test_main_worker_rejects_custom_worker_extension():
+    from nemo_rl.models.generation.vllm import vllm_worker
+
+    with pytest.raises(ValueError, match="worker_extension_cls is not supported"):
+        vllm_worker._validate_worker_extension_cls(
+            {"worker_extension_cls": "pkg.CustomExtension"},
+            "pkg.NemoInternalExtension",
+        )
+
+
 def test_configure_generation_config_keeps_dummy_startup_weights_with_draft_refit():
     """Speculative training can keep dummy startup weights when draft refit is available."""
     vllm_config = deepcopy(basic_vllm_test_config)
@@ -612,6 +1470,7 @@ def test_configure_generation_config_keeps_dummy_startup_weights_with_draft_refi
     )
 
     assert configured["vllm_cfg"]["load_format"] == "dummy"
+    assert configured["_draft_weights_from_refit"] is True
 
 
 def test_configure_generation_config_keeps_real_quant_export_on_cpu() -> None:
@@ -824,7 +1683,7 @@ def get_basic_megatron_test_config(
                 "data_parallel_sharding_strategy": "optim_grads_params",
             },
         },
-        "draft": {"enabled": False},
+        "draft": Eagle3DraftConfig(enabled=False),
         "optimizer": None,  # Remove default FSDP optimizer
         "scheduler": None,  # Remove default scheduler
         "max_grad_norm": 1.0,
@@ -974,6 +1833,91 @@ def test_vllm_missing_required_config_key(cluster):
     print(f"Successfully caught missing config key with error: {error_message}")
 
 
+@pytest.mark.parametrize(
+    ("config_updates", "error_match"),
+    [
+        ({"colocated.enabled": True}, "not supported yet.*colocated"),
+        ({"refit_transport": "nccl_reshard"}, "explicitly unsupported.*nccl_reshard"),
+        (
+            {"refit_transport": "nixl"},
+            "not supported yet.*update_weights_from_checkpoint_engine",
+        ),
+        (
+            {"refit_transport": "custom.module:Engine"},
+            "not supported yet.*update_weights_from_checkpoint_engine",
+        ),
+        ({"refit_transport": "vllm_s3_sparse"}, "refit_transport"),
+        ({"refit_transport": "vllm_zmq_sparse"}, "refit_transport"),
+        ({"quant_cfg": "NVFP4_DEFAULT_CFG"}, "explicitly unsupported.*quant_cfg"),
+        ({"_draft_weights_from_refit": True}, "policy.draft.enabled=true"),
+        (
+            {
+                "vllm_kwargs": {
+                    "speculative_config": {
+                        "method": "mtp",
+                        "num_speculative_tokens": 1,
+                    }
+                },
+                "_mtp_weights_from_refit": True,
+            },
+            "not supported yet.*MTP draft weights",
+        ),
+    ],
+)
+def test_vllm_generation_rejects_unsupported_reload_refit_config(
+    config_updates, error_match
+):
+    class DummyCluster:
+        num_gpus_per_node = 1
+
+        def world_size(self):
+            return 1
+
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["colocated"]["enabled"] = False
+    vllm_config["refit_transport"] = None
+    vllm_config["vllm_cfg"]["refit_with_reload_api"] = True
+    for path, value in config_updates.items():
+        target = vllm_config
+        parts = path.split(".")
+        for part in parts[:-1]:
+            target = target[part]
+        target[parts[-1]] = value
+
+    with pytest.raises(AssertionError, match=error_match):
+        VllmGeneration(DummyCluster(), vllm_config)
+
+
+def test_vllm_validate_settings_rejects_unsupported_reload_refit_config():
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["colocated"]["enabled"] = True
+    vllm_config["vllm_cfg"]["refit_with_reload_api"] = True
+    master_config = types.SimpleNamespace(policy={"generation": vllm_config})
+
+    with pytest.raises(AssertionError, match="not supported yet.*colocated"):
+        VllmGeneration.validate_settings(master_config)
+
+
+def test_vllm_validate_settings_accepts_default_non_colocated_reload_refit():
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["colocated"]["enabled"] = False
+    vllm_config["refit_transport"] = None
+    vllm_config["vllm_cfg"]["refit_with_reload_api"] = True
+    master_config = types.SimpleNamespace(policy={"generation": vllm_config})
+
+    VllmGeneration.validate_settings(master_config)
+
+
+def test_vllm_validate_settings_accepts_missing_vllm_cfg_as_refit_disabled():
+    vllm_config = {
+        "backend": "vllm",
+        "colocated": {"enabled": False, "resources": {}},
+    }
+    master_config = types.SimpleNamespace(policy={"generation": vllm_config})
+
+    VllmGeneration.validate_settings(master_config)
+
+
 def test_vllm_policy_generation(policy, test_input_data, tokenizer):
     """Test vLLM policy generation capabilities."""
     # Test generation
@@ -1010,6 +1954,38 @@ def test_vllm_policy_generation(policy, test_input_data, tokenizer):
     assert all(len(text) > 0 for text in generated_texts), (
         "Some generated texts are empty"
     )
+
+
+@pytest.mark.vllm
+def test_vllm_policy_generation_with_fastokens_enabled(
+    monkeypatch, cluster, test_input_data, tokenizer
+):
+    """Test real vLLM generation when vLLM's fastokens patch is enabled."""
+    # Keep this on the VLLM-only flag path; NeMo-RL mirrors NRL_USE_FASTOKENS.
+    monkeypatch.delenv("NRL_USE_FASTOKENS", raising=False)
+    monkeypatch.setenv("VLLM_USE_FASTOKENS", "1")
+
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config = configure_generation_config(vllm_config, tokenizer)
+    vllm_policy = VllmGeneration(cluster, vllm_config)
+
+    try:
+        outputs = vllm_policy.generate(test_input_data)
+
+        assert "output_ids" in outputs, "output_ids not found in generation output"
+        assert outputs["output_ids"].shape[0] == len(test_input_data["input_ids"]), (
+            "Wrong batch size in output"
+        )
+
+        generated_texts = tokenizer.batch_decode(
+            outputs["output_ids"], skip_special_tokens=True
+        )
+        print(f"Generated texts with fastokens enabled: {generated_texts}")
+        assert all(len(text) > 0 for text in generated_texts), (
+            "Some generated texts are empty"
+        )
+    finally:
+        vllm_policy.shutdown()
 
 
 async def _generate_async(vllm_policy, tokenizer, test_input_data, greedy=False):
@@ -1064,7 +2040,7 @@ async def test_vllm_policy_generation_async(
         lm_policy = Policy(cluster, dtensor_config, tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = lm_policy.prepare_refit_info()
+        state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
         async_policy.prepare_refit_info(state_dict_info)
 
         print("refitting vllm policy...")
@@ -1165,7 +2141,7 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
     dtensor_config = basic_dtensor_test_config
     lm_policy = Policy(cluster, dtensor_config, tokenizer)
 
-    state_dict_info = lm_policy.prepare_refit_info()
+    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
     policy.prepare_refit_info(state_dict_info)
 
     print("refitting vllm policy...")
@@ -1495,6 +2471,11 @@ async def test_vllm_generation_with_hf_training_colocated(
     dtensor_config = deepcopy(basic_dtensor_test_config)
     dtensor_config["dtensor_cfg"]["cpu_offload"] = cpu_offload
     dtensor_config["dtensor_cfg"]["_v2"] = enable_lora
+    if enable_lora:
+        dtensor_config["dtensor_cfg"]["checkpoint"] = {
+            "model_save_format": "safetensors",
+            "save_consolidated": "false",
+        }
     dtensor_config["dtensor_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
     dtensor_config["dtensor_cfg"]["lora_cfg"]["enabled"] = enable_lora
     dtensor_config["train_global_batch_size"] = 4
@@ -1502,7 +2483,7 @@ async def test_vllm_generation_with_hf_training_colocated(
 
     # Prepare refit info
     print("Preparing refit info...")
-    state_dict_info = lm_policy.prepare_refit_info()
+    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
     vllm_policy.prepare_refit_info(state_dict_info)
 
     # Test
@@ -1583,6 +2564,11 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     dtensor_config["train_global_batch_size"] = 4
     # lora must use dtensor v2
     dtensor_config["dtensor_cfg"]["_v2"] = enable_lora
+    if enable_lora:
+        dtensor_config["dtensor_cfg"]["checkpoint"] = {
+            "model_save_format": "safetensors",
+            "save_consolidated": "false",
+        }
     dtensor_config["dtensor_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
     dtensor_config["dtensor_cfg"]["lora_cfg"]["enabled"] = enable_lora
     lm_policy = Policy(policy_cluster_separate, dtensor_config, tokenizer)
@@ -1602,7 +2588,7 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     ray.get(futures_train + futures_inference)
 
     # prepare refit info
-    state_dict_info = lm_policy.prepare_refit_info()
+    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
     vllm_policy.prepare_refit_info(state_dict_info)
 
     # Test
@@ -1857,6 +2843,7 @@ def test_vllm_http_server(cluster, tokenizer):
         d["choices"][0]["logprobs"]["content"][0].pop("logprob")
 
         # Remove version-dependent fields that vLLM may or may not include
+        d.pop("ec_transfer_params", None)
         message = d["choices"][0]["message"]
         for key in ("reasoning", "reasoning_content"):
             message.pop(key, None)
@@ -2258,7 +3245,7 @@ def test_vllm_weight_update_and_prefix_cache_reset(
         vllm_policy = VllmGeneration(cluster, vllm_config)
 
         print("preparing refit info...")
-        state_dict_info = lm_policy.prepare_refit_info()
+        state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
         vllm_policy.prepare_refit_info(state_dict_info)
 
         # Prepare input data (batch size 2)
@@ -2369,6 +3356,10 @@ def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
     elif train_backend == "dtensor_v2":
         train_config = deepcopy(basic_dtensor_test_config)
         train_config["dtensor_cfg"]["_v2"] = True
+        train_config["dtensor_cfg"]["checkpoint"] = {
+            "model_save_format": "safetensors",
+            "save_consolidated": "false",
+        }
     elif train_backend == "megatron":
         train_config = get_basic_megatron_test_config(tp=1, pp=1, precision="float32")
     else:
@@ -2376,7 +3367,7 @@ def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
     lm_policy = Policy(cluster, train_config, tokenizer)
 
     print("preparing refit info...")
-    state_dict_info = lm_policy.prepare_refit_info()
+    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
     vllm_policy.prepare_refit_info(state_dict_info)
 
     print("refitting vllm policy...")
@@ -2450,7 +3441,7 @@ def test_vllm_generation_with_stop(cluster, test_input_data, tokenizer, is_eval)
         lm_policy = Policy(cluster, dtensor_config, tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = lm_policy.prepare_refit_info()
+        state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
         vllm_generation.prepare_refit_info(state_dict_info)
 
         print("refitting vllm policy...")
@@ -2589,7 +3580,7 @@ async def test_vllm_refit_non_colocated_update_weights(
     ray.get(futures_train + futures_inference)
 
     # prepare refit info
-    state_dict_info = lm_policy.prepare_refit_info()
+    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
     vllm_generation.prepare_refit_info(state_dict_info)
 
     print("refitting vllm policy...")
@@ -2712,7 +3703,9 @@ def test_vllm_generation_with_megatron_training(
         megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = megatron_policy.prepare_refit_info()
+        state_dict_info = megatron_policy.prepare_refit_info(
+            refit_payload_mode="hf_export"
+        )
         vllm_policy.prepare_refit_info(state_dict_info)
 
         print("Refitting vLLM policy with Megatron weights...")
@@ -2874,7 +3867,9 @@ def test_vllm_generation_with_megatron_training_moe_model(
         megatron_policy = Policy(moe_cluster, megatron_config, test_tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = megatron_policy.prepare_refit_info()
+        state_dict_info = megatron_policy.prepare_refit_info(
+            refit_payload_mode="hf_export"
+        )
         vllm_policy.prepare_refit_info(state_dict_info)
 
         print("Refitting vLLM policy with Megatron weights...")
@@ -3000,7 +3995,7 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
     megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
 
     print("preparing refit info...")
-    state_dict_info = megatron_policy.prepare_refit_info()
+    state_dict_info = megatron_policy.prepare_refit_info(refit_payload_mode="hf_export")
     vllm_policy.prepare_refit_info(state_dict_info)
 
     print("Refitting vLLM policy with Megatron...")
@@ -3116,7 +4111,9 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
         megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = megatron_policy.prepare_refit_info()
+        state_dict_info = megatron_policy.prepare_refit_info(
+            refit_payload_mode="hf_export"
+        )
         vllm_policy.prepare_refit_info(state_dict_info)
 
         print("Refitting vLLM with Megatron PP=2 weights...")
@@ -3182,7 +4179,9 @@ def test_vllm_megatron_weight_update_with_packing(cluster, test_input_data):
         vllm_generation = VllmGeneration(cluster, vllm_config)
 
         # prepare refit info
-        state_dict_info = megatron_policy.prepare_refit_info()
+        state_dict_info = megatron_policy.prepare_refit_info(
+            refit_payload_mode="hf_export"
+        )
         vllm_generation.prepare_refit_info(state_dict_info)
 
         print("refitting vllm policy...")

@@ -11,18 +11,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import os
+import random
+import re
 import socket
 import subprocess
+import sys
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
 import pytest
 import ray
 
+from nemo_rl.distributed import virtual_cluster
 from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_DATA_PLANE_PORT_RANGE_HIGH,
+    DEFAULT_DATA_PLANE_PORT_RANGE_LOW,
+    DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
     DEFAULT_GENERATION_PORT_RANGE_HIGH,
     DEFAULT_GENERATION_PORT_RANGE_LOW,
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
     DEFAULT_GYM_PORT_RANGE_HIGH,
     DEFAULT_GYM_PORT_RANGE_LOW,
     DEFAULT_MASTER_PORT_RANGE_HIGH,
@@ -40,9 +51,31 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_free_consecutive_ports_local,
     _get_free_port_local,
     _get_node_ip_and_free_port,
+    _reserve_data_plane_ports,
 )
 from nemo_rl.utils.venvs import create_local_venv
 from tests.unit.conftest import TEST_ASSETS_DIR
+
+
+def _ray_sub_default(name: str) -> int:
+    ray_sub = (Path(__file__).resolve().parents[3] / "ray.sub").read_text()
+    match = re.search(
+        rf'^{re.escape(name)}="?\$\{{[A-Z0-9_]+:-(\d+)\}}"?',
+        ray_sub,
+        re.MULTILINE,
+    )
+    assert match is not None, f"{name} default not found in ray.sub"
+    return int(match.group(1))
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    (("SANDBOX_PORT", 6000), ("SANDBOX_BASE_PORT", 6001)),
+)
+def test_ray_sub_default_handles_quoted_and_aliased_variables(
+    name: str, expected: int
+) -> None:
+    assert _ray_sub_default(name) == expected
 
 
 def test_get_node_ip_and_free_port_does_not_start_with_zero():
@@ -257,6 +290,31 @@ def test_maybe_configure_data_plane_env_then_init_ray_threads_env_vars():
         assert env_vars["MC_ENABLE_DEST_DEVICE_AFFINITY"] == "1"
 
 
+def test_init_ray_adds_hf_modules_cache_to_cluster_pythonpath():
+    """Direct actors must import trust_remote_code classes while unpickling."""
+    from nemo_rl.distributed.virtual_cluster import init_ray
+
+    with (
+        patch("ray.init") as mock_ray_init,
+        patch("ray.cluster_resources") as mock_cluster_resources,
+    ):
+        mock_cluster_resources.return_value = {"nrl_tag_0": 1}
+        env = {
+            "CUDA_VISIBLE_DEVICES": "0",
+            "HF_MODULES_CACHE": "/hf/modules",
+            "PYTHONPATH": "/project",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            init_ray()
+
+        env_vars = mock_ray_init.call_args_list[0][1]["runtime_env"]["env_vars"]
+        assert env_vars["HF_MODULES_CACHE"] == "/hf/modules"
+        assert env_vars["PYTHONPATH"].split(os.pathsep) == [
+            "/hf/modules",
+            "/project",
+        ]
+
+
 def test_init_ray_alone_has_no_data_plane_awareness():
     """Every non-data-plane launcher's call (bare init_ray(), no preceding
     maybe_configure_data_plane_env) must not touch mooncake env vars --
@@ -277,6 +335,10 @@ def test_init_ray_alone_has_no_data_plane_awareness():
         assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in env_vars
 
 
+@pytest.mark.skipif(
+    os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1",
+    reason="No venv is built when every PY_EXECUTABLES entry is sys.executable",
+)
 def test_mcore_py_executable():
     # The temporary directory is created within the project.
     # For some reason, creating a virtual environment outside of the project
@@ -379,6 +441,42 @@ class TestBindSocketInRange:
         assert port == 12022
         mock_sock.bind.assert_called_once_with(("", 12022))
 
+    def test_bounded_path_draws_from_the_supplied_rng(self):
+        """The supplied rng, not the process-wide `random` module, picks the port."""
+        mock_sock = MagicMock()
+
+        port = _bind_socket_in_range(mock_sock, 12100, 12200, rng=random.Random(1234))
+
+        assert port == random.Random(1234).randint(12100, 12199)
+        mock_sock.bind.assert_called_once_with(("", port))
+
+    def test_exhaustive_path_draws_from_the_supplied_rng(self):
+        """The max_retries=None shuffle must also honor the supplied rng."""
+        mock_sock = MagicMock()
+
+        port = _bind_socket_in_range(
+            mock_sock, 12200, 12300, max_retries=None, rng=random.Random(1234)
+        )
+
+        expected_candidates = list(range(12200, 12300))
+        random.Random(1234).shuffle(expected_candidates)
+        assert port == expected_candidates[0]
+        mock_sock.bind.assert_called_once_with(("", port))
+
+    def test_distinct_seeds_decorrelate_ports(self):
+        """The property rng exists for: ranks on one node must not collide.
+
+        Without it every rank replays the same process-wide sequence.
+        """
+        ports = set()
+        for rank in range(4):
+            mock_sock = MagicMock()
+            ports.add(
+                _bind_socket_in_range(mock_sock, 12300, 13300, rng=random.Random(rank))
+            )
+
+        assert len(ports) == 4
+
 
 class TestGetFreePortLocal:
     """Tests for _get_free_port_local()."""
@@ -480,6 +578,81 @@ class TestGetFreeConsecutivePortsLocal:
     def test_rejects_non_positive_consecutive(self):
         with pytest.raises(AssertionError, match="consecutive must be >= 1"):
             _get_free_consecutive_ports_local(14950, 15000, consecutive=0)
+
+
+class TestReserveDataPlanePorts:
+    """Tests for _reserve_data_plane_ports().
+
+    The defaults the data plane lands on -- 50050 for mooncake's metadata
+    server and 50051 for the master RPC, both from TransferQueue's config.yaml,
+    plus 9003 for the master's metrics server from its own gflag -- all sit
+    inside the 9000-65000 ephemeral range these nodes use. The kernel can hand
+    any of them to an outgoing connection in the minutes between job start and
+    the master's bind, and the master then exits with EADDRINUSE after every
+    node is already up.
+    """
+
+    def test_ports_are_distinct_bindable_and_in_band(self):
+        ports = _reserve_data_plane_ports(3)
+
+        # Distinctness is the regression worth guarding: without excluded_ports
+        # the allocator can hand back the same port twice, pointing two of the
+        # master's servers at one address.
+        assert len(set(ports)) == 3, f"all ports must differ, got {ports}"
+        for label, port in zip(("metadata", "master", "metrics"), ports):
+            assert (
+                DEFAULT_DATA_PLANE_PORT_RANGE_LOW
+                <= port
+                < DEFAULT_DATA_PLANE_PORT_RANGE_HIGH
+            ), f"{label} port {port} escaped the band ray.sub's map documents"
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                # No SO_REUSEADDR, matching mooncake_master: a port obtainable
+                # only by reusing a lingering slot is not one the master could
+                # bind either.
+                s.bind(("", port))
+
+    def test_ports_stay_below_the_ephemeral_floor(self):
+        ephemeral_range = Path("/proc/sys/net/ipv4/ip_local_port_range")
+        if not ephemeral_range.exists():
+            pytest.skip(f"{ephemeral_range} is unavailable on this platform")
+
+        ephemeral_low = int(ephemeral_range.read_text().split()[0])
+        assert max(_reserve_data_plane_ports(3)) < ephemeral_low
+
+    def test_occupied_port_is_routed_around(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
+            try:
+                held.bind(("", DEFAULT_DATA_PLANE_PORT_RANGE_LOW))
+            except OSError:
+                pytest.skip(
+                    f"port {DEFAULT_DATA_PLANE_PORT_RANGE_LOW} is in use on this host"
+                )
+            held.listen(1)
+            ports = _reserve_data_plane_ports(3)
+
+        assert DEFAULT_DATA_PLANE_PORT_RANGE_LOW not in ports
+
+    def test_raises_when_the_band_cannot_satisfy_the_request(self, monkeypatch):
+        # A one-port band also proves each choice is excluded from the next:
+        # without that, the second call would reuse the first port instead of
+        # failing.
+        monkeypatch.setattr(
+            virtual_cluster,
+            "DEFAULT_DATA_PLANE_PORT_RANGE_HIGH",
+            DEFAULT_DATA_PLANE_PORT_RANGE_LOW + 1,
+        )
+        try:
+            # The one-port case has to succeed first, or a busy port would
+            # raise this same error before the exclusion is ever reached and
+            # the assertion below would pass for the wrong reason.
+            _reserve_data_plane_ports(1)
+        except RuntimeError:
+            pytest.skip(
+                f"port {DEFAULT_DATA_PLANE_PORT_RANGE_LOW} is in use on this host"
+            )
+
+        with pytest.raises(RuntimeError, match="Could not find a free port in range"):
+            _reserve_data_plane_ports(2)
 
 
 class TestRayVirtualClusterPortRange:
@@ -634,9 +807,61 @@ class TestVllmPortAssignment:
         assert "VLLM_PORT" not in env_vars
 
 
+def _ray_sub_reserved_ports() -> set[int]:
+    """Every port ray.sub hands to Ray itself."""
+    reserved = {
+        _ray_sub_default("PORT"),
+        _ray_sub_default("RAY_CLIENT_SERVER_PORT"),
+        _ray_sub_default("DASHBOARD_PORT"),
+    }
+    # ray.sub gives the head node these ports + 1; workers get the odd values.
+    for name in (
+        "NODE_MANAGER_PORT",
+        "OBJECT_MANAGER_PORT",
+        "RUNTIME_ENV_AGENT_PORT",
+        "DASHBOARD_AGENT_GRPC_PORT",
+        "METRICS_EXPORT_PORT",
+        "DASHBOARD_AGENT_LISTEN_PORT",
+    ):
+        reserved |= {_ray_sub_default(name), _ray_sub_default(name) + 1}
+    reserved |= set(
+        range(
+            _ray_sub_default("MIN_WORKER_PORT"),
+            _ray_sub_default("MAX_WORKER_PORT") + 1,
+        )
+    )
+    return reserved
+
+
+def test_router_band_does_not_collide_with_ray_sub_ports():
+    reserved = _ray_sub_reserved_ports()
+
+    router_band = set(
+        range(
+            DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
+            DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+        )
+    )
+    assert not router_band & reserved, sorted(router_band & reserved)
+
+
+def test_data_plane_band_does_not_collide_with_ray_sub_ports():
+    reserved = _ray_sub_reserved_ports()
+
+    data_plane_band = set(
+        range(DEFAULT_DATA_PLANE_PORT_RANGE_LOW, DEFAULT_DATA_PLANE_PORT_RANGE_HIGH)
+    )
+    assert not data_plane_band & reserved, sorted(data_plane_band & reserved)
+
+
 def test_default_port_ranges_ordered_and_below_ephemeral_floor():
     # Lowest observed ephemeral floor on some GB200 nodes; stock Linux is 32768.
     EPHEMERAL_FLOOR = 9000
+    assert (
+        DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW
+        < DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH
+        <= DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW
+    )
     assert DEFAULT_MASTER_PORT_RANGE_LOW < DEFAULT_MASTER_PORT_RANGE_HIGH
     assert DEFAULT_GENERATION_PORT_RANGE_LOW < DEFAULT_GENERATION_PORT_RANGE_HIGH
     assert DEFAULT_GYM_PORT_RANGE_LOW < DEFAULT_GYM_PORT_RANGE_HIGH
@@ -651,12 +876,12 @@ def test_default_port_ranges_ordered_and_below_ephemeral_floor():
     )
     # SGLang router / Prometheus carve-outs live inside the vLLM band (only one
     # rollout backend runs at a time), stay above the 8-engine vLLM high-water
-    # mark and the Ray dashboard (8265), and sit below the ephemeral floor.
+    # mark and the Ray dashboard, and sit below the ephemeral floor.
     assert (
         DEFAULT_VLLM_PORT_RANGE_LOW + 8 * DEFAULT_VLLM_PORTS_PER_ENGINE
         < DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW
     )
-    assert 8265 < DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW
+    assert _ray_sub_default("DASHBOARD_PORT") < DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW
     assert DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW < DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH
     assert (
         DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH < DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW
@@ -666,5 +891,66 @@ def test_default_port_ranges_ordered_and_below_ephemeral_floor():
         < DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH
     )
     assert DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH < EPHEMERAL_FLOOR
+    # The data-plane band sits below the Ray GCS ports, which is the only gap
+    # left under the router band, and has to hold every port mooncake's master
+    # listens on.
+    assert DEFAULT_DATA_PLANE_PORT_RANGE_LOW < DEFAULT_DATA_PLANE_PORT_RANGE_HIGH
+    assert DEFAULT_DATA_PLANE_PORT_RANGE_HIGH <= _ray_sub_default("PORT")
+    assert (
+        DEFAULT_DATA_PLANE_PORT_RANGE_HIGH - DEFAULT_DATA_PLANE_PORT_RANGE_LOW >= 3
+    ), "the band must fit the metadata, master RPC and metrics ports"
     # Avoid privileged ports (<1024).
+    assert DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW > 1024
     assert DEFAULT_MASTER_PORT_RANGE_LOW > 1024
+    assert DEFAULT_DATA_PLANE_PORT_RANGE_LOW > 1024
+
+
+_REGISTRY_PROBE = """
+import json
+
+from nemo_rl.distributed.ray_actor_environment_registry import (
+    ACTOR_ENVIRONMENT_REGISTRY,
+    get_actor_python_env,
+)
+from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+
+envs = {fqn: get_actor_python_env(fqn) for fqn in ACTOR_ENVIRONMENT_REGISTRY}
+# Also assert on PY_EXECUTABLES directly: a constant with no registry entry
+# is invisible to envs, so the class-level promise needs its own check.
+constants = {n: getattr(PY_EXECUTABLES, n) for n in vars(PY_EXECUTABLES) if n.isupper()}
+print(
+    json.dumps(
+        {
+            "all_system": set(envs.values()) | set(constants.values())
+            == {PY_EXECUTABLES.SYSTEM},
+            "envs": envs,
+            "constants": constants,
+        }
+    )
+)
+"""
+
+
+@pytest.mark.parametrize("use_system_executable", [False, True])
+def test_actor_registry_honors_system_flag(use_system_executable):
+    # The registry freezes its executable strings at import, so the flag can
+    # only be exercised in a fresh interpreter.
+    env = dict(os.environ)
+    env["NEMO_RL_PY_EXECUTABLES_SYSTEM"] = "1" if use_system_executable else "0"
+    result = subprocess.run(
+        [sys.executable, "-c", _REGISTRY_PROBE],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+
+    if use_system_executable:
+        assert payload["all_system"], (payload["envs"], payload["constants"])
+    else:
+        envs = payload["envs"]
+        assert envs[
+            "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
+        ].startswith("uv run")
+        assert envs["nemo_rl.environments.nemo_gym.NemoGym"].startswith("uv run")

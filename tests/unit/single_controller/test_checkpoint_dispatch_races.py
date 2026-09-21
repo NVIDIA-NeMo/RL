@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TypeVar, cast
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -60,6 +61,7 @@ from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
     PromptGroupPhase,
+    RecoveryGranularity,
     RolloutRecoveryLedger,
     build_rollout_recovery_state,
 )
@@ -83,6 +85,12 @@ def _with_mutation_cut(callback: Callable[[DataPlaneMutationCut], _T]) -> _T:
             return callback(cut)
 
     return asyncio.run(apply())
+
+
+def _init_recovery_telemetry(controller: Any, *, train_steps: int = 0) -> None:
+    """Initialize constructor-owned telemetry state for hand-built controllers."""
+    controller._train_steps = train_steps
+    controller._logger = MagicMock()
 
 
 async def _wait_for_event_or_pump(
@@ -238,6 +246,9 @@ class _RecoveryRolloutManager:
     ) -> None:
         self.recovery_ledger.discard_group(cut, group_id)
 
+    def record_recovery_siblings(self, *, reused: int, redispatched: int) -> None:
+        del reused, redispatched
+
 
 class _BlockingRolloutManager:
     """Hold one admitted rollout unfinished while the checkpoint is written."""
@@ -250,6 +261,12 @@ class _BlockingRolloutManager:
 
     def set_weight_version(self, version: int) -> None:
         self.weight_version = version
+
+    def set_data_plane_checkpoint_barrier(
+        self, barrier: DataPlaneCheckpointBarrier
+    ) -> None:
+        """Accept the controller-owned barrier used by the production manager."""
+        del barrier
 
     def reserve_prompt_group(
         self,
@@ -354,6 +371,8 @@ class _LedgerFacade:
             expected_generations=2,
             target_step=target_step,
             start_weight_version=7,
+            task_source=None,
+            recovery_granularity=RecoveryGranularity.SIBLING,
             admitted=admitted,
             admission_id=admission_id,
         )
@@ -566,6 +585,7 @@ def test_checkpoint_after_fetch_before_admit_owns_the_prompt(tmp_path) -> None:
             await controller._save_checkpoint(
                 {"loss": 1.0},
                 is_policy_training_step=True,
+                is_final_checkpoint=False,
             )
         finally:
             sampler.release_admission.set()
@@ -640,6 +660,7 @@ def test_checkpoint_owns_batch_7_while_its_rollout_is_unfinished(tmp_path) -> No
             await controller._save_checkpoint(
                 {"loss": 1.0},
                 is_policy_training_step=True,
+                is_final_checkpoint=False,
             )
         finally:
             rollout_manager.release.set()
@@ -679,6 +700,7 @@ def test_commit_contending_with_checkpoint_has_exactly_one_saved_owner(
             dp_client,
             partition_id="rollout_data",
             pad_value_dict={"input_ids": 0},
+            include_message_violation_fields=False,
             require_routed_experts=False,
         )
         group_id = buffer.reserve(
@@ -720,6 +742,7 @@ def test_commit_contending_with_checkpoint_has_exactly_one_saved_owner(
             controller._save_checkpoint(
                 {"loss": 1.0},
                 is_policy_training_step=True,
+                is_final_checkpoint=False,
             )
         )
         save_started = await asyncio.to_thread(dp_client.save_started.wait, 5.0)
@@ -782,6 +805,7 @@ def test_canonical_replay_wins_over_stale_ledger_entry(
             dp_client,
             partition_id="rollout_data",
             pad_value_dict={"input_ids": 0},
+            include_message_violation_fields=False,
             require_routed_experts=False,
         )
         group_id = buffer.reserve(
@@ -834,6 +858,7 @@ def test_canonical_replay_wins_over_stale_ledger_entry(
             await controller._save_checkpoint(
                 {"loss": 1.0},
                 is_policy_training_step=True,
+                is_final_checkpoint=False,
             )
         finally:
             controller._checkpointer.shutdown()
@@ -902,8 +927,12 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
+        _init_recovery_telemetry(controller, train_steps=7)
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
+        controller._master_config = SimpleNamespace(
+            token_capture=SimpleNamespace(enabled=False)
+        )
         controller._last_checkpoint_path = str(tmp_path)
         controller._data_plane_checkpoint_metadata = {
             "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
@@ -946,6 +975,11 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
         assert sampler.dispatch_index == 7
         assert controller._batch_shortfall == {6: 1}
         assert controller._sampler_stamps_target_steps is True
+        recovery_metrics = controller._logger.log_metrics.call_args.args[0]
+        assert recovery_metrics["groups_unfinished_found"] == 1.0
+        assert recovery_metrics["siblings_reused"] == 0.0
+        assert recovery_metrics["siblings_rerun"] == 2.0
+        assert "groups_redispatched" not in recovery_metrics
 
     asyncio.run(exercise())
 
@@ -961,6 +995,7 @@ def test_recovery_rejects_an_unhandled_phase_before_redispatch() -> None:
         )
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
+        _init_recovery_telemetry(controller)
         controller._rollout_manager = SimpleNamespace(recovery_ledger=recovery_ledger)
         launched = False
 
@@ -1009,8 +1044,12 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
         rollout_manager = _RecoveryRolloutManager(RolloutRecoveryLedger())
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
+        _init_recovery_telemetry(controller, train_steps=7)
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
+        controller._master_config = SimpleNamespace(
+            token_capture=SimpleNamespace(enabled=False)
+        )
         controller._last_checkpoint_path = str(tmp_path)
         controller._data_plane_checkpoint_metadata = {
             "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
@@ -1097,6 +1136,7 @@ def test_recovery_launches_admitted_groups_before_waiting_to_readmit() -> None:
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
+        _init_recovery_telemetry(controller, train_steps=6)
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
         controller._trainer_version = 6
@@ -1164,6 +1204,9 @@ def test_recovery_load_does_not_require_every_unfinished_group_to_fit_at_once(
         controller = object.__new__(controller_cls)
         controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         controller._rollout_manager = rollout_manager
+        controller._master_config = SimpleNamespace(
+            token_capture=SimpleNamespace(enabled=False)
+        )
         controller._last_checkpoint_path = str(tmp_path)
         controller._data_plane_checkpoint_metadata = {
             "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
@@ -1308,7 +1351,7 @@ def test_reserve_drain_is_recoverable_before_sampler_admission() -> None:
 
         async def block_admission(
             group_ids: list[str],
-        ) -> tuple[int, list[str], int]:
+        ) -> int:
             admission_started.set()
             await release_admission.wait()
             async with controller._data_plane_checkpoint_barrier.mutation() as cut:
@@ -1318,7 +1361,7 @@ def test_reserve_drain_is_recoverable_before_sampler_admission() -> None:
                         group_id,
                         target_step=7,
                     )
-            return 7, group_ids, 0
+            return 7
 
         async def launch(
             prompt: DatumSpec,

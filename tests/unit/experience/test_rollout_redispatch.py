@@ -29,12 +29,13 @@ behaviour these budgets were added on top of.
 The invariants every test here upholds:
   - nothing is committed unless the rollout actually succeeded
   - every reserved slot is released, whatever the outcome
-  - each attempt gets a fresh group_id, so a failed attempt's rows cannot collide
-    with the retry's
+  - each attempt gets a fresh TQ group ID, so a failed attempt's rows cannot
+    collide with the retry's
   - cancellation is never retried
 """
 
 import asyncio
+import copy
 import uuid
 
 import pytest
@@ -44,6 +45,11 @@ from nemo_rl.experience.failures import (
     GenerationUnavailable,
     RolloutDataFailure,
     RolloutRedispatchExhausted,
+)
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_GROUP_ATTEMPT_KEY,
+    NEMO_GYM_GROUP_ID_KEY,
+    PromptGroupRecord,
 )
 from nemo_rl.experience.rollout_manager import (
     RolloutManager,
@@ -84,16 +90,24 @@ class _ScriptedImpl:
     def __init__(self, failures) -> None:
         self._failures = list(failures)
         self.attempts = 0
+        self.samples = []
 
     async def run_rollout(self, input_sample):
-        del input_sample
+        self.samples.append(copy.deepcopy(input_sample))
         index = self.attempts
         self.attempts += 1
         if index < len(self._failures):
             failure = self._failures[index]
             if failure is not None:
                 raise failure
-        return f"record-{index}"
+        return PromptGroupRecord(
+            prompt_idx=0,
+            prompt=[],
+            extra_env_info=None,
+            metadata={"sentinel": f"record-{index}"},
+            completions=[],
+            rollout_metrics={},
+        )
 
 
 def _make_manager(buffer, impl, policy) -> RolloutManager:
@@ -105,6 +119,10 @@ def _make_manager(buffer, impl, policy) -> RolloutManager:
     manager._weight_version = 0
     manager._retry_policy = policy
     manager._stats = RolloutStats()
+    manager._canonical_groups_finalized = 0
+    manager._canonical_output_tokens = 0
+    manager._recovery_siblings_reused = 0
+    manager._recovery_siblings_redispatched = 0
     manager._skipped_prompts = 0
     manager._consecutive_infra_drops = 0
     return manager
@@ -144,7 +162,7 @@ class TestInfraRedispatch:
         assert impl.attempts == 2, "one failure, then one successful retry"
         assert len(buffer.commits) == 1
 
-    def test_each_attempt_reserves_a_fresh_group_id(self, no_sleep):
+    def test_each_attempt_reserves_a_fresh_tq_group_id(self, no_sleep):
         """A failed attempt's rows must not be able to collide with the retry's."""
         buffer = _Buffer()
         impl = _ScriptedImpl([GenerationUnavailable("x"), GenerationUnavailable("y")])
@@ -159,6 +177,32 @@ class TestInfraRedispatch:
         # The two failed attempts released their slots; the third committed.
         assert buffer.removals == buffer.reserved[:2]
         assert buffer.commits == buffer.reserved[2:]
+
+    def test_retries_preserve_logical_group_id_and_increment_group_attempt(
+        self, no_sleep
+    ):
+        buffer = _Buffer()
+        impl = _ScriptedImpl([GenerationUnavailable("x"), GenerationUnavailable("y")])
+        manager = _make_manager(
+            buffer, impl, RolloutRetryPolicy.single_attempt(max_infra_attempts=5)
+        )
+        sample = {
+            "idx": 3,
+            "extra_env_info": {"responses_create_params": {}},
+        }
+
+        asyncio.run(manager.generate_and_push(sample))
+
+        logical_group_ids = [
+            attempt["extra_env_info"][NEMO_GYM_GROUP_ID_KEY] for attempt in impl.samples
+        ]
+        assert len(set(logical_group_ids)) == 1
+        assert [
+            attempt["extra_env_info"][NEMO_GYM_GROUP_ATTEMPT_KEY]
+            for attempt in impl.samples
+        ] == [0, 1, 2]
+        assert len(set(buffer.reserved)) == 3
+        assert NEMO_GYM_GROUP_ID_KEY not in sample["extra_env_info"]
 
     def test_exhausting_the_infra_budget_reports_fleet_wide_failure(self, no_sleep):
         buffer = _Buffer()

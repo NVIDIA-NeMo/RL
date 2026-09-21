@@ -108,9 +108,13 @@ def make_rollout_batch(
     }
 
     if multimodal:
-        # VLM extras as flat top-level fields (the codec wire format —
-        # nested dicts aren't valid leaves). Real production writes these
-        # with similar shapes; we keep them small for fast tests.
+        # VLM extras as flat *dense* top-level fields. This is the codec's
+        # plain-tensor path, not the packed wire form a real VLM rollout
+        # writes: production sends these as one flattened ``torch.jagged``
+        # value per field with the geometry on ``KVBatchMeta.tags`` (see
+        # ``multimodal_utils.encode_multimodal_for_wire``). Tests that need
+        # the packed form build it locally; this stays dense so the codec's
+        # dtype/shape handling is covered without TQ tag plumbing.
         T, H, W = 1, 8, 8
         n_image_tokens = T * H * W
         out["pixel_values"] = torch.randn(n, n_image_tokens, 3, generator=g).to(

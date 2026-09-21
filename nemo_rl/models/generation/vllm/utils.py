@@ -17,12 +17,17 @@ from typing import Any, Optional
 
 import torch
 
+from nemo_rl.data.multimodal_utils import (
+    VLLM_CONTENT_KEY,
+    VLLM_MULTI_MODAL_DATA_KEY,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_FALLBACK_DTYPE,
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
     GenerationDatumSpec,
 )
+from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
 R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
@@ -31,6 +36,96 @@ VLLM_LOGPROB_FLOOR = -9999.0
 # The expert-id range vs carry dtype is model-constant, so it is verified on the
 # first non-empty routed-experts tensor per process and skipped afterwards.
 G_ROUTED_EXPERTS_RANGE_CHECKED = False
+GROUPED_MOE_MXFP8_REFIT_ERROR = (
+    "MXFP8 refit does not support grouped MoE expert weights."
+)
+_GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES = (
+    "mlp.experts.gate_up_proj",
+    "mlp.experts.down_proj",
+)
+
+
+def assert_reload_refit_config_supported(config: VllmConfig) -> None:
+    """Reject pure-config combinations unsupported by vLLM reload refit."""
+    vllm_cfg = config.get("vllm_cfg")
+    if not vllm_cfg or not vllm_cfg.get("refit_with_reload_api"):
+        return
+
+    assert not config["colocated"]["enabled"], (
+        "policy.generation.vllm_cfg.refit_with_reload_api=true is not "
+        "supported yet with colocated vLLM refit. Support for the "
+        "colocated IPC/ZMQ reload-refit path will be added later. Set "
+        "refit_with_reload_api=false for now."
+    )
+    refit_transport = config.get("refit_transport")
+    if refit_transport == "nccl_reshard":
+        raise AssertionError(
+            "policy.generation.vllm_cfg.refit_with_reload_api=true is "
+            "explicitly unsupported with "
+            "policy.generation.refit_transport='nccl_reshard'. "
+            "nccl_reshard_refit is its own refit path and does not use "
+            "vLLM's reload_weights API."
+        )
+    if refit_transport == "nixl" or (
+        isinstance(refit_transport, str) and ":" in refit_transport
+    ):
+        raise AssertionError(
+            "policy.generation.vllm_cfg.refit_with_reload_api=true is not "
+            "supported yet with checkpoint-engine refit "
+            "(update_weights_from_checkpoint_engine). Support for using "
+            "vLLM's reload_weights API with checkpoint-engine transports is "
+            "future work. Set refit_transport=null or set "
+            "refit_with_reload_api=false for now."
+        )
+    assert refit_transport is None, (
+        "policy.generation.vllm_cfg.refit_with_reload_api=true is only "
+        "supported with the default non-colocated collective refit path. "
+        f"Got policy.generation.refit_transport={refit_transport!r}. Set "
+        "refit_transport=null or set refit_with_reload_api=false."
+    )
+    assert config.get("quant_cfg") is None, (
+        "policy.generation.vllm_cfg.refit_with_reload_api=true is "
+        "explicitly unsupported with policy.generation.quant_cfg set. "
+        "ModelOpt quantized refit requires the ModelOpt weight-loading path. "
+        "Set quant_cfg=null or set refit_with_reload_api=false."
+    )
+    assert not config.get("_draft_weights_from_refit"), (
+        "policy.generation.vllm_cfg.refit_with_reload_api=true is not "
+        "supported yet when policy.draft.enabled=true. Support for Eagle "
+        "draft-weight refit with vLLM's reload_weights API will be added "
+        "later. Set policy.draft.enabled=false or set "
+        "refit_with_reload_api=false for now."
+    )
+    vllm_kwargs = config.get("vllm_kwargs") or {}
+    spec_cfg = vllm_kwargs.get("speculative_config")
+    spec_method = None
+    if isinstance(spec_cfg, dict) and spec_cfg.get("num_speculative_tokens") != 0:
+        spec_method = spec_cfg.get("method")
+    if spec_method in ("deepseek_mtp", "mtp") and config.get("_mtp_weights_from_refit"):
+        raise AssertionError(
+            "policy.generation.vllm_cfg.refit_with_reload_api=true is not "
+            "supported yet when vLLM refit also updates MTP draft weights. "
+            "Support for MTP speculative decoding with reload refit will be "
+            "added later. Set refit_with_reload_api=false for now."
+        )
+
+
+def is_grouped_moe_expert_weight_name(name: str) -> bool:
+    """Return whether a checkpoint key is a grouped MoE expert slab."""
+    return name.endswith(_GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES)
+
+
+def assert_refit_unsupported_grouped_moe_params(
+    config: VllmConfig, state_dict_info: dict[str, Any]
+) -> None:
+    """Reject grouped MoE MXFP8 state-dict params before refit starts."""
+    vllm_cfg = config["vllm_cfg"]
+    if (
+        vllm_cfg.get("precision") == "fp8"
+        and vllm_cfg.get("is_mx")
+        and any(is_grouped_moe_expert_weight_name(name) for name in state_dict_info)
+    ):
+        raise AssertionError(GROUPED_MOE_MXFP8_REFIT_ERROR)
 
 
 def _as_routed_experts_tensor(
@@ -92,37 +187,32 @@ def format_prompt_for_vllm_generation(
         token_ids = valid_ids.tolist()
         return {"prompt_token_ids": token_ids}
 
-    def _get_multi_modal_data(index: int) -> dict[str, Any]:
-        multi_modal_data = {}
-        images = data.get("vllm_images", None)
-        if images is not None and len(images[index]) > 0:
-            multi_modal_data["image"] = (
-                images[index][0] if len(images[index]) == 1 else images[index]
-            )
-        audios = data.get("vllm_audios", None)
-        if audios is not None and len(audios[index]) > 0:
-            multi_modal_data["audio"] = (
-                audios[index][0] if len(audios[index]) == 1 else audios[index]
-            )
-        videos = data.get("vllm_videos", None)
-        if videos is not None and len(videos[index]) > 0:
-            multi_modal_data["video"] = (
-                videos[index][0] if len(videos[index]) == 1 else videos[index]
-            )
-        return multi_modal_data
+    content_rows = data.get(VLLM_CONTENT_KEY)
+    multi_modal_rows = data.get(VLLM_MULTI_MODAL_DATA_KEY)
 
-    # Native image, audio, and video side channels share this formatter path.
-    if "vllm_content" in data:
+    def _get_multi_modal_data(index: int) -> dict[str, Any]:
+        row = multi_modal_rows[index] if multi_modal_rows is not None else None
+        if not row:
+            return {}
+        return {
+            modality: value
+            for modality, value in row.items()
+            if value is not None
+            and (not isinstance(value, (list, tuple)) or len(value) > 0)
+        }
+
+    # vLLM-ready content and modality data share this formatter path.
+    if content_rows is not None or multi_modal_rows is not None:
         # VLM generation using content and multi_modal_data
         for i in range(start_idx, end_idx):
-            msg = data["vllm_content"][i]
+            msg = content_rows[i] if content_rows is not None else None
             multi_modal_data = _get_multi_modal_data(i)
             if not multi_modal_data:
                 prompts.append(_get_regular_prompt(i))
                 continue
             # Raw processor content is valid only for the initial turn. Later
             # turns use the updated pre-tokenized conversation plus the same
-            # native media, preventing vLLM from regenerating the stale prompt.
+            # modality data, preventing vLLM from regenerating the stale prompt.
             prompt_dict = {"prompt": msg} if msg is not None else _get_regular_prompt(i)
             prompt_dict["multi_modal_data"] = multi_modal_data
             prompts.append(prompt_dict)
