@@ -1,0 +1,45 @@
+#!/bin/bash
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
+source "$SCRIPT_DIR/common.env"
+
+# ===== BEGIN CONFIG =====
+NUM_NODES=1
+STEPS_PER_RUN=450
+MAX_STEPS=450
+NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))
+NUM_MINUTES=120
+# ===== END CONFIG =====
+
+exit_if_max_steps_reached
+
+cd "$PROJECT_ROOT"
+uv run examples/run_grpo.py \
+    --config "$CONFIG_PATH" \
+    grpo.max_num_steps=$MAX_STEPS \
+    logger.log_dir="$LOG_DIR" \
+    logger.wandb_enabled=True \
+    logger.wandb.project=nemo-rl \
+    logger.wandb.name="$EXP_NAME" \
+    logger.monitor_gpus=True \
+    logger.tensorboard_enabled=True \
+    checkpointing.enabled=True \
+    checkpointing.checkpoint_dir="$CKPT_DIR" \
+    "$@" \
+    2>&1 | tee "$RUN_LOG"
+
+uv run tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"
+
+# Survivor metrics must be emitted and remain positive for every optimizer step.
+# Throughput and convergence bounds need calibration on the nightly hardware.
+uv run tests/check_metrics.py "$JSON_METRICS" \
+    'len(data["train/loss"]) == 450' \
+    'all_finite(data["train/loss"])' \
+    'all_finite(data["train/grad_norm"])' \
+    'all_finite(data["train/reward"])' \
+    'all_finite(data["train/seq_logprob_error_valid_tokens"])' \
+    'all_finite(data["train/seq_logprob_error_valid_seqs"])' \
+    'min(data["train/seq_logprob_error_valid_tokens"]) > 0' \
+    'min(data["train/seq_logprob_error_valid_seqs"]) > 0' \
+    'min(data["train/num_masked_seqs_by_logprob_error"]) >= 0'
+
+rm -rf "$CKPT_DIR"

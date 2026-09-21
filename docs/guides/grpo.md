@@ -588,10 +588,16 @@ MTP (such as the NeMo-Gym Nemotron recipes), distillation (`mopd`), or
 Automodel must first satisfy these constraints; setting the flag alone
 does not make them compatible.
 
+The [Qwen2.5-Math-1.5B single-forward recipe](../../examples/configs/recipes/llm/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-forward.yaml)
+provides a complete configuration for one node with eight GPUs. Its nightly
+test checks finite training metrics and positive survivor counts. For a
+separate-forward baseline, run the same recipe with
+`grpo.seq_logprob_error_in_loss=false`; keep the other settings unchanged.
+
 The loss computes the same mean `exp(abs(policy_logprob - generation_logprob))`
 over valid response tokens, using detached logprobs from the training forward.
 Both seq_logprob_error_in_loss true and false ignore nonfinite
-logprobs at masked-out positions. 
+logprobs at masked-out positions.
 Rejected sequences contribute zero loss but are still processed by the batched
 forward/backward. The worker sums survivor counts over every microbatch and DP
 rank, then rescales accumulated gradients before gradient clipping and the

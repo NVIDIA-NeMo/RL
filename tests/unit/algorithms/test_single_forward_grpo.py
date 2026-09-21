@@ -18,10 +18,28 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
-from nemo_rl.algorithms.loss.interfaces import rescale_loss_metrics
+from nemo_rl.algorithms.loss.utils import rescale_loss_metrics
 from nemo_rl.algorithms.loss.wrapper import SequencePackingLossWrapper
 from nemo_rl.algorithms.utils import compute_seq_logprob_errors
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"force_on_policy_ratio": False}, "force_on_policy_ratio"),
+        ({"token_level_loss": False}, "token_level_loss"),
+        ({"positive_example_nll_weight": 0.1}, "NLL"),
+    ],
+)
+def test_in_loss_filter_rejects_incompatible_loss_configuration(
+    overrides: dict[str, bool | float], message: str
+) -> None:
+    """Passing a threshold cannot silently enable filtering for ordinary PPO."""
+    cfg = ClippedPGLossConfig(force_on_policy_ratio=True)
+    cfg = cfg.model_copy(update=overrides)
+    with pytest.raises(ValueError, match=message):
+        ClippedPGLossFn(cfg, seq_logprob_error_threshold=2.0)
 
 
 def _batch() -> tuple[BatchedDataDict, torch.Tensor]:

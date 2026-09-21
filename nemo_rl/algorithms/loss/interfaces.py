@@ -41,7 +41,8 @@ class MetricNormalizer(enum.Enum):
     from the same flags that pick the denominators, so it lives next to the
     metric definitions instead of in a consumer-side table. Metrics absent
     from the mapping fall back to the gradient normalization (the
-    ``loss_type`` denominator) on the consumer side.
+    ``loss_type`` denominator) in split-API trainers. Survivor rescaling only
+    changes advertised denominators and leaves unadvertised metrics unchanged.
     """
 
     TOKENS = "tokens"  # divided by global_valid_toks
@@ -58,25 +59,6 @@ class LossInputType(enum.Enum):
     DRAFT = "draft"
 
 
-def rescale_loss_metrics(
-    metrics: dict[str, Any],
-    normalizers: dict[str, MetricNormalizer],
-    *,
-    token_factor: float,
-    sequence_factor: float,
-) -> dict[str, Any]:
-    """Change global loss denominators while preserving raw counts and extrema."""
-    factors = {
-        MetricNormalizer.TOKENS: token_factor,
-        MetricNormalizer.SEQUENCES: sequence_factor,
-        MetricNormalizer.NONE: 1.0,
-    }
-    return {
-        key: value * factors[normalizers[key]] if key in normalizers else value
-        for key, value in metrics.items()
-    }
-
-
 class LossFunction(Protocol):
     """Signature for loss functions used in reinforcement learning algorithms.
 
@@ -86,8 +68,9 @@ class LossFunction(Protocol):
     Losses may additionally expose a ``metric_normalizations:
     dict[str, MetricNormalizer]`` attribute advertising the global denominator
     each returned metric was normalized by (see ``MetricNormalizer``). It is
-    optional: consumers fall back to the ``loss_type`` denominator for
-    metrics (or losses) that do not advertise.
+    optional: split-API trainers fall back to the ``loss_type`` denominator for
+    metrics (or losses) that do not advertise. Survivor rescaling instead
+    leaves metrics absent from the mapping unchanged.
     """
 
     loss_type: LossType
