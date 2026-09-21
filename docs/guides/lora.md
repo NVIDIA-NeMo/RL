@@ -49,6 +49,7 @@ The table below maps equivalent fields and highlights the differences.
 | Optimized kernels | `use_triton` | — |
 | Adapter dtype | _(follows base layer)_ | `lora_dtype` |
 | Experimental A2A comm | — | `a2a_experimental` |
+| Share adapters across grouped MoE experts | — | `share_expert_adapters` |
 | Warm start from a donor adapter | `restore_from` (adapter directory) | `restore_from` (Megatron `iter_*` checkpoint) |
 
 The effective learning-rate multiplier for the adapter is `alpha / dim` on both backends.
@@ -108,6 +109,7 @@ policy:
       lora_B_init_method: "zero"    # Initialization method for lora B: "zero"
       a2a_experimental: false       # Enables the experimental All-to-All (A2A) communication strategy
       lora_dtype: None              # Adapter weights dtype
+      share_expert_adapters: true   # Share one adapter across grouped MoE experts on each EP rank
       restore_from: null            # Warm start from a donor PEFT checkpoint (see below)
 ```
 
@@ -130,6 +132,7 @@ policy:
 - **`lora_B_init_method`** (str): Initialization method for the low-rank matrix B. Defaults to `"zero"`.
 - **`a2a_experimental`** (bool): Enables the experimental All-to-All (A2A) communication strategy. Defaults to `False`.
 - **`lora_dtype`** (torch.dtype): Adapter weights dtype. By default it follows `orig_linear`'s dtype, but for quantized weights (e.g. 4-bit) it must be specified explicitly.
+- **`share_expert_adapters`** (bool): Share one adapter across all grouped MoE experts on each expert-parallel rank. Set to `false` to create one adapter per local expert. Defaults to `true` for backward compatibility.
 - **`restore_from`** (str, optional): Path to a donor Megatron-Bridge PEFT checkpoint (an `iter_XXXXXXX` directory, or a checkpoint root resolving to one) whose adapter weights initialize this run's LoRA modules. See [Warm-Starting from a LoRA Checkpoint](#warm-starting-from-a-lora-checkpoint).
 
 ## Warm-Starting from a LoRA Checkpoint
