@@ -198,6 +198,7 @@ RUN_NAME="pmx-${CLUSTER}-${MODEL}-${MODE}-${ARM}-${TOPOLOGY}-${RUN_GROUP}"
 JOB_NAME="${SLURM_ACCOUNT}-pmx.${CLUSTER}-${MODEL}-${MODE}-${ARM}-${TOPOLOGY}-${RUN_GROUP}"
 RUN_ROOT="${RESULT_ROOT}/${RUN_NAME}"
 LOCAL_JOB_ROOT="${LOCAL_ROOT}/${RUN_NAME}"
+RAY_LOCAL_ROOT=${RAY_LOCAL_ROOT:-/raid/scratch/${USER}/r}
 RUN_REPO="${LOCAL_JOB_ROOT}/source"
 DATASETS_CACHE="${LOCAL_JOB_ROOT}/hf/datasets"
 DATASET_STAGE_COMMAND="if [ -d ${HF_HOME_SOURCE}/datasets ]; then rsync -a --ignore-existing ${HF_HOME_SOURCE}/datasets/ ${LOCAL_JOB_ROOT}/hf/datasets/; fi"
@@ -344,10 +345,10 @@ if [[ "${PERFORMANCE_RECIPE}" == 1 ]]; then
   fi
 fi
 
-printf 'cluster=%s\nmodel=%s\nmode=%s\narm=%s\ntopology=%s\nconfig=%s\nnodes=%s\nsegment=%s\nsteps=%s\nshared_model=%s\nmoe_backend=%s\ngpu_memory_utilization=%s\ndatasets_cache=%s\nnuma_membind_disabled=%s\nforce_rebuild_venvs=%s\nactor_venv_root=%s\nsha=%s\nsource_payload_sha=%s\nsource_archive_override=%s\nsource_archive_sha256=%s\nray_memory_usage_threshold=%s\nrun=%s\n' \
+printf 'cluster=%s\nmodel=%s\nmode=%s\narm=%s\ntopology=%s\nconfig=%s\nnodes=%s\nsegment=%s\nsteps=%s\nshared_model=%s\nmoe_backend=%s\ngpu_memory_utilization=%s\ndatasets_cache=%s\nray_local_root=%s\nnuma_membind_disabled=%s\nforce_rebuild_venvs=%s\nactor_venv_root=%s\nsha=%s\nsource_payload_sha=%s\nsource_archive_override=%s\nsource_archive_sha256=%s\nray_memory_usage_threshold=%s\nrun=%s\n' \
   "${CLUSTER}" "${MODEL}" "${MODE}" "${ARM}" "${TOPOLOGY}" "${CONFIG}" "${NUM_NODES}" \
   "${SEGMENT_SIZE}" "${MAX_STEPS}" "${USE_SHARED_MODEL}" "${MOE_BACKEND}" \
-  "${GPU_MEMORY_UTILIZATION}" "${DATASETS_CACHE}" \
+  "${GPU_MEMORY_UTILIZATION}" "${DATASETS_CACHE}" "${RAY_LOCAL_ROOT}" \
   "${NRL_DISABLE_NUMA_MEMBIND}" "${NRL_FORCE_REBUILD_VENVS}" "${ACTOR_VENV_ROOT}" "${SOURCE_SHA}" \
   "${SOURCE_PAYLOAD_SHA}" "${SOURCE_ARCHIVE_OVERRIDE}" "${SOURCE_ARCHIVE_SHA256}" \
   "${RAY_memory_usage_threshold:-}" "${RUN_NAME}"
@@ -468,7 +469,7 @@ export VLLM_CACHE_ROOT=${LOCAL_JOB_ROOT}/vllm; \
 export TORCHINDUCTOR_CACHE_DIR=${LOCAL_JOB_ROOT}/inductor; \
 export TRITON_CACHE_DIR=${LOCAL_JOB_ROOT}/triton; \
 export UV_CACHE_DIR=${LOCAL_JOB_ROOT}/uv; \
-export RAY_TMPDIR=${LOCAL_JOB_ROOT}/ray; \
+export RAY_TMPDIR=${RAY_LOCAL_ROOT}/\${SLURM_JOB_ID}; \
 export PYTHONPATH=${RUN_REPO}:${RUN_REPO}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:${RUN_REPO}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM; \
 export FLA_TILELANG=0; \
 export NRL_DISABLE_NUMA_MEMBIND=${NRL_DISABLE_NUMA_MEMBIND}; \
@@ -477,8 +478,8 @@ export NRL_IGNORE_VERSION_MISMATCH=${NRL_IGNORE_VERSION_MISMATCH}; \
 ${COMMAND}"
 
 SETUP_COMMAND="set -euo pipefail; \
-rm -rf ${LOCAL_JOB_ROOT}; \
-mkdir -p ${RUN_REPO} ${LOCAL_JOB_ROOT}/hf/hub ${LOCAL_JOB_ROOT}/hf/datasets ${LOCAL_JOB_ROOT}/vllm ${LOCAL_JOB_ROOT}/inductor ${LOCAL_JOB_ROOT}/triton ${LOCAL_JOB_ROOT}/uv ${LOCAL_JOB_ROOT}/ray; \
+rm -rf ${LOCAL_JOB_ROOT} ${RAY_LOCAL_ROOT}/\${SLURM_JOB_ID}; \
+mkdir -p ${RUN_REPO} ${LOCAL_JOB_ROOT}/hf/hub ${LOCAL_JOB_ROOT}/hf/datasets ${LOCAL_JOB_ROOT}/vllm ${LOCAL_JOB_ROOT}/inductor ${LOCAL_JOB_ROOT}/triton ${LOCAL_JOB_ROOT}/uv ${RAY_LOCAL_ROOT}/\${SLURM_JOB_ID}; \
 tar -xf ${SOURCE_ARCHIVE} -C ${RUN_REPO}; \
 ${MODEL_STAGE_COMMAND} \
 ${DATASET_STAGE_COMMAND}"
@@ -531,7 +532,7 @@ export SETUP_COMMAND
 export GPUS_PER_NODE=4
 export CPUS_PER_WORKER=${CPUS_PER_WORKER:-144}
 export BASE_LOG_DIR="${RUN_ROOT}"
-export RAY_TMPDIR_ROOT="${LOCAL_JOB_ROOT}/ray"
+export RAY_TMPDIR_ROOT="${RAY_LOCAL_ROOT}"
 
 SBATCH_MODE=()
 if [[ "${ACTION}" == test-only ]]; then
