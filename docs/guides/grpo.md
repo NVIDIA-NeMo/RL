@@ -627,6 +627,16 @@ and the forward/backward work on rejected sequences. The rescaling restores
 normalization over surviving tokens before clipping; it does not introduce
 a different clipping threshold.
 
+The following Qwen2.5-Math-1.5B snapshot compares the two modes with seed 42
+on eight GB300 GPUs (two nodes). The reward curves closely track over the
+shared steps. Mean step time over steps 51–381 is 6.67 seconds with in-loss
+filtering versus 8.05 seconds with separate-forward filtering, a 17.1% reduction.
+The timing axis is zoomed to 4–11 seconds; all spikes remain in the averages.
+This snapshot includes 450 steps for `true` and 381 for `false` and is a
+single-seed comparison, not a guarantee of equivalent convergence.
+
+![Train reward, token multiplicative probability error, and step time for single-forward versus separate-forward sequence-logprob filtering.](../assets/grpo-qwen-single-forward-comparison.png)
+
 #### Overlong Filtering
 
 This feature is controlled by the parameter `overlong_filtering`. It filters out sequences that exceed a predefined maximum length, helping maintain computational efficiency and model stability. When `overlong_filtering=True`, samples that reach `max_total_sequence_length` without producing an end-of-text token are excluded from loss computation. This reduces noise from penalizing generations that may be high-quality but exceed the sequence length limit.
