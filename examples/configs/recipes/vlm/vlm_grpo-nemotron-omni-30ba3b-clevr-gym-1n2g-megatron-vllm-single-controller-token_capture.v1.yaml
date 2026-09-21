@@ -5,6 +5,9 @@
 # supplies the data paths, the 1 trainer + 1 generator split, and the step
 # budget. Token capture requires the Gym rollout path, so the native CLEVR
 # dataset/environment of the parent recipe are swapped for Gym rows here.
+# Prefix caching stays off (hybrid-Mamba align cache mode asserts chunked
+# prefill) and the parent's mm_processor_cache_gb=0 keeps concrete pixels
+# available to the capture host.
 defaults: ./vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron-single-controller-async.v1.yaml
 data:
   _override_: true
@@ -47,15 +50,9 @@ policy:
       async_engine: true
       expose_http_server: true
       logprobs_mode: raw_logprobs
-      # The capture host is the worker's in-process HTTP server; prefix caching
-      # on this hybrid-Mamba model forces mamba_cache_mode=align, which asserts
-      # chunked prefill, so keep it off.
       enable_prefix_caching: false
       enforce_eager: true
-      reset_encoder_cache_after_weight_update: false
     vllm_kwargs:
-      # No processor cache: the worker needs concrete pixels to capture.
-      mm_processor_cache_gb: 0
       limit_mm_per_prompt:
         image: 2
       skip_mm_profiling: true
