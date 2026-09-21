@@ -559,6 +559,14 @@ class RolloutReassembler:
             "finalize/calls_per_rollout": (
                 sum(len(row.staging_keys) for row in rows) / len(rows)
             ),
+            # Fraction of valid rows that carry captured media. 1.0 on a VLM
+            # run is the signal that the learner trains on captured pixels
+            # rather than text-only rows; text runs report 0.0.
+            "finalize/media_row_rate": (
+                sum(1 for row in valid_rows if row.media) / len(valid_rows)
+                if valid_rows
+                else 0.0
+            ),
         }
         # Ledger-derived admission counters (per group): each manifest row
         # carries its admission mode. token_in_rate near 1.0 is the capture

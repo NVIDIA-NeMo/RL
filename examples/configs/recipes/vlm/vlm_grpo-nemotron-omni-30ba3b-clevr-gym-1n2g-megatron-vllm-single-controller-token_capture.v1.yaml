@@ -1,0 +1,68 @@
+# Nemotron-Omni CLEVR through NeMo-Gym (string_match verifier) with async vLLM
+# generation, a Megatron learner, and vLLM media token capture enabled.
+#
+# Functional-test recipe: tests/functional/nemotron_omni_clevr_vllm_token_capture_single_controller_1n2g.sh
+# supplies the data paths, the 1 trainer + 1 generator split, and the step
+# budget. Token capture requires the Gym rollout path, so the native CLEVR
+# dataset/environment of the parent recipe are swapped for Gym rows here.
+defaults: ./vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron-single-controller-async.v1.yaml
+data:
+  _override_: true
+  max_input_seq_length: null
+  shuffle: true
+  num_workers: 0
+  use_multiple_dataloader: false
+  train:
+    data_path: /path/to/clevr_gym/train.jsonl
+  validation:
+    data_path: /path/to/clevr_gym/val.jsonl
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+env:
+  _override_: true
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  should_mask_flagged_samples: true
+  nemo_gym:
+    is_trajectory_collection: false
+    skip_venv_if_present: true
+    port_range_low: 5000
+    port_range_high: 5999
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/string_match/configs/string_match.yaml
+    string_match_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 1
+policy:
+  generation:
+    backend: vllm
+    refit_transport: null
+    vllm_cfg:
+      async_engine: true
+      expose_http_server: true
+      logprobs_mode: raw_logprobs
+      # The capture host is the worker's in-process HTTP server; prefix caching
+      # on this hybrid-Mamba model forces mamba_cache_mode=align, which asserts
+      # chunked prefill, so keep it off.
+      enable_prefix_caching: false
+      enforce_eager: true
+      reset_encoder_cache_after_weight_update: false
+    vllm_kwargs:
+      # No processor cache: the worker needs concrete pixels to capture.
+      mm_processor_cache_gb: 0
+      limit_mm_per_prompt:
+        image: 2
+      skip_mm_profiling: true
+      mamba_ssm_cache_dtype: float32
+      kernel_config:
+        enable_flashinfer_autotune: false
+        moe_backend: triton
+token_capture:
+  enabled: true
+  staging_partition: rollout_staging

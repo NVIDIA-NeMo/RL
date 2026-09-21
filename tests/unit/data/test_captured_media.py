@@ -270,6 +270,8 @@ def test_publication_packs_mixed_rows_and_cleans_all_call_media(dp):
         canonical_sample_ids=["g0_g0", "g0_g1", "g0_g2"],
     )
     assert result.valid_row_count == 2
+    # One of the two valid rows carries media; the rejected row does not count.
+    assert result.metrics["finalize/media_row_rate"] == 0.5
     fields = dp.get_samples(result.meta.sample_ids, "train", result.meta.fields)
     assert fields["sample_mask"].tolist() == [1.0, 1.0, 0.0]
     materialized = dict(fields)
@@ -911,6 +913,7 @@ def test_video_publication_with_text_and_rejected_siblings(dp):
         canonical_sample_ids=["g0_g0", "g0_g1", "g0_g2"],
     )
     assert result.valid_row_count == 2
+    assert result.metrics["finalize/media_row_rate"] == 0.5
     fields = dict(dp.get_samples(result.meta.sample_ids, "train", result.meta.fields))
     reassemble_packed_multimodal(fields, result.meta.tags)
     for name in ("pixel_values", "imgs_sizes", "num_frames"):

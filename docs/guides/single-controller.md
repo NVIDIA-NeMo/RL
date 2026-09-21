@@ -425,7 +425,11 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   the sink, and a failed discard is logged at ERROR.
   Upgrade the paired Gym and RL changes together; checkpoints written with the
   former `media_capture`/tensor-attachment format or with the two-write
-  `media_geometry_json` layout are not compatible.
+  `media_geometry_json` layout are not compatible. The GB200 functional shard
+  `L1_Functional_Tests_GB200_Vllm_Omni_Single_Controller.sh` smokes this path
+  end to end (CLEVR-style images through Gym `string_match`, native video
+  through Gym `mcqa`) and gates on `train/finalize/media_row_rate == 1`, the
+  metric that reports the fraction of learner rows built from captured media.
   This integration does not require Megatron inference capture support or a new
   Megatron-LM pin. Compaction, mixed image/video conversations, native audio,
   video token pruning, static tiling (`num_tiles`), other processor families,
