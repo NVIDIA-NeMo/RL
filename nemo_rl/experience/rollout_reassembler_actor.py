@@ -23,12 +23,12 @@ import ray
 
 from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
-from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS
+from nemo_rl.experience.metric_utils import RolloutTelemetry, calculate_single_metric
 from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup, RolloutReassembler
 from nemo_rl.utils.rpc_guard import assert_metadata_only
-from nemo_rl.experience.metric_utils import RolloutTelemetry, calculate_single_metric
 from nemo_rl.utils.venvs import make_actor_runtime_env
 
 if TYPE_CHECKING:
