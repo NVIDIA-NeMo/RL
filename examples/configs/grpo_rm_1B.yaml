@@ -21,6 +21,9 @@ env:
       num_nodes: 1
     # TODO: Mcore path support https://github.com/NVIDIA-NeMo/RL/issues/1154
     dtensor_cfg:
+      checkpoint:
+        model_save_format: "safetensors"
+        save_consolidated: "false"
       _v2: true
       enabled: true
       sequence_parallel: false

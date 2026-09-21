@@ -23,27 +23,33 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-# This module is collected by catch-all unit-test lanes that intentionally do
-# not install the mcore extra. Skip before importing MBridge so those lanes can
-# deselect the mcore-marked tests without failing during collection.
+# This module is collected by every unit-test shard, including lanes that do
+# not install the Megatron-Bridge extra. Skip at collection time there instead
+# of turning an unrelated shard into an import error.
+pytest.importorskip("megatron.core")
 pytest.importorskip("megatron.bridge")
 
-from megatron.bridge.models.nemotron_omni.nemotron_omni_provider import (
+from megatron.bridge.models.nemotron_omni.nemotron_omni_provider import (  # noqa: E402
     NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT,
     NemotronOmniModelProvider,
 )
-from megatron.core import dist_checkpointing, parallel_state
-from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core import dist_checkpointing, parallel_state  # noqa: E402
+from megatron.core.distributed import DistributedDataParallelConfig  # noqa: E402
+from megatron.core.tensor_parallel.random import (  # noqa: E402
+    model_parallel_cuda_manual_seed,
+)
+from megatron.core.transformer.enums import AttnBackend  # noqa: E402
 
-from nemo_rl.data.multimodal_utils import PackedTensor
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import (
+from nemo_rl.data.multimodal_utils import PackedTensor  # noqa: E402
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict  # noqa: E402
+from nemo_rl.distributed.model_utils import (  # noqa: E402
     from_parallel_logits_to_logprobs_packed_sequences,
 )
-from nemo_rl.models.megatron.data import get_microbatch_iterator, process_microbatch
-from nemo_rl.models.megatron.train import (
+from nemo_rl.models.megatron.data import (  # noqa: E402
+    get_microbatch_iterator,
+    process_microbatch,
+)
+from nemo_rl.models.megatron.train import (  # noqa: E402
     LogprobsPostProcessor,
     megatron_forward_backward,
 )
@@ -79,7 +85,7 @@ class _TinyOmniProvider(NemotronOmniModelProvider):
     use_vision_backbone_fp8_arch: bool = False
     vision_proj_ffn_hidden_size: int = 256
     pipeline_model_parallel_size: int = 1
-    use_cpu_initialization: bool = True
+    use_cpu_initialization: bool = False
     gradient_accumulation_fusion: bool = False
     nemotron_omni_contract: str = NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT
 
@@ -117,6 +123,8 @@ def _build_distributed_model(
     sequence_parallel: bool = False,
     language_layer_pattern: str = "M",
     attention_backend: AttnBackend | None = None,
+    mtp_num_layers: int | None = None,
+    mtp_hybrid_override_pattern: str | None = None,
 ):
     if parallel_state.model_parallel_is_initialized():
         parallel_state.destroy_model_parallel()
@@ -140,6 +148,9 @@ def _build_distributed_model(
     }
     if attention_backend is not None:
         provider_kwargs["attention_backend"] = attention_backend
+    if mtp_num_layers is not None:
+        provider_kwargs["mtp_num_layers"] = mtp_num_layers
+        provider_kwargs["mtp_hybrid_override_pattern"] = mtp_hybrid_override_pattern
     provider = _TinyOmniProvider(
         **provider_kwargs,
     )
@@ -151,6 +162,7 @@ def _build_distributed_model(
             use_distributed_optimizer=False,
             check_for_nan_in_grad=True,
         ),
+        use_cpu_initialization=False,
         wrap_with_ddp=True,
         mixed_precision_wrapper=None,
     )
@@ -234,7 +246,8 @@ def _deduplicated_expanded_fixture(device: torch.device):
             "pixel_values": PackedTensor(
                 [image.clone(), image.clone()],
                 dim_to_pack=0,
-                pad_to_max_shape=True,
+                preprocess_mode="patchify",
+                preprocess_kwargs={"patch_dim": 16},
             ),
             "imgs_sizes": PackedTensor(
                 [image_size.clone(), image_size.clone()],
@@ -245,7 +258,8 @@ def _deduplicated_expanded_fixture(device: torch.device):
     pixel_row = PackedTensor(
         image,
         dim_to_pack=0,
-        pad_to_max_shape=True,
+        preprocess_mode="patchify",
+        preprocess_kwargs={"patch_dim": 16},
     ).enable_deduplication()
     image_size_row = PackedTensor(
         image_size,
@@ -662,3 +676,91 @@ def _run_pipeline_forward_contract(rank: int, world_size: int) -> None:
 
 def test_nemotron_omni_pp2_scheduled_forward_contract(distributed_test_runner):
     distributed_test_runner(_run_pipeline_forward_contract, world_size=2)
+
+
+def _run_mtp_multimodal_forward_contract(rank: int, world_size: int) -> None:
+    """Multimodal batch through the NeMo-RL forward with an MTP-enabled hybrid LM.
+
+    HybridModel asserts position_ids are present whenever its MTP block runs.
+    The worker builds them for caller-packed models, and model_forward must keep
+    them on multimodal batches for this model instead of dropping them.
+    """
+    assert world_size == 2
+    model = _build_distributed_model(
+        context_parallel_size=2,
+        mtp_num_layers=1,
+        mtp_hybrid_override_pattern="M",
+    )
+    model.eval()
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    input_ids, lengths, images, image_sizes = _expanded_fixture(device)
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": lengths,
+            "pixel_values": PackedTensor(
+                [images[0:1], images[1:2]],
+                dim_to_pack=0,
+            ),
+            "imgs_sizes": PackedTensor(
+                [image_sizes[0:1], image_sizes[1:2]],
+                dim_to_pack=0,
+            ),
+        }
+    )
+    data.micro_batch_indices = [[[0, 2]]]
+    data.micro_batch_lengths = [[int(lengths.sum().item())]]
+    cfg = {
+        "dynamic_batching": {"enabled": False},
+        "sequence_packing": {"enabled": True},
+        "make_sequence_length_divisible_by": 4,
+        "megatron_cfg": {
+            "tensor_model_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_size": 2,
+            "sequence_parallel": False,
+            "mtp_num_layers": 1,
+        },
+    }
+    (
+        data_iterator,
+        num_microbatches,
+        micro_batch_size,
+        _,
+        padded_seq_length,
+    ) = get_microbatch_iterator(
+        data,
+        cfg,
+        mbs=2,
+        straggler_timer=None,
+        model_slices_context_parallel_inputs=True,
+        mtp_enabled=True,
+    )
+
+    with torch.no_grad():
+        results = megatron_forward_backward(
+            model=model,
+            data_iterator=data_iterator,
+            num_microbatches=num_microbatches,
+            seq_length=padded_seq_length,
+            mbs=micro_batch_size,
+            post_processing_fn=LogprobsPostProcessor(cfg),
+            forward_only=True,
+            model_slices_context_parallel_inputs=True,
+        )
+
+    assert len(results) == num_microbatches
+    for result in results:
+        assert torch.isfinite(result["logprobs"]).all()
+        assert result["logprobs"].shape == input_ids.shape
+
+    del model, results
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.distributed.barrier()
+    parallel_state.destroy_model_parallel()
+
+
+def test_nemotron_omni_cp2_mtp_multimodal_logprob_forward(distributed_test_runner):
+    distributed_test_runner(_run_mtp_multimodal_forward_contract, world_size=2)

@@ -305,6 +305,17 @@ def test_actor_mask_metric_fragments_have_exact_global_mean_and_preserve_kl():
     assert metrics["kl_penalty"] == pytest.approx(expected_kl.item())
 
 
+@pytest.mark.parametrize(
+    "invalid_penalty",
+    [-0.01, float("nan"), float("inf"), float("-inf")],
+)
+def test_clipped_pg_loss_config_rejects_invalid_reference_kl_penalty(
+    invalid_penalty: float,
+) -> None:
+    with pytest.raises(ValueError):
+        ClippedPGLossConfig(reference_policy_kl_penalty=invalid_penalty)
+
+
 def setup_dpo_loss_test_data(vocab_size=16, batch_size=1):
     seq_len = 4
     data = {

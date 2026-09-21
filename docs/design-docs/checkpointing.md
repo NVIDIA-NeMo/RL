@@ -2,6 +2,23 @@
 
 NeMo RL provides two checkpoint formats for Hugging Face models: Torch distributed and Hugging Face format. Torch distributed is used by default for efficiency, and Hugging Face format is provided for compatibility with Hugging Face's `AutoModel.from_pretrained` API. Note that Hugging Face format checkpoints save only the model weights, ignoring the optimizer states. It is recommended to use Torch distributed format to save intermediate checkpoints and to save a Hugging Face checkpoint only at the end of training. 
 
+## Automodel consolidated checkpoints
+
+Automodel-backed policies accept three canonical values for
+`policy.dtensor_cfg.checkpoint.save_consolidated`: quoted `"false"`, `"final"`, and
+`"every"`.
+`"final"` exports Hugging Face weights only after a completed training run;
+timeout checkpoints remain resumable distributed checkpoints and are not treated as
+final saves.
+
+> [!IMPORTANT]
+> NeMo RL no longer accepts YAML booleans for `save_consolidated`. Migrate
+> `checkpointing.save_consolidated: false` to
+> `policy.dtensor_cfg.checkpoint.save_consolidated: "false"`, and migrate
+> `checkpointing.save_consolidated: true` to
+> `policy.dtensor_cfg.checkpoint.save_consolidated: "every"`.
+> PPO value models use the corresponding `value.dtensor_cfg.checkpoint` fields.
+
 ## Converting Torch Distributed Checkpoints to Hugging Face Format
 
 A checkpoint converter is provided to convert a Torch distributed checkpoint to Hugging Face format after training:
@@ -42,7 +59,7 @@ uv run --extra mcore examples/converters/convert_megatron_to_hf.py \
 When training with [LoRA (Low-Rank Adaptation)](../guides/lora.md) on the Megatron backend, the resulting checkpoint contains only the adapter weights alongside the base model configuration. The `convert_lora_to_hf.py` script supports two export modes:
 
 - **Merged**: fold the LoRA adapter into the base model and export a single standalone HuggingFace checkpoint.
-- **Adapter-only**: export only the LoRA adapter weights in [HuggingFace PEFT](https://huggingface.co/docs/peft) format, keeping the base model separate.
+- **Adapter-only**: export only the LoRA adapter weights in [HuggingFace PEFT](https://huggingface.co/docs/peft/en/index) format, keeping the base model separate.
 
 This script requires Megatron-Core, so make sure to launch with the `mcore` extra.
 

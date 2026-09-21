@@ -6,8 +6,6 @@ checkpointing:
   keep_top_k: 1000000
   save_period: 4
   checkpoint_must_save_by: null
-  model_save_format: "safetensors"
-  save_consolidated: false
   save_optimizer: true
 
 grpo:
@@ -236,6 +234,7 @@ policy:
     vllm_cfg:
       async_engine: true
       precision: ${policy.precision}
+      refit_with_reload_api: false
       kv_cache_dtype: "auto"
       tensor_parallel_size: 8
       pipeline_parallel_size: 1

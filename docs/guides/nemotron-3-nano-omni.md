@@ -14,8 +14,11 @@ The maintained Nemotron recipes enable `grpo.deduplicate_multimodal_data` to
 share immutable model-ready media segments across logical GRPO generations and
 re-intern them after batching, replay, and sharding. The representation supports
 image, video, and audio payload keys, although the maintained recipes currently
-qualify image inputs only. Deduplication currently requires the vLLM generation
-backend and `data_plane.enabled=false`.
+qualify image inputs only. Deduplication requires the vLLM generation backend.
+It works with `data_plane.enabled=true` except on NeMo-Gym runs, where the
+TransferQueue trainer does not attach the initial Gym image payloads. On the
+data plane it saves driver RAM only: `PackedTensor.to_wire` emits one row per
+*logical* row, so the wire payload is `O(G x images)` either way.
 
 `grpo.debug_payload_metrics` emits logical, physical, and protocol-5 serialized
 payload sizes for the exact Ray boundaries used by generation, replay, logprobs,
@@ -33,7 +36,7 @@ Both share the same checkpoint, model code, and reward pipeline; they differ onl
 
 ### Recipe 1 — CLEVR-CoGenT (single-node)
 
-The CLEVR-CoGenT recipe uses [`examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml`](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml). It expects 8 GPUs on a single node, EP=8 across the experts, and TP=8 in vLLM.
+The CLEVR-CoGenT recipe uses [`examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml`](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml). It expects 8 GPUs on a single node, EP=8 across the experts, and TP=8 in vLLM.
 
 Key knobs in the config:
 
@@ -56,7 +59,7 @@ From inside the container on an 8-GPU node:
 ```bash
 export NRL_MAMBA_PREFILL_DECODE_SYNC="${NRL_MAMBA_PREFILL_DECODE_SYNC:-1}"
 
-uv run examples/run_vlm_grpo.py --config examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml \
+uv run examples/run_vlm_grpo.py --config examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml \
     cluster.gpus_per_node=8 \
     cluster.num_nodes=1
 ```
@@ -64,7 +67,7 @@ uv run examples/run_vlm_grpo.py --config examples/configs/recipes/vlm/vlm_grpo-n
 To override the model path or any other YAML field, append Hydra-style overrides:
 
 ```bash
-uv run examples/run_vlm_grpo.py --config examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml \
+uv run examples/run_vlm_grpo.py --config examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml \
     policy.model_name=/path/to/your/checkpoint \
     cluster.gpus_per_node=8 cluster.num_nodes=1
 ```

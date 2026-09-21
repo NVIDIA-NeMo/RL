@@ -16,7 +16,7 @@ import math
 import random
 import warnings
 from functools import partial, wraps
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 import torch
@@ -27,9 +27,16 @@ from transformers import (
 )
 
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
+from nemo_rl.data.deepseek_v4_tokenizer import (
+    get_deepseek_v4_tokenizer,
+    should_use_deepseek_v4_chat_template,
+)
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.fastokens import maybe_patch_fastokens
 from nemo_rl.utils.logger import Logger
+
+if TYPE_CHECKING:
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
 ACTOR_TOKEN_COUNT_METRIC = "num_valid_actor_tokens"
@@ -147,7 +154,7 @@ def calculate_baseline_and_std_per_prompt(
     valid_mask: torch.Tensor,
     leave_one_out_baseline: bool = True,
     std_rewards: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Function to compute a baseline for each (prompt, response) pair in the batch.
 
     The same baseline is calculated for each prompt. Samples set to 0 in 'valid_mask'
@@ -165,7 +172,13 @@ def calculate_baseline_and_std_per_prompt(
                                   shaped reward.
 
     Returns:
-    tensor (b,), tensor (b,) of baselines and std on the same device as 'rewards'
+    tensor (b,), tensor (b,), bool tensor (b,) of baselines, std, and a per-sample
+    boolean that is True if the sample group distribution associated with the sample
+    is trivial, i.e. all the rewards are a single value.
+
+    Any non-zero std computed from a trivial distribution is float32 rounding noise
+    which can create explosive advantages during normalization that should not be
+    used for GRPO training.
     """
     if std_rewards is None:
         std_rewards = rewards
@@ -174,6 +187,7 @@ def calculate_baseline_and_std_per_prompt(
     baseline = torch.zeros_like(rewards)
     sq_baseline = torch.zeros_like(rewards)
     std = torch.zeros_like(rewards)
+    is_trivial_distribution = torch.ones_like(rewards, dtype=torch.bool)
     device_ordinal = rewards.get_device()
     if device_ordinal == -1:
         reward_device = torch.device("cpu")
@@ -223,9 +237,22 @@ def calculate_baseline_and_std_per_prompt(
                 )
                 / num_valid
             )
+            comparison_mask = baseline_mask_matrix.bool() & valid_mask[
+                prompt_idx
+            ].bool().unsqueeze(0)
+            comparison_rewards = (
+                std_rewards[prompt_idx].unsqueeze(0).expand(len(prompt_idx), -1)
+            )
+            comparison_min = comparison_rewards.masked_fill(
+                ~comparison_mask, torch.inf
+            ).amin(dim=1)
+            comparison_max = comparison_rewards.masked_fill(
+                ~comparison_mask, -torch.inf
+            ).amax(dim=1)
 
             baseline[prompt_idx] = prompt_baseline
             sq_baseline[prompt_idx] = std_prompt_baseline_square
+            is_trivial_distribution[prompt_idx] = comparison_min == comparison_max
             std[prompt_idx] = (
                 (
                     (std_prompt_baseline_square - std_prompt_baseline.square())
@@ -235,7 +262,31 @@ def calculate_baseline_and_std_per_prompt(
                 .nan_to_num(0)
             )
 
-    return baseline, std
+    return baseline, std, is_trivial_distribution
+
+
+def calculate_trivial_reward_distributions(
+    prompts: torch.Tensor,
+    rewards: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return an all-or-nothing exact-equality mask for each prompt group.
+
+    Unlike the per-sample mask returned by
+    ``calculate_baseline_and_std_per_prompt``, this always compares the full
+    valid reward group. It is therefore independent of leave-one-out baseline
+    semantics and safe to use for prompt-level dynamic sampling.
+    """
+    is_trivial_prompt_distribution = torch.ones_like(rewards, dtype=torch.bool)
+    for prompt in torch.unique(prompts, dim=0):
+        prompt_mask = (prompts == prompt).all(1)
+        valid_rewards = rewards[prompt_mask & valid_mask.bool()]
+        is_trivial = valid_rewards.numel() <= 1 or (
+            valid_rewards.amin() == valid_rewards.amax()
+        )
+        is_trivial_prompt_distribution[prompt_mask] = is_trivial
+
+    return is_trivial_prompt_distribution
 
 
 def surpress_user_warnings(f):  # type: ignore
@@ -433,7 +484,18 @@ def get_tokenizer(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    if "chat_template" in tokenizer_config:
+    use_deepseek_v4_tokenizer = should_use_deepseek_v4_chat_template(tokenizer_config)
+    chat_template_kwargs = tokenizer_config.get("chat_template_kwargs")
+    if chat_template_kwargs is not None:
+        assert isinstance(chat_template_kwargs, dict), (
+            "chat_template_kwargs should be a dictionary"
+        )
+    if use_deepseek_v4_tokenizer:
+        print("Using vLLM 0.25.1's DeepSeek V4 chat renderer")
+        tokenizer = get_deepseek_v4_tokenizer(tokenizer, chat_template_kwargs)
+        if processor is not None:
+            processor.tokenizer = tokenizer
+    elif "chat_template" in tokenizer_config:
         if tokenizer_config["chat_template"] is None:
             print("Using passthrough chat template")
             tokenizer.chat_template = COMMON_CHAT_TEMPLATES.passthrough_prompt_response
@@ -451,15 +513,9 @@ def get_tokenizer(
     else:
         print("No chat template provided, using tokenizer's default")
 
-    if (
-        "chat_template_kwargs" in tokenizer_config
-        and tokenizer_config["chat_template_kwargs"] is not None
-    ):
-        assert isinstance(tokenizer_config["chat_template_kwargs"], dict), (
-            "chat_template_kwargs should be a dictionary"
-        )
+    if chat_template_kwargs is not None and not use_deepseek_v4_tokenizer:
         tokenizer.apply_chat_template = partial(
-            tokenizer.apply_chat_template, **tokenizer_config["chat_template_kwargs"]
+            tokenizer.apply_chat_template, **chat_template_kwargs
         )
 
     # The "tokenizer" is passed to the policy workers only to use the pad/eos/bos tokens for extra padding and processing of the tokenized messages. That is the only reason it is needed.
@@ -517,7 +573,9 @@ def get_tokenizer(
     return tokenizer if processor is None else processor
 
 
-def maybe_pad_last_batch(batch: dict, dp_size: int, mbs: int) -> dict:
+def maybe_pad_last_batch(
+    batch: "BatchedDataDict[Any]", dp_size: int, mbs: int
+) -> "BatchedDataDict[Any]":
     """Pads the given batch so that its size is divisible by (mbs * dp_size).
 
     Args:
@@ -531,48 +589,39 @@ def maybe_pad_last_batch(batch: dict, dp_size: int, mbs: int) -> dict:
     min_padding = (math.ceil(batch.size / (mbs * dp_size)) * mbs * dp_size) - batch.size
     if min_padding > 0:
         print(f"Padding last validation batch with {min_padding} padding samples")
-        # Pad input_ids
-        batch["input_ids"] = torch.cat(
-            [
-                batch["input_ids"],
-                batch["input_ids"][-1].unsqueeze(0).repeat(min_padding, 1),
-            ]
-        )
-        # Pad input_lengths
-        batch["input_lengths"] = torch.cat(
-            [
-                batch["input_lengths"],
-                batch["input_lengths"][-1].unsqueeze(0).repeat(min_padding),
-            ]
-        )
-        if "token_mask" in batch:
-            # Pad token_mask
-            batch["token_mask"] = torch.cat(
-                [
-                    batch["token_mask"],
-                    batch["token_mask"][-1].unsqueeze(0).repeat(min_padding, 1),
-                ]
-            )
-        # Pad sample_mask
-        batch["sample_mask"] = torch.cat(
-            [
-                batch["sample_mask"],
-                torch.zeros_like(batch["sample_mask"][-1])
-                .unsqueeze(0)
-                .repeat(min_padding),
-            ]
-        )
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
-        if "reference_policy_logprobs" in batch:
-            # Pad reference_policy_logprobs
-            batch["reference_policy_logprobs"] = torch.cat(
-                [
-                    batch["reference_policy_logprobs"],
-                    batch["reference_policy_logprobs"][-1]
-                    .unsqueeze(0)
-                    .repeat(min_padding, 1),
-                ]
-            )
+        if "pair_index" in batch and "is_chosen" in batch:
+            if min_padding % 2 != 0:
+                raise ValueError(
+                    "Preference validation batches must be padded by complete pairs."
+                )
+            # Padding runs before sequence packing, while preference rows are
+            # still interleaved. Duplicate complete media-bearing pairs so all
+            # batch-aligned fields remain consistent.
+            pair_repeats = min_padding // 2
+            padding_indices = [batch.size - 2, batch.size - 1] * pair_repeats
+        else:
+            padding_indices = [batch.size - 1] * min_padding
+
+        padding_batch = batch.select_indices(padding_indices)
+        padding_batch["sample_mask"] = torch.zeros_like(padding_batch["sample_mask"])
+
+        if "pair_index" in padding_batch and "is_chosen" in padding_batch:
+            first_padding_pair = int(batch["pair_index"].max().item()) + 1
+            padding_batch["pair_index"] = torch.arange(
+                first_padding_pair,
+                first_padding_pair + min_padding // 2,
+                dtype=batch["pair_index"].dtype,
+                device=batch["pair_index"].device,
+            ).repeat_interleave(2)
+            padding_batch["is_chosen"] = torch.tensor(
+                [True, False],
+                dtype=batch["is_chosen"].dtype,
+                device=batch["is_chosen"].device,
+            ).repeat(min_padding // 2)
+
+        batch = BatchedDataDict.from_batches([batch, padding_batch])
     return batch
 
 

@@ -21,6 +21,12 @@ This module provides different advantage estimation strategies:
 - RawRewardAdvantageEstimator: Raw reward as advantage with optional batch normalization (no baseline, no value model)
 - GeneralizedAdvantageEstimator: Generalized Advantage Estimation (GAE) with temporal bootstrapping
 - OPDAdvantageEstimator: Multi-Teacher On-Policy Distillation (MOPD) token-level distillation advantages
+
+Every group-relative estimator (GRPO, GDPO, Reinforce++) accepts ``valid_mask``
+and must honor it: the SingleController always passes ``final_sample_mask`` as
+``valid_mask`` so token-capture placeholder rows (and sequence-logprob-error
+masked rows) do not vote in their siblings' baselines.
+
 Reference papers:
 - ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
 - Reinforce++: https://arxiv.org/abs/2501.03262
@@ -82,7 +88,7 @@ class GRPOAdvantageEstimator:
         self.use_leave_one_out_baseline = estimator_config.use_leave_one_out_baseline
         self.normalize_rewards = estimator_config.normalize_rewards
 
-    def compute_advantage(self, prompt_ids, rewards, mask, **kwargs):
+    def compute_advantage(self, prompt_ids, rewards, mask, valid_mask=None, **kwargs):
         """Compute GRPO advantages.
 
         Args:
@@ -90,15 +96,24 @@ class GRPOAdvantageEstimator:
             rewards: Tensor of shape [batch_size] containing reward for each sample.
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
                   Used only for expanding advantages to token-level shape.
+            valid_mask: Optional tensor of shape [batch_size], 1.0 for samples whose
+                  reward should participate in the per-prompt baseline/std. Token-capture
+                  placeholder rows carry 0.0 (their sample_mask already excludes them
+                  from the loss; excluding them here keeps siblings' baselines unbiased).
+                  None keeps the legacy all-valid behavior.
             **kwargs: Additional arguments (unused).
 
         Returns:
             Advantages tensor of shape [batch_size, seq_len].
         """
-        baseline, std = calculate_baseline_and_std_per_prompt(
+        (
+            baseline,
+            std,
+            is_trivial_distribution,
+        ) = calculate_baseline_and_std_per_prompt(
             prompt_ids,
             rewards,
-            torch.ones_like(rewards),
+            torch.ones_like(rewards) if valid_mask is None else valid_mask.float(),
             leave_one_out_baseline=self.use_leave_one_out_baseline,
         )
         advantages = (rewards - baseline).unsqueeze(-1)
@@ -106,9 +121,9 @@ class GRPOAdvantageEstimator:
         if self.normalize_rewards:
             # don't sharpen the ones with no variation
             epsilon = 1e-6
-            non_zero_std_mask = std > 0
-            advantages[non_zero_std_mask] = advantages[non_zero_std_mask] / (
-                std.unsqueeze(-1)[non_zero_std_mask] + epsilon
+            normalize_mask = (std > 0) & ~is_trivial_distribution
+            advantages[normalize_mask] = advantages[normalize_mask] / (
+                std.unsqueeze(-1)[normalize_mask] + epsilon
             )
 
         return advantages.expand(mask.shape)
@@ -135,6 +150,7 @@ class GDPOAdvantageEstimator:
         rewards,
         mask,
         repeated_batch,
+        valid_mask=None,
         **kwargs,
     ):
         """Compute GDPO advantages.
@@ -144,6 +160,11 @@ class GDPOAdvantageEstimator:
             rewards: Unused; for interface consistency.
             repeated_batch: Batch containing named reward component keys (e.g. reward/correctness, reward/format).
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
+            valid_mask: Optional tensor of shape [batch_size], 1.0 for samples whose
+                  reward components should participate in the per-prompt baseline/std.
+                  Token-capture placeholder rows carry 0.0 (their sample_mask already
+                  excludes them from the loss; excluding them here keeps siblings'
+                  baselines unbiased). None keeps the legacy all-valid behavior.
             **kwargs: Additional arguments (unused).
 
         Returns:
@@ -168,7 +189,8 @@ class GDPOAdvantageEstimator:
                 "Provide exactly one weight per component, ordered alphabetically by "
                 "component name (matching the sorted reward/<name> keys)."
             )
-        valid = torch.ones_like(repeated_batch[reward_component_keys[0]])
+        reference = repeated_batch[reward_component_keys[0]]
+        valid = torch.ones_like(reference) if valid_mask is None else valid_mask.float()
         leave_one_out = self.use_leave_one_out_baseline
         assert prompt_ids.shape[0] == valid.shape[0], (
             "prompt_ids must match reward batch size; "
@@ -177,7 +199,11 @@ class GDPOAdvantageEstimator:
         advantage_parts = []
         for key in reward_component_keys:
             r = repeated_batch[key]
-            base, std_k = calculate_baseline_and_std_per_prompt(
+            (
+                base,
+                std_k,
+                is_trivial_distribution,
+            ) = calculate_baseline_and_std_per_prompt(
                 prompt_ids,
                 r,
                 valid,
@@ -186,9 +212,9 @@ class GDPOAdvantageEstimator:
             adv_k = (r - base).unsqueeze(-1)
             if self.normalize_rewards:
                 epsilon = 1e-6
-                non_zero_std_mask = std_k > 0
-                adv_k[non_zero_std_mask] = adv_k[non_zero_std_mask] / (
-                    std_k.unsqueeze(-1)[non_zero_std_mask] + epsilon
+                normalize_mask = (std_k > 0) & ~is_trivial_distribution
+                adv_k[normalize_mask] = adv_k[normalize_mask] / (
+                    std_k.unsqueeze(-1)[normalize_mask] + epsilon
                 )
 
             advantage_parts.append(adv_k)
@@ -230,6 +256,7 @@ class ReinforcePlusPlusAdvantageEstimator:
         *,
         logprobs_policy=None,
         logprobs_reference=None,
+        valid_mask=None,
         **kwargs,
     ):
         """Compute Reinforce++ advantages with optional KL penalty.
@@ -242,6 +269,11 @@ class ReinforcePlusPlusAdvantageEstimator:
                   that only considers valid tokens.
             logprobs_policy: Policy log probabilities of shape [batch_size, seq_len], required if use_kl_in_reward.
             logprobs_reference: Reference policy log probabilities of shape [batch_size, seq_len], required if use_kl_in_reward.
+            valid_mask: Optional tensor of shape [batch_size], 1.0 for samples whose
+                  reward should participate in the per-prompt mean baseline. Token-capture
+                  placeholder rows carry 0.0 (their sample_mask already excludes them from
+                  the loss; excluding them here keeps siblings' baselines unbiased).
+                  None keeps the legacy all-valid behavior.
             **kwargs: Additional arguments (unused).
 
         Returns:
@@ -249,10 +281,10 @@ class ReinforcePlusPlusAdvantageEstimator:
         """
         # minus baseline
         if self.minus_baseline:
-            mean, _ = calculate_baseline_and_std_per_prompt(
+            mean, _, _ = calculate_baseline_and_std_per_prompt(
                 prompt_ids,
                 rewards,
-                torch.ones_like(rewards),
+                torch.ones_like(rewards) if valid_mask is None else valid_mask.float(),
                 leave_one_out_baseline=False,
             )
             adv = rewards - mean
@@ -481,11 +513,10 @@ class GeneralizedAdvantageEstimator:
         lam_value = self._resolve_lambda_value()
         lam_policy = self._resolve_lambda_policy(mask)
 
-        # If lambdas differ, compute GAE twice (decoupled); otherwise once.
-        need_decouple = (
-            self.gae_lambda_value is not None
-            or self.gae_lambda_policy is not None
-            or self.length_adaptive_alpha > 0
+        # A tensor policy lambda is length-adaptive and may differ per sample.
+        # Scalar overrides only need separate passes when their resolved values differ.
+        need_decouple = isinstance(lam_policy, torch.Tensor) or (
+            lam_value != lam_policy
         )
         if need_decouple:
             _, returns = self._compute_gae(
@@ -505,6 +536,7 @@ class GeneralizedAdvantageEstimator:
                 token_level_rewards,
                 values,
                 mask,
+                gae_lambda=lam_value,
             )
 
         # Whiten advantages (optional) and zero out masked positions (always)
@@ -541,6 +573,38 @@ class GeneralizedAdvantageEstimator:
         lam = gae_lambda if gae_lambda is not None else self.gae_lambda
 
         gen_len = token_level_rewards.shape[-1]
+        if self.gae_gamma == 1.0 and not isinstance(lam, torch.Tensor) and lam == 1.0:
+            print(
+                f"Fast GAE compute activated for lambda={lam}, gamma={self.gae_gamma}",
+                flush=True,
+            )
+
+            # With zero terminal bootstrap, the TD value terms telescope:
+            # A_t = sum_{k=t}^T r_k - V_t. Scan rewards instead of running
+            # one Python/PyTorch iteration per token. Keep tensor-valued lambda
+            # on the general path.
+            masked_rewards = token_level_rewards * mask
+            reward_to_go = (
+                masked_rewards.to(
+                    torch.promote_types(masked_rewards.dtype, values.dtype)
+                )
+                .flip(-1)
+                .cumsum(-1)
+                .flip(-1)
+            )
+
+            # At masked positions, the loop carries the next valid token's
+            # advantage. Gather that token's value to preserve this behavior
+            # for both advantages and returns, including fully masked rows.
+            indices = torch.arange(gen_len, device=values.device)
+            next_valid = torch.where(mask.bool(), indices, gen_len)
+            next_valid = next_valid.flip(-1)
+            next_valid = next_valid.cummin(-1).values
+            next_valid = next_valid.flip(-1)
+            padded_values = torch.nn.functional.pad(values, (0, 1))
+            advantages = reward_to_go - padded_values.gather(-1, next_valid)
+            return advantages, advantages + values
+
         next_values: torch.Tensor = torch.zeros(
             values.shape[0], device=values.device, dtype=values.dtype
         )

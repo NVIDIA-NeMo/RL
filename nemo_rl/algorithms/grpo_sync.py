@@ -37,6 +37,8 @@ import warnings
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
+    from transformers import AutoProcessor
+
     from nemo_rl.models.policy.tq_policy import TQPolicy
 
 import numpy as np
@@ -50,6 +52,7 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     _clip_grpo_advantages,
     _create_advantage_estimator,
+    _initial_policy_generation_stale,
     _log_mixed_rewards_and_advantages_information,
     _placeholder_seq_logprob_error_metrics,
     _policy_dtype,
@@ -68,13 +71,19 @@ from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     finalize_actor_token_metrics,
+    calculate_trivial_reward_distributions,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_performance_metrics,
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+from nemo_rl.data.multimodal_utils import present_multimodal_fields
 from nemo_rl.data_plane.interfaces import KVBatchMeta
+from nemo_rl.data_plane.observability import (
+    log_step_metrics,
+    metrics_never_fail_the_step,
+)
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS, DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -82,7 +91,9 @@ from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
-from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.utils.checkpoint import (
+    CheckpointManager,
+)
 from nemo_rl.utils.logger import Logger, print_message_log_samples
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
@@ -126,9 +137,9 @@ def _train_fields_for_step(skip_prev_logprobs: bool) -> tuple[str, ...]:
     )
 
 
-# ── DAPO non-zero-std dynamic sampling, slice-only ─────────────────────
+# ── DAPO non-trivial-reward dynamic sampling, slice-only ───────────────
 # Slice-only formulation of nemo_rl.algorithms.grpo.dynamic_sampling: filter
-# on std != 0, accumulate survivors across iterations, slice on overflow.
+# on exact reward variation, accumulate survivors across iterations, slice on overflow.
 # Bulk in TQ untouched except for clear_samples of dropped/discarded uids.
 
 
@@ -181,15 +192,21 @@ def _apply_dynamic_sampling(
     pending_unfiltered_rewards.append(driver_carry["total_reward"])
 
     # Filter input comes from ``meta.tags`` so the filter decision is
-    # meta-only — no tensor data needed. The driver mirrored ``std``
-    # into tags right after baseline/std compute.
+    # meta-only — no tensor data needed. The driver mirrored the exact
+    # full-prompt trivial-distribution mask into tags after reward processing.
     if meta.tags is None:
         raise ValueError(
             "_apply_dynamic_sampling: meta.tags is None — driver must "
-            "stamp 'std' into meta.tags before this call."
+            "stamp 'is_trivial_prompt_distribution' into meta.tags before this call."
         )
-    keep_idx = [i for i, t in enumerate(meta.tags) if t["std"] != 0.0]
-    drop_keys = [k for k, t in zip(meta.sample_ids, meta.tags) if t["std"] == 0.0]
+    keep_idx = [
+        i for i, t in enumerate(meta.tags) if not t["is_trivial_prompt_distribution"]
+    ]
+    drop_keys = [
+        k
+        for k, t in zip(meta.sample_ids, meta.tags)
+        if t["is_trivial_prompt_distribution"]
+    ]
     if drop_keys:
         policy.discard_samples(drop_keys, meta.partition_id)
 
@@ -378,6 +395,42 @@ def _compute_seq_logprob_error_metrics(
     return masking_data["sample_mask"], seq_logprob_error_metrics
 
 
+def _log_data_plane_metrics(
+    policy: Any, logger: Logger, step: int, total_step_time: float
+) -> None:
+    """Log this step's data-plane cost. Never raises.
+
+    On by default, so this runs every step of every recipe.
+    """
+    with metrics_never_fail_the_step(step):
+        _log_data_plane_metrics_impl(policy, logger, step, total_step_time)
+
+
+def _log_data_plane_metrics_impl(
+    policy: Any, logger: Logger, step: int, total_step_time: float
+) -> None:
+    """Log this step's data-plane cost. No-op unless observability is enabled.
+
+    The policy computes both the metrics and the scope they cover, because
+    the baselines they are differenced against belong with the client whose
+    counters they baseline. This end owns only where they are logged.
+
+    The prefix names the scope because the two differ by a lot: the driver
+    issues about one op of each kind per step while the bulk traffic is the
+    workers' per-DP-rank ``get_samples``. Note that even the cluster view
+    omits the rollout actor, which builds its own client and is not on the
+    worker group -- so ``kv_first_write`` is not in these totals.
+    """
+    get_metrics = getattr(policy, "get_data_plane_step_metrics", None)
+    if not callable(get_metrics):
+        return  # not a data-plane policy
+    result = get_metrics(total_step_time)
+    if result is None:
+        return  # observability disabled -> plain adapter
+    metrics, scope = result
+    log_step_metrics(logger, metrics, step, scope)
+
+
 def grpo_train_sync(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -391,6 +444,19 @@ def grpo_train_sync(
     checkpointer: CheckpointManager,
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
+    # Unused here, and present only so the shared VLM launcher can pass one
+    # fixed kwarg set to whichever trainer ``select_sync_trainer`` returns.
+    # ``grpo_train``'s sole use of it is
+    # ``attach_initial_nemo_gym_image_payloads``, gated on
+    # ``grpo.deduplicate_multimodal_data`` *and* ``should_use_nemo_gym`` — the
+    # combination ``setup()`` rejects via
+    # ``_validate_multimodal_dedup_capability``. Non-Gym dedup runs never call
+    # that helper, so they need no processor here either.
+    #
+    # TODO: replace this parity kwarg with a ``ProcessorInterface`` both
+    # trainers consume, rather than threading ``Optional[AutoProcessor]``
+    # through every signature — ``grpo.py`` repeats it at seven sites.
+    processor: Optional["AutoProcessor"] = None,
 ) -> None:
     """Run GRPO training algorithm — TransferQueue-mediated.
 
@@ -415,7 +481,13 @@ def grpo_train_sync(
 
     kv_scales_cache = None  # Cache reused for computed kv scales
 
-    POLICY_GENERATION_STALE = True
+    # Skip a redundant iter-1 refit when setup() already synced weights
+    # (synchronizer not stale, fresh run). The redundant refit resets
+    # vLLM CUDA-graph / KV-cache state and yields a step-1
+    # token_mult_prob_error spike that converges by step 3.
+    POLICY_GENERATION_STALE = _initial_policy_generation_stale(
+        policy_generation, grpo_save_state.total_steps
+    )
     assert policy_generation is not None
 
     if master_config.grpo.skip_reference_policy_logprobs_calculation:
@@ -578,9 +650,18 @@ def grpo_train_sync(
             with timer.time("total_step_time"):
                 print("▶ Preparing batch...", flush=True)
                 with timer.time("data_processing"):
+                    # ``share_immutable_media`` must be passed here exactly as
+                    # ``grpo_train`` passes it (grpo.py). Without it
+                    # ``_prepare_multimodal_sharing`` never runs, so
+                    # ``deduplicate_multimodal_data`` becomes a silent no-op on
+                    # this trainer and the deepcopy below makes G independent
+                    # copies of every image in driver RAM.
                     repeated_batch: BatchedDataDict[DatumSpec] = (
                         batch.repeat_interleave(
-                            master_config.grpo.num_generations_per_prompt
+                            master_config.grpo.num_generations_per_prompt,
+                            share_immutable_media=(
+                                master_config.grpo.deduplicate_multimodal_data
+                            ),
                         )
                     )
 
@@ -698,24 +779,50 @@ def grpo_train_sync(
                             driver_carry,
                             master_config.grpo.reward_shaping,
                         )
-                    driver_carry["baseline"], driver_carry["std"] = (
-                        calculate_baseline_and_std_per_prompt(
-                            driver_carry["prompt_ids_for_adv"],
-                            driver_carry["total_reward"],
-                            torch.ones_like(driver_carry["total_reward"]),
-                            leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
+                    std_rewards = (
+                        driver_carry["unshaped_total_reward"]
+                        if master_config.grpo.use_dynamic_sampling
+                        and "unshaped_total_reward" in driver_carry
+                        else None
+                    )
+                    (
+                        baseline,
+                        std,
+                        _,
+                    ) = calculate_baseline_and_std_per_prompt(
+                        driver_carry["prompt_ids_for_adv"],
+                        driver_carry["total_reward"],
+                        torch.ones_like(driver_carry["total_reward"]),
+                        leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
+                        std_rewards=std_rewards,
+                    )
+                    driver_carry["baseline"] = baseline
+                    driver_carry["std"] = std
+                    tags = {
+                        "std": driver_carry["std"].tolist(),
+                        "baseline": driver_carry["baseline"].tolist(),
+                    }
+                    if master_config.grpo.use_dynamic_sampling:
+                        dynamic_sampling_rewards = (
+                            std_rewards
+                            if std_rewards is not None
+                            else driver_carry["total_reward"]
                         )
-                    )
-                    # Mirror std onto meta so dynamic_sampling can filter
-                    # without fetching tensor data.
-                    meta.stamp_tags(
-                        {
-                            "std": driver_carry["std"].tolist(),
-                            "baseline": driver_carry["baseline"].tolist(),
-                        }
-                    )
+                        is_trivial_prompt_distribution = (
+                            calculate_trivial_reward_distributions(
+                                driver_carry["prompt_ids_for_adv"],
+                                dynamic_sampling_rewards,
+                                torch.ones_like(dynamic_sampling_rewards),
+                            )
+                        )
+                        tags["is_trivial_prompt_distribution"] = (
+                            is_trivial_prompt_distribution.tolist()
+                        )
+                    # Mirror the full-prompt decision onto meta so dynamic
+                    # sampling can filter without fetching tensor data.
+                    meta.stamp_tags(tags)
 
-                # ── Dynamic sampling (DAPO non-zero-std filter) ────────
+                # ── Dynamic sampling (DAPO reward-variation filter) ───
                 # Slice-only; bulk in TQ untouched except for clear_samples
                 # of dropped / overflow-discarded uids.
                 ds_metrics: dict = {}
@@ -951,9 +1058,14 @@ def grpo_train_sync(
                         # (logprobs/advantages/masks) and wire-only message
                         # log bulk fields are skipped by virtue of not being
                         # in DP_CALIB_INPUT_FIELDS.
+                        # VLM extras cannot be named in
+                        # ``DP_CALIB_INPUT_FIELDS``: the rollout writes
+                        # pixel_values / image_grid_thw / … individually and
+                        # which of them exist is per-processor, so the static
+                        # list alone would calibrate image-blind.
                         _calib_fields = [
                             f for f in (meta.fields or []) if f in DP_CALIB_INPUT_FIELDS
-                        ]
+                        ] + present_multimodal_fields(meta)
                         calibration_data = policy.read_from_dataplane(
                             meta,
                             select_fields=_calib_fields,
@@ -1194,7 +1306,9 @@ def grpo_train_sync(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config.checkpointing,
+                            is_final_checkpoint=(
+                                is_last_step or early_stop_message is not None
+                            ),
                         )
                         if master_config.data["use_multiple_dataloader"]:
                             for (
@@ -1340,6 +1454,10 @@ def grpo_train_sync(
             logger.log_metrics(
                 performance_metrics, total_steps + 1, prefix="performance"
             )
+            # Before the step_finished=True log below, which commits the step:
+            # anything logged against a committed step is dropped by wandb, so
+            # these series were computed, printed, and silently discarded.
+            _log_data_plane_metrics(policy, logger, total_steps + 1, total_time)
             logger.log_metrics(
                 timing_metrics,
                 total_steps + 1,

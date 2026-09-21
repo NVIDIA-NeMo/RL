@@ -13,8 +13,17 @@
 # limitations under the License.
 
 import os
+from collections.abc import Iterator
 from contextlib import contextmanager
 from importlib.util import find_spec
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
+
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
+)
 
 
 def _get_vllm_file(relative_path: str) -> str:
@@ -622,6 +631,270 @@ def _patch_vllm_glm_decoder_sequence_parallel_moe(logger) -> None:
     logger.info("Successfully disabled decoder-level SP-MoE for GLM DSA models.")
 
 
+def _patch_vllm_moe_routed_experts_capture(logger, *, required: bool = False) -> bool:
+    """Fire the routed-experts capture hook on the monolithic fused-MoE path.
+
+    ``RoutedExpertsCapturer`` (used by router replay / R3) is driven by the
+    ``capture_fn`` that only fires inside ``BaseRouter._select_experts``. But
+    ``MoERunner._apply_quant_method`` calls ``select_experts`` only on the
+    *modular* kernel branch; *monolithic* kernels (e.g. the FlashInfer TRT-LLM
+    NVFP4-per-token fused MoE) compute top-k routing internally via
+    ``forward_monolithic`` and never call it. The capture buffer therefore
+    stays zero, and the returned ``routed_experts`` are all-zero -> Megatron's
+    router replay sees duplicate expert ids and dies with "Split sizes doesn't
+    match total dim 0" in the MoE all_to_all during get_logprobs.
+
+    This inserts an explicit ``select_experts`` call on the monolithic branch,
+    guarded by ``capture_fn is not None`` so it only runs during rollout when
+    routing capture is active (no cost otherwise).
+    """
+    try:
+        file_to_patch = _get_vllm_file(
+            "model_executor/layers/fused_moe/runner/moe_runner.py"
+        )
+    except RuntimeError:
+        message = "Could not locate moe_runner.py for routed-experts capture patch."
+        if required:
+            raise RuntimeError(message) from None
+        logger.warning(message)
+        return False
+
+    marker = "NeMo-RL patch (routed-experts capture for router replay)"
+    old_snippet = (
+        "        if self.routed_experts.quant_method.is_monolithic:\n"
+        "            # Monolithic kernels: pass router_logits to routed_experts\n"
+        "            fused_out = self.routed_experts.forward_monolithic("
+    )
+    new_snippet = (
+        "        if self.routed_experts.quant_method.is_monolithic:\n"
+        "            # Monolithic kernels: pass router_logits to routed_experts\n"
+        "            # NeMo-RL patch (routed-experts capture for router replay): "
+        "monolithic MoE kernels compute top-k routing\n"
+        "            # inside the fused kernel and never call router.select_experts,\n"
+        "            # so the RoutedExpertsCapturer hook never fires and returned\n"
+        "            # routes are all-zero. Fire it explicitly when capture is on.\n"
+        '            if getattr(self.router, "capture_fn", None) is not None:\n'
+        "                self.router.select_experts(\n"
+        "                    hidden_states=hidden_states,\n"
+        "                    router_logits=router_logits,\n"
+        "                    topk_indices_dtype=self._quant_method.topk_indices_dtype,\n"
+        "                    input_ids=input_ids,\n"
+        "                )\n"
+        "            fused_out = self.routed_experts.forward_monolithic("
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if marker in content:
+            logger.info("MoE routed-experts capture patch already applied.")
+            return True
+        if old_snippet not in content:
+            message = (
+                "Could not apply MoE routed-experts capture patch: expected "
+                f"code snippet not found in {file_to_patch}. The vLLM version "
+                "may have changed."
+            )
+            if required:
+                raise RuntimeError(message)
+            logger.warning(message)
+            return False
+        content = content.replace(old_snippet, new_snippet, 1)
+        write_back(content)
+
+    logger.info("Successfully patched MoE routed-experts capture (monolithic path).")
+    return True
+
+
+def _patch_vllm_nemotron_h_fp32_lm_head(logger) -> bool:
+    """Compute NemotronH logits with an fp32 LM head (MiniMax-M1-style).
+
+    bf16 rounding of the logits GEMM output is the dominant contributor to
+    generation/training logprob mismatch (train/token_mult_prob_error). With
+    this patch the sampled-token logprobs come from fp32 logits, matching a
+    trainer that enables megatron_cfg.fp32_lm_head.
+
+    This must be a source patch (not a monkeypatch): the model executes in
+    vLLM's EngineCore worker subprocesses, which import vllm independently of
+    this process. The patched code is opt-in at runtime via an internal
+    NRL_VLLM_FP32_LM_HEAD=1 environment variable set from
+    policy.generation.vllm_cfg.fp32_lm_head.
+    When enabled, the live ParallelLMHead keeps its original parameter dtype
+    and quantization config; only the projection path casts hidden states,
+    weights, and optional bias to fp32 at runtime.
+    """
+    try:
+        file_to_patch = _get_vllm_file("model_executor/models/nemotron_h.py")
+    except RuntimeError:
+        logger.warning("Could not locate nemotron_h.py for the fp32 LM head patch.")
+        return False
+
+    old_import_snippet = """import torch
+from torch import nn"""
+    old_fp32_import_snippet = """import os
+
+import torch
+from torch import nn"""
+    new_import_snippet = old_fp32_import_snippet
+    old_lm_head_snippet = """        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=self.quant_config,
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )"""
+    new_lm_head_snippet = f"""        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=self.quant_config,
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )
+        self._nrl_fp32_lm_head = (
+            os.environ.get("{VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR}", "0") == "1"
+        )"""
+    old_logits_processor_snippet = (
+        "        self.logits_processor = LogitsProcessor(config.vocab_size)"
+    )
+    new_logits_processor_snippet = """        self.logits_processor = LogitsProcessor(config.vocab_size)
+        if self._nrl_fp32_lm_head:
+
+            def _nrl_fp32_lm_head_forward(
+                input_, embedding_bias=None, _lm_head=self.lm_head
+            ):
+                if not getattr(_lm_head, "_nrl_fp32_lm_head_forward_logged", False):
+                    print(
+                        "[fp32_lm_head] NemotronH vLLM lm_head.forward casts "
+                        "input and weight to fp32",
+                        flush=True,
+                    )
+                    _lm_head._nrl_fp32_lm_head_forward_logged = True
+                logits = torch.matmul(
+                    input_.to(dtype=torch.float32),
+                    _lm_head.weight.to(dtype=torch.float32).t(),
+                )
+                if embedding_bias is not None:
+                    logits = logits + embedding_bias.to(dtype=torch.float32)
+                return logits
+
+            self.lm_head.forward = _nrl_fp32_lm_head_forward
+            _orig_quant_apply = self.lm_head.quant_method.apply
+
+            def _nrl_fp32_lm_head_apply(
+                layer,
+                input_,
+                bias=None,
+                _lm_head=self.lm_head,
+                _orig_apply=_orig_quant_apply,
+                **kwargs,
+            ):
+                if layer is _lm_head:
+                    return _lm_head(input_, bias)
+                return _orig_apply(layer, input_, bias=bias, **kwargs)
+
+            self.lm_head.quant_method.apply = _nrl_fp32_lm_head_apply"""
+    old_snippet = """        logits = self.logits_processor(self.lm_head, hidden_states)
+        return logits"""
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if (
+            new_import_snippet in content
+            and new_lm_head_snippet in content
+            and new_logits_processor_snippet in content
+        ):
+            logger.info("NemotronH fp32 LM head patch already present.")
+            return True
+
+        if new_import_snippet not in content:
+            if old_fp32_import_snippet in content:
+                content = content.replace(
+                    old_fp32_import_snippet, new_import_snippet, 1
+                )
+            elif content.count(old_import_snippet) == 1:
+                content = content.replace(old_import_snippet, new_import_snippet, 1)
+            else:
+                logger.warning(
+                    "NemotronH fp32 LM head import anchor not found exactly once "
+                    "in %s; patch not applied.",
+                    file_to_patch,
+                )
+                return False
+
+        if new_lm_head_snippet not in content:
+            if content.count(old_lm_head_snippet) != 1:
+                logger.warning(
+                    "NemotronH fp32 LM head constructor anchor not found exactly "
+                    "once in %s; patch not applied.",
+                    file_to_patch,
+                )
+                return False
+            content = content.replace(old_lm_head_snippet, new_lm_head_snippet, 1)
+
+        if new_logits_processor_snippet not in content:
+            if content.count(old_logits_processor_snippet) != 1:
+                logger.warning(
+                    "NemotronH fp32 logits_processor anchor not found exactly once "
+                    "in %s; patch not applied.",
+                    file_to_patch,
+                )
+                return False
+            content = content.replace(
+                old_logits_processor_snippet, new_logits_processor_snippet, 1
+            )
+
+        if content.count(old_snippet) != 1:
+            logger.warning(
+                "NemotronH fp32 compute_logits anchor not found exactly once "
+                "in %s; patch not applied.",
+                file_to_patch,
+            )
+            return False
+        write_back(content)
+
+    logger.info("Applied NemotronH fp32 LM head source patch.")
+    return True
+
+
+@contextmanager
+def modelopt_moe_amax_aliases(model: "torch.nn.Module") -> Iterator[None]:
+    """Temporarily expose nested ModelOpt MoE amax buffers to vLLM's loader.
+
+    Verified against vLLM 0.26.0: ``RoutedExperts.load_weights`` maps expert
+    amax keys to names such as ``w13_input_quantizer._amax``, then resolves
+    them with one ``getattr``. This refit path sends ModelOpt buffers through
+    that loader, which offers no hook for resolving nested target names.
+
+    Nemotron-H reached this loader after vLLM removed the inner
+    ``NemotronHModel.load_weights`` in 0.26.0. Its old flat parameter lookup
+    accepted dotted keys exposed by our buffer-to-parameter adapter:
+    https://github.com/vllm-project/vllm/commit/c233d90aa826df072872df47b201450059be8e71
+
+    Aliases reference the original tensors without registering additional
+    buffers or state-dict entries. Existing attributes belong to the caller
+    or an outer context and are preserved. Only aliases created here are
+    removed, including when setup or weight loading raises.
+
+    Args:
+        model: ModelOpt model whose MoE quantizer buffers will be refitted.
+    """
+    aliased: list[tuple["torch.nn.Module", str]] = []
+    try:
+        for module in model.modules():
+            for child_name, child in module.named_children():
+                if not child_name.startswith(("w13_", "w2_")):
+                    continue
+                if not child_name.endswith("_quantizer"):
+                    continue
+                for buf_name, buf in child.named_buffers(recurse=False):
+                    if not buf_name.endswith("_amax"):
+                        continue
+                    alias = f"{child_name}.{buf_name}"
+                    if hasattr(module, alias):
+                        continue
+                    setattr(module, alias, buf)
+                    aliased.append((module, alias))
+        yield
+    finally:
+        for module, alias in reversed(aliased):
+            delattr(module, alias)
+
+
 def ensure_vllm_source_compat() -> None:
     """Apply interpreter-independent vLLM source-compat patches.
 
@@ -643,12 +916,23 @@ def _apply_vllm_patches(
     py_executable: str,
     *,
     extra_env_vars: list[str] | None = None,
+    nemotron_h_fp32_lm_head: bool | None = None,
+    require_moe_routed_experts_capture: bool = False,
 ) -> None:
     # Import lazily so importing the worker module does not import vLLM.
     import vllm.envs as envs
     from vllm.logger import init_logger
 
     patch_logger = init_logger("vllm_patch")
+    nemotron_h_fp32_lm_head_enabled = bool(nemotron_h_fp32_lm_head)
+    if nemotron_h_fp32_lm_head_enabled:
+        os.environ[VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR] = "1"
+        extra_env_vars = [
+            *(extra_env_vars or []),
+            VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
+        ]
+    else:
+        os.environ.pop(VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, None)
 
     # Whether the v1 patch matters at all depends on which executor vLLM will
     # select. 0.25 defaults this to "1" (RayExecutorV2), which has no
@@ -692,3 +976,15 @@ def _apply_vllm_patches(
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
+    if nemotron_h_fp32_lm_head_enabled and not _patch_vllm_nemotron_h_fp32_lm_head(
+        patch_logger
+    ):
+        raise RuntimeError(
+            "vllm_cfg.fp32_lm_head is enabled, but that flag currently maps to "
+            "the Nemotron-H-only vLLM fp32 LM head source patch, and the patch "
+            "could not be applied. Disable the flag or update the patch anchors "
+            "for this vLLM version."
+        )
+    _patch_vllm_moe_routed_experts_capture(
+        patch_logger, required=require_moe_routed_experts_capture
+    )

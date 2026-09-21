@@ -1,0 +1,240 @@
+# VLM MPO Algorithm Configuration
+mpo:
+  max_num_epochs: 1
+  max_num_steps: 150
+  # Optional checkpoint boundary for time-sliced jobs. The final scheduler
+  # horizon remains max_num_steps across resumed segments.
+  stop_after_step: null
+  val_period: 25
+  val_batches: 8
+  val_global_batch_size: 8
+  val_micro_batch_size: 1
+  val_at_start: true
+  val_at_end: false
+  seed: 42
+  reference_policy_kl_penalty: 0.05
+  preference_average_log_probs: false
+  sft_average_log_probs: ${.preference_average_log_probs}
+  quality_average_log_probs: false
+  preference_loss_weight: 1.0
+  sft_loss_weight: 0.0
+  bco_loss_weight: 1.0
+  reward_shift_momentum: 0.99
+  reward_shift: 0.0
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/vlm_mpo
+  metric_name: val:validation-default_loss
+  higher_is_better: false
+  keep_top_k: 3
+  save_period: 50
+  checkpoint_must_save_by: null
+  save_optimizer: true
+
+policy:
+  model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+    fix_mistral_regex: true
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  max_total_sequence_length: 8192
+  precision: bfloat16
+  offload_optimizer_for_logprob: false
+  dtensor_cfg:
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: ""
+    enabled: false
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    clear_cache_every_n_steps: null
+    automodel_kwargs: {}
+    lora_cfg:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: post
+      lora_A_init: xavier
+      use_triton: true
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: 16384
+    logprob_mb_tokens: 16384
+    algorithm: modified_first_fit_decreasing
+    fuse_loss: true
+    pair_grouping_key: pair_index
+    max_sequences_per_bin: 1
+  make_sequence_length_divisible_by: 8
+  max_grad_norm: 1.0
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 5.0e-6
+      weight_decay: 0.1
+      betas: [0.9, 0.98]
+      eps: 1.0e-5
+      foreach: false
+      fused: false
+  scheduler:
+    - name: torch.optim.lr_scheduler.LinearLR
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 20
+    - name: torch.optim.lr_scheduler.ConstantLR
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [20]
+  megatron_cfg:
+    enabled: true
+    env_vars:
+      TORCH_CUDA_ARCH_LIST: "9.0"
+    checkpoint:
+      async_save: false
+      ckpt_assume_constant_structure: false
+    use_fused_linear_logprobs: false
+    fused_linear_logprobs_chunk_size: 256
+    force_reconvert_from_hf: false
+    empty_unused_memory_level: 1
+    activation_checkpointing: false
+    cuda_graph_impl: none
+    cuda_graph_modules: []
+    cuda_graph_warmup_steps: 3
+    fine_grained_activation_offloading: false
+    offload_modules: null
+    recompute_granularity: full
+    recompute_modules: null
+    tensor_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    sequence_parallel: true
+    freeze_moe_router: false
+    moe_router_dtype: fp64
+    moe_router_load_balancing_type: aux_loss
+    moe_router_bias_update_rate: 1.0e-3
+    moe_permute_fusion: true
+    apply_rope_fusion: true
+    bias_activation_fusion: true
+    defer_fp32_logits: false
+    moe_per_layer_logging: false
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: alltoall
+    moe_shared_expert_overlap: false
+    use_gloo_process_groups: false
+    gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
+    freeze_audio_encoder: true
+    freeze_audio_projector: true
+    mtp_num_layers: 0
+    mtp_loss_scaling_factor: 0.0
+    peft:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: post
+      lora_A_init_method: xavier
+      lora_B_init_method: zero
+      a2a_experimental: false
+      lora_dtype: null
+    optimizer:
+      optimizer: adam
+      lr: 5.0e-6
+      min_lr: 5.0e-6
+      weight_decay: 0.1
+      bf16: true
+      fp16: false
+      params_dtype: float32
+      adam_beta1: 0.9
+      adam_beta2: 0.98
+      adam_eps: 1.0e-8
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      clip_grad: ${policy.max_grad_norm}
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+      overlap_cpu_optimizer_d2h_h2d: false
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: constant
+      lr_decay_style: constant
+      lr_warmup_iters: 1
+      lr_warmup_init: 1.0e-8
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      data_parallel_sharding_strategy: optim_grads_params
+      use_custom_fsdp: false
+    fp8_cfg:
+      enabled: false
+      fp8: e4m3
+      fp8_recipe: blockwise
+      fp8_param: false
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 1
+  train:
+    dataset_name: MMPRPreference
+    data_path: REPLACE_WITH_MMPR_METADATA_PATH
+    split_validation_size: 0.01
+    seed: 42
+    max_samples: null
+    cache_dir: null
+  validation: null
+  default:
+    prompt_file: null
+    system_prompt_file: null
+
+logger:
+  log_dir: logs
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  num_val_samples_to_print: 0
+  wandb:
+    project: vlm-mpo
+    name: vlm-mpo
+  swanlab:
+    project: vlm-mpo
+    name: vlm-mpo
+  tensorboard:
+    log_dir: tb_logs-vlm-mpo
+  mlflow:
+    experiment_name: vlm-mpo
+    run_name: vlm-mpo
+    tracking_uri: http://localhost:5000
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
+  segment_size: null
