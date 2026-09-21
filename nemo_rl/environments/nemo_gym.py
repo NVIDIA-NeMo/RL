@@ -78,6 +78,7 @@ from nemo_rl.environments.gym_checkpoint_adapter import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym_multimodal import (
+    _explicit_prompt_multimodal_payload,
     _has_image_before_first_trainable_output,
     _index_per_turn_images,
     _is_trainable_output_item,
@@ -2476,6 +2477,10 @@ Depending on your data shape, you may want to change these values."""
         returned_media_sources = extract_input_media_sources_from_responses_messages(
             media_messages
         )
+        first_trainable_item = next(
+            (item for item in response["output"] if _is_trainable_output_item(item)),
+            None,
+        )
         first_turn_has_additional_images = (
             processor is not None
             and _has_image_before_first_trainable_output(response["output"])
@@ -2508,6 +2513,10 @@ Depending on your data shape, you may want to change these values."""
             # ordered image set rather than marking a tool-only subset as
             # authoritative.
             and not first_turn_has_additional_images
+            and (
+                first_trainable_item is None
+                or "prompt_multimodal_content" not in first_trainable_item
+            )
         )
         raw_initial_image_sources = [
             source
@@ -2530,14 +2539,6 @@ Depending on your data shape, you may want to change these values."""
             and raw_initial_image_sources
             and len(raw_initial_image_sources) == len(raw_initial_sources)
         ):
-            first_trainable_item = next(
-                (
-                    item
-                    for item in response["output"]
-                    if _is_trainable_output_item(item)
-                ),
-                None,
-            )
             predicted = predicted_static_image_num_tokens(
                 parity_processor,
                 [
@@ -2690,11 +2691,25 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             nemo_rl_message_log.append(user_message)
 
             if processor is not None and not media_geometry_failed:
-                images_this_turn = (
-                    per_turn_images[turn_idx] if turn_idx < len(per_turn_images) else []
-                )
+                explicit_media = _explicit_prompt_multimodal_payload(output_item_dict)
+                if explicit_media is None:
+                    images_this_turn = (
+                        per_turn_images[turn_idx]
+                        if turn_idx < len(per_turn_images)
+                        else []
+                    )
+                    processor_kwargs = None
+                    image_group_frame_counts = None
+                else:
+                    (
+                        images_this_turn,
+                        processor_kwargs,
+                        image_group_frame_counts,
+                    ) = explicit_media
                 expected_num_tokens: list[int] | None = None
-                if images_this_turn and parity_processor is not None:
+                if (images_this_turn or explicit_media is not None) and (
+                    parity_processor is not None
+                ):
                     turn_runs = count_image_placeholder_runs(
                         new_prompt_token_ids, parity_processor
                     )
@@ -2724,6 +2739,8 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                             self, "_pad_dynamic_image_shapes", False
                         ),
                         expected_num_tokens_per_image=expected_num_tokens,
+                        processor_kwargs=processor_kwargs,
+                        image_group_frame_counts=image_group_frame_counts,
                     )
                 except RolloutGeometryUnderdetermined as exc:
                     media_geometry_failed = True
@@ -2764,6 +2781,8 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             seen_token_ids.extend(generation_token_ids)
 
             # We pop to remove larger tensors from logging.
+            output_item_dict.pop("prompt_multimodal_content", None)
+            output_item_dict.pop("prompt_mm_processor_kwargs", None)
             batch_decode_items.append(
                 (output_item_dict, prompt_token_ids, generation_token_ids)
             )
