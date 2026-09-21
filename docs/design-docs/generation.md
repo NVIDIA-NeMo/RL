@@ -94,6 +94,75 @@ The {py:class}`UpdatableVllmInternalWorker <nemo_rl.models.generation.vllm_backe
 2. Updating weights from IPC handles for efficient weight sharing.
 3. Checking if weights have been updated correctly.
 
+### Reasoning Token Budget
+
+Reasoning models are frequently evaluated with a per-request cap on reasoning
+tokens. RL rollouts should decode under the same configuration, otherwise the
+policy is trained on traces that differ from the ones it is measured on. Set
+`policy.generation.vllm_cfg.thinking_token_budget` to forward that cap to
+vLLM's `SamplingParams` field of the same name:
+
+```yaml
+policy:
+  generation:
+    backend: vllm
+    vllm_cfg:
+      reasoning_parser: deepseek_r1   # required; see below
+      thinking_token_budget: 2048
+```
+
+Requirements and caveats, all enforced or documented because vLLM rejects the
+*request* rather than the engine when they are unmet:
+
+- **A reasoning parser is required.** vLLM only honors the budget on an engine
+  whose `ReasoningConfig` is populated, which happens when `reasoning_parser`
+  is passed to its `EngineArgs`. NeMo RL forwards
+  `vllm_cfg.reasoning_parser` (and `vllm_cfg.reasoning_parser_plugin`
+  alongside it, for custom parsers) into the engine, and fails at
+  configuration time with a clear error if a budget is set without one.
+  `vllm_kwargs.reasoning_parser` reaches the same `EngineArgs` field and is
+  accepted too; setting both to different values is an error rather than a
+  silent override.
+- **vLLM's domain is a non-negative token count, or `-1` for unlimited.**
+  Booleans and floats are rejected. `-1` is the one value that does not need a
+  reasoning parser, because vLLM normalizes it to "no cap".
+- **A tokenizer is required.** vLLM can only enable its `ReasoningConfig` with
+  a tokenizer, so `vllm_cfg.skip_tokenizer_init: true` with a finite budget is
+  rejected at configuration time.
+- **Not supported by the V2 model runner.** vLLM raises
+  `thinking_token_budget is not yet supported by the V2 model runner` per
+  request, so run with `VLLM_USE_V2_MODEL_RUNNER=0`. That variable is
+  tri-state in vLLM: unset means the runner is chosen per model architecture.
+  NeMo RL therefore *rejects* a finite budget when the variable is explicitly
+  truthy, and *warns* when it is unset, because a model that defaults to the
+  v2 runner will fail on its first request.
+
+Leaving `thinking_token_budget` unset changes nothing: no field is added to
+`SamplingParams` and the reasoning budget stays unconstrained.
+
+#### What else the engine-level reasoning parser affects
+
+Setting `reasoning_parser` is not scoped to the token budget. vLLM copies it
+into `StructuredOutputsConfig.reasoning_parser`, so guided decoding becomes
+reasoning-aware: constraints are applied to the content after the reasoning
+block rather than to the reasoning tokens themselves. On a model that was
+previously run with guided decoding and no reasoning parser, enabling one
+changes where those constraints bite.
+
+#### Scope: the in-process rollout path only
+
+The budget is attached to the `SamplingParams` the workers build, so it covers
+the `generate` / `generate_async` rollout paths. It does **not** reach rollouts
+driven through the optional OpenAI-compatible HTTP server
+(`vllm_cfg.expose_http_server`), where the caller supplies its own sampling
+parameters per request; set the field on those requests if you need it there.
+
+The serving layer has its own reasoning parser,
+`vllm_cfg.http_server_serving_chat_kwargs.reasoning_parser`, which controls how
+the endpoint splits reasoning out of a response. It is independent of the
+engine-level one, and NeMo RL warns at configuration time when the two
+disagree, since that combination is almost always unintended.
+
 ## Megatron Backend
 
 The Megatron backend provides native Megatron-Core inference capabilities, eliminating the need for weight conversion between training and generation. This backend is particularly beneficial when using Megatron for training, as it enables seamless integration and optimal performance.

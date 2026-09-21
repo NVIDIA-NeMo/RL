@@ -1776,6 +1776,7 @@ class VllmAsyncGenerationWorkerImpl(
                 stop_token_ids=self.cfg["stop_token_ids"],
                 stop=final_stop_strings,
                 include_stop_str_in_output=True,  # returning stop strings like hf
+                **self._extra_sampling_kwargs,
             )
 
             request_id = str(uuid.uuid4())
