@@ -572,6 +572,11 @@ class AsyncRolloutImpl:
             rollout_metrics = self._aggregate_rollout_metrics(
                 completions, all_sample_metrics
             )
+            rollout_metrics["mean_prompt_length"] = float(
+                sum(
+                    len(message["token_ids"]) for message in input_sample["message_log"]
+                )
+            )
 
         timer.stop(f"{timer_prefix}/total")
         rollout_metrics.update(timer.get_timing_metrics("sum"))
@@ -1377,7 +1382,18 @@ class AsyncNemoGymRolloutImpl:
         # Compute rollout metrics.
         with timer.time(f"{timer_prefix}/compute_metrics"):
             rollout_metrics = self._compute_rollout_metrics(
-                completions, _nemo_gym_metric_namespace(inputs[0])
+                completions,
+                _nemo_gym_metric_namespace(inputs[0]),
+                prompt_lengths=(
+                    [
+                        len(result["input_message_log"][0]["token_ids"])
+                        for result in completed_results
+                    ]
+                    if all(
+                        result.get("input_message_log") for result in completed_results
+                    )
+                    else None
+                ),
             )
             # Same helper the batched path uses, so the two cannot drift apart.
             rollout_metrics.update(_effort_shaping_metrics(shaping))
@@ -1469,6 +1485,8 @@ class AsyncNemoGymRolloutImpl:
         self,
         completions: list[Completion],
         agent_name: str,
+        *,
+        prompt_lengths: list[int] | None = None,
     ) -> dict[str, Any]:
         """Aggregate per-sample and per-agent metrics."""
         # Prepare lists of values for each metric.
@@ -1558,6 +1576,15 @@ class AsyncNemoGymRolloutImpl:
         # runs can diagnose one environment without contamination from another.
         environment = _rollout_environment_metric_component(agent_name)
         environment_prefix = f"environment/{environment}"
+        if prompt_lengths is not None:
+            # V1 NeMo-Gym records the first input-message length (not the
+            # completed conversation length) as mean_prompt_length.
+            rollout_metrics["mean_prompt_length"] = sum(prompt_lengths) / n
+            rollout_metrics.update(
+                calculate_single_metric(
+                    prompt_lengths, n, f"{environment_prefix}/prompt_tokens_per_sample"
+                )
+            )
         rollout_metrics.update(
             calculate_single_metric(
                 total_reward, n, f"{environment_prefix}/total_reward"
@@ -1593,6 +1620,16 @@ class AsyncNemoGymRolloutImpl:
             )
         )
         rollout_metrics[f"{environment_prefix}/sample_count"] = n
+        for name, values in (
+            ("turns_per_sample", turn_count),
+            ("max_gen_tokens_per_turn", max_gen_tokens_per_turn),
+        ):
+            rollout_metrics[f"{environment_prefix}/{name}/p95"] = pct(values, 95)
+        rollout_metrics[f"{environment_prefix}/turns_per_sample/p99"] = pct(
+            turn_count, 99
+        )
+        for name in ("natural_termination_rate", "truncation_rate"):
+            rollout_metrics[f"{environment_prefix}/{name}"] = rollout_metrics[name]
 
         # Agent-level metrics. Receipts are lineage records, not agent
         # results — keep them (and their manifests) out of the logged table.

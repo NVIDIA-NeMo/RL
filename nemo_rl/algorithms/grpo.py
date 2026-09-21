@@ -102,7 +102,11 @@ from nemo_rl.experience.interfaces import (
     RETAINED_TASK_INDICES_KEY,
     TRAINED_TASK_INDICES_KEY,
 )
-from nemo_rl.experience.metric_utils import is_histogram_metric
+from nemo_rl.experience.metric_utils import (
+    calculate_single_metric,
+    is_histogram_metric,
+    pct,
+)
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     attach_initial_nemo_gym_image_payloads,
@@ -4435,7 +4439,8 @@ def aggregate_rollout_metrics(
     """Aggregate rollout metrics from multiple trajectory groups.
 
     Different metric types are aggregated according to their semantics:
-    - Histogram observations: flattened into one step-level distribution
+    - Histogram observations: flattened into one step-level distribution;
+      core rollout and per-environment summaries are recomputed from it
     - Metrics ending with "/min" or starting with "min_" (excluding "_rate" suffix): take the minimum
     - Metrics ending with "/max" or starting with "max_" (excluding "_rate" suffix): take the maximum
     - "total_turns": summed
@@ -4453,24 +4458,6 @@ def aggregate_rollout_metrics(
         if is_histogram_metric(k):
             observations = [observation for group in v for observation in group]
             aggregated[k] = observations
-            if k.startswith("environment/") and k.endswith("/histogram"):
-                metric_name = k.removesuffix("/histogram")
-                if observations:
-                    aggregated[f"{metric_name}/mean"] = float(np.mean(observations))
-                    aggregated[f"{metric_name}/min"] = min(observations)
-                    aggregated[f"{metric_name}/max"] = max(observations)
-                    aggregated[f"{metric_name}/median"] = float(np.median(observations))
-                    aggregated[f"{metric_name}/p50"] = float(
-                        np.percentile(observations, 50)
-                    )
-                    aggregated[f"{metric_name}/p95"] = float(
-                        np.percentile(observations, 95)
-                    )
-                    aggregated[f"{metric_name}/stddev"] = (
-                        float(np.std(observations, ddof=1))
-                        if len(observations) > 1
-                        else float("nan")
-                    )
         elif not isinstance(v[0], (int, float)):
             aggregated[k] = v
         elif k.endswith("/min") or (k.startswith("min_") and not k.endswith("_rate")):
@@ -4491,6 +4478,50 @@ def aggregate_rollout_metrics(
             )
         else:
             aggregated[k] = sum(v) / len(v)
+    # Reduce distributions last: dictionary insertion order must not allow a
+    # per-group median/stddev to overwrite the selected-cohort statistic.
+    for key, observations in list(aggregated.items()):
+        if not key.endswith("/histogram"):
+            continue
+        metric_name = key.removesuffix("/histogram")
+        if not (
+            key.startswith("environment/")
+            or metric_name
+            in {
+                "turns_per_sample",
+                "total_tokens_per_sample",
+                "gen_tokens_per_sample",
+                "env_tokens_per_sample",
+                "max_gen_tokens_per_turn",
+                "total_reward",
+            }
+        ):
+            continue
+        if not observations:
+            continue
+        denominator = len(observations)
+        if "/env_extra/" in metric_name:
+            # V1 divides numeric extra sums by all samples for that agent,
+            # even when some rows omit an optional field. Distribution
+            # statistics still describe the observations that are present.
+            environment_prefix = metric_name.split("/env_extra/", 1)[0]
+            denominator = aggregated.get(
+                f"{environment_prefix}/sample_count", denominator
+            )
+        aggregated.update(
+            calculate_single_metric(observations, denominator, metric_name)
+        )
+        aggregated[f"{metric_name}/p50"] = aggregated[f"{metric_name}/median"]
+        # Match V1's discrete percentile convention, not numpy interpolation.
+        aggregated[f"{metric_name}/p95"] = pct(observations, 95)
+        aggregated[f"{metric_name}/p99"] = pct(observations, 99)
+    if (
+        "gen_tokens_per_sample/histogram" in aggregated
+        and aggregated["gen_tokens_per_sample/histogram"]
+    ):
+        aggregated["mean_gen_tokens_per_sample"] = aggregated[
+            "gen_tokens_per_sample/mean"
+        ]
     return aggregated
 
 

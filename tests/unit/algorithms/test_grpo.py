@@ -6294,6 +6294,10 @@ class TestComputeAndApplySeqLogprobErrorMasking:
 class TestAggregateRolloutMetrics:
     """Tests for aggregate_rollout_metrics which aggregates per-group metrics by semantic type."""
 
+    @pytest.fixture(autouse=True)
+    def reset_env_calls(self):
+        """Pure metric reductions do not need the module's Ray environment actors."""
+
     def test_min_metrics_take_minimum(self):
         metrics = {
             "gen_tokens/min": [10, 5, 8],
@@ -6368,10 +6372,67 @@ class TestAggregateRolloutMetrics:
         assert result["environment/swe/gen_tokens_per_sample/mean"] == 42.5
         assert result["environment/swe/gen_tokens_per_sample/median"] == 30.0
         assert result["environment/swe/gen_tokens_per_sample/p50"] == 30.0
-        assert result["environment/swe/gen_tokens_per_sample/p95"] == pytest.approx(
-            91.0
-        )
+        assert result["environment/swe/gen_tokens_per_sample/p95"] == 100
+        assert result["environment/swe/gen_tokens_per_sample/p99"] == 100
         assert result["environment/swe/sample_count"] == 4
+
+    def test_environment_statistics_ignore_key_order_and_group_partition(self):
+        histogram = "environment/swe/turns_per_sample/histogram"
+        # Deliberately put derived statistics AFTER the histogram.
+        metrics = {
+            histogram: [[1], [2, 3, 40]],
+            "environment/swe/turns_per_sample/mean": [1, 15],
+            "environment/swe/turns_per_sample/median": [1, 3],
+            "environment/swe/turns_per_sample/stddev": [float("nan"), 21.66],
+            "environment/swe/turns_per_sample/p95": [1, 40],
+        }
+        result = aggregate_rollout_metrics(metrics)
+        pooled = aggregate_rollout_metrics({histogram: [[1, 2, 3, 40]]})
+        assert result == pooled
+        assert result["environment/swe/turns_per_sample/mean"] == 11.5
+        assert result["environment/swe/turns_per_sample/median"] == 2.5
+        assert result["environment/swe/turns_per_sample/p95"] == 40
+
+    def test_optional_environment_extra_keeps_v1_denominator(self):
+        result = aggregate_rollout_metrics(
+            {
+                "environment/swe/env_extra/timeout/histogram": [[1.0], [0.0]],
+                "environment/swe/env_extra/timeout/mean": [0.5, 0.0],
+                "environment/swe/sample_count": [2, 2, 2],
+                "environment/math/sample_count": [4],
+            }
+        )
+        assert result["environment/swe/env_extra/timeout/mean"] == pytest.approx(1 / 6)
+        assert result["environment/swe/env_extra/timeout/median"] == 0.5
+        assert result["environment/swe/env_extra/timeout/histogram"] == [1.0, 0.0]
+
+    def test_global_and_environment_core_distributions_match(self):
+        groups = [[1], [2, 3, 40]]
+        result = aggregate_rollout_metrics(
+            {
+                "turns_per_sample/histogram": groups,
+                "turns_per_sample/p95": [1, 40],
+                "gen_tokens_per_sample/histogram": groups,
+                "mean_gen_tokens_per_sample": [1, 15],
+                "environment/swe/turns_per_sample/histogram": groups,
+            }
+        )
+        for stat in (
+            "histogram",
+            "mean",
+            "min",
+            "max",
+            "median",
+            "stddev",
+            "p50",
+            "p95",
+            "p99",
+        ):
+            assert (
+                result[f"turns_per_sample/{stat}"]
+                == result[f"environment/swe/turns_per_sample/{stat}"]
+            )
+        assert result["mean_gen_tokens_per_sample"] == 11.5
 
     def test_histogram_substring_keys_still_average(self):
         """Histogram-like substrings do not identify distributions."""

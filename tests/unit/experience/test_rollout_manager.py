@@ -69,9 +69,11 @@ from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
 )
 from nemo_rl.experience.rollouts import (
+    _postprocess_single_nemo_gym_group,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
 )
+from nemo_rl.utils.timer import Timer
 
 # Fixtures shared with the heavyweight rollout tests.
 from tests.unit.environments.test_nemo_gym import (
@@ -1172,6 +1174,92 @@ def test_nemo_gym_rollout_metrics_include_environment_distributions():
         0.25,
     ]
     assert metrics[f"{environment_prefix}/sample_count"] == 2
+
+
+@pytest.mark.parametrize("mask_env_flagged_samples", [False, True])
+def test_nemo_gym_telemetry_matches_v1_postprocessing(mask_env_flagged_samples):
+    """Same completed trajectories, including failures, must give V1 metrics."""
+    results = []
+    for turns, reward, flagged in ((1, 1.0, False), (3, 0.0, True), (2, 0.5, False)):
+        messages = []
+        for turn in range(turns):
+            messages.extend(
+                [
+                    {
+                        "role": "user",
+                        "content": "prompt",
+                        "token_ids": torch.tensor([1]),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([2] * (turn + 1)),
+                        "generation_logprobs": torch.tensor([-0.1] * (turn + 1)),
+                    },
+                ]
+            )
+        results.append(
+            {
+                "input_message_log": messages[:1],
+                "message_log": messages,
+                "full_result": {
+                    "reward": reward,
+                    "eval_timed_out": flagged,
+                    "instance_config": {"mask_sample": flagged},
+                },
+            }
+        )
+    # Second row reaches the length cap; it remains in raw rollout metrics
+    # regardless of the environment masking switch.
+    impl = _nemo_gym_impl(mask_env_flagged_samples)
+    impl._max_seq_len = 9
+    completions, _ = impl._results_to_completions(deepcopy(results))
+    actual = impl._compute_rollout_metrics(completions, "swe", prompt_lengths=[1, 1, 1])
+    legacy_result = _postprocess_single_nemo_gym_group(
+        nemo_gym_rows=[{"agent_ref": {"name": "swe"}} for _ in results],
+        results=deepcopy(results),
+        timer=Timer(),
+        timer_prefix="timing/test",
+        policy_generation=SimpleNamespace(cfg={"vllm_cfg": {"max_model_len": 9}}),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(3)}),
+        tokenizer=SimpleNamespace(pad_token_id=0),
+        log_full_result_tables=False,
+        mask_env_flagged_samples=mask_env_flagged_samples,
+    )
+    legacy = legacy_result.rollout_metrics
+    assert (
+        actual["mean_prompt_length"]
+        == legacy_result.final_batch["length"].float().mean().item()
+    )
+    assert (
+        actual["environment/swe/prompt_tokens_per_sample/mean"]
+        == actual["mean_prompt_length"]
+    )
+    for name in (
+        "turns_per_sample",
+        "gen_tokens_per_sample",
+        "total_tokens_per_sample",
+        "max_gen_tokens_per_turn",
+        "total_reward",
+    ):
+        for stat in ("mean", "min", "max", "median", "stddev", "histogram"):
+            key = f"{name}/{stat}"
+            assert actual[key] == pytest.approx(legacy[key])
+            assert actual[f"environment/swe/{key}"] == pytest.approx(legacy[key])
+    for name in (
+        "natural_termination_rate",
+        "truncation_rate",
+        "turns_per_sample/p95",
+        "turns_per_sample/p99",
+        "max_gen_tokens_per_turn/p95",
+    ):
+        assert actual[name] == legacy[name]
+        assert actual[f"environment/swe/{name}"] == legacy[name]
+    for stat in ("mean", "min", "max", "median", "stddev", "histogram"):
+        assert actual[
+            f"environment/swe/env_extra/eval_timed_out/{stat}"
+        ] == pytest.approx(legacy[f"swe/eval_timed_out/{stat}"])
+    assert actual["environment/swe/sample_count"] == 3
 
 
 def _reward_penalty_result(output, assistant_overrides=None, assistant_tokens=None):
