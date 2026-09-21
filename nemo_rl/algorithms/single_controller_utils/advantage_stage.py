@@ -40,7 +40,6 @@ import torch
 
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
-    _advantage_valid_mask,
     _clip_grpo_advantages,
     compute_and_apply_seq_logprob_error_masking,
 )
@@ -431,9 +430,9 @@ class AdvantageComputer:
 
         mask = token_mask * final_sample_mask.unsqueeze(-1)
         advantage_valid_mask = final_sample_mask
-        if not cfg.is_ppo:
-            assert isinstance(cfg.algo, GRPOConfig)
-            advantage_valid_mask = _advantage_valid_mask(final_sample_mask, cfg.algo)
+        if not cfg.is_ppo and cfg.algo.masked_reward_policy == "include":
+            # Preserve data-plane validity: token-capture placeholders never vote.
+            advantage_valid_mask = sample_mask
 
         repeated_batch: dict[str, torch.Tensor] = {
             "total_reward": rewards,
