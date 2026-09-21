@@ -100,6 +100,7 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo import DynamoConfig
 from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.generation.megatron import MegatronGeneration
+from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 from nemo_rl.utils.timer import Timer
 from tests.unit.algorithms.utils import (
@@ -6511,18 +6512,16 @@ def test_in_loss_threshold_skips_policy_forward_without_disabling_threshold():
     assert config.grpo.seq_logprob_error_threshold == 2.0
 
 
-@pytest.mark.parametrize("include_draft", [True, False])
-def test_validate_single_forward_config(
-    mock_grpo_components, include_draft: bool
-) -> None:
+@pytest.mark.parametrize("draft", [None, {"enabled": False}, Eagle3DraftConfig()])
+def test_validate_single_forward_config(mock_grpo_components, draft) -> None:
     config = mock_grpo_components["master_config"]
     config.loss_fn.seq_logprob_error_in_loss = True
     config.grpo.seq_logprob_error_threshold = 2.0
     config.loss_fn.force_on_policy_ratio = True
     config.loss_fn.token_level_loss = True
     config.policy["megatron_cfg"] = {"enabled": True, "mtp_num_layers": 0}
-    if include_draft:
-        config.policy["draft"] = {"enabled": False}
+    if draft is not None:
+        config.policy["draft"] = draft
     else:
         config.policy.pop("draft", None)
     _validate_seq_logprob_error_in_loss(config)
@@ -6543,6 +6542,7 @@ def test_validate_single_forward_config(
         ({"policy": {"megatron_cfg": {"enabled": False}}}, "Megatron backend"),
         ({"policy": {"megatron_cfg": {"enabled": True, "mtp_num_layers": 1}}}, "MTP"),
         ({"policy": {"draft": {"enabled": True}}}, "draft"),
+        ({"policy": {"draft": Eagle3DraftConfig(enabled=True)}}, "draft"),
     ],
 )
 def test_single_forward_rejects_unsupported_configs(
