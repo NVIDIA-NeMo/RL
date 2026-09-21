@@ -177,6 +177,7 @@ def record_to_train_batch(
         TRUNCATED: truncated,
         "total_reward": total_reward,
         _VIOLATION_COUNTS_KEY: violation_counts,
+        "rollout_environment": record.metadata.get("rollout_environment", "unknown"),
     }
     if ROUTED_EXPERTS_FIELD in flat:
         train_data[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
@@ -238,6 +239,11 @@ def pack_payload(
             # and parsing it back out of "{group_id}_g{i}" would make the
             # numerics depend on a naming convention.
             GROUP_ID_TAG: group_id,
+            **(
+                {"rollout_environment": train_batch["rollout_environment"]}
+                if train_batch.get("rollout_environment", "unknown") != "unknown"
+                else {}
+            ),
             **violations[i],
             **multimodal_tags[i],
         }

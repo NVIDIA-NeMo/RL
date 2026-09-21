@@ -715,6 +715,7 @@ class SingleControllerActor:
             "reward_partials": [],
             "advantage_partials": [],
             "num_mask_sample_filtered": [],
+            "environment_counts": [],
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
@@ -5380,6 +5381,9 @@ class SingleControllerActor:
         )
         self._step_log_dict["reward_partials"].append(outcome.reward_partial)
         self._step_log_dict["advantage_partials"].append(outcome.advantage_partial)
+        self._step_log_dict.setdefault("environment_counts", []).append(
+            outcome.environment_counts
+        )
         if outcome.seq_logprob_error_metrics is not None:
             self._step_log_dict["seq_logprob_error_metrics"].append(
                 outcome.seq_logprob_error_metrics
