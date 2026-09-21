@@ -107,9 +107,9 @@ def test_refit_wire_format_canonicalizes_scale_shape_and_zero_bytes():
 
 def test_refit_wire_format_restores_flashinfer_flattened_leading_dimensions():
     weight_shape = (3, 5, 64)
-    values = torch.arange(
-        torch.Size(weight_shape).numel(), dtype=torch.float32
-    ).to(torch.float8_e4m3fn)
+    values = torch.arange(torch.Size(weight_shape).numel(), dtype=torch.float32).to(
+        torch.float8_e4m3fn
+    )
     values = values.reshape(-1, weight_shape[-1])
     scales = torch.arange(
         torch.Size(weight_shape).numel() // MXFP8_BLOCK_SIZE,

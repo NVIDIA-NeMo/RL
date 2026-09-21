@@ -15,7 +15,7 @@
 import os
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 from unittest.mock import patch
 
@@ -26,7 +26,6 @@ from transformers import AutoConfig, AutoModel
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
-from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.utils import replace_parameter
 from vllm.triton_utils import tl, triton
@@ -34,13 +33,19 @@ from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
 
 from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
-from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
-from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
-    pad_flashinfer_scale_k,
-)
 from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
     MXFP8_SCALE_SUFFIX,
     canonicalize_mxfp8_refit_output,
+)
+from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
+    assign_or_replace_parameter,
+    flashinfer_mxfp8_moe_padding_plan,
+    pad_flashinfer_scale_k,
+    pad_tensor_dim,
+    pad_w13_intermediate,
+)
+from nemo_rl.models.generation.vllm.quantization.utils import (
+    resolve_module_from_param_name,
 )
 from nemo_rl.models.generation.vllm.utils import is_grouped_moe_expert_weight_name
 from nemo_rl.models.generation.vllm.worker_utils import (
@@ -523,73 +528,19 @@ def _get_params_in_layers(param_names, layers):
     return params
 
 
-def _get_module_from_param_name(model, name: str):
-    name = deepseek_v4_fp8.map_checkpoint_name(model, name)
+def get_module_from_param_name(model, name: str):
+    """Resolve the vLLM submodule owning an HF-named parameter.
 
-    # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
-    # The module path is all but the last part (the parameter's own name)
-    path_parts = name.split(".")
-    module_path = path_parts[:-1]
-    # Replace with the fused model name
-    packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
-    reversed_mapping = {
-        original_name: fused_name
-        for fused_name, original_names_list in packed_modules_mapping.items()
-        for original_name in original_names_list
-    }
-    if module_path[-1] in reversed_mapping.keys():
-        module_path[-1] = reversed_mapping[module_path[-1]]
-
-    module_path = deepseek_v4_fp8.remap_packed_module_path(model, module_path)
-
-    if hasattr(model, "hf_to_vllm_mapper") and hasattr(
-        model.hf_to_vllm_mapper, "orig_to_new_prefix"
-    ):
-        if module_path[0] in model.hf_to_vllm_mapper.orig_to_new_prefix:
-            module_path[0] = model.hf_to_vllm_mapper.orig_to_new_prefix[module_path[0]]
-    if hasattr(model, "hf_to_vllm_mapper") and hasattr(
-        model.hf_to_vllm_mapper, "orig_to_new_substr"
-    ):
-        for i in range(len(module_path)):
-            if module_path[i] in model.hf_to_vllm_mapper.orig_to_new_substr:
-                module_path[i] = model.hf_to_vllm_mapper.orig_to_new_substr[
-                    module_path[i]
-                ]
-
-    current_module = model
-    try:
-        # Traverse the model hierarchy
-        for part in module_path:
-            # vLLM 0.25 split the old FusedMoE module into a MoERunner that
-            # delegates to a RoutedExperts submodule owning the expert weights
-            # (w13_weight/w2_weight), so stop at either and return the
-            # weight-owning module.
-            if isinstance(current_module, MoERunner):
-                return current_module.routed_experts
-            if isinstance(current_module, RoutedExperts):
-                return current_module
-            if part == "model" and not hasattr(current_module, part):
-                # Some HF/vLLM model classes expose the decoder directly (for
-                # example ``language_model``) while parameter names still carry
-                # vLLM's synthetic ``model.`` prefix.
-                continue
-            if part == "layers" and not hasattr(current_module, part):
-                # Qwen3.5-MoE VL exposes ``language_model`` as a CausalLM
-                # wrapper; its decoder stack lives under ``language_model.model``.
-                wrapped_model = getattr(current_module, "model", None)
-                if wrapped_model is not None and hasattr(wrapped_model, part):
-                    current_module = wrapped_model
-            if isinstance(current_module, torch.nn.ModuleList):
-                current_module = current_module[int(part)]
-            else:
-                current_module = getattr(current_module, part)
-    except (AttributeError, IndexError, ValueError) as e:
-        print(f"Warning: Could not find module for parameter '{name}'. Error: {e}")
-    # Fused param names (e.g. "...experts.w13_weight") end the traversal on the
-    # MoERunner itself; normalize to the weight-owning RoutedExperts submodule.
-    if isinstance(current_module, MoERunner):
-        return current_module.routed_experts
-    return current_module
+    Walks ``name``'s dotted path through ``model``, remapping fused/renamed
+    prefixes via ``packed_modules_mapping`` and ``hf_to_vllm_mapper``, and
+    stopping early at a ``RoutedExperts`` (or its owning ``MoERunner``) since
+    per-expert path components below that point do not exist as submodules.
+    """
+    resolution = resolve_module_from_param_name(model, name)
+    if resolution is None:
+        print(f"Warning: Could not find module for parameter '{name}'.")
+        return None
+    return resolution.module
 
 
 _GROUPED_EXPERT_WEIGHT_SUFFIXES = (
@@ -614,7 +565,7 @@ def _is_fp8_weight(name, model):
         fp8_state.seen_params.add(name)
         # Filter out bias params
         if name.endswith("weight") or _is_grouped_expert_weight(name):
-            module = _get_module_from_param_name(model, name)
+            module = get_module_from_param_name(model, name)
             # We currently only quantize linear layers
             if (
                 isinstance(module, LinearBase)
@@ -630,7 +581,7 @@ def _is_fp8_weight(name, model):
 
 
 def _is_fp8_grouped_moe_expert(name: str, model: Any) -> bool:
-    experts_module = _get_module_from_param_name(model, name)
+    experts_module = get_module_from_param_name(model, name)
     return (
         isinstance(experts_module, RoutedExperts)
         and experts_module.w13_weight.dtype == torch.float8_e4m3fn
@@ -1161,7 +1112,8 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
     weight = layer.weight.data  # [N, K]
     N, K = weight.shape
 
-    if not hasattr(layer, "weight_scale_from_checkpoint"):
+    first_load = not hasattr(layer, "weight_scale_from_checkpoint")
+    if first_load:
         layer.weight_scale_from_checkpoint = ModelWeightParameter(
             data=layer.weight_scale.data,
             input_dim=1,
@@ -1172,20 +1124,20 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
             "weight_scale_from_checkpoint", layer.weight_scale_from_checkpoint
         )
         weight_scale = layer.weight_scale.data
-        # Swizzle the weight scales
-        scale_k = K // 32
-        weight_scale_2d = weight_scale[:N, :scale_k].contiguous()
-        weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
-        layer.weight_scale = torch.nn.Parameter(
-            weight_scale_swizzled.contiguous(), requires_grad=False
-        )
     else:
         weight_scale = layer.weight_scale_from_checkpoint.data
-        # Swizzle the weight scales
-        scale_k = K // 32
-        weight_scale_2d = weight_scale[:N, :scale_k].contiguous()
-        weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
-        layer.weight_scale.copy_(weight_scale_swizzled.contiguous())
+
+    scale_k = K // 32
+    weight_scale_2d = weight_scale[:N, :scale_k].contiguous()
+    weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
+    # The checkpoint parameter aliases the original storage on first load.
+    # Install separate runtime storage before writing the swizzled scale.
+    assign_or_replace_parameter(
+        layer,
+        "weight_scale",
+        weight_scale_swizzled,
+        force_replace=first_load,
+    )
 
 
 def create_weights_mxfp8_moe(
@@ -1364,61 +1316,6 @@ def process_weights_after_loading_moe(self, layer) -> None:
             routing_tables=layer._expert_routing_tables(),
             layer=layer,
         )
-
-
-def _round_up(value: int, multiple: int) -> int:
-    return ((value + multiple - 1) // multiple) * multiple
-
-
-def _pad_tensor_dim(
-    tensor: torch.Tensor, dim: int, padded_size: int, pad_value: int = 0
-) -> torch.Tensor:
-    current_size = tensor.shape[dim]
-    if current_size == padded_size:
-        return tensor
-    padded_shape = list(tensor.shape)
-    padded_shape[dim] = padded_size
-    padded = torch.zeros(padded_shape, dtype=tensor.dtype, device=tensor.device)
-    if pad_value != 0:
-        padded.fill_(pad_value)
-    padded.narrow(dim, 0, current_size).copy_(tensor)
-    return padded
-
-
-def _pad_w13_shards(
-    tensor: torch.Tensor,
-    intermediate_size_factor: int,
-    padded_intermediate_size: int,
-    pad_value: int = 0,
-) -> torch.Tensor:
-    """Pad the intermediate dim of a [E, factor*I, K] tensor to [E, factor*I_pad, K].
-
-    Pads each of the factor shards separately so gated W13 halves stay aligned
-    for swap_w13_to_w31 and reorder_rows_for_gated_act_gemm.
-    """
-    num_experts, total_rows, cols = tensor.shape
-    rows_per_shard = total_rows // intermediate_size_factor
-    if rows_per_shard == padded_intermediate_size:
-        return tensor
-    shards = tensor.reshape(num_experts, intermediate_size_factor, rows_per_shard, cols)
-    shards = _pad_tensor_dim(shards, 2, padded_intermediate_size, pad_value)
-    return shards.reshape(
-        num_experts, intermediate_size_factor * padded_intermediate_size, cols
-    )
-
-
-def _clamp_mxfp8_scale(scale: torch.Tensor) -> torch.Tensor:
-    return torch.where(scale == 0, torch.ones_like(scale), scale)
-
-
-def _set_mxfp8_apply_tensor(layer, name: str, value: torch.Tensor) -> None:
-    existing = getattr(layer, name, None)
-    if existing is not None and existing.shape == value.shape:
-        # Keep storage stable across refits (CUDA graphs capture pointers).
-        existing.copy_(value)
-    else:
-        # Clone: value may view a scratch buffer shared across layers.
-        setattr(layer, name, torch.nn.Parameter(value.clone(), requires_grad=False))
 
 
 # Shared gather destinations keyed by (tag, shape, device). They persist across
@@ -1607,86 +1504,83 @@ def _shuffle_mxfp8_moe_per_expert(
     )
 
 
-def process_weights_after_loading_mxfp8_moe(self, layer: RoutedExperts) -> None:
-    """Shuffle weights and scales into FlashInfer TRTLLM MXFP8 layout.
-
-    FlashInfer's shuffle_matrix_sf_a requires M divisible by 128, so the
-    intermediate dim is padded to 128 (Nemotron-3-Nano: 1856 -> 1920,
-    928 -> 1024 at TP2). The TRTLLM kernel also produced non-finite output
-    for Nano's hidden 2816 unless padded to the next 512 boundary (3072).
-    When padding is needed, the checkpoint-layout parameters keep their
-    original shapes so refit keeps loading into them unchanged, and the
-    padded+shuffled kernel inputs are maintained as separate *_for_apply
-    tensors consumed by apply_monolithic_mxfp8_moe. Already-aligned models
-    keep the original in-place shuffle behavior.
-    """
+def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
+    """Shuffle weights and scales into FlashInfer TRTLLM MXFP8 layout."""
     from vllm.model_executor.layers.fused_moe import FusedMoeWeightScaleSupported
     from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
     from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
         swap_w13_to_w31,
     )
-    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
-        MXFP8_BLOCK_SIZE,
-    )
     from vllm.model_executor.parameter import ModelWeightParameter
     from vllm.model_executor.utils import set_weight_attrs
 
-    if (
-        self.mxfp8_backend != Fp8MoeBackend.FLASHINFER_TRTLLM
-        or not self.experts_cls.is_monolithic()
-    ):
+    if self.mxfp8_backend != Fp8MoeBackend.FLASHINFER_TRTLLM:
         raise NotImplementedError(
-            "NeMo-RL's padded and batched MXFP8 refit path requires the "
-            "monolithic FlashInfer TRTLLM backend."
+            "MXFP8 MoE refit layout conversion only supports FLASHINFER_TRTLLM; "
+            f"got {self.mxfp8_backend}."
         )
 
-    layer.weight_block_size = self.weight_block_size
     epilogue_tile_m = 128
+    e8m0_unit_scale = 127
     is_gated = self.moe.is_act_and_mul
-    intermediate_size_factor = 2 if is_gated else 1
-
-    # Sizes come from the checkpoint-layout params, not layer attributes:
-    # layer.intermediate_size_per_partition is switched to the padded value
-    # below, while these params keep their original shapes across refits.
-    original_intermediate_size = layer.w2_weight.shape[2]
-    original_hidden_size = layer.w13_weight.shape[2]
-    padded_intermediate_size = _round_up(original_intermediate_size, 128)
-    padded_hidden_size = _round_up(original_hidden_size, 512)
-    needs_padding = (
-        padded_intermediate_size != original_intermediate_size
-        or padded_hidden_size != original_hidden_size
-    )
-
     first_load = not hasattr(layer, "w13_weight_scale_from_checkpoint")
     w13_weight = layer.w13_weight.data
     if first_load:
         w13_scale = layer.w13_weight_scale.data
-        w2_scale = layer.w2_weight_scale.data
     else:
         w13_scale = layer.w13_weight_scale_from_checkpoint.data
-        w2_scale = layer.w2_weight_scale_from_checkpoint.data
     w2_weight = layer.w2_weight.data
+    if first_load:
+        w2_scale = layer.w2_weight_scale.data
+    else:
+        w2_scale = layer.w2_weight_scale_from_checkpoint.data
 
-    if needs_padding:
-        w13_weight = _pad_w13_shards(
-            w13_weight, intermediate_size_factor, padded_intermediate_size
+    unpadded_hidden_size = w13_weight.shape[2]
+    unpadded_intermediate_size = w2_weight.shape[2]
+    padded_hidden_size, padded_intermediate_size = flashinfer_mxfp8_moe_padding_plan(
+        unpadded_hidden_size, unpadded_intermediate_size
+    )
+    requires_padding = (
+        padded_hidden_size != unpadded_hidden_size
+        or padded_intermediate_size != unpadded_intermediate_size
+    )
+    if requires_padding and not self.experts_cls.is_monolithic():
+        raise NotImplementedError(
+            "Padded FlashInfer TRTLLM MXFP8 MoE requires a monolithic kernel."
         )
-        w13_weight = _pad_tensor_dim(w13_weight, 2, padded_hidden_size)
-        w13_scale = _pad_w13_shards(
-            w13_scale, intermediate_size_factor, padded_intermediate_size, pad_value=1
+
+    if requires_padding:
+        from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+            MXFP8_BLOCK_SIZE,
         )
-        w13_scale = _pad_tensor_dim(
-            w13_scale, 2, padded_hidden_size // MXFP8_BLOCK_SIZE, pad_value=1
+
+        w13_weight = pad_w13_intermediate(
+            w13_weight,
+            padded_intermediate_size,
+            is_gated,
         )
-        w2_weight = _pad_tensor_dim(w2_weight, 1, padded_hidden_size)
-        w2_weight = _pad_tensor_dim(w2_weight, 2, padded_intermediate_size)
-        w2_scale = _pad_tensor_dim(w2_scale, 1, padded_hidden_size, pad_value=1)
-        w2_scale = _pad_tensor_dim(
-            w2_scale, 2, padded_intermediate_size // MXFP8_BLOCK_SIZE, pad_value=1
+        w13_weight = pad_tensor_dim(w13_weight, 2, padded_hidden_size)
+        w2_weight = pad_tensor_dim(w2_weight, 1, padded_hidden_size)
+        w2_weight = pad_tensor_dim(w2_weight, 2, padded_intermediate_size)
+        w13_scale = pad_w13_intermediate(
+            w13_scale,
+            padded_intermediate_size,
+            is_gated,
+            e8m0_unit_scale,
         )
-        # Zero E8M0 scale bytes destabilize the TRTLLM kernel; clamp to byte 1.
-        w13_scale = _clamp_mxfp8_scale(w13_scale)
-        w2_scale = _clamp_mxfp8_scale(w2_scale)
+        w13_scale = pad_tensor_dim(
+            w13_scale,
+            2,
+            padded_hidden_size // MXFP8_BLOCK_SIZE,
+            e8m0_unit_scale,
+        )
+        w2_scale = pad_tensor_dim(w2_scale, 1, padded_hidden_size, e8m0_unit_scale)
+        w2_scale = pad_tensor_dim(
+            w2_scale,
+            2,
+            padded_intermediate_size // MXFP8_BLOCK_SIZE,
+            e8m0_unit_scale,
+        )
 
     if is_gated:
         # FI TRTLLM gated kernels use W31 ordering. Model checkpoints store
@@ -1700,7 +1594,13 @@ def process_weights_after_loading_mxfp8_moe(self, layer: RoutedExperts) -> None:
         w13_scale_shuffled,
         w2_scale_shuffled,
     ) = _shuffle_mxfp8_moe_batched(
-        layer, w13_weight, w2_weight, w13_scale, w2_scale, is_gated, epilogue_tile_m
+        layer,
+        w13_weight,
+        w2_weight,
+        w13_scale,
+        w2_scale,
+        is_gated,
+        epilogue_tile_m,
     )
 
     if first_load:
@@ -1737,66 +1637,58 @@ def process_weights_after_loading_mxfp8_moe(self, layer: RoutedExperts) -> None:
             {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value},
         )
 
-    if needs_padding:
-        # Checkpoint-layout params (w13_weight, w2_weight, w13_weight_scale,
-        # w2_weight_scale and the *_from_checkpoint aliases) stay untouched so
-        # refit keeps loading unpadded tensors into them. The kernel consumes
-        # the *_for_apply tensors instead.
-        layer.mxfp8_unpadded_hidden_size = original_hidden_size
-        layer.mxfp8_padded_hidden_size = padded_hidden_size
-        layer.mxfp8_unpadded_intermediate_size_per_partition = (
-            original_intermediate_size
-        )
-        layer.mxfp8_padded_intermediate_size_per_partition = padded_intermediate_size
-        # vLLM 0.25 stores this size on both RoutedExperts and its FusedMoEConfig.
-        # Keep them aligned so routing/kernel setup sees the padded value.
-        # Hidden size stays original: apply pads x and narrows the output back.
-        layer.intermediate_size_per_partition = padded_intermediate_size
-        layer.moe_config.intermediate_size_per_partition = padded_intermediate_size
-        self.moe.intermediate_size_per_partition = padded_intermediate_size
-        _set_mxfp8_apply_tensor(layer, "w13_weight_for_apply", w13_weight_shuffled)
-        _set_mxfp8_apply_tensor(layer, "w2_weight_for_apply", w2_weight_shuffled)
-        _set_mxfp8_apply_tensor(layer, "w13_scale_for_apply", w13_scale_shuffled)
-        _set_mxfp8_apply_tensor(layer, "w2_scale_for_apply", w2_scale_shuffled)
-    else:
-        if first_load:
-            layer.w13_weight_scale = torch.nn.Parameter(
-                w13_scale_shuffled, requires_grad=False
-            )
-            layer.w2_weight_scale = torch.nn.Parameter(
-                w2_scale_shuffled, requires_grad=False
-            )
-        else:
-            layer.w13_weight_scale.copy_(w13_scale_shuffled)
-            layer.w2_weight_scale.copy_(w2_scale_shuffled)
-        layer.w13_weight.copy_(w13_weight_shuffled)
-        layer.w2_weight.copy_(w2_weight_shuffled)
+    assign_or_replace_parameter(
+        layer,
+        "w13_weight_scale",
+        w13_scale_shuffled,
+        force_replace=first_load,
+    )
+    assign_or_replace_parameter(
+        layer,
+        "w2_weight_scale",
+        w2_scale_shuffled,
+        force_replace=first_load,
+    )
 
-    runtime_w13_scale = getattr(layer, "w13_scale_for_apply", layer.w13_weight_scale)
-    runtime_w2_scale = getattr(layer, "w2_scale_for_apply", layer.w2_weight_scale)
-    assert self.moe is layer.moe_config
+    if requires_padding:
+        assign_or_replace_parameter(
+            layer,
+            "w13_weight_for_apply",
+            w13_weight_shuffled,
+        )
+        assign_or_replace_parameter(
+            layer,
+            "w2_weight_for_apply",
+            w2_weight_shuffled,
+        )
+    else:
+        assign_or_replace_parameter(layer, "w13_weight", w13_weight_shuffled)
+        assign_or_replace_parameter(layer, "w2_weight", w2_weight_shuffled)
 
     if self.moe_kernel is None:
-        from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
-            make_fp8_moe_kernel,
-            make_fp8_moe_quant_config,
-        )
+        from vllm.model_executor.layers.quantization.fp8 import make_fp8_moe_kernel
 
-        self.moe_quant_config = make_fp8_moe_quant_config(
-            fp8_backend=self.mxfp8_backend,
-            w1_scale=runtime_w13_scale,
-            w2_scale=runtime_w2_scale,
-            a1_scale=None,
-            a2_scale=None,
-            block_shape=self.weight_block_size,
-            swiglu_limit=getattr(layer, "swiglu_limit", None),
-            gemm1_alpha=getattr(layer, "swiglu_alpha", None),
-            gemm1_beta=getattr(layer, "swiglu_beta", None),
-            layer=layer,
-        )
+        kernel_moe_config = self.moe
+        if requires_padding:
+            # TRTLLM consumes the padded fields. The logical fields are kept so
+            # the patched apply path can pad inputs and trim outputs.
+            kernel_moe_config = replace(
+                self.moe,
+                hidden_dim=padded_hidden_size,
+                hidden_dim_unpadded=unpadded_hidden_size,
+                intermediate_size=(
+                    padded_intermediate_size * self.moe.moe_parallel_config.tp_size
+                ),
+                intermediate_size_per_partition=padded_intermediate_size,
+                intermediate_size_per_partition_unpadded=unpadded_intermediate_size,
+            )
+        self._mxfp8_kernel_moe_config = kernel_moe_config
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        assert self.moe_quant_config is not None
+        assert self.experts_cls is not None
         self.moe_kernel = make_fp8_moe_kernel(
             moe_quant_config=self.moe_quant_config,
-            moe_config=self.moe,
+            moe_config=kernel_moe_config,
             fp8_backend=self.mxfp8_backend,
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
@@ -1805,8 +1697,8 @@ def process_weights_after_loading_mxfp8_moe(self, layer: RoutedExperts) -> None:
     else:
         assert self.moe_quant_config is not None
         for kernel_scale, runtime_scale, scale_name in (
-            (self.moe_quant_config.w1_scale, runtime_w13_scale, "w13"),
-            (self.moe_quant_config.w2_scale, runtime_w2_scale, "w2"),
+            (self.moe_quant_config.w1_scale, layer.w13_weight_scale, "w13"),
+            (self.moe_quant_config.w2_scale, layer.w2_weight_scale, "w2"),
         ):
             if kernel_scale is runtime_scale:
                 continue
@@ -1821,33 +1713,37 @@ def process_weights_after_loading_mxfp8_moe(self, layer: RoutedExperts) -> None:
 
 def apply_monolithic_mxfp8_moe(
     self,
-    layer: RoutedExperts,
+    layer,
     x: torch.Tensor,
     router_logits: torch.Tensor,
     input_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Forward for the FlashInfer TRTLLM MXFP8 MoE with hidden-dim padding.
+    """Apply FlashInfer TRTLLM MXFP8 MoE using padded execution tensors."""
+    import torch.nn.functional as F
 
-    Uses vLLM 0.25.1's modular MoE kernel with the *_for_apply tensors built by
-    process_weights_after_loading_mxfp8_moe when padding is active, pads x's
-    hidden dim to mxfp8_padded_hidden_size before the kernel, and narrows the
-    output back.
-    """
+    del input_ids
     assert self.is_monolithic
     assert self.moe_kernel is not None
-    unpadded_hidden_size = x.shape[-1]
-    padded_hidden_size = getattr(
-        layer, "mxfp8_padded_hidden_size", unpadded_hidden_size
-    )
-    if unpadded_hidden_size < padded_hidden_size:
-        x = torch.nn.functional.pad(
-            x, (0, padded_hidden_size - unpadded_hidden_size), value=0.0
-        )
 
+    kernel_moe_config = getattr(self, "_mxfp8_kernel_moe_config", self.moe)
+    unpadded_hidden_size = kernel_moe_config.hidden_dim_unpadded
+    padded_hidden_size = kernel_moe_config.hidden_dim
+    assert unpadded_hidden_size is not None
+    if x.shape[-1] != unpadded_hidden_size:
+        raise ValueError(
+            f"Expected MXFP8 MoE hidden size {unpadded_hidden_size}, got {x.shape[-1]}."
+        )
+    x_for_moe = F.pad(x, (0, padded_hidden_size - unpadded_hidden_size))
+    w13_weight = getattr(layer, "w13_weight_for_apply", None)
+    if w13_weight is None:
+        w13_weight = layer.w13_weight
+    w2_weight = getattr(layer, "w2_weight_for_apply", None)
+    if w2_weight is None:
+        w2_weight = layer.w2_weight
     output = self.moe_kernel.apply_monolithic(
-        x,
-        getattr(layer, "w13_weight_for_apply", layer.w13_weight),
-        getattr(layer, "w2_weight_for_apply", layer.w2_weight),
+        x_for_moe,
+        w13_weight,
+        w2_weight,
         router_logits,
         activation=layer.activation,
         global_num_experts=layer.global_num_experts,
@@ -1858,9 +1754,7 @@ def apply_monolithic_mxfp8_moe(
         e_score_correction_bias=layer.e_score_correction_bias,
         routed_scaling_factor=layer.routed_scaling_factor,
     )
-    if output.shape[-1] != unpadded_hidden_size:
-        output = output[..., :unpadded_hidden_size].contiguous()
-    return output
+    return output[..., :unpadded_hidden_size].contiguous()
 
 
 def process_weights_after_loading_kv(self, layer) -> None:

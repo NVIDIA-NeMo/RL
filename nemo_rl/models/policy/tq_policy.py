@@ -56,6 +56,8 @@ from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
     GLOBAL_FORWARD_PAD_SEQLEN,
     LP_SEED_FIELDS,
+    MICRO_BATCH_INDICES,
+    MICRO_BATCH_LENGTHS,
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
     fields_with_optional_opd_full,
@@ -116,9 +118,14 @@ class TQPolicy(TQDriverMixin, Policy):
     the driver and forwards ``setup_data_plane(dp_cfg)`` to every worker
     so they can attach as clients (``bootstrap=False``).
 
+    ``checkpointing`` is an internal bootstrap mode derived from the existing
+    checkpoint settings and resume path, not another user-facing switch. For
+    Mooncake it enables hard-pinned memory, disables offload, and keeps the
+    driver out of the storage topology; workers inherit the controller's mode.
+
     The partition lifecycle (``register_partition`` / ``clear_samples``) is
     the trainer's responsibility — this class assumes the partition
-    named ``self.tq_partition_id`` (default ``"train"``) is open with a
+    named by ``tq_partition_id`` (default ``"train"``) is open with a
     schema covering ``DP_TRAIN_FIELDS`` (the bulk schema written by the
     rollout actor at first put + driver-/worker-written deltas).
     """
@@ -127,6 +134,7 @@ class TQPolicy(TQDriverMixin, Policy):
         self,
         *args: Any,
         dp_cfg: DataPlaneRuntimeConfig,
+        checkpointing: bool = False,
         tq_partition_id: str = "train",
         **kwargs: Any,
     ) -> None:
@@ -143,17 +151,24 @@ class TQPolicy(TQDriverMixin, Policy):
                 f"TP/PP/CP/EP sizes."
             )
         self.dp_cfg = dp_cfg
-        self.dp_client = build_data_plane_client(dp_cfg, bootstrap=True)
+        self.dp_client = build_data_plane_client(
+            dp_cfg, bootstrap=True, checkpointing=checkpointing
+        )
         self.tq_partition_id = tq_partition_id
         self._router_replay_enabled = bool(
             (self.cfg.get("router_replay") or {}).get("enabled", False)
         )
-        # Per-token teacher payload column read by the full-vocabulary MOPD loss.
+        # Per-token teacher payload column read by the full-vocabulary MOPD loss,
+        # plus (on the hidden-state path) a per-sample teacher-identity column.
         # Resolved by the driver in setup; absent means the feature is off and
-        # the column must stay out of every fetch.
+        # the columns must stay out of every fetch.
+        _opd_full_cfg = self.cfg.get("on_policy_distillation_full")
         self._opd_full_field: Optional[str] = (
-            self.cfg.get("on_policy_distillation_full") or {}
-        ).get("payload_field")
+            _opd_full_cfg["payload_field"] if _opd_full_cfg else None
+        )
+        self._opd_full_teacher_index_field: Optional[str] = (
+            _opd_full_cfg["teacher_index_field"] if _opd_full_cfg else None
+        )
         # The baseline the cluster step metrics are differenced against. Kept
         # per policy rather than in module state so two trainers in one
         # process cannot interleave one baseline; the driver's own baseline
@@ -207,6 +222,7 @@ class TQPolicy(TQDriverMixin, Policy):
                     DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
                 ),
                 field=self._opd_full_field,
+                teacher_index_field=self._opd_full_teacher_index_field,
             ),
             num_samples=num_samples,
             consumer_tasks=["prev_lp", "ref_lp", "train"],
@@ -229,6 +245,7 @@ class TQPolicy(TQDriverMixin, Policy):
                     DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
                 ),
                 field=self._opd_full_field,
+                teacher_index_field=self._opd_full_teacher_index_field,
             ),
             num_samples=num_samples,
             consumer_tasks=[partition_id],
@@ -499,7 +516,11 @@ class TQPolicy(TQDriverMixin, Policy):
         train_meta = self._with_route_fields(
             meta,
             tuple(
-                fields_with_optional_opd_full(train_fields, field=self._opd_full_field)
+                fields_with_optional_opd_full(
+                    train_fields,
+                    field=self._opd_full_field,
+                    teacher_index_field=self._opd_full_teacher_index_field,
+                )
             ),
             task_name="train",
             want_routes=True,
@@ -633,7 +654,11 @@ class TQPolicy(TQDriverMixin, Policy):
             # router replay and route-plan passthrough. The opd_full payload
             # column has no such gate, so it is appended here.
             tuple(
-                fields_with_optional_opd_full(train_fields, field=self._opd_full_field)
+                fields_with_optional_opd_full(
+                    train_fields,
+                    field=self._opd_full_field,
+                    teacher_index_field=self._opd_full_teacher_index_field,
+                )
             ),
             task_name="train",
             want_routes=True,
@@ -667,10 +692,15 @@ class TQPolicy(TQDriverMixin, Policy):
                 f"got {len(dp_metas)} batches for dp_world={dp_world}."
             )
         spa, dba = self._packing_args("train_mb_tokens")
-        if spa is not None or dba is not None:
+        if dba is not None:
+            raise ValueError("Placed metadata does not support dynamic batching.")
+        if spa is not None and any(
+            MICRO_BATCH_INDICES not in meta.extra_info
+            or MICRO_BATCH_LENGTHS not in meta.extra_info
+            for meta in dp_metas
+        ):
             raise ValueError(
-                "Placed metadata supports fixed batches only. Disable NeMo-RL "
-                "sequence packing and dynamic batching."
+                "Placed packed metadata requires producer microbatch shapes."
             )
         train_metas = [
             replace(meta, task_name="train")

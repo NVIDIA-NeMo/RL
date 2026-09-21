@@ -14,7 +14,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -33,6 +33,7 @@ from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.utils.checkpoint import CheckpointManager
 
 
 def _make_loss_config(
@@ -274,6 +275,32 @@ def test_gae_vapo_decoupled_lambda():
     # because they are computed with different lambda values
     adv_plus_val = advantages + values
     assert not torch.allclose(returns, adv_plus_val, atol=1e-5)
+
+
+def test_gae_equal_explicit_lambdas_compute_once():
+    """Explicit equal policy and value lambdas reuse a single GAE pass."""
+    config = GAEConfig(
+        gae_lambda_value=1.0,
+        gae_lambda_policy=1.0,
+        normalize_advantages=False,
+    )
+    estimator = GeneralizedAdvantageEstimator(config, _make_loss_config(kl_penalty=0.0))
+    mask = torch.ones(2, 4)
+    values = torch.randn(2, 4)
+
+    with patch.object(
+        estimator, "_compute_gae", wraps=estimator._compute_gae
+    ) as compute_gae:
+        advantages, returns = estimator.compute_advantage(
+            prompt_ids=torch.tensor([[0], [1]]),
+            rewards=torch.tensor([1.0, 2.0]),
+            mask=mask,
+            values=values,
+        )
+
+    assert compute_gae.call_count == 1
+    assert compute_gae.call_args.kwargs["gae_lambda"] == 1.0
+    torch.testing.assert_close(returns, advantages + values)
 
 
 def test_gae_length_adaptive_lambda():
@@ -1075,6 +1102,62 @@ def _run_mock_ppo_train(
     )
 
 
+def test_ppo_dynamic_sampling_uses_whole_prompt_triviality():
+    """PPO must keep a mixed prompt intact even when one rollout has zero LOO std."""
+    from nemo_rl.algorithms import ppo as ppo_mod
+    from nemo_rl.algorithms.utils import (
+        calculate_baseline_and_std_per_prompt,
+        calculate_trivial_reward_distributions,
+    )
+
+    rewards = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0])
+    prompt_ids = torch.tensor([[0]] * 4 + [[1]] * 4)
+    repeated_batch = BatchedDataDict(
+        {
+            "message_log": [
+                [{"role": "user", "content": f"prompt-{i // 4}"}] for i in range(8)
+            ],
+            "total_reward": rewards,
+        }
+    )
+    baseline, std, loo_is_trivial = calculate_baseline_and_std_per_prompt(
+        prompt_ids,
+        rewards,
+        torch.ones_like(rewards),
+        leave_one_out_baseline=True,
+    )
+    prompt_is_trivial = calculate_trivial_reward_distributions(
+        prompt_ids, rewards, torch.ones_like(rewards)
+    )
+
+    assert loo_is_trivial.tolist()[:4] == [True, False, False, False]
+    assert prompt_is_trivial.tolist() == [False] * 4 + [True] * 4
+
+    timer = MagicMock()
+    timer.time.return_value = nullcontext()
+    master_config = SimpleNamespace(
+        ppo=SimpleNamespace(
+            use_dynamic_sampling=True,
+            num_prompts_per_step=1,
+            num_generations_per_prompt=4,
+            dynamic_sampling_max_gen_batches=2,
+        )
+    )
+    result, is_batch_complete, _, _ = ppo_mod.dynamic_sampling(
+        repeated_batch,
+        std,
+        baseline,
+        dynamic_sampling_num_gen_batches=1,
+        master_config=master_config,
+        timer=timer,
+        is_trivial_prompt_distribution=prompt_is_trivial,
+    )
+
+    assert is_batch_complete is True
+    assert result.size == 4
+    torch.testing.assert_close(result["filtered_reward"], rewards[:4])
+
+
 def test_ppo_train_noncolocated_refit_offload_lifecycle(monkeypatch):
     harness = _run_mock_ppo_train(
         monkeypatch,
@@ -1513,8 +1596,10 @@ def _patch_ppo_setup_prerequisites(monkeypatch):
         def load_training_info(self, _path):
             return None
 
-        def get_resume_paths(self, _path, *, model_component="policy"):
-            return None, None
+        # The real resolver: a warm-start test needs the seed's subtree to
+        # resolve. It still returns (None, None) when there is no checkpoint,
+        # which is what every other test here relies on.
+        get_resume_paths = staticmethod(CheckpointManager.get_resume_paths)
 
     class DummyLoader:
         def __init__(self, *_args, **_kwargs):
@@ -2105,6 +2190,24 @@ def test_ppo_setup_rejects_a_warm_start_that_does_not_resolve(monkeypatch, tmp_p
 
     with pytest.raises(ValueError, match="would silently start cold"):
         _run_noncolocated_setup(monkeypatch, config)
+
+
+def test_ppo_setup_warm_start_takes_weights_but_not_the_seeds_optimizer(
+    monkeypatch, tmp_path
+):
+    """The seed's Adam state and LR-scheduler step count belong to the run that
+    produced it, so a warm start rebuilds both and only the weights carry over."""
+    seed = tmp_path / "critic_pretrain" / "step_370"
+    (seed / "value" / "weights").mkdir(parents=True)
+    (seed / "value" / "optimizer").mkdir()
+    config = _make_noncolocated_setup_config()
+    config.ppo.warm_start_value_checkpoint = str(seed)
+
+    *_, value_factory, _, _ = _run_noncolocated_setup(monkeypatch, config)
+
+    value_kwargs = value_factory.call_args.kwargs
+    assert value_kwargs["weights_path"] == seed / "value" / "weights"
+    assert value_kwargs["optimizer_path"] is None
 
 
 def test_colocated_setup_keeps_single_cluster_and_skips_collective(monkeypatch):

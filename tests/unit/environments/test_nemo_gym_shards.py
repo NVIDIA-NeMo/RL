@@ -20,9 +20,11 @@ from nemo_rl.environments.nemo_gym_shards import (
     GYM_LOG_DIR_KEY,
     ShardConfigError,
     ShardPlan,
+    ShardSetupError,
     ShardSpec,
     apply_shard_log_dir,
     apply_shard_overlay,
+    build_route_shard_map,
     find_gym_config_entries,
     parse_shard_plan,
 )
@@ -84,6 +86,25 @@ def test_parse_shard_plan_accepts_omegaconf_input():
 def test_top_level_config_paths_conflicts_with_shards():
     with pytest.raises(ShardConfigError, match="cannot be combined with 'shards'"):
         parse_shard_plan(_sharded_config(config_paths=["gym.yaml"]))
+
+
+def test_an_inherited_config_paths_can_be_retracted_with_null():
+    """A Hydra override can blank a key it inherited but cannot delete it, so
+    null has to read as absent or no recipe could ever be sharded."""
+    plan = parse_shard_plan(_sharded_config(config_paths=None))
+
+    assert plan is not None
+    assert [shard.name for shard in plan.shards] == ["judged", "tools"]
+
+
+def test_a_nulled_entry_overlay_is_not_forwarded_to_gym():
+    """Gym should get the key gone, not the key set to null."""
+    plan = parse_shard_plan(_sharded_config(policy_model=None))
+    assert plan is not None
+
+    merged = apply_shard_overlay({"policy_model": None}, plan, plan.shards[0])
+
+    assert "policy_model" not in merged
 
 
 def test_multi_shard_plan_rejects_an_unclaimed_inherited_overlay():
@@ -370,6 +391,84 @@ def test_common_overrides_only_override_common_inherited_entries():
         parse_shard_plan(config)
 
 
+def test_shards_land_on_distinct_nodes_unless_told_otherwise():
+    assert parse_shard_plan(_sharded_config()).placement_strategy == "STRICT_SPREAD"
+
+
+def test_placement_strategy_can_be_relaxed_to_run_shards_on_one_machine():
+    plan = parse_shard_plan(
+        _sharded_config(
+            placement_strategy="PACK",
+            shards=[
+                {
+                    "name": "judged",
+                    "config_paths": ["judge.yaml"],
+                    "port_range_low": 5000,
+                    "port_range_high": 5500,
+                },
+                {
+                    "name": "tools",
+                    "config_paths": ["tools.yaml"],
+                    "port_range_low": 5501,
+                    "port_range_high": 6000,
+                },
+            ],
+        )
+    )
+
+    assert plan.placement_strategy == "PACK"
+
+
+def test_relaxed_placement_requires_disjoint_explicit_port_ranges():
+    with pytest.raises(ShardConfigError, match="require explicit port_range"):
+        parse_shard_plan(_sharded_config(placement_strategy="PACK"))
+
+    with pytest.raises(ShardConfigError, match="overlapping port ranges"):
+        parse_shard_plan(
+            _sharded_config(
+                placement_strategy="PACK",
+                shards=[
+                    {
+                        "name": "judged",
+                        "config_paths": ["judge.yaml"],
+                        "port_range_low": 5000,
+                        "port_range_high": 5600,
+                    },
+                    {
+                        "name": "tools",
+                        "config_paths": ["tools.yaml"],
+                        "port_range_low": 5600,
+                        "port_range_high": 6000,
+                    },
+                ],
+            )
+        )
+
+
+def test_an_unknown_placement_strategy_is_rejected():
+    with pytest.raises(ShardConfigError, match="placement_strategy must be one of"):
+        parse_shard_plan(_sharded_config(placement_strategy="SPRED"))
+
+
+@pytest.mark.parametrize("placement_strategy", ["PACK", "SPREAD", "STRICT_PACK"])
+def test_replicas_that_could_share_a_node_would_share_a_port_range(
+    placement_strategy,
+):
+    """Replicas come from one merge, so they cannot be given separate ranges."""
+    config = _sharded_config(placement_strategy=placement_strategy)
+    config["shards"][1]["replicas"] = 2
+
+    with pytest.raises(ShardConfigError, match=r"\['tools'\] declare replicas"):
+        parse_shard_plan(config)
+
+
+def test_replicas_are_fine_on_the_default_strategy_that_spreads_them():
+    config = _sharded_config()
+    config["shards"][1]["replicas"] = 2
+
+    assert [shard.replicas for shard in parse_shard_plan(config).shards] == [1, 2]
+
+
 def test_apply_shard_overlay_layers_shard_over_common():
     plan = ShardPlan(
         shards=[],
@@ -445,6 +544,105 @@ def test_apply_shard_overlay_keeps_global_ports_by_default():
     )
 
     assert (merged["port_range_low"], merged["port_range_high"]) == (5000, 5999)
+
+
+def test_build_route_shard_map_routes_agents_and_task_sources():
+    route_to_shard = build_route_shard_map(
+        {
+            "judged": {
+                "math_agent": ["responses_api_agents"],
+                "math_env": ["resources_servers"],
+            },
+            "tools": {
+                "bash_agent": ["responses_api_agents"],
+                "bash_tools": ["resources_servers"],
+            },
+        }
+    )
+
+    assert route_to_shard == {
+        "math_agent": "judged",
+        "math_env": "judged",
+        "bash_agent": "tools",
+        "bash_tools": "tools",
+    }
+
+
+def test_build_route_shard_map_rejects_an_agent_in_two_shards():
+    """Rows naming the agent could go to either shard, so routing is undefined."""
+    with pytest.raises(ShardSetupError, match="hosted by both shard"):
+        build_route_shard_map(
+            {
+                "judged": {"math_agent": ["responses_api_agents"]},
+                "tools": {"math_agent": ["responses_api_agents"]},
+            }
+        )
+
+
+def test_agents_are_never_allowlisted_for_duplication():
+    """The allowlist covers shared support entries, not routing ambiguity."""
+    with pytest.raises(ShardSetupError, match="hosted by both shard"):
+        build_route_shard_map(
+            {
+                "a": {"math_agent": ["responses_api_agents"]},
+                "b": {"math_agent": ["responses_api_agents"]},
+            },
+            allowed_duplicate_entries={"math_agent"},
+        )
+
+
+def test_task_sources_are_never_allowlisted_for_duplication():
+    with pytest.raises(ShardSetupError, match="hosted by both shard"):
+        build_route_shard_map(
+            {
+                "a": {"math_env": ["resources_servers"]},
+                "b": {"math_env": ["resources_servers"]},
+            },
+            allowed_duplicate_entries={"math_env"},
+        )
+
+
+def test_build_route_shard_map_rejects_an_unlisted_duplicate_entry():
+    with pytest.raises(ShardSetupError, match="allowed_duplicate_entries"):
+        build_route_shard_map(
+            {
+                "judged": {"shared_judge": ["responses_api_models"]},
+                "tools": {"shared_judge": ["responses_api_models"]},
+            }
+        )
+
+
+def test_build_route_shard_map_allows_a_listed_duplicate_entry():
+    """Policy proxies are copied into every shard on purpose."""
+    route_to_shard = build_route_shard_map(
+        {
+            "judged": {
+                "math_agent": ["responses_api_agents"],
+                "policy_model": ["responses_api_models"],
+            },
+            "tools": {
+                "bash_agent": ["responses_api_agents"],
+                "policy_model": ["responses_api_models"],
+            },
+        },
+        allowed_duplicate_entries={"policy_model"},
+    )
+
+    assert route_to_shard == {"math_agent": "judged", "bash_agent": "tools"}
+
+
+def test_a_routable_name_is_still_a_duplicate_when_it_is_a_model_elsewhere():
+    """Reusing a routable name for a model engine doubles that engine's GPU claim."""
+    with pytest.raises(ShardSetupError, match="allowed_duplicate_entries"):
+        build_route_shard_map(
+            {
+                "judged": {"math": ["responses_api_agents"]},
+                "tools": {
+                    "math": ["responses_api_models"],
+                    "bash": ["responses_api_agents"],
+                },
+            }
+        )
 
 
 def test_apply_shard_log_dir_gives_each_shard_its_own_directory():
