@@ -2258,7 +2258,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
                             {
                                 "value": "second",
                                 "input_message_log": [
-                                    {"role": "user", "token_ids": [1]}
+                                    {"role": "user", "token_ids": [1, 2]}
                                 ],
                             },
                             None,
@@ -2314,10 +2314,20 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
         {},
     )
     manager._compute_reward_penalty_metrics = lambda counts, num_results: {}
-    manager._compute_rollout_metrics = lambda completions, agent: {
-        "completion_count": len(completions),
-        "agent": agent,
-    }
+
+    def _compute_metrics(
+        completions: list[str],
+        agent: str,
+        *,
+        prompt_lengths: list[int] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "completion_count": len(completions),
+            "agent": agent,
+            "prompt_lengths": prompt_lengths,
+        }
+
+    manager._compute_rollout_metrics = _compute_metrics
 
     completions, prompt_message_log, metrics = asyncio.run(
         manager._run_rollouts(
@@ -2336,6 +2346,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     assert metrics == {
         "completion_count": 2,
         "agent": "agent",
+        "prompt_lengths": [1, 2],
         "remote_time": 2.0,
     }
 
