@@ -1,0 +1,101 @@
+defaults: vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video.v1.yaml
+
+# End-to-end asynchronous GRPO for SpatialClaw. NeMo Gym owns the full agent
+# loop; only generations from the trainable main-policy session receive loss.
+# Planner, reflection, finalizer, and auxiliary VLM sessions remain isolated.
+grpo:
+  max_num_epochs: 1000000000
+  max_num_steps: 1000000000
+  seq_logprob_error_threshold: null
+  deduplicate_multimodal_data: true
+  async_grpo:
+    enabled: true
+    in_flight_weight_updates: true
+
+policy:
+  max_total_sequence_length: 16384
+  logprob_chunk_size: 2048
+  generation:
+    vllm_cfg:
+      video:
+        sampling_style: nemotron_vl
+        num_frames: 32
+        temporal_patch_size: 2
+      logprobs_mode: raw_logprobs
+      enable_prefix_caching: false
+      http_server_serving_chat_kwargs:
+        chat_template: null
+        chat_template_content_format: string
+        reasoning_parser: nemotron_v3
+    vllm_kwargs:
+      allowed_local_media_path: ${oc.env:SPATIALCLAW_VIDEO_ROOT,/path/to/spatialclaw-videos}
+      max_num_batched_tokens: ${policy.max_total_sequence_length}
+      max_num_seqs: 1
+      limit_mm_per_prompt:
+        # Capacity includes 32 initial keyframes plus images returned by show()
+        # calls. The context window independently bounds usable observations.
+        image: 512
+        video:
+          count: 1
+          num_frames: 32
+      mm_processor_cache_gb: 0
+      enable_chunked_prefill: false
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  num_workers: 0
+  train:
+    data_path: ${oc.env:SPATIALCLAW_DATA_PATH}
+  validation:
+    data_path: ${oc.env:SPATIALCLAW_DATA_PATH}
+  default:
+    num_frames: 32
+    video_sampling_style: nemotron_vl
+    video_temporal_patch_size: 2
+    video_target_num_patches: 256
+    video_maintain_aspect_ratio: true
+
+env:
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    skip_venv_if_present: true
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/spatialclaw/configs/spatialclaw.yaml
+      - responses_api_agents/spatialclaw_agent/configs/spatialclaw_agent.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          # Later exact-history turns are clamped to the remaining context by
+          # the model server's prefix-aware tokenize preflight.
+          max_input_tokens: ${policy.max_total_sequence_length}
+          extra_body:
+            bad_words:
+              - <image>
+              - <img>
+              - </img>
+              - <so_embedding>
+              - <so_start>
+              - <so_end>
+    spatialclaw_agent:
+      responses_api_agents:
+        spatialclaw_agent:
+          dataset_config: null
+          video_input_mode: key-frame-aware
+          keep_workspaces: true
+          timeout: 1800
+          max_output_tokens: 1024
+          auxiliary_max_output_tokens: 1024
+          compact_main_prompt: true
+          compact_planner_prompt: true
+          main_enable_thinking: true
+          main_reasoning_budget: 512
+          auxiliary_enable_thinking: false
+          config_overrides:
+            video_max_fps: 2
+            num_key_frames: 32
+            max_show_images_per_session: 250
+            max_steps: 4
+            enable_planning: true
+            enable_reflection: true
+            reflect_every_n_steps: 1
