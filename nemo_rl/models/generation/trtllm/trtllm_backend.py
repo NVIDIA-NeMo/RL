@@ -529,6 +529,9 @@ class NcclExtension(WorkerExtension):
         self._refit_stats_dict = {
             "convert_s": 0.0,
             "reload_s": 0.0,
+            "bulk_convert_s": 0.0,
+            "bulk_reload_s": 0.0,
+            "bulk_reload_calls": 0,
             "buckets": 0,
             "tensors": 0,
         }
@@ -543,6 +546,8 @@ class NcclExtension(WorkerExtension):
         print(
             f"[refit-timing] path={path} {parts} "
             f"convert={stats['convert_s']:.2f}s reload={stats['reload_s']:.2f}s "
+            f"bulk_convert={stats['bulk_convert_s']:.2f}s bulk_reload={stats['bulk_reload_s']:.2f}s "
+            f"bulk_reload_calls={stats['bulk_reload_calls']} "
             f"buckets={stats['buckets']} tensors={stats['tensors']}",
             flush=True,
         )
@@ -754,17 +759,28 @@ class NcclExtension(WorkerExtension):
                 def post(
                     ctx, prefix=prefix, projection=projection, expert_ids=expert_ids
                 ):
-                    self._load_received_experts(prefix, projection, expert_ids, ctx.buf)
+                    self._queue_received_experts(prefix, projection, expert_ids, ctx.buf)
 
                 specs[name] = LocalParamSpec(base=None, pre=pre, post=post)
         return HFToLocalParamMap(specs=specs)
 
-    def _load_received_experts(
+    @staticmethod
+    def _bulk_reload_batch_bytes() -> int:
+        """Converted bytes to accumulate before one ``model_loader.reload`` call.
+
+        Every reload walks the whole module tree, so loading each received
+        ``[E_local, out, in]`` projection stack on its own costs one full scan per
+        stack. Batching keeps that host cost off the transfer's critical path;
+        the budget bounds how many converted stacks wait on the GPU. 0 disables
+        batching (one reload per stack, the pre-batching behaviour).
+        """
+        return int(os.environ.get("NRL_TRTLLM_REFIT_RELOAD_BATCH_BYTES", str(2 << 30)))
+
+    def _convert_received_experts(
         self, prefix: str, projection: str, expert_ids: list[int], stack: torch.Tensor
-    ) -> None:
-        """Load one received ``[E_local, out, in]`` projection stack."""
-        model_engine = self.engine.model_engine
-        model = model_engine.model
+    ) -> dict:
+        """Turn one received ``[E_local, out, in]`` stack into loader-ready tensors."""
+        model = self.engine.model_engine.model
         quant_config = model.model_config.quant_config
         if fp8_quantization.is_quantized_expert_refit(quant_config):
             weights: dict = {}
@@ -776,12 +792,140 @@ class NcclExtension(WorkerExtension):
                 expert_ids=expert_ids,
                 is_mx=fp8_quantization.is_mxfp8_model(quant_config),
             )
-        else:
-            weights = {
-                f"{prefix}.{expert_id}.{projection}.weight": expert
-                for expert_id, expert in zip(expert_ids, stack.unbind(0))
-            }
-        model_engine.model_loader.reload(model, weights, allow_partial_loading=True)
+            return weights
+        # bf16 engines load the staging views directly; keep them alive until
+        # the batched reload has copied them (record_stream is on the caller).
+        return {
+            f"{prefix}.{expert_id}.{projection}.weight": expert
+            for expert_id, expert in zip(expert_ids, stack.unbind(0))
+        }
+
+    def _queue_received_experts(
+        self, prefix: str, projection: str, expert_ids: list[int], stack: torch.Tensor
+    ) -> None:
+        """Convert one received stack and reload it, batched under the byte budget."""
+        import time
+
+        stats = self._refit_stats
+        t0 = time.perf_counter()
+        weights = self._convert_received_experts(prefix, projection, expert_ids, stack)
+        stats["bulk_convert_s"] += time.perf_counter() - t0
+        pending = getattr(self, "_pending_bulk_reload", None)
+        if pending is None:
+            pending = self._pending_bulk_reload = {"weights": {}, "bytes": 0}
+        pending["weights"].update(weights)
+        pending["bytes"] += sum(
+            t.numel() * t.element_size() for t in weights.values()
+        )
+        if pending["bytes"] >= self._bulk_reload_batch_bytes():
+            self._flush_received_experts()
+
+    @staticmethod
+    def _direct_expert_load_enabled() -> bool:
+        """Load received expert stacks straight into their MoE modules.
+
+        ``model_loader.reload`` walks every module of the model per call and
+        ends with a stream synchronize, so each call stalls the receive loop
+        until every transfer enqueued so far has landed. The direct path replays
+        the loader's MoE branch for just the modules the queued stacks belong
+        to and leaves the copies enqueued. NRL_TRTLLM_REFIT_DIRECT_EXPERT_LOAD=0
+        falls back to the loader.
+        """
+        return os.environ.get("NRL_TRTLLM_REFIT_DIRECT_EXPERT_LOAD", "1") != "0"
+
+    def _moe_weight_owners(self) -> dict:
+        """``expert prefix -> module`` for every MoE weight owner, built once."""
+        owners = getattr(self, "_moe_weight_owner_map", None)
+        if owners is not None:
+            return owners
+        try:
+            from tensorrt_llm._torch.moe.fused_moe.weight_owner import (
+                is_moe_weight_owner,
+            )
+        except ImportError:
+            # Older module layout: the fused MoE backend is the module that
+            # carries the EP slot assignment and loads its own weights.
+            def is_moe_weight_owner(module) -> bool:
+                return hasattr(module, "initial_local_expert_ids") and hasattr(
+                    module, "load_weights"
+                )
+
+        owners = {}
+        model = self.engine.model_engine.model
+        for name, module in getattr(model, "named_modules", lambda: ())():
+            if not is_moe_weight_owner(module):
+                continue
+            # The loader addresses ConfigurableMoE's weight-owning backend by
+            # its parent's name (see _load_weights_impl_v2).
+            if name.endswith(".backend"):
+                name = name[: -len(".backend")]
+            owners[name] = module
+        self._moe_weight_owner_map = owners
+        return owners
+
+    def _load_expert_weights_direct(self, weights: dict) -> dict:
+        """Replay the loader's per-module MoE branch for the queued stacks.
+
+        Returns the weights that no known MoE module claimed (loaded by the
+        generic loader afterwards).
+        """
+        model_loader = self.engine.model_engine.model_loader
+        mapper = model_loader.weight_mapper
+        if mapper is None:
+            return weights
+        owners = self._moe_weight_owners()
+        weights = mapper.preprocess_weights(weights, allow_partial_loading=True)
+        # "<prefix>.<expert>.<projection>.<leaf>" -> "<prefix>"
+        prefixes = {name.rsplit(".", 3)[0] for name in weights if name.count(".") >= 3}
+        leftover = dict(weights)
+        for prefix in sorted(prefixes):
+            module = owners.get(prefix)
+            if module is None:
+                continue
+            module_weights = mapper.filter_weights(prefix, weights)
+            if not module_weights:
+                continue
+            module_name = prefix.rsplit(".", 1)[-1]
+            if mapper.is_special_instance_module(module):
+                mapper.handle_special_instance_module(
+                    module, module_name, module_weights, allow_partial_loading=True
+                )
+            else:
+                module.load_weights(weights=[module_weights], allow_partial_loading=True)
+            for key in list(leftover):
+                if key.startswith(prefix + "."):
+                    del leftover[key]
+        return leftover
+
+    def _flush_received_experts(self) -> None:
+        """Reload every queued converted stack in one loader call."""
+        import time
+
+        pending = getattr(self, "_pending_bulk_reload", None)
+        if not pending or not pending["weights"]:
+            return
+        weights = pending["weights"]
+        self._pending_bulk_reload = {"weights": {}, "bytes": 0}
+        model_engine = self.engine.model_engine
+        stats = self._refit_stats
+        t0 = time.perf_counter()
+        # CPU wall only (kernels stay enqueued on the receive stream): the
+        # loader's per-call module scan is the host cost this measures.
+        if self._direct_expert_load_enabled():
+            weights = self._load_expert_weights_direct(weights)
+        if weights:
+            model_engine.model_loader.reload(
+                model_engine.model, weights, allow_partial_loading=True
+            )
+        stats["bulk_reload_s"] += time.perf_counter() - t0
+        stats["bulk_reload_calls"] += 1
+
+    def _load_received_experts(
+        self, prefix: str, projection: str, expert_ids: list[int], stack: torch.Tensor
+    ) -> None:
+        """Convert and reload one received stack immediately (unbatched)."""
+        self._queue_received_experts(prefix, projection, expert_ids, stack)
+        self._flush_received_experts()
 
     def _recv_bulk_params(self) -> None:
         """Receive every bulk param of every PP stage into its local slots."""
@@ -830,9 +974,12 @@ class NcclExtension(WorkerExtension):
                     if spec.post is not None:
                         spec.post(ctx)
                     del ctx
+                # Whatever is still queued belongs to this stage's stream.
+                self._flush_received_experts()
                 event = torch.cuda.Event()
                 event.record()
                 events[idx] = event
+        self._flush_received_experts()
         torch.cuda.synchronize()
 
     def _receive_and_load_misc_params(self) -> None:

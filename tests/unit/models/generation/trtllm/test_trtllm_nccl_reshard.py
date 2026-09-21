@@ -127,6 +127,8 @@ def _extension(rank, local_ids_by_layer, quantized=False, device="cpu"):
 def test_local_shard_slices_and_expert_specs(monkeypatch):
     from nemo_rl.models.generation.trtllm import trtllm_backend
 
+    monkeypatch.setenv("NRL_TRTLLM_REFIT_DIRECT_EXPERT_LOAD", "0")
+
     monkeypatch.setattr(
         trtllm_backend.fp8_quantization, "is_quantized_expert_refit", lambda cfg: False
     )
@@ -145,6 +147,8 @@ def test_local_shard_slices_and_expert_specs(monkeypatch):
     assert tuple(ctx.buf.shape) == (2, 16, 4) and ctx.buf.dtype == torch.bfloat16
     ctx.buf.copy_(torch.arange(2 * 16 * 4, dtype=torch.bfloat16).view(2, 16, 4))
     spec.post(ctx)
+    # post queues the converted stack; the receive loop flushes per stage.
+    ext._flush_received_experts()
     model_loader.reload.assert_called_once()
     _model, weights = model_loader.reload.call_args.args[:2]
     assert model_loader.reload.call_args.kwargs == {"allow_partial_loading": True}
@@ -154,6 +158,8 @@ def test_local_shard_slices_and_expert_specs(monkeypatch):
 
 def test_expert_spec_quantizes_locally(monkeypatch):
     from nemo_rl.models.generation.trtllm import trtllm_backend
+
+    monkeypatch.setenv("NRL_TRTLLM_REFIT_DIRECT_EXPERT_LOAD", "0")
 
     monkeypatch.setattr(
         trtllm_backend.fp8_quantization, "is_quantized_expert_refit", lambda cfg: True
@@ -168,6 +174,7 @@ def test_expert_spec_quantizes_locally(monkeypatch):
     ctx = spec.pre(spec.base)
     ctx.buf.copy_(torch.randn(2, 8, 64, dtype=torch.bfloat16))
     spec.post(ctx)
+    ext._flush_received_experts()
     weights = model_loader.reload.call_args.args[1]
     assert set(weights) == {
         f"{prefix}.{e}.gate_proj.{leaf}" for e in (2, 3) for leaf in ("weight", "weight_scale_inv")
@@ -175,6 +182,99 @@ def test_expert_spec_quantizes_locally(monkeypatch):
     expected, expected_scale = cast_tensor_to_mxfp8_blockwise(ctx.buf[0])
     assert torch.equal(weights[f"{prefix}.2.gate_proj.weight"].float(), expected.float())
     assert torch.equal(weights[f"{prefix}.2.gate_proj.weight_scale_inv"], expected_scale)
+
+
+def test_received_experts_reload_in_batches(monkeypatch):
+    """Stacks accumulate until the byte budget, then load in one reload call."""
+    from nemo_rl.models.generation.trtllm import trtllm_backend
+
+    monkeypatch.setenv("NRL_TRTLLM_REFIT_DIRECT_EXPERT_LOAD", "0")
+
+    monkeypatch.setattr(
+        trtllm_backend.fp8_quantization, "is_quantized_expert_refit", lambda cfg: False
+    )
+    prefix = "model.layers.0.mlp.experts"
+    infos = [
+        _param_info(f"{prefix}.{proj}.weight", (8, 16, 4), proj, ep_size=4, rank_offset=2)
+        for proj in ("gate_proj", "up_proj")
+    ]
+    ext, model_loader = _extension(rank=3, local_ids_by_layer={prefix: [2, 3]})
+    param_map = ext._build_expert_local_param_map(
+        {"layer_names": ["layer0"], "per_layer_params": {"layer0": infos}}
+    )
+    # Large budget: both stacks wait for the flush and share one reload.
+    monkeypatch.setenv("NRL_TRTLLM_REFIT_RELOAD_BATCH_BYTES", str(1 << 40))
+    for info in infos:
+        spec = param_map.get(info["name"])
+        ctx = spec.pre(spec.base)
+        ctx.buf.zero_()
+        spec.post(ctx)
+    model_loader.reload.assert_not_called()
+    ext._flush_received_experts()
+    model_loader.reload.assert_called_once()
+    weights = model_loader.reload.call_args.args[1]
+    assert set(weights) == {
+        f"{prefix}.{e}.{proj}.weight" for e in (2, 3) for proj in ("gate_proj", "up_proj")
+    }
+    assert ext._refit_stats["bulk_reload_calls"] == 1
+    # Budget 0: every stack loads on the spot, as before batching.
+    model_loader.reload.reset_mock()
+    monkeypatch.setenv("NRL_TRTLLM_REFIT_RELOAD_BATCH_BYTES", "0")
+    spec = param_map.get(infos[0]["name"])
+    ctx = spec.pre(spec.base)
+    spec.post(ctx)
+    model_loader.reload.assert_called_once()
+    ext._flush_received_experts()
+    model_loader.reload.assert_called_once()
+
+
+
+def test_received_experts_load_directly_into_moe_modules(monkeypatch):
+    """The direct path replays the loader's MoE branch per module, no global reload."""
+    from nemo_rl.models.generation.trtllm import trtllm_backend
+
+    monkeypatch.setattr(
+        trtllm_backend.fp8_quantization, "is_quantized_expert_refit", lambda cfg: False
+    )
+    monkeypatch.setenv("NRL_TRTLLM_REFIT_RELOAD_BATCH_BYTES", str(1 << 40))
+    monkeypatch.delenv("NRL_TRTLLM_REFIT_DIRECT_EXPERT_LOAD", raising=False)
+    prefix = "model.layers.0.mlp.experts"
+    info = _param_info(f"{prefix}.down_proj.weight", (8, 16, 4), "down_proj", ep_size=4, rank_offset=2)
+    ext, model_loader = _extension(rank=3, local_ids_by_layer={prefix: [2, 3]})
+    calls = []
+    mapper = MagicMock()
+    mapper.preprocess_weights.side_effect = lambda w, allow_partial_loading=False: dict(w)
+    mapper.filter_weights.side_effect = lambda pre, w: {
+        k[len(pre) + 1 :]: v for k, v in w.items() if k.startswith(pre + ".")
+    }
+    mapper.is_special_instance_module.return_value = True
+    mapper.handle_special_instance_module.side_effect = (
+        lambda module, name, weights, allow_partial_loading=False: calls.append(
+            (module, name, sorted(weights), allow_partial_loading)
+        )
+    )
+    model_loader.weight_mapper = mapper
+    moe_module = object()
+    monkeypatch.setattr(ext, "_moe_weight_owners", lambda: {prefix: moe_module})
+    spec = ext._build_expert_local_param_map(
+        {"layer_names": ["layer0"], "per_layer_params": {"layer0": [info]}}
+    ).get(info["name"])
+    ctx = spec.pre(spec.base)
+    ctx.buf.zero_()
+    spec.post(ctx)
+    ext._flush_received_experts()
+    assert calls == [
+        (moe_module, "experts", ["2.down_proj.weight", "3.down_proj.weight"], True)
+    ]
+    model_loader.reload.assert_not_called()
+    assert ext._refit_stats["bulk_reload_calls"] == 1
+    # A prefix no MoE module owns falls back to the generic loader.
+    monkeypatch.setattr(ext, "_moe_weight_owners", lambda: {})
+    ctx = spec.pre(spec.base)
+    spec.post(ctx)
+    ext._flush_received_experts()
+    model_loader.reload.assert_called_once()
+
 
 
 def test_expert_spec_rejects_slot_mismatch_and_non_expert_bulk(monkeypatch):
