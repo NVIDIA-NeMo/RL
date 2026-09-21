@@ -323,6 +323,7 @@ class WindowedSampler(BaseSampler):
         *,
         max_staleness_versions: int,
         sample_freshest_first: bool = False,
+        min_groups_for_streaming_train: Optional[int] = None,
     ) -> None:
         super().__init__(buffer)
         if max_staleness_versions < 0:
@@ -332,9 +333,14 @@ class WindowedSampler(BaseSampler):
             )
         self.max_staleness_versions = max_staleness_versions
         self.sample_freshest_first = sample_freshest_first
+        # Unordered: any full buffer is selectable, so the minimum capacity is the streaming floor.
+        self.min_groups_for_streaming_train = min_groups_for_streaming_train
 
     def _eviction_window(self) -> int:
         return self.max_staleness_versions
+
+    def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
+        return self.min_groups_for_streaming_train
 
     def should_abort_inflight(
         self,
@@ -692,8 +698,10 @@ SamplerConfig = Annotated[
 def required_buffer_capacity_for_config(
     cfg: SamplerConfig,
     groups_per_step: int,
+    *,
+    min_groups_for_streaming_train: int,
 ) -> Optional[int]:
-    """Return a built-in sampler's required capacity without constructing it."""
+    """Return a sampler config's required capacity without constructing it."""
     if isinstance(cfg, ReadyFirstSamplerConfig):
         return _gated_required_buffer_capacity(
             groups_per_step,
@@ -709,6 +717,8 @@ def required_buffer_capacity_for_config(
             groups_per_step,
             gate_window=cfg.peak_lookahead_versions,
         )
+    if isinstance(cfg, WindowedSamplerConfig):
+        return min_groups_for_streaming_train
     return None
 
 
@@ -786,12 +796,15 @@ def sampler_supports_training_claims(cfg: SamplerConfig) -> bool:
 def create_sampler(
     buffer: TQReplayBuffer,
     cfg: SamplerConfig,
+    *,
+    min_groups_for_streaming_train: Optional[int] = None,
 ) -> PromptGroupSampler:
     """Build a sampler from its config (or import one by FQN).
 
     Args:
         buffer: Shared TQReplayBuffer holding the candidate slots.
         cfg: Discriminated sampler config selecting the policy.
+        min_groups_for_streaming_train: Streaming floor used by the windoweds sampler.
     """
     sampler_cls = _sampler_class_for_config(cfg)
     sampler: PromptGroupSampler
@@ -800,6 +813,7 @@ def create_sampler(
             buffer,
             max_staleness_versions=cfg.max_staleness_versions,
             sample_freshest_first=cfg.sample_freshest_first,
+            min_groups_for_streaming_train=min_groups_for_streaming_train,
         )
     elif isinstance(cfg, ReadyFirstSamplerConfig):
         sampler = sampler_cls(

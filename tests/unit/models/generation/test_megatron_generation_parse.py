@@ -33,17 +33,114 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from megatron.core.inference.config import (
+    AsyncScheduleMode,
+    CudaGraphSizingDistribution,
+    InferenceConfig,
+    PrefixCachingCoordinatorPolicy,
+    PrefixCachingEvictionPolicy,
+)
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
     text_generation_server as mlm_text_gen_server,
 )
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.held_port import HeldPortReservation
 from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationMixin,
+    _apply_inference_cuda_graph_scope,
+    _apply_optional_inference_config_kwargs,
+    _resolve_coordinator_policy,
 )
 
 PAD = 0
+
+
+@pytest.mark.mcore
+def test_inference_cuda_graph_scope_is_applied_when_configured():
+    engine_model = SimpleNamespace(config=SimpleNamespace())
+
+    _apply_inference_cuda_graph_scope(
+        engine_model, {"inference_cuda_graph_scope": "block"}
+    )
+
+    assert (
+        engine_model.config.inference_cuda_graph_scope is InferenceCudaGraphScope.block
+    )
+
+
+@pytest.mark.mcore
+def test_optional_inference_config_kwargs_are_typed_and_forwarded():
+    inference_config_kwargs = {}
+
+    _apply_optional_inference_config_kwargs(
+        inference_config_kwargs,
+        {
+            "cuda_graph_sizing_distribution": "hybrid",
+            "cuda_graph_max_tokens": "512",
+            "async_sched_mode": "async",
+            "vision_embedding_cache_max_bytes": "1024",
+            "allow_stale_multimodal_embeddings": 1,
+            "prefix_caching_eviction_policy": "lru",
+            "prefix_caching_mamba_gb": None,
+            "prefix_cache_ttl_seconds": "300",
+            "prefix_caching_routing_alpha": "0.75",
+            "logging_step_interval": "10",
+        },
+    )
+
+    assert inference_config_kwargs == {
+        "cuda_graph_sizing_distribution": CudaGraphSizingDistribution.HYBRID,
+        "cuda_graph_max_tokens": 512,
+        "async_sched_mode": AsyncScheduleMode.ASYNC,
+        "vision_embedding_cache_max_bytes": 1024,
+        "allow_stale_multimodal_embeddings": True,
+        "prefix_caching_eviction_policy": PrefixCachingEvictionPolicy.LRU,
+        "prefix_caching_mamba_gb": None,
+        "prefix_cache_ttl_seconds": 300.0,
+        "prefix_caching_routing_alpha": 0.75,
+        "logging_step_interval": 10,
+    }
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("mcore_generation_config", "expected_policy"),
+    [
+        (
+            {
+                "enable_prefix_caching": False,
+                "prefix_caching_coordinator_policy": "longest_prefix",
+            },
+            PrefixCachingCoordinatorPolicy.LOAD_BALANCED,
+        ),
+        (
+            {"enable_prefix_caching": True},
+            InferenceConfig.prefix_caching_coordinator_policy,
+        ),
+        (
+            {
+                "enable_prefix_caching": True,
+                "prefix_caching_coordinator_policy": "longest_prefix",
+            },
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+        ),
+        (
+            {
+                "enable_prefix_caching": True,
+                "prefix_caching_coordinator_policy": "first_prefix_block",
+            },
+            PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK,
+        ),
+    ],
+)
+def test_resolve_coordinator_policy(
+    mcore_generation_config: dict[str, object],
+    expected_policy: PrefixCachingCoordinatorPolicy,
+) -> None:
+    """The engine and every frontend must use the same routing policy."""
+    assert _resolve_coordinator_policy(mcore_generation_config) is expected_policy
 
 
 class FakeInferenceReply:
@@ -173,6 +270,11 @@ def test_http_server_port_reservation(monkeypatch):
     probes queue instead of being refused), the worker adopts that same socket
     through the fd handoff — the port is never released in between — and the
     server falls back to a fresh port only when nothing was reserved.
+
+    Adoption is deferred to server startup rather than worker init, so that a
+    listening fd is never live across model initialization, where a long-lived
+    child process could inherit it and absorb SO_REUSEPORT traffic it never
+    serves.
     """
     # The holder resolves the node IP via held_port; the server resolves it via
     # virtual_cluster (megatron_worker imports it at call time). Patch both.
@@ -202,7 +304,7 @@ def test_http_server_port_reservation(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_rl.distributed.virtual_cluster._get_free_port_local",
-        lambda: 12345,
+        lambda *_args, **_kwargs: 12345,
     )
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
     requests_mock = MagicMock()
@@ -218,7 +320,15 @@ def test_http_server_port_reservation(monkeypatch):
             coordinator_addr="tcp://127.0.0.1:5555",
             megatron_tokenizer=object(),
             rank=0,
-            cfg={"generation": {"mcore_generation_config": {"parsers": []}}},
+            cfg={
+                "generation": {
+                    "mcore_generation_config": {
+                        "block_size_tokens": 64,
+                        "enable_prefix_caching": False,
+                        "parsers": [],
+                    }
+                }
+            },
             _reserved_http_server_port=reserved_port,
             inference_wrapped_model=SimpleNamespace(multimodal_prompt_config=None),
         )
@@ -227,6 +337,11 @@ def test_http_server_port_reservation(monkeypatch):
         try:
             assert started["server_port"] == expected_port
             assert base_url == f"http://10.0.0.5:{expected_port}/v1"
+            assert started["block_size_tokens"] == 64
+            assert (
+                started["prefix_caching_coordinator_policy"]
+                is PrefixCachingCoordinatorPolicy.LOAD_BALANCED
+            )
             if reserved_port is None:
                 assert reserved_socket is None
                 continue
@@ -254,3 +369,91 @@ def test_http_server_port_reservation(monkeypatch):
         finally:
             if reserved_socket is not None:
                 reserved_socket.close()
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("gen_cfg_extra", "expected_num_replicas"),
+    [
+        ({}, None),
+        ({"http_server_num_replicas": 8}, 8),
+    ],
+)
+def test_http_server_num_replicas_is_forwarded_only_when_set(
+    monkeypatch, gen_cfg_extra, expected_num_replicas
+):
+    """Replica count reaches MCore, and stays absent when unconfigured."""
+    started = {}
+    monkeypatch.setattr(
+        mlm_text_gen_server,
+        "start_text_gen_server",
+        lambda **kwargs: started.update(kwargs),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.distributed.virtual_cluster._get_node_ip_local",
+        lambda: "10.0.0.5",
+    )
+    monkeypatch.setattr(
+        "nemo_rl.distributed.virtual_cluster._get_free_port_local",
+        lambda *_args, **_kwargs: 12345,
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    requests_mock = MagicMock()
+    health_get = requests_mock.Session.return_value.__enter__.return_value.get
+    health_get.return_value.status_code = 200
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.megatron.megatron_worker.requests",
+        requests_mock,
+    )
+
+    worker = SimpleNamespace(
+        coordinator_addr="tcp://127.0.0.1:5555",
+        megatron_tokenizer=object(),
+        rank=0,
+        cfg={
+            "generation": {
+                "mcore_generation_config": {
+                    "block_size_tokens": 64,
+                    "enable_prefix_caching": False,
+                    "parsers": [],
+                    **gen_cfg_extra,
+                }
+            }
+        },
+        _reserved_http_server_port=None,
+        inference_wrapped_model=SimpleNamespace(multimodal_prompt_config=None),
+    )
+
+    MegatronGenerationMixin._setup_openai_api_server(worker)
+
+    if expected_num_replicas is None:
+        assert "num_replicas" not in started
+    else:
+        assert started["num_replicas"] == expected_num_replicas
+
+
+@pytest.mark.mcore
+def test_mp_coordinator_starts_exposed_http_server(monkeypatch):
+    coordinator_call = object()
+    future = MagicMock()
+    setup_server = MagicMock(return_value="http://10.0.0.5:5555/v1")
+    worker = SimpleNamespace(
+        cfg={"generation": {"mcore_generation_config": {"expose_http_server": True}}},
+        dynamic_inference_engine=SimpleNamespace(is_mp_coordinator=True),
+        _inference_loop=object(),
+        _start_inference_coordinator=MagicMock(return_value=coordinator_call),
+        _setup_openai_api_server=setup_server,
+    )
+    run_coroutine = MagicMock(return_value=future)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.megatron.megatron_worker.asyncio.run_coroutine_threadsafe",
+        run_coroutine,
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+
+    MegatronGenerationMixin._run_async_coordinator_start(worker)
+
+    run_coroutine.assert_called_once_with(coordinator_call, worker._inference_loop)
+    future.result.assert_called_once_with()
+    setup_server.assert_called_once_with()
+    assert worker.base_url == "http://10.0.0.5:5555/v1"

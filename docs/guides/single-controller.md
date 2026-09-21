@@ -25,7 +25,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
       enabled: true
     ```
 
-2. **Pick a generation backend** and **disable colocated inference** (setup rejects `colocated.enabled: true`). With vLLM, enable the async engine (SC drives rollout via `RolloutManager.generate_and_push`, which is only supported on the disaggregated async engine):
+2. **Pick a generation backend**. With vLLM, **disable colocated inference** (setup rejects `colocated.enabled: true` for every backend except Megatron) and enable the async engine (SC drives rollout via `RolloutManager.generate_and_push`, which is only supported on the disaggregated async engine):
 
     ```yaml
     policy:
@@ -40,7 +40,8 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
             gpus_per_node: 4  # inference GPUs; remainder go to training
     ```
 
-    Megatron generation is also supported, non-colocated only. It requires the Megatron trainer (`policy.megatron_cfg.enabled: true`) and NeMo-Gym rollouts additionally require `policy.generation.mcore_generation_config.expose_http_server: true`. The exemplar — a NeMo-Gym run with the OpenAI server exposed — lives at [examples/nemo_gym/grpo_qwen3_0_6b_megatron_generation_single_controller.yaml](../../examples/nemo_gym/grpo_qwen3_0_6b_megatron_generation_single_controller.yaml):
+    Megatron generation is also supported, colocated or non-colocated. It requires the Megatron trainer (`policy.megatron_cfg.enabled: true`) and NeMo-Gym rollouts additionally require `policy.generation.mcore_generation_config.expose_http_server: true`. Colocated (`colocated.enabled: true`) additionally requires `async_rl.min_groups_for_streaming_train == num_prompts_per_step`: the engine stands down for the whole train step, so each step must be assembled as one full batch before training takes the GPUs. Per-request deadlines (`generation_timeout_s`, `rollout_timeout_s`) exclude the time the engine is stood down: in-flight requests freeze with their clocks suspended, and the clocks resume on the post-step wake.
+    The non-colocated exemplar — a NeMo-Gym run with the OpenAI server exposed — lives at [examples/nemo_gym/grpo_qwen3_0_6b_megatron_generation_single_controller.yaml](../../examples/nemo_gym/grpo_qwen3_0_6b_megatron_generation_single_controller.yaml); the colocated exemplar at [examples/configs/grpo_math_1B_megatron_generation_colocated_single_controller.yaml](../../examples/configs/grpo_math_1B_megatron_generation_colocated_single_controller.yaml):
 
     ```yaml
     policy:
@@ -51,11 +52,29 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
         mcore_generation_config:
           expose_http_server: true  # required for NeMo-Gym rollouts
         colocated:
-          enabled: false
+          enabled: false  # set true for colocated (no resources split needed)
           resources:
             num_nodes: 1
             gpus_per_node: 1  # inference GPUs; remainder go to training
     ```
+
+    For default non-colocated vLLM refit, the SingleController entrypoint uses the
+    same vLLM generation path as legacy GRPO/PPO, so you can opt into vLLM's
+    native reload API with:
+
+    ```yaml
+    policy:
+      generation:
+        backend: "vllm"
+        refit_transport: null
+        colocated:
+          enabled: false
+        vllm_cfg:
+          async_engine: true
+          refit_with_reload_api: true
+    ```
+
+    This reload API path has the same limitations described in [Weight Refit](./refit.md#vllm-reload-api).
 
 3. **One RL step = one training batch.** The batch a step trains on is the whole step (see `validate_single_controller_config` in [nemo_rl/algorithms/single_controller_utils/config.py](../../nemo_rl/algorithms/single_controller_utils/config.py)). A GRPO step is also one optimizer step. A PPO step applies `ppo.ppo_epochs` actor updates and `ppo.critic_ppo_epochs` critic updates over that same batch. Both counts must be at least 1 and can be configured independently; the exemplar defaults the critic count to `${ppo.ppo_epochs}`.
 
@@ -71,7 +90,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
       use_importance_sampling_correction: true
     ```
 
-5. **Save the data plane for replay recovery.** When Single-Controller checkpointing is enabled, all built-in samplers require `checkpointing.save_data_plane: true` so completed, unconsumed rollout groups survive a restart. Native TQ checkpointing currently supports only the `simple` storage backend. For multi-node runs, `checkpoint_dir` must be on a durable filesystem visible at the same path from every node.
+5. **Save the data plane for replay recovery.** When Single-Controller checkpointing is enabled, all built-in samplers require `checkpointing.save_data_plane: true` so completed, unconsumed rollout groups survive a restart. Native TQ checkpointing supports both `simple` and `mooncake_cpu` through these same checkpoint settings; no backend-specific switch is needed. For multi-node runs, `checkpoint_dir` must be on a durable filesystem visible at the same path from every node.
 
     ```yaml
     checkpointing:
@@ -118,6 +137,8 @@ checkpointing:
 
 rollout_checkpointing:
   snapshot_attempt_interval_s: 120
+  telemetry_interval_s: null
+  max_consecutive_failures: 3
   keep_latest_k: 2
   restore_mode: latest
   extra_fingerprint_excluded_paths: []
@@ -134,6 +155,17 @@ recommended for continuous post-step coverage; with a larger value, attempts
 are skipped until the matching trainer checkpoint exists. Before the first
 training step, snapshots are anchored to the initial model and a fingerprint of
 the rollout-semantic configuration.
+
+`telemetry_interval_s` controls an independent wall-clock sampler for rollout
+throughput and checkpoint pressure. It is `null` (disabled) by default; set it
+to a positive number such as `30` to emit one sample every 30 seconds. This does
+not change the checkpoint cadence. See the
+[Single-Controller rollout recovery metrics](../observability/metrics.md#single-controller-rollout-recovery-metrics)
+for the emitted fields.
+
+`max_consecutive_failures` is the number of consecutive retryable periodic-save
+failures tolerated before training aborts. A successful or skipped checkpoint
+attempt resets the count; checkpoint invariant failures still fail immediately.
 
 The bootstrap fingerprint is fail-closed: every configuration value affects
 compatibility unless NeMo-RL's built-in denylist identifies it as operational,
@@ -166,11 +198,20 @@ on the original run as well as its restart.
 Periodic snapshots currently require all of the following:
 
 - `checkpointing.enabled: true` and `checkpointing.save_data_plane: true`.
-- `data_plane.backend: simple`, because native TQ save/load is required.
+- `data_plane.backend: simple` or `data_plane.backend: mooncake_cpu`, because native TQ save/load is required.
 - `token_capture.enabled: true`.
 - A replay-recoverable sampler with training-claim ownership. All built-in
   samplers qualify. A custom sampler must explicitly declare both
   `supports_buffer_checkpoint = True` and `supports_training_claims = True`.
+
+With `data_plane.backend: mooncake_cpu`, data-plane checkpointing also requires
+`async_rl.generation_fleet_health.restart_dead_shards: false`. Setup rejects
+automatic shard restarts because replacing a generation worker can discard
+its owned Mooncake payload and leave stale checkpoint worker handles. This
+restriction applies to both trainer-step checkpoints and periodic rollout
+snapshots; restarting the whole job from a saved checkpoint is still supported.
+Support for live shard restarts is tracked in
+[NVIDIA-NeMo/RL#4178](https://github.com/NVIDIA-NeMo/RL/issues/4178).
 
 Each trainer or bootstrap anchor has a `rollout_snapshots/` directory. A
 published `snapshot_NNNNNN/` contains the native TQ snapshot and matching
@@ -225,7 +266,7 @@ generation in the group has finished.
 
 When a sampler does not support replay recovery, a requested data-plane checkpoint is written in `shadow` mode. The TQ snapshot is retained, but no authoritative replay index is written and its rows are not restored into the training replay buffer.
 
-Native TQ save/load currently requires `data_plane.backend: "simple"`. Mooncake-backed storage is not recoverable through this mechanism. A failure while saving or validating the TQ snapshot prevents the incomplete checkpoint bundle from becoming the latest resumable checkpoint.
+Native TQ save/load works with both `data_plane.backend: "simple"` and `data_plane.backend: "mooncake_cpu"`, using the existing `checkpointing.enabled: true` and `checkpointing.save_data_plane: true` settings. A failure while saving or validating the TQ snapshot prevents the incomplete checkpoint bundle from becoming the latest resumable checkpoint.
 
 ## Async-RL Knobs and Sampler Modes
 
@@ -357,7 +398,7 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   Gym rollouts; multimodal/VLM MOPD is not yet supported. See
   [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
 - Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
-- Generation backend: vLLM and Megatron generation are supported; SGLang and TRT-LLM have not been tested on SC.
+- Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes); SGLang and TRT-LLM have not been tested on SC.
 - Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`); checkpointing is.
 - (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, and the critic shards it against the configured `value.train_global_batch_size` rather than its actual size, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.
 - Reward shaping and sample filtering — `reward_shaping`, `reward_scaling`, and `use_dynamic_sampling` are implemented on neither algorithm block, so setup rejects them rather than silently skipping the shaping. Environment-flagged sample masking and `overlong_filtering` are supported; truncated completions are excluded from the loss through `sample_mask`, and a step in which every completion is filtered is rejected rather than skipped.

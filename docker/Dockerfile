@@ -147,6 +147,12 @@ ARG NVTE_BUILD_MAX_JOBS=8
 ARG NVTE_BUILD_THREADS_PER_JOB=2
 ARG NVTE_CUDA_ARCHS=90;100
 ARG NVTE_FRAMEWORK=pytorch
+# TE 2.18 enables its experimental NCCL-EP backend by default on Hopper and
+# newer GPUs. Current recipes use Megatron Core's standard token dispatcher,
+# so retain the existing capability set and avoid requiring matching system
+# NCCL-EP headers. Custom NCCL-EP experiments can opt in explicitly with
+# ``--build-arg NVTE_WITH_NCCL_EP=1``.
+ARG NVTE_WITH_NCCL_EP=0
 # Only use for custom vllm installs. Learn more at https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/use-custom-vllm.md
 ARG BUILD_CUSTOM_VLLM
 ARG BUILD_CUSTOM_VLLM_URL
@@ -172,6 +178,9 @@ ENV UV_LINK_MODE=copy
 
 # Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
+
+# Build HybridEP with inter-node transport support.
+ENV HYBRID_EP_MULTINODE=1
 
 # Ensure HybridEP/DeepEP JIT compilation can find nvcc at runtime
 ENV CUDA_HOME=/usr/local/cuda
@@ -214,10 +223,10 @@ COPY --from=nemo-rl --link \
 
 RUN --mount=type=ssh \
     --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed <<"EOF" bash -exu
-CACHE_KEY=$(echo "${BASE_IMAGE}-${UV_VERSION}" | md5sum | cut -c1-12)
+CACHE_KEY=$(echo "${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE}" | md5sum | cut -c1-12)
 SEED_KEY=$(cat /tmp/uv-cache-seed/.cache-key 2>/dev/null || echo "")
 if [ -n "$SEED_KEY" ] && [ "$SEED_KEY" != "$CACHE_KEY" ]; then
-    echo "Cache key mismatch (base image or uv version changed) — skipping stale seed"
+    echo "Cache key mismatch (base image, uv version, or build mode changed) — skipping stale seed"
 elif [ -n "$SEED_KEY" ]; then
     echo "Seeding uv cache (key=${CACHE_KEY})"
     mkdir -p /root/.cache/uv
@@ -241,6 +250,11 @@ fi
 # to warm the uv cache, then at the end just sync the default dependencies.
 # Do everything in one layer to prevent large layers.
 
+apt-get update
+# DeepEP's multinode link needs the exact filename libnvidia-ml.so.1; the CUDA base
+# only ships stubs/libnvidia-ml.so. Purged again after the syncs below.
+apt-get install -y --no-install-recommends libnvidia-ml-dev
+uv cache clean deep-ep
 # Everything is hardlinked against the uv cache; this layer holds exactly one real copy of every wheel.
 UV_LINK_MODE=hardlink uv sync --frozen --no-install-project
 if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
@@ -301,6 +315,10 @@ while IFS=$'\t' read -r venv_name stage extras; do
     UV_PROJECT_ENVIRONMENT="$venv_path" UV_LINK_MODE=hardlink uv sync --frozen $extras --no-install-project
 done < /opt/actor_venvs.tsv
 
+apt-get purge -y libnvidia-ml-dev
+apt-get autoremove -y
+rm -rf /var/lib/apt/lists/*
+
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
 find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
@@ -347,6 +365,11 @@ rsync -a --ignore-existing /tmp/trtllm-ccache-seed/ "${CCACHE_DIR}/"
 
 # uv uses the shared image cache. Only the custom wheel needs a cache mount
 # because uv can miss no-build-isolation wheels across build environments.
+# The mount is builder-local scratch: it is not part of this layer, so a later
+# stage cannot rely on it -- when this RUN is served from the BuildKit layer
+# cache the mount stays empty. The build below therefore also mirrors the
+# current content-addressed wheel into /opt/trtllm_wheels, which IS part of this
+# layer; the release stage and runtime `uv run --extra trtllm` read it from there.
 echo "TRT-LLM cache state before build:"
 du -sh /root/.cache/uv /root/.cache/trtllm-wheels
 
@@ -359,6 +382,7 @@ set +e
 # cache make overlayfs copy them up into this layer, and the copies outlive the rm -rf below.
 UV_CACHE_DIR=/root/.cache/uv \
     TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
+    TRTLLM_WHEEL_CACHE_MIRROR_DIR=/opt/trtllm_wheels \
     UV_PROJECT_ENVIRONMENT=/tmp/trtllm-build-venv \
     uv sync --verbose --link-mode symlink --locked --extra trtllm --no-install-project \
     2>&1 | tee "$TRTLLM_SYNC_LOG" \
@@ -472,14 +496,13 @@ EOF
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
-ARG BASE_IMAGE
-RUN --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked <<"EOF" bash -exu
-# Reuse the custom wheel produced by the hermetic stage. Normal uv artifacts
-# stay in /root/.cache/uv, which remains available to symlinked environments.
-# Mirror only the current content-addressed TRT-LLM wheel into the image so
-# runtime `uv run --extra trtllm` calls do not fall back to a source build.
-export TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels
-export TRTLLM_WHEEL_CACHE_MIRROR_DIR=/opt/trtllm_wheels
+RUN <<"EOF" bash -exu
+# Reuse the custom wheel the hermetic stage mirrored into /opt/trtllm_wheels
+# (the runtime default of the TRT-LLM build backend). It lives in that layer,
+# so it is present whether the TRT-LLM RUN executed on this builder or was
+# restored from the layer cache; do not read it from the builder-local cache
+# mount here. Normal uv artifacts stay in /root/.cache/uv.
+export TRTLLM_WHEEL_CACHE_DIR=/opt/trtllm_wheels
 export TRTLLM_REQUIRE_CACHED_WHEEL=1
 # Worker-venv prefetch, phase 2: the nemo_rl project itself.
 #
@@ -507,10 +530,10 @@ EOF
 # themselves are built in hardlink mode: examples/nemo_gym/prefetch_venvs.py pins
 # UV_LINK_MODE=hardlink in the Gym actor's runtime_env, because Gym's setup scripts shell
 # out to `uv pip install --no-cache`, which uv refuses to combine with symlink installs.
-# Gym pins vllm==0.24.0; override it to vLLM's default prebuilt CUDA wheel so Gym's venvs share
+# Gym pins vllm==0.25.1; override it to vLLM's default prebuilt CUDA wheel so Gym's venvs share
 # RL's torch/nvidia stack. UV_TORCH_BACKEND keeps torch on the same CUDA backend.
 ARG NEMO_GYM_CUDA=cu130
-ARG NEMO_GYM_VLLM_VERSION=0.24.0
+ARG NEMO_GYM_VLLM_VERSION=0.25.1
 RUN <<"EOF" bash -exu
 if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     case "${TARGETARCH:-amd64}" in arm64) WHEEL_ARCH=aarch64 ;; *) WHEEL_ARCH=x86_64 ;; esac
@@ -593,8 +616,8 @@ ARG WHEEL_CACHE_EXPORT_NONCE
 RUN --mount=type=bind,from=trtllm-wheel-cache-seed,source=.,target=/tmp/trtllm-wheel-cache-seed \
     --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked <<"EOF" bash -exu
 echo "Exporting TRT-LLM wheel cache for build ${WHEEL_CACHE_EXPORT_NONCE:-local} (${WHEEL_CACHE_EXPORT_MODE})"
-# If the release RUN was a BuildKit cache hit, restore the seed into a fresh
-# builder-local mount before exporting it.
+# If the hermetic TRT-LLM RUN was a BuildKit cache hit, this builder-local mount is empty;
+# restore the seed before exporting it.
 if [[ -z "$(find /root/.cache/trtllm-wheels -mindepth 1 -print -quit)" ]]; then
     rsync -a /tmp/trtllm-wheel-cache-seed/ /root/.cache/trtllm-wheels/
 fi

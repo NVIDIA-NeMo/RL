@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import MagicMock, patch
 
@@ -48,8 +49,9 @@ from nemo_rl.algorithms.grpo import (
     RewardPenaltyConfig,
     _initial_grpo_save_state,
 )
-from nemo_rl.algorithms.loss import ClippedPGLossConfig
-from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
+from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+from nemo_rl.algorithms.loss.interfaces import LossInputType
+from nemo_rl.algorithms.opd import OnPolicyDistillationConfig, get_opd_full_config
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
     MasterConfig,
@@ -59,6 +61,7 @@ from nemo_rl.algorithms.single_controller_utils import (
 from nemo_rl.algorithms.single_controller_utils.config import (
     RolloutCheckpointConfig,
     TokenCaptureConfig,
+    _validate_opd_full_config,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
@@ -498,12 +501,19 @@ def test_build_trainer_initializes_reference_model_only_for_nonzero_kl(
             None,
             weights_path=None,
             optimizer_path=None,
+            checkpointing=True,
+            reserved_http_server_ports={0: 5555, 2: 6666},
         )
 
     assert (
         mock_policy.call_args.kwargs["init_reference_model"]
         is expected_init_reference_model
     )
+    assert mock_policy.call_args.kwargs["checkpointing"] is True
+    assert mock_policy.call_args.kwargs["reserved_http_server_ports"] == {
+        0: 5555,
+        2: 6666,
+    }
 
 
 def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
@@ -587,6 +597,36 @@ def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
 
 class TestSetup:
     """setup arg validation + actor_args assembly."""
+
+    @pytest.mark.parametrize("colocated", [False, True])
+    def test_nvfp4_pertoken_rejected_before_setup_factories(
+        self, patched_factories: dict[str, Any], colocated: bool
+    ) -> None:
+        mc = _make_master_config(colocated=colocated, megatron_enabled=True)
+        mc.policy["generation"]["nvfp4_pertoken_rollout"] = {"enabled": True}
+
+        with pytest.raises(
+            ValueError,
+            match="SingleController does not support generation.nvfp4_pertoken_rollout",
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        for factory in (
+            "setup_response_data",
+            "_build_clusters",
+            "_build_generation",
+            "_build_trainer",
+        ):
+            patched_factories[factory].assert_not_called()
+
+    @pytest.mark.parametrize("rollout", [None, {"enabled": False}])
+    def test_nvfp4_pertoken_off_preserves_single_controller_validation(
+        self, rollout: dict[str, bool] | None
+    ) -> None:
+        mc = _make_master_config()
+        if rollout is not None:
+            mc.policy["generation"]["nvfp4_pertoken_rollout"] = rollout
+        validate_single_controller_config(mc)
 
     def test_reward_penalties_are_typed(self):
         assert isinstance(_make_master_config().reward_penalties, RewardPenaltyConfig)
@@ -692,12 +732,111 @@ class TestSetup:
         patched_factories["_build_clusters"].assert_not_called()
         patched_factories["_build_trainer"].assert_not_called()
 
-    def test_rejects_mooncake_data_plane_checkpointing(self):
+    def test_warns_when_rollout_telemetry_lacks_vllm_metrics(self, patched_factories):
+        mc = _make_master_config()
+        mc.rollout_checkpointing.telemetry_interval_s = 30.0
+        mc.policy["generation"]["vllm_cfg"] = {"async_engine": True}
+
+        with pytest.warns(UserWarning, match="vLLM token, request, and KV-cache"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_warns_when_vllm_telemetry_uses_sync_engine(self, patched_factories):
+        mc = _make_master_config()
+        mc.rollout_checkpointing.telemetry_interval_s = 30.0
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": False,
+            "enable_vllm_metrics_logger": True,
+        }
+
+        with pytest.warns(UserWarning, match="async_engine=true"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_non_vllm_telemetry_warning_has_no_vllm_config_guidance(
+        self, patched_factories
+    ):
+        mc = _make_master_config(backend="sglang")
+        mc.rollout_checkpointing.telemetry_interval_s = 30.0
+
+        with pytest.warns(UserWarning) as warning_records:
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        messages = [str(record.message) for record in warning_records]
+        assert any("backend='sglang'" in message for message in messages)
+        assert all("enable_vllm_metrics_logger" not in message for message in messages)
+
+    def test_rejects_unknown_backend_data_plane_checkpointing(self):
+        mc = _make_master_config()
+        mc.data_plane["backend"] = "future_backend"
+        mc.checkpointing["save_data_plane"] = True
+        with pytest.raises(NotImplementedError, match="backend='future_backend'"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    @pytest.mark.parametrize("token_capture_enabled", [False, True])
+    @pytest.mark.parametrize("snapshot_interval", [None, 1.0])
+    @pytest.mark.parametrize("fleet_health_enabled", [False, True])
+    def test_mooncake_checkpointing_rejects_generation_shard_restarts(
+        self,
+        patched_factories: dict[str, MagicMock],
+        token_capture_enabled: bool,
+        snapshot_interval: float | None,
+        fleet_health_enabled: bool,
+    ) -> None:
         mc = _make_master_config()
         mc.data_plane["backend"] = "mooncake_cpu"
-        mc.checkpointing["save_data_plane"] = True
-        with pytest.raises(NotImplementedError, match="backend='mooncake_cpu'"):
+        mc.checkpointing.update(enabled=True, save_data_plane=True)
+        mc.async_rl.generation_fleet_health.enabled = fleet_health_enabled
+        mc.async_rl.generation_fleet_health.restart_dead_shards = True
+        mc.token_capture = TokenCaptureConfig(enabled=token_capture_enabled)
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=snapshot_interval
+        )
+
+        with pytest.raises(ValueError, match="restart_dead_shards=false"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        for factory in (
+            "setup_response_data",
+            "_build_clusters",
+            "_build_generation",
+            "_build_trainer",
+            "build_data_plane_client",
+        ):
+            patched_factories[factory].assert_not_called()
+
+    @pytest.mark.parametrize(
+        "backend,checkpointing_enabled,save_data_plane,restart_dead_shards",
+        [
+            ("mooncake_cpu", True, True, False),
+            ("simple", True, True, True),
+            ("mooncake_cpu", False, True, True),
+            ("mooncake_cpu", False, False, True),
+            ("mooncake_cpu", True, False, True),
+        ],
+    )
+    def test_generation_shard_restart_guard_leaves_other_configs_unchanged(
+        self,
+        patched_factories: dict[str, MagicMock],
+        backend: str,
+        checkpointing_enabled: bool,
+        save_data_plane: bool,
+        restart_dead_shards: bool,
+    ) -> None:
+        mc = _make_master_config(
+            sampler_cfg=CustomSamplerConfig(
+                target=f"{__name__}:_NonCheckpointingCustomSampler"
+            )
+        )
+        mc.data_plane["backend"] = backend
+        mc.checkpointing.update(
+            enabled=checkpointing_enabled, save_data_plane=save_data_plane
+        )
+        mc.async_rl.generation_fleet_health.enabled = True
+        mc.async_rl.generation_fleet_health.restart_dead_shards = restart_dead_shards
+        patched_factories["fake_gen"].worker_group.dp_size = 1
+
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["_build_generation"].assert_called_once()
 
     def test_periodic_checkpointing_requires_trainer_checkpointing(self):
         mc = _make_master_config()
@@ -913,6 +1052,29 @@ class TestSetup:
         assert after == before
         patched_factories["setup_response_data"].assert_not_called()
 
+    @pytest.mark.parametrize("enabled", [False, True])
+    @pytest.mark.parametrize("save_data_plane", [False, True])
+    def test_mooncake_checkpoint_mode_follows_existing_settings(
+        self, patched_factories, enabled, save_data_plane
+    ):
+        mc = _make_master_config(
+            sampler_cfg=CustomSamplerConfig(
+                target=f"{__name__}:_NonCheckpointingCustomSampler"
+            )
+        )
+        mc.data_plane["backend"] = "mooncake_cpu"
+        mc.checkpointing.update(enabled=enabled, save_data_plane=save_data_plane)
+
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert patched_factories["_build_trainer"].call_args.kwargs[
+            "checkpointing"
+        ] is (enabled and save_data_plane)
+        assert (
+            actor_args.dp_client
+            is patched_factories["build_data_plane_client"].return_value
+        )
+
     def test_rejects_windowed_checkpointing_without_native_tq(self):
         mc = _make_master_config()
         mc.checkpointing["enabled"] = True
@@ -929,7 +1091,7 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-    def test_checkpointing_error_explains_mooncake_incompatibility(self):
+    def test_mooncake_checkpointing_requires_only_the_shared_data_plane_setting(self):
         mc = _make_master_config()
         mc.checkpointing["enabled"] = True
         mc.checkpointing["save_data_plane"] = False
@@ -939,7 +1101,8 @@ class TestSetup:
         with pytest.raises(
             ValueError,
             match=(
-                "backend='mooncake_cpu'.*backend='simple'.*checkpointing.enabled=false"
+                "replay-checkpoint-capable sampler requires "
+                "checkpointing.save_data_plane=true"
             ),
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
@@ -1113,6 +1276,12 @@ class TestSetup:
             ("megatron_dtensor_trainer", ValueError, "megatron_cfg.enabled"),
             ("megatron_recompute_mismatch", ValueError, "kv_cache_management_mode"),
             ("megatron_fleet_health", NotImplementedError, "generation_fleet_health"),
+            (
+                "megatron_colocated_min_groups",
+                ValueError,
+                "min_groups_for_streaming_train",
+            ),
+            ("colocated_vllm", ValueError, "supported only with backend='megatron'"),
             ("gym_on_sglang", NotImplementedError, "vllm and megatron"),
             (
                 "deferred_routes_without_capture",
@@ -1171,6 +1340,18 @@ class TestSetup:
                 colocated=False, backend="megatron", megatron_enabled=True
             )
             mc.async_rl.generation_fleet_health.enabled = True
+        elif invalid_case == "megatron_colocated_min_groups":
+            # The colocated engine stands down once per step, so streaming
+            # below a whole batch is rejected at setup.
+            mc = _make_master_config(
+                colocated=True, backend="megatron", megatron_enabled=True
+            )
+            mc.async_rl.min_groups_for_streaming_train = (
+                mc.grpo.num_prompts_per_step - 1
+            )
+        elif invalid_case == "colocated_vllm":
+            # Colocated generation is rejected for every backend but megatron.
+            mc = _make_master_config(colocated=True)
         elif invalid_case == "gym_on_sglang":
             mc = _make_master_config(colocated=False, backend="sglang")
         elif invalid_case == "prompt_group_recovery_without_capture":
@@ -1766,9 +1947,9 @@ class TestSetup:
         assert metrics.generation_init_reserve_time_s == 3.0
         assert metrics.generation_init_load_time_s is not None
 
-    def _make_gym_megatron_config(self) -> MasterConfig:
+    def _make_gym_megatron_config(self, *, colocated: bool = False) -> MasterConfig:
         mc = _make_master_config(
-            colocated=False, backend="megatron", megatron_enabled=True
+            colocated=colocated, backend="megatron", megatron_enabled=True
         )
         mc.policy["generation"]["mcore_generation_config"]["expose_http_server"] = True
         mc.policy["generation"]["stop_strings"] = None
@@ -1776,6 +1957,8 @@ class TestSetup:
         mc.policy["generation"]["top_k"] = None
         return mc
 
+    @pytest.mark.mcore
+    @pytest.mark.parametrize("colocated", [True, False])
     @pytest.mark.parametrize(
         ("scenario", "error_match"),
         [
@@ -1787,15 +1970,19 @@ class TestSetup:
         ids=["gym", "gym_served_mismatch", "gym_router_failure", "native"],
     )
     def test_megatron_setup(
-        self, patched_factories, scenario: str, error_match: str | None
+        self,
+        patched_factories,
+        scenario: str,
+        error_match: str | None,
+        colocated: bool,
     ):
-        """Non-colocated Megatron generation setup, gym and native legs.
+        """Megatron generation setup: gym and native legs, colocated or not.
 
-        gym: reserve rank-0's URL, spin Gym up on it, build trainer and engine
-        in parallel (the engine through _build_generation with the reserved
-        port), run the initial refit while Gym is still waiting -- the
-        skip-load engine only starts serving then -- cross-check the served
-        address, reap the port holder.
+        gym: reserve every frontend URL, spin Gym up on them, build trainer and
+        engine in parallel (the engine through _build_generation with the
+        reserved ports), run the initial refit while Gym is still waiting --
+        the skip-load engine only starts serving then -- cross-check the served
+        addresses, reap every port holder.
         gym_served_mismatch: the served-vs-reserved cross-check fires after the
         builds when the engine comes up on a different address.
         gym_router_failure: the holder is created before the executor
@@ -1804,28 +1991,39 @@ class TestSetup:
         native: expose_http_server=false and no Gym, so nothing reserves a URL,
         no port holder is created, the cross-check is skipped, and the initial
         refit is left to the actor.
+        colocated: rank 0 lives with the trainer — the reservation targets the
+        shared cluster, the reserved port rides the trainer build, and the
+        engine wraps the trainer's policy instead of a dedicated cluster.
         """
         gym = scenario != "native"
         if gym:
-            mc = self._make_gym_megatron_config()
+            mc = self._make_gym_megatron_config(colocated=colocated)
             patched_factories["setup_response_data"].return_value = (
                 list(range(8)),
                 None,
             )
         else:
             mc = _make_master_config(
-                colocated=False, backend="megatron", megatron_enabled=True
+                colocated=colocated, backend="megatron", megatron_enabled=True
             )
         if scenario == "gym_router_failure":
             mc.async_rl.generation_router.enabled = True
         tokenizer = MagicMock(pad_token_id=0)
-        reserved_url = "http://10.0.0.1:5555/v1"
-        served_url = (
-            "http://10.0.0.9:7/v1"
+        reserved_urls = [
+            "http://10.0.0.1:5555/v1",
+            "http://10.0.0.2:6666/v1",
+        ]
+        reserved_http_server_ports = {0: 5555, 2: 6666}
+        served_urls = (
+            ["http://10.0.0.9:7/v1", reserved_urls[1]]
             if scenario == "gym_served_mismatch"
-            else reserved_url
+            # The worker-group completion order need not match reservation.
+            else list(reversed(reserved_urls))
         )
-        port_holder = MagicMock(name="port_holder")
+        port_holders = [
+            MagicMock(name="port_holder_rank_0"),
+            MagicMock(name="port_holder_rank_2"),
+        ]
         fake_gym_actor = MagicMock(name="nemo_gym_actor")
         weight_sync = patched_factories["create_weight_synchronizer"].return_value
         # Run the real _build_generation (MegatronGeneration is mocked below) so its
@@ -1863,17 +2061,17 @@ class TestSetup:
             patch.object(sc_setup_mod, "ray") as mock_ray,
             router_patch,
         ):
-            mock_megatron.reserve_http_server_address.return_value = (
-                reserved_url,
-                5555,
-                port_holder,
+            mock_megatron.reserve_http_server_addresses.return_value = (
+                reserved_urls,
+                reserved_http_server_ports,
+                port_holders,
             )
             # Wire the real check through the class mock so the
             # served-vs-reserved legs exercise the genuine logic.
-            mock_megatron.verify_served_address = (
-                MegatronGeneration.verify_served_address
+            mock_megatron.verify_served_addresses = (
+                MegatronGeneration.verify_served_addresses
             )
-            mock_megatron.return_value.dp_openai_server_base_urls = [served_url]
+            mock_megatron.return_value.dp_openai_server_base_urls = served_urls
             if error_match is None:
                 actor_args, metrics = setup_single_controller(mc, tokenizer)
             else:
@@ -1885,13 +2083,15 @@ class TestSetup:
         # Reservation + holder lifecycle exist on the gym legs only; every gym
         # leg — success or either failure — reaps the holder exactly once.
         if gym:
-            mock_megatron.reserve_http_server_address.assert_called_once_with(
+            mock_megatron.reserve_http_server_addresses.assert_called_once_with(
                 inference_cluster,
                 mc.policy,
             )
-            mock_ray.kill.assert_called_once_with(port_holder)
+            assert [call.args for call in mock_ray.kill.call_args_list] == [
+                (port_holder,) for port_holder in port_holders
+            ]
         else:
-            mock_megatron.reserve_http_server_address.assert_not_called()
+            mock_megatron.reserve_http_server_addresses.assert_not_called()
             mock_ray.kill.assert_not_called()
 
         if scenario == "gym_router_failure":
@@ -1901,19 +2101,34 @@ class TestSetup:
             patched_factories["_build_generation"].assert_not_called()
             return
 
-        # Construction: trainer and generation are independent build tasks; the
-        # dedicated Megatron policy is built by _build_generation with the weight
-        # load skipped and the reserved port adopted (gym) or absent (native).
+        # Construction: colocated builds the trainer first and wraps its
+        # policy, with the reserved port riding the trainer build;
+        # non-colocated builds the dedicated Megatron policy in parallel via
+        # _build_generation, with the weight load skipped and the reserved
+        # port adopted by the engine (gym) or absent (native).
         patched_factories["_build_trainer"].assert_called_once()
-        patched_factories["_build_generation"].assert_called_once()
-        mock_megatron.assert_called_once_with(
-            config=mc.policy,
-            tokenizer=tokenizer,
-            cluster=inference_cluster,
-            reserved_http_server_port=5555 if gym else None,
-            processor=None,
-            skip_weight_load=True,
+        _, trainer_kwargs = patched_factories["_build_trainer"].call_args
+        assert trainer_kwargs["reserved_http_server_ports"] == (
+            reserved_http_server_ports if colocated and gym else None
         )
+        if colocated:
+            patched_factories["_build_generation"].assert_not_called()
+            mock_megatron.assert_called_once_with(
+                config=mc.policy,
+                tokenizer=tokenizer,
+                policy=patched_factories["fake_policy"],
+                processor=None,
+            )
+        else:
+            patched_factories["_build_generation"].assert_called_once()
+            mock_megatron.assert_called_once_with(
+                config=mc.policy,
+                tokenizer=tokenizer,
+                cluster=inference_cluster,
+                reserved_http_server_ports=reserved_http_server_ports if gym else None,
+                processor=None,
+                skip_weight_load=True,
+            )
         # Stood down like every other backend; before the first refit this is a
         # cache clear on the non-colocated Megatron workers.
         mock_megatron.return_value.finish_generation.assert_called_once_with()
@@ -1922,7 +2137,7 @@ class TestSetup:
             # cross-check — so the mismatch leg sees it too. The initial refit
             # must happen during that wait because it starts Megatron's server.
             _, spinup_kwargs = mock_spinup.call_args
-            assert spinup_kwargs["base_urls"] == [reserved_url]
+            assert spinup_kwargs["base_urls"] == reserved_urls
             # The initial refit ran in setup, against the collective brought up
             # there; the served-address check reads the URLs it populated.
             weight_sync.init_communicator.assert_called_once_with()
@@ -1944,8 +2159,12 @@ class TestSetup:
         patched_factories["create_weight_synchronizer"].assert_called_once()
         _, factory_kwargs = patched_factories["create_weight_synchronizer"].call_args
         assert factory_kwargs["generation_backend"] == "megatron"
-        assert factory_kwargs["colocated"] is False
+        assert factory_kwargs["colocated"] is colocated
         assert factory_kwargs["inference_cluster"] is inference_cluster
+        assert (
+            factory_kwargs["refit_timeout_s"]
+            == mc.async_rl.generation_fleet_health.refit_timeout_s
+        )
         if gym:
             assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
             assert metrics.nemo_gym_init_time_s is not None
@@ -2002,7 +2221,7 @@ class TestSetup:
 
 
 class TestNativeTQRecoverySetup:
-    def test_setup_loads_tq_before_creating_single_controller_client(
+    def test_simple_storage_setup_loads_tq_before_creating_controller_client(
         self, tmp_path, patched_factories
     ):
         checkpoint_path = tmp_path / "step_3"
@@ -2025,12 +2244,148 @@ class TestNativeTQRecoverySetup:
         checkpointer.load_training_info.return_value = vars(save_state)
         checkpointer.get_resume_paths.return_value = (None, None)
         mc = _make_master_config()
+        mc.data_plane["backend"] = "simple"
 
         with patch.object(sc_setup_mod, "CheckpointManager", return_value=checkpointer):
             actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert events == ["load", "build"]
         assert actor_args.data_plane_checkpoint_metadata == _native_tq_metadata()
+        assert actor_args.rollout_checkpoint_load_metrics["tq_load_seconds"] >= 0
+
+    @pytest.mark.parametrize("save_enabled", [False, True])
+    def test_mooncake_setup_defers_restore_and_warmup_decision_to_actor(
+        self, tmp_path, patched_factories, save_enabled
+    ):
+        checkpoint_path = tmp_path / "step_3"
+        (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)
+        (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+        torch.save({}, checkpoint_path / "train_dataloader.pt")
+        save_state = _save_state()
+        policy = patched_factories["fake_policy"]
+        dp_client = MagicMock(name="dp_client")
+        events: list[str] = []
+        policy.load_data_plane_checkpoint.side_effect = lambda checkpoint_dir: (
+            events.append("load") or _native_tq_metadata()
+        )
+        patched_factories["build_data_plane_client"].side_effect = (
+            lambda *args, **kwargs: events.append("build") or dp_client
+        )
+        checkpointer = MagicMock()
+        checkpointer.get_latest_checkpoint_path.return_value = str(checkpoint_path)
+        checkpointer.load_training_info.return_value = vars(save_state)
+        checkpointer.get_resume_paths.return_value = (None, None)
+        mc = _make_master_config()
+        mc.data_plane["backend"] = "mooncake_cpu"
+        mc.checkpointing["enabled"] = save_enabled
+        mc.checkpointing["save_data_plane"] = save_enabled
+
+        with patch.object(sc_setup_mod, "CheckpointManager", return_value=checkpointer):
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert events == ["build"]
+        assert (
+            patched_factories["_build_trainer"].call_args.kwargs["checkpointing"]
+            is True
+        )
+        policy.load_data_plane_checkpoint.assert_not_called()
+        dp_client.register_partition.assert_not_called()
+        assert actor_args.last_checkpoint_path == str(checkpoint_path)
+        assert actor_args.data_plane_checkpoint_metadata is None
+        assert "tq_load_seconds" not in actor_args.rollout_checkpoint_load_metrics
+
+    def test_mooncake_periodic_snapshot_path_waits_for_finalizer_clients(
+        self, tmp_path, patched_factories
+    ):
+        trainer_checkpoint = tmp_path / "checkpoints" / "step_3"
+        snapshot_path = trainer_checkpoint / "rollout_snapshots" / "snapshot_000007"
+        save_state = _save_state()
+        checkpointer = MagicMock()
+        checkpointer.checkpoint_dir = tmp_path / "checkpoints"
+        checkpointer.get_latest_checkpoint_path.return_value = str(trainer_checkpoint)
+        checkpointer.load_training_info.return_value = vars(save_state)
+        checkpointer.get_resume_paths.return_value = (None, None)
+        resolved_snapshot = SimpleNamespace(
+            path=snapshot_path,
+            manifest=SimpleNamespace(current_epoch=2, sampler_dispatch_index=7),
+        )
+
+        mc = _make_master_config(colocated=False, backend="vllm")
+        mc.data_plane["backend"] = "mooncake_cpu"
+        mc.checkpointing.update(
+            {
+                "checkpoint_dir": str(tmp_path / "checkpoints"),
+                "enabled": True,
+                "save_data_plane": True,
+                "save_period": 1,
+            }
+        )
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "vllm_cfg": {"async_engine": True},
+            }
+        )
+        mc.logger["log_dir"] = str(tmp_path / "logs")
+        mc.token_capture.enabled = True
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0,
+            restore_mode="latest",
+        )
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            None,
+        )
+
+        ready_ref = object()
+        ready_remote = MagicMock(return_value=ready_ref)
+        finalizer = SimpleNamespace(__ray_ready__=SimpleNamespace(remote=ready_remote))
+        with (
+            patch.object(sc_setup_mod, "CheckpointManager", return_value=checkpointer),
+            patch.object(
+                sc_setup_mod,
+                "resolve_latest_snapshot",
+                return_value=resolved_snapshot,
+            ) as resolve_latest,
+            patch.object(sc_setup_mod, "load_dataloader_state") as load_dataloader,
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
+            ),
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor."
+                "create_rollout_reassembler_actors",
+                return_value=[finalizer],
+            ),
+            patch.object(sc_setup_mod.ray, "get", return_value=[True]) as ray_get,
+        ):
+            actor_args, _ = setup_single_controller(
+                mc,
+                MagicMock(pad_token_id=0),
+            )
+
+        resolve_latest.assert_called_once_with(
+            trainer_checkpoint,
+            expected_train_step=3,
+            expected_trainer_version=3,
+            expected_bootstrap_fingerprint=None,
+        )
+        load_dataloader.assert_called_once_with(
+            patched_factories["dataloader"],
+            str(snapshot_path),
+            mc.data,
+        )
+        ready_remote.assert_called_once_with()
+        ray_get.assert_called_once_with([ready_ref])
+        patched_factories["fake_policy"].load_data_plane_checkpoint.assert_not_called()
+        actor_args.dp_client.register_partition.assert_not_called()
+        assert actor_args.last_checkpoint_path == str(snapshot_path)
+        assert actor_args.data_plane_checkpoint_metadata is None
+        assert actor_args.save_state.current_epoch == 2
+        assert actor_args.save_state.sampler_dispatch_index == 7
 
     def test_loads_authoritative_tq_checkpoint_when_metadata_file_exists(
         self, tmp_path
@@ -2044,7 +2399,7 @@ class TestNativeTQRecoverySetup:
         save_state = _save_state()
 
         restored = sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
-            policy,
+            load_checkpoint=policy.load_data_plane_checkpoint,
             last_checkpoint_path=str(checkpoint_path),
             save_state=save_state,
             partition_id="rollout_data",
@@ -2065,7 +2420,7 @@ class TestNativeTQRecoverySetup:
         policy.load_data_plane_checkpoint.return_value = metadata
 
         restored = sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
-            policy,
+            load_checkpoint=policy.load_data_plane_checkpoint,
             last_checkpoint_path=str(checkpoint_path),
             save_state=_save_state(trainer_version=7),
             partition_id="rollout_data",
@@ -2082,7 +2437,7 @@ class TestNativeTQRecoverySetup:
 
         with pytest.raises(RuntimeError, match="legacy replay_buffer.pt"):
             sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
-                policy,
+                load_checkpoint=policy.load_data_plane_checkpoint,
                 last_checkpoint_path=str(checkpoint_path),
                 save_state=_save_state(),
                 partition_id="rollout_data",
@@ -2099,7 +2454,7 @@ class TestNativeTQRecoverySetup:
         policy = MagicMock()
 
         restored = sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
-            policy,
+            load_checkpoint=policy.load_data_plane_checkpoint,
             last_checkpoint_path=str(checkpoint_path),
             save_state=_save_state(),
             partition_id="rollout_data",
@@ -2121,7 +2476,7 @@ class TestNativeTQRecoverySetup:
 
         with pytest.raises(FileNotFoundError, match="matching native TQ checkpoint"):
             sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
-                MagicMock(),
+                load_checkpoint=MagicMock(),
                 last_checkpoint_path=str(checkpoint_path),
                 save_state=_save_state(),
                 partition_id="rollout_data",
@@ -2137,9 +2492,222 @@ class TestNativeTQRecoverySetup:
 
         with pytest.raises(ValueError, match="does not match the trainer checkpoint"):
             sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
-                policy,
+                load_checkpoint=policy.load_data_plane_checkpoint,
                 last_checkpoint_path=str(checkpoint_path),
                 save_state=_save_state(),
                 partition_id="rollout_data",
                 sampler_name="in_order",
             )
+
+
+# ── Full-vocabulary MOPD (on_policy_distillation.full) ──────────────────────
+
+_FULLVOCAB_RECIPES = (
+    "mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller-fullvocab.yaml",
+    "mopd-qwen3-1.7b-3n4g-megatron-pack-single-controller-fullvocab.yaml",
+)
+
+
+def _load_fullvocab_master_config(
+    recipe_name: str = _FULLVOCAB_RECIPES[0],
+) -> MasterConfig:
+    register_omegaconf_resolvers()
+    repo_root = Path(__file__).resolve().parents[3]
+    recipe = repo_root / "examples/configs/recipes/llm" / recipe_name
+    resolved = OmegaConf.to_container(load_config(recipe), resolve=True)
+    assert isinstance(resolved, dict)
+    return MasterConfig.model_validate(resolved)
+
+
+@pytest.mark.parametrize("recipe_name", _FULLVOCAB_RECIPES)
+def test_fullvocab_mopd_recipes_resolve_to_runtime_contract(recipe_name: str):
+    """Both shipped recipes load and survive every opd_full validator.
+
+    The loss-side validator rejects each policy-gradient knob that opd_full
+    would otherwise ignore, and the base MOPD recipe two levels up turns
+    several of them on -- so a recipe that forgets to override one fails at
+    construction. Nothing else catches that at PR time: these recipes only run
+    in the nightly suites (``nightly.txt`` / ``nightly_gb200.txt``), not in CI.
+    """
+    config = _load_fullvocab_master_config(recipe_name)
+    validate_single_controller_config(config)
+
+    full_cfg = get_opd_full_config(config)
+    assert full_cfg is not None
+    assert full_cfg.teacher_payload == "hidden_states"
+    assert full_cfg.chunk_size == 1024
+    # Off: the residual is an algebraic identity (all three kernels read the same
+    # logits), so it costs a second full-vocabulary log-softmax without being
+    # able to catch a corrupted teacher.
+    assert full_cfg.validate_decomposition is False
+
+    # opd_full still runs the OPD advantage estimator: `advantages` is a
+    # required training column and its stage gates the training step.
+    assert config.grpo.adv_estimator.name == "opd"
+    # Self-distillation: student and teacher are the same checkpoint, which is
+    # what makes "the divergence must stay ~0" a meaningful assertion.
+    assert (
+        config.on_policy_distillation.teacher_model_by_agent_name["default_teacher"]
+        == config.policy["model_name"]
+    )
+
+
+def test_fullvocab_recipe_builds_an_opd_full_loss_function():
+    """The recipe's loss block is accepted by the opd_full loss constructor."""
+    config = _load_fullvocab_master_config()
+    loss_fn = ClippedPGLossFn(
+        config.loss_fn,
+        opd_full=get_opd_full_config(config),
+    )
+    assert loss_fn.input_type is LossInputType.OPD_FULL
+
+
+class TestOPDFullValidation:
+    """``_validate_opd_full_config`` rejects at startup, not mid-training.
+
+    Each combination below otherwise fails only once the whole cluster and
+    every teacher worker are already up -- or, for the fused packing path, not
+    until the first training forward.
+    """
+
+    def test_accepts_the_shipped_recipe(self):
+        config = _load_fullvocab_master_config()
+        _validate_opd_full_config(config, config.on_policy_distillation)
+
+    def test_is_a_no_op_when_full_is_absent(self):
+        config = _load_fullvocab_master_config()
+        config.on_policy_distillation.full = None
+        _validate_opd_full_config(config, config.on_policy_distillation)
+
+    def test_rejects_fused_linear_logprobs(self):
+        """The fused forward bypasses output_layer, so the capture hook never fires."""
+        config = _load_fullvocab_master_config()
+        config.policy["megatron_cfg"]["use_fused_linear_logprobs"] = True
+        with pytest.raises(ValueError, match="use_fused_linear_logprobs"):
+            _validate_opd_full_config(config, config.on_policy_distillation)
+
+    def test_rejects_fused_packing_loss(self):
+        """prepare_packed_loss_input only supports LossInputType.LOGPROB.
+
+        Without this check the run dies inside the first training forward, and
+        a real production MOPD config (nemo_gym/nemotron-3-ultra) already sets
+        ``fuse_loss: true``.
+        """
+        config = _load_fullvocab_master_config()
+        config.policy["sequence_packing"]["enabled"] = True
+        config.policy["sequence_packing"]["fuse_loss"] = True
+        with pytest.raises(ValueError, match="fuse_loss"):
+            _validate_opd_full_config(config, config.on_policy_distillation)
+
+    def test_rejects_more_than_one_teacher_checkpoint(self):
+        """One LM head and one payload column exist; a second teacher needs both."""
+        config = _load_fullvocab_master_config()
+        config.on_policy_distillation.teacher_model_by_agent_name = {
+            "a": "/ckpt/teacher-a",
+            "b": "/ckpt/teacher-b",
+        }
+        with pytest.raises(ValueError, match="exactly one unique"):
+            _validate_opd_full_config(config, config.on_policy_distillation)
+
+    def test_rejects_pipeline_parallel_on_the_hidden_state_path(self):
+        """Megatron builds output_layer only on the last pipeline stage.
+
+        Resolving the teacher checkpoint iteration goes through Megatron-Bridge's
+        read_train_state, whose broadcast spans the whole student world, so
+        earlier stages would raise while the last stage hangs inside it.
+        """
+        config = _load_fullvocab_master_config()
+        config.policy["megatron_cfg"]["pipeline_model_parallel_size"] = 2
+        with pytest.raises(ValueError, match="pipeline_model_parallel_size > 1"):
+            _validate_opd_full_config(config, config.on_policy_distillation)
+
+    def test_rejects_a_sampling_temperature_on_the_hidden_state_path(self):
+        """Temperature divides the training logits after the capture hook reads them.
+
+        The student would be scaled and the teacher -- reconstructed from
+        unscaled hidden states -- would not, silently optimizing a mismatched
+        objective that no self-distillation gate can detect.
+        """
+        config = _load_fullvocab_master_config()
+        config.policy["generation"]["temperature"] = 0.7
+        with pytest.raises(ValueError, match="temperature != 1.0"):
+            _validate_opd_full_config(config, config.on_policy_distillation)
+
+    def test_allows_a_sampling_temperature_on_the_logits_path(self):
+        """Both sides come from the same divided tensor there, so they agree."""
+        config = _load_fullvocab_master_config()
+        config.policy["generation"]["temperature"] = 0.7
+        assert config.on_policy_distillation.full is not None
+        config.on_policy_distillation.full.teacher_payload = "logits"
+        _validate_opd_full_config(config, config.on_policy_distillation)
+
+    def test_allows_pipeline_parallel_on_the_logits_path(self):
+        """The logits payload needs no teacher LM head, so no such collective."""
+        config = _load_fullvocab_master_config()
+        config.policy["megatron_cfg"]["pipeline_model_parallel_size"] = 2
+        assert config.on_policy_distillation.full is not None
+        config.on_policy_distillation.full.teacher_payload = "logits"
+        _validate_opd_full_config(config, config.on_policy_distillation)
+
+    def test_rejects_a_non_megatron_backend(self):
+        """DTensor has no vocabulary-parallel logit path for the kernels."""
+        config = _load_fullvocab_master_config()
+        config.policy["megatron_cfg"]["enabled"] = False
+        with pytest.raises(ValueError, match="requires the Megatron backend"):
+            _validate_opd_full_config(config, config.on_policy_distillation)
+
+
+class _FakeTeacherGroup:
+    def __init__(self, model_name: str, cfg: dict):
+        self.model_name = model_name
+        self.cfg = cfg
+
+
+def _fake_trainer(result: str = "/resolved/teacher") -> Any:
+    trainer = MagicMock()
+    trainer.worker_group.run_all_workers_single_data.return_value = [result, result]
+    return trainer
+
+
+def test_load_opd_full_teacher_lm_heads_sends_the_teacher_groups_own_config(
+    monkeypatch,
+):
+    """The LM head must be resolved from the teacher, never from the student.
+
+    ``TeacherWorkerGroup`` drops ``pretrained_checkpoint`` from the config it
+    copies, so what arrives here already describes the teacher alone; a config
+    still carrying that key would resolve the student's checkpoint and distill
+    the student into itself with a divergence of exactly zero.
+    """
+    monkeypatch.setattr(sc_setup_mod, "ray", MagicMock(get=lambda futures: futures))
+    teacher_cfg = {"model_name": "Qwen/Qwen3-8B", "megatron_cfg": {"enabled": True}}
+    trainer = _fake_trainer()
+
+    sc_setup_mod._load_opd_full_teacher_lm_heads(
+        trainer, {"default_teacher": _FakeTeacherGroup("Qwen/Qwen3-8B", teacher_cfg)}
+    )
+
+    call = trainer.worker_group.run_all_workers_single_data.call_args
+    assert call.args == ("load_opd_full_teacher_lm_head",)
+    sent = call.kwargs["teacher_path_config"]
+    assert sent["model_name"] == "Qwen/Qwen3-8B"
+    assert "pretrained_checkpoint" not in sent
+
+
+def test_load_opd_full_teacher_lm_heads_rejects_two_teacher_checkpoints(monkeypatch):
+    monkeypatch.setattr(sc_setup_mod, "ray", MagicMock(get=lambda futures: futures))
+    trainer = _fake_trainer()
+
+    with pytest.raises(ValueError, match="exactly one teacher"):
+        sc_setup_mod._load_opd_full_teacher_lm_heads(
+            trainer,
+            {
+                "a": _FakeTeacherGroup(
+                    "Qwen/teacher-a", {"model_name": "Qwen/teacher-a"}
+                ),
+                "b": _FakeTeacherGroup(
+                    "Qwen/teacher-b", {"model_name": "Qwen/teacher-b"}
+                ),
+            },
+        )
+    trainer.worker_group.run_all_workers_single_data.assert_not_called()

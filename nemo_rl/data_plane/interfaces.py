@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PositiveInt
 from tensordict import TensorDict
 
 DATA_PLANE_CHECKPOINT_SCHEMA_VERSION = 2
@@ -80,6 +80,11 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     admitted and never shrink — so raise it only when a per-key payload (one
     sample of one field) genuinely exceeds it, not for headroom.
 
+    ``use_gdr`` lets CUDA-initialized clients transfer through TransferQueue's
+    persistent GPU staging buffer. ``gdr_staging_buffer_mb`` is the positive
+    HBM capacity of that buffer per active GDR client. CPU-only clients keep
+    using the registered host-buffer path.
+
     Every RDMA rail on the host is offered to mooncake (see ``rdma_devices``).
     That is only safe with ``MC_ENABLE_DEST_DEVICE_AFFINITY=1``, which pins each
     transfer's peer rail to the local one by name; on a rail-isolated RoCE
@@ -91,6 +96,8 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     local_buffer_size: int = 4294967296  # 4 GiB per client process
     reuse_registered_buffers: bool = True
     staging_buffer_size: int = 268435456  # 256 MiB per pool slot
+    use_gdr: bool = False
+    gdr_staging_buffer_mb: PositiveInt = 1024
 
 
 class DataPlaneConfig(TypedDict):
@@ -131,13 +138,15 @@ class DataPlaneConfig(TypedDict):
     observability: NotRequired["ObservabilityConfig"]
 
 
-_CHECKPOINTABLE_BACKENDS: frozenset[str] = frozenset({"simple"})
+_CHECKPOINTABLE_BACKENDS: frozenset[str] = frozenset({"simple", "mooncake_cpu"})
 
 
 def data_plane_supports_checkpointing(cfg: DataPlaneConfig) -> bool:
     """Return whether the configured backend supports complete save/load.
 
-    This is a static allow-list so an unrecognized future backend defaults to
+    Simple and Mooncake support native TQ checkpoints. The existing
+    checkpointing settings decide whether a run saves data-plane state;
+    normal PUTs remain memory-only. An unrecognized future backend defaults to
     unsupported until its storage payload and controller metadata are both
     known to round-trip through a checkpoint.
     """
@@ -175,11 +184,22 @@ class ObservabilityConfig(TypedDict):
     injected programmatically (callables don't round-trip through
     YAML) — set ``cfg["observability"]["callback"] = my_fn`` before
     :func:`build_data_plane_client` to plug into wandb / file / log.
-    Default callback prints one line per op for debug.
+    There is no default callback: per-step metrics reach the logger via
+    ``get_step_metrics``, so a per-op sink is opt-in.
+
+    ``verify_tensor_hash`` is a correctness check, not a metric: each put
+    records a per-row ``torch.hash_tensor`` fold of the row's values, mixed
+    with the row's dtype and shape, and each get re-checks it, so a value
+    that changes between wire-in and wire-out is reported
+    (``hash/mismatches``) instead of silently training on it. It reads every
+    tensor element a second time on both sides — roughly 8 ms for a 107 MB
+    batch — so leave it off outside of debugging. It does not detect a
+    permutation *within* a row; see ``data_plane/README.md``.
     """
 
     enabled: bool
     callback: NotRequired[Callable[[dict[str, Any]], None]]
+    verify_tensor_hash: NotRequired[bool]
 
 
 class LocalDataPlaneConfig(BaseModel, extra="allow"):

@@ -274,6 +274,12 @@ def test_distillation_train_max_steps(mock_components):
     )
 
     assert mock_components["student_policy"].train.call_count == 5
+    final_timing_call = [
+        call
+        for call in mock_components["logger"].log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "timing/train"
+    ][-1]
+    assert final_timing_call.kwargs["step_finished"] is True
 
 
 def test_ft_save_period_triggers_periodic_saves(mock_components):
@@ -368,15 +374,23 @@ def test_distillation_train_uses_nemo_gym_rollout_when_enabled(mock_components):
     assert train_metric_calls[-1].args[0]["mean_gen_tokens_per_sample"] == 3.0
 
 
-def test_exit_on_timeout(mock_components, capsys):
+def test_exit_on_timeout(mock_components, capsys, tmp_path):
     """Test that training loop exits when timeout is reached"""
     # Set max steps to large number
     mock_components["master_config"].distillation.max_num_steps = 100
+    mock_components["master_config"].checkpointing["enabled"] = True
+    mock_components["master_config"].checkpointing["metric_name"] = None
+    mock_components["checkpointer"].init_tmp_checkpoint.return_value = str(
+        tmp_path / "tmp_step"
+    )
 
     distillation_save_state = _initial_distillation_save_state()
 
     # Mock TimeoutChecker to return False for first 7 checks, then True (timeout)
-    with patch("nemo_rl.algorithms.distillation.TimeoutChecker") as mock_timeout_class:
+    with (
+        patch("nemo_rl.algorithms.distillation.torch.save"),
+        patch("nemo_rl.algorithms.distillation.TimeoutChecker") as mock_timeout_class,
+    ):
         mock_timeout_instance = MagicMock()
         # Create a side_effect that returns False 7 times, then True
         check_results = [False] * 7 + [True]
@@ -402,6 +416,12 @@ def test_exit_on_timeout(mock_components, capsys):
 
         # Verify training stopped at 8 steps (when check_save returned True)
         assert mock_components["student_policy"].train.call_count == 8
+        assert (
+            mock_components["student_policy"].save_checkpoint.call_args.kwargs[
+                "is_final_checkpoint"
+            ]
+            is False
+        )
 
         # Verify the timeout message was printed and training actually stopped
         captured = capsys.readouterr()
@@ -917,6 +937,64 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
         setup(master_config, tokenizer, dataset, None)
 
 
+def test_distillation_train_shuts_down_environments_after_failure():
+    task_to_env = {"nemo_gym": MagicMock()}
+    val_task_to_env = task_to_env
+
+    with (
+        patch.object(
+            distil_mod,
+            "_distillation_train_impl",
+            side_effect=RuntimeError("rollout failed"),
+        ),
+        patch.object(distil_mod, "shutdown_environments") as shutdown,
+        pytest.raises(RuntimeError, match="rollout failed"),
+    ):
+        distillation_train(
+            student_policy=MagicMock(),
+            teacher_policy=MagicMock(),
+            student_generation=MagicMock(),
+            dataloader=MagicMock(),
+            val_dataloader=None,
+            tokenizer=MagicMock(),
+            loss_fn=MagicMock(),
+            task_to_env=task_to_env,
+            val_task_to_env=val_task_to_env,
+            logger=MagicMock(),
+            checkpointer=MagicMock(),
+            distillation_save_state=MagicMock(),
+            master_config=MagicMock(),
+        )
+
+    shutdown.assert_called_once_with(task_to_env, val_task_to_env)
+
+
+def test_distillation_train_shuts_down_environments_after_success():
+    task_to_env = {"nemo_gym": MagicMock()}
+
+    with (
+        patch.object(distil_mod, "_distillation_train_impl"),
+        patch.object(distil_mod, "shutdown_environments") as shutdown,
+    ):
+        distillation_train(
+            student_policy=MagicMock(),
+            teacher_policy=MagicMock(),
+            student_generation=MagicMock(),
+            dataloader=MagicMock(),
+            val_dataloader=None,
+            tokenizer=MagicMock(),
+            loss_fn=MagicMock(),
+            task_to_env=task_to_env,
+            val_task_to_env=task_to_env,
+            logger=MagicMock(),
+            checkpointer=MagicMock(),
+            distillation_save_state=MagicMock(),
+            master_config=MagicMock(),
+        )
+
+    shutdown.assert_called_once_with(task_to_env, task_to_env)
+
+
 @pytest.mark.parametrize("refit_transport", [None, "nixl"])
 def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
     """Smoke test: calling setup with a non-colocated config should succeed."""
@@ -1004,7 +1082,7 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
         def __init__(self, *args, **kwargs):
             pass
 
-        def prepare_refit_info(self):
+        def prepare_refit_info(self, *, refit_payload_mode):
             return {}
 
         def offload_after_refit(self):
@@ -1026,6 +1104,9 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
 
         def prepare_refit_info(self, *args, **kwargs):
             return None
+
+        def get_refit_payload_mode(self):
+            return "hf_export"
 
         def init_collective(self, *args, **kwargs):
             self.collective_calls.append((args, kwargs))
@@ -1153,7 +1234,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch):
         def offload_after_refit(self):
             return None
 
-        def prepare_refit_info(self):
+        def prepare_refit_info(self, *, refit_payload_mode):
             return {}
 
     class DummyVllmGeneration:
@@ -1174,6 +1255,9 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch):
 
         def prepare_refit_info(self, *args, **kwargs):
             self.prepare_refit_info_called = True
+
+        def get_refit_payload_mode(self):
+            return "hf_export"
 
     nemo_gym_actor = MagicMock()
 
