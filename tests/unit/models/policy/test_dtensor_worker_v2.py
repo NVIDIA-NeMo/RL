@@ -14,6 +14,7 @@
 
 import os
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -157,7 +158,6 @@ def create_test_config(
     expert_parallel_size: int = 1,
     sequence_packing_enabled: bool = False,
     automodel_kwargs: AutomodelKwargs | None = None,
-    checkpointing: dict | None = None,
 ) -> PolicyConfig:
     config = {
         "model_name": model_name,
@@ -188,6 +188,18 @@ def create_test_config(
         "dtensor_cfg": {
             **({"_v2": dtensor_v2} if dtensor_v2 else {}),
             "enabled": True,
+            **(
+                {
+                    "checkpoint": {
+                        "model_save_format": "safetensors",
+                        "save_consolidated": "false",
+                        "single_rank_consolidation": False,
+                        "consolidation_timeout_minutes": 30,
+                    },
+                }
+                if dtensor_v2
+                else {}
+            ),
             "cpu_offload": cpu_offload,
             "sequence_parallel": sp,
             "activation_checkpointing": activation_checkpointing,
@@ -227,8 +239,6 @@ def create_test_config(
     }
     if automodel_kwargs is not None:
         config["dtensor_cfg"]["automodel_kwargs"] = automodel_kwargs
-    if checkpointing is not None:
-        config["checkpointing"] = checkpointing
     return config
 
 
@@ -443,7 +453,6 @@ def test_dtensor_v2_checkpoint_save_and_load(
             tp=2,
             cp=1,
             dtensor_v2=True,
-            checkpointing=checkpointing_config,
         )
 
         policy = Policy(
@@ -465,7 +474,7 @@ def test_dtensor_v2_checkpoint_save_and_load(
             policy.save_checkpoint(
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
-                checkpointing_cfg=checkpointing_config,
+                is_final_checkpoint=False,
             )
             policy.finalize_async_save()
 
@@ -478,7 +487,6 @@ def test_dtensor_v2_checkpoint_save_and_load(
                 tp=2,
                 cp=1,
                 dtensor_v2=True,
-                checkpointing=checkpointing_config,
             )
 
             # Shutdown original policy first to free GPU memory
@@ -895,7 +903,12 @@ class TestAutocastContext:
 
 
 def _init_v2_worker_mocked(
-    monkeypatch, *, init_reference_model, weights_path, optimizer_path
+    monkeypatch,
+    *,
+    init_reference_model,
+    weights_path,
+    optimizer_path,
+    model_type=None,
 ):
     """Run DTensorPolicyWorkerV2Impl.__init__ with all heavy deps mocked.
 
@@ -916,7 +929,7 @@ def _init_v2_worker_mocked(
     # Unpacked as runtime config at the end of __init__.
     runtime_config = RuntimeConfig(
         model_class="model_class",
-        model_config="model_config",
+        model_config=SimpleNamespace(model_type=model_type),
         hf_config_overrides={},
         allow_flash_attn_args=False,
         attn_impl="attn_impl",
@@ -942,7 +955,8 @@ def _init_v2_worker_mocked(
         side_effect=lambda **kw: call_log.append("load_checkpoint")
     )
 
-    def fake_init_checkpoint_manager(self, config_updates=None, checkpoint_root=None):
+    def fake_init_checkpoint_manager(self, config_updates=None):
+        self._test_checkpoint_config_updates = config_updates
         self.checkpoint_manager = MagicMock()
         self.checkpoint_manager.load_checkpoint = load_checkpoint_mock
 
@@ -983,7 +997,12 @@ def _init_v2_worker_mocked(
     config = {
         "model_name": "base-model",
         "tokenizer": {},
-        "dtensor_cfg": {},
+        "dtensor_cfg": {
+            "checkpoint": {
+                "model_save_format": "safetensors",
+                "save_consolidated": "false",
+            },
+        },
         "generation": {},
     }
     worker = object.__new__(DTensorPolicyWorkerV2Impl)
@@ -996,6 +1015,26 @@ def _init_v2_worker_mocked(
         init_reference_model=init_reference_model,
     )
     return worker, call_log, setup_mock, load_checkpoint_mock
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+@pytest.mark.parametrize(
+    ("model_type", "expected_async"),
+    [("deepseek_v4", False), ("deepseek_v3", True)],
+)
+def test_dtensor_v2_scopes_synchronous_checkpointing_to_dsv4(
+    monkeypatch, model_type, expected_async
+):
+    worker, *_ = _init_v2_worker_mocked(
+        monkeypatch,
+        init_reference_model=False,
+        weights_path=None,
+        optimizer_path=None,
+        model_type=model_type,
+    )
+
+    assert worker._test_checkpoint_config_updates["is_async"] is expected_async
 
 
 @pytest.mark.automodel

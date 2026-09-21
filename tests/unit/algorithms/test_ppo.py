@@ -14,7 +14,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -34,6 +34,7 @@ from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.utils.checkpoint import CheckpointManager
 
 
 def _make_loss_config(
@@ -284,6 +285,32 @@ def test_gae_vapo_decoupled_lambda():
     # because they are computed with different lambda values
     adv_plus_val = advantages + values
     assert not torch.allclose(returns, adv_plus_val, atol=1e-5)
+
+
+def test_gae_equal_explicit_lambdas_compute_once():
+    """Explicit equal policy and value lambdas reuse a single GAE pass."""
+    config = GAEConfig(
+        gae_lambda_value=1.0,
+        gae_lambda_policy=1.0,
+        normalize_advantages=False,
+    )
+    estimator = GeneralizedAdvantageEstimator(config, _make_loss_config(kl_penalty=0.0))
+    mask = torch.ones(2, 4)
+    values = torch.randn(2, 4)
+
+    with patch.object(
+        estimator, "_compute_gae", wraps=estimator._compute_gae
+    ) as compute_gae:
+        advantages, returns = estimator.compute_advantage(
+            prompt_ids=torch.tensor([[0], [1]]),
+            rewards=torch.tensor([1.0, 2.0]),
+            mask=mask,
+            values=values,
+        )
+
+    assert compute_gae.call_count == 1
+    assert compute_gae.call_args.kwargs["gae_lambda"] == 1.0
+    torch.testing.assert_close(returns, advantages + values)
 
 
 def test_gae_length_adaptive_lambda():
@@ -658,6 +685,40 @@ def test_ppo_schema_rejects_unsupported_estimator_name():
         PPOConfig(adv_estimator={"name": "grpo"})
 
 
+def test_ppo_config_defaults_both_epoch_counts_to_four():
+    config = PPOConfig()
+
+    assert config.ppo_epochs == 4
+    assert config.critic_ppo_epochs == 4
+
+
+def test_ppo_config_accepts_more_critic_epochs():
+    config = PPOConfig(ppo_epochs=1, critic_ppo_epochs=3)
+
+    assert config.critic_ppo_epochs == 3
+
+
+def test_ppo_config_accepts_independent_actor_and_critic_epoch_counts():
+    config = PPOConfig(ppo_epochs=3, critic_ppo_epochs=1)
+
+    assert config.ppo_epochs == 3
+    assert config.critic_ppo_epochs == 1
+
+
+def test_ppo_config_rejects_zero_ppo_epochs():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="ppo_epochs must be at least 1"):
+        PPOConfig(ppo_epochs=0)
+
+
+def test_ppo_config_rejects_zero_critic_ppo_epochs():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="critic_ppo_epochs must be at least 1"):
+        PPOConfig(critic_ppo_epochs=0)
+
+
 def test_create_advantage_estimator_rejects_unsupported_name():
     """The factory still guards names that skipped schema validation.
 
@@ -739,6 +800,7 @@ def _run_mock_ppo_train(
     max_num_steps: int,
     ppo_epochs: int,
     seq_logprob_error_threshold: float | None,
+    critic_ppo_epochs: int | None = None,
     policy_training_start_step: int = 0,
     warmup_generation_lead_steps: int | None = None,
     overlong_filtering: bool = False,
@@ -860,6 +922,9 @@ def _run_mock_ppo_train(
         "value_inference_finish"
     )
     value_model.finish_training.side_effect = lambda: events.append("value_finish")
+    value_model.prepare_for_training.side_effect = lambda: events.append(
+        "value_train_prep"
+    )
     value_model.get_values.return_value = {"values": torch.zeros(2, 3, 1)}
     value_model.train.side_effect = lambda *_args, **_kwargs: (
         events.append("value_train") or value_result
@@ -921,6 +986,9 @@ def _run_mock_ppo_train(
             overlong_filtering=overlong_filtering,
             policy_training_start_step=policy_training_start_step,
             ppo_epochs=ppo_epochs,
+            critic_ppo_epochs=(
+                ppo_epochs if critic_ppo_epochs is None else critic_ppo_epochs
+            ),
             reward_scaling={"enabled": False},
             reward_shaping=RewardShapingConfig(enabled=False),
             seq_logprob_error_threshold=seq_logprob_error_threshold,
@@ -1047,6 +1115,62 @@ def _run_mock_ppo_train(
     )
 
 
+def test_ppo_dynamic_sampling_uses_whole_prompt_triviality():
+    """PPO must keep a mixed prompt intact even when one rollout has zero LOO std."""
+    from nemo_rl.algorithms import ppo as ppo_mod
+    from nemo_rl.algorithms.utils import (
+        calculate_baseline_and_std_per_prompt,
+        calculate_trivial_reward_distributions,
+    )
+
+    rewards = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0])
+    prompt_ids = torch.tensor([[0]] * 4 + [[1]] * 4)
+    repeated_batch = BatchedDataDict(
+        {
+            "message_log": [
+                [{"role": "user", "content": f"prompt-{i // 4}"}] for i in range(8)
+            ],
+            "total_reward": rewards,
+        }
+    )
+    baseline, std, loo_is_trivial = calculate_baseline_and_std_per_prompt(
+        prompt_ids,
+        rewards,
+        torch.ones_like(rewards),
+        leave_one_out_baseline=True,
+    )
+    prompt_is_trivial = calculate_trivial_reward_distributions(
+        prompt_ids, rewards, torch.ones_like(rewards)
+    )
+
+    assert loo_is_trivial.tolist()[:4] == [True, False, False, False]
+    assert prompt_is_trivial.tolist() == [False] * 4 + [True] * 4
+
+    timer = MagicMock()
+    timer.time.return_value = nullcontext()
+    master_config = SimpleNamespace(
+        ppo=SimpleNamespace(
+            use_dynamic_sampling=True,
+            num_prompts_per_step=1,
+            num_generations_per_prompt=4,
+            dynamic_sampling_max_gen_batches=2,
+        )
+    )
+    result, is_batch_complete, _, _ = ppo_mod.dynamic_sampling(
+        repeated_batch,
+        std,
+        baseline,
+        dynamic_sampling_num_gen_batches=1,
+        master_config=master_config,
+        timer=timer,
+        is_trivial_prompt_distribution=prompt_is_trivial,
+    )
+
+    assert is_batch_complete is True
+    assert result.size == 4
+    torch.testing.assert_close(result["filtered_reward"], rewards[:4])
+
+
 def test_ppo_train_noncolocated_refit_offload_lifecycle(monkeypatch):
     harness = _run_mock_ppo_train(
         monkeypatch,
@@ -1058,7 +1182,11 @@ def test_ppo_train_noncolocated_refit_offload_lifecycle(monkeypatch):
     assert harness.refit.call_count == 2
     assert harness.policy.train.call_count == 4
     assert harness.value_model.train.call_count == 4
-    assert harness.policy.offload_to_cpu.call_count == 4
+    assert harness.value_model.prepare_for_training.call_count == 2
+    assert harness.policy.prepare_for_training.call_count == 2
+    # One offload after each rollout step; there is no longer an extra policy
+    # offload between PPO epochs.
+    assert harness.policy.offload_to_cpu.call_count == 2
     harness.policy_generation.prepare_for_generation.assert_not_called()
     assert harness.policy_generation.finish_generation.call_count == 2
 
@@ -1078,6 +1206,68 @@ def test_ppo_train_noncolocated_refit_offload_lifecycle(monkeypatch):
             "policy_offload",
             "rollout",
         ]
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_ppo_train_runs_extra_critic_epochs_without_extra_actor_updates(
+    monkeypatch, async_mode
+):
+    harness = _run_mock_ppo_train(
+        monkeypatch,
+        async_mode=async_mode,
+        max_num_steps=1,
+        ppo_epochs=2,
+        critic_ppo_epochs=3,
+        seq_logprob_error_threshold=None,
+    )
+
+    assert harness.value_model.train.call_count == 3
+    assert harness.policy.train.call_count == 2
+    assert harness.value_model.prepare_for_training.call_count == 1
+    assert harness.policy.prepare_for_training.call_count == 1
+    value_phase = harness.events[
+        harness.events.index("value_train_prep") : harness.events.index(
+            "policy_train_prep"
+        )
+    ]
+    assert value_phase == [
+        "value_train_prep",
+        "value_train",
+        "value_train",
+        "value_train",
+        "value_finish",
+    ]
+    policy_prep_index = harness.events.index("policy_train_prep")
+    policy_train_indices = [
+        index for index, event in enumerate(harness.events) if event == "policy_train"
+    ]
+    assert harness.events[policy_prep_index : policy_train_indices[-1] + 1] == [
+        "policy_train_prep",
+        "policy_train",
+        "policy_train",
+    ]
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_ppo_train_critic_keeps_extra_epochs_during_policy_warmup(
+    monkeypatch, async_mode
+):
+    harness = _run_mock_ppo_train(
+        monkeypatch,
+        async_mode=async_mode,
+        max_num_steps=2,
+        ppo_epochs=2,
+        critic_ppo_epochs=3,
+        seq_logprob_error_threshold=None,
+        policy_training_start_step=1,
+    )
+
+    # Step 0 is critic-only warmup; step 1 trains both. The critic always
+    # runs all 3 epochs, independent of the policy warmup gate.
+    assert harness.value_model.train.call_count == 6
+    assert harness.policy.train.call_count == 2
+    assert harness.value_model.prepare_for_training.call_count == 2
+    assert harness.policy.prepare_for_training.call_count == 1
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
@@ -1419,8 +1609,10 @@ def _patch_ppo_setup_prerequisites(monkeypatch):
         def load_training_info(self, _path):
             return None
 
-        def get_resume_paths(self, _path, *, model_component="policy"):
-            return None, None
+        # The real resolver: a warm-start test needs the seed's subtree to
+        # resolve. It still returns (None, None) when there is no checkpoint,
+        # which is what every other test here relies on.
+        get_resume_paths = staticmethod(CheckpointManager.get_resume_paths)
 
     class DummyLoader:
         def __init__(self, *_args, **_kwargs):
@@ -1475,6 +1667,7 @@ def _run_noncolocated_setup(monkeypatch, config):
     policy.init_collective.return_value = ["policy-future"]
     value_model = MagicMock()
     generation = MagicMock()
+    generation.get_refit_payload_mode.return_value = "hf_export"
     generation.init_collective.return_value = ["generation-future"]
     policy_factory = MagicMock(return_value=policy)
     value_factory = MagicMock(return_value=value_model)
@@ -1955,18 +2148,35 @@ def test_noncolocated_vllm_builds_separate_clusters_and_collective(monkeypatch):
     value_model = result[2]
     value_model.finish_training.assert_called_once_with()
     policy.prepare_for_training.assert_called_once_with()
-    policy.prepare_refit_info.assert_called_once_with()
+    policy.prepare_refit_info.assert_called_once_with(refit_payload_mode="hf_export")
     generation.prepare_refit_info.assert_called_once_with({"state": "dict"})
 
 
 @pytest.mark.parametrize(
-    ("async_enabled", "expected_train_iters"),
-    [(False, 3), (True, 30)],
+    (
+        "async_enabled",
+        "critic_ppo_epochs",
+        "policy_training_start_step",
+        "expected_policy_train_iters",
+        "expected_value_train_iters",
+    ),
+    [
+        (False, 3, 0, 3, 3),
+        (False, 5, 0, 3, 5),
+        (True, 3, 0, 30, 30),
+        (True, 5, 2, 24, 50),
+        (True, 5, 10, 1, 50),
+    ],
 )
 def test_megatron_train_iters_matches_ppo_training_limit(
-    monkeypatch, async_enabled, expected_train_iters
+    monkeypatch,
+    async_enabled,
+    critic_ppo_epochs,
+    policy_training_start_step,
+    expected_policy_train_iters,
+    expected_value_train_iters,
 ):
-    """Async PPO cycles data until max_num_steps; sync PPO also honors epochs."""
+    """Each model's scheduler budget follows its own number of epochs."""
     from nemo_rl.algorithms.ppo import AsyncPPOConfig
 
     config = _make_noncolocated_setup_config()
@@ -1975,12 +2185,14 @@ def test_megatron_train_iters_matches_ppo_training_limit(
     config.ppo.max_num_steps = 10
     config.ppo.max_num_epochs = -1 if async_enabled else 1
     config.ppo.ppo_epochs = 3
+    config.ppo.critic_ppo_epochs = critic_ppo_epochs
+    config.ppo.policy_training_start_step = policy_training_start_step
     config.ppo.async_ppo = AsyncPPOConfig(enabled=async_enabled)
 
     _run_noncolocated_setup(monkeypatch, config)
 
-    assert config.policy["megatron_cfg"]["train_iters"] == expected_train_iters
-    assert config.value["megatron_cfg"]["train_iters"] == expected_train_iters
+    assert config.policy["megatron_cfg"]["train_iters"] == expected_policy_train_iters
+    assert config.value["megatron_cfg"]["train_iters"] == expected_value_train_iters
 
 
 def test_ppo_setup_rejects_a_warm_start_that_does_not_resolve(monkeypatch, tmp_path):
@@ -1990,6 +2202,24 @@ def test_ppo_setup_rejects_a_warm_start_that_does_not_resolve(monkeypatch, tmp_p
 
     with pytest.raises(ValueError, match="would silently start cold"):
         _run_noncolocated_setup(monkeypatch, config)
+
+
+def test_ppo_setup_warm_start_takes_weights_but_not_the_seeds_optimizer(
+    monkeypatch, tmp_path
+):
+    """The seed's Adam state and LR-scheduler step count belong to the run that
+    produced it, so a warm start rebuilds both and only the weights carry over."""
+    seed = tmp_path / "critic_pretrain" / "step_370"
+    (seed / "value" / "weights").mkdir(parents=True)
+    (seed / "value" / "optimizer").mkdir()
+    config = _make_noncolocated_setup_config()
+    config.ppo.warm_start_value_checkpoint = str(seed)
+
+    *_, value_factory, _, _ = _run_noncolocated_setup(monkeypatch, config)
+
+    value_kwargs = value_factory.call_args.kwargs
+    assert value_kwargs["weights_path"] == seed / "value" / "weights"
+    assert value_kwargs["optimizer_path"] is None
 
 
 def test_colocated_setup_keeps_single_cluster_and_skips_collective(monkeypatch):
@@ -2209,23 +2439,11 @@ def test_async_ppo_launcher_entry_guards(mutate, message):
         _validate_async_ppo_entry_config(config)
 
 
-@pytest.mark.parametrize(
-    ("mutate", "message"),
-    [
-        (lambda cfg: setattr(cfg.ppo, "ppo_epochs", 0), "ppo_epochs"),
-        (
-            lambda cfg: (
-                setattr(cfg.ppo, "skip_reference_policy_logprobs_calculation", True),
-                setattr(cfg.loss_fn, "reference_policy_kl_penalty", 0.1),
-            ),
-            "Skipping reference logprobs",
-        ),
-    ],
-)
-def test_async_ppo_training_loop_guards(mutate, message):
+def test_async_ppo_training_loop_rejects_skipped_reference_logprobs_with_kl_penalty():
     config = _make_async_ppo_config()
-    mutate(config)
-    with pytest.raises(ValueError, match=message):
+    config.ppo.skip_reference_policy_logprobs_calculation = True
+    config.loss_fn.reference_policy_kl_penalty = 0.1
+    with pytest.raises(ValueError, match="Skipping reference logprobs"):
         _call_async_ppo_until_guard(config)
 
 

@@ -45,7 +45,10 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     VllmConfig,
+    parse_nvfp4_pertoken_rollout,
     resolve_vllm_video_config,
+    validate_nvfp4_pertoken_model,
+    vllm_nemotron_h_fp32_lm_head_enabled,
 )
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
@@ -56,6 +59,7 @@ from nemo_rl.models.generation.vllm.video_utils import (
     register_torchcodec_vllm_video_loader,
 )
 from nemo_rl.models.generation.vllm.worker_utils import (
+    find_tokenizer_required_architectures,
     resolve_data_parallel_local_rank,
     resolve_distributed_executor_backend,
 )
@@ -197,6 +201,18 @@ def _merge_fp8_kwargs(vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]) -
     vllm_kwargs["hf_overrides"] = merged_hf_overrides
 
 
+def _validate_worker_extension_cls(
+    vllm_kwargs: dict[str, Any], required_worker_extension_cls: str
+) -> None:
+    """Reserve ``worker_extension_cls`` for NeMo-RL's refit protocol."""
+    if "worker_extension_cls" in vllm_kwargs:
+        raise ValueError(
+            "generation.vllm_kwargs.worker_extension_cls is not supported: "
+            "NeMo-RL's refit protocol requires "
+            f"{required_worker_extension_cls}."
+        )
+
+
 def _log_effective_quantization_ignore_patterns(
     vllm_cfg: dict[str, Any], vllm_kwargs: dict[str, Any]
 ) -> None:
@@ -207,6 +223,27 @@ def _log_effective_quantization_ignore_patterns(
         "ignore", []
     )
     print(f"NRL_MXFP8_EFFECTIVE_IGNORE={effective_ignore}")
+
+
+def _configure_nvfp4_pertoken_engine_kwargs(
+    cfg: VllmConfig, llm_kwargs: dict[str, Any]
+) -> None:
+    """Configure per-token NVFP4 on the standard vLLM worker when enabled."""
+    validated_config = parse_nvfp4_pertoken_rollout(cfg)
+    if validated_config is None:
+        return
+
+    # This module subclasses vLLM types and is intentionally imported only in
+    # the vLLM worker environment, not by Megatron training workers.
+    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken import (
+        configure_nvfp4_pertoken_engine_kwargs,
+    )
+
+    configure_nvfp4_pertoken_engine_kwargs(
+        llm_kwargs,
+        validated_config.resolved_ignore(),
+        explicit_engine_kwargs=cfg.get("vllm_kwargs") or {},
+    )
 
 
 # Use a base class to share some functions to avoid code duplication.
@@ -437,9 +474,16 @@ class BaseVllmGenerationWorker:
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
 
+        vllm_cfg = self.cfg["vllm_cfg"]
         _apply_vllm_patches(
             self.py_executable,
             extra_env_vars=extra_env_vars,
+            nemotron_h_fp32_lm_head=vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg),
+            require_moe_routed_experts_capture=bool(
+                (self.cfg.get("vllm_kwargs") or {}).get(
+                    "enable_return_routed_experts", False
+                )
+            ),
         )
 
         # Skip model loading if we're not the model owner
@@ -454,6 +498,9 @@ class BaseVllmGenerationWorker:
         # vLLM handles the parallelism internally through Ray
         self.rank = 0
         self.world_size = 1
+
+    def _refit_with_reload_api_enabled(self) -> bool:
+        return bool(self.cfg["vllm_cfg"].get("refit_with_reload_api"))
 
     @trace_fn(RLSpanGroup.MODEL_INIT, "rl.vllm.load_model")
     def _load_model(self, bundle_indices, seed):
@@ -562,10 +609,13 @@ class BaseVllmGenerationWorker:
         # (see VllmInternalWorkerExtension.load_mtp_weights_from_disk).
         spec_cfg = vllm_kwargs.get("speculative_config")
         mtp_weights_from_refit = bool(self.cfg.get("_mtp_weights_from_refit"))
+        self._mtp_speculative_enabled = spec_cfg is not None and spec_cfg.get(
+            "method"
+        ) in ("deepseek_mtp", "mtp")
+        self._mtp_weights_from_refit = mtp_weights_from_refit
         self._mtp_load_from_disk: bool = (
             load_format == "dummy"
-            and spec_cfg is not None
-            and spec_cfg.get("method") in ("deepseek_mtp", "mtp")
+            and self._mtp_speculative_enabled
             and not mtp_weights_from_refit
         )
 
@@ -606,6 +656,8 @@ class BaseVllmGenerationWorker:
         self.routed_experts_dtype = resolve_routed_experts_dtype(
             get_num_routed_experts(hf_config)
         )
+        if parse_nvfp4_pertoken_rollout(self.cfg) is not None:
+            validate_nvfp4_pertoken_model(hf_config)
         if "GptOssForCausalLM" in getattr(hf_config, "architectures", []):
             if "quantization_config" in hf_config:
                 assert load_format == "dummy", (
@@ -613,28 +665,9 @@ class BaseVllmGenerationWorker:
                 )
                 # disable quantization
                 vllm_kwargs["hf_overrides"]["quantization_config"] = {}
-        elif any(
-            arch in getattr(hf_config, "architectures", [])
-            for arch in (
-                "Gemma3ForConditionalGeneration",
-                "Gemma4ForConditionalGeneration",
-                "Mistral3ForConditionalGeneration",
-                "Qwen3_5ForConditionalGeneration",
-                "Qwen3_5MoeForConditionalGeneration",
-            )
+        elif detected_arch := find_tokenizer_required_architectures(
+            getattr(hf_config, "architectures", None)
         ):
-            detected_arch = [
-                arch
-                for arch in getattr(hf_config, "architectures", [])
-                if arch
-                in (
-                    "Gemma3ForConditionalGeneration",
-                    "Gemma4ForConditionalGeneration",
-                    "Mistral3ForConditionalGeneration",
-                    "Qwen3_5ForConditionalGeneration",
-                    "Qwen3_5MoeForConditionalGeneration",
-                )
-            ]
             if self.cfg["vllm_cfg"]["skip_tokenizer_init"]:
                 print(
                     f"Detected {detected_arch} which may crash when skip_tokenizer_init is True. "
@@ -676,8 +709,15 @@ class BaseVllmGenerationWorker:
             # Text-only runs additionally set generation.vllm_kwargs.language_model_only
             # in the recipe YAML to skip vLLM's multimodal preflight.
 
+        default_worker_extension_cls = (
+            "nemo_rl.models.generation.vllm.vllm_backend."
+            "VllmInternalWorkerExtensionWithCheckpointEngine"
+            if checkpoint_engine_config is not None
+            else "nemo_rl.models.generation.vllm.vllm_backend."
+            "VllmInternalWorkerExtension"
+        )
+        _validate_worker_extension_cls(vllm_kwargs, default_worker_extension_cls)
         _log_effective_quantization_ignore_patterns(self.cfg["vllm_cfg"], vllm_kwargs)
-
         llm_kwargs = dict(
             model=self.model_name,
             served_model_name=self.model_name,
@@ -694,13 +734,6 @@ class BaseVllmGenerationWorker:
             enforce_eager=self.cfg["vllm_cfg"]["enforce_eager"],
             max_model_len=self.cfg["vllm_cfg"]["max_model_len"],
             trust_remote_code=True,
-            worker_extension_cls=(
-                "nemo_rl.models.generation.vllm.vllm_backend."
-                "VllmInternalWorkerExtensionWithCheckpointEngine"
-                if checkpoint_engine_config is not None
-                else "nemo_rl.models.generation.vllm.vllm_backend."
-                "VllmInternalWorkerExtension"
-            ),
             enable_sleep_mode=True,
             # Set disable_log_stats=False so that self.llm.get_metrics() works.
             disable_log_stats=False,
@@ -717,9 +750,9 @@ class BaseVllmGenerationWorker:
                 sampling_style=video_config.sampling_style,
                 temporal_patch_size=video_config.temporal_patch_size,
             )
-
+        _configure_nvfp4_pertoken_engine_kwargs(self.cfg, llm_kwargs)
+        llm_kwargs.setdefault("worker_extension_cls", default_worker_extension_cls)
         _maybe_enable_vllm_native_tracing(llm_kwargs)
-
         self._create_engine(llm_kwargs)
         log_gpu_memory_diagnostics(
             label="after_engine_create", worker_type="VllmGenerationWorker", device_id=0
@@ -933,7 +966,21 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
     def post_init(self):
         if self.llm is not None:
             self.llm.collective_rpc("bind_numa", args=tuple())
+            if parse_nvfp4_pertoken_rollout(self.cfg) is not None:
+                target_counts = self.llm.collective_rpc(
+                    "report_nvfp4_pertoken_target_count", args=tuple()
+                )
+                if not target_counts or sum(target_counts) == 0:
+                    raise RuntimeError(
+                        "generation.nvfp4_pertoken_rollout selected no "
+                        "RoutedExperts targets across the vLLM model"
+                    )
         self.vllm_device_ids = self.report_device_id()
+        if self._mtp_speculative_enabled:
+            self.llm.collective_rpc(
+                "configure_mtp_drafter_weight_source",
+                args=(self._mtp_weights_from_refit,),
+            )
         if self._mtp_load_from_disk:
             self.llm.collective_rpc(
                 "load_mtp_weights_from_disk", args=(self.model_name,)
@@ -1318,7 +1365,8 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 )
 
             result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_collective", args=(refit_timeout_s,)
+                "update_weights_from_collective",
+                args=(refit_timeout_s, self._refit_with_reload_api_enabled()),
             )
             worker_results = cast(list[bool], result_or_coro)
 

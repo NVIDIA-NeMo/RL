@@ -136,6 +136,7 @@ def _make_master_config(
             "save_period": 10,
             "save_optimizer": False,
         },
+        logger={"wandb_enabled": False, "wandb": {}},
         loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
         env={},
         cluster={"num_nodes": 2, "gpus_per_node": 8, "segment_size": None},
@@ -163,6 +164,16 @@ def _ppo_master_config(**kwargs) -> MasterConfig:
     return _make_master_config(**kwargs)
 
 
+def _colocated_megatron_ppo_config(
+    *, policy_training_start_step: int = 0
+) -> MasterConfig:
+    mc = _ppo_master_config(megatron_enabled=True)
+    mc.ppo.policy_training_start_step = policy_training_start_step
+    mc.policy["generation"]["backend"] = "megatron"
+    mc.policy["generation"]["colocated"]["enabled"] = True
+    return mc
+
+
 class TestAlgorithmBlockValidator:
     """Exactly-one-block, enforced at construction so no reader sees a bad pair."""
 
@@ -186,7 +197,8 @@ class TestAlgorithmBlockValidator:
         ids=["grpo", "ppo"],
     )
     def test_the_exemplars_still_validate(self, name):
-        MasterConfig(**self._resolved(name))
+        config = MasterConfig(**self._resolved(name))
+        assert config.checkpointing["save_period"] == 1
 
     def test_rejects_a_config_with_no_algorithm_block(self):
         resolved = self._resolved("grpo_math_1B_megatron_single_controller.yaml")
@@ -235,8 +247,29 @@ class TestAlgoConfigSelection:
 
 
 class TestPPOValidation:
-    def test_accepts_a_well_formed_ppo_config(self):
-        validate_single_controller_config(_ppo_master_config())
+    @pytest.mark.parametrize(
+        "make_config",
+        [
+            _ppo_master_config,
+            _colocated_megatron_ppo_config,
+            # Warmup steps wake the stood-down engine through the
+            # (frozen-weight) sync, so the combination is legal.
+            lambda: _colocated_megatron_ppo_config(policy_training_start_step=2),
+        ],
+        ids=["base", "colocated_megatron", "colocated_megatron_warmup"],
+    )
+    def test_accepts_a_well_formed_ppo_config(self, make_config):
+        validate_single_controller_config(make_config())
+
+    def test_rejects_message_penalties_without_nemo_gym(self):
+        mc = _ppo_master_config()
+        assert mc.ppo is not None
+        mc.ppo.invalid_tool_call_advantage = -5.0
+
+        with pytest.raises(
+            ValueError, match="active algorithm block require the NeMo-Gym"
+        ):
+            validate_single_controller_config(mc)
 
     @pytest.mark.parametrize("missing", ["value", "value_loss_fn"])
     def test_rejects_ppo_without_its_critic_blocks(self, missing):
@@ -253,8 +286,7 @@ class TestPPOValidation:
             validate_single_controller_config(mc)
 
     def test_rejects_multi_chunk_streaming(self):
-        """The critic has no split API, so it would step once per chunk while
-        the policy steps once per RL step."""
+        """PPO cannot spread one full-batch optimizer epoch across chunks."""
         mc = _ppo_master_config(min_groups_for_streaming_train=1)
 
         with pytest.raises(
@@ -271,16 +303,6 @@ class TestPPOValidation:
             ValueError,
             match=r"must equal value.train_global_batch_size \(4\)",
         ):
-            validate_single_controller_config(mc)
-
-    def test_rejects_a_ppo_epoch_count_below_one(self):
-        mc = _ppo_master_config(
-            ppo=PPOConfig.model_construct(
-                max_num_steps=100, ppo_epochs=0, **_STEP_CONFIG
-            )
-        )
-
-        with pytest.raises(ValueError, match="ppo_epochs must be at least 1"):
             validate_single_controller_config(mc)
 
     @pytest.mark.parametrize(
@@ -329,13 +351,11 @@ class TestPPOValidation:
     @pytest.mark.parametrize(
         "enable",
         [
-            lambda cfg: setattr(cfg, "overlong_filtering", True),
             lambda cfg: setattr(cfg, "use_dynamic_sampling", True),
             lambda cfg: setattr(cfg.reward_scaling, "enabled", True),
             lambda cfg: setattr(cfg.reward_shaping, "enabled", True),
         ],
         ids=[
-            "overlong_filtering",
             "use_dynamic_sampling",
             "reward_scaling",
             "reward_shaping",
@@ -350,14 +370,12 @@ class TestPPOValidation:
         ):
             validate_single_controller_config(mc)
 
-    def test_rejects_shaping_on_a_grpo_run_too(self):
-        mc = _make_master_config()
-        mc.grpo.overlong_filtering = True
+    @pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
+    def test_accepts_overlong_filtering(self, algorithm: str):
+        mc = _make_master_config() if algorithm == "grpo" else _ppo_master_config()
+        getattr(mc, algorithm).overlong_filtering = True
 
-        with pytest.raises(
-            NotImplementedError, match="overlong_filtering not supported"
-        ):
-            validate_single_controller_config(mc)
+        validate_single_controller_config(mc)
 
     def test_rejects_a_dtensor_critic(self):
         """Only the Megatron value worker carries TQWorkerMixin."""
@@ -461,20 +479,59 @@ class TestAdvantageEstimatorSelection:
 
 
 class TestMegatronTrainIters:
-    @pytest.mark.parametrize(("ppo_epochs", "expected"), [(1, 7), (3, 21)])
-    def test_injects_into_both_policy_and_value(self, ppo_epochs, expected):
-        """Each epoch steps both optimizers, so each is a scheduler tick."""
+    @pytest.mark.parametrize(
+        (
+            "ppo_epochs",
+            "policy_training_start_step",
+            "expected_policy",
+            "expected_value",
+        ),
+        [
+            (1, 0, 7, 7),
+            (3, 0, 21, 21),
+            (3, 2, 15, 21),
+            (3, 7, 1, 21),
+        ],
+    )
+    def test_injects_into_both_policy_and_value(
+        self,
+        ppo_epochs,
+        policy_training_start_step,
+        expected_policy,
+        expected_value,
+    ):
+        """Each scheduler budget matches its model's optimizer update count."""
         mc = _ppo_master_config(
             megatron_enabled=True,
             ppo=PPOConfig.model_construct(
-                max_num_steps=7, ppo_epochs=ppo_epochs, **_STEP_CONFIG
+                max_num_steps=7,
+                ppo_epochs=ppo_epochs,
+                critic_ppo_epochs=ppo_epochs,
+                policy_training_start_step=policy_training_start_step,
+                **_STEP_CONFIG,
             ),
         )
 
         sc_setup_mod._maybe_inject_megatron_train_iters(mc)
 
-        assert mc.policy["megatron_cfg"]["train_iters"] == expected
-        assert mc.value["megatron_cfg"]["train_iters"] == expected
+        assert mc.policy["megatron_cfg"]["train_iters"] == expected_policy
+        assert mc.value["megatron_cfg"]["train_iters"] == expected_value
+
+    def test_injects_distinct_policy_and_value_budgets(self):
+        mc = _ppo_master_config(
+            megatron_enabled=True,
+            ppo=PPOConfig.model_construct(
+                max_num_steps=7,
+                ppo_epochs=1,
+                critic_ppo_epochs=3,
+                **_STEP_CONFIG,
+            ),
+        )
+
+        sc_setup_mod._maybe_inject_megatron_train_iters(mc)
+
+        assert mc.policy["megatron_cfg"]["train_iters"] == 7
+        assert mc.value["megatron_cfg"]["train_iters"] == 21
 
     def test_skips_a_critic_on_a_non_megatron_backend(self):
         mc = _ppo_master_config(megatron_enabled=False, max_num_steps=7)
@@ -588,9 +645,12 @@ class TestSetupBuildsTheCritic:
 
 
 class TestValueWarmStart:
-    def test_fresh_run_builds_the_critic_from_the_warm_start(
+    def test_fresh_run_takes_warm_start_weights_but_not_its_optimizer(
         self, patched_ppo_factories, tmp_path
     ):
+        """The seed's Adam state and scheduler step count belong to the run that
+        produced it, so a warm start rebuilds both and only the weights carry
+        over."""
         seed = tmp_path / "critic_pretrain" / "step_370"
         (seed / "value" / "weights").mkdir(parents=True)
         (seed / "value" / "optimizer").mkdir()
@@ -607,7 +667,7 @@ class TestValueWarmStart:
 
         value_kwargs = patched_ppo_factories["_build_value"].call_args.kwargs
         assert value_kwargs["weights_path"] == seed / "value" / "weights"
-        assert value_kwargs["optimizer_path"] == seed / "value" / "optimizer"
+        assert value_kwargs["optimizer_path"] is None
         # The policy is untouched by a warm start: pi_0 comes from the base model.
         trainer_kwargs = patched_ppo_factories["_build_trainer"].call_args.kwargs
         assert trainer_kwargs["weights_path"] is None

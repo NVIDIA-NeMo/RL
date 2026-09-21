@@ -26,10 +26,38 @@ VLMMessageLogType = list[dict[str, Union[str, torch.Tensor, PackedTensor]]]
 
 # Flattened message log where all tensors and data are concatenated together for a conversation
 # Converts a conversation from list-of-turns format to key-value format with concatenated tensors
-FlatMessagesType = dict[str, Union[list[str], torch.Tensor]]
+FlatMessagesType = dict[str, Union[list[str], torch.Tensor, PackedTensor]]
 
 PathLike = Union[str, "os.PathLike[Any]"]
 TokenizerType = PreTrainedTokenizerBase
+
+
+@dataclass(frozen=True)
+class NemoGymSourceIdentity:
+    """Filesystem identity used to cache agent names from one Gym dataset."""
+
+    path: str
+    device: int
+    inode: int
+    ctime_ns: int
+    mtime_ns: int
+    size: int
+
+    @classmethod
+    def from_stat(cls, path: str, stat: os.stat_result) -> "NemoGymSourceIdentity":
+        """Build a source identity snapshot from a resolved path and stat result."""
+        return cls(
+            path=path,
+            device=stat.st_dev,
+            inode=stat.st_ino,
+            ctime_ns=stat.st_ctime_ns,
+            mtime_ns=stat.st_mtime_ns,
+            size=stat.st_size,
+        )
+
+    def matches(self, stat: os.stat_result) -> bool:
+        """Return whether ``stat`` still describes the same source contents."""
+        return self == self.from_stat(self.path, stat)
 
 
 class DatumSpec(TypedDict):
@@ -44,12 +72,13 @@ class DatumSpec(TypedDict):
 
 
 class PreferenceDatumSpec(TypedDict):
-    message_log_chosen: LLMMessageLogType
-    message_log_rejected: LLMMessageLogType
+    message_log_chosen: LLMMessageLogType | VLMMessageLogType
+    message_log_rejected: LLMMessageLogType | VLMMessageLogType
     length_chosen: int
     length_rejected: int
     loss_multiplier: float
     idx: int
+    task_name: NotRequired[str]
 
 
 @dataclass

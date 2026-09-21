@@ -9,6 +9,8 @@ For the full list of supported Qwen models, see
 
 ## Version Guides
 
+- **[Qwen3.8](qwen3-8.md)** — initial dense `Qwen3.8-27B` text-only GRPO
+  support on the Megatron backend, with a low-cost functional nightly recipe.
 - **[Qwen3.5](qwen3-5.md)** — LLM and VLM recipes for `Qwen3.5-9B-Base`,
   `Qwen3.5-35B-A3B-Base`, and `Qwen3.5-397B-A17B` on the Megatron and AutoModel
   backends. This guide covers backend and parallelism support, example recipes, and the
@@ -27,4 +29,5 @@ truth for those models.
 :hidden:
 
 qwen3-5.md
+qwen3-8.md
 ```

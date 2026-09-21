@@ -25,6 +25,7 @@ from torch import nn
 from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
+from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
@@ -63,12 +64,12 @@ def filter_multimodal_kwargs_for_model(
     accepted_kwargs = _accepted_forward_kwargs(type(model))
     if accepted_kwargs is None:
         return multimodal_kwargs
-    # A forward that cannot consume imgs_sizes also cannot crop the per-image
-    # pad_to_max_shape padding, so mixed-resolution batches would feed padded
-    # pixels to the vision encoder and mismatch the placeholder count. This is
+    # AutoModel materializes pixels with pad_to_max_shape. A forward that cannot
+    # consume imgs_sizes cannot crop that padding, so mixed-resolution batches
+    # would mismatch the placeholder count. This is
     # the AutoModel Nemotron Omni path (nvidia/Nemotron-3-Nano-Omni-30B-A3B-
     # Reasoning-BF16), whose HF forward takes pixel_values but not imgs_sizes,
-    # unlike the mcore NemotronOmniModel which crops via imgs_sizes.
+    # unlike mcore, which consumes native-resolution pre-patchified pixels.
     imgs_sizes = multimodal_kwargs.get("imgs_sizes")
     if (
         imgs_sizes is not None
@@ -297,7 +298,9 @@ def process_microbatch(
         flash_attn_kwargs = {}
 
     # Add vlm kwargs to model call
-    vlm_kwargs = mb.get_multimodal_dict(as_tensors=True, device=input_ids.device)
+    vlm_kwargs = mb.get_multimodal_dict(
+        True, input_ids.device, None, "pad_to_max_shape"
+    )
     if len(vlm_kwargs) > 0:
         # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
         position_ids = None
@@ -399,6 +402,15 @@ def check_sequence_dim(
     seq_dim_size = data.get("input_ids").shape[sequence_dim]
     for k, v in data.items():
         if k in skip_set:
+            continue
+        # Multimodal fields are never sequence-aligned: dim 1 is
+        # num_images / num_patches. In-memory these ride as
+        # ``PackedTensor`` and are skipped by ``torch.is_tensor`` below, but
+        # the data-plane wire form is a nested tensor, so name it here.
+        # Mirrors ``megatron/data.py::get_and_validate_seqlen``; kept inside
+        # this helper rather than pushed onto ``skip_keys`` because all seven
+        # call sites need it and none of them should know the wire format.
+        if k in PACKED_MULTIMODAL_FIELDS:
             continue
         if torch.is_tensor(v) and len(v.shape) > 1:
             assert v.shape[sequence_dim] == seq_dim_size, (

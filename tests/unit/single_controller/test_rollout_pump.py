@@ -22,12 +22,14 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
+    CheckpointMutationKind,
     DataPlaneCheckpointBarrier,
     DataPlaneMutationCut,
     TQReplayBuffer,
@@ -45,13 +47,14 @@ from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     MasterConfig,
+    RolloutRecoveryConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutManager, RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
-    RolloutRecoveryLedgerState,
+    RolloutRecoveryState,
 )
 
 # Reuse fixtures from the experience tests; same shape as test_async_rollout_manager.
@@ -100,8 +103,15 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     ctrl._batch_shortfall = {}
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
+    # Empty means the legacy (non-token-capture) dispatch path.
+    ctrl._finalizer_actors = []
     ctrl._replacement_reserve = deque()
     ctrl._rollout_recovery_enabled = False
+    ctrl._rollout_slot_waiters = 0
+    ctrl._rollout_permitted_waiters = 0
+    ctrl._buffer_capacity_waiters = 0
+    ctrl._rollout_completion_durations_s = deque(maxlen=10_000)
+    ctrl._rollout_queue_wait_durations_s = deque(maxlen=10_000)
 
 
 class _PausingMutationBarrier(DataPlaneCheckpointBarrier):
@@ -113,8 +123,10 @@ class _PausingMutationBarrier(DataPlaneCheckpointBarrier):
         self.release_mutation = asyncio.Event()
 
     @asynccontextmanager
-    async def mutation(self) -> AsyncIterator[DataPlaneMutationCut]:
-        async with super().mutation() as cut:
+    async def mutation(
+        self, kind: CheckpointMutationKind = "other"
+    ) -> AsyncIterator[DataPlaneMutationCut]:
+        async with super().mutation(kind) as cut:
             yield cut
             self.mutation_applied.set()
             await self.release_mutation.wait()
@@ -193,6 +205,7 @@ def test_rollout_pump_stamps_target_steps(
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._rollout_manager = _RecordingRolloutManager(buffer)
+    ctrl._finalizer_actors = []
     # The sampler owns admission + target_step stamping (the dispatch counter
     # lives on the sampler, not the actor).
     ctrl._sampler = make_sampler(buffer)
@@ -276,71 +289,49 @@ def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
     assert ctrl._inflight_rollouts == 0
 
 
-@pytest.mark.parametrize(
-    ("restored", "expected_new_dispatches"),
-    [
-        # Room left for a partial top-up.
-        (1, 1),
-        # Target step already full: the whole batch is dropped.
-        (2, 0),
-        # More restored than a batch: still zero, never negative.
-        (3, 0),
-    ],
-)
-def test_rollout_pump_tops_up_restored_target_step(
-    restored: int,
-    expected_new_dispatches: int,
-) -> None:
-    # On resume the buffer holds groups still stamped for the next target
-    # step. In-order selection consumes a target step as one fixed-size batch,
-    # so the pump must dispatch only the shortfall — a full batch on top would
-    # leave surplus groups that are never selected and whose capacity permits
-    # are held until evict.
-    buffer = _RecordingBuffer([0] * restored)
+def test_reserved_admission_rejects_an_occupied_target_step() -> None:
+    """A stale sampler cursor must not silently discard newly yielded prompts."""
+    buffer = _RecordingBuffer([0])
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
     ctrl._buffer = buffer
-    ctrl._async_cfg = SimpleNamespace(
-        max_inflight_prompts=2, diagnostics=False, rollout_failure=_failure_cfg()
+    ctrl._rollout_manager = SimpleNamespace(
+        mark_prompt_group_admitted=MagicMock(),
+        discard_prompt_group=MagicMock(),
     )
-    ctrl._master_config = SimpleNamespace(
-        grpo=GRPOConfig.model_construct(max_num_epochs=1)
-    )
-    ctrl._algo_cfg = ctrl._master_config.grpo
-    ctrl._rollout_manager = _RecordingRolloutManager(buffer)
-    # lookahead=0 keeps the single batch on target_step 0.
     ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
-    ctrl._dataloader = [
-        BatchedDataDict(
-            {
-                "message_log": [
-                    [{"role": "user", "content": "p0"}],
-                    [{"role": "user", "content": "p1"}],
-                ]
-            }
-        )
-    ]
-    ctrl._rollout_permitted = asyncio.Event()
-    ctrl._rollout_permitted.set()
-    ctrl._rollout_exhausted = asyncio.Event()
-    ctrl._buffer_capacity = asyncio.Semaphore(4)
-    ctrl._inflight_rollouts = 0
-    ctrl._inflight_by_group_id = {}
-    ctrl._dispatched_rollouts = set()
     ctrl._trainer_version = 0
-    ctrl._current_epoch = 0
-    _init_pump_ledgers(ctrl)
+    ctrl._sampler_stamps_target_steps = False
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
 
-    asyncio.run(ctrl._rollout_pump())
+    with pytest.raises(RuntimeError, match="already contains 1 group"):
+        asyncio.run(ctrl._admit_reserved_prompt_groups(["new-group"]))
 
-    # Only the shortfall was dispatched on top of the restored groups.
-    assert buffer.target_step_list == [0] * (restored + expected_new_dispatches)
-    # A dispatched prompt keeps its permit (the train pump releases it after
-    # consuming the group), so exactly one permit per dispatch is held and the
-    # dropped prompts consume none.
-    assert ctrl._buffer_capacity._value == 4 - expected_new_dispatches
-    assert ctrl._inflight_rollouts == 0
-    assert ctrl._rollout_exhausted.is_set()
+    assert buffer.target_step_list == [0]
+    ctrl._rollout_manager.mark_prompt_group_admitted.assert_not_called()
+    ctrl._rollout_manager.discard_prompt_group.assert_not_called()
+
+
+def test_non_recovery_reserve_drain_rejects_an_occupied_target_step() -> None:
+    """The ordinary spare-pool admission enforces the same cursor invariant."""
+    buffer = _RecordingBuffer([0])
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._algo_cfg = SimpleNamespace(num_prompts_per_step=1)
+    ctrl._buffer = buffer
+    ctrl._replacement_reserve = deque([{"idx": 0}])
+    ctrl._rollout_recovery_enabled = False
+    ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
+    ctrl._trainer_version = 0
+    launched: list[Any] = []
+
+    async def launch(*args: Any) -> None:
+        launched.append(args)
+
+    with pytest.raises(RuntimeError, match="already contains 1 group"):
+        asyncio.run(ctrl._drain_reserve_into_steps(launch))
+
+    assert launched == []
 
 
 class _SkippingRolloutManager:
@@ -928,7 +919,7 @@ def test_checkpoint_observes_stale_abort_ledger_discard() -> None:
 
         checkpoint_entered = asyncio.Event()
 
-        async def checkpoint_snapshot() -> RolloutRecoveryLedgerState:
+        async def checkpoint_snapshot() -> RolloutRecoveryState:
             async with barrier.checkpoint():
                 checkpoint_entered.set()
                 return ledger.state_dict()
@@ -1015,6 +1006,7 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         )
         ctrl._algo_cfg = ctrl._master_config.grpo
         ctrl._rollout_manager = manager
+        ctrl._finalizer_actors = []
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
         ctrl._dataloader = [
@@ -1104,6 +1096,7 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         )
         ctrl._algo_cfg = ctrl._master_config.grpo
         ctrl._rollout_manager = _NeverCalledRolloutManager()
+        ctrl._finalizer_actors = []
         # Over-sampled windowed policy: admit never gates (buffer unused here).
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
         ctrl._dataloader = [
@@ -1127,6 +1120,219 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         assert created_semaphores[0]._value == 1
         assert ctrl._inflight_rollouts == 0
         assert ctrl._dispatched_rollouts == set()
+        assert ctrl._rollout_exhausted.is_set()
+
+    asyncio.run(_main())
+
+
+def test_actor_path_releases_generation_permit_before_finalization() -> None:
+    class _SplitRolloutManager:
+        def __init__(self) -> None:
+            self.generated = 0
+            self.two_generated = asyncio.Event()
+            self.stats = SimpleNamespace(committed=0)
+
+        async def generate_for_finalization(
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
+        ) -> Any:
+            del prompt, target_step, inflight_registry
+            self.generated += 1
+            if self.generated == 2:
+                self.two_generated.set()
+            return SimpleNamespace(group_id=f"g{self.generated}")
+
+    async def _main() -> None:
+        manager = _SplitRolloutManager()
+        release_finalizers = asyncio.Event()
+        finalizers_started = 0
+
+        async def _delayed_finalize(
+            request: Any,
+            *,
+            target_step: int | None = None,
+        ) -> bool:
+            nonlocal finalizers_started
+            del request, target_step
+            finalizers_started += 1
+            await release_finalizers.wait()
+            return True
+
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._async_cfg = SimpleNamespace(
+            max_inflight_prompts=1,
+            diagnostics=False,
+            rollout_failure=_failure_cfg(),
+        )
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(max_num_epochs=1),
+            token_capture=SimpleNamespace(min_valid_fraction_per_group=None),
+        )
+        ctrl._algo_cfg = ctrl._master_config.grpo
+        ctrl._rollout_manager = manager
+        _init_pump_ledgers(ctrl)
+        ctrl._finalizer_actors = [object()]
+        ctrl._finalize_with_actor = _delayed_finalize
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
+        ctrl._dataloader = [
+            BatchedDataDict(
+                {
+                    "message_log": [
+                        [{"role": "user", "content": "first"}],
+                        [{"role": "user", "content": "second"}],
+                    ]
+                }
+            )
+        ]
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
+        ctrl._buffer_capacity = asyncio.Semaphore(2)
+        ctrl._inflight_rollouts = 0
+        ctrl._inflight_by_group_id = {}
+        ctrl._dispatched_rollouts = set()
+        ctrl._trainer_version = 0
+        ctrl._current_epoch = 0
+
+        pump = asyncio.create_task(ctrl._rollout_pump())
+        await asyncio.wait_for(manager.two_generated.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+        assert finalizers_started == 2
+        assert ctrl._inflight_rollouts == 0
+        release_finalizers.set()
+        await asyncio.wait_for(pump, timeout=1.0)
+
+        # Successful commits transfer both buffer permits to the train pump.
+        assert ctrl._buffer_capacity._value == 0
+        assert ctrl._rollout_exhausted.is_set()
+
+    asyncio.run(_main())
+
+
+@pytest.mark.parametrize("committed", [False, True])
+def test_actor_finalization_discards_recovery_ledger_ownership(
+    committed: bool,
+) -> None:
+    class _RecoveryCaptureManager:
+        def __init__(self) -> None:
+            self.recovery_ledger = RolloutRecoveryLedger()
+            self.stats = SimpleNamespace(committed=0)
+
+        def reserve_prompt_group(
+            self,
+            cut: DataPlaneMutationCut,
+            prompt: Any,
+            *,
+            target_step: int | None,
+            admitted: bool,
+            admission_id: str,
+        ) -> str:
+            return self.recovery_ledger.reserve_group(
+                cut,
+                prompt_id=str(prompt["idx"]),
+                prompt_payload=prompt,
+                expected_generations=1,
+                target_step=target_step,
+                start_weight_version=0,
+                admitted=admitted,
+                admission_id=admission_id,
+            ).group_id
+
+        def mark_prompt_group_admitted(
+            self,
+            cut: DataPlaneMutationCut,
+            group_id: str,
+            *,
+            target_step: int | None,
+        ) -> None:
+            self.recovery_ledger.mark_group_admitted(
+                cut,
+                group_id,
+                target_step=target_step,
+                start_weight_version=0,
+            )
+
+        def discard_prompt_group(
+            self,
+            cut: DataPlaneMutationCut,
+            group_id: str,
+        ) -> None:
+            self.recovery_ledger.discard_group(cut, group_id)
+
+        async def generate_for_finalization(
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None,
+            inflight_registry: dict[str, tuple[asyncio.Task[None], int]],
+            lineage_group_id: str,
+        ) -> Any:
+            del prompt, target_step, inflight_registry
+            assert self.recovery_ledger.get_group(lineage_group_id)
+            return SimpleNamespace(group_id=lineage_group_id)
+
+    async def _main() -> None:
+        manager = _RecoveryCaptureManager()
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._async_cfg = SimpleNamespace(
+            max_inflight_prompts=1,
+            diagnostics=False,
+            rollout_failure=_failure_cfg(),
+        )
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(max_num_epochs=1),
+            token_capture=SimpleNamespace(min_valid_fraction_per_group=None),
+        )
+        ctrl._algo_cfg = ctrl._master_config.grpo
+        ctrl._buffer = _RecordingBuffer()
+        ctrl._rollout_manager = manager
+        ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
+        ctrl._dataloader = [
+            BatchedDataDict(
+                {
+                    "idx": [7],
+                    "message_log": [[{"role": "user", "content": "prompt"}]],
+                }
+            )
+        ]
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
+        ctrl._buffer_capacity = asyncio.Semaphore(1)
+        ctrl._inflight_rollouts = 0
+        ctrl._inflight_by_group_id = {}
+        ctrl._dispatched_rollouts = set()
+        ctrl._trainer_version = 0
+        ctrl._current_epoch = 0
+        ctrl._sampler_stamps_target_steps = False
+        ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        _init_pump_ledgers(ctrl)
+        ctrl._finalizer_actors = [object()]
+        ctrl._rollout_recovery_enabled = True
+
+        async def _finalize(
+            request: Any,
+        ) -> Any:
+            async with ctrl._data_plane_checkpoint_barrier.mutation() as cut:
+                manager.recovery_ledger.discard_group(cut, request.group_id)
+            if not committed:
+                return None
+            return SimpleNamespace(valid_row_count=1, total_row_count=1)
+
+        ctrl._finalize_with_actor = _finalize
+
+        await ctrl._rollout_pump()
+
+        assert manager.recovery_ledger.groups() == []
+        assert manager.stats.committed == int(committed)
+        # A committed group transfers its permit to the train pump; a dropped
+        # group returns it immediately because no canonical replay row owns it.
+        assert ctrl._buffer_capacity._value == (0 if committed else 1)
         assert ctrl._rollout_exhausted.is_set()
 
     asyncio.run(_main())
@@ -1158,6 +1364,11 @@ def test_rollout_pump_writes_expected_tq_data(
     dp_adapter = _SyncDPAdapter(tq_actor)
 
     master_config = MasterConfig.model_construct(
+        data_plane={
+            "enabled": True,
+            "impl": "transfer_queue",
+            "backend": "simple",
+        },
         policy={
             "train_global_batch_size": expected_samples,
             "generation": {"colocated": {"enabled": False}},
@@ -1204,12 +1415,14 @@ def test_rollout_pump_writes_expected_tq_data(
         dp_adapter,
         partition_id=_PARTITION_ID,
         pad_value_dict={"token_ids": int(tokenizer.pad_token_id or 0)},
+        include_message_violation_fields=False,
     )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         task_to_env=task_to_env,
         num_generations_per_prompt=num_generations,
         max_seq_len=max_seq_len,
+        rollout_recovery_config=RolloutRecoveryConfig(),
         max_rollout_turns=max_rollout_turns,
         policy_generation=vllm_generation,
         use_nemo_gym=False,
@@ -1231,6 +1444,7 @@ def test_rollout_pump_writes_expected_tq_data(
         partition_id=_PARTITION_ID,
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
+        finalizer_actors=[],
     )
     ctrl = SingleControllerActor.remote(
         master_config=master_config,
@@ -1271,6 +1485,8 @@ def test_rollout_pump_writes_expected_tq_data(
         bulk["sample_mask"].float(),
         torch.ones(expected_samples, dtype=torch.float32),
     )
+    assert not bulk["mask_sample"].bool().any()
+    assert not bulk["truncated"].bool().any()
 
     # Same deterministic prompt as test_async_rollout_manager: the model
     # solves the calculator task every time -> reward == 1.0 and decoded
@@ -1308,4 +1524,5 @@ def test_rollout_pump_writes_expected_tq_data(
             "num_invalid_tool_calls",
             "num_malformed_thinking",
             "num_assistant_messages",
+            "num_routed_experts_backfilled",
         }

@@ -61,6 +61,29 @@ def _load_megatron_common_state_dict(iteration_dir: Path) -> dict[str, Any]:
     return load_common_state_dict(str(iteration_dir))
 
 
+def _load_megatron_sharded_metadata_keys(iteration_dir: Path) -> set[str]:
+    """Load the keys of tensors and objects stored in a torch_dist checkpoint."""
+    try:
+        from megatron.core.dist_checkpointing.serialization import (
+            load_sharded_metadata,
+        )
+    except ImportError as error:
+        raise RuntimeError(
+            "Megatron-Core is required to inspect optimizer state in the distributed "
+            f"checkpoint at {iteration_dir}. Install NeMo-RL with the `mcore` extra."
+        ) from error
+
+    return {str(key) for key in load_sharded_metadata(str(iteration_dir))}
+
+
+def _is_megatron_optimizer_key(key: str) -> bool:
+    """Return whether a flattened Megatron checkpoint key belongs to the optimizer."""
+    # ChainedOptimizer prefixes every sharded key when a model has multiple
+    # sub-optimizers (for example, dense and expert parameters in MoE models).
+    key = re.sub(r"^chained_\d+\.", "", key)
+    return key == "optimizer" or key.startswith(("optimizer.", "optimizer/"))
+
+
 def validate_warm_start_checkpoint(
     warm_start: PathLike, model_component: str = "value"
 ) -> None:
@@ -140,15 +163,10 @@ class CheckpointingConfig(TypedDict):
     ft_save_period (Optional[int]): How often to save fault-tolerance checkpoints, in steps.
         When set, a checkpoint is saved every ft_save_period steps for crash recovery.
         Requires ft_keep_latest_k to control how many of these are retained.
-    model_save_format (str | None): Format for saving model (v2 allowed values: "torch_save" or "safetensors", v1 allowed values: None).
-    save_consolidated (bool): Whether to save consolidated checkpoints (for HF compatibility).
-    model_cache_dir (str): Directory for model cache (for safetensors format).
-    model_repo_id (str): Repository ID for the model (for safetensors format).
-    is_peft (bool): Whether the model uses PEFT.
     save_optimizer (bool): Whether to save optimizer state with checkpoints.
     save_data_plane (bool): Whether SingleController checkpoints include the
-        native TQ snapshot and replay-buffer metadata. Currently supported only
-        with the simple data-plane backend.
+        native TQ snapshot and replay-buffer metadata. Supported by the simple
+        and mooncake_cpu backends; no backend-specific checkpoint switch is needed.
     load_replay_buffer (bool): Whether async GRPO restores replay-buffer state
         when resuming from a checkpoint. Defaults to True. When False the
         buffer starts empty and a frontier-aligned resume regenerates the
@@ -169,14 +187,21 @@ class CheckpointingConfig(TypedDict):
     save_optimizer: NotRequired[bool]  # Default: True
     save_data_plane: NotRequired[bool]
     load_replay_buffer: NotRequired[bool]  # Default: True (async GRPO only)
-    # New nemo-automodel integration fields
-    model_save_format: NotRequired[str | None]  # Default: "safetensors"
-    save_consolidated: NotRequired[bool]  # Default: False
-    model_cache_dir: NotRequired[str]  # Default: ""
-    model_repo_id: NotRequired[str]  # Default: ""
-    is_peft: NotRequired[bool]  # Default: False
-    peft_config: NotRequired[Any]  # Default: None
-    is_async: NotRequired[bool]  # Default: False
+
+
+_AUTOMODEL_ONLY_CHECKPOINT_FIELDS = frozenset(
+    {
+        "model_save_format",
+        "save_consolidated",
+        "single_rank_consolidation",
+        "consolidation_timeout_minutes",
+        "model_cache_dir",
+        "model_repo_id",
+        "is_peft",
+        "peft_config",
+        "is_async",
+    }
+)
 
 
 class CheckpointManager:
@@ -206,6 +231,20 @@ class CheckpointManager:
         Args:
             config (CheckpointingConfig)
         """
+        automodel_only_fields = sorted(
+            _AUTOMODEL_ONLY_CHECKPOINT_FIELDS.intersection(config)
+        )
+        if automodel_only_fields:
+            raise ValueError(
+                "Automodel-only fields are not supported under the top-level "
+                f"checkpointing config: {', '.join(automodel_only_fields)}. "
+                "Configure model_save_format, save_consolidated, "
+                "single_rank_consolidation, and consolidation_timeout_minutes "
+                "under policy.dtensor_cfg (and value.dtensor_cfg for value "
+                "models); remove the remaining fields because they are managed "
+                "internally."
+            )
+
         self.checkpoint_dir = Path(config["checkpoint_dir"])
         self.metric_name: str | None = config["metric_name"]
         self.higher_is_better = config["higher_is_better"]
@@ -213,13 +252,6 @@ class CheckpointManager:
         self.save_period: int = config["save_period"]
         self.ft_keep_latest_k: int | None = config.get("ft_keep_latest_k", None)
         self.save_optimizer = config["save_optimizer"]
-
-        # Store nemo-automodel specific config options
-        self.model_save_format = config.get("model_save_format", "safetensors")
-        self.save_consolidated = config.get("save_consolidated", False)
-        self.model_cache_dir = config.get("model_cache_dir", "")
-        self.model_repo_id = config.get("model_repo_id", "")
-        self.is_peft = config.get("is_peft", False)
 
         # Async finalization state
         self._finalize_thread: Optional[threading.Thread] = None
@@ -267,6 +299,14 @@ class CheckpointManager:
                     # state is embedded in the weights_path. We will actually load the optimizer
                     # state from the weights_path.
                     return weights_path, optimizer_path
+
+                # Modern torch_dist checkpoints shard optimizer tensors separately
+                # from the common state. Inspect stored keys rather than trusting
+                # run_config.save_optim, which only records configuration intent.
+                if (iteration_dir / "metadata.json").exists():
+                    sharded_keys = _load_megatron_sharded_metadata_keys(iteration_dir)
+                    if any(_is_megatron_optimizer_key(key) for key in sharded_keys):
+                        return weights_path, optimizer_path
 
             warnings.warn(
                 f"Optimizer state not found at {optimizer_path} (DTensor path), and no embedded "
@@ -322,7 +362,9 @@ class CheckpointManager:
         # save config
         if run_config is not None:
             with open(save_dir / "config.yaml", "w") as f:
-                yaml.safe_dump(run_config.model_dump(), f)
+                # JSON mode converts enums and other Pydantic-supported scalar
+                # types to the primitive values expected by safe YAML.
+                yaml.safe_dump(run_config.model_dump(mode="json"), f)
 
         return Path(os.path.abspath(save_dir))
 

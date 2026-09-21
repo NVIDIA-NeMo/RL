@@ -29,7 +29,7 @@ dependencies = [
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
   "ray[default]>=2.55.1",
-  "wandb>=0.28.0",
+  "wandb>=0.30.0",                                                                                       # Address dependency vulnerabilities in bundled wandb-core
   "numpy",
   "datasets>=4.0.0",
   "rich",
@@ -70,7 +70,7 @@ dependencies = [
   "pybase64",                                                                                                 # for sglang refit
   "awscrt>=0.35.0",                                                                                           # for parallel S3 refit transport
   "zstandard",                                                                                                # for sparse refit body compression
-  "fastokens-b10>=0.1.1",                                                                                     # Rust-backed BPE tokenizer (~10x faster encode); enable at runtime with NRL_USE_FASTOKENS=1
+  "fastokens>=0.2.0",                                                                                         # Rust-backed BPE tokenizer (~10x faster encode); enable at runtime with NRL_USE_FASTOKENS=1
   # OpenTelemetry instrumentation. Base (not extra) so it reaches every worker
   # venv; `telemetry.enabled` in the config is the on/off switch. Sourced from
   # git in [tool.uv.sources] — see the note there; the floor is above the
@@ -112,8 +112,14 @@ dependencies = [
   # build-container runner is aarch64 (uv reports aarch64-unknown-linux-gnu),
   # so the marker must include aarch64 — otherwise mooncake is silently
   # excluded from the resolution during the Docker build.
-  "mooncake-transfer-engine-cuda13==0.3.11.post1 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  # NOTE: 0.3.13.post1 is the latest release on PyPI as of this bump, but still
+  # vendors golang.org/x/net v0.55.0 (confirmed via strings on libetcd_wrapper.so) --
+  # one version behind the fix for a known dependency vulnerability. This bump
+  # narrows the gap (v0.48.0 -> v0.55.0) but does not fully close it; re-check
+  # when a newer release ships.
+  "mooncake-transfer-engine-cuda13==0.3.13.post1 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
 ]
+
 
 [project.optional-dependencies]
 fsdp = [
@@ -145,8 +151,7 @@ automodel = [
   "causal-conv1d",
   "nv-grouped-gemm",
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.14.1",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@29d31c095796f3c8ece47ee9cdcc167051bbeed9 ; platform_machine == 'x86_64'",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
 ]
 vllm = [
   "transformers==5.12.1",
@@ -156,18 +161,19 @@ vllm = [
   # deep_ep also needs libibverbs-dev
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@29d31c095796f3c8ece47ee9cdcc167051bbeed9 ; platform_machine == 'x86_64'",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
-  # Default wheels on GitHub are cu130. See v0.25.1 release assets:
-  # https://github.com/vllm-project/vllm/releases/tag/v0.25.1
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1-cp38-abi3-manylinux_2_28_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1-cp38-abi3-manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "vllm==0.25.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
+  # Default wheels on GitHub are cu130. See v0.26.0 release assets:
+  # https://github.com/vllm-project/vllm/releases/tag/v0.26.0
+  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.26.0/vllm-0.26.0-cp38-abi3-manylinux_2_28_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.26.0/vllm-0.26.0-cp38-abi3-manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "vllm==0.26.0 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.13",
-  "flashinfer-cubin==0.6.13",
-  "flashinfer-jit-cache==0.6.13",
-  "nvidia-cutlass-dsl[cu13]==4.5.2",
+  "flashinfer-python==0.6.14",
+  "flashinfer-cubin==0.6.14",
+  "flashinfer-jit-cache==0.6.14",
+  "nvidia-cutlass-dsl[cu13]==4.6.0",
+  # Quack 0.6.1 uses the CUTLASS DSL 4.6 API required by vLLM 0.26.
+  "quack-kernels==0.6.1",
 ]
 sglang = [
   # sgl-project/sglang branch `sglang-miles` (based on v0.5.16). Needed for the
@@ -216,8 +222,7 @@ mcore = [
   # silently falls back to the PyPI releases instead of the pinned git revs.
   "mamba-ssm",
   "causal-conv1d",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@29d31c095796f3c8ece47ee9cdcc167051bbeed9 ; platform_machine == 'x86_64'",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
   "flashinfer-python==0.6.8.post1",
   "flashinfer-cubin==0.6.8.post1",
   "flashinfer-jit-cache==0.6.8.post1",
@@ -226,6 +231,12 @@ mcore = [
   "torch-memory-saver>=0.0.9.post1",
   "nvshmem4py-cu13>=0.2.1",
   "cupy-cuda13x",
+  # megatron-energon already flows in transitively (megatron-core[dev,mlm] declares it), so
+  # this is not a mirror in the sense forbidden above -- it is a deliberately tighter floor:
+  # Megatron-LM pins ~=7.0, and the energon SFT path requires 7.3+.
+  # tests/unit/test_dependency_pins.py fails if Megatron-LM's own pin moves, so a
+  # Megatron-Bridge bump forces a re-check of this floor.
+  "megatron-energon[av-decode]~=7.3", # for energon backend
 ]
 # TRT-LLM is built from source via 3rdparty/TensorRT-LLM-workspace's custom PEP 517
 # backend (_backend.py). The path source lets uv lock resolve the dep graph
@@ -295,7 +306,11 @@ test = [
 tensorrt-llm = { path = "3rdparty/TensorRT-LLM-workspace" }
 nemo-automodel = { path = "3rdparty/Automodel-workspace/Automodel", editable = true }
 megatron-bridge = { path = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge", editable = true }
-nemo_gym = { workspace = true }
+# Keep Gym as an editable path dependency rather than a workspace member. Both
+# projects define a ``vllm`` extra with intentionally different server stacks;
+# uv applies a requested extra name to every selected workspace member, which
+# makes the RL vLLM + base Gym worker environment impossible to select.
+nemo_gym = { path = "3rdparty/Gym-workspace/Gym", editable = true }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
 # Must stay on the rev megatron-core pins for its dev/otel extras: the workspace
 # resolves a single nemo-lens, and PyPI's newest release (0.1.0) is older than
@@ -322,14 +337,13 @@ nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v
 # FlashMLA derives its version from the Git revision in setup.py. Keep this pin
 # synchronized with the static dependency metadata below.
 flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA", rev = "b7643bd54521f563b839b98289b5cd048c062ba2" }
-nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "c3b913b9cc1d82d5a0af9fa77b4db87829e6f158" }
+nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "43fd41a58d52c4e6e5dec1d1ff5989ecc737ae1a" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.6.0" }
-flashinfer-cubin = { index = "flashinfer", extra = "sglang" }
+flashinfer-cubin = { index = "flashinfer" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
 
 [tool.uv.workspace]
 members = [
-  "3rdparty/Gym-workspace/Gym",
   # Research projects are also added here in order for them to share the global root level uv.lock.
   # If we don't do this, the research projects do not see the global uv.lock, and may mistakenly
   # install numpy>=2.0 because nemo-rl's core [dependencies] do not pin numpy, but when you inspect
@@ -367,7 +381,6 @@ environments = [
 preview = true # Enable preview features like extra-build-dependencies
 no-build-isolation-package = [
   "transformer-engine-torch",
-  "transformer-engine",
   "flash-attn",
   "mamba-ssm",
   "causal-conv1d",
@@ -395,7 +408,7 @@ link-mode = "copy"
 # vllm defaults to opencv for video IO but falls back to torchcodec.
 # The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
-  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.15",
+  "transformer-engine[pytorch,core_cu13]==2.18.0",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
   "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
@@ -414,8 +427,7 @@ override-dependencies = [
   "llguidance>=1.3.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@29d31c095796f3c8ece47ee9cdcc167051bbeed9 ; platform_machine == 'x86_64'",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
   # Override sglang's xgrammar==0.1.32 to address CVE GHSA-7rgv-gqhr-fxg3.
@@ -441,9 +453,8 @@ override-dependencies = [
   # 2.5.x). The original driver — TransferQueue pinning `numpy<2.0.0` — is
   # gone as of TQ v0.1.9; drop this override once the trtllm cap lifts.
   "numpy>=2.1.0",
-  # av (PyAV) carries CVE-bundled codec libs (libx264, libx265, libopenh264, libmp3lame).
-  # It is only needed by megatron-bridge's optional WAN diffusion path, which installs it
-  # at test time via scripts/install_diffusion_deps.sh. Exclude from the shipped container.
+  # av (PyAV) bundles FFmpeg-derived codecs that may incur royalties. Exclude it from the
+  # shipped container; audio/video tests install it via tools/install_audio_deps.sh.
   "av; sys_platform == 'never'",
   # decord2 is pulled transitively by sglang → qwen-vl-utils[decord] on aarch64 Linux.
   # NeMo-RL no longer calls any decord API (replaced by torchvision/torchaudio).
@@ -456,7 +467,7 @@ constraint-dependencies = [
   # whose [tool.uv.sources] pins them to git. uv requires such URL deps to also appear as a
   # direct requirement or constraint of the root project. Keep these URLs/revs in sync with
   # Megatron-LM's [tool.uv.sources] (uv errors loudly on mismatch after a submodule bump).
-  "emerging-optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.2.0",
+  "emerging-optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.3.0",
   "fast-hadamard-transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git@f134af63deb2df17e1171a9ec1ea4a7d8604d5ca",
   # Same story for megatron-fsdp, which nemo-automodel (r0.6.0) resolves from a
   # Megatron-LM fork via its own [tool.uv.sources] instead of PyPI. Keep this URL/rev
@@ -487,96 +498,28 @@ constraint-dependencies = [
   "opencv-python-headless>=5.0.0",            # CVE floor: patches CVE-2025-9951, CVE-2025-1594, CVE-2024-31582 (bundled FFmpeg 5.1.6 in 4.x)
 ]
 
-# Workaround for https://github.com/NVIDIA/cutlass/issues/3259: libs-base
-# and libs-cu13 wheels overlap and race on shared paths. libs-cu13 is a
-# functional superset at 4.5.2, so drop libs-base to make installs deterministic.
-exclude-dependencies = ["nvidia-cutlass-dsl-libs-base"]
-
 conflicts = [
-  [
-    { package = "nemo-rl", extra = "automodel" },
-    { package = "nemo-gym", extra = "vllm" },
-  ],
-  [
-    { package = "nemo-rl", extra = "vllm" },
-    { package = "nemo-gym", extra = "vllm" },
-  ],
-  [
-    { package = "nemo-rl", extra = "sglang" },
-    { package = "nemo-gym", extra = "vllm" },
-  ],
-  [
-    { package = "nemo-rl", extra = "mcore" },
-    { package = "nemo-gym", extra = "vllm" },
-  ],
-  [
-    { package = "nemo-rl", extra = "trtllm" },
-    { package = "nemo-gym", extra = "vllm" },
-  ],
-  [
-    { extra = "fsdp" },
-    { extra = "sglang" },
-  ],
-  [
-    { extra = "automodel" },
-    { extra = "sglang" },
-  ],
-  [
-    { extra = "mcore" },
-    { extra = "sglang" },
-  ],
-  [
-    { extra = "vllm" },
-    { extra = "sglang" },
-  ],
-  [
-    { extra = "automodel" },
-    { extra = "fsdp" },
-  ],
-  [
-    { extra = "automodel" },
-    { extra = "mcore" },
-  ],
-  [
-    { extra = "automodel" },
-    { extra = "vllm" },
-  ],
-  [
-    { extra = "vllm" },
-    { extra = "mcore" },
-  ],
-  [
-    { extra = "trtllm" },
-    { extra = "vllm" },
-  ],
-  [
-    { extra = "trtllm" },
-    { extra = "sglang" },
-  ],
-  [
-    { extra = "trtllm" },
-    { extra = "automodel" },
-  ],
-  [
-    { extra = "trtllm" },
-    { extra = "mcore" },
-  ],
-  [
-    { extra = "trtllm" },
-    { extra = "fsdp" },
-  ],
-  [
-    { extra = "trtllm" },
-    { extra = "modelopt" },
-  ],
-  [
-    { extra = "trtllm" },
-    { extra = "nvrx" },
-  ],
-  [
-    { extra = "trtllm" },
-    { extra = "nemo_gym" },
-  ],
+  [{ extra = "fsdp" }, { extra = "sglang" }],
+  [{ extra = "automodel" }, { extra = "sglang" }],
+  [{ extra = "mcore" }, { extra = "sglang" }],
+  [{ extra = "vllm" }, { extra = "sglang" }],
+  [{ extra = "automodel" }, { extra = "fsdp" }],
+  [{ extra = "automodel" }, { extra = "mcore" }],
+  [{ extra = "automodel" }, { extra = "vllm" }],
+  [{ extra = "vllm" }, { extra = "mcore" }],
+  [{ extra = "trtllm" }, { extra = "vllm" }],
+  [{ extra = "trtllm" }, { extra = "sglang" }],
+  [{ extra = "trtllm" }, { extra = "automodel" }],
+  [{ extra = "trtllm" }, { extra = "mcore" }],
+  [{ extra = "trtllm" }, { extra = "fsdp" }],
+  [{ extra = "trtllm" }, { extra = "modelopt" }],
+  [{ extra = "trtllm" }, { extra = "nvrx" }],
+  [{ extra = "trtllm" }, { extra = "nemo_gym" }],
+  # Gym pins openai==2.44.0 (merged PR #2872 tree) while sglang==0.5.12.post1
+  # pins openai==2.6.1; no environment installs both extras together.
+  # Spelled nemo_gym (the raw extras-table key): uv < 0.12 compares conflict
+  # entries against unnormalized extra names and rejects "nemo-gym".
+  [{ extra = "nemo_gym" }, { extra = "sglang" }],
 ]
 
 
@@ -586,7 +529,6 @@ flash-attn = [{ requirement = "torch", match-runtime = true }]
 # Git-sourced packages CAN use match-runtime = true if we provide dependency-metadata
 deep_ep = [{ requirement = "torch", match-runtime = true }]
 deep_gemm = [{ requirement = "torch", match-runtime = true }]
-transformer-engine = [{ requirement = "torch", match-runtime = true }]
 transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
@@ -598,6 +540,42 @@ flash_mla = [{ requirement = "torch", match-runtime = true }]
 # sync with docker/Dockerfile's BASE_IMAGE CUDA major version (currently cuda13.x).
 [tool.uv.extra-build-variables]
 torch-memory-saver = { TMS_CUDA_MAJOR = "13" }
+
+# CUTLASS DSL 4.5.x publishes overlapping base and cu13 wheels. Override the
+# affected metadata so those versions use the self-contained cu13 wheel, while
+# 4.6.x retains libs-base/libs-core for its common Python and MLIR modules.
+[[tool.uv.dependency-metadata]]
+name = "nvidia-cutlass-dsl"
+version = "4.5.0"
+requires-dist = ["nvidia-cutlass-dsl-libs-cu13==4.5.0; extra == 'cu13'"]
+provides-extras = ["cu13"]
+
+[[tool.uv.dependency-metadata]]
+name = "nvidia-cutlass-dsl"
+version = "4.5.1"
+requires-dist = ["nvidia-cutlass-dsl-libs-cu13==4.5.1; extra == 'cu13'"]
+provides-extras = ["cu13"]
+
+[[tool.uv.dependency-metadata]]
+name = "nvidia-cutlass-dsl"
+version = "4.5.2"
+requires-dist = ["nvidia-cutlass-dsl-libs-cu13==4.5.2; extra == 'cu13'"]
+provides-extras = ["cu13"]
+
+[[tool.uv.dependency-metadata]]
+name = "nvidia-cutlass-dsl-libs-cu13"
+version = "4.5.0"
+requires-dist = ["numpy", "typing-extensions", "cuda-python>=12.8"]
+
+[[tool.uv.dependency-metadata]]
+name = "nvidia-cutlass-dsl-libs-cu13"
+version = "4.5.1"
+requires-dist = ["numpy", "typing-extensions", "cuda-python>=12.8"]
+
+[[tool.uv.dependency-metadata]]
+name = "nvidia-cutlass-dsl-libs-cu13"
+version = "4.5.2"
+requires-dist = ["numpy", "typing-extensions", "cuda-python>=12.8"]
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
@@ -629,7 +607,7 @@ requires-dist = ["torch", "packaging", "ninja", "causal-conv1d"]
 [[tool.uv.dependency-metadata]]
 name = "deep_ep"
 # This version has to match the version in the commit/rev/tag used
-version = "v1.2.1+29d31c0"
+version = "1.2.1+17cfb81"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
@@ -637,16 +615,6 @@ name = "deep_gemm"
 # This version has to match the version in the commit/rev/tag used
 version = "2.5.0"
 requires-dist = ["torch", "packaging", "ninja"]
-
-[[tool.uv.dependency-metadata]]
-name = "transformer-engine"
-version = "2.15.0+42b8400"
-requires-dist = ["torch", "pydantic", "importlib-metadata>=1.0", "packaging"]
-
-[[tool.uv.dependency-metadata]]
-name = "transformer-engine-torch"
-version = "2.15.0+42b8400"
-requires-dist = ["torch", "transformer-engine"]
 
 [[tool.uv.dependency-metadata]]
 name = "nv-grouped-gemm"

@@ -24,6 +24,7 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
+    apply_message_level_advantage_penalties,
     fields_for_put,
     reduce_advantage_pump_metrics,
     squeeze_trailing_unit_dim,
@@ -138,12 +139,14 @@ class TestReduceAdvantagePumpMetrics:
             rewards=[torch.tensor([1.0, 3.0])],
             masked_advantages=[torch.tensor([-1.0, 0.0, 2.0])],
             sequence_lengths=[4, 6],
+            num_mask_sample_filtered=[1, 2],
         )
         assert out["reward"] == pytest.approx(2.0)
         assert out["advantages/mean"] == pytest.approx(1.0 / 3.0)
         assert out["advantages/max"] == pytest.approx(2.0)
         assert out["advantages/min"] == pytest.approx(-1.0)
         assert out["total_num_tokens"] == pytest.approx(10.0)
+        assert out["num_mask_sample_filtered"] == pytest.approx(3.0)
 
     def test_empty_advantages_tensor_yields_zeros(self) -> None:
         out = reduce_advantage_pump_metrics(
@@ -231,6 +234,75 @@ class TestReduceAdvantagePumpMetrics:
             )
             == {}
         )
+
+
+class TestApplyMessageLevelAdvantagePenalties:
+    def test_overwrites_only_flagged_tokens(self) -> None:
+        advantages = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+        result = apply_message_level_advantage_penalties(
+            advantages,
+            invalid_tool_call_mask=torch.tensor([[False, True, False, False]]),
+            malformed_thinking_mask=torch.tensor([[False, False, True, False]]),
+            invalid_tool_call_advantage=-5.0,
+            malformed_thinking_advantage=-7.0,
+        )
+        torch.testing.assert_close(result, torch.tensor([[1.0, -5.0, -7.0, 4.0]]))
+        torch.testing.assert_close(advantages, torch.tensor([[1.0, 2.0, 3.0, 4.0]]))
+
+    def test_invalid_tool_call_takes_precedence_on_overlap(self) -> None:
+        result = apply_message_level_advantage_penalties(
+            torch.zeros(1, 2),
+            invalid_tool_call_mask=torch.tensor([[False, True]]),
+            malformed_thinking_mask=torch.tensor([[False, True]]),
+            invalid_tool_call_advantage=-5.0,
+            malformed_thinking_advantage=-7.0,
+        )
+        torch.testing.assert_close(result, torch.tensor([[0.0, -5.0]]))
+
+    def test_only_invalid_tool_call_penalty_leaves_malformed_untouched(
+        self,
+    ) -> None:
+        result = apply_message_level_advantage_penalties(
+            torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
+            invalid_tool_call_mask=torch.tensor([[False, True, False, False]]),
+            malformed_thinking_mask=torch.tensor([[False, False, True, False]]),
+            invalid_tool_call_advantage=-5.0,
+            malformed_thinking_advantage=None,
+        )
+        torch.testing.assert_close(result, torch.tensor([[1.0, -5.0, 3.0, 4.0]]))
+
+    def test_only_malformed_thinking_penalty_leaves_invalid_untouched(
+        self,
+    ) -> None:
+        result = apply_message_level_advantage_penalties(
+            torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
+            invalid_tool_call_mask=torch.tensor([[False, True, False, False]]),
+            malformed_thinking_mask=torch.tensor([[False, False, True, False]]),
+            invalid_tool_call_advantage=None,
+            malformed_thinking_advantage=-7.0,
+        )
+        torch.testing.assert_close(result, torch.tensor([[1.0, 2.0, -7.0, 4.0]]))
+
+    def test_disabled_penalties_leave_advantages_unchanged(self) -> None:
+        advantages = torch.tensor([[1.0, 2.0]])
+        result = apply_message_level_advantage_penalties(
+            advantages,
+            invalid_tool_call_mask=torch.tensor([[True, False]]),
+            malformed_thinking_mask=torch.tensor([[False, True]]),
+            invalid_tool_call_advantage=None,
+            malformed_thinking_advantage=None,
+        )
+        assert result is advantages
+
+    def test_rejects_misaligned_mask(self) -> None:
+        with pytest.raises(ValueError, match="invalid_tool_call_mask shape"):
+            apply_message_level_advantage_penalties(
+                torch.zeros(1, 2),
+                invalid_tool_call_mask=torch.zeros(1, 3, dtype=torch.bool),
+                malformed_thinking_mask=torch.zeros(1, 2, dtype=torch.bool),
+                invalid_tool_call_advantage=-5.0,
+                malformed_thinking_advantage=None,
+            )
 
 
 class TestFieldsForPut:

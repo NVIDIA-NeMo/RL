@@ -3,8 +3,10 @@
 defaults: "grpo_math_1B.yaml"
 
 grpo:
-  # Share immutable multimodal payloads across logical GRPO rows. Currently
-  # qualified with the vLLM generation backend and data_plane.enabled=false.
+  # Share immutable multimodal payloads across logical GRPO rows. Requires the
+  # vLLM generation backend. Works with data_plane.enabled=true except on
+  # NeMo-Gym runs; note it saves driver RAM only -- the wire payload is one row
+  # per logical row either way.
   deduplicate_multimodal_data: false
   # Debug-only exact Ray payload telemetry; serialization adds runtime overhead.
   debug_payload_metrics: false
