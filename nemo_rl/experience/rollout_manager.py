@@ -66,7 +66,11 @@ from nemo_rl.experience.interfaces import (
     Completion,
     PromptGroupRecord,
 )
-from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.metric_utils import (
+    RolloutTelemetry,
+    calculate_single_metric,
+    pct,
+)
 from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
     PromptGroupStatus,
@@ -1229,7 +1233,18 @@ class AsyncNemoGymRolloutImpl:
                 # recovery records inherit the current mask and reward semantics.
                 # Completion callbacks are token-capture receipt-only, making this
                 # conversion lightweight and safe to repeat during group metrics.
-                row_completions, _ = self._results_to_completions([result])
+                row_completions, penalty_counts = self._results_to_completions([result])
+                agent_name = _nemo_gym_metric_namespace(inputs_by_rowidx[rowidx])
+                row_metrics = self._compute_rollout_metrics(row_completions, agent_name)
+                row_shaping = shaping_by_rowidx[rowidx]
+                if row_shaping is not None:
+                    row_metrics.update(_effort_shaping_metrics(row_shaping))
+                row_metrics.update(
+                    self._compute_reward_penalty_metrics(penalty_counts, 1)
+                )
+                row_completions[0].telemetry = RolloutTelemetry.from_metrics(
+                    _rollout_environment_metric_component(agent_name), row_metrics
+                )
                 await on_completion(rowidx, row_completions[0])
             if timing_metrics is not None:
                 env_timing_metrics = timing_metrics
@@ -2424,6 +2439,7 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    telemetry=completion.telemetry,
                 )
                 previous = pending_group_results.get(generation_index)
                 if previous is not None:
@@ -2453,6 +2469,7 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    telemetry=completion.telemetry,
                 )
 
         try:
@@ -2488,6 +2505,21 @@ class RolloutManager:
                 rewards,
                 mask_sample,
             ) = self._recovery_ledger.finalization_inputs(group_id)
+            telemetry = tuple(
+                sibling.current_attempt.telemetry
+                for sibling in self._recovery_ledger.get_group(group_id).siblings
+            )
+            environments = {
+                snapshot.environment for snapshot in telemetry if snapshot is not None
+            }
+            if len(environments) > 1:
+                raise ValueError(
+                    "Recovered siblings have inconsistent telemetry environments"
+                )
+            if environments:
+                # Fully sealed restored groups do not dispatch, so the resolved
+                # Gym namespace must come from their durable observations.
+                rollout_environment = next(iter(environments))
             request = ReassemblyRequest(
                 group_id=group_id,
                 rollout_ids=tuple(physical_rollout_ids),
@@ -2499,6 +2531,7 @@ class RolloutManager:
                 mask_sample=tuple(mask_sample),
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
                 rollout_environment=rollout_environment,
+                telemetry=telemetry,
             )
             assert_metadata_only(request)
             return request
