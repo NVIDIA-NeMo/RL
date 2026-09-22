@@ -538,6 +538,17 @@ def test_restored_prefix_parser_receives_complete_generation_token_ids() -> None
     ]
 
 
+def test_restored_prefix_parser_counts_reasoning_over_complete_generation() -> None:
+    delegate = MagicMock()
+    delegate.count_reasoning_tokens.return_value = 3
+    parser = _RestoredPrefixParser(delegate=delegate, prefix_token_ids=(10, 11))
+
+    count = parser.count_reasoning_tokens([12, 13])
+
+    assert count == 3
+    delegate.count_reasoning_tokens.assert_called_once_with([10, 11, 12, 13])
+
+
 @pytest.mark.parametrize(
     ("prompt_token_ids", "generation_token_count", "output_limit", "match"),
     [
