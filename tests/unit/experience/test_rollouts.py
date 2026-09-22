@@ -38,6 +38,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleGameLogic,
     SlidingPuzzleMetadata,
 )
+from nemo_rl.algorithms.multi_trace_metrics import finalize_sum_count_metrics
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.experience.rollouts import (
@@ -435,6 +436,69 @@ class TestCompactionRolloutMetrics:
             assert f"mask_sample/by_kind/{kind}/count" in m
         assert all(math.isfinite(v) for v in m.values())
         json.dumps(m)
+
+    def test_delegation_split(self):
+        # Two delegating rollouts (one solved, one env-masked and unsolved) and
+        # two non-delegating (one solved, one not).
+        infos = [
+            {"num_subagent_sessions": 2, "mask_sample": False, "resolved": True},
+            {"num_subagent_sessions": 1, "mask_sample": True, "resolved": False, "agent_timed_out": True},
+            {"num_subagent_sessions": 0, "mask_sample": False, "resolved": True},
+            {"num_subagent_sessions": 0, "mask_sample": False, "resolved": False},
+        ]
+        rewards = [1.0, 0.0, 1.0, 0.0]
+        m = _compaction_rollout_metrics(infos, rewards)
+
+        assert (m["reward/by_delegation/delegated/sum"], m["reward/by_delegation/delegated/count"]) == (1.0, 2)
+        assert (m["reward/by_delegation/none/sum"], m["reward/by_delegation/none/count"]) == (1.0, 2)
+        # Solve rate over ALL rollouts: 1/2 both arms — the env-masked rollout
+        # drags the delegating arm down through no fault of the policy.
+        assert (m["resolved/by_delegation/delegated/sum"], m["resolved/by_delegation/delegated/count"]) == (1, 2)
+        assert (m["resolved/by_delegation/none/sum"], m["resolved/by_delegation/none/count"]) == (1, 2)
+        # Dropping it: delegating solves 1/1, non-delegating 1/2.
+        assert (m["resolved/by_delegation_unmasked/delegated/sum"], m["resolved/by_delegation_unmasked/delegated/count"]) == (1, 1)
+        assert (m["resolved/by_delegation_unmasked/none/sum"], m["resolved/by_delegation_unmasked/none/count"]) == (1, 2)
+        assert (m["reward/by_delegation_unmasked/delegated/sum"], m["reward/by_delegation_unmasked/delegated/count"]) == (1.0, 1)
+        # The yield gap that explains the difference.
+        assert m["mask_sample/by_delegation/delegated/count"] == 1
+        assert m["mask_sample/by_delegation/none/count"] == 0
+
+        # Delegation buckets partition the rollouts, exactly like the mask split.
+        assert (
+            m["reward/by_delegation/delegated/count"] + m["reward/by_delegation/none/count"]
+            == m["rollouts/count"]
+        )
+        # Stable key set even when a bucket is empty.
+        none_only = _compaction_rollout_metrics([{"num_subagent_sessions": 0}], [1.0])
+        for bucket in ("delegated", "none"):
+            for key in ("reward/by_delegation", "resolved/by_delegation",
+                        "reward/by_delegation_unmasked", "resolved/by_delegation_unmasked"):
+                assert f"{key}/{bucket}/sum" in none_only
+                assert f"{key}/{bucket}/count" in none_only
+            assert f"mask_sample/by_delegation/{bucket}/count" in none_only
+        assert none_only["reward/by_delegation/delegated/count"] == 0
+        assert all(math.isfinite(v) for v in m.values())
+        json.dumps(m)
+
+    def test_delegation_means_survive_finalize(self):
+        """/sum + /count -> /mean through the trainer's aggregation step."""
+        infos = [
+            {"num_subagent_sessions": 1, "mask_sample": False, "resolved": True},
+            {"num_subagent_sessions": 1, "mask_sample": False, "resolved": False},
+            {"num_subagent_sessions": 0, "mask_sample": False, "resolved": False},
+        ]
+        final = finalize_sum_count_metrics(
+            _compaction_rollout_metrics(infos, [1.0, 0.0, 0.0])
+        )
+        assert final["resolved/by_delegation/delegated/mean"] == 0.5
+        assert final["resolved/by_delegation/none/mean"] == 0.0
+        assert final["reward/by_delegation/delegated/mean"] == 0.5
+        # Empty bucket: no /mean (no rollouts to average), and no NaN emitted.
+        empty = finalize_sum_count_metrics(
+            _compaction_rollout_metrics([{"num_subagent_sessions": 0}], [1.0])
+        )
+        assert "resolved/by_delegation/delegated/mean" not in empty
+        assert all(math.isfinite(v) for v in empty.values())
 
     def test_empty_group(self):
         m = _compaction_rollout_metrics([], [])

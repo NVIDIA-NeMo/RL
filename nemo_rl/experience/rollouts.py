@@ -1660,6 +1660,16 @@ def _compaction_rollout_metrics(
     (termination kind of env-masked rollouts); ``reward/{masked,unmasked}/{sum,count}``;
     ``reward/masked_resolved/count`` (env-masked AND resolved: inflates the
     baseline of every unmasked sibling with no gradient of its own).
+
+    Delegation split (``delegated`` = the rollout spawned >=1 subagent session):
+    ``{reward,resolved}/by_delegation/{delegated,none}/{sum,count}`` and the
+    same pair under ``by_delegation_unmasked``. ``resolved/*/mean`` is the SOLVE
+    RATE of each arm — the headline "does delegating help" number. Read the
+    unmasked pair for that comparison: an env-masked rollout scores 0 through
+    no fault of the policy, and delegating rollouts run longer, so they take
+    more env faults; the all-rollouts pair conflates that yield loss with a
+    genuine capability difference. ``mask_sample/by_delegation/{bucket}/count``
+    exposes exactly that yield gap.
     """
     assert len(rollout_infos) == len(rewards), (
         f"{len(rollout_infos)} rollout infos vs {len(rewards)} rewards"
@@ -1673,6 +1683,12 @@ def _compaction_rollout_metrics(
     masked_rewards: list[float] = []
     unmasked_rewards: list[float] = []
     masked_resolved = 0
+    delegation_buckets = ("delegated", "none")
+    by_delegation: dict[str, list[float]] = {b: [] for b in delegation_buckets}
+    resolved_by_delegation: dict[str, int] = {b: 0 for b in delegation_buckets}
+    masked_by_delegation: dict[str, int] = {b: 0 for b in delegation_buckets}
+    unmasked_by_delegation: dict[str, list[float]] = {b: [] for b in delegation_buckets}
+    unmasked_resolved_by_delegation: dict[str, int] = {b: 0 for b in delegation_buckets}
     for info, reward in zip(rollout_infos, rewards):
         num_compactions = info.get("num_compactions") or 0
         by_num_compactions[
@@ -1680,13 +1696,22 @@ def _compaction_rollout_metrics(
         ].append(reward)
         kind = _termination_kind(info)
         by_termination[kind].append(reward)
+        delegation = (
+            "delegated" if (info.get("num_subagent_sessions") or 0) > 0 else "none"
+        )
+        resolved = bool(info.get("resolved"))
+        by_delegation[delegation].append(reward)
+        resolved_by_delegation[delegation] += resolved
         if info.get("mask_sample"):
             masked_by_kind[kind] += 1
+            masked_by_delegation[delegation] += 1
             masked_rewards.append(reward)
-            if bool(info.get("resolved")):
+            if resolved:
                 masked_resolved += 1
         else:
             unmasked_rewards.append(reward)
+            unmasked_by_delegation[delegation].append(reward)
+            unmasked_resolved_by_delegation[delegation] += resolved
 
     for bucket, values in by_num_compactions.items():
         metrics[f"reward/by_num_compactions/{bucket}/sum"] = sum(values)
@@ -1697,6 +1722,23 @@ def _compaction_rollout_metrics(
         metrics[f"reward/by_termination/{kind}/sum"] = sum(values)
         metrics[f"reward/by_termination/{kind}/count"] = len(values)
         metrics[f"mask_sample/by_kind/{kind}/count"] = masked_by_kind[kind]
+    for bucket in delegation_buckets:
+        values = by_delegation[bucket]
+        unmasked_values = unmasked_by_delegation[bucket]
+        metrics[f"reward/by_delegation/{bucket}/sum"] = sum(values)
+        metrics[f"reward/by_delegation/{bucket}/count"] = len(values)
+        metrics[f"resolved/by_delegation/{bucket}/sum"] = resolved_by_delegation[bucket]
+        metrics[f"resolved/by_delegation/{bucket}/count"] = len(values)
+        metrics[f"mask_sample/by_delegation/{bucket}/count"] = masked_by_delegation[
+            bucket
+        ]
+        metrics[f"reward/by_delegation_unmasked/{bucket}/sum"] = sum(unmasked_values)
+        metrics[f"reward/by_delegation_unmasked/{bucket}/count"] = len(unmasked_values)
+        n_unmasked = len(unmasked_values)
+        metrics[f"resolved/by_delegation_unmasked/{bucket}/sum"] = (
+            unmasked_resolved_by_delegation[bucket]
+        )
+        metrics[f"resolved/by_delegation_unmasked/{bucket}/count"] = n_unmasked
     metrics["reward/masked/sum"] = sum(masked_rewards)
     metrics["reward/masked/count"] = len(masked_rewards)
     metrics["reward/unmasked/sum"] = sum(unmasked_rewards)
@@ -2409,6 +2451,13 @@ def run_async_nemo_gym_rollout(
             )
             for i, r in enumerate(results)
         ]
+        # Subagent TRACES per rollout (rows), vs `num_subagent_sessions`
+        # (sessions): a subagent that compacts contributes several traces from
+        # one session, and the traces are what the loss sees.
+        subagent_traces_per_rollout = [0] * batch_size
+        for i, kind in enumerate(trace_kinds):
+            if kind == "subagent":
+                subagent_traces_per_rollout[trace_rollout_local_idx[i]] += 1
         trace_prompt_tokens = [
             len(r["input_message_log"][0]["token_ids"]) for r in results
         ]
@@ -2485,6 +2534,13 @@ def run_async_nemo_gym_rollout(
                 batch_size,
                 "subagent_sessions_per_sample",
             ),
+            **_calculate_single_metric(
+                subagent_traces_per_rollout,
+                batch_size,
+                "subagent_traces_per_sample",
+            ),
+            "delegation_rate": sum(1 for c in subagent_traces_per_rollout if c > 0)
+            / batch_size,
             "mask_sample_rate": sum(1 for info in rollout_infos if info["mask_sample"])
             / batch_size,
             # Exact-aggregation (/sum + /count) rollout splits: reward by
