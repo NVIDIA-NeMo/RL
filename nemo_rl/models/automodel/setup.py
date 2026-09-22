@@ -752,7 +752,6 @@ def setup_model_and_optimizer(
 
     model_name = config["model_name"]
 
-    load_dtype = runtime_config.dtype
     if init_optimizer:
         optimizer_cfg = config.get("optimizer")
         if not optimizer_cfg:
@@ -763,8 +762,15 @@ def setup_model_and_optimizer(
         for key, value in optimizer_kwargs.items():
             if isinstance(value, str) and value.startswith("torch."):
                 optimizer_kwargs[key] = getattr(torch, value.removeprefix("torch."))
-        if not _has_optimizer_fp32_master(optimizer_cls, optimizer_kwargs):
+        # Params are the only weight copy unless the optimizer keeps FP32 masters.
+        if _has_optimizer_fp32_master(optimizer_cls, optimizer_kwargs):
+            load_dtype = runtime_config.dtype
+        else:
             load_dtype = torch.float32
+    else:
+        # Frozen forward-only model (distillation teacher, reward model): no
+        # optimizer, so there are no master weights to protect.
+        load_dtype = runtime_config.dtype
 
     # Validate CP configuration with model type before from_pretrained
     if cp_size > 1:

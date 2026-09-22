@@ -632,9 +632,9 @@ def _patch_vllm_glm_decoder_sequence_parallel_moe(logger) -> None:
 
 
 def _patch_vllm_minimax_m3_topk_buffer_layout(logger) -> None:
-    """Backport the MiniMax-M3 token-major top-k buffer fix to vLLM 0.25.1.
+    """Backport the MiniMax-M3 token-major top-k buffer fix to vLLM 0.26.0.
 
-    vLLM 0.25.1 allocates ``topk_indices_buffer`` as token-major ``[T, H, K]``
+    vLLM 0.26.0 allocates ``topk_indices_buffer`` as token-major ``[T, H, K]``
     for the NVIDIA MSA path, while its common Triton indexer and sparse-attention
     paths read and write it as head-major ``[H, T, K]``. The wrong shape and
     strides can make ``_topk_index_kernel`` access memory out of bounds and fail
@@ -789,7 +789,7 @@ def _patch_vllm_minimax_m3_topk_buffer_layout(logger) -> None:
             if not indexer_known or not sparse_attention_known:
                 logger.warning(
                     "Could not apply MiniMax-M3 top-k buffer patch: expected "
-                    "vLLM 0.25.1 source shape was not found (indexer=%s, "
+                    "vLLM 0.26.0 source shape was not found (indexer=%s, "
                     "sparse_attention=%s).",
                     indexer_known,
                     sparse_attention_known,
