@@ -92,6 +92,7 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     RolloutSnapshotManifest,
     bootstrap_compatibility_identity,
     commit_snapshot,
+    ensure_bootstrap_anchor,
     prepare_snapshot_paths,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
@@ -1434,6 +1435,7 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         try:
             actor._sampler.restore_dispatch_index(5)
+            actor._rollout_manager.set_next_nemo_gym_task_index(123)
             result = asyncio.run(actor._save_rollout_checkpoint(force=True))
             assert result.saved
             assert result.reason == "completed"
@@ -1452,6 +1454,7 @@ class TestPeriodicRolloutCheckpoint:
             (snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).read_text()
         )
         assert manifest["sampler_dispatch_index"] == 5
+        assert manifest["next_nemo_gym_task_index"] == 123
         assert (snapshot / "data_plane" / "metadata.json").is_file()
         assert (snapshot / "train_dataloader.pt").is_file()
         assert (snapshot / REPLAY_BUFFER_METADATA_FILENAME).is_file()
@@ -2544,7 +2547,13 @@ def _write_checkpoint(
     return step_dir
 
 
-def _write_periodic_snapshot(step_dir: Path) -> Path:
+def _write_periodic_snapshot(
+    step_dir: Path,
+    *,
+    train_step: int = 3,
+    bootstrap_fingerprint: Optional[str] = None,
+    next_nemo_gym_task_index: Optional[int] = None,
+) -> Path:
     """Write one committed rollout snapshot newer than its trainer anchor."""
     tmp_snapshot, final_snapshot, _ = prepare_snapshot_paths(step_dir)
     torch.save(
@@ -2558,16 +2567,21 @@ def _write_periodic_snapshot(step_dir: Path) -> Path:
     (tmp_snapshot / DATA_PLANE_CHECKPOINT_DIR).mkdir()
     manifest = RolloutSnapshotManifest(
         schema_version=ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
-        base_train_step=3,
-        trainer_version=3,
+        base_train_step=train_step,
+        trainer_version=train_step,
         current_epoch=4,
         sampler_dispatch_index=6,
         mutation_version=9,
         rolled_back_train_group_count=0,
-        bootstrap_fingerprint=None,
+        bootstrap_fingerprint=bootstrap_fingerprint,
+        next_nemo_gym_task_index=next_nemo_gym_task_index,
     )
+    manifest_dict = manifest.to_dict()
+    if next_nemo_gym_task_index is None:
+        # Model snapshots written before the counter field existed.
+        manifest_dict.pop("next_nemo_gym_task_index")
     (tmp_snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).write_text(
-        json.dumps(manifest.to_dict())
+        json.dumps(manifest_dict)
     )
     commit_snapshot(tmp_snapshot, final_snapshot, keep_latest_k=2)
     return final_snapshot
@@ -2688,19 +2702,16 @@ class TestSetupResumeWiring:
         assert actor_args.save_state == _get_grpo_save_state(dict(_STEP_3_SAVE_STATE))
         assert actor_args.last_checkpoint_path == str(step_3)
 
-    def test_periodic_snapshot_restores_exact_dispatch_cursor(
+    @pytest.mark.parametrize("bootstrap", [False, True])
+    @pytest.mark.parametrize("snapshot_counter", [None, 0, 123])
+    def test_periodic_snapshot_restores_dispatch_cursor_and_task_counter(
         self,
         patched_factories,  # noqa: F811
         tmp_path,
+        bootstrap: bool,
+        snapshot_counter: Optional[int],
     ):
         ckpt_dir = tmp_path / "ckpts"
-        step_3 = _write_checkpoint(
-            ckpt_dir,
-            3,
-            _STEP_3_SAVE_STATE,
-            dataloader_state={"fake_position": 3},
-        )
-        final_snapshot = _write_periodic_snapshot(step_3)
         mc = _setup_master_config(str(ckpt_dir))
         mc.checkpointing["save_period"] = 1
         mc.rollout_checkpointing = RolloutCheckpointConfig(
@@ -2717,17 +2728,48 @@ class TestSetupResumeWiring:
             }
         )
         mc.logger["log_dir"] = str(tmp_path / "logs")
+        bootstrap_identity = bootstrap_compatibility_identity(mc)
+        if bootstrap:
+            anchor = ensure_bootstrap_anchor(ckpt_dir, identity=bootstrap_identity)
+            train_step = 0
+            trainer_counter = 0
+        else:
+            train_step = 3
+            trainer_counter = 42
+            anchor = _write_checkpoint(
+                ckpt_dir,
+                train_step,
+                {
+                    **_STEP_3_SAVE_STATE,
+                    "next_nemo_gym_task_index": trainer_counter,
+                },
+                dataloader_state={"fake_position": 3},
+            )
+        final_snapshot = _write_periodic_snapshot(
+            anchor,
+            train_step=train_step,
+            bootstrap_fingerprint=(
+                bootstrap_identity.fingerprint() if bootstrap else None
+            ),
+            next_nemo_gym_task_index=snapshot_counter,
+        )
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
             None,
         )
-        tq_metadata = _native_tq_metadata(step=3, trainer_version=3, epoch=4)
+        tq_metadata = _native_tq_metadata(
+            step=train_step, trainer_version=train_step, epoch=4
+        )
         tq_metadata["replay_group_count"] = 0
         patched_factories[
             "fake_policy"
         ].load_data_plane_checkpoint.return_value = tq_metadata
 
         with (
+            patch(
+                "nemo_rl.algorithms.single_controller_utils.setup.bootstrap_compatibility_identity",
+                return_value=bootstrap_identity,
+            ),
             patch(
                 "nemo_rl.algorithms.single_controller_utils.setup.should_use_nemo_gym",
                 return_value=True,
@@ -2750,6 +2792,9 @@ class TestSetupResumeWiring:
 
         assert actor_args.save_state.current_epoch == 4
         assert actor_args.save_state.sampler_dispatch_index == 6
+        assert actor_args.save_state.next_nemo_gym_task_index == (
+            trainer_counter if snapshot_counter is None else snapshot_counter
+        )
         assert actor_args.last_checkpoint_path == str(final_snapshot)
         assert actor_args.rollout_checkpoint_load_metrics is not None
         assert {

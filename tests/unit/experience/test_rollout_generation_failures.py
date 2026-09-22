@@ -44,6 +44,7 @@ from nemo_rl.experience.failures import (
     RolloutTimeout,
     classify_rollout_failure,
 )
+from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.rollout_manager import (
     AsyncRolloutImpl,
     RequestDeadlineRegistry,
@@ -465,6 +466,7 @@ class _PartialGymMethod:
         self._failures_before_success = failures_before_success
         self.attempts = 0
         self.dispatched: list[list[int]] = []
+        self.dispatched_task_indices: list[list[int | None]] = []
 
     def options(self, **kwargs):
         del kwargs
@@ -473,6 +475,9 @@ class _PartialGymMethod:
     def remote(self, inputs, timer_prefix):
         del timer_prefix
         self.dispatched.append([row["_rowidx"] for row in inputs])
+        self.dispatched_task_indices.append(
+            [row.get(NEMO_GYM_TASK_INDEX_KEY) for row in inputs]
+        )
         attempt = self.attempts
         self.attempts += 1
         return self._stream(inputs, attempt)
@@ -545,6 +550,12 @@ def _make_gym_impl(
     impl._num_generations_per_prompt = num_generations
     impl._max_seq_len = 128
     impl._max_rollout_turns = 1
+    impl._generation_config = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_new_tokens": 128,
+    }
+    impl.set_next_nemo_gym_task_index(0)
     impl._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
     impl._deadline_registry = None
     impl._max_gym_row_attempts = row_attempts
@@ -615,13 +626,25 @@ class TestPartialGymRedispatch:
         # Rows 0-1 land, then the stream dies; the retry should carry rows 2-3 only.
         method = _PartialGymMethod(fail_after_rows=2, failures_before_success=1)
         impl = _make_gym_impl(method, num_generations=4, row_attempts=3)
+        impl.set_next_nemo_gym_task_index(17)
 
-        completions, _, _ = asyncio.run(
-            impl._run_rollouts(_gym_rows(4), Timer(), "timing/rollout")
+        record = asyncio.run(
+            impl.run_rollout(
+                {
+                    "idx": 0,
+                    "message_log": [],
+                    "extra_env_info": {
+                        "task_source": "workplace_assistant",
+                        "responses_create_params": {},
+                    },
+                }
+            )
         )
 
         assert method.dispatched == [[0, 1, 2, 3], [2, 3]]
-        assert len(completions) == 4
+        assert method.dispatched_task_indices == [[17, 17, 17, 17], [17, 17]]
+        assert impl.get_next_nemo_gym_task_index() == 18
+        assert len(record.completions) == 4
 
     def test_completed_rows_survive_across_attempts(self):
         """The point of the exercise: work already done is not thrown away.

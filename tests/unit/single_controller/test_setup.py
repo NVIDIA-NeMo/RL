@@ -2376,7 +2376,11 @@ class TestNativeTQRecoverySetup:
         checkpointer.get_resume_paths.return_value = (None, None)
         resolved_snapshot = SimpleNamespace(
             path=snapshot_path,
-            manifest=SimpleNamespace(current_epoch=2, sampler_dispatch_index=7),
+            manifest=SimpleNamespace(
+                current_epoch=2,
+                sampler_dispatch_index=7,
+                next_nemo_gym_task_index=None,
+            ),
         )
 
         mc = _make_master_config(colocated=False, backend="vllm")
