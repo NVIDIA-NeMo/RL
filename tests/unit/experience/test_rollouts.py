@@ -2713,6 +2713,14 @@ def test_run_async_nemo_gym_rollout(
             "example_multi_step_simple_agent/accuracy/median": 0.0,
             "example_multi_step_simple_agent/accuracy/min": 0.0,
             "example_multi_step_simple_agent/accuracy/stddev": 0.0,
+            # Gym declares mask_sample on every verify response (Gym #2611), so it
+            # surfaces through the per-agent metric pass like any other scalar field.
+            "example_multi_step_simple_agent/mask_sample/histogram": None,
+            "example_multi_step_simple_agent/mask_sample/max": 0.0,
+            "example_multi_step_simple_agent/mask_sample/mean": 0.0,
+            "example_multi_step_simple_agent/mask_sample/median": 0.0,
+            "example_multi_step_simple_agent/mask_sample/min": 0.0,
+            "example_multi_step_simple_agent/mask_sample/stddev": 0.0,
             "example_multi_step_simple_agent/order_instruction_following_failure/histogram": None,
             "example_multi_step_simple_agent/order_instruction_following_failure/max": 0.0,
             "example_multi_step_simple_agent/order_instruction_following_failure/mean": 0.0,
