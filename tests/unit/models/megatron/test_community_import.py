@@ -148,10 +148,8 @@ def test_prefer_nvrx_uses_async_save_and_restores_original_save(monkeypatch):
         def save(self, sharded_state_dict, checkpoint_dir):
             self.original_save_calls.append((sharded_state_dict, checkpoint_dir))
 
-        def async_save(self, sharded_state_dict, checkpoint_dir, async_strategy):
-            self.async_save_calls.append(
-                (sharded_state_dict, checkpoint_dir, async_strategy)
-            )
+        def async_save(self, sharded_state_dict, checkpoint_dir):
+            self.async_save_calls.append((sharded_state_dict, checkpoint_dir))
             return FakeAsyncRequest(self)
 
     _install_torch_strategy_module(monkeypatch, FakeStrategy)
@@ -162,7 +160,7 @@ def test_prefer_nvrx_uses_async_save_and_restores_original_save(monkeypatch):
         strategy.save({"x": 1}, "/tmp/ckpt")
         assert FakeStrategy.save is not original_save
 
-    assert strategy.async_save_calls == [({"x": 1}, "/tmp/ckpt", "nvrx")]
+    assert strategy.async_save_calls == [({"x": 1}, "/tmp/ckpt")]
     assert strategy.execute_sync_calls == 1
     assert strategy.original_save_calls == []
     assert FakeStrategy.save is original_save
@@ -179,10 +177,8 @@ def test_prefer_nvrx_falls_back_to_original_save_when_nvrx_missing(monkeypatch):
         def save(self, sharded_state_dict, checkpoint_dir):
             self.original_save_calls.append((sharded_state_dict, checkpoint_dir))
 
-        def async_save(self, sharded_state_dict, checkpoint_dir, async_strategy):
-            self.async_save_calls.append(
-                (sharded_state_dict, checkpoint_dir, async_strategy)
-            )
+        def async_save(self, sharded_state_dict, checkpoint_dir):
+            self.async_save_calls.append((sharded_state_dict, checkpoint_dir))
             raise ModuleNotFoundError("nvrx is unavailable")
 
     _install_torch_strategy_module(monkeypatch, FakeStrategy)
@@ -191,7 +187,7 @@ def test_prefer_nvrx_falls_back_to_original_save_when_nvrx_missing(monkeypatch):
     with module._prefer_nvrx_for_dist_ckpt_save():
         strategy.save({"y": 2}, "/tmp/ckpt")
 
-    assert strategy.async_save_calls == [({"y": 2}, "/tmp/ckpt", "nvrx")]
+    assert strategy.async_save_calls == [({"y": 2}, "/tmp/ckpt")]
     assert strategy.original_save_calls == [({"y": 2}, "/tmp/ckpt")]
 
 
