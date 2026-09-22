@@ -1,6 +1,6 @@
 # Environments for GRPO Training
 
-GRPO includes multiple environments, each offering a standard interface for reward computation and evaluation.
+NeMo RL includes built-in Math, Code, Code Jaccard, and Reward Model environments, along with an interface for registering custom environments directly in NeMo RL. They share a standard interface for reward computation and evaluation and are designed for teams running single-turn or lightweight-evaluation GRPO training. For custom environments at scale, multi-turn agentic workflows, or more complex evaluation, see [Scaling to Custom and Multi-Turn Environments with NeMo Gym](#scaling-to-custom-and-multi-turn-environments-with-nemo-gym).
 
 ## Math Environment
 
@@ -266,3 +266,23 @@ env:
 data:
   env_name: code_gen  # Use your registered environment name
 ```
+
+## Scaling to Custom and Multi-Turn Environments with NeMo Gym
+
+[NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) is a library for evaluating and improving models and agents using environments. It provides infrastructure for developing environments and running evaluation and training at scale, as well as a collection of built-in benchmarks and training environments. In NeMo Gym, an environment is the complete system an agent interacts with: a dataset of tasks, an agent harness that defines how the model interacts with the world, a verifier that scores task completion, and state that holds per-task execution context.
+
+NeMo RL's built-in environments and `register_env` interface are a good starting point for single-turn tasks and lightweight evaluation. Consider moving to NeMo Gym when:
+
+- You need custom environments with external tool calling, sandboxes, or stateful multi-step execution beyond what `register_env` conveniently supports at scale.
+- You need multi-turn agentic workflows in which agents orchestrate complex interactions with tools.
+- You need complex or reproducible evaluation, such as shared environments and verifiers across teams, thousands of concurrent environments, or stateful evaluation of agents.
+- You want to use the same environment definitions across evaluation, agent optimization, and training.
+
+NeMo Gym integrates with NeMo RL's rollout and training loop. Follow the [NeMo RL GRPO training tutorial](https://docs.nvidia.com/nemo/gym/tutorials/training-tutorials/nemo-rl-grpo/) for the current instructions for running GRPO training in NeMo RL with NeMo Gym environments.
+
+To learn more, see:
+
+- [NeMo Gym documentation](https://docs.nvidia.com/nemo/gym/main/about/)
+- [NeMo Gym Getting Started guide](https://docs.nvidia.com/nemo/gym/main/get-started)
+- [NeMo Gym on GitHub](https://github.com/NVIDIA-NeMo/Gym)
+- [NeMo Gym on PyPI](https://pypi.org/project/nemo-gym/)
