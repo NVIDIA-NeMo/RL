@@ -156,9 +156,7 @@ def _prefer_nvrx_for_dist_ckpt_save():
 
     def _save_with_nvrx_fallback(self, sharded_state_dict, checkpoint_dir):
         try:
-            async_request = self.async_save(
-                sharded_state_dict, checkpoint_dir, async_strategy="nvrx"
-            )
+            async_request = self.async_save(sharded_state_dict, checkpoint_dir)
             async_request.execute_sync()
             del async_request
         except (ImportError, ModuleNotFoundError):
