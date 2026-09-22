@@ -1215,9 +1215,7 @@ class RayVirtualCluster:
             return identity
 
         topology = get_ray_cluster_topology()
-        if not any(
-            domain != NVLINK_DOMAIN_UNKNOWN for domain, _ in topology.values()
-        ):
+        if not any(domain != NVLINK_DOMAIN_UNKNOWN for domain, _ in topology.values()):
             return identity
 
         node_of_pg: list[str] = []
