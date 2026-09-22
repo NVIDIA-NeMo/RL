@@ -140,7 +140,10 @@ def _as_routed_experts_tensor(
     global G_ROUTED_EXPERTS_RANGE_CHECKED
     tensor = torch.as_tensor(value, device=device)
     if not G_ROUTED_EXPERTS_RANGE_CHECKED and tensor.numel() > 0:
-        max_id = int(tensor.max())
+        # Reduce in int64: torch has no max() kernel for the unsigned carry
+        # dtypes (uint16/uint32) that models with more than 255 experts use, so
+        # ``tensor.max()`` raises NotImplementedError("max_all" ...) on them.
+        max_id = int(tensor.to(torch.int64).max())
         limit = torch.iinfo(dtype).max
         if max_id > limit:
             raise ValueError(
@@ -307,11 +310,13 @@ def pad_and_align_routed_expert_indices(
             "Router replay allows at most one surplus final-token route."
         )
 
+    # Build in int64 and narrow afterwards: torch has no arange kernel for the
+    # unsigned carry dtypes (uint16/uint32) used when a model has > 255 experts.
     default_route = torch.arange(
         routed.shape[2],
-        dtype=routed_experts_dtype,
+        dtype=torch.int64,
         device=device,
-    )
+    ).to(dtype=routed_experts_dtype)
     full = (
         default_route.view(1, 1, -1)
         .expand(padded_length, routed.shape[1], routed.shape[2])

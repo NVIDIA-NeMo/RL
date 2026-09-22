@@ -296,6 +296,34 @@ def test_normalize_routed_experts_full_sequence_alignment():
     assert torch.equal(routed_experts[5:], expected_default_route.expand(3, 3, 2))
 
 
+def test_normalize_routed_experts_uint16_ids_pass_the_range_check(monkeypatch):
+    """Models with more than 255 experts return uint16 expert ids; torch has no
+    max() kernel for uint16, so the range check must reduce in a wider dtype."""
+
+    class Output:
+        pass
+
+    monkeypatch.setattr(vllm_utils, "G_ROUTED_EXPERTS_RANGE_CHECKED", False)
+    request_output = Output()
+    completion_output = Output()
+    completion_output.routed_experts = torch.tensor(
+        [[[0, 511], [300, 256]], [[511, 1], [2, 3]]], dtype=torch.uint16
+    )
+
+    routed_experts = pad_and_align_routed_expert_indices(
+        request_output,
+        completion_output,
+        valid_length=2,
+        padded_length=3,
+        device=torch.device("cpu"),
+        routed_experts_dtype=torch.uint16,
+    )
+
+    assert routed_experts.dtype == torch.uint16
+    assert routed_experts.shape == (3, 2, 2)
+    assert routed_experts[:2].to(torch.int64).max().item() == 511
+
+
 def test_normalize_routed_experts_concatenates_prompt_and_decode():
     class Output:
         pass
