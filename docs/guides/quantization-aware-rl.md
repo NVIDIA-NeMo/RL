@@ -1,6 +1,6 @@
 # Quantization-Aware RL (QARL)
 
-Quantization-Aware RL (QARL) integrates [NVIDIA Model Optimizer (ModelOpt)](https://github.com/NVIDIA/Model-Optimizer) into the NeMo RL training loop, enabling quantization-aware training and generation for both GRPO and on-policy distillation workflows. QARL automatically quantizes a standard model at initialization, maintains quantizer state (amax values) throughout training, and transfers quantized state to vLLM during weight refit. By default, vLLM generation uses fake-quantized modules. For NVFP4 W4A4 and W4A16 rollout experiments, NeMo RL can instead stream packed real-quant ModelOpt NVFP4 weights and scales into vLLM.
+Quantization-Aware RL (QARL) integrates [NVIDIA Model Optimizer (ModelOpt)](https://github.com/NVIDIA/Model-Optimizer) into the NeMo RL training loop, enabling quantization-aware training and generation for both GRPO and on-policy distillation workflows. QARL automatically quantizes a standard model at initialization, maintains quantizer state (amax values) throughout training, and transfers quantized state to vLLM during weight refit.
 
 ## Overview
 
@@ -15,7 +15,7 @@ See [Verified Configurations](#verified-configurations) for the workflow + recip
 
 ## Verified Configurations
 
-The following workflow + quantization recipe combinations have been validated end-to-end (Megatron training + NVFP4-quantized vLLM generation + held-out validation):
+The following workflow + quantization recipe combinations have been validated end to end. Rows marked as smoke tests validate training and refit execution but do not make a convergence claim.
 
 | Workflow | Quantization | Recipe | Status | Example Config |
 |---|---|---|---|---|

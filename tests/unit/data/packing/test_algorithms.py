@@ -25,6 +25,13 @@ from nemo_rl.data.packing.algorithms import (
     get_packer,
 )
 
+ALL_ALGORITHMS = list(PackingAlgorithm)
+DETERMINISTIC_ALGORITHMS = [
+    algorithm
+    for algorithm in ALL_ALGORITHMS
+    if algorithm is not PackingAlgorithm.FIRST_FIT_SHUFFLE
+]
+
 
 def validate_solution(
     sequence_lengths: List[int], bins: List[List[int]], bin_capacity: int
@@ -92,16 +99,10 @@ class TestSequencePacker:
             "mixed_sizes": [10, 50, 100, 20, 80, 30, 70, 40, 60, 90],
         }
 
-    # TODO(ahmadki): use the function to specify all test algorithms ins tead of lists below
     @pytest.fixture
     def algorithms(self) -> List[PackingAlgorithm]:
         """Fixture for packing algorithms."""
-        return [
-            PackingAlgorithm.CONCATENATIVE,
-            PackingAlgorithm.FIRST_FIT_DECREASING,
-            PackingAlgorithm.FIRST_FIT_SHUFFLE,
-            PackingAlgorithm.MODIFIED_FIRST_FIT_DECREASING,
-        ]
+        return ALL_ALGORITHMS
 
     def test_get_packer(self, bin_capacity: int, algorithms: List[PackingAlgorithm]):
         """Test the get_packer factory function."""
@@ -116,15 +117,7 @@ class TestSequencePacker:
             invalid_algorithm = object()
             get_packer(invalid_algorithm, bin_capacity)  # type: ignore
 
-    @pytest.mark.parametrize(
-        "algorithm",
-        [
-            PackingAlgorithm.CONCATENATIVE,
-            PackingAlgorithm.FIRST_FIT_DECREASING,
-            PackingAlgorithm.FIRST_FIT_SHUFFLE,
-            PackingAlgorithm.MODIFIED_FIRST_FIT_DECREASING,
-        ],
-    )
+    @pytest.mark.parametrize("algorithm", ALL_ALGORITHMS)
     def test_small_sequences(
         self,
         bin_capacity: int,
@@ -141,15 +134,7 @@ class TestSequencePacker:
         # Print the number of bins used (for information)
         print(f"{algorithm.name} used {len(bins)} bins for small sequences")
 
-    @pytest.mark.parametrize(
-        "algorithm",
-        [
-            PackingAlgorithm.CONCATENATIVE,
-            PackingAlgorithm.FIRST_FIT_DECREASING,
-            PackingAlgorithm.FIRST_FIT_SHUFFLE,
-            PackingAlgorithm.MODIFIED_FIRST_FIT_DECREASING,
-        ],
-    )
+    @pytest.mark.parametrize("algorithm", ALL_ALGORITHMS)
     def test_medium_sequences(
         self,
         bin_capacity: int,
@@ -166,15 +151,7 @@ class TestSequencePacker:
         # Print the number of bins used (for information)
         print(f"{algorithm.name} used {len(bins)} bins for medium sequences")
 
-    @pytest.mark.parametrize(
-        "algorithm",
-        [
-            PackingAlgorithm.CONCATENATIVE,
-            PackingAlgorithm.FIRST_FIT_DECREASING,
-            PackingAlgorithm.FIRST_FIT_SHUFFLE,
-            PackingAlgorithm.MODIFIED_FIRST_FIT_DECREASING,
-        ],
-    )
+    @pytest.mark.parametrize("algorithm", ALL_ALGORITHMS)
     def test_large_sequences(
         self,
         bin_capacity: int,
@@ -191,16 +168,7 @@ class TestSequencePacker:
         # Print the number of bins used (for information)
         print(f"{algorithm.name} used {len(bins)} bins for large sequences")
 
-    @pytest.mark.parametrize(
-        "algorithm",
-        [
-            PackingAlgorithm.CONCATENATIVE,
-            PackingAlgorithm.FIRST_FIT_DECREASING,
-            PackingAlgorithm.FIRST_FIT_SHUFFLE,
-            PackingAlgorithm.MODIFIED_FIRST_FIT_DECREASING,
-        ],
-    )
-    # TODO(ahmadki): use the function to specify all test algorithms instead of lists below
+    @pytest.mark.parametrize("algorithm", ALL_ALGORITHMS)
     @pytest.mark.parametrize(
         "case_name, sequence_lengths",
         [
@@ -228,15 +196,7 @@ class TestSequencePacker:
         if case_name == "single_item":
             assert len(bins) == 1
 
-    @pytest.mark.parametrize(
-        "algorithm",
-        [
-            PackingAlgorithm.CONCATENATIVE,
-            PackingAlgorithm.FIRST_FIT_DECREASING,
-            PackingAlgorithm.FIRST_FIT_SHUFFLE,
-            PackingAlgorithm.MODIFIED_FIRST_FIT_DECREASING,
-        ],
-    )
+    @pytest.mark.parametrize("algorithm", ALL_ALGORITHMS)
     def test_empty_list(self, bin_capacity: int, algorithm: PackingAlgorithm):
         """Test empty list with algorithms that can handle it."""
         packer = get_packer(algorithm, bin_capacity)
@@ -245,15 +205,7 @@ class TestSequencePacker:
         # For empty list, check that no bins are created
         assert len(bins) == 0
 
-    @pytest.mark.parametrize(
-        "algorithm",
-        [
-            PackingAlgorithm.CONCATENATIVE,
-            PackingAlgorithm.FIRST_FIT_DECREASING,
-            PackingAlgorithm.FIRST_FIT_SHUFFLE,
-            PackingAlgorithm.MODIFIED_FIRST_FIT_DECREASING,
-        ],
-    )
+    @pytest.mark.parametrize("algorithm", ALL_ALGORITHMS)
     def test_error_cases(self, bin_capacity: int, algorithm: PackingAlgorithm):
         """Test error cases with all algorithms."""
         # Test with a sequence length that exceeds bin capacity
@@ -263,14 +215,7 @@ class TestSequencePacker:
         with pytest.raises(ValueError):
             packer.pack(sequence_lengths)
 
-    @pytest.mark.parametrize(
-        "algorithm",
-        [
-            PackingAlgorithm.CONCATENATIVE,
-            PackingAlgorithm.FIRST_FIT_DECREASING,
-            PackingAlgorithm.MODIFIED_FIRST_FIT_DECREASING,
-        ],
-    )
+    @pytest.mark.parametrize("algorithm", DETERMINISTIC_ALGORITHMS)
     def test_deterministic(
         self,
         bin_capacity: int,
@@ -325,15 +270,7 @@ class TestSequencePacker:
                 f"Warning: {algorithm.name} produced the same result with different seeds"
             )
 
-    @pytest.mark.parametrize(
-        "algorithm",
-        [
-            PackingAlgorithm.CONCATENATIVE,
-            PackingAlgorithm.FIRST_FIT_DECREASING,
-            PackingAlgorithm.FIRST_FIT_SHUFFLE,
-            PackingAlgorithm.MODIFIED_FIRST_FIT_DECREASING,
-        ],
-    )
+    @pytest.mark.parametrize("algorithm", ALL_ALGORITHMS)
     def test_min_bin_count(
         self,
         bin_capacity: int,
@@ -366,15 +303,7 @@ class TestSequencePacker:
             for bin_contents in bins_more:
                 assert len(bin_contents) > 0, "Found empty bin"
 
-    @pytest.mark.parametrize(
-        "algorithm",
-        [
-            PackingAlgorithm.CONCATENATIVE,
-            PackingAlgorithm.FIRST_FIT_DECREASING,
-            PackingAlgorithm.FIRST_FIT_SHUFFLE,
-            PackingAlgorithm.MODIFIED_FIRST_FIT_DECREASING,
-        ],
-    )
+    @pytest.mark.parametrize("algorithm", ALL_ALGORITHMS)
     def test_bin_count_multiple(
         self,
         bin_capacity: int,
@@ -418,14 +347,7 @@ class TestSequencePacker:
             for bin_contents in bins_force:
                 assert len(bin_contents) > 0, "Found empty bin"
 
-    @pytest.mark.parametrize(
-        "algorithm",
-        [
-            PackingAlgorithm.CONCATENATIVE,
-            PackingAlgorithm.FIRST_FIT_DECREASING,
-            PackingAlgorithm.MODIFIED_FIRST_FIT_DECREASING,
-        ],
-    )
+    @pytest.mark.parametrize("algorithm", DETERMINISTIC_ALGORITHMS)
     def test_combined_constraints(
         self,
         bin_capacity: int,
@@ -503,14 +425,7 @@ class TestSequencePacker:
         ):
             packer.pack(sequence_lengths)
 
-    @pytest.mark.parametrize(
-        "algorithm",
-        [
-            PackingAlgorithm.CONCATENATIVE,
-            PackingAlgorithm.FIRST_FIT_DECREASING,
-            PackingAlgorithm.MODIFIED_FIRST_FIT_DECREASING,
-        ],
-    )
+    @pytest.mark.parametrize("algorithm", DETERMINISTIC_ALGORITHMS)
     def test_packing_preservation(
         self,
         bin_capacity: int,
