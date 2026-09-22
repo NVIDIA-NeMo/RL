@@ -610,6 +610,26 @@ class TestDTensorParamsGenerator:
         assert results["e_score_correction_bias"].dtype == torch.float32
         assert results["ordinary_buffer"].dtype == torch.bfloat16
 
+    def test_preserves_fp32_router_correction_bias_after_adapter_rename(self):
+        """Adapter key renames must not hide FP32 router-state semantics."""
+
+        class RouterAdapter:
+            def convert_single_tensor_to_hf(self, fqn, tensor, **_kwargs):
+                assert fqn == "e_score_correction_bias"
+                return [("model.layers.0.mlp.gate.bias", tensor)]
+
+        class RouterModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer(
+                    "e_score_correction_bias", torch.arange(4, dtype=torch.float32)
+                )
+                self.state_dict_adapter = RouterAdapter()
+
+        results = dict(dtensor_params_generator(RouterModel(), torch.bfloat16))
+
+        assert results["model.layers.0.mlp.gate.bias"].dtype == torch.float32
+
     def test_contiguous_output(self):
         """Test that output tensors are contiguous."""
         # Arrange

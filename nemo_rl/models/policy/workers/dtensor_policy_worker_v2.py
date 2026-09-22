@@ -124,7 +124,11 @@ def dtensor_params_generator(
 
         adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
         for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-            refit_dtype = _refit_tensor_dtype(adapted_fqn, adapted_tensor, target_dtype)
+            # Select the refit dtype from the native name. State-dict adapters
+            # may rename inference-critical FP32 state (for example Inkling's
+            # ``e_score_correction_bias`` becomes the raw checkpoint key
+            # ``gate.bias``), which would otherwise hide its dtype semantics.
+            refit_dtype = _refit_tensor_dtype(name, adapted_tensor, target_dtype)
             yield (
                 adapted_fqn,
                 adapted_tensor.to(refit_dtype, non_blocking=True).contiguous(),
