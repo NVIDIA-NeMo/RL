@@ -53,7 +53,7 @@ _WINDOW = 32
 # keys off the same line.
 _UPSTREAM_FIX_MARKER = "self._dist_init_store = store"
 _UPSTREAM_FIXED_SOURCE = """\
-class RayWorkerV2(WorkerProc):
+class RayWorkerProc(WorkerProc):
     def create_dist_init_method(self) -> str:
         host = ray.util.get_node_ip_address()
         store = TCPStore(

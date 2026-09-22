@@ -30,10 +30,14 @@ torch 2.13 bumped the version byte from 2 to 3 without changing the ``'c'``
 payload, so when the training venv runs torch 2.13 and an inference venv runs
 torch 2.11 (sglang / TRT-LLM, whose kernels are built against 2.11) every
 colocated refit dies at the first handle. Rewriting the version byte of
-``'c'`` handles to the legacy value makes them readable by both versions; the
-expandable-segment format did change, so ``'e'`` handles are left alone and
-fail loudly as before.
+``'c'`` handles to the legacy value makes them readable by both versions. The
+expandable-segment format did change, so ``'e'`` handles -- what the trainer
+emits under ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` -- are left
+alone; they still open on a same-torch consumer (vLLM) and trip torch's
+version check on a torch 2.11 one (sglang / TRT-LLM).
 """
+
+from typing import Any
 
 CUDA_IPC_MEM_HANDLE_SIZE = 64
 """``sizeof(cudaIpcMemHandle_t)``; a raw handle of exactly this size predates versioning."""
@@ -45,7 +49,7 @@ LEGACY_SHAREABLE_HANDLE_VERSION = 2
 """The version byte torch <= 2.12 writes. torch 2.13 writes 3 with an identical ``'c'`` payload."""
 
 
-def normalize_cuda_ipc_handle(handle):
+def normalize_cuda_ipc_handle(handle: Any) -> Any:
     """Rewrite a newer ``'c'``-type storage handle so older torch can open it.
 
     Args:

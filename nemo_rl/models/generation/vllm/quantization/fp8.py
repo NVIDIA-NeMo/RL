@@ -1114,8 +1114,9 @@ def process_weights_after_loading_moe(self, layer) -> None:
     replace_parameter() to avoid creating new torch.nn.Parameter objects, because that removes
     the weight_loader attribute which we need for refit.
 
-    Updated for vLLM 0.25 which passes a RoutedExperts module as `layer` and
-    sets up the MoE kernel via make_fp8_moe_kernel(routing_tables=..., layer=...).
+    Updated for vLLM >= 0.25, which passes a RoutedExperts module as `layer` and
+    sets up the MoE kernel via make_fp8_moe_kernel(routing_tables=...); 0.29
+    dropped the kernel factory's `layer=` kwarg.
     """
     from vllm.model_executor.layers.quantization.fp8 import (
         convert_to_fp8_moe_kernel_format,

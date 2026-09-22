@@ -448,10 +448,10 @@ override-dependencies = [
   "fastapi[standard]>=0.133.0,<0.137.0",
   "nvidia-modelopt[torch]>=0.44.0a0",
   # vLLM 0.29 lists instanttensor (the optional `load_format="instanttensor"`
-  # safetensors loader) as an unconditional dependency, but it only publishes
-  # x86_64 wheels and its sdist compiles libaio/liburing/boost. vLLM imports it
-  # lazily and NeMo-RL never selects that load format, so keep the wheel on
-  # x86_64 and skip it on aarch64 (GB200) instead of building it from source.
+  # safetensors loader) as an unconditional dependency. NeMo-RL never selects
+  # that load format and vLLM imports it lazily, so it is kept on x86_64 only;
+  # on aarch64 (GB200) the dependency is dropped rather than installed. 0.2.0
+  # ships aarch64 wheels, so this is a choice, not a wheel-availability limit.
   "instanttensor>=0.1.9; platform_machine == 'x86_64'",
   "llguidance>=1.7.0,<1.8.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2

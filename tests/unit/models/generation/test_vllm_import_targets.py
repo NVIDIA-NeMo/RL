@@ -31,9 +31,17 @@ import pytest
 pytestmark = pytest.mark.vllm
 
 # tests/unit/models/generation/<this file> -> parents[4] is the repo root.
-_GENERATION_DIR = Path(__file__).resolve().parents[4] / "nemo_rl/models/generation/vllm"
-_SOURCES = sorted(_GENERATION_DIR.rglob("*.py"))
-assert _SOURCES, f"no sources found under {_GENERATION_DIR}"
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+# All three trees import vLLM lazily inside GPU-only methods: the vLLM
+# generation workers, the Dynamo generation worker, and the ModelOpt fakequant /
+# real-quant refit backends.
+_GENERATION_DIRS = (
+    _REPO_ROOT / "nemo_rl/models/generation/vllm",
+    _REPO_ROOT / "nemo_rl/models/generation/dynamo",
+    _REPO_ROOT / "nemo_rl/modelopt/models/generation",
+)
+_SOURCES = sorted(p for d in _GENERATION_DIRS for p in d.rglob("*.py"))
+assert _SOURCES, f"no sources found under {_GENERATION_DIRS}"
 
 
 _IMPORT_GUARDS = {"ImportError", "ModuleNotFoundError", "Exception"}
@@ -90,7 +98,7 @@ def _vllm_import_froms(path: Path) -> list[tuple[int, str, list[str]]]:
 
 
 @pytest.mark.parametrize(
-    "source", _SOURCES, ids=[str(p.relative_to(_GENERATION_DIR)) for p in _SOURCES]
+    "source", _SOURCES, ids=[str(p.relative_to(_REPO_ROOT)) for p in _SOURCES]
 )
 def test_vllm_import_targets_resolve(source: Path):
     failures = []

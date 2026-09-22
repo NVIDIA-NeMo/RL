@@ -312,7 +312,7 @@ def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
         )
         return
 
-    # vLLM >= 0.29: RayWorkerV2.create_dist_init_method binds and keeps the
+    # vLLM >= 0.29: RayWorkerProc.create_dist_init_method binds and keeps the
     # TCPStore before publishing its port (vllm-project/vllm#50969).
     upstream_fix_marker = "self._dist_init_store = store"
     marker = "start_port=envs.VLLM_PORT + 32"

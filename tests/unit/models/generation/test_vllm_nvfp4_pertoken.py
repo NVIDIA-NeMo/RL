@@ -891,3 +891,112 @@ def test_per_token_method_uses_host_captured_experts(nvfp4_module):
     assert wrapped.is_monolithic()
     assert "TrtLlmNvFp4ExpertsMonolithic" in wrapped.__name__
     assert wrapped.supports_routing_replay_capture(object.__new__(wrapped)) is False
+
+
+def test_per_token_method_rebuilds_kernel_through_the_installed_vllm_signature(
+    nvfp4_module, monkeypatch
+):
+    """The per-refit kernel rebuild must call vLLM's factory as vLLM 0.29 defines it.
+
+    0.29 dropped the ``layer`` kwarg (the te_nvfp4_pertoken recipe died with
+    ``TypeError: unexpected keyword argument 'layer'``) and binds routed-experts
+    capture to the experts object, so the rebuilt kernel has to use the
+    host-captured experts class. Binding the recorded kwargs to the installed
+    factory's signature turns the next upstream signature change into a unit
+    failure instead of a GPU-job failure.
+    """
+    import inspect
+
+    M = nvfp4_module
+    from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
+        TrtLlmNvFp4ExpertsMonolithic,
+    )
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+        NvFp4MoeBackend,
+        make_nvfp4_moe_kernel,
+    )
+
+    # vLLM's ModelOptNvFp4FusedMoE.__init__ probes the GPU for a backend; stand in
+    # for it with the attributes the per-token subclass reads.
+    def fake_parent_init(self, quant_config, moe_config):
+        self.moe = moe_config
+        self.use_a16 = False
+        self.nvfp4_backend = NvFp4MoeBackend.FLASHINFER_TRTLLM
+        self.experts_cls = TrtLlmNvFp4ExpertsMonolithic
+
+    monkeypatch.setattr(M.ModelOptNvFp4FusedMoE, "__init__", fake_parent_init)
+    method = M.ModelOptNvFp4PerTokenFusedMoE(
+        quant_config=None, moe_config=types.SimpleNamespace(is_act_and_mul=True)
+    )
+    # __init__ swaps in the wrapper that reports no in-kernel capture.
+    assert issubclass(method.experts_cls, TrtLlmNvFp4ExpertsMonolithic)
+    assert method.experts_cls is not TrtLlmNvFp4ExpertsMonolithic
+    assert (
+        method.experts_cls.supports_routing_replay_capture(
+            object.__new__(method.experts_cls)
+        )
+        is False
+    )
+
+    signature = inspect.signature(make_nvfp4_moe_kernel)
+    calls = []
+
+    def recording_make_kernel(**kwargs):
+        signature.bind(**kwargs)  # TypeError on any kwarg the installed vLLM lacks
+        calls.append(kwargs)
+        return types.SimpleNamespace(
+            fused_experts=types.SimpleNamespace(
+                process_weights_after_loading=lambda layer: None
+            )
+        )
+
+    monkeypatch.setattr(M, "make_nvfp4_moe_kernel", recording_make_kernel)
+    monkeypatch.setattr(
+        M,
+        "convert_to_nvfp4_moe_kernel_format",
+        lambda **kw: tuple(
+            kw[k]
+            for k in (
+                "w13",
+                "w13_scale",
+                "w13_scale_2",
+                "a13_scale",
+                "w2",
+                "w2_scale",
+                "w2_scale_2",
+                "a2_scale",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        M.ModelOptNvFp4PerTokenFusedMoE,
+        "get_fused_moe_quant_config",
+        lambda self, layer: "quant-config",
+    )
+
+    layer = torch.nn.Module()
+    num_experts = 2
+    for name, shape in {
+        "w13_weight": (num_experts, 8, 4),
+        "w13_weight_scale": (num_experts, 8, 1),
+        "w13_weight_scale_2": (num_experts, 2),
+        "w13_input_scale": (num_experts,),
+        "w2_weight": (num_experts, 4, 4),
+        "w2_weight_scale": (num_experts, 4, 1),
+        "w2_weight_scale_2": (num_experts,),
+        "w2_input_scale": (num_experts,),
+    }.items():
+        layer.register_parameter(
+            name, torch.nn.Parameter(torch.zeros(shape), requires_grad=False)
+        )
+    layer._expert_routing_tables = lambda: ("routing-tables",)
+
+    method.process_weights_after_loading(layer)
+
+    assert len(calls) == 1
+    kwargs = calls[0]
+    assert kwargs["experts_cls"] is method.experts_cls
+    assert kwargs["per_token_activation"] is True
+    assert kwargs["backend"] is NvFp4MoeBackend.FLASHINFER_TRTLLM
+    assert kwargs["routing_tables"] == ("routing-tables",)
+    assert kwargs["moe_quant_config"] == "quant-config"

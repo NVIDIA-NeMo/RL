@@ -226,7 +226,7 @@ The synchronous and asynchronous overlays are:
 
 They require the corresponding Nemotron Omni support in Megatron Bridge and
 video request/token propagation in NeMo Gym. Policy preprocessing numerically
-matches unmodified stock vLLM 0.25.1; a custom vLLM fork is not required.
+matches unmodified stock vLLM 0.29.0; a custom vLLM fork is not required.
 
 Both overlays use a large positive `grpo.max_num_steps` value so it does not
 bind normal training. Training still follows the existing GRPO step-limit

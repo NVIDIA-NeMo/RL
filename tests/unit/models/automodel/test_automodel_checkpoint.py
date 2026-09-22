@@ -1259,6 +1259,7 @@ def _manager_with_stub_config(monkeypatch):
     return manager, built
 
 
+@pytest.mark.automodel
 def test_init_checkpointer_opts_async_daemons_into_the_prefix_store(monkeypatch):
     """With the training store's address known, the DCP daemons must reuse it.
 
@@ -1268,7 +1269,11 @@ def test_init_checkpointer_opts_async_daemons_into_the_prefix_store(monkeypatch)
     """
     monkeypatch.setenv("MASTER_ADDR", "10.0.0.1")
     monkeypatch.setenv("MASTER_PORT", "1401")
-    monkeypatch.delenv("DCP_USE_PREFIX_STORE", raising=False)
+    # setenv before delenv so monkeypatch records the variable's absence and
+    # removes the "1" init_checkpointer writes at teardown; delenv alone on an
+    # absent name records nothing and the value leaks into every later test.
+    monkeypatch.setenv("DCP_USE_PREFIX_STORE", "")
+    monkeypatch.delenv("DCP_USE_PREFIX_STORE")
     manager, _ = _manager_with_stub_config(monkeypatch)
 
     manager.init_checkpointer(config_updates={"is_async": True})
@@ -1276,6 +1281,7 @@ def test_init_checkpointer_opts_async_daemons_into_the_prefix_store(monkeypatch)
     assert os.environ["DCP_USE_PREFIX_STORE"] == "1"
 
 
+@pytest.mark.automodel
 def test_init_checkpointer_leaves_prefix_store_alone_without_master_env(monkeypatch):
     monkeypatch.delenv("MASTER_ADDR", raising=False)
     monkeypatch.delenv("MASTER_PORT", raising=False)
@@ -1289,6 +1295,7 @@ def test_init_checkpointer_leaves_prefix_store_alone_without_master_env(monkeypa
     assert "DCP_USE_PREFIX_STORE" not in os.environ
 
 
+@pytest.mark.automodel
 def test_init_checkpointer_respects_an_explicit_prefix_store_choice(monkeypatch):
     monkeypatch.setenv("MASTER_ADDR", "10.0.0.1")
     monkeypatch.setenv("MASTER_PORT", "1401")

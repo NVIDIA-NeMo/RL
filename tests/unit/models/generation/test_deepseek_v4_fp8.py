@@ -454,3 +454,16 @@ def test_resume_model_post_load_keeps_a_foreign_instance_override(deepseek_v4_fp
     model.process_weights_after_loading()
 
     assert calls == ["custom"]
+
+
+def test_vllm_layerwise_reload_keeps_two_distinct_skip_sets():
+    """_layerwise_skip_sets falls back to one set when SKIP_LOAD_TENSORS is
+    absent; right for vLLM 0.25, silently wrong for a rename (experts get
+    counted and finalize_refit converts them twice). Pin the 0.29 shape."""
+    from vllm.model_executor.model_loader.reload.meta import (
+        SKIP_LOAD_TENSORS,
+        SKIP_TENSORS,
+    )
+
+    assert SKIP_LOAD_TENSORS is not SKIP_TENSORS
+    assert SKIP_LOAD_TENSORS <= SKIP_TENSORS

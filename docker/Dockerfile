@@ -384,8 +384,8 @@ set +e
 # CI creates a fresh buildx builder for every job, so the cache mount above only
 # lives for the duration of one build: when a later build reuses this layer from
 # the registry cache and re-executes the release stage (any NeMo-RL source
-# change does that), the mount is empty there. The release stage re-seeds it
-# from this mirror instead of failing on TRTLLM_REQUIRE_CACHED_WHEEL.
+# change does that), the mount is empty there. The release stage reads the
+# wheel from this mirror instead of failing on TRTLLM_REQUIRE_CACHED_WHEEL.
 UV_CACHE_DIR=/root/.cache/uv \
     TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
     TRTLLM_WHEEL_CACHE_MIRROR_DIR=/opt/trtllm_wheels \
