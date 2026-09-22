@@ -4440,6 +4440,130 @@ def test_grpo_train_reuses_rollouts_for_policy_updates(
     assert mock_grpo_components["policy"].train.call_count == 2
 
 
+@pytest.mark.parametrize("seq_logprob_error_threshold", [None, 0.1])
+def test_setup_rejects_repeated_force_on_policy_updates(
+    mock_grpo_components, monkeypatch, seq_logprob_error_threshold
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.num_updates_per_rollout = 2
+    master_config.grpo.seq_logprob_error_threshold = seq_logprob_error_threshold
+    master_config.grpo.val_period = 0
+    master_config.grpo.batch_multiplier = 1
+    master_config.loss_fn.force_on_policy_ratio = True
+    master_config.data.update(shuffle=False, num_workers=0)
+    checkpointer = MagicMock()
+    checkpointer.get_latest_checkpoint_path.return_value = None
+    monkeypatch.setattr(grpo_mod, "Logger", MagicMock())
+    monkeypatch.setattr(grpo_mod, "CheckpointManager", lambda _config: checkpointer)
+    monkeypatch.setattr(grpo_mod, "StatefulDataLoader", MagicMock())
+    cluster_factory = MagicMock()
+    monkeypatch.setattr(grpo_mod, "RayVirtualCluster", cluster_factory)
+
+    with pytest.raises(
+        AssertionError,
+        match="force_on_policy_ratio requires grpo.num_updates_per_rollout == 1",
+    ):
+        setup(master_config, MagicMock(), MagicMock(), None)
+
+    cluster_factory.assert_not_called()
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
+@pytest.mark.parametrize("num_updates", [1, 2])
+@pytest.mark.parametrize("worker_elapsed", [False, True])
+def test_grpo_train_accumulates_update_work(
+    mock_grpo_components, train_func, num_updates, worker_elapsed
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.num_updates_per_rollout = num_updates
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.val_period = 0
+    policy = mock_grpo_components["policy"]
+    update_results = []
+    for update_idx in range(num_updates):
+        result = dict(
+            policy.train.return_value,
+            loss=torch.tensor(0.5 / (update_idx + 1)),
+            total_flops=(update_idx + 1) * 1e12,
+            num_ranks=2,
+            theoretical_tflops=100.0,
+        )
+        if worker_elapsed:
+            result["train_elapsed_seconds"] = float(update_idx + 1)
+        update_results.append(result)
+    policy.train.side_effect = update_results
+    policy.train_from_meta.side_effect = update_results
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+
+    with ExitStack() as stack:
+        _enter_stop_test_mocks(
+            stack,
+            train_func,
+            master_config,
+            mock_grpo_components,
+            mock_batch,
+            {"mean_gen_tokens_per_sample": 2.0},
+        )
+        stack.enter_context(_patched_logprob_phase(policy))
+        module = "grpo_sync" if train_func is grpo_train_sync else "grpo"
+        stack.enter_context(
+            patch(
+                f"nemo_rl.algorithms.{module}.Timer.get_timing_metrics",
+                side_effect=lambda **kwargs: {"total_step_time": 8.0},
+            )
+        )
+        performance = stack.enter_context(
+            patch(
+                f"nemo_rl.algorithms.{module}.print_performance_metrics",
+                return_value={},
+            )
+        )
+        train_func(
+            policy,
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    train = policy.train_from_meta if train_func is grpo_train_sync else policy.train
+    assert train.call_count == num_updates
+    assert all(
+        call.args[0] is train.call_args_list[0].args[0] for call in train.call_args_list
+    )
+    timing_logs = [
+        call
+        for call in mock_grpo_components["logger"].log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "timing/train"
+    ]
+    assert len(timing_logs) == 1
+    timing = timing_logs[0].args[0]
+    assert timing["total_step_time"] == 8.0
+    assert timing["time_per_policy_update"] == 8.0 / num_updates
+    assert timing_logs[0].kwargs["step_finished"] is True
+    reported = performance.call_args.args[0]
+    assert reported["total_flops"] == sum(
+        result["total_flops"] for result in update_results
+    )
+    assert reported["num_ranks"] == 2
+    assert reported["theoretical_tflops"] == 100.0
+    assert torch.equal(reported["loss"], update_results[-1]["loss"])
+    if worker_elapsed:
+        assert reported["train_elapsed_seconds"] == sum(
+            result["train_elapsed_seconds"] for result in update_results
+        )
+    else:
+        assert "train_elapsed_seconds" not in reported
+
+
 def test_clip_grpo_advantages_respects_config_bounds():
     """Shared clip helper clamps only when bounds are configured."""
     from nemo_rl.algorithms.grpo import _clip_grpo_advantages

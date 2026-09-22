@@ -69,6 +69,7 @@ from nemo_rl.algorithms.loss import (
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.utils import (
+    aggregate_policy_update_results,
     calculate_baseline_and_std_per_prompt,
     calculate_trivial_reward_distributions,
     get_gdpo_reward_component_keys,
@@ -1043,6 +1044,7 @@ def grpo_train_sync(
                     POLICY_GENERATION_STALE = True
 
                 num_updates_per_rollout = master_config.grpo.num_updates_per_rollout
+                update_results = []
                 with timer.time("policy_training"):
                     for update_idx in range(num_updates_per_rollout):
                         print(
@@ -1058,10 +1060,12 @@ def grpo_train_sync(
                             timer=timer,
                             train_fields=train_fields,
                         )
+                        update_results.append(train_results)
                         print(
                             f"    • Policy loss: {train_results['loss'].mean().item():.4f}",
                             flush=True,
                         )
+                train_results = aggregate_policy_update_results(update_results)
 
                 if sync_kv_scales:
                     with timer.time("recompute_kv_scales"):
@@ -1451,6 +1455,17 @@ def grpo_train_sync(
                 if k != "total_step_time":
                     percent = (v / total_time * 100) if total_time > 0 else 0
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)", flush=True)
+
+            # Amortize the full rollout step across all updates on its batch.
+            # Keep total_step_time unchanged for throughput and wall-time accounting.
+            timing_metrics["time_per_policy_update"] = (
+                total_time / num_updates_per_rollout
+            )
+            print(
+                "  • Time per policy update (amortized): "
+                f"{timing_metrics['time_per_policy_update']:.2f}s",
+                flush=True,
+            )
 
             timing_metrics["valid_tokens_per_sec_per_gpu"] = (
                 metrics["global_valid_toks"] / total_time / total_num_gpus
