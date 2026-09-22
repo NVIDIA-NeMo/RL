@@ -269,7 +269,7 @@ data:
 
 ## Scaling to Custom and Multi-Turn Environments with NeMo Gym
 
-[NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) is a library for evaluating and improving models and agents using environments. It provides infrastructure for developing environments and running evaluation and training at scale, as well as a collection of built-in benchmarks and training environments. In NeMo Gym, an environment is the complete system an agent interacts with: a dataset of tasks, an agent harness that defines how the model interacts with the world, a verifier that scores task completion, and state that holds per-task execution context.
+[NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) is a library for evaluating and improving models and agents using [environments](https://docs.nvidia.com/nemo/gym/about/concepts/environments/). In NeMo Gym, an environment is the complete system an agent interacts with: a dataset of tasks, an agent harness that defines how the model interacts with the world, a verifier that scores task completion, and state that holds per-task execution context.
 
 NeMo RL's built-in environments and `register_env` interface are a good starting point for single-turn tasks and lightweight evaluation. Consider moving to NeMo Gym when:
 
@@ -278,11 +278,4 @@ NeMo RL's built-in environments and `register_env` interface are a good starting
 - You need complex or reproducible evaluation, such as shared environments and verifiers across teams, thousands of concurrent environments, or stateful evaluation of agents.
 - You want to use the same environment definitions across evaluation, agent optimization, and training.
 
-NeMo Gym integrates with NeMo RL's rollout and training loop. Follow the [NeMo RL GRPO training tutorial](https://docs.nvidia.com/nemo/gym/tutorials/training-tutorials/nemo-rl-grpo/) for the current instructions for running GRPO training in NeMo RL with NeMo Gym environments.
-
-To learn more, see:
-
-- [NeMo Gym documentation](https://docs.nvidia.com/nemo/gym/main/about/)
-- [NeMo Gym Getting Started guide](https://docs.nvidia.com/nemo/gym/main/get-started)
-- [NeMo Gym on GitHub](https://github.com/NVIDIA-NeMo/Gym)
-- [NeMo Gym on PyPI](https://pypi.org/project/nemo-gym/)
+NeMo Gym integrates with NeMo RL's rollout and training loop. Follow the [NeMo RL GRPO training tutorial](https://docs.nvidia.com/nemo/gym/tutorials/training-tutorials/nemo-rl-grpo/) for current instructions for running GRPO training in NeMo RL with NeMo Gym environments.
