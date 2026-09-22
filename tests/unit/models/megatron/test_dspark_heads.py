@@ -37,7 +37,9 @@ def _load_heads() -> tuple[type[nn.Module], type[nn.Module]]:
     module_path = (
         Path(__file__).resolve().parents[4] / "nemo_rl/models/megatron/draft/dspark.py"
     )
-    spec = importlib.util.spec_from_file_location("dspark_head_contract", module_path)
+    spec = importlib.util.spec_from_file_location(
+        "nemo_rl.models.megatron.draft.dspark", module_path
+    )
     if spec is None or spec.loader is None:
         pytest.fail("Could not load the DSpark head module", pytrace=False)
     module = importlib.util.module_from_spec(spec)
@@ -670,6 +672,87 @@ def test_markov_head_fails_loudly_on_ambiguous_inputs() -> None:
             previous_token_ids=previous_token_ids,
             slot_valid=slot_valid.to(torch.int64),
         )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"target_vocab_size": 0}, "target_vocab_size must be positive"),
+        ({"draft_vocab_size": 0}, "draft_vocab_size must be positive"),
+        ({"markov_rank": 0}, "markov_rank must be positive"),
+        ({"draft_vocab_start_index": -1}, "draft vocab shard must satisfy"),
+    ],
+)
+def test_markov_head_rejects_invalid_dimensions(
+    overrides: dict[str, int], message: str
+) -> None:
+    config = dict(target_vocab_size=11, draft_vocab_size=7, markov_rank=3)
+    config.update(overrides)
+    with pytest.raises(ValueError, match=message):
+        DSparkMarkovHead(**config)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"hidden_size": 0}, "hidden_size must be positive"),
+        ({"markov_rank": -1}, "markov_rank must be nonnegative"),
+        ({"markov_rank": 0}, "with_markov requires a positive markov_rank"),
+    ],
+)
+def test_confidence_head_rejects_invalid_dimensions(
+    overrides: dict[str, int], message: str
+) -> None:
+    config = dict(hidden_size=4, markov_rank=2)
+    config.update(overrides)
+    with pytest.raises(ValueError, match=message):
+        DSparkConfidenceHead(with_markov=True, **config)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error", "message"),
+    [
+        ("hidden_states", torch.zeros(2, 3), ValueError, "trailing size"),
+        ("hidden_states", torch.zeros(2, 4, dtype=torch.long), TypeError, "floating"),
+        ("slot_valid", torch.ones(3, dtype=torch.bool), ValueError, "leading shape"),
+        ("slot_valid", torch.ones(2), TypeError, "boolean"),
+        (
+            "slot_valid",
+            torch.ones(2, dtype=torch.bool, device="meta"),
+            ValueError,
+            "share a device",
+        ),
+        ("markov_embeddings", None, ValueError, "required"),
+        ("markov_embeddings", torch.zeros(2, 3), ValueError, "trailing size"),
+        (
+            "markov_embeddings",
+            torch.zeros(2, 2, dtype=torch.long),
+            TypeError,
+            "floating",
+        ),
+        (
+            "markov_embeddings",
+            torch.zeros(2, 2, device="meta"),
+            ValueError,
+            "share a device",
+        ),
+    ],
+)
+def test_confidence_head_rejects_invalid_inputs(
+    field: str,
+    value: Tensor | None,
+    error: type[Exception],
+    message: str,
+) -> None:
+    head = DSparkConfidenceHead(hidden_size=4, markov_rank=2, with_markov=True)
+    inputs = {
+        "hidden_states": torch.zeros(2, 4),
+        "slot_valid": torch.ones(2, dtype=torch.bool),
+        "markov_embeddings": torch.zeros(2, 2),
+    }
+    inputs[field] = value
+    with pytest.raises(error, match=message):
+        head(**inputs)
 
 
 def test_confidence_head_matches_public_checkpoint_contract() -> None:
