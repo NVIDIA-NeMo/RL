@@ -16,7 +16,7 @@ import json
 import os
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, fields
 from typing import Any, Callable, Optional, TypeVar, cast
@@ -59,6 +59,7 @@ from nemo_rl.algorithms.reward_functions import (
 from nemo_rl.algorithms.utils import (
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
+    calculate_trivial_reward_distributions,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_efficiency_summary,
@@ -85,7 +86,12 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
+from nemo_rl.environments.nemo_gym import (
+    NemoGymShardSet,
+    build_nemo_gym_actors,
+    should_use_nemo_gym,
+    validate_dataset_agent_coverage,
+)
 from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.interfaces import (
     FRONTIER_ORDINAL_KEY,
@@ -499,6 +505,18 @@ def _needs_hf_refit_handshake(
     return not (nccl_reshard_refit_enabled and not colocated_inference)
 
 
+def _shutdown_completed_nemo_gym_startup(
+    future: Future[tuple[NemoGymShardSet, float]] | None,
+) -> None:
+    if future is None:
+        return
+    try:
+        shard_set, _ = future.result()
+    except BaseException:
+        return
+    shard_set.shutdown()
+
+
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
@@ -819,9 +837,13 @@ def setup(
     nemo_gym_actor = None
 
     def _spinup_nemo_gym(base_urls, model_name):
-        """Spin up the NeMo Gym actor against the given generation server URLs."""
+        """Spin up the NeMo Gym stack against the given generation server URLs.
+
+        Returns a shard set, which is the one actor of an unsharded job as much
+        as it is the K of a sharded one.
+        """
         t0 = time.perf_counter()
-        actor = spinup_nemo_gym_actor(
+        shard_set = build_nemo_gym_actors(
             env_configs,
             base_urls=base_urls,
             model_name=model_name,
@@ -829,7 +851,19 @@ def setup(
             enable_router_replay=router_replay_enabled(policy_config),
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
         )
-        return actor, time.perf_counter() - t0
+        train_splits = (
+            {f"train[{name}]": split for name, split in dataset.items()}
+            if isinstance(dataset, dict)
+            else {"train": dataset}
+        )
+        try:
+            validate_dataset_agent_coverage(
+                shard_set, {**train_splits, "validation": val_dataset}
+            )
+        except BaseException:
+            shard_set.shutdown()
+            raise
+        return shard_set, time.perf_counter() - t0
 
     total_nodes = cluster_config["num_nodes"]
     segment_size = cluster_config.get("segment_size")
@@ -1431,6 +1465,7 @@ def setup(
 
             print("  ⚡ Init tasks: policy, megatron_generation, nemo_gym", flush=True)
             init_tasks_t0 = time.perf_counter()
+            nemo_gym_future: Future[tuple[NemoGymShardSet, float]] | None = None
             try:
                 with ThreadPoolExecutor(max_workers=3) as executor:
                     policy_future = executor.submit(
@@ -1452,6 +1487,9 @@ def setup(
                         # so it must happen while Gym is waiting rather than after it resolves.
                         init_megatron_weight_synchronizer(policy, policy_generation)
                     nemo_gym_actor, nemo_gym_time = nemo_gym_future.result()
+            except BaseException:
+                _shutdown_completed_nemo_gym_startup(nemo_gym_future)
+                raise
             finally:
                 for port_holder in port_holders:
                     ray.kill(port_holder)
@@ -1591,9 +1629,18 @@ def setup(
                 f"  ⚡ Init tasks: {', '.join(init_tasks.keys())}",
                 flush=True,
             )
-            with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
-                submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
-                results = {k: f.result() for k, f in submitted.items()}
+            submitted: dict[str, Future[Any]] = {}
+            try:
+                with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
+                    submitted = {
+                        key: executor.submit(task) for key, task in init_tasks.items()
+                    }
+                    results = {
+                        key: future.result() for key, future in submitted.items()
+                    }
+            except BaseException:
+                _shutdown_completed_nemo_gym_startup(submitted.get("nemo_gym"))
+                raise
 
             if colocated_inference:
                 policy_generation, vllm_load_time, policy, policy_time = results[
@@ -1905,6 +1952,7 @@ def dynamic_sampling(
     master_config: MasterConfig,
     timer: Timer,
     batch_cache: BatchedDataDict[DatumSpec] = None,
+    is_trivial_prompt_distribution: torch.Tensor | None = None,
 ) -> BatchedDataDict[DatumSpec]:
     """Implements the dynamic sampling algorithm to select prompts with non-zero standard deviation.
 
@@ -1925,6 +1973,10 @@ def dynamic_sampling(
         dynamic_sampling_num_gen_batches (int): Number of generation batches processed at the current step.
         master_config (MasterConfig): Configuration containing GRPO and policy settings.
         batch_cache (BatchedDataDict[DatumSpec], optional): Cache storing previously selected prompts with non-zero std.
+        is_trivial_prompt_distribution (torch.Tensor, optional): Exact-equality
+            mask for each sample's full prompt reward group. When provided,
+            trivial groups are filtered all-or-nothing even if floating-point
+            roundoff produces a positive std.
 
     Returns:
         tuple: A tuple containing:
@@ -1951,12 +2003,19 @@ def dynamic_sampling(
     # If sampled prompts (with non-zero std) are fewer than num_prompts_per_step * num_generations_per_prompt, continue sampling until dynamic_sampling_max_gen_batches is reached.
     if master_config.grpo.use_dynamic_sampling:
         with timer.time("dynamic_sampling"):
-            # Get the prompt indices with non-zero std
-            non_zero_std_mask = std != 0.0
+            # Exact reward equality, rather than floating-point std noise, decides
+            # whether a prompt has useful reward variation.
+            if is_trivial_prompt_distribution is None:
+                raise ValueError(
+                    "dynamic_sampling: is_trivial_prompt_distribution is None -- "
+                    "the caller must compute it before this call when "
+                    "use_dynamic_sampling is set."
+                )
+            non_trivial_reward_mask = ~is_trivial_prompt_distribution
 
             keep_prompt_indices = torch.arange(
-                len(non_zero_std_mask), device=std.device
-            )[non_zero_std_mask].tolist()
+                len(non_trivial_reward_mask), device=std.device
+            )[non_trivial_reward_mask].tolist()
 
             # Only select the inputs that have non-zero std
             # total_reward is already a part of repeated_batch so we don't need to add it again
@@ -3288,11 +3347,24 @@ def _grpo_train_impl(
                         and "unshaped_total_reward" in repeated_batch
                         else None
                     )
+                    is_trivial_prompt_distribution = (
+                        calculate_trivial_reward_distributions(
+                            input_ids,
+                            std_rewards if std_rewards is not None else rewards,
+                            torch.ones_like(rewards),
+                        )
+                        if master_config.grpo.use_dynamic_sampling
+                        else None
+                    )
                     if master_config.grpo.calculate_advantages_on_gpu:
                         print("Computing advantages on GPU!")
                         # Just fix the device id for now
                         device_id = 0
-                        baseline, std = calculate_baseline_and_std_per_prompt(
+                        (
+                            baseline,
+                            std,
+                            _,
+                        ) = calculate_baseline_and_std_per_prompt(
                             input_ids.cuda(device_id),
                             rewards.cuda(device_id),
                             torch.ones_like(rewards).cuda(device_id),
@@ -3306,7 +3378,11 @@ def _grpo_train_impl(
                         baseline = baseline.cpu()
                         std = std.cpu()
                     else:
-                        baseline, std = calculate_baseline_and_std_per_prompt(
+                        (
+                            baseline,
+                            std,
+                            _,
+                        ) = calculate_baseline_and_std_per_prompt(
                             input_ids,
                             rewards,
                             torch.ones_like(rewards),
@@ -3324,6 +3400,9 @@ def _grpo_train_impl(
                             master_config,
                             timer,
                             batch_cache,
+                            is_trivial_prompt_distribution=(
+                                is_trivial_prompt_distribution
+                            ),
                         )
                     )
                     if ds_metrics:
