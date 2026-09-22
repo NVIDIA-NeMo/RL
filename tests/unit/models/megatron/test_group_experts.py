@@ -304,7 +304,7 @@ def test_native_mxfp8_dense_fc1_split_and_fc2_direct_refresh() -> None:
     assert torch.equal(second.view(torch.uint8), replacement)
 
 
-def test_native_mxfp8_task_builder_delegates_and_classifies_grouped_tasks() -> None:
+def test_native_mxfp8_task_builder_uses_public_bridge_api() -> None:
     fc1_name = "decoder.layers.0.mlp.experts.linear_fc1.weight"
     fc2_name = "decoder.layers.0.mlp.experts.linear_fc2.weight"
     tasks = [
@@ -315,27 +315,21 @@ def test_native_mxfp8_task_builder_delegates_and_classifies_grouped_tasks() -> N
         SimpleNamespace(global_param_name=f"{fc1_name}0"),
         SimpleNamespace(global_param_name=fc2_name),
     ]
-    hf_pretrained = object()
     model = object()
-    calls: list[tuple[object, list[object]]] = []
+    calls: list[list[object]] = []
 
     class FakeBridge:
-        def build_export_mxfp8_tasks(
-            self, received_hf_pretrained: object, models: list[object]
-        ) -> list[SimpleNamespace]:
-            calls.append((received_hf_pretrained, models))
+        def get_export_mxfp8_tasks(self, models: list[object]) -> list[SimpleNamespace]:
+            calls.append(models)
             return tasks
 
     worker = _native_worker([])
     worker.model = model
-    worker.megatron_bridge = SimpleNamespace(
-        _model_bridge=FakeBridge(),
-        hf_pretrained=hf_pretrained,
-    )
+    worker.megatron_bridge = FakeBridge()
 
     result = worker._build_native_mxfp8_conversion_tasks()
 
-    assert calls == [(hf_pretrained, [model])]
+    assert calls == [[model]]
     assert result is tasks
     assert worker._native_grouped_mxfp8_tasks == [tasks[1], tasks[3]]
 

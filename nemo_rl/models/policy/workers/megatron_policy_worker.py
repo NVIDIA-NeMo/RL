@@ -3072,9 +3072,7 @@ class MegatronPolicyWorkerImpl(
 
     def _build_native_mxfp8_conversion_tasks(self) -> list[Any]:
         """Delegate MXFP8 task construction and classify singular grouped tasks."""
-        tasks = self.megatron_bridge._model_bridge.build_export_mxfp8_tasks(
-            self.megatron_bridge.hf_pretrained, [self.model]
-        )
+        tasks = self.megatron_bridge.get_export_mxfp8_tasks([self.model])
         grouped_suffixes = (
             ".mlp.experts.linear_fc1.weight",
             ".mlp.experts.linear_fc2.weight",
