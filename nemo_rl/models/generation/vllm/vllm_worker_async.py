@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 import warnings
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Literal, Optional, cast
@@ -206,6 +206,12 @@ class _RestoredPrefixParser:
                 *self.prefix_token_ids,
                 *model_output_token_ids,
             ],
+        )
+
+    def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
+        """Count reasoning across the restored prefix and generated tail."""
+        return self.delegate.count_reasoning_tokens(
+            [*self.prefix_token_ids, *token_ids]
         )
 
 
