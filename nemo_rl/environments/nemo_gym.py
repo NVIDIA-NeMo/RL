@@ -409,7 +409,7 @@ def _model_checkpoint_ready(
     state: str,
     inflight_total: int,
     generation_pending_total: int | None,
-    generation_cut_proof: dict[str, object] | None,
+    generation_cut_summary: dict[str, object] | None,
 ) -> bool:
     """Accept drained models or a complete durable cut of their live calls."""
     if state != "paused":
@@ -419,7 +419,7 @@ def _model_checkpoint_ready(
         return inflight_total == 0
     if generation_pending_total != 0:
         return False
-    return inflight_total == 0 or generation_cut_proof is not None
+    return inflight_total == 0 or generation_cut_summary is not None
 
 
 class GymControlRequestError(RuntimeError):
@@ -1144,7 +1144,7 @@ Depending on your data shape, you may want to change these values."""
                         state=payload.state,
                         inflight_total=payload.inflight_total,
                         generation_pending_total=payload.generation_pending_total,
-                        generation_cut_proof=payload.generation_cut_proof,
+                        generation_cut_summary=payload.generation_cut_summary,
                     )
                     and payload.workers.acknowledged == payload.workers.expected
                 )
@@ -1159,7 +1159,7 @@ Depending on your data shape, you may want to change these values."""
                             state=payload.state,
                             inflight_total=payload.inflight_total,
                             generation_pending_total=payload.generation_pending_total,
-                            generation_cut_proof=payload.generation_cut_proof,
+                            generation_cut_summary=payload.generation_cut_summary,
                         )
                         and payload.workers.acknowledged == payload.workers.expected
                     )
@@ -1174,7 +1174,7 @@ Depending on your data shape, you may want to change these values."""
             generation_cut_prepared = any(
                 result.ready
                 and isinstance(result.payload, GymModelPrepareResponse)
-                and result.payload.generation_cut_proof is not None
+                and result.payload.generation_cut_summary is not None
                 for result in results
             )
             for discovered in ordered_participants:
@@ -1335,7 +1335,7 @@ Depending on your data shape, you may want to change these values."""
                     state=status.state,
                     inflight_total=status.inflight_total,
                     generation_pending_total=status.generation_pending_total,
-                    generation_cut_proof=status.generation_cut_proof,
+                    generation_cut_summary=status.generation_cut_summary,
                 )
                 and status.missing_workers == 0
                 and status.workers.acknowledged == status.workers.expected
@@ -1350,7 +1350,7 @@ Depending on your data shape, you may want to change these values."""
                 state=status.state,
                 inflight_total=status.inflight_total,
                 generation_pending_total=status.generation_pending_total,
-                generation_cut_proof=status.generation_cut_proof,
+                generation_cut_summary=status.generation_cut_summary,
             )
         payload = GymModelPrepareResponse(
             state=status.state,
@@ -1358,7 +1358,7 @@ Depending on your data shape, you may want to change these values."""
             inflight_total=status.inflight_total,
             response_inflight_total=status.response_inflight_total,
             generation_pending_total=status.generation_pending_total,
-            generation_cut_proof=status.generation_cut_proof,
+            generation_cut_summary=status.generation_cut_summary,
             waiters_total=status.waiters_total,
         )
         if not ready:
