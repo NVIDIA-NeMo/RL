@@ -1013,112 +1013,52 @@ def test_native_grouped_bf16_experts_route_to_misc_instead_of_raising() -> None:
     assert misc == [task]
 
 
-def test_native_conversion_builder_expands_bf16_grouped_experts_for_misc(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from megatron.bridge.models.conversion import model_bridge
-    from megatron.bridge.models.conversion import utils as conversion_utils
-    from megatron.core import fp8_utils
+def test_native_conversion_builder_routes_expanded_bf16_experts_to_misc() -> None:
+    from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
+    from megatron.bridge.models.conversion.param_mapping import (
+        FusedGatedExpertMapping,
+    )
 
     global_name = "decoder.layers.0.mlp.experts.linear_fc1.weight"
     members = [
         torch.zeros((8, 64), dtype=torch.bfloat16),
         torch.ones((8, 64), dtype=torch.bfloat16),
     ]
+    tasks = [
+        WeightConversionTask(
+            param_name=f"{global_name}{expert}",
+            global_param_name=f"{global_name}{expert}",
+            mapping=FusedGatedExpertMapping(
+                f"{global_name}{expert}",
+                "model.layers.0.mlp.experts.gate_up_proj.weight",
+            ),
+            param_weight=member,
+        )
+        for expert, member in enumerate(members)
+    ]
+    calls: list[list[object]] = []
 
-    class GroupedWeight:
-        shape = (2, 8, 64)
-        quantized_tensors: list[torch.Tensor] | None = None
-
-        def split_into_quantized_tensors(self) -> list[torch.Tensor]:
-            return members
-
-        def __getitem__(self, _index: int) -> torch.Tensor:
-            raise AssertionError("TE GroupedTensor does not support indexing")
-
-    parameter = GroupedWeight()
-    owner = SimpleNamespace(config=SimpleNamespace())
-    mapping = SimpleNamespace()
-    validated_names: list[str] = []
-
-    class Registry:
-        def set_process_groups_from_pg_collection(self, _groups: object) -> None:
-            pass
-
-        def megatron_to_hf_lookup(self, name: str) -> object | None:
-            return mapping if name in {f"{global_name}0", f"{global_name}1"} else None
-
-    registry = Registry()
-
-    class Bridge:
-        hf_pretrained = SimpleNamespace(config=SimpleNamespace())
-
-        def mapping_registry(self) -> Registry:
-            return registry
-
-        def _megatron_global_param_names_all_pp_ranks(
-            self, _models: list[object]
-        ) -> list[str]:
-            return [global_name]
-
-        def _share_embeddings_and_output_weights(self, _config: object) -> bool:
-            return False
-
-        def _validate_conversion_mappings(
-            self,
-            _registry: Registry,
-            names: list[str],
-            _hf_keys: object,
-        ) -> dict[str, object]:
-            validated_names.extend(names)
-            return {name: mapping for name in names}
-
-        def _unwrap_name(self, name: str) -> str:
-            return name
-
-        def _is_adapter_param_name(self, _name: str) -> bool:
-            return False
+    class FakeBridge:
+        def get_export_mxfp8_tasks(
+            self, models: list[object]
+        ) -> list[WeightConversionTask]:
+            calls.append(models)
+            return tasks
 
     worker = _native_worker([])
-    worker.model = SimpleNamespace(
-        config=SimpleNamespace(
-            moe_single_grouped_weight=True,
-            num_moe_experts=2,
-            expert_model_parallel_size=1,
-        ),
-        named_parameters=lambda: [(global_name, parameter)],
-    )
-    worker.megatron_bridge = SimpleNamespace(
-        _model_bridge=Bridge(),
-        hf_pretrained=Bridge.hf_pretrained,
-    )
-    monkeypatch.setattr(fp8_utils, "is_grouped_mxfp8tensor", lambda _param: False)
-    monkeypatch.setattr(model_bridge, "_get_pg_collection_from_model", lambda _m: None)
-    monkeypatch.setattr(model_bridge, "_get_pp_rank", lambda _m: 0)
-    monkeypatch.setattr(
-        model_bridge,
-        "_megatron_local_name_to_global",
-        lambda _models, _config, name, _vp_stage: name,
-    )
-    monkeypatch.setattr(
-        conversion_utils,
-        "get_module_and_param_from_name",
-        lambda _models, _name, _vp_stage: (owner, parameter),
-    )
-    monkeypatch.setattr(conversion_utils, "persistent_buffers", lambda _model: [])
+    model = object()
+    worker.model = model
+    worker.megatron_bridge = FakeBridge()
 
-    tasks = worker._build_native_mxfp8_conversion_tasks()
+    result = worker._build_native_mxfp8_conversion_tasks()
+    native, grouped, misc = worker._partition_native_mxfp8_conversion_tasks(result)
 
-    assert validated_names == [f"{global_name}0", f"{global_name}1"]
-    assert [task.global_param_name for task in tasks] == [
-        f"{global_name}0",
-        f"{global_name}1",
-    ]
-    assert tasks[0].param_weight is not None
-    assert tasks[1].param_weight is not None
-    assert tasks[0].param_weight is members[0]
-    assert tasks[1].param_weight is members[1]
-    assert parameter.quantized_tensors is members
+    assert calls == [[model]]
+    assert result is tasks
+    assert worker._native_grouped_mxfp8_tasks == []
+    assert native == []
+    assert grouped == []
+    assert misc == tasks
 
 
 def test_mtp_grouped_experts_are_excluded_on_the_megatron_name_alone() -> None:
@@ -1149,17 +1089,14 @@ def test_mtp_grouped_experts_are_excluded_on_the_megatron_name_alone() -> None:
     )
 
     class FakeBridge:
-        def build_export_mxfp8_tasks(
-            self, _hf_pretrained: object, _models: list[object]
+        def get_export_mxfp8_tasks(
+            self, _models: list[object]
         ) -> list[SimpleNamespace]:
             return [task]
 
     worker = _native_worker([])
     worker.model = object()
-    worker.megatron_bridge = SimpleNamespace(
-        _model_bridge=FakeBridge(),
-        hf_pretrained=object(),
-    )
+    worker.megatron_bridge = FakeBridge()
 
     worker._build_native_mxfp8_conversion_tasks()
     assert worker._native_grouped_mxfp8_tasks == [task]
