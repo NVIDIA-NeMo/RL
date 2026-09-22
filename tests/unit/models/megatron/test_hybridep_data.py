@@ -111,6 +111,7 @@ def test_hybridep_prepads_packed_inputs_before_model_forward():
     assert torch.equal(padded_params.cu_seqlens_q, cu_seqlens)
     assert torch.equal(padded_params.cu_seqlens_kv, cu_seqlens)
     assert torch.equal(padded_params.cu_seqlens_q_padded, torch.tensor([0, 4, 16]))
+    assert padded_params.pad_between_seqs is True
     assert padded_params.total_tokens == 16
     mock_get_group.assert_called_once_with(check_initialized=False)
     mock_all_reduce.assert_called_once()

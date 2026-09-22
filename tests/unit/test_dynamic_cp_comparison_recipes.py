@@ -13,6 +13,19 @@ from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 RECIPE_DIR = (
     Path(__file__).resolve().parents[2] / "examples/configs/recipes/llm/performance"
 )
+_LOCAL_RECIPES = (
+    "grpo-qwen3-30ba3b-4n4g-async-1off-megatron-dynamiccp-10step.yaml",
+    "grpo-qwen3-30ba3b-4n4g-async-1off-megatron-staticcp-10step.yaml",
+    "grpo-qwen3-32b-4n4g-async-1off-megatron-dynamiccp-10step.yaml",
+    "grpo-qwen3-32b-4n4g-async-1off-megatron-staticcp-10step.yaml",
+)
+
+# The comparison recipes are personal benchmark inputs, not repository
+# examples. Run these assertions when that local set exists and skip otherwise.
+pytestmark = pytest.mark.skipif(
+    any(not (RECIPE_DIR / recipe_name).exists() for recipe_name in _LOCAL_RECIPES),
+    reason="local dynamic/static-CP comparison recipes are not present",
+)
 
 
 @pytest.mark.parametrize(

@@ -1,9 +1,0 @@
-defaults: ./grpo-qwen3-32b-4n4g-megatron-dynamiccp-10step.yaml
-policy:
-  megatron_cfg:
-    dynamic_context_parallel:
-      enabled: false
-logger:
-  log_dir: logs/grpo-qwen3-32b-4n4g-megatron-staticcp-10step
-  wandb:
-    name: qwen3-32b-4n4g-static-cp-10step

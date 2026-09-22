@@ -15,8 +15,7 @@ from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
 
 RECIPE_DIR = (
-    Path(__file__).resolve().parents[2]
-    / "examples/configs/recipes/llm/performance"
+    Path(__file__).resolve().parents[2] / "examples/configs/recipes/llm/performance"
 )
 RECIPES = (
     (
@@ -40,6 +39,13 @@ RECIPES = (
         8,
         8,
     ),
+)
+
+# These benchmark recipes are intentionally local/ignored. Keep the topology
+# checks useful for local recipe development without breaking a clean checkout.
+pytestmark = pytest.mark.skipif(
+    any(not (RECIPE_DIR / recipe_name).exists() for recipe_name, *_ in RECIPES),
+    reason="local dynamic-CP benchmark recipes are not present",
 )
 
 

@@ -80,7 +80,7 @@ class CPRankPlan:
     steps: tuple[CPRankStep, ...]
 
 
-def _padding_for_cp(
+def padding_for_cp(
     cp_size: int,
     *,
     sequence_parallel_size: int,
@@ -103,7 +103,7 @@ def _resize_assignment(
     user_pad_multiple: int,
     token_alignment: int,
 ) -> CPAssignment:
-    factor = _padding_for_cp(
+    factor = padding_for_cp(
         cp_size,
         sequence_parallel_size=sequence_parallel_size,
         user_pad_multiple=user_pad_multiple,
@@ -137,25 +137,36 @@ def _fill_idle_lanes(
 ) -> list[CPAssignment]:
     """Increase the smallest real CP groups until no legal expansion fits."""
     idle_lanes = lanes - sum(task.cp_size for task in tasks)
+    blocked: set[int] = set()
     while idle_lanes:
         candidates = [
             (task.cp_size, index)
             for index, task in enumerate(tasks)
-            if task.cp_size < max_size and task.cp_size <= idle_lanes
+            if index not in blocked
+            and task.cp_size < max_size
+            and task.cp_size <= idle_lanes
         ]
         if not candidates:
             break
         _, index = min(candidates)
         task = tasks[index]
-        tasks[index] = _resize_assignment(
-            task,
-            task.cp_size * 2,
-            lengths=lengths,
-            tokens_per_rank=tokens_per_rank,
-            sequence_parallel_size=sequence_parallel_size,
-            user_pad_multiple=user_pad_multiple,
-            token_alignment=token_alignment,
-        )
+        try:
+            tasks[index] = _resize_assignment(
+                task,
+                task.cp_size * 2,
+                lengths=lengths,
+                tokens_per_rank=tokens_per_rank,
+                sequence_parallel_size=sequence_parallel_size,
+                user_pad_multiple=user_pad_multiple,
+                token_alignment=token_alignment,
+            )
+        except ValueError:
+            # CP growth also increases the per-sequence padding multiple. A task
+            # can therefore overflow after expansion even though the aggregate
+            # budget grew. Idle filling is optional, so retain the valid task and
+            # try another candidate instead of failing the whole rollout.
+            blocked.add(index)
+            continue
         idle_lanes -= task.cp_size
 
     # Descending powers of two guarantee that each consecutive lane start is
@@ -351,7 +362,7 @@ def plan_cp_phases(
     ):
         size = min_size
         while True:
-            multiple = _padding_for_cp(
+            multiple = padding_for_cp(
                 size,
                 sequence_parallel_size=sequence_parallel_size,
                 user_pad_multiple=user_pad_multiple,
@@ -420,7 +431,7 @@ def plan_cp_phases(
         )
         cursor = sum(task.cp_size for task in phase)
         while cursor < lanes:
-            factor = _padding_for_cp(
+            factor = padding_for_cp(
                 min_size,
                 sequence_parallel_size=sequence_parallel_size,
                 user_pad_multiple=user_pad_multiple,

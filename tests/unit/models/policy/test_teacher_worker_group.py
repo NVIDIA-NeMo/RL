@@ -94,8 +94,8 @@ def test_create_teacher_configs_deduplicates():
     assert len(configs) == 2
 
 
-def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
-    """Frozen teachers do not require rollout-to-training route consistency."""
+def test_teacher_worker_group_disables_student_only_runtime_features(monkeypatch):
+    """Frozen teachers do not use student router replay or dynamic dispatch."""
     import nemo_rl.distributed.worker_groups as worker_groups
     from nemo_rl.models.policy.teacher_worker_group import (
         TeacherConfig,
@@ -119,7 +119,13 @@ def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
     cluster.world_size.return_value = 1
     policy_config = {
         "model_name": "/ckpt/student",
-        "megatron_cfg": {"enabled": True},
+        "megatron_cfg": {
+            "enabled": True,
+            "dynamic_context_parallel": {
+                "enabled": True,
+                "tokens_per_rank": 4096,
+            },
+        },
         "dtensor_cfg": {"enabled": False},
         "sequence_packing": {"enabled": False},
         "dynamic_batching": {"enabled": False},
@@ -148,7 +154,10 @@ def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
 
     assert captured["cfg"]["router_replay"]["enabled"] is False
     assert teacher.cfg["router_replay"]["enabled"] is False
+    assert "dynamic_context_parallel" not in captured["cfg"]["megatron_cfg"]
+    assert "dynamic_context_parallel" not in teacher.cfg["megatron_cfg"]
     assert policy_config["router_replay"]["enabled"] is True
+    assert policy_config["megatron_cfg"]["dynamic_context_parallel"]["enabled"] is True
 
 
 def test_teacher_worker_group_drops_the_student_pretrained_checkpoint(monkeypatch):

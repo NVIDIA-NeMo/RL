@@ -20,8 +20,9 @@ the world_size compatibility validation that prevents confusing reshape errors
 when the cluster size is insufficient for the specified parallelism configuration.
 """
 
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -67,8 +68,10 @@ def create_mock_tokenizer():
 def test_dynamic_cp_score_keeps_complete_training_sized_steps() -> None:
     policy = Policy.__new__(Policy)
     policy.cfg = {"train_global_batch_size": 2}
+    policy.debug_payload_metrics = False
     policy.sharding_annotations = object()
     policy._dynamic_cp_schedule = None
+    policy._report_sharded_payload = MagicMock()
     policy.worker_group = MagicMock()
     policy.worker_group.run_all_workers_sharded_data.return_value = "futures"
     policy.worker_group.get_all_worker_results.return_value = ["worker-results"]
@@ -76,11 +79,13 @@ def test_dynamic_cp_score_keeps_complete_training_sized_steps() -> None:
     schedule = object()
     dispatch = SimpleNamespace(
         schedule=schedule,
-        data="sharded-data",
+        data=[[BatchedDataDict(input_ids=torch.zeros(2, 8, dtype=torch.long))]],
         plans="rank-plans",
         output_rows=[],
     )
     expected = BatchedDataDict(logprobs=torch.zeros(4, 8))
+    timer = MagicMock()
+    timer.time.side_effect = lambda _label: nullcontext()
 
     with (
         patch(
@@ -92,11 +97,20 @@ def test_dynamic_cp_score_keeps_complete_training_sized_steps() -> None:
             return_value=expected,
         ),
     ):
-        result = Policy._get_dynamic_cp_outputs(policy, "get_logprobs", data)
+        result = Policy._get_dynamic_cp_outputs(
+            policy, "get_logprobs", data, timer=timer
+        )
 
     assert result is expected
     assert policy._dynamic_cp_schedule is schedule
     assert build_dispatch.call_args.kwargs["batch_size"] == 2
+    assert timer.time.call_args_list == [
+        call("get_logprobs/shard_data"),
+        call("get_logprobs/submit_logprob_futures"),
+    ]
+    policy._report_sharded_payload.assert_called_once_with(
+        [dispatch.data[0][0]], "policy_get_logprobs"
+    )
 
 
 def create_dtensor_config(

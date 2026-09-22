@@ -187,6 +187,26 @@ def test_idle_lanes_expand_real_assignment_and_recompute_padding():
     check_plan(phases, [3], 8, 128, 2)
 
 
+def test_idle_lane_expansion_skips_task_when_larger_cp_padding_overflows():
+    lengths = [100] * 32
+    phases = plan_cp_phases(
+        lengths,
+        lanes=2,
+        min_size=1,
+        max_size=2,
+        tokens_per_rank=4096,
+        sequence_parallel_size=1,
+        user_pad_multiple=1,
+        token_alignment=128,
+    )
+
+    real = [task for task in phases[0].assignments if task.sample_indices]
+    placeholders = [task for task in phases[0].assignments if not task.sample_indices]
+    assert [(task.cp_size, task.padded_tokens) for task in real] == [(1, 4096)]
+    assert [task.cp_size for task in placeholders] == [1]
+    check_plan(phases, lengths, 2, 4096, 1)
+
+
 def test_maximum_cp_keeps_placeholders_when_real_work_cannot_fill_lanes():
     phases = make_plan([3], maximum=4)
     real = [

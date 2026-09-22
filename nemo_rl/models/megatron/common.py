@@ -216,15 +216,15 @@ def get_moe_metrics(
         per_layer_logging: If True, include per-layer values in the returned dict.
         num_layers: Total number of transformer layers. When provided together with a
             non-empty ``track_names``, the aux-loss tracker is pre-initialized on every
-            rank before the reduction (see Note). Defaults to None, which disables
-            pre-initialization.
+            rank before the reduction (see Note). Required for dynamic CP.
         mtp_num_layers: Extra layers contributed by Multi-Token Prediction, added to
             ``num_layers`` to size the pre-initialized tensor, matching the size the
             router uses when recording. Defaults to None (treated as 0).
         track_names: Aux-loss names to pre-initialize; must mirror what the router
             records for the configured ``moe_router_load_balancing_type``, so callers
             should derive it via ``get_aux_loss_track_names(model_config)``. Defaults to
-            None, which disables pre-initialization.
+            None, which disables pre-initialization. Dynamic CP requires an explicit
+            list (which may be empty) so every rank uses the same collective order.
         dynamic_parallel_group: Fixed TP*DP*CP group used only by dynamic CP.
             Dynamic lanes can execute different numbers of microbatches and the
             router's per-forward TP*CP group changes with each task, so its last
@@ -252,6 +252,14 @@ def get_moe_metrics(
         record an aux loss this step (e.g. a stage with no MoE layer, or an MTP MoE
         layer that lives only on the last stage).
     """
+    if dynamic_parallel_group is not None and (
+        track_names is None or num_layers is None
+    ):
+        raise ValueError(
+            "Dynamic CP MoE metrics require explicit track_names and num_layers "
+            "so every rank reduces the same tensors in the same order"
+        )
+
     # Pre-initialize the aux-loss tracker so every PP rank has the same set of
     # named, equally-sized tensors BEFORE the collective all_reduce below.
     #
@@ -284,18 +292,20 @@ def get_moe_metrics(
         # counts every real task once, irrespective of uneven lane task counts.
         # The caller's loss_scale is 1 / number_of_unique_real_tasks.
         mcore_tracker = get_moe_metrics_tracker()
-        dynamic_names = (
-            track_names if track_names is not None else list(mcore_tracker.metrics)
-        )
+        # The validation above makes this list rank-identical. Never derive
+        # collective order from lazily populated, rank-local tracker state.
+        assert track_names is not None
+        dynamic_names = track_names
         for name in dynamic_names:
-            entry = mcore_tracker.metrics.get(name)
-            if entry is not None:
-                # Padding-only lanes receive a pre-initialized z-loss entry but
-                # never call record(), so its avg_group remains None locally.
-                # z_loss is nevertheless an averaged metric on every lane.
-                if name == "z_loss" or getattr(entry, "avg_group", None) is not None:
-                    dynamic_avg_names.add(name)
-                dist.all_reduce(entry.values, group=dynamic_parallel_group)
+            # ensure_initialized above guarantees this lookup on every rank;
+            # fail locally rather than conditionally skipping a collective.
+            entry = mcore_tracker.metrics[name]
+            # Padding-only lanes receive a pre-initialized z-loss entry but
+            # never call record(), so its avg_group remains None locally.
+            # z_loss is nevertheless an averaged metric on every lane.
+            if name == "z_loss":
+                dynamic_avg_names.add(name)
+            dist.all_reduce(entry.values, group=dynamic_parallel_group)
     tracker = get_moe_layer_wise_logging_tracker()
     if dynamic_names is not None:
         tracker = {name: tracker[name] for name in dynamic_names if name in tracker}

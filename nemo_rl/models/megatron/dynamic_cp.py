@@ -24,8 +24,8 @@ from nemo_rl.distributed.dynamic_context_parallel import CPRankPlan, CPRankStep
 
 _DYNAMIC_TP_CP_GROUPS: dict[int, Any] = {}
 _ROUTER_CONFIG_BASELINES: dict[int, tuple[Any, Any]] = {}
-_DYNAMIC_MOE_GRAD_SCALE_CORRECTIONS: dict[int, float] = {}
 _DYNAMIC_MTP_METRICS: dict[str, torch.Tensor] = {}
+_ACTIVE_BIND_TARGETS: dict[int, "_BindTargets"] = {}
 
 
 @dataclass(frozen=True)
@@ -147,6 +147,52 @@ def _is_hybrid_stack(module: torch.nn.Module) -> bool:
         and hasattr(module, "layer_config_list")
         and hasattr(module, "_cp_layout_manager")
     )
+
+
+@dataclass(frozen=True)
+class _BindTargets:
+    """Stable module classifications reused by every task in one model call."""
+
+    modules: tuple[torch.nn.Module, ...]
+    pg_collections: tuple[torch.nn.Module, ...]
+    direct_groups: tuple[torch.nn.Module, ...]
+    hybrid_stacks: tuple[torch.nn.Module, ...]
+    routers: tuple[Router, ...]
+    mamba_mixers: tuple[torch.nn.Module, ...]
+    gated_delta_products: tuple[torch.nn.Module, ...]
+    gated_delta_nets: tuple[torch.nn.Module, ...]
+
+
+def _classify_bind_targets(model: torch.nn.Module) -> _BindTargets:
+    modules = tuple(model.modules())
+    return _BindTargets(
+        modules=modules,
+        pg_collections=tuple(
+            module
+            for module in modules
+            if getattr(module, "pg_collection", None) is not None
+            and hasattr(module.pg_collection, "cp")
+        ),
+        direct_groups=tuple(
+            module
+            for module in modules
+            if _uses_direct_cp_group(module) and hasattr(module, "cp_group")
+        ),
+        hybrid_stacks=tuple(module for module in modules if _is_hybrid_stack(module)),
+        routers=tuple(module for module in modules if isinstance(module, Router)),
+        mamba_mixers=tuple(module for module in modules if _is_mamba_mixer(module)),
+        gated_delta_products=tuple(
+            module for module in modules if _is_gated_delta_product(module)
+        ),
+        gated_delta_nets=tuple(
+            module for module in modules if _is_gated_delta_net(module)
+        ),
+    )
+
+
+def _bind_targets(model: torch.nn.Module) -> _BindTargets:
+    """Reuse the outer schedule's classification, with a safe direct-call fallback."""
+    return _ACTIVE_BIND_TARGETS.get(id(model)) or _classify_bind_targets(model)
 
 
 def _rebuild_mamba_cp(module: torch.nn.Module, group: Any) -> None:
@@ -299,6 +345,9 @@ def get_dynamic_mtp_metrics(
     *, parallel_group: torch.distributed.ProcessGroup
 ) -> dict[str, float]:
     """Reduce token-weighted MTP metrics over the fixed DP*CP lane group."""
+    # This branch is collective-safe: training gives every lane at least one
+    # real or placeholder task, and even a zero-token placeholder records all
+    # four tensors. Evaluation records MTP metrics on no lane, so all lanes exit.
     if "loss_sums" not in _DYNAMIC_MTP_METRICS:
         return {}
     try:
@@ -503,7 +552,11 @@ def _dynamic_process_mtp_loss(
 
 @contextmanager
 def _patch_mtp_loss_for_dynamic_cp(enabled: bool) -> Iterator[None]:
-    """Temporarily route GPT/HybridModel MTP through the NeMo-side fix."""
+    """Temporarily route GPT/HybridModel MTP through the NeMo-side fix.
+
+    This module-level patch relies on the current worker contract: one training
+    model executes at a time and generation does not share the worker process.
+    """
     if not enabled:
         yield
         return
@@ -589,7 +642,9 @@ def _dynamic_attach_and_log_load_balancing_loss(
 
 
 @contextmanager
-def _patch_hybrid_mtp_padding_masks(model: torch.nn.Module) -> Iterator[None]:
+def _patch_hybrid_mtp_padding_masks(
+    model: torch.nn.Module, modules: tuple[torch.nn.Module, ...] | None = None
+) -> Iterator[None]:
     """Carry correct router padding semantics through every dynamic MTP block.
 
     The pinned HybridModel accepts ``padding_mask`` and sends it through the
@@ -609,7 +664,7 @@ def _patch_hybrid_mtp_padding_masks(model: torch.nn.Module) -> Iterator[None]:
     """
     padding_masks: dict[int, torch.Tensor | None] = {}
     handles: list[Any] = []
-    modules = list(model.modules())
+    modules = modules or tuple(model.modules())
     mtp_blocks: list[torch.nn.Module] = []
 
     def capture_padding_mask(
@@ -695,6 +750,8 @@ def _patch_hybrid_mtp_padding_masks(model: torch.nn.Module) -> Iterator[None]:
         return args, kwargs
 
     patched_classes: list[tuple[type[Any], bool, Any]] = []
+    # This class-level patch has the same single-model worker assumption as the
+    # MTP patch above; the preservation context always restores it in finally.
     for router_class in {
         type(module) for module in modules if isinstance(module, Router)
     }:
@@ -746,14 +803,12 @@ def preserve_attention_cp_groups(model: torch.nn.Module) -> Iterator[None]:
     Keep the active group through backward recomputation; restore it after the
     complete no-pipeline schedule. TP, DP and optimizer groups are unchanged.
     """
-    modules = list(model.modules())
+    targets = _classify_bind_targets(model)
+    modules = targets.modules
     saved_collections = [
-        (module, module.pg_collection)
-        for module in modules
-        if getattr(module, "pg_collection", None) is not None
-        and hasattr(module.pg_collection, "cp")
+        (module, module.pg_collection) for module in targets.pg_collections
     ]
-    saved_mamba = [(module, module.cp) for module in modules if _is_mamba_mixer(module)]
+    saved_mamba = [(module, module.cp) for module in targets.mamba_mixers]
     saved_gdp = [
         (
             module,
@@ -762,13 +817,11 @@ def preserve_attention_cp_groups(model: torch.nn.Module) -> Iterator[None]:
             module.nheads_local_cp,
             module.ngroups_local_cp,
         )
-        for module in modules
-        if _is_gated_delta_product(module)
+        for module in targets.gated_delta_products
     ]
     saved_gdn = [
         (module, module.cp_size, getattr(module, "feat_dim_split", None))
-        for module in modules
-        if _is_gated_delta_net(module)
+        for module in targets.gated_delta_nets
     ]
     saved_direct_groups = [
         (
@@ -777,8 +830,7 @@ def preserve_attention_cp_groups(model: torch.nn.Module) -> Iterator[None]:
             getattr(module, "tp_cp_group", None),
             hasattr(module, "tp_cp_group"),
         )
-        for module in modules
-        if _uses_direct_cp_group(module) and hasattr(module, "cp_group")
+        for module in targets.direct_groups
     ]
     saved_hybrid_stacks = [
         (
@@ -786,33 +838,42 @@ def preserve_attention_cp_groups(model: torch.nn.Module) -> Iterator[None]:
             module._cp_layout_manager,
             module._has_linear_layer_with_chunkwise_cp,
         )
-        for module in modules
-        if _is_hybrid_stack(module)
+        for module in targets.hybrid_stacks
     ]
     saved_routers = [
-        (module, module.cp_group, module.tp_cp_group)
-        for module in modules
-        if isinstance(module, Router)
+        (module, module.cp_group, module.tp_cp_group) for module in targets.routers
     ]
     router_configs: dict[int, Any] = {}
-    for module, collection in saved_collections:
-        module.pg_collection = copy(collection)
-    for module, _, _ in saved_routers:
-        config = module.config
-        router_configs[id(config)] = config
-        _ROUTER_CONFIG_BASELINES[id(config)] = (
-            config.moe_aux_loss_coeff,
-            config.moe_z_loss_coeff,
-        )
-        _DYNAMIC_MOE_GRAD_SCALE_CORRECTIONS[id(config)] = 1.0
     mtp_enabled = any(
         bool(getattr(getattr(module, "config", None), "mtp_num_layers", 0))
         for module in modules
     )
+    model_id = id(model)
+    if model_id in _ACTIVE_BIND_TARGETS:
+        raise RuntimeError("Dynamic CP model binding is not re-entrant")
     try:
+        _ACTIVE_BIND_TARGETS[model_id] = targets
+        for module, collection in saved_collections:
+            module.pg_collection = copy(collection)
+        for module, _, _ in saved_routers:
+            config = module.config
+            config_id = id(config)
+            # Transformer layers commonly share one TransformerConfig.  Record
+            # that shared object once, while still rejecting overlap with a
+            # different active model binding.
+            if config_id in router_configs:
+                continue
+            if config_id in _ROUTER_CONFIG_BASELINES:
+                raise RuntimeError("Dynamic CP router binding is not re-entrant")
+            baseline = (
+                config.moe_aux_loss_coeff,
+                config.moe_z_loss_coeff,
+            )
+            _ROUTER_CONFIG_BASELINES[config_id] = baseline
+            router_configs[config_id] = config
         with (
             _patch_mtp_loss_for_dynamic_cp(mtp_enabled),
-            _patch_hybrid_mtp_padding_masks(model),
+            _patch_hybrid_mtp_padding_masks(model, modules),
         ):
             try:
                 yield
@@ -820,6 +881,7 @@ def preserve_attention_cp_groups(model: torch.nn.Module) -> Iterator[None]:
                 _DYNAMIC_MTP_METRICS.clear()
                 raise
     finally:
+        _ACTIVE_BIND_TARGETS.pop(model_id, None)
         for module, collection in saved_collections:
             module.pg_collection = collection
         for module, cp in saved_mamba:
@@ -851,7 +913,6 @@ def preserve_attention_cp_groups(model: torch.nn.Module) -> Iterator[None]:
             module.tp_cp_group = tp_cp_group
         for config_id, config in router_configs.items():
             aux_coeff, z_coeff = _ROUTER_CONFIG_BASELINES.pop(config_id)
-            _DYNAMIC_MOE_GRAD_SCALE_CORRECTIONS.pop(config_id, None)
             config.moe_aux_loss_coeff = aux_coeff
             config.moe_z_loss_coeff = z_coeff
 
@@ -876,7 +937,6 @@ def _bind_router_config(router: Router, *, padding_only: bool) -> None:
         z_coeff = None
     router.config.moe_aux_loss_coeff = aux_coeff
     router.config.moe_z_loss_coeff = z_coeff
-    _DYNAMIC_MOE_GRAD_SCALE_CORRECTIONS[id(router.config)] = 1.0
 
 
 def _has_positive_coefficient(value: Any) -> bool:
@@ -896,13 +956,9 @@ def configure_dynamic_moe_loss_scaling(
     a caller forgot the packed padding mask.  The worker's ordinary
     ``1/global_valid_tokens`` MoE scale is therefore sufficient.
     """
-    routers = [module for module in model.modules() if isinstance(module, Router)]
+    routers = _bind_targets(model).routers
     if not routers:
         return
-
-    configs = {id(router.config): router.config for router in routers}
-    for config_id in configs:
-        _DYNAMIC_MOE_GRAD_SCALE_CORRECTIONS[config_id] = 1.0
 
     if not model.training or not torch.is_grad_enabled():
         return
@@ -916,11 +972,6 @@ def configure_dynamic_moe_loss_scaling(
 
     if any(router.tp_cp_group is not routers[0].tp_cp_group for router in routers[1:]):
         raise ValueError("Dynamic CP routers disagree on the active TP*CP group")
-
-
-def dynamic_moe_grad_scale_correction(model_config: Any) -> float:
-    """Return the active task's aux-loss correction, or the static default."""
-    return _DYNAMIC_MOE_GRAD_SCALE_CORRECTIONS.get(id(model_config), 1.0)
 
 
 def bind_attention_cp_group(model: torch.nn.Module, packed_seq_params: Any) -> Any:
@@ -949,41 +1000,40 @@ def bind_attention_cp_group(model: torch.nn.Module, packed_seq_params: Any) -> A
     if tp_cp_group.size() != expected_tp_cp_size:
         raise ValueError("Dynamic MoE TP*CP group has the wrong size")
     padding_only = bool(getattr(packed_seq_params, "dynamic_cp_padding_only", False))
-    for module in model.modules():
-        collection = getattr(module, "pg_collection", None)
-        if collection is not None and hasattr(collection, "cp"):
-            collection.cp = group
-            if hasattr(collection, "tp_cp"):
-                collection.tp_cp = tp_cp_group
-        if _uses_direct_cp_group(module) and hasattr(module, "cp_group"):
-            module.cp_group = group
-            if hasattr(module, "tp_cp_group"):
-                module.tp_cp_group = tp_cp_group
-        if _is_hybrid_stack(module):
-            _bind_hybrid_stack_layout(module, group=group, tp_cp_group=tp_cp_group)
-        if isinstance(module, Router):
-            module.cp_group = group
+    targets = _bind_targets(model)
+    for module in targets.pg_collections:
+        module.pg_collection.cp = group
+        if hasattr(module.pg_collection, "tp_cp"):
+            module.pg_collection.tp_cp = tp_cp_group
+    for module in targets.direct_groups:
+        module.cp_group = group
+        if hasattr(module, "tp_cp_group"):
             module.tp_cp_group = tp_cp_group
-            _bind_router_config(module, padding_only=padding_only)
-        if _is_mamba_mixer(module):
-            _rebuild_mamba_cp(module, group)
-        elif _is_gated_delta_product(module):
-            _rebuild_gdp_cp(module, group)
-        elif _is_gated_delta_net(module):
-            baseline_size = module.cp_size
-            baseline_split = getattr(module, "feat_dim_split", None)
-            module.cp_size = context.size
-            if baseline_split is not None:
-                scaled_split = []
-                for value in baseline_split:
-                    numerator = value * baseline_size
-                    if numerator % context.size:
-                        raise ValueError(
-                            "GatedDeltaNet projection dimensions are not divisible "
-                            f"by runtime CP={context.size}"
-                        )
-                    scaled_split.append(numerator // context.size)
-                module.feat_dim_split = tuple(scaled_split)
+    for module in targets.hybrid_stacks:
+        _bind_hybrid_stack_layout(module, group=group, tp_cp_group=tp_cp_group)
+    for module in targets.routers:
+        module.cp_group = group
+        module.tp_cp_group = tp_cp_group
+        _bind_router_config(module, padding_only=padding_only)
+    for module in targets.mamba_mixers:
+        _rebuild_mamba_cp(module, group)
+    for module in targets.gated_delta_products:
+        _rebuild_gdp_cp(module, group)
+    for module in targets.gated_delta_nets:
+        baseline_size = module.cp_size
+        baseline_split = getattr(module, "feat_dim_split", None)
+        module.cp_size = context.size
+        if baseline_split is not None:
+            scaled_split = []
+            for value in baseline_split:
+                numerator = value * baseline_size
+                if numerator % context.size:
+                    raise ValueError(
+                        "GatedDeltaNet projection dimensions are not divisible "
+                        f"by runtime CP={context.size}"
+                    )
+                scaled_split.append(numerator // context.size)
+            module.feat_dim_split = tuple(scaled_split)
     model_packed = copy(packed_seq_params)
     model_packed.cp_group = group
     return model_packed

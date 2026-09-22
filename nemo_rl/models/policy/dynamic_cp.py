@@ -23,6 +23,7 @@ from nemo_rl.distributed.dynamic_context_parallel import (
     CPSyncGroup,
     DynamicContextParallelConfig,
     assignments_for_lane,
+    padding_for_cp,
     plan_cp_phases,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -82,6 +83,20 @@ def _minimum_cp_size_for_experts(
     return minimum
 
 
+def _dynamic_cp_token_alignment(megatron_cfg: dict[str, Any]) -> int:
+    """Return the precision/dispatcher alignment used by the planner."""
+    fp8 = megatron_cfg.get("fp8_cfg") or {}
+    alignment = 1
+    if fp8.get("enabled"):
+        alignment = {"blockwise": 128, "mxfp8": 32}.get(fp8["fp8_recipe"], 16)
+    if (
+        megatron_cfg.get("moe_token_dispatcher_type") == "flex"
+        and megatron_cfg.get("moe_flex_dispatcher_backend") == "hybridep"
+    ):
+        alignment = max(alignment, 128)
+    return alignment
+
+
 def dynamic_cp_config(cfg: dict[str, Any]) -> DynamicContextParallelConfig | None:
     """Read optional config without introducing defaults at worker call sites."""
     megatron = cfg.get("megatron_cfg")
@@ -110,6 +125,22 @@ def validate_dynamic_cp(cfg: dict[str, Any], *, lanes: int) -> None:
         )
     if mc.get("cuda_graph_impl") not in (None, "none"):
         raise ValueError("Dynamic CP does not support CUDA graph capture")
+    cp_comm_type = _model_setting(mc, "cp_comm_type")
+    cp_comm_types = (
+        cp_comm_type
+        if isinstance(cp_comm_type, (list, tuple))
+        else [cp_comm_type]
+    )
+    if (
+        "a2a+p2p" in cp_comm_types
+        or _model_setting(mc, "hierarchical_context_parallel_sizes") is not None
+    ):
+        raise ValueError(
+            "Dynamic CP does not support hierarchical context parallelism "
+            "(cp_comm_type='a2a+p2p' or "
+            "hierarchical_context_parallel_sizes). Set cp_comm_type to 'p2p' or "
+            "'a2a' and remove hierarchical_context_parallel_sizes."
+        )
     if _model_setting(mc, "overlap_moe_expert_parallel_comm"):
         raise ValueError("Dynamic CP does not support overlap_moe_expert_parallel_comm")
     if "quantile_balancing" in _routing_types(mc):
@@ -135,6 +166,24 @@ def validate_dynamic_cp(cfg: dict[str, Any], *, lanes: int) -> None:
         sequence_parallel_size=tp if mc["sequence_parallel"] else 1,
         user_pad_multiple=cfg["make_sequence_length_divisible_by"],
     )
+    maximum_padding = padding_for_cp(
+        maximum,
+        sequence_parallel_size=tp if mc["sequence_parallel"] else 1,
+        user_pad_multiple=cfg["make_sequence_length_divisible_by"],
+        token_alignment=_dynamic_cp_token_alignment(mc),
+    )
+    sequence_ceiling = cfg["max_total_sequence_length"]
+    padded_ceiling = (
+        (sequence_ceiling + maximum_padding - 1) // maximum_padding * maximum_padding
+    )
+    maximum_capacity = dynamic.tokens_per_rank * maximum
+    if padded_ceiling > maximum_capacity:
+        raise ValueError(
+            "Dynamic CP cannot fit policy.max_total_sequence_length="
+            f"{sequence_ceiling} at max_size={maximum}: padding requires "
+            f"{padded_ceiling} tokens but the configured capacity is "
+            f"tokens_per_rank * max_size = {maximum_capacity}"
+        )
 
 
 @dataclass
@@ -193,15 +242,7 @@ def _schedule_parameters(
     lanes = sharding.shape["data_parallel"] * cp
     tp = mc["tensor_model_parallel_size"]
     minimum = _minimum_cp_size_for_experts(mc, dynamic.min_size)
-    fp8 = mc.get("fp8_cfg") or {}
-    alignment = 1
-    if fp8.get("enabled"):
-        alignment = {"blockwise": 128, "mxfp8": 32}.get(fp8["fp8_recipe"], 16)
-    if (
-        mc.get("moe_token_dispatcher_type") == "flex"
-        and mc.get("moe_flex_dispatcher_backend") == "hybridep"
-    ):
-        alignment = max(alignment, 128)
+    alignment = _dynamic_cp_token_alignment(mc)
     return (
         lanes,
         minimum,
@@ -408,48 +449,54 @@ def build_cp_dispatch(
             )
         else:
             valid_sequences = valid_tokens = 0.0
-        samples_by_cp = Counter()
-        tasks_by_cp = Counter()
-        packed_tokens = 0
-        packed_capacity = 0
-        for group in groups:
-            for task in group.assignments:
-                samples_by_cp[task.cp_size] += len(task.sample_indices)
-                if task.sample_indices:
-                    tasks_by_cp[task.cp_size] += 1
-                    packed_tokens += task.padded_tokens
-                    packed_capacity += task.cp_size * schedule.tokens_per_rank
-        group_task_ranges = [
-            (
-                min(len(assignments_for_lane(group, lane)) for lane in range(lanes)),
-                max(len(assignments_for_lane(group, lane)) for lane in range(lanes)),
-            )
+        assignments_by_group_lane = tuple(
+            tuple(assignments_for_lane(group, lane) for lane in range(lanes))
             for group in groups
-        ]
-        logger.info(
-            "Dynamic CP %s: samples=%d groups=%d uneven_groups=%d "
-            "local_tasks=[%d,%d] "
-            "samples_by_cp=%s tasks_by_cp=%s packing_utilization=%.4f "
-            "valid_sequences=%s valid_tokens=%s schedule=%s",
-            "train" if training else "score",
-            gbs,
-            len(groups),
-            sum(low < high for low, high in group_task_ranges),
-            min(
-                sum(len(assignments_for_lane(group, lane)) for group in groups)
-                for lane in range(lanes)
-            ),
-            max(
-                sum(len(assignments_for_lane(group, lane)) for group in groups)
-                for lane in range(lanes)
-            ),
-            dict(sorted(samples_by_cp.items())),
-            dict(sorted(tasks_by_cp.items())),
-            packed_tokens / packed_capacity if packed_capacity else 0.0,
-            valid_sequences,
-            valid_tokens,
-            "reused" if reused_schedule else "new",
         )
+        if logger.isEnabledFor(logging.INFO):
+            samples_by_cp = Counter()
+            tasks_by_cp = Counter()
+            packed_tokens = 0
+            packed_capacity = 0
+            for group in groups:
+                for task in group.assignments:
+                    samples_by_cp[task.cp_size] += len(task.sample_indices)
+                    if task.sample_indices:
+                        tasks_by_cp[task.cp_size] += 1
+                        packed_tokens += task.padded_tokens
+                        packed_capacity += task.cp_size * schedule.tokens_per_rank
+            group_task_ranges = [
+                (
+                    min(len(assignments) for assignments in group_assignments),
+                    max(len(assignments) for assignments in group_assignments),
+                )
+                for group_assignments in assignments_by_group_lane
+            ]
+            tasks_per_lane = [
+                sum(
+                    len(assignments_by_group_lane[group_index][lane])
+                    for group_index in range(len(groups))
+                )
+                for lane in range(lanes)
+            ]
+            logger.info(
+                "Dynamic CP %s: samples=%d groups=%d uneven_groups=%d "
+                "local_tasks=[%d,%d] "
+                "samples_by_cp=%s tasks_by_cp=%s packing_utilization=%.4f "
+                "valid_sequences=%s valid_tokens=%s schedule=%s",
+                "train" if training else "score",
+                gbs,
+                len(groups),
+                sum(low < high for low, high in group_task_ranges),
+                min(tasks_per_lane),
+                max(tasks_per_lane),
+                dict(sorted(samples_by_cp.items())),
+                dict(sorted(tasks_by_cp.items())),
+                packed_tokens / packed_capacity if packed_capacity else 0.0,
+                valid_sequences,
+                valid_tokens,
+                "reused" if reused_schedule else "new",
+            )
         for lane in range(lanes):
             rank_groups = tuple(
                 CPRankGroup(
@@ -460,10 +507,10 @@ def build_cp_dispatch(
                                 i + start for i in assignment.sample_indices
                             ),
                         )
-                        for assignment in assignments_for_lane(group, lane)
+                        for assignment in assignments_by_group_lane[group_index][lane]
                     )
                 )
-                for group in groups
+                for group_index in range(len(groups))
             )
             rank_steps[lane].append(
                 CPRankStep(rank_groups, valid_sequences, valid_tokens)

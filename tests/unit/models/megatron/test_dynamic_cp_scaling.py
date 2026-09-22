@@ -24,7 +24,10 @@ pytestmark = pytest.mark.mcore
 @pytest.mark.parametrize("active_cp", [1, 2, 4])
 @pytest.mark.parametrize("num_microbatches", [1, 3])
 @pytest.mark.parametrize("per_token", [False, True])
-def test_mcore_legacy_loss_scaling(base_cp, active_cp, num_microbatches, per_token):
+@pytest.mark.parametrize("replicated_cp_loss", [False, True])
+def test_mcore_legacy_loss_scaling(
+    base_cp, active_cp, num_microbatches, per_token, replicated_cp_loss
+):
     # MCore is optional in the standard CPU test environment.
     from megatron.core.pipeline_parallel.schedules import forward_step_calc_loss
 
@@ -33,7 +36,7 @@ def test_mcore_legacy_loss_scaling(base_cp, active_cp, num_microbatches, per_tok
         active_cp_size=active_cp,
         schedule_cp_size=base_cp,
         num_microbatches=num_microbatches,
-        replicated_cp_loss=True,
+        replicated_cp_loss=replicated_cp_loss,
     )
     metrics = []
     loss, _ = forward_step_calc_loss(
@@ -49,5 +52,6 @@ def test_mcore_legacy_loss_scaling(base_cp, active_cp, num_microbatches, per_tok
         is_last_stage=True,
     )
     loss.backward()
-    assert original_loss.grad.item() * active_cp == pytest.approx(1.0)
+    expected_grad = 1.0 / active_cp if replicated_cp_loss else 1.0
+    assert original_loss.grad.item() == pytest.approx(expected_grad)
     assert metrics == [{"loss": 2.0}]

@@ -139,6 +139,8 @@ def test_dynamic_binding_updates_router_and_ssm_then_restores(monkeypatch):
     model.add_module("gdn", _GatedDelta(original_cp))
     model.add_module("gdp", _GatedDeltaProduct(original_cp))
     model.add_module("router", _Router(original_tp_cp, config))
+    # Real transformer layers share one config across many routers.
+    model.add_module("router2", _Router(original_tp_cp, config))
     packed = SimpleNamespace(
         local_cp_size=2,
         cp_group=active_cp,
@@ -160,6 +162,8 @@ def test_dynamic_binding_updates_router_and_ssm_then_restores(monkeypatch):
         assert model_packed.cp_group is active_cp
         assert model.router.cp_group is active_cp
         assert model.router.tp_cp_group is active_tp_cp
+        assert model.router2.cp_group is active_cp
+        assert model.router2.tp_cp_group is active_tp_cp
         assert model.mamba.pg_collection.cp is active_cp
         assert model.mamba.cp is not original_mamba_helper
         assert model.mamba.cp.cp_group is active_cp
@@ -174,6 +178,8 @@ def test_dynamic_binding_updates_router_and_ssm_then_restores(monkeypatch):
 
     assert model.router.cp_group is original_tp_cp
     assert model.router.tp_cp_group is original_tp_cp
+    assert model.router2.cp_group is original_tp_cp
+    assert model.router2.tp_cp_group is original_tp_cp
     assert model.mamba.pg_collection.cp is original_cp
     assert model.mamba.cp is original_mamba_helper
     assert model.gdn.pg_collection.cp is original_cp
@@ -221,6 +227,30 @@ def test_dynamic_padding_task_keeps_only_global_aux_loss(monkeypatch):
     assert config.moe_z_loss_coeff == 0.01
 
 
+def test_dynamic_binding_setup_failure_cleans_global_state(monkeypatch):
+    from nemo_rl.models.megatron import dynamic_cp
+
+    group = _Group(1)
+    config = SimpleNamespace(moe_aux_loss_coeff=0.1, moe_z_loss_coeff=0.01)
+    # The second config fails after the first baseline has been installed.
+    invalid_config = SimpleNamespace(moe_aux_loss_coeff=0.2)
+    model = torch.nn.Module()
+    model.add_module("router", _Router(group, config))
+    model.add_module("invalid_router", _Router(group, invalid_config))
+
+    monkeypatch.setattr(dynamic_cp, "Router", _Router)
+
+    with pytest.raises(AttributeError):
+        with dynamic_cp.preserve_attention_cp_groups(model):
+            pytest.fail("setup unexpectedly completed")
+
+    assert id(model) not in dynamic_cp._ACTIVE_BIND_TARGETS
+    assert id(config) not in dynamic_cp._ROUTER_CONFIG_BASELINES
+    assert id(invalid_config) not in dynamic_cp._ROUTER_CONFIG_BASELINES
+    assert model.router.cp_group is group
+    assert model.router.tp_cp_group is group
+
+
 @pytest.mark.parametrize("active_size", [1, 4])
 def test_dynamic_moe_scaling_is_applied_by_router_attachment(monkeypatch, active_size):
     from nemo_rl.models.megatron import dynamic_cp
@@ -243,10 +273,8 @@ def test_dynamic_moe_scaling_is_applied_by_router_attachment(monkeypatch, active
 
     with dynamic_cp.preserve_attention_cp_groups(model):
         dynamic_cp.configure_dynamic_moe_loss_scaling(model, padding_mask)
-        assert dynamic_cp.dynamic_moe_grad_scale_correction(config) == 1.0
         assert config.moe_z_loss_coeff == 0.02
 
-    assert dynamic_cp.dynamic_moe_grad_scale_correction(config) == 1.0
     assert config.moe_aux_loss_coeff == 0.1
     assert config.moe_z_loss_coeff == 0.02
 

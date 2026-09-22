@@ -1766,26 +1766,6 @@ def test_compute_moe_grad_scale_normalizes_by_valid_tokens():
     assert torch.allclose(scale_fn(), torch.tensor(0.25))
 
 
-def test_compute_moe_grad_scale_applies_dynamic_task_correction(monkeypatch):
-    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
-
-    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
-    _disable_opd_full(worker)
-    model_config = SimpleNamespace()
-    worker.model = SimpleNamespace(config=model_config)
-    monkeypatch.setattr(
-        worker_module,
-        "dynamic_moe_grad_scale_correction",
-        lambda config: 1.5 if config is model_config else 1.0,
-    )
-
-    scale_fn = worker_module.MegatronPolicyWorkerImpl._compute_moe_grad_scale(
-        worker, torch.tensor(4.0)
-    )
-
-    assert torch.allclose(scale_fn(), torch.tensor(0.375))
-
-
 def test_compute_moe_grad_scale_clamps_zero_valid_tokens():
     """clamp(min=1) must guard against division by zero when no valid tokens."""
     from nemo_rl.models.policy.workers.megatron_policy_worker import (

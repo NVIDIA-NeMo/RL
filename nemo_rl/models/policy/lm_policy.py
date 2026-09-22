@@ -15,7 +15,7 @@ import os
 import warnings
 from collections import defaultdict
 from contextlib import nullcontext
-from typing import Any, Iterable, Optional, Union
+from typing import Any, Iterable, Mapping, Optional, Sequence, Union
 
 import numpy as np
 import ray
@@ -656,7 +656,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
     def _report_sharded_payload(
         self,
-        sharded_data: list["SlicedDataDict"],
+        sharded_data: Sequence[Mapping[str, Any]],
         boundary: str,
     ) -> None:
         """Measure the exact unique per-DP-shard Ray arguments."""
@@ -671,33 +671,63 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
 
     def _get_dynamic_cp_outputs(
-        self, method: str, data: BatchedDataDict, **kwargs: Any
+        self,
+        method: str,
+        data: BatchedDataDict,
+        *,
+        timer: Optional[Timer] = None,
+        **kwargs: Any,
     ) -> BatchedDataDict:
-        schedule_batch_size = self.cfg["train_global_batch_size"]
-        if data.size % schedule_batch_size:
-            # A standalone score batch need not be a multiple of training GBS.
-            # In that case plan it as one batch; otherwise preserve every
-            # training-sized step so score and train can share the schedule.
-            schedule_batch_size = data.size
-        schedule = self._matching_dynamic_cp_schedule(data, schedule_batch_size)
-        dispatch = build_cp_dispatch(
-            data,
-            self.cfg,
-            self.sharding_annotations,
-            batch_size=schedule_batch_size,
-            training=False,
-            schedule=schedule,
-        )
+        labels = {
+            "get_logprobs": (
+                "get_logprobs/shard_data",
+                "get_logprobs/submit_logprob_futures",
+                "policy_get_logprobs",
+            ),
+            "get_reference_policy_logprobs": (
+                "get_reference_policy_logprobs/shard_data",
+                "get_reference_policy_logprobs/submit_reference_policy_logprob_futures",
+                "policy_get_reference_logprobs",
+            ),
+            "get_topk_logits": (
+                "get_topk_logits/shard_data",
+                "get_topk_logits/submit_topk_logits_futures",
+                None,
+            ),
+        }
+        shard_label, submit_label, payload_boundary = labels[method]
+        with timer.time(shard_label) if timer else nullcontext():
+            schedule_batch_size = self.cfg["train_global_batch_size"]
+            if data.size % schedule_batch_size:
+                # A standalone score batch need not be a multiple of training GBS.
+                # In that case plan it as one batch; otherwise preserve every
+                # training-sized step so score and train can share the schedule.
+                schedule_batch_size = data.size
+            schedule = self._matching_dynamic_cp_schedule(data, schedule_batch_size)
+            dispatch = build_cp_dispatch(
+                data,
+                self.cfg,
+                self.sharding_annotations,
+                batch_size=schedule_batch_size,
+                training=False,
+                schedule=schedule,
+            )
         self._dynamic_cp_schedule = dispatch.schedule
-        futures = self.worker_group.run_all_workers_sharded_data(
-            method,
-            data=dispatch.data,
-            cp_plan=dispatch.plans,
-            in_sharded_axes=["data_parallel", "context_parallel"],
-            replicate_on_axes=list(replicated_axes(dynamic_cp=True)),
-            output_is_replicated=list(replicated_axes(dynamic_cp=True)),
-            common_kwargs=kwargs,
-        )
+        if payload_boundary is not None:
+            self._report_sharded_payload(
+                [shard for dp_shards in dispatch.data for shard in dp_shards],
+                payload_boundary,
+            )
+        with timer.time(submit_label) if timer else nullcontext():
+            futures = self.worker_group.run_all_workers_sharded_data(
+                method,
+                data=dispatch.data,
+                cp_plan=dispatch.plans,
+                in_sharded_axes=["data_parallel", "context_parallel"],
+                replicate_on_axes=list(replicated_axes(dynamic_cp=True)),
+                output_is_replicated=list(replicated_axes(dynamic_cp=True)),
+                common_kwargs=kwargs,
+            )
         return collect_cp_outputs(
             self.worker_group.get_all_worker_results(futures), dispatch, data.size
         )
@@ -731,7 +761,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
         if self.dynamic_cp:
-            return self._get_dynamic_cp_outputs("get_logprobs", data)
+            return self._get_dynamic_cp_outputs("get_logprobs", data, timer=timer)
 
         with timer.time("get_logprobs/shard_data") if timer else nullcontext():
             sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
@@ -780,7 +810,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """
         if self.dynamic_cp:
             return self._get_dynamic_cp_outputs(
-                "get_reference_policy_logprobs", data, micro_batch_size=micro_batch_size
+                "get_reference_policy_logprobs",
+                data,
+                timer=timer,
+                micro_batch_size=micro_batch_size,
             )
 
         with (
@@ -837,7 +870,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """Dispatch get_topk_logits to workers (no CP/packed support initially)."""
         if self.dynamic_cp:
             return self._get_dynamic_cp_outputs(
-                "get_topk_logits", data, k=k, micro_batch_size=micro_batch_size
+                "get_topk_logits",
+                data,
+                timer=timer,
+                k=k,
+                micro_batch_size=micro_batch_size,
             )
         with timer.time("get_topk_logits/shard_data") if timer else nullcontext():
             sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
@@ -981,8 +1018,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 if dispatch is not None
                 else self._shard_for_train(data, batch_size)
             )
-        if dispatch is None:
-            self._report_sharded_payload(sharded_data, "policy_train")
+        self._report_sharded_payload(
+            (
+                sharded_data
+                if dispatch is None
+                else [shard for dp_shards in sharded_data for shard in dp_shards]
+            ),
+            "policy_train",
+        )
 
         if self.flops_tracker is not None:
             self.flops_tracker.reset()

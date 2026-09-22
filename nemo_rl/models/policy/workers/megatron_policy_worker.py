@@ -76,7 +76,6 @@ from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
     process_global_batch,
 )
-from nemo_rl.models.megatron.dynamic_cp import dynamic_moe_grad_scale_correction
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
     broadcast_obj_from_pp_rank,
@@ -1428,19 +1427,9 @@ class MegatronPolicyWorkerImpl(
         return metrics
 
     def _compute_moe_grad_scale(self, global_valid_toks):
-        """Build a moe_grad_scale_func that normalizes the aux-loss gradient.
-
-        The base scale is 1/global_valid_toks (clamped to avoid division by
-        zero). Dynamic CP additionally supplies the current task's exact-token
-        correction; static CP and dense models retain a correction of one.
-        """
+        """Build a moe_grad_scale_func normalized by valid tokens."""
         moe_scale = 1.0 / global_valid_toks.clamp(min=1).float()
-
-        def _scale() -> torch.Tensor:
-            model_config = self._get_model_config() if hasattr(self, "model") else None
-            return moe_scale * dynamic_moe_grad_scale_correction(model_config)
-
-        return _scale
+        return lambda: moe_scale
 
     def _set_moe_grad_scale_func(self, func):
         """Set moe_grad_scale_func on the model config for MOE aux loss scaling."""

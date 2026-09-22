@@ -160,6 +160,7 @@ class TestDynamicCPDispatch(unittest.TestCase):
             token_mask=torch.ones(5, 12, dtype=torch.long),
         )
         cfg = self._validation_cfg()
+        cfg["max_total_sequence_length"] = 10
         cfg["megatron_cfg"].update(
             {
                 "moe_router_load_balancing_type": "global_aux_loss",
@@ -187,6 +188,7 @@ class TestDynamicCPDispatch(unittest.TestCase):
     def _validation_cfg(self) -> dict:
         return {
             "make_sequence_length_divisible_by": 1,
+            "max_total_sequence_length": 32,
             "sequence_packing": {"enabled": True, "pair_grouping_key": None},
             "dynamic_batching": {"enabled": False},
             "draft": {"enabled": False},
@@ -227,6 +229,30 @@ class TestDynamicCPDispatch(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "overlap_moe_expert_parallel_comm"):
             validate_dynamic_cp(cfg, lanes=4)
 
+    def test_dynamic_cp_validation_rejects_hierarchical_cp(self):
+        cases = {
+            "direct cp_comm_type": {"cp_comm_type": "a2a+p2p"},
+            "override cp_comm_type list": {
+                "model_overrides": {"cp_comm_type": ["p2p", "a2a+p2p"]}
+            },
+            "direct hierarchy sizes": {
+                "hierarchical_context_parallel_sizes": [2, 2]
+            },
+            "override hierarchy sizes": {
+                "model_overrides": {
+                    "hierarchical_context_parallel_sizes": [2, 2]
+                }
+            },
+        }
+        for name, settings in cases.items():
+            with self.subTest(name=name):
+                cfg = self._validation_cfg()
+                cfg["megatron_cfg"].update(settings)
+                with self.assertRaisesRegex(
+                    ValueError, "does not support hierarchical context parallelism"
+                ):
+                    validate_dynamic_cp(cfg, lanes=4)
+
     def test_dynamic_cp_validation_allows_mtp_and_hybridep_prepad_separately(self):
         mtp_cfg = self._validation_cfg()
         mtp_cfg["megatron_cfg"]["mtp_num_layers"] = 1
@@ -238,6 +264,11 @@ class TestDynamicCPDispatch(unittest.TestCase):
                 "moe_token_dispatcher_type": "flex",
                 "moe_flex_dispatcher_backend": "hybridep",
                 "moe_hybridep_prepad_packed_inputs": True,
+                "dynamic_context_parallel": {
+                    "enabled": True,
+                    "tokens_per_rank": 256,
+                    "max_size": 4,
+                },
             }
         )
         validate_dynamic_cp(hybridep_cfg, lanes=4)
@@ -251,6 +282,15 @@ class TestDynamicCPDispatch(unittest.TestCase):
             }
         )
         validate_dynamic_cp(cfg, lanes=4)
+
+    def test_dynamic_cp_validation_rejects_unreachable_sequence_ceiling(self):
+        cfg = self._validation_cfg()
+        cfg["max_total_sequence_length"] = 33
+
+        with self.assertRaisesRegex(
+            ValueError, "cannot fit.*max_total_sequence_length"
+        ):
+            validate_dynamic_cp(cfg, lanes=4)
 
     def test_dynamic_cp_keeps_preference_pairs_atomic(self):
         data = BatchedDataDict(

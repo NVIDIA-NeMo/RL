@@ -169,6 +169,10 @@ class TeacherWorkerGroup:
             cfg["megatron_cfg"]["peft"]["enabled"] = False
         if "draft" in cfg:
             cfg["draft"]["enabled"] = False
+        # Teacher inference is dispatched through TQ metadata and never receives
+        # the driver's dynamic-CP rank plan. It may use its configured static CP,
+        # but must not inherit the student's dynamic execution block.
+        cfg["megatron_cfg"].pop("dynamic_context_parallel", None)
         # Router replay keeps the student's rollout and training logprobs
         # consistent. A frozen teacher has no training pass, and its text-only
         # TQ fetch does not carry routed_experts, so replay must stay off.

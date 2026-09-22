@@ -190,6 +190,10 @@ def pad_packed_seq_for_hybridep(
         cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
+        # HybridEP just added physical padding beyond the logical boundaries.
+        # Set this explicitly because model-owned/static packing may have
+        # already resolved TE's optional inference to False.
+        pad_between_seqs=True,
         total_tokens=target_seq_len,
     )
     return input_ids, input_ids_cp_sharded, packed_seq_params, cu_seqlens_padded

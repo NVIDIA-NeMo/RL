@@ -127,7 +127,10 @@ def test_dynamic_cp_metrics_use_one_fixed_sum_group(monkeypatch):
     from nemo_rl.models.megatron.common import get_moe_metrics
 
     entry = SimpleNamespace(values=torch.tensor([1.0, 3.0]))
-    live_tracker = SimpleNamespace(metrics={"load_balancing_loss": entry})
+    live_tracker = SimpleNamespace(
+        metrics={"load_balancing_loss": entry},
+        ensure_initialized=lambda *_args: None,
+    )
     reductions = []
     fixed_group = object()
 
@@ -155,11 +158,21 @@ def test_dynamic_cp_metrics_use_one_fixed_sum_group(monkeypatch):
 
     metrics = get_moe_metrics(
         loss_scale=0.25,
+        num_layers=2,
+        track_names=["load_balancing_loss"],
         dynamic_parallel_group=fixed_group,
     )
 
     assert reductions == [fixed_group]
     assert metrics["load_balancing_loss"] == pytest.approx(1.0)
+
+
+@pytest.mark.mcore
+def test_dynamic_cp_metrics_require_deterministic_collective_inputs():
+    from nemo_rl.models.megatron.common import get_moe_metrics
+
+    with pytest.raises(ValueError, match="explicit track_names and num_layers"):
+        get_moe_metrics(loss_scale=1.0, dynamic_parallel_group=object())
 
 
 @pytest.mark.mcore
@@ -173,7 +186,8 @@ def test_dynamic_cp_avg_group_metrics_use_rank_participation_scale(monkeypatch):
     # never populated by record(); the name must still select AVG semantics.
     z_entry = SimpleNamespace(values=torch.tensor([2.0, 4.0]), avg_group=None)
     live_tracker = SimpleNamespace(
-        metrics={"load_balancing_loss": aux_entry, "z_loss": z_entry}
+        metrics={"load_balancing_loss": aux_entry, "z_loss": z_entry},
+        ensure_initialized=lambda *_args: None,
     )
     fixed_group = object()
     reductions = []
@@ -200,6 +214,8 @@ def test_dynamic_cp_avg_group_metrics_use_rank_participation_scale(monkeypatch):
 
     metrics = get_moe_metrics(
         loss_scale=0.25,
+        num_layers=2,
+        track_names=["load_balancing_loss", "z_loss"],
         dynamic_parallel_group=fixed_group,
         dynamic_avg_loss_scale=0.125,
     )
@@ -215,7 +231,10 @@ def test_dynamic_cp_global_aux_uses_aligned_round_scale(monkeypatch):
     from nemo_rl.models.megatron.common import get_moe_metrics
 
     entry = SimpleNamespace(values=torch.tensor([2.0]), avg_group=None)
-    live_tracker = SimpleNamespace(metrics={"global_load_balancing_loss": entry})
+    live_tracker = SimpleNamespace(
+        metrics={"global_load_balancing_loss": entry},
+        ensure_initialized=lambda *_args: None,
+    )
     monkeypatch.setattr(
         megatron_module.common, "get_moe_metrics_tracker", lambda: live_tracker
     )
@@ -235,6 +254,8 @@ def test_dynamic_cp_global_aux_uses_aligned_round_scale(monkeypatch):
 
     metrics = get_moe_metrics(
         loss_scale=0.1,
+        num_layers=1,
+        track_names=["global_load_balancing_loss"],
         dynamic_parallel_group=object(),
         dynamic_global_loss_scale=0.25,
     )
