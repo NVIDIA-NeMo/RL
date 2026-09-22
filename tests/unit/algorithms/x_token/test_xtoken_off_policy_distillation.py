@@ -332,7 +332,10 @@ def test_setup_requires_dtensor_v2_student():
     cfg.policy["dtensor_cfg"]["_v2"] = False
     with (
         patch.object(xt_mod, "RayVirtualCluster") as mock_cluster,
-        pytest.raises(AssertionError),
+        pytest.raises(
+            ValueError,
+            match=r"policy\.dtensor_cfg\._v2=false selects the DTensor v1 backend",
+        ),
     ):
         setup(
             cfg,
@@ -349,7 +352,10 @@ def test_setup_requires_dtensor_v2_teacher():
     cfg.teachers[0].dtensor_cfg["_v2"] = False
     with (
         patch.object(xt_mod, "RayVirtualCluster") as mock_cluster,
-        pytest.raises(AssertionError),
+        pytest.raises(
+            ValueError,
+            match=r"teachers\.0\.dtensor_cfg\._v2=false selects the DTensor v1 backend",
+        ),
     ):
         setup(
             cfg,
