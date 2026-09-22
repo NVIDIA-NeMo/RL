@@ -84,6 +84,8 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         out["moe_metrics"] = results[0]["moe_metrics"]
     if "mtp_metrics" in results[0]:
         out["mtp_metrics"] = results[0]["mtp_metrics"]
+    if "draft_grad_norm" in results[0]:
+        out["draft_grad_norm"] = results[0]["draft_grad_norm"]
     all_mb_metrics: dict[str, list[Any]] = defaultdict(list)
     for r in results:
         for k, v in r["all_mb_metrics"].items():
@@ -158,12 +160,17 @@ class TQPolicy(TQDriverMixin, Policy):
         self._router_replay_enabled = bool(
             (self.cfg.get("router_replay") or {}).get("enabled", False)
         )
-        # Per-token teacher payload column read by the full-vocabulary MOPD loss.
+        # Per-token teacher payload column read by the full-vocabulary MOPD loss,
+        # plus (on the hidden-state path) a per-sample teacher-identity column.
         # Resolved by the driver in setup; absent means the feature is off and
-        # the column must stay out of every fetch.
+        # the columns must stay out of every fetch.
+        _opd_full_cfg = self.cfg.get("on_policy_distillation_full")
         self._opd_full_field: Optional[str] = (
-            self.cfg.get("on_policy_distillation_full") or {}
-        ).get("payload_field")
+            _opd_full_cfg["payload_field"] if _opd_full_cfg else None
+        )
+        self._opd_full_teacher_index_field: Optional[str] = (
+            _opd_full_cfg["teacher_index_field"] if _opd_full_cfg else None
+        )
         # The baseline the cluster step metrics are differenced against. Kept
         # per policy rather than in module state so two trainers in one
         # process cannot interleave one baseline; the driver's own baseline
@@ -217,6 +224,7 @@ class TQPolicy(TQDriverMixin, Policy):
                     DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
                 ),
                 field=self._opd_full_field,
+                teacher_index_field=self._opd_full_teacher_index_field,
             ),
             num_samples=num_samples,
             consumer_tasks=["prev_lp", "ref_lp", "train"],
@@ -239,6 +247,7 @@ class TQPolicy(TQDriverMixin, Policy):
                     DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
                 ),
                 field=self._opd_full_field,
+                teacher_index_field=self._opd_full_teacher_index_field,
             ),
             num_samples=num_samples,
             consumer_tasks=[partition_id],
@@ -509,7 +518,11 @@ class TQPolicy(TQDriverMixin, Policy):
         train_meta = self._with_route_fields(
             meta,
             tuple(
-                fields_with_optional_opd_full(train_fields, field=self._opd_full_field)
+                fields_with_optional_opd_full(
+                    train_fields,
+                    field=self._opd_full_field,
+                    teacher_index_field=self._opd_full_teacher_index_field,
+                )
             ),
             task_name="train",
             want_routes=True,
@@ -643,7 +656,11 @@ class TQPolicy(TQDriverMixin, Policy):
             # router replay and route-plan passthrough. The opd_full payload
             # column has no such gate, so it is appended here.
             tuple(
-                fields_with_optional_opd_full(train_fields, field=self._opd_full_field)
+                fields_with_optional_opd_full(
+                    train_fields,
+                    field=self._opd_full_field,
+                    teacher_index_field=self._opd_full_teacher_index_field,
+                )
             ),
             task_name="train",
             want_routes=True,
