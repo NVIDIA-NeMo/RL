@@ -36,12 +36,49 @@ policy:
         # TRT-LLM CacheTransceiverConfig backend for the KV handoff:
         # DEFAULT | UCX | NIXL | MOONCAKE | MPI
         cache_transceiver_backend: DEFAULT
+        # Frontend (disagg server) workers per replica. Each is its own actor
+        # with a distinct URL, so one frontend's CPU stops being the replica's
+        # turn-throughput ceiling. replicas * workers must be <= 256.
+        num_frontend_workers: 1
+        # Base port for the frontends' deterministic ports
+        # (base + replica_idx * num_frontend_workers + frontend_idx). Keep it
+        # outside virtual_cluster's random master-port window (1400-1999).
+        frontend_base_port: 17300
+        # Thin the ctx->gen relay: token ids as one base64 int32 string instead
+        # of a 30k-int JSON array, and drop the (redundant) message history.
+        gen_tokids_ctxbytes: false
+        gen_strip_message_history: false
+        # Render the chat template and tokenize on the frontends instead of the
+        # single ctx adapter process. Guarded by ctx-side shadow validation
+        # (NRL_TRTLLM_TOKENIZE_SHADOW_RATE).
+        frontend_tokenize: false
+        # KV transceiver tuning. null means "don't forward", so TRT-LLM keeps
+        # its own default for each.
+        # CPP | PYTHON. TRT-LLM's own default is "auto", which only adopts the
+        # model's preferred runtime when the effective backend supports it and
+        # silently falls back to C++ otherwise -- not what a hybrid Mamba model
+        # wants, since the recurrent-state handoff needs the Python (v2) one.
+        cache_transceiver_runtime: null
+        # MiB of bounce buffer, or 0 to keep the per-block path. Read only by
+        # the Python (v2) transceiver.
+        kv_cache_bounce_size_mb: null
+        max_tokens_in_buffer: null
+        # Milliseconds before an unfinished KV transfer is cancelled. TRT-LLM's
+        # default (60 s) is tuned for short prompts at low concurrency; large
+        # multi-turn workloads want a much larger value.
+        kv_transfer_timeout_ms: null
         # Per-role overrides merged over trtllm_cfg (TP, the MoE split, and any
-        # other trtllm_cfg key). Uncomment to give the roles different shapes.
-        # ctx_trtllm_kwargs:
-        #   tensor_parallel_size: 4
-        # gen_trtllm_kwargs:
-        #   tensor_parallel_size: 2
+        # other trtllm_cfg key), so the roles can have different shapes. A key
+        # set here WINS over trtllm_cfg -- pinning tensor_parallel_size below
+        # would make trtllm_cfg.tensor_parallel_size a no-op for the disagg
+        # layout, silently. Empty means both roles inherit trtllm_cfg unchanged.
+        # Each role must satisfy moe_tp * moe_ep == its own TP. For example:
+        #   ctx_trtllm_kwargs:
+        #     tensor_parallel_size: 4
+        #   gen_trtllm_kwargs:
+        #     tensor_parallel_size: 2
+        ctx_trtllm_kwargs: {}
+        gen_trtllm_kwargs: {}
     trtllm_kwargs:
       batch_wait_timeout_iters: 32
       batch_wait_max_tokens_ratio: 0.5
