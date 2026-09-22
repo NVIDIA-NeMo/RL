@@ -206,7 +206,7 @@ def _compute_advantages(
     """
     prompt_ids = _prompt_ids_for_baseline(rep_prompts)
     valid_mask = torch.ones_like(rewards)
-    baseline, std = calculate_baseline_and_std_per_prompt(
+    baseline, std, _ = calculate_baseline_and_std_per_prompt(
         prompts=prompt_ids,
         rewards=rewards,
         valid_mask=valid_mask,
