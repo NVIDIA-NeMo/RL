@@ -6433,6 +6433,66 @@ class TestAggregateRolloutMetrics:
         assert result["environment/swe/env_extra/timeout/median"] == 0.5
         assert result["environment/swe/env_extra/timeout/histogram"] == [1.0, 0.0]
 
+    def test_legacy_agent_alias_pools_only_its_selected_environment(self):
+        result = aggregate_rollout_metrics(
+            {
+                "total_reward/histogram": [[0.0] * 2] * 3 + [[0.0] * 4],
+                "swe/timeout/histogram": [[1.0], [0.0]],
+                "swe/timeout/mean": [0.5, 0.0],
+                "swe/timeout/stddev": [float("nan"), float("nan")],
+                "environment/swe/env_extra/timeout/histogram": [[1.0], [0.0]],
+                "environment/swe/sample_count": [2, 2, 2],
+                "environment/math/sample_count": [4],
+                "unrelated/timeout/histogram": [[1.0], [0.0]],
+                "unrelated/timeout/mean": [0.5, 0.0],
+            }
+        )
+        assert result["swe/timeout/mean"] == pytest.approx(1 / 6)
+        assert result["swe/timeout/median"] == 0.5
+        assert result["swe/timeout/stddev"] == pytest.approx(2**-0.5)
+        # A histogram alone is not evidence of a Gym agent alias.
+        assert result["unrelated/timeout/mean"] == 0.25
+
+    def test_colliding_legacy_names_pool_both_agent_populations(self):
+        component = grpo_mod.rollout_environment_metric_component("a/b")
+        result = aggregate_rollout_metrics(
+            {
+                "total_reward/histogram": [[0.0] * 3, [0.0] * 2],
+                # agent=a, field=b/c and agent=a/b, field=c share a legacy key.
+                "a/b/c/histogram": [[0.0], [10.0]],
+                "a/b/c/mean": [0.0, 5.0],
+                "environment/a/env_extra/b/c/histogram": [[0.0]],
+                "environment/a/sample_count": [3],
+                f"environment/{component}/env_extra/c/histogram": [[10.0]],
+                f"environment/{component}/sample_count": [2],
+            }
+        )
+        assert result["a/b/c/mean"] == 2.0
+        assert result["a/b/c/median"] == 5.0
+        assert result["a/b/c/stddev"] == pytest.approx(50**0.5)
+        assert result["environment/a/env_extra/b/c/mean"] == 0.0
+        assert result[f"environment/{component}/env_extra/c/mean"] == 5.0
+
+    @pytest.mark.parametrize("old_has_diagnostic", [False, True])
+    def test_mixed_old_replay_preserves_legacy_reduction(self, old_has_diagnostic):
+        # Both groups contain two samples. The old group predates environment
+        # telemetry, including when it omits the optional diagnostic entirely.
+        old_means = [0.0] if old_has_diagnostic else []
+        old_histograms = [[0.0, 0.0]] if old_has_diagnostic else []
+        result = aggregate_rollout_metrics(
+            {
+                "total_reward/histogram": [[0.0, 0.0], [1.0, 1.0]],
+                "swe/score/histogram": old_histograms + [[10.0]],
+                "swe/score/mean": old_means + [5.0],
+                "environment/swe/env_extra/score/histogram": [[10.0]],
+                "environment/swe/sample_count": [2],
+            }
+        )
+        assert result["swe/score/mean"] == (2.5 if old_has_diagnostic else 5.0)
+        assert "swe/score/p50" not in result
+        # Canonical summaries still describe the explicitly attributed cohort.
+        assert result["environment/swe/env_extra/score/mean"] == 5.0
+
     def test_global_and_environment_core_distributions_match(self):
         groups = [[1], [2, 3, 40]]
         result = aggregate_rollout_metrics(

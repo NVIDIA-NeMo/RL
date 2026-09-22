@@ -106,6 +106,7 @@ from nemo_rl.experience.metric_utils import (
     calculate_single_metric,
     is_histogram_metric,
     pct,
+    rollout_environment_metric_component,
 )
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
@@ -4440,7 +4441,8 @@ def aggregate_rollout_metrics(
 
     Different metric types are aggregated according to their semantics:
     - Histogram observations: flattened into one step-level distribution;
-      core rollout and per-environment summaries are recomputed from it
+      core rollout, per-environment and recognized legacy agent summaries
+      are recomputed from it
     - Metrics ending with "/min" or starting with "min_" (excluding "_rate" suffix): take the minimum
     - Metrics ending with "/max" or starting with "max_" (excluding "_rate" suffix): take the maximum
     - "total_turns": summed
@@ -4508,12 +4510,41 @@ def aggregate_rollout_metrics(
         "truncated": {"truncation_rate": "mean"},
         "max_turns_reached": {"max_turns_reached_rate": "mean"},
     }
+    # Old ordinary replay metadata has agent histograms but no environment
+    # counts. Preserve its legacy reduction when any selected rows lack those
+    # counts, rather than divide a mixed old/new population by only new rows.
+    can_pool_agent_metrics = "total_reward/histogram" in aggregated and len(
+        aggregated["total_reward/histogram"]
+    ) == sum(
+        value
+        for name, value in aggregated.items()
+        if name.startswith("environment/")
+        and name.endswith("/sample_count")
+        and name.count("/") == 2
+    )
     for key, observations in list(aggregated.items()):
         if not key.endswith("/histogram"):
             continue
         metric_name = key.removesuffix("/histogram")
+        # Gym retains raw <agent>/<field> aliases alongside sanitized env_extra
+        # names. Either part may contain '/', so match exact canonical families
+        # rather than assuming a single split or comparing histogram values.
+        agent_counts = {}
+        if can_pool_agent_metrics:
+            for index, character in enumerate(metric_name):
+                if character != "/":
+                    continue
+                environment = rollout_environment_metric_component(metric_name[:index])
+                prefix = f"environment/{environment}"
+                field = metric_name[index + 1 :]
+                if (
+                    f"{prefix}/env_extra/{field}/histogram" in aggregated
+                    and f"{prefix}/sample_count" in aggregated
+                ):
+                    agent_counts[prefix] = aggregated[f"{prefix}/sample_count"]
         if not (
-            key.startswith("environment/")
+            agent_counts
+            or key.startswith("environment/")
             or key.startswith("capture/")
             or metric_name
             in {
@@ -4532,7 +4563,13 @@ def aggregate_rollout_metrics(
         if not observations:
             continue
         denominator = len(observations)
-        if "/env_extra/" in metric_name:
+        if agent_counts:
+            # Optional fields use all selected siblings of the agent. If raw
+            # names collide, the flattened legacy histogram already combines
+            # those agents; pool their counts too, without conflating the
+            # separately named per-environment distributions.
+            denominator = sum(agent_counts.values())
+        elif "/env_extra/" in metric_name:
             # V1 divides numeric extra sums by all samples for that agent,
             # even when some rows omit an optional field. Distribution
             # statistics still describe the observations that are present.

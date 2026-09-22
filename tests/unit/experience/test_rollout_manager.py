@@ -30,6 +30,7 @@ import tempfile
 import uuid
 from copy import deepcopy
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -45,6 +46,8 @@ from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data.processors import nemo_gym_data_processor
+from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.experience.failures import GenerationUnavailable
@@ -65,6 +68,11 @@ from nemo_rl.experience.rollout_manager import (
     RolloutStats,
     _nemo_gym_metric_namespace,
     _rollout_environment_metric_component,
+)
+from nemo_rl.experience.rollout_reassembler import FinalizedGroup
+from nemo_rl.experience.rollout_reassembler_actor import (
+    ReassemblyRequest,
+    RolloutReassemblerActor,
 )
 from nemo_rl.experience.rollout_recovery import (
     RecoveryGranularity,
@@ -1269,6 +1277,74 @@ def test_nemo_gym_rollout_metrics_include_environment_distributions():
         0.25,
     ]
     assert metrics[f"{environment_prefix}/sample_count"] == 2
+
+
+@pytest.mark.parametrize("agent_name", ["swe", "swe/e2e"])
+@pytest.mark.parametrize("field", ["judge_score", "judge/score"])
+@pytest.mark.parametrize("optional", [False, True])
+def test_capture_agent_summaries_match_selected_population(agent_name, field, optional):
+    """Pool sealed siblings after actor finalization, including optional extras."""
+    impl = _nemo_gym_impl(True)
+    environment = _rollout_environment_metric_component(agent_name)
+    completions = []
+    snapshots = []
+    for index, score in enumerate([0.0, 1.0, 10.0]):
+        result = _mask_gate_receipt_result()
+        result["full_result"]["reward"] = float(index == 2)
+        if not (optional and index == 1):
+            result["full_result"][field] = score
+        completion = impl._results_to_completions([result])[0][0]
+        completions.append(completion)
+        snapshots.append(
+            RolloutTelemetry.from_metrics(
+                environment, impl._compute_rollout_metrics([completion], agent_name)
+            )
+        )
+
+    expected = impl._compute_rollout_metrics(completions, agent_name)
+    actor_cls = RolloutReassemblerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._max_seq_len = 10
+    # Exercise the real actor's metadata publication; tensor reconstruction is
+    # covered by the Gym-backed finalizer tests, not this CPU regression.
+    actor._finalizer = MagicMock()
+    actor._finalizer.finalize_group.return_value = FinalizedGroup(
+        meta=KVBatchMeta(
+            partition_id="canonical",
+            task_name="train",
+            sample_ids=["g0", "g1", "g2"],
+            sequence_lengths=[3, 3, 3],
+        ),
+        group_min_wv=4,
+        group_max_wv=4,
+        staging_keys=[],
+    )
+    finalized = actor.finalize(
+        ReassemblyRequest(
+            group_id="group",
+            rollout_ids=("g0", "g1", "g2"),
+            canonical_sample_ids=("g0", "g1", "g2"),
+            receipts=(None, None, None),
+            rewards=tuple(c.reward for c in completions),
+            fallback_weight_version=4,
+            prompt_idx=17,
+            mask_sample=(False, False, False),
+            rollout_environment=environment,
+            telemetry=tuple(snapshots),
+        )
+    )
+    per_group = {}
+    for metrics in finalized.meta.extra_info[ROLLOUT_METRICS]:
+        for name, value in metrics.items():
+            per_group.setdefault(name, []).append(value)
+    actual = aggregate_rollout_metrics(per_group)
+    for diagnostic in ("reward", field):
+        for stat in ("mean", "min", "max", "median", "stddev", "histogram"):
+            key = f"{agent_name}/{diagnostic}/{stat}"
+            assert actual[key] == pytest.approx(expected[key]), key
+            assert actual[key] == pytest.approx(
+                actual[f"environment/{environment}/env_extra/{diagnostic}/{stat}"]
+            ), key
 
 
 @pytest.mark.parametrize("mask_env_flagged_samples", [False, True])

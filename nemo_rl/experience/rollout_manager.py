@@ -17,10 +17,8 @@ from __future__ import annotations
 import asyncio
 import copy
 import enum
-import hashlib
 import json
 import math
-import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -70,6 +68,9 @@ from nemo_rl.experience.metric_utils import (
     RolloutTelemetry,
     calculate_single_metric,
     pct,
+)
+from nemo_rl.experience.metric_utils import (
+    rollout_environment_metric_component as _rollout_environment_metric_component,
 )
 from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
@@ -132,18 +133,6 @@ def _nemo_gym_metric_namespace(row: Mapping[str, Any]) -> str:
     if isinstance(task_source, str) and task_source:
         return f"task-source:{task_source}"
     return "nemo_gym"
-
-
-_METRIC_COMPONENT_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
-
-
-def _rollout_environment_metric_component(environment: str) -> str:
-    """Return a readable metric path component without silent collisions."""
-    sanitized = _METRIC_COMPONENT_PATTERN.sub("_", environment).strip("_.")
-    if sanitized == environment:
-        return sanitized
-    digest = hashlib.blake2s(environment.encode(), digest_size=8).hexdigest()
-    return f"{sanitized or 'unknown'}-{digest}"
 
 
 class RolloutOutcome(str, enum.Enum):
