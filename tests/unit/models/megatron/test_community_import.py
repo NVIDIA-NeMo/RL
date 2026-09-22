@@ -195,6 +195,34 @@ def test_prefer_nvrx_falls_back_to_original_save_when_nvrx_missing(monkeypatch):
     assert strategy.original_save_calls == [({"y": 2}, "/tmp/ckpt")]
 
 
+def test_prefer_nvrx_is_noop_when_async_save_lacks_strategy_kwarg(monkeypatch):
+    """Newer Megatron-LM has no MCore async writer: the sync save must stay as is."""
+    module = _load_community_import_module(monkeypatch)
+
+    class FakeStrategy:
+        def __init__(self):
+            self.original_save_calls = []
+            self.async_save_calls = []
+
+        def save(self, sharded_state_dict, checkpoint_dir):
+            self.original_save_calls.append((sharded_state_dict, checkpoint_dir))
+
+        def async_save(self, sharded_state_dict, checkpoint_dir):
+            self.async_save_calls.append((sharded_state_dict, checkpoint_dir))
+            raise AssertionError("async_save must not be used on this pin")
+
+    _install_torch_strategy_module(monkeypatch, FakeStrategy)
+    strategy = FakeStrategy()
+    original_save = FakeStrategy.save
+
+    with module._prefer_nvrx_for_dist_ckpt_save():
+        assert FakeStrategy.save is original_save
+        strategy.save({"z": 3}, "/tmp/ckpt")
+
+    assert strategy.async_save_calls == []
+    assert strategy.original_save_calls == [({"z": 3}, "/tmp/ckpt")]
+
+
 def _stage_conversion(path) -> None:
     """Materialize a complete conversion layout (iter_0000000/run_config.yaml)."""
     os.makedirs(os.path.join(str(path), "iter_0000000"), exist_ok=True)

@@ -1626,11 +1626,7 @@ def test_megatron_finalize_async_save_releases_colocated_nvrx_cache(
         def cleanup_tensor_caches(cls):
             events.append(("cleanup_tensor_caches", None))
 
-    monkeypatch.setattr(
-        worker_module,
-        "get_async_strategy",
-        lambda strategy: (strategy, {"FileSystemWriterAsync": _Writer}),
-    )
+    monkeypatch.setattr(worker_module, "FileSystemWriterAsync", _Writer)
     monkeypatch.setattr(
         worker_module.gc, "collect", lambda: events.append(("gc_collect", None))
     )
