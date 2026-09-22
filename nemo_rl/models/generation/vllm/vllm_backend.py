@@ -17,7 +17,7 @@ import re
 import socket
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Protocol
 
 import torch
 import zmq
@@ -27,6 +27,7 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     preinit_nixl_from_vllm_config,
     resolve_rollout_rank,
 )
+from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -307,6 +308,22 @@ class _IPCWeightManifest:
             details.append(_format_refit_key_error("missing keys", missing_keys))
         if details:
             raise IPCWeightManifestError("; ".join(details))
+
+
+class _ReloadWeightPreparer(Protocol):
+    """Turn transport batches into reload-safe checkpoint tensors.
+
+    Tensors returned by ``process`` must not reference the source IPC buffer,
+    because it is released as soon as the batch is acknowledged.
+    """
+
+    def reset(self) -> None: ...
+
+    def process(
+        self, weights: list[tuple[str, torch.Tensor]]
+    ) -> list[tuple[str, torch.Tensor]]: ...
+
+    def finish(self) -> None: ...
 
 
 class NixlVllmWorker(VllmWorker):
@@ -709,11 +726,14 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         return sorted(applier.discover_native_skips(state_dict_info))
 
     def _uses_fp8_kv_cache(self) -> bool:
-        """Return whether this worker owns an FP8 KV cache."""
+        """Return whether this worker owns separately refittable FP8 KV scales."""
         vllm_config = getattr(self.model_runner, "vllm_config", None)
         cache_config = getattr(vllm_config, "cache_config", None)
         kv_cache_dtype = getattr(cache_config, "cache_dtype", None)
-        return kv_cache_dtype is not None and "fp8" in str(kv_cache_dtype).lower()
+        if kv_cache_dtype is None:
+            return False
+        kv_cache_dtype = str(kv_cache_dtype).lower()
+        return kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES
 
     def _maybe_process_fp8_kv_cache(self) -> None:
         """Process weights after loading for FP8 KV cache (static scales)."""
@@ -1063,9 +1083,21 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
     def _uses_native_layerwise_refit(self, transport: WeightUpdateTransport) -> bool:
         """Return whether this transport needs vLLM's layerwise lifecycle."""
-        return transport in ("ipc", "collective", "nccl_reshard") and (
-            self._uses_unquantized_flashinfer_trtllm()
-        )
+        return (
+            transport in ("ipc", "collective", "nccl_reshard")
+            and self._uses_unquantized_flashinfer_trtllm()
+        ) or (transport in ("ipc", "collective") and self._uses_deepseek_v4_fp8_refit())
+
+    def _uses_deepseek_v4_fp8_refit(self) -> bool:
+        """Return whether the realized rollout model needs DSV4 FP8 reload hooks."""
+        model = self.model_runner.model
+        config = getattr(model, "config", None)
+        if getattr(config, "model_type", None) != "deepseek_v4":
+            return False
+
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        return fp8.is_fp8_model(self.model_runner.vllm_config)
 
     def _validate_native_layerwise_refit(
         self, transport: WeightUpdateTransport | None = None
@@ -1119,15 +1151,19 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         self, transport: UnsupportedNativeRefitTransport
     ) -> None:
         """Reject transports that cannot run the native layerwise lifecycle."""
-        if not self._uses_unquantized_flashinfer_trtllm():
-            return
-
         label = transport.replace("_", "-")
-        raise RuntimeError(
-            f"{label} refit does not support the unquantized FlashInfer "
-            "TRTLLM MoE backend yet because it bypasses vLLM's native "
-            "layerwise reload lifecycle"
-        )
+        if self._uses_unquantized_flashinfer_trtllm():
+            raise RuntimeError(
+                f"{label} refit does not support the unquantized FlashInfer "
+                "TRTLLM MoE backend yet because it bypasses vLLM's native "
+                "layerwise reload lifecycle"
+            )
+        if self._uses_deepseek_v4_fp8_refit():
+            raise RuntimeError(
+                f"{label} refit does not support DeepSeek V4 FP8 because it "
+                "bypasses the model's prepare/finalize refit hooks. Use IPC "
+                "or collective refit with refit_with_reload_api=False."
+            )
 
     @contextmanager
     def _weight_update_lifecycle(
@@ -1140,6 +1176,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         """
         if self._uses_native_layerwise_refit(transport):
             self._validate_native_layerwise_refit(transport)
+            use_deepseek_v4_fp8 = self._uses_deepseek_v4_fp8_refit()
             previous_failure = self._nrl_layerwise_reload_failure
             if previous_failure is not None:
                 raise RuntimeError(
@@ -1153,19 +1190,27 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             )
 
             model = self.model_runner.model
-            # Restore only the realized BF16 TRTLLM modules. MXFP8 modules own
-            # checkpoint-scale parameters created after vLLM recorded reload
-            # metadata, so restoring the whole mixed model would delete those
-            # parameters. Their layouts are rebuilt separately after transfer.
-            reload_targets = _unquantized_flashinfer_trtllm_modules(model)
+            # DSV4 needs a full-model reload; BF16 TRTLLM reload stays scoped
+            # to its realized modules so mixed-model MXFP8 metadata survives.
+            reload_targets = (
+                [model]
+                if use_deepseek_v4_fp8
+                else _unquantized_flashinfer_trtllm_modules(model)
+            )
             reloaded_module_ids = _reload_target_module_ids(reload_targets)
+            added_skip_tensors: set[str] = set()
+            if use_deepseek_v4_fp8:
+                from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
 
             def finalize() -> None:
                 with torch.device(self.device):
                     finalize_layerwise_reload(model, self.model_config)
-                    _process_mxfp8_modules_after_native_reload(
-                        model, reloaded_module_ids
-                    )
+                    if use_deepseek_v4_fp8:
+                        deepseek_v4_fp8.finalize_refit(model)
+                    else:
+                        _process_mxfp8_modules_after_native_reload(
+                            model, reloaded_module_ids
+                        )
                     _refresh_hpc_modules_after_layerwise_reload(model)
                     self._maybe_process_mtp_drafter_after_loading()
                 torch.cuda.synchronize()
@@ -1173,6 +1218,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             try:
                 with set_current_vllm_config(self.model_runner.vllm_config):
                     with torch.device(self.device):
+                        if use_deepseek_v4_fp8:
+                            added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)
                         for reload_target in reload_targets:
                             initialize_layerwise_reload(reload_target)
                     self._nrl_layerwise_reload_active = True
@@ -1182,6 +1229,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 raise
             finally:
                 self._nrl_layerwise_reload_active = False
+                if use_deepseek_v4_fp8:
+                    deepseek_v4_fp8.restore_refit(added_skip_tensors)
 
             return
 
@@ -1227,11 +1276,179 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
     def _weight_update_errors_are_fatal(self) -> bool:
         """Whether transport errors should propagate instead of returning False."""
-        return self._uses_unquantized_flashinfer_trtllm()
+        return self._uses_unquantized_flashinfer_trtllm() or (
+            self._nrl_layerwise_reload_failure is not None
+        )
 
     def _synchronize_before_ipc_data_ack(self) -> None:
         """Fence work consuming one IPC data batch before its acknowledgment."""
         torch.cuda.current_stream().synchronize()
+
+    def _get_reload_weight_preparer(self) -> _ReloadWeightPreparer | None:
+        """Return this worker's transport-neutral checkpoint preparer."""
+        return None
+
+    def _drain_ipc_reload_sender(self) -> None:
+        """Release a REQ sender after a native reload has failed."""
+        while True:
+            payload = self.zmq_socket.recv_pyobj()
+            self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+            if payload == IPCProtocol.COMPLETE:
+                return
+
+    def _update_weights_via_ipc_zmq_with_reload(
+        self, preparer: _ReloadWeightPreparer
+    ) -> bool:
+        """Receive IPC batches through vLLM's native layerwise reload API."""
+        try:
+            self.maybe_init_zmq()
+            manifest = _IPCWeightManifest(self.state_dict_info)
+            complete_received = False
+
+            def iter_prepared_weights() -> Iterator[tuple[str, torch.Tensor]]:
+                nonlocal complete_received
+                while True:
+                    payload = self.zmq_socket.recv_pyobj()
+
+                    if payload == IPCProtocol.COMPLETE:
+                        complete_received = True
+                        manifest.require_complete()
+                        preparer.finish()
+                        return
+
+                    buffer = None
+                    weight = None
+                    weights = None
+                    prepared_weights = None
+                    batch_keys = None
+                    batch_error = None
+                    try:
+                        ipc_handle, list_keys, used_bytes = payload
+                        batch_keys = manifest.validate_batch(list_keys)
+                        if batch_keys is None:
+                            continue
+
+                        buffer = rebuild_cuda_tensor_from_ipc(
+                            ipc_handle, self.device.index
+                        )
+                        weights = []
+                        offset = 0
+                        for key in list_keys:
+                            shape, dtype = self.state_dict_info[key]  # pyrefly
+                            if isinstance(shape, list):
+                                shape = torch.Size(shape)
+
+                            size_in_bytes = dtype.itemsize * shape.numel()
+                            weight = (
+                                buffer[offset : offset + size_in_bytes]
+                                .view(dtype=dtype)
+                                .view(shape)
+                            )
+                            weights.append((key, weight))
+                            offset += calculate_aligned_size(size_in_bytes)
+
+                        assert offset == used_bytes, (
+                            "Offset is not equal to used bytes, usually indicate "
+                            "inaccurate info like keys or cached dtype in "
+                            "state_dict_info"
+                        )
+                        prepared_weights = preparer.process(weights)
+                    except Exception as error:
+                        batch_error = error
+                        batch_desc = ", ".join(
+                            f"{k}: {tuple(w.shape)} {w.dtype}"
+                            for k, w in (weights or [])[:40]
+                        )
+                        logger.exception(
+                            "IPC reload batch preparation failed (batch: %s)",
+                            batch_desc,
+                        )
+                    finally:
+                        if buffer is not None:
+                            try:
+                                self._synchronize_before_ipc_data_ack()
+                            except Exception as error:
+                                if batch_error is None:
+                                    batch_error = error
+                                logger.exception(
+                                    "IPC reload batch synchronization failed"
+                                )
+
+                        if batch_error is not None:
+                            manifest.record_load_failure(batch_error)
+                        elif batch_keys is not None:
+                            manifest.record_loaded(batch_keys)
+
+                        # Prepared weights must own their storage. Drop every raw
+                        # IPC view before ACK permits sender-side buffer reuse.
+                        del weight, weights, buffer
+                        weight = None
+                        weights = None
+                        buffer = None
+                        try:
+                            self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+                        except Exception:
+                            if batch_error is None:
+                                raise
+                            logger.exception(
+                                "Failed to ACK an IPC batch after preparation failed"
+                            )
+
+                    if batch_error is not None:
+                        raise batch_error
+                    if prepared_weights is not None:
+                        yield from prepared_weights
+
+            prepared_iterator: Iterator[tuple[str, torch.Tensor]] | None = None
+            try:
+                preparer.reset()
+                prepared_iterator = iter_prepared_weights()
+                self.model_runner.reload_weights(
+                    weights_iterator=prepared_iterator,
+                    is_checkpoint_format=True,
+                )
+
+                if not complete_received:
+                    raise RuntimeError(
+                        "vLLM reload_weights returned before exhausting the IPC "
+                        "weight iterator"
+                    )
+
+                torch.accelerator.synchronize()
+            except Exception:
+                if prepared_iterator is not None:
+                    try:
+                        prepared_iterator.close()
+                    except Exception:
+                        logger.exception(
+                            "Failed to close the IPC reload weight iterator"
+                        )
+                try:
+                    if complete_received:
+                        self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+                    else:
+                        self._drain_ipc_reload_sender()
+                except Exception:
+                    logger.exception(
+                        "Failed to release the IPC sender after reload failure"
+                    )
+                raise
+
+            # COMPLETE is deliberately acknowledged only after reload finalization
+            # and the final device fence have both succeeded.
+            self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+
+            gc.collect()
+            torch.cuda.empty_cache()
+            return True
+        except Exception as e:
+            if self._weight_update_errors_are_fatal():
+                raise
+            logger.exception(
+                "Error in native IPC reload for VllmInternalWorkerExtension: %s",
+                e,
+            )
+            return False
 
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
@@ -1240,6 +1457,10 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         Returns:
             bool: True if weights were successfully updated.
         """
+        preparer = self._get_reload_weight_preparer()
+        if preparer is not None:
+            return self._update_weights_via_ipc_zmq_with_reload(preparer)
+
         buffer = None
         weight = None
         weights = None
@@ -1381,6 +1602,14 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             "state_dict_info is not prepared. "
             "Please call prepare_refit_info when initializing the worker."
         )
+
+        if refit_with_reload_api and self._uses_deepseek_v4_fp8_refit():
+            raise RuntimeError(
+                "DeepSeek V4 FP8 does not support refit_with_reload_api=True "
+                "because it bypasses the model's prepare/finalize refit hooks. "
+                "Set refit_with_reload_api=False to use the supported "
+                "collective refit lifecycle."
+            )
 
         try:
             if refit_with_reload_api:

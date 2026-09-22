@@ -202,6 +202,27 @@ def test_blocking_generate_is_rejected_and_async_generation_uses_http(
     assert "return_tokens_as_token_ids" not in requests[0][1]
 
 
+@pytest.mark.parametrize("prompt_key", ["vllm_content", "vllm_multi_modal_data"])
+def test_async_generate_rejects_multimodal_prompt_columns(
+    monkeypatch: pytest.MonkeyPatch, prompt_key: str
+) -> None:
+    _patch_runtime(monkeypatch)
+    post = MagicMock(
+        side_effect=AssertionError("Multimodal prompts must not reach HTTP")
+    )
+    monkeypatch.setattr(generation_module, "async_http_post_json", post)
+    generation = DynamoGeneration(cluster=object(), config=_config())
+    data = _data()
+    data[prompt_key] = ["prompt" if prompt_key == "vllm_content" else {"image": "img"}]
+
+    async def collect() -> list:
+        return [item async for item in generation.generate_async(data)]
+
+    with pytest.raises(NotImplementedError, match="multimodal"):
+        asyncio.run(collect())
+    post.assert_not_called()
+
+
 def test_prompt_at_context_limit_is_rejected(monkeypatch) -> None:
     _patch_runtime(monkeypatch)
     generation = DynamoGeneration(cluster=object(), config=_config())

@@ -35,6 +35,7 @@ import threading
 import time
 import warnings
 import weakref
+from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
 from queue import Empty, SimpleQueue
@@ -48,6 +49,7 @@ import transfer_queue as tq
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.adapters.transfer_queue_env import rail_link_layers
+from nemo_rl.data_plane.codec import timed_codec
 from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
     DataPlaneConfig,
@@ -55,6 +57,7 @@ from nemo_rl.data_plane.interfaces import (
     backend_config,
     data_plane_supports_checkpointing,
 )
+from nemo_rl.distributed.virtual_cluster import _reserve_data_plane_ports
 
 LOGGER = logging.getLogger(__name__)
 
@@ -597,6 +600,127 @@ def _patch_mooncake_staging_buffers(max_bytes: int) -> None:
     cls._nrl_staging_patched = True
 
 
+class _MooncakeMasterArgv:
+    """Stand-in for the mooncake bootstrap module's ``subprocess`` reference.
+
+    Overrides ``Popen``, and only for ``mooncake_master``'s argv; everything
+    else the bootstrap reaches for (``STDOUT``, the offload client's launch)
+    delegates to the real module untouched.
+    """
+
+    def __init__(self, wrapped: Any, metrics_port: int) -> None:
+        self._wrapped = wrapped
+        self.metrics_port = metrics_port
+        self.master_launched = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped, name)
+
+    def Popen(self, args: Any, *rest: Any, **kwargs: Any) -> Any:
+        """Append ``--metrics_port`` when this is the master being launched."""
+        if (
+            isinstance(args, (list, tuple))
+            and args
+            and os.path.basename(str(args[0])) == "mooncake_master"
+        ):
+            args = [*args, f"--metrics_port={self.metrics_port}"]
+            self.master_launched = True
+        return self._wrapped.Popen(args, *rest, **kwargs)
+
+
+_METRICS_PORT_DRIFT_CONSEQUENCE = (
+    "the --metrics_port TQ omits cannot be applied, leaving mooncake_master's "
+    "metrics server on its 9003 default inside this node's ephemeral range"
+)
+
+
+def _patch_mooncake_master_metrics_port(port: int) -> None:
+    """Move mooncake_master's metrics server onto a reserved *port*.
+
+    ``MasterAdminServer::Start`` binds the metrics socket before it consults
+    ``enable_metric_reporting``, and the master exits non-zero if that bind
+    fails, so the ``metrics_port`` gflag default (9003) is a port the job
+    depends on whether or not anything scrapes it — and it sits inside the
+    ephemeral range these nodes hand out as source ports. TQ forwards no
+    ``--metrics_port``, nor a ``--config_path`` file that could carry one, so
+    without this the metrics server is the one data-plane port that cannot
+    move into ray.sub's band and the master can still lose a startup race it
+    has no reason to be in.
+
+    TQ does build the master's argv in this process, though: ``tq.init`` ->
+    ``_maybe_create_tq_storage`` -> ``initialize_mooncake_storage`` all run on
+    the driver, so appending the flag to the ``subprocess.Popen`` the bootstrap
+    calls is enough. gflags takes the last occurrence of a repeated flag, so
+    this stays correct if a future TQ revision starts passing its own.
+
+    The provider registry holds a ``functools.wraps`` wrapper closed over the
+    original bootstrap function, so rebinding the module attribute alone would
+    never be called — the same trap ``extract_field_schema`` has. Re-registering
+    is also where the drift check lives: if the bootstrap ever launches the
+    master by some other route the flag stops landing silently, putting the
+    metrics server back on 9003, so the bootstrap is required to have gone
+    through the wrapped ``Popen``.
+    """
+    # Imported here, not at module top, so a TQ that has moved these
+    # submodules reports the drift below instead of failing this file's import.
+    try:
+        from transfer_queue.storage.bootstrap import mooncake_bootstrap as _bs
+        from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
+    except ImportError as e:
+        raise _tq_shape_drift_error(
+            "storage.bootstrap is no longer importable",
+            _METRICS_PORT_DRIFT_CONSEQUENCE,
+            "import",
+        ) from e
+
+    installed = getattr(_bs, "subprocess", None)
+    if isinstance(installed, _MooncakeMasterArgv):
+        # The installed proxy is its own idempotence marker, rather than a
+        # separate _nrl_*_patched flag like the sibling patches use: it is the
+        # object that lets a re-init in the same process keep one wrapper and
+        # repoint it to the port this call reserved.
+        installed.metrics_port = port
+        return
+    if installed is None:
+        raise _tq_shape_drift_error(
+            "the mooncake bootstrap no longer launches the master via subprocess",
+            _METRICS_PORT_DRIFT_CONSEQUENCE,
+            "launch site",
+        )
+
+    bootstrap = StorageBootstrapProvider.get_provider("MooncakeStore")
+    if bootstrap is None:
+        raise _tq_shape_drift_error(
+            "MooncakeStore is no longer a registered bootstrap provider",
+            _METRICS_PORT_DRIFT_CONSEQUENCE,
+            "registry key",
+        )
+    # Rebound under a typed name because the None check above does not narrow
+    # ``get_provider``'s ``Callable | None`` inside the closure that calls it.
+    registered_bootstrap: Callable[..., Any] = bootstrap
+
+    argv = _MooncakeMasterArgv(installed, port)
+
+    def _bootstrap_with_metrics_port(conf: Any) -> Any:
+        argv.master_launched = False
+        result = registered_bootstrap(conf)
+        if not argv.master_launched:
+            raise _tq_shape_drift_error(
+                "the mooncake bootstrap ran without launching mooncake_master "
+                "through its subprocess.Popen",
+                _METRICS_PORT_DRIFT_CONSEQUENCE,
+                "launch site",
+            )
+        return result
+
+    # pyrefly: ignore[bad-assignment]  the proxy stands in for the module on purpose
+    _bs.subprocess = argv
+    # Upstream's own decorator, so the entry is stored exactly as TQ stores it.
+    StorageBootstrapProvider.register_provider("MooncakeStore")(
+        _bootstrap_with_metrics_port
+    )
+
+
 def _connect_existing() -> None:
     """Worker-process path: connect this process's client to the Ray cluster.
 
@@ -606,7 +730,7 @@ def _connect_existing() -> None:
     tq.init()
 
 
-def _init_tq(cfg: DataPlaneConfig) -> None:
+def _init_tq(cfg: DataPlaneConfig, *, checkpointing: bool = False) -> None:
     """Driver-process path: bootstrap the TQ controller for the chosen backend."""
     from omegaconf import OmegaConf
 
@@ -671,6 +795,12 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
                 "Mooncake backend requires a local node IP; "
                 "_get_local_node_ip() returned empty."
             )
+        # All three of the master's listening ports come from one band below
+        # the ephemeral floor. The metrics port reaches the master through a
+        # patched argv rather than the config below, because TQ forwards no
+        # --metrics_port — see _patch_mooncake_master_metrics_port.
+        metadata_port, master_port, metrics_port = _reserve_data_plane_ports(3)
+        _patch_mooncake_master_metrics_port(metrics_port)
         # Sizes are per client process and RDMA-pinned — see MooncakeCpuConfig
         # in nemo_rl/data_plane/interfaces.py for the per-node arithmetic.
         mooncake_cfg = backend_config(cfg)
@@ -684,14 +814,23 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
                     # _init_tq runs on the driver only — driver IS the
                     # head, so local_ip here is also the head's IP that
                     # mooncake_master + the metadata server bind to.
-                    "metadata_server": f"{local_ip}:50050",
-                    "master_server_address": f"{local_ip}:50051",
+                    "metadata_server": f"{local_ip}:{metadata_port}",
+                    "master_server_address": f"{local_ip}:{master_port}",
+                    # Runtime mode derived from the existing trainer settings,
+                    # not a second user-facing checkpoint switch.
+                    "checkpoint": {"enabled": checkpointing},
                     **_mooncake_transport_config(),
                     "use_gdr": bool(mooncake_cfg.use_gdr),
                     "gdr_staging_buffer_mb": int(mooncake_cfg.gdr_staging_buffer_mb),
                 },
             },
         }
+        if checkpointing:
+            # Establish owner-local checkpoint requirements before any client
+            # attaches. Non-checkpointing jobs keep TQ's storage defaults.
+            overlay["backend"]["MooncakeStore"].update(
+                hard_pin=True, offload={"enabled": False}
+            )
     else:
         raise ValueError(f"unknown TQ backend: {backend!r}")
 
@@ -743,7 +882,7 @@ def _from_wire(td: TensorDict) -> TensorDict:
     ``codec.materialize`` applies the same exclusion.
     """
     # NonTensorData / NonTensorStack leaves are only visible via td.keys(),
-    # not keys(leaves_only=True) — iterating the latter would silently drop
+    # not keys(leaves_only=True) -- iterating the latter would silently drop
     # them from the rebuilt dict.
     # Deferred: ``multimodal_utils`` pulls PIL, requests and a few hundred
     # transformers submodules, and this adapter is imported by every process
@@ -751,26 +890,28 @@ def _from_wire(td: TensorDict) -> TensorDict:
     # for the same reason.
     from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
 
-    new_dict: dict[str, Any] = {}
-    changed = False
-    for k in td.keys():
-        v = td.get(k)
-        field_name = str(k)
-        if (
-            isinstance(v, torch.Tensor)
-            and v.is_nested
-            and field_name not in PACKED_MULTIMODAL_FIELDS
-        ):
-            rows = list(v.unbind())
-            if rows and all(row.shape == rows[0].shape for row in rows[1:]):
-                v = torch.stack(rows)
-                changed = True
-        new_dict[field_name] = v
-    if not changed:
-        return td
-    new_td = TensorDict(new_dict, batch_size=td.batch_size)
-    _assert_no_key_loss(new_dict, new_td, "_from_wire")
-    return new_td
+    with timed_codec("unpack"):
+        new_dict: dict[str, Any] = {}
+        changed = False
+        for k in td.keys():
+            v = td.get(k)
+            field_name = str(k)
+            if (
+                isinstance(v, torch.Tensor)
+                and v.is_nested
+                and field_name not in PACKED_MULTIMODAL_FIELDS
+            ):
+                rows = list(v.unbind())
+                if rows and all(row.shape == rows[0].shape for row in rows[1:]):
+                    v = torch.stack(rows)
+                    changed = True
+            new_dict[field_name] = v
+        if not changed:
+            # The traversal still ran; only the rebuild was skipped.
+            return td
+        new_td = TensorDict(new_dict, batch_size=td.batch_size)
+        _assert_no_key_loss(new_dict, new_td, "_from_wire")
+        return new_td
 
 
 class TQDataPlaneClient(DataPlaneClient):
@@ -782,7 +923,13 @@ class TQDataPlaneClient(DataPlaneClient):
     _gdr_requested: bool = False
     _gdr_put_confirmed: bool = False
 
-    def __init__(self, cfg: DataPlaneConfig, *, bootstrap: bool = True) -> None:
+    def __init__(
+        self,
+        cfg: DataPlaneConfig,
+        *,
+        bootstrap: bool = True,
+        checkpointing: bool = False,
+    ) -> None:
         """Construct a TQ-backed client.
 
         Args:
@@ -792,7 +939,13 @@ class TQDataPlaneClient(DataPlaneClient):
                 already-running named controller actor in the Ray
                 cluster — ``cfg`` is then only consulted for client-side
                 knobs (poll interval).
+            checkpointing: Whether the caller will save or restore data-plane
+                state. Used only at bootstrap; workers inherit the mode from TQ.
         """
+        # Ray serializes this driver-built client into the SingleController
+        # actor; retain the config so process-local hooks can be reinstalled.
+        self._cfg = cfg
+
         # mooncake_cpu setup must run BEFORE _init_tq / _connect_existing
         # — once tq.init/connect runs, Mooncake's engine.so reads the
         # env vars and they can't be changed. MC_TCP_BIND_ADDRESS is
@@ -825,6 +978,13 @@ class TQDataPlaneClient(DataPlaneClient):
             mooncake_cfg = backend_config(cfg)
             if mooncake_cfg.reuse_registered_buffers:
                 _patch_mooncake_staging_buffers(mooncake_cfg.staging_buffer_size)
+            # Install before attaching; TQ's controller supplies the resolved
+            # checkpoint mode to each process-local storage manager.
+            from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
+                install_tq_mooncake_checkpoint_plugin,
+            )
+
+            install_tq_mooncake_checkpoint_plugin()
 
         self._backend = cfg["backend"]
         self._supports_checkpointing = data_plane_supports_checkpointing(cfg)
@@ -836,7 +996,7 @@ class TQDataPlaneClient(DataPlaneClient):
         self._gdr_put_confirmed = False
 
         if bootstrap:
-            _init_tq(cfg)
+            _init_tq(cfg, checkpointing=checkpointing)
         else:
             _connect_existing()
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]
@@ -849,6 +1009,35 @@ class TQDataPlaneClient(DataPlaneClient):
         # The controller's field map is append-only, so each field only needs
         # warming once for the lifetime of this client.
         self._warmed_fields: dict[str, set[str]] = {}
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Serialize the config needed to rebuild a process-local TQ client."""
+        return {"cfg": self._cfg}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Rebuild process-local TQ state after Ray deserialization."""
+        cfg = state.get("cfg")
+        if cfg is None:
+            raise RuntimeError(
+                "Cannot deserialize TQDataPlaneClient without its data-plane config"
+            )
+        self.__init__(cast(DataPlaneConfig, cfg), bootstrap=False)
+
+    @staticmethod
+    def _read_complete_checkpoint_metadata(
+        checkpoint_dir: str | Path,
+    ) -> dict[str, Any]:
+        """Read TQ metadata and require a complete storage payload."""
+        metadata_path = Path(checkpoint_dir) / "metadata.json"
+        with metadata_path.open() as metadata_file:
+            checkpoint_metadata = json.load(metadata_file)
+        if not isinstance(checkpoint_metadata, dict):
+            raise ValueError("TQ checkpoint metadata must be a dictionary")
+        if checkpoint_metadata.get("storage_saved") is not True:
+            raise RuntimeError(
+                "TQ checkpoint is incomplete: metadata.json storage_saved must be true"
+            )
+        return checkpoint_metadata
 
     def _require_checkpointing_support(self) -> None:
         """Reject backends that cannot round-trip all data-plane state."""
@@ -1157,6 +1346,7 @@ class TQDataPlaneClient(DataPlaneClient):
         self._require_checkpointing_support()
         _connect_existing()
         tq.save_checkpoint(checkpoint_dir, metadata=metadata)
+        self._read_complete_checkpoint_metadata(checkpoint_dir)
 
     def load_checkpoint(self, checkpoint_dir: str | Path) -> dict[str, Any]:
         """Restore TQ state after initialization and before data operations.
@@ -1169,9 +1359,7 @@ class TQDataPlaneClient(DataPlaneClient):
         self._require_clean_for_load()
         # Validate the adapter-owned metadata before starting TQ's
         # non-transactional storage/controller restore.
-        metadata_path = Path(checkpoint_dir) / "metadata.json"
-        with metadata_path.open() as metadata_file:
-            checkpoint_metadata = json.load(metadata_file)
+        checkpoint_metadata = self._read_complete_checkpoint_metadata(checkpoint_dir)
         user_metadata = checkpoint_metadata.get("user_metadata", {})
         if not isinstance(user_metadata, dict):
             raise ValueError("TQ checkpoint user_metadata must be a dictionary")
