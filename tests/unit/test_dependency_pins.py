@@ -197,6 +197,15 @@ def test_transformer_engine_git_build_uses_runtime_torch() -> None:
     ]
 
 
+def test_transformer_engine_nonisolated_build_has_wheel() -> None:
+    pyproject = tomllib.loads(ROOT_PYPROJECT.read_text())
+    build_requirements = {
+        canonicalize_name(Requirement(requirement).name)
+        for requirement in pyproject["dependency-groups"]["build"]
+    }
+    assert "wheel" in build_requirements
+
+
 @pytest.mark.parametrize("package", ["av", "opencv-python-headless"])
 def test_royalty_sensitive_codecs_are_excluded(package: str) -> None:
     lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text())

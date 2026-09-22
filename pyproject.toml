@@ -261,6 +261,8 @@ build = [
   "torch==2.11.0",
   # Build requirement for TE
   "setuptools",
+  # TE imports wheel.bdist_wheel when build isolation is disabled.
+  "wheel>=0.46.2",
   "packaging",
   "einops",
   # Build requirement for nemo_run
