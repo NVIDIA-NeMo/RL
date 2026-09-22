@@ -415,6 +415,15 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   extras retain placeholder positions and token hashes for multi-turn prefix
   replacement, including video's timestamp-separated visual-token spans.
   Processor-cache bypass ensures the worker has concrete pixels to capture.
+  Retained images are re-processed by vLLM under the current turn's token
+  budget, which is shared across every image in the prompt; when that budget
+  binds (an image's native patch grid exceeds its share of
+  `max_model_len - prompt_len`) vLLM re-tiles the image and the continuation
+  is rejected before inference with HTTP 400 and error code
+  `retained_media_changed` (other capture-time validation failures use
+  `media_capture_rejected`), and Gym records the rollout as failed. Text-call
+  rows carry sentinels in each column's own dtype, because TransferQueue keeps
+  one dtype per field across live rows.
   Media bundles are structurally validated before writing and after reading
   (required tensors, patch geometry, frame grouping); malformed or missing
   columns reject the rollout as `invalid_media_columns`, incompatible parts

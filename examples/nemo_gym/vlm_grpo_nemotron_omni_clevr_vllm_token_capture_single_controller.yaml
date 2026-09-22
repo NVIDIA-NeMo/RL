@@ -1,14 +1,16 @@
 # Nemotron-Omni CLEVR through NeMo-Gym (string_match verifier) with async vLLM
 # generation, a Megatron learner, and vLLM media token capture enabled.
 #
-# Functional-test recipe: tests/functional/nemotron_omni_clevr_vllm_token_capture_single_controller_1n2g.sh
+# Functional-test config (not a nightly recipe, so it lives beside the other
+# Gym smoke configs rather than under examples/configs/recipes/):
+# tests/functional/nemotron_omni_clevr_vllm_token_capture_single_controller_1n2g.sh
 # supplies the data paths, the 1 trainer + 1 generator split, and the step
 # budget. Token capture requires the Gym rollout path, so the native CLEVR
 # dataset/environment of the parent recipe are swapped for Gym rows here.
 # Prefix caching stays off (hybrid-Mamba align cache mode asserts chunked
 # prefill) and the parent's mm_processor_cache_gb=0 keeps concrete pixels
 # available to the capture host.
-defaults: ./vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron-single-controller-async.v1.yaml
+defaults: ../configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron-single-controller-async.v1.yaml
 data:
   _override_: true
   max_input_seq_length: null

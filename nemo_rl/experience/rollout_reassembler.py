@@ -604,13 +604,22 @@ class RolloutReassembler:
         # Method list is derived from Gym's own type rather than hand-copied,
         # so a new resolution method Gym adds gets a bucket automatically
         # instead of silently missing from these metrics.
-        from typing import get_args
+        from typing import Literal, get_args, get_origin
 
         from nemo_gym.token_id_capture.staging.records import RolloutReceipt
 
-        terminal_selection_methods = get_args(
-            RolloutReceipt.model_fields["terminal_selection"].annotation
-        )
+        # Gym declares the field as ``Literal[...]`` or ``Literal[...] | None``
+        # (optional since Gym #2823); unwrap the union so the method names, not
+        # the union members, name the buckets.
+        annotation = RolloutReceipt.model_fields["terminal_selection"].annotation
+        terminal_selection_methods: list[str] = []
+        for member in (
+            get_args(annotation)
+            if get_origin(annotation) is not Literal
+            else (annotation,)
+        ):
+            if get_origin(member) is Literal:
+                terminal_selection_methods.extend(get_args(member))
         for method in terminal_selection_methods:
             method_receipts = sum(
                 1

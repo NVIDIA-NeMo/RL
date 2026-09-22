@@ -164,9 +164,20 @@ class StagedMediaTensors:
         return int(math.isqrt(int(self.imgs.shape[-1]) // 3))
 
 
-def _sentinel() -> torch.Tensor:
-    """Placeholder for an absent media tensor: TQ rows cannot be empty."""
-    return torch.zeros((1,), dtype=torch.int64)
+def _media_sentinels(pixel_dtype: torch.dtype) -> dict[str, torch.Tensor]:
+    """Placeholders for absent media, one per tensor column, in that column's dtype.
+
+    TQ rows cannot be empty, and TQ keeps one dtype per field across all live
+    rows: a later put with a different dtype is logged by the controller and
+    silently loses its shape metadata, which the KV (Mooncake) backend needs
+    to reconstruct the row. So a sentinel must never introduce a second dtype
+    into a column; each keeps its real column's dtype and rank.
+    """
+    return {
+        "imgs": torch.zeros((1, 1), dtype=pixel_dtype),
+        "imgs_sizes": torch.zeros((1, 2), dtype=torch.int32),
+        "num_frames": torch.zeros((1,), dtype=torch.int32),
+    }
 
 
 def validate_media_tensors(
@@ -365,10 +376,19 @@ class TQTokenSink:
     """
 
     def __init__(
-        self, dp_client: Any, *, staging_partition: str, capture_media: bool = False
+        self,
+        dp_client: Any,
+        *,
+        staging_partition: str,
+        capture_media: bool = False,
+        media_pixel_dtype: torch.dtype | None = None,
     ) -> None:
         self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
         self._capture_media = capture_media
+        # Pixel dtype every media row of this partition must carry (the engine
+        # model dtype). Fixes the ``media_imgs`` column dtype so text-call
+        # sentinels and real rows agree; see ``_media_sentinels``.
+        self._media_pixel_dtype = media_pixel_dtype
 
     def stage(
         self,
@@ -395,6 +415,18 @@ class TQTokenSink:
                     "media attachments require a media-enabled staging partition"
                 )
             media = validate_media_tensors(attachments)
+            media_columns: dict[str, torch.Tensor] | None = None
+            if self._capture_media:
+                if self._media_pixel_dtype is None:
+                    raise ValueError("media-enabled staging requires media_pixel_dtype")
+                if media is not None and media.imgs.dtype != self._media_pixel_dtype:
+                    raise ValueError(
+                        f"media imgs dtype {media.imgs.dtype} does not match the "
+                        f"staging column dtype {self._media_pixel_dtype}"
+                    )
+                media_columns = _media_columns(
+                    media, _media_sentinels(self._media_pixel_dtype)
+                )
             field_dict = {
                 "token_ids_delta": torch.tensor(
                     [record.token_ids_delta], dtype=torch.int64
@@ -499,8 +531,8 @@ class TQTokenSink:
                 [routed_encoding], dtype=torch.int64
             )
             field_dict[ROUTED_LEN_FIELD] = torch.tensor([routed_len], dtype=torch.int64)
-            if self._capture_media:
-                field_dict.update(_media_columns(media))
+            if media_columns is not None:
+                field_dict.update(media_columns)
             tags = [
                 {
                     "rollout_id": record.rollout_id,
@@ -560,14 +592,18 @@ class TQTokenSink:
         self._store.clear(staging_keys)
 
 
-def _media_columns(media: StagedMediaTensors | None) -> dict[str, torch.Tensor]:
+def _media_columns(
+    media: StagedMediaTensors | None, sentinels: dict[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
     """Encode one row's media columns for a media-enabled partition.
 
     Tensors are written with TQ's row dimension prepended and otherwise native:
     ``imgs`` drops its own leading 1 so the row is ``[total_patches, F]`` and
     the patch dim is the row's leading (ragged) dim, exactly like
     ``token_ids_delta`` / ``routed_experts``, which is what a batched nested
-    read requires. ``fetch_media`` restores ``[1, total_patches, F]``.
+    read requires. ``fetch_media`` restores ``[1, total_patches, F]``. Integer
+    geometry is written as int32 (validated to fit) so each column has one
+    dtype across real rows and ``sentinels``.
     """
     present = media is not None
     has_frames = present and media.num_frames is not None
@@ -580,8 +616,10 @@ def _media_columns(media: StagedMediaTensors | None) -> dict[str, torch.Tensor]:
         if media is None
         else {
             "imgs": media.imgs.reshape(media.imgs.shape[1], media.imgs.shape[2]),
-            "imgs_sizes": media.imgs_sizes,
-            "num_frames": media.num_frames,
+            "imgs_sizes": media.imgs_sizes.to(torch.int32),
+            "num_frames": None
+            if media.num_frames is None
+            else media.num_frames.to(torch.int32),
         }
     )
     for name, column in MEDIA_TENSOR_COLUMNS.items():
@@ -589,7 +627,7 @@ def _media_columns(media: StagedMediaTensors | None) -> dict[str, torch.Tensor]:
         if tensor is None:
             # Only absent media or optional frame counts use sentinels; a
             # missing required tensor was rejected by validate_media_tensors.
-            columns[column] = _sentinel().unsqueeze(0)
+            columns[column] = sentinels[name].unsqueeze(0)
         else:
             columns[column] = tensor.detach().cpu().contiguous().unsqueeze(0)
     return columns
@@ -722,8 +760,8 @@ class TQTokenSource:
 
         ``items`` come from ``fetch_for_finalization`` (their flags were read
         with the base columns) and must all have ``media_present=True`` and
-        the same ``media_has_frames``: a nested column needs one dtype, and a
-        sentinel row (int64) cannot batch beside a real tensor (bf16 / int32).
+        the same ``media_has_frames``: a sentinel ``num_frames`` row is all
+        zeros and would fail validation beside real frame counts.
         Results are returned in request order. A transport miss raises
         ``KeyError``; malformed columns raise ``TypeError`` / ``ValueError``.
         """

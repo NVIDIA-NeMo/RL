@@ -33,6 +33,21 @@ if TYPE_CHECKING:
 MEDIA_SPANS_FIELD = "media_spans"
 
 
+class MediaCaptureRejected(ValueError):
+    """A captured call's media cannot be staged; the request is rejected before inference.
+
+    ``code`` is a stable, machine-readable reason surfaced in the HTTP 400
+    body and the worker log. ``retained_media_changed`` marks a retained
+    image or video whose geometry or placeholder tokens differ from the
+    staged occurrence (e.g. vLLM re-tiled it under a tighter token budget);
+    every other capture-time validation failure uses ``media_capture_rejected``.
+    """
+
+    def __init__(self, message: str, *, code: str = "media_capture_rejected") -> None:
+        super().__init__(message)
+        self.code = code
+
+
 def _token_digest(tokens: list[int]) -> str:
     return hashlib.sha256(
         json.dumps(tokens, separators=(",", ":")).encode()
@@ -68,7 +83,7 @@ class CapturedMediaItem:
                 for size in self.imgs_sizes
             )
         ):
-            raise ValueError("Malformed media placeholder metadata")
+            raise MediaCaptureRejected("Malformed media placeholder metadata")
         previous_end = self.placeholder_offset
         for start, length in self.embedding_spans:
             if (
@@ -78,7 +93,7 @@ class CapturedMediaItem:
                 or length <= 0
                 or start + length > self.end
             ):
-                raise ValueError("Invalid media embedding span")
+                raise MediaCaptureRejected("Invalid media embedding span")
             previous_end = start + length
 
     @property
@@ -107,7 +122,7 @@ class CapturedMediaItem:
             or end > len(tokens)
             or _token_digest(tokens[start:end]) != self.placeholder_digest
         ):
-            raise ValueError(
+            raise MediaCaptureRejected(
                 "Media placeholder does not match the exact carried prompt"
             )
         for offset, length in self.embedding_spans:
@@ -115,7 +130,7 @@ class CapturedMediaItem:
                 t != self.token_id
                 for t in tokens[offset - origin : offset - origin + length]
             ):
-                raise ValueError(
+                raise MediaCaptureRejected(
                     "Media embeddings do not match the exact carried prompt"
                 )
 
@@ -135,7 +150,7 @@ def _geometry_tensor(value: Any) -> torch.Tensor:
         or bool((tensor <= 0).any())
         or bool((tensor > torch.iinfo(torch.int32).max).any())
     ):
-        raise ValueError("Omni media geometry requires positive int32 values")
+        raise MediaCaptureRejected("Omni media geometry requires positive int32 values")
     return tensor.to(dtype=torch.int32)
 
 
@@ -153,7 +168,9 @@ def pack_images(
         or pixels.shape[1] != 3
         or pixels.shape[0] != sizes.shape[0]
     ):
-        raise ValueError("Omni capture requires [frames, 3, height, width] pixels")
+        raise MediaCaptureRejected(
+            "Omni capture requires [frames, 3, height, width] pixels"
+        )
     patches = []
     for image, (height, width) in zip(pixels, sizes.tolist(), strict=True):
         if (
@@ -162,7 +179,7 @@ def pack_images(
             or height % patch_size
             or width % patch_size
         ):
-            raise ValueError("Image geometry does not match the patch layout")
+            raise MediaCaptureRejected("Image geometry does not match the patch layout")
         patch = image[:, :height, :width].reshape(
             3, height // patch_size, patch_size, width // patch_size, patch_size
         )
@@ -174,27 +191,29 @@ def _processed_omni_tensors(
     data: dict[str, Any], modality: str, *, patch_size: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if data.get("num_tiles") is not None:
-        raise ValueError("Omni capture does not support static num_tiles")
+        raise MediaCaptureRejected("Omni capture does not support static num_tiles")
     if modality == "video":
         pixels = data.get("pixel_values_flat_video")
         if not isinstance(pixels, torch.Tensor) or pixels.ndim != 4:
-            raise ValueError("Video capture requires processed frame pixels")
+            raise MediaCaptureRejected("Video capture requires processed frame pixels")
         count = _geometry_tensor(data["video_num_patches"]).reshape(-1)
         if count.shape != (1,) or int(count[0]) != pixels.shape[0]:
-            raise ValueError("Video frame count disagrees with processed pixels")
+            raise MediaCaptureRejected(
+                "Video frame count disagrees with processed pixels"
+            )
         sizes = torch.tensor(
             [list(pixels.shape[-2:])] * pixels.shape[0], dtype=torch.int32
         )
     else:
         pixels = data.get("pixel_values_flat")
         if not isinstance(pixels, torch.Tensor) or pixels.ndim != 3:
-            raise ValueError("Image capture requires processed CHW pixels")
+            raise MediaCaptureRejected("Image capture requires processed CHW pixels")
         sizes = _geometry_tensor(data["imgs_sizes"])
         if tuple(sizes.shape) != (2,) or sizes.tolist() != list(pixels.shape[-2:]):
-            raise ValueError("Image capture requires exact CHW/HW geometry")
+            raise MediaCaptureRejected("Image capture requires exact CHW/HW geometry")
         pixels, sizes = pixels.unsqueeze(0), sizes.unsqueeze(0)
     if pixels.dtype not in (torch.float32, torch.float16, torch.bfloat16):
-        raise ValueError("Unsupported processed pixel dtype")
+        raise MediaCaptureRejected("Unsupported processed pixel dtype")
     return pack_images(pixels, sizes, patch_size=patch_size), sizes
 
 
@@ -216,24 +235,28 @@ def capture_processed_media(
     placeholders = engine_prompt.get("mm_placeholders") or {}
     kwargs = engine_prompt.get("mm_kwargs") or {}
     if (set(placeholders) | set(kwargs)) - {"image", "video"}:
-        raise ValueError("Omni token capture supports images and native video only")
+        raise MediaCaptureRejected(
+            "Omni token capture supports images and native video only"
+        )
     occurrences: list[tuple[int, Literal["image", "video"], Any, Any]] = []
     modalities: tuple[Literal["image"], Literal["video"]] = ("image", "video")
     for modality in modalities:
         spans, items = placeholders.get(modality, []), kwargs.get(modality, [])
         if len(spans) != len(items):
-            raise ValueError("Media placeholders and processor occurrences disagree")
+            raise MediaCaptureRejected(
+                "Media placeholders and processor occurrences disagree"
+            )
         occurrences.extend(
             (span.offset, modality, span, item)
             for span, item in zip(spans, items, strict=True)
         )
     occurrences.sort(key=lambda occurrence: occurrence[0])
     if len({modality for _, modality, _, _ in occurrences}) > 1:
-        raise ValueError(
+        raise MediaCaptureRejected(
             "Shared media capture currently requires image-only or video-only conversations"
         )
     if occurrences and (patch_size is None or patch_size <= 0):
-        raise ValueError("Media capture requires the model patch size")
+        raise MediaCaptureRejected("Media capture requires the model patch size")
     added, seen, packed, sizes_parts, frame_counts = [], [], [], [], []
     corrected = {name: [] for name in placeholders}
     previous_end = 0
@@ -241,7 +264,7 @@ def capture_processed_media(
     for _, occurrence_modality, span, item in occurrences:
         modality: Literal["image", "video"] = occurrence_modality
         if item is None:
-            raise ValueError(
+            raise MediaCaptureRejected(
                 "Media capture requires processor data, not cache references"
             )
         if (
@@ -251,13 +274,13 @@ def capture_processed_media(
             or span.length <= 0
             or span.offset + span.length > len(tokens)
         ):
-            raise ValueError("Invalid media placeholder range")
+            raise MediaCaptureRejected("Invalid media placeholder range")
         previous_end = span.offset + span.length
         data = item.get_data()
         assert patch_size is not None
         patches, sizes = _processed_omni_tensors(data, modality, patch_size=patch_size)
         if pixel_dtype is not None and pixel_dtype != patches.dtype:
-            raise ValueError("Media tensor dtypes changed within a call")
+            raise MediaCaptureRejected("Media tensor dtypes changed within a call")
         pixel_dtype = patches.dtype
         packed.append(patches)
         sizes_parts.append(sizes)
@@ -265,7 +288,7 @@ def capture_processed_media(
         local_tokens = tokens[span.offset : previous_end]
         if modality == "video":
             if image_token_id is None:
-                raise ValueError(
+                raise MediaCaptureRejected(
                     "Native video capture requires the image-context token ID"
                 )
             token_id = image_token_id
@@ -276,33 +299,35 @@ def capture_processed_media(
                 if span.is_embed.dtype != torch.bool or tuple(span.is_embed.shape) != (
                     span.length,
                 ):
-                    raise ValueError("Invalid image embedding mask")
+                    raise MediaCaptureRejected("Invalid image embedding mask")
                 positions = span.is_embed.nonzero().flatten().tolist()
             if not positions or positions != list(
                 range(positions[0], positions[-1] + 1)
             ):
-                raise ValueError(
+                raise MediaCaptureRejected(
                     "Image capture requires contiguous image embedding positions"
                 )
             token_id = local_tokens[positions[0]]
             if data.get("num_tokens_per_image") is not None and int(
                 data["num_tokens_per_image"]
             ) != len(positions):
-                raise ValueError("Image embedding count changed")
+                raise MediaCaptureRejected("Image embedding count changed")
         if not positions or any(local_tokens[i] != token_id for i in positions):
-            raise ValueError("Invalid media embedding tokens")
+            raise MediaCaptureRejected("Invalid media embedding tokens")
         offset = span.offset
         if splice is not None:
             if span.offset + span.length <= splice.template_cut_start:
                 if len(seen) >= len(retained):
-                    raise ValueError(
+                    raise MediaCaptureRejected(
                         "Rendered prefix has an unexpected media occurrence"
                     )
                 offset = retained[len(seen)].placeholder_offset
             elif span.offset >= splice.template_cut_start:
                 offset = splice.model_cut_end + span.offset - splice.template_cut_start
             else:
-                raise ValueError("Media placeholder crosses the token splice boundary")
+                raise MediaCaptureRejected(
+                    "Media placeholder crosses the token splice boundary"
+                )
         runs = []
         for position in positions:
             if runs and runs[-1][0] + runs[-1][1] == offset + position:
@@ -322,16 +347,21 @@ def capture_processed_media(
             splice.token_ids if splice is not None else tokens, origin=0
         )
         if offset < prev_len < captured.end:
-            raise ValueError("Media placeholder crosses the captured prefix boundary")
+            raise MediaCaptureRejected(
+                "Media placeholder crosses the captured prefix boundary"
+            )
         if captured.end <= prev_len:
             if len(seen) >= len(retained) or captured != retained[len(seen)]:
-                raise ValueError("Retained media geometry or tokens changed")
+                raise MediaCaptureRejected(
+                    "Retained media geometry or tokens changed",
+                    code="retained_media_changed",
+                )
             seen.append(captured)
         else:
             added.append(captured)
         corrected[modality].append(replace(span, offset=offset))
     if tuple(seen) != retained:
-        raise ValueError("Rendered prefix dropped captured media")
+        raise MediaCaptureRejected("Rendered prefix dropped captured media")
     tensors = None
     if packed:
         full = {

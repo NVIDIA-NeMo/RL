@@ -31,8 +31,9 @@ from fastapi import FastAPI
 
 from nemo_rl.data.captured_media import (
     MEDIA_SPANS_FIELD,
-    CapturedMediaItem,
     CapturedMedia,
+    CapturedMediaItem,
+    MediaCaptureRejected,
     capture_processed_media,
 )
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
@@ -526,8 +527,15 @@ class VllmAsyncGenerationWorkerImpl(
         from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 
         dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
+        # The Omni processor emits pixels in the engine's model dtype; the
+        # sink pins its media column to it so text-call sentinels never
+        # introduce a second dtype (TQ keeps one dtype per field).
+        pixel_dtype = self.llm.model_config.dtype if capture_media else None
         sink = TQTokenSink(
-            dp_client, staging_partition=staging_partition, capture_media=capture_media
+            dp_client,
+            staging_partition=staging_partition,
+            capture_media=capture_media,
+            media_pixel_dtype=pixel_dtype,
         )
         if capture_media:
             # Optional engine/Gym capabilities are checked only on VLM workers.
@@ -639,7 +647,7 @@ class VllmAsyncGenerationWorkerImpl(
             return None
         if not self._capture_media:
             if engine_prompt.get("mm_placeholders") or engine_prompt.get("mm_kwargs"):
-                raise ValueError(
+                raise MediaCaptureRejected(
                     "Multimodal token capture requires media capture setup"
                 )
             return None
@@ -662,7 +670,7 @@ class VllmAsyncGenerationWorkerImpl(
                 parent = admission.parent_call_id
                 while parent is not None:
                     if parent in visited:
-                        raise ValueError("Cycle in retained media chain")
+                        raise MediaCaptureRejected("Cycle in retained media chain")
                     visited.add(parent)
                     call = source.fetch_for_finalization(
                         [staging_key(admission.rollout_id, parent)],
@@ -681,7 +689,7 @@ class VllmAsyncGenerationWorkerImpl(
                     or snapshot.chain_hash
                     != compute_chain_hash(chain_hash, snapshot.token_ids_delta)
                 ):
-                    raise ValueError("Invalid retained media call chain")
+                    raise MediaCaptureRejected("Invalid retained media call chain")
                 parent, length, chain_hash = (
                     snapshot.model_call_id,
                     snapshot.cum_len,
@@ -692,14 +700,14 @@ class VllmAsyncGenerationWorkerImpl(
                 admission.prev_len,
                 admission.parent_chain_hash,
             ):
-                raise ValueError(
+                raise MediaCaptureRejected(
                     "Retained image chain does not match capture admission"
                 )
             retained_items = []
             for call in calls:
                 extras = call.extras or {}
                 if MEDIA_SPANS_FIELD not in extras:
-                    raise ValueError("Retained vLLM media spans are missing")
+                    raise MediaCaptureRejected("Retained vLLM media spans are missing")
                 for value in extras[MEDIA_SPANS_FIELD]:
                     item = CapturedMediaItem.from_dict(value)
                     item.verify_tokens(
@@ -1391,6 +1399,27 @@ class VllmAsyncGenerationWorkerImpl(
                             "type": "invalid_request_error",
                             "param": e.parameter,
                             "code": 400,
+                        }
+                    },
+                    status_code=400,
+                )
+            except MediaCaptureRejected as e:
+                # Raised inside preprocess_chat before begin_call, so no capture
+                # state exists yet and the abort below is a no-op kept for
+                # symmetry. Return a 400 carrying a stable code so Gym and the
+                # worker log can distinguish a retained-media re-tile from a
+                # real engine error (which stays a 500 below).
+                worker_self._abort_request_capture(request, reason=e.code)
+                LOGGER.warning(
+                    "Rejected captured call before inference (%s): %s", e.code, e
+                )
+                return JSONResponse(
+                    content={
+                        "error": {
+                            "message": str(e),
+                            "type": "invalid_request_error",
+                            "param": "messages",
+                            "code": e.code,
                         }
                     },
                     status_code=400,

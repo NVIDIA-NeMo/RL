@@ -31,6 +31,7 @@ from nemo_gym.token_id_capture.staging.records import (
 
 from nemo_rl.data.captured_media import (
     MEDIA_SPANS_FIELD,
+    MediaCaptureRejected,
     pack_images,
 )
 from nemo_rl.data.captured_media import (
@@ -129,7 +130,12 @@ def stage(
     sink=None,
     expect="staged",
 ):
-    sink = sink or TQTokenSink(dp, staging_partition=partition, capture_media=True)
+    sink = sink or TQTokenSink(
+        dp,
+        staging_partition=partition,
+        capture_media=True,
+        media_pixel_dtype=torch.float32,
+    )
     capture = RolloutTokenCapture(
         sink=sink, weight_version_fn=lambda: 3, adapter=VLLMCaptureAdapter()
     )
@@ -303,7 +309,7 @@ def test_missing_or_corrupt_media_rejects_rollout(dp, corruption, reason):
     elif corruption == "dtype":
         stored[MEDIA_IMGS_FIELD] = stored[MEDIA_IMGS_FIELD].to(torch.int64)
     elif corruption == "frames_flag":
-        # A still flagged as video reads the int64 sentinel as frame counts.
+        # A still flagged as video reads the all-zero num_frames sentinel.
         stored[MEDIA_HAS_FRAMES_FIELD] = torch.tensor(True)
     else:
         stored[MEDIA_PRESENT_FIELD] = torch.tensor(False)
@@ -327,9 +333,12 @@ def test_image_free_continuation_has_no_pixel_column(dp):
     assert descriptor.items == ()
     child_row = dp._partitions["staging"].rows[child.staging_key]
     # Every row of a media partition carries the columns; this one is flagged
-    # empty and holds sentinels, so the finalizer never reads its tensors.
+    # empty and holds sentinels, so the finalizer never reads its tensors. The
+    # sentinels keep each column's dtype: TQ allows one dtype per field.
     assert child_row[MEDIA_PRESENT_FIELD].item() is False
-    assert child_row[MEDIA_IMGS_FIELD].dtype is torch.int64
+    root_row = dp._partitions["staging"].rows[root.staging_key]
+    for column in MEDIA_TENSOR_COLUMNS.values():
+        assert child_row[column].dtype is root_row[column].dtype, column
     client = RecordingClient(dp)
     row = finalizer(client).finalize_rollout("r0", receipt(root, child), reward=1.0)
     assert row.valid, row.rejection_reason
@@ -388,8 +397,16 @@ def test_changed_retained_images_fail_before_inference(change):
     )
     if change == "cache_reference":
         prompt["mm_kwargs"]["image"][0] = None
-    with pytest.raises(ValueError):
+    with pytest.raises(MediaCaptureRejected) as excinfo:
         capture_processed_media(prompt, prev_len=6, retained=first.items)
+    # A changed retained image carries its own code so the worker's HTTP 400
+    # (and its log line) distinguish it from other capture-time rejections.
+    expected = (
+        "retained_media_changed"
+        if change in ("length", "size")
+        else "media_capture_rejected"
+    )
+    assert excinfo.value.code == expected
 
 
 def test_splice_coordinates_handle_reasoning_shift_and_repeated_pad_runs():
@@ -469,7 +486,12 @@ def test_failed_combined_write_is_capture_failed_and_leaves_no_row(dp, monkeypat
     """Tokens and pixels share one write: a failure is reported at call time
     (no ``staged`` coords for a row the finalizer would have to reject) and the
     attempted key is discarded."""
-    sink = TQTokenSink(dp, staging_partition="staging", capture_media=True)
+    sink = TQTokenSink(
+        dp,
+        staging_partition="staging",
+        capture_media=True,
+        media_pixel_dtype=torch.float32,
+    )
     cleared = []
 
     def fail(*args, **kwargs):
@@ -644,7 +666,12 @@ def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(dp
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
     worker._capture_calls = {}
     worker.token_capture = RolloutTokenCapture(
-        sink=TQTokenSink(dp, staging_partition="staging", capture_media=True),
+        sink=TQTokenSink(
+            dp,
+            staging_partition="staging",
+            capture_media=True,
+            media_pixel_dtype=torch.float32,
+        ),
         weight_version_fn=lambda: 0,
         adapter=VLLMCaptureAdapter(),
     )
@@ -838,6 +865,8 @@ def test_native_video_rejects_inconsistent_frame_count():
 
 @pytest.mark.parametrize("temporal_patch_size", [1, 2])
 def test_real_vllm_video_replacement_round_trips(dp, temporal_patch_size):
+    # nemo_gym-marked tests run in a lane without the vllm extra.
+    pytest.importorskip("vllm")
     from transformers import BatchFeature
     from vllm.model_executor.models.nano_nemotron_vl import (
         NanoNemotronVLMultiModalProcessor,

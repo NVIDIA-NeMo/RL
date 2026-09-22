@@ -29,6 +29,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 
@@ -87,7 +88,11 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
-        lambda dp_client, *, staging_partition, capture_media: sink,
+        lambda dp_client,
+        *,
+        staging_partition,
+        capture_media,
+        media_pixel_dtype=None: sink,
     )
     worker = _fake_worker()
 
@@ -126,7 +131,11 @@ def test_weight_version_is_stamped_from_worker_state(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
-        lambda dp_client, *, staging_partition, capture_media: sink,
+        lambda dp_client,
+        *,
+        staging_partition,
+        capture_media,
+        media_pixel_dtype=None: sink,
     )
     worker = _fake_worker()
     asyncio.run(
@@ -523,6 +532,8 @@ def test_request_capture_abort_fails_the_call_and_drains_state():
 
 @pytest.mark.parametrize("pruning_rate", [0.0, 0.5])
 def test_omni_capture_setup_rejects_video_pruning(monkeypatch, pruning_rate):
+    # nemo_gym-marked tests run in a lane without the vllm extra.
+    pytest.importorskip("vllm")
     from vllm.model_executor.models.nano_nemotron_vl import NanoNemotronVLProcessingInfo
 
     info = object.__new__(NanoNemotronVLProcessingInfo)
@@ -544,7 +555,8 @@ def test_omni_capture_setup_rejects_video_pruning(monkeypatch, pruning_rate):
     )
     worker = _fake_worker()
     worker.llm = SimpleNamespace(
-        renderer=SimpleNamespace(get_mm_processor=lambda: SimpleNamespace(info=info))
+        renderer=SimpleNamespace(get_mm_processor=lambda: SimpleNamespace(info=info)),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.build_data_plane_client",

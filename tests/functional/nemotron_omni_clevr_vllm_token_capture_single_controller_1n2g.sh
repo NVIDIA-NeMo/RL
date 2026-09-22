@@ -93,7 +93,7 @@ PY
 # SingleController requires disaggregated generation: one GPU trains the
 # frozen-decoder policy, one GPU hosts async vLLM (TP1) with the capture host.
 uv run --no-sync python examples/run_grpo_single_controller.py \
-    --config examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-gym-1n2g-megatron-vllm-single-controller-token_capture.v1.yaml \
+    --config examples/nemo_gym/vlm_grpo_nemotron_omni_clevr_vllm_token_capture_single_controller.yaml \
     cluster.num_nodes=1 \
     cluster.gpus_per_node=2 \
     ++cluster.segment_size=1 \

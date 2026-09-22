@@ -119,9 +119,9 @@ def _still(*, dtype=torch.bfloat16, sizes=((2, 4), (4, 2)), patch_size=2):
     return {"imgs": imgs.to(dtype), "imgs_sizes": sizes_t}
 
 
-def _video(*, frames=(1,), patch_size=2):
+def _video(*, frames=(1,), patch_size=2, dtype=torch.float16):
     per_frame = [(2, 2)] * sum(frames)
-    bundle = _still(dtype=torch.float16, sizes=per_frame, patch_size=patch_size)
+    bundle = _still(dtype=dtype, sizes=per_frame, patch_size=patch_size)
     bundle["num_frames"] = torch.tensor(frames, dtype=torch.int32)
     return bundle
 
@@ -134,17 +134,33 @@ def _assert_same_tensor(actual, expected):
 
 def test_media_rows_round_trip_in_a_single_put(tq_client, media_partition):
     client = _RecordingClient(tq_client)
-    sink = TQTokenSink(client, staging_partition=media_partition, capture_media=True)
+    sink = TQTokenSink(
+        client,
+        staging_partition=media_partition,
+        capture_media=True,
+        media_pixel_dtype=torch.bfloat16,
+    )
     source = TQTokenSource(
         client, staging_partition=media_partition, capture_media=True
     )
     chain, _, _ = build_fixture_artifacts("worked_example")
     single, _, _ = build_fixture_artifacts("single_call")
     records = [*chain[:2], single[0]]
-    still, video = _still(), _video(frames=(1,))
+    still, video = _still(), _video(frames=(1,), dtype=torch.bfloat16)
     bundles = [still, video, None]  # bf16 still, one-frame video, text call
     for record, bundle in zip(records, bundles, strict=True):
         assert sink.stage(record, attachments=bundle).ok
+    # TQ keeps one dtype per field across live rows (a mismatch is swallowed by
+    # the controller and drops the row's shape metadata), so the text call's
+    # sentinels must share each column's dtype with the real rows.
+    raw = tq_client.get_samples(
+        partition_id=media_partition,
+        sample_ids=[record.staging_key for record in records],
+        select_fields=list(MEDIA_TENSOR_COLUMNS.values()),
+    )
+    for column in MEDIA_TENSOR_COLUMNS.values():
+        dtypes = {raw[column][i].dtype for i in range(3)}
+        assert len(dtypes) == 1, (column, dtypes)
     # One put per call, each carrying token, flag, and tensor columns.
     assert len(client.puts) == 3
     for fields in client.puts:
@@ -179,7 +195,12 @@ def test_batched_media_read_returns_ragged_rows_in_request_order(
     tq_client, media_partition
 ):
     client = _RecordingClient(tq_client)
-    sink = TQTokenSink(client, staging_partition=media_partition, capture_media=True)
+    sink = TQTokenSink(
+        client,
+        staging_partition=media_partition,
+        capture_media=True,
+        media_pixel_dtype=torch.bfloat16,
+    )
     source = TQTokenSource(
         client, staging_partition=media_partition, capture_media=True
     )
@@ -224,6 +245,7 @@ def test_text_only_partition_never_touches_media_columns(tq_client, staging_part
         lambda b: {**b, "imgs": b["imgs"].tolist()},
         lambda b: {**b, "imgs": b["imgs"][:, :0]},
         lambda b: {**b, "imgs": b["imgs"].to(torch.int64)},
+        lambda b: {**b, "imgs": b["imgs"].to(torch.float16)},  # not the column dtype
         lambda b: {**b, "imgs": b["imgs"][0]},  # 2-D
         lambda b: {**b, "imgs": b["imgs"][:, :, :11]},  # not 3*P*P
         lambda b: {**b, "imgs_sizes": b["imgs_sizes"].to(torch.float32)},
@@ -239,7 +261,12 @@ def test_text_only_partition_never_touches_media_columns(tq_client, staging_part
 )
 def test_malformed_media_fails_before_any_put(tq_client, media_partition, mutate):
     client = _RecordingClient(tq_client)
-    sink = TQTokenSink(client, staging_partition=media_partition, capture_media=True)
+    sink = TQTokenSink(
+        client,
+        staging_partition=media_partition,
+        capture_media=True,
+        media_pixel_dtype=torch.bfloat16,
+    )
     records, _, _ = build_fixture_artifacts("single_call")
     result = sink.stage(records[0], attachments=mutate(_still()))
     assert not result.ok
@@ -265,7 +292,12 @@ def test_validate_media_tensors_preserves_dtypes():
 
 def test_failed_combined_write_discards_the_attempted_key(tq_client, media_partition):
     client = _RecordingClient(tq_client, fail_put=RuntimeError("storage down"))
-    sink = TQTokenSink(client, staging_partition=media_partition, capture_media=True)
+    sink = TQTokenSink(
+        client,
+        staging_partition=media_partition,
+        capture_media=True,
+        media_pixel_dtype=torch.bfloat16,
+    )
     records, _, _ = build_fixture_artifacts("single_call")
     result = sink.stage(records[0], attachments=_still())
     assert not result.ok and "storage down" in (result.error or "")
@@ -285,7 +317,12 @@ def test_cleanup_failure_still_reports_the_stage_failure(
         fail_put=RuntimeError("storage down"),
         fail_clear=RuntimeError("cleanup down"),
     )
-    sink = TQTokenSink(client, staging_partition=media_partition, capture_media=True)
+    sink = TQTokenSink(
+        client,
+        staging_partition=media_partition,
+        capture_media=True,
+        media_pixel_dtype=torch.bfloat16,
+    )
     records, _, _ = build_fixture_artifacts("single_call")
     with caplog.at_level("ERROR", logger="nemo_rl.data_plane.tq_token_sink"):
         result = sink.stage(records[0], attachments=_still())

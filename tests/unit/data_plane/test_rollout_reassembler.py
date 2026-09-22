@@ -146,10 +146,27 @@ def test_finalize_rollout_rejections(tq_client, partitions):
         finalizer.finalize_rollout("rej_a", poisoned, reward=0.0).rejection_reason
         == "capture_poisoned"
     )
-    empty = dict(receipt, manifest=[], terminal_model_call_id=None)
+    # Gym (since #2823) rejects an unpoisoned receipt with no terminal call, so
+    # an empty manifest only reaches the finalizer poisoned, the way
+    # ``nemo_gym.py`` emits it (``failure_reason="missing_terminal_row"``).
+    unpoisoned_empty = dict(receipt, manifest=[], terminal_model_call_id=None)
+    assert (
+        finalizer.finalize_rollout(
+            "rej_a", unpoisoned_empty, reward=0.0
+        ).rejection_reason
+        or ""
+    ).startswith("invalid_receipt:")
+    empty = dict(
+        receipt,
+        manifest=[],
+        terminal_model_call_id=None,
+        terminal_selection=None,
+        capture_poisoned=True,
+        failure_reason="missing_terminal_row",
+    )
     assert (
         finalizer.finalize_rollout("rej_a", empty, reward=0.0).rejection_reason
-        == "empty_manifest"
+        == "rollout_failed:missing_terminal_row"
     )
     wrong_identity = finalizer.finalize_rollout("someone_else", receipt, reward=0.0)
     assert (wrong_identity.rejection_reason or "").startswith("identity_mismatch")
