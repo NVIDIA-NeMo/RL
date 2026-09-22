@@ -712,6 +712,7 @@ project-excludes = ["**/*venv/**/*"]
 
 [tool.coverage.run]
 concurrency = ["thread", "multiprocessing"]
+source_pkgs = ["nemo_rl"]
 omit = ["/tmp/*"]
 
 [tool.coverage.paths]
