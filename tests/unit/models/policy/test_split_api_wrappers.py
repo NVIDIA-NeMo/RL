@@ -138,6 +138,13 @@ def _make_tq_policy() -> tuple[TQPolicy, MagicMock]:
 
 
 class TestTQPolicySplitFanout:
+    def test_offload_waits_for_all_workers(self):
+        p, wg = _make_tq_policy()
+        with patch("nemo_rl.models.policy.tq_policy.ray") as mock_ray:
+            assert p.offload_train_step() is None
+        wg.run_all_workers_single_data.assert_called_once_with("offload_train_step")
+        mock_ray.get.assert_called_once_with(["f0", "f1"])
+
     def test_begin_consumes_single_data_futures_with_ray_get(self):
         """run_all_workers_single_data returns plain ObjectRefs, not a
         MultiWorkerFuture — the fan-out must ray.get them (PR #2683

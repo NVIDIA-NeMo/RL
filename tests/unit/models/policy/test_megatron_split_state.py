@@ -1623,6 +1623,146 @@ class TestChunkRecordIsGuarded:
 # ── prepare_for_lp_inference ─────────────────────────────────────────────
 
 
+class _DiscardingGradBuffer:
+    """Reproduce Megatron offload/reload's destructive storage lifecycle on CPU."""
+
+    def __init__(self, values):
+        self.grad_data = torch.tensor(values, dtype=torch.float32)
+        self.grad_bytes = 0
+
+    def offload_to_cpu(self, *, move_params, move_grads):
+        if move_grads:
+            self.grad_bytes = self.grad_data.untyped_storage().nbytes()
+            self.grad_data.untyped_storage().resize_(0)
+
+    def reload_from_cpu(self, *, move_params, move_grads):
+        if move_grads and self.grad_bytes:
+            self.grad_data.untyped_storage().resize_(self.grad_bytes)
+            self.grad_data.zero_()
+            self.grad_bytes = 0
+
+
+class TestOffloadTrainStep:
+    @staticmethod
+    def _worker():
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.buffers = [_DiscardingGradBuffer([1.0, 2.0, 3.0])]
+        w.model.expert_parallel_buffers = [_DiscardingGradBuffer([4.0, 5.0])]
+        w.finalize_async_save = MagicMock()
+        w.move_optimizer = MagicMock()
+        w.optimizer_cpu_offload = False
+        w.offload_optimizer_for_logprob = True
+        w._train_step_state = {
+            "offloaded_grads": None,
+            "local_valid_toks": torch.tensor(7.0),
+            "num_chunks": 1,
+            "saved_grad_sync_func": "ORIGINAL_GRAD_SYNC_FUNC",
+            "saved_no_sync_func": "ORIGINAL_NO_SYNC_FUNC",
+            "saved_finalize_model_grads_func": "ORIGINAL_FINALIZE",
+        }
+        w.model.config.grad_sync_func = None
+        w.model.config.finalize_model_grads_func = None
+        return w
+
+    def test_preserves_dense_expert_gradients_across_two_switches(
+        self, mock_module_symbols
+    ):
+        w = self._worker()
+        state = w._train_step_state
+        buffers = [*w.model.buffers, *w.model.expert_parallel_buffers]
+        # Keep the same views, as parameters do through param.main_grad.
+        main_grads = [buffer.grad_data.view(-1) for buffer in buffers]
+        expected = [grad.clone() for grad in main_grads]
+
+        # Exercise the real move_model DDP branch with the buffer lifecycle
+        # above, not a no-op mock that could hide lost gradient storage.
+        with patch(f"{WORKER_MOD}.DistributedDataParallel", type(w.model)):
+            for chunk in (2, 3):
+                w.offload_train_step()
+                assert all(grad.untyped_storage().nbytes() == 0 for grad in main_grads)
+                assert w._train_step_state is state
+                w.prepare_for_training()
+                assert state["offloaded_grads"] is None
+                for grad, saved in zip(main_grads, expected):
+                    torch.testing.assert_close(grad, saved)
+                # The logprob detour must keep the restored accumulation.
+                with patch("torch.randn"):
+                    w.prepare_for_lp_inference(keep_train_buffers=True)
+                for grad, saved in zip(main_grads, expected):
+                    grad.add_(chunk)
+                    saved.add_(chunk)
+                state["num_chunks"] += 1
+                state["local_valid_toks"] += 7
+
+        for grad, saved in zip(main_grads, expected):
+            torch.testing.assert_close(grad, saved)
+        assert state["num_chunks"] == 3
+        assert state["local_valid_toks"].item() == 21
+        assert w.model.config.grad_sync_func is None
+        assert w.model.config.finalize_model_grads_func is None
+        assert [call.args[0] for call in w.move_optimizer.call_args_list] == [
+            "cpu",
+            "cuda",
+            "cpu",
+            "cuda",
+        ]
+        w.model.zero_grad_buffer.assert_not_called()
+        w.optimizer.step.assert_not_called()
+        w.scheduler.step.assert_not_called()
+
+    def test_requires_open_step(self, mock_module_symbols):
+        w = self._worker()
+        w._train_step_state = None
+        with pytest.raises(RuntimeError, match="no train step open"):
+            w.offload_train_step()
+
+    def test_rejects_unsupported_model_without_mutating_state(
+        self, mock_module_symbols
+    ):
+        w = self._worker()
+        with pytest.raises(ValueError, match="requires Megatron DDP"):
+            w.offload_train_step()
+        assert w._train_step_state["offloaded_grads"] is None
+
+    def test_rejects_shared_mxfp8_buffers(self, mock_module_symbols):
+        w = self._worker()
+        w.megatron_cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag = True
+        w.megatron_cfg.ddp.overlap_param_gather = True
+        with patch(f"{WORKER_MOD}.DistributedDataParallel", type(w.model)):
+            with pytest.raises(ValueError, match="shared MXFP8"):
+                w.offload_train_step()
+        assert w._train_step_state["offloaded_grads"] is None
+
+    def test_offloaded_step_rejects_double_offload_train_and_finish(
+        self, mock_module_symbols
+    ):
+        w = self._worker()
+        with patch(f"{WORKER_MOD}.DistributedDataParallel", type(w.model)):
+            w.offload_train_step()
+            with pytest.raises(RuntimeError, match="already offloaded"):
+                w.offload_train_step()
+            with pytest.raises(RuntimeError, match="prepare_for_training"):
+                w.train_microbatch({})
+            with pytest.raises(RuntimeError, match="prepare_for_training"):
+                w.finish_train_step()
+            # Release saved state without touching freed CUDA buffer views.
+            w.abort_train_step()
+        assert w._train_step_state is None
+        assert w.model.config.grad_sync_func == "ORIGINAL_GRAD_SYNC_FUNC"
+        w.model.zero_grad_buffer.assert_not_called()
+        w.optimizer.zero_grad.assert_not_called()
+
+    def test_restore_rejects_changed_buffer_layout(self, mock_module_symbols):
+        w = self._worker()
+        with patch(f"{WORKER_MOD}.DistributedDataParallel", type(w.model)):
+            w.offload_train_step()
+            w.model.expert_parallel_buffers = []
+            with pytest.raises(RuntimeError, match="gradient buffers changed"):
+                w.prepare_for_training()
+
+
 class TestPrepareForLpInference:
     """``keep_train_buffers`` decides whether an open step's accumulated
     gradients survive the logprob phase.
