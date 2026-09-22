@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import os
 import shutil
 import threading
@@ -142,6 +143,10 @@ def _prefer_nvrx_for_dist_ckpt_save():
     Megatron-LM's torch_dist sync save currently routes through the MCore async
     finalize path, which can fail when write results contain non-picklable
     objects (e.g., code objects) during gather_object.
+
+    Newer Megatron-LM pins (NVIDIA/Megatron-LM#7052 and later) dropped the MCore
+    async writer: ``async_save`` no longer takes ``async_strategy`` and the sync
+    save uses PyTorch's writer directly, so this is a no-op there.
     """
     try:
         from megatron.core.dist_checkpointing.strategies.torch import (
@@ -149,6 +154,14 @@ def _prefer_nvrx_for_dist_ckpt_save():
         )
     except ImportError:
         # If dist-checkpoint strategy cannot be imported, leave behavior unchanged.
+        yield
+        return
+
+    if (
+        "async_strategy"
+        not in inspect.signature(TorchDistSaveShardedStrategy.async_save).parameters
+    ):
+        # Without an MCore async writer there is nothing to prefer NVRx over.
         yield
         return
 
