@@ -146,11 +146,12 @@ def test_finalize_rollout_rejections(tq_client, partitions):
         finalizer.finalize_rollout("rej_a", poisoned, reward=0.0).rejection_reason
         == "capture_poisoned"
     )
+    # Gym's RolloutReceipt forbids an unpoisoned receipt without a terminal call,
+    # so an empty manifest fails schema validation before any finalizer check.
     empty = dict(receipt, manifest=[], terminal_model_call_id=None)
     assert (
-        finalizer.finalize_rollout("rej_a", empty, reward=0.0).rejection_reason
-        == "empty_manifest"
-    )
+        finalizer.finalize_rollout("rej_a", empty, reward=0.0).rejection_reason or ""
+    ).startswith("invalid_receipt:")
     wrong_identity = finalizer.finalize_rollout("someone_else", receipt, reward=0.0)
     assert (wrong_identity.rejection_reason or "").startswith("identity_mismatch")
 
