@@ -37,6 +37,7 @@ from __future__ import annotations
 import hashlib
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -64,9 +65,38 @@ REQUIRES: list[str] = _META["project"].get("dependencies", [])
 # by base image and architecture so it can span ref and uv-version changes.
 # There is no env-var override — to build a different fork/ref, edit
 # [tool.trtllm].
+#
+# The url may embed ``${VAR}`` placeholders when a private fork is used. The raw
+# string is folded into the wheel cache key; only the value handed to the build
+# script is expanded, so a rotated token never invalidates the cache or lands in
+# a cache path. See _expanded_trtllm_url.
 _TRTLLM: dict[str, str] = _META["tool"]["trtllm"]
 TRTLLM_URL: str = _TRTLLM["url"]
 TRTLLM_REF: str = _TRTLLM["ref"]
+
+
+def _expanded_trtllm_url(env: dict[str, str]) -> str:
+    """Expand ``${VAR}`` placeholders in TRTLLM_URL from *env*.
+
+    Args:
+        env: Environment mapping to resolve placeholders against.
+
+    Returns:
+        The url with every ``${VAR}`` replaced by its value in *env*.
+
+    Raises:
+        RuntimeError: If a referenced variable is unset or empty. Substituting
+            an empty token would otherwise produce a URL that fails to
+            authenticate with an opaque git error deep inside the build.
+    """
+    missing = [name for name in re.findall(r"\$\{(\w+)\}", TRTLLM_URL) if not env.get(name)]
+    if missing:
+        raise RuntimeError(
+            f"[tool.trtllm].url references {', '.join(missing)}, which "
+            f"{'is' if len(missing) == 1 else 'are'} unset or empty. "
+            "Pass the value into the build environment before building."
+        )
+    return re.sub(r"\$\{(\w+)\}", lambda m: env[m.group(1)], TRTLLM_URL)
 
 
 def _wheel_platform_tag() -> str:
@@ -91,7 +121,11 @@ _METADATA_WHEEL_TAG = "py3-none-any"
 # with tools/build-custom-trtllm.sh, which reads BUILD_CUSTOM_TRTLLM_ARCH and
 # falls back to this same default. Folded into the wheel cache key below so
 # editing the arch list forces a rebuild instead of reusing a stale wheel.
-_DEFAULT_ARCH = "90-real;100-real"
+# Blackwell (sm_100), Blackwell-Ultra (sm_103) and Rubin (sm_107).
+# NOTE the nvshmem arch patch in build-custom-trtllm.sh carries its own copy of
+# this list in BARE form (100;103;107) -- nvshmem rejects the suffixed names
+# CMake generates, so the two lists are written differently on purpose.
+_DEFAULT_ARCH = "100-real;103-real;107-real"
 
 
 def _build_input_tag(arch: str) -> str:
@@ -176,6 +210,9 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         raise FileNotFoundError(f"Build script not found: {script}")
 
     env = os.environ.copy()
+    # Raw (still containing any ${VAR}) — this is what the cache key is built
+    # from, so rotating a clone token does not invalidate cached wheels and no
+    # secret is ever written into a cache path.
     git_url = TRTLLM_URL
     git_ref = TRTLLM_REF
     # NOTE: when bumping the ref (in the [tool.trtllm] table of this pyproject.toml),
@@ -216,12 +253,20 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         env["WHEEL_OUTPUT_DIR"] = str(cache_dir)
         venv_bin = str(Path(sys.executable).parent)
         env["PATH"] = f"{venv_bin}:{env.get('PATH', os.defpath)}"
-        subprocess.run(
-            ["bash", str(script), git_url, git_ref],
-            check=True,
+        # check=False + explicit raise: CalledProcessError stringifies the full
+        # argv, which would print the expanded url -- clone token and all --
+        # into the build log on any failure.
+        result = subprocess.run(
+            ["bash", str(script), _expanded_trtllm_url(env), git_ref],
+            check=False,
             env=env,
             cwd=str(repo_root),
         )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"build-custom-trtllm.sh failed with exit code {result.returncode} "
+                f"for ref {git_ref} (url redacted). See the build output above."
+            )
         wheel = max(cache_dir.glob("tensorrt_llm-*.whl"), default=None)
         if wheel is None:
             raise RuntimeError(
