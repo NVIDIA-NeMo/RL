@@ -14,6 +14,8 @@
 
 import asyncio
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -88,6 +90,13 @@ class VllmCheckpointEngineMixin(VllmShardedExpertRefitMixin):
     def _validate_checkpoint_engine_weight_update(self) -> None:
         """Run worker-specific compatibility checks before receiving weights."""
 
+    @contextmanager
+    def _checkpoint_engine_weight_update_lifecycle(
+        self,
+    ) -> Iterator[Callable[[], None]]:
+        """Provide an optional model-specific lifecycle around all weight batches."""
+        yield lambda: None
+
     def checkpoint_engine_total_memory_bytes(self) -> int:
         device = torch.cuda.current_device()
         return torch.cuda.get_device_properties(device).total_memory
@@ -147,16 +156,19 @@ class VllmCheckpointEngineMixin(VllmShardedExpertRefitMixin):
         load_time = 0.0
         start_time = time.time()
 
-        async for weight_batch in self.checkpoint_engine.receive_weight_batches():
-            loaded_batches += 1
-            loaded_tensors += len(weight_batch)
-            loaded_bytes += sum(weight.nbytes for _name, weight in weight_batch)
+        with self._checkpoint_engine_weight_update_lifecycle() as finalize:
+            async for weight_batch in self.checkpoint_engine.receive_weight_batches():
+                loaded_batches += 1
+                loaded_tensors += len(weight_batch)
+                loaded_bytes += sum(weight.nbytes for _name, weight in weight_batch)
 
-            load_start = time.time()
-            self._load_weights(weight_batch)
-            torch.cuda.current_stream().synchronize()
-            load_time += time.time() - load_start
-            del weight_batch
+                load_start = time.time()
+                self._load_weights(weight_batch)
+                torch.cuda.current_stream().synchronize()
+                load_time += time.time() - load_start
+                del weight_batch
+
+            finalize()
 
         self._maybe_process_fp8_kv_cache()
 

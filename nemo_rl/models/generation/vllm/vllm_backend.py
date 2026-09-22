@@ -59,7 +59,9 @@ except ImportError:
     )
 
 
-WeightUpdateTransport = Literal["ipc", "collective", "nccl_reshard"]
+WeightUpdateTransport = Literal[
+    "ipc", "collective", "nccl_reshard", "checkpoint_engine"
+]
 UnsupportedNativeRefitTransport = Literal["checkpoint_engine", "sparse_delta"]
 WeightUpdateFinalizer = Callable[[], None]
 
@@ -999,7 +1001,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     def _uses_native_layerwise_refit(self, transport: WeightUpdateTransport) -> bool:
         """Return whether this transport needs vLLM's layerwise lifecycle."""
         return (
-            transport in ("ipc", "collective", "nccl_reshard")
+            transport in ("ipc", "collective", "nccl_reshard", "checkpoint_engine")
             and self._uses_unquantized_flashinfer_trtllm()
         ) or (transport in ("ipc", "collective") and self._uses_deepseek_v4_fp8_refit())
 
@@ -1021,7 +1023,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         if not self._uses_unquantized_flashinfer_trtllm():
             return
 
-        if transport in ("ipc", "collective", "nccl_reshard") and (
+        if transport in ("ipc", "collective", "nccl_reshard", "checkpoint_engine") and (
             self._uses_fp8_kv_cache()
         ):
             raise RuntimeError(
@@ -2195,4 +2197,16 @@ class VllmInternalWorkerExtensionWithCheckpointEngine(
     """vLLM worker extension with checkpoint-engine refit support."""
 
     def _validate_checkpoint_engine_weight_update(self) -> None:
-        self._reject_unsupported_native_refit("checkpoint_engine")
+        if not self._uses_native_layerwise_refit("checkpoint_engine"):
+            self._reject_unsupported_native_refit("checkpoint_engine")
+
+    @contextmanager
+    def _checkpoint_engine_weight_update_lifecycle(
+        self,
+    ) -> Iterator[WeightUpdateFinalizer]:
+        if not self._uses_native_layerwise_refit("checkpoint_engine"):
+            yield lambda: None
+            return
+
+        with self._weight_update_lifecycle("checkpoint_engine") as finalize:
+            yield finalize

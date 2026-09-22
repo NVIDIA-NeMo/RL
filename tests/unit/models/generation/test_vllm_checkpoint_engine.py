@@ -15,6 +15,7 @@
 """Tests for vLLM checkpoint-engine worker lifecycle helpers."""
 
 import asyncio
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -92,6 +93,14 @@ def test_update_weights_from_checkpoint_engine_async_loads_all_batches(monkeypat
     worker = VllmCheckpointEngineMixin()
     worker.checkpoint_engine = FakeEngine()
     events = []
+
+    @contextmanager
+    def lifecycle():
+        events.append(("lifecycle_enter",))
+        yield lambda: events.append(("finalize",))
+        events.append(("lifecycle_exit",))
+
+    worker._checkpoint_engine_weight_update_lifecycle = lifecycle
     worker._load_weights = lambda batch: events.append(
         ("load", [name for name, _weight in batch])
     )
@@ -104,16 +113,19 @@ def test_update_weights_from_checkpoint_engine_async_loads_all_batches(monkeypat
 
     assert asyncio.run(worker._update_weights_from_checkpoint_engine_async()) is True
     assert events == [
+        ("lifecycle_enter",),
         ("load", ["a"]),
         ("sync",),
         ("load", ["b", "c"]),
         ("sync",),
+        ("finalize",),
+        ("lifecycle_exit",),
         ("fp8",),
     ]
 
 
 @pytest.mark.vllm
-def test_checkpoint_engine_rejects_native_trtllm_refit():
+def test_checkpoint_engine_uses_native_trtllm_refit_lifecycle():
     from nemo_rl.models.generation.vllm.vllm_backend import (
         VllmInternalWorkerExtensionWithCheckpointEngine,
     )
@@ -122,9 +134,30 @@ def test_checkpoint_engine_rejects_native_trtllm_refit():
         VllmInternalWorkerExtensionWithCheckpointEngine
     )
     worker._uses_unquantized_flashinfer_trtllm = lambda: True
+    worker._uses_fp8_kv_cache = lambda: False
+    worker._mtp_drafter_refit_enabled = lambda: False
+    worker._uses_deepseek_v4_fp8_refit = lambda: False
+    events = []
 
-    with pytest.raises(RuntimeError, match="checkpoint-engine"):
-        asyncio.run(worker._update_weights_from_checkpoint_engine_async())
+    @contextmanager
+    def lifecycle(transport):
+        events.append(("enter", transport))
+        yield lambda: events.append(("finalize", transport))
+        events.append(("exit", transport))
+
+    worker._weight_update_lifecycle = lifecycle
+
+    worker._validate_checkpoint_engine_weight_update()
+    with worker._checkpoint_engine_weight_update_lifecycle() as finalize:
+        events.append(("load",))
+        finalize()
+
+    assert events == [
+        ("enter", "checkpoint_engine"),
+        ("load",),
+        ("finalize", "checkpoint_engine"),
+        ("exit", "checkpoint_engine"),
+    ]
 
 
 @pytest.mark.vllm
