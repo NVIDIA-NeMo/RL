@@ -50,8 +50,11 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     MasterConfig,
+    _advantage_valid_mask,
+    _apply_mask_sample_filter,
     _clip_grpo_advantages,
     _create_advantage_estimator,
+    _dynamic_sampling_valid_mask,
     _initial_policy_generation_stale,
     _log_mixed_rewards_and_advantages_information,
     _placeholder_seq_logprob_error_metrics,
@@ -733,7 +736,9 @@ def grpo_train_sync(
                         calculate_baseline_and_std_per_prompt(
                             driver_carry["prompt_ids_for_adv"],
                             driver_carry["total_reward"],
-                            torch.ones_like(driver_carry["total_reward"]),
+                            _dynamic_sampling_valid_mask(
+                                driver_carry, master_config.grpo
+                            ),
                             leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
                         )
                     )
@@ -795,8 +800,10 @@ def grpo_train_sync(
                         pending_meta = None
                         pending_carry = None
 
-                # Mirrors legacy ``grpo.py:1707-1716`` — applied on the
-                # post-DS survivors so dropped rows don't affect this set.
+                # Apply loss filters to post-DS survivors, as in the legacy loop.
+                metrics["num_mask_sample_filtered"] = _apply_mask_sample_filter(
+                    driver_carry
+                )
                 if master_config.grpo.overlong_filtering:
                     lm = driver_carry["loss_multiplier"].clone()
                     lm[driver_carry["truncated"]] = 0
@@ -906,6 +913,9 @@ def grpo_train_sync(
                 with timer.time("advantage_calculation"):
                     print("▶ Computing advantages...", flush=True)
                     mask = token_mask * sample_mask.unsqueeze(-1)
+                    advantage_valid_mask = _advantage_valid_mask(
+                        sample_mask, master_config.grpo
+                    )
 
                     # GRPO / Reinforce++ ignore ``repeated_batch`` (it's
                     # swallowed via ``**kwargs``); GDPO reads the
@@ -926,6 +936,9 @@ def grpo_train_sync(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=rewards,
                         mask=mask,
+                        valid_mask=advantage_valid_mask,
+                        normalization_mask=token_mask
+                        * advantage_valid_mask.unsqueeze(-1),
                         repeated_batch=adv_inputs,
                         logprobs_policy=prev_logprobs,
                         logprobs_reference=reference_policy_logprobs,
