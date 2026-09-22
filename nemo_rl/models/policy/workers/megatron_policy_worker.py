@@ -995,6 +995,9 @@ class MegatronPolicyWorkerImpl(
             "check_dim_skip_keys is only supported by the v2 DTensor worker; "
             "Megatron does not run cross-tokenizer distillation."
         )
+        self._assert_model_onloaded("train", "prepare_for_training")
+        if not eval_mode:
+            self._assert_training_state_restored("train")
         self.timer.start("train")
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
@@ -2199,6 +2202,7 @@ class MegatronPolicyWorkerImpl(
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        self._assert_model_onloaded("get_logprobs", "prepare_for_lp_inference")
         self.timer.start("get_logprobs")
         no_grad = torch.no_grad()
         no_grad.__enter__()
@@ -2740,6 +2744,7 @@ class MegatronPolicyWorkerImpl(
                 - topk_logits: Tensor of top-k logits for each position in the sequence
                 - topk_indices: Tensor of top-k indices for each position in the sequence
         """
+        self._assert_model_onloaded("get_topk_logits", "prepare_for_lp_inference")
         no_grad = torch.no_grad()
         no_grad.__enter__()
 
@@ -4158,6 +4163,9 @@ class MegatronPolicyWorkerImpl(
             self.model = self.move_model(
                 self.model, "cpu", move_params=False, move_grads=True
             )  # get rid of grad buffers
+            # Parameters stay on CUDA, so only this flag records that a
+            # prepare_for_training() is now required before the next train step.
+            self._training_state_parked = True
 
         # offload optimizer to cpu
         torch.randn(1).cuda()  # wake up torch allocator
@@ -4169,6 +4177,7 @@ class MegatronPolicyWorkerImpl(
             and self.offload_optimizer_for_logprob
         ):
             self.move_optimizer("cpu")
+            self._training_state_parked = True
 
         # No teacher projection happens during logprob inference, so the head can
         # follow the configured offload policy here too.
@@ -4226,6 +4235,7 @@ class MegatronPolicyWorkerImpl(
             and not self.optimizer_cpu_offload
         ):
             self.move_optimizer("cuda")
+        self._training_state_parked = False
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             torch.cuda.empty_cache()
