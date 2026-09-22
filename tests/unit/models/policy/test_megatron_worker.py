@@ -1331,9 +1331,9 @@ def test_megatron_refit_bridge_tasks_export_logical_quantized_weights(
     logical_weight = torch.arange(8, dtype=torch.bfloat16).reshape(4, 2)
     bf16_source = torch.ones((2, 2), dtype=torch.bfloat16)
     dequantize = MagicMock(
-        side_effect=lambda tensor: logical_weight
-        if tensor is quantized_source
-        else tensor
+        side_effect=lambda tensor: (
+            logical_weight if tensor is quantized_source else tensor
+        )
     )
     monkeypatch.setattr(
         worker_module,
@@ -2024,8 +2024,8 @@ def test_megatron_finalize_async_save_releases_colocated_nvrx_cache(
 
     monkeypatch.setattr(
         worker_module,
-        "get_async_strategy",
-        lambda strategy: (strategy, {"FileSystemWriterAsync": _Writer}),
+        "_get_nvrx_filesystem_writer_cls",
+        lambda: _Writer,
     )
     monkeypatch.setattr(
         worker_module.gc, "collect", lambda: events.append(("gc_collect", None))

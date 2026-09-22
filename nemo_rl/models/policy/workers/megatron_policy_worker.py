@@ -39,7 +39,6 @@ from megatron.bridge.training.utils.train_utils import (
 )
 from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallelV1,
@@ -162,6 +161,15 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 )
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+def _get_nvrx_filesystem_writer_cls() -> type[Any]:
+    """Load the NVRx writer only when its CUDA tensor cache must be cleared."""
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
+        FileSystemWriterAsync,
+    )
+
+    return FileSystemWriterAsync
 
 
 def _should_use_router_replay(
@@ -5367,19 +5375,8 @@ class MegatronPolicyWorkerImpl(
             terminate=release_cuda_cache,
         )
         if release_cuda_cache:
-            _, async_modules = get_async_strategy(
-                self.mcore_state.cfg.checkpoint.async_strategy
-            )
-            writer_cls = async_modules["FileSystemWriterAsync"]
-            cleanup_tensor_caches = getattr(writer_cls, "cleanup_tensor_caches", None)
-            if cleanup_tensor_caches is not None:
-                cleanup_tensor_caches()
-            else:
-                # Compatibility with older NVRx versions that predate the
-                # public cleanup helper.
-                cached_identifiers = getattr(writer_cls, "_cached_identifiers", None)
-                if cached_identifiers is not None:
-                    cached_identifiers.clear()
+            writer_cls = _get_nvrx_filesystem_writer_cls()
+            writer_cls.cleanup_tensor_caches()
             gc.collect()
             torch.cuda.ipc_collect()
             torch.cuda.empty_cache()
