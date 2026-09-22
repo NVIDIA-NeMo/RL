@@ -128,8 +128,13 @@ git lfs install --skip-repo
 # Use init + fetch --depth=1 <hash> to get a shallow clone at a specific commit.
 echo "Cloning TensorRT-LLM..."
 git init "$BUILD_DIR"
+# set -x is on (see top of script) and would otherwise trace these commands
+# with $GIT_URL fully expanded -- including any embedded credentials -- right
+# next to the redacted echo above. Quiet the trace for just these two lines.
+set +x
 git -C "$BUILD_DIR" remote add origin "$GIT_URL"
 git -C "$BUILD_DIR" fetch --depth=1 origin "$GIT_REF"
+set -x
 git -C "$BUILD_DIR" checkout FETCH_HEAD
 cd "$BUILD_DIR"
 echo "Fetching LFS objects (internal_cutlass_kernels archives)..."
