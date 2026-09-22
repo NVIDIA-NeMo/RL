@@ -163,7 +163,12 @@ def test_record_to_train_batch_preserves_routed_experts_in_tq_payload() -> None:
 
 
 def test_environment_identity_survives_payload_packing() -> None:
-    record = _record([_completion(route_start=10, reward=1.0)])
+    record = _record(
+        [
+            _completion(route_start=10, reward=1.0),
+            _completion(route_start=30, reward=0.0),
+        ]
+    )
     record.metadata["rollout_environment"] = "swe"
     batch = record_to_train_batch(
         record,
@@ -171,7 +176,16 @@ def test_environment_identity_survives_payload_packing() -> None:
         include_message_violation_fields=False,
     )
     _, fields, tags = pack_payload(batch, weight_version=0, group_id="g", prompt_idx=17)
-    assert tags[0]["rollout_environment"] == "swe"
+    expected_tag = {
+        "weight_version": 0,
+        "prompt_idx": 17,
+        "rollout_environment": "swe",
+        "num_invalid_tool_calls": 0,
+        "num_malformed_thinking": 0,
+        "num_assistant_messages": 1,
+        "num_routed_experts_backfilled": 0,
+    }
+    assert tags == [expected_tag, expected_tag]
     assert "rollout_environment" not in fields
 
 
