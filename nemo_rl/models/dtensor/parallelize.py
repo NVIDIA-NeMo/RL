@@ -471,6 +471,8 @@ def _parallelize_nm5_h(
     activation_checkpointing: bool = False,
     cpu_offload: bool = False,
     custom_parallel_plan: Optional[Union[dict, str]] = None,
+    *,
+    output_dtype: Optional[torch.dtype],
 ) -> torch.distributed.fsdp.FSDPModule:
     """Parallelize a NemotronHForCausalLM model across data and tensor parallel dimensions."""
     assert not sequence_parallel, (
@@ -507,7 +509,7 @@ def _parallelize_nm5_h(
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
         reduce_dtype=torch.float32,
-        output_dtype=torch.float32,
+        output_dtype=output_dtype,
     )
 
     offload_policy = (
@@ -555,6 +557,8 @@ def _parallelize_model(
     activation_checkpointing: bool = False,
     cpu_offload: bool = False,
     custom_parallel_plan: Optional[Union[dict, str]] = None,
+    *,
+    output_dtype: Optional[torch.dtype],
 ):
     """Parallelize a model using DTensor.
 
@@ -597,6 +601,7 @@ def _parallelize_model(
             activation_checkpointing,
             cpu_offload,
             custom_parallel_plan,
+            output_dtype=output_dtype,
         )
 
     elif model_cls in [
@@ -745,7 +750,7 @@ def _parallelize_model(
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
         reduce_dtype=torch.float32,
-        output_dtype=torch.float32,
+        output_dtype=output_dtype,
     )
 
     offload_policy = (

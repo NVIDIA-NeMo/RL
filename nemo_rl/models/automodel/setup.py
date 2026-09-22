@@ -70,7 +70,11 @@ from nemo_rl.models.automodel.config import (
     RuntimeConfig,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig, TokenizerConfig
-from nemo_rl.models.policy.utils import configure_dynamo_cache, resolve_model_class
+from nemo_rl.models.policy.utils import (
+    configure_dynamo_cache,
+    resolve_fsdp_output_dtype,
+    resolve_model_class,
+)
 
 STRING_TO_DTYPE = {
     "float32": torch.float32,
@@ -500,7 +504,9 @@ def setup_distributed(
         mp_policy=MixedPrecisionPolicy(
             param_dtype=dtype,
             reduce_dtype=torch.float32,
-            output_dtype=torch.float32,
+            output_dtype=resolve_fsdp_output_dtype(
+                config["dtensor_cfg"].get("fsdp_output_dtype"), dtype
+            ),
         ),
         offload_policy=CPUOffloadPolicy(pin_memory=False) if cpu_offload else None,
         activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],

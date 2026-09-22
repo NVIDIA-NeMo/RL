@@ -89,6 +89,7 @@ from nemo_rl.models.policy.interfaces import (
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
     get_runtime_env_for_policy_worker,
+    resolve_fsdp_output_dtype,
     resolve_model_class,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -452,6 +453,9 @@ class DTensorPolicyWorkerImpl(
                 "activation_checkpointing"
             ],
             custom_parallel_plan=self.cfg["dtensor_cfg"]["custom_parallel_plan"],
+            output_dtype=resolve_fsdp_output_dtype(
+                self.cfg["dtensor_cfg"].get("fsdp_output_dtype"), self.dtype
+            ),
         )
 
         # Attach CP attention-mask hooks (strip mask, set is_causal=True).

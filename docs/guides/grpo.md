@@ -369,6 +369,16 @@ GRPO uses temperature, top-p (nucleus sampling), and top-k sampling during rollo
 
 RL generations typically produce highly variable sequence lengths, which result in a significant amount of padding if approached naively. We address this with Sequence Packing and Dynamic Batching, which are techniques to reduce the amount of padding required. You can read more about these in the [design doc](../design-docs/sequence-packing-and-dynamic-batching.md).
 
+### FSDP2 Output Dtype (`fsdp_output_dtype`)
+
+With the DTensor backend every FSDP unit's forward output is cast to the mixed-precision `output_dtype`, which defaults to `float32`: each wrapped block returns fp32 hidden states (the tensors activation checkpointing keeps alive between blocks) and the language-model head returns fp32 logits. For long sequences that doubles the checkpointed activation memory. `policy.dtensor_cfg.fsdp_output_dtype: param` keeps outputs in the compute dtype instead; the vocabulary-parallel and chunked log-prob kernels cast per chunk to fp32 internally, so the loss math is unchanged. In a 160k-token context-parallel run this saved about 0.33 GiB per block per GPU (roughly 60 blocks). The logits are only cheaper on the chunked log-prob path: the full-logits post-processors and the unchunked path (`logprob_chunk_size: null`) still materialize an fp32 copy of the logits, so they do not benefit. Non-HF MoE models run without autocast, so there `output_dtype` is the only thing controlling the dtype that crosses FSDP unit boundaries; validate numerics on such a model before flipping it. The default stays `float32`.
+
+```yaml
+policy:
+  dtensor_cfg:
+    fsdp_output_dtype: param   # default: float32
+```
+
 ### Chunked Fused Linear Logprobs
 
 During standard GRPO training the model materializes a full logit tensor of shape `[batch_size, seq_length, vocab_size]` for the policy forward-backward pass as well as for the previous-policy and reference-policy logprob computations. This can cause out-of-memory (OOM) errors for long sequences or large vocabularies. The **chunked fused linear logprobs** path avoids this by computing the per-token log probabilities directly from the hidden states with a fused linear cross-entropy kernel: it chunks the sequence dimension, projects each chunk to logits on the fly, gathers the realized-token log probabilities, and discards the logits before moving to the next chunk. (GRPO uses the kernel only to read logprobs; it does not compute a cross-entropy loss.)
