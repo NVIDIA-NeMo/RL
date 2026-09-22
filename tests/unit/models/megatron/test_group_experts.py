@@ -88,6 +88,10 @@ def _native_worker(
 ) -> MegatronPolicyWorkerImpl:
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.fp8_cfg = {"enabled": True, "fp8_param": True, "fp8_recipe": "mxfp8"}
+    worker.megatron_cfg = SimpleNamespace(
+        optimizer=SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=False),
+        ddp=SimpleNamespace(overlap_param_gather=False),
+    )
     worker.cfg = cast(
         Any,
         {
