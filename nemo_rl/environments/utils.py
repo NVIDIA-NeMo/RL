@@ -21,6 +21,8 @@ from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
+# Teardown must be bounded: it runs in a finally block, so a hung shutdown would
+# replace a real training error with an indefinite hang.
 DEFAULT_ENV_SHUTDOWN_TIMEOUT_SECONDS = 10.0
 
 
