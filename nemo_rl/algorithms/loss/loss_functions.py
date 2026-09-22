@@ -546,7 +546,6 @@ class ClippedPGLossFn(LossFunction):
 
         seq_error_metrics = {}
         if self.seq_logprob_error_in_loss:
-            assert self.seq_logprob_error_threshold is not None
             errors, _ = compute_seq_logprob_errors(
                 policy_logprobs=curr_logprobs.detach(),
                 generation_logprobs=generation_logprobs,

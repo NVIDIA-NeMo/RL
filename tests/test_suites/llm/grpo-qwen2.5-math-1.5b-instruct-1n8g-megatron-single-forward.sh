@@ -35,7 +35,7 @@ uv run tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' "$JSON_METRICS") -ge $MAX_STEPS ]]; then
     # Survivor metrics must remain finite and positive for every optimizer step.
-    # Throughput and convergence bounds need calibration on the nightly hardware.
+    # Use the sibling Qwen v3 recipe's token-error and step-time regression bounds.
     uv run tests/check_metrics.py "$JSON_METRICS" \
         'all_finite(data["train/loss"])' \
         'all_finite(data["train/grad_norm"])' \
@@ -44,7 +44,9 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'all_finite(data["train/seq_logprob_error_valid_seqs"])' \
         'min(data["train/seq_logprob_error_valid_tokens"]) > 0' \
         'min(data["train/seq_logprob_error_valid_seqs"]) > 0' \
-        'min(data["train/num_masked_seqs_by_logprob_error"]) >= 0'
+        'median(data["train/token_mult_prob_error"]) < 1.1' \
+        'data["train/token_mult_prob_error"]["450"] < 1.1' \
+        'mean(data["timing/train/total_step_time"], 2) < 25'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
