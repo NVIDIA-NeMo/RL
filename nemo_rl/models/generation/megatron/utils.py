@@ -76,7 +76,7 @@ def sample_vision_tensors(data, index: int):
             "Megatron image generation requires matching per-sample "
             "pixel_values and imgs_sizes."
         )
-    if imgs.ndim == 3:
+    if imgs.ndim == 3 and pixel_values.preprocess_mode != "patchify":
         imgs = imgs.unsqueeze(0)
     if sizes.ndim == 1:
         sizes = sizes.unsqueeze(0)

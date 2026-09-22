@@ -132,8 +132,6 @@ checkpointing:
   # toward short rollouts at a save boundary).
   load_replay_buffer: true
   save_data_plane: false
-  model_save_format: "safetensors"
-  save_consolidated: false
   save_optimizer: true
 
 policy:
@@ -157,6 +155,11 @@ policy:
   dtensor_cfg:
     _v2: true
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
@@ -231,6 +234,7 @@ policy:
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    fp32_lm_head: false
     moe_per_layer_logging: False
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
@@ -314,6 +318,19 @@ policy:
       fp8_recipe: "blockwise"
       fp8_param: false
 
+    # Transformer Engine FP4 training; disabled by default.
+    fp4_cfg:
+      enabled: false
+      fp4: "e2m1"
+      fp4_recipe: "nvfp4"
+      fp4_param: false
+
+    # Keep boundary transformer layers in BF16 during FP8 or FP4 training.
+    # The layer counts apply only when first_last_layers_bf16 is true.
+    first_last_layers_bf16: false
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
+
     env_vars: null
 
   draft:
@@ -323,6 +340,8 @@ policy:
     loss_weight: 0.1
     num_layers: null
     aux_layer_indices: null
+    token_chunk_size: 4096
+    optimizer: null
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md
   # for more details on dynamic batching and sequence packing.
@@ -432,6 +451,7 @@ policy:
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
+      fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head}
       # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
       refit_with_reload_api: false
       tensor_parallel_size: 1
@@ -570,8 +590,9 @@ data_plane:
                                      # serialized groups and cost throughput;
                                      # higher buys little at linear HBM cost.
                                      # GDR needs that headroom to pay off.
-  # observability:                    # NotRequired
-  #   enabled: false
+  observability:                      # per-op data-plane timing/volume
+    enabled: true                     # per-op timing/volume; cost is below measurement noise
+    verify_tensor_hash: false         # debug: per-row hash of each row's values+dtype+shape, wire-in vs wire-out
 
 # Multi-Teacher On-Policy Distillation (MOPD); null = disabled (default). Mirrors
 # the field on the GRPO MasterConfig added for MOPD support.

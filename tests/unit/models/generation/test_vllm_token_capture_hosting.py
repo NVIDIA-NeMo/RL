@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -255,7 +256,11 @@ def _served_content(gen_ids, logprobs):
     }
 
 
-def test_request_capture_round_trip_stages_and_rides_coords():
+@pytest.mark.parametrize("with_message_tokens", [False, True])
+@pytest.mark.parametrize("with_routed_experts", [False, True])
+def test_request_capture_round_trip_stages_and_rides_coords(
+    with_message_tokens: bool, with_routed_experts: bool
+) -> None:
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     request = _FakeRequest(
@@ -270,14 +275,34 @@ def test_request_capture_round_trip_stages_and_rides_coords():
     )
     VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11, 12])
     content = _served_content([13, 14], [-0.1, -0.2])
-    # Full-length routes on the served response must not survive the strip.
-    content["choices"][0]["message"]["routed_experts"] = [[[0]]] * 5
+    message = content["choices"][0]["message"]
+    if with_message_tokens:
+        # The HTTP serializer preserves these dynamic fields on the message.
+        message.update(
+            prompt_token_ids=[10, 11, 12],
+            generation_token_ids=[13, 14],
+            generation_log_probs=[-0.1, -0.2],
+        )
+    if with_routed_experts:
+        message["routed_experts"] = [[[0]]] * 5
     content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
         worker, request, content
     )
     # Bytes were staged before the coords existed (fail-closed ordering).
     assert len(sink.records) == 1
     assert sink.records[0].token_ids_delta == [10, 11, 12, 13, 14]
+    assert sink.records[0].token_mask_delta == [0.0, 0.0, 0.0, 1.0, 1.0]
+    assert sink.records[0].generation_log_probs_delta == [
+        0.0,
+        0.0,
+        0.0,
+        -0.1,
+        -0.2,
+    ]
+    if with_routed_experts:
+        assert sink.records[0].extras["routed_experts"]
+    else:
+        assert sink.records[0].extras is None
     coords = content["ng_commit_coords"]
     assert coords["disposition"] == "staged"
     assert (coords["delta_len"], coords["cum_len"]) == (5, 5)
@@ -285,12 +310,10 @@ def test_request_capture_round_trip_stages_and_rides_coords():
     assert "token_ids_delta" not in coords
     assert coords["chain_hash"] == sink.records[0].chain_hash
     assert coords["cumulative_hash"] == sink.records[0].cumulative_hash
-    # Logprobs and routes never transit worker -> gate; state map is drained.
-    assert (
-        "logprobs" not in content["choices"][0]
-        or content["choices"][0]["logprobs"] is None
-    )
-    assert "routed_experts" not in content["choices"][0]["message"]
+    # Only the ordinary response fields and coords transit worker -> gate.
+    assert content["choices"] == [
+        {"index": 0, "message": {"role": "assistant", "content": "x"}}
+    ]
     assert worker._capture_calls == {}
 
 
@@ -442,19 +465,28 @@ def test_staging_chain_admission_requires_the_resolved_prefix_keyword():
     assert worker._capture_calls == {}
 
 
-def test_request_capture_is_a_noop_without_context_or_capture():
+@pytest.mark.parametrize("capture_enabled", [False, True])
+def test_request_capture_is_a_noop_without_context_or_capture(
+    capture_enabled: bool,
+) -> None:
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     plain = _FakeRequest(stream=False)  # no ng_capture attribute
+    if not capture_enabled:
+        worker.token_capture = None
+        plain.ng_capture = {"rollout_id": "r0", "model_call_id": "c1", "mode": "text"}
     VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, plain, [1, 2])
-    content = {
-        "choices": [{"message": {"role": "assistant"}, "logprobs": {"content": []}}]
-    }
-    out = VllmAsyncGenerationWorkerImpl._finish_request_capture(
-        worker, plain, dict(content)
+    content = _served_content([3], [-0.1])
+    content["choices"][0]["message"].update(
+        prompt_token_ids=[1, 2],
+        generation_token_ids=[3],
+        generation_log_probs=[-0.1],
+        routed_experts=[[[0]]] * 3,
     )
-    assert "ng_commit_coords" not in out
-    assert out["choices"][0]["logprobs"] is not None  # untouched off the capture path
+    original = deepcopy(content)
+    out = VllmAsyncGenerationWorkerImpl._finish_request_capture(worker, plain, content)
+    assert out == original
+    assert worker._capture_calls == {}
     assert sink.records == []
 
 
