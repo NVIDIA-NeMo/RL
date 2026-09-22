@@ -740,6 +740,7 @@ class DTensorPolicyWorkerImpl(
                 for mb_idx, mb in enumerate(
                     itertools.chain(mb_iterator, dummy_iterator)
                 ):
+                    is_dummy_batch = mb_idx >= iterator_len
                     # Conditioanlly empty cache when sensitive to fragmentation
                     if empty_cache_steps and mb_idx % empty_cache_steps == 0:
                         torch.cuda.empty_cache()
@@ -943,7 +944,7 @@ class DTensorPolicyWorkerImpl(
                         del logits
 
                         # skip the update for dummy batches
-                        if mb_idx < iterator_len:
+                        if not is_dummy_batch:
                             ## scale by the number of global batches so we get the correct
                             ## value when summing metrics across all microbatches
                             for k in loss_metrics.keys():
@@ -968,8 +969,11 @@ class DTensorPolicyWorkerImpl(
                             loss *= self.dp_size * self.cp_size
                             loss.backward()
 
-                    if num_valid_samples > 0:
-                        mb_losses.append(loss.item())
+                    if not is_dummy_batch and num_valid_samples > 0:
+                        # Metrics were materialized together by the loss;
+                        # undo this worker's per-global-batch scaling without
+                        # synchronizing the loss tensor again.
+                        mb_losses.append(loss_metrics["loss"] * num_global_batches)
                         all_mb_metrics.append(loss_metrics)
 
                 grad_norm: Optional[float | torch.Tensor] = None
