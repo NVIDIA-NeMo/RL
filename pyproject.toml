@@ -263,6 +263,12 @@ trtllm = [
   "tensorrt-llm==1.3.0rc21",
   "transformers==5.5.4",
   "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  # tensorrt-llm 1.3.0rc21's _ipc_utils.py reads `cudaIpcMemHandle_t.reserved`,
+  # which cuda-bindings 13.4 removed; every TP>1 TRT-LLM engine then dies in
+  # allocate_allreduce_fusion_workspace with an AttributeError. Hold this venv
+  # on the 13.3 series that tensorrt-llm was released against.
+  "cuda-python<13.4",
+  "cuda-bindings<13.4",
 ]
 modelopt = ["nvidia-modelopt"]
 nvrx = [
