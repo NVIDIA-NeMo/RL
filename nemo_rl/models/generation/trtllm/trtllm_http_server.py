@@ -322,6 +322,21 @@ def create_app(
         # Conversation identity for rank-affine ADP routing: canonical body
         # conversation_params, else the id the disagg service stamps onto
         # disaggregated_params for its ctx/gen legs. None = no affinity.
+        #
+        # The canonical field is not populated yet: Gym is the only component
+        # that knows the rollout identity, and no released Gym sends it (it
+        # appears nowhere in the tree, including upstream main). It arrives with
+        # https://github.com/NVIDIA-NeMo/Gym/pull/3582 ("forward gym session id
+        # as backend conversation id"), still open at time of writing, after
+        # which the Gym submodule pin has to be bumped for this branch to see an
+        # id at all.
+        #
+        # Until then a turn lands on an effectively random attention-DP rank and
+        # the context engine re-prefills most of its history: measured at
+        # 2P-DEP8 / conc 512, 17-26% of turns found their prefix on the serving
+        # rank (about 1/DEP) versus 96-97% once the id flows. Nothing fails --
+        # disaggregation just gives up most of its benefit -- so treat a run
+        # with no conversation id as unmeasured rather than as a baseline.
         _conv_id = (body.get("conversation_params") or {}).get("conversation_id") or (
             body.get("disaggregated_params") or {}
         ).get("conversation_id")
