@@ -68,7 +68,7 @@ def test_prepare_packed_loss_input_preserves_prepacked_layout(monkeypatch):
         return expected
 
     monkeypatch.setattr(
-        "nemo_rl.algorithms.loss.utils."
+        "nemo_rl.algorithms.loss.loss_input."
         "from_parallel_logits_to_logprobs_packed_sequences",
         fake_logprobs,
     )
