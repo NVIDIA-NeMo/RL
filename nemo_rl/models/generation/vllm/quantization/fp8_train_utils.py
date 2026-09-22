@@ -13,6 +13,142 @@
 # limitations under the License.
 
 
+import torch
+
+MXFP8_BLOCK_SIZE = 32
+MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
+MXFP8_SCALE_DTYPE = torch.uint8
+MXFP8_SCALE_SUFFIX = "_scale_from_checkpoint"
+
+
+def canonicalize_mxfp8_refit_output(
+    weight_shape: torch.Size | tuple[int, ...],
+    values: torch.Tensor,
+    scales: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Validate and normalize the MXFP8 refit wire representation.
+
+    Both supported trainer-side and vLLM receiver-side quantizers produce this
+    format: E4M3 values retain the logical checkpoint shape, while E8M0 scale
+    bytes use one entry per 32 values along the final dimension. A zero scale
+    byte is only valid for an all-zero value block. The scale tensor is sent as
+    the matching ``*_scale_from_checkpoint`` parameter.
+    """
+    shape = torch.Size(weight_shape)
+    if not shape or shape[-1] % MXFP8_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"MXFP8 requires a non-empty shape with the last dim divisible by "
+            f"{MXFP8_BLOCK_SIZE}, got {tuple(shape)}."
+        )
+    if values.numel() != shape.numel():
+        raise ValueError(
+            f"MXFP8 values must contain {shape.numel()} elements for weight "
+            f"shape {tuple(shape)}, got {values.numel()}."
+        )
+    if not values.shape or values.shape[-1] != shape[-1]:
+        raise ValueError(
+            f"MXFP8 values must preserve the final dimension {shape[-1]} for "
+            f"weight shape {tuple(shape)}, got {tuple(values.shape)}."
+        )
+    if values.dtype != MXFP8_VALUE_DTYPE:
+        raise ValueError(
+            f"MXFP8 values must use {MXFP8_VALUE_DTYPE}, got {values.dtype}."
+        )
+    if scales.dtype != MXFP8_SCALE_DTYPE:
+        raise ValueError(
+            f"MXFP8 scales must use {MXFP8_SCALE_DTYPE}, got {scales.dtype}."
+        )
+
+    if values.shape != shape:
+        values = values.reshape(shape)
+    scale_shape = torch.Size((*shape[:-1], shape[-1] // MXFP8_BLOCK_SIZE))
+    expected_scales = scale_shape.numel()
+    if scales.numel() != expected_scales:
+        raise ValueError(
+            f"MXFP8 scales must contain {expected_scales} values for weight "
+            f"shape {tuple(shape)}, got {scales.numel()}."
+        )
+    scales = scales.reshape(scale_shape)
+    # An E8M0 byte of zero represents 2^-127. FlashInfer emits it for all-zero
+    # blocks, but TRTLLM does not accept it. Changing the scale to one preserves
+    # the represented zeros because every value in the block is zero.
+    scales = scales.masked_fill(scales == 0, 1)
+    return values, scales
+
+
+def _mxfp8_e4m3_quantize_torch(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference MXFP8 quantization with row-major scales.
+
+    Replicates vLLM's _mxfp8_e4m3_quantize_torch (Apache-2.0,
+    vllm/model_executor/layers/quantization/utils/mxfp8_utils.py) for trainer
+    processes without a vLLM install: for each block of 32 elements along the
+    last dimension, a shared e8m0 scale (biased exponent of the block amax)
+    and float8_e4m3fn values.
+    """
+    assert x.shape[-1] % MXFP8_BLOCK_SIZE == 0, (
+        f"MXFP8 requires the last dim to be divisible by {MXFP8_BLOCK_SIZE}, got {x.shape}"
+    )
+    orig_shape = x.shape
+    num_blocks = x.shape[-1] // MXFP8_BLOCK_SIZE
+
+    x_fp32 = x.to(torch.float32)
+    x_blocked = x_fp32.view(*orig_shape[:-1], num_blocks, MXFP8_BLOCK_SIZE)
+
+    amax = x_blocked.abs().amax(dim=-1)
+    amax = amax.clamp(min=torch.finfo(torch.float32).tiny)
+    scale_biased = torch.floor(torch.log2(amax)) + 127.0
+    scale_biased = scale_biased.clamp(0, 254)
+    scales_uint8 = scale_biased.to(torch.uint8)
+
+    descale = torch.exp2(scale_biased - 127.0)
+    x_scaled = x_blocked / descale.unsqueeze(-1)
+
+    x_fp8 = x_scaled.view(orig_shape).to(MXFP8_VALUE_DTYPE)
+
+    if x.ndim == 2:
+        scales_uint8 = scales_uint8.view(x.shape[0], -1)
+    elif x.ndim == 3:
+        scales_uint8 = scales_uint8.view(x.shape[0], x.shape[1], -1)
+
+    return x_fp8, scales_uint8
+
+
+def mxfp8_e4m3_quantize_for_refit(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a weight to MXFP8 on the trainer for pre-quantized refit.
+
+    Mirrors the receiver path in quantization/fp8.py load_weights
+    (mxfp8_e4m3_quantize + scale reshape) so the streamed E4M3 data and
+    *_scale_from_checkpoint scales load bit-identically without receiver-side
+    re-quantization. Uses the same FlashInfer CuTe-DSL backend as vLLM on
+    Blackwell and the torch reference elsewhere.
+    """
+    x_q = x_scales = None
+    if x.is_cuda and torch.cuda.get_device_capability(x.device) >= (10, 0):
+        try:
+            from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
+        except ImportError as exc:
+            raise RuntimeError(
+                "Trainer-side MXFP8 refit prequantization on sm100+ requires "
+                "FlashInfer so it matches the vLLM receiver quantization path."
+            ) from exc
+        else:
+            x_q, x_scales = flashinfer_mxfp8_quantize(
+                x,
+                is_sf_swizzled_layout=False,
+                alignment=32,
+                backend="cute-dsl",
+            )
+            if x_scales.ndim == 1 and x.ndim == 2:
+                x_scales = x_scales.view(x.size(0), -1)
+    if x_q is None or x_scales is None:
+        x_q, x_scales = _mxfp8_e4m3_quantize_torch(x)
+    return canonicalize_mxfp8_refit_output(x.shape, x_q, x_scales)
+
+
 def get_vllm_qkv_scale_names(layer_idx: int) -> dict[str, str]:
     """Get vLLM-compatible parameter names for Q/K/V FP8 scales.
 

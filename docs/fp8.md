@@ -122,6 +122,43 @@ MXFP8 configurations should use `quantization_ignore_patterns` instead.
 (`precision: "fp8"` without `is_mx`) has no pattern-based replacement yet and
 must continue to use `quantization_ignored_layer_kws`.
 
+For MXFP8 rollout with Megatron training, trainer-side prequantization can
+reduce the refit payload:
+
+```yaml
+policy:
+    generation:
+        vllm_cfg:
+            precision: fp8
+            is_mx: true
+            refit_prequantize: true
+```
+
+`refit_prequantize` is an MXFP8 refit optimization. It requires
+`precision: fp8`, `is_mx: true`, and the Megatron policy backend. It moves
+eligible weight quantization to the trainer and transfers E4M3 values plus E8M0
+scales instead of BF16 weights. It is rejected for blockwise FP8, BF16, NVFP4,
+sparse-delta refit, and NCCL-Reshard refit. NVFP4 real-quant rollout uses its own
+packed-weight refit protocol.
+
+The default receiver-side path and the optional trainer-side path make a
+different runtime tradeoff:
+
+| Path | Wire payload per 32 values | Quantization runtime | Use when |
+|---|---:|---|---|
+| Receiver-side (default) | 64 bytes of BF16 | The rollout worker uses vLLM's installed quantizer | Runtime alignment is more important than refit transfer cost |
+| Trainer-side (`refit_prequantize: true`) | 32 bytes of E4M3 values + 1 E8M0 scale byte | The policy worker uses FlashInfer on Blackwell | Colocated refit transfer and receiver work are measurable bottlenecks |
+
+The transport payloads differ, but both paths produce the same explicit
+post-quantization loader representation: the E4M3 value tensor keeps the
+logical checkpoint shape, and the matching `*_scale_from_checkpoint` tensor
+stores E8M0 bytes with shape
+`(*weight.shape[:-1], weight.shape[-1] / 32)`. NeMo RL validates this contract
+and applies the same scale reshape and zero-scale handling on both paths. The
+GB200 test suite checks bitwise parity against the installed vLLM quantizer and
+runs functional GRPO refits for both paths across the separate policy and
+rollout worker environments with numerical error bounds.
+
 To train with FP8, you need to set the Megatron path and configure it using the following settings:
 
 ```yaml

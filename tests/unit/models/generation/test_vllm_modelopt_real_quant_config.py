@@ -1171,9 +1171,9 @@ def test_real_quant_load_weights_expands_non_gated_experts_per_expert(
 
     batched_forwarded = []
     extension = _make_real_quant_extension(backend, make_model(None), [])
+    _patch_real_quant_load(monkeypatch, backend, batched_forwarded)
     extension.prepare_refit_info(state_dict_info)
     extension._nrl_w13_num_shards_by_prefix = {prefix: 1}
-    _patch_real_quant_load(monkeypatch, backend, batched_forwarded)
     w13_block_scale = torch.arange(8).reshape(2, 4, 1)
     assert (
         extension._load_weights(
