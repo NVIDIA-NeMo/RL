@@ -998,10 +998,21 @@ class TQMegatronTokenStager:
         # spliced chain the preparer recorded). A malformed payload poisons
         # the call with ``capture_failed`` coordinates (surfacing in Gym as
         # ``worker_capture_failed``, matching vLLM) instead of raising here,
-        # which would leave Gym with no coordinates at all.
-        capture_payload_view = _MegatronCapturePayload.from_offloaded(
-            payload, minf_params
-        )
+        # which would leave Gym with no coordinates at all. The payload view
+        # is derived before Gym's extraction (media delta slicing and the
+        # preparer's counts), so its failures are routed through the same
+        # poison path explicitly.
+        try:
+            capture_payload_view = _MegatronCapturePayload.from_offloaded(
+                payload, minf_params
+            )
+        except (TypeError, ValueError, RuntimeError) as error:
+            coords = self._capture.fail_call(
+                call, reason=f"{type(error).__name__}: {error}"
+            )
+            return MegatronPayloadStageResult(
+                response_metadata={"ng_commit_coords": coords.model_dump(mode="json")}
+            )
         # Gym's record cannot carry tensors; park them on the sink so stage()
         # writes them in the same put as the tokens.
         staging_key = f"{admission.rollout_id}/{admission.model_call_id}"

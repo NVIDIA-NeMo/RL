@@ -651,6 +651,48 @@ def test_megatron_stager_poisons_malformed_payloads_with_capture_failed(
         )
 
 
+def test_megatron_stager_poisons_payload_view_failures_with_capture_failed(
+    tq_client, staging_partition
+):
+    """Errors while deriving the media delta poison the call, not drop its coords.
+
+    ``_MegatronCapturePayload.from_offloaded`` runs after ``begin_call`` and
+    before Gym's extraction; a ``media_prev_count`` the engine's media cannot
+    satisfy must still surface as ``capture_failed`` (``worker_capture_failed``
+    in Gym), never as a ``None`` result, which Gym records as
+    ``worker_response_missing_commit_coordinates``.
+    """
+    stager = TQMegatronTokenStager(
+        TQTokenSink(tq_client, staging_partition=staging_partition)
+    )
+    admission = nemo_gym.CaptureAdmission(
+        rollout_id="minf-r0", model_call_id="c1", mode="text"
+    )
+
+    result = stager.stage(
+        "minf-response-1",
+        _minf_payload(multimodal=True),  # the engine saw one image
+        finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
+        offload_params={
+            "ng_capture": admission.model_dump(mode="json"),
+            # The parent chain claims two images were already staged.
+            MINF_CAPTURE_PARAMS_FIELD: {
+                COMPACT_PREV_LEN_KEY: 0,
+                MEDIA_PREV_COUNT_KEY: 2,
+            },
+        },
+    )
+
+    assert result is not None
+    coords = result.response_metadata["ng_commit_coords"]
+    assert coords["disposition"] == "capture_failed"
+    assert coords["weight_version"] == 7
+    with pytest.raises(KeyError):
+        TQTokenSource(tq_client, staging_partition=staging_partition).fetch(
+            ["minf-r0/c1"]
+        )
+
+
 @pytest.mark.parametrize(
     ("with_capture_metadata", "policy_epoch"),
     [
