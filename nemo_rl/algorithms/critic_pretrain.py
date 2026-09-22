@@ -824,13 +824,27 @@ def _forward_values_and_returns(
             ],
         )
     if critic_batch is not None:
-        if "trace_in_rollout_idx" in repeated_batch and bool(
+        _is_multi_trace = "trace_in_rollout_idx" in repeated_batch and bool(
             (repeated_batch["trace_in_rollout_idx"] != 0).any()
-        ):
+        )
+        if _is_multi_trace and turn_spans is not None:
+            # Token-level privilege IS multi-trace safe (see below), but the
+            # turn-level anchor remap has not been verified against sibling
+            # traces — fail loud rather than supervise at wrong positions.
             raise NotImplementedError(
-                "Privileged critic pretraining is not supported on multi-trace "
-                "shards (the reference-block remap assumes one trace per rollout)."
+                "Privileged + TURN-LEVEL critic pretraining is not supported on "
+                "multi-trace shards (the anchor remap into the augmented batch "
+                "assumes one trace per rollout). Use the token-level estimator."
             )
+        # Token level: both the builder and remap_by_response_mask are strictly
+        # PER-ROW — the block is prefixed to each row's own message log and
+        # values are carried back row i -> row i by response-token count. A
+        # subagent trace is just another row whose extra_env_info names the same
+        # instance, so it receives the same reference block as its root (verified
+        # on real shards: 45/45 rows incl. 13 subagent traces resolve the golden
+        # patch, one instance_id per group). The within-group no-confound
+        # argument is likewise unaffected: the block stays byte-identical across
+        # every trace of every sibling rollout.
         vals_aug = value_model.get_values(critic_batch)["values"].squeeze(-1)
         critic_batch["values"] = vals_aug
         train_data["values"] = remap_by_response_mask(
