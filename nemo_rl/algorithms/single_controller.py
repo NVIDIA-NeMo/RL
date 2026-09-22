@@ -164,8 +164,6 @@ from nemo_rl.environments.gym_checkpoint import (
     GymCompletedExecution,
     gym_checkpoint_continuations,
     gym_checkpoint_staging_keys,
-    gym_generation_cut_proofs,
-    gym_generation_cut_staging_keys,
 )
 from nemo_rl.environments.nemo_gym import (
     should_use_nemo_gym,
@@ -4698,10 +4696,6 @@ class SingleControllerActor:
                         gym_checkpoint_staging_keys,
                         tmp_path,
                         gym_checkpoint,
-                    )
-                if gym_prepare is not None:
-                    gym_staging_keys.update(
-                        gym_generation_cut_staging_keys(gym_prepare)
                     )
                 barrier_requested = time.monotonic()
                 async with self._data_plane_checkpoint_barrier.checkpoint() as cut:

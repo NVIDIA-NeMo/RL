@@ -661,9 +661,9 @@ class GymModelPrepareResponse(_StrictWireModel):
     inflight_total: NonNegativeInt
     response_inflight_total: NonNegativeInt | None = None
     generation_pending_total: NonNegativeInt | None = None
-    # Gym owns the nested generation-cut proof schema. RL persists the opaque
-    # validated payload and extracts only its durable TQ staging keys.
-    generation_cut_proof: dict[str, object] | None = None
+    # Gym owns the full cut artifacts. RL only needs bounded evidence that
+    # every worker published a complete, digest-validated cut.
+    generation_cut_summary: dict[str, object] | None = None
     waiters_total: NonNegativeInt
 
 
@@ -686,7 +686,7 @@ class GymSingleWorkerModelStatusResponse(_LiveResponseWireModel):
     inflight_total: NonNegativeInt
     response_inflight_total: NonNegativeInt | None = None
     generation_pending_total: NonNegativeInt | None = None
-    generation_cut_proof: dict[str, object] | None = None
+    generation_cut_summary: dict[str, object] | None = None
     waiters_total: NonNegativeInt
     inflight: list[GymModelInflightRequest]
     tombstones: list[GymExecutionIdentity]
@@ -702,8 +702,8 @@ class GymCoordinatorWorkerStatus(_LiveResponseWireModel):
     acked_seq: NonNegativeInt
     inflight: NonNegativeInt
     generation_pending: NonNegativeInt | None = None
-    # RL only observes proof presence here; Gym owns the nested proof schema.
-    generation_cut_proof: dict[str, object] | None = None
+    # RL only observes summary presence here; Gym owns the worker artifact.
+    generation_cut_summary: dict[str, object] | None = None
     proof_error: str | None = None
     connected: bool
 
@@ -715,7 +715,7 @@ class GymCoordinatorModelStatusResponse(_LiveResponseWireModel):
     inflight_total: NonNegativeInt
     response_inflight_total: NonNegativeInt | None = None
     generation_pending_total: NonNegativeInt | None = None
-    generation_cut_proof: dict[str, object] | None = None
+    generation_cut_summary: dict[str, object] | None = None
     waiters_total: NonNegativeInt
     per_worker: dict[str, GymCoordinatorWorkerStatus]
 
@@ -824,14 +824,8 @@ class GymCheckpointPrepareResult(_StrictWireModel):
 def gym_generation_cut_proofs(
     prepare: GymCheckpointPrepareResult,
 ) -> tuple[dict[str, object], ...]:
-    """Return opaque policy-model cut proofs in deterministic participant order."""
-    proofs = [
-        dict(result.payload.generation_cut_proof)
-        for result in prepare.participants
-        if isinstance(result.payload, GymModelPrepareResponse)
-        and result.payload.generation_cut_proof is not None
-    ]
-    return tuple(proofs)
+    """Return legacy inline proofs; current Gym prepare responses contain none."""
+    return ()
 
 
 def gym_generation_cut_receipts(
@@ -960,7 +954,6 @@ class GymModelCommitResponse(_StrictWireModel):
     rollouts: NonNegativeInt
     rows: NonNegativeInt
     excluded_tombstoned: NonNegativeInt
-    excluded_inactive: NonNegativeInt = 0
     generation_cut_records: NonNegativeInt = 0
     manifest_digest: Sha256Digest
     storage_reference_index: GymCheckpointArtifactReference
@@ -1329,8 +1322,7 @@ class GymModelRestoreResponse(_StrictWireModel):
     rollouts: NonNegativeInt
     rows: NonNegativeInt
     checkpoint_id: str | None = None
-    tombstones: list[GymExecutionIdentity]
-    source_attempts: list[GymExecutionIdentity]
+    tombstones_restored: NonNegativeInt
     storage_reference_index: GymCheckpointArtifactReference
     generation_cuts_restored: NonNegativeInt = 0
 

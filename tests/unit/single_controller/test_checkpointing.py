@@ -770,18 +770,10 @@ class _FakeGymCheckpointActor:
                         "inflight_total": 1,
                         "response_inflight_total": 0,
                         "generation_pending_total": 0,
-                        "generation_cut_proof": {
+                        "generation_cut_summary": {
                             "checkpoint_id": checkpoint_id,
-                            "generation_cut_receipt": {
-                                "prefixes": [
-                                    {
-                                        "disposition": "durable_prefix",
-                                        "staging_keys": [
-                                            self.generation_cut_staging_key
-                                        ],
-                                    }
-                                ]
-                            },
+                            "records": 1,
+                            "proof_digest": "a" * 64,
                         },
                         "waiters_total": 0,
                     },
@@ -2602,16 +2594,10 @@ class TestPeriodicRolloutCheckpoint:
                             "inflight_total": 1,
                             "response_inflight_total": 0,
                             "generation_pending_total": 0,
-                            "generation_cut_proof": {
+                            "generation_cut_summary": {
                                 "checkpoint_id": "checkpoint-1",
-                                "generation_cut_receipt": {
-                                    "prefixes": [
-                                        {
-                                            "disposition": "durable_prefix",
-                                            "staging_keys": [staging_key],
-                                        }
-                                    ]
-                                },
+                                "records": 1,
+                                "proof_digest": "a" * 64,
                             },
                             "waiters_total": 0,
                         },
@@ -2619,13 +2605,71 @@ class TestPeriodicRolloutCheckpoint:
                 ],
             }
         )
-        checkpoint = GymCheckpointCommitResult(
-            checkpoint_id="checkpoint-1",
-            participants=[],
+        storage_index_path = tmp_path / "model-storage-references.jsonl"
+        storage_index_payload = (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "capture_key": "r0",
+                    "boundary_model_call_id": "c1",
+                    "kind": "generation_prefix_cut",
+                    "key": staging_key,
+                },
+                separators=(",", ":"),
+            ).encode()
+            + b"\n"
+        )
+        storage_index_path.write_bytes(storage_index_payload)
+        manifest_path = tmp_path / "model-manifest.json"
+        manifest_payload = b"{}"
+        manifest_path.write_bytes(manifest_payload)
+        checkpoint = GymCheckpointCommitResult.model_validate(
+            {
+                "checkpoint_id": "checkpoint-1",
+                "participants": [
+                    {
+                        "participant": {
+                            "server_name": "policy",
+                            "component": "responses_api_models",
+                            "participant_name": "policy",
+                        },
+                        "payload": {
+                            "rollouts": 1,
+                            "rows": 1,
+                            "excluded_tombstoned": 0,
+                            "generation_cut_records": 1,
+                            "manifest_digest": hashlib.sha256(
+                                manifest_payload
+                            ).hexdigest(),
+                            "storage_reference_index": {
+                                "schema_version": 1,
+                                "relative_path": storage_index_path.name,
+                                "sha256": hashlib.sha256(
+                                    storage_index_payload
+                                ).hexdigest(),
+                                "records": 1,
+                                "bytes": len(storage_index_payload),
+                            },
+                        },
+                        "manifest": {
+                            "participant": {
+                                "server_name": "policy",
+                                "component": "responses_api_models",
+                                "participant_name": "policy",
+                            },
+                            "relative_path": manifest_path.name,
+                            "manifest_digest": hashlib.sha256(
+                                manifest_payload
+                            ).hexdigest(),
+                        },
+                    }
+                ],
+            }
         )
         actor._gym_participant_checkpointing_enabled = True
 
-        async def fail_snapshot(*_args: Any, **_kwargs: Any) -> None:
+        async def fail_snapshot(*_args: Any, **kwargs: Any) -> None:
+            assert kwargs["gym_staging_keys"] == {staging_key}
             raise OSError("injected snapshot failure")
 
         prepare_checkpoint = AsyncMock(return_value=(prepare, checkpoint))

@@ -186,7 +186,7 @@ def test_coordinator_model_status_accepts_current_and_additive_fields() -> None:
                     "acked_seq": 1,
                     "inflight": 0,
                     "generation_pending": 0,
-                    "generation_cut_proof": None,
+                    "generation_cut_summary": None,
                     "proof_error": None,
                     "connected": True,
                     "future_worker_metric": 7,
@@ -734,7 +734,6 @@ def test_private_lineage_is_not_scanned_for_tq_staging_ownership(tmp_path) -> No
                     },
                 },
                 "tombstones": [],
-                "source_attempts": [],
             }
         )
     )
@@ -870,8 +869,7 @@ def test_private_lineage_is_not_scanned_for_tq_staging_ownership(tmp_path) -> No
             {
                 "rollouts": 0,
                 "rows": 0,
-                "tombstones": [],
-                "source_attempts": [],
+                "tombstones_restored": 0,
             },
             "storage_reference_index",
         ),
@@ -940,7 +938,6 @@ def test_storage_reference_index_avoids_private_lineage_scan(tmp_path) -> None:
                         "rollouts": 1,
                         "rows": 2,
                         "excluded_tombstoned": 0,
-                        "excluded_inactive": 3,
                         "manifest_digest": manifest_digest,
                         "storage_reference_index": reference,
                     },
@@ -1079,8 +1076,7 @@ def test_restore_must_report_the_committed_artifact_coordinates() -> None:
                         "rollouts": 1,
                         "rows": 2,
                         "checkpoint_id": "snapshot-7",
-                        "tombstones": [],
-                        "source_attempts": [],
+                        "tombstones_restored": 0,
                         "storage_reference_index": storage_reference,
                     },
                 }
@@ -1099,8 +1095,7 @@ def test_restore_must_report_the_committed_artifact_coordinates() -> None:
                         "rollouts": 1,
                         "rows": 2,
                         "checkpoint_id": "snapshot-7",
-                        "tombstones": [],
-                        "source_attempts": [],
+                        "tombstones_restored": 0,
                         "storage_reference_index": {
                             **storage_reference,
                             "sha256": "e" * 64,

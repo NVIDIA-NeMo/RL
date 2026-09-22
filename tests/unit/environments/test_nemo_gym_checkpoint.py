@@ -121,7 +121,7 @@ def _completion_receipt(
     }
 
 
-def test_generation_cut_proof_exposes_durable_tq_prefix_keys() -> None:
+def test_legacy_generation_cut_proof_exposes_durable_tq_prefix_keys() -> None:
     proof = {
         "checkpoint_id": "checkpoint-1",
         "generation_cut_receipt": {
@@ -152,7 +152,11 @@ def test_generation_cut_proof_exposes_durable_tq_prefix_keys() -> None:
                         "inflight_total": 1,
                         "response_inflight_total": 1,
                         "generation_pending_total": 0,
-                        "generation_cut_proof": proof,
+                        "generation_cut_summary": {
+                            "checkpoint_id": "checkpoint-1",
+                            "records": 1,
+                            "proof_digest": "a" * 64,
+                        },
                         "waiters_total": 0,
                     },
                 }
@@ -160,8 +164,8 @@ def test_generation_cut_proof_exposes_durable_tq_prefix_keys() -> None:
         }
     )
 
-    assert gym_generation_cut_proofs(prepare) == (proof,)
-    assert gym_generation_cut_staging_keys(prepare) == {
+    assert gym_generation_cut_proofs(prepare) == ()
+    assert gym_generation_cut_staging_keys((proof,)) == {
         "__generation_cut__/checkpoint-1/r0/c1"
     }
 
@@ -341,7 +345,7 @@ def test_checkpoint_prepare_fans_out_using_component_routes() -> None:
             "workers": {"acknowledged": 1, "expected": 1},
             "inflight_total": 0,
             "waiters_total": 0,
-            "generation_cut_proof": {"proof_digest": "a" * 64},
+            "generation_cut_summary": {"proof_digest": "a" * 64},
         },
         "agent": {
             "state": "preparing",
@@ -454,7 +458,7 @@ def test_checkpoint_prepare_waits_for_draining_policy_model() -> None:
                 "inflight_total": 1,
                 "response_inflight_total": 0,
                 "generation_pending_total": 0,
-                "generation_cut_proof": {"proof_digest": "b" * 64},
+                "generation_cut_summary": {"proof_digest": "b" * 64},
                 "waiters_total": 0,
                 "inflight": [],
                 "tombstones": [],
@@ -546,14 +550,14 @@ def test_checkpoint_prepare_waits_for_draining_coordinator_policy_model() -> Non
                 "inflight_total": 0,
                 "response_inflight_total": 0,
                 "generation_pending_total": 0,
-                "generation_cut_proof": {"proof_digest": "c" * 64},
+                "generation_cut_summary": {"proof_digest": "c" * 64},
                 "waiters_total": 0,
                 "per_worker": {
                     "worker-0": {
                         "acked_seq": 1,
                         "inflight": 0,
                         "generation_pending": 0,
-                        "generation_cut_proof": None,
+                        "generation_cut_summary": None,
                         "proof_error": None,
                         "connected": True,
                     },
@@ -561,7 +565,7 @@ def test_checkpoint_prepare_waits_for_draining_coordinator_policy_model() -> Non
                         "acked_seq": 1,
                         "inflight": 0,
                         "generation_pending": 0,
-                        "generation_cut_proof": None,
+                        "generation_cut_summary": None,
                         "proof_error": None,
                         "connected": True,
                     },
@@ -823,7 +827,6 @@ def test_checkpoint_commit_restore_and_resume_fan_out() -> None:
             "rollouts": 2,
             "rows": 4,
             "excluded_tombstoned": 0,
-            "excluded_inactive": 1,
             "manifest_digest": "a" * 64,
             "storage_reference_index": storage_reference_index,
         },
@@ -840,8 +843,7 @@ def test_checkpoint_commit_restore_and_resume_fan_out() -> None:
             "rollouts": 2,
             "rows": 4,
             "checkpoint_id": "snapshot-7",
-            "tombstones": [],
-            "source_attempts": [{"rollout_id": "rollout-1", "attempt_index": 0}],
+            "tombstones_restored": 0,
             "storage_reference_index": storage_reference_index,
         },
         ("agent", "restore"): {
