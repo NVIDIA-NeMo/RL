@@ -122,8 +122,6 @@ checkpointing:
   # the buffered window fresh instead of reusing completed groups (which skew
   # toward short rollouts at a save boundary).
   load_replay_buffer: true
-  model_save_format: "safetensors"
-  save_consolidated: false
   save_optimizer: true
   # SingleController only: include native TQ state and the metadata-only replay
   # index. Required for recovery-capable samplers to preserve completed,
@@ -151,6 +149,12 @@ policy:
   dtensor_cfg:
     _v2: true
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      # Canonical Automodel modes: "false", "final", or "every".
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
@@ -243,6 +247,7 @@ policy:
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    fp32_lm_head: false # Emit fp32 logits from Megatron's LM head; must match policy.generation.vllm_cfg.fp32_lm_head.
     moe_per_layer_logging: False
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
@@ -326,6 +331,19 @@ policy:
       fp8_recipe: "blockwise"
       fp8_param: false
 
+    # Transformer Engine FP4 training; disabled by default.
+    fp4_cfg:
+      enabled: false
+      fp4: "e2m1"
+      fp4_recipe: "nvfp4"
+      fp4_param: false
+
+    # Keep boundary transformer layers in BF16 during FP8 or FP4 training.
+    # The layer counts apply only when first_last_layers_bf16 is true.
+    first_last_layers_bf16: false
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
+
     env_vars: null
 
   draft:
@@ -336,6 +354,13 @@ policy:
     loss_weight: 0.1
     num_layers: null
     aux_layer_indices: null
+    # Tokens per FP32 vocab tile in the streaming draft soft-CE. Lower it if the
+    # tile (token_chunk_size x vocab, in fp32) is too large for the device;
+    # raise it if the GPU is launch-bound.
+    token_chunk_size: 4096
+    # Optional draft-only optimizer schedule. Set a mapping with `lr` and
+    # optional `min_lr`/`weight_decay` to enable it.
+    optimizer: null
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
   # for more details on dynamic batching and sequence packing.
@@ -451,6 +476,7 @@ policy:
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
+      fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head} # Compute Nemotron-H logits with an fp32 LM head.
       # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
       refit_with_reload_api: false
       tensor_parallel_size: 1

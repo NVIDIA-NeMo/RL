@@ -26,7 +26,8 @@ nemo_rl.models.megatron.setup, focusing on:
 
 import os
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, call, patch
@@ -34,6 +35,52 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 import torch
 import yaml
+
+# The BF16 decoder-layer boundary a 48-layer model with 2 start / 4 end layers
+# resolves to. The driver derives this and writes it into the rollout config;
+# the Megatron worker verifies against it.
+_EXPECTED_BF16_BOUNDARY = [
+    "*.layers.0.mlp.experts*",
+    "*.layers.1.mlp.experts*",
+    "*.layers.44.mlp.experts*",
+    "*.layers.45.mlp.experts*",
+    "*.layers.46.mlp.experts*",
+    "*.layers.47.mlp.experts*",
+]
+
+
+def _nvfp4_model_config() -> SimpleNamespace:
+    # Megatron is optional outside the mcore test lane.
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    boundary_fields = {
+        "first_last_layers_bf16",
+        "num_layers_at_start_in_bf16",
+        "num_layers_at_end_in_bf16",
+    }
+    defaults = {
+        item.name: item.default
+        for item in fields(TransformerConfig)
+        if item.name in boundary_fields
+    }
+    return SimpleNamespace(num_layers=48, **defaults)
+
+
+@pytest.mark.mcore
+def test_mcore_bf16_boundary_defaults_match_driver_constants() -> None:
+    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
+        MCORE_DEFAULT_NUM_LAYERS_AT_END_IN_BF16,
+        MCORE_DEFAULT_NUM_LAYERS_AT_START_IN_BF16,
+    )
+
+    model_cfg = _nvfp4_model_config()
+    assert (
+        model_cfg.num_layers_at_start_in_bf16
+        == MCORE_DEFAULT_NUM_LAYERS_AT_START_IN_BF16
+    )
+    assert (
+        model_cfg.num_layers_at_end_in_bf16 == MCORE_DEFAULT_NUM_LAYERS_AT_END_IN_BF16
+    )
 
 
 @dataclass
@@ -1176,6 +1223,37 @@ class TestApplyPrecisionConfig:
             _apply_precision_config(model_cfg, config, torch.float32)
             assert model_cfg.pipeline_dtype == expected_dtype
 
+    def test_fp32_lm_head_sets_logit_dtype(self):
+        """The fp32 LM-head knob maps to Megatron-Bridge provider logit_dtype."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace(bf16=False, fp16=False, logit_dtype=None)
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp32_lm_head": True,
+            }
+        }
+
+        _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert model_cfg.logit_dtype is torch.float32
+
+    def test_fp32_lm_head_requires_provider_logit_dtype(self):
+        """Fail loudly when the Bridge provider cannot emit fp32 logits."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp32_lm_head": True,
+            }
+        }
+
+        with pytest.raises(ValueError, match="logit_dtype"):
+            _apply_precision_config(model_cfg, config, torch.bfloat16)
+
     @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
     def test_loads_te_precision_config_when_configured(
         self, mock_load_recipe, tmp_path
@@ -1223,7 +1301,12 @@ class TestApplyPrecisionConfig:
             "megatron_cfg": {
                 "pipeline_dtype": "bfloat16",
                 "te_precision_config_file": str(recipe_file),
-                "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+                "fp8_cfg": {
+                    "enabled": True,
+                    "fp8": "e4m3",
+                    "fp8_recipe": "mxfp8",
+                    "fp8_param": False,
+                },
             }
         }
 
@@ -1253,7 +1336,12 @@ class TestApplyPrecisionConfig:
             "megatron_cfg": {
                 "pipeline_dtype": "bfloat16",
                 "te_precision_config_file": str(recipe_file),
-                "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+                "fp8_cfg": {
+                    "enabled": True,
+                    "fp8": "e4m3",
+                    "fp8_recipe": "mxfp8",
+                    "fp8_param": False,
+                },
             }
         }
 
@@ -1284,7 +1372,12 @@ class TestApplyPrecisionConfig:
             "megatron_cfg": {
                 "pipeline_dtype": "bfloat16",
                 "te_precision_config_file": str(recipe_file),
-                "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+                "fp8_cfg": {
+                    "enabled": True,
+                    "fp8": "e4m3",
+                    "fp8_recipe": "mxfp8",
+                    "fp8_param": False,
+                },
             }
         }
 
@@ -1349,7 +1442,12 @@ class TestApplyPrecisionConfig:
             "megatron_cfg": {
                 "pipeline_dtype": "bfloat16",
                 "te_precision_config_file": str(recipe_file),
-                "fp8_cfg": {"enabled": True},
+                "fp8_cfg": {
+                    "enabled": True,
+                    "fp8": "e4m3",
+                    "fp8_recipe": "default",
+                    "fp8_param": False,
+                },
             }
         }
 
@@ -1419,6 +1517,573 @@ class TestApplyPrecisionConfig:
 
         assert len(warning_records) == 0
         mock_load_recipe.assert_called_once_with(str(recipe_file))
+
+    @pytest.mark.parametrize(
+        ("fp8_recipe", "fp8_quantizer_factory"),
+        [
+            ("default", None),
+            ("custom", "test_quantizers.create_quantizers"),
+        ],
+        ids=["factory-absent", "factory-present"],
+    )
+    def test_fp8_configuration(
+        self, fp8_recipe: str, fp8_quantizer_factory: str | None
+    ) -> None:
+        """Test FP8 configuration."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = MagicMock()
+        fp8_cfg = {
+            "enabled": True,
+            "fp8": "e4m3",
+            "fp8_recipe": fp8_recipe,
+            "fp8_param": False,
+        }
+        if fp8_quantizer_factory is not None:
+            fp8_cfg["fp8_quantizer_factory"] = fp8_quantizer_factory
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp8_cfg": fp8_cfg,
+            }
+        }
+
+        _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert model_cfg.fp8 == "e4m3"
+        assert model_cfg.fp8_recipe == fp8_recipe
+        assert model_cfg.fp8_param is False
+        assert model_cfg.fp8_quantizer_factory == fp8_quantizer_factory
+
+    def test_fp4_configuration_uses_nvfp4_parameter_defaults(self):
+        """Apply NVFP4 defaults without repeating them in the recipe."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace(fp8=None)
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp4_cfg": {
+                    "enabled": True,
+                    "fp4": "e2m1",
+                },
+            }
+        }
+
+        _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert model_cfg.fp4 == "e2m1"
+        assert model_cfg.fp4_recipe == "nvfp4"
+        assert model_cfg.fp4_param is False
+        assert model_cfg.fp8 is None
+
+    def test_fp4_param_rejects_generation_refit(self):
+        """Reject FP4 parameter storage when generation requires weight refit."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        config = {
+            "generation": {"backend": "vllm"},
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp4_cfg": {
+                    "enabled": True,
+                    "fp4": "e2m1",
+                    "fp4_param": True,
+                },
+            },
+        }
+
+        with pytest.raises(ValueError, match="no FP4 parameter-and-scale export path"):
+            _apply_precision_config(SimpleNamespace(), config, torch.bfloat16)
+
+    def test_fp4_param_allows_training_without_refit(self):
+        """Allow FP4 parameter storage when no generation refit is configured."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace(fp8=None)
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp4_cfg": {
+                    "enabled": True,
+                    "fp4": "e2m1",
+                    "fp4_param": True,
+                },
+            }
+        }
+
+        _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert model_cfg.fp4_param is True
+
+    def test_fp8_and_fp4_are_mutually_exclusive(self):
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        with pytest.raises(ValueError, match="cannot both"):
+            _apply_precision_config(
+                SimpleNamespace(),
+                {
+                    "megatron_cfg": {
+                        "pipeline_dtype": "bfloat16",
+                        "fp8_cfg": {
+                            "enabled": True,
+                            "fp8": "e4m3",
+                            "fp8_recipe": "default",
+                            "fp8_param": False,
+                        },
+                        "fp4_cfg": {"enabled": True},
+                    }
+                },
+                torch.bfloat16,
+            )
+
+    def test_fp4_requires_format_when_enabled(self):
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        with pytest.raises(KeyError, match="'fp4'"):
+            _apply_precision_config(
+                SimpleNamespace(),
+                {
+                    "megatron_cfg": {
+                        "pipeline_dtype": "bfloat16",
+                        "fp4_cfg": {"enabled": True},
+                    }
+                },
+                torch.bfloat16,
+            )
+
+    def test_fp4_rejects_unknown_fields(self):
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        with pytest.raises(ValueError, match="extra_forbidden"):
+            _apply_precision_config(
+                SimpleNamespace(),
+                {
+                    "megatron_cfg": {
+                        "pipeline_dtype": "bfloat16",
+                        "fp4_cfg": {"enabled": False, "fp4_recipie": "nvfp4"},
+                    }
+                },
+                torch.bfloat16,
+            )
+
+    def test_fp4_disabled_leaves_precision_unchanged(self):
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace()
+        _apply_precision_config(
+            model_cfg,
+            {
+                "megatron_cfg": {
+                    "pipeline_dtype": "bfloat16",
+                    "fp4_cfg": {"enabled": False},
+                }
+            },
+            torch.bfloat16,
+        )
+
+        assert not hasattr(model_cfg, "fp4")
+
+    @pytest.mark.parametrize(
+        "policy_update",
+        [
+            {"precision": "float32"},
+            {"quant_cfg": "examples/modelopt/quant_configs/nvfp4_experts.yaml"},
+            {"megatron_cfg": {"fp4_cfg": {"enabled": False}}},
+            {"megatron_cfg": {"fp4_cfg": {"fp4_recipe": "other"}}},
+            {"megatron_cfg": {"env_vars": {"NVTE_BACKWARD_OVERRIDE": "dequantized"}}},
+            {"megatron_cfg": {"te_precision_config_file": None}},
+        ],
+    )
+    def test_nvfp4_pertoken_requires_validated_training_contract(self, policy_update):
+        from pathlib import Path
+
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        config = {
+            "precision": "bfloat16",
+            "generation": {
+                "backend": "vllm",
+                "nvfp4_pertoken_rollout": {"enabled": True},
+            },
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp4_cfg": {
+                    "enabled": True,
+                    "fp4": "e2m1",
+                },
+                "env_vars": {
+                    "NVTE_NVFP4_ROW_SCALED_ACTIVATION": "1",
+                    "NVTE_NVFP4_DISABLE_RHT": "1",
+                    "NVTE_NVFP4_DISABLE_2D_QUANTIZATION": "1",
+                    "NVTE_BACKWARD_OVERRIDE": "dequantized",
+                },
+                "te_precision_config_file": str(
+                    Path(__file__).resolve().parents[4]
+                    / "examples/te_precision/attn_bf16_mlp_nvfp4.yaml"
+                ),
+            },
+        }
+        if "precision" in policy_update:
+            config["precision"] = policy_update["precision"]
+        if "quant_cfg" in policy_update:
+            config["quant_cfg"] = policy_update["quant_cfg"]
+        if "megatron_cfg" in policy_update:
+            for key, value in policy_update["megatron_cfg"].items():
+                if key == "fp4_cfg":
+                    config["megatron_cfg"]["fp4_cfg"].update(value)
+                else:
+                    config["megatron_cfg"][key] = value
+
+        with pytest.raises(ValueError, match="requires policy.precision"):
+            _apply_precision_config(_nvfp4_model_config(), config, torch.bfloat16)
+
+    @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
+    def test_nvfp4_pertoken_accepts_complete_training_contract(self, mock_load_recipe):
+        from pathlib import Path
+
+        from megatron.core.quantization.utils import load_quantization_recipe
+
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        mock_load_recipe.side_effect = load_quantization_recipe
+
+        model_cfg = _nvfp4_model_config()
+        config = {
+            "precision": "bfloat16",
+            "generation": {
+                "backend": "vllm",
+                "nvfp4_pertoken_rollout": {
+                    "enabled": True,
+                    # The driver derives and writes this before workers start;
+                    # the trainer only verifies it against its own MCore config.
+                    "additional_ignore": _EXPECTED_BF16_BOUNDARY,
+                },
+            },
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp4_cfg": {"enabled": True, "fp4": "e2m1"},
+                "first_last_layers_bf16": True,
+                "num_layers_at_start_in_bf16": 2,
+                "num_layers_at_end_in_bf16": 4,
+                "te_precision_config_file": str(
+                    Path(__file__).resolve().parents[4]
+                    / "examples/te_precision/attn_bf16_mlp_nvfp4.yaml"
+                ),
+                "env_vars": {
+                    "NVTE_NVFP4_ROW_SCALED_ACTIVATION": "1",
+                    "NVTE_NVFP4_DISABLE_RHT": "1",
+                    "NVTE_NVFP4_DISABLE_2D_QUANTIZATION": "1",
+                    "NVTE_BACKWARD_OVERRIDE": "dequantized",
+                },
+            },
+        }
+
+        _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert (
+            config["generation"]["nvfp4_pertoken_rollout"]["additional_ignore"]
+            == _EXPECTED_BF16_BOUNDARY
+        )
+        mock_load_recipe.assert_called_once_with(
+            config["megatron_cfg"]["te_precision_config_file"]
+        )
+
+    @pytest.fixture
+    def nvfp4_policy(self, tmp_path: Path) -> dict[str, Any]:
+        recipe_path = tmp_path / "precision.yaml"
+        recipe_path.write_text(
+            (
+                Path(__file__).resolve().parents[4]
+                / "examples/te_precision/attn_bf16_mlp_nvfp4.yaml"
+            ).read_text()
+        )
+        return {
+            "precision": "bfloat16",
+            "generation": {
+                "backend": "vllm",
+                "nvfp4_pertoken_rollout": {"enabled": True},
+            },
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp4_cfg": {"enabled": True, "fp4": "e2m1"},
+                "te_precision_config_file": str(recipe_path),
+                "env_vars": {
+                    "NVTE_NVFP4_ROW_SCALED_ACTIVATION": "1",
+                    "NVTE_NVFP4_DISABLE_RHT": "1",
+                    "NVTE_NVFP4_DISABLE_2D_QUANTIZATION": "1",
+                    "NVTE_BACKWARD_OVERRIDE": "dequantized",
+                },
+            },
+        }
+
+    @pytest.mark.parametrize(
+        "variable",
+        [
+            "NVTE_NVFP4_ROW_SCALED_ACTIVATION",
+            "NVTE_NVFP4_DISABLE_RHT",
+            "NVTE_NVFP4_DISABLE_2D_QUANTIZATION",
+            "NVTE_BACKWARD_OVERRIDE",
+        ],
+    )
+    @pytest.mark.parametrize("value", [None, "0"])
+    def test_nvfp4_pertoken_requires_each_env_variable(
+        self, nvfp4_policy: dict[str, Any], variable: str, value: str | None
+    ) -> None:
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        env_vars = nvfp4_policy["megatron_cfg"]["env_vars"]
+        expected = env_vars.pop(variable)
+        if value is not None:
+            env_vars[variable] = value
+        with pytest.raises(ValueError, match="invalid env values") as exc_info:
+            _apply_precision_config(_nvfp4_model_config(), nvfp4_policy, torch.bfloat16)
+        message = str(exc_info.value)
+        assert f"{variable}={expected}" in message
+        assert f"invalid env values: {{{variable!r}: {value!r}}}" in message
+        for key, required in env_vars.items():
+            if key != variable:
+                assert f"{key}={required}" in message
+
+    def test_nvfp4_pertoken_stochastic_rounding_flag_is_optional(
+        self, nvfp4_policy: dict[str, Any]
+    ) -> None:
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        assert (
+            "NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING"
+            not in nvfp4_policy["megatron_cfg"]["env_vars"]
+        )
+        _apply_precision_config(_nvfp4_model_config(), nvfp4_policy, torch.bfloat16)
+
+    @pytest.mark.parametrize("evaluation", [False, True])
+    def test_nvfp4_pertoken_accepts_arbitrary_recipe_keys(
+        self, nvfp4_policy: dict[str, Any], evaluation: bool
+    ) -> None:
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_path = Path(nvfp4_policy["megatron_cfg"]["te_precision_config_file"])
+        recipe = yaml.safe_load(recipe_path.read_text())
+        for old, new in (("bf16", "high_precision"), ("nvfp4", "expert_precision")):
+            recipe["configs"][new] = recipe["configs"].pop(old)
+            if evaluation:
+                recipe["configs"][new]["evaluation_recipe"] = recipe["configs"][new][
+                    "training_recipe"
+                ].copy()
+            for matcher in recipe["matchers"].values():
+                if matcher["config"] == old:
+                    matcher["config"] = new
+        recipe_path.write_text(yaml.safe_dump(recipe, sort_keys=False))
+        _apply_precision_config(_nvfp4_model_config(), nvfp4_policy, torch.bfloat16)
+
+    @pytest.mark.parametrize("catchall_first", [False, True])
+    def test_nvfp4_pertoken_rejects_missing_or_misordered_catchall(
+        self, nvfp4_policy: dict[str, Any], catchall_first: bool
+    ) -> None:
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_path = Path(nvfp4_policy["megatron_cfg"]["te_precision_config_file"])
+        recipe = yaml.safe_load(recipe_path.read_text())
+        catchall = recipe["matchers"].pop("fallthrough_bf16")
+        if catchall_first:
+            recipe["matchers"] = {"fallthrough_bf16": catchall, **recipe["matchers"]}
+        recipe_path.write_text(yaml.safe_dump(recipe, sort_keys=False))
+        with pytest.raises(ValueError, match="mismatches") as exc_info:
+            _apply_precision_config(_nvfp4_model_config(), nvfp4_policy, torch.bfloat16)
+        message = str(exc_info.value)
+        for mode in ("training", "evaluation"):
+            if catchall_first:
+                assert (
+                    f"mlp.experts.linear_fc1 ({mode}): expected nvfp4, got bf16"
+                    in message
+                )
+            else:
+                assert f"mlp.linear_fc1 ({mode}): expected bf16, got nvfp4" in message
+                assert (
+                    f"mlp.shared_experts.linear_fc2 ({mode}): expected bf16, got nvfp4"
+                    in message
+                )
+
+    @pytest.mark.parametrize("mode", ["training", "evaluation"])
+    @pytest.mark.parametrize(
+        "module_path",
+        [
+            "self_attention.linear_qkv",
+            "mlp.linear_fc1",
+            "mlp.shared_experts.linear_fc2",
+        ],
+    )
+    @pytest.mark.parametrize("precision", ["nvfp4", "mxfp8"])
+    def test_nvfp4_pertoken_rejects_quantized_protected_modules(
+        self, nvfp4_policy: dict[str, Any], mode: str, module_path: str, precision: str
+    ) -> None:
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_path = Path(nvfp4_policy["megatron_cfg"]["te_precision_config_file"])
+        recipe = yaml.safe_load(recipe_path.read_text())
+        recipe["configs"]["bad_precision"] = {
+            "transformer_engine_config_type": "TEQuantizationParams",
+            "training_recipe": {},
+        }
+        field = (
+            "fp4_quantization_recipe"
+            if precision == "nvfp4"
+            else "fp8_quantization_recipe"
+        )
+        recipe["configs"]["bad_precision"][f"{mode}_recipe"] = {field: precision}
+        recipe["matchers"] = {
+            "bad_override": {
+                "config": "bad_precision",
+                "type": "glob",
+                "pattern": f"*.{module_path}",
+                "enabled": True,
+            },
+            **recipe["matchers"],
+        }
+        recipe_path.write_text(yaml.safe_dump(recipe, sort_keys=False))
+        with pytest.raises(ValueError, match="mismatches") as exc_info:
+            _apply_precision_config(_nvfp4_model_config(), nvfp4_policy, torch.bfloat16)
+        message = str(exc_info.value)
+        assert f"{module_path} ({mode}): expected bf16, got" in message
+        assert precision in message
+        if mode == "evaluation":
+            assert "(training)" not in message
+
+    @pytest.mark.parametrize("mode", ["training", "evaluation"])
+    def test_nvfp4_pertoken_rejects_bf16_without_autocast_override(
+        self, nvfp4_policy: dict[str, Any], mode: str
+    ) -> None:
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_path = Path(nvfp4_policy["megatron_cfg"]["te_precision_config_file"])
+        recipe = yaml.safe_load(recipe_path.read_text())
+        recipe["configs"]["bf16"][f"{mode}_recipe"] = {
+            "override_quantized_autocast": False
+        }
+        recipe_path.write_text(yaml.safe_dump(recipe, sort_keys=False))
+        with pytest.raises(ValueError, match="mismatches") as exc_info:
+            _apply_precision_config(_nvfp4_model_config(), nvfp4_policy, torch.bfloat16)
+        assert f"self_attention.linear_qkv ({mode}): expected bf16, got nvfp4" in str(
+            exc_info.value
+        )
+
+    @pytest.mark.parametrize(
+        "evaluation_recipe", [{}, {"fp8_quantization_recipe": "mxfp8"}]
+    )
+    def test_nvfp4_pertoken_rejects_non_nvfp4_expert_evaluation(
+        self, nvfp4_policy: dict[str, Any], evaluation_recipe: dict[str, str]
+    ) -> None:
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_path = Path(nvfp4_policy["megatron_cfg"]["te_precision_config_file"])
+        recipe = yaml.safe_load(recipe_path.read_text())
+        recipe["configs"]["nvfp4"]["evaluation_recipe"] = evaluation_recipe
+        recipe_path.write_text(yaml.safe_dump(recipe, sort_keys=False))
+        with pytest.raises(ValueError, match="mismatches") as exc_info:
+            _apply_precision_config(_nvfp4_model_config(), nvfp4_policy, torch.bfloat16)
+        message = str(exc_info.value)
+        assert "mlp.experts.linear_fc1 (evaluation): expected nvfp4, got" in message
+        assert "(training)" not in message
+
+    def test_nvfp4_pertoken_rejects_unnormalized_rollout_boundary(self):
+        """A missed driver-side normalization must fail here, not run split.
+
+        ``normalize_nvfp4_pertoken_policy_config`` has to run on every entry
+        point. If one is missed the rollout arrives with no BF16 boundary while
+        the trainer keeps first/last layers in BF16, so the two would disagree
+        on precision with nothing to signal it.
+        """
+        from pathlib import Path
+
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = _nvfp4_model_config()
+        config = {
+            "precision": "bfloat16",
+            "generation": {
+                "backend": "vllm",
+                "nvfp4_pertoken_rollout": {"enabled": True},
+            },
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp4_cfg": {"enabled": True, "fp4": "e2m1"},
+                "first_last_layers_bf16": True,
+                "num_layers_at_start_in_bf16": 2,
+                "num_layers_at_end_in_bf16": 4,
+                "te_precision_config_file": str(
+                    Path(__file__).resolve().parents[4]
+                    / "examples/te_precision/attn_bf16_mlp_nvfp4.yaml"
+                ),
+                "env_vars": {
+                    "NVTE_NVFP4_ROW_SCALED_ACTIVATION": "1",
+                    "NVTE_NVFP4_DISABLE_RHT": "1",
+                    "NVTE_NVFP4_DISABLE_2D_QUANTIZATION": "1",
+                    "NVTE_BACKWARD_OVERRIDE": "dequantized",
+                },
+            },
+        }
+
+        with pytest.raises(ValueError, match="did not run for this entry point"):
+            _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+    def test_first_and_last_bf16_layers_are_forwarded(self):
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace()
+        _apply_precision_config(
+            model_cfg,
+            {
+                "megatron_cfg": {
+                    "pipeline_dtype": "bfloat16",
+                    "first_last_layers_bf16": True,
+                    "num_layers_at_start_in_bf16": 2,
+                    "num_layers_at_end_in_bf16": 4,
+                }
+            },
+            torch.bfloat16,
+        )
+
+        assert model_cfg.first_last_layers_bf16 is True
+        assert model_cfg.num_layers_at_start_in_bf16 == 2
+        assert model_cfg.num_layers_at_end_in_bf16 == 4
+
+    def test_te_precision_recipe_matches_attention_and_mlp_modules(self):
+        from pathlib import Path
+
+        from megatron.core.quantization.quant_config import MatchContext
+
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_path = (
+            Path(__file__).resolve().parents[4]
+            / "examples/te_precision/attn_bf16_mlp_nvfp4.yaml"
+        )
+        model_cfg = SimpleNamespace()
+        _apply_precision_config(
+            model_cfg,
+            {
+                "megatron_cfg": {
+                    "pipeline_dtype": "bfloat16",
+                    "te_precision_config_file": str(recipe_path),
+                }
+            },
+            torch.bfloat16,
+        )
+
+        def match(module_path):
+            return model_cfg.quant_recipe.match_to_config_key(
+                MatchContext(module_path=module_path, layer_number=0)
+            )
+
+        assert match("decoder.layers.0.self_attention.linear_qkv") == "bf16"
+        assert match("decoder.layers.0.self_attention.linear_proj") == "bf16"
+        assert match("decoder.layers.0.mlp.experts.linear_fc1") == "nvfp4"
+        assert match("decoder.layers.0.mlp.experts.linear_fc2") == "nvfp4"
+        assert match("decoder.layers.0.mlp.linear_fc1") == "bf16"
+        assert match("decoder.layers.0.mlp.linear_fc2") == "bf16"
+        assert match("decoder.layers.0.mlp.shared_experts.linear_fc1") == "bf16"
+        assert match("decoder.layers.0.mlp.shared_experts.linear_fc2") == "bf16"
+        assert match("decoder.layers.0.input_layernorm") == "bf16"
 
 
 @pytest.mark.mcore
@@ -1646,48 +2311,6 @@ class TestApplyPerformanceConfig:
             _apply_performance_config(model_cfg, config)
 
         assert "activation_func must be set" in str(exc_info.value)
-
-    @pytest.mark.parametrize(
-        ("fp8_recipe", "fp8_quantizer_factory"),
-        [
-            ("default", None),
-            ("custom", "test_quantizers.create_quantizers"),
-        ],
-        ids=["factory-absent", "factory-present"],
-    )
-    def test_fp8_configuration(
-        self, fp8_recipe: str, fp8_quantizer_factory: str | None
-    ) -> None:
-        """Test FP8 configuration."""
-        from nemo_rl.models.megatron.setup import _apply_performance_config
-
-        model_cfg = MagicMock()
-        model_cfg.gated_linear_unit = True
-        fp8_cfg = {
-            "enabled": True,
-            "fp8": "e4m3",
-            "fp8_recipe": fp8_recipe,
-            "fp8_param": False,
-        }
-        if fp8_quantizer_factory is not None:
-            fp8_cfg["fp8_quantizer_factory"] = fp8_quantizer_factory
-        config = {
-            "megatron_cfg": {
-                "activation_checkpointing": False,
-                "apply_rope_fusion": False,
-                "bias_activation_fusion": False,
-                "gradient_accumulation_fusion": False,
-                "use_fused_weighted_squared_relu": False,
-                "fp8_cfg": fp8_cfg,
-            }
-        }
-
-        _apply_performance_config(model_cfg, config)
-
-        assert model_cfg.fp8 == "e4m3"
-        assert model_cfg.fp8_recipe == fp8_recipe
-        assert model_cfg.fp8_param is False
-        assert model_cfg.fp8_quantizer_factory == fp8_quantizer_factory
 
     def test_fine_grained_activation_offloading_enabled(self):
         """Test happy path: enabled with non-empty offload_modules list."""

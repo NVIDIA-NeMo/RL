@@ -28,6 +28,7 @@ import torch
 import uvicorn
 from fastapi import FastAPI
 
+from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GENERATION_PORT_RANGE_HIGH,
@@ -44,6 +45,10 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmAsyncCheckpointEngineRpcMixin,
 )
+from nemo_rl.models.generation.vllm.collective_rpc import (
+    resolve_collective_rpc_result,
+)
+from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
@@ -432,6 +437,17 @@ class VllmAsyncGenerationWorkerImpl(
             self._sparse_refit_receiver.set_async_loop(self._engine_loop)
         if self.llm is not None:
             await self.llm.collective_rpc("bind_numa", args=tuple())
+            if parse_nvfp4_pertoken_rollout(self.cfg) is not None:
+                target_counts = await resolve_collective_rpc_result(
+                    self.llm.collective_rpc(
+                        "report_nvfp4_pertoken_target_count", args=tuple()
+                    )
+                )
+                if not target_counts or sum(target_counts) == 0:
+                    raise RuntimeError(
+                        "generation.nvfp4_pertoken_rollout selected no "
+                        "RoutedExperts targets across the vLLM model"
+                    )
         self.vllm_device_ids = await self.report_device_id_async()
         if self._mtp_speculative_enabled:
             await self.llm.collective_rpc(
@@ -497,6 +513,10 @@ class VllmAsyncGenerationWorkerImpl(
             adapter=VLLMCaptureAdapter(),
         )
         return True
+
+    async def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
+        """Run owner-local checkpoint I/O without blocking the actor event loop."""
+        return await asyncio.to_thread(run_checkpoint_command, body)
 
     async def set_rollout_weight_version(self, version: int) -> None:
         """Rotate the weight version stamped on subsequent captured calls."""
@@ -684,11 +704,17 @@ class VllmAsyncGenerationWorkerImpl(
         coords = self.token_capture.complete_call_from_response(call, payload)
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
-            # The delta-aligned routes were staged to TQ above; the served
-            # full-length copy is dead weight the gate strips on arrival.
+            # Token arrays and delta-aligned routes were staged to TQ above;
+            # remove the serializer's message fields before the worker->gate hop.
             message = choice.get("message")
             if isinstance(message, dict):
-                message.pop("routed_experts", None)
+                for field in (
+                    "prompt_token_ids",
+                    "generation_token_ids",
+                    "generation_log_probs",
+                    "routed_experts",
+                ):
+                    message.pop(field, None)
         content["ng_commit_coords"] = coords.model_dump()
         return content
 
