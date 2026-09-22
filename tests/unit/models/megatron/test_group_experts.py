@@ -891,6 +891,7 @@ def test_native_mxfp8_metadata_has_ordered_component_shapes() -> None:
 
 
 def test_native_mxfp8_metadata_keeps_bf16_ignored_experts_in_misc() -> None:
+    from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
     from megatron.bridge.models.conversion.param_mapping import (
         AutoMapping,
         GatedMLPMapping,
@@ -898,39 +899,43 @@ def test_native_mxfp8_metadata_keeps_bf16_ignored_experts_in_misc() -> None:
 
     native_prefix = "model.layers.0.mlp.experts.0"
     ignored_prefix = "model.layers.1.mlp.experts.0"
-    native_fc1 = SimpleNamespace(
+    native_fc1 = WeightConversionTask(
+        param_name="decoder.layers.0.mlp.experts.local_experts.0.linear_fc1.weight",
+        global_param_name="decoder.layers.0.mlp.experts.local_experts.0.linear_fc1.weight",
         mapping=GatedMLPMapping(
             "decoder.layers.0.mlp.experts.local_experts.0.linear_fc1.weight",
             gate=f"{native_prefix}.gate_proj.weight",
             up=f"{native_prefix}.up_proj.weight",
         ),
         param_weight=_native_tensor((8, 64), value_marker=1, scale_marker=2),
-        global_param_name="decoder.layers.0.mlp.experts.local_experts.0.linear_fc1.weight",
     )
-    native_fc2 = SimpleNamespace(
+    native_fc2 = WeightConversionTask(
+        param_name="decoder.layers.0.mlp.experts.local_experts.0.linear_fc2.weight",
+        global_param_name="decoder.layers.0.mlp.experts.local_experts.0.linear_fc2.weight",
         mapping=AutoMapping(
             "decoder.layers.0.mlp.experts.local_experts.0.linear_fc2.weight",
             f"{native_prefix}.down_proj.weight",
         ),
         param_weight=_native_tensor((64, 32), value_marker=3, scale_marker=4),
-        global_param_name="decoder.layers.0.mlp.experts.local_experts.0.linear_fc2.weight",
     )
-    ignored_fc1 = SimpleNamespace(
+    ignored_fc1 = WeightConversionTask(
+        param_name="decoder.layers.1.mlp.experts.local_experts.0.linear_fc1.weight",
+        global_param_name="decoder.layers.1.mlp.experts.local_experts.0.linear_fc1.weight",
         mapping=GatedMLPMapping(
             "decoder.layers.1.mlp.experts.local_experts.0.linear_fc1.weight",
             gate=f"{ignored_prefix}.gate_proj.weight",
             up=f"{ignored_prefix}.up_proj.weight",
         ),
         param_weight=torch.zeros((8, 64), dtype=torch.bfloat16),
-        global_param_name="decoder.layers.1.mlp.experts.local_experts.0.linear_fc1.weight",
     )
-    ignored_fc2 = SimpleNamespace(
+    ignored_fc2 = WeightConversionTask(
+        param_name="decoder.layers.1.mlp.experts.local_experts.0.linear_fc2.weight",
+        global_param_name="decoder.layers.1.mlp.experts.local_experts.0.linear_fc2.weight",
         mapping=AutoMapping(
             "decoder.layers.1.mlp.experts.local_experts.0.linear_fc2.weight",
             f"{ignored_prefix}.down_proj.weight",
         ),
         param_weight=torch.zeros((64, 32), dtype=torch.bfloat16),
-        global_param_name="decoder.layers.1.mlp.experts.local_experts.0.linear_fc2.weight",
     )
     tasks = [native_fc1, native_fc2, ignored_fc1, ignored_fc2]
     worker = _native_worker(tasks)
