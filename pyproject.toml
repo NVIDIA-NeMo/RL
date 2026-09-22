@@ -357,7 +357,10 @@ explicit = true
 
 [[tool.uv.index]]
 name = "flashinfer"
-url = "https://flashinfer.ai/whl"
+# Keep this spelling (trailing slash included) identical to Megatron-Bridge's
+# flashinfer [[tool.uv.index]] entry: uv treats differently spelled URLs for the
+# same package as conflicting indexes and refuses to lock.
+url = "https://flashinfer.ai/whl/"
 explicit = true
 
 [[tool.uv.index]]
