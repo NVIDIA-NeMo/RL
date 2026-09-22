@@ -15,24 +15,35 @@
 
 from __future__ import annotations
 
-from dataclasses import fields
+import builtins
+from dataclasses import fields, replace
+from typing import Any
+from unittest.mock import MagicMock, call, patch
 
 import pytest
+import ray
 import torch
 
+import nemo_rl.experience.rollout_reassembler_actor as actor_module
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_reassembler_actor import (
     _FORBIDDEN_RPC_KEYS,
     ReassemblyRequest,
+    RolloutReassemblerActor,
+    RolloutReassemblerActorConfig,
     assert_metadata_only,
+    create_rollout_reassembler_actors,
 )
 
 
 def _request() -> ReassemblyRequest:
     return ReassemblyRequest(
         group_id="group",
+        prompt_idx=17,
         rollout_ids=("group_g0",),
+        canonical_sample_ids=("group_g0",),
         receipts=(
             {
                 "rollout_id": "group_g0",
@@ -47,7 +58,6 @@ def _request() -> ReassemblyRequest:
         ),
         rewards=(1.0,),
         mask_sample=(False,),
-        prompt_idx=0,
         fallback_weight_version=4,
     )
 
@@ -69,6 +79,49 @@ def test_finalizer_request_and_result_are_metadata_only() -> None:
         metrics={"finalize/total_ms": 1.0},
     )
     assert_metadata_only(result)
+
+
+def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
+    actor_cls = RolloutReassemblerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._finalizer = MagicMock()
+    result = FinalizedGroup(
+        meta=None,
+        group_min_wv=4,
+        group_max_wv=4,
+        staging_keys=[],
+        dropped=True,
+        drop_reason="test",
+    )
+    actor._finalizer.finalize_group.return_value = result
+    request = replace(_request(), loss_multiplier=0.25)
+
+    assert actor.finalize(request) is result
+    actor._finalizer.finalize_group.assert_called_once_with(
+        "group",
+        ["group_g0"],
+        [request.receipts[0]],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=4,
+        prompt_idx=17,
+        loss_multiplier=0.25,
+        canonical_sample_ids=["group_g0"],
+    )
+
+
+def test_finalizer_forwards_mooncake_checkpoint_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor_cls = RolloutReassemblerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    command = {"operation": "INFO"}
+    response = {"participant_id": "finalizer"}
+    dispatch = MagicMock(return_value=response)
+    monkeypatch.setattr(actor_module, "run_checkpoint_command", dispatch)
+
+    assert actor.mooncake_checkpoint(command) is response
+    dispatch.assert_called_once_with(command)
 
 
 @pytest.mark.parametrize(
@@ -95,17 +148,20 @@ def test_rpc_dataclass_fields_are_classified() -> None:
     assert {f.name for f in fields(ReassemblyRequest)} == {
         "group_id",
         "rollout_ids",
+        "canonical_sample_ids",
         "receipts",
         "rewards",
         "fallback_weight_version",
         "prompt_idx",
         "mask_sample",
+        "loss_multiplier",
     }
     assert {f.name for f in fields(FinalizedGroup)} == {
         "meta",
         "group_min_wv",
         "group_max_wv",
         "staging_keys",
+        "canonical_output_tokens",
         "metrics",
         "dropped",
         "drop_reason",
@@ -119,3 +175,86 @@ def test_every_forbidden_key_is_rejected(key) -> None:
     """Removing an entry from the denylist should fail loudly."""
     with pytest.raises(TypeError, match="forbidden heavy field"):
         assert_metadata_only({key: [1, 2, 3]})
+
+
+@pytest.mark.parametrize(
+    ("startup_fails", "cleanup_fails"),
+    [(False, False), (True, False), (True, True)],
+    ids=["ready", "startup-failure", "cleanup-failure"],
+)
+def test_factory_selects_gym_environment_and_waits_for_dependencies(
+    startup_fails: bool,
+    cleanup_fails: bool,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor_fqn = "nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor"
+    assert ACTOR_ENVIRONMENTS[actor_fqn] == ["nemo_gym"]
+    config = RolloutReassemblerActorConfig(
+        partition_id="canonical",
+        staging_partition="staging",
+        pad_token_id=0,
+        router_replay_enabled=False,
+        defer_routed_experts_to_policy=False,
+        max_seq_len=4096,
+    )
+    dp_config = {"enabled": True, "impl": "transfer_queue", "backend": "simple"}
+    actors = [MagicMock(), MagicMock()]
+    runtime_env = {"py_executable": "/gym-venv/bin/python"}
+    with (
+        patch.object(
+            actor_module, "make_actor_runtime_env", return_value=runtime_env
+        ) as make_env,
+        patch.object(RolloutReassemblerActor, "options") as options,
+        patch.object(ray, "get") as get,
+        patch.object(ray, "kill") as kill,
+    ):
+        options.return_value.remote.side_effect = actors
+        if startup_fails:
+            startup_error = ray.exceptions.RayError("missing nemo_gym")
+            get.side_effect = startup_error
+            if cleanup_fails:
+                kill.side_effect = [RuntimeError("kill failed"), None]
+            with pytest.raises(ray.exceptions.RayError) as exc_info:
+                create_rollout_reassembler_actors(dp_config, config, num_workers=2)
+            assert exc_info.value is startup_error
+            assert kill.call_args_list == [call(actor) for actor in actors]
+            if cleanup_fails:
+                assert (
+                    "finalizer actor termination failed: kill failed"
+                    in capsys.readouterr().out
+                )
+        else:
+            assert (
+                create_rollout_reassembler_actors(dp_config, config, num_workers=2)
+                == actors
+            )
+            kill.assert_not_called()
+
+        make_env.assert_called_once_with(actor_fqn)
+        assert options.call_args_list == [call(runtime_env=runtime_env)] * 2
+        assert (
+            options.return_value.remote.call_args_list == [call(dp_config, config)] * 2
+        )
+        for actor in actors:
+            actor.check_dependencies.remote.assert_called_once_with()
+        get.assert_called_once_with(
+            [actor.check_dependencies.remote.return_value for actor in actors]
+        )
+
+
+def test_dependency_check_propagates_import_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_import = builtins.__import__
+    import_error = ModuleNotFoundError("No module named 'nemo_gym'", name="nemo_gym")
+
+    def fail_rebuild_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "nemo_gym.token_id_capture.staging.rebuild":
+            raise import_error
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_rebuild_import)
+    actor = object.__new__(RolloutReassemblerActor.__ray_metadata__.modified_class)
+    with pytest.raises(ModuleNotFoundError) as exc_info:
+        actor.check_dependencies()
+    assert exc_info.value is import_error

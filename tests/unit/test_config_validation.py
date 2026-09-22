@@ -31,6 +31,7 @@ from nemo_rl.algorithms.grpo import (
 from nemo_rl.algorithms.grpo import (
     MasterConfig as GRPOMasterConfig,
 )
+from nemo_rl.algorithms.mpo import MasterConfig as MPOMasterConfig
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
 from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
@@ -102,6 +103,15 @@ configs_dir = Path(
 config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
 assert len(config_files) > 0, "No config files found"
 
+# Every shipped config tree. Only the dtensor guard uses it -- most of examples/nemo_gym cannot
+# satisfy the schema test by design (env manifests, launcher templates, unset env interpolations).
+repo_root = Path(os.path.join(os.path.dirname(absolute_path), "../..")).resolve()
+full_config_files = config_files + [
+    path
+    for extra in ("examples/nemo_gym", "research")
+    for path in glob.glob(str(repo_root / extra / "**/*.yaml"), recursive=True)
+]
+
 
 @pytest.mark.parametrize("config_file", config_files)
 def test_all_config_files_have_required_keys(config_file):
@@ -142,6 +152,9 @@ def test_all_config_files_have_required_keys(config_file):
     elif "dpo" in config_dict:
         master_config_class = DPOMasterConfig
         config_type = "dpo"
+    elif "mpo" in config_dict:
+        master_config_class = MPOMasterConfig
+        config_type = "mpo"
     elif "sft" in config_dict:
         master_config_class = SFTMasterConfig
         config_type = "sft"
@@ -340,3 +353,49 @@ def test_all_config_no_tp_size_accuracy_issues(config_file):
             f"Config file {config_file} has TP size >= 4 accuracy issues. "
             "Please set policy.train_micro_batch_size and policy.logprob_batch_size to be the same value."
         )
+
+
+@pytest.mark.parametrize("config_file", full_config_files)
+def test_all_config_dtensor_selects_v2(config_file):
+    """Test that no shipped config selects the DTensor v1 backend.
+
+    v1 is being removed, so every dtensor_cfg that is enabled must pin _v2: true. An absent
+    _v2 is also a failure while the schema default is still False, since that silently
+    resolves to v1. The walk is recursive because dtensor_cfg also appears under teacher,
+    teachers[i] and env.reward_model, and distillation.py has no _v2 check of its own.
+    """
+
+    print(f"\nValidating config file: {config_file}")
+
+    config = load_config_with_inheritance(config_file)
+    # resolve=False: _v2 / enabled are never interpolations, and resolving would fail on the
+    # configs that interpolate an env var CI does not set.
+    config_dict = OmegaConf.to_container(config, resolve=False)
+
+    def walk(node, path):
+        if isinstance(node, dict):
+            nested = node.get("dtensor_cfg")
+            if isinstance(nested, dict):
+                yield path, nested
+            for key, value in node.items():
+                if key != "dtensor_cfg":
+                    yield from walk(value, f"{path}.{key}" if path else key)
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                yield from walk(value, f"{path}[{index}]")
+
+    for section, dtensor_cfg in walk(config_dict, ""):
+        v2 = dtensor_cfg.get("_v2", "<absent>")
+
+        # Mirrors reject_dtensor_v1, which fires on an explicit false regardless of enabled.
+        if v2 is False:
+            raise AssertionError(
+                f"Config file {config_file} sets {section}.dtensor_cfg._v2: false, which "
+                "selects the removed DTensor v1 backend. Set it to true."
+            )
+
+        if dtensor_cfg.get("enabled") and v2 is not True:
+            raise AssertionError(
+                f"Config file {config_file} enables {section}.dtensor_cfg but does not set "
+                f"_v2: true (found {v2!r}). DTensor v2 is the only supported backend."
+            )

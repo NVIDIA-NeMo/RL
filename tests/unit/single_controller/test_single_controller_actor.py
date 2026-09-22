@@ -16,7 +16,9 @@
 
 import asyncio
 import math
+import threading
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -25,7 +27,12 @@ from ray.exceptions import ActorDiedError
 from tensordict import TensorDict
 
 import nemo_rl.algorithms.single_controller as single_controller
-from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DATA_PLANE_CHECKPOINT_DIR,
+    REPLAY_BUFFER_METADATA_FILENAME,
+    REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
+    DataPlaneCheckpointBarrier,
+)
 from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
@@ -40,9 +47,17 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     MasterConfig,
 )
-from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import ROLLOUT_METRICS
+from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
+from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
+from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, ROLLOUT_METRICS
+from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS
+from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.rollout_reassembler_actor import RolloutReassemblerActor
+from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
+from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    VllmAsyncGenerationWorkerImpl,
+)
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 
@@ -50,10 +65,33 @@ class FakeWeightSynchronizer:
     pass
 
 
+def _data_plane_config(backend: str = "simple") -> dict[str, Any]:
+    config: dict[str, Any] = {
+        "enabled": True,
+        "impl": "transfer_queue",
+        "backend": backend,
+    }
+    return config
+
+
 class _InitBuffer:
     """Minimal non-optional TQ buffer contract for actor-init tests."""
 
     def __init__(self) -> None:
+        self.checkpoint_barrier: DataPlaneCheckpointBarrier | None = None
+
+    def set_data_plane_checkpoint_barrier(
+        self, barrier: DataPlaneCheckpointBarrier
+    ) -> None:
+        self.checkpoint_barrier = barrier
+
+
+class _InitRolloutManager:
+    """Minimal rollout-manager contract for actor-init tests."""
+
+    def __init__(self, tq_buffer: _InitBuffer) -> None:
+        self._tq_buffer = tq_buffer
+        self.recovery_ledger = RolloutRecoveryLedger()
         self.checkpoint_barrier: DataPlaneCheckpointBarrier | None = None
 
     def set_data_plane_checkpoint_barrier(
@@ -79,6 +117,7 @@ def _checkpointing_config(tmp_path) -> dict:
 def _grpo_master_config(tmp_path) -> MasterConfig:
     """A minimal GRPO MasterConfig the real __init__ accepts."""
     return MasterConfig.model_construct(
+        data_plane=_data_plane_config(),
         policy={
             "train_global_batch_size": 8,
             "generation": {"colocated": {"enabled": False}},
@@ -104,14 +143,18 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
     args = dict(
         partition_id="rollout_data",
         dp_client=None,
-        gen_handle=None,
-        trainer_handle=None,
+        gen_handle=SimpleNamespace(
+            worker_group=SimpleNamespace(workers=[], dp_leader_worker_indices=[])
+        ),
+        trainer_handle=SimpleNamespace(worker_group=SimpleNamespace(workers=[])),
+        value_handle=None,
+        teacher_worker_groups=None,
         dataloader=None,
         weight_synchronizer=FakeWeightSynchronizer(),
         advantage_estimator=None,
         loss_fn=None,
         tq_buffer=tq_buffer,
-        rollout_manager=SimpleNamespace(_tq_buffer=tq_buffer),
+        rollout_manager=_InitRolloutManager(tq_buffer),
         env_handles={},
         fleet_monitor=None,
         generation_router=None,
@@ -121,6 +164,9 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         last_checkpoint_path=None,
         finalizer_actors=[],
         data_plane_checkpoint_metadata=None,
+        partition_includes_multimodal_fields=False,
+        bootstrap_identity=None,
+        rollout_checkpoint_load_metrics=None,
     )
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -135,53 +181,196 @@ def _init_controller(master_config, actor_args):
     )
 
 
-def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
-    monkeypatch.setattr(single_controller, "Logger", lambda _: object())
-    master_config = MasterConfig.model_construct(
-        policy={
-            "train_global_batch_size": 4,
-            "generation": {"colocated": {"enabled": False}},
-        },
-        grpo=GRPOConfig.model_construct(
-            num_prompts_per_step=2,
-            num_generations_per_prompt=4,
-        ),
-        async_rl=AsyncRLConfig(min_groups_for_streaming_train=1),
-        logger={},
-        env={},
-    )
-    tq_buffer = _InitBuffer()
-    actor_args = SimpleNamespace(
-        partition_id="rollout_data",
-        dp_client=None,
-        gen_handle=None,
-        trainer_handle=None,
-        dataloader=None,
-        weight_synchronizer=None,
-        advantage_estimator=None,
-        loss_fn=None,
-        tq_buffer=tq_buffer,
-        rollout_manager=SimpleNamespace(_tq_buffer=tq_buffer),
-        env_handles={},
-        fleet_monitor=None,
-        generation_router=None,
-        train_cluster=None,
-        inference_cluster=None,
-    )
-    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+def test_resumed_mooncake_init_restores_without_partition_registration(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
+    monkeypatch.setattr(single_controller, "configure_checkpoint_workers", MagicMock())
+    checkpoint_path = tmp_path / "step_0"
+    data_plane_path = checkpoint_path / DATA_PLANE_CHECKPOINT_DIR
+    data_plane_path.mkdir(parents=True)
+    (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+    metadata = {
+        "data_plane_checkpoint_schema_version": DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
+        "single_controller_train_steps": 0,
+        "single_controller_trainer_version": 0,
+        "single_controller_epoch": 0,
+        "partition_id": "rollout_data",
+        "sampler_name": "in_order",
+        "mode": "authoritative",
+        "replay_metadata_schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
+        "replay_manifest_digest": "digest-0",
+        "replay_group_count": 0,
+    }
+    clock = MagicMock(return_value=10.0)
+    monkeypatch.setattr(single_controller.time, "monotonic", clock)
 
-    with pytest.raises(
-        ValueError,
-        match=(
-            r"num_prompts_per_step \* num_generations_per_prompt \(8\) "
-            r"must equal policy.train_global_batch_size \(4\)"
-        ),
-    ):
-        controller_cls(
-            master_config=master_config,
-            actor_args=actor_args,
-            setup_timing_metrics=SetupTimingMetrics(),
+    def load_checkpoint(_checkpoint_path: object) -> dict[str, Any]:
+        clock.return_value = 15.0
+        return metadata
+
+    dp_client = MagicMock(name="dp_client")
+    dp_client.load_checkpoint.side_effect = load_checkpoint
+    master_config = _grpo_master_config(tmp_path)
+    master_config.data_plane = _data_plane_config("mooncake_cpu")
+    actor_args = _actor_args_for_init(
+        dp_client=dp_client,
+        last_checkpoint_path=str(checkpoint_path),
+        rollout_checkpoint_load_metrics={"snapshot_resolution_seconds": 1.0},
+    )
+
+    controller = _init_controller(master_config, actor_args)
+
+    dp_client.load_checkpoint.assert_called_once_with(data_plane_path)
+    single_controller.configure_checkpoint_workers.assert_called_once_with([])
+    dp_client.register_partition.assert_not_called()
+    assert controller._data_plane_checkpoint_metadata == metadata
+    assert controller._rollout_checkpoint_load_metrics == {
+        "snapshot_resolution_seconds": 1.0,
+        "tq_load_seconds": 5.0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_enabled", "save_data_plane"),
+    [(False, False), (False, True), (True, True)],
+)
+def test_fresh_mooncake_init_registers_partition(
+    monkeypatch, tmp_path, checkpoint_enabled, save_data_plane
+) -> None:
+    monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
+    configure = MagicMock()
+    monkeypatch.setattr(single_controller, "configure_checkpoint_workers", configure)
+    dp_client = MagicMock(name="dp_client")
+    master_config = _grpo_master_config(tmp_path)
+    master_config.data_plane = _data_plane_config("mooncake_cpu")
+    master_config.checkpointing["enabled"] = checkpoint_enabled
+    master_config.checkpointing["save_data_plane"] = save_data_plane
+    actor_args = _actor_args_for_init(dp_client=dp_client)
+    if not checkpoint_enabled:
+        actor_args.trainer_handle = None
+
+    controller = _init_controller(master_config, actor_args)
+
+    if checkpoint_enabled:
+        configure.assert_called_once_with([])
+    else:
+        configure.assert_not_called()
+    dp_client.load_checkpoint.assert_not_called()
+    dp_client.register_partition.assert_called_once()
+    assert controller._data_plane_checkpoint_metadata is None
+
+
+def test_fresh_mooncake_init_preserves_token_capture_and_multimodal_partitions(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
+    monkeypatch.setattr(single_controller, "configure_checkpoint_workers", MagicMock())
+    dp_client = MagicMock(name="dp_client")
+    master_config = _grpo_master_config(tmp_path)
+    master_config.data_plane = _data_plane_config("mooncake_cpu")
+    master_config.token_capture.enabled = True
+    actor_args = _actor_args_for_init(
+        dp_client=dp_client,
+        partition_includes_multimodal_fields=True,
+    )
+
+    _init_controller(master_config, actor_args)
+
+    assert dp_client.register_partition.call_count == 2
+    canonical_call, staging_call = dp_client.register_partition.call_args_list
+    assert canonical_call.kwargs["partition_id"] == "rollout_data"
+    assert set(DP_TRAIN_FIELDS).issubset(canonical_call.kwargs["fields"])
+    assert set(WIRE_MULTIMODAL_FIELDS).issubset(canonical_call.kwargs["fields"])
+    assert staging_call.kwargs["partition_id"] == (
+        master_config.token_capture.staging_partition
+    )
+    assert staging_call.kwargs["fields"] == list(STAGING_FIELDS)
+
+
+@pytest.mark.parametrize("token_capture", [False, True])
+def test_mooncake_checkpoint_workers_configured_before_restore(
+    monkeypatch, tmp_path, token_capture
+) -> None:
+    configure = MagicMock()
+    monkeypatch.setattr(single_controller, "configure_checkpoint_workers", configure)
+    master_config = _grpo_master_config(tmp_path)
+    master_config.data_plane = _data_plane_config("mooncake_cpu")
+    master_config.token_capture.enabled = token_capture
+    master_config.checkpointing.update(enabled=True, save_data_plane=True)
+    workers = [object() for _ in range(9)]
+
+    def group(members: list[object], leaders: tuple[int, ...] = ()) -> SimpleNamespace:
+        return SimpleNamespace(
+            worker_group=SimpleNamespace(
+                workers=members, dp_leader_worker_indices=list(leaders)
+            )
         )
+
+    actor_args = _actor_args_for_init(
+        dp_client=MagicMock(),
+        trainer_handle=group(workers[:2]),
+        value_handle=group(workers[2:3]),
+        teacher_worker_groups={"teacher": group(workers[3:4])},
+        gen_handle=group(workers[4:8], leaders=(0, 2)),
+        finalizer_actors=workers[8:],
+    )
+
+    def stop_after_restore(**kwargs):
+        expected = workers[:4] + (workers[4:8:2] if token_capture else []) + workers[8:]
+        configure.assert_called_once_with(expected)
+        raise RuntimeError("stop after checkpoint worker configuration")
+
+    monkeypatch.setattr(
+        single_controller,
+        "_maybe_restore_native_data_plane_checkpoint",
+        stop_after_restore,
+    )
+    with pytest.raises(
+        RuntimeError, match="stop after checkpoint worker configuration"
+    ):
+        _init_controller(master_config, actor_args)
+
+
+@pytest.mark.parametrize(
+    "worker_class,module",
+    [
+        (TQWorkerMixin, "nemo_rl.data_plane.worker_mixin"),
+        (
+            RolloutReassemblerActor.__ray_metadata__.modified_class,
+            "nemo_rl.experience.rollout_reassembler_actor",
+        ),
+    ],
+)
+@pytest.mark.parametrize("result", [None, {"shard": "owner-0.bin", "object_count": 2}])
+def test_checkpoint_worker_hooks_delegate_to_local_manager(
+    monkeypatch, worker_class, module, result
+) -> None:
+    command = {"operation": "SAVE_SHARD", "checkpoint_root": "/checkpoint"}
+    run_command = MagicMock(return_value=result)
+    monkeypatch.setattr(f"{module}.run_checkpoint_command", run_command)
+    worker = object.__new__(worker_class)
+
+    assert worker.mooncake_checkpoint(command) is result
+    run_command.assert_called_once_with(command)
+
+
+def test_generation_checkpoint_command_runs_off_actor_event_loop(monkeypatch) -> None:
+    event_loop_thread = threading.get_ident()
+    command = {"operation": "SAVE_SHARD", "checkpoint_root": "/checkpoint"}
+    result = {"shard": "owner-0.bin", "object_count": 2}
+
+    def run_command(body):
+        assert threading.get_ident() != event_loop_thread
+        assert body is command
+        return result
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.run_checkpoint_command",
+        run_command,
+    )
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    assert asyncio.run(worker.mooncake_checkpoint(command)) is result
 
 
 def test_logs_hyperparameters_and_concrete_weight_synchronizer(
@@ -192,6 +381,7 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
     logger = MagicMock()
     monkeypatch.setattr(single_controller, "Logger", lambda _: logger)
     master_config = MasterConfig.model_construct(
+        data_plane=_data_plane_config(),
         policy={
             "train_global_batch_size": 8,
             "generation": {"colocated": {"enabled": False}},
@@ -254,6 +444,7 @@ def test_reference_logprobs_required_only_when_kl_enabled(
     """KL-disabled SingleController runs do not request reference logprobs."""
     monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
     master_config = MasterConfig.model_construct(
+        data_plane=_data_plane_config(),
         policy={
             "train_global_batch_size": 8,
             "generation": {"colocated": {"enabled": False}},
@@ -316,6 +507,7 @@ def test_logs_setup_timing_metrics(monkeypatch, tmp_path) -> None:
     logger = MagicMock()
     monkeypatch.setattr(single_controller, "Logger", lambda _: logger)
     master_config = MasterConfig.model_construct(
+        data_plane=_data_plane_config(),
         policy={
             "train_global_batch_size": 8,
             "generation": {"colocated": {"enabled": False}},
@@ -469,6 +661,9 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     # monitor there is nothing to reconcile.
     ctrl._gen_fleet = None
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
+    ctrl._trainer = SimpleNamespace(sync_params_before_refit=MagicMock())
+    ctrl._timer = Timer()
+    ctrl._rollout_manager = SimpleNamespace(resume_request_deadlines=MagicMock())
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(),
         requires_kv_scale_sync=False,
@@ -484,6 +679,7 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     asyncio.run(ctrl._sync_weights())
 
     ctrl._weight_synchronizer.sync_weights.assert_called_once_with(kv_scales=None)
+    ctrl._trainer.sync_params_before_refit.assert_called_once_with()
     assert ctrl._gen.invalidate_kv_cache.call_count == expected_invalidation_calls
     assert ctrl._rollout_permitted.is_set()
 
@@ -498,13 +694,16 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     # monitor there is nothing to reconcile.
     ctrl._gen_fleet = None
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
+    ctrl._rollout_manager = SimpleNamespace(resume_request_deadlines=MagicMock())
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(),
         requires_kv_scale_sync=True,
     )
     ctrl._trainer = SimpleNamespace(
-        calibrate_qkv_fp8_scales=MagicMock(return_value={"layers": {"layer.0": 0.5}})
+        calibrate_qkv_fp8_scales=MagicMock(return_value={"layers": {"layer.0": 0.5}}),
+        sync_params_before_refit=MagicMock(),
     )
+    ctrl._timer = Timer()
     ctrl._inflight_by_group_id = {}
     ctrl._rollout_recovery_enabled = False
     # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
@@ -528,6 +727,7 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     ctrl._weight_synchronizer.sync_weights.assert_called_once_with(
         kv_scales={"layer.0": 0.5}
     )
+    ctrl._trainer.sync_params_before_refit.assert_called_once_with()
 
 
 class _AdvantageDataPlane:
@@ -593,6 +793,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
@@ -653,6 +854,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     assert metrics[0]["max_seq_mult_prob_error"] == pytest.approx(math.e)
     assert metrics[0]["max_seq_mult_prob_error_after_mask"] == pytest.approx(1.0)
     assert "advantages" in (result_meta.fields or [])
+    assert ctrl._data_plane_checkpoint_barrier.mutation_version == 1
 
 
 @pytest.mark.parametrize(
@@ -691,6 +893,7 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
@@ -755,6 +958,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
@@ -820,6 +1024,7 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
@@ -887,6 +1092,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
@@ -948,6 +1154,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
@@ -1028,6 +1235,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
 
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = FakeEstimator()
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = True
@@ -1152,23 +1360,31 @@ class _FullStepSampler(_OneThenEmptySampler):
 
 
 class _ChunkedSampler(_EmptySampler):
-    """Assembles one step out of several single-group chunks, then goes empty.
+    """Assembles one step out of ``chunks`` selects, then goes empty.
 
-    This is the shape the streaming path actually produces and the reason
-    ``keep_train_buffers`` exists: every chunk after the first runs against an
-    already-open train step.
+    Single-group chunks are the shape the streaming path actually produces and
+    the reason ``keep_train_buffers`` exists: every chunk after the first runs
+    against an already-open train step. ``groups_per_chunk`` covers the blocking
+    (colocated) shape, where the whole step arrives as one multi-group chunk.
+    ``select_bounds`` records the (min, max) the pump asked for on each select.
     """
 
-    def __init__(self, meta: KVBatchMeta, chunks: int) -> None:
+    def __init__(
+        self, meta: KVBatchMeta, chunks: int, groups_per_chunk: int = 1
+    ) -> None:
         self._meta = meta
         self._remaining = chunks
+        self._groups_per_chunk = groups_per_chunk
+        self.select_bounds: list[tuple[int, int]] = []
 
     async def select(self, **kwargs):
-        del kwargs
+        self.select_bounds.append(
+            (kwargs["min_prompt_groups"], kwargs["max_prompt_groups"])
+        )
         if self._remaining == 0:
             return None, 0
         self._remaining -= 1
-        return self._meta, 1
+        return self._meta, self._groups_per_chunk
 
 
 class _SequenceSampler(_EmptySampler):
@@ -1185,6 +1401,12 @@ class _SequenceSampler(_EmptySampler):
 class _EmptyBuffer:
     def __len__(self) -> int:
         return 0
+
+    def training_owned_group_ids(self) -> set[str]:
+        return set()
+
+    def release_training_claims(self, group_ids: list[str]) -> None:
+        assert not group_ids
 
 
 class _NoOpTrainer:
@@ -1213,13 +1435,28 @@ class _NoOpTrainer:
 
 
 class _LpRecordingTrainer(_NoOpTrainer):
-    """Records the ``keep_train_buffers`` flag the pump passes on each chunk."""
+    """Records ``keep_train_buffers`` flags and the per-chunk call order.
 
-    def __init__(self) -> None:
+    ``calls`` may be shared with other doubles so a test can assert the
+    interleaving (e.g. the engine stand-down against trainer GPU work).
+    """
+
+    def __init__(self, calls: list[object] | None = None) -> None:
         self.keep_train_buffers_calls: list[bool] = []
+        self.calls: list[object] = [] if calls is None else calls
 
     def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
         self.keep_train_buffers_calls.append(keep_train_buffers)
+        self.calls.append("lp_inference_prep")
+
+    def prepare_for_training(self) -> None:
+        self.calls.append("prepare_for_training")
+
+    def train_microbatches_from_meta(
+        self, meta: KVBatchMeta, *, train_fields: tuple[str, ...]
+    ) -> None:
+        del meta, train_fields
+        self.calls.append("train")
 
     def get_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
         del meta
@@ -1319,6 +1556,9 @@ class _StepMetricRecordingGeneration:
         if method == self._dies_in:
             raise ActorDiedError()
 
+    def blocks_training(self) -> bool:
+        return False
+
     def snapshot_step_metrics(self) -> None:
         self._record("snapshot_step_metrics")
 
@@ -1379,12 +1619,18 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._critic_ppo_epochs = 1
     ctrl._value = None
     ctrl._value_loss_fn = None
+    # Continuous-serving default; the pump asks before every step's trainer work.
     ctrl._gen = SimpleNamespace(
         requires_kv_scale_sync=False,
+        blocks_training=lambda: False,
         snapshot_step_metrics=lambda: None,
         get_step_metrics=lambda: {},
     )
-    ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
+    ctrl._rollout_manager = SimpleNamespace(
+        set_weight_version=MagicMock(),
+        suspend_request_deadlines=MagicMock(),
+        resume_request_deadlines=MagicMock(),
+    )
     ctrl._loss_fn = None
     ctrl._dp_client = _NoOpDataPlane()
     ctrl._timer = Timer()
@@ -1805,36 +2051,26 @@ def test_train_pump_collects_generation_metrics_at_step_boundaries(
         assert train_metrics["vllm/spec_acceptance_rate"] == pytest.approx(0.8)
 
 
-def test_train_pump_skips_generation_metrics_without_generation_handle(
-    monkeypatch,
+@pytest.mark.parametrize(
+    "engine_blocks_training", [False, True], ids=["streaming", "blocking"]
+)
+def test_train_pump_chunked_step_by_engine_regime(
+    monkeypatch, engine_blocks_training
 ) -> None:
-    meta = KVBatchMeta(
-        partition_id="rollout_data",
-        task_name="train",
-        sample_ids=["sample-0"],
-        fields=[],
-        sequence_lengths=[1],
-        tags=[{"weight_version": 0}],
-    )
-    ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
-    ctrl._gen = None
-    ctrl._sync_weights = AsyncMock(return_value=0)
-    ctrl._logger = MagicMock()
-    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+    """One step, observed under both engine regimes.
 
-    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+    Streaming: the step arrives as two single-group chunks. The engine is
+    never stood down, the rollout gate stays open, and the configured
+    streaming minimum reaches the sampler. The logprob detour between chunks
+    must not offload the trainer's grad buffers — mcore's offload frees the
+    gradients earlier chunks accumulated rather than copying them out. First
+    chunk: no step open, the offload is worth taking; later chunks: buffers
+    stay resident.
 
-    train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
-    assert "vllm/spec_acceptance_rate" not in train_metrics
-
-
-def test_train_pump_keeps_train_buffers_once_the_step_is_open(monkeypatch) -> None:
-    """The logprob detour between chunks must not offload the trainer's grad
-    buffers, because mcore's offload frees the gradients the earlier chunks of
-    this step accumulated rather than copying them out.
-
-    First chunk: no step open yet, nothing to preserve, so the offload is still
-    worth taking. Every later chunk: step open, buffers must stay resident.
+    Blocking (colocated Megatron): setup pins min_groups_for_streaming_train
+    == num_prompts_per_step, so the pump demands the whole step from the
+    sampler (min == max) and it arrives as one chunk; the gate is closed and
+    the engine slept exactly once, before any trainer GPU work.
     """
     meta = KVBatchMeta(
         partition_id="rollout_data",
@@ -1844,20 +2080,59 @@ def test_train_pump_keeps_train_buffers_once_the_step_is_open(monkeypatch) -> No
         sequence_lengths=[1],
         tags=[{"weight_version": 0}],
     )
-    # num_prompts_per_step is 2 in the harness, so two single-group chunks close
-    # the step.
-    ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
+    # num_prompts_per_step is 2 in the harness: two single-group chunks close
+    # the streaming step, one two-group chunk the blocking one.
+    sampler = (
+        _ChunkedSampler(meta, chunks=1, groups_per_chunk=2)
+        if engine_blocks_training
+        else _ChunkedSampler(meta, chunks=2)
+    )
+    ctrl = _train_pump_controller(sampler=sampler)
+    if engine_blocks_training:
+        # Mirror the colocated setup invariant the config validator enforces.
+        ctrl._async_cfg.min_groups_for_streaming_train = 2
     ctrl._policy_logprobs_required = True
-    trainer = _LpRecordingTrainer()
+    calls: list[object] = []
+
+    def _finish_generation() -> None:
+        calls.append(("finish_generation", ctrl._rollout_permitted.is_set()))
+
+    trainer = _LpRecordingTrainer(calls)
     ctrl._trainer = trainer
-    ctrl._sync_weights = AsyncMock(return_value=1)
+    ctrl._gen = SimpleNamespace(
+        requires_kv_scale_sync=False,
+        blocks_training=lambda: engine_blocks_training,
+        finish_generation=_finish_generation,
+        snapshot_step_metrics=lambda: None,
+        get_step_metrics=lambda: {},
+    )
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._sync_weights = AsyncMock(return_value=0)
     ctrl._logger = MagicMock()
     monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
 
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
     assert ctrl._train_steps == 1
-    assert trainer.keep_train_buffers_calls == [False, True]
+    chunk = ["lp_inference_prep", "prepare_for_training", "train"]
+    if engine_blocks_training:
+        # Stood down exactly once, with the gate already closed, before the
+        # trainer touched the GPUs; the whole step then ran as one chunk. The
+        # (mocked) post-step _sync_weights reopens the gate.
+        assert calls == [("finish_generation", False)] + chunk
+        assert trainer.keep_train_buffers_calls == [False]
+        assert not ctrl._rollout_permitted.is_set()
+        assert sampler.select_bounds == [(2, 2)]
+        # Frozen requests' deadline clocks pause with the engine.
+        ctrl._rollout_manager.suspend_request_deadlines.assert_called_once()
+    else:
+        assert calls == chunk * 2
+        assert trainer.keep_train_buffers_calls == [False, True]
+        assert ctrl._rollout_permitted.is_set()
+        assert sampler.select_bounds[0] == (1, 2)
+        ctrl._rollout_manager.suspend_request_deadlines.assert_not_called()
+    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
 
 
 def test_train_pump_does_not_offload_the_policy_on_a_grpo_run(monkeypatch) -> None:
@@ -2078,12 +2353,18 @@ def test_train_pump_skips_the_critic_on_an_empty_chunk(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("ppo_epochs", [1, 2])
+@pytest.mark.parametrize(
+    "engine_blocks_training", [False, True], ids=["streaming", "blocking"]
+)
 def test_train_pump_freezes_the_policy_during_critic_warmup(
-    monkeypatch, capsys, ppo_epochs
+    monkeypatch, capsys, ppo_epochs, engine_blocks_training
 ) -> None:
     """Below policy_training_start_step the critic trains alone: no optimizer
     step, and no weight transfer to generation either. The frozen policy does
-    not shorten the critic's own epoch loop."""
+    not shorten the critic's own epoch loop. A blocking (colocated) engine is
+    the one exception on the sync: it was stood down at step start and its
+    wake rides the sync, so the sync runs for the wake alone -- a reshard of
+    the frozen weights."""
     critic_ppo_epochs = 3
     meta = _single_group_meta()
     ctrl, value = _ppo_train_pump_controller(
@@ -2092,6 +2373,20 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
         ppo_epochs=ppo_epochs,
         critic_ppo_epochs=critic_ppo_epochs,
     )
+    stand_downs: list[bool] = []
+    if engine_blocks_training:
+        ctrl._gen = SimpleNamespace(
+            requires_kv_scale_sync=False,
+            blocks_training=lambda: True,
+            wake_carries_weight_updates=lambda: True,
+            finish_generation=lambda: stand_downs.append(
+                ctrl._rollout_permitted.is_set()
+            ),
+            snapshot_step_metrics=lambda: None,
+            get_step_metrics=lambda: {},
+        )
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
     trainer = MagicMock(spec=_NoOpTrainer)
     ctrl._trainer = trainer
     ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
@@ -2103,7 +2398,15 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
     trainer.prepare_for_training.assert_not_called()
     trainer.begin_train_step.assert_not_called()
     trainer.finish_train_step.assert_not_called()
-    ctrl._sync_weights.assert_not_awaited()
+    if engine_blocks_training:
+        # Stood down once per step (not per epoch), with the gate already
+        # closed; the sync (mocked -- the real one reopens the gate) is the wake.
+        assert stand_downs == [False]
+        ctrl._rollout_manager.suspend_request_deadlines.assert_called_once()
+        ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    else:
+        ctrl._sync_weights.assert_not_awaited()
+        ctrl._rollout_manager.suspend_request_deadlines.assert_not_called()
     # The step still closed and published the new version, so staleness
     # accounting keeps working through the warmup.
     assert ctrl._train_steps == 1
@@ -2249,6 +2552,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False

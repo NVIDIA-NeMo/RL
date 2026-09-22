@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
+from collections.abc import Mapping
 from typing import Annotated, Any, Literal, NotRequired, TypedDict, cast, get_args
 
 from pydantic import (
@@ -23,11 +25,22 @@ from pydantic import (
     PositiveInt,
 )
 
-from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.generation.interfaces import (
+    GenerationConfig,
+    get_num_routed_experts,
+)
+from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
+    MCORE_DEFAULT_NUM_LAYERS_AT_END_IN_BF16,
+    MCORE_DEFAULT_NUM_LAYERS_AT_START_IN_BF16,
+    NvFp4PerTokenRolloutConfig,
+    resolve_boundary_ignore_patterns,
+)
 
 VllmRefitTransportName = Literal["s3", "zmq"]
 VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard"]
 VLLM_SPARSE_REFIT_TRANSPORTS = frozenset({"vllm_s3_sparse", "vllm_zmq_sparse"})
+VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR = "NRL_VLLM_FP32_LM_HEAD"
+REFITTABLE_FP8_KV_CACHE_DTYPES = frozenset({"fp8", "fp8_e4m3"})
 
 
 # TODO(rohitrango): Move model-specific video fields behind ProcessorInterface.
@@ -60,6 +73,10 @@ class VllmSpecificArgs(TypedDict):
     # with generation-time processors should request ``raw_logprobs`` when
     # comparing generation and policy logprobs.
     logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
+    # Nemotron-H only: compute vLLM Nemotron-H logits with an fp32 LM head.
+    # Pair this with policy.megatron_cfg.fp32_lm_head when using a Megatron
+    # trainer.
+    fp32_lm_head: NotRequired[bool]
     # Cap each request's generated tokens so the training prompt plus response
     # fits within max_model_len. This is needed when multimodal processing makes
     # the training prompt longer than its text-only representation.
@@ -71,9 +88,14 @@ class VllmSpecificArgs(TypedDict):
     # MXFP8 exclusion patterns forwarded through vLLM's quantization config.
     # Supports exact names, substrings, and fnmatch wildcards.
     quantization_ignore_patterns: NotRequired[list[str]]
-    kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
+    kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3", "fp8_ds_mla"]
     enforce_eager: NotRequired[bool]
     enable_return_routed_experts: NotRequired[bool]
+    # Collect vLLM request, cache, and cumulative token counters in a model-owner
+    # background thread for performance diagnostics.
+    enable_vllm_metrics_logger: NotRequired[bool]
+    # Sampling cadence for the optional vLLM metrics logger.
+    vllm_metrics_logger_interval: NotRequired[float]
     # Whether to show a tqdm progress bar during generation. Defaults to vLLM's own default (True) when absent. Only applies when async_engine is False.
     use_tqdm: NotRequired[bool]
     # By default, NeMo RL only has a Python handle to the vllm.LLM generation engine. The expose_http_server flag here will expose that generation engine as an HTTP server.
@@ -104,6 +126,13 @@ class VllmSpecificArgs(TypedDict):
     refit_with_reload_api: NotRequired[bool]
     # A filepath that can be imported to register a vLLM reasoning parser
     reasoning_parser_plugin: NotRequired[str]
+
+
+def vllm_nemotron_h_fp32_lm_head_enabled(
+    vllm_cfg: VllmSpecificArgs | dict[str, Any],
+) -> bool:
+    """Return whether vLLM should run Nemotron-H logits with an fp32 head."""
+    return bool(vllm_cfg.get("fp32_lm_head"))
 
 
 class VllmDeltaCompressionConfig(BaseModel, extra="allow"):
@@ -177,6 +206,10 @@ class VllmRefitConfig(BaseModel, extra="allow"):
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
+    # Per-token NVFP4 W4A4 rollout (TE-training flow; no ModelOpt training).
+    # Mutually exclusive with quant_cfg/real_quant below. Defaults and validation
+    # live in NvFp4PerTokenRolloutConfig.
+    nvfp4_pertoken_rollout: NotRequired[NvFp4PerTokenRolloutConfig]
     # Null uses the topology default (IPC colocated, NCCL non-colocated).
     # Built-ins select sparse delta over S3/ZeroMQ or NIXL.
     # A custom checkpoint engine may use a ``module:ClassName`` selector.
@@ -193,6 +226,12 @@ class VllmConfig(GenerationConfig):
     # colocated CUDA-IPC refit, where packed export tensors can stay on GPU.
     real_quant_export_cpu_offload: NotRequired[bool]
     real_quant_ignore: NotRequired[list[str]]
+
+    # FQN of a worker extension class to use instead of the resolved default
+    # generation worker. Must be a subclass of the resolved worker and cannot
+    # be combined with quant_cfg. Its runtime environment must already be in
+    # ACTOR_ENVIRONMENT_REGISTRY.
+    worker_extension_cls_fqn: NotRequired[str | None]
 
 
 def resolve_vllm_video_config(config: VllmConfig) -> VllmVideoConfig | None:
@@ -263,8 +302,177 @@ def materialize_vllm_video_config(
     video_media_io_kwargs["num_frames"] = video_config.num_frames
 
 
+# Entry points with end-to-end coverage for the per-token NVFP4 rollout.
+# Every other entry point shares the same Megatron training worker and vLLM
+# refit path, so the mode is expected to work there, but is unvalidated.
+NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS = frozenset({"grpo"})
+
+
+def parse_nvfp4_pertoken_rollout(
+    config: VllmConfig,
+) -> NvFp4PerTokenRolloutConfig | None:
+    """Parse the optional per-token rollout block under its strict schema."""
+    raw = config.get("nvfp4_pertoken_rollout")
+    if raw is None:
+        return None
+    parsed = NvFp4PerTokenRolloutConfig.model_validate(raw)
+    return parsed if parsed.enabled else None
+
+
+def normalize_nvfp4_pertoken_policy_config(
+    policy_config: Mapping[str, Any],
+    *,
+    entry_point: str = "grpo",
+) -> None:
+    """Derive rollout BF16 exclusions from the policy's Megatron boundary.
+
+    This runs on the driver before generation workers are created so trainer
+    and rollout actors receive one normalized precision contract.
+
+    ``entry_point`` names the calling algorithm so an unvalidated one warns
+    instead of appearing supported; see
+    ``NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS``.
+    """
+    generation_config = policy_config.get("generation") or {}
+    if generation_config.get("backend") != "vllm":
+        return
+    rollout = parse_nvfp4_pertoken_rollout(cast(VllmConfig, generation_config))
+    if rollout is None:
+        return
+    if entry_point not in NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS:
+        warnings.warn(
+            "generation.nvfp4_pertoken_rollout has end-to-end coverage on "
+            f"{sorted(NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS)} only. {entry_point} "
+            "reuses the same Megatron training worker and vLLM refit path, so the "
+            "mode is expected to work, but it has not been validated there.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    from transformers import AutoConfig
+
+    model_name = policy_config.get("model_name")
+    if not model_name:
+        raise ValueError(
+            "NVFP4 per-token boundary resolution requires policy.model_name"
+        )
+    overrides = policy_config.get("hf_config_overrides") or {}
+    hf_config = AutoConfig.from_pretrained(
+        model_name, trust_remote_code=True, **overrides
+    )
+    text_config = getattr(hf_config, "text_config", None)
+    num_hidden_layers = overrides.get("num_hidden_layers")
+    if num_hidden_layers is None:
+        num_hidden_layers = getattr(hf_config, "num_hidden_layers", None)
+    if num_hidden_layers is None and text_config is not None:
+        num_hidden_layers = getattr(text_config, "num_hidden_layers", None)
+    if num_hidden_layers is None:
+        raise ValueError(
+            "NVFP4 per-token boundary resolution requires num_hidden_layers "
+            "in the HF config"
+        )
+
+    megatron_cfg = policy_config.get("megatron_cfg") or {}
+    first_last_layers_bf16 = bool(megatron_cfg.get("first_last_layers_bf16", False))
+    num_start = int(
+        megatron_cfg.get(
+            "num_layers_at_start_in_bf16",
+            MCORE_DEFAULT_NUM_LAYERS_AT_START_IN_BF16,
+        )
+        or 0
+    )
+    num_end = int(
+        megatron_cfg.get(
+            "num_layers_at_end_in_bf16",
+            MCORE_DEFAULT_NUM_LAYERS_AT_END_IN_BF16,
+        )
+        or 0
+    )
+    raw_rollout = generation_config.setdefault("nvfp4_pertoken_rollout", {})
+    # A user-written value is only cross-checked; the Megatron boundary below
+    # is what the rollout ends up using.
+    expected_ignore = (
+        rollout.additional_ignore if "additional_ignore" in raw_rollout else None
+    )
+    resolved = resolve_boundary_ignore_patterns(
+        num_hidden_layers=int(num_hidden_layers),
+        first_last_layers_bf16=first_last_layers_bf16,
+        num_layers_at_start_in_bf16=num_start,
+        num_layers_at_end_in_bf16=num_end,
+        expected_additional_ignore=expected_ignore,
+    )
+    raw_rollout["additional_ignore"] = resolved
+    print(
+        "[nvfp4_pertoken] derived rollout BF16 decoder layers from Megatron: "
+        f"{resolved}",
+        flush=True,
+    )
+
+
+def validate_nvfp4_pertoken_generation(
+    config: VllmConfig, *, is_eval: bool
+) -> NvFp4PerTokenRolloutConfig | None:
+    """Reject topology and rollout combinations unsupported by per-token NVFP4."""
+    rollout = parse_nvfp4_pertoken_rollout(config)
+    if rollout is None:
+        return None
+    if is_eval:
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout does not support standalone evaluation"
+        )
+    if config.get("quant_cfg") is not None or config.get("real_quant"):
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout is mutually exclusive with "
+            "generation.quant_cfg and generation.real_quant"
+        )
+    if config.get("refit_transport") is not None:
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout requires refit_transport=null"
+        )
+    colocated = config.get("colocated") or {}
+    vllm_cfg = config["vllm_cfg"]
+    if not colocated.get("enabled"):
+        raise ValueError("generation.nvfp4_pertoken_rollout requires colocated rollout")
+    if vllm_cfg["pipeline_parallel_size"] > 1:
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout does not support vLLM PP>1 yet: "
+            "a stage that owns quantized layers rejects another stage's expert "
+            "weights during refit. Set generation.vllm_cfg.pipeline_parallel_size=1."
+        )
+    if vllm_cfg.get("expert_parallel_size") != 1:
+        raise ValueError("generation.nvfp4_pertoken_rollout requires vLLM EP=1")
+    if vllm_cfg.get("kv_cache_dtype") != "auto":
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout requires kv_cache_dtype=auto"
+        )
+    if vllm_cfg.get("precision") != "bfloat16":
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout requires vLLM precision=bfloat16"
+        )
+    speculative_config = (config.get("vllm_kwargs") or {}).get("speculative_config")
+    if speculative_config and not (
+        isinstance(speculative_config, dict)
+        and speculative_config.get("num_speculative_tokens") == 0
+    ):
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout does not support speculative decoding"
+        )
+    return rollout
+
+
+def validate_nvfp4_pertoken_model(hf_config: Any) -> None:
+    """Preflight the model before vLLM performs constructed-model validation."""
+    if get_num_routed_experts(hf_config) is None:
+        architectures = getattr(hf_config, "architectures", []) or []
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout requires a model with routed "
+            f"experts; no routed-expert count was found for {architectures or 'the HF config'}."
+        )
+
+
 def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
     """Validate the selected refit transport and resolve its scoped defaults."""
+    rollout = parse_nvfp4_pertoken_rollout(config)
     if cast(dict[str, Any], config).get("checkpoint_engine") is not None:
         raise ValueError(
             "policy.generation.checkpoint_engine was replaced by "
@@ -272,6 +480,10 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
             "policy.generation.refit_cfg.nixl."
         )
     transport = config.get("refit_transport")
+    if rollout is not None and transport is not None:
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout requires refit_transport=null"
+        )
     if transport is None:
         return None
     if transport == "nccl_reshard":

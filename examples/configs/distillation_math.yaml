@@ -27,8 +27,6 @@ checkpointing:
     keep_top_k: 3
     save_period: 10
     checkpoint_must_save_by: null
-    model_save_format: "safetensors"
-    save_consolidated: false
     save_optimizer: true
 
 policy: &POLICY_BASE
@@ -49,6 +47,12 @@ policy: &POLICY_BASE
     dtensor_cfg: &DTENSOR_BASE
         enabled: true
         _v2: true
+        checkpoint:
+            model_save_format: "safetensors"
+            # Canonical Automodel modes: "false", "final", or "every".
+            save_consolidated: "false"
+            single_rank_consolidation: false
+            consolidation_timeout_minutes: 30
         cpu_offload: False
         sequence_parallel: false
         activation_checkpointing: true
@@ -140,6 +144,7 @@ policy: &POLICY_BASE
         apply_rope_fusion: True
         bias_activation_fusion: True
         defer_fp32_logits: False
+        fp32_lm_head: false # Emit fp32 logits from Megatron's LM head; must match policy.generation.vllm_cfg.fp32_lm_head.
         moe_per_layer_logging: False
         moe_enable_deepep: false
         moe_token_dispatcher_type: "alltoall"
@@ -229,6 +234,7 @@ policy: &POLICY_BASE
             precision: ${...precision}
             kv_cache_dtype: "auto"
             logprobs_mode: processed_logprobs
+            fp32_lm_head: ${...megatron_cfg.fp32_lm_head} # Compute Nemotron-H logits with an fp32 LM head.
             # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
             refit_with_reload_api: false
             tensor_parallel_size: 1

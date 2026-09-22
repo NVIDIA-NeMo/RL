@@ -44,9 +44,13 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     create_sampler,
     required_buffer_capacity_for_config,
     sampler_supports_buffer_checkpoint,
+    sampler_supports_training_claims,
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS
+
+# No instance-side assertion for this leg (the config's target is never imported).
+_SKIP_INSTANCE = object()
 
 
 class FakeBuffer:
@@ -92,6 +96,9 @@ class FakeBuffer:
             del self.target_step_list[i]
             del self.ready_list[i]
         return len(idxs)
+
+    async def claim_for_training(self, idxs: list[int]) -> int:
+        return await self.remove(idxs, remove_in_dp=False)
 
 
 def _run(coro):
@@ -272,6 +279,20 @@ class TestFactory:
         )
         assert not CheckpointingEchoSampler.constructed
 
+    @pytest.mark.parametrize(
+        ("config", "expected"),
+        [
+            (InOrderSamplerConfig(), True),
+            (CustomSamplerConfig(target=f"{__name__}:EchoSampler"), False),
+            (
+                CustomSamplerConfig(target=f"{__name__}:CheckpointingEchoSampler"),
+                True,
+            ),
+        ],
+    )
+    def test_training_claim_capability_requires_custom_opt_in(self, config, expected):
+        assert sampler_supports_training_claims(config) is expected
+
     def test_ready_first_config_builds_ready_first_sampler(self):
         s = create_sampler(
             FakeBuffer(),
@@ -297,11 +318,49 @@ class TestReadyFirstConfig:
         with pytest.raises(ValidationError):
             ReadyFirstSamplerConfig(max_staleness_versions=-1)
 
-    def test_required_capacity_covers_live_and_lookahead_batches(self):
-        cfg = ReadyFirstSamplerConfig(max_staleness_versions=2)
-        assert required_buffer_capacity_for_config(cfg, groups_per_step=4) == 12
-        sampler = create_sampler(FakeBuffer(), cfg)
-        assert sampler.required_buffer_capacity(groups_per_step=4) == 12
+    @pytest.mark.parametrize(
+        ("cfg", "expected", "instance_expected"),
+        [
+            pytest.param(
+                ReadyFirstSamplerConfig(max_staleness_versions=2),
+                12,
+                12,
+                id="gated_live_plus_lookahead",
+            ),
+            # Unordered + evicting: any full buffer is selectable, so one
+            # select's minimum is the floor on both sides.
+            pytest.param(
+                WindowedSamplerConfig(max_staleness_versions=1),
+                3,
+                3,
+                id="windowed_select_minimum",
+            ),
+            # A custom sampler's bound is unknowable without importing the
+            # target, so the config side reports None, like BaseSampler does.
+            pytest.param(
+                CustomSamplerConfig(target="not_a_real_module:NotARealClass"),
+                None,
+                _SKIP_INSTANCE,
+                id="custom_unknown",
+            ),
+        ],
+    )
+    def test_required_capacity_per_sampler_family(
+        self, cfg, expected, instance_expected
+    ):
+        assert (
+            required_buffer_capacity_for_config(
+                cfg, groups_per_step=4, min_groups_for_streaming_train=3
+            )
+            == expected
+        )
+        if instance_expected is not _SKIP_INSTANCE:
+            sampler = create_sampler(
+                FakeBuffer(), cfg, min_groups_for_streaming_train=3
+            )
+            assert (
+                sampler.required_buffer_capacity(groups_per_step=4) == instance_expected
+            )
 
 
 class TestWarmupLookaheadWindow:
@@ -313,14 +372,24 @@ class TestWarmupLookaheadWindow:
         )
 
         # Steady state alone would be 4*(1+1)=8; the warmup peak needs 4*(3+1)=16.
-        assert required_buffer_capacity_for_config(cfg, groups_per_step=4) == 16
+        assert (
+            required_buffer_capacity_for_config(
+                cfg, groups_per_step=4, min_groups_for_streaming_train=1
+            )
+            == 16
+        )
         sampler = create_sampler(FakeBuffer(), cfg)
         assert sampler.required_buffer_capacity(groups_per_step=4) == 16
 
     def test_capacity_is_unchanged_without_a_warmup_window(self):
         cfg = InOrderSamplerConfig(max_lookahead_versions=1)
 
-        assert required_buffer_capacity_for_config(cfg, groups_per_step=4) == 8
+        assert (
+            required_buffer_capacity_for_config(
+                cfg, groups_per_step=4, min_groups_for_streaming_train=1
+            )
+            == 8
+        )
         sampler = create_sampler(FakeBuffer(), cfg)
         assert sampler.required_buffer_capacity(groups_per_step=4) == 8
 
@@ -693,6 +762,7 @@ class CheckpointingEchoSampler(EchoSampler):
     """Custom sampler with a static replay-checkpoint capability."""
 
     supports_buffer_checkpoint = True
+    supports_training_claims = True
     constructed = False
 
     def __init__(self, *args, **kwargs) -> None:

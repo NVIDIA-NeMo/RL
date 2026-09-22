@@ -45,20 +45,18 @@ def rl_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
     # Extract stop_strings if present
     stop_strings = [datum.get("stop_strings", None) for datum in data_batch]
 
-    # Presence of the key selects vLLM's native-media path. Placeholder-style
-    # processors intentionally set the content to None so vLLM uses input_ids.
+    # Preserve vLLM-ready prompt data without interpreting its modality keys.
     extra_args = {}
-    if any("vllm_content" in datum_spec for datum_spec in data_batch):
-        vllm_content = [
+    if any(
+        "vllm_content" in datum_spec or "vllm_multi_modal_data" in datum_spec
+        for datum_spec in data_batch
+    ):
+        extra_args["vllm_content"] = [
             datum_spec.get("vllm_content", None) for datum_spec in data_batch
         ]
-        vllm_images = [datum_spec.get("vllm_images", []) for datum_spec in data_batch]
-        vllm_videos = [datum_spec.get("vllm_videos", []) for datum_spec in data_batch]
-        vllm_audios = [datum_spec.get("vllm_audios", []) for datum_spec in data_batch]
-        extra_args["vllm_content"] = vllm_content
-        extra_args["vllm_images"] = vllm_images
-        extra_args["vllm_videos"] = vllm_videos
-        extra_args["vllm_audios"] = vllm_audios
+        extra_args["vllm_multi_modal_data"] = [
+            datum_spec.get("vllm_multi_modal_data", {}) for datum_spec in data_batch
+        ]
 
     output: BatchedDataDict[Any] = BatchedDataDict(
         message_log=message_log,
@@ -118,21 +116,17 @@ def eval_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
     idx = [datum_spec["idx"] for datum_spec in data_batch]
     task_names = [datum_spec.get("task_name", None) for datum_spec in data_batch]
 
-    # Preserve native media when placeholder-style processors intentionally
-    # set vllm_content to None in favor of their expanded input_ids.
+    # Preserve vLLM-ready prompt data without interpreting its modality keys.
     extra_args = {}
-    if any("vllm_content" in datum_spec for datum_spec in data_batch):
+    if any(
+        "vllm_content" in datum_spec or "vllm_multi_modal_data" in datum_spec
+        for datum_spec in data_batch
+    ):
         extra_args["vllm_content"] = [
             datum_spec.get("vllm_content", None) for datum_spec in data_batch
         ]
-        extra_args["vllm_images"] = [
-            datum_spec.get("vllm_images", []) for datum_spec in data_batch
-        ]
-        extra_args["vllm_audios"] = [
-            datum_spec.get("vllm_audios", []) for datum_spec in data_batch
-        ]
-        extra_args["vllm_videos"] = [
-            datum_spec.get("vllm_videos", []) for datum_spec in data_batch
+        extra_args["vllm_multi_modal_data"] = [
+            datum_spec.get("vllm_multi_modal_data", {}) for datum_spec in data_batch
         ]
 
     output: BatchedDataDict[Any] = BatchedDataDict(
@@ -163,7 +157,8 @@ def preference_collate_fn(
         make_sequence_length_divisible_by: Make the sequence length divisible by this value
         add_loss_mask: Whether to add a token_mask to the returned data
     Returns:
-        BatchedDataDict with input_ids, input_lengths, token_mask (optional), and sample_mask fields.
+        BatchedDataDict with input_ids, input_lengths, token_mask (optional),
+        sample_mask, pair_index, is_chosen, and any multimodal processor outputs.
     """
     message_log = []
     length = []
@@ -205,14 +200,26 @@ def preference_collate_fn(
         make_sequence_length_divisible_by=make_sequence_length_divisible_by,
     )
 
+    num_pairs = len(data_batch)
     data: BatchedDataDict[Any] = BatchedDataDict(
         {
             "input_ids": cat_and_padded["token_ids"],
             "input_lengths": input_lengths,
             "sample_mask": batch["loss_multiplier"],
+            # Packing can reorder rows, so preference losses must not infer
+            # pair membership from positional [::2] / [1::2] slicing.
+            "pair_index": torch.arange(num_pairs, dtype=torch.long).repeat_interleave(
+                2
+            ),
+            "is_chosen": torch.arange(2 * num_pairs) % 2 == 0,
         }
     )
     if add_loss_mask:
         data["token_mask"] = cat_and_padded["token_loss_mask"]
+
+    # Keep processor-expanded multimodal data in the same batch coordinate
+    # system as input_ids. NeMo-RL packs the full THD rows; NemotronOmniModel
+    # inserts media embeddings and selects the context-parallel slice.
+    data.update(cat_and_padded.get_multimodal_dict(as_tensors=False))
 
     return data

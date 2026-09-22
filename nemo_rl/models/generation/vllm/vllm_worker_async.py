@@ -28,6 +28,7 @@ import torch
 import uvicorn
 from fastapi import FastAPI
 
+from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GENERATION_PORT_RANGE_HIGH,
@@ -44,6 +45,10 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmAsyncCheckpointEngineRpcMixin,
 )
+from nemo_rl.models.generation.vllm.collective_rpc import (
+    resolve_collective_rpc_result,
+)
+from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
@@ -312,7 +317,7 @@ class VllmAsyncGenerationWorkerImpl(
     def _start_vllm_metrics_logger(self) -> None:
         """Start a background thread that periodically collects vLLM logger metrics.
 
-        Controlled by vllm_metrics_logger_interval (default: 0.5) in vllm_cfg.
+        Controlled by the required vllm_metrics_logger_interval in vllm_cfg.
         Runs only on the model-owner actor.
         """
         from vllm.v1.metrics.reader import Gauge, Counter, get_metrics_snapshot
@@ -392,6 +397,30 @@ class VllmAsyncGenerationWorkerImpl(
             }
         return metric
 
+    def drain_latest_vllm_logger_metrics(self) -> dict[str, Any]:
+        """Return latest samples and prune histories after a telemetry poll."""
+        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+            return {}
+
+        with self._vllm_metrics_lock:
+            histories = {
+                "inflight_batch_sizes": self.inflight_batch_sizes,
+                "num_pending_samples": self.num_pending_samples,
+                "kv_cache_usage_perc": self.kv_cache_usage_perc,
+                "generation_tokens": self.generation_tokens,
+            }
+            latest = {
+                name: [values[-1]] if values else []
+                for name, values in histories.items()
+            }
+            # Keep worker-owned histories distinct from the lists handed to Ray;
+            # the sampling thread may append immediately after this lock exits.
+            self.inflight_batch_sizes = list(latest["inflight_batch_sizes"])
+            self.num_pending_samples = list(latest["num_pending_samples"])
+            self.kv_cache_usage_perc = list(latest["kv_cache_usage_perc"])
+            self.generation_tokens = list(latest["generation_tokens"])
+            return {name: list(values) for name, values in latest.items()}
+
     def clear_vllm_logger_metrics(self) -> None:
         if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             return
@@ -408,7 +437,23 @@ class VllmAsyncGenerationWorkerImpl(
             self._sparse_refit_receiver.set_async_loop(self._engine_loop)
         if self.llm is not None:
             await self.llm.collective_rpc("bind_numa", args=tuple())
+            if parse_nvfp4_pertoken_rollout(self.cfg) is not None:
+                target_counts = await resolve_collective_rpc_result(
+                    self.llm.collective_rpc(
+                        "report_nvfp4_pertoken_target_count", args=tuple()
+                    )
+                )
+                if not target_counts or sum(target_counts) == 0:
+                    raise RuntimeError(
+                        "generation.nvfp4_pertoken_rollout selected no "
+                        "RoutedExperts targets across the vLLM model"
+                    )
         self.vllm_device_ids = await self.report_device_id_async()
+        if self._mtp_speculative_enabled:
+            await self.llm.collective_rpc(
+                "configure_mtp_drafter_weight_source",
+                args=(self._mtp_weights_from_refit,),
+            )
         if self._mtp_load_from_disk:
             await self.llm.collective_rpc(
                 "load_mtp_weights_from_disk", args=(self.model_name,)
@@ -468,6 +513,10 @@ class VllmAsyncGenerationWorkerImpl(
             adapter=VLLMCaptureAdapter(),
         )
         return True
+
+    async def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
+        """Run owner-local checkpoint I/O without blocking the actor event loop."""
+        return await asyncio.to_thread(run_checkpoint_command, body)
 
     async def set_rollout_weight_version(self, version: int) -> None:
         """Rotate the weight version stamped on subsequent captured calls."""
@@ -655,11 +704,17 @@ class VllmAsyncGenerationWorkerImpl(
         coords = self.token_capture.complete_call_from_response(call, payload)
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
-            # The delta-aligned routes were staged to TQ above; the served
-            # full-length copy is dead weight the gate strips on arrival.
+            # Token arrays and delta-aligned routes were staged to TQ above;
+            # remove the serializer's message fields before the worker->gate hop.
             message = choice.get("message")
             if isinstance(message, dict):
-                message.pop("routed_experts", None)
+                for field in (
+                    "prompt_token_ids",
+                    "generation_token_ids",
+                    "generation_log_probs",
+                    "routed_experts",
+                ):
+                    message.pop(field, None)
         content["ng_commit_coords"] = coords.model_dump()
         return content
 
@@ -767,10 +822,17 @@ class VllmAsyncGenerationWorkerImpl(
                 """Clamp the request's max output tokens so that input + output <= max_model_len."""
                 remaining = self.model_config.max_model_len - len(prompt_token_ids)
                 if remaining <= 0:
-                    raise ValueError(
+                    # preserve the literal "context length" in this message to match Gym's overflow handling
+                    message = (
                         f"Prompt length ({len(prompt_token_ids)}) fills or exceeds "
-                        f"max_model_len ({self.model_config.max_model_len}). "
+                        f"this model's maximum context length ({self.model_config.max_model_len}). "
                         f"No room for output tokens."
+                    )
+                    LOGGER.warning("Prompt exceeds max_model_len: %s", message)
+                    raise VLLMValidationError(
+                        message,
+                        parameter="input_tokens",
+                        value=len(prompt_token_ids),
                     )
                 max_tokens = min(request_max_tokens, remaining)
                 self._set_max_tokens(request, max_tokens)
@@ -1153,6 +1215,7 @@ class VllmAsyncGenerationWorkerImpl(
                         "error": {
                             "message": str(e),
                             "type": "invalid_request_error",
+                            "param": e.parameter,
                             "code": 400,
                         }
                     },

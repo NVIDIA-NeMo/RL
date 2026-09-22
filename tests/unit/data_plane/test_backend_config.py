@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import pydantic
 import pytest
+from omegaconf import OmegaConf
 from pydantic import TypeAdapter
 
 from nemo_rl.data_plane.interfaces import (
@@ -48,7 +49,7 @@ def _cfg(backend: str, **extra) -> dict:
     ("backend", "expected"),
     [
         ("simple", True),
-        ("mooncake_cpu", False),
+        ("mooncake_cpu", True),
         ("future_backend", False),
     ],
 )
@@ -61,12 +62,19 @@ def test_checkpointing_capability_defaults_to_unsupported(
 def test_nested_block_is_used() -> None:
     cfg = _cfg(
         "mooncake_cpu",
-        mooncake_cpu={"global_segment_size": 111, "reuse_registered_buffers": False},
+        mooncake_cpu={
+            "global_segment_size": 111,
+            "reuse_registered_buffers": False,
+            "use_gdr": True,
+            "gdr_staging_buffer_mb": 512,
+        },
     )
     resolved = backend_config(cfg)
     assert isinstance(resolved, MooncakeCpuConfig)
     assert resolved.global_segment_size == 111
     assert resolved.reuse_registered_buffers is False
+    assert resolved.use_gdr is True
+    assert resolved.gdr_staging_buffer_mb == 512
 
 
 def test_absent_block_falls_back_to_model_defaults() -> None:
@@ -81,6 +89,16 @@ def test_absent_block_falls_back_to_model_defaults() -> None:
     assert resolved.local_buffer_size == 4294967296  # 4 GiB per client process
     # The opt-out flag defaults on, so omitting it must not disable the pool.
     assert resolved.reuse_registered_buffers is True
+    assert resolved.use_gdr is False
+    assert resolved.gdr_staging_buffer_mb == 1024
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_gdr_staging_size_rejects_non_positive_values(value: int) -> None:
+    with pytest.raises(pydantic.ValidationError):
+        backend_config(
+            _cfg("mooncake_cpu", mooncake_cpu={"gdr_staging_buffer_mb": value})
+        )
 
 
 def test_accepts_an_already_coerced_model() -> None:
@@ -94,6 +112,47 @@ def test_partial_nested_block_keeps_other_defaults() -> None:
     resolved = backend_config(cfg)
     assert resolved.local_buffer_size == 7
     assert resolved.global_segment_size == MooncakeCpuConfig().global_segment_size
+
+
+def test_mooncake_has_no_backend_specific_checkpoint_knobs() -> None:
+    assert {"checkpoint", "hard_pin", "offload"}.isdisjoint(
+        MooncakeCpuConfig.model_fields
+    )
+
+
+@pytest.mark.parametrize("checkpointing", [False, True])
+@pytest.mark.parametrize("use_gdr", [False, True])
+def test_mooncake_checkpoint_mode_is_internal(
+    monkeypatch, checkpointing, use_gdr
+) -> None:
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    captured = {}
+    monkeypatch.setattr(adapter, "_get_local_node_ip", lambda: "10.0.0.7")
+    monkeypatch.setattr(
+        adapter,
+        "_mooncake_transport_config",
+        lambda: {"protocol": "rdma", "device_name": "mlx5_test"},
+    )
+    monkeypatch.setattr(adapter.os, "chmod", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        adapter.tq,
+        "init",
+        lambda *, conf: captured.setdefault("conf", conf),
+    )
+
+    cfg = _cfg("mooncake_cpu")
+    cfg["mooncake_cpu"] = {"use_gdr": use_gdr, "gdr_staging_buffer_mb": 384}
+    adapter._init_tq(cfg, checkpointing=checkpointing)
+
+    conf = OmegaConf.to_container(captured["conf"], resolve=True)
+    mooncake = conf["backend"]["MooncakeStore"]
+    assert mooncake["hard_pin"] is (True if checkpointing else None)
+    # TQ merges its own offload defaults into the resolved backend config.
+    assert mooncake["offload"]["enabled"] is False
+    assert mooncake["checkpoint"] == {"enabled": checkpointing}
+    assert mooncake["use_gdr"] is use_gdr
+    assert mooncake["gdr_staging_buffer_mb"] == 384
 
 
 def test_simple_backend_nested_block_is_used() -> None:

@@ -36,10 +36,11 @@ from typing import TYPE_CHECKING, Any, Literal, Optional
 import numpy as np
 import torch
 
-FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
-
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
+from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, backend_config
+from nemo_rl.data_plane.observability import is_metrics_client
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
     GLOBAL_FORWARD_PAD_SEQLEN,
@@ -58,8 +59,13 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.r3_trace import trace_tq_fetch_payload
 
 if TYPE_CHECKING:
-    from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta
-    from nemo_rl.data_plane.interfaces import DataPlaneClient
+    from nemo_rl.data_plane import KVBatchMeta
+    from nemo_rl.data_plane.interfaces import (
+        DataPlaneClient,
+        DataPlaneRuntimeConfig,
+    )
+
+FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
 
 
 def _broadcast_batched_data_dict(
@@ -83,77 +89,66 @@ def _broadcast_batched_data_dict(
     backend = torch.distributed.get_backend(group)
     bcast_device: Any = torch.cuda.current_device() if backend == "nccl" else "cpu"
 
-    # Leader-only: the flat payload of each packed field, kept from the
-    # descriptor pass so ``to_wire``'s ``torch.cat`` of the whole column runs
-    # once, not once per pass (multimodal_utils.py:203 warns about exactly this).
-    leader_flat: dict[str, torch.Tensor] = {}
+    # Leader-only: keep physical segments uncoalesced until their broadcast
+    # turn so only one packed payload is staged on the GPU at a time.
+    packed_segments: dict[str, list[torch.Tensor]] = {}
+    leader_error: Exception | None = None
 
     if is_leader:
-        assert data is not None, "leader must provide non-None data"
-        descriptor: list[Any] = []
-        for k, v in data.items():
-            if isinstance(v, torch.Tensor):
-                descriptor.append(
-                    (k, "tensor", str(v.dtype), tuple(v.shape), str(v.device))
-                )
-            elif isinstance(v, PackedTensor):
-                # A PackedTensor on the ``raw`` branch would be pickled by
-                # ``broadcast_object_list`` into one contiguous *device* tensor
-                # -- 26.25 GiB for a VLM batch (job 17648488). Ship it the way
-                # the wire already does: payload as one flat tensor, geometry as
-                # ints. Densifying instead loses the row boundaries the model
-                # needs to match media to placeholders (job 17652563).
-                nested, shapes = v.to_wire()
-                if nested is None:
-                    # Every row empty -- a shard holding only media-free
-                    # samples. The key still has to cross: consumers branch on
-                    # the key set (``len(get_multimodal_dict(...)) > 0`` decides
-                    # whether the caller's position_ids are used), and the
-                    # independent-fetch path keeps it. Ship geometry alone.
+        try:
+            assert data is not None, "leader must provide non-None data"
+            descriptor: list[Any] = []
+            for k, v in data.items():
+                if isinstance(v, torch.Tensor):
                     descriptor.append(
-                        (k, "empty_packed", len(v), v.dim_to_pack, v.pad_to_max_shape)
+                        (k, "tensor", str(v.dtype), tuple(v.shape), str(v.device))
                     )
-                    continue
-                values = nested.values()
-                leader_flat[k] = values
-                descriptor.append(
-                    (
-                        k,
-                        "packed_wire",
-                        str(values.dtype),
-                        str(values.device),
-                        nested.offsets().tolist(),
-                        shapes,
-                        v.pad_to_max_shape,
+                elif isinstance(v, PackedTensor):
+                    header, shapes, dtype, source_device, packed_segments[k] = (
+                        v.broadcast_parts()
                     )
-                )
-            elif (
-                v is None
-                or isinstance(v, (str, int, float, bool))
-                or (isinstance(v, np.ndarray) and v.dtype == object)
-            ):
-                # Scalars and object arrays are what the raw branch is for:
-                # small, and cheap to pickle into the object list.
-                descriptor.append((k, "raw", v))
-            else:
-                # Mirrors the write-side gate in ``column_io.kv_first_write``:
-                # an unknown wrapper on the ``raw`` branch is pickled into
-                # device memory by ``broadcast_object_list``, which is how the
-                # PackedTensor payload became a 26 GiB allocation. Fail at the
-                # boundary instead of discovering it as an OOM.
-                raise TypeError(
-                    f"Field {k!r}: unexpected broadcast type {type(v).__name__}. "
-                    "The replica-group broadcast carries torch.Tensor, "
-                    "PackedTensor, np.ndarray[object] and scalars; a bulk "
-                    "wrapper must get its own branch rather than being pickled."
-                )
-        payload: list[Any] = [descriptor]
+                    descriptor.append(
+                        (k, "packed_tensor", header, shapes, dtype, source_device)
+                    )
+                elif (
+                    v is None
+                    or isinstance(v, (str, int, float, bool))
+                    or (isinstance(v, np.ndarray) and v.dtype == object)
+                ):
+                    # Scalars and object arrays are what the raw branch is for:
+                    # small, and cheap to pickle into the object list.
+                    descriptor.append((k, "raw", v))
+                else:
+                    raise TypeError(
+                        f"Field {k!r}: unexpected broadcast type "
+                        f"{type(v).__name__}. "
+                        "The replica-group broadcast carries torch.Tensor, "
+                        "PackedTensor, np.ndarray[object] and scalars; a bulk "
+                        "wrapper must get its own branch rather than being pickled."
+                    )
+        except Exception as error:
+            # Every rank must enter the first collective, even when the source
+            # cannot describe its batch. Otherwise the peers wait indefinitely.
+            leader_error = error
+            payload: list[Any] = [("error", type(error).__name__, str(error))]
+        else:
+            payload = [("ok", descriptor)]
     else:
         payload = [None]
 
     torch.distributed.broadcast_object_list(payload, src=src, group=group)
-    descriptor = payload[0]
-    assert descriptor is not None
+    status, *contents = payload[0]
+    if status == "error":
+        if leader_error is not None:
+            raise leader_error
+        error_type, error_message = contents
+        raise RuntimeError(
+            f"Broadcast source rank {src} failed while describing its batch "
+            f"({error_type}): {error_message}"
+        )
+
+    assert status == "ok"
+    descriptor = contents[0]
 
     # pyrefly: ignore  # bad-assignment
     out: BatchedDataDict[Any] = data if is_leader else BatchedDataDict()
@@ -187,41 +182,99 @@ def _broadcast_batched_data_dict(
                 and torch.device(src_device).type != torch.device(bcast_device).type
             ):
                 out[key] = tensor.to(src_device)
-        elif kind == "packed_wire":
-            dtype_str, src_device, offsets, shapes, pad_to_max_shape = entry[2:]
+        elif kind == "packed_tensor":
+            header, shapes, dtype_str, source_device = entry[2:]
             if is_leader:
-                flat = leader_flat[key].to(bcast_device)
+                segments = packed_segments.pop(key)
+                tensor = (
+                    torch.cat(
+                        [
+                            segment.to(bcast_device).contiguous().view(-1)
+                            for segment in segments
+                        ]
+                    )
+                    if segments
+                    else torch.empty(
+                        0,
+                        dtype=getattr(torch, dtype_str.split(".")[-1]),
+                        device=bcast_device,
+                    )
+                )
             else:
                 dtype = getattr(torch, dtype_str.split(".")[-1])
-                flat = torch.empty(offsets[-1], dtype=dtype, device=bcast_device)
-            torch.distributed.broadcast(flat, src=src, group=group)
-            # Drop the cached CPU concat now it has shipped: holding it to
-            # the end of the loop keeps three copies of the largest column
-            # live at once (segments, concat, device copy).
-            leader_flat.pop(key, None)
+                numel = sum(
+                    torch.Size(shape).numel() for shape in shapes if shape is not None
+                )
+                tensor = torch.empty(numel, dtype=dtype, device=bcast_device)
+            if tensor.numel():
+                if tensor.dtype == torch.int16:
+                    wire = tensor.to(torch.int32)
+                    torch.distributed.broadcast(wire, src=src, group=group)
+                    tensor = wire.to(torch.int16)
+                    del wire
+                else:
+                    torch.distributed.broadcast(tensor, src=src, group=group)
             if not is_leader:
-                nested = torch.nested.nested_tensor_from_jagged(
-                    flat, torch.tensor(offsets, dtype=torch.int64, device=flat.device)
-                )
-                if torch.device(src_device).type != torch.device(bcast_device).type:
-                    nested = nested.to(src_device)
-                out[key] = PackedTensor.from_wire(
-                    nested, shapes, pad_to_max_shape=pad_to_max_shape
-                )
-        elif kind == "empty_packed":
-            # Structural only: no payload, so followers rebuild from the
-            # geometry and land on the leader's key set.
-            n_rows, dim_to_pack, pad_to_max_shape = entry[2:]
-            if not is_leader:
-                out[key] = PackedTensor(
-                    [None] * n_rows,
-                    dim_to_pack,
-                    pad_to_max_shape=pad_to_max_shape,
-                )
+                if torch.device(source_device).type != torch.device(bcast_device).type:
+                    tensor = tensor.to(source_device)
+                out[key] = header.rebuild_from_broadcast_parts(shapes, tensor)
+            del tensor
         else:
             if not is_leader:
                 out[key] = entry[2]
     return out
+
+
+def _materialize_fetched(
+    td: Any,
+    *,
+    local_batch: bool,
+    layout: Layout,
+    pad_value_dict: dict[str, int | float] | None,
+    pad_to_seqlen: int,
+    tags: list[dict[str, Any]] | None = None,
+) -> BatchedDataDict[Any]:
+    """Materialize a fetched TensorDict with the reader that matches the writer.
+
+    ``materialize`` and ``materialize_local`` are not interchangeable. The
+    local adapter stores each non-tensor column as one ``NonTensorData`` with
+    ``batch_size=(N,)``, and ``materialize`` reads a ``NonTensorData`` as a
+    single row, so calling it on a local batch collapses N rows into 1 without
+    raising. Both readers are picked from the same ``local_batch`` flag, so
+    this only guards against a future edit that changes one of the two
+    branches; it costs the TQ path one ``isinstance`` per column.
+    """
+    from tensordict import NonTensorData
+
+    from nemo_rl.data_plane import materialize
+    from nemo_rl.data_plane.adapters.local import materialize_local
+
+    if not local_batch:
+        batched = [
+            str(key)
+            for key in td.keys(include_nested=False)
+            if isinstance(td.get(key), NonTensorData)
+        ]
+        if batched:
+            raise TypeError(
+                f"materialize() cannot read process-local columns {sorted(batched)}: "
+                "each holds a whole column in one NonTensorData and would collapse "
+                "to a single row. This batch needs materialize_local()."
+            )
+    if local_batch:
+        return materialize_local(
+            td,
+            layout=layout,
+            pad_value_dict=pad_value_dict,
+            pad_to_seqlen=pad_to_seqlen,
+        )
+    return materialize(
+        td,
+        layout=layout,
+        pad_value_dict=pad_value_dict,
+        pad_to_seqlen=pad_to_seqlen,
+        tags=tags,
+    )
 
 
 class TQWorkerMixin:
@@ -235,8 +288,8 @@ class TQWorkerMixin:
     _dp_client: Optional[DataPlaneClient] = None
     _route_fallback_counts: Counter[str] = Counter()
 
-    def setup_data_plane(self, cfg: DataPlaneConfig) -> None:
-        """Connect this worker process's client to the existing TQ controller.
+    def setup_data_plane(self, cfg: DataPlaneRuntimeConfig) -> None:
+        """Create this worker process's configured data-plane client.
 
         Called once by the driver after worker construction. Idempotent.
         """
@@ -250,19 +303,33 @@ class TQWorkerMixin:
         # entrypoints then delegate to the same ``train`` / ``get_logprobs``
         # that carry the flag into ``models/megatron/data.py``.
         #
-        # ``train_microbatch_presharded`` is the exception: it lands in
-        # ``_train_microbatch_body``, which passes none of the capability flags
-        # and never attaches the media-token validity mask. That path is
-        # SingleController-only, so ``train_microbatch`` raises for a
-        # multimodal model rather than training on rows it mis-describes.
+        # ``train_microbatch_presharded`` lands in ``_train_microbatch_body``,
+        # which applies the same media-token validity mask and model packing/CP
+        # capability flags as the regular training path.
         if self._dp_client is not None:
             return
         self._route_fallback_counts = Counter()
         from nemo_rl.data_plane import build_data_plane_client
 
+        # ``LocalDataPlaneConfig`` is the process-local plane: no TQ, no
+        # mooncake, so no GDR to order against a CUDA context.
+        if (
+            not isinstance(cfg, LocalDataPlaneConfig)
+            and cfg["backend"] == "mooncake_cpu"
+            and backend_config(cfg).use_gdr
+            and not torch.cuda.is_initialized()
+        ):
+            raise RuntimeError(
+                "CUDA must be initialized before attaching TransferQueue with GDR"
+            )
+
         # bootstrap=False — the driver already created the named
         # controller actor; this process attaches as a client.
         self._dp_client = build_data_plane_client(cfg, bootstrap=False)
+
+    def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
+        """Run an owner-local checkpoint command; return metadata, never payloads."""
+        return run_checkpoint_command(body)
 
     def _require_dp_client(self) -> DataPlaneClient:
         if self._dp_client is None:
@@ -304,6 +371,23 @@ class TQWorkerMixin:
         """Cross-DP forward pad target, minted by :meth:`TQPolicy._stamp_pad_seqlen`."""
         return int((meta.extra_info or {}).get(GLOBAL_FORWARD_PAD_SEQLEN, 0))
 
+    def get_data_plane_snapshot(self) -> "dict[str, Any] | None":
+        """This rank's data-plane counters, for cluster-wide aggregation.
+
+        Returns ``None`` when observability is off or no client exists, so
+        the driver can filter rather than special-case. The payload is
+        counters only (about 1 kB), not tensors.
+
+        Closes this rank's step window (``step_wall_ms``, ``step_max_ms``) as
+        it reads, since the driver calls this once per step. Neither a sum
+        the cluster reduces with a max nor a max itself can be differenced
+        out of a cumulative counter, so without the reset the cluster's
+        per-step figures would latch at the worst call ever seen.
+        """
+        if not is_metrics_client(self._dp_client):
+            return None
+        return self._dp_client.snapshot(reset_step_window=True)
+
     def _fetch(
         self,
         meta: "KVBatchMeta",
@@ -338,7 +422,7 @@ class TQWorkerMixin:
         if fetch_policy not in {"auto", "independent", "leader_broadcast"}:
             raise ValueError(f"unknown fetch_policy: {fetch_policy!r}")
 
-        from nemo_rl.data_plane import materialize
+        from nemo_rl.data_plane.adapters.local import is_local_batch_meta
 
         pad_value_dict = self._pad_value_dict()
         replica_group = (
@@ -353,18 +437,27 @@ class TQWorkerMixin:
             )
 
         pad_to_seqlen = self._forward_pad_seqlen(meta) if dp_aligned_seq_len else 0
+        local_batch = is_local_batch_meta(meta)
 
         if replica_group is not None and replica_group.size() > 1:
             is_leader = self._is_replica_leader()
             leader = torch.distributed.get_global_rank(replica_group, 0)
             if is_leader:
-                td = self._require_dp_client().get_samples(
-                    sample_ids=meta.sample_ids,
-                    partition_id=meta.partition_id,
-                    select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
-                )
-                data = materialize(
+                dp_client = self._require_dp_client()
+                if local_batch:
+                    td = dp_client.get_data(
+                        meta,
+                        select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
+                    )
+                else:
+                    td = dp_client.get_samples(
+                        sample_ids=meta.sample_ids,
+                        partition_id=meta.partition_id,
+                        select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
+                    )
+                data = _materialize_fetched(
                     td,
+                    local_batch=local_batch,
                     layout=layout,
                     pad_value_dict=pad_value_dict,
                     pad_to_seqlen=pad_to_seqlen,
@@ -391,13 +484,21 @@ class TQWorkerMixin:
                 data = preprocess(self, data)
             return data
 
-        td = self._require_dp_client().get_samples(
-            sample_ids=meta.sample_ids,
-            partition_id=meta.partition_id,
-            select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
-        )
-        data = materialize(
+        dp_client = self._require_dp_client()
+        if local_batch:
+            td = dp_client.get_data(
+                meta,
+                select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
+            )
+        else:
+            td = dp_client.get_samples(
+                sample_ids=meta.sample_ids,
+                partition_id=meta.partition_id,
+                select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
+            )
+        data = _materialize_fetched(
             td,
+            local_batch=local_batch,
             layout=layout,
             pad_value_dict=pad_value_dict,
             pad_to_seqlen=pad_to_seqlen,
@@ -683,6 +784,48 @@ class TQWorkerMixin:
 
         return NamedSharding.is_axis_zero(self._local_coords(), REPLICATED_AXES)
 
+    def _is_stage_local_writer(self) -> bool:
+        """True iff this rank is the TP/CP-zero rank of its own pipeline stage.
+
+        Unlike :meth:`_is_replica_leader` this does not pin the pipeline stage,
+        so it selects one rank per stage rather than one per DP rank. Callers
+        must therefore only write outputs that exist on a single stage; see
+        :meth:`_write_back_stage_local`.
+        """
+        from nemo_rl.distributed.named_sharding import NamedSharding
+
+        return NamedSharding.is_axis_zero(
+            self._local_coords(), ("tensor_parallel", "context_parallel")
+        )
+
+    def _write_back_stage_local(
+        self,
+        meta: "KVBatchMeta",
+        fields: dict[str, torch.Tensor],
+    ) -> None:
+        """Write fields produced on exactly one pipeline stage.
+
+        The ordinary :meth:`_write_back` writes from the replica leader, which
+        sits on stage 0. Outputs that only the last stage holds -- notably the
+        full-vocabulary MOPD teacher payload -- would then have to be broadcast
+        backwards just to be written, which for a per-token payload means moving
+        gigabytes across the pipeline group for nothing. This writes from the
+        stage that already owns the data instead.
+
+        Single-writer safety comes from the caller: it must pass fields that are
+        absent (``None``) on every other stage, so exactly one stage reaches this
+        and :meth:`_is_stage_local_writer` picks one rank within it.
+
+        Args:
+            meta: Per-rank ``KVBatchMeta`` for this slice.
+            fields: Map of field name to tensor to write back.
+        """
+        if not self._is_stage_local_writer() or not fields:
+            return
+        from nemo_rl.data_plane.column_io import write_columns
+
+        write_columns(self._require_dp_client(), meta, fields)
+
     def _write_back(
         self,
         meta: "KVBatchMeta",
@@ -826,8 +969,33 @@ class TQWorkerMixin:
         self,
         meta: "KVBatchMeta",
         micro_batch_size: Optional[int] = None,
+        opd_full_payload: Optional[str] = None,
+        opd_full_payload_dtype: Optional[str] = None,
+        opd_full_payload_field: Optional[str] = None,
+        opd_full_teacher_index: Optional[int] = None,
+        opd_full_teacher_index_field: Optional[str] = None,
     ) -> None:
-        """Per-rank frozen-teacher logprob entrypoint for SingleController MOPD."""
+        """Per-rank frozen-teacher logprob entrypoint for SingleController MOPD.
+
+        Args:
+            meta: Per-rank ``KVBatchMeta`` for this DP shard.
+            micro_batch_size: Overrides the configured logprob batch size.
+            opd_full_payload: When set (``"hidden_states"`` or ``"logits"``), also
+                emit the full-vocabulary teacher payload from the same forward.
+            opd_full_payload_dtype: Torch dtype name for that payload.
+            opd_full_payload_field: Data-plane column the payload is written to.
+            opd_full_teacher_index: This teacher group's stable index (see
+                ``create_teacher_worker_groups``), tagged onto every row this
+                call writes so the student can select the matching LM head.
+            opd_full_teacher_index_field: Data-plane column the index is
+                written to; ``None`` when the run doesn't need per-sample
+                teacher routing (logits payload, or opd_full off).
+
+        Raises:
+            ValueError: If a payload is requested without a target column, or
+                if a teacher-index column is requested without an index.
+            RuntimeError: If batching metadata was not planned driver-side.
+        """
         data = self._fetch(meta)
         cfg = getattr(self, "cfg", {})
         batching_enabled = bool(
@@ -844,10 +1012,60 @@ class TQWorkerMixin:
                 "can desynchronize data-parallel collectives."
             )
         data = self._attach_or_repack_pack_metadata(data, meta)
-        result: BatchedDataDict[Any] = self.get_logprobs(  # type: ignore[attr-defined]
-            data=data,
-            micro_batch_size=micro_batch_size,
-        )
+        if opd_full_payload is None:
+            result: BatchedDataDict[Any] = self.get_logprobs(  # type: ignore[attr-defined]
+                data=data,
+                micro_batch_size=micro_batch_size,
+            )
+        else:
+            if opd_full_payload_field is None:
+                raise ValueError(
+                    "opd_full_payload requires opd_full_payload_field naming the "
+                    "data-plane column to write the teacher payload to."
+                )
+            if opd_full_payload_dtype is None:
+                raise ValueError(
+                    "opd_full_payload requires opd_full_payload_dtype; it is "
+                    "resolved by the driver from OnPolicyDistillationFullConfig, "
+                    "which owns the default."
+                )
+            if (
+                opd_full_teacher_index_field is not None
+                and opd_full_teacher_index is None
+            ):
+                raise ValueError(
+                    "opd_full_teacher_index_field requires opd_full_teacher_index "
+                    "naming which teacher this group is. Defaulting it would tag "
+                    "every row as teacher 0 -- a valid index, so the student "
+                    "would silently project these rows through the wrong LM head."
+                )
+            result = self.get_logprobs_with_full_payload(  # type: ignore[attr-defined]
+                data=data,
+                payload=opd_full_payload,
+                payload_dtype=opd_full_payload_dtype,
+                micro_batch_size=micro_batch_size,
+            )
+            # None off the last pipeline stage, which is what keeps this to a
+            # single writer: the payload never leaves the stage that produced it.
+            teacher_full_payload = result.get("teacher_full_payload")
+            if teacher_full_payload is not None:
+                stage_local_fields = {
+                    opd_full_payload_field: teacher_full_payload.detach().cpu()
+                }
+                if opd_full_teacher_index_field is not None:
+                    # Guarded above: a column without an index already raised,
+                    # on every rank, before the forward ran.
+                    assert opd_full_teacher_index is not None
+                    # Every row in this call comes from the same physical
+                    # teacher (one TeacherWorkerGroup per checkpoint), so the
+                    # index is a constant broadcast across the batch dim.
+                    stage_local_fields[opd_full_teacher_index_field] = torch.full(
+                        (teacher_full_payload.shape[0],),
+                        int(opd_full_teacher_index),
+                        dtype=torch.int64,
+                    )
+                self._write_back_stage_local(meta, stage_local_fields)
+            del teacher_full_payload
         self._write_back_result_field(
             meta,
             result,

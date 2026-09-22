@@ -71,6 +71,11 @@ class PromptGroupSampler(Protocol):
 
     Implement this (or subclass ``BaseSampler``) to add a custom sampling
     algorithm; point ``async_rl.sampler`` at ``module:ClassName`` to load it.
+    A custom sampler that supports replay recovery must explicitly declare
+    ``supports_buffer_checkpoint = True``. It must additionally declare
+    ``supports_training_claims = True`` before periodic rollout snapshots may
+    be enabled; omitting that optional capability preserves the legacy
+    remove-on-selection behavior.
     """
 
     async def admit(self, *, trainer_version_fn: Callable[[], int]) -> Optional[int]:
@@ -93,7 +98,12 @@ class PromptGroupSampler(Protocol):
         min_prompt_groups: int,
         max_prompt_groups: int,
     ) -> tuple[Optional[KVBatchMeta], int]:
-        """Pick up to ``max_prompt_groups`` eligible groups; drop them locally."""
+        """Pick up to ``max_prompt_groups`` eligible groups for training.
+
+        Claim-aware samplers transfer the groups from ordinary replay-buffer
+        selection into training ownership until the controller releases them.
+        Legacy custom samplers may still remove selected groups immediately.
+        """
         ...
 
     async def evict(self, *, current_train_weight: int) -> int:
@@ -116,6 +126,9 @@ class PromptGroupSampler(Protocol):
 
     supports_buffer_checkpoint: ClassVar[bool]
     """Whether completed buffered groups can be restored safely."""
+
+    supports_training_claims: ClassVar[bool]
+    """Whether selected groups remain owned until the train step commits."""
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         """Buffer-capacity the policy needs, or ``None`` if unconstrained."""
@@ -159,6 +172,7 @@ class BaseSampler(abc.ABC):
     """
 
     supports_buffer_checkpoint: ClassVar[bool] = False
+    supports_training_claims: ClassVar[bool] = True
 
     def __init__(self, buffer: TQReplayBuffer) -> None:
         self._buffer = buffer
@@ -287,7 +301,7 @@ class BaseSampler(abc.ABC):
         ]
         selected_meta = selected_metas[0].concat(*selected_metas[1:])  # type: ignore[union-attr]
         selected_meta.extra_info[ROLLOUT_METRICS] = selected_rollout_metrics
-        await self._buffer.remove(selected_idxs, remove_in_dp=False)
+        await self._buffer.claim_for_training(selected_idxs)
         return selected_meta, len(selected_idxs)
 
 
@@ -309,6 +323,7 @@ class WindowedSampler(BaseSampler):
         *,
         max_staleness_versions: int,
         sample_freshest_first: bool = False,
+        min_groups_for_streaming_train: Optional[int] = None,
     ) -> None:
         super().__init__(buffer)
         if max_staleness_versions < 0:
@@ -318,9 +333,14 @@ class WindowedSampler(BaseSampler):
             )
         self.max_staleness_versions = max_staleness_versions
         self.sample_freshest_first = sample_freshest_first
+        # Unordered: any full buffer is selectable, so the minimum capacity is the streaming floor.
+        self.min_groups_for_streaming_train = min_groups_for_streaming_train
 
     def _eviction_window(self) -> int:
         return self.max_staleness_versions
+
+    def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
+        return self.min_groups_for_streaming_train
 
     def should_abort_inflight(
         self,
@@ -655,7 +675,8 @@ class CustomSamplerConfig(BaseModel, extra="allow"):
     # Extra keys are forwarded to the constructor (after ``buffer``). The
     # target class must declare a boolean ``supports_buffer_checkpoint`` class
     # attribute so setup can validate recovery requirements before allocating
-    # cluster resources.
+    # cluster resources. Periodic rollout snapshots additionally require an
+    # explicit boolean ``supports_training_claims = True`` declaration.
     target: str
 
 
@@ -677,8 +698,10 @@ SamplerConfig = Annotated[
 def required_buffer_capacity_for_config(
     cfg: SamplerConfig,
     groups_per_step: int,
+    *,
+    min_groups_for_streaming_train: int,
 ) -> Optional[int]:
-    """Return a built-in sampler's required capacity without constructing it."""
+    """Return a sampler config's required capacity without constructing it."""
     if isinstance(cfg, ReadyFirstSamplerConfig):
         return _gated_required_buffer_capacity(
             groups_per_step,
@@ -694,6 +717,8 @@ def required_buffer_capacity_for_config(
             groups_per_step,
             gate_window=cfg.peak_lookahead_versions,
         )
+    if isinstance(cfg, WindowedSamplerConfig):
+        return min_groups_for_streaming_train
     return None
 
 
@@ -747,15 +772,39 @@ def sampler_supports_buffer_checkpoint(cfg: SamplerConfig) -> bool:
     return capability
 
 
+def sampler_supports_training_claims(cfg: SamplerConfig) -> bool:
+    """Return whether selection transfers rows into training ownership.
+
+    Built-in samplers use :meth:`TQReplayBuffer.claim_for_training`. Custom
+    samplers retain the legacy local-removal contract unless they explicitly
+    opt in, so enabling periodic snapshots cannot silently assume ownership
+    metadata that the sampler never created.
+    """
+    sampler_cls = _sampler_class_for_config(cfg)
+    if isinstance(cfg, CustomSamplerConfig):
+        capability = sampler_cls.__dict__.get("supports_training_claims", False)
+    else:
+        capability = getattr(sampler_cls, "supports_training_claims", None)
+    if not isinstance(capability, bool):
+        raise TypeError(
+            f"{sampler_cls.__name__}.supports_training_claims must be a "
+            f"boolean class attribute, got {capability!r}"
+        )
+    return capability
+
+
 def create_sampler(
     buffer: TQReplayBuffer,
     cfg: SamplerConfig,
+    *,
+    min_groups_for_streaming_train: Optional[int] = None,
 ) -> PromptGroupSampler:
     """Build a sampler from its config (or import one by FQN).
 
     Args:
         buffer: Shared TQReplayBuffer holding the candidate slots.
         cfg: Discriminated sampler config selecting the policy.
+        min_groups_for_streaming_train: Streaming floor used by the windoweds sampler.
     """
     sampler_cls = _sampler_class_for_config(cfg)
     sampler: PromptGroupSampler
@@ -764,6 +813,7 @@ def create_sampler(
             buffer,
             max_staleness_versions=cfg.max_staleness_versions,
             sample_freshest_first=cfg.sample_freshest_first,
+            min_groups_for_streaming_train=min_groups_for_streaming_train,
         )
     elif isinstance(cfg, ReadyFirstSamplerConfig):
         sampler = sampler_cls(
@@ -790,7 +840,8 @@ def create_sampler(
                 f"interface (needs admit/select/evict/should_abort_inflight, "
                 f"dispatch_index, set_dispatch_index, restore_dispatch_index, "
                 f"is_on_policy, supports_buffer_checkpoint, "
-                f"required_buffer_capacity)"
+                f"required_buffer_capacity; periodic rollout snapshots also "
+                f"require supports_training_claims=True)"
             )
     else:
         raise ValueError(f"unknown sampler config {type(cfg).__name__}")

@@ -26,13 +26,61 @@ nemo_rl.models.megatron.setup, focusing on:
 
 import os
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
+import yaml
+
+# The BF16 decoder-layer boundary a 48-layer model with 2 start / 4 end layers
+# resolves to. The driver derives this and writes it into the rollout config;
+# the Megatron worker verifies against it.
+_EXPECTED_BF16_BOUNDARY = [
+    "*.layers.0.mlp.experts*",
+    "*.layers.1.mlp.experts*",
+    "*.layers.44.mlp.experts*",
+    "*.layers.45.mlp.experts*",
+    "*.layers.46.mlp.experts*",
+    "*.layers.47.mlp.experts*",
+]
+
+
+def _nvfp4_model_config() -> SimpleNamespace:
+    # Megatron is optional outside the mcore test lane.
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    boundary_fields = {
+        "first_last_layers_bf16",
+        "num_layers_at_start_in_bf16",
+        "num_layers_at_end_in_bf16",
+    }
+    defaults = {
+        item.name: item.default
+        for item in fields(TransformerConfig)
+        if item.name in boundary_fields
+    }
+    return SimpleNamespace(num_layers=48, **defaults)
+
+
+@pytest.mark.mcore
+def test_mcore_bf16_boundary_defaults_match_driver_constants() -> None:
+    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
+        MCORE_DEFAULT_NUM_LAYERS_AT_END_IN_BF16,
+        MCORE_DEFAULT_NUM_LAYERS_AT_START_IN_BF16,
+    )
+
+    model_cfg = _nvfp4_model_config()
+    assert (
+        model_cfg.num_layers_at_start_in_bf16
+        == MCORE_DEFAULT_NUM_LAYERS_AT_START_IN_BF16
+    )
+    assert (
+        model_cfg.num_layers_at_end_in_bf16 == MCORE_DEFAULT_NUM_LAYERS_AT_END_IN_BF16
+    )
 
 
 @dataclass
@@ -705,6 +753,37 @@ class TestApplyParallelismConfig:
 
 
 @pytest.mark.mcore
+class TestApplyMultimodalConfig:
+    def test_maps_legacy_omni_freeze_controls(self):
+        from nemo_rl.models.megatron.setup import _apply_multimodal_config
+
+        model_cfg = SimpleNamespace(
+            freeze_vision_model=False,
+            freeze_vision_projection=False,
+            freeze_sound_encoder=False,
+            freeze_sound_projection=False,
+            radio_force_cpe_eval_mode=False,
+        )
+        config = {
+            "megatron_cfg": {
+                "freeze_vision_encoder": False,
+                "freeze_vision_projector": False,
+                "freeze_audio_encoder": True,
+                "freeze_audio_projector": True,
+                "radio_force_cpe_eval_mode": True,
+            }
+        }
+
+        _apply_multimodal_config(model_cfg, config)
+
+        assert model_cfg.freeze_vision_model is False
+        assert model_cfg.freeze_vision_projection is False
+        assert model_cfg.freeze_sound_encoder is True
+        assert model_cfg.freeze_sound_projection is True
+        assert model_cfg.radio_force_cpe_eval_mode is True
+
+
+@pytest.mark.mcore
 class TestApplyMoeConfig:
     """Tests for _apply_moe_config function."""
 
@@ -807,6 +886,119 @@ class TestApplyMoeConfig:
         _apply_moe_config(model_cfg, config)
 
         assert not hasattr(model_cfg, "moe_grouped_gemm")
+
+    def test_hybridep_input_prepadding_wins_after_bridge_validation(self):
+        from nemo_rl.models.megatron import setup
+
+        validate_megatron_config = getattr(setup, "validate_megatron_config", None)
+        assert validate_megatron_config is not None
+
+        model_cfg = SimpleNamespace(
+            moe_hybridep_pad_uneven_dispatch_inputs=False,
+        )
+        megatron_cfg = SimpleNamespace(model=model_cfg)
+
+        def bridge_validate():
+            model_cfg.moe_hybridep_pad_uneven_dispatch_inputs = True
+
+        megatron_cfg.validate = MagicMock(side_effect=bridge_validate)
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=8,
+            moe_flex_dispatcher_backend="hybridep",
+            moe_hybridep_prepad_packed_inputs=True,
+            pipeline_model_parallel_size=1,
+            mtp_num_layers=0,
+        )
+        config["sequence_packing"] = {"enabled": True}
+
+        validate_megatron_config(megatron_cfg, config)
+
+        megatron_cfg.validate.assert_called_once_with()
+        assert model_cfg.moe_hybridep_pad_uneven_dispatch_inputs is False
+
+    def test_hybridep_dispatch_padding_stays_enabled_without_input_prepadding(self):
+        from nemo_rl.models.megatron.setup import validate_megatron_config
+
+        model_cfg = SimpleNamespace(
+            moe_hybridep_pad_uneven_dispatch_inputs=True,
+        )
+        megatron_cfg = SimpleNamespace(model=model_cfg)
+        megatron_cfg.validate = MagicMock()
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=8,
+            moe_flex_dispatcher_backend="hybridep",
+        )
+
+        validate_megatron_config(megatron_cfg, config)
+
+        megatron_cfg.validate.assert_called_once_with()
+        assert model_cfg.moe_hybridep_pad_uneven_dispatch_inputs is True
+
+    def test_hybridep_input_prepadding_requires_flex_dispatcher(self, monkeypatch):
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "8")
+        monkeypatch.setenv("USE_MNNVL", "0")
+        model_cfg = SimpleNamespace(
+            moe_hybridep_pad_uneven_dispatch_inputs=True,
+        )
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=8,
+            moe_token_dispatcher_type="alltoall",
+            moe_flex_dispatcher_backend="hybridep",
+            moe_hybridep_prepad_packed_inputs=True,
+            pipeline_model_parallel_size=1,
+            mtp_num_layers=0,
+        )
+        config["sequence_packing"] = {"enabled": True}
+
+        with pytest.raises(ValueError, match="flex token dispatcher"):
+            _apply_moe_config(model_cfg, config)
+
+    @pytest.mark.parametrize(
+        ("overrides", "message"),
+        [
+            ({"pipeline_model_parallel_size": 8}, "pipeline parallel size 1"),
+            ({"mtp_num_layers": 1}, "MTP disabled"),
+        ],
+    )
+    def test_hybridep_input_prepadding_rejects_unsupported_layouts(
+        self, monkeypatch, overrides, message
+    ):
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "8")
+        monkeypatch.setenv("USE_MNNVL", "0")
+        model_cfg = SimpleNamespace(
+            moe_hybridep_pad_uneven_dispatch_inputs=True,
+        )
+        megatron_overrides = {
+            "expert_model_parallel_size": 8,
+            "moe_flex_dispatcher_backend": "hybridep",
+            "moe_hybridep_prepad_packed_inputs": True,
+            "pipeline_model_parallel_size": 1,
+            "mtp_num_layers": 0,
+            **overrides,
+        }
+        config = self._base_moe_cfg(**megatron_overrides)
+        config["sequence_packing"] = {"enabled": True}
+
+        with pytest.raises(ValueError, match=message):
+            _apply_moe_config(model_cfg, config)
+
+    def test_non_hybridep_preserves_uneven_dispatch_padding_default(self):
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = SimpleNamespace(
+            moe_hybridep_pad_uneven_dispatch_inputs=False,
+        )
+        config = self._base_moe_cfg(
+            moe_flex_dispatcher_backend="deepep",
+        )
+
+        _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.moe_hybridep_pad_uneven_dispatch_inputs is False
 
     def test_hybridep_env_vars_auto_set_with_warning(self, monkeypatch):
         """HybridEP backend with no env config: auto-set env vars and emit warnings."""
@@ -1031,6 +1223,37 @@ class TestApplyPrecisionConfig:
             _apply_precision_config(model_cfg, config, torch.float32)
             assert model_cfg.pipeline_dtype == expected_dtype
 
+    def test_fp32_lm_head_sets_logit_dtype(self):
+        """The fp32 LM-head knob maps to Megatron-Bridge provider logit_dtype."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace(bf16=False, fp16=False, logit_dtype=None)
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp32_lm_head": True,
+            }
+        }
+
+        _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert model_cfg.logit_dtype is torch.float32
+
+    def test_fp32_lm_head_requires_provider_logit_dtype(self):
+        """Fail loudly when the Bridge provider cannot emit fp32 logits."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp32_lm_head": True,
+            }
+        }
+
+        with pytest.raises(ValueError, match="logit_dtype"):
+            _apply_precision_config(model_cfg, config, torch.bfloat16)
+
     @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
     def test_loads_te_precision_config_when_configured(
         self, mock_load_recipe, tmp_path
@@ -1078,7 +1301,12 @@ class TestApplyPrecisionConfig:
             "megatron_cfg": {
                 "pipeline_dtype": "bfloat16",
                 "te_precision_config_file": str(recipe_file),
-                "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+                "fp8_cfg": {
+                    "enabled": True,
+                    "fp8": "e4m3",
+                    "fp8_recipe": "mxfp8",
+                    "fp8_param": False,
+                },
             }
         }
 
@@ -1108,7 +1336,12 @@ class TestApplyPrecisionConfig:
             "megatron_cfg": {
                 "pipeline_dtype": "bfloat16",
                 "te_precision_config_file": str(recipe_file),
-                "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+                "fp8_cfg": {
+                    "enabled": True,
+                    "fp8": "e4m3",
+                    "fp8_recipe": "mxfp8",
+                    "fp8_param": False,
+                },
             }
         }
 
@@ -1139,7 +1372,12 @@ class TestApplyPrecisionConfig:
             "megatron_cfg": {
                 "pipeline_dtype": "bfloat16",
                 "te_precision_config_file": str(recipe_file),
-                "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+                "fp8_cfg": {
+                    "enabled": True,
+                    "fp8": "e4m3",
+                    "fp8_recipe": "mxfp8",
+                    "fp8_param": False,
+                },
             }
         }
 
@@ -1204,7 +1442,12 @@ class TestApplyPrecisionConfig:
             "megatron_cfg": {
                 "pipeline_dtype": "bfloat16",
                 "te_precision_config_file": str(recipe_file),
-                "fp8_cfg": {"enabled": True},
+                "fp8_cfg": {
+                    "enabled": True,
+                    "fp8": "e4m3",
+                    "fp8_recipe": "default",
+                    "fp8_param": False,
+                },
             }
         }
 
@@ -1274,6 +1517,573 @@ class TestApplyPrecisionConfig:
 
         assert len(warning_records) == 0
         mock_load_recipe.assert_called_once_with(str(recipe_file))
+
+    @pytest.mark.parametrize(
+        ("fp8_recipe", "fp8_quantizer_factory"),
+        [
+            ("default", None),
+            ("custom", "test_quantizers.create_quantizers"),
+        ],
+        ids=["factory-absent", "factory-present"],
+    )
+    def test_fp8_configuration(
+        self, fp8_recipe: str, fp8_quantizer_factory: str | None
+    ) -> None:
+        """Test FP8 configuration."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = MagicMock()
+        fp8_cfg = {
+            "enabled": True,
+            "fp8": "e4m3",
+            "fp8_recipe": fp8_recipe,
+            "fp8_param": False,
+        }
+        if fp8_quantizer_factory is not None:
+            fp8_cfg["fp8_quantizer_factory"] = fp8_quantizer_factory
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp8_cfg": fp8_cfg,
+            }
+        }
+
+        _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert model_cfg.fp8 == "e4m3"
+        assert model_cfg.fp8_recipe == fp8_recipe
+        assert model_cfg.fp8_param is False
+        assert model_cfg.fp8_quantizer_factory == fp8_quantizer_factory
+
+    def test_fp4_configuration_uses_nvfp4_parameter_defaults(self):
+        """Apply NVFP4 defaults without repeating them in the recipe."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace(fp8=None)
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp4_cfg": {
+                    "enabled": True,
+                    "fp4": "e2m1",
+                },
+            }
+        }
+
+        _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert model_cfg.fp4 == "e2m1"
+        assert model_cfg.fp4_recipe == "nvfp4"
+        assert model_cfg.fp4_param is False
+        assert model_cfg.fp8 is None
+
+    def test_fp4_param_rejects_generation_refit(self):
+        """Reject FP4 parameter storage when generation requires weight refit."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        config = {
+            "generation": {"backend": "vllm"},
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp4_cfg": {
+                    "enabled": True,
+                    "fp4": "e2m1",
+                    "fp4_param": True,
+                },
+            },
+        }
+
+        with pytest.raises(ValueError, match="no FP4 parameter-and-scale export path"):
+            _apply_precision_config(SimpleNamespace(), config, torch.bfloat16)
+
+    def test_fp4_param_allows_training_without_refit(self):
+        """Allow FP4 parameter storage when no generation refit is configured."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace(fp8=None)
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp4_cfg": {
+                    "enabled": True,
+                    "fp4": "e2m1",
+                    "fp4_param": True,
+                },
+            }
+        }
+
+        _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert model_cfg.fp4_param is True
+
+    def test_fp8_and_fp4_are_mutually_exclusive(self):
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        with pytest.raises(ValueError, match="cannot both"):
+            _apply_precision_config(
+                SimpleNamespace(),
+                {
+                    "megatron_cfg": {
+                        "pipeline_dtype": "bfloat16",
+                        "fp8_cfg": {
+                            "enabled": True,
+                            "fp8": "e4m3",
+                            "fp8_recipe": "default",
+                            "fp8_param": False,
+                        },
+                        "fp4_cfg": {"enabled": True},
+                    }
+                },
+                torch.bfloat16,
+            )
+
+    def test_fp4_requires_format_when_enabled(self):
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        with pytest.raises(KeyError, match="'fp4'"):
+            _apply_precision_config(
+                SimpleNamespace(),
+                {
+                    "megatron_cfg": {
+                        "pipeline_dtype": "bfloat16",
+                        "fp4_cfg": {"enabled": True},
+                    }
+                },
+                torch.bfloat16,
+            )
+
+    def test_fp4_rejects_unknown_fields(self):
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        with pytest.raises(ValueError, match="extra_forbidden"):
+            _apply_precision_config(
+                SimpleNamespace(),
+                {
+                    "megatron_cfg": {
+                        "pipeline_dtype": "bfloat16",
+                        "fp4_cfg": {"enabled": False, "fp4_recipie": "nvfp4"},
+                    }
+                },
+                torch.bfloat16,
+            )
+
+    def test_fp4_disabled_leaves_precision_unchanged(self):
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace()
+        _apply_precision_config(
+            model_cfg,
+            {
+                "megatron_cfg": {
+                    "pipeline_dtype": "bfloat16",
+                    "fp4_cfg": {"enabled": False},
+                }
+            },
+            torch.bfloat16,
+        )
+
+        assert not hasattr(model_cfg, "fp4")
+
+    @pytest.mark.parametrize(
+        "policy_update",
+        [
+            {"precision": "float32"},
+            {"quant_cfg": "examples/modelopt/quant_configs/nvfp4_experts.yaml"},
+            {"megatron_cfg": {"fp4_cfg": {"enabled": False}}},
+            {"megatron_cfg": {"fp4_cfg": {"fp4_recipe": "other"}}},
+            {"megatron_cfg": {"env_vars": {"NVTE_BACKWARD_OVERRIDE": "dequantized"}}},
+            {"megatron_cfg": {"te_precision_config_file": None}},
+        ],
+    )
+    def test_nvfp4_pertoken_requires_validated_training_contract(self, policy_update):
+        from pathlib import Path
+
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        config = {
+            "precision": "bfloat16",
+            "generation": {
+                "backend": "vllm",
+                "nvfp4_pertoken_rollout": {"enabled": True},
+            },
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp4_cfg": {
+                    "enabled": True,
+                    "fp4": "e2m1",
+                },
+                "env_vars": {
+                    "NVTE_NVFP4_ROW_SCALED_ACTIVATION": "1",
+                    "NVTE_NVFP4_DISABLE_RHT": "1",
+                    "NVTE_NVFP4_DISABLE_2D_QUANTIZATION": "1",
+                    "NVTE_BACKWARD_OVERRIDE": "dequantized",
+                },
+                "te_precision_config_file": str(
+                    Path(__file__).resolve().parents[4]
+                    / "examples/te_precision/attn_bf16_mlp_nvfp4.yaml"
+                ),
+            },
+        }
+        if "precision" in policy_update:
+            config["precision"] = policy_update["precision"]
+        if "quant_cfg" in policy_update:
+            config["quant_cfg"] = policy_update["quant_cfg"]
+        if "megatron_cfg" in policy_update:
+            for key, value in policy_update["megatron_cfg"].items():
+                if key == "fp4_cfg":
+                    config["megatron_cfg"]["fp4_cfg"].update(value)
+                else:
+                    config["megatron_cfg"][key] = value
+
+        with pytest.raises(ValueError, match="requires policy.precision"):
+            _apply_precision_config(_nvfp4_model_config(), config, torch.bfloat16)
+
+    @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
+    def test_nvfp4_pertoken_accepts_complete_training_contract(self, mock_load_recipe):
+        from pathlib import Path
+
+        from megatron.core.quantization.utils import load_quantization_recipe
+
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        mock_load_recipe.side_effect = load_quantization_recipe
+
+        model_cfg = _nvfp4_model_config()
+        config = {
+            "precision": "bfloat16",
+            "generation": {
+                "backend": "vllm",
+                "nvfp4_pertoken_rollout": {
+                    "enabled": True,
+                    # The driver derives and writes this before workers start;
+                    # the trainer only verifies it against its own MCore config.
+                    "additional_ignore": _EXPECTED_BF16_BOUNDARY,
+                },
+            },
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp4_cfg": {"enabled": True, "fp4": "e2m1"},
+                "first_last_layers_bf16": True,
+                "num_layers_at_start_in_bf16": 2,
+                "num_layers_at_end_in_bf16": 4,
+                "te_precision_config_file": str(
+                    Path(__file__).resolve().parents[4]
+                    / "examples/te_precision/attn_bf16_mlp_nvfp4.yaml"
+                ),
+                "env_vars": {
+                    "NVTE_NVFP4_ROW_SCALED_ACTIVATION": "1",
+                    "NVTE_NVFP4_DISABLE_RHT": "1",
+                    "NVTE_NVFP4_DISABLE_2D_QUANTIZATION": "1",
+                    "NVTE_BACKWARD_OVERRIDE": "dequantized",
+                },
+            },
+        }
+
+        _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert (
+            config["generation"]["nvfp4_pertoken_rollout"]["additional_ignore"]
+            == _EXPECTED_BF16_BOUNDARY
+        )
+        mock_load_recipe.assert_called_once_with(
+            config["megatron_cfg"]["te_precision_config_file"]
+        )
+
+    @pytest.fixture
+    def nvfp4_policy(self, tmp_path: Path) -> dict[str, Any]:
+        recipe_path = tmp_path / "precision.yaml"
+        recipe_path.write_text(
+            (
+                Path(__file__).resolve().parents[4]
+                / "examples/te_precision/attn_bf16_mlp_nvfp4.yaml"
+            ).read_text()
+        )
+        return {
+            "precision": "bfloat16",
+            "generation": {
+                "backend": "vllm",
+                "nvfp4_pertoken_rollout": {"enabled": True},
+            },
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp4_cfg": {"enabled": True, "fp4": "e2m1"},
+                "te_precision_config_file": str(recipe_path),
+                "env_vars": {
+                    "NVTE_NVFP4_ROW_SCALED_ACTIVATION": "1",
+                    "NVTE_NVFP4_DISABLE_RHT": "1",
+                    "NVTE_NVFP4_DISABLE_2D_QUANTIZATION": "1",
+                    "NVTE_BACKWARD_OVERRIDE": "dequantized",
+                },
+            },
+        }
+
+    @pytest.mark.parametrize(
+        "variable",
+        [
+            "NVTE_NVFP4_ROW_SCALED_ACTIVATION",
+            "NVTE_NVFP4_DISABLE_RHT",
+            "NVTE_NVFP4_DISABLE_2D_QUANTIZATION",
+            "NVTE_BACKWARD_OVERRIDE",
+        ],
+    )
+    @pytest.mark.parametrize("value", [None, "0"])
+    def test_nvfp4_pertoken_requires_each_env_variable(
+        self, nvfp4_policy: dict[str, Any], variable: str, value: str | None
+    ) -> None:
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        env_vars = nvfp4_policy["megatron_cfg"]["env_vars"]
+        expected = env_vars.pop(variable)
+        if value is not None:
+            env_vars[variable] = value
+        with pytest.raises(ValueError, match="invalid env values") as exc_info:
+            _apply_precision_config(_nvfp4_model_config(), nvfp4_policy, torch.bfloat16)
+        message = str(exc_info.value)
+        assert f"{variable}={expected}" in message
+        assert f"invalid env values: {{{variable!r}: {value!r}}}" in message
+        for key, required in env_vars.items():
+            if key != variable:
+                assert f"{key}={required}" in message
+
+    def test_nvfp4_pertoken_stochastic_rounding_flag_is_optional(
+        self, nvfp4_policy: dict[str, Any]
+    ) -> None:
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        assert (
+            "NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING"
+            not in nvfp4_policy["megatron_cfg"]["env_vars"]
+        )
+        _apply_precision_config(_nvfp4_model_config(), nvfp4_policy, torch.bfloat16)
+
+    @pytest.mark.parametrize("evaluation", [False, True])
+    def test_nvfp4_pertoken_accepts_arbitrary_recipe_keys(
+        self, nvfp4_policy: dict[str, Any], evaluation: bool
+    ) -> None:
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_path = Path(nvfp4_policy["megatron_cfg"]["te_precision_config_file"])
+        recipe = yaml.safe_load(recipe_path.read_text())
+        for old, new in (("bf16", "high_precision"), ("nvfp4", "expert_precision")):
+            recipe["configs"][new] = recipe["configs"].pop(old)
+            if evaluation:
+                recipe["configs"][new]["evaluation_recipe"] = recipe["configs"][new][
+                    "training_recipe"
+                ].copy()
+            for matcher in recipe["matchers"].values():
+                if matcher["config"] == old:
+                    matcher["config"] = new
+        recipe_path.write_text(yaml.safe_dump(recipe, sort_keys=False))
+        _apply_precision_config(_nvfp4_model_config(), nvfp4_policy, torch.bfloat16)
+
+    @pytest.mark.parametrize("catchall_first", [False, True])
+    def test_nvfp4_pertoken_rejects_missing_or_misordered_catchall(
+        self, nvfp4_policy: dict[str, Any], catchall_first: bool
+    ) -> None:
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_path = Path(nvfp4_policy["megatron_cfg"]["te_precision_config_file"])
+        recipe = yaml.safe_load(recipe_path.read_text())
+        catchall = recipe["matchers"].pop("fallthrough_bf16")
+        if catchall_first:
+            recipe["matchers"] = {"fallthrough_bf16": catchall, **recipe["matchers"]}
+        recipe_path.write_text(yaml.safe_dump(recipe, sort_keys=False))
+        with pytest.raises(ValueError, match="mismatches") as exc_info:
+            _apply_precision_config(_nvfp4_model_config(), nvfp4_policy, torch.bfloat16)
+        message = str(exc_info.value)
+        for mode in ("training", "evaluation"):
+            if catchall_first:
+                assert (
+                    f"mlp.experts.linear_fc1 ({mode}): expected nvfp4, got bf16"
+                    in message
+                )
+            else:
+                assert f"mlp.linear_fc1 ({mode}): expected bf16, got nvfp4" in message
+                assert (
+                    f"mlp.shared_experts.linear_fc2 ({mode}): expected bf16, got nvfp4"
+                    in message
+                )
+
+    @pytest.mark.parametrize("mode", ["training", "evaluation"])
+    @pytest.mark.parametrize(
+        "module_path",
+        [
+            "self_attention.linear_qkv",
+            "mlp.linear_fc1",
+            "mlp.shared_experts.linear_fc2",
+        ],
+    )
+    @pytest.mark.parametrize("precision", ["nvfp4", "mxfp8"])
+    def test_nvfp4_pertoken_rejects_quantized_protected_modules(
+        self, nvfp4_policy: dict[str, Any], mode: str, module_path: str, precision: str
+    ) -> None:
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_path = Path(nvfp4_policy["megatron_cfg"]["te_precision_config_file"])
+        recipe = yaml.safe_load(recipe_path.read_text())
+        recipe["configs"]["bad_precision"] = {
+            "transformer_engine_config_type": "TEQuantizationParams",
+            "training_recipe": {},
+        }
+        field = (
+            "fp4_quantization_recipe"
+            if precision == "nvfp4"
+            else "fp8_quantization_recipe"
+        )
+        recipe["configs"]["bad_precision"][f"{mode}_recipe"] = {field: precision}
+        recipe["matchers"] = {
+            "bad_override": {
+                "config": "bad_precision",
+                "type": "glob",
+                "pattern": f"*.{module_path}",
+                "enabled": True,
+            },
+            **recipe["matchers"],
+        }
+        recipe_path.write_text(yaml.safe_dump(recipe, sort_keys=False))
+        with pytest.raises(ValueError, match="mismatches") as exc_info:
+            _apply_precision_config(_nvfp4_model_config(), nvfp4_policy, torch.bfloat16)
+        message = str(exc_info.value)
+        assert f"{module_path} ({mode}): expected bf16, got" in message
+        assert precision in message
+        if mode == "evaluation":
+            assert "(training)" not in message
+
+    @pytest.mark.parametrize("mode", ["training", "evaluation"])
+    def test_nvfp4_pertoken_rejects_bf16_without_autocast_override(
+        self, nvfp4_policy: dict[str, Any], mode: str
+    ) -> None:
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_path = Path(nvfp4_policy["megatron_cfg"]["te_precision_config_file"])
+        recipe = yaml.safe_load(recipe_path.read_text())
+        recipe["configs"]["bf16"][f"{mode}_recipe"] = {
+            "override_quantized_autocast": False
+        }
+        recipe_path.write_text(yaml.safe_dump(recipe, sort_keys=False))
+        with pytest.raises(ValueError, match="mismatches") as exc_info:
+            _apply_precision_config(_nvfp4_model_config(), nvfp4_policy, torch.bfloat16)
+        assert f"self_attention.linear_qkv ({mode}): expected bf16, got nvfp4" in str(
+            exc_info.value
+        )
+
+    @pytest.mark.parametrize(
+        "evaluation_recipe", [{}, {"fp8_quantization_recipe": "mxfp8"}]
+    )
+    def test_nvfp4_pertoken_rejects_non_nvfp4_expert_evaluation(
+        self, nvfp4_policy: dict[str, Any], evaluation_recipe: dict[str, str]
+    ) -> None:
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_path = Path(nvfp4_policy["megatron_cfg"]["te_precision_config_file"])
+        recipe = yaml.safe_load(recipe_path.read_text())
+        recipe["configs"]["nvfp4"]["evaluation_recipe"] = evaluation_recipe
+        recipe_path.write_text(yaml.safe_dump(recipe, sort_keys=False))
+        with pytest.raises(ValueError, match="mismatches") as exc_info:
+            _apply_precision_config(_nvfp4_model_config(), nvfp4_policy, torch.bfloat16)
+        message = str(exc_info.value)
+        assert "mlp.experts.linear_fc1 (evaluation): expected nvfp4, got" in message
+        assert "(training)" not in message
+
+    def test_nvfp4_pertoken_rejects_unnormalized_rollout_boundary(self):
+        """A missed driver-side normalization must fail here, not run split.
+
+        ``normalize_nvfp4_pertoken_policy_config`` has to run on every entry
+        point. If one is missed the rollout arrives with no BF16 boundary while
+        the trainer keeps first/last layers in BF16, so the two would disagree
+        on precision with nothing to signal it.
+        """
+        from pathlib import Path
+
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = _nvfp4_model_config()
+        config = {
+            "precision": "bfloat16",
+            "generation": {
+                "backend": "vllm",
+                "nvfp4_pertoken_rollout": {"enabled": True},
+            },
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp4_cfg": {"enabled": True, "fp4": "e2m1"},
+                "first_last_layers_bf16": True,
+                "num_layers_at_start_in_bf16": 2,
+                "num_layers_at_end_in_bf16": 4,
+                "te_precision_config_file": str(
+                    Path(__file__).resolve().parents[4]
+                    / "examples/te_precision/attn_bf16_mlp_nvfp4.yaml"
+                ),
+                "env_vars": {
+                    "NVTE_NVFP4_ROW_SCALED_ACTIVATION": "1",
+                    "NVTE_NVFP4_DISABLE_RHT": "1",
+                    "NVTE_NVFP4_DISABLE_2D_QUANTIZATION": "1",
+                    "NVTE_BACKWARD_OVERRIDE": "dequantized",
+                },
+            },
+        }
+
+        with pytest.raises(ValueError, match="did not run for this entry point"):
+            _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+    def test_first_and_last_bf16_layers_are_forwarded(self):
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace()
+        _apply_precision_config(
+            model_cfg,
+            {
+                "megatron_cfg": {
+                    "pipeline_dtype": "bfloat16",
+                    "first_last_layers_bf16": True,
+                    "num_layers_at_start_in_bf16": 2,
+                    "num_layers_at_end_in_bf16": 4,
+                }
+            },
+            torch.bfloat16,
+        )
+
+        assert model_cfg.first_last_layers_bf16 is True
+        assert model_cfg.num_layers_at_start_in_bf16 == 2
+        assert model_cfg.num_layers_at_end_in_bf16 == 4
+
+    def test_te_precision_recipe_matches_attention_and_mlp_modules(self):
+        from pathlib import Path
+
+        from megatron.core.quantization.quant_config import MatchContext
+
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_path = (
+            Path(__file__).resolve().parents[4]
+            / "examples/te_precision/attn_bf16_mlp_nvfp4.yaml"
+        )
+        model_cfg = SimpleNamespace()
+        _apply_precision_config(
+            model_cfg,
+            {
+                "megatron_cfg": {
+                    "pipeline_dtype": "bfloat16",
+                    "te_precision_config_file": str(recipe_path),
+                }
+            },
+            torch.bfloat16,
+        )
+
+        def match(module_path):
+            return model_cfg.quant_recipe.match_to_config_key(
+                MatchContext(module_path=module_path, layer_number=0)
+            )
+
+        assert match("decoder.layers.0.self_attention.linear_qkv") == "bf16"
+        assert match("decoder.layers.0.self_attention.linear_proj") == "bf16"
+        assert match("decoder.layers.0.mlp.experts.linear_fc1") == "nvfp4"
+        assert match("decoder.layers.0.mlp.experts.linear_fc2") == "nvfp4"
+        assert match("decoder.layers.0.mlp.linear_fc1") == "bf16"
+        assert match("decoder.layers.0.mlp.linear_fc2") == "bf16"
+        assert match("decoder.layers.0.mlp.shared_experts.linear_fc1") == "bf16"
+        assert match("decoder.layers.0.mlp.shared_experts.linear_fc2") == "bf16"
+        assert match("decoder.layers.0.input_layernorm") == "bf16"
 
 
 @pytest.mark.mcore
@@ -1501,34 +2311,6 @@ class TestApplyPerformanceConfig:
             _apply_performance_config(model_cfg, config)
 
         assert "activation_func must be set" in str(exc_info.value)
-
-    def test_fp8_configuration(self):
-        """Test FP8 configuration."""
-        from nemo_rl.models.megatron.setup import _apply_performance_config
-
-        model_cfg = MagicMock()
-        model_cfg.gated_linear_unit = True
-        config = {
-            "megatron_cfg": {
-                "activation_checkpointing": False,
-                "apply_rope_fusion": False,
-                "bias_activation_fusion": False,
-                "gradient_accumulation_fusion": False,
-                "use_fused_weighted_squared_relu": False,
-                "fp8_cfg": {
-                    "enabled": True,
-                    "fp8": "e4m3",
-                    "fp8_recipe": "default",
-                    "fp8_param": False,
-                },
-            }
-        }
-
-        _apply_performance_config(model_cfg, config)
-
-        assert model_cfg.fp8 == "e4m3"
-        assert model_cfg.fp8_recipe == "default"
-        assert model_cfg.fp8_param is False
 
     def test_fine_grained_activation_offloading_enabled(self):
         """Test happy path: enabled with non-empty offload_modules list."""
@@ -2535,6 +3317,64 @@ class TestCreateMegatronConfigOptimizerFp8Recipe:
         )
 
         assert optimizer.fp8_recipe is None
+
+
+@pytest.mark.mcore
+class TestCreateMegatronConfigFP8Buffers:
+    """Tests for MXFP8 parameter-buffer plumbing into optimizer and DDP."""
+
+    @staticmethod
+    def _subconfig_kwargs():
+        from nemo_rl.models.megatron.setup import _create_megatron_config
+
+        config = {
+            "megatron_cfg": {
+                "optimizer": {"use_distributed_optimizer": True},
+                "scheduler": {},
+                "distributed_data_parallel_config": {
+                    "overlap_param_gather": True,
+                    "grad_reduce_in_fp32": False,
+                    "overlap_grad_reduce": True,
+                    "data_parallel_sharding_strategy": "optim_grads_params",
+                },
+                "fp8_cfg": {
+                    "enabled": True,
+                    "fp8_recipe": "mxfp8",
+                    "fp8_param": True,
+                },
+                "train_iters": 10,
+            },
+            "train_global_batch_size": 8,
+        }
+        with (
+            patch("nemo_rl.models.megatron.setup.ConfigContainer"),
+            patch("nemo_rl.models.megatron.setup.TrainingConfig"),
+            patch("nemo_rl.models.megatron.setup.OptimizerConfig") as mock_optimizer,
+            patch(
+                "nemo_rl.models.megatron.setup.DistributedDataParallelConfig"
+            ) as mock_ddp,
+            patch("nemo_rl.models.megatron.setup.SchedulerConfig"),
+            patch("nemo_rl.models.megatron.setup.TokenizerConfig"),
+            patch("nemo_rl.models.megatron.setup.LoggerConfig"),
+        ):
+            _create_megatron_config(
+                model_cfg=MagicMock(),
+                checkpoint_config=MagicMock(),
+                config=config,
+                hf_model_name="test-model",
+                dtype=torch.bfloat16,
+                fp8_param_enabled=True,
+            )
+
+        return mock_optimizer.call_args.kwargs, mock_ddp.call_args.kwargs
+
+    def test_mxfp8_recipe_and_param_gather_are_forwarded(self):
+        optimizer_kwargs, ddp_kwargs = self._subconfig_kwargs()
+
+        assert optimizer_kwargs["fp8_recipe"] == "mxfp8"
+        assert optimizer_kwargs["reuse_grad_buf_for_mxfp8_param_ag"] is True
+        assert ddp_kwargs["fp8_param_gather"] is True
+        assert ddp_kwargs["reuse_grad_buf_for_mxfp8_param_ag"] is True
 
 
 @pytest.mark.mcore
@@ -3595,12 +4435,13 @@ class TestDraftSetup:
         )
 
     @patch("nemo_rl.models.megatron.setup.get_pg_collection")
-    @patch("nemo_rl.models.megatron.setup.build_draft_model")
+    @patch("nemo_rl.models.megatron.draft.training.build_draft_model")
     def test_draft_pre_wrap_hook_attaches_only_owner_chunk(
         self, mock_build_draft_model, mock_get_pg_collection
     ):
         """The nested draft model should attach only to the owner post-process chunk."""
         from nemo_rl.models.megatron.setup import _create_draft_pre_wrap_hook
+        from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 
         class DummyChunk(torch.nn.Module):
             def __init__(self, *, post_process: bool = False):
@@ -3617,7 +4458,7 @@ class TestDraftSetup:
         mock_get_pg_collection.return_value = MagicMock()
 
         hook = _create_draft_pre_wrap_hook(
-            policy_cfg={"draft": {"enabled": True, "model_name": None}},
+            policy_cfg={"draft": Eagle3DraftConfig(enabled=True, model_name=None)},
             megatron_cfg=MagicMock(),
             state=MagicMock(),
             preload_policy_from_pretrained=False,
@@ -3634,6 +4475,61 @@ class TestDraftSetup:
             mock_build_draft_model.call_args.kwargs["policy_model_chunk"] is chunks[1]
         )
 
+    @pytest.mark.parametrize(
+        "draft_cfg_kind", ["absent", "dict-disabled", "typed-disabled"]
+    )
+    @patch("nemo_rl.models.megatron.setup._load_checkpoint_from_path")
+    @patch("nemo_rl.models.megatron.setup.get_pg_collection")
+    @patch("nemo_rl.models.megatron.draft.training.build_draft_model")
+    def test_draft_pre_wrap_hook_is_identity_when_draft_disabled(
+        self,
+        mock_build_draft_model,
+        mock_get_pg_collection,
+        mock_load_checkpoint,
+        draft_cfg_kind,
+    ):
+        """A disabled draft config must leave the policy chunks untouched.
+
+        `_create_draft_pre_wrap_hook` resolves the speculator eagerly, so a
+        disabled or absent config has to short-circuit before the builder, the
+        process-group lookup and the pretrained preload run.
+        """
+        from nemo_rl.models.megatron.setup import _create_draft_pre_wrap_hook
+        from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
+
+        class DummyChunk(torch.nn.Module):
+            def __init__(self, *, post_process: bool = False):
+                super().__init__()
+                self.post_process = post_process
+
+        chunks = [
+            DummyChunk(post_process=False),
+            DummyChunk(post_process=True),
+        ]
+        if draft_cfg_kind == "absent":
+            policy_cfg = {}
+        elif draft_cfg_kind == "dict-disabled":
+            policy_cfg = {"draft": {"enabled": False}}
+        else:
+            policy_cfg = {"draft": Eagle3DraftConfig(enabled=False, model_name=None)}
+
+        hook = _create_draft_pre_wrap_hook(
+            policy_cfg=policy_cfg,
+            megatron_cfg=MagicMock(),
+            state=MagicMock(),
+            # True so the preload branch would fire if the disabled config were
+            # not short-circuited.
+            preload_policy_from_pretrained=True,
+        )
+
+        returned_model = hook(chunks)
+
+        assert returned_model is chunks
+        assert all(getattr(chunk, "draft_model", None) is None for chunk in chunks)
+        mock_build_draft_model.assert_not_called()
+        mock_get_pg_collection.assert_not_called()
+        mock_load_checkpoint.assert_not_called()
+
     @patch("nemo_rl.models.megatron.draft.utils.copy_policy_lm_head_to_draft")
     @patch("nemo_rl.models.megatron.draft.utils.load_hf_weights_to_eagle")
     @patch("nemo_rl.models.megatron.draft.eagle.EagleModel")
@@ -3646,7 +4542,8 @@ class TestDraftSetup:
         mock_copy_lm_head,
     ):
         """Missing draft LM-head weights should fall back to the policy LM head."""
-        from nemo_rl.models.megatron.setup import build_draft_model
+        from nemo_rl.models.megatron.draft.utils import build_draft_model
+        from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 
         mock_auto_config.return_value.to_dict.return_value = {
             "num_hidden_layers": 2,
@@ -3671,7 +4568,7 @@ class TestDraftSetup:
 
         returned_model = build_draft_model(
             model_provider=self._build_model_provider(),
-            draft_config={"enabled": True, "model_name": "dummy-draft"},
+            draft_config=Eagle3DraftConfig(enabled=True, model_name="dummy-draft"),
             pg_collection=SimpleNamespace(tp=None),
             policy_model_chunk=policy_model_chunk,
         )
@@ -3709,12 +4606,13 @@ class TestDraftSetup:
             )
 
     @patch("nemo_rl.models.megatron.setup.get_pg_collection")
-    @patch("nemo_rl.models.megatron.setup.build_draft_model")
+    @patch("nemo_rl.models.megatron.draft.training.build_draft_model")
     def test_attached_draft_state_is_serializable(
         self, mock_build_draft_model, mock_get_pg_collection
     ):
         """Attached draft modules should be part of the owner chunk state_dict."""
         from nemo_rl.models.megatron.setup import _create_draft_pre_wrap_hook
+        from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 
         class DummyChunk(torch.nn.Module):
             def __init__(self):
@@ -3727,7 +4625,7 @@ class TestDraftSetup:
         def attach_fresh_draft():
             chunk = DummyChunk()
             hook = _create_draft_pre_wrap_hook(
-                policy_cfg={"draft": {"enabled": True, "model_name": None}},
+                policy_cfg={"draft": Eagle3DraftConfig(enabled=True, model_name=None)},
                 megatron_cfg=MagicMock(),
                 state=MagicMock(),
                 preload_policy_from_pretrained=False,
@@ -4057,3 +4955,777 @@ class TestForceSyncOptimizerFp32FromModel:
                 f"DistributedOptimizer no longer references {name!r}; "
                 "_force_sync_optimizer_fp32_from_model's level-1 sync is now a silent no-op."
             )
+
+
+@pytest.mark.mcore
+class TestForceSyncModelFromOptimizerFp32:
+    """Regression tests for the first forward after a full optimizer resume."""
+
+    @staticmethod
+    def _make_distrib_opt(hdo_cls, model_values=(0.0, 0.0), master_values=(3.0, 4.0)):
+        model_param = torch.tensor(model_values)
+        fp32_master = torch.tensor(master_values)
+
+        class _HDO(hdo_cls):
+            def __init__(self):
+                self.param_to_fp32_param = {model_param: fp32_master}
+
+        model_chunk = MagicMock()
+        distrib_opt = SimpleNamespace(
+            optimizer=_HDO(),
+            model_chunks=[model_chunk],
+        )
+        return SimpleNamespace(
+            distrib_opt=distrib_opt,
+            model_param=model_param,
+            fp32_master=fp32_master,
+            model_chunk=model_chunk,
+        )
+
+    def test_restores_compute_params_and_forces_dp_sync(self, monkeypatch):
+        """Loaded FP32 masters must reach BF16 shards before the first forward."""
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        class _HybridDeviceOptimizer:
+            pass
+
+        TestForceSyncOptimizerFp32FromModel._patch_hdo_class(
+            monkeypatch, _HybridDeviceOptimizer
+        )
+        fake = self._make_distrib_opt(_HybridDeviceOptimizer)
+
+        setup_mod._force_sync_model_from_optimizer_fp32(fake.distrib_opt)
+
+        torch.testing.assert_close(fake.model_param, fake.fp32_master)
+        fake.model_chunk.start_param_sync.assert_called_once_with(force_sync=True)
+
+    def test_handles_chained_optimizers(self, monkeypatch):
+        """Every distributed optimizer in a chain is restored and synchronized."""
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        class _HybridDeviceOptimizer:
+            pass
+
+        TestForceSyncOptimizerFp32FromModel._patch_hdo_class(
+            monkeypatch, _HybridDeviceOptimizer
+        )
+        a = self._make_distrib_opt(
+            _HybridDeviceOptimizer, model_values=(0.0, 0.0), master_values=(1.0, 2.0)
+        )
+        b = self._make_distrib_opt(
+            _HybridDeviceOptimizer, model_values=(0.0, 0.0), master_values=(5.0, 6.0)
+        )
+        chained = SimpleNamespace(chained_optimizers=[a.distrib_opt, b.distrib_opt])
+
+        setup_mod._force_sync_model_from_optimizer_fp32(chained)
+
+        for fake in (a, b):
+            torch.testing.assert_close(fake.model_param, fake.fp32_master)
+            fake.model_chunk.start_param_sync.assert_called_once_with(force_sync=True)
+
+    def test_noop_for_non_hybrid_optimizer(self, monkeypatch):
+        """Other optimizer implementations must remain untouched."""
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        class _HybridDeviceOptimizer:
+            pass
+
+        TestForceSyncOptimizerFp32FromModel._patch_hdo_class(
+            monkeypatch, _HybridDeviceOptimizer
+        )
+        model_chunk = MagicMock()
+        plain_opt = SimpleNamespace(
+            optimizer=object(),
+            model_chunks=[model_chunk],
+        )
+
+        setup_mod._force_sync_model_from_optimizer_fp32(plain_opt)
+
+        model_chunk.start_param_sync.assert_not_called()
+
+
+@pytest.mark.mcore
+class TestPeftWarmStart:
+    """Tests for the megatron_cfg.peft.restore_from warm-start path."""
+
+    @staticmethod
+    def _peft_cfg(**overrides):
+        """A complete megatron_cfg.peft config for an enabled LoRA run."""
+        cfg = {
+            "enabled": True,
+            "target_modules": ["linear_qkv"],
+            "exclude_modules": [],
+            "dim": 8,
+            "alpha": 32,
+            "dropout": 0.0,
+            "dropout_position": "pre",
+            "lora_A_init_method": "xavier",
+            "lora_B_init_method": "zero",
+            "a2a_experimental": False,
+            "lora_dtype": None,
+        }
+        cfg.update(overrides)
+        return cfg
+
+    def _make_donor_iter_dir(self, tmp_path, peft_section=None):
+        """Create a donor iteration directory with a run_config.yaml."""
+        iter_dir = tmp_path / "donor" / "iter_0000005"
+        iter_dir.mkdir(parents=True)
+        run_config = {"peft": peft_section} if peft_section is not None else {}
+        with open(iter_dir / "run_config.yaml", "w") as f:
+            yaml.dump(run_config, f)
+        return iter_dir
+
+    @pytest.mark.parametrize("key", ["target_modules", "exclude_modules"])
+    def test_null_module_list_matches_empty(self, tmp_path, key):
+        from nemo_rl.models.megatron.setup import _validate_peft_restore_config
+
+        donor = self._peft_cfg(**{key: None})
+        iter_dir = self._make_donor_iter_dir(tmp_path, donor)
+        _validate_peft_restore_config(str(iter_dir), self._peft_cfg(**{key: []}))
+
+    def test_moe_layout_uses_bridge_defaults(self, tmp_path):
+        import nemo_rl.models.megatron.setup as setup_mod
+
+        @dataclass
+        class UpdatedLoRA(setup_mod.LoRA):
+            normalize_moe_lora: bool = True
+
+        iter_dir = self._make_donor_iter_dir(
+            tmp_path, self._peft_cfg(normalize_moe_lora=True)
+        )
+        with patch.object(setup_mod, "LoRA", UpdatedLoRA):
+            setup_mod._validate_peft_restore_config(str(iter_dir), self._peft_cfg())
+
+    def test_resolve_iter_dir_directly(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _resolve_peft_restore_dir
+
+        iter_dir = self._make_donor_iter_dir(tmp_path, {"dim": 8, "alpha": 32})
+        assert _resolve_peft_restore_dir(str(iter_dir)) == str(iter_dir)
+
+    def test_resolve_root_with_tracker_file(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _resolve_peft_restore_dir
+
+        iter_dir = self._make_donor_iter_dir(tmp_path, {"dim": 8, "alpha": 32})
+        with open(tmp_path / "donor" / "latest_checkpointed_iteration.txt", "w") as f:
+            f.write("5")
+        assert _resolve_peft_restore_dir(str(tmp_path / "donor")) == str(iter_dir)
+
+    def test_resolve_root_with_iter_subdirs_fallback(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _resolve_peft_restore_dir
+
+        iter_dir = self._make_donor_iter_dir(tmp_path, {"dim": 8, "alpha": 32})
+        # No tracker file: falls back to scanning iter_* subdirectories.
+        assert _resolve_peft_restore_dir(str(tmp_path / "donor")) == str(iter_dir)
+
+    def test_resolve_missing_path_raises(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _resolve_peft_restore_dir
+
+        with pytest.raises(FileNotFoundError, match="does not exist"):
+            _resolve_peft_restore_dir(str(tmp_path / "nonexistent"))
+
+    def test_resolve_root_without_iterations_raises(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _resolve_peft_restore_dir
+
+        empty_root = tmp_path / "donor"
+        empty_root.mkdir()
+        with pytest.raises(FileNotFoundError, match="iter_"):
+            _resolve_peft_restore_dir(str(empty_root))
+
+    def test_resolve_iter_dir_missing_run_config_raises(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _resolve_peft_restore_dir
+
+        iter_dir = tmp_path / "donor" / "iter_0000005"
+        iter_dir.mkdir(parents=True)
+        with pytest.raises(FileNotFoundError, match="run_config.yaml"):
+            _resolve_peft_restore_dir(str(tmp_path / "donor"))
+
+    def test_validate_config_match_passes(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _validate_peft_restore_config
+
+        iter_dir = self._make_donor_iter_dir(tmp_path, self._peft_cfg())
+        _validate_peft_restore_config(
+            str(iter_dir), self._peft_cfg()
+        )  # should not raise
+
+    def test_validate_config_dim_mismatch_raises(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _validate_peft_restore_config
+
+        iter_dir = self._make_donor_iter_dir(tmp_path, self._peft_cfg(dim=16))
+        with pytest.raises(ValueError, match="dim"):
+            _validate_peft_restore_config(str(iter_dir), self._peft_cfg())
+
+    def test_validate_config_alpha_mismatch_raises(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _validate_peft_restore_config
+
+        iter_dir = self._make_donor_iter_dir(tmp_path, self._peft_cfg(alpha=64))
+        with pytest.raises(ValueError, match="alpha"):
+            _validate_peft_restore_config(str(iter_dir), self._peft_cfg())
+
+    def test_validate_config_missing_peft_section_raises(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _validate_peft_restore_config
+
+        iter_dir = self._make_donor_iter_dir(tmp_path, peft_section=None)
+        with pytest.raises(ValueError, match="no 'peft' section"):
+            _validate_peft_restore_config(str(iter_dir), self._peft_cfg())
+
+    def test_validate_config_missing_dim_key_raises(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _validate_peft_restore_config
+
+        donor_section = self._peft_cfg()
+        del donor_section["dim"]
+        iter_dir = self._make_donor_iter_dir(tmp_path, donor_section)
+        with pytest.raises(ValueError, match="'dim'"):
+            _validate_peft_restore_config(str(iter_dir), self._peft_cfg())
+
+    def test_validate_config_target_modules_mismatch_raises(self, tmp_path):
+        """A superset donor must fail closed, not load silently.
+
+        The adapter-only distributed load discards unrequested donor keys
+        without any diagnostics (DCP ASSUME_OK_UNEXPECTED skips the mismatch
+        check), so this comparison is the only thing standing between a
+        superset donor and a partial warm start.
+        """
+        from nemo_rl.models.megatron.setup import _validate_peft_restore_config
+
+        iter_dir = self._make_donor_iter_dir(
+            tmp_path,
+            self._peft_cfg(
+                target_modules=[
+                    "linear_qkv",
+                    "linear_proj",
+                    "linear_fc1",
+                    "linear_fc2",
+                ]
+            ),
+        )
+        with pytest.raises(ValueError, match="target_modules"):
+            _validate_peft_restore_config(str(iter_dir), self._peft_cfg())
+
+    def test_validate_config_exclude_modules_mismatch_raises(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _validate_peft_restore_config
+
+        iter_dir = self._make_donor_iter_dir(
+            tmp_path, self._peft_cfg(exclude_modules=["lm_head"])
+        )
+        with pytest.raises(ValueError, match="exclude_modules"):
+            _validate_peft_restore_config(str(iter_dir), self._peft_cfg())
+
+    def test_validate_config_missing_target_modules_key_raises(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _validate_peft_restore_config
+
+        donor_section = self._peft_cfg()
+        del donor_section["target_modules"]
+        iter_dir = self._make_donor_iter_dir(tmp_path, donor_section)
+        with pytest.raises(ValueError, match="'target_modules'"):
+            _validate_peft_restore_config(str(iter_dir), self._peft_cfg())
+
+    def test_validate_config_module_order_does_not_matter(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _validate_peft_restore_config
+
+        iter_dir = self._make_donor_iter_dir(
+            tmp_path, self._peft_cfg(target_modules=["linear_qkv", "linear_proj"])
+        )
+        _validate_peft_restore_config(
+            str(iter_dir),
+            self._peft_cfg(target_modules=["linear_proj", "linear_qkv"]),
+        )  # should not raise
+
+    def test_validate_config_moe_shaping_mismatch_raises(self, tmp_path):
+        from nemo_rl.models.megatron.setup import _validate_peft_restore_config
+
+        donor_section = self._peft_cfg()
+        donor_section["normalize_moe_lora"] = True  # run uses the default False
+        iter_dir = self._make_donor_iter_dir(tmp_path, donor_section)
+        with pytest.raises(ValueError, match="normalize_moe_lora"):
+            _validate_peft_restore_config(str(iter_dir), self._peft_cfg())
+
+    def test_validate_config_absent_moe_shaping_keys_pass(self, tmp_path):
+        """Donors saved before these bridge fields existed are not blocked."""
+        from nemo_rl.models.megatron.setup import _validate_peft_restore_config
+
+        iter_dir = self._make_donor_iter_dir(tmp_path, self._peft_cfg())
+        _validate_peft_restore_config(
+            str(iter_dir), self._peft_cfg()
+        )  # should not raise
+
+    def test_warm_start_hook_loads_adapter_only_and_restores_cfg(self, tmp_path):
+        from megatron.core.rerun_state_machine import RerunMode
+
+        from nemo_rl.models.megatron.setup import _create_peft_warm_start_hook
+
+        ckpt_cfg = SimpleNamespace(
+            load="/runs/current/policy/weights",
+            finetune=True,  # left over from the PEFT base-weights hook
+            load_optim=True,
+            load_rng=True,
+        )
+        # GlobalState.cfg's setter installs a signal handler based on
+        # cfg.train, so the namespace needs a train section too.
+        megatron_cfg = SimpleNamespace(
+            checkpoint=ckpt_cfg,
+            train=SimpleNamespace(exit_signal_handler=False),
+        )
+
+        from megatron.bridge.training.state import GlobalState
+
+        state = GlobalState()
+        # In production state.cfg IS megatron_cfg (setup.py assigns it), and
+        # _load_checkpoint_from_path reads its config off state.cfg.
+        state.cfg = megatron_cfg
+        state.train_state.step = 123
+        state.train_state.consumed_train_samples = 456
+
+        class FakeRerunStateMachine:
+            def __init__(self):
+                self.mode = RerunMode.VALIDATE_RESULTS
+
+            def get_mode(self):
+                return self.mode
+
+            def set_mode(self, mode):
+                self.mode = mode
+
+        rerun_state_machine = FakeRerunStateMachine()
+
+        captured = {}
+
+        def fake_load(**kwargs):
+            # Capture the checkpoint config as seen mid-load.
+            captured["load"] = ckpt_cfg.load
+            captured["finetune"] = ckpt_cfg.finetune
+            captured["load_optim"] = ckpt_cfg.load_optim
+            captured["load_rng"] = ckpt_cfg.load_rng
+            # The loader reads its config off state.cfg: assert the mutation
+            # is visible there, not just on the local SimpleNamespace.
+            captured["state_cfg_finetune"] = kwargs["state"].cfg.checkpoint.finetune
+            captured["load_dir"] = kwargs["load_dir"]
+            captured["optimizer"] = kwargs["optimizer"]
+            captured["opt_param_scheduler"] = kwargs["opt_param_scheduler"]
+            captured["skip_load_to_model_and_opt"] = kwargs[
+                "skip_load_to_model_and_opt"
+            ]
+            captured["ignore_ckpt_step"] = kwargs["ignore_ckpt_step"]
+            captured["checkpointing_context"] = kwargs["checkpointing_context"]
+            captured["rerun_mode"] = rerun_state_machine.get_mode()
+            return 0, 0
+
+        model = [MagicMock()]
+        with (
+            patch(
+                "nemo_rl.models.megatron.setup._load_checkpoint_from_path",
+                autospec=True,
+                side_effect=fake_load,
+            ),
+            patch(
+                "nemo_rl.models.megatron.setup.update_num_microbatches"
+            ) as mock_update_microbatches,
+            patch(
+                "nemo_rl.models.megatron.setup.get_rerun_state_machine",
+                return_value=rerun_state_machine,
+            ),
+        ):
+            hook = _create_peft_warm_start_hook(
+                megatron_cfg, state, "/donor/iter_0000005"
+            )
+            result = hook(model)
+
+        assert result is model
+        # The load was routed through the PEFT-resume path: checkpoint.load
+        # pointed at the donor with finetune=False (adapter-only, non-strict
+        # load) but optimizer/RNG state disabled.
+        assert captured["load_dir"] == "/donor/iter_0000005"
+        assert captured["load"] == "/donor/iter_0000005"
+        assert captured["finetune"] is False
+        assert captured["state_cfg_finetune"] is False
+        assert captured["load_optim"] is False
+        assert captured["load_rng"] is False
+        assert captured["optimizer"] is None
+        assert captured["opt_param_scheduler"] is None
+        assert captured["skip_load_to_model_and_opt"] is False
+        assert captured["ignore_ckpt_step"] is True
+        # An empty context isolates the donor load from the run's own
+        # dataloader-state directory.
+        assert captured["checkpointing_context"] == {}
+        assert captured["rerun_mode"] is RerunMode.DISABLED
+        # Config restored after the load.
+        assert ckpt_cfg.load == "/runs/current/policy/weights"
+        assert ckpt_cfg.finetune is True
+        assert ckpt_cfg.load_optim is True
+        assert ckpt_cfg.load_rng is True
+        assert rerun_state_machine.get_mode() is RerunMode.VALIDATE_RESULTS
+        # Train state reset so the run starts at step 0.
+        assert state.train_state.step == 0
+        assert state.train_state.consumed_train_samples == 0
+        mock_update_microbatches.assert_called_once_with(
+            consumed_samples=0, verbose=False
+        )
+
+    def test_warm_start_hook_restores_cfg_on_load_failure(self):
+        from megatron.core.rerun_state_machine import RerunMode
+
+        from nemo_rl.models.megatron.setup import _create_peft_warm_start_hook
+
+        ckpt_cfg = SimpleNamespace(
+            load="/runs/current/policy/weights",
+            finetune=True,
+            load_optim=True,
+            load_rng=True,
+        )
+        megatron_cfg = SimpleNamespace(checkpoint=ckpt_cfg)
+
+        from megatron.bridge.training.state import GlobalState
+
+        state = GlobalState()
+        rerun_state_machine = MagicMock()
+        rerun_state_machine.get_mode.return_value = RerunMode.VALIDATE_RESULTS
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.setup._load_checkpoint_from_path",
+                side_effect=RuntimeError("boom"),
+            ),
+            patch("nemo_rl.models.megatron.setup.update_num_microbatches"),
+            patch(
+                "nemo_rl.models.megatron.setup.get_rerun_state_machine",
+                return_value=rerun_state_machine,
+            ),
+        ):
+            hook = _create_peft_warm_start_hook(
+                megatron_cfg, state, "/donor/iter_0000005"
+            )
+            with pytest.raises(RuntimeError, match="boom"):
+                hook([MagicMock()])
+
+        # Even on failure the run's own checkpoint config is restored.
+        assert ckpt_cfg.load == "/runs/current/policy/weights"
+        assert ckpt_cfg.finetune is True
+        assert ckpt_cfg.load_optim is True
+        assert ckpt_cfg.load_rng is True
+        assert rerun_state_machine.set_mode.call_args_list == [
+            call(RerunMode.DISABLED),
+            call(RerunMode.VALIDATE_RESULTS),
+        ]
+
+    def test_restore_from_without_peft_enabled_raises(self):
+        """restore_from with PEFT disabled must fail loudly, not silently no-op."""
+        import nemo_rl.models.megatron.setup as setup_mod
+
+        mock_state = MagicMock()
+        mock_state.start_time = 0.0
+
+        megatron_cfg = MagicMock()
+        megatron_cfg.ft = None
+        megatron_cfg.model.vocab_size = 32000
+        megatron_cfg.model.make_vocab_size_divisible_by = 128
+        megatron_cfg.model.tensor_model_parallel_size = 1
+
+        policy_cfg = {
+            "megatron_cfg": {
+                "peft": {"enabled": False, "restore_from": "/donor"},
+            }
+        }
+
+        with (
+            patch.object(setup_mod, "GlobalState", return_value=mock_state),
+            patch.object(setup_mod, "_patch_bridge_signal_handler_for_worker_threads"),
+            patch.object(setup_mod, "initialize_megatron"),
+            patch.object(setup_mod, "set_jit_fusion_options"),
+            patch.object(setup_mod, "init_checkpointing_context"),
+            patch.object(setup_mod, "build_tokenizer"),
+            patch("torch.distributed.barrier"),
+            patch("torch.distributed.all_reduce"),
+            patch("torch.tensor") as mock_tensor,
+        ):
+            mock_tensor_instance = MagicMock()
+            mock_tensor_instance.item.return_value = 0.0
+            mock_tensor.return_value = mock_tensor_instance
+
+            with pytest.raises(ValueError, match="peft.restore_from is set"):
+                setup_mod.setup_model_and_optimizer(
+                    policy_cfg=policy_cfg,
+                    megatron_cfg=megatron_cfg,
+                )
+
+    def test_bridge_peft_resume_filters_adapters_and_loads_non_strict(self):
+        """Exercise both Bridge behaviors required by the warm-start hook."""
+        checkpointing = pytest.importorskip(
+            "megatron.bridge.training.checkpointing",
+            reason="requires the mcore extra (Megatron-Bridge)",
+        )
+        from megatron.bridge.training.state import TrainState
+
+        load_dir = "/donor/iter_0000005"
+        peft = MagicMock()
+        cfg = SimpleNamespace(
+            peft=peft,
+            checkpoint=SimpleNamespace(
+                load=load_dir,
+                pretrained_checkpoint="/base-model",
+                finetune=False,
+                load_rng=False,
+                load_optim=False,
+                ckpt_format="torch_dist",
+                fully_parallel_save=True,
+                stage_precision_aware_optimizer_state_on_cpu=False,
+                load_main_params_from_ckpt=False,
+            ),
+            model=SimpleNamespace(
+                tensor_model_parallel_size=1,
+                pipeline_model_parallel_size=1,
+                fp16=False,
+                bf16=False,
+            ),
+            optimizer=SimpleNamespace(use_distributed_optimizer=False),
+            rng=SimpleNamespace(data_parallel_random_init=False),
+            ddp=SimpleNamespace(use_megatron_fsdp=False),
+        )
+        state = SimpleNamespace(
+            cfg=cfg,
+            train_state=TrainState(),
+            wandb_logger=None,
+            mlflow_logger=None,
+            comet_logger=None,
+        )
+        model = [MagicMock()]
+        pg_collection = MagicMock()
+        pg_collection.tp.rank.return_value = 0
+        pg_collection.tp.size.return_value = 1
+        pg_collection.pp.rank.return_value = 0
+        pg_collection.pp.size.return_value = 1
+        pg_collection.dp_cp = MagicMock()
+
+        full_state_dict = {
+            "model": {
+                "decoder.layers.0.linear.weight": torch.ones(2, 2),
+                "decoder.layers.0.linear.adapter.lora_A": torch.ones(1, 2),
+            },
+            "checkpoint_version": 3.0,
+        }
+        filtered_state_dict = {
+            "model": {
+                "decoder.layers.0.linear.adapter.lora_A": torch.ones(1, 2),
+            },
+            "checkpoint_version": 3.0,
+        }
+
+        def fake_load_base(*args, rank0, **kwargs):
+            loaded = (
+                {"checkpoint_version": 3.0} if rank0 else kwargs["sharded_state_dict"]
+            )
+            return loaded, load_dir, False, None
+
+        run_config = {
+            "model": {
+                "tensor_model_parallel_size": 1,
+                "pipeline_model_parallel_size": 1,
+            },
+            "checkpoint": {
+                "save_rng": False,
+                "save_optim": False,
+                "fully_parallel_save": True,
+            },
+        }
+
+        with (
+            patch.object(
+                checkpointing,
+                "_load_base_checkpoint",
+                side_effect=fake_load_base,
+            ),
+            patch.object(
+                checkpointing,
+                "generate_state_dict",
+                return_value=full_state_dict,
+            ),
+            patch.object(
+                checkpointing,
+                "apply_peft_adapter_filter_to_state_dict",
+                return_value=filtered_state_dict,
+            ) as mock_filter,
+            patch.object(
+                checkpointing.dist_checkpointing,
+                "load_content_metadata",
+                return_value={},
+            ),
+            patch.object(checkpointing, "read_run_config", return_value=run_config),
+            patch.object(checkpointing, "file_exists", return_value=True),
+            patch.object(checkpointing, "read_train_state", return_value=TrainState()),
+            patch.object(checkpointing, "update_num_microbatches"),
+            patch.object(checkpointing, "set_checkpoint_version"),
+            patch.object(checkpointing, "get_checkpoint_version", return_value=3.0),
+            patch.object(
+                checkpointing,
+                "_get_model_glu_interleave_sizes",
+                return_value=(None, None),
+            ),
+            patch.object(checkpointing, "_load_model_state_dict") as mock_model_load,
+            patch.object(checkpointing, "is_hf_checkpoint_dir", return_value=False),
+            patch.object(checkpointing, "unwrap_model", return_value=model),
+            patch.object(checkpointing.wandb_utils, "on_load_checkpoint_success"),
+            patch.object(checkpointing.mlflow_utils, "on_load_checkpoint_success"),
+            patch.object(checkpointing.comet_utils, "on_load_checkpoint_success"),
+            patch("torch.distributed.is_initialized", return_value=False),
+            patch("torch.cuda.empty_cache"),
+        ):
+            checkpointing._load_checkpoint_from_path(
+                load_dir=load_dir,
+                state=state,
+                model=model,
+                optimizer=None,
+                opt_param_scheduler=None,
+                strict=True,
+                checkpointing_context={},
+                skip_load_to_model_and_opt=False,
+                ignore_ckpt_step=True,
+                pg_collection=pg_collection,
+            )
+
+        mock_filter.assert_called_once_with(full_state_dict, peft)
+        mock_model_load.assert_called_once_with(
+            model[0], filtered_state_dict["model"], False
+        )
+
+    def _run_policy_setup(self, tmp_path, *, resume_exists):
+        """Run setup_model_and_optimizer with PEFT warm start configured.
+
+        Returns the warm-start hook factory mock and the actual pre-wrap hooks
+        passed to get_model, so callers can check presence and ordering.
+        """
+        import nemo_rl.models.megatron.setup as setup_mod
+
+        donor_iter_dir = self._make_donor_iter_dir(tmp_path, self._peft_cfg())
+
+        mock_state = MagicMock()
+        mock_state.start_time = 0.0
+
+        megatron_cfg = MagicMock()
+        megatron_cfg.ft = None
+        megatron_cfg.model.vocab_size = 32000
+        megatron_cfg.model.make_vocab_size_divisible_by = 128
+        megatron_cfg.model.tensor_model_parallel_size = 1
+        megatron_cfg.ddp.overlap_param_gather = False
+        megatron_cfg.checkpoint.load = (
+            "/runs/current/policy/weights" if resume_exists else None
+        )
+        megatron_cfg.checkpoint.pretrained_checkpoint = None
+
+        policy_cfg = {
+            "megatron_cfg": {
+                "freeze_moe_router": False,
+                "peft": self._peft_cfg(restore_from=str(donor_iter_dir)),
+            }
+        }
+
+        mock_model_chunk = MagicMock()
+        mock_optimizer = MagicMock()
+        mock_scheduler = MagicMock()
+        mock_tensor_instance = MagicMock()
+        mock_tensor_instance.item.return_value = 0.0
+
+        with (
+            patch.object(setup_mod, "GlobalState", return_value=mock_state),
+            patch.object(setup_mod, "_patch_bridge_signal_handler_for_worker_threads"),
+            patch.object(setup_mod, "ProcessGroupCollection"),
+            patch.object(setup_mod, "initialize_megatron"),
+            patch.object(setup_mod, "set_jit_fusion_options"),
+            patch.object(setup_mod, "init_checkpointing_context"),
+            patch.object(setup_mod, "build_tokenizer"),
+            patch.object(
+                setup_mod, "get_model", return_value=[mock_model_chunk]
+            ) as mock_get_model,
+            patch.object(
+                setup_mod,
+                "setup_optimizer",
+                return_value=(mock_optimizer, mock_scheduler),
+            ),
+            patch.object(
+                setup_mod,
+                "_create_peft_pre_wrap_hook",
+                return_value=lambda model: model,
+            ),
+            patch.object(setup_mod, "_create_peft_warm_start_hook") as mock_hook,
+            patch.object(setup_mod, "checkpoint_exists", return_value=resume_exists),
+            patch.object(setup_mod, "load_checkpoint"),
+            patch.object(setup_mod, "get_attached_draft_model", return_value=None),
+            patch("torch.distributed.barrier"),
+            patch("torch.distributed.all_reduce"),
+            patch("torch.tensor", return_value=mock_tensor_instance),
+        ):
+            setup_mod.setup_model_and_optimizer(
+                policy_cfg=policy_cfg,
+                megatron_cfg=megatron_cfg,
+            )
+        return mock_hook, mock_get_model.call_args.kwargs["pre_wrap_hook"]
+
+    def test_policy_warm_start_hook_appended_on_fresh_run(self, tmp_path):
+        """No resume checkpoint -> the policy warm-start hook is composed."""
+        mock_hook, hooks = self._run_policy_setup(tmp_path, resume_exists=False)
+        mock_hook.assert_called_once()
+        peft_index = next(
+            i
+            for i, hook in enumerate(hooks)
+            if hook is not mock_hook.return_value
+            and hook.__name__ == "composed_peft_hook"
+        )
+        assert hooks[peft_index + 1] is mock_hook.return_value
+
+    def test_policy_warm_start_hook_skipped_on_resume(self, tmp_path):
+        """Resume checkpoint already carries this run's adapters -> no hook."""
+        mock_hook, hooks = self._run_policy_setup(tmp_path, resume_exists=True)
+        mock_hook.assert_not_called()
+        assert mock_hook.return_value not in hooks
+
+    def test_reference_warm_start_hook_appended_unconditionally(self, tmp_path):
+        """The reference model warm-starts even when the policy resumes.
+
+        This asymmetry is the KL-anchoring story: on a resume the policy's
+        adapters come from the resume checkpoint, but the reference must stay
+        anchored to the initial (donor warm-started) policy. A regression that
+        drops the reference hook produces a silently wrong KL anchor rather
+        than a crash.
+        """
+        import nemo_rl.models.megatron.setup as setup_mod
+
+        donor_iter_dir = self._make_donor_iter_dir(tmp_path, self._peft_cfg())
+
+        megatron_cfg = MagicMock()
+        megatron_cfg.dist.use_torch_fsdp2 = False
+
+        mock_model = MagicMock()
+        mock_model.state_dict.return_value = {
+            "layer1.weight": torch.tensor([1.0, 2.0]),
+        }
+
+        config = {
+            "megatron_cfg": {
+                "freeze_moe_router": False,
+                "peft": self._peft_cfg(restore_from=str(donor_iter_dir)),
+            }
+        }
+
+        with (
+            patch.object(setup_mod, "ProcessGroupCollection"),
+            patch.object(setup_mod, "init_checkpointing_context"),
+            patch.object(setup_mod, "GlobalState", return_value=MagicMock()),
+            patch.object(setup_mod, "get_model", return_value=[mock_model]),
+            patch.object(setup_mod, "checkpoint_exists", return_value=False),
+            patch.object(setup_mod, "clear_global_router_replay_instances"),
+            patch.object(setup_mod, "load_checkpoint"),
+            patch.object(
+                setup_mod,
+                "_create_peft_pre_wrap_hook",
+                return_value=lambda model: model,
+            ),
+            patch.object(setup_mod, "_create_peft_warm_start_hook") as mock_hook,
+            patch.object(setup_mod, "HAVE_FSDP2", False),
+        ):
+            setup_mod.setup_reference_model_state(
+                config=config,
+                megatron_cfg=megatron_cfg,
+                pretrained_path="/path/to/pretrained",
+            )
+
+        mock_hook.assert_called_once()
+        # The hook receives the resolved donor iteration directory.
+        assert mock_hook.call_args.args[2] == str(donor_iter_dir)
