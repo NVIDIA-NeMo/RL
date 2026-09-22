@@ -2683,7 +2683,7 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
         patch(
             "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
             return_value=[MagicMock(name="finalizer_0")],
-        ),
+        ) as mock_finalizers,
     ):
         mock_megatron.reserve_http_server_addresses.return_value = (
             ["http://10.0.0.1:5555/v1"],
@@ -2711,6 +2711,10 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
         assert set(MEDIA_STAGING_FIELDS) <= fields
     else:
         assert set(MEDIA_STAGING_FIELDS).isdisjoint(fields)
+    # The finalizer learns whether a group without media may be published:
+    # in a multimodal run it must be dropped (see RolloutReassembler).
+    finalizer_config = mock_finalizers.call_args.args[1]
+    assert finalizer_config.multimodal is multimodal
 
 
 @pytest.mark.mcore

@@ -1039,14 +1039,15 @@ def _stage_vlm_rollout(
     }
 
 
-def _media_finalizer(tq_client):
-    return RolloutReassembler(
-        tq_client,
+def _media_finalizer(tq_client, **overrides):
+    kwargs = dict(
         partition_id=MEDIA_CANONICAL_PARTITION,
         staging_partition=MEDIA_STAGING_PARTITION,
         pad_token_id=PAD,
         max_seq_len=4096,
     )
+    kwargs.update(overrides)
+    return RolloutReassembler(tq_client, **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -1182,3 +1183,114 @@ def test_finalize_group_publishes_media_with_empty_rows_for_text_siblings(
         source.fetch([receipt["manifest"][0]["staging_key"]])
     with pytest.raises(KeyError):
         source.fetch_media(receipt["manifest"][0]["staging_key"])
+
+
+@pytest.mark.parametrize("case", ["all-placeholders", "valid-text-row"])
+def test_finalize_group_multimodal_drops_group_without_any_media_row(
+    tq_client, media_partitions, case
+):
+    """A multimodal capture run never publishes a group whose valid rows carry no media.
+
+    Such a group would land in the canonical partition without the media columns;
+    TransferQueue answers a batch fetch with only the fields every requested key
+    produced, so a train shard mixing its keys with media keys would lose
+    ``pixel_values`` for the media rows too (see
+    ``test_get_samples_rejects_a_batch_where_some_keys_lack_a_selected_field``).
+    """
+    group_id = f"mm-drop-{case}"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    if case == "valid-text-row":
+        # A staged rollout whose engine payload carried no media: valid, but text.
+        receipts = [
+            _stage_vlm_rollout(tq_client, rollout_ids[0], media_tensors=None),
+            None,
+        ]
+    else:
+        receipts = [None, None]  # every rollout poisoned -> placeholders only
+
+    finalized = _media_finalizer(tq_client, multimodal=True).finalize_group(
+        group_id,
+        rollout_ids,
+        receipts,
+        [1.0, 0.0],
+        mask_sample=[False, False],
+        fallback_weight_version=4,
+        prompt_idx=3,
+    )
+
+    assert finalized.dropped
+    assert finalized.meta is None
+    assert "media" in (finalized.drop_reason or "")
+    assert finalized.metrics["finalize/group_dropped"] == 1.0
+    # Nothing was published, and the staged call rows were cleared.
+    published = set(tq_client.list_sample_ids(MEDIA_CANONICAL_PARTITION))
+    assert published.isdisjoint(rollout_ids)
+    if case == "valid-text-row":
+        source = TQTokenSource(tq_client, staging_partition=MEDIA_STAGING_PARTITION)
+        with pytest.raises(KeyError):
+            source.fetch([receipts[0]["manifest"][0]["staging_key"]])
+
+
+def test_finalize_group_default_still_publishes_group_without_media(
+    tq_client, media_partitions
+):
+    """Text-only runs (``multimodal=False``) keep publishing placeholder-only groups."""
+    group_id = "text-keep"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    finalized = _media_finalizer(tq_client).finalize_group(
+        group_id,
+        rollout_ids,
+        [None, None],
+        [0.0, 0.0],
+        mask_sample=[False, False],
+        fallback_weight_version=4,
+        prompt_idx=3,
+    )
+    assert not finalized.dropped
+    assert finalized.meta is not None
+    assert finalized.meta.sample_ids == rollout_ids
+
+
+def test_get_samples_rejects_a_batch_where_some_keys_lack_a_selected_field(
+    tq_client, media_partitions
+):
+    """One train fetch spans a media group and a media-less group.
+
+    TransferQueue returns only the fields every requested key produced, so the
+    response would silently omit ``pixel_values`` for the media rows as well.
+    The client must raise instead of handing back the narrowed batch.
+    """
+    finalizer = _media_finalizer(tq_client)  # multimodal=False publishes both groups
+    media_ids = ["mix-a_g0", "mix-a_g1"]
+    media_group = finalizer.finalize_group(
+        "mix-a",
+        media_ids,
+        [_stage_vlm_rollout(tq_client, media_ids[0]), None],
+        [1.0, 0.0],
+        mask_sample=[False, False],
+        fallback_weight_version=4,
+        prompt_idx=1,
+    )
+    text_ids = ["mix-b_g0", "mix-b_g1"]
+    text_group = finalizer.finalize_group(
+        "mix-b",
+        text_ids,
+        [None, None],
+        [0.0, 0.0],
+        mask_sample=[False, False],
+        fallback_weight_version=4,
+        prompt_idx=2,
+    )
+    assert "pixel_values" in (media_group.meta.fields or [])
+    assert "pixel_values" not in (text_group.meta.fields or [])
+
+    # What the staleness sampler hands the trainer: one meta, union of fields.
+    batch = media_group.meta.concat(text_group.meta)
+    assert "pixel_values" in (batch.fields or [])
+
+    with pytest.raises(KeyError, match="pixel_values"):
+        tq_client.get_samples(
+            sample_ids=list(batch.sample_ids),
+            partition_id=MEDIA_CANONICAL_PARTITION,
+            select_fields=list(batch.fields),
+        )

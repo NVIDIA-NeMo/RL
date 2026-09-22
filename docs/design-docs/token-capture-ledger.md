@@ -176,7 +176,14 @@ call row:
   pixels the policy generated against. `finalize_group` stacks the per-rollout
   `PackedTensor`s (empty rows for text siblings and placeholders) into the
   canonical batch through the same `pack_payload` transport the token-echo path
-  uses.
+  uses. A group in which no valid rollout carried media is dropped rather than
+  published (`multimodal run, no valid rollout carried media`; the controller
+  sources a replacement): its rows would omit the media columns, and
+  TransferQueue answers a batch fetch with only the fields every requested key
+  produced, so a train shard mixing such keys with VLM keys would lose
+  `pixel_values` for the VLM rows too. `TQDataPlaneClient.get_samples` raises
+  `KeyError` if a requested column is missing from the response, so that
+  narrowing can no longer pass silently on either path.
 
 Setup rejects `token_capture.enabled` with a multimodal policy on the vLLM
 backend (that capture path stages the pre-processor prompt and carries no
