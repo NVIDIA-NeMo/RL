@@ -352,7 +352,8 @@ def test_all_config_dtensor_selects_v2(config_file):
 
     v1 is being removed, so every dtensor_cfg that is enabled must pin _v2: true. An absent
     _v2 is also a failure while the schema default is still False, since that silently
-    resolves to v1.
+    resolves to v1. The walk is recursive because dtensor_cfg also appears under teacher,
+    teachers[i] and env.reward_model, and distillation.py has no _v2 check of its own.
     """
 
     print(f"\nValidating config file: {config_file}")
@@ -360,15 +361,19 @@ def test_all_config_dtensor_selects_v2(config_file):
     config = load_config_with_inheritance(config_file)
     config_dict = OmegaConf.to_container(config, resolve=True)
 
-    for section in ("policy", "value"):
-        section_dict = config_dict.get(section)
-        if not isinstance(section_dict, dict):
-            continue
+    def walk(node, path):
+        if isinstance(node, dict):
+            nested = node.get("dtensor_cfg")
+            if isinstance(nested, dict):
+                yield path, nested
+            for key, value in node.items():
+                if key != "dtensor_cfg":
+                    yield from walk(value, f"{path}.{key}" if path else key)
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                yield from walk(value, f"{path}[{index}]")
 
-        dtensor_cfg = section_dict.get("dtensor_cfg")
-        if not isinstance(dtensor_cfg, dict):
-            continue
-
+    for section, dtensor_cfg in walk(config_dict, ""):
         v2 = dtensor_cfg.get("_v2", "<absent>")
 
         # Mirrors reject_dtensor_v1, which fires on an explicit false regardless of enabled.
