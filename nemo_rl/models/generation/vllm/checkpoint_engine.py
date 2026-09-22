@@ -95,7 +95,7 @@ class VllmCheckpointEngineMixin(VllmShardedExpertRefitMixin):
         self,
     ) -> Iterator[Callable[[], None]]:
         """Provide an optional model-specific lifecycle around all weight batches."""
-        yield lambda: None
+        yield self._maybe_process_fp8_kv_cache
 
     def checkpoint_engine_total_memory_bytes(self) -> int:
         device = torch.cuda.current_device()
@@ -169,8 +169,6 @@ class VllmCheckpointEngineMixin(VllmShardedExpertRefitMixin):
                 del weight_batch
 
             finalize()
-
-        self._maybe_process_fp8_kv_cache()
 
         total_time = time.time() - start_time
         loaded_gib = loaded_bytes / (1024 * 1024 * 1024)

@@ -68,6 +68,8 @@ async def test_checkpoint_engine_refit_guard(monkeypatch, model_type, fp8_enable
     model = torch.nn.Module()
     model.config = SimpleNamespace(model_type=model_type)
     ext.model_runner = SimpleNamespace(model=model, vllm_config=object())
+    ext.model_config = SimpleNamespace(dtype=torch.bfloat16, quantization=None)
+    ext.device = torch.device("cpu")
     ext._uses_unquantized_flashinfer_trtllm = lambda: False
     ext._maybe_process_fp8_kv_cache = lambda: None
 
@@ -284,8 +286,9 @@ def test_deepseek_v4_context_entry_failure_preserves_original_error(
     assert restored == [set()]
 
 
+@pytest.mark.parametrize("transport", ["collective", "checkpoint_engine"])
 def test_weight_update_lifecycle_keeps_full_post_load_for_non_deepseek_models(
-    monkeypatch,
+    monkeypatch, transport
 ):
     import vllm.config
     from vllm.model_executor.model_loader import utils as loader_utils
@@ -325,7 +328,7 @@ def test_weight_update_lifecycle_keeps_full_post_load_for_non_deepseek_models(
     )
     ext._maybe_process_fp8_kv_cache = lambda: call_order.append(("kv", None))
 
-    with ext._weight_update_lifecycle("collective") as finalize:
+    with ext._weight_update_lifecycle(transport) as finalize:
         call_order.append(("stream", None))
         finalize()
 

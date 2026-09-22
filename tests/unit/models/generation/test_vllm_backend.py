@@ -381,9 +381,7 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
 
 
 @pytest.mark.vllm
-@pytest.mark.parametrize(
-    "transport", ["ipc", "collective", "nccl_reshard", "checkpoint_engine"]
-)
+@pytest.mark.parametrize("transport", ["ipc", "collective", "nccl_reshard"])
 def test_mixed_mxfp8_native_refit_processes_each_module_once(monkeypatch, transport):
     """Mixed refits reload BF16 experts and rebuild each MXFP8 layout once."""
     from vllm.model_executor.layers.quantization.modelopt import (
@@ -498,7 +496,7 @@ def test_mixed_mxfp8_native_refit_processes_each_module_once(monkeypatch, transp
 
 
 @pytest.mark.vllm
-@pytest.mark.parametrize("transport", ["ipc", "collective", "checkpoint_engine"])
+@pytest.mark.parametrize("transport", ["ipc", "collective"])
 def test_mixed_native_refit_preserves_post_load_mxfp8_scale(monkeypatch, transport):
     """Native reload must not restore MXFP8 linears to pre-load metadata."""
     from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
@@ -828,9 +826,7 @@ def test_quantized_model_uses_native_refit_for_realized_bf16_trtllm_modules():
 
 
 @pytest.mark.vllm
-@pytest.mark.parametrize(
-    "transport", ["ipc", "collective", "nccl_reshard", "checkpoint_engine"]
-)
+@pytest.mark.parametrize("transport", ["ipc", "collective", "nccl_reshard"])
 def test_mixed_native_refit_rejects_fp8_kv_cache(transport):
     from nemo_rl.models.generation.vllm import vllm_backend
 

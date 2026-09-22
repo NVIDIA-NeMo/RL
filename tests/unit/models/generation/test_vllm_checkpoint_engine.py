@@ -97,7 +97,12 @@ def test_update_weights_from_checkpoint_engine_async_loads_all_batches(monkeypat
     @contextmanager
     def lifecycle():
         events.append(("lifecycle_enter",))
-        yield lambda: events.append(("finalize",))
+
+        def finalize():
+            events.append(("finalize",))
+            worker._maybe_process_fp8_kv_cache()
+
+        yield finalize
         events.append(("lifecycle_exit",))
 
     worker._checkpoint_engine_weight_update_lifecycle = lifecycle
@@ -119,13 +124,13 @@ def test_update_weights_from_checkpoint_engine_async_loads_all_batches(monkeypat
         ("load", ["b", "c"]),
         ("sync",),
         ("finalize",),
-        ("lifecycle_exit",),
         ("fp8",),
+        ("lifecycle_exit",),
     ]
 
 
 @pytest.mark.vllm
-def test_checkpoint_engine_uses_native_trtllm_refit_lifecycle():
+def test_checkpoint_engine_uses_full_post_load_lifecycle_for_trtllm():
     from nemo_rl.models.generation.vllm.vllm_backend import (
         VllmInternalWorkerExtensionWithCheckpointEngine,
     )
@@ -147,6 +152,7 @@ def test_checkpoint_engine_uses_native_trtllm_refit_lifecycle():
 
     worker._weight_update_lifecycle = lifecycle
 
+    assert not worker._uses_native_layerwise_refit("checkpoint_engine")
     worker._validate_checkpoint_engine_weight_update()
     with worker._checkpoint_engine_weight_update_lifecycle() as finalize:
         events.append(("load",))
