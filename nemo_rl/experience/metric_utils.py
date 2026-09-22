@@ -14,11 +14,24 @@
 
 """Shared aggregation helpers for rollout metrics."""
 
+import hashlib
 import math
+import re
 import statistics
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Self
+
+_METRIC_COMPONENT_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def rollout_environment_metric_component(environment: str) -> str:
+    """Return a readable metric path component without silent collisions."""
+    sanitized = _METRIC_COMPONENT_PATTERN.sub("_", environment).strip("_.")
+    if sanitized == environment:
+        return sanitized
+    digest = hashlib.blake2s(environment.encode(), digest_size=8).hexdigest()
+    return f"{sanitized or 'unknown'}-{digest}"
 
 
 @dataclass(frozen=True)
