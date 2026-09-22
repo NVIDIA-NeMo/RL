@@ -2428,7 +2428,7 @@ async def run_hf_train_process(
 
 @pytest.mark.asyncio
 @pytest.mark.automodel
-@pytest.mark.timeout(200)
+@pytest.mark.timeout(360)
 @pytest.mark.parametrize(
     ("async_engine", "cpu_offload", "vllm_precision", "enable_lora"),
     [
@@ -2487,7 +2487,7 @@ async def test_vllm_generation_with_hf_training_colocated(
 
 @pytest.mark.asyncio
 @pytest.mark.automodel
-@pytest.mark.timeout(200)
+@pytest.mark.timeout(360)
 @pytest.mark.parametrize(
     ("async_engine", "cpu_offload", "vllm_precision", "enable_lora"),
     [

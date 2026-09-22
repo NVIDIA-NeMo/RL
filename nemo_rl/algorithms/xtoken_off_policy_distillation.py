@@ -258,9 +258,9 @@ def setup(
     reject_dtensor_v1(policy_config["dtensor_cfg"], "policy.dtensor_cfg")
     for i, tc in enumerate(teacher_configs):
         assert tc["dtensor_cfg"]["enabled"], (
-            f"xtoken distillation requires teachers[{i}].dtensor_cfg.enabled=true."
+            f"xtoken distillation requires teachers.{i}.dtensor_cfg.enabled=true."
         )
-        reject_dtensor_v1(tc["dtensor_cfg"], f"teachers[{i}].dtensor_cfg")
+        reject_dtensor_v1(tc["dtensor_cfg"], f"teachers.{i}.dtensor_cfg")
 
     # A null projection path marks a same-vocab teacher (direct KL, no
     # projection/alignment); that only makes sense when it shares the student's
