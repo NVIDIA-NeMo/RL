@@ -30,7 +30,13 @@ from typing import Any
 
 import torch
 import zmq
-from tensorrt_llm._ray_utils import control_action_decorator
+
+try:
+    # tensorrt_llm._ray_utils is the pre-rc28 location; it now re-exports from
+    # here with a FutureWarning ("will be removed in a future release").
+    from tensorrt_llm.executor.ray.utils import control_action_decorator
+except ImportError:
+    from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
 
 from nemo_rl.models.policy.utils import (
