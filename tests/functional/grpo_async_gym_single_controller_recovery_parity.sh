@@ -371,6 +371,7 @@ uv run --directory "$PROJECT_ROOT" --no-sync python "$PARITY_HELPER" compare \
     --recovery-audit "$RECOVERY_AUDIT_STAGE2" \
     --recovery-audit "$RECOVERY_AUDIT_STAGE3" \
     --timeline-output "$ROLLOUT_TIMELINE" \
+    --allow-missing-training-payloads \
     --steps "$MAX_STEPS" \
     --prompts-per-step "$NUM_PROMPTS" \
     --generations-per-prompt "$NUM_GENERATIONS" \

@@ -412,19 +412,71 @@ def _events(*, retried: bool) -> list[dict]:
             }
         )
         for generation_index in range(2):
-            records.append(
-                {
-                    "event": "completion_forwarded",
-                    "timestamp_ns": (len(records) + 1) * 1_000_000_000,
-                    "target_step": target_step,
-                    "prompt_idx": prompt_idx,
-                    "task_source": task_source,
-                    "generation_index": generation_index,
-                    "reward": float(prompt_idx),
-                    "rollout_id": f"r{prompt_idx}_g{generation_index}{suffix}",
-                }
-            )
+            completion = {
+                "target_step": target_step,
+                "prompt_idx": prompt_idx,
+                "task_source": task_source,
+                "generation_index": generation_index,
+                "reward": float(prompt_idx),
+                "rollout_id": f"r{prompt_idx}_g{generation_index}{suffix}",
+            }
+            for event_name in ("completion_arrived", "completion_forwarded"):
+                records.append(
+                    {
+                        "event": event_name,
+                        "timestamp_ns": (len(records) + 1) * 1_000_000_000,
+                        **completion,
+                    }
+                )
     return records
+
+
+def _event_identity(record: dict) -> tuple:
+    return (
+        record.get("target_step"),
+        record.get("prompt_idx"),
+        record.get("task_source"),
+        record.get("generation_index"),
+    )
+
+
+def _retimestamp_events(records: list[dict]) -> None:
+    for position, record in enumerate(records, start=1):
+        record["timestamp_ns"] = position * 1_000_000_000
+
+
+def _swap_first_two_completion_pairs(records: list[dict]) -> None:
+    identities: list[tuple] = []
+    for record in records:
+        if record.get("event") != "completion_forwarded":
+            continue
+        identity = _event_identity(record)
+        if identity not in identities:
+            identities.append(identity)
+        if len(identities) == 2:
+            break
+    assert len(identities) == 2
+
+    selected_positions = [
+        position
+        for position, record in enumerate(records)
+        if record.get("event") in ("completion_arrived", "completion_forwarded")
+        and _event_identity(record) in identities
+    ]
+    by_identity = {
+        identity: [
+            record
+            for record in records
+            if record.get("event") in ("completion_arrived", "completion_forwarded")
+            and _event_identity(record) == identity
+        ]
+        for identity in identities
+    }
+    replacement = by_identity[identities[1]] + by_identity[identities[0]]
+    assert len(selected_positions) == len(replacement) == 4
+    for position, record in zip(selected_positions, replacement, strict=True):
+        records[position] = record
+    _retimestamp_events(records)
 
 
 def _training_record() -> dict:
@@ -497,6 +549,7 @@ def _write_compare_fixture(tmp_path: Path) -> argparse.Namespace:
         rtol=1e-5,
         atol=1e-6,
         timeline_output=None,
+        allow_missing_training_payloads=True,
         require_completion_order_match=False,
     )
 
@@ -569,8 +622,19 @@ def test_compare_runs_ignores_untrained_lookahead_events(tmp_path: Path) -> None
 def test_compare_runs_rejects_changed_prompt_order(tmp_path: Path) -> None:
     args = _write_compare_fixture(tmp_path)
     records = _events(retried=True)
-    first = records.pop(0)
-    records.insert(3, first)
+    first = next(
+        record
+        for record in records
+        if record["event"] == "dispatch" and record["task_source"] == "simple"
+    )
+    records.remove(first)
+    workplace_dispatch = next(
+        position
+        for position, record in enumerate(records)
+        if record["event"] == "dispatch" and record["task_source"] == "workplace"
+    )
+    records.insert(workplace_dispatch + 1, first)
+    _retimestamp_events(records)
     _write_jsonl(args.recovery_events[0], records)
 
     with pytest.raises(AssertionError, match="logical prompt order differs"):
@@ -580,7 +644,10 @@ def test_compare_runs_rejects_changed_prompt_order(tmp_path: Path) -> None:
 def test_compare_runs_rejects_duplicate_completion(tmp_path: Path) -> None:
     args = _write_compare_fixture(tmp_path)
     records = _events(retried=True)
-    records.append(dict(records[1]))
+    forwarded = next(
+        record for record in records if record["event"] == "completion_forwarded"
+    )
+    records.append(dict(forwarded))
     _write_jsonl(args.recovery_events[0], records)
 
     with pytest.raises(AssertionError, match="forwarded twice"):
@@ -591,7 +658,7 @@ def test_compare_runs_rejects_changed_completion_order(tmp_path: Path) -> None:
     args = _write_compare_fixture(tmp_path)
     args.require_completion_order_match = True
     records = _events(retried=True)
-    records[1], records[2] = records[2], records[1]
+    _swap_first_two_completion_pairs(records)
     _write_jsonl(args.recovery_events[0], records)
 
     with pytest.raises(AssertionError, match="logical completion order differs"):
@@ -604,13 +671,21 @@ def test_compare_runs_reports_changed_completion_order_by_default(
     args = _write_compare_fixture(tmp_path)
     args.timeline_output = tmp_path / "rollout-timeline.json"
     records = _events(retried=True)
-    records[1], records[2] = records[2], records[1]
+    _swap_first_two_completion_pairs(records)
     _write_jsonl(args.recovery_events[0], records)
 
     _HELPER.compare_runs(args)
 
     timeline = json.loads(args.timeline_output.read_text())
     assert timeline["completion_order_matches"] is False
+    individual = timeline["ordering_parity"]["forwarded_completion"]["individual"]
+    assert individual["discordant_pairs"] == 1
+    assert individual["comparable_pairs"] == 6
+    assert individual["kendall_tau"] == pytest.approx(2 / 3)
+    arrival = timeline["ordering_parity"]["arrival"]
+    assert arrival["complete"] is True
+    assert arrival["individual"]["discordant_pairs"] == 1
+    assert arrival["individual"]["kendall_tau"] == pytest.approx(2 / 3)
 
 
 def test_compare_runs_writes_rollout_timeline(tmp_path: Path) -> None:
@@ -628,6 +703,126 @@ def test_compare_runs_writes_rollout_timeline(tmp_path: Path) -> None:
         3,
     ]
     assert timeline["recovery"][0]["dispatches"][0]["rollout_id"] == "r0_g0-a1"
+    group_ready = timeline["ordering_parity"]["forwarded_completion"][
+        "prompt_group_ready"
+    ]
+    assert group_ready["within_step_exact_match"] is True
+    assert group_ready["kendall_tau"] == 1.0
+    arrival = timeline["ordering_parity"]["arrival"]
+    assert arrival["complete"] is True
+    assert arrival["individual"]["within_step_exact_match"] is True
+    assert arrival["prompt_group_last_sibling"]["kendall_tau"] == 1.0
+
+
+def test_rank_metrics_compare_only_within_train_step() -> None:
+    first = (0, 0, "simple", 0)
+    second = (0, 1, "workplace", 0)
+    later_step = (1, 2, "simple", 0)
+
+    metrics = _HELPER._within_step_rank_metrics(
+        [first, second, later_step],
+        [later_step, second, first],
+    )
+
+    assert metrics["comparable_pairs"] == 1
+    assert metrics["discordant_pairs"] == 1
+    assert metrics["inversion_rate"] == 1.0
+    assert metrics["kendall_tau"] == -1.0
+
+
+def test_prompt_group_ready_order_uses_last_sibling() -> None:
+    simple_0 = (0, 0, "simple", 0)
+    simple_1 = (0, 0, "simple", 1)
+    workplace_0 = (0, 1, "workplace", 0)
+    workplace_1 = (0, 1, "workplace", 1)
+
+    baseline = _HELPER._prompt_group_ready_order(
+        [simple_0, workplace_0, simple_1, workplace_1]
+    )
+    recovery = _HELPER._prompt_group_ready_order(
+        [simple_0, workplace_0, workplace_1, simple_1]
+    )
+
+    assert baseline == [simple_0[:3], workplace_0[:3]]
+    assert recovery == [workplace_0[:3], simple_0[:3]]
+    metrics = _HELPER._within_step_rank_metrics(baseline, recovery)
+    assert metrics["discordant_pairs"] == 1
+    assert metrics["kendall_tau"] == -1.0
+
+
+def test_effective_arrival_order_uses_retained_recovery_attempt() -> None:
+    def event(
+        event_name: str,
+        *,
+        prompt_idx: int,
+        rollout_id: str,
+    ) -> dict:
+        return {
+            "event": event_name,
+            "target_step": 0,
+            "prompt_idx": prompt_idx,
+            "task_source": "simple",
+            "generation_index": 0,
+            "rollout_id": rollout_id,
+            "reward": 1.0,
+        }
+
+    stages = [
+        [
+            event("completion_arrived", prompt_idx=0, rollout_id="r0_g0"),
+            event("completion_forwarded", prompt_idx=0, rollout_id="r0_g0"),
+        ],
+        [
+            event("completion_arrived", prompt_idx=1, rollout_id="r1_g0-a1"),
+            event("completion_forwarded", prompt_idx=1, rollout_id="r1_g0-a1"),
+            event("completion_arrived", prompt_idx=0, rollout_id="r0_g0-a1"),
+            event("completion_forwarded", prompt_idx=0, rollout_id="r0_g0-a1"),
+        ],
+    ]
+
+    order, missing = _HELPER._effective_arrival_order(stages)
+
+    assert order == [
+        (0, 1, "simple", 0),
+        (0, 0, "simple", 0),
+    ]
+    assert missing == []
+
+
+def test_compare_runs_accepts_missing_training_payload_dumps(tmp_path: Path) -> None:
+    args = _write_compare_fixture(tmp_path)
+    for path in (
+        args.baseline_log_dir / "exp_001/train_data_step1.jsonl",
+        args.recovery_log_dir / "exp_002/train_data_step1.jsonl",
+    ):
+        path.unlink()
+
+    _HELPER.compare_runs(args)
+
+
+def test_compare_runs_requires_opt_in_for_missing_training_payload_dumps(
+    tmp_path: Path,
+) -> None:
+    args = _write_compare_fixture(tmp_path)
+    args.allow_missing_training_payloads = False
+    for path in (
+        args.baseline_log_dir / "exp_001/train_data_step1.jsonl",
+        args.recovery_log_dir / "exp_002/train_data_step1.jsonl",
+    ):
+        path.unlink()
+
+    with pytest.raises(AssertionError, match="allow-missing-training-payloads"):
+        _HELPER.compare_runs(args)
+
+
+def test_compare_runs_rejects_one_sided_training_payload_dumps(
+    tmp_path: Path,
+) -> None:
+    args = _write_compare_fixture(tmp_path)
+    (args.recovery_log_dir / "exp_002/train_data_step1.jsonl").unlink()
+
+    with pytest.raises(AssertionError, match="present for only one run"):
+        _HELPER.compare_runs(args)
 
 
 def test_rollout_timeline_accepts_subset_redispatch() -> None:

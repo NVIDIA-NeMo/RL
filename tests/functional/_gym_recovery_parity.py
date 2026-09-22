@@ -401,6 +401,174 @@ def _effective_completions(
     return ordered, {identity: effective[identity][2] for identity in ordered}
 
 
+def _completion_identity(event: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        event.get("target_step"),
+        event.get("prompt_idx"),
+        event.get("task_source"),
+        event.get("generation_index"),
+    )
+
+
+def _prompt_group_ready_order(
+    completion_order: list[tuple[Any, ...]],
+) -> list[tuple[Any, ...]]:
+    """Order prompt groups by the rank of their last completed sibling."""
+    last_completion_rank: dict[tuple[Any, ...], int] = {}
+    for rank, identity in enumerate(completion_order):
+        last_completion_rank[identity[:3]] = rank
+    return sorted(last_completion_rank, key=last_completion_rank.__getitem__)
+
+
+def _within_step_rank_metrics(
+    baseline_order: list[tuple[Any, ...]],
+    recovery_order: list[tuple[Any, ...]],
+) -> dict[str, Any]:
+    """Compare relative ordering without rewarding already-ordered train steps."""
+    if set(baseline_order) != set(recovery_order):
+        raise AssertionError(
+            "rank parity requires identical logical identities: "
+            f"baseline={baseline_order!r}, recovery={recovery_order!r}"
+        )
+
+    recovery_ranks = {identity: rank for rank, identity in enumerate(recovery_order)}
+    target_steps = sorted({identity[0] for identity in baseline_order})
+    concordant_pairs = 0
+    discordant_pairs = 0
+    per_step: list[dict[str, Any]] = []
+    for target_step in target_steps:
+        baseline_step = [
+            identity for identity in baseline_order if identity[0] == target_step
+        ]
+        recovery_step = [
+            identity for identity in recovery_order if identity[0] == target_step
+        ]
+        step_discordant = 0
+        for left_index, left in enumerate(baseline_step):
+            for right in baseline_step[left_index + 1 :]:
+                if recovery_ranks[left] < recovery_ranks[right]:
+                    concordant_pairs += 1
+                else:
+                    discordant_pairs += 1
+                    step_discordant += 1
+        per_step.append(
+            {
+                "target_step": target_step,
+                "baseline_order": baseline_step,
+                "recovery_order": recovery_step,
+                "exact_match": baseline_step == recovery_step,
+                "discordant_pairs": step_discordant,
+                "comparable_pairs": len(baseline_step) * (len(baseline_step) - 1) // 2,
+            }
+        )
+
+    comparable_pairs = concordant_pairs + discordant_pairs
+    inversion_rate = discordant_pairs / comparable_pairs if comparable_pairs else None
+    kendall_tau = (
+        (concordant_pairs - discordant_pairs) / comparable_pairs
+        if comparable_pairs
+        else None
+    )
+    return {
+        "within_step_exact_match": all(step["exact_match"] for step in per_step),
+        "concordant_pairs": concordant_pairs,
+        "discordant_pairs": discordant_pairs,
+        "comparable_pairs": comparable_pairs,
+        "inversion_rate": inversion_rate,
+        "kendall_tau": kendall_tau,
+        "per_step": per_step,
+    }
+
+
+def _effective_arrival_order(
+    stages: list[list[dict[str, Any]]],
+) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
+    """Select the arrival corresponding to each retained forwarded completion."""
+    retained: dict[tuple[Any, ...], tuple[int, int, Any]] = {}
+    for stage_index, events in enumerate(stages):
+        for position, event in enumerate(events):
+            if event.get("event") != "completion_forwarded":
+                continue
+            retained[_completion_identity(event)] = (
+                stage_index,
+                position,
+                event.get("rollout_id"),
+            )
+
+    arrivals: dict[tuple[Any, ...], tuple[int, int]] = {}
+    for stage_index, events in enumerate(stages):
+        for position, event in enumerate(events):
+            if event.get("event") != "completion_arrived":
+                continue
+            identity = _completion_identity(event)
+            selected = retained.get(identity)
+            if selected is None:
+                continue
+            retained_stage, forwarded_position, rollout_id = selected
+            if (
+                stage_index == retained_stage
+                and position < forwarded_position
+                and event.get("rollout_id") == rollout_id
+            ):
+                arrivals[identity] = (stage_index, position)
+
+    ordered = sorted(arrivals, key=arrivals.__getitem__)
+    missing = [identity for identity in retained if identity not in arrivals]
+    return ordered, missing
+
+
+def _ordering_parity_report(
+    *,
+    baseline_stages: list[list[dict[str, Any]]],
+    recovery_stages: list[list[dict[str, Any]]],
+    baseline_completion_order: list[tuple[Any, ...]],
+    recovery_completion_order: list[tuple[Any, ...]],
+) -> dict[str, Any]:
+    baseline_group_order = _prompt_group_ready_order(baseline_completion_order)
+    recovery_group_order = _prompt_group_ready_order(recovery_completion_order)
+    baseline_arrival_order, baseline_missing_arrivals = _effective_arrival_order(
+        baseline_stages
+    )
+    recovery_arrival_order, recovery_missing_arrivals = _effective_arrival_order(
+        recovery_stages
+    )
+    arrivals_complete = not baseline_missing_arrivals and not recovery_missing_arrivals
+
+    arrival_report: dict[str, Any] = {
+        "complete": arrivals_complete,
+        "baseline_order": baseline_arrival_order,
+        "recovery_order": recovery_arrival_order,
+        "baseline_missing": baseline_missing_arrivals,
+        "recovery_missing": recovery_missing_arrivals,
+        "individual": None,
+        "prompt_group_last_sibling": None,
+    }
+    if arrivals_complete:
+        arrival_report["individual"] = _within_step_rank_metrics(
+            baseline_arrival_order, recovery_arrival_order
+        )
+        arrival_report["prompt_group_last_sibling"] = _within_step_rank_metrics(
+            _prompt_group_ready_order(baseline_arrival_order),
+            _prompt_group_ready_order(recovery_arrival_order),
+        )
+
+    return {
+        "forwarded_completion": {
+            "baseline_order": baseline_completion_order,
+            "recovery_order": recovery_completion_order,
+            "individual": _within_step_rank_metrics(
+                baseline_completion_order, recovery_completion_order
+            ),
+            "baseline_prompt_group_ready_order": baseline_group_order,
+            "recovery_prompt_group_ready_order": recovery_group_order,
+            "prompt_group_ready": _within_step_rank_metrics(
+                baseline_group_order, recovery_group_order
+            ),
+        },
+        "arrival": arrival_report,
+    }
+
+
 def _trained_step_events(
     events: list[dict[str, Any]], *, steps: int
 ) -> list[dict[str, Any]]:
@@ -526,6 +694,7 @@ def _write_rollout_timeline(
     baseline_order: list[tuple[Any, ...]],
     recovery_order: list[tuple[Any, ...]],
     completion_order_matches: bool,
+    ordering_parity: dict[str, Any],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -534,6 +703,7 @@ def _write_rollout_timeline(
                 "completion_order_matches": completion_order_matches,
                 "baseline_completion_order": baseline_order,
                 "recovery_completion_order": recovery_order,
+                "ordering_parity": ordering_parity,
                 "baseline": _rollout_timeline(
                     baseline_stages, effective_order=baseline_order
                 ),
@@ -608,9 +778,28 @@ def _compare_training_payloads(
     steps: int,
     rtol: float,
     atol: float,
+    allow_missing: bool,
 ) -> None:
     baseline_files = _step_files(baseline_dir)
     recovery_files = _step_files(recovery_dir, allow_restarts=True)
+    if not baseline_files and not recovery_files:
+        if not allow_missing:
+            raise AssertionError(
+                "training payload dumps are unavailable; pass "
+                "--allow-missing-training-payloads to explicitly use logical "
+                "identity, reward, ordering, and semantic-metric parity"
+            )
+        print(
+            "training payload dumps are unavailable; logical rollout identities, "
+            "step membership, rewards, ordering, and semantic metrics remain checked",
+            flush=True,
+        )
+        return
+    if not baseline_files or not recovery_files:
+        raise AssertionError(
+            "training payload dumps are present for only one run: "
+            f"baseline={sorted(baseline_files)}, recovery={sorted(recovery_files)}"
+        )
     expected_steps = set(range(1, steps + 1))
     if set(baseline_files) != expected_steps:
         raise AssertionError(
@@ -753,7 +942,24 @@ def compare_runs(args: argparse.Namespace) -> None:
     recovery_completion_order, recovery_completions = _effective_completions(
         recovery_stages
     )
+    if baseline_completions != recovery_completions:
+        raise AssertionError(
+            "logical completion rewards differ between uninterrupted and recovery runs"
+        )
+    expected_completions = expected_groups * args.generations_per_prompt
+    if len(baseline_completions) != expected_completions:
+        raise AssertionError(
+            f"observed {len(baseline_completions)} logical completions, "
+            f"expected {expected_completions}"
+        )
+
     completion_order_matches = baseline_completion_order == recovery_completion_order
+    ordering_parity = _ordering_parity_report(
+        baseline_stages=[baseline_events],
+        recovery_stages=recovery_stages,
+        baseline_completion_order=baseline_completion_order,
+        recovery_completion_order=recovery_completion_order,
+    )
     if args.timeline_output is not None:
         _write_rollout_timeline(
             args.timeline_output,
@@ -762,6 +968,7 @@ def compare_runs(args: argparse.Namespace) -> None:
             baseline_order=baseline_completion_order,
             recovery_order=recovery_completion_order,
             completion_order_matches=completion_order_matches,
+            ordering_parity=ordering_parity,
         )
     if args.require_completion_order_match and not completion_order_matches:
         raise AssertionError(
@@ -775,15 +982,42 @@ def compare_runs(args: argparse.Namespace) -> None:
         + " between uninterrupted and recovery runs",
         flush=True,
     )
-    if baseline_completions != recovery_completions:
-        raise AssertionError(
-            "logical completion rewards differ between uninterrupted and recovery runs"
+    forwarded = ordering_parity["forwarded_completion"]
+    for label, metrics in (
+        ("individual forwarded completions", forwarded["individual"]),
+        ("prompt-group readiness", forwarded["prompt_group_ready"]),
+    ):
+        print(
+            f"{label} within-step rank parity: "
+            f"kendall_tau={metrics['kendall_tau']!r} "
+            f"inversion_rate={metrics['inversion_rate']!r} "
+            f"discordant_pairs={metrics['discordant_pairs']}/"
+            f"{metrics['comparable_pairs']}",
+            flush=True,
         )
-    expected_completions = expected_groups * args.generations_per_prompt
-    if len(baseline_completions) != expected_completions:
-        raise AssertionError(
-            f"observed {len(baseline_completions)} logical completions, "
-            f"expected {expected_completions}"
+    arrival = ordering_parity["arrival"]
+    if arrival["complete"]:
+        for label, metrics in (
+            ("individual arrivals", arrival["individual"]),
+            (
+                "prompt-group last-sibling arrivals",
+                arrival["prompt_group_last_sibling"],
+            ),
+        ):
+            print(
+                f"{label} within-step rank parity: "
+                f"kendall_tau={metrics['kendall_tau']!r} "
+                f"inversion_rate={metrics['inversion_rate']!r} "
+                f"discordant_pairs={metrics['discordant_pairs']}/"
+                f"{metrics['comparable_pairs']}",
+                flush=True,
+            )
+    else:
+        print(
+            "arrival rank parity unavailable because retained completion-arrived "
+            f"events are missing: baseline={arrival['baseline_missing']!r}, "
+            f"recovery={arrival['recovery_missing']!r}",
+            flush=True,
         )
 
     retried_sources = {
@@ -805,6 +1039,7 @@ def compare_runs(args: argparse.Namespace) -> None:
         steps=args.steps,
         rtol=args.rtol,
         atol=args.atol,
+        allow_missing=args.allow_missing_training_payloads,
     )
     _compare_metrics(
         args.baseline_metrics,
@@ -861,6 +1096,7 @@ def _parser() -> argparse.ArgumentParser:
     compare.add_argument("--baseline-audit", type=Path, required=True)
     compare.add_argument("--recovery-audit", type=Path, action="append", required=True)
     compare.add_argument("--timeline-output", type=Path)
+    compare.add_argument("--allow-missing-training-payloads", action="store_true")
     compare.add_argument("--require-completion-order-match", action="store_true")
     compare.add_argument("--steps", type=int, required=True)
     compare.add_argument("--prompts-per-step", type=int, required=True)
