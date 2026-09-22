@@ -93,17 +93,7 @@ the recipe's `noncolocated` suffix describes generation placement, not a separat
 policy/value GPU split. Existing in-order sampling and no-short-batch PPO guards
 remain in effect.
 
-## Development run on cw-dfw
-
-`examples/ppo_streaming_cw_dfw.sh` submits the supplied Qwen2.5-1.5B GSM8K recipe
-with one training node and one generation node using `nemo_rl.0922.sqsh`. Defaults
-are three steps, 256 prompt groups per batch, a 32-group readiness threshold,
-one policy epoch, two full-batch critic epochs, and no critic warmup.
-
-```bash
-bash examples/ppo_streaming_cw_dfw.sh
-PPO_MAX_STEPS=10 PPO_STREAMING_GROUPS=64 bash examples/ppo_streaming_cw_dfw.sh
-```
+## Verifying streaming
 
 Inspect `train_pump: step ... chunk ...` and `closing on ... chunk(s)` records to
 confirm that the run actually processed multiple chunks. Job completion alone
