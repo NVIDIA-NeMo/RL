@@ -381,6 +381,7 @@ environments = [
 ]
 preview = true # Enable preview features like extra-build-dependencies
 no-build-isolation-package = [
+  "transformer-engine",
   "transformer-engine-torch",
   "flash-attn",
   "mamba-ssm",
@@ -530,6 +531,7 @@ conflicts = [
 # Augment build dependencies for packages that need torch at build time
 [tool.uv.extra-build-dependencies]
 flash-attn = [{ requirement = "torch", match-runtime = true }]
+transformer-engine = [{ requirement = "torch", match-runtime = true }]
 # Git-sourced packages CAN use match-runtime = true if we provide dependency-metadata
 deep_ep = [{ requirement = "torch", match-runtime = true }]
 deep_gemm = [{ requirement = "torch", match-runtime = true }]

@@ -189,6 +189,14 @@ def test_transformer_engine_override_matches_megatron_bridge_source() -> None:
     assert root_override.url == expected_url
 
 
+def test_transformer_engine_git_build_uses_runtime_torch() -> None:
+    uv = tomllib.loads(ROOT_PYPROJECT.read_text())["tool"]["uv"]
+    assert "transformer-engine" in uv["no-build-isolation-package"]
+    assert uv["extra-build-dependencies"]["transformer-engine"] == [
+        {"requirement": "torch", "match-runtime": True}
+    ]
+
+
 @pytest.mark.parametrize("package", ["av", "opencv-python-headless"])
 def test_royalty_sensitive_codecs_are_excluded(package: str) -> None:
     lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text())
