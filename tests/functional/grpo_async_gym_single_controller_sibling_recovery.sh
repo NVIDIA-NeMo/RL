@@ -1,14 +1,41 @@
 #!/bin/bash
 # Two-process functional test for sibling-level token-capture recovery.
+#
+# SC_SIBLING_RECOVERY_GENERATION_BACKEND selects the SC+Gym smoke that both
+# phases run through: vllm (default) or megatron. The hook, overrides and
+# assertions are backend-agnostic; only the base test and its log path differ.
 
 set -eou pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 PROJECT_ROOT=$(realpath "$SCRIPT_DIR/../..")
-BASE_TEST=$SCRIPT_DIR/grpo_async_gym_single_controller.sh
-TEST_DIR=$SCRIPT_DIR/grpo_async_gym_single_controller_sibling_recovery
+GENERATION_BACKEND=${SC_SIBLING_RECOVERY_GENERATION_BACKEND:-vllm}
+case "$GENERATION_BACKEND" in
+    vllm)
+        BASE_NAME=grpo_async_gym_single_controller
+        TEST_DIR=$SCRIPT_DIR/grpo_async_gym_single_controller_sibling_recovery
+        ;;
+    megatron)
+        BASE_NAME=grpo_megatron_generation_gym_single_controller
+        TEST_DIR=$SCRIPT_DIR/grpo_megatron_generation_gym_single_controller_sibling_recovery
+        # Megatron capture needs the MInf hooks from NVIDIA/Megatron-LM PR #7015.
+        # Until the pinned megatron-core carries them, setup refuses the config,
+        # so skip with the same annotation the >= 3-GPU tests use instead of
+        # failing on a known-missing dependency.
+        if ! uv run --directory "$PROJECT_ROOT" --no-sync python -c \
+            'from nemo_rl.algorithms.single_controller_utils.setup import _require_minf_capture_hooks; _require_minf_capture_hooks()'; then
+            echo "::warning title=Megatron sibling recovery test skipped::The pinned megatron-core lacks the MInf capture hooks (Megatron-LM PR #7015); this test proves nothing until the submodule bump lands."
+            exit 0
+        fi
+        ;;
+    *)
+        echo "Unsupported SC_SIBLING_RECOVERY_GENERATION_BACKEND=$GENERATION_BACKEND (expected vllm or megatron)"
+        exit 2
+        ;;
+esac
+BASE_TEST=$SCRIPT_DIR/$BASE_NAME.sh
 CHECKPOINT_DIR=$TEST_DIR/checkpoints
-BASE_RUN_LOG=$SCRIPT_DIR/grpo_async_gym_single_controller/run.log
+BASE_RUN_LOG=$SCRIPT_DIR/$BASE_NAME/run.log
 PHASE1_LOG=$TEST_DIR/phase1.log
 PHASE2_LOG=$TEST_DIR/phase2.log
 PHASE1_EVENTS=$TEST_DIR/phase1-events.jsonl
@@ -78,4 +105,4 @@ uv run --directory "$PROJECT_ROOT" --no-sync python -c \
     'import sys, torch; state = torch.load(sys.argv[1], weights_only=True); group_id = sys.argv[2]; assert group_id not in {group["group_id"] for group in state["groups"]}, state' \
     "$CHECKPOINT_DIR/step_2/rollout_recovery.pt" "$PARTIAL_GROUP_ID"
 
-echo "Sibling-level token-capture recovery functional test passed."
+echo "Sibling-level token-capture recovery functional test passed ($GENERATION_BACKEND backend)."

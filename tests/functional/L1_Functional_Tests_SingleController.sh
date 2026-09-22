@@ -195,6 +195,11 @@ run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controll
 # Two-process token-capture recovery: preserve one sealed sibling in TQ and
 # redispatch only its unfinished peer after restoring the step checkpoint.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_sibling_recovery.sh
+# The same two-process recovery through Megatron generation, which stages
+# deltas from MCore rather than the vLLM worker. The vLLM run above cannot
+# cover that custody path. Self-skips (with a ::warning) while the pinned
+# megatron-core predates Megatron-LM PR #7015.
+run_test      env SC_SIBLING_RECOVERY_GENERATION_BACKEND=megatron uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_sibling_recovery.sh
 # Periodic native-TQ snapshot while a streamed step owns only part of its
 # rollout batch, followed by SIGKILL and rollback to the durable trainer anchor.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_streaming_recovery.sh
