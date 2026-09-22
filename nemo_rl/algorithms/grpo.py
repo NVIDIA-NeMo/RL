@@ -407,6 +407,9 @@ class GRPOSaveState:
     # SingleController only: exact last admitted dispatch batch. None preserves
     # compatibility with checkpoints that only recorded the trainer version.
     sampler_dispatch_index: Optional[int] = None
+    # SingleController NeMo-Gym only: next per-attempt task ID. Zero keeps
+    # checkpoints written before the counter was introduced loadable.
+    next_nemo_gym_task_index: int = 0
 
 
 def _initial_grpo_save_state() -> GRPOSaveState:

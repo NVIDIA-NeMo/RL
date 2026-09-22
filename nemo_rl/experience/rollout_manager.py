@@ -61,6 +61,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
     Completion,
     PromptGroupRecord,
 )
@@ -964,8 +965,25 @@ class AsyncNemoGymRolloutImpl:
         ).max_gym_row_attempts
         self._stats = stats
         self._effort_config = effort_config
+        # Small integers keep Gym task IDs safe for NumPy/W&B numeric metrics.
+        self._next_nemo_gym_task_index = 0
 
         self._validate_init_params()
+
+    def get_next_nemo_gym_task_index(self) -> int:
+        """Return the next attempt ID for checkpointing."""
+        return self._next_nemo_gym_task_index
+
+    def set_next_nemo_gym_task_index(self, value: int) -> None:
+        """Restore the next attempt ID before dispatching rollouts."""
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError("next NeMo-Gym task index must be a non-negative integer")
+        self._next_nemo_gym_task_index = value
+
+    def _take_nemo_gym_task_index(self) -> int:
+        task_index = self._next_nemo_gym_task_index
+        self._next_nemo_gym_task_index += 1
+        return task_index
 
     async def run_rollout(
         self,
@@ -994,6 +1012,7 @@ class AsyncNemoGymRolloutImpl:
 
         rollout_inputs = self._build_inputs(
             input_sample,
+            task_index=self._take_nemo_gym_task_index(),
             rollout_ids=rollout_ids,
             generation_indices=generation_indices,
         )
@@ -1062,12 +1081,17 @@ class AsyncNemoGymRolloutImpl:
         self,
         input_sample: DatumSpec,
         *,
+        task_index: int,
         rollout_ids: Optional[list[str]] = None,
         generation_indices: Optional[list[int]] = None,
     ) -> list[dict]:
         """Build N row dicts from input_sample, applying generation config params."""
         # Build a template row from the input_sample's extra_env_info, applying generation params.
         template_row: dict = copy.deepcopy(input_sample["extra_env_info"])  # type: ignore
+        # One fresh ID per run_rollout attempt, shared by all sibling rows.
+        # Dataset IDs may repeat; do not mutate the source sample. Row-level
+        # redispatch reuses these built rows and therefore keeps the same ID.
+        template_row[NEMO_GYM_TASK_INDEX_KEY] = task_index
 
         # We do not translate max_seq_len into row-level max_tokens here because that would
         # change semantics from "total sequence length" to "max new tokens".
@@ -1795,6 +1819,17 @@ class RolloutManager:
             version: Trainer weight version to stamp on future rollout tags.
         """
         self._weight_version = int(version)
+
+    def get_next_nemo_gym_task_index(self) -> int:
+        """Return the Gym attempt counter, or zero for native rollouts."""
+        if isinstance(self._impl, AsyncNemoGymRolloutImpl):
+            return self._impl.get_next_nemo_gym_task_index()
+        return 0
+
+    def set_next_nemo_gym_task_index(self, value: int) -> None:
+        """Restore the attempt counter for Gym rollouts only."""
+        if isinstance(self._impl, AsyncNemoGymRolloutImpl):
+            self._impl.set_next_nemo_gym_task_index(value)
 
     async def run_rollout(
         self,

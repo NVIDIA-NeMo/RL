@@ -500,6 +500,7 @@ class _RefitRecordingTrainer(_FakeTrainer):
 class _FakeRolloutManager:
     def __init__(self, events: Optional[list[str]] = None) -> None:
         self.weight_versions: list[int] = []
+        self.next_nemo_gym_task_index = 0
         self._tq_buffer = None
         self.recovery_ledger = RolloutRecoveryLedger()
         self._events = events
@@ -515,6 +516,12 @@ class _FakeRolloutManager:
 
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
+
+    def get_next_nemo_gym_task_index(self) -> int:
+        return self.next_nemo_gym_task_index
+
+    def set_next_nemo_gym_task_index(self, value: int) -> None:
+        self.next_nemo_gym_task_index = value
 
     def suspend_request_deadlines(self) -> None:
         if self._events is not None:
@@ -1020,6 +1027,7 @@ class TestCounterRestore:
         save_state.current_epoch = 2
         save_state.consumed_samples = 42
         save_state.total_valid_tokens = 1234
+        save_state.next_nemo_gym_task_index = 321
 
         actor = _ACTOR_CLS(
             _actor_master_config(tmp_path),
@@ -1035,6 +1043,7 @@ class TestCounterRestore:
         assert actor._consumed_samples == 42
         assert actor._current_epoch == 2
         assert actor._total_valid_tokens == 1234
+        assert actor._rollout_manager.get_next_nemo_gym_task_index() == 321
 
     def test_restores_trainer_version_independently_from_train_step(self, tmp_path):
         save_state = _initial_grpo_save_state()
@@ -1125,6 +1134,23 @@ class TestCounterRestore:
 
 
 class TestSaveTrigger:
+    def test_saves_live_gym_counter_and_restores_it(self, tmp_path: Path) -> None:
+        mc = _actor_master_config(tmp_path, max_num_steps=1, save_period=1)
+
+        def advance_counter(actor: Any) -> None:
+            actor._rollout_manager.set_next_nemo_gym_task_index(123)
+
+        _run_train_pump(mc, _make_actor_args(), seed=advance_counter)
+        info = _training_info(tmp_path / "checkpoints", 1)
+        assert info["next_nemo_gym_task_index"] == 123
+
+        restored = _ACTOR_CLS(
+            mc,
+            _make_actor_args(save_state=_get_grpo_save_state(info)),
+            SetupTimingMetrics(),
+        )
+        assert restored._rollout_manager.get_next_nemo_gym_task_index() == 123
+
     def test_saves_on_period_boundary_and_last_step(self, tmp_path):
         mc = _actor_master_config(tmp_path, max_num_steps=4, save_period=2)
         trainer = _FakeTrainer()
@@ -1140,6 +1166,7 @@ class TestSaveTrigger:
         assert info_2["current_step"] == 2
         assert info_2["trainer_version"] == 2
         assert info_2["sampler_dispatch_index"] == -1
+        assert info_2["next_nemo_gym_task_index"] == 0
         assert info_2["total_steps"] == 2
         assert info_2["consumed_samples"] == 4  # 2 prompts/step * 2 steps
         # No validation ran, so the default val_reward is dropped.
@@ -2317,6 +2344,7 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     actor._checkpoint_save_lock = asyncio.Lock()
     actor._save_state = SimpleNamespace()
+    actor._rollout_manager = _FakeRolloutManager()
     actor._train_steps = 1
     actor._trainer_version = 1
     actor._current_epoch = 0

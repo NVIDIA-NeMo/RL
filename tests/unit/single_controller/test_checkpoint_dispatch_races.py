@@ -258,9 +258,16 @@ class _BlockingRolloutManager:
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.weight_version = 0
+        self.next_nemo_gym_task_index = 0
 
     def set_weight_version(self, version: int) -> None:
         self.weight_version = version
+
+    def get_next_nemo_gym_task_index(self) -> int:
+        return self.next_nemo_gym_task_index
+
+    def set_next_nemo_gym_task_index(self, value: int) -> None:
+        self.next_nemo_gym_task_index = value
 
     def set_data_plane_checkpoint_barrier(
         self, barrier: DataPlaneCheckpointBarrier
