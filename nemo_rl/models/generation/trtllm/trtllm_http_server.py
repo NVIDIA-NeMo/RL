@@ -27,6 +27,7 @@ Under PD disaggregation this endpoint is *leg-aware*. A replica's
 """
 
 import asyncio
+import functools
 import logging
 import os
 import random
@@ -43,6 +44,21 @@ from nemo_rl.models.generation.openai_server_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@functools.cache
+def _choice_declares_token_ids() -> bool:
+    """Whether the installed TRT-LLM's chat choice model declares ``token_ids``.
+
+    Cached because it is consulted once per generated response, and imported
+    lazily because this module is also used on the aggregated path where
+    tensorrt_llm need not be importable.
+    """
+    try:
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionResponseChoice
+    except ImportError:
+        return False
+    return "token_ids" in ChatCompletionResponseChoice.model_fields
 
 
 def _tokenizer_backend_name(tokenizer: Any) -> str:
@@ -306,8 +322,9 @@ def create_app(
         # Conversation identity for rank-affine ADP routing: canonical body
         # conversation_params, else the id the disagg service stamps onto
         # disaggregated_params for its ctx/gen legs. None = no affinity.
-        _conv_id = ((body.get("conversation_params") or {}).get("conversation_id")
-                    or (body.get("disaggregated_params") or {}).get("conversation_id"))
+        _conv_id = (body.get("conversation_params") or {}).get("conversation_id") or (
+            body.get("disaggregated_params") or {}
+        ).get("conversation_id")
         disagg_params = None
         if body.get("disaggregated_params") is not None:
             from tensorrt_llm.serve.openai_protocol import (
@@ -318,9 +335,7 @@ def create_app(
             disagg_params = to_llm_disaggregated_params(
                 WireDisaggregatedParams(**body["disaggregated_params"])
             )
-        is_context_leg = (
-            getattr(disagg_params, "request_type", None) == "context_only"
-        )
+        is_context_leg = getattr(disagg_params, "request_type", None) == "context_only"
 
         # The NeMo-RL generation config, not the request, is the source of truth
         # for sampling params.
@@ -474,9 +489,7 @@ def create_app(
             # -- reasoning parsing, tool parsing, stop-token trimming -- is for
             # the completed generation, so skip it and hand the disagg server
             # just what it needs to build the generation leg.
-            return _context_leg_response(
-                model_name, adj_prompt, gen, disagg_params
-            )
+            return _context_leg_response(model_name, adj_prompt, gen, disagg_params)
 
         gen_token_ids = list(gen.token_ids)
 
@@ -562,10 +575,6 @@ def create_app(
                     "index": 0,
                     "message": msg_dict,
                     "finish_reason": finish_reason,
-                    # Generated token ids. ChatCompletionResponseChoice needs
-                    # the matching field upstream (CompletionResponseChoice
-                    # already has it) or the disagg server rejects this.
-                    "token_ids": gen_token_ids,
                 }
             ],
             # Declared on ChatCompletionResponse precisely so a generation
@@ -577,6 +586,16 @@ def create_app(
                 "total_tokens": len(adj_prompt) + len(gen_token_ids),
             },
         }
+
+        # Generated token ids get their own declared field only on a TRT-LLM
+        # build whose ChatCompletionResponseChoice carries one
+        # (CompletionResponseChoice already does). Emitting it unconditionally
+        # would 400 at the disagg server's extra="forbid" re-validation on every
+        # other build -- which is precisely where the token_id:N logprobs
+        # fallback below is supposed to take over, so the write has to be gated
+        # the same way the read is.
+        if _choice_declares_token_ids():
+            response["choices"][0]["token_ids"] = gen_token_ids
 
         if logprobs_requested and gen_logprobs:
             # `token` carries the id rather than the decoded text when asked.

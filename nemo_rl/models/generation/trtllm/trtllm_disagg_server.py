@@ -1,4 +1,3 @@
-
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,8 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""One replica's disaggregation front-end, backed by TRT-LLM's
-``OpenAIDisaggServer``.
+"""One replica's disaggregation front-end, backed by TRT-LLM's ``OpenAIDisaggServer``.
 
 Started the same way as :mod:`trtllm_http_server`: a uvicorn app in a daemon
 thread, returning the URL NeMo-Gym will talk to. That server owns everything
@@ -22,6 +20,7 @@ generation engine runs the decode, and the KV handshake between them. NeMo RL
 only hands it the two address pools and the router policies.
 """
 
+import json
 import logging
 import threading
 import time
@@ -34,7 +33,9 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "DisaggServerActor",
     "DisaggServerActorImpl",
+    "attach_rollout_fields",
     "build_config",
+    "generation_token_ids",
     "start_server",
     "wait_ready",
 ]
@@ -111,6 +112,62 @@ _TOKEN_ID_PREFIX = "token_id:"
 _ADAPTED_PATHS = frozenset({"/v1/chat/completions", "/v1/completions"})
 
 
+def generation_token_ids(choice: dict[str, Any]) -> Optional[list[int]]:
+    """Generated token ids, from whichever declared field carries them.
+
+    ``ChatCompletionResponseChoice.token_ids`` is the clean home, but it does
+    not exist upstream yet. Until it does they ride in
+    ``logprobs.content[].token`` using vLLM's ``token_id:N`` encoding, which is
+    a declared string field and therefore survives the hop.
+    """
+    if choice.get("token_ids"):
+        return list(choice["token_ids"])
+
+    content = (choice.get("logprobs") or {}).get("content") or []
+    ids = []
+    for entry in content:
+        token = entry.get("token") or ""
+        if not token.startswith(_TOKEN_ID_PREFIX):
+            return None
+        ids.append(int(token[len(_TOKEN_ID_PREFIX) :]))
+    return ids or None
+
+
+def attach_rollout_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    """Re-attach, in place, the fields NeMo-Gym reads off ``choices[].message``.
+
+    The counterpart of the aggregated path's ``msg_dict`` assignment in
+    :mod:`trtllm_http_server`: there the engine answers Gym directly and writes
+    the fields onto the message, here the engine had to route them through
+    declared response fields to survive the disagg server's ``extra="forbid"``
+    re-validation, so they are moved back. The two must agree field for field --
+    a message missing ``generation_token_ids`` is skipped outright by
+    ``nemo_gym.py``, silently dropping that turn's training data -- which is why
+    this lives at module level with no ``tensorrt_llm`` import in its way.
+    """
+    choices = payload.get("choices") or []
+    if not choices:
+        return payload
+
+    choice = choices[0]
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        return payload
+
+    if payload.get("prompt_token_ids") is not None:
+        message["prompt_token_ids"] = payload["prompt_token_ids"]
+
+    token_ids = generation_token_ids(choice)
+    if token_ids is not None:
+        message["generation_token_ids"] = token_ids
+
+    content = (choice.get("logprobs") or {}).get("content")
+    if content:
+        message["generation_log_probs"] = [entry.get("logprob") for entry in content]
+
+    return payload
+
+
 class _DropGymOnlyRequestFields:
     """ASGI middleware stripping the vLLM-only fields from request bodies.
 
@@ -132,9 +189,6 @@ class _DropGymOnlyRequestFields:
         if scope.get("type") != "http" or scope.get("path") not in _ADAPTED_PATHS:
             await self.app(scope, receive, send)
             return
-
-
-        import json
 
         chunks: list[bytes] = []
         while True:
@@ -315,66 +369,16 @@ def _build_adaptor_class() -> type:
                 response = await inner(req, raw_req)
                 if req.stream or not isinstance(response, JSONResponse):
                     return response
-                return self._attach_rollout_fields(response, raw_req)
+                # The translation itself is module-level and tensorrt_llm-free
+                # so it can be unit-tested against the exact payload
+                # trtllm_http_server emits; only the JSONResponse re-wrap
+                # belongs to this subclass.
+                return JSONResponse(
+                    content=attach_rollout_fields(json.loads(response.body)),
+                    status_code=response.status_code,
+                )
 
             return wrapper
-
-        @staticmethod
-        def _generation_token_ids(choice: dict[str, Any]) -> Optional[list[int]]:
-            """Generated token ids, from whichever declared field carries them.
-
-            ``ChatCompletionResponseChoice.token_ids`` is the clean home, but it
-            does not exist upstream yet. Until it does they ride in
-            ``logprobs.content[].token`` using vLLM's ``token_id:N`` encoding,
-            which is a declared string field and therefore survives the hop.
-            """
-            if choice.get("token_ids"):
-                return list(choice["token_ids"])
-
-            content = (choice.get("logprobs") or {}).get("content") or []
-            ids = []
-            for entry in content:
-                token = entry.get("token") or ""
-                if not token.startswith(_TOKEN_ID_PREFIX):
-                    return None
-                ids.append(int(token[len(_TOKEN_ID_PREFIX) :]))
-            return ids or None
-
-        def _attach_rollout_fields(
-            self, response: JSONResponse, raw_req: "Request | None" = None
-        ) -> JSONResponse:
-            """Re-attach the fields NeMo-Gym reads off ``choices[].message``."""
-            import json
-
-            payload = json.loads(response.body)
-
-            choices = payload.get("choices") or []
-            if not choices:
-                return JSONResponse(
-                    content=payload, status_code=response.status_code
-                )
-
-            choice = choices[0]
-            message = choice.get("message")
-            if not isinstance(message, dict):
-                return JSONResponse(
-                    content=payload, status_code=response.status_code
-                )
-
-            if payload.get("prompt_token_ids") is not None:
-                message["prompt_token_ids"] = payload["prompt_token_ids"]
-
-            token_ids = self._generation_token_ids(choice)
-            if token_ids is not None:
-                message["generation_token_ids"] = token_ids
-
-            content = (choice.get("logprobs") or {}).get("content")
-            if content:
-                message["generation_log_probs"] = [
-                    entry.get("logprob") for entry in content
-                ]
-
-            return JSONResponse(content=payload, status_code=response.status_code)
 
     return OpenAIDisaggServerAdaptor
 
@@ -395,13 +399,12 @@ def _build_frontend_tokenizer(
     import base64
 
     import numpy as np
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
     from transformers import AutoConfig, AutoTokenizer
 
     from nemo_rl.models.generation.trtllm.trtllm_http_server import (
         build_spliced_prompt_ids,
     )
-
-    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
@@ -575,31 +578,30 @@ class DisaggServerActorImpl:
             config, port=self._port, tokenize_fn=tokenize_fn
         )
 
-    def start(
-        self,
-        ctx_addrs: Optional[list[tuple[str, int]]] = None,
-        gen_addrs: Optional[list[tuple[str, int]]] = None,
-        *,
-        ctx_router: str = "conversation",
-        gen_router: str = "load_balancing",
-        gen_tokids_ctxbytes: bool = False,
-        gen_strip_message_history: bool = False,
-    ) -> str:
-        """Ensure the server is up and return the URL NeMo-Gym will talk to."""
-        if self._base_url is None:
-            assert ctx_addrs is not None and gen_addrs is not None, (
-                "start() needs the address pools unless they were passed to "
-                "the constructor via serve_args"
-            )
-            self._start_serving(
-                ctx_addrs,
-                gen_addrs,
-                ctx_router=ctx_router,
-                gen_router=gen_router,
-                gen_tokids_ctxbytes=gen_tokids_ctxbytes,
-                gen_strip_message_history=gen_strip_message_history,
-            )
+    def start(self) -> str:
+        """Wait for the server to answer and return the URL NeMo-Gym will talk to.
+
+        Serving is the constructor's job, not this method's -- that is what
+        makes Ray actor restart replay it. A second entry point that could also
+        start would be a silently *less* configured one (no frontend_tokenize,
+        no model name, hardcoded routers), so the invariant is asserted instead
+        of being papered over with a fallback.
+        """
+        assert self._base_url is not None, (
+            "DisaggServerActorImpl must be constructed with serve_args; the "
+            "constructor is what starts serving so Ray actor restart replays it."
+        )
         wait_ready(self._base_url)
+        # wait_ready cannot distinguish "my server is up" from "a server is up
+        # on this host:port". uvicorn's bind failure calls sys.exit(1), which
+        # only unwinds the daemon thread, so without this a port collision is
+        # answered 200 by the winner and this replica advertises a URL it does
+        # not own while its engines sit idle.
+        assert self._thread is not None and self._thread.is_alive(), (
+            f"disagg frontend {self._frontend_idx} for replica "
+            f"{self._replica_idx} died while coming up at {self._base_url} "
+            "(most likely its port was already bound on this node)"
+        )
 
         logger.info(
             "disagg frontend %d/%d for replica %d ready at %s",
@@ -628,8 +630,6 @@ def wait_ready(base_url: str, timeout_s: float = 300.0) -> None:
     It reaches out to every engine in its pools on startup, so readiness lags
     the thread start by more than a socket bind.
     """
-    import time
-
     import requests
 
     health = base_url.rsplit("/v1", 1)[0] + "/health"

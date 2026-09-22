@@ -22,7 +22,7 @@ to time-multiplex GPU memory between training and inference phases.
 import asyncio
 import os
 from collections import defaultdict
-from typing import Any, AsyncGenerator, Optional, Union, cast
+from typing import Any, AsyncGenerator, Literal, Optional, Union, cast
 
 import numpy as np
 import ray
@@ -37,7 +37,11 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     reject_unenforceable_refit_deadline,
 )
-from nemo_rl.models.generation.trtllm.config import TrtllmConfig
+from nemo_rl.models.generation.trtllm.config import (
+    TrtllmConfig,
+    TrtllmDisaggConfig,
+    resolve_trtllm_disagg_config,
+)
 
 
 class TrtllmGeneration(GenerationInterface):
@@ -50,13 +54,15 @@ class TrtllmGeneration(GenerationInterface):
     ) -> None:
         """Pre-initialize placement groups matching TRT-LLM's topology."""
         trtllm_cfg = config["trtllm_cfg"]
-        disagg = trtllm_cfg.get("disaggregation") or {}
+        disagg = resolve_trtllm_disagg_config(config)
         engine_tp = trtllm_cfg["tensor_parallel_size"]
-        if disagg.get("enabled"):
+        if disagg.enabled:
             engine_tp = max(
-                int((disagg.get(f"{role}_trtllm_kwargs") or {}).get(
-                    "tensor_parallel_size", engine_tp
-                ))
+                int(
+                    disagg.role_trtllm_kwargs(role).get(
+                        "tensor_parallel_size", engine_tp
+                    )
+                )
                 for role in ("ctx", "gen")
             )
         pp = trtllm_cfg.get("pipeline_parallel_size", 1)
@@ -83,7 +89,7 @@ class TrtllmGeneration(GenerationInterface):
         # disagg servers hold HTTP connections to engines that would be asleep.
         # Reject the combination instead of hanging on the first request after a
         # sleep.
-        assert not (disagg.get("enabled") and colocated), (
+        assert not (disagg.enabled and colocated), (
             "PD disaggregation requires non-colocated generation: colocated mode "
             "sleeps the engines between rollouts, which drops the KV cache the "
             "transceiver needs. Set colocated.enabled=false or "
@@ -110,6 +116,10 @@ class TrtllmGeneration(GenerationInterface):
     ):
         self.cfg = config
         self.tp_size = self.cfg["trtllm_cfg"]["tensor_parallel_size"]
+        # Validated once here rather than per access: every disagg default
+        # lives on the schema, so the rest of this class reads attributes
+        # instead of re-deriving a default per key.
+        self._disagg = resolve_trtllm_disagg_config(config)
 
         # Per-engine role and TP width, in engine order -- the single source of
         # truth for how the cluster is sliced. Without disaggregation every
@@ -142,7 +152,7 @@ class TrtllmGeneration(GenerationInterface):
         # -- the LLM constructor would otherwise raise a less actionable error
         # deep inside the engine. Under disaggregation this is per role, since
         # both TP and the MoE split can differ between prefill and decode.
-        if self._disagg_cfg.get("enabled"):
+        if self._disagg_cfg.enabled:
             engine_configs = [
                 (f"{role}_trtllm_kwargs", self._role_kwargs(role))
                 for role in ("ctx", "gen")
@@ -207,9 +217,7 @@ class TrtllmGeneration(GenerationInterface):
         # Engines differ from one another only under disaggregation, so the
         # explicit bundle list (which fixes engine order) is only required
         # there; a uniform run keeps the original workers_per_node path.
-        use_explicit_bundles = (
-            self.widest_engine_gpus > 1 or self._disagg_cfg.get("enabled")
-        )
+        use_explicit_bundles = self.widest_engine_gpus > 1 or self._disagg_cfg.enabled
         node_bundle_indices = (
             self._get_tied_worker_bundle_indices(cluster)
             if use_explicit_bundles
@@ -305,24 +313,24 @@ class TrtllmGeneration(GenerationInterface):
     #  Engine layout
     # ------------------------------------------------------------------ #
 
-    def _role_kwargs(self, role: str) -> dict[str, Any]:
+    def _role_kwargs(self, role: Literal["ctx", "gen"]) -> dict[str, Any]:
         """This role's engine overrides, merged over the base ``trtllm_cfg``.
 
         Any TRT-LLM kwarg may be overridden per role; TP and the MoE split are
         the ones that usually differ between prefill and decode.
         """
-        overrides = self._disagg_cfg.get(f"{role}_trtllm_kwargs") or {}
+        overrides = self._disagg_cfg.role_trtllm_kwargs(role)
         return {**self.cfg["trtllm_cfg"], **overrides}
 
     def _plan_engines(self, world_size: int) -> tuple[list[str], list[int], int]:
-        """Per-engine ``(role, tp_width)``, in engine order.
+        r"""Per-engine ``(role, tp_width)``, in engine order.
 
         Without disaggregation every engine is a plain generation engine of
         ``tensor_parallel_size`` GPUs. Under disaggregation each replica
         contributes its context engines followed by its generation engines:
 
             [ctx_tp x M, gen_tp x K,   ctx_tp x M, gen_tp x K, ...]
-             \\______ replica 0 _____/  \\____ replica 1 ...
+             \______ replica 0 _____/  \____ replica 1 ...
 
         The replica *count* is derived, not configured: it follows from the
         cluster size, the same way the DP-shard count does without
@@ -330,7 +338,7 @@ class TrtllmGeneration(GenerationInterface):
         are adjacent.
         """
         disagg = self._disagg_cfg
-        if not disagg.get("enabled"):
+        if not disagg.enabled:
             assert world_size % self.tp_size == 0, (
                 f"Cluster world_size ({world_size}) must be divisible by "
                 f"TP size ({self.tp_size})."
@@ -346,8 +354,8 @@ class TrtllmGeneration(GenerationInterface):
         for role, value in (("ctx", ctx_tp), ("gen", gen_tp)):
             assert value >= 1, f"{role}_trtllm_kwargs.tensor_parallel_size must be >= 1"
 
-        num_ctx = int(disagg["num_context_engines"])
-        num_gen = int(disagg["num_generation_engines"])
+        num_ctx = disagg.num_context_engines
+        num_gen = disagg.num_generation_engines
         assert num_ctx >= 1 and num_gen >= 1, (
             f"a replica needs at least one engine of each role, got "
             f"num_context_engines={num_ctx}, num_generation_engines={num_gen}"
@@ -380,7 +388,7 @@ class TrtllmGeneration(GenerationInterface):
         does not strictly need to know it; it is recorded anyway because the
         transceiver config and the role's kwargs are chosen from it.
         """
-        if node_bundle_indices is None or not self._disagg_cfg.get("enabled"):
+        if node_bundle_indices is None or not self._disagg_cfg.enabled:
             return self.cfg
 
         overrides: dict[str, dict[str, Any]] = {}
@@ -388,7 +396,7 @@ class TrtllmGeneration(GenerationInterface):
         for (pg_idx, bundles), role in zip(
             node_bundle_indices, self._engine_roles, strict=True
         ):
-            prefix = "ctx" if role == "context" else "gen"
+            prefix: Literal["ctx", "gen"] = "ctx" if role == "context" else "gen"
             # Ordinal within the role, so a layout with several engines of one
             # role (CTX_ENGINES=2, or more than one replica) can still tell them
             # apart. Only consumers that need a stable per-engine name use it --
@@ -401,7 +409,7 @@ class TrtllmGeneration(GenerationInterface):
             overrides[self._engine_key(pg_idx, bundles)] = {
                 "_disagg_role": role,
                 "_disagg_role_ordinal": ordinal,
-                **(self._disagg_cfg.get(f"{prefix}_trtllm_kwargs") or {}),
+                **self._disagg_cfg.role_trtllm_kwargs(prefix),
             }
 
         cfg = dict(self.cfg)
@@ -538,8 +546,8 @@ class TrtllmGeneration(GenerationInterface):
     # ------------------------------------------------------------------ #
 
     @property
-    def _disagg_cfg(self) -> dict[str, Any]:
-        return self.cfg["trtllm_cfg"].get("disaggregation") or {}
+    def _disagg_cfg(self) -> TrtllmDisaggConfig:
+        return self._disagg
 
     def _assert_direct_dispatch_allowed(self) -> None:
         """Reject the token-in-token-out path while PD is enabled.
@@ -550,7 +558,7 @@ class TrtllmGeneration(GenerationInterface):
         run *without* disaggregation while the user believes they are
         exercising it. Fail loudly instead.
         """
-        if self._disagg_cfg.get("enabled"):
+        if self._disagg_cfg.enabled:
             raise RuntimeError(
                 "PD disaggregation is only wired for the HTTP/NeMo-Gym rollout "
                 "path; TrtllmGeneration.generate()/generate_async() dispatch "
@@ -574,8 +582,8 @@ class TrtllmGeneration(GenerationInterface):
             return self._disagg_server_urls
 
         disagg = self._disagg_cfg
-        num_ctx = int(disagg["num_context_engines"])
-        num_gen = int(disagg["num_generation_engines"])
+        num_ctx = disagg.num_context_engines
+        num_gen = disagg.num_generation_engines
         per_replica = num_ctx + num_gen
 
         assert self.cfg["trtllm_cfg"].get("expose_http_server"), (
@@ -583,9 +591,12 @@ class TrtllmGeneration(GenerationInterface):
             "address is the only way the disagg server can reach an engine."
         )
 
-        addrs = self._report_engine_addrs()
-        missing = [i for i, a in enumerate(addrs) if not a]
+        reported = self._report_engine_addrs()
+        missing = [i for i, a in enumerate(reported) if not a]
         assert not missing, f"engines {missing} reported no HTTP address"
+        # Rebind after the guard so the element type is non-optional from here
+        # down; asserting on a separate list does not narrow `reported` itself.
+        addrs: list[dict[str, Any]] = [a for a in reported if a]
 
         from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
@@ -593,7 +604,7 @@ class TrtllmGeneration(GenerationInterface):
             DisaggServerActor,
         )
 
-        n_fe = int(disagg.get("num_frontend_workers") or 1)
+        n_fe = disagg.num_frontend_workers
         assert self.num_replicas * n_fe <= 256, (
             "replicas * num_frontend_workers must fit the snowflake node_id "
             f"space (8 bits): {self.num_replicas} * {n_fe} > 256"
@@ -601,8 +612,13 @@ class TrtllmGeneration(GenerationInterface):
         # Deterministic ports: a restarted frontend re-binds the same port on
         # its pinned node, so the URL Gym holds stays valid across crashes.
         # Keep the base outside virtual_cluster's random master-port window
-        # (1400-1999); frontends on one node get base+frontend_idx.
-        base_port = int(disagg.get("frontend_base_port") or 17300)
+        # (1400-1999). The offset must carry BOTH indices: several replicas can
+        # land on one node (a node holds `gpus_per_node / replica_width`
+        # replicas), and with only frontend_idx in it every replica's frontend
+        # 0 would ask for the same port -- the losers die inside their daemon
+        # thread while /health is answered 200 by the winner bound on 0.0.0.0,
+        # so they silently advertise the winner's URL and their engines idle.
+        base_port = disagg.frontend_base_port
 
         self._disagg_actors = []
         futures = []
@@ -616,13 +632,11 @@ class TrtllmGeneration(GenerationInterface):
                     (a["host"], a["port"])
                     for a in addrs[base + num_ctx : base + per_replica]
                 ],
-                ctx_router=disagg["ctx_router"],
-                gen_router=disagg["gen_router"],
-                gen_tokids_ctxbytes=bool(disagg.get("gen_tokids_ctxbytes", False)),
-                gen_strip_message_history=bool(
-                    disagg.get("gen_strip_message_history", False)
-                ),
-                frontend_tokenize=bool(disagg.get("frontend_tokenize", False)),
+                ctx_router=disagg.ctx_router,
+                gen_router=disagg.gen_router,
+                gen_tokids_ctxbytes=disagg.gen_tokids_ctxbytes,
+                gen_strip_message_history=disagg.gen_strip_message_history,
+                frontend_tokenize=disagg.frontend_tokenize,
                 model_name=self.cfg["model_name"],
                 default_chat_template_kwargs=self.cfg["trtllm_cfg"].get(
                     "default_chat_template_kwargs"
@@ -654,7 +668,7 @@ class TrtllmGeneration(GenerationInterface):
                     replica_idx,
                     frontend_idx=fe_idx,
                     num_frontends=n_fe,
-                    port=base_port + fe_idx,
+                    port=base_port + replica_idx * n_fe + fe_idx,
                     serve_args=serve_args,
                 )
                 self._disagg_actors.append(actor)
@@ -723,7 +737,7 @@ class TrtllmGeneration(GenerationInterface):
         contract "one URL per DP shard" true on both paths -- an engine-per-URL
         list would have ``num_engines`` entries, which is no longer ``dp_size``.
         """
-        if self._disagg_cfg.get("enabled"):
+        if self._disagg_cfg.enabled:
             return self._start_disagg_servers()
         if not self.cfg["trtllm_cfg"].get("expose_http_server"):
             return [cast(Optional[str], None)] * self.dp_size
