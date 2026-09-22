@@ -78,6 +78,10 @@ policy:
     vllm_cfg:
       tensor_parallel_size: 8
       skip_tokenizer_init: false
+      # Inkling carries short-convolution state alongside the attention KV cache.
+      # Disable cached-prefix execution so rollout logprobs stay comparable with
+      # the policy's full-sequence recomputation.
+      enable_prefix_caching: false
       env_vars:
         VLLM_USE_V2_MODEL_RUNNER: '1'
     vllm_kwargs:
