@@ -2539,9 +2539,7 @@ def _chunked_distributed_student_teacher_backward(
     """
     seq_len = int(student_vocab_parallel_logits.shape[1])
     num_chunks = (seq_len + chunk_size - 1) // chunk_size
-    grad_input: torch.Tensor = torch.empty_like(
-        student_vocab_parallel_logits, dtype=torch.float32
-    )
+    grad_input: torch.Tensor = torch.empty_like(student_vocab_parallel_logits)
 
     for chunk_idx in range(num_chunks):
         s0 = chunk_idx * chunk_size
@@ -2561,12 +2559,13 @@ def _chunked_distributed_student_teacher_backward(
             reduction_local, op=torch.distributed.ReduceOp.SUM, group=tp_group
         )
 
-        # Inplace index into the preallocated grad_input tensor
-        grad_input_chunk = grad_input[:, s0:s1, :]
-        grad_input_chunk.copy_(
-            student_probs.mul_(weight - reduction_local.unsqueeze(-1))
+        # Both multiplies happen in fp32, before the copy_ narrows to the logits'
+        # dtype: multiplying after the cast costs an extra rounding in bf16.
+        grad_input[:, s0:s1, :].copy_(
+            student_probs.mul_(weight - reduction_local.unsqueeze(-1)).mul_(
+                grad_output[:, s0:s1].unsqueeze(-1)
+            )
         )
-        grad_input_chunk.mul_(grad_output[:, s0:s1].unsqueeze(-1))
 
         # Explicitly free before next iteration allocates
         del student_log_probs, teacher_log_probs, weight, student_probs, reduction_local

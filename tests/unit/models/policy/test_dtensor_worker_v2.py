@@ -186,7 +186,6 @@ def create_test_config(
     cpu_offload: bool = False,
     activation_checkpointing: bool = False,
     custom_parallel_plan: str | None = None,
-    dtensor_v2: bool = False,
     precision: str = "float32",
     expert_parallel_size: int = 1,
     sequence_packing_enabled: bool = False,
@@ -219,20 +218,14 @@ def create_test_config(
             },
         },
         "dtensor_cfg": {
-            **({"_v2": dtensor_v2} if dtensor_v2 else {}),
+            "_v2": True,
             "enabled": True,
-            **(
-                {
-                    "checkpoint": {
-                        "model_save_format": "safetensors",
-                        "save_consolidated": "false",
-                        "single_rank_consolidation": False,
-                        "consolidation_timeout_minutes": 30,
-                    },
-                }
-                if dtensor_v2
-                else {}
-            ),
+            "checkpoint": {
+                "model_save_format": "safetensors",
+                "save_consolidated": "false",
+                "single_rank_consolidation": False,
+                "consolidation_timeout_minutes": 30,
+            },
             "cpu_offload": cpu_offload,
             "sequence_parallel": sp,
             "activation_checkpointing": activation_checkpointing,
@@ -321,145 +314,6 @@ def two_gpu_virtual_cluster():
     cluster.shutdown()
 
 
-def compare_model_configs(config_v1: dict, config_v2: dict) -> list[str]:
-    """
-    Compare two model configurations and return a list of discrepancies.
-
-    Args:
-        config_v1: Model config from dtensor worker v1
-        config_v2: Model config from dtensor worker v2
-
-    Returns:
-        List of discrepancy descriptions. Empty list if configs are equivalent.
-    """
-    discrepancies = []
-
-    def compare_dicts(d1, d2, path=""):
-        """Recursively compare two dictionaries."""
-        all_keys = set(d1.keys()) | set(d2.keys())
-
-        for key in all_keys:
-            current_path = f"{path}.{key}" if path else key
-
-            if key not in d1:
-                discrepancies.append(f"Key '{current_path}' missing in v1 config")
-            elif key not in d2:
-                discrepancies.append(f"Key '{current_path}' missing in v2 config")
-            else:
-                val1, val2 = d1[key], d2[key]
-
-                if isinstance(val1, dict) and isinstance(val2, dict):
-                    compare_dicts(val1, val2, current_path)
-                elif val1 != val2:
-                    discrepancies.append(
-                        f"Value mismatch at '{current_path}': v1={val1}, v2={val2}"
-                    )
-
-    compare_dicts(config_v1, config_v2)
-    return discrepancies
-
-
-@pytest.mark.hf_gated
-@pytest.mark.automodel
-@pytest.mark.parametrize(
-    "model_fixture_name,tp,cp,sp,cpu_offload,activation_checkpointing",
-    [
-        # TP=2, CP=1
-        ("tiny_qwen2_model_path", 2, 1, False, False, False),
-        ("tiny_llama_model_path", 2, 1, False, False, False),
-        ("tiny_qwen3_model_path", 2, 1, False, False, False),
-        ("tiny_gemma3_model_path", 2, 1, False, False, False),
-        # TP=1, CP=2
-        ("tiny_qwen2_model_path", 1, 2, False, False, False),
-        ("tiny_llama_model_path", 1, 2, False, False, False),
-        ("tiny_qwen3_model_path", 1, 2, False, False, False),
-    ],
-)
-def test_dtensor_worker_v1_v2_model_config_equivalence(
-    request,
-    two_gpu_virtual_cluster,  # noqa: F811
-    model_fixture_name,
-    tp,
-    cp,
-    sp,
-    cpu_offload,
-    activation_checkpointing,
-):
-    """Test that dtensor worker v1 and v2 produce equivalent model configurations.
-
-    This test verifies that DTensorPolicyWorkerV2 produces the same model config
-    as the v1 worker, ensuring backward compatibility.
-    """
-    # Get the actual model path from the fixture name
-    model_name = request.getfixturevalue(model_fixture_name)
-    # Create v1 configuration
-    config_v1 = create_test_config(
-        model_name=model_name,
-        tp=tp,
-        cp=cp,
-        sp=sp,
-        cpu_offload=cpu_offload,
-        activation_checkpointing=activation_checkpointing,
-        dtensor_v2=False,  # Use v1 worker
-    )
-    # Create and test v1 policy first
-    print("Creating policy with v1 worker...")
-    policy_v1 = Policy(
-        tokenizer=get_tokenizer(config_v1["tokenizer"]),
-        config=config_v1,
-        init_optimizer=False,
-        init_reference_model=False,
-        cluster=two_gpu_virtual_cluster,
-        name_prefix="lm_policy_v1",
-    )
-
-    model_config_v1 = ray.get(
-        policy_v1.worker_group.workers[0].return_model_config.remote()
-    )
-    policy_v1.shutdown()
-
-    # Create v2 configuration
-    config_v2 = create_test_config(
-        model_name=model_name,
-        tp=tp,
-        cp=cp,
-        sp=sp,
-        cpu_offload=cpu_offload,
-        activation_checkpointing=activation_checkpointing,
-        dtensor_v2=True,  # Use v2 worker
-    )
-    policy_v2 = Policy(
-        tokenizer=get_tokenizer(config_v2["tokenizer"]),
-        config=config_v2,
-        init_optimizer=False,
-        init_reference_model=False,
-        cluster=two_gpu_virtual_cluster,
-        name_prefix="lm_policy_v2",
-    )
-
-    model_config_v2 = ray.get(
-        policy_v2.worker_group.workers[0].return_model_config.remote()
-    )
-    policy_v2.shutdown()
-
-    config_v1_dict = vars(model_config_v1)
-    config_v2_dict = vars(model_config_v2)
-    config_v1_dict.pop("nemo_version", None)
-    config_v2_dict.pop("nemo_version", None)
-    config_v1_dict.pop("pad_token_id", None)
-    config_v2_dict.pop("pad_token_id", None)
-
-    # if head_dim doesn't exist in raw HF model config, automodel (dtensor v2 worker) updates model config in-place
-    # so we need to remove the head_dim key from the v2 config
-    if "head_dim" not in config_v1_dict and "head_dim" in config_v2_dict:
-        config_v2_dict.pop("head_dim", None)
-
-    discrepancies = compare_model_configs(config_v1_dict, config_v2_dict)
-    assert not discrepancies, (
-        f"Model configurations differ between v1 and v2 approaches for {model_name}"
-    )
-
-
 @pytest.mark.hf_gated
 @pytest.mark.automodel
 @pytest.mark.timeout(360)
@@ -485,7 +339,6 @@ def test_dtensor_v2_checkpoint_save_and_load(
             model_name=tiny_llama_model_path,
             tp=2,
             cp=1,
-            dtensor_v2=True,
         )
 
         policy = Policy(
@@ -519,7 +372,6 @@ def test_dtensor_v2_checkpoint_save_and_load(
                 model_name=tiny_llama_model_path,
                 tp=2,
                 cp=1,
-                dtensor_v2=True,
             )
 
             # Shutdown original policy first to free GPU memory
@@ -570,7 +422,6 @@ def test_dtensor_v2_mixed_precision_training_and_logprobs(
         model_name=tiny_llama_model_path,
         tp=2,
         cp=1,
-        dtensor_v2=True,
         precision=precision,
     )
 

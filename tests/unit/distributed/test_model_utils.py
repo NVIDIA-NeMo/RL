@@ -1936,7 +1936,7 @@ def test_reverse_kl_vanishes_for_identical_logits(single_rank_collectives):
 
 
 def test_student_teacher_kernels_accept_bf16_logits(single_rank_collectives):
-    """bf16 logits in, fp32 value and fp32 grad out -- the mainline dtype path."""
+    """bf16 logits in, fp32 value and bf16 grad out -- the mainline dtype path."""
     torch.manual_seed(5)
     student = torch.randn(1, 4, 8, dtype=torch.bfloat16, requires_grad=True)
     teacher = torch.randn(1, 4, 8, dtype=torch.bfloat16)
@@ -1948,8 +1948,8 @@ def test_student_teacher_kernels_accept_bf16_logits(single_rank_collectives):
 
     assert reverse_kl.dtype == torch.float32
     assert student.grad is not None
-    # The kernel hands autograd an fp32 grad for a bf16 input, matching
-    # ChunkedDistributedEntropy; autograd casts it back to the leaf's dtype.
+    # The grad buffer is allocated in the logits' dtype; every multiply still
+    # happens in fp32, before the copy_ narrows it.
     assert student.grad.dtype == student.dtype
 
 

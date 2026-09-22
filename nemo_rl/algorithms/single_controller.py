@@ -388,6 +388,9 @@ class SingleControllerActor:
                     save_state=actor_args.save_state,
                     partition_id=self._partition_id,
                     sampler_name=master_config.async_rl.sampler.name,
+                    opd_full_teacher_checkpoints=(
+                        opd_module.opd_full_teacher_checkpoints_by_index(master_config)
+                    ),
                 )
             )
             if actor_args.rollout_checkpoint_load_metrics is not None:
@@ -1548,6 +1551,15 @@ class SingleControllerActor:
             metadata["rollout_recovery_group_count"] = rollout_recovery_group_count
         elif rollout_recovery_group_count is not None:
             raise ValueError("rollout recovery group count requires a payload hash")
+        if self._teacher_coordinator is not None:
+            # The rows in this checkpoint are tagged with a teacher_index each;
+            # record what those indices meant so a restore can reject a config
+            # that would renumber them.
+            teacher_checkpoints = (
+                self._teacher_coordinator.teacher_checkpoints_by_index()
+            )
+            if teacher_checkpoints is not None:
+                metadata["opd_full_teacher_checkpoints"] = teacher_checkpoints
         started = time.monotonic()
         print(f"data-plane checkpoint save started: {checkpoint_dir}", flush=True)
         try:

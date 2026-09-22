@@ -81,6 +81,12 @@ from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
     process_global_batch,
 )
+from nemo_rl.models.megatron.draft.step_state import (
+    DRAFT_LOSS_METRIC_KEY,
+    DRAFT_STEP_PAYLOAD_KEY,
+    DraftStepPayload,
+    DraftStepState,
+)
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
     broadcast_obj_from_pp_rank,
@@ -839,16 +845,26 @@ class MegatronPolicyWorkerImpl(
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
 
-        # Full-vocabulary MOPD: this rank's teacher LM-head shard, loaded on
-        # demand (see load_opd_full_teacher_lm_head). A plain tensor, not a
-        # module, so it stays invisible to checkpoint saving and refit.
+        # Full-vocabulary MOPD: this rank's teacher LM-head shard(s), loaded on
+        # demand (see load_opd_full_teacher_lm_head). Keyed by teacher_index
+        # (stable per unique checkpoint, assigned by create_teacher_worker_groups)
+        # so multi-teacher runs hold one shard per teacher; single-teacher runs
+        # just have one entry. Plain tensors, not modules, so they stay invisible
+        # to checkpoint saving and refit.
         opd_full_cfg = self.cfg.get("on_policy_distillation_full") or {}
         self._opd_full_enabled = bool(opd_full_cfg)
         self._opd_full_lm_head_lifecycle: Optional[str] = (
             opd_full_cfg["teacher_lm_head_lifecycle"] if opd_full_cfg else None
         )
-        self._opd_full_teacher_lm_head: Optional[torch.Tensor] = None
-        self._opd_full_teacher_checkpoint_path: Optional[str] = None
+        self._opd_full_teacher_lm_heads: dict[int, torch.Tensor] = {}
+        self._opd_full_teacher_checkpoint_paths: dict[int, str] = {}
+        # Whether the ``evict`` lifecycle has dropped the shards and the next
+        # training phase must reload them. Tracked explicitly because the reload
+        # resolves the checkpoint through Megatron-Bridge's ``read_train_state``,
+        # a whole-world broadcast, and ``_opd_full_teacher_lm_heads`` cannot
+        # stand in for it: ranks off the last pipeline stage own no shard, so
+        # that dict is empty there whether or not an eviction happened.
+        self._opd_full_lm_head_evicted = False
 
         self._init_inference_engine_state()
         self._init_generation_refit_state()
@@ -1081,7 +1097,7 @@ class MegatronPolicyWorkerImpl(
                     num_microbatches=num_microbatches,
                     sampling_params=self.sampling_params,
                     draft_model=self.draft_model,
-                    teacher_output_layer_weight=self._opd_full_teacher_lm_head,
+                    teacher_output_layer_weight_by_index=self._opd_full_teacher_lm_heads,
                 )
 
                 rerun_state_machine = get_rerun_state_machine()
@@ -1395,9 +1411,10 @@ class MegatronPolicyWorkerImpl(
     #    ``forward_backward_func``, i.e. once per chunk). All three are nulled
     #    for the duration of the step and restored at finish/abort; see
     #    ``begin_train_step`` for what each one does.
-    # 3. Grad clip is bundled inside ``MegatronOptimizer.step()``; the 1/N
-    #    rescale via ``self.model.scale_gradients(1/N)`` must run before
-    #    ``optimizer.step()`` so the clip operates on the rescaled grad.
+    # 3. Grad clip is bundled inside ``MegatronOptimizer.step()``; the policy
+    #    1/N rescale and relative draft-denominator correction must run before
+    #    end-of-step finalization and ``optimizer.step()`` so clipping sees
+    #    normalized gradients.
     # 4. With ``calculate_per_token_loss=True`` + ``average_in_collective=
     #    False``, mcore's DDP sums (does not average) grads across DP, so
     #    no FSDP-style ``loss *= dp_size*cp_size`` cancellation is needed
@@ -1463,6 +1480,7 @@ class MegatronPolicyWorkerImpl(
             # streaming chunks the controller has fed into this optimizer step
             # so far.
             "num_chunks": 0,
+            "draft_step_state": DraftStepState(),
             # Saved across the step so we can restore at finish/abort.
             "saved_grad_sync_func": None,
             "saved_no_sync_func": None,
@@ -1737,7 +1755,8 @@ class MegatronPolicyWorkerImpl(
             num_microbatches=num_microbatches,
             sampling_params=self.sampling_params,
             draft_model=self.draft_model,
-            teacher_output_layer_weight=self._opd_full_teacher_lm_head,
+            defer_draft_normalization=True,
+            teacher_output_layer_weight_by_index=self._opd_full_teacher_lm_heads,
         )
 
         # Placeholder N=1: loss returns un-normalized sums. ``backward``
@@ -1804,6 +1823,14 @@ class MegatronPolicyWorkerImpl(
         )
 
         for m in mb_metrics_collected:
+            draft_payload = m.get(DRAFT_STEP_PAYLOAD_KEY)
+            if draft_payload is not None:
+                if not isinstance(draft_payload, DraftStepPayload):
+                    raise TypeError(
+                        "draft step metric payload must be DraftStepPayload, "
+                        f"got {type(draft_payload).__name__}."
+                    )
+                state["draft_step_state"].accumulate(draft_payload)
             state["all_mb_metrics"].append(m)
             # ``loss`` key is the un-normalized per-mb scalar; collect for
             # the global_loss aggregation at finish.
@@ -1838,15 +1865,29 @@ class MegatronPolicyWorkerImpl(
     def _finish_train_step_body(self, state: dict[str, Any]) -> dict[str, Any]:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
-        # All-reduce accumulated mask sums across DP to recover true N.
-        to_reduce = torch.stack(
+        # Recover policy and draft counts with one existing DP collective.
+        # The draft slice is length-1 while the step is active and empty
+        # otherwise, so every rank in the DP group has to agree on
+        # ``active`` or this all_reduce sees mismatched shapes. It does:
+        # the payload comes from the draft loss wrapper, which is built
+        # from the same policy config on every DP rank, and Megatron runs
+        # the same microbatch count on all of them.
+        draft_step_state: DraftStepState = state["draft_step_state"]
+        policy_counts = torch.stack(
             [state["local_valid_seqs"], state["local_valid_toks"]]
         ).to(torch.float64)
+        to_reduce = torch.cat(
+            [
+                policy_counts,
+                draft_step_state.counts_for_reduction(policy_counts),
+            ]
+        )
         torch.distributed.all_reduce(
             to_reduce, group=parallel_state.get_data_parallel_group()
         )
         global_valid_seqs = to_reduce[0]
         global_valid_toks = to_reduce[1]
+        draft_step_state.set_global_counts(to_reduce[2:])
 
         if state["loss_type"] == LossType.TOKEN_LEVEL:
             n_true = global_valid_toks
@@ -1860,6 +1901,11 @@ class MegatronPolicyWorkerImpl(
         # global mean grad; for reduce_scatter (dist-opt) it's the shard.
         # Either way, opt.step sees the right-normalized gradient.
         self.model.scale_gradients(inv_n)
+        if draft_step_state.active:
+            draft_step_state.correct_main_grads(
+                self.model.parameters(),
+                policy_normalization_count=n_true,
+            )
         # The uniform rescale gives MTP the main loss's denominator. Correct
         # detached, MTP-tagged parameters back to the valid-token denominator
         # used by the synchronous path. For token-level loss the factor is 1.
@@ -1931,6 +1977,11 @@ class MegatronPolicyWorkerImpl(
             else None
         )
 
+        draft_grad_norm = None
+        if draft_step_state.active:
+            grad_norms_by_group = self.optimizer.grad_norms_by_group
+            draft_grad_norm = grad_norms_by_group.get("draft")
+
         pg_collection = get_pg_collection(self.model)
         update_successful = logical_and_across_model_parallel_group(
             update_successful, mp_group=pg_collection.mp
@@ -1940,6 +1991,9 @@ class MegatronPolicyWorkerImpl(
         )
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
             num_zeros_in_grad, mp_group=pg_collection.mp
+        )
+        draft_grad_norm = reduce_max_stat_across_model_parallel_group(
+            draft_grad_norm, mp_group=pg_collection.mp
         )
         if state["mtp_enabled"]:
             # MTP parameters live on the last PP stage. Make their independently
@@ -2044,7 +2098,11 @@ class MegatronPolicyWorkerImpl(
         for m in state["all_mb_metrics"]:
             out: dict[str, Any] = {}
             for k, v in m.items():
-                if "_min" in k or "_max" in k:
+                if k == DRAFT_STEP_PAYLOAD_KEY:
+                    continue
+                if k == DRAFT_LOSS_METRIC_KEY and draft_step_state.active:
+                    out[k] = draft_step_state.normalize_metric(v)
+                elif "_min" in k or "_max" in k:
                     out[k] = v
                 else:
                     out[k] = _scale_metric(k, v)
@@ -2072,6 +2130,8 @@ class MegatronPolicyWorkerImpl(
             "all_mb_metrics": mb_metrics,
             "grad_norm": torch.tensor([grad_norm]),
         }
+        if draft_grad_norm is not None:
+            metrics["draft_grad_norm"] = torch.tensor([draft_grad_norm])
 
         # MoE aux-loss metrics: same convention as sync train() — scale
         # by the total pipeline-microbatch count accumulated across all
@@ -2226,13 +2286,24 @@ class MegatronPolicyWorkerImpl(
         self.timer.stop("get_logprobs")
         return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu")
 
-    def _resolve_output_layer_owner(self) -> Any:
-        """Return the unwrapped module that owns ``output_layer`` on this rank.
+    def _resolve_output_layer_owner(self) -> Optional[Any]:
+        """Return the unwrapped module owning ``output_layer``, or None off the last PP stage.
+
+        Megatron builds ``output_layer`` only on the last pipeline stage, and
+        that is also the only stage where the opd_full loss runs, so the earlier
+        stages legitimately have nothing to project with. They still resolve the
+        checkpoint through Megatron-Bridge's ``read_train_state``, a whole-world
+        broadcast; see ``_load_opd_full_teacher_lm_head_from_path``.
+
+        Returns:
+            The module owning ``output_layer``, or ``None`` when this rank is
+            not the last pipeline stage.
 
         Raises:
-            AttributeError: If this rank has no output layer. Megatron only builds
-                one on the last pipeline stage, so this is the expected failure
-                when opd_full runs with student pipeline parallelism.
+            AttributeError: If this rank is the last pipeline stage -- or runs
+                without ``torch.distributed``, where pipeline placement does
+                not apply -- and still has no output layer. That is a
+                malformed model rather than a pipeline-placement consequence.
         """
         model = unwrap_model(self.model)
         if hasattr(model, "output_layer"):
@@ -2240,96 +2311,152 @@ class MegatronPolicyWorkerImpl(
         language_model = getattr(model, "language_model", None)
         if language_model is not None and hasattr(language_model, "output_layer"):
             return language_model
-        pipeline_size = (
-            parallel_state.get_pipeline_model_parallel_world_size()
-            if torch.distributed.is_initialized()
-            else 1
-        )
+        if (
+            torch.distributed.is_initialized()
+            and not parallel_state.is_pipeline_last_stage(ignore_virtual=True)
+        ):
+            return None
         raise AttributeError(
-            "opd_full requires an output_layer on this rank, but none was found "
-            f"after unwrapping {type(model).__qualname__}. Megatron builds "
-            "output_layer only on the last pipeline stage "
-            f"(pipeline_model_parallel_size={pipeline_size}); the teacher LM head "
-            "cannot be loaded per-stage because resolving its checkpoint iteration "
-            "(Megatron-Bridge read_train_state) broadcasts over the whole world. "
-            "Use pipeline_model_parallel_size=1 or "
-            "on_policy_distillation.full.teacher_payload='logits'."
+            "opd_full requires an output_layer on the last pipeline stage, but "
+            f"none was found after unwrapping {type(model).__qualname__}."
         )
 
-    def load_opd_full_teacher_lm_head(self, teacher_path_config: PolicyConfig) -> str:
-        """Resolve and load the teacher LM head for full-vocabulary MOPD.
+    def load_opd_full_teacher_lm_head(
+        self, teacher_path_config: PolicyConfig, teacher_index: int
+    ) -> str:
+        """Resolve and load one teacher's LM head for full-vocabulary MOPD.
 
-        Called after the teacher worker groups exist, because the teacher's
-        Megatron checkpoint is only materialized by their HF conversion. Path
-        resolution happens here rather than on the driver: the driver process
-        is never provisioned with the mcore extra that validate_model_paths'
-        module needs.
+        Called once per unique teacher checkpoint after the teacher worker
+        groups exist, because each teacher's Megatron checkpoint is only
+        materialized by its own HF conversion. Path resolution happens here
+        rather than on the driver: the driver process is never provisioned
+        with the mcore extra that validate_model_paths' module needs.
 
         Args:
             teacher_path_config: The teacher group's own policy config, which
                 carries no `pretrained_checkpoint`, so resolution keys off the
                 teacher's model name.
+            teacher_index: Stable per-checkpoint index (see
+                ``create_teacher_worker_groups``) this shard is stored under.
 
         Returns:
             The resolved Megatron checkpoint root of the teacher.
         """
         _, teacher_pretrained_path, _ = validate_model_paths(teacher_path_config)
-        self._load_opd_full_teacher_lm_head_from_path(teacher_pretrained_path)
+        self._load_opd_full_teacher_lm_head_from_path(
+            teacher_pretrained_path, teacher_index
+        )
         return teacher_pretrained_path
 
     def _load_opd_full_teacher_lm_head_from_path(
-        self, teacher_pretrained_path: str
+        self, teacher_pretrained_path: str, teacher_index: int
     ) -> None:
-        """Load this rank's shard of the teacher LM head from an already-resolved path."""
+        """Load this rank's shard of one teacher's LM head from an already-resolved path.
+
+        Under student pipeline parallelism only the last stage owns an
+        ``output_layer``, and only there does the opd_full loss run. The earlier
+        stages request no shard, but must still call the loader because
+        resolving the teacher's checkpoint iteration (Megatron-Bridge's
+        ``read_train_state``) broadcasts over the whole student world --
+        skipping it would hang the last stage. They record the checkpoint path
+        all the same, so the ``evict`` lifecycle re-enters that broadcast in
+        lockstep with the stage that actually reloads a shard.
+
+        Raises:
+            ValueError: If this teacher's hidden size disagrees with a teacher
+                already loaded on this rank.
+        """
+        self._opd_full_teacher_checkpoint_paths[teacher_index] = teacher_pretrained_path
+
         owner = self._resolve_output_layer_owner()
+        if owner is None:
+            load_teacher_output_layer_weight(
+                teacher_pretrained_path=teacher_pretrained_path,
+                local_vocab_size=None,
+                dtype=None,
+            )
+            return
+
         output_layer = owner.output_layer
         output_weight = output_layer.weight
         if output_weight is None:
             output_weight = owner.shared_embedding_or_output_weight()
 
-        self._opd_full_teacher_checkpoint_path = teacher_pretrained_path
         teacher_lm_head = load_teacher_output_layer_weight(
             teacher_pretrained_path=teacher_pretrained_path,
             local_vocab_size=output_layer.output_size_per_partition,
             dtype=output_weight.dtype,
         )
-        self._opd_full_teacher_lm_head = teacher_lm_head
+        assert teacher_lm_head is not None  # requested a shard, so one comes back
+        # Every teacher's hidden states ride the same data-plane column, so a
+        # teacher with a different hidden size cannot even be transported: the
+        # rows would be jagged in a dimension the codec requires to be uniform,
+        # and the run would die assembling a microbatch long after the whole
+        # cluster and every teacher came up. Catch it here instead, while the
+        # driver is still walking the teachers one RPC at a time. Only V_local
+        # and dtype are safe by construction -- both are the student's.
+        teacher_hidden_size = int(teacher_lm_head.shape[1])
+        if self._opd_full_teacher_lm_heads:
+            loaded_index = next(iter(self._opd_full_teacher_lm_heads))
+            loaded_hidden_size = int(
+                self._opd_full_teacher_lm_heads[loaded_index].shape[1]
+            )
+            if teacher_hidden_size != loaded_hidden_size:
+                raise ValueError(
+                    "opd_full needs every teacher to share one hidden size on "
+                    "the hidden_states payload, because one payload column "
+                    f"carries them all: teacher_index={teacher_index} "
+                    f"({teacher_pretrained_path}) has hidden_size="
+                    f"{teacher_hidden_size}, but teacher_index={loaded_index} "
+                    f"has {loaded_hidden_size}. Use "
+                    "on_policy_distillation.full.teacher_payload='logits', "
+                    "which ships an already-projected distribution and needs "
+                    "no shared hidden size."
+                )
+        self._opd_full_teacher_lm_heads[teacher_index] = teacher_lm_head
         if self._opd_full_lm_head_lifecycle == "none":
             self._move_opd_full_teacher_lm_head("cuda")
 
     @torch.no_grad()
     def _move_opd_full_teacher_lm_head(self, device: str) -> None:
-        """Move the cached teacher LM-head shard between CPU and GPU."""
-        if self._opd_full_teacher_lm_head is None:
+        """Move every cached teacher LM-head shard between CPU and GPU."""
+        if not self._opd_full_teacher_lm_heads:
             return
         target_device = torch.device(device)
-        if self._opd_full_teacher_lm_head.device == target_device:
-            return
-        self._opd_full_teacher_lm_head = self._opd_full_teacher_lm_head.to(
-            device=target_device, non_blocking=True
-        )
+        for teacher_index, lm_head in self._opd_full_teacher_lm_heads.items():
+            if lm_head.device == target_device:
+                continue
+            self._opd_full_teacher_lm_heads[teacher_index] = lm_head.to(
+                device=target_device, non_blocking=True
+            )
 
     def _release_opd_full_teacher_lm_head(self) -> None:
-        """Apply the configured lifecycle policy after a training phase."""
-        if self._opd_full_teacher_lm_head is None:
+        """Apply the configured lifecycle policy after a training phase.
+
+        Gated on the recorded checkpoint paths rather than on the shards
+        themselves: every rank that took part in the load has a path, but only
+        the last pipeline stage has a shard, and the eviction flag has to
+        advance on all of them or the reload collective goes out of lockstep.
+        """
+        if not self._opd_full_teacher_checkpoint_paths:
             return
         if self._opd_full_lm_head_lifecycle == "offload":
             self._move_opd_full_teacher_lm_head("cpu")
         elif self._opd_full_lm_head_lifecycle == "evict":
-            self._opd_full_teacher_lm_head = None
+            self._opd_full_teacher_lm_heads = {}
+            self._opd_full_lm_head_evicted = True
 
     def _stage_opd_full_teacher_lm_head_for_training(self) -> None:
-        """Make the teacher LM-head shard resident on GPU for a train step."""
+        """Make every teacher LM-head shard resident on GPU for a train step."""
         if not self._opd_full_enabled:
             return
-        if (
-            self._opd_full_teacher_lm_head is None
-            and self._opd_full_lm_head_lifecycle == "evict"
-            and self._opd_full_teacher_checkpoint_path is not None
-        ):
-            self._load_opd_full_teacher_lm_head_from_path(
-                self._opd_full_teacher_checkpoint_path
-            )
+        if self._opd_full_lm_head_evicted:
+            # list(): the reload rewrites the same keys of the dict it walks.
+            for teacher_index, path in list(
+                self._opd_full_teacher_checkpoint_paths.items()
+            ):
+                self._load_opd_full_teacher_lm_head_from_path(path, teacher_index)
+            self._opd_full_lm_head_evicted = False
         self._move_opd_full_teacher_lm_head("cuda")
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs_with_full_payload")
