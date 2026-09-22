@@ -202,6 +202,7 @@ def _controller(
     controller._dp_client = client
     controller._partition_id = scenarios.PARTITION
     controller._rollout_manager = _manager(buffer, barrier, generation)
+    controller._teacher_coordinator = None
     controller._sampler = InOrderSampler(buffer, max_lookahead_versions=2)
     if dispatch_index is not None:
         controller._sampler.restore_dispatch_index(dispatch_index)

@@ -46,6 +46,10 @@ basic_env_config: RewardModelEnvironmentConfig = {
     },
     "dtensor_cfg": {
         "_v2": True,
+        "checkpoint": {
+            "model_save_format": "safetensors",
+            "save_consolidated": "false",
+        },
         "enabled": True,
         "cpu_offload": False,
         "sequence_parallel": False,

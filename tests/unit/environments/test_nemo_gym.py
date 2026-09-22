@@ -674,7 +674,7 @@ def test_video_datum_uses_cached_frames_without_decoding_video(monkeypatch, tmp_
     frame_paths = []
     for index in range(4):
         frame_path = tmp_path / f"frame_{index:04d}.png"
-        Image.new("RGB", (8, 8), color=(index, 0, 0)).save(frame_path)
+        Image.new("RGB", (16, 16), color=(index, 0, 0)).save(frame_path)
         frame_paths.append(frame_path)
     example = {
         "responses_create_params": {
@@ -885,7 +885,9 @@ def test_nemotron_video_datum_uses_dynamic_tubelet_inputs(monkeypatch, tmp_path)
     )
 
     user_message = datum["message_log"][0]
-    assert user_message["pixel_values"].as_tensor().shape == (4, 3, 96, 160)
+    pixel_values = user_message["pixel_values"]
+    assert pixel_values.as_tensor(mode="pad_to_max_shape").shape == (4, 3, 96, 160)
+    assert pixel_values.as_tensor(mode="patchify").shape == (1, 240, 768)
     assert user_message["imgs_sizes"].as_tensor().tolist() == [[96, 160]] * 4
     assert user_message["num_frames"].as_tensor().tolist() == [4]
     extra_body = json.loads(
@@ -961,8 +963,8 @@ def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_pa
         "nemo_rl.environments.nemo_gym_multimodal.process_nemotron_video_frames",
         lambda *args, **kwargs: {
             "input_ids": torch.tensor([[7, 18, 18, 9]]),
-            "pixel_values": torch.ones(4, 3, 8, 8),
-            "imgs_sizes": torch.tensor([[8, 8]] * 4),
+            "pixel_values": torch.ones(4, 3, 16, 16),
+            "imgs_sizes": torch.tensor([[16, 16]] * 4),
         },
     )
 

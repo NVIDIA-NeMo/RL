@@ -46,6 +46,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleMetadata,
 )
 from nemo_rl.environments.interfaces import EnvironmentReturn
+from nemo_rl.environments.nemo_gym import NemoGymShardSet
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -1899,6 +1900,7 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
                 "task_source": "workplace_assistant",
                 "responses_create_params": {},
                 "_ng_task_index": task_index,
+                "agent_ref": {"name": "agent"},
             }
         )
     original_media = [
@@ -2153,6 +2155,7 @@ def test_run_nemo_gym_rollout_sync_separates_collection_and_identity_groups(
     async def fake_stream(**kwargs):
         assert kwargs["num_generations"] == input_batch.size
         assert kwargs["identity_num_generations"] == 2
+        assert kwargs["routing_group_size"] == 2
         assert kwargs["returns_entire_batch"] is True
         assert kwargs["log_full_result_tables"] is False
         assert kwargs["deduplicate_multimodal_data"] is True
@@ -2220,6 +2223,18 @@ def test_run_async_nemo_gym_rollout_validates_identity_group_size(
 
     with pytest.raises(ValueError, match=error):
         asyncio.run(collect())
+
+
+def test_run_nemo_gym_rollout_sync_requires_explicit_prompt_group_size():
+    with pytest.raises(TypeError, match="num_generations_per_prompt"):
+        run_nemo_gym_rollout_sync(
+            policy_generation=None,
+            input_batch=BatchedDataDict({"loss_multiplier": torch.ones(1)}),
+            tokenizer=None,
+            task_to_env={},
+            generation_config={},
+            log_full_result_tables=False,
+        )
 
 
 def test_rollout_manager_consumes_stream_and_restores_input_order():
@@ -2308,8 +2323,16 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     completions, prompt_message_log, metrics = asyncio.run(
         manager._run_rollouts(
             inputs=[
-                {"_rowidx": 0, "task_source": "workplace_assistant"},
-                {"_rowidx": 1, "task_source": "workplace_assistant"},
+                {
+                    "_rowidx": 0,
+                    "task_source": "workplace_assistant",
+                    "agent_ref": {"name": "agent"},
+                },
+                {
+                    "_rowidx": 1,
+                    "task_source": "workplace_assistant",
+                    "agent_ref": {"name": "agent"},
+                },
             ],
             timer=rollouts_mod.Timer(),
             timer_prefix="timing/test",
@@ -2323,6 +2346,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
         "completion_count": 2,
         "agent": "agent",
         "remote_time": 2.0,
+        "timing/test/routing/group_share/nemo_gym": 1,
     }
 
 
@@ -2450,6 +2474,122 @@ def test_prepare_nemo_gym_rows_stamps_distinct_legacy_prompt_groups():
     assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [0, 0, 0, 0]
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 0, 1]
     assert [row["_rowidx"] for row in rows] == [0, 1, 2, 3]
+
+
+def test_rollout_manager_rotates_replicas_and_reports_group_share():
+    first, second = object(), object()
+    selected = []
+    manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._timeouts = RolloutTimeouts()
+    manager._max_gym_row_attempts = 1
+    manager._deadline_registry = None
+    manager._num_generations_per_prompt = 1
+    manager._task_to_env = {
+        "nemo_gym": NemoGymShardSet(
+            handles={"tools": [first, second]},
+            route_to_shard={"agent": "tools"},
+        )
+    }
+    manager._tokenizer = None
+    manager._effort_config = None
+    manager._stats = None
+
+    async def fake_stream_rows(
+        environment,
+        pending,
+        results,
+        shaping_by_rowidx,
+        total_rows,
+        timer_prefix,
+        *,
+        on_completion,
+    ):
+        del total_rows, timer_prefix, on_completion
+        selected.append(environment)
+        for row in pending:
+            rowidx = row["_rowidx"]
+            results[rowidx] = {"input_message_log": [{"token_ids": [1]}]}
+            shaping_by_rowidx[rowidx] = SimpleNamespace(
+                length_rewards_low=[],
+                rewards_low=[],
+                low_lengths=[],
+                high_lengths=[],
+            )
+
+    manager._stream_rows = fake_stream_rows
+    manager._results_to_completions = lambda _results: ([object()], {})
+    manager._compute_rollout_metrics = lambda *_args: {}
+    manager._compute_reward_penalty_metrics = lambda *_args: {}
+
+    async def run_group():
+        return await manager._run_rollouts(
+            inputs=[{"_rowidx": 0, "agent_ref": {"name": "agent"}}],
+            timer=rollouts_mod.Timer(),
+            timer_prefix="timing/test",
+        )
+
+    metrics = [asyncio.run(run_group())[2] for _ in range(3)]
+
+    assert selected == [first, second, first]
+    per_group_metrics = {key: [group[key] for group in metrics] for key in metrics[0]}
+    from nemo_rl.algorithms.grpo import aggregate_rollout_metrics
+
+    aggregated = aggregate_rollout_metrics(per_group_metrics)
+    assert aggregated["timing/test/routing/group_share/tools/0"] == pytest.approx(2 / 3)
+    assert aggregated["timing/test/routing/group_share/tools/1"] == pytest.approx(1 / 3)
+
+
+def test_rollout_manager_attributes_awaited_stream_failure_to_instance():
+    class _FailedRef:
+        def __await__(self):
+            async def _resolve():
+                raise RuntimeError("actor died")
+
+            return _resolve().__await__()
+
+    class _FailedStream:
+        def __init__(self):
+            self._sent = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._sent:
+                raise StopAsyncIteration
+            self._sent = True
+            return _FailedRef()
+
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, inputs, timer_prefix):
+            del inputs, timer_prefix
+            return _FailedStream()
+
+    manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._timeouts = RolloutTimeouts()
+    manager._max_gym_row_attempts = 1
+    manager._deadline_registry = None
+    manager._num_generations_per_prompt = 1
+    manager._task_to_env = {
+        "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
+    }
+    manager._tokenizer = None
+
+    with pytest.raises(RuntimeError, match="actor died") as exc_info:
+        asyncio.run(
+            manager._run_rollouts(
+                inputs=[{"_rowidx": 0, "agent_ref": {"name": "agent"}}],
+                timer=rollouts_mod.Timer(),
+                timer_prefix="timing/test",
+            )
+        )
+    assert exc_info.value.__notes__ == [
+        "NeMo-Gym instance 'nemo_gym' failed during rollout collection"
+    ]
 
 
 @pytest.mark.nemo_gym

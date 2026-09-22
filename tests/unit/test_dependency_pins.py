@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Guards on pins we declare directly even though a submodule already declares them.
+"""Guards on dependency pins and exclusions declared in the root project.
 
 `megatron-energon` reaches us transitively as
 nemo-rl[mcore] -> megatron-bridge[te,ssm] -> megatron-core[dev,mlm] -> megatron-energon,
@@ -101,3 +101,23 @@ def test_mcore_energon_floor_is_within_megatron_lm_range(
         f"the floor; widening it past upstream either makes `uv lock` unsatisfiable or "
         f"silently has no effect."
     )
+
+
+@pytest.mark.parametrize("package", ["av", "opencv-python-headless"])
+def test_royalty_sensitive_codecs_are_excluded(package: str) -> None:
+    lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text())
+    canonical_name = canonicalize_name(package)
+    overrides = [
+        override
+        for override in lock["manifest"]["overrides"]
+        if canonicalize_name(override["name"]) == canonical_name
+    ]
+
+    assert len(overrides) == 1, (
+        f"expected exactly one uv.lock override for {package}, got {overrides}"
+    )
+    assert overrides[0].get("marker") == "sys_platform == 'never'"
+    assert all(
+        canonicalize_name(locked_package["name"]) != canonical_name
+        for locked_package in lock["package"]
+    ), f"{package} must not be resolved in uv.lock"
