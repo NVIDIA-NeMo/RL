@@ -218,24 +218,9 @@ ppo:
 
 `policy_training_start_step: 0` is the natural pairing, but keeping a short online warmup is equally valid: it calibrates the seeded critic on this run's own rollout distribution before the policy starts moving. A nonzero value is also what `async_ppo.warmup_generation_lead_steps` requires (`async_rl.sampler.warmup_lookahead_versions` on the SingleController path) — both must be null when it is 0.
 
-The path is a `step_<n>` directory holding a `value/` subtree — the layout a PPO or critic-pretraining run checkpoints. The critic restores its weights from it, plus optimizer moments and LR-scheduler state whenever the seed carries them; a seed written with `save_optimizer: false` restores weights only and warns. Setup rejects a path with no `value/weights` subtree rather than letting the critic start cold behind the message above. Nothing else is read: the policy starts from the base model, the dataloader from the beginning, and the step counter at 0.
+The path is a `step_<n>` directory holding a `value/` subtree — the layout a PPO or critic-pretraining run checkpoints. **Only the weights carry over.** The critic's optimizer and LR schedule are always rebuilt: the seed's Adam moments and scheduler step count describe the run that produced it, so restoring them would precondition this critic on another run's gradient statistics and start it past its own LR warmup. Setup rejects a path with no `value/weights` subtree rather than letting the critic start cold behind the message above. Nothing else is read: the policy starts from the base model, the dataloader from the beginning, and the step counter at 0.
 
-**The seed and this run must agree on the value scheduler.** The seed is restored through the ordinary resume path, so Megatron compares nine scheduler fields against the ones this run builds and raises on the first mismatch — `use_checkpoint_opt_param_scheduler` is off, so `OptimizerParamScheduler._check_and_set` asserts equality. Match all of these across the two runs:
-
-- `value.megatron_cfg.optimizer.lr` and `.min_lr` — they feed `max_lr`/`min_lr` and are the *first* two fields checked. They live in the optimizer block, not the scheduler block.
-- `value.megatron_cfg.scheduler`.
-- `value.train_global_batch_size` — it multiplies `lr_decay_steps`, `wd_incr_steps` and `lr_warmup_steps`.
-- the tick budget `train_iters`. A synchronous run sets it to `min(max_num_steps, max_num_epochs × len(dataloader)) × critic_ppo_epochs`; an async run sets it to `max_num_steps × critic_ppo_epochs`, since async requires `max_num_epochs: -1`. `len(dataloader)` is prompt batches per epoch, so on a synchronous run the dataset size and `num_prompts_per_step` are part of the budget whenever the epoch term is the smaller one — as it is for the shipped recipes that set `max_num_epochs: 15`. Matching `max_num_steps` and `critic_ppo_epochs` alone is not enough there.
-
-A mismatch fails during critic init. Which field is named depends on which input differs: a batch-size difference reports `warmup iterations`, a learning-rate difference reports `learning rate`.
-
-```
-AssertionError: OptimizerParamScheduler: class input value <X> and checkpointvalue <Y> for total number of weight decay iterations do not match
-```
-
-(`checkpointvalue` runs together in the upstream message; search for it as written.)
-
-Carrying the seed's schedule over is deliberate — it is what lets the post-warmup LR continue instead of restarting. Set `value.megatron_cfg.scheduler.override_opt_param_scheduler: true` if you would rather this run's settings win; the seed's step position is still restored, so the critic resumes at the seed's tick count rather than at step 0. All of this is Megatron-only — a DTensor critic (the default in `ppo_math_1B.yaml`) loads the seed's scheduler state with no comparison and has no override knob.
+Because the optimizer is rebuilt, the seed and this run **do not** have to agree on the value scheduler: `value.megatron_cfg.optimizer.lr`/`.min_lr`, `value.megatron_cfg.scheduler`, `value.train_global_batch_size` and the `train_iters` budget are all free to differ, so a critic pretrained at a different learning rate, batch size or step budget is usable as is.
 
 The warm start applies to a fresh run only: once the run has written a checkpoint of its own, that checkpoint wins. That is what lets the setting stay in the config across resumes — a resubmitted run restores its own critic instead of re-seeding from the pretrained one, with no config edit in between.
 

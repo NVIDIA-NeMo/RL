@@ -39,6 +39,7 @@ from nemo_rl.data.multimodal_utils import (
     PackedTensor,
 )
 from nemo_rl.data.packing import get_packer
+from nemo_rl.data_plane.schema import OPD_FULL_FIELDS
 from nemo_rl.distributed.collectives import (
     gather_jagged_object_lists,
     rebalance_nd_tensor,
@@ -1040,7 +1041,12 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             if k in PACKED_MULTIMODAL_FIELDS:
                 continue
             if torch.is_tensor(v) and len(v.shape) >= dim + 1:
-                self.data[k] = torch.narrow(v, dim=dim, start=0, length=truncated_len)
+                length = truncated_len
+                if k in OPD_FULL_FIELDS:
+                    # materialize() leaves the payload at its natural width,
+                    # which can already be shorter than this microbatch's seqlen.
+                    length = min(truncated_len, int(v.shape[dim]))
+                self.data[k] = torch.narrow(v, dim=dim, start=0, length=length)
 
     def make_microbatch_iterator_with_dynamic_shapes(
         self,
