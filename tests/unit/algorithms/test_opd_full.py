@@ -972,7 +972,7 @@ def test_prepare_loss_input_projects_the_payload_and_drops_the_last_position(
     assert "next_token_logprobs" not in loss_input
 
 
-def test_prepare_opd_full_loss_input_routes_rows_by_the_teacher_index_column(
+def test_prepare_loss_input_routes_rows_by_the_teacher_index_column(
     _single_rank_collectives,
 ):
     """The routing column is read off the microbatch, not passed in by hand.
@@ -995,7 +995,7 @@ def test_prepare_opd_full_loss_input_routes_rows_by_the_teacher_index_column(
         }
     )
 
-    loss_input = prepare_opd_full_loss_input(
+    loss_input, _ = prepare_loss_input(
         student_logits,
         data,
         _loss_fn(),
@@ -1022,7 +1022,7 @@ def test_prepare_opd_full_loss_input_routes_rows_by_the_teacher_index_column(
     assert divergence.requires_grad
 
 
-def test_prepare_opd_full_loss_input_requires_the_index_column_for_two_teachers(
+def test_prepare_loss_input_requires_the_index_column_for_two_teachers(
     _single_rank_collectives,
 ):
     """Two heads loaded but the microbatch carries no index column: fail loud."""
@@ -1035,7 +1035,7 @@ def test_prepare_opd_full_loss_input_requires_the_index_column_for_two_teachers(
     )
 
     with pytest.raises(ValueError, match="no per-row teacher index"):
-        prepare_opd_full_loss_input(
+        prepare_loss_input(
             torch.randn(batch_size, seq_len, vocab, requires_grad=True),
             data,
             _loss_fn(),
