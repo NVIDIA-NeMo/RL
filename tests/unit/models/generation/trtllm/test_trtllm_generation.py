@@ -18,9 +18,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from pydantic import ValidationError
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.trtllm import trtllm_generation
+from nemo_rl.models.generation.trtllm.config import resolve_trtllm_disagg_config
 from nemo_rl.models.generation.trtllm.trtllm_generation import TrtllmGeneration
 
 pytestmark = pytest.mark.trtllm
@@ -336,3 +338,106 @@ def test_ipc_refit_and_missing_worker_group():
     broken.worker_group.workers = []
     with pytest.raises(RuntimeError, match="Worker group not initialised"):
         broken.update_weights_via_ipc_zmq()
+
+
+# -------------------------------------------------------------------------- #
+#  Disaggregation config and engine planning
+# -------------------------------------------------------------------------- #
+
+
+def test_disagg_defaults_come_from_the_schema_not_the_call_sites():
+    # Absent and present-but-empty must agree: every default lives on the model,
+    # so no consumer has to re-derive one per key.
+    for raw in (None, {}):
+        cfg = _config(disaggregation=raw) if raw is not None else _config()
+        disagg = resolve_trtllm_disagg_config(cfg)
+        assert disagg.enabled is False
+        assert disagg.num_context_engines == 1
+        assert disagg.num_generation_engines == 1
+        assert disagg.num_frontend_workers == 1
+        assert disagg.frontend_base_port == 17300
+        assert disagg.ctx_router == "conversation"
+        assert disagg.gen_router == "load_balancing"
+        assert disagg.cache_transceiver_backend == "DEFAULT"
+        assert disagg.cache_transceiver_runtime is None
+        assert disagg.ctx_trtllm_kwargs == {}
+
+
+def test_a_plausible_but_wrong_router_is_rejected():
+    # round_robin parses as a str but silently discards the prefix affinity the
+    # context engines depend on, so the schema has to reject it.
+    with pytest.raises(ValidationError):
+        resolve_trtllm_disagg_config(
+            _config(disaggregation={"enabled": True, "ctx_router": "round_robin"})
+        )
+
+
+def test_unknown_disagg_keys_are_preserved_for_older_configs():
+    disagg = resolve_trtllm_disagg_config(
+        _config(disaggregation={"enabled": True, "some_future_key": 3})
+    )
+    assert disagg.enabled is True
+    assert disagg.model_extra["some_future_key"] == 3
+
+
+@pytest.mark.parametrize(
+    "disaggregation, world_size, expected_roles, expected_tps, expected_replicas",
+    [
+        # Disabled: a replica is an engine, so the count follows TP as before.
+        (None, 8, ["generation"] * 8, [1] * 8, 8),
+        # Enabled, 1:1 at TP1 -- the exemplar's defaults on one 8-GPU node.
+        (
+            {"enabled": True},
+            8,
+            ["context", "generation"] * 4,
+            [1, 1] * 4,
+            4,
+        ),
+        # Per-role TP and engine counts are independent, and same-role engines
+        # stay contiguous within a replica.
+        (
+            {
+                "enabled": True,
+                "num_context_engines": 2,
+                "num_generation_engines": 1,
+                "ctx_trtllm_kwargs": {"tensor_parallel_size": 1},
+                "gen_trtllm_kwargs": {"tensor_parallel_size": 2},
+            },
+            8,
+            ["context", "context", "generation"] * 2,
+            [1, 1, 2] * 2,
+            2,
+        ),
+    ],
+)
+def test_plan_engines_lays_replicas_out_contiguously(
+    disaggregation, world_size, expected_roles, expected_tps, expected_replicas
+):
+    cfg = _config(**({"disaggregation": disaggregation} if disaggregation else {}))
+    generation = TrtllmGeneration.__new__(TrtllmGeneration)
+    generation.cfg = cfg
+    generation.tp_size = cfg["trtllm_cfg"]["tensor_parallel_size"]
+    generation._disagg = resolve_trtllm_disagg_config(cfg)
+
+    roles, tps, num_replicas = generation._plan_engines(world_size)
+
+    assert roles == expected_roles
+    assert tps == expected_tps
+    assert num_replicas == expected_replicas
+
+
+def test_plan_engines_rejects_a_replica_width_that_does_not_tile_the_cluster():
+    cfg = _config(
+        disaggregation={
+            "enabled": True,
+            "ctx_trtllm_kwargs": {"tensor_parallel_size": 2},
+            "gen_trtllm_kwargs": {"tensor_parallel_size": 1},
+        }
+    )
+    generation = TrtllmGeneration.__new__(TrtllmGeneration)
+    generation.cfg = cfg
+    generation.tp_size = cfg["trtllm_cfg"]["tensor_parallel_size"]
+    generation._disagg = resolve_trtllm_disagg_config(cfg)
+
+    with pytest.raises(AssertionError, match="replica width 3 GPUs"):
+        generation._plan_engines(8)

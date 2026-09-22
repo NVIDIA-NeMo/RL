@@ -127,9 +127,7 @@ class TrtllmAsyncGenerationWorkerImpl:
         overrides = self.cfg["trtllm_cfg"].get("_engine_overrides")
         if not overrides or self._bundle_indices is None:
             return {}
-        key = f"{self._bundle_pg_idx}:" + ",".join(
-            str(i) for i in self._bundle_indices
-        )
+        key = f"{self._bundle_pg_idx}:" + ",".join(str(i) for i in self._bundle_indices)
         entry = overrides.get(key)
         if entry is None:
             raise RuntimeError(
