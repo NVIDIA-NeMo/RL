@@ -1099,6 +1099,7 @@ def test_get_grpo_save_state_handles_legacy_checkpoint_and_filters_metrics():
         "sampler_dispatch_index": None,
         # None unless adaptive-ppo-clip is on.
         "cur_adaptive_ppo_clip_k": None,
+        "next_nemo_gym_task_index": 0,
     }
     assert "total_valid_tokens" not in loaded_state
     assert not hasattr(save_state, "val:accuracy")
@@ -1109,6 +1110,7 @@ def test_grpo_save_state_checkpoint_round_trip():
     save_state.current_step = 4
     save_state.total_steps = 4
     save_state.total_valid_tokens = 128
+    save_state.next_nemo_gym_task_index = 123
     save_state.val_reward = 0.8
     setattr(save_state, "val:accuracy", 0.8)
 
@@ -1117,6 +1119,7 @@ def test_grpo_save_state_checkpoint_round_trip():
     assert restored_state.current_step == 4
     assert restored_state.total_steps == 4
     assert restored_state.total_valid_tokens == 128
+    assert restored_state.next_nemo_gym_task_index == 123
     assert restored_state.val_reward == 0.8
     assert not hasattr(restored_state, "val:accuracy")
 

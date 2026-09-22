@@ -528,6 +528,9 @@ class SingleControllerActor:
         self._value_loss_fn = getattr(actor_args, "value_loss_fn", None)
         self._buffer = actor_args.tq_buffer
         self._rollout_manager = actor_args.rollout_manager
+        self._rollout_manager.set_next_nemo_gym_task_index(
+            actor_args.save_state.next_nemo_gym_task_index
+        )
         # Rebind so writer and sampler share one buffer instance even
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
@@ -5240,6 +5243,9 @@ class SingleControllerActor:
             _save_adaptive_loss_state(save_state, self._loss_fn)
             save_state.sampler_name = self._async_cfg.sampler.name
             save_state.sampler_dispatch_index = self._sampler.dispatch_index
+            save_state.next_nemo_gym_task_index = (
+                self._rollout_manager.get_next_nemo_gym_task_index()
+            )
             dataloader_state = self._dataloader.state_dict()
             # The spare pool and dataloader advance together under the same mutation
             # cut in recovery-enabled dispatch, so preserve them in this cut too.
