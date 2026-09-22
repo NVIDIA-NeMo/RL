@@ -817,7 +817,7 @@ def grpo_train_sync(
                             calculate_trivial_reward_distributions(
                                 driver_carry["prompt_ids_for_adv"],
                                 dynamic_sampling_rewards,
-                                torch.ones_like(dynamic_sampling_rewards),
+                                baseline_valid_mask,
                             )
                         )
                         tags["is_trivial_prompt_distribution"] = (

@@ -3406,7 +3406,7 @@ def _grpo_train_impl(
                         calculate_trivial_reward_distributions(
                             input_ids,
                             std_rewards if std_rewards is not None else rewards,
-                            torch.ones_like(rewards),
+                            baseline_valid_mask,
                         )
                         if master_config.grpo.use_dynamic_sampling
                         else None
