@@ -191,14 +191,14 @@ class _FakeTrainer:
         weights_path: str,
         optimizer_path: Optional[str],
         tokenizer_path: str,
-        checkpointing_cfg: dict[str, Any],
+        is_final_checkpoint: bool,
     ) -> None:
         self.save_calls.append(
             {
                 "weights_path": weights_path,
                 "optimizer_path": optimizer_path,
                 "tokenizer_path": tokenizer_path,
-                "checkpointing_cfg": checkpointing_cfg,
+                "is_final_checkpoint": is_final_checkpoint,
             }
         )
         # Mimic the real Policy: materialize the checkpoint subdirs.
@@ -705,7 +705,7 @@ def _actor_master_config(
         policy={
             # One optimizer.step per RL step: prompts * generations == gbs.
             "train_global_batch_size": num_prompts_per_step * 2,
-            "generation": {"colocated": {"enabled": False}},
+            "generation": {"backend": "vllm", "colocated": {"enabled": False}},
         },
         loss_fn=ClippedPGLossConfig(),
         env={},
@@ -1164,7 +1164,6 @@ class TestSaveTrigger:
         assert first["tokenizer_path"] == str(
             ckpt_dir / "tmp_step_2" / "policy" / "tokenizer"
         )
-        assert first["checkpointing_cfg"] is mc.checkpointing
         assert trainer.save_calls[1]["weights_path"] == str(
             ckpt_dir / "tmp_step_4" / "policy" / "weights"
         )
@@ -1325,6 +1324,7 @@ class TestSaveTrigger:
 
         assert actor._train_steps == 1
         assert len(trainer.save_calls) == 1
+        assert trainer.save_calls[0]["is_final_checkpoint"] is False
         assert _step_dir_names(tmp_path / "checkpoints") == {"step_1"}
 
     def test_rollout_exhaustion_saves_final_checkpoint(self, tmp_path):
@@ -1352,6 +1352,7 @@ class TestSaveTrigger:
 
         # Stopped short of max_num_steps=4, but the completed steps saved.
         assert actor._train_steps == 2
+        assert trainer.save_calls[-1]["is_final_checkpoint"] is True
         assert _step_dir_names(tmp_path / "checkpoints") == {"step_1", "step_2"}
 
     def test_ft_save_period_triggers_saves(self, tmp_path):
@@ -2148,7 +2149,11 @@ class TestDataPlaneCheckpoint:
             actor._train_steps = 1
             actor._trainer_version = 1
             save_task = asyncio.create_task(
-                actor._save_checkpoint({"loss": 1.0}, is_policy_training_step=True)
+                actor._save_checkpoint(
+                    {"loss": 1.0},
+                    is_policy_training_step=True,
+                    is_final_checkpoint=False,
+                )
             )
             started = await asyncio.to_thread(dp_client.save_started.wait, 30.0)
             assert started
@@ -2356,7 +2361,11 @@ class TestPPOSaveOrder:
         calls: list[str] = []
         actor = _ppo_save_actor(tmp_path, calls)
 
-        asyncio.run(actor._save_checkpoint({}, is_policy_training_step=True))
+        asyncio.run(
+            actor._save_checkpoint(
+                {}, is_policy_training_step=True, is_final_checkpoint=True
+            )
+        )
 
         assert calls == [
             "policy.offload_to_cpu",
@@ -2366,6 +2375,8 @@ class TestPPOSaveOrder:
             "policy.prepare_for_training",
             "policy.save_checkpoint",
         ]
+        assert actor._trainer.save_kwargs["is_final_checkpoint"] is True
+        assert actor._value.save_kwargs["is_final_checkpoint"] is True
 
 
 class TestPPOWarmupCheckpoint:
@@ -2384,7 +2395,11 @@ class TestPPOWarmupCheckpoint:
         self, actor, is_policy_training_step
     ):
         asyncio.run(
-            actor._save_checkpoint({}, is_policy_training_step=is_policy_training_step)
+            actor._save_checkpoint(
+                {},
+                is_policy_training_step=is_policy_training_step,
+                is_final_checkpoint=False,
+            )
         )
 
         written = actor._trainer.save_kwargs["optimizer_path"] is not None
@@ -2400,7 +2415,11 @@ class TestPPOWarmupCheckpoint:
         setattr(actor._save_state, "train:loss", 1.23)
 
         with pytest.warns(UserWarning, match="not available during PPO critic warmup"):
-            asyncio.run(actor._save_checkpoint({}, is_policy_training_step=False))
+            asyncio.run(
+                actor._save_checkpoint(
+                    {}, is_policy_training_step=False, is_final_checkpoint=False
+                )
+            )
 
         assert not hasattr(actor._save_state, "train:loss")
 
@@ -2409,7 +2428,11 @@ class TestPPOWarmupCheckpoint:
         actor._master_config.checkpointing["metric_name"] = "train:loss"
 
         with pytest.raises(ValueError, match="not found in train metrics"):
-            asyncio.run(actor._save_checkpoint({}, is_policy_training_step=True))
+            asyncio.run(
+                actor._save_checkpoint(
+                    {}, is_policy_training_step=True, is_final_checkpoint=False
+                )
+            )
 
 
 # ── metric_name behavior ─────────────────────────────────────────────────────
@@ -2682,7 +2705,7 @@ class TestSetupResumeWiring:
                 return_value=True,
             ),
             patch(
-                "nemo_rl.algorithms.single_controller_utils.setup.spinup_nemo_gym_actor",
+                "nemo_rl.algorithms.single_controller_utils.setup.build_nemo_gym_actors",
                 return_value=MagicMock(),
             ),
             patch(

@@ -14,7 +14,7 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
-from typing import Any, ClassVar, TypeAlias
+from typing import Any, TypeAlias
 
 from megatron.energon import Cooker, CrudeSample, DefaultTaskEncoder
 
@@ -39,8 +39,6 @@ class BaseSFTTaskEncoder(
     ABC,
 ):
     """Common SFT lifecycle shared by the Energon task encoders."""
-
-    sample_schema: ClassVar[str]
 
     def __init__(
         self,

@@ -39,6 +39,12 @@ from omegaconf import OmegaConf
 # The actor factory or rollout code consumes these separately.
 NEMO_RL_DICT_CONFIG_KEYS = frozenset({"effort_levels", "tokenizer_config"})
 
+# Ray placement-group strategies a shard plan may ask for. STRICT_SPREAD is the
+# point of sharding -- one actor per node -- and anything else colocates shards
+# and gives up the capacity isolation. PACK exists so the mechanism can be
+# exercised on a single machine.
+PLACEMENT_STRATEGIES = frozenset({"STRICT_SPREAD", "SPREAD", "STRICT_PACK", "PACK"})
+DEFAULT_PLACEMENT_STRATEGY = "STRICT_SPREAD"
 DEFAULT_REPLICAS = 1
 SHARD_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -47,9 +53,16 @@ SHARD_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 # nemo_gym is installed only in the actor's venv.
 GYM_LOG_DIR_KEY = "nemo_gym_log_dir"
 
+# Gym's server-type keys that make an entry a rollout destination.
+GYM_ROUTABLE_KEYS = frozenset({"responses_api_agents", "resources_servers"})
+
 
 class ShardConfigError(ValueError):
     """Raised for a malformed ``env.nemo_gym.shards`` block."""
+
+
+class ShardSetupError(RuntimeError):
+    """Raised when a sharded stack fails to start or fails its startup checks."""
 
 
 @dataclass(frozen=True)
@@ -82,6 +95,7 @@ class ShardPlan:
     common_inherited_overlays: frozenset[str] = frozenset()
     common_overrides: dict[str, Any] = field(default_factory=dict)
     allowed_duplicate_entries: frozenset[str] = frozenset()
+    placement_strategy: str = DEFAULT_PLACEMENT_STRATEGY
 
 
 SHARDING_CONFIG_KEYS = frozenset(field.name for field in fields(ShardPlan))
@@ -259,11 +273,13 @@ def parse_shard_plan(nemo_gym_config: Mapping[str, Any]) -> ShardPlan | None:
         raise ShardConfigError("env.nemo_gym.shards must be a non-empty list")
 
     # A top-level config_paths could plausibly belong to one shard or all of
-    # them, so its scope must remain explicit.
-    if "config_paths" in nemo_gym_config:
+    # them, so its scope must remain explicit. A null reads as absent because
+    # Hydra can blank an inherited key but cannot delete it.
+    if nemo_gym_config.get("config_paths") is not None:
         raise ShardConfigError(
             "env.nemo_gym.config_paths cannot be combined with 'shards'. "
-            "Move each path into the shard that should host it."
+            "Move each path into the shard that should host it, and set the "
+            "inherited config_paths to null."
         )
     shards = [_parse_shard(raw, index) for index, raw in enumerate(raw_shards)]
 
@@ -320,6 +336,62 @@ def parse_shard_plan(nemo_gym_config: Mapping[str, Any]) -> ShardPlan | None:
             f"{sorted(inherited_inventory)}."
         )
 
+    configured_strategy = nemo_gym_config.get("placement_strategy")
+    placement_strategy = (
+        DEFAULT_PLACEMENT_STRATEGY
+        if configured_strategy is None
+        else configured_strategy
+    )
+    if placement_strategy not in PLACEMENT_STRATEGIES:
+        raise ShardConfigError(
+            f"env.nemo_gym.placement_strategy must be one of "
+            f"{sorted(PLACEMENT_STRATEGIES)}, got {placement_strategy!r}"
+        )
+
+    # Replicas are stamped from one merge, so they share that shard's port
+    # range and no per-replica override exists to give them separate ones.
+    # Only STRICT_SPREAD guarantees each one its own node, and therefore its
+    # own port space; under any other strategy two replicas can land together
+    # and race for the same ports at spinup.
+    replicated = [shard.name for shard in shards if shard.replicas > 1]
+    if replicated and placement_strategy != DEFAULT_PLACEMENT_STRATEGY:
+        raise ShardConfigError(
+            f"Shards {replicated} declare replicas, which requires "
+            f"placement_strategy {DEFAULT_PLACEMENT_STRATEGY} so that each "
+            f"replica gets its own node and port space; got "
+            f"{placement_strategy!r}. Replicas share one merged config, so "
+            f"they cannot be given separate port ranges. Either drop the "
+            f"replicas or split them into separate shards with their own "
+            f"port_range_low/high."
+        )
+
+    if placement_strategy != DEFAULT_PLACEMENT_STRATEGY:
+        missing_ranges = [
+            shard.name for shard in shards if shard.port_range_low is None
+        ]
+        if missing_ranges:
+            raise ShardConfigError(
+                f"Shards {missing_ranges} require explicit port_range_low/high "
+                f"with placement_strategy {placement_strategy!r}, because relaxed "
+                "placement can colocate shard stacks on one node."
+            )
+        ranges: list[tuple[int, int, str]] = []
+        for shard in shards:
+            assert shard.port_range_low is not None
+            assert shard.port_range_high is not None
+            ranges.append((shard.port_range_low, shard.port_range_high, shard.name))
+        ranges.sort()
+        for (_, previous_high, previous_name), (
+            current_low,
+            _,
+            current_name,
+        ) in zip(ranges, ranges[1:]):
+            if current_low <= previous_high:
+                raise ShardConfigError(
+                    f"Shards '{previous_name}' and '{current_name}' have "
+                    "overlapping port ranges under relaxed placement"
+                )
+
     common_overrides = _as_plain_dict(
         nemo_gym_config.get("common_overrides"),
         context="env.nemo_gym.common_overrides",
@@ -368,6 +440,7 @@ def parse_shard_plan(nemo_gym_config: Mapping[str, Any]) -> ShardPlan | None:
         common_inherited_overlays=common_inherited,
         common_overrides=common_overrides,
         allowed_duplicate_entries=raw_allowed,
+        placement_strategy=placement_strategy,
     )
 
 
@@ -380,6 +453,11 @@ def apply_shard_overlay(
     an unsharded job. Dict-shaped entries inherited from a parent recipe are
     removed from the shared base and restored only for the shards that claim
     them. Explicit overrides win over inherited values.
+
+    Top-level keys left null are dropped rather than forwarded. Blanking a key
+    is the only way a Hydra override can retract one it inherited (see
+    ``parse_shard_plan``), and Gym should not receive a null where it expects
+    an entry.
     """
     inherited_entries = set(find_gym_config_entries(base_config))
     shared_base = {
@@ -403,11 +481,63 @@ def apply_shard_overlay(
         ),
         context=f"merged config for shard '{shard.name}'",
     )
+    merged = {key: value for key, value in merged.items() if value is not None}
     merged["config_paths"] = list(shard.config_paths)
     if shard.port_range_low is not None:
         merged["port_range_low"] = shard.port_range_low
         merged["port_range_high"] = shard.port_range_high
     return merged
+
+
+def build_route_shard_map(
+    entries_by_shard: Mapping[str, Mapping[str, list[str]]],
+    allowed_duplicate_entries: frozenset[str] | set[str] = frozenset(),
+) -> dict[str, str]:
+    """Map each routable entry to its shard, rejecting ambiguous routes.
+
+    Takes what each shard reported from ``NemoGym.list_entries()`` and returns
+    ``{route_name: shard_name}``, the lookup the router dispatches on. Current
+    Gym rows route either by ``agent_ref.name`` or by ``task_source``. The
+    latter names the agent or resources-server entry that declared the dataset,
+    so both entry types must be included.
+
+    Two failures are caught here rather than at first dispatch. A routable
+    entry hosted by two shards is always an error: rows naming it could go to
+    either, so routing would be silently nondeterministic. Any other entry in
+    two shards has to be allowlisted, because duplication is usually accidental
+    — a shared YAML dropped into two shards' path lists quietly brings its judge
+    along and doubles that judge's GPU claim.
+
+    Only names are compared. What an entry means is Gym's business.
+    """
+    route_to_shard: dict[str, str] = {}
+    for shard_name, entries in entries_by_shard.items():
+        for entry, types in entries.items():
+            if not GYM_ROUTABLE_KEYS.intersection(types):
+                continue
+            if entry in route_to_shard:
+                raise ShardSetupError(
+                    f"Routable Gym entry '{entry}' is hosted by both shard "
+                    f"'{route_to_shard[entry]}' and shard '{shard_name}'. An "
+                    f"agent or resources server must live in exactly one shard "
+                    f"so rows naming it have one destination."
+                )
+            route_to_shard[entry] = shard_name
+
+    hosting_shard: dict[str, str] = {}
+    for shard_name, entries in entries_by_shard.items():
+        for entry in entries:
+            if entry in hosting_shard and entry not in allowed_duplicate_entries:
+                raise ShardSetupError(
+                    f"Config entry '{entry}' appears in shard "
+                    f"'{hosting_shard[entry]}' and shard '{shard_name}' but is "
+                    f"not listed in allowed_duplicate_entries. If this entry "
+                    f"starts a model engine, duplicating it doubles its GPU "
+                    f"claim; if the duplication is intended, allowlist it."
+                )
+            hosting_shard.setdefault(entry, shard_name)
+
+    return route_to_shard
 
 
 def apply_shard_log_dir(
