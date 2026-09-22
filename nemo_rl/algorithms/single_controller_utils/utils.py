@@ -26,10 +26,15 @@ from nemo_rl.data_plane import KVBatchMeta
 
 # Reduction rules for all_mb_metrics. Mirror grpo.py / grpo_sync.py.
 _MB_METRIC_MIN: frozenset[str] = frozenset(
-    {"probs_ratio_min", "probs_ratio_clamped_min"}
+    {"probs_ratio_min", "probs_ratio_clamped_min", "opd_full_reverse_kl_min"}
 )
 _MB_METRIC_MAX: frozenset[str] = frozenset(
-    {"probs_ratio_max", "probs_ratio_clamped_max"}
+    {
+        "probs_ratio_max",
+        "probs_ratio_clamped_max",
+        "opd_full_reverse_kl_max",
+        "opd_full_decomposition_error",
+    }
 )
 _MB_METRIC_MEAN: frozenset[str] = frozenset(
     {
@@ -63,6 +68,11 @@ def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
         metrics["grad_norm"] = grad_norm.detach().mean().item()
     elif grad_norm is not None:
         metrics["grad_norm"] = float(grad_norm)
+    draft_grad_norm = train_result.get("draft_grad_norm")
+    if isinstance(draft_grad_norm, torch.Tensor):
+        metrics["draft_grad_norm"] = draft_grad_norm.detach().mean().item()
+    elif draft_grad_norm is not None:
+        metrics["draft_grad_norm"] = float(draft_grad_norm)
     if "total_flops" in train_result:
         metrics["total_flops"] = float(train_result["total_flops"])
     if "num_ranks" in train_result:

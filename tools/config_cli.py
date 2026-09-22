@@ -241,6 +241,12 @@ def _prune_equal(a: Any, b: Any) -> Any:
     - Else: if equal, return a sentinel indicating removal; otherwise return `a`.
     """
     if _dict_like(a) and _dict_like(b):
+        # `_override_` makes the merge drop the base subtree wholesale (see
+        # merge_with_override), so a key matching the base is not redundant --
+        # pruning it would resolve to absent instead of the base value.
+        if a.get("_override_", False):
+            return a
+
         out: dict[str, Any] = {}
         a_dict: dict[str, Any] = a  # type: ignore[assignment]
         b_dict: dict[str, Any] = b  # type: ignore[assignment]

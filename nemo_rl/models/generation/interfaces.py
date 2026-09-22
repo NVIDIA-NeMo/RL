@@ -14,12 +14,18 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cache
-from typing import TYPE_CHECKING, Any, NotRequired, Optional, TypedDict, Union
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, Optional, TypedDict, Union
 
 import ray
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+# The universal contract is hf_export: the source exports an HF-named,
+# backend-independent representation that each destination converts locally.
+# logical_weights is a Megatron-to-Megatron exception, read only by the Megatron
+# policy worker; new backends should not inherit that coupling implicitly.
+RefitPayloadMode = Literal["hf_export", "logical_weights"]
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
@@ -412,18 +418,17 @@ def reject_unenforceable_refit_deadline(
     Accepting it and doing nothing would be worse than refusing. The deadline exists so
     that a generation rank dying mid-refit cannot hang the weight-sync collective
     forever; a user who sets it on a backend that ignores it gets exactly that hang,
-    while believing they are protected. Only vLLM threads the deadline down to the
-    collective today.
+    while believing they are protected. Only transports whose workers own an
+    abortable collective can enforce it.
 
-    ``None`` -- every path that does not configure a deadline, which is all of them by
-    default -- passes through untouched, so this is inert unless someone opts in.
+    ``None`` disables the deadline and passes through untouched.
     """
     if refit_timeout_s is not None:
         raise NotImplementedError(
-            f"{backend} generation cannot enforce a refit deadline "
-            f"(refit_timeout_s={refit_timeout_s}). Only the vLLM backend threads it "
-            "into the refit collective. Unset "
-            "async_rl.generation_fleet_health.refit_timeout_s, or use vLLM generation."
+            f"{backend} refit cannot enforce a refit deadline "
+            f"(refit_timeout_s={refit_timeout_s}). Unset "
+            "async_rl.generation_fleet_health.refit_timeout_s, or select a refit "
+            "transport with worker-side watchdog support."
         )
 
 
@@ -486,6 +491,49 @@ class GenerationInterface(ABC):
         """Resume previously paused generation on the backend."""
         raise NotImplementedError
 
+    def restart_shard(self, shard_idx: int) -> Optional[str]:
+        """Rebuild one data-parallel shard's workers and bring its engine back up.
+
+        Declared here because ``EngineSupervisor`` calls it by name on whatever backend it
+        was handed. Undeclared, a backend that does not implement it -- or one that loses
+        the method to a merge, which has happened once already -- degrades to an
+        ``AttributeError`` swallowed by the supervisor's ``except``, and the shard is
+        recorded as a failed restart rather than as an unsupported one. Raising here says
+        which it is.
+
+        Blocking and slow -- it reloads the model -- so callers run it off the control
+        loop.
+
+        Returns:
+            The replacement's OpenAI base URL, or None for an engine that exposes no HTTP
+            server. The URL is expected to differ from the old one: the new engine binds
+            its own port, so callers must publish it rather than assume the fleet's URL
+            list is still accurate.
+        """
+        raise NotImplementedError
+
+    def shard_liveness_ref(self, shard_idx: int) -> ray.ObjectRef:
+        """Liveness of the worker leading one data-parallel shard.
+
+        Which Ray worker leads shard N depends on how shards are laid out across workers,
+        which is the backend's business. Asking for it by shard index keeps that here
+        rather than in the control loop, where the same arithmetic had a second copy that
+        also assumed every backend has a ``worker_group`` -- an assumption that has already
+        broken a lane once (``'DynamoGeneration' object has no attribute 'worker_group'``).
+        """
+        raise NotImplementedError
+
+    def log_shard_gpu_state(
+        self, shard_idx: int, *, label: str, timeout_s: float = 30.0
+    ) -> None:
+        """Print the state of the GPU one shard holds, from that shard's own node.
+
+        A no-op by default rather than ``NotImplementedError``, unlike ``restart_shard``
+        above: this is a diagnostic taken on the restart path, and a backend that cannot
+        provide it should cost the caller nothing. Failing a restart over a missing log
+        line would be worse than the missing log line.
+        """
+
     @property
     def requires_kv_scale_sync(self) -> bool:
         """Whether the generation backend requires KV cache scales synchronization."""
@@ -520,6 +568,10 @@ class GenerationInterface(ABC):
     def get_inference_world_size(self) -> int | None:
         """Return a backend-specific collective world size when required."""
         return None
+
+    def get_refit_payload_mode(self) -> RefitPayloadMode:
+        """Return the backend's required representation for transferred weights."""
+        return "hf_export"
 
     def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
         """Prepare per-layer param metadata for nccl_reshard-based refit."""
@@ -652,3 +704,15 @@ class GenerationInterface(ABC):
             metrics return an empty dictionary.
         """
         return {}
+
+    def drain_latest_logger_metrics(self) -> dict[str, Any]:
+        """Consume a bounded latest-value snapshot for frequent telemetry polls.
+
+        Implementations may clear or compact their accumulated metric histories.
+        Callers must not assume that a later ``get_logger_metrics`` includes values
+        observed before this drain. Backends supporting raw rollout throughput
+        should return cumulative sampled-token counters under ``generation_tokens``
+        as ``data_parallel_worker_id -> list[counter]``. The controller computes
+        per-worker deltas before summing them, so counter resets are detectable.
+        """
+        return self.get_logger_metrics()

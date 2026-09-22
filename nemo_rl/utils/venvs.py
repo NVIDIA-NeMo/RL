@@ -69,6 +69,17 @@ def create_local_venv(
     Returns:
         str: Path to the python executable in the created virtual environment
     """
+    # A single token that is an executable file is already an interpreter, not a
+    # command line to run under uv -- there is nothing to build.
+    parts = shlex.split(py_executable)
+    if len(parts) == 1 and os.path.isfile(parts[0]) and os.access(parts[0], os.X_OK):
+        logger.warning(
+            f"{py_executable} is an interpreter, not a uv command, so no venv was built "
+            f"for {venv_name}; using it as-is (NEMO_RL_PY_EXECUTABLES_SYSTEM=1 sets every "
+            "PY_EXECUTABLES entry to sys.executable)."
+        )
+        return py_executable
+
     # This directory is where virtual environments will be installed
     # It is local to the driver process but should be visible to all worker nodes
     # If this directory is not accessible from worker nodes (e.g., on a distributed
@@ -112,8 +123,13 @@ def create_local_venv(
     # Command doesn't matter, since `uv` syncs the environment no matter the command.
     exec_cmd.extend(["echo", f"Finished creating venv {venv_path}"])
 
-    # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
-    subprocess.run(["uv", "sync", "--directory", git_root], env=env, check=True)
+    # Run uv sync first to ensure build requirements are set (for --no-build-isolation packages).
+    # --inexact: this base-set sync must not prune extras out of a venv that was
+    # pre-materialized in the image; pruning and re-adding hardlinked packages would copy
+    # them up into the image's final layer.
+    subprocess.run(
+        ["uv", "sync", "--inexact", "--directory", git_root], env=env, check=True
+    )
     subprocess.run(exec_cmd, env=env, check=True)
 
     # Return the path to the python executable in the virtual environment

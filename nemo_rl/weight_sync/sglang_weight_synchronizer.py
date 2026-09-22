@@ -24,7 +24,7 @@ is shared; the subclasses supply the transport-specific connect and transfer
 and own the GPU phase transitions around them.
 
 Colocated:
-  1. policy.offload_before_refit()                        -- free GPU for staging
+  1. policy.offload_before_refit()                         -- free GPU for staging
   2. generation.prepare_for_generation(tags=["weights"])   -- allocate buffers
   3. _refit()                                              -- Ray CUDA-IPC transfer
   4. policy.offload_after_refit()                          -- restore optimizer state
@@ -88,7 +88,9 @@ class _SGLangWeightSynchronizer(WeightSynchronizer):
         return self._stale
 
     def init_communicator(self) -> None:
-        state_dict_info = self._policy.prepare_refit_info()
+        state_dict_info = self._policy.prepare_refit_info(
+            refit_payload_mode=self._generation.get_refit_payload_mode()
+        )
         self._generation.prepare_refit_info(state_dict_info)
 
     def shutdown(self) -> None:

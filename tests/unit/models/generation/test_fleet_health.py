@@ -136,6 +136,133 @@ class TestStaleIsTheOnlyWayBack:
         assert monitor.snapshot()[0].weight_version == 42
 
 
+class TestFailedRestart:
+    """A restart that does not bring the engine up.
+
+    Its own transition because record_probe deliberately ignores non-serving states -- a
+    probe must never resurrect a shard. Reporting a failed restart that way would strand
+    the shard in RESTARTING: never retried, because it is no longer DEAD, and never
+    retired, because retirement is driven by restart attempts.
+    """
+
+    def test_a_failed_restart_goes_back_to_dead(self):
+        monitor = _monitor(unhealthy_threshold=1)
+        _fail(monitor, 0, times=1)
+        monitor.mark_restarting(0)
+
+        monitor.mark_restart_failed(0)
+
+        assert monitor.state_of(0) is ShardState.DEAD
+
+    def test_the_shard_is_retryable_again(self):
+        """DEAD is what makes it eligible for another attempt; RESTARTING is a dead end."""
+        monitor = _monitor(unhealthy_threshold=1, max_restart_attempts_per_shard=3)
+        _fail(monitor, 0, times=1)
+        monitor.mark_restarting(0)
+        monitor.mark_restart_failed(0)
+
+        assert 0 in monitor.absent_shards()
+        monitor.mark_restarting(0)
+        assert monitor.state_of(0) is ShardState.RESTARTING
+
+    def test_failed_restarts_consume_the_budget(self):
+        """A DEAD -> RESTARTING -> DEAD cycle must still cost an attempt, or a shard that
+        fails to come up retries forever.
+
+        Retirement is lazy: mark_restarting increments *then* checks, so the budget is
+        enforced when the next attempt is requested, not when the last one is spent. The
+        supervisor is built for that -- it picks up DEAD shards, calls mark_restarting,
+        then checks for RETIRED -- so this costs one extra tick and leaks nothing.
+        """
+        monitor = _monitor(unhealthy_threshold=1, max_restart_attempts_per_shard=2)
+        _fail(monitor, 0, times=1)
+        for _ in range(2):
+            monitor.mark_restarting(0)
+            monitor.mark_restart_failed(0)
+        assert monitor.state_of(0) is ShardState.DEAD, "budget spent, not yet retired"
+
+        monitor.mark_restarting(0)
+
+        assert monitor.state_of(0) is ShardState.RETIRED
+
+    def test_it_never_serves_after_a_failed_restart(self):
+        monitor = _monitor(unhealthy_threshold=1, healthy_threshold=1)
+        _fail(monitor, 0, times=1)
+        monitor.mark_restarting(0)
+        monitor.mark_restart_failed(0)
+        for _ in range(10):
+            monitor.record_probe(0, ok=True)
+
+        assert 0 not in monitor.serving_shards()
+
+    def test_a_retired_shard_is_not_dragged_back_to_dead(self):
+        monitor = _monitor(unhealthy_threshold=1, max_restart_attempts_per_shard=1)
+        _fail(monitor, 0, times=1)
+        monitor.mark_restarting(0)
+        monitor.mark_restart_failed(0)
+        monitor.mark_restarting(0)  # one past the budget
+        assert monitor.state_of(0) is ShardState.RETIRED
+
+        monitor.mark_restart_failed(0)
+
+        assert monitor.state_of(0) is ShardState.RETIRED, "retirement is terminal"
+
+
+class TestARestartedEngineHasNoHistory:
+    """A replacement process must not inherit the dead engine's record.
+
+    ``mark_loaded`` already clears the probe counters, and says why: carrying them into a
+    fresh engine would let one unlucky probe re-condemn it. The same argument covers
+    ``consecutive_reported_failures`` and ``state_before_partial``, which ``report_refit``
+    reads -- so leaving them set makes a brand-new engine come back SUSPECT at 2 of 3 on
+    the counter that condemns it.
+
+    Deterministic on the condemn-silent-participant path rather than a race:
+    ``suspected_shards()`` selects on ``state_before_partial`` being SUSPECT, so every
+    shard condemned that way carries it into DEAD.
+    """
+
+    def test_a_replacement_comes_back_healthy_with_a_clean_streak(self):
+        monitor = _monitor(shard_count=4, unhealthy_threshold=3)
+        # Two failed generations, then an aborted refit pulls it out of service, then it
+        # is condemned as the silent participant -- the exact sequence that sets both
+        # fields and then restarts the shard.
+        monitor.report_failure(1, error="generation failed")
+        monitor.report_failure(1, error="generation failed")
+        assert monitor.state_of(1) is ShardState.SUSPECT
+        monitor.mark_weights_partial(1)
+        assert 1 in monitor.suspected_shards()
+        monitor.condemn_silent_participant(1, reason="silent in refit")
+        assert monitor.state_of(1) is ShardState.DEAD
+
+        monitor.mark_restarting(1)
+        monitor.mark_loaded(1, base_url="http://replacement:9000/v1")
+        assert monitor.state_of(1) is ShardState.STALE
+
+        # The next completed refit must return a fresh engine to service outright.
+        monitor.report_refit(1, weight_version=7)
+
+        assert monitor.state_of(1) is ShardState.HEALTHY
+        snapshot = {h.dp_shard_idx: h for h in monitor.snapshot()}
+        assert snapshot[1].consecutive_reported_failures == 0
+        assert snapshot[1].state_before_partial is None
+
+    def test_one_later_failure_only_reaches_suspect(self):
+        """Where an engine with a single failure belongs -- not one step from DEAD."""
+        monitor = _monitor(shard_count=4, unhealthy_threshold=3)
+        monitor.report_failure(1, error="generation failed")
+        monitor.report_failure(1, error="generation failed")
+        monitor.mark_weights_partial(1)
+        monitor.condemn_silent_participant(1, reason="silent in refit")
+        monitor.mark_restarting(1)
+        monitor.mark_loaded(1, base_url="http://replacement:9000/v1")
+        monitor.report_refit(1, weight_version=7)
+
+        monitor.report_failure(1, error="one unrelated failure")
+
+        assert monitor.state_of(1) is ShardState.SUSPECT
+
+
 class TestRetirement:
     def test_restarts_are_bounded_then_the_shard_retires(self):
         monitor = _monitor(unhealthy_threshold=1, max_restart_attempts_per_shard=2)
@@ -472,6 +599,20 @@ class TestConclusiveActorDeath:
         monitor.record_actor_death(0)
 
         assert monitor.state_of(0) is ShardState.RETIRED
+
+    def test_a_replacement_that_dies_again_returns_to_dead(self):
+        """STALE is not absent, so a second death has to be able to condemn it --
+        otherwise a replacement that dies before the refit lands is stranded."""
+        monitor = _monitor(shard_count=2, unhealthy_threshold=1)
+        monitor.record_actor_death(0)
+        monitor.mark_restarting(0)
+        monitor.mark_loaded(0, base_url="http://h:9000/v1")
+        assert monitor.state_of(0) is ShardState.STALE
+
+        monitor.record_actor_death(0, error="ActorDiedError: replacement died")
+
+        assert monitor.state_of(0) is ShardState.DEAD
+        assert 0 in monitor.absent_shards()
 
     def test_the_error_is_recorded(self):
         monitor = _monitor(shard_count=2)

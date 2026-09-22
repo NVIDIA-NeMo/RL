@@ -61,3 +61,4 @@ class PromptGroupRecord:
     metadata: dict[str, Any]
     completions: list["Completion"]
     rollout_metrics: dict[str, Any]
+    loss_multiplier: float = 1.0

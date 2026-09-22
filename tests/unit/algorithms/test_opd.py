@@ -1137,8 +1137,11 @@ def test_create_teacher_worker_groups_reuses_reserved_clusters(monkeypatch):
     initialized_clusters = []
 
     class FakeTeacherWorkerGroup:
-        def __init__(self, *, teacher_cfg, cluster, policy_config, tokenizer):
+        def __init__(
+            self, *, teacher_cfg, cluster, policy_config, tokenizer, teacher_index
+        ):
             initialized_clusters.append((teacher_cfg.alias, cluster))
+            self.teacher_index = teacher_index
             self.worker_group = SimpleNamespace(workers=[])
             self.use_sequence_packing = True
             self.sequence_length_pad_multiple = 1
@@ -1165,6 +1168,71 @@ def test_create_teacher_worker_groups_reuses_reserved_clusters(monkeypatch):
     ]
     assert list(worker_groups) == ["math", "code"]
     assert alias_to_group_alias == {"math": "math", "code": "code"}
+    # The teacher index is derived from the deduplicated checkpoint, not from
+    # the YAML key order this dict happens to have: it keys the student's per-
+    # teacher LM-head shards, so editing the config must not repoint an
+    # already-tagged row at another teacher's head.
+    assert {alias: group.teacher_index for alias, group in worker_groups.items()} == {
+        "code": 0,
+        "math": 1,
+    }
+
+
+def test_teacher_index_follows_the_checkpoint_not_the_alias():
+    """Renaming or reordering agents must not renumber an already-tagged row."""
+    from nemo_rl.algorithms import opd
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    def checkpoints_by_index(teacher_model_by_agent_name):
+        configs = create_teacher_configs_from_opd_config(
+            {
+                "teacher_model_by_agent_name": teacher_model_by_agent_name,
+                "non_colocated_teachers": {
+                    "enabled": True,
+                    "default_teacher_cfg": {"num_nodes": 2, "gpus_per_node": 4},
+                },
+            }
+        )
+        return [cfg.model_name for cfg in opd.teacher_configs_by_index(configs)]
+
+    baseline = ["/checkpoints/code", "/checkpoints/math"]
+    assert (
+        checkpoints_by_index({"math": "/checkpoints/math", "code": "/checkpoints/code"})
+        == baseline
+    )
+    # Same two checkpoints, renamed agents in the opposite YAML order.
+    assert (
+        checkpoints_by_index(
+            {"zeta": "/checkpoints/code", "alpha": "/checkpoints/math"}
+        )
+        == baseline
+    )
+
+    # A checkpoint shared by two agents: which alias represents it is
+    # first-seen-wins over this dict, so alias-based numbering flipped here.
+    shared = ["/checkpoints/other", "/checkpoints/shared"]
+    assert (
+        checkpoints_by_index(
+            {
+                "aaa": "/checkpoints/shared",
+                "zzz": "/checkpoints/shared",
+                "mmm": "/checkpoints/other",
+            }
+        )
+        == shared
+    )
+    assert (
+        checkpoints_by_index(
+            {
+                "zzz": "/checkpoints/shared",
+                "aaa": "/checkpoints/shared",
+                "mmm": "/checkpoints/other",
+            }
+        )
+        == shared
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1211,3 +1279,87 @@ def test_create_advantage_estimator_opd_branch():
         estimator = _create_advantage_estimator(master_config)
     assert isinstance(estimator, OPDAdvantageEstimator)
     assert len(caught) == 3
+
+
+def _meta_teacher_class():
+    class MetaTeacher:
+        def __init__(self):
+            self.sharding_annotations = _MockShardingAnnotations(1)
+
+        def get_logprobs_from_meta(self, meta):
+            del meta
+
+    return MetaTeacher
+
+
+def test_tq_teacher_enrichment_advertises_the_full_payload_column(monkeypatch):
+    """With ``full.enabled`` the enriched meta names the payload column too.
+
+    The training fetch only sees what ``enrich`` returns, so a coordinator that
+    forgot the column would leave the loss without its teacher payload.
+    """
+    import asyncio
+
+    from nemo_rl.algorithms import opd
+    from nemo_rl.data_plane.schema import OPD_FULL_HIDDEN_STATES_FIELD
+
+    monkeypatch.setattr(opd, "read_columns", lambda *a, **kw: None)
+    monkeypatch.setattr(opd, "write_columns", lambda *a, **kw: None)
+    coordinator = opd.TQTeacherLogprobCoordinator(
+        dp_client=object(),
+        teacher_worker_groups={"primary": _meta_teacher_class()()},
+        alias_to_group_alias={"math": "primary"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {"math": "/ckpt/shared"},
+            "full": {"enabled": True, "teacher_payload": "hidden_states"},
+        },
+    )
+    meta = _teacher_meta("group", batch_size=3, seq_len=5)
+
+    enriched = asyncio.run(coordinator.enrich(meta, _teacher_record("math")))
+
+    assert "teacher_reference_logprobs" in enriched.fields
+    assert OPD_FULL_HIDDEN_STATES_FIELD in enriched.fields
+    metrics = coordinator.drain_metrics()
+    # Tokens, not bytes: 3 samples x 5 tokens.
+    assert metrics["on_policy_distillation/teacher_full_payload_tokens"] == 15.0
+    # Drained: the counter resets with the rest.
+    assert (
+        coordinator.drain_metrics()[
+            "on_policy_distillation/teacher_full_payload_tokens"
+        ]
+        == 0.0
+    )
+
+
+def test_tq_teacher_enrichment_does_not_advertise_a_payload_when_full_is_disabled(
+    monkeypatch,
+):
+    import asyncio
+
+    from nemo_rl.algorithms import opd
+    from nemo_rl.data_plane.schema import OPD_FULL_FIELDS
+
+    monkeypatch.setattr(opd, "read_columns", lambda *a, **kw: None)
+    monkeypatch.setattr(opd, "write_columns", lambda *a, **kw: None)
+    coordinator = opd.TQTeacherLogprobCoordinator(
+        dp_client=object(),
+        teacher_worker_groups={"primary": _meta_teacher_class()()},
+        alias_to_group_alias={"math": "primary"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {"math": "/ckpt/shared"},
+            "full": {"enabled": False},
+        },
+    )
+
+    enriched = asyncio.run(
+        coordinator.enrich(
+            _teacher_meta("group", batch_size=2, seq_len=4), _teacher_record("math")
+        )
+    )
+
+    assert not set(OPD_FULL_FIELDS) & set(enriched.fields)
+    assert (
+        "on_policy_distillation/teacher_full_payload_tokens"
+        not in coordinator.drain_metrics()
+    )

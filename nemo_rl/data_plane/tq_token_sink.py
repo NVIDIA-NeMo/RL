@@ -37,7 +37,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import ray
 import torch
@@ -464,8 +464,12 @@ def _select_row(rows: TensorDict, index: int) -> dict[str, torch.Tensor]:
     """
     row: dict[str, torch.Tensor] = {}
     for field in rows.keys():
-        leaf = cast(torch.Tensor, rows.get(field))
-        row[str(field)] = leaf[index].unsqueeze(0)
+        value = rows.get(field)
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"staging field {field!r} must be a tensor, got {type(value).__name__}"
+            )
+        row[str(field)] = value[index].unsqueeze(0)
     return row
 
 

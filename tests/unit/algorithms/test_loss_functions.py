@@ -2770,11 +2770,11 @@ def test_cross_tokenizer_prepare_loss_input_partitions_canonical_ce(
     )
 
     monkeypatch.setattr(
-        "nemo_rl.algorithms.loss.utils.prepare_xtoken_cross_tokenizer_loss_input",
+        "nemo_rl.algorithms.loss.loss_input.prepare_xtoken_cross_tokenizer_loss_input",
         lambda *args, **kwargs: (torch.empty(0), {}, {}, None, cp_group),
     )
     monkeypatch.setattr(
-        "nemo_rl.algorithms.loss.utils.get_cp_sharded_next_token_logprobs",
+        "nemo_rl.algorithms.loss.loss_input.get_cp_sharded_next_token_logprobs",
         lambda *args, **kwargs: full_logprobs,
     )
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group: 2)
@@ -2817,11 +2817,11 @@ def test_cross_tokenizer_prepare_loss_input_rejects_nondivisible_cp_window(
     )
 
     monkeypatch.setattr(
-        "nemo_rl.algorithms.loss.utils.prepare_xtoken_cross_tokenizer_loss_input",
+        "nemo_rl.algorithms.loss.loss_input.prepare_xtoken_cross_tokenizer_loss_input",
         lambda *args, **kwargs: (torch.empty(0), {}, {}, None, cp_group),
     )
     monkeypatch.setattr(
-        "nemo_rl.algorithms.loss.utils.get_cp_sharded_next_token_logprobs",
+        "nemo_rl.algorithms.loss.loss_input.get_cp_sharded_next_token_logprobs",
         lambda *args, **kwargs: next_token_logprobs,
     )
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group: 4)

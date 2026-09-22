@@ -75,6 +75,7 @@ from nemo_rl.models.dtensor.parallelize import (
     get_grad_norm,
     to_local_if_dtensor,
 )
+from nemo_rl.models.generation.interfaces import RefitPayloadMode
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
     pack_sequences,
@@ -343,7 +344,12 @@ class DTensorPolicyWorkerImpl(
                 raise ValueError(f"Unknown reward model type: {rm_type}")
         else:
             # DO NOT assume AutoModelForCausalLM, multimodal models can inherit from AutoModelForImageTextToText, AutoModelForTextToWaveform, etc.
-            model_class = resolve_model_class(model_config.model_type)
+            # This worker loads weights on rank 0 and applies FSDP itself. NeMo
+            # AutoModel wrappers may run collectives while the other ranks wait.
+            model_class = resolve_model_class(
+                model_config.model_type,
+                use_nemo_automodel=False,
+            )
 
         full_state_dict = None
         if self.rank == 0:
@@ -786,7 +792,7 @@ class DTensorPolicyWorkerImpl(
 
                         # add vlm kwargs to model call
                         vlm_kwargs = mb.get_multimodal_dict(
-                            as_tensors=True, device=input_ids.device
+                            True, input_ids.device, None, "pad_to_max_shape"
                         )
                         vlm_kwargs = filter_multimodal_kwargs_for_model(
                             self.model, vlm_kwargs
@@ -1090,7 +1096,7 @@ class DTensorPolicyWorkerImpl(
                 input_ids = lp_batch.get("input_ids").cuda()
                 input_lengths = lp_batch.get("input_lengths")
                 vlm_kwargs = lp_batch.get_multimodal_dict(
-                    as_tensors=True, device=input_ids.device
+                    True, input_ids.device, None, "pad_to_max_shape"
                 )
                 vlm_kwargs = filter_multimodal_kwargs_for_model(self.model, vlm_kwargs)
 
@@ -1531,7 +1537,7 @@ class DTensorPolicyWorkerImpl(
                 input_ids = lp_batch.get("input_ids").cuda()
                 input_lengths = lp_batch.get("input_lengths")
                 vlm_kwargs = lp_batch.get_multimodal_dict(
-                    as_tensors=True, device=input_ids.device
+                    True, input_ids.device, None, "pad_to_max_shape"
                 )
                 vlm_kwargs = filter_multimodal_kwargs_for_model(self.model, vlm_kwargs)
                 batch_size, seq_len = input_ids.shape
@@ -1837,8 +1843,11 @@ class DTensorPolicyWorkerImpl(
         return self.model.config
 
     @torch.no_grad()
-    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+    def prepare_refit_info(
+        self, *, refit_payload_mode: RefitPayloadMode = "hf_export"
+    ) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
+        del refit_payload_mode
         state_dict_info = {}
         for name, tensor in self.model.state_dict().items():
             # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective

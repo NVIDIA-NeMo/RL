@@ -29,10 +29,20 @@ from megatron.core.parallel_state import (
 from megatron.core.utils import StragglerDetector
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
-from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
+from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS, PackedTensor
+from nemo_rl.data_plane.schema import OPD_FULL_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
+from nemo_rl.models.megatron.alignment import (
+    get_fp8_token_alignment,
+    get_parallel_token_alignment,
+)
 from nemo_rl.models.megatron.common import _round_up_to_multiple
+from nemo_rl.models.megatron.hybridep import (
+    get_packed_seq_padding_mask,
+    pad_packed_seq_for_hybridep,
+    uses_hybridep_flex_dispatcher,
+)
 from nemo_rl.utils.r3_trace import (
     r3_trace_verify_forward_enabled,
     trace_cp_routed_experts,
@@ -50,6 +60,7 @@ class ProcessedInputs:
     packed_seq_params: Optional[PackedSeqParams]
     cu_seqlens_padded: Optional[torch.Tensor]
     mtp_loss_mask: Optional[torch.Tensor] = None
+    padding_mask: Optional[torch.Tensor] = None
     routed_experts: Optional[torch.Tensor] = None
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
     original_seq_length: Optional[int] = None
@@ -69,11 +80,15 @@ class ProcessedMicrobatch:
         input_ids_cp_sharded: Model-forward token IDs. Usually CP-sharded; models
             that insert media before CP selection receive the full packed THD row.
         attention_mask: Attention mask tensor (None for packed sequences)
-        position_ids: Position IDs tensor (None for packed sequences)
+        position_ids: Position IDs tensor. None for packed sequences unless the
+            model runs MTP, in which case per-sample arange positions are packed
+            like input_ids (full THD row for models that CP-slice their own
+            inputs, CP-local shard otherwise)
         packed_seq_params: PackedSeqParams for sequence packing (None if not packing)
         cu_seqlens_padded: Padded cumulative sequence lengths (None if not packing)
         mtp_loss_mask: Pre-computed MTP loss mask (token_mask × sample_mask).
             None when MTP is disabled or token/sample masks are absent.
+        padding_mask: Packed-sequence padding mask for MoE routing.
         routed_experts: Optional token-aligned routed expert ids
         routed_experts_cp_sharded: Context-parallel sharded routed expert ids
         media_token_validity_mask: Which media-token positions actually anchor a
@@ -89,6 +104,7 @@ class ProcessedMicrobatch:
     packed_seq_params: Optional[PackedSeqParams]
     cu_seqlens_padded: Optional[torch.Tensor]
     mtp_loss_mask: Optional[torch.Tensor] = None
+    padding_mask: Optional[torch.Tensor] = None
     routed_experts: Optional[torch.Tensor] = None
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
     original_seq_length: Optional[int] = None
@@ -106,6 +122,9 @@ def make_processed_microbatch_iterator(
     delegate_pack_to_model: bool = False,
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
+    create_packed_seq_padding_mask: bool = False,
+    prepad_packed_seq_for_hybridep: bool = False,
+    mtp_enabled: bool = False,
 ) -> Iterator[ProcessedMicrobatch]:
     """Wrap a raw microbatch iterator to yield processed microbatches.
 
@@ -120,6 +139,10 @@ def make_processed_microbatch_iterator(
         pad_individual_seqs_to_multiple_of: Padding multiple for individual sequences
         pad_packed_seq_to_multiple_of: Padding multiple for packed sequences
         pad_full_seq_to: Target length for full sequence padding (optional)
+        create_packed_seq_padding_mask: Whether to mask packed padding from MoE routing
+        prepad_packed_seq_for_hybridep: Whether to align packed inputs across the
+            HybridEP group before model forward
+        mtp_enabled: Whether the model uses multi-token prediction layers.
 
     Yields:
         ProcessedMicrobatch objects containing processed tensors ready for model forward
@@ -142,6 +165,9 @@ def make_processed_microbatch_iterator(
             delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
             straggler_timer=straggler_timer,
+            create_packed_seq_padding_mask=create_packed_seq_padding_mask,
+            prepad_packed_seq_for_hybridep=prepad_packed_seq_for_hybridep,
+            mtp_enabled=mtp_enabled,
         )
 
         yield ProcessedMicrobatch(
@@ -153,6 +179,7 @@ def make_processed_microbatch_iterator(
             packed_seq_params=processed_inputs.packed_seq_params,
             cu_seqlens_padded=processed_inputs.cu_seqlens_padded,
             mtp_loss_mask=processed_inputs.mtp_loss_mask,
+            padding_mask=processed_inputs.padding_mask,
             routed_experts=processed_inputs.routed_experts,
             routed_experts_cp_sharded=processed_inputs.routed_experts_cp_sharded,
             original_seq_length=processed_inputs.original_seq_length,
@@ -160,24 +187,12 @@ def make_processed_microbatch_iterator(
         )
 
 
-def _get_fp8_token_alignment(megatron_cfg: dict[str, Any]) -> int:
-    """Return the token-dimension alignment required by the FP8 recipe."""
-    fp8_cfg = megatron_cfg.get("fp8_cfg") or {}
-    if not fp8_cfg.get("enabled", False):
-        return 1
-    if fp8_cfg["fp8_recipe"] == "blockwise":
-        return 128
-    if fp8_cfg["fp8_recipe"] == "mxfp8":
-        return 32
-    return 16
-
-
 def _get_non_packed_sequence_pad_factor(cfg: dict[str, Any]) -> int:
     """Combine user, parallelism, and FP8 alignment for dense batches."""
     megatron_cfg = cfg["megatron_cfg"]
     factor = lcm(
         cfg["make_sequence_length_divisible_by"],
-        _get_fp8_token_alignment(megatron_cfg),
+        get_fp8_token_alignment(megatron_cfg),
     )
     cp_size = megatron_cfg["context_parallel_size"]
     if cp_size > 1:
@@ -225,6 +240,7 @@ def get_microbatch_iterator(
     delegate_pack_to_model: bool = False,
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
+    mtp_enabled: bool = False,
 ) -> Tuple[Iterator[ProcessedMicrobatch], int, int, int, int]:
     """Create a processed microbatch iterator from a batch of data.
 
@@ -237,6 +253,7 @@ def get_microbatch_iterator(
         cfg: Configuration dictionary
         mbs: Microbatch size
         seq_length_key: Key for sequence lengths in data dict (auto-detected if None)
+        mtp_enabled: Whether the model uses multi-token prediction layers.
 
     Returns:
         Tuple containing the iterator and metadata
@@ -250,6 +267,8 @@ def get_microbatch_iterator(
     pad_factor = 1
     pad_full_seq_to = None
     pad_packed_seq_to_multiple_of = 1
+    create_packed_seq_padding_mask = False
+    prepad_packed_seq_for_hybridep = False
 
     _, seq_dim_size = get_and_validate_seqlen(data)
 
@@ -257,13 +276,37 @@ def get_microbatch_iterator(
     if seq_length_key is None and cfg["sequence_packing"]["enabled"]:
         seq_length_key = "input_lengths"
 
+    prepacked = "cu_seqlens" in data or "cu_seqlens_padded" in data
+    if prepacked and not all(
+        key in data for key in ("cu_seqlens", "cu_seqlens_padded")
+    ):
+        raise ValueError("Prepacked input requires both cumulative boundary fields.")
+    if prepacked and (
+        not cfg["sequence_packing"]["enabled"]
+        or not cfg["sequence_packing"].get("fuse_loss", False)
+        or cfg["dynamic_batching"]["enabled"]
+    ):
+        raise ValueError("Prepacked input requires fused sequence packing only.")
     if not cfg["sequence_packing"]["enabled"]:
         pad_factor = _get_non_packed_sequence_pad_factor(cfg)
 
-    if cfg["dynamic_batching"]["enabled"]:
+    if prepacked:
+        create_packed_seq_padding_mask = bool(
+            cfg["megatron_cfg"].get("moe_router_enable_expert_bias", False)
+        )
+        raw_iterator = data.make_microbatch_iterator(1)
+        data_iterator_len = data.size
+        micro_batch_size = 1
+    elif cfg["dynamic_batching"]["enabled"]:
         raw_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
         data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
     elif cfg["sequence_packing"]["enabled"]:
+        create_packed_seq_padding_mask = uses_hybridep_flex_dispatcher(
+            cfg["megatron_cfg"]
+        )
+        prepad_packed_seq_for_hybridep = create_packed_seq_padding_mask and cfg[
+            "megatron_cfg"
+        ].get("moe_hybridep_prepad_packed_inputs")
         raw_iterator = data.make_microbatch_iterator_for_packable_sequences()
         data_iterator_len, pack_seq_dim_size = (
             data.get_microbatch_iterator_for_packable_sequences_len()
@@ -291,9 +334,12 @@ def get_microbatch_iterator(
         pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
         pad_full_seq_to=pad_full_seq_to,
         straggler_timer=straggler_timer,
+        create_packed_seq_padding_mask=create_packed_seq_padding_mask,
+        prepad_packed_seq_for_hybridep=prepad_packed_seq_for_hybridep,
         delegate_pack_to_model=delegate_pack_to_model,
         delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
         model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
+        mtp_enabled=mtp_enabled,
     )
 
     # Compute padded sequence length for pipeline parallelism
@@ -324,6 +370,143 @@ def get_ltor_masks_and_position_ids(*args: Any, **kwargs: Any) -> Any:
     return _impl(*args, **kwargs)
 
 
+def _prepacked_boundary(
+    data: BatchedDataDict[Any], key: str, device: torch.device
+) -> torch.Tensor:
+    value = data[key]
+    if isinstance(value, PackedTensor):
+        value = value.as_tensor()
+    elif isinstance(value, list):
+        if len(value) != 1:
+            raise ValueError(f"{key} must describe one physical pack.")
+        value = value[0]
+    elif torch.is_tensor(value) and value.ndim == 2 and value.shape[0] == 1:
+        value = value[0]
+    if not torch.is_tensor(value) or value.ndim != 1:
+        raise ValueError(f"{key} must be a one-dimensional tensor.")
+    return value.to(device=device, dtype=torch.int32)
+
+
+def _slice_prepacked_for_cp(value: torch.Tensor, padded: torch.Tensor) -> torch.Tensor:
+    """Apply Megatron's per-source zigzag CP slicing to a packed row."""
+    if value.ndim < 2 or value.shape[:2] != (1, int(padded[-1])):
+        raise ValueError(
+            "Prepacked token-aligned tensors must have shape [1, pack length, ...]."
+        )
+    cp_rank = get_context_parallel_rank()
+    cp_size = get_context_parallel_world_size()
+    return torch.cat(
+        [
+            _get_tokens_on_this_cp_rank(
+                value[:, int(start) : int(end)], cp_rank, cp_size, seq_dim=1
+            )
+            for start, end in zip(padded[:-1], padded[1:])
+        ],
+        dim=1,
+    ).contiguous()
+
+
+def _prepare_prepacked(
+    data: BatchedDataDict[Any],
+    *,
+    model_slices_context_parallel_inputs: bool,
+    create_padding_mask: bool = False,
+    mtp_enabled: bool = False,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    PackedSeqParams,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
+    input_ids = data["input_ids"]
+    if not torch.is_tensor(input_ids) or input_ids.shape[0] != 1:
+        raise ValueError("Prepacked input_ids must contain one physical row.")
+    cu = _prepacked_boundary(data, "cu_seqlens", input_ids.device)
+    padded = _prepacked_boundary(data, "cu_seqlens_padded", input_ids.device)
+    source_lengths = cu[1:] - cu[:-1]
+    padded_lengths = padded[1:] - padded[:-1]
+    pack_length = int(padded[-1])
+    if (
+        cu.shape != padded.shape
+        or cu.numel() < 2
+        or int(cu[0]) != 0
+        or int(padded[0]) != 0
+        or pack_length > input_ids.shape[1]
+        or bool((source_lengths <= 0).any())
+        or bool((source_lengths > padded_lengths).any())
+    ):
+        raise ValueError("Invalid prepacked source boundaries.")
+    batch_size, sequence_length = input_ids.shape[:2]
+    for key, value in list(data.items()):
+        if (
+            key in {"cu_seqlens", "cu_seqlens_padded"}
+            or not torch.is_tensor(value)
+            or value.ndim < 2
+            or value.shape[0] != batch_size
+            or value.shape[1] != sequence_length
+        ):
+            continue
+        data[key] = value[:, :pack_length].contiguous()
+    input_ids = data["input_ids"]
+    cp_size = get_context_parallel_world_size()
+    if cp_size > 1 and bool((padded_lengths % (2 * cp_size) != 0).any()):
+        raise ValueError(
+            "Every prepacked padded source length must be divisible by 2 * "
+            f"context_parallel_size ({2 * cp_size})."
+        )
+    local_input_ids = _slice_prepacked_for_cp(input_ids, padded)
+    input_ids_cp_sharded = (
+        input_ids if model_slices_context_parallel_inputs else local_input_ids
+    )
+    padding_mask = None
+    if create_padding_mask:
+        full_padding_mask = get_packed_seq_padding_mask(
+            cu_seqlens=cu,
+            cu_seqlens_padded=padded,
+            total_tokens=pack_length,
+        )
+        padding_mask = (
+            full_padding_mask
+            if model_slices_context_parallel_inputs
+            else _slice_prepacked_for_cp(full_padding_mask, padded)
+        )
+    position_ids = None
+    if mtp_enabled:
+        full_position_ids = torch.zeros_like(input_ids)
+        for physical_start, source_length in zip(padded[:-1], source_lengths):
+            source_length = int(source_length)
+            physical_start = int(physical_start)
+            full_position_ids[:, physical_start : physical_start + source_length] = (
+                torch.arange(source_length, device=input_ids.device)
+            )
+        position_ids = (
+            full_position_ids
+            if model_slices_context_parallel_inputs
+            else _slice_prepacked_for_cp(full_position_ids, padded)
+        )
+    params = PackedSeqParams(
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu,
+        cu_seqlens_q_padded=padded,
+        cu_seqlens_kv_padded=padded,
+        max_seqlen_q=int(padded_lengths.max()),
+        max_seqlen_kv=int(padded_lengths.max()),
+        pad_between_seqs=not torch.equal(cu, padded),
+        qkv_format="thd",
+        total_tokens=input_ids_cp_sharded.shape[1],
+    )
+    return (
+        input_ids,
+        input_ids_cp_sharded,
+        params,
+        padded,
+        padding_mask,
+        position_ids,
+    )
+
+
 def process_microbatch(
     data_dict: BatchedDataDict[Any],
     seq_length_key: Optional[str] = None,
@@ -335,8 +518,25 @@ def process_microbatch(
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
     straggler_timer: Optional[StragglerDetector] = None,
+    create_packed_seq_padding_mask: bool = False,
+    prepad_packed_seq_for_hybridep: bool = False,
+    mtp_enabled: bool = False,
 ) -> ProcessedInputs:
     """Process a microbatch for Megatron model forward pass."""
+    prepacked = "cu_seqlens" in data_dict
+    if (
+        create_packed_seq_padding_mask
+        and model_slices_context_parallel_inputs
+        and not prepacked
+    ):
+        raise NotImplementedError(
+            "HybridEP padding masks are not supported for models that perform "
+            "context-parallel input slicing internally."
+        )
+    if prepad_packed_seq_for_hybridep and delegate_pack_to_model:
+        raise NotImplementedError(
+            "HybridEP input prepadding requires NeMo-owned sequence packing."
+        )
     ctx = straggler_timer(bdata=True) if straggler_timer is not None else nullcontext()
     with ctx:
         input_ids = data_dict["input_ids"]
@@ -363,6 +563,7 @@ def process_microbatch(
         cu_seqlens = None
         cu_seqlens_padded = None
         mtp_loss_mask = None
+        padding_mask = None
         media_token_validity_mask = None
 
         if pack_sequences:
@@ -377,7 +578,49 @@ def process_microbatch(
             # Get sequence lengths and context parallel size
             seq_lengths = data_dict[seq_length_key]
 
-            if delegate_pack_to_model:
+            prepacked = "cu_seqlens" in data_dict
+            if prepacked:
+                if delegate_pack_to_model:
+                    raise ValueError("Prepacked input cannot use model-owned packing.")
+                (
+                    input_ids,
+                    input_ids_cp_sharded,
+                    packed_seq_params,
+                    cu_seqlens_padded,
+                    padding_mask,
+                    position_ids,
+                ) = _prepare_prepacked(
+                    data_dict,
+                    model_slices_context_parallel_inputs=(
+                        model_slices_context_parallel_inputs
+                    ),
+                    create_padding_mask=create_packed_seq_padding_mask,
+                    mtp_enabled=mtp_enabled,
+                )
+                original_seq_length = input_ids.shape[1]
+                routed_experts = data_dict.get("routed_experts")
+                routed_experts_cp_sharded = routed_experts
+                if (
+                    routed_experts is not None
+                    and not model_slices_context_parallel_inputs
+                ):
+                    routed_experts_cp_sharded = _slice_prepacked_for_cp(
+                        routed_experts, cu_seqlens_padded
+                    )
+                if "mtp_loss_mask" in data_dict:
+                    mtp_loss_mask = data_dict["mtp_loss_mask"]
+                    if not model_slices_context_parallel_inputs:
+                        mtp_loss_mask = _slice_prepacked_for_cp(
+                            mtp_loss_mask, cu_seqlens_padded
+                        )
+                if "media_token_validity_mask" in data_dict:
+                    media_token_validity_mask = data_dict["media_token_validity_mask"]
+                    if not model_slices_context_parallel_inputs:
+                        media_token_validity_mask = _slice_prepacked_for_cp(
+                            media_token_validity_mask, cu_seqlens_padded
+                        )
+                attention_mask = None
+            elif delegate_pack_to_model:
                 has_mtp_loss_mask = "mtp_loss_mask" in data_dict
                 assert not has_mtp_loss_mask or delegate_mtp_loss_mask_to_model, (
                     "MTP training requires a self-packing VLM that advertises "
@@ -494,6 +737,47 @@ def process_microbatch(
                     input_ids_cp_sharded = input_ids
                 else:
                     input_ids_cp_sharded = local_input_ids
+                if create_packed_seq_padding_mask:
+                    if prepad_packed_seq_for_hybridep:
+                        (
+                            input_ids,
+                            input_ids_cp_sharded,
+                            packed_seq_params,
+                            cu_seqlens_padded,
+                        ) = pad_packed_seq_for_hybridep(
+                            input_ids=input_ids,
+                            input_ids_cp_sharded=input_ids_cp_sharded,
+                            packed_seq_params=packed_seq_params,
+                            cu_seqlens_padded=cu_seqlens_padded,
+                            pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
+                            cp_rank=get_context_parallel_rank(),
+                            cp_size=get_context_parallel_world_size(),
+                        )
+                    full_padding_mask = get_packed_seq_padding_mask(
+                        cu_seqlens=cu_seqlens,
+                        cu_seqlens_padded=cu_seqlens_padded,
+                        total_tokens=input_ids.shape[1],
+                    )
+                    if (
+                        model_slices_context_parallel_inputs
+                        or get_context_parallel_world_size() == 1
+                    ):
+                        padding_mask = full_padding_mask
+                    else:
+                        cp_partition_indices = get_packed_seq_cp_partition_indices(
+                            packed_seq_params,
+                            total_tokens=input_ids.shape[1],
+                            cp_size=get_context_parallel_world_size(),
+                            cp_rank=get_context_parallel_rank(),
+                            device=input_ids.device,
+                        )
+                        padding_mask = full_padding_mask.index_select(
+                            1, cp_partition_indices
+                        ).contiguous()
+                    assert padding_mask.shape == input_ids_cp_sharded.shape, (
+                        f"padding_mask shape {padding_mask.shape} must match "
+                        f"model input shape {input_ids_cp_sharded.shape}."
+                    )
                 # routed_experts and the R3 trace token identity ride the SAME
                 # per-seq zigzag CP sharding as input_ids, re-derived from
                 # cu_seqlens_padded.
@@ -627,10 +911,43 @@ def process_microbatch(
                         else local_media_mask
                     ).bool()
 
-                # For packed sequences, position_ids and attention_mask are typically None
-                # The PackedSeqParams handles all necessary sequence information
-                position_ids = None
+                # PackedSeqParams carries the sequence layout:
+                # attention_mask and position_ids are normally None here.
+                # The MTP block is different: it rolls and embeds position_ids per packed segment.
+                # Pack per-sample arange positions like input_ids, on every forward.
                 attention_mask = None
+                if mtp_enabled:
+                    position_ids_source = (
+                        torch.arange(
+                            original_seq_length,
+                            dtype=torch.long,
+                            device=input_ids.device,
+                        )
+                        .unsqueeze(0)
+                        .expand(original_batch_size, -1)
+                    )
+                    (
+                        packed_position_ids,
+                        local_position_ids,
+                        _,
+                        _,
+                        _,
+                    ) = _pack_sequences_for_megatron(
+                        position_ids_source,
+                        seq_lengths,
+                        pad_individual_seqs_to_multiple_of,
+                        pad_packed_seq_to_multiple_of,
+                        pad_full_seq_to,
+                        cp_rank=get_context_parallel_rank(),
+                        cp_size=get_context_parallel_world_size(),
+                    )
+                    position_ids = (
+                        packed_position_ids
+                        if model_slices_context_parallel_inputs
+                        else local_position_ids
+                    )
+                else:
+                    position_ids = None
         else:
             if routed_experts is not None:
                 if "input_lengths" not in data_dict:
@@ -690,6 +1007,7 @@ def process_microbatch(
         packed_seq_params=packed_seq_params,
         cu_seqlens_padded=cu_seqlens_padded,
         mtp_loss_mask=mtp_loss_mask,
+        padding_mask=padding_mask,
         routed_experts=routed_experts,
         routed_experts_cp_sharded=routed_experts_cp_sharded,
         original_seq_length=original_seq_length,
@@ -1352,11 +1670,7 @@ def _get_pack_sequence_parameters_for_megatron(
     cp_size = megatron_cfg["context_parallel_size"]
 
     # individual sequence needs to be splitted to CP domain, and to TP domain when SP is enabled.
-    minimum_pad_factor = 1
-    if cp_size > 1:
-        minimum_pad_factor *= cp_size * 2
-    if tp_size > 1 and sp:
-        minimum_pad_factor *= tp_size
+    minimum_pad_factor = get_parallel_token_alignment(megatron_cfg)
     assert pad_individual_seqs_to_multiple_of % minimum_pad_factor == 0, (
         f"make_sequence_length_divisible_by ({pad_individual_seqs_to_multiple_of}) is not a multiple of minimum_pad_factor ({minimum_pad_factor}).\n"
         f"Please set policy.make_sequence_length_divisible_by to a multiple of {minimum_pad_factor}.\n"
@@ -1373,7 +1687,7 @@ def _get_pack_sequence_parameters_for_megatron(
     #   HybridEP+flex : 128  (MAX_NUM_OF_TOKENS_PER_RANK must be divisible by
     #                         NUM_OF_TOKENS_PER_CHUNK=128 in deep_ep JIT kernels)
     # When multiple constraints apply, take the max (128 is a multiple of 32/16).
-    divisor = _get_fp8_token_alignment(megatron_cfg)
+    divisor = get_fp8_token_alignment(megatron_cfg)
     if (
         megatron_cfg.get("moe_token_dispatcher_type") == "flex"
         and megatron_cfg.get("moe_flex_dispatcher_backend") == "hybridep"
@@ -1474,11 +1788,16 @@ def _unpack_sequences_from_megatron(
 def get_and_validate_seqlen(data: BatchedDataDict[Any]):
     # dim 1 is always assumed to be the sequence dim, sanity check this here.
     # Skip multimodal fields: their dim 1 is num_images / num_patches, not
-    # seqlen.
+    # seqlen. Skip opd_full's teacher payload columns too: materialize()
+    # deliberately does not pad them to the forward pass's pad_to_seqlen
+    # target (they never feed the model forward, only the loss, which reads
+    # each sequence's own real length regardless of how far the column is
+    # padded) -- see codec.py's OPD_FULL_FIELDS exclusion. Their dim 1 can
+    # therefore legitimately be shorter than every other column's.
     sequence_dim = 1
     seq_dim_size = data["input_ids"].shape[sequence_dim]
     for k, v in data.items():
-        if k in PACKED_MULTIMODAL_FIELDS:
+        if k in PACKED_MULTIMODAL_FIELDS or k in OPD_FULL_FIELDS:
             continue
         if torch.is_tensor(v) and len(v.shape) > 1:
             assert v.shape[sequence_dim] == seq_dim_size, (

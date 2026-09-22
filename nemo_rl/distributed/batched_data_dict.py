@@ -33,12 +33,13 @@ from typing_extensions import Self
 
 from nemo_rl.data.multimodal_utils import (
     MULTIMODAL_CONTENT_TYPES,
-    NATIVE_MULTIMODAL_KEYS,
     PACKED_MULTIMODAL_FIELDS,
     PER_TOKEN_MULTIMODAL_FIELDS,
+    VLLM_PROMPT_KEYS,
     PackedTensor,
 )
 from nemo_rl.data.packing import get_packer
+from nemo_rl.data_plane.schema import OPD_FULL_FIELDS
 from nemo_rl.distributed.collectives import (
     gather_jagged_object_lists,
     rebalance_nd_tensor,
@@ -61,7 +62,7 @@ def _prepare_multimodal_sharing(
 ) -> dict[int, Any]:
     """Enable PackedTensor provenance and return deepcopy memo entries.
 
-    PackedTensor is an explicit multimodal type. Raw native-vLLM payloads are
+    PackedTensor is an explicit multimodal type. Raw vLLM-ready payloads are
     shared only under named media keys or typed content parts. Containers are
     still deep-copied so rollout rows may diverge safely.
     """
@@ -77,7 +78,7 @@ def _prepare_multimodal_sharing(
             for key, child in item.items():
                 visit(
                     child,
-                    in_media_context or typed_media or key in NATIVE_MULTIMODAL_KEYS,
+                    in_media_context or typed_media or key in VLLM_PROMPT_KEYS,
                 )
             return
         if isinstance(item, (list, tuple)):
@@ -106,6 +107,8 @@ class SequencePackingArgs(TypedDict):
     sequence_length_pad_multiple: (
         int  # pad each sequence to a multiple of this value (for CP/TP alignment)
     )
+    pair_grouping_key: NotRequired[str]
+    max_sequences_per_bin: NotRequired[int]
 
 
 class DynamicBatchingArgs(TypedDict):
@@ -139,6 +142,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         as_tensors: bool = False,
         device: Optional[torch.device] = None,
         pixel_dtype: Optional[torch.dtype] = None,
+        pixel_preprocess_mode: Optional[str] = None,
     ) -> dict[str, Any]:
         """Return the multimodal fields as a dict.
 
@@ -189,7 +193,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 # unwrapping via as_tensor).
                 if pixel_dtype is not None and k in self._PIXEL_DTYPE_CAST_KEYS:
                     v = v.to_dtype(pixel_dtype)
-                result[k] = v.as_tensor(device=device) if as_tensors else v
+                preprocess_mode = pixel_preprocess_mode if k == "pixel_values" else None
+                result[k] = v.as_tensor(device, preprocess_mode) if as_tensors else v
             elif k in PER_TOKEN_MULTIMODAL_FIELDS:
                 # Plain per-token tensor: emit as-is.
                 result[k] = v
@@ -626,6 +631,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 collect_metrics=False,  # TODO(ahmadki): make configurable
                 min_bin_count=shards,
                 bin_count_multiple=shards,
+                max_sequences_per_bin=sequence_packing_args.get(
+                    "max_sequences_per_bin"
+                ),
             )
 
             input_lengths_key = sequence_packing_args["input_lengths_key"]
@@ -637,6 +645,18 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
             def _get_padded_seqlen(seqlen: int) -> int:
                 return (seqlen + pad_multiple - 1) // pad_multiple * pad_multiple
+
+            grouping_key = sequence_packing_args.get("pair_grouping_key")
+            grouping_values = None
+            if grouping_key is not None:
+                if grouping_key not in self.data:
+                    raise KeyError(
+                        f"sequence_packing pair_grouping_key={grouping_key!r} "
+                        "is not present in the batch"
+                    )
+                grouping_values = self.data[grouping_key]
+                if not isinstance(grouping_values, torch.Tensor):
+                    grouping_values = torch.as_tensor(grouping_values)
 
             # Store bin assignments for each chunk to reuse later
             all_chunk_bin_assignments = []
@@ -653,10 +673,45 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     _get_padded_seqlen(seq_len.item()) for seq_len in chunk_seqlens
                 ]
 
-                # Pack sequences in this chunk into bins
-                chunk_bin_assignments = bin_packer.pack(
-                    sequence_lengths=chunk_padded_seqlens_list,
-                )
+                if grouping_values is None:
+                    chunk_bin_assignments = bin_packer.pack(
+                        sequence_lengths=chunk_padded_seqlens_list,
+                    )
+                else:
+                    # Treat every preference pair as one atomic virtual item.
+                    # The packer sees the pair's combined padded length and the
+                    # resulting bins are expanded back to sequence-row indices.
+                    chunk_groups = grouping_values[chunk_start:chunk_end]
+                    group_to_members: dict[int, list[int]] = {}
+                    for local_idx, group_id in enumerate(chunk_groups.tolist()):
+                        group_to_members.setdefault(int(group_id), []).append(local_idx)
+                    sorted_group_ids = sorted(group_to_members)
+                    group_lengths = [
+                        sum(
+                            chunk_padded_seqlens_list[member]
+                            for member in group_to_members[group_id]
+                        )
+                        for group_id in sorted_group_ids
+                    ]
+                    bin_capacity = sequence_packing_args["max_tokens_per_microbatch"]
+                    for group_id, group_length in zip(sorted_group_ids, group_lengths):
+                        if group_length > bin_capacity:
+                            raise ValueError(
+                                f"sequence_packing pair group {group_id} requires "
+                                f"{group_length} tokens but "
+                                f"max_tokens_per_microbatch={bin_capacity}"
+                            )
+                    group_bins = bin_packer.pack(sequence_lengths=group_lengths)
+                    chunk_bin_assignments = [
+                        [
+                            member
+                            for group_position in group_bin
+                            for member in group_to_members[
+                                sorted_group_ids[group_position]
+                            ]
+                        ]
+                        for group_bin in group_bins
+                    ]
                 all_chunk_bin_assignments.append(chunk_bin_assignments)
                 all_chunk_padded_seqlens.append(chunk_padded_seqlens_list)
 
@@ -962,7 +1017,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     shared_leaves = (
                         _prepare_multimodal_sharing(
                             item,
-                            media_context=k in NATIVE_MULTIMODAL_KEYS,
+                            media_context=k in VLLM_PROMPT_KEYS,
                         )
                         if share_immutable_media
                         else {}
@@ -986,7 +1041,12 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             if k in PACKED_MULTIMODAL_FIELDS:
                 continue
             if torch.is_tensor(v) and len(v.shape) >= dim + 1:
-                self.data[k] = torch.narrow(v, dim=dim, start=0, length=truncated_len)
+                length = truncated_len
+                if k in OPD_FULL_FIELDS:
+                    # materialize() leaves the payload at its natural width,
+                    # which can already be shorter than this microbatch's seqlen.
+                    length = min(truncated_len, int(v.shape[dim]))
+                self.data[k] = torch.narrow(v, dim=dim, start=0, length=length)
 
     def make_microbatch_iterator_with_dynamic_shapes(
         self,

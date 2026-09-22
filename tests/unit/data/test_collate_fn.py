@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from nemo_rl.data.collate_fn import (
@@ -21,7 +23,8 @@ from nemo_rl.data.collate_fn import (
     preference_collate_fn,
     rl_collate_fn,
 )
-from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.interfaces import DatumSpec, PreferenceDatumSpec
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -33,7 +36,7 @@ def test_preference_collate_fn():
 
     # Create test data with varying sequence lengths
     data_batch = [
-        DatumSpec(
+        PreferenceDatumSpec(
             message_log_chosen=[
                 {
                     "role": "user",
@@ -64,7 +67,7 @@ def test_preference_collate_fn():
             idx=0,
             task_name="test_task",
         ),
-        DatumSpec(
+        PreferenceDatumSpec(
             message_log_chosen=[
                 {
                     "role": "user",
@@ -111,6 +114,8 @@ def test_preference_collate_fn():
     assert "input_lengths" in train_data
     assert "token_mask" in train_data
     assert "sample_mask" in train_data
+    assert "pair_index" in train_data
+    assert "is_chosen" in train_data
 
     # Verify batch size is doubled (chosen + rejected for each example)
     assert train_data["input_ids"].shape[0] == 4  # 2 examples * 2 (chosen + rejected)
@@ -141,6 +146,10 @@ def test_preference_collate_fn():
         0.0,
     ]  # loss_multiplier repeated for chosen/rejected
     assert torch.equal(train_data["sample_mask"], torch.tensor(expected_sample_mask))
+    assert torch.equal(train_data["pair_index"], torch.tensor([0, 0, 1, 1]))
+    assert torch.equal(
+        train_data["is_chosen"], torch.tensor([True, False, True, False])
+    )
 
     # Verify message content is preserved
     # First example chosen
@@ -165,11 +174,129 @@ def test_collate_preserves_native_media_when_vllm_content_is_none():
         idx=0,
         task_name="vlm",
         vllm_content=None,
-        vllm_images=[image],
-        vllm_audios=[],
-        vllm_videos=[],
+        vllm_multi_modal_data={"image": image},
     )
 
     for batch in (rl_collate_fn([datum]), eval_collate_fn([datum])):
         assert batch["vllm_content"] == [None]
-        assert batch["vllm_images"] == [[image]]
+        assert batch["vllm_multi_modal_data"] == [{"image": image}]
+
+
+def test_preference_collate_fn_preserves_media_in_mixed_batches():
+    """Missing media rows remain aligned regardless of their batch position."""
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.pad_token_id = 0
+
+    def make_datum(idx: int, with_image: bool) -> PreferenceDatumSpec:
+        def make_branch(token: int, pixel_value: float) -> list[dict[str, Any]]:
+            user_message: dict[str, Any] = {
+                "role": "user",
+                "content": "Look" if with_image else "Read",
+                "token_ids": torch.tensor([token]),
+            }
+            if with_image:
+                user_message["pixel_values"] = PackedTensor(
+                    torch.full((1, 3, 2, 2), pixel_value),
+                    dim_to_pack=0,
+                )
+            return [
+                user_message,
+                {
+                    "role": "assistant",
+                    "content": "Done",
+                    "token_ids": torch.tensor([token + 1]),
+                },
+            ]
+
+        return PreferenceDatumSpec(
+            message_log_chosen=make_branch(2 * idx + 1, 1.0),
+            message_log_rejected=make_branch(2 * idx + 3, 2.0),
+            length_chosen=2,
+            length_rejected=2,
+            loss_multiplier=1.0,
+            idx=idx,
+            task_name="mixed_media",
+        )
+
+    text_datum = make_datum(0, with_image=False)
+    image_datum = make_datum(1, with_image=True)
+
+    for data_batch, expected_missing_rows in (
+        ([text_datum, image_datum], (0, 1)),
+        ([image_datum, text_datum], (2, 3)),
+    ):
+        train_data = preference_collate_fn(
+            data_batch,
+            mock_tokenizer,
+            make_sequence_length_divisible_by=1,
+            add_loss_mask=False,
+        )
+
+        pixel_values = train_data["pixel_values"]
+        assert isinstance(pixel_values, PackedTensor)
+        assert len(pixel_values) == 4
+        assert (
+            tuple(
+                index
+                for index, tensor in enumerate(pixel_values.tensors)
+                if tensor is None
+            )
+            == expected_missing_rows
+        )
+
+
+def _vllm_datum(idx: int, **vllm_kwargs) -> DatumSpec:
+    """Minimal DatumSpec carrying only the fields both collators need."""
+    return DatumSpec(
+        message_log=[
+            {"role": "user", "content": "hi", "token_ids": torch.tensor([1, 2])}
+        ],
+        length=2,
+        loss_multiplier=1.0,
+        extra_env_info={"ground_truth": "a"},
+        idx=idx,
+        task_name="vlm",
+        **vllm_kwargs,
+    )
+
+
+@pytest.mark.parametrize("collate_fn", [rl_collate_fn, eval_collate_fn])
+def test_collate_fn_omits_vllm_columns_for_text_only_batch(collate_fn):
+    """Rows from a text-only processor carry no vLLM prompt keys at all."""
+    batch = collate_fn([_vllm_datum(0), _vllm_datum(1)])
+
+    assert "vllm_content" not in batch
+    assert "vllm_multi_modal_data" not in batch
+
+
+@pytest.mark.parametrize("collate_fn", [rl_collate_fn, eval_collate_fn])
+def test_collate_fn_keeps_vllm_columns_for_fully_truncated_batch(collate_fn):
+    """A batch where every row was truncated still emits both prompt columns.
+
+    ``vlm_hf_data_processor`` sets ``vllm_content=None`` /
+    ``vllm_multi_modal_data={}`` for over-length rows, so the gate must key off
+    presence rather than value or the vLLM path silently loses its columns.
+    """
+    batch = collate_fn(
+        [_vllm_datum(i, vllm_content=None, vllm_multi_modal_data={}) for i in range(2)]
+    )
+
+    assert batch["vllm_content"] == [None, None]
+    assert batch["vllm_multi_modal_data"] == [{}, {}]
+
+
+@pytest.mark.parametrize("collate_fn", [rl_collate_fn, eval_collate_fn])
+def test_collate_fn_pads_rows_missing_vllm_keys(collate_fn):
+    """Mixed batches align every row so the columns stay row-indexable."""
+    image = MagicMock()
+    batch = collate_fn(
+        [
+            _vllm_datum(
+                0, vllm_content="<image> q", vllm_multi_modal_data={"image": image}
+            ),
+            _vllm_datum(1),
+        ]
+    )
+
+    assert batch["vllm_content"] == ["<image> q", None]
+    assert batch["vllm_multi_modal_data"] == [{"image": image}, {}]
