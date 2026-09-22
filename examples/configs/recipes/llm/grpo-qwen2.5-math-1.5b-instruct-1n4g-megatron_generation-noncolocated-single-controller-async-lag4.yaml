@@ -9,8 +9,13 @@ async_rl:
   sampler:
     max_lookahead_versions: 4
   max_buffered_rollouts: 160
+  generation_fleet_health:
+    # Native MCore refit has no worker-side abort hook for a deadline.
+    refit_timeout_s: null
 policy:
   generation:
     backend: megatron
+    refit_transport: mcore
     mcore_generation_config:
+      refit_backend: nccl
       kv_cache_management_mode: recompute

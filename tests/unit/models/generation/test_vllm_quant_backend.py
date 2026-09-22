@@ -176,7 +176,9 @@ def test_vllm_quant_refit(cluster, async_engine):
             )
 
         # Refit: transfer pre-folded weights + input_quantizer amax from Megatron to vLLM
-        state_dict_info = megatron_policy.prepare_refit_info()
+        state_dict_info = megatron_policy.prepare_refit_info(
+            refit_payload_mode="hf_export"
+        )
         vllm_policy.prepare_refit_info(state_dict_info)
         refit_policy_generation(
             megatron_policy, vllm_policy, vllm_config["colocated"]["enabled"]
@@ -261,7 +263,9 @@ def test_vllm_kv_quant_refit(cluster, recipe, uses_constant_amax, monkeypatch):
                 "have non-positive amax"
             )
 
-        state_dict_info = megatron_policy.prepare_refit_info()
+        state_dict_info = megatron_policy.prepare_refit_info(
+            refit_payload_mode="hf_export"
+        )
         vllm_policy.prepare_refit_info(state_dict_info)
         refit_policy_generation(
             megatron_policy, vllm_policy, vllm_config["colocated"]["enabled"]
