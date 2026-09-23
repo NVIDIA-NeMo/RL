@@ -26,7 +26,7 @@ dependencies = [
   "pip",        # Required for frozen environments; uv venv --seed may not reliably install pip
   "ninja",      # for flash-attn parallel build
   # Deliberately a range, not an exact pin: each backend extra pins the torch its
-  # wheels were built against (vllm/mcore/automodel/fsdp: 2.13.0; sglang/trtllm:
+  # wheels were built against (vllm/mcore/automodel: 2.13.0; sglang/trtllm:
   # 2.11.0) and resolves in its own uv conflict fork, so the base spec must admit
   # both. The ceiling keeps the driver venv from drifting to a newer torch on a
   # relock; it resolves to the highest allowed (2.13.0), matching vLLM.
@@ -127,16 +127,6 @@ dependencies = [
 
 
 [project.optional-dependencies]
-fsdp = [
-  "torch==2.13.0",
-  "torchvision==0.28.0",
-  "transformers==5.12.1",
-  # Build against the runtime torch/CUDA ABI; the old wheels target torch 2.10.
-  "flash-attn==2.8.1",
-  "mamba-ssm",
-  "causal-conv1d",
-  "tilelang>=0.1.9,<0.1.13; sys_platform == 'linux' and platform_machine == 'x86_64'",
-]
 automodel = [
   # Colocated with vLLM engines (CUDA-IPC refit); must share vLLM's torch ABI.
   "torch==2.13.0",
@@ -382,6 +372,7 @@ members = [
   # nemo-rl's uv.lock you'll see it's 1.X b/c megatron mandates 1.X in the optional dependencies, so
   # globally we must choose 1.X otherwise we run into pickle issues from ray.
   "research/template_project",
+  "research/flow_grpo",
 ]
 
 [[tool.uv.index]]
@@ -546,11 +537,9 @@ constraint-dependencies = [
 # Qwen3.5 model and every Blackwell vLLM worker with `ModuleNotFoundError: cutlass.cute`.
 
 conflicts = [
-  [{ extra = "fsdp" }, { extra = "sglang" }],
   [{ extra = "automodel" }, { extra = "sglang" }],
   [{ extra = "mcore" }, { extra = "sglang" }],
   [{ extra = "vllm" }, { extra = "sglang" }],
-  [{ extra = "automodel" }, { extra = "fsdp" }],
   [{ extra = "automodel" }, { extra = "mcore" }],
   [{ extra = "automodel" }, { extra = "vllm" }],
   [{ extra = "vllm" }, { extra = "mcore" }],
@@ -558,7 +547,6 @@ conflicts = [
   [{ extra = "trtllm" }, { extra = "sglang" }],
   [{ extra = "trtllm" }, { extra = "automodel" }],
   [{ extra = "trtllm" }, { extra = "mcore" }],
-  [{ extra = "trtllm" }, { extra = "fsdp" }],
   [{ extra = "trtllm" }, { extra = "modelopt" }],
   [{ extra = "trtllm" }, { extra = "nvrx" }],
   [{ extra = "trtllm" }, { extra = "nemo_gym" }],
@@ -789,6 +777,7 @@ convention = "google"
 [tool.ruff.lint.per-file-ignores]
 # Ignore all directories named `tests`.
 "tests/**" = ["D"]
+"research/*/tests/**" = ["D"]
 # Ignore all files that end in `_test.py`.
 "*_test.py" = ["D"]
 # Ignore F401 (import but unused) in __init__.py

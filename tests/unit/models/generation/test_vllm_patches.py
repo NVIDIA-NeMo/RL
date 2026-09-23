@@ -14,7 +14,8 @@
 
 """Guards for vLLM source patches and scoped runtime workarounds.
 
-The two port patches ship their own suites. These cover the remaining patches:
+The two port patches ship their own suites. This module covers the other
+source-sensitive compatibility patches:
 
 * ``_patch_vllm_tool_parser_namespace_tool`` is the most load-bearing patch in
   the repo -- it is the only thing that makes vLLM 0.25.1 importable against
@@ -49,6 +50,7 @@ from nemo_rl.models.generation.vllm.config import (
     vllm_nemotron_h_fp32_lm_head_enabled,
 )
 from tests.unit.models.generation.vllm_patch_source_utils import (
+    patch_snippets,
     write_unpatched_copy,
 )
 
@@ -586,7 +588,6 @@ def test_capture_router_fallback_patch_binds_router_for_unsupported_kernel(
     monkeypatch, tmp_path
 ):
     """Execute the patched binder body against stand-ins for both kernel kinds."""
-    from tests.unit.models.generation.vllm_patch_source_utils import patch_snippets
 
     old_snippet, _new_snippet = patch_snippets(_CAPTURER_PATCH_FN)
     source = tmp_path / "routed_experts_capturer.py"

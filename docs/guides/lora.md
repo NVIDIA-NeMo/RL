@@ -18,13 +18,12 @@ LoRA is implemented on two training backends, each with its own config schema:
 
 | Backend | Config path | Notes |
 | --- | --- | --- |
-| **DTensor (Automodel)** | `policy.dtensor_cfg.lora_cfg` | Requires DTensor v2 (`policy.dtensor_cfg._v2=true`). DTensor v1 does **not** support LoRA. This is the default backend. |
+| **DTensor (Automodel)** | `policy.dtensor_cfg.lora_cfg` | This is the default backend. |
 | **Megatron Core** | `policy.megatron_cfg.peft` | Requires `policy.megatron_cfg.enabled=true` (and `policy.dtensor_cfg.enabled=false`). |
 
 LoRA is supported across the SFT, GRPO, and DPO algorithms on both backends.
 
 ```{note}
-On the DTensor backend, Triton-optimized LoRA kernels are only used in the DTensor v2 path.
 Automodel does not support Triton kernels when `tensor_parallel_size > 1`, so set
 `use_triton: false` in that case (see the parameter details below).
 ```
@@ -60,7 +59,6 @@ LoRA settings live under `policy.dtensor_cfg.lora_cfg`:
 ```yaml
 policy:
   dtensor_cfg:
-    _v2: true                   # LoRA requires DTensor v2
     lora_cfg:
       enabled: False            # Set to True to enable LoRA fine-tuning
       target_modules: []        # List of module names to apply LoRA
@@ -71,7 +69,7 @@ policy:
       dropout: 0.0              # Dropout probability for LoRA layers
       dropout_position: "post"  # Dropout position: "pre" or "post"
       lora_A_init: "xavier"     # Initialization method: "xavier" or "uniform"
-      use_triton: true          # Use Triton-optimized kernels (DTensor v2 path)
+      use_triton: true          # Use Triton-optimized kernels
       restore_from: null        # Warm start from a donor adapter checkpoint (see below)
 ```
 
@@ -86,7 +84,7 @@ policy:
 - **`dropout`** (float): Dropout probability for regularization.
 - **`dropout_position`** (str): Apply dropout before (`"pre"`) or after (`"post"`) LoRA.
 - **`lora_A_init`** (str): Initialization method for the LoRA A matrix (`"xavier"` or `"uniform"`). The B matrix is always initialized to zero.
-- **`use_triton`** (bool): Use Triton-optimized kernels for better performance. Used for DTensor v2 only. **Note**: [Automodel does not support Triton for TP > 1](https://github.com/NVIDIA-NeMo/Automodel/blob/b2db55eee98dfe81a8bfe5e23ac4e57afd8ab261/nemo_automodel/recipes/llm/train_ft.py#L199). Set to `false` when `tensor_parallel_size > 1` to avoid compatibility issues.
+- **`use_triton`** (bool): Use Triton-optimized kernels for better performance. **Note**: [Automodel does not support Triton for TP > 1](https://github.com/NVIDIA-NeMo/Automodel/blob/b2db55eee98dfe81a8bfe5e23ac4e57afd8ab261/nemo_automodel/recipes/llm/train_ft.py#L199). Set to `false` when `tensor_parallel_size > 1` to avoid compatibility issues.
 - **`restore_from`** (str, optional): Path to a donor PEFT adapter checkpoint (a directory containing `adapter_model.safetensors` + `adapter_config.json`, e.g. a previous run's `step_*/policy/weights`) whose adapter weights initialize this run's LoRA modules. See [Warm-Starting from a LoRA Checkpoint](#warm-starting-from-a-lora-checkpoint).
 
 ## Megatron Configuration
