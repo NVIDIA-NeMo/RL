@@ -43,7 +43,6 @@ FANOUT_METHODS = [
     (
         "broadcast_weights_for_collective",
         [
-            "workers/dtensor_policy_worker.py",
             "workers/dtensor_policy_worker_v2.py",
             "workers/megatron_policy_worker.py",
             "interfaces.py",

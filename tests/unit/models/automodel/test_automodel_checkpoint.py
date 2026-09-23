@@ -43,6 +43,54 @@ from nemo_rl.models.automodel.checkpoint import (
 
 
 @pytest.mark.automodel
+@pytest.mark.parametrize(
+    "saved_dtype,current_dtype,master_weights",
+    [
+        (torch.float32, torch.int16, True),
+        (torch.int16, torch.int16, True),
+        (torch.float32, torch.float32, True),
+        (torch.float32, torch.int16, False),
+    ],
+)
+def test_resume_master_weight_dtype(
+    tmp_path, saved_dtype, current_dtype, master_weights
+):
+    """Inspect real DCP metadata before it can cast incompatible master buffers."""
+    import torch.distributed.checkpoint as dcp
+
+    def state(dtype):
+        return {
+            "optim": {
+                "state": {"weight": {"master_param": torch.zeros(2, dtype=dtype)}}
+            }
+        }
+
+    optimizer_path = str(tmp_path / "optimizer")
+    dcp.save(state(saved_dtype), checkpoint_id=os.path.join(optimizer_path, "optim"))
+    manager = AutomodelCheckpointManager(MagicMock(), MagicMock())
+    manager.checkpointer = MagicMock()
+    manager.update_checkpointer_config = MagicMock()
+    optimizer = MagicMock(master_weights=master_weights)
+    model = torch.nn.Linear(2, 1, dtype=torch.bfloat16)
+    with patch("nemo_rl.models.automodel.checkpoint.OptimizerState") as wrapper:
+        wrapper.return_value.state_dict.return_value = state(current_dtype)
+        if master_weights and saved_dtype != current_dtype:
+            with pytest.raises(
+                ValueError, match="Cannot resume optimizer master weights"
+            ):
+                manager.load_checkpoint(model, str(tmp_path), optimizer, optimizer_path)
+            manager.checkpointer.load_optimizer.assert_not_called()
+        else:
+            manager.load_checkpoint(model, str(tmp_path), optimizer, optimizer_path)
+            manager.checkpointer.load_optimizer.assert_called_once()
+        if not master_weights:
+            wrapper.assert_not_called()
+
+    # A weights-only warm start does not inspect optimizer state.
+    manager.load_checkpoint(model, str(tmp_path))
+
+
+@pytest.mark.automodel
 def test_build_checkpoint_config_forwards_explicit_settings():
     config = build_checkpoint_config(
         {

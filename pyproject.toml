@@ -122,17 +122,6 @@ dependencies = [
 
 
 [project.optional-dependencies]
-fsdp = [
-  "transformers==5.12.1",
-  # +cu13 wheels from GitHub match torch cu130; PyPI often resolves to +cu12 (libcudart.so.12).
-  # https://github.com/Dao-AILab/flash-attention/releases/tag/v2.8.1
-  "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
-  "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
-  "mamba-ssm",
-  "causal-conv1d",
-  "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
-]
 automodel = [
   "nemo-automodel[moe]",
   # Automodel's FLA kernels require this TileLang version on Hopper.
@@ -350,6 +339,7 @@ members = [
   # nemo-rl's uv.lock you'll see it's 1.X b/c megatron mandates 1.X in the optional dependencies, so
   # globally we must choose 1.X otherwise we run into pickle issues from ray.
   "research/template_project",
+  "research/flow_grpo",
   "research/gdpo",
 ]
 
@@ -500,11 +490,9 @@ constraint-dependencies = [
 ]
 
 conflicts = [
-  [{ extra = "fsdp" }, { extra = "sglang" }],
   [{ extra = "automodel" }, { extra = "sglang" }],
   [{ extra = "mcore" }, { extra = "sglang" }],
   [{ extra = "vllm" }, { extra = "sglang" }],
-  [{ extra = "automodel" }, { extra = "fsdp" }],
   [{ extra = "automodel" }, { extra = "mcore" }],
   [{ extra = "automodel" }, { extra = "vllm" }],
   [{ extra = "vllm" }, { extra = "mcore" }],
@@ -512,7 +500,6 @@ conflicts = [
   [{ extra = "trtllm" }, { extra = "sglang" }],
   [{ extra = "trtllm" }, { extra = "automodel" }],
   [{ extra = "trtllm" }, { extra = "mcore" }],
-  [{ extra = "trtllm" }, { extra = "fsdp" }],
   [{ extra = "trtllm" }, { extra = "modelopt" }],
   [{ extra = "trtllm" }, { extra = "nvrx" }],
   [{ extra = "trtllm" }, { extra = "nemo_gym" }],
@@ -736,6 +723,7 @@ convention = "google"
 [tool.ruff.lint.per-file-ignores]
 # Ignore all directories named `tests`.
 "tests/**" = ["D"]
+"research/*/tests/**" = ["D"]
 # Ignore all files that end in `_test.py`.
 "*_test.py" = ["D"]
 # Ignore F401 (import but unused) in __init__.py

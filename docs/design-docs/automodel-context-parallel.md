@@ -35,12 +35,12 @@ The dependency changes in `pyproject.toml` are:
 | --- | --- | --- |
 | Base `transformers` constraint | `>=5.5.0,<5.9.0` | `>=5.5.0,<=5.12.1` |
 | Automodel extra | `transformers>=5.5.0,<5.6.0` | `transformers==5.12.1` |
-| FSDP, vLLM, and MCore extras | No direct Transformers pin | `transformers==5.12.1` |
+| vLLM and MCore extras | No direct Transformers pin | `transformers==5.12.1` |
 | Automodel TileLang dependency on Linux x86_64 | No Automodel-specific pin | `tilelang==0.1.11` |
 | Shared `apache-tvm-ffi` override | `>=0.1.9` | `==0.1.11` |
 | `megatron-fsdp` | No root constraint | Git constraint at [`455389c4`](https://github.com/yuhezhang-ai/Megatron-LM/commit/455389c480af6b3acdca74c7830c68b3274eb083) |
 
-The Automodel, FSDP, vLLM, and MCore environments select Transformers 5.12.1. The SGLang
+The Automodel, vLLM, and MCore environments select Transformers 5.12.1. The SGLang
 extra remains independently pinned to Transformers 5.6.0. The `megatron-fsdp` constraint
 mirrors Automodel's source and revision so `uv` can resolve the transitive URL dependency
 consistently. The lock file was regenerated as part of the dependency upgrade.

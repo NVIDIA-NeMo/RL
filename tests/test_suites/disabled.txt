@@ -91,3 +91,6 @@ tests/test_suites/vlm/vlm_mpo-nemotron-omni-30ba3b-mmpr-1n8g-megatron-tp8.v1.sh
 
 # Research template: example only; not scheduled for convergence.
 research/template_project/tests/test_suites/llm/single_update_1n8g.sh
+
+# Full Flow-GRPO recipe requires an externally served GenRM OCR judge.
+research/flow_grpo/tests/test_suites/flow_grpo_qwen_image_ocr.sh
