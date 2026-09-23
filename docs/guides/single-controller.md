@@ -119,6 +119,9 @@ With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint co
 The TQ snapshot and replay index are captured under the same checkpoint barrier. Generation may continue while the snapshot is written, but completed-group commits and destructive TQ clears wait at the barrier. This ensures that the TQ snapshot and replay index describe the same set of groups.
 
 On resume, Single-Controller validates the TQ snapshot against the trainer checkpoint, restores the replay index, and makes completed, committed, unconsumed groups available to the sampler before training resumes.
+The restored TQ partition schemas are authoritative, so startup does not replay
+fresh-run placeholder partition registration. This applies to native and
+NeMo-Gym recovery alike, for both supported TQ backends.
 
 Replay recovery is supported by all built-in samplers: `in_order`, `weight_fifo`, `ready_first`, and `windowed`. Custom samplers must explicitly declare `supports_buffer_checkpoint = True`. Otherwise, setup emits a warning and completed buffered groups are not restored.
 
@@ -145,7 +148,53 @@ rollout_checkpointing:
 
 token_capture:
   enabled: true
+
+async_rl:
+  rollout_failure:
+    nemo_gym:
+      # Stable token-capture identities are retried through the recovery ledger,
+      # not by physically redispatching the same row identity.
+      max_row_attempts: 1
 ```
+
+To include NeMo-Gym's model lineage, parked agent boundaries, and resource
+snapshots in the same outer snapshot, enable the experimental participant
+protocol:
+
+```yaml
+rollout_checkpointing:
+  snapshot_attempt_interval_s: 120
+  gym:
+    capability_discovery_enabled: true
+    participant_checkpointing_enabled: true
+    prepare_timeout_s: 300
+```
+
+Single Controller first closes new rollout admission, acknowledges completed
+Gym executions that are already owned by canonical TQ rows, and asks Gym to
+park the remaining work. Gym writes its participant manifests into the
+unpublished snapshot directory. Agent participants commit first and return a
+compact continuation index. The policy model uses those roots to package only
+active lineage and returns a digest-bound index of the TQ staging keys those
+continuations require. Only then does Single Controller take the short
+data-plane barrier, verify those keys, and save TQ plus replay and recovery
+metadata. The outer snapshot binds the Gym sidecar coordinates and participant
+manifest digests and publishes atomically. On failure, Gym is resumed and the
+previous committed snapshot stays authoritative.
+
+This mode requires a Gym revision that advertises completed-result
+acknowledgement, agent continuation indexes, and external-storage reference
+indexes. It also requires
+`token_capture.enabled: true`; NeMo-RL never tells Gym to release a completed
+terminal result until the canonical TQ and replay-buffer commit has succeeded.
+On restore, Gym validates and rehydrates its own artifacts, and NeMo-RL checks
+that Gym reports the same sidecar digests and that every indexed TQ row exists.
+The continuation and external-storage indexes are required; checkpoints that
+omit either sidecar fail closed instead of making NeMo-RL inspect Gym's private
+lineage format.
+Use `restore_mode: latest`: full trainer checkpoints do not yet contain Gym
+participant state, so startup fails safely if no compatible periodic rollout
+snapshot exists for the selected trainer anchor.
 
 `snapshot_attempt_interval_s` is the cadence at which Single-Controller attempts
 a rollout snapshot. It is not a guarantee that a snapshot is written at every

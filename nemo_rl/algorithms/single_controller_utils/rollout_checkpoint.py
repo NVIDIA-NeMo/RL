@@ -27,15 +27,23 @@ from pathlib import Path
 from typing import Any, Literal, Mapping, Optional, get_args
 
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+from nemo_rl.environments.gym_checkpoint import GymCheckpointCommitResult
 
-ROLLOUT_SNAPSHOT_SCHEMA_VERSION = 3
+ROLLOUT_SNAPSHOT_SCHEMA_VERSION = 4
 BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION = 7
 BOOTSTRAP_DIRNAME = "bootstrap"
 BOOTSTRAP_MANIFEST_FILENAME = "manifest.json"
 ROLLOUT_SNAPSHOTS_DIRNAME = "rollout_snapshots"
 ROLLOUT_SNAPSHOT_MANIFEST_FILENAME = "manifest.json"
+GYM_RESTART_FALLBACK_SCHEMA_VERSION = 1
+GYM_RESTART_FALLBACK_MANIFEST_FILENAME = "gym_restart_fallback.json"
 
-RolloutCheckpointAttemptOutcome = Literal["completed", "failed", "skipped"]
+RolloutCheckpointAttemptOutcome = Literal[
+    "completed",
+    "failed",
+    "published_release_pending",
+    "skipped",
+]
 ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES: tuple[RolloutCheckpointAttemptOutcome, ...] = (
     get_args(RolloutCheckpointAttemptOutcome)
 )
@@ -47,6 +55,7 @@ RolloutCheckpointAttemptReason = Literal[
     "missing_trainer_anchor",
     "no_data_plane_mutations",
     "optimizer_commit_in_progress",
+    "release_pending",
     "timeout",
     "trainer_state_changed",
 ]
@@ -247,6 +256,8 @@ class RolloutSnapshotManifest:
     mutation_version: int
     rolled_back_train_group_count: int
     bootstrap_fingerprint: Optional[str]
+    gym_topology_fingerprint: Optional[str] = None
+    gym_checkpoint: Optional[GymCheckpointCommitResult] = None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> RolloutSnapshotManifest:
@@ -271,6 +282,21 @@ class RolloutSnapshotManifest:
             raise ValueError(
                 "rollout snapshot bootstrap_fingerprint must be a string or null"
             )
+        gym_topology_fingerprint = raw.get("gym_topology_fingerprint")
+        if gym_topology_fingerprint is not None and (
+            not isinstance(gym_topology_fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", gym_topology_fingerprint) is None
+        ):
+            raise ValueError(
+                "rollout snapshot gym_topology_fingerprint must be a SHA-256 "
+                "digest or null"
+            )
+        raw_gym_checkpoint = raw.get("gym_checkpoint")
+        gym_checkpoint = (
+            None
+            if raw_gym_checkpoint is None
+            else GymCheckpointCommitResult.model_validate(raw_gym_checkpoint)
+        )
         manifest = cls(
             schema_version=raw["schema_version"],
             base_train_step=raw["base_train_step"],
@@ -280,6 +306,8 @@ class RolloutSnapshotManifest:
             mutation_version=raw["mutation_version"],
             rolled_back_train_group_count=raw["rolled_back_train_group_count"],
             bootstrap_fingerprint=fingerprint,
+            gym_topology_fingerprint=gym_topology_fingerprint,
+            gym_checkpoint=gym_checkpoint,
         )
         if manifest.schema_version != ROLLOUT_SNAPSHOT_SCHEMA_VERSION:
             raise ValueError(
@@ -301,10 +329,144 @@ class RolloutSnapshotManifest:
             raise ValueError(
                 "rollout snapshot sampler_dispatch_index must be at least -1"
             )
+        if (
+            manifest.gym_checkpoint is not None
+            and manifest.gym_topology_fingerprint is None
+        ):
+            raise ValueError(
+                "rollout snapshot with Gym participant state requires a Gym "
+                "topology fingerprint"
+            )
         return manifest
 
     def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["gym_checkpoint"] = (
+            self.gym_checkpoint.model_dump(mode="json")
+            if self.gym_checkpoint is not None
+            else None
+        )
+        return payload
+
+
+@dataclass(frozen=True)
+class GymRestartFallbackManifest:
+    """Marks a trainer checkpoint that can restart unfinished Gym work.
+
+    The marker is written only when the trainer/data-plane checkpoint is
+    complete but its coordinated Gym participant snapshot could not be
+    published. It prevents an older trainer checkpoint with no Gym state from
+    being mistaken for a deliberately recoverable fallback.
+    """
+
+    schema_version: int
+    mode: Literal["restart_unfinished"]
+    base_train_step: int
+    trainer_version: int
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, Any]) -> GymRestartFallbackManifest:
+        expected_fields = {
+            "schema_version",
+            "mode",
+            "base_train_step",
+            "trainer_version",
+        }
+        if set(raw) != expected_fields:
+            raise ValueError(
+                "Gym restart-fallback manifest fields do not match the schema: "
+                f"actual={sorted(raw)!r}, expected={sorted(expected_fields)!r}"
+            )
+        schema_version = raw["schema_version"]
+        base_train_step = raw["base_train_step"]
+        trainer_version = raw["trainer_version"]
+        if (
+            isinstance(schema_version, bool)
+            or schema_version != GYM_RESTART_FALLBACK_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                f"unsupported Gym restart-fallback schema version: {schema_version!r}"
+            )
+        if raw["mode"] != "restart_unfinished":
+            raise ValueError(f"unsupported Gym restart-fallback mode: {raw['mode']!r}")
+        for name, value in (
+            ("base_train_step", base_train_step),
+            ("trainer_version", trainer_version),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"Gym restart-fallback {name} must be a non-negative integer"
+                )
+        return cls(
+            schema_version=schema_version,
+            mode="restart_unfinished",
+            base_train_step=base_train_step,
+            trainer_version=trainer_version,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def write_gym_restart_fallback_manifest(
+    checkpoint_path: Path,
+    *,
+    base_train_step: int,
+    trainer_version: int,
+) -> Path:
+    """Atomically mark a trainer checkpoint for restart-only Gym recovery."""
+    manifest = GymRestartFallbackManifest.from_mapping(
+        {
+            "schema_version": GYM_RESTART_FALLBACK_SCHEMA_VERSION,
+            "mode": "restart_unfinished",
+            "base_train_step": base_train_step,
+            "trainer_version": trainer_version,
+        }
+    )
+    path = checkpoint_path / GYM_RESTART_FALLBACK_MANIFEST_FILENAME
+    tmp_path = path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(manifest.to_dict(), sort_keys=True, indent=2) + "\n")
+    _fsync_file(tmp_path)
+    os.replace(tmp_path, path)
+    _fsync_directory(checkpoint_path)
+    return path
+
+
+def load_gym_restart_fallback_manifest(
+    checkpoint_path: Path,
+    *,
+    expected_train_step: int,
+    expected_trainer_version: int,
+) -> Optional[GymRestartFallbackManifest]:
+    """Load and bind an explicit restart-only marker to its trainer state."""
+    path = checkpoint_path / GYM_RESTART_FALLBACK_MANIFEST_FILENAME
+    if not path.is_file():
+        return None
+    raw = json.loads(path.read_text())
+    if not isinstance(raw, Mapping):
+        raise ValueError("Gym restart-fallback manifest must contain a mapping")
+    manifest = GymRestartFallbackManifest.from_mapping(raw)
+    if (
+        manifest.base_train_step != expected_train_step
+        or manifest.trainer_version != expected_trainer_version
+    ):
+        raise ValueError(
+            "Gym restart-fallback manifest does not match the trainer checkpoint: "
+            f"manifest={(manifest.base_train_step, manifest.trainer_version)!r}, "
+            f"expected={(expected_train_step, expected_trainer_version)!r}"
+        )
+    return manifest
+
+
+def remove_gym_restart_fallback_manifest(checkpoint_path: Path) -> bool:
+    """Remove the fallback marker after an exact Gym snapshot is durable."""
+    path = checkpoint_path / GYM_RESTART_FALLBACK_MANIFEST_FILENAME
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    _fsync_directory(checkpoint_path)
+    return True
 
 
 @dataclass(frozen=True)

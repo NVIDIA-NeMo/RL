@@ -58,6 +58,7 @@ from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
 )
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.environments.nemo_gym_shards import parse_shard_plan
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
@@ -99,6 +100,9 @@ class NemoGymRolloutFTConfig(BaseModel, extra="allow"):
     # retrying the whole prompt group. Gym's stream dies on its first failing row, so one
     # bad row takes every later row with it; recovering those individually is much
     # cheaper than redoing all num_generations_per_prompt of them.
+    # Token-capture runs require 1 because their stable (rollout_id, attempt_index)
+    # identities cannot be physically redispatched without first retiring the old
+    # Gym execution; the setup validator rejects larger values on that path.
     max_row_attempts: PositiveInt = 3
 
 
@@ -739,6 +743,36 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
         return TaskSourceRecoveryGranularity(task_source, self.default_granularity)
 
 
+class GymRolloutCheckpointConfig(BaseModel, extra="forbid"):
+    """NeMo-Gym checkpoint control-plane discovery.
+
+    This is opt-in while the Gym control protocol is experimental. Discovery
+    validates and fingerprints every participant before training starts.
+    ``participant_checkpointing_enabled`` adds Gym participant state to each
+    periodic snapshot and to the coordinated rollout snapshot published with
+    every trainer checkpoint. It also enables completed-result acknowledgement.
+    Discovery lets SC validate the participant topology, acknowledgement,
+    continuation-index, and external-storage-index capabilities before training
+    starts.
+    """
+
+    capability_discovery_enabled: bool = False
+    participant_checkpointing_enabled: bool = False
+    prepare_timeout_s: Annotated[float, Field(gt=0)] = 300.0
+
+    @model_validator(mode="after")
+    def validate_participant_checkpointing(self) -> "GymRolloutCheckpointConfig":
+        if (
+            self.participant_checkpointing_enabled
+            and not self.capability_discovery_enabled
+        ):
+            raise ValueError(
+                "participant_checkpointing_enabled=true requires "
+                "capability_discovery_enabled=true"
+            )
+        return self
+
+
 class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     """Frequent rollout-state snapshots anchored to durable trainer state.
 
@@ -783,6 +817,7 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     keep_latest_k: Annotated[int, Field(ge=1)] = 2
     restore_mode: Literal["latest", "trainer_checkpoint"] = "latest"
     extra_fingerprint_excluded_paths: list[str] = Field(default_factory=list)
+    gym: GymRolloutCheckpointConfig = Field(default_factory=GymRolloutCheckpointConfig)
 
     @model_validator(mode="after")
     def validate_extra_fingerprint_excluded_paths(self) -> "RolloutCheckpointConfig":
@@ -1269,6 +1304,22 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         )
     _validate_algo_settings(master_config)
 
+    if master_config.rollout_checkpointing.gym.capability_discovery_enabled:
+        nemo_gym_config = master_config.env.get("nemo_gym", {})
+        shard_plan = parse_shard_plan(nemo_gym_config)
+        gym_actor_count = (
+            1
+            if shard_plan is None
+            else sum(shard.replicas for shard in shard_plan.shards)
+        )
+        if gym_actor_count != 1:
+            raise NotImplementedError(
+                "Gym participant checkpointing currently supports exactly one "
+                f"NeMo-Gym actor, but env.nemo_gym.shards configures "
+                f"{gym_actor_count}. Configure one shard with replicas=1, or "
+                "disable rollout_checkpointing.gym.capability_discovery_enabled."
+            )
+
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
 
@@ -1342,6 +1393,18 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     token_capture_config = master_config.token_capture
     recovery_config = master_config.rollout_recovery
+    if (
+        token_capture_config.enabled
+        and async_config.rollout_failure.nemo_gym.max_row_attempts != 1
+    ):
+        raise ValueError(
+            "token_capture.enabled=true requires "
+            "async_rl.rollout_failure.nemo_gym.max_row_attempts=1. "
+            "Token-captured rows use stable (rollout_id, attempt_index) "
+            "identities, so an immediate row redispatch could overlap the old "
+            "Gym execution. Higher-level rollout recovery creates a new tracked "
+            "attempt instead."
+        )
     if not token_capture_config.enabled and (
         recovery_config.default_granularity is not RecoveryGranularity.SIBLING
         or recovery_config.task_source_granularity_overrides

@@ -78,6 +78,8 @@ from nemo_rl.data_plane.schema import (
     OPD_FULL_TEACHER_INDEX_FIELD,
     SC_ROLLOUT_SCHEMA_FIELDS,
 )
+from nemo_rl.environments.gym_checkpoint import GymCheckpointTopology
+from nemo_rl.environments.nemo_gym import NemoGymShardSet
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
@@ -572,6 +574,7 @@ def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
         "++data_plane.simple.num_storage_units=2",
         "++data_plane.claim_meta_poll_interval_s=0.5",
         "++token_capture.enabled=true",
+        "++async_rl.rollout_failure.nemo_gym.max_row_attempts=1",
         "++rollout_recovery.default_granularity=prompt_group",
         "++async_rl.sampler.name=in_order",
         "++async_rl.sampler.max_lookahead_versions=1",
@@ -670,6 +673,7 @@ class TestSetup:
     ):
         mc = _make_master_config(env={"should_use_nemo_gym": True})
         mc.token_capture.enabled = True
+        mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
         mc.grpo.invalid_tool_call_advantage = -5.0
 
         with pytest.raises(
@@ -857,6 +861,267 @@ class TestSetup:
         with pytest.raises(ValueError, match="requires checkpointing.enabled=true"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+    def test_gym_checkpointing_requires_periodic_snapshots(self):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            gym={"capability_discovery_enabled": True}
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "gym.capability_discovery_enabled=true requires.*"
+                "snapshot_attempt_interval_s"
+            ),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_gym_participant_checkpointing_requires_discovery(self):
+        with pytest.raises(
+            ValueError,
+            match=(
+                "participant_checkpointing_enabled=true requires "
+                "capability_discovery_enabled=true"
+            ),
+        ):
+            RolloutCheckpointConfig(
+                snapshot_attempt_interval_s=1.0,
+                gym={"participant_checkpointing_enabled": True},
+            )
+
+    def test_gym_participant_checkpointing_requires_token_capture(self):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": True,
+            "expose_http_server": True,
+        }
+        mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_data_plane"] = True
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0,
+            gym={
+                "capability_discovery_enabled": True,
+                "participant_checkpointing_enabled": True,
+            },
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="participant_checkpointing_enabled=true requires "
+            "token_capture.enabled=true",
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_gym_participant_checkpointing_requires_latest_restore_mode(self):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": True,
+            "expose_http_server": True,
+        }
+        mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_data_plane"] = True
+        mc.token_capture = TokenCaptureConfig(enabled=True)
+        mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0,
+            restore_mode="trainer_checkpoint",
+            gym={
+                "capability_discovery_enabled": True,
+                "participant_checkpointing_enabled": True,
+            },
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="Gym participant checkpointing requires.*restore_mode='latest'",
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    @pytest.mark.parametrize(
+        "shards",
+        [
+            [
+                {"name": "first", "config_paths": ["first.yaml"]},
+                {"name": "second", "config_paths": ["second.yaml"]},
+            ],
+            [
+                {
+                    "name": "replicated",
+                    "config_paths": ["replicated.yaml"],
+                    "replicas": 2,
+                }
+            ],
+        ],
+    )
+    def test_gym_checkpointing_rejects_multiple_gym_actors_before_setup(self, shards):
+        mc = _make_master_config(
+            env={
+                "should_use_nemo_gym": True,
+                "nemo_gym": {"shards": shards},
+            }
+        )
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0,
+            gym={"capability_discovery_enabled": True},
+        )
+
+        with pytest.raises(
+            NotImplementedError,
+            match="participant checkpointing currently supports exactly one",
+        ):
+            validate_single_controller_config(mc)
+
+    def test_gym_checkpointing_accepts_one_explicit_shard(self):
+        mc = _make_master_config(
+            env={
+                "should_use_nemo_gym": True,
+                "nemo_gym": {
+                    "shards": [{"name": "only", "config_paths": ["only.yaml"]}]
+                },
+            }
+        )
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0,
+            gym={"capability_discovery_enabled": True},
+        )
+
+        validate_single_controller_config(mc)
+
+    def test_completed_rollout_checkpointing_allows_multiple_gym_actors(self):
+        mc = _make_master_config(
+            env={
+                "should_use_nemo_gym": True,
+                "nemo_gym": {
+                    "shards": [
+                        {"name": "first", "config_paths": ["first.yaml"]},
+                        {"name": "second", "config_paths": ["second.yaml"]},
+                    ]
+                },
+            }
+        )
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0
+        )
+
+        validate_single_controller_config(mc)
+
+    def test_gym_checkpointing_discovers_topology_during_setup(
+        self,
+        tmp_path: Path,
+        patched_factories,
+    ):
+        mc = _make_master_config(colocated=False, backend="vllm")
+        mc.checkpointing.update(
+            {
+                "checkpoint_dir": str(tmp_path / "checkpoints"),
+                "enabled": True,
+                "save_data_plane": True,
+                "save_period": 1,
+            }
+        )
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "vllm_cfg": {
+                    "async_engine": True,
+                    "expose_http_server": True,
+                },
+            }
+        )
+        mc.logger["log_dir"] = str(tmp_path / "logs")
+        mc.token_capture.enabled = True
+        mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0,
+            gym={
+                "capability_discovery_enabled": True,
+                "participant_checkpointing_enabled": True,
+            },
+        )
+        topology = {
+            "schema_version": 1,
+            "participants": [
+                {
+                    "participant": {
+                        "server_name": "policy",
+                        "component": "responses_api_models",
+                        "participant_name": "policy",
+                    },
+                    "schema_version": 1,
+                    "admission_states": ["accepting", "draining", "paused"],
+                    "checkpoint_mode": "export_restore",
+                    "concurrency_contract": "stateless",
+                    "multi_process": {
+                        "mode": "single_worker",
+                        "num_workers": 1,
+                    },
+                    "instance_role": "policy",
+                    "features": ["external_storage_reference_index_v1"],
+                },
+                {
+                    "participant": {
+                        "server_name": "agent-route",
+                        "component": "responses_api_agents",
+                        "participant_name": "test-agent",
+                    },
+                    "schema_version": 1,
+                    "admission_states": ["accepting"],
+                    "checkpoint_mode": "export_restore",
+                    "concurrency_contract": "serialized_per_session",
+                    "multi_process": {
+                        "mode": "single_worker",
+                        "num_workers": 1,
+                    },
+                    "instance_role": None,
+                    "features": [
+                        "agent_continuation_index_v1",
+                        "completed_result_acknowledgement",
+                    ],
+                },
+            ],
+        }
+        topology_ref = object()
+        fake_gym_actor = MagicMock(name="nemo_gym_actor")
+        fake_gym_actor.discover_checkpoint_capabilities.remote.return_value = (
+            topology_ref
+        )
+        fake_gym_shards = NemoGymShardSet(handles={"default": [fake_gym_actor]})
+        fake_finalizers = [MagicMock(name="finalizer")]
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod,
+                "build_nemo_gym_actors",
+                return_value=fake_gym_shards,
+            ),
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            patch.object(
+                sc_setup_mod.ray,
+                "get",
+                side_effect=lambda ref: topology if ref is topology_ref else ref,
+            ),
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor."
+                "create_rollout_reassembler_actors",
+                return_value=fake_finalizers,
+            ),
+        ):
+            actor_args, _ = setup_single_controller(
+                mc,
+                MagicMock(pad_token_id=0),
+            )
+
+        assert actor_args.gym_checkpoint_topology == (
+            GymCheckpointTopology.model_validate(topology)
+        )
+        fake_gym_actor.discover_checkpoint_capabilities.remote.assert_called_once_with()
+
     def test_periodic_checkpointing_requires_data_plane_save(self):
         mc = _make_master_config(
             sampler_cfg=CustomSamplerConfig(
@@ -897,6 +1162,7 @@ class TestSetup:
         mc.checkpointing["enabled"] = True
         mc.checkpointing["save_data_plane"] = True
         mc.token_capture = TokenCaptureConfig(enabled=True)
+        mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
         )
@@ -916,6 +1182,7 @@ class TestSetup:
         mc.checkpointing["enabled"] = True
         mc.checkpointing["save_data_plane"] = True
         mc.token_capture = TokenCaptureConfig(enabled=True)
+        mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
         )
@@ -948,6 +1215,7 @@ class TestSetup:
         )
         mc.logger["log_dir"] = str(tmp_path / "logs")
         mc.token_capture.enabled = True
+        mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
         )
@@ -1026,6 +1294,7 @@ class TestSetup:
         )
         mc.logger = {"log_dir": str(tmp_path / "logs")}
         mc.token_capture.enabled = True
+        mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0,
             restore_mode="trainer_checkpoint",
@@ -1774,6 +2043,7 @@ class TestSetup:
         # wandb keys that _make_master_config populates.
         mc.logger = {**mc.logger, "log_dir": "/tmp/test-token-capture"}
         mc.token_capture.enabled = True
+        mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
         mc.token_capture.num_reassembler_workers = 3
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
@@ -2320,6 +2590,7 @@ class TestNativeTQRecoverySetup:
 
         assert events == ["load", "build"]
         assert actor_args.data_plane_checkpoint_metadata == _native_tq_metadata()
+        actor_args.dp_client.register_partition.assert_not_called()
         assert actor_args.rollout_checkpoint_load_metrics["tq_load_seconds"] >= 0
 
     @pytest.mark.parametrize("save_enabled", [False, True])
@@ -2400,6 +2671,7 @@ class TestNativeTQRecoverySetup:
         )
         mc.logger["log_dir"] = str(tmp_path / "logs")
         mc.token_capture.enabled = True
+        mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0,
             restore_mode="latest",

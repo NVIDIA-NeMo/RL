@@ -5,6 +5,7 @@
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 PROJECT_ROOT=$(realpath $SCRIPT_DIR/../..)
+GYM_ROOT=${NEMO_GYM_SOURCE_DIR:-$PROJECT_ROOT/3rdparty/Gym-workspace/Gym}
 # Mark the current repo as safe, since wandb fetches metadata about the repo
 git config --global --add safe.directory $PROJECT_ROOT
 
@@ -18,7 +19,9 @@ RUN_LOG=$EXP_DIR/run.log
 CHECKPOINT_DIR=$EXP_DIR/checkpoints
 DATA_DIR=$EXP_DIR/data
 SC_ENTRYPOINT=${SC_TEST_ENTRYPOINT:-$PROJECT_ROOT/examples/run_grpo_single_controller.py}
-export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
+# Functional stacks can exercise an unmerged Gym checkpoint branch without
+# changing NeMo-RL's submodule pin. The in-tree submodule remains the default.
+export PYTHONPATH=${GYM_ROOT}:${PROJECT_ROOT}:${PYTHONPATH:-}
 
 rm -rf $EXP_DIR $LOG_DIR
 mkdir -p $EXP_DIR $LOG_DIR $CHECKPOINT_DIR $DATA_DIR
@@ -30,31 +33,46 @@ cd $PROJECT_ROOT
 
 # Follow nemo-gym instructions here to get this data:
 # https://docs.nvidia.com/nemo/gym/0.1.0/tutorials/nemo-rl-grpo/setup.html#training-nemo-rl-grpo-setup
-cd 3rdparty/Gym-workspace/Gym
-
-# We need HF_TOKEN to download the data from huggingface
-if [[ ! -f env.yaml ]]; then
-    if [[ -z "${HF_TOKEN:-}" ]]; then
-        echo "[ERROR] HF_TOKEN is not set"
+CUSTOM_TRAIN_PATH=${NEMO_GYM_TRAIN_DATA_PATH:-}
+CUSTOM_VALIDATION_PATH=${NEMO_GYM_VALIDATION_DATA_PATH:-}
+if [[ -n "$CUSTOM_TRAIN_PATH" || -n "$CUSTOM_VALIDATION_PATH" ]]; then
+    if [[ -z "$CUSTOM_TRAIN_PATH" || -z "$CUSTOM_VALIDATION_PATH" ]]; then
+        echo "[ERROR] NEMO_GYM_TRAIN_DATA_PATH and NEMO_GYM_VALIDATION_DATA_PATH must be set together"
         exit 1
     fi
-    echo "hf_token: $HF_TOKEN" >> env.yaml
+    if [[ ! -f "$CUSTOM_TRAIN_PATH" || ! -f "$CUSTOM_VALIDATION_PATH" ]]; then
+        echo "[ERROR] custom NeMo-Gym train or validation data does not exist"
+        exit 1
+    fi
+    TRAIN_PATH=$(realpath "$CUSTOM_TRAIN_PATH")
+    VALIDATION_PATH=$(realpath "$CUSTOM_VALIDATION_PATH")
+else
+    cd "$GYM_ROOT"
+
+    # We need HF_TOKEN to download the data from huggingface
+    if [[ ! -f env.yaml ]]; then
+        if [[ -z "${HF_TOKEN:-}" ]]; then
+            echo "[ERROR] HF_TOKEN is not set"
+            exit 1
+        fi
+        echo "hf_token: $HF_TOKEN" >> env.yaml
+    fi
+
+    uv run ng_prepare_data "+config_paths=[resources_servers/workplace_assistant/configs/workplace_assistant.yaml]" \
+        +output_dirpath=data/workplace_assistant \
+        +mode=train_preparation \
+        +should_download=true \
+        +data_source=huggingface
+    cd -
+
+    # This trimming of the workplace assistant dataset is necessary b/c with all the tools the first prompt is >4000 tokens
+    # which will cause vllm to return nothing on the first prompt and crash RL. Since we want to keep this test short to
+    # smoke test, we trim all but the first tool
+    TRAIN_PATH=$DATA_DIR/workplace_assistant_train.jsonl
+    VALIDATION_PATH=$DATA_DIR/workplace_assistant_validation.jsonl
+    jq -c '.responses_create_params.tools |= (.[0:1])' "$GYM_ROOT/data/workplace_assistant/train.jsonl" > $TRAIN_PATH
+    jq -c '.responses_create_params.tools |= (.[0:1])' "$GYM_ROOT/data/workplace_assistant/validation.jsonl" > $VALIDATION_PATH
 fi
-
-uv run ng_prepare_data "+config_paths=[resources_servers/workplace_assistant/configs/workplace_assistant.yaml]" \
-    +output_dirpath=data/workplace_assistant \
-    +mode=train_preparation \
-    +should_download=true \
-    +data_source=huggingface
-cd -
-
-# This trimming of the workplace assistant dataset is necessary b/c with all the tools the first prompt is >4000 tokens
-# which will cause vllm to return nothing on the first prompt and crash RL. Since we want to keep this test short to
-# smoke test, we trim all but the first tool
-TRAIN_PATH=$DATA_DIR/workplace_assistant_train.jsonl
-VALIDATION_PATH=$DATA_DIR/workplace_assistant_validation.jsonl
-jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl > $TRAIN_PATH
-jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl > $VALIDATION_PATH
 
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $SC_ENTRYPOINT \
