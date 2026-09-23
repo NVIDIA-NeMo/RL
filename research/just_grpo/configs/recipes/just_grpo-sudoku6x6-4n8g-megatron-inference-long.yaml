@@ -1,0 +1,115 @@
+# Matched Sudoku 6x6 run: 32 shared GPUs, Megatron training and inference.
+defaults: ../../../../examples/configs/grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 8
+  max_num_steps: 100
+  max_val_samples: 1024
+  val_batch_size: 128
+  val_at_start: true
+  val_at_end: true
+  max_num_epochs: 1000
+  normalize_rewards: false
+loss_fn:
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2.0
+policy:
+  worker_extension_cls_fqn: just_grpo.diffusion.megatron_diffusion_policy.MegatronDiffusionPolicyWorker
+  model_name: nvidia/Nemotron-Labs-Diffusion-3B
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step},${grpo.num_generations_per_prompt}}
+  max_total_sequence_length: 1536
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    activation_checkpointing: true
+    optimizer:
+      lr: ${policy.optimizer.kwargs.lr}
+      min_lr: ${policy.optimizer.kwargs.lr}
+      weight_decay: ${policy.optimizer.kwargs.weight_decay}
+      use_precision_aware_optimizer: false
+    scheduler:
+      lr_decay_iters: ${grpo.max_num_steps}
+      lr_warmup_init: ${mul:${policy.optimizer.kwargs.lr},0.1}
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    defer_fp32_logits: true
+  sequence_packing:
+    enabled: false
+  optimizer:
+    kwargs:
+      lr: 3.0e-07
+      fused: true
+  generation:
+    max_new_tokens: 512
+    stop_token_ids:
+    - 11
+    backend: megatron
+    refit_transport: mcore
+    mcore_generation_config:
+      refit_backend: gloo
+      cuda_graph_impl: none
+      materialize_only_last_token_logits: false
+data:
+  train:
+    _override_: true
+    dataset_name: sudoku6x6
+    size: 50000
+    seed: 1
+    repeat: 1
+  validation:
+    dataset_name: sudoku6x6
+    size: 256
+    seed: 2
+    repeat: 4
+  default:
+    prompt_file: null
+    processor: null
+    prompt_style: sudoku_answer_tag
+    enable_thinking: true
+    env_name: sudoku6x6
+  max_input_seq_length: 1280
+env:
+  _override_: true
+  sudoku6x6: {}
+checkpointing:
+  enabled: false
+logger:
+  log_dir: results/just_grpo_sudoku6x6_megatron
+  monitor_gpus: false
+  wandb_enabled: true
+  wandb:
+    project: diffusion_rl
+    name: ${oc.env:WANDB_RUN_NAME,just_grpo_sudoku6x6_megatron}
+cluster:
+  num_nodes: 4
+  gpus_per_node: 8
+just_grpo:
+  distributed: true
+  runtime: megatron
+  generation_python: null
+  max_generation_kl: 0.05
+  training_token_fraction: 1.0
+  schedule:
+    mask_token_id: 100
+    block_size: 16
+    reveal_tokens_per_step: 1
+  sampling:
+    temperature: ${policy.generation.temperature}
+    block_size: ${just_grpo.schedule.block_size}
+    max_steps: 16
+    selection_policy: leftmost
+    threshold: 0.9
+    returns_reveal_steps: false
+    returns_entropy: false
+  validation_sampling:
+    temperature: ${policy.generation.val_temperature}
+    block_size: ${just_grpo.sampling.block_size}
+    max_steps: ${just_grpo.sampling.max_steps}
+    selection_policy: ${just_grpo.sampling.selection_policy}
+    threshold: ${just_grpo.sampling.threshold}
+    returns_reveal_steps: ${just_grpo.sampling.returns_reveal_steps}
+    returns_entropy: ${just_grpo.sampling.returns_entropy}
