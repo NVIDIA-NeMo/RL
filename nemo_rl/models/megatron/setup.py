@@ -698,9 +698,9 @@ def _validate_peft_restore_config(
                 "donor to target the same modules; train a new adapter instead."
             )
     # These megatron-bridge LoRA fields change the adapter shape/key layout
-    # for MoE expert layers. NeMo RL never sets them (a run always uses the
-    # bridge defaults), but a native Megatron-Bridge donor checkpoint may
-    # have; a mismatch would restore onto a different adapter layout.
+    # for MoE expert layers. Compare configured values when NeMo RL exposes
+    # them and bridge defaults otherwise; a mismatch would restore onto a
+    # different adapter layout.
     lora_field_defaults = {field.name: field.default for field in fields(LoRA)}
     for key in (
         "normalize_moe_lora",
@@ -2435,6 +2435,11 @@ def setup_model_and_optimizer(
             a2a_experimental=peft_cfg["a2a_experimental"],
             lora_dtype=peft_cfg["lora_dtype"],
         )
+        if "share_expert_adapters" in peft_cfg:
+            peft = replace(
+                peft,
+                share_expert_adapters=peft_cfg["share_expert_adapters"],
+            )
         # Resolve and validate the warm-start donor checkpoint up front so a
         # bad path or mismatched donor fails before any model construction.
         peft_restore_dir = None
@@ -2767,6 +2772,11 @@ def setup_reference_model_state(
             a2a_experimental=peft_cfg["a2a_experimental"],
             lora_dtype=peft_cfg["lora_dtype"],
         )
+        if "share_expert_adapters" in peft_cfg:
+            peft = replace(
+                peft,
+                share_expert_adapters=peft_cfg["share_expert_adapters"],
+            )
     else:
         peft = None
 

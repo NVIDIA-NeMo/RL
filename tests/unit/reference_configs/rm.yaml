@@ -44,7 +44,13 @@ policy:
     reward_model_type: "bradley_terry"  # only "bradley_terry" is currently supported
 
   dtensor_cfg:
+    _v2: true
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: false

@@ -197,8 +197,9 @@ class SequencePackingFusionLossWrapper:
     This avoids per-sequence kernel launches and TP/CP communication overhead while
     producing numerically identical results.
 
-    The prepare_fn should be prepare_packed_loss_input (from nemo_rl.algorithms.loss.utils),
-    which currently only supports LossInputType.LOGPROB.
+    The prepare_fn should be prepare_packed_loss_input (from
+    nemo_rl.algorithms.loss.loss_input), which currently only supports
+    LossInputType.LOGPROB.
     """
 
     def __init__(
