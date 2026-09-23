@@ -170,34 +170,39 @@ class RLSpanGroup:
     U_STEP = STEP
     U_MODEL_INIT = MODEL_INIT
     U_EVALUATE = EVALUATE
+    """An eval pass; an umbrella unless its inside is timed as idle."""
+
     U_ROLLOUT = ROLLOUT
+    """The ``collect_rollouts`` umbrella."""
+
     U_SETUP = SETUP
+    """Startup is real overhead, but no subset of these spans is summable.
+
+    The phases nest (``rl.startup`` over ``rl.setup.workers`` over
+    ``rl.vllm.load_model``) and the worker builds run concurrently under
+    parallel init, so a rollup adding them by ``rl.bucket`` would multiply
+    startup rather than measure it. The flat number lives in the
+    ``rl.setup.duration`` metric at ``phase=total_setup``, which is the one
+    value that cannot double-count. These spans are for shape only.
+    """
+
     U_PER_PROMPT = PER_PROMPT
+    """Per-prompt work on the single-controller path overlaps itself.
+
+    Many rollouts are in flight at once (``max_inflight_prompts``), so any
+    bucket these carried would sum to a large multiple of the wall clock they
+    happened in. That applies to the data-plane put inside a rollout as much as
+    to the rollout span itself, which is why this group overrides
+    ``DATA_PLANE``'s overhead bucket there -- see ``per_prompt_scope``.
+    """
 
     # ------------------------------------------------------------------ #
     # All groups and presets
     # ------------------------------------------------------------------ #
 
-    ALL_GROUPS: Final[frozenset] = frozenset(
-        [
-            JOB,
-            CHECKPOINT,
-            EVALUATE,
-            MODEL_INIT,
-            STEP,
-            SETUP,
-            ROLLOUT,
-            GENERATION,
-            LOGPROB,
-            REWARD,
-            ADVANTAGE,
-            POLICY_UPDATE,
-            DATA_PROCESSING,
-            DATA_PLANE,
-            PER_PROMPT,
-            EFFICIENCY,
-        ]
-    )
+    #: Every group declared above. Computed after the class body, since a class
+    #: body cannot read its own attributes; see :func:`_group_values`.
+    ALL_GROUPS: ClassVar[frozenset[str]]
 
     #: Named subsets a user can select instead of listing groups. ``"all"`` is
     #: not here: lens reserves it and resolves it as a wildcard over whatever is
@@ -284,6 +289,30 @@ class RLSpanGroup:
         library, which is why the driver reports it.
         """
         return SpanRegistry.resolve(spec)
+
+
+def _group_values(*, umbrella: bool) -> frozenset[str]:
+    """Group names declared on :class:`RLSpanGroup`, by spelling.
+
+    Read off the class rather than listed by hand: a group added above but
+    forgotten in a list is never registered with lens, so ``span_groups: all``
+    leaves it out and selecting it yields silence rather than an error.
+    """
+    return frozenset(
+        value
+        for name, value in vars(RLSpanGroup).items()
+        if isinstance(value, str)
+        and name.isupper()
+        and name.startswith("U_") is umbrella
+    )
+
+
+RLSpanGroup.ALL_GROUPS = _group_values(umbrella=False)
+
+#: The ``U_`` aliases, whose spans carry no ``rl.bucket``. Consumed by
+#: ``instrumentation.UMBRELLA_GROUPS``, which cannot compute it itself without
+#: importing this module's internals.
+UMBRELLA_GROUP_VALUES: Final[frozenset[str]] = _group_values(umbrella=True)
 
 
 def register_span_groups(*, allow_override: bool = True) -> None:

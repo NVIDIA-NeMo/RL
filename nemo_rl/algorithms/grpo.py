@@ -48,6 +48,7 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.metric_utils import (
+    SETUP_TIMING_PREFIX,
     SetupTimingMetrics,
     print_setup_timing_summary,
 )
@@ -1957,7 +1958,7 @@ def setup(
     # Log worker initialization timing metrics to logger
     print_setup_timing_summary(setup_timing_metrics)
     logger.log_metrics(
-        setup_timing_metrics.to_metrics_dict(), step=0, prefix="timing/setup"
+        setup_timing_metrics.to_metrics_dict(), step=0, prefix=SETUP_TIMING_PREFIX
     )
 
     print("\n" + "=" * 60)

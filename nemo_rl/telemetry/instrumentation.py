@@ -53,7 +53,11 @@ from nemo.lens import (
     safe_set_span_attributes as _safe_set_span_attributes,
 )
 
-from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.telemetry.span_groups import UMBRELLA_GROUP_VALUES, RLSpanGroup
+from nemo_rl.telemetry.vocabulary import (
+    INIT_TOTAL_CATEGORY,
+    RUN_WINDOW_WALL_CLOCK_CATEGORIES,
+)
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Tracer
@@ -129,34 +133,13 @@ class Bucket(str, Enum):
     WASTED = "wasted"
 
 
-# Span groups that are umbrellas / lifecycle only — no rl.bucket tag.
-# Spelled with the U_ aliases so this set and the call sites that use it read
-# the same; the values are identical to the unprefixed names.
-UMBRELLA_GROUPS: frozenset[str] = frozenset(
-    {
-        RLSpanGroup.U_JOB,
-        RLSpanGroup.U_STEP,
-        RLSpanGroup.U_ROLLOUT,  # collect_rollouts umbrella
-        RLSpanGroup.U_MODEL_INIT,
-        RLSpanGroup.U_EVALUATE,  # eval pass; treat as umbrella unless timed as idle
-        # Startup is real overhead, but no subset of these spans is summable:
-        # the phases nest (rl.startup over rl.setup.workers over
-        # rl.vllm.load_model) and the worker builds run concurrently under
-        # parallel init, so a rollup adding them by rl.bucket would multiply
-        # startup rather than measure it. The flat number lives in the
-        # rl.setup.duration metric at phase=total_setup, which is the one value
-        # that cannot double-count. These spans are for shape only.
-        RLSpanGroup.U_SETUP,
-        # Per-prompt work on the single-controller path is exactly the work that
-        # overlaps itself: up to max_inflight_prompts rollouts are in flight at
-        # once (1280 in some recipes), so any bucket these carried would sum to
-        # a large multiple of the wall clock they happened in. That applies to
-        # the data-plane put inside a rollout as much as to the rollout span
-        # itself, which is why this group overrides DATA_PLANE's overhead
-        # bucket there -- see per_prompt_scope.
-        RLSpanGroup.U_PER_PROMPT,
-    }
-)
+# Span groups that are umbrellas / lifecycle only — no rl.bucket tag. Exactly
+# the U_ aliases, so it is read off the class: a new alias missing from a
+# hand-written set would be treated as a leaf and silently given a bucket.
+# Why each is an umbrella is documented on the alias itself; the short version
+# is that their spans nest or overlap, so summing them by rl.bucket would
+# report a multiple of the wall clock they happened in.
+UMBRELLA_GROUPS: frozenset[str] = UMBRELLA_GROUP_VALUES
 
 # Default classification for RLSpanGroup members that are leaf work.
 # logprob / advantage count as overhead (prep), not the productive policy
@@ -221,7 +204,7 @@ _DEFAULT_GROUP_BUCKET: Mapping[str, Bucket] = {
 EFFICIENCY_CATEGORY_BUCKET: Mapping[str, Bucket] = {
     # Metric + span, but the span is unbucketed (trace-only) — see
     # UNBUCKETED_SPAN_CATEGORIES.
-    "init/total": Bucket.OVERHEAD,
+    INIT_TOTAL_CATEGORY: Bucket.OVERHEAD,
     "idle/buffer_starvation": Bucket.IDLE,  # metric + span rl.idle.buffer_starvation
     "idle/refit_bubble": Bucket.IDLE,  # metric + span rl.idle.refit_bubble
     "idle/validation": Bucket.IDLE,  # metric only — span double-counts generate
@@ -281,8 +264,8 @@ COLLECTOR_LOOP_CATEGORIES: frozenset[str] = frozenset(
 # spans join this trace. Bucketing both would charge the same wall clock to two
 # buckets at once. The ``init/total`` *metric* keeps its bucket: it is read as a
 # single per-run number, not summed against sibling spans.
-UNBUCKETED_SPAN_CATEGORIES: frozenset[str] = COLLECTOR_LOOP_CATEGORIES | frozenset(
-    {"init/total"}
+UNBUCKETED_SPAN_CATEGORIES: frozenset[str] = (
+    COLLECTOR_LOOP_CATEGORIES | RUN_WINDOW_WALL_CLOCK_CATEGORIES
 )
 
 

@@ -97,7 +97,10 @@ from nemo_rl.algorithms.grpo import (
     aggregate_rollout_metrics,
     compute_and_apply_seq_logprob_error_masking,
 )
-from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
+from nemo_rl.algorithms.metric_utils import (
+    SETUP_TIMING_PREFIX,
+    SetupTimingMetrics,
+)
 from nemo_rl.algorithms.ppo import _compute_critic_metrics
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -522,7 +525,7 @@ class SingleControllerActor:
             hparams["token_capture"]["control_auth_token"] = "<redacted>"
         self._logger.log_hyperparams(hparams)
         self._logger.log_metrics(
-            setup_timing_metrics.to_metrics_dict(), step=0, prefix="timing/setup"
+            setup_timing_metrics.to_metrics_dict(), step=0, prefix=SETUP_TIMING_PREFIX
         )
         self._timer = Timer()
         self._throughput_sample_time: Optional[float] = None

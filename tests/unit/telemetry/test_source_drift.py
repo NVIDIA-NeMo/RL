@@ -59,6 +59,50 @@ def _string_arg(node: ast.Call, index: int = 0) -> str | None:
     )
 
 
+def _target_name(node: ast.expr) -> str | None:
+    """``self._rollout_span_name`` / ``NAME`` as a flat string, for the map below."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        return f"{node.value.id}.{node.attr}"
+    return None
+
+
+def _assigned_strings(tree: ast.AST) -> dict[str, set[str]]:
+    """``{target: every string literal assigned to it}`` within one module.
+
+    A span name held in a variable is invisible to a literal-only matcher, and
+    the branch that picks the name is exactly where a guard is worth having:
+    ``self._rollout_span_name`` is assigned ``rl.grpo.generation`` or
+    ``rl.ppo.generation`` depending on the algorithm the collector was built
+    for. All assignments are collected, so both branches are checked.
+    """
+    assigned: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Constant):
+            continue
+        if not isinstance(node.value.value, str):
+            continue
+        for target in node.targets:
+            name = _target_name(target)
+            if name:
+                assigned.setdefault(name, set()).add(node.value.value)
+    return assigned
+
+
+def _span_name_candidates(
+    node: ast.Call, index: int, assigned: dict[str, set[str]]
+) -> set[str]:
+    """Span names the *index*-th argument can carry, literal or via a variable."""
+    if len(node.args) <= index:
+        return set()
+    literal = _string_arg(node, index)
+    if literal is not None:
+        return {literal}
+    name = _target_name(node.args[index])
+    return set(assigned.get(name, ())) if name else set()
+
+
 # Span helpers whose first argument is a span group and whose second is the
 # span name. The umbrella pair emits the same span as the leaf pair, minus the
 # rl.bucket, so every guard here has to look at all four or it silently stops
@@ -78,28 +122,32 @@ _LEAF_HELPERS = frozenset({"managed_span", "trace_fn"})
 # happened in. Kept as an explicit list because the property that makes them
 # unsummable -- concurrency at the dispatch site -- is not visible in the span
 # name, so nothing else would catch a group swapped back.
-_CONCURRENT_ROLLOUT_SPANS = {
+_CONCURRENT_ROLLOUT_SPANS = (
     # One asyncio task per prompt group, bounded by max_inflight_prompts.
-    "rl.sc.generate_and_push": _ALGORITHMS / "single_controller.py",
-    # One batch-worker thread per rollout batch.
-    "rl.grpo.generation": _ALGORITHMS / "grpo.py",
-}
+    ("rl.sc.generate_and_push", _ALGORITHMS / "single_controller.py"),
+    # One batch-worker thread per rollout batch. The collector holds the name
+    # in an attribute, which is why the matcher below resolves variables; the
+    # per-step span of the same name in grpo.py is sequential, not this one.
+    ("rl.grpo.generation", _ALGORITHMS / "async_utils" / "trajectory_collector.py"),
+    ("rl.ppo.generation", _ALGORITHMS / "async_utils" / "trajectory_collector.py"),
+)
 
 
 def _span_groups_by_name(source: Path) -> dict[str, set[str]]:
     """``{span name: {group attribute names it is opened with}}`` for one file."""
+    tree = ast.parse(source.read_text())
+    assigned = _assigned_strings(tree)
     groups: dict[str, set[str]] = {}
-    for node in ast.walk(ast.parse(source.read_text())):
+    for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         called = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
-        if called not in _GROUP_TAKING_HELPERS:
-            continue
-        name = _string_arg(node, index=1)
-        if name is None or not node.args:
+        if called not in _GROUP_TAKING_HELPERS or not node.args:
             continue
         group = node.args[0]
-        if isinstance(group, ast.Attribute):
+        if not isinstance(group, ast.Attribute):
+            continue
+        for name in _span_name_candidates(node, 1, assigned):
             groups.setdefault(name, set()).add(group.attr)
     return groups
 
@@ -122,7 +170,7 @@ def test_concurrently_dispatched_rollout_spans_stay_unbucketed():
         if not attr.startswith("_") and getattr(RLSpanGroup, attr) in UMBRELLA_GROUPS
     }
 
-    for name, source in _CONCURRENT_ROLLOUT_SPANS.items():
+    for name, source in _CONCURRENT_ROLLOUT_SPANS:
         found = _span_groups_by_name(source).get(name)
         assert found, f"{name} is no longer emitted from {source.name}"
         bucketed = found - umbrella_attrs
@@ -233,117 +281,53 @@ def test_every_efficiency_timer_at_a_call_site_is_declared():
     assert used, "found no idle/* or wasted/* timers -- has the matcher gone stale?"
 
 
-def _teed_logger_keys() -> dict[str, int]:
-    """``{logger key: line}`` for every ``_TeedMetric`` declared in metrics.py.
+def _emitted_span_names(
+    called: str, node: ast.Call, assigned: dict[str, set[str]]
+) -> set[str]:
+    """The span names a call emits, empty if the call emits none.
 
-    Parsed rather than imported for the reason the module header gives, and
-    because the key is the first positional argument either way -- importing
-    would buy nothing but a dependency on lens being installed.
-    """
-    source = _REPO / "nemo_rl" / "telemetry" / "metrics.py"
-    keys: dict[str, int] = {}
-    for node in ast.walk(ast.parse(source.read_text())):
-        if not isinstance(node, ast.Call):
-            continue
-        if (getattr(node.func, "id", None) or getattr(node.func, "attr", None)) != (
-            "_TeedMetric"
-        ):
-            continue
-        key = _string_arg(node)
-        if key:
-            keys[key] = node.lineno
-    return keys
-
-
-def _metric_dict_keys(root: Path) -> dict[str, str]:
-    """String literals used as metrics-dict keys under *root*.
-
-    Two shapes, which is how every teed scalar is actually produced: a literal
-    key in a dict display, and a subscript assignment onto an accumulating dict.
-    Deliberately not "every string constant in the file" -- that would also
-    match a key named only in a docstring, and a rename that updated the prose
-    but not the code would still pass.
-    """
-    found: dict[str, str] = {}
-    for source in _python_sources(root):
-        where = source.relative_to(_REPO).as_posix()
-        for node in ast.walk(ast.parse(source.read_text())):
-            if isinstance(node, ast.Dict):
-                for key in node.keys:
-                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                        found.setdefault(key.value, where)
-            elif isinstance(node, ast.Assign | ast.AugAssign):
-                targets = (
-                    node.targets if isinstance(node, ast.Assign) else [node.target]
-                )
-                for target in targets:
-                    if (
-                        isinstance(target, ast.Subscript)
-                        and isinstance(target.slice, ast.Constant)
-                        and isinstance(target.slice.value, str)
-                    ):
-                        found.setdefault(target.slice.value, where)
-    return found
-
-
-def test_every_teed_logger_key_is_emitted():
-    """Direction is ``declared <= emitted``.
-
-    ``_TeedMetric`` is both the declaration of an OTel series and the mapping
-    from the logger key that feeds it, which is the whole point of keeping them
-    in one row: an earlier design kept a separate key-to-field map, three of its
-    entries pointed at keys nothing emitted, and those gauges reported a flat
-    line rather than an error. Nothing at runtime can catch that -- the tee
-    reads the key out of the metrics dict with ``.get`` and a miss is
-    indistinguishable from a step that did not report the value -- so a rename
-    on one side only has to fail here or not at all.
-    """
-    declared = _teed_logger_keys()
-    emitted: dict[str, str] = {}
-    for directory in (
-        _ALGORITHMS,
-        _REPO / "nemo_rl" / "models",
-        _REPO / "nemo_rl" / "experience",
-    ):
-        emitted.update(_metric_dict_keys(directory))
-
-    unemitted = {
-        key: f"metrics.py:{line}"
-        for key, line in declared.items()
-        if key not in emitted
-    }
-    assert not unemitted, (
-        "logger keys declared in _TEED_SCALARS that no call site emits, so each "
-        f"is a gauge that will report nothing: {unemitted}"
-    )
-    # Sanity on both halves, so neither a moved declaration nor a stale matcher
-    # can turn this into a tautology.
-    assert declared, "found no _TeedMetric declarations -- has the matcher gone stale?"
-    assert emitted, "found no metrics-dict keys -- has the matcher gone stale?"
-
-
-def _emitted_span_name(called: str, node: ast.Call) -> str | None:
-    """The span name a call emits, or None if the call does not emit one.
-
-    Three of the helpers build the name rather than taking it, so matching only
-    on a literal argument would miss them entirely -- which is how ``rl.idle.*``
+    Several helpers build the name rather than taking it, so matching only on a
+    literal argument would miss them entirely -- which is how ``rl.idle.*``
     stayed outside this guard until ``rl.setup.*`` arrived the same way.
     """
     if called in _GROUP_TAKING_HELPERS:
         # Span name is the second positional arg, after the span group.
-        return _string_arg(node, index=1)
+        return _span_name_candidates(node, 1, assigned)
     if called == "startup_span":
-        return "rl.startup"
+        return {"rl.startup"}
     if called == "setup_span":
         phase = _string_arg(node)
-        return f"rl.setup.{phase}" if phase else None
+        return {f"rl.setup.{phase}"} if phase else set()
     if called == "efficiency_span":
         category = _string_arg(node)
-        return f"rl.{category.replace('/', '.')}" if category else None
+        return {f"rl.{category.replace('/', '.')}"} if category else set()
     if called == "traced_worker_init":
         # Takes the name directly: the group is fixed at U_MODEL_INIT.
-        return _string_arg(node)
-    return None
+        name = _string_arg(node)
+        return {name} if name else set()
+    return set()
+
+
+def _data_plane_span_names() -> dict[str, str]:
+    """``{rl.data_plane.<op>: where}`` for every op the wrapper spans.
+
+    The wrapper interpolates the op into the span name, so these names never
+    appear as a literal anywhere and the docs guard below could not see them.
+    The op *is* a literal at each ``self._run("<op>", ...)`` call site, so it is
+    collected from there instead.
+    """
+    source = _REPO / "nemo_rl" / "data_plane" / "observability.py"
+    where = source.relative_to(_REPO).as_posix()
+    names: dict[str, str] = {}
+    for node in ast.walk(ast.parse(source.read_text())):
+        if not isinstance(node, ast.Call):
+            continue
+        if getattr(node.func, "attr", None) not in {"_run", "_run_async"}:
+            continue
+        op = _string_arg(node)
+        if op:
+            names[f"rl.data_plane.{op}"] = where
+    return names
 
 
 def test_every_emitted_span_name_is_documented():
@@ -361,17 +345,20 @@ def test_every_emitted_span_name_is_documented():
         )
     )
 
-    emitted: dict[str, str] = {}
+    emitted: dict[str, str] = dict(_data_plane_span_names())
     for directory in _SPAN_EMITTING_DIRS:
         for source in _python_sources(directory):
-            for node in ast.walk(ast.parse(source.read_text())):
+            tree = ast.parse(source.read_text())
+            assigned = _assigned_strings(tree)
+            for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
                     continue
                 called = getattr(node.func, "attr", None) or getattr(
                     node.func, "id", None
                 )
-                name = _emitted_span_name(called, node) if called else None
-                if name:
+                if not called:
+                    continue
+                for name in _emitted_span_names(called, node, assigned):
                     emitted[name] = source.relative_to(_REPO).as_posix()
 
     undocumented = {

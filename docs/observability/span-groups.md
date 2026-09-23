@@ -61,7 +61,7 @@ One consequence worth knowing: registration is an *import side effect*, so a gro
 | `advantage` | RL | `rl.<algo>.advantage_calculation` |
 | `policy_update` | RL | `rl.<algo>.policy_training` (and `rl.ppo.value_training` for PPO) |
 | `data_processing` | RL | `rl.<algo>.data_processing` |
-| `data_plane` | RL | `rl.data_plane.<op>` — one span per transfer-queue operation from a batch-shaped caller. The eleven ops are `register`, `claim_meta`, `get_data`, `check_consumption_status`, `put`, `get`, `list_sample_ids`, `clear`, `save_checkpoint`, `load_checkpoint`, `close` |
+| `data_plane` | RL | `rl.data_plane.<op>` — one span per transfer-queue operation from a batch-shaped caller. The eleven ops give `rl.data_plane.register`, `rl.data_plane.claim_meta`, `rl.data_plane.get_data`, `rl.data_plane.check_consumption_status`, `rl.data_plane.put`, `rl.data_plane.get`, `rl.data_plane.list_sample_ids`, `rl.data_plane.clear`, `rl.data_plane.save_checkpoint`, `rl.data_plane.load_checkpoint`, `rl.data_plane.close` |
 | `per_prompt` | RL | spans emitted once per prompt: `rl.sc.generate_and_push` and the rollout path's `rl.data_plane.put`. A cardinality axis rather than a phase — see [Per-prompt spans](#per-prompt-spans) |
 | `efficiency` | RL | idle phases on async GRPO — driver-side `rl.idle.buffer_starvation`, `rl.idle.refit_bubble`, and collector-side `rl.idle.refit_event_wait`, `rl.idle.generation_limit_pause` |
 

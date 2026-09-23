@@ -28,6 +28,21 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.metric_names import (
+    FINISHED_REASON_LABEL,
+    GENERATION_LENGTH_HISTOGRAMS,
+    GENERATION_LENGTH_MEAN_KEY,
+    GENERATION_TOKEN_COUNTERS,
+    GENERATION_TOKENS_KEY,
+    GENERATIONS_FAILED_KEY,
+    GENERATIONS_OK_KEY,
+    OK_FINISH_REASONS,
+    PROMPT_LENGTH_HISTOGRAMS,
+    PROMPT_LENGTH_MEAN_KEY,
+    PROMPT_TOKEN_COUNTERS,
+    PROMPT_TOKENS_KEY,
+    REQUEST_SUCCESS_COUNTERS,
+)
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
 R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
@@ -536,24 +551,6 @@ COUNTER_KEY_SEP = "|"
 HISTOGRAM_SUM_PART = "sum"
 HISTOGRAM_COUNT_PART = "count"
 
-# Engine series surfaced per step, beyond the spec-decode family. vLLM has
-# renamed several of these across releases (compare the alias lists in
-# nemo_rl/models/generation/dynamo/metrics.py), so each entry lists the
-# candidates in preference order and a missing one is simply skipped.
-PROMPT_TOKEN_COUNTERS = ("vllm:prompt_tokens", "vllm:prompt_tokens_total")
-GENERATION_TOKEN_COUNTERS = ("vllm:generation_tokens", "vllm:generation_tokens_total")
-PROMPT_LENGTH_HISTOGRAMS = ("vllm:request_prompt_tokens",)
-GENERATION_LENGTH_HISTOGRAMS = ("vllm:request_generation_tokens",)
-REQUEST_SUCCESS_COUNTERS = ("vllm:request_success", "vllm:request_success_total")
-
-# vLLM's FinishReason vocabulary: stop, length, abort, error, repetition. Only
-# the first two leave a usable sample behind -- ``length`` is a normal outcome in
-# RL, where a rollout routinely runs to max_tokens. Everything else is counted as
-# failed rather than dropped, so ok + failed stays equal to the engine's total
-# even if a future vLLM adds a reason we have never heard of.
-OK_FINISH_REASONS = frozenset({"stop", "length"})
-FINISHED_REASON_LABEL = "finished_reason"
-
 # Metric names kept from a worker's snapshot. The snapshot carries every series
 # vLLM exposes (~40), and forwarding all of them would put unbounded,
 # version-dependent cardinality on the step metrics.
@@ -671,24 +668,32 @@ def compute_engine_step_metrics(
         omitted rather than reported as zero, so a vLLM release that renames one
         leaves a gap in the dashboard instead of a plausible-looking zero.
     """
-    keys = set(start_counters) | set(end_counters)
-    delta = {k: end_counters.get(k, 0.0) - start_counters.get(k, 0.0) for k in keys}
+    # A series absent from the end snapshot stays absent (see Returns). These
+    # totals are summed over workers, so one that went backwards means an
+    # engine restarted mid-step (restart_shard) and reset its counters: the
+    # step's true count is unknown, so leave it out rather than report a
+    # negative number.
+    delta = {
+        k: end - start_counters.get(k, 0.0)
+        for k, end in end_counters.items()
+        if end >= start_counters.get(k, 0.0)
+    }
 
     metrics: dict[str, float] = {}
 
     prompt_tokens = _first_delta(delta, PROMPT_TOKEN_COUNTERS)
     if prompt_tokens is not None:
-        metrics["vllm/prompt_tokens"] = prompt_tokens
+        metrics[PROMPT_TOKENS_KEY] = prompt_tokens
     generation_tokens = _first_delta(delta, GENERATION_TOKEN_COUNTERS)
     if generation_tokens is not None:
-        metrics["vllm/generation_tokens"] = generation_tokens
+        metrics[GENERATION_TOKENS_KEY] = generation_tokens
 
     prompt_length = _mean_from_histogram(delta, PROMPT_LENGTH_HISTOGRAMS)
     if prompt_length is not None:
-        metrics["vllm/prompt_length_mean"] = prompt_length
+        metrics[PROMPT_LENGTH_MEAN_KEY] = prompt_length
     generation_length = _mean_from_histogram(delta, GENERATION_LENGTH_HISTOGRAMS)
     if generation_length is not None:
-        metrics["vllm/generation_length_mean"] = generation_length
+        metrics[GENERATION_LENGTH_MEAN_KEY] = generation_length
 
     ok, failed, saw_any = 0.0, 0.0, False
     for name in REQUEST_SUCCESS_COUNTERS:
@@ -705,8 +710,8 @@ def compute_engine_step_metrics(
         if saw_any:
             break
     if saw_any:
-        metrics["vllm/generations_ok"] = ok
-        metrics["vllm/generations_failed"] = failed
+        metrics[GENERATIONS_OK_KEY] = ok
+        metrics[GENERATIONS_FAILED_KEY] = failed
 
     return metrics
 

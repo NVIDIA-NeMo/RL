@@ -45,6 +45,7 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossFn,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.metric_utils import SETUP_TIMING_PREFIX
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
@@ -107,6 +108,7 @@ from nemo_rl.telemetry.instrumentation import (
 )
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.telemetry.vocabulary import TeedMetric, register_teed_metrics
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
@@ -1024,7 +1026,9 @@ def setup(
         print(f"  Total setup: {total_setup:.1f}s")
 
         # Log all metrics to the logger for analysis
-        logger.log_metrics(worker_init_timing_metrics, step=0, prefix="timing/setup")
+        logger.log_metrics(
+            worker_init_timing_metrics, step=0, prefix=SETUP_TIMING_PREFIX
+        )
 
     print("\n" + "=" * 60)
     print(" " * 18 + "SETUP COMPLETE")
@@ -1224,12 +1228,27 @@ def _create_advantage_estimator(master_config: MasterConfig):
     return adv_estimator
 
 
+CRITIC_LOSS_KEY = "critic/loss"
+
+#: Teed row for the value-model loss _compute_critic_metrics builds below.
+#: PPO-only, so it is declared here and a GRPO run never sees it.
+CRITIC_TEED_METRICS = (
+    TeedMetric(
+        CRITIC_LOSS_KEY,
+        "rl.value.loss",
+        description="Value/critic training loss (PPO).",
+    ),
+)
+
+register_teed_metrics(CRITIC_TEED_METRICS)
+
+
 def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
     """Aggregate value-model metrics under the ``critic/`` namespace."""
     value_mb_metrics = value_results.get("all_mb_metrics", {})
     critic_metrics: dict[str, Any] = {
         "critic/grad_norm": value_results["grad_norm"].numpy(),
-        "critic/loss": value_results["loss"].numpy(),
+        CRITIC_LOSS_KEY: value_results["loss"].numpy(),
     }
     for key, value in value_mb_metrics.items():
         metric_name = f"critic/{key}"

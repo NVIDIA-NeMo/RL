@@ -57,6 +57,7 @@ from nemo_rl.distributed.model_utils import (
     vocab_parallel_gather_columns,
     vocab_parallel_log_softmax,
 )
+from nemo_rl.telemetry.vocabulary import TeedMetric, register_teed_metrics
 
 if TYPE_CHECKING:
     # Import-time only: nemo_rl.algorithms.opd imports the data plane, which
@@ -64,6 +65,27 @@ if TYPE_CHECKING:
     from nemo_rl.algorithms.opd import OnPolicyDistillationFullConfig
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
+
+KL_PENALTY_KEY = "kl_penalty"
+APPROX_ENTROPY_KEY = "approx_entropy"
+
+#: Teed rows for the two metrics the losses below compute. The kl_penalty key
+#: is named for the penalty, but the value has the coefficient divided back
+#: out, so the series it feeds really is the divergence.
+LOSS_TEED_METRICS = (
+    TeedMetric(
+        KL_PENALTY_KEY,
+        "rl.kl.divergence",
+        description="KL divergence from the reference policy.",
+    ),
+    TeedMetric(
+        APPROX_ENTROPY_KEY,
+        "rl.entropy",
+        description="Approximate policy entropy.",
+    ),
+)
+
+register_teed_metrics(LOSS_TEED_METRICS)
 
 
 class DraftCrossEntropyLossConfig(TypedDict):
@@ -408,7 +430,7 @@ class ClippedPGLossFn(LossFunction):
         self.metric_normalizations: dict[str, MetricNormalizer] = {
             # Normalized like the gradient (loss_type-dependent).
             "loss": grad_normalizer,
-            "kl_penalty": grad_normalizer,
+            KL_PENALTY_KEY: grad_normalizer,
             # Token-normalized diagnostics, independent of loss_type.
             "probs_ratio": MetricNormalizer.TOKENS,
             "probs_ratio_clamped": MetricNormalizer.TOKENS,
@@ -416,7 +438,7 @@ class ClippedPGLossFn(LossFunction):
             "gen_kl_error": MetricNormalizer.TOKENS,
             "policy_kl_error": MetricNormalizer.TOKENS,
             "js_divergence_error": MetricNormalizer.TOKENS,
-            "approx_entropy": MetricNormalizer.TOKENS,
+            APPROX_ENTROPY_KEY: MetricNormalizer.TOKENS,
             # Keyed on sequence_level_importance_ratios, NOT loss_type.
             "sampling_importance_ratio": (
                 MetricNormalizer.SEQUENCES
@@ -450,7 +472,7 @@ class ClippedPGLossFn(LossFunction):
             # policy-gradient diagnostics above are never produced there.
             self.metric_normalizations = {
                 "loss": grad_normalizer,
-                "kl_penalty": grad_normalizer,
+                KL_PENALTY_KEY: grad_normalizer,
                 "num_valid_samples": MetricNormalizer.NONE,
                 "opd_full_reverse_kl": MetricNormalizer.TOKENS,
                 "opd_full_reverse_kl_min": MetricNormalizer.NONE,
@@ -949,14 +971,14 @@ class ClippedPGLossFn(LossFunction):
                 "probs_ratio_max": probs_ratio_max,
                 "probs_ratio_clamped_min": probs_ratio_clamped_min,
                 "probs_ratio_clamped_max": probs_ratio_clamped_max,
-                "kl_penalty": kl.item() / self.reference_policy_kl_penalty if kl else 0,
+                KL_PENALTY_KEY: kl.item() / self.reference_policy_kl_penalty if kl else 0,
                 "token_mult_prob_error": mult_prob_error,
                 "gen_kl_error": gen_kl_error,
                 "policy_kl_error": policy_kl_error,
                 "js_divergence_error": js_divergence_error,
                 "sampling_importance_ratio": sample_importance_ratio.item(),
                 "num_valid_samples": sample_mask.sum().item(),
-                "approx_entropy": seq_entropy_approx.item(),
+                APPROX_ENTROPY_KEY: seq_entropy_approx.item(),
                 **_is_filter_metrics,
                 **seq_error_metrics,
                 "positive_nll_loss": nll_loss.item(),
@@ -1072,7 +1094,7 @@ class ClippedPGLossFn(LossFunction):
                 # Report the raw KL, undoing the coefficient. Guard on the
                 # coefficient: `kl` is 0-dim, so its `numel()` is always 1 and
                 # cannot stand in for "the penalty is active".
-                "kl_penalty": (
+                KL_PENALTY_KEY: (
                     kl.item() / self.reference_policy_kl_penalty
                     if self.reference_policy_kl_penalty
                     else 0
