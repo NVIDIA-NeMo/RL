@@ -107,9 +107,8 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 
 ### Direct manifest reads for NeMo-Gym token capture
 
-For a Gym actor and its policy proxy that share the same node-local filesystem,
-use direct manifest reads to avoid HTTP connector admission for completed
-rollouts:
+When a Gym actor and its policy proxy share the same node-local filesystem,
+read completed-rollout manifests directly from the ledger:
 
 ```yaml
 token_capture:
@@ -121,46 +120,30 @@ token_capture:
   capture_dir: /dev/shm/gym_token_capture/my-run
 ```
 
-The GRPO and PPO single-controller exemplars select `local_file`. The schema
-keeps `http` as its default for existing configurations that omit the field.
-`manifest_read_workers` and `manifest_queue_size` must be positive integers;
-`control_timeout_s` must be positive and finite. HTTP mode retains the shared
-Gym client and sequential receipt processing from main.
+The proxy commits `<capture_dir>/lineage/<rollout_id>.lineage.jsonl` before
+returning its response. The actor snapshots that file under the writer's shared
+lock, then parses and assembles the existing token-free receipt in a dedicated
+thread pool. The controller and finalizer continue using the same receipt and
+TransferQueue payloads. Rollout HTTP traffic and uvloop stay unchanged.
 
-Each Gym proxy commits call metadata to
-`<capture_dir>/lineage/<rollout_id>.lineage.jsonl` before serving its response.
-After the rollout completes, the Gym actor admits a job to one bounded service
-shared by all of its rollout streams. Its dedicated threads snapshot the ledger
-under the writer's shared file lock, release the lock, parse the manifest, and
-build the existing token-free receipt. The controller sends that receipt to the
-existing finalizer, which fetches token payloads from TransferQueue. The actor's
-rollout HTTP client and uvloop remain enabled.
+All streams in an actor share the pool. A semaphore caps executor submissions at
+`manifest_read_workers + manifest_queue_size`; other callers wait asynchronously.
+One deadline covers admission, read and assembly. A timeout or cancelled caller
+signals the worker but retains its permit until the job actually finishes.
+Ready receipts stream immediately. Existing rollout timing metrics include
+`manifest_read_total`; there is no manifest cache or separate metrics service.
+Start with two workers: additional parsing threads can increase GIL contention.
 
-Use a unique capture directory per run. The Gym library must provide
-`FileManifestReader` and writer identity markers. After starting the proxy,
-actor startup verifies matching host, directory device, and inode; missing or
-mismatched visibility fails startup with a diagnostic. A remote filesystem with
-the same path string is not sufficient. There is no automatic HTTP fallback;
-select `manifest_transport: http` explicitly for deployments without local
-visibility.
+Use a unique capture directory per run. Startup checks the writer's hostname,
+directory device and inode, and fails if the actor cannot see the same ledger.
+The companion Gym reader API is required. There is no automatic HTTP fallback.
+Missing/corrupt/timed-out manifests retain the existing receipt/finalizer failure
+behavior; deadlines still depend on the actor event loop getting CPU.
 
-One deadline covers queue admission and waiting for the finished receipt. On
-expiry the caller receives a failed result and finalization produces a
-placeholder, as for an unavailable HTTP manifest. The thread is signalled to
-cancel, but its slot remains occupied until it returns. Closing a rollout
-stream cancels its pending admissions, read futures, and rollout task; other
-streams continue using the same actor-wide service. Schema-invalid ledgers
-produce a corruption result without terminating a reader consumer. Timeout
-callbacks run when the actor event loop can execute, so a busy event loop can
-still delay result delivery.
-
-Periodic `manifest_local_file` logs report bounded latency samples, outcomes,
-and queue/worker high-water marks. Start with two threads; increase capacity
-only after measuring contention and actor event-loop latency. No manifest
-cache grows with rollout count. Transport, timeout, and reader
-capacity settings are operational fingerprint exclusions, so switching them
-does not change receipt/checkpoint compatibility.
-
+The schema default remains `http` for older configurations; the GRPO/PPO
+single-controller examples select `local_file`. Worker count and queue capacity
+must be positive integers; the timeout must be positive and finite. These
+operational settings are excluded from checkpoint compatibility fingerprints.
 
 ## Checkpointing and Replay Recovery
 

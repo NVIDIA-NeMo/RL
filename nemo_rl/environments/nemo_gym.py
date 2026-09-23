@@ -20,7 +20,6 @@ import sys
 import threading
 from collections import Counter
 from collections.abc import AsyncGenerator, Awaitable, Mapping
-from contextlib import aclosing
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -54,12 +53,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym_manifest import (
-    ManifestReadJob,
-    ManifestReadResult,
-    ManifestReceiptService,
-    format_metrics_line,
-)
+from nemo_rl.environments.nemo_gym_manifest import ManifestReceiptReader
 from nemo_rl.environments.nemo_gym_multimodal import (
     _index_per_turn_images,
     _is_trainable_output_item,
@@ -96,7 +90,6 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 NEMO_GYM_ACTOR_FQN = "nemo_rl.environments.nemo_gym.NemoGym"
 NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S = 120
 _MANIFEST_ROOT_WAIT_S = 120.0
-_MANIFEST_REPORT_INTERVAL_S = 60.0
 
 # The three server-type keys Gym nests under a top-level config entry. Gym's
 # constant is private (nemo_gym.discovery._SERVER_GROUP_KEYS), and the literal
@@ -454,9 +447,7 @@ class NemoGym(EnvironmentInterface):
         self._manifest_transport = token_capture.manifest_transport
         self._manifest_read_workers = token_capture.manifest_read_workers
         self._manifest_queue_size = token_capture.manifest_queue_size
-        self._manifest_reader: Any = None
-        self._manifest_service: Optional[ManifestReceiptService] = None
-        self._manifest_last_report = 0.0
+        self._manifest_reader: Optional[ManifestReceiptReader] = None
         self._control_headers: Dict[str, str] = {}
         self._server_client = None
         # Populated by _spinup. Declared here so a restarted actor -- Ray recreates it
@@ -654,144 +645,31 @@ Depending on your data shape, you may want to change these values."""
             self._init_local_manifest_reader(os.path.join(capture_dir, "lineage"))
 
     def _init_local_manifest_reader(self, root: str) -> None:
-        """Verify the writer's ledger root is visible here and open a reader on it.
-
-        Setup failures (missing root, no writer marker, different device/inode
-        or host, Gym without the reader API) raise: local mode never falls
-        back to HTTP silently.
-        """
+        # Deferred: Gym is an optional dependency outside Gym actors.
         try:
-            from nemo_gym.token_id_capture.lineage import (
+            from nemo_gym.token_id_capture import (
                 FileManifestReader,
-                LedgerRootMismatch,
                 verify_ledger_root_visibility,
             )
-        except ImportError as error:
-            raise RuntimeError(
-                "token_capture.manifest_transport=local_file requires a NeMo-Gym that "
-                "provides nemo_gym.token_id_capture.lineage.FileManifestReader; the "
-                f"installed Gym predates it ({error})"
-            ) from error
-        try:
-            diagnostics = verify_ledger_root_visibility(
-                root, require_writer_marker=True, wait_s=_MANIFEST_ROOT_WAIT_S
-            )
-            self._manifest_reader = FileManifestReader(root)
-        except LedgerRootMismatch as error:
-            raise RuntimeError(
-                "token_capture.manifest_transport=local_file: the NemoGym actor does not "
-                f"see the ledger the policy proxy writes ({error}). Local mode requires "
-                "actor and Gym policy server on one node sharing capture_dir; use "
-                "manifest_transport: http otherwise."
-            ) from error
-        # Keep first-use imports out of the first completion burst.
-        from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON  # noqa: F401
-        from nemo_gym.token_id_capture.staging import resolve_terminal  # noqa: F401
-        from nemo_gym.token_id_capture.staging.records import CallRecord  # noqa: F401
-        from nemo_gym.token_id_capture.staging.terminal import (  # noqa: F401
-            select_terminal_call,
-        )
 
-        reader = diagnostics["reader"]
-        tmpfs = reader.get("is_tmpfs")
-        print(
-            "token-capture manifest transport: local_file "
-            f"root={root} host={reader.get('hostname')} dev={reader.get('device')} "
-            f"ino={reader.get('inode')} tmpfs={tmpfs} writers={diagnostics['writers']} "
-            f"matching_writers={diagnostics['matching_writers']} "
-            f"workers={self._manifest_read_workers} queue={self._manifest_queue_size} "
-            f"deadline_s={self._control_timeout_s}",
-            flush=True,
-        )
-        if tmpfs is False:
-            print(
-                f"WARNING: token-capture ledger root {root} is not on tmpfs; direct "
-                "reads still work but this recipe expects /dev/shm.",
-                flush=True,
-            )
-
-    async def _ensure_manifest_service(self) -> ManifestReceiptService:
-        """Start the actor-wide bounded reader on first use (needs a running loop)."""
-        service = self._manifest_service
-        if service is None:
-            if self._manifest_reader is None:
-                raise RuntimeError(
-                    "token_capture.manifest_transport=local_file is configured but the "
-                    "ledger reader was not initialised at spinup"
-                )
-            service = ManifestReceiptService(
-                self._manifest_reader,
+            verify_ledger_root_visibility(root, wait_s=_MANIFEST_ROOT_WAIT_S)
+            self._manifest_reader = ManifestReceiptReader(
+                FileManifestReader(root),
                 self._assemble_receipt,
                 workers=self._manifest_read_workers,
                 queue_size=self._manifest_queue_size,
                 timeout_s=self._control_timeout_s,
             )
-            service.start()
-            self._manifest_service = service
-            self._manifest_last_report = monotonic()
-        return service
-
-    @staticmethod
-    def _local_receipt_job(
-        nemo_gym_row: dict, nemo_gym_result: dict
-    ) -> ManifestReadJob:
-        assert isinstance(nemo_gym_result, dict), (
-            f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
+        except (ImportError, RuntimeError, OSError) as error:
+            raise RuntimeError(
+                f"Cannot enable manifest_transport=local_file for {root}: {error}. "
+                "Install the companion Gym reader and share capture_dir with the policy "
+                "proxy on the same node, or select manifest_transport: http."
+            ) from error
+        print(
+            f"token-capture manifests: local_file root={root} workers={self._manifest_read_workers}",
+            flush=True,
         )
-        terminal_response_id = nemo_gym_result.get("terminal_response_id")
-        if not (isinstance(terminal_response_id, str) and terminal_response_id):
-            terminal_response_id = None
-        scored_response = nemo_gym_result.get("response")
-        if not isinstance(scored_response, dict):
-            scored_response = None
-        return ManifestReadJob(
-            rollout_id=nemo_gym_row[_NG_ROLLOUT_ID_BODY_KEY],
-            terminal_response_id=terminal_response_id,
-            scored_response=scored_response,
-            reward=float(nemo_gym_result.get("reward") or 0.0),
-        )
-
-    def _local_receipt_payload(
-        self, nemo_gym_row: dict, nemo_gym_result: dict, read: ManifestReadResult
-    ) -> dict:
-        """Same token-free result shape ``_postprocess_receipt_mode`` returns."""
-        if read.receipt is None:
-            # An unreadable manifest finalizes as a placeholder row, exactly
-            # like an unfetchable one in HTTP mode.
-            print(
-                f"manifest({read.rollout_id}) fetch failed (local_file "
-                f"{read.error_kind}): {read.error}",
-                flush=True,
-            )
-        self._maybe_report_manifest_metrics()
-        return {
-            "message_log": [],
-            "input_message_log": [],
-            "full_result": nemo_gym_result,
-            "rollout_id": read.rollout_id,
-            "receipt": read.receipt,
-        }
-
-    def _maybe_report_manifest_metrics(self, *, force: bool = False) -> None:
-        service = self._manifest_service
-        if service is None:
-            return
-        now = monotonic()
-        if not force and now - self._manifest_last_report < _MANIFEST_REPORT_INTERVAL_S:
-            return
-        self._manifest_last_report = now
-        metrics = service.metrics_snapshot(reset=True)
-        if metrics.get("count/completed", 0) > 0:
-            print(format_metrics_line("token-capture", metrics), flush=True)
-
-    async def _postprocess_receipt_local(
-        self, nemo_gym_row: dict, nemo_gym_result: dict
-    ) -> dict:
-        """Local-mode twin of ``_postprocess_receipt_mode`` (one rollout, awaited)."""
-        service = await self._ensure_manifest_service()
-        job = self._local_receipt_job(nemo_gym_row, nemo_gym_result)
-        read = await service.receipt(job)
-        return self._local_receipt_payload(nemo_gym_row, nemo_gym_result, read)
 
     def set_tokenizer(self, tokenizer: PreTrainedTokenizerBase) -> None:
         """Install the tokenizer run_rollouts postprocesses with.
@@ -934,151 +812,80 @@ Depending on your data shape, you may want to change these values."""
         _require_resolved_agent_refs(nemo_gym_examples)
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
-        async def _await_rollout(
-            task: Awaitable[tuple[dict, dict]],
-        ) -> tuple[dict, dict]:
-            try:
-                return await task
-            except Exception as error:
-                if hasattr(error, "response_content"):
-                    print("EXCEPTION RESULT", error.response_content, file=sys.stderr)
-                typed = _typed_gym_failure(error)
-                if typed is not None:
-                    # Chaining would put the unpicklable Gym exception back on the wire.
-                    raise typed from None
-                raise
+        local_manifests = (
+            self._token_capture_enabled and self._manifest_transport == "local_file"
+        )
+        receipt_tasks: set[asyncio.Task[tuple[dict, dict]]] = set()
+        if local_manifests:
 
-        manifest_service = None
-        if self._token_capture_enabled and self._manifest_transport == "local_file":
-            manifest_service = await self._ensure_manifest_service()
+            async def complete(task: Awaitable[tuple[dict, dict]]) -> tuple[dict, dict]:
+                row, result = await task
+                started = monotonic()
+                result = await self._postprocess_receipt_mode(row, result)
+                timer.record(
+                    f"{timer_prefix}/manifest_read_total",
+                    monotonic() - started,
+                    should_log=False,
+                )
+                return row, result
 
-        async def _postprocessed_results() -> AsyncGenerator[tuple[dict, dict], None]:
-            outstanding: dict[
-                asyncio.Future[ManifestReadResult], tuple[dict, dict]
-            ] = {}
-            admission: Optional[asyncio.Task[asyncio.Future[ManifestReadResult]]] = None
-            admission_row: Optional[tuple[dict, dict]] = None
-            next_rollout: Optional[asyncio.Task[tuple[dict, dict]]] = None
+            # Rollouts are already dispatched by Gym. Stream ready receipts without
+            # waiting for slower siblings; the actor-wide reader bounds file work.
+            receipt_tasks = {
+                asyncio.create_task(complete(task)) for task in nemo_gym_result_iterator
+            }
+            nemo_gym_result_iterator = asyncio.as_completed(receipt_tasks)
 
-            def take_admission() -> None:
-                nonlocal admission, admission_row
-                if admission is not None and admission.done():
-                    future = admission.result()
-                    assert admission_row is not None
-                    outstanding[future] = admission_row
-                    admission = None
-                    admission_row = None
+            def finished(task: asyncio.Task[tuple[dict, dict]]) -> None:
+                # Do not retain delivered rollout payloads until the batch ends.
+                receipt_tasks.discard(task)
+                if not task.cancelled():
+                    task.exception()  # Observe errors even if the stream closes early.
 
-            def ready_items() -> list[tuple[dict, dict]]:
-                items = []
-                for finished in [future for future in outstanding if future.done()]:
-                    row, result = outstanding.pop(finished)
-                    read = finished.result()
-                    timer.record(f"{timer_prefix}/manifest_read_total", read.total_s)
-                    timer.record(
-                        f"{timer_prefix}/manifest_admission_wait", read.admission_wait_s
-                    )
-                    items.append((row, self._local_receipt_payload(row, result, read)))
-                return items
+            for task in receipt_tasks:
+                task.add_done_callback(finished)
 
-            try:
-                for task in nemo_gym_result_iterator:
-                    if manifest_service is None:
-                        # Preserve sequential HTTP/non-capture processing.
-                        with timer.time(label=f"{timer_prefix}/await_results"):
-                            row, result = await _await_rollout(task)
-                        with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                            if self._token_capture_enabled:
-                                processed = await self._postprocess_receipt_mode(
-                                    row, result
-                                )
-                            else:
-                                processed = self._postprocess_nemo_gym_to_nemo_rl_result(
-                                    row,
-                                    result,
-                                    tokenizer,
-                                    include_initial_multimodal_data=not deduplicate_multimodal_data,
-                                )
-                                if _has_nan_generation_logprobs(processed):
-                                    raise RuntimeError(
-                                        "Generation logprobs contain NaN"
-                                    )
-                        yield row, processed
-                        continue
-
-                    next_rollout = asyncio.create_task(_await_rollout(task))
-                    while True:
-                        if next_rollout.done() and (
-                            next_rollout.cancelled()
-                            or next_rollout.exception() is not None
-                        ):
-                            # A failed rollout must not wait behind a full manifest queue.
-                            next_rollout.result()
-                        take_admission()
-                        for item in ready_items():
-                            yield item
-                        if next_rollout.done() and admission is None:
-                            row, result = next_rollout.result()
-                            next_rollout = None
-                            # At most one blocked admission per stream. Ready
-                            # receipts keep flowing while the shared queue is full.
-                            admission_row = (row, result)
-                            admission = asyncio.create_task(
-                                manifest_service.submit(
-                                    self._local_receipt_job(row, result)
-                                )
+        try:
+            num_results = 0
+            for task in nemo_gym_result_iterator:
+                with timer.time(label=f"{timer_prefix}/await_results"):
+                    try:
+                        nemo_gym_row, nemo_gym_result = await task
+                    except Exception as error:
+                        if hasattr(error, "response_content"):
+                            print(
+                                "EXCEPTION RESULT",
+                                error.response_content,
+                                file=sys.stderr,
                             )
-                            break
-                        waiters = set(outstanding)
-                        if admission is not None:
-                            waiters.add(admission)
-                        if not next_rollout.done():
-                            waiters.add(next_rollout)
-                        label = (
-                            "postprocess_results"
-                            if outstanding or admission
-                            else "await_results"
+                        typed = _typed_gym_failure(error)
+                        if typed is not None:
+                            # `from None`, deliberately: chaining the original would put the
+                            # unpicklable exception back on the wire as __cause__ and undo
+                            # the whole point. The status and message are already in `detail`.
+                            raise typed from None
+                        raise
+
+                with timer.time(label=f"{timer_prefix}/postprocess_results"):
+                    if local_manifests:
+                        nemo_rl_result = nemo_gym_result
+                    elif self._token_capture_enabled:
+                        # Receipt mode: fetch the ledger manifest and assemble the
+                        # receipt locally; token-free result. The canonical row is
+                        # rebuilt by the finalizer, so no message_log walk (and no
+                        # NaN check) applies here.
+                        nemo_rl_result = await self._postprocess_receipt_mode(
+                            nemo_gym_row, nemo_gym_result
                         )
-                        with timer.time(label=f"{timer_prefix}/{label}"):
-                            await asyncio.wait(
-                                waiters, return_when=asyncio.FIRST_COMPLETED
-                            )
-
-                while admission is not None or outstanding:
-                    take_admission()
-                    for item in ready_items():
-                        yield item
-                    waiters = set(outstanding)
-                    if admission is not None:
-                        waiters.add(admission)
-                    if waiters:
-                        with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                            await asyncio.wait(
-                                waiters, return_when=asyncio.FIRST_COMPLETED
-                            )
-            finally:
-                # Keep ownership across cancellation, errors and generator close.
-                # An admission may have returned a future before take_admission()
-                # had a chance to register it; that future belongs to us too.
-                owned: set[asyncio.Future[Any]] = set(outstanding)
-                if next_rollout is not None:
-                    owned.add(next_rollout)
-                if admission is not None:
-                    owned.add(admission)
-                    if (
-                        admission.done()
-                        and not admission.cancelled()
-                        and admission.exception() is None
-                    ):
-                        owned.add(admission.result())
-                for future in owned:
-                    future.cancel()
-                if owned:
-                    await asyncio.gather(*owned, return_exceptions=True)
-
-        num_results = 0
-        async with aclosing(_postprocessed_results()) as results:
-            async for nemo_gym_row, nemo_rl_result in results:
+                    else:
+                        nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                            nemo_gym_row,
+                            nemo_gym_result,
+                            tokenizer,
+                            include_initial_multimodal_data=not deduplicate_multimodal_data,
+                        )
+                        if _has_nan_generation_logprobs(nemo_rl_result):
+                            raise RuntimeError("Generation logprobs contain NaN")
                 num_results += 1
                 timing_metrics = None
                 if num_results == len(nemo_gym_examples):
@@ -1107,14 +914,20 @@ Depending on your data shape, you may want to change these values."""
                         file=sys.stderr,
                     )
 
-                # Return the identity Gym resolved inside this actor so the caller
-                # can hydrate the row copy it serialized before resolution.
+                # task_source is resolved to agent_ref inside this Ray actor, after
+                # the caller's row was serialized. Return the resolved ref explicitly
+                # so the caller can hydrate its own row copy before postprocessing.
                 yield (
                     nemo_gym_row["_rowidx"],
                     nemo_gym_row["agent_ref"],
                     nemo_rl_result,
                     timing_metrics,
                 )
+        finally:
+            for task in receipt_tasks:
+                task.cancel()
+            if receipt_tasks:
+                await asyncio.gather(*receipt_tasks, return_exceptions=True)
 
     async def _postprocess_receipt_mode(
         self, nemo_gym_row: dict, nemo_gym_result: dict
@@ -1127,8 +940,6 @@ Depending on your data shape, you may want to change these values."""
         Ray return carries only the receipt (~100 B/call) beside the
         agent-level result.
         """
-        if self._manifest_transport == "local_file":
-            return await self._postprocess_receipt_local(nemo_gym_row, nemo_gym_result)
         assert isinstance(nemo_gym_result, dict), (
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
@@ -1146,17 +957,29 @@ Depending on your data shape, you may want to change these values."""
             scored_response = None
         receipt = None
         try:
-            manifest = await self._control(
-                "GET",
-                f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/{rollout_id}/manifest",
-            )
-            receipt = self._assemble_receipt(
-                rollout_id,
-                manifest,
-                terminal_response_id=terminal_response_id,
-                scored_response=scored_response,
-                reward=float(nemo_gym_result.get("reward") or 0.0),
-            )
+            if self._manifest_transport == "local_file":
+                if self._manifest_reader is None:
+                    raise RuntimeError(
+                        "local manifest reader was not initialized at spinup"
+                    )
+                receipt = await self._manifest_reader.read_receipt(
+                    rollout_id,
+                    terminal_response_id=terminal_response_id,
+                    scored_response=scored_response,
+                    reward=float(nemo_gym_result.get("reward") or 0.0),
+                )
+            else:
+                manifest = await self._control(
+                    "GET",
+                    f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/{rollout_id}/manifest",
+                )
+                receipt = self._assemble_receipt(
+                    rollout_id,
+                    manifest,
+                    terminal_response_id=terminal_response_id,
+                    scored_response=scored_response,
+                    reward=float(nemo_gym_result.get("reward") or 0.0),
+                )
         except (RuntimeError, OSError) as error:
             # An unfetchable manifest finalizes as a placeholder row.
             print(f"manifest({rollout_id}) fetch failed: {error}", flush=True)
@@ -1576,9 +1399,8 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
         """
         rh, self.rh = self.rh, None
         try:
-            if self._manifest_service is not None:
-                self._maybe_report_manifest_metrics(force=True)
-                await self._manifest_service.close()
+            if self._manifest_reader is not None:
+                await self._manifest_reader.close()
         finally:
             if rh is not None:
                 rh.shutdown()
