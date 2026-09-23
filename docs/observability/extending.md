@@ -189,7 +189,7 @@ if telemetry is not None:
 | Resource attribute | `rl.<attr>` / shared `dl.<attr>` | `rl.model`, `dl.tensor_parallel.size` |
 | Metric name | `rl.<subsystem>.<metric>` (application scope) | `rl.efficiency.seconds` |
 
-Metric names use the **application scope** (`rl.*`) — never `dl.*`. Attribute names shared across consumers use the constants in `nemo.lens.semconv`; RL-specific short strings are fine hard-coded.
+Metric names use the **application scope** (`rl.*`) — never `dl.*`. NeMo-RL names its own attributes, in `nemo_rl/telemetry/`, rather than importing them from `nemo.lens.semconv`: they describe RL's properties, so RL is where a rename has to happen. The lens constants are for the few attributes lens itself sets, such as `nv.dl.rank`.
 
 ## Choosing a span group
 
@@ -231,21 +231,27 @@ Group names live in one flat namespace shared with every other library in the pr
 
 NeMo-RL records its `rl.*` metrics from the driver rather than scattering record calls through the algorithm code (see [Metrics](metrics.md)). NeMo-RL owns every `rl.*` metric name: they are declared with lens's metric registry, so adding one needs no lens change.
 
-**If the value already flows through `Logger.log_metrics`** — the common case — you only add a row. Append a `_TeedMetric` to `_TRAIN_SCALARS` (or `_VLLM_STEP_METRICS`) in `nemo_rl/telemetry/metrics.py`, giving the logger key, the registry key, the OTel name and the kind:
+**If the value already flows through `Logger.log_metrics`** — the common case — declare it next to the code that produces it, not in `nemo_rl/telemetry/`. Add a `TeedMetric` row in the module that logs the key and register it there:
 
 ```python
-_TeedMetric(
-    "my_logger_key", "my_metric", "rl.my.metric", kind="gauge", description="..."
-)
+from nemo_rl.telemetry.vocabulary import TeedMetric, register_teed_metrics
+
+MY_KEY = "my_logger_key"
+
+MY_TEED_METRICS = (TeedMetric(MY_KEY, "rl.my.metric", kind="gauge", description="..."),)
+
+register_teed_metrics(MY_TEED_METRICS)
 ```
 
-The row is both the declaration and the mapping, which is deliberate: an earlier design kept a separate key-to-field map, three of its entries pointed at keys nothing emitted, and those gauges reported a flat line instead of an error. Keep them in one row and `tests/unit/telemetry/test_source_drift.py` fails the build when a logger key stops being emitted.
+Use `MY_KEY` at the site that writes the dict too. That is the point of declaring it here: one name serves both the logging and the export, so there is no second copy to drift, and nothing in `telemetry/` has to be edited to add an algorithm. The registry key is derived from the series name, so it is not typed a second time either.
+
+Existing homes to append to rather than invent a new one: `nemo_rl/algorithms/metric_utils.py` for keys every training loop logs, the loss that computes a loss metric, and `nemo_rl/models/generation/vllm/metric_names.py` for the engine series. Rows are collected process-wide and handed to lens once, on the first tee, so an owner that a given run never imports simply declares nothing.
 
 **If the series is keyed by a growing label set** — e.g. one value per efficiency category — declare **one dimensioned series** and pass the label through `attributes`, rather than one series per label. `rl.efficiency.seconds` is the worked example; `rl.setup.duration` is the same shape for a label set that is not even knowable at declaration time, since `SetupTimingMetrics.extras` is filled in at runtime.
 
 **If the dict arrives under a prefix other than `train`**, add the dispatch in `_tee_rl_metrics_to_otel`. Prefixes are matched rather than merged so neither family is scanned for the other's keys: `timing/setup` arrives once at step 0 and shares no key with the per-step dicts.
 
-**If the value does not go through the Logger at all**, declare it in the same table and call `record_metrics(meter, RL_METRIC_GROUP, {...})` from wherever it is produced.
+**If the value does not go through the Logger at all**, declare the row the same way and call `record_metrics(meter, RL_METRIC_GROUP, {...})` from wherever it is produced.
 
 Prefer an attribute over a name whenever the label set can grow: `rl.efficiency.seconds{rl.efficiency.category="idle/refit_bubble"}` stays stable as categories come and go, while `rl.efficiency.idle_refit_bubble_seconds` forces an instrument change per category. Keep attribute cardinality bounded — a per-step or per-request value belongs on a span, not a metric label.
 

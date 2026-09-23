@@ -79,6 +79,7 @@ RL_EFFICIENCY_CATEGORY_ATTR = "rl.efficiency.category"
 RL_IDLE_POLLS_ATTR = "rl.idle.polls"
 
 __all__ = [
+    "NO_SPAN",
     "managed_span",
     "umbrella_span",
     "streaming_umbrella_span",
@@ -740,6 +741,12 @@ def streaming_umbrella_span(
         yield lambda: otel_trace.use_span(span, end_on_exit=False)
     finally:
         span.end()
+
+
+#: The span a caller gets when its group is off. ``nullcontext`` holds no
+#: state, so one instance is safe to enter concurrently from any number of
+#: threads -- shared rather than built per call site.
+NO_SPAN: Final[ContextManager[None]] = nullcontext(None)
 
 
 def _no_span_activation() -> ContextManager[None]:

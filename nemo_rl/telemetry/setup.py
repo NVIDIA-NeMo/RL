@@ -221,8 +221,9 @@ def _rank_attributes(rank: int, world_size: int) -> dict[str, Any]:
     Lens has no notion of rank: it neither filters nor samples on one, so every
     process that sets up telemetry exports. Rank is recorded as a resource
     attribute instead, which is what makes a single rank's spans selectable
-    afterwards -- filter on ``nv.dl.rank`` in the collector, or leave
-    ``telemetry.enabled`` false on the ranks that should stay quiet.
+    afterwards -- filter on ``nv.dl.rank`` in the collector. There is no
+    per-rank switch to reach for instead: ``telemetry.enabled`` is one
+    job-wide value every worker inherits through the Ray ``runtime_env``.
 
     Passing rank at all is what keeps that filter available; lens warns when
     ``nv.dl.rank`` is missing, because without it a process cannot be told
@@ -387,9 +388,10 @@ def init_telemetry_worker(
     ``WORLD_SIZE`` env vars the worker was launched with, and are recorded as
     ``nv.dl.rank`` / ``nv.dl.world_size`` resource attributes.
 
-    Every worker that gets here exports. Narrowing that down is a downstream
-    decision now: filter on ``nv.dl.rank`` in the collector, or leave
-    ``telemetry.enabled`` false for the ranks that should stay quiet.
+    Every worker that gets here exports, and ``telemetry.enabled`` is
+    job-wide, so it cannot keep some ranks quiet while others export.
+    Narrowing down is a downstream decision: filter on ``nv.dl.rank`` in the
+    collector.
 
     Args:
         rank: This process's rank. Defaults to the ``RANK`` env var.

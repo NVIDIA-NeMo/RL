@@ -43,7 +43,7 @@ import logging
 import zlib
 from bisect import bisect_left
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from time import monotonic
@@ -68,6 +68,7 @@ from tensordict import NonTensorData, NonTensorStack, TensorDict, TensorDictBase
 from nemo_rl.data_plane.codec import drain_codec_ms
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.telemetry.instrumentation import (
+    NO_SPAN,
     in_per_prompt_scope,
     is_span_group_enabled,
     managed_span,
@@ -77,10 +78,6 @@ from nemo_rl.telemetry.instrumentation import (
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 
 logger = logging.getLogger(__name__)
-
-#: Reused rather than built per op: ``nullcontext`` holds no state, so one
-#: instance is safe to enter concurrently from any number of threads.
-_NO_SPAN = nullcontext(None)
 
 # Span attribute names for a data-plane op. ``op`` and ``partition`` are bounded
 # (a fixed op vocabulary, a handful of partitions), so they are safe as
@@ -1755,14 +1752,11 @@ class MetricsDataPlaneClient(DataPlaneClient):
         per_prompt = in_per_prompt_scope()
         group = RLSpanGroup.U_PER_PROMPT if per_prompt else RLSpanGroup.DATA_PLANE
         if not is_span_group_enabled(group):
-            # Gate before building the name and the attribute dict, and before
-            # either helper's generator is created. This is the most frequent
-            # telemetry call site in the repo -- once per data-plane op, so once
-            # per prompt on the rollout path -- and those three allocations cost
-            # ~1.8us each, which a run that never enabled telemetry should not
-            # be paying. A shared no-op context is safe to reuse: nullcontext
-            # holds no state.
-            span_ctx: Any = _NO_SPAN
+            # Gate before building the name, the attribute dict and either
+            # helper's generator: this is the most frequent telemetry call site
+            # in the repo, once per data-plane op, and those allocations cost
+            # ~1.8us each on a run that never enabled telemetry.
+            span_ctx: Any = NO_SPAN
         else:
             name = f"rl.data_plane.{op}"
             # Annotated rather than inferred as dict[str, str]: these are span

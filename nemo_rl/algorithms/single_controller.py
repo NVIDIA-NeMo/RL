@@ -179,8 +179,10 @@ from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.telemetry.instrumentation import (
+    NO_SPAN,
     RL_IDLE_POLLS_ATTR,
     efficiency_span,
+    is_span_group_enabled,
     managed_span,
     per_prompt_scope,
     safe_set_span_attributes,
@@ -2142,37 +2144,22 @@ class SingleControllerActor:
                             # step-shaped span would misreport when generation
                             # happened. A SKIPPED outcome re-enters this loop
                             # with a substitute prompt and opens another span,
-                            # which is what rl.rollout.attempt distinguishes --
-                            # attempt > 0 covers generation whose tokens were
-                            # discarded.
+                            # which rl.rollout.attempt distinguishes.
                             #
-                            # PER_PROMPT rather than ROLLOUT or GENERATION, on
-                            # two counts. It carries no rl.bucket: up to
+                            # PER_PROMPT, and carrying no rl.bucket: up to
                             # max_inflight_prompts of these overlap (1280 in
                             # some recipes), so tagged productive they would sum
-                            # to many times the wall clock they happened in --
-                            # productive generation is attributed by the
-                            # worker-side rl.vllm.generate spans instead. And
-                            # its count scales with the prompt count rather than
-                            # the step count, so it is gated apart from the
-                            # phase spans; PER_PROMPT is out of the per_step
-                            # preset for that reason.
+                            # to many times the wall clock they happened in.
+                            # Productive generation is attributed inside the
+                            # generation workers instead.
                             #
-                            # The scope covers the same region so the data-plane
-                            # put this rollout commits through is gated with it
-                            # -- that client cannot see whether its caller is a
-                            # rollout or a batch stage. Entered outside the span
-                            # so it still applies when the group is off and the
-                            # span is None.
-                            #
-                            # This branch only. The token-capture branch above
-                            # commits through the finalizer pool rather than
-                            # here, so its attempt boundary is a different shape
-                            # and it is left uninstrumented for now -- see
-                            # docs/observability/span-groups.md.
-                            with (
-                                per_prompt_scope(),
-                                umbrella_span(
+                            # Gated before the attribute dict is built, since
+                            # this runs once per prompt. per_prompt_scope() is
+                            # entered either way: the data-plane put inside
+                            # reads it, and that client cannot otherwise see
+                            # whether its caller is a rollout or a batch stage.
+                            if is_span_group_enabled(RLSpanGroup.U_PER_PROMPT):
+                                rollout_span: Any = umbrella_span(
                                     RLSpanGroup.U_PER_PROMPT,
                                     "rl.sc.generate_and_push",
                                     tracer=self._tracer,
@@ -2184,8 +2171,10 @@ class SingleControllerActor:
                                             else {"rl.target_step": target_step}
                                         ),
                                     },
-                                ),
-                            ):
+                                )
+                            else:
+                                rollout_span = NO_SPAN
+                            with per_prompt_scope(), rollout_span:
                                 if lineage_group_id is None:
                                     outcome = await self._rollout_manager.generate_and_push(
                                         prompt,

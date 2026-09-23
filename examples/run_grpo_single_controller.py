@@ -131,88 +131,96 @@ def main() -> None:
     # unless telemetry is enabled.
     init_telemetry_driver(config, algorithm="ppo" if is_ppo_run(config) else "grpo")
 
-    # One trace over the whole startup, so init_ray() and setup_single_controller()
-    # -- separate top-level calls -- read as a waterfall rather than as unrelated
-    # roots. Closed before the actor is launched, so the run's own job and step
-    # spans (opened inside SingleControllerActor) stay separate traces.
-    with startup_span():
-        # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
-        maybe_configure_data_plane_env(config.data_plane)
-        maybe_configure_engine_reaping_env(
-            config.async_rl.generation_fleet_health.enabled
-        )
-        # Opens rl.setup.ray_init itself, so no span here.
-        init_ray()
-
-        with setup_span("tokenizer"):
-            processor = None
-            if config.policy.get("is_vlm"):
-                processor = get_tokenizer(
-                    config.policy["tokenizer"], get_processor=True
-                )
-                tokenizer = processor.tokenizer
-            else:
-                tokenizer = get_tokenizer(config.policy["tokenizer"])
-            assert config.policy["generation"] is not None, (
-                "A generation config is required for SC-driven async GRPO"
-            )
-            has_refit_draft_weights = draft_refit_enabled(config.policy.get("draft"))
-            megatron_cfg = config.policy.get("megatron_cfg") or {}
-            trains_mtp = bool(megatron_cfg.get("mtp_num_layers"))
-            config.policy["generation"] = configure_generation_config(
-                config.policy["generation"],
-                tokenizer,
-                has_refit_draft_weights=has_refit_draft_weights,
-                trains_mtp=trains_mtp,
-            )
-
-        # NeMo-Gym specific config setup. Its own phase rather than part of the
-        # tokenizer block: it resolves and can launch gym resource servers, so it
-        # is one of the phases most likely to be the slow one.
-        if bool(config.env.get("should_use_nemo_gym")):
-            with setup_span("nemo_gym_config"):
-                setup_nemo_gym_config(config, tokenizer)
-
-        # No child spans inside: its phases run concurrently under parallel init,
-        # and OTel context does not cross into worker threads, so spans opened
-        # there would detach into their own traces. The breakdown comes from the
-        # rl.setup.duration metric, which is measured inside each phase.
-        with setup_span("workers"):
-            actor_args, setup_timing_metrics = setup_single_controller(
-                config, tokenizer, processor=processor
-            )
-
-    print("🚀 Launching SingleControllerActor")
-    sc = SingleControllerActor.remote(
-        master_config=config,
-        actor_args=actor_args,
-        setup_timing_metrics=setup_timing_metrics,
-    )
+    # Startup is inside the try so shutdown_telemetry() below still runs when
+    # it raises, which is when buffered spans are most worth having.
+    actor_args = None
     try:
+        # One root span, so init_ray() and setup_single_controller() phases land
+        # in the same trace. Closed before the actor is launched, so the run's
+        # own job and step spans stay separate traces.
+        with startup_span():
+            # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
+            maybe_configure_data_plane_env(config.data_plane)
+            maybe_configure_engine_reaping_env(
+                config.async_rl.generation_fleet_health.enabled
+            )
+            # Opens rl.setup.ray_init itself, so no span here.
+            init_ray()
+
+            with setup_span("tokenizer"):
+                processor = None
+                if config.policy.get("is_vlm"):
+                    processor = get_tokenizer(
+                        config.policy["tokenizer"], get_processor=True
+                    )
+                    tokenizer = processor.tokenizer
+                else:
+                    tokenizer = get_tokenizer(config.policy["tokenizer"])
+                assert config.policy["generation"] is not None, (
+                    "A generation config is required for SC-driven async GRPO"
+                )
+                has_refit_draft_weights = draft_refit_enabled(
+                    config.policy.get("draft")
+                )
+                megatron_cfg = config.policy.get("megatron_cfg") or {}
+                trains_mtp = bool(megatron_cfg.get("mtp_num_layers"))
+                config.policy["generation"] = configure_generation_config(
+                    config.policy["generation"],
+                    tokenizer,
+                    has_refit_draft_weights=has_refit_draft_weights,
+                    trains_mtp=trains_mtp,
+                )
+
+            # Its own phase rather than part of the tokenizer block: it resolves
+            # and can launch gym resource servers, so it is one of the phases
+            # most likely to be the slow one.
+            if bool(config.env.get("should_use_nemo_gym")):
+                with setup_span("nemo_gym_config"):
+                    setup_nemo_gym_config(config, tokenizer)
+
+            # No child spans here: parallel init runs in threads, which do not
+            # carry the OTel context. The breakdown comes from the
+            # rl.setup.duration metric.
+            with setup_span("workers"):
+                actor_args, setup_timing_metrics = setup_single_controller(
+                    config, tokenizer, processor=processor
+                )
+
+        print("🚀 Launching SingleControllerActor")
+        sc = SingleControllerActor.remote(
+            master_config=config,
+            actor_args=actor_args,
+            setup_timing_metrics=setup_timing_metrics,
+        )
         result = _run_with_controller_liveness_watch(sc, config.async_rl.stall_watchdog)
         print(f"SC run complete: {result}")
     finally:
-        # Drain env actors before generation to avoid in-flight requests during shutdown.
-        shutdown_environments(actor_args.env_handles)
+        # None when setup raised before building them.
+        if actor_args is not None:
+            # Drain env actors before generation to avoid in-flight requests
+            # during shutdown.
+            shutdown_environments(actor_args.env_handles)
 
-        teacher_worker_groups = getattr(actor_args, "teacher_worker_groups", None) or {}
-        for teacher_alias, teacher in teacher_worker_groups.items():
-            try:
-                teacher.shutdown()
-            except Exception as e:
-                print(f"Teacher {teacher_alias!r} shutdown failed: {e}")
+            teacher_worker_groups = (
+                getattr(actor_args, "teacher_worker_groups", None) or {}
+            )
+            for teacher_alias, teacher in teacher_worker_groups.items():
+                try:
+                    teacher.shutdown()
+                except Exception as e:
+                    print(f"Teacher {teacher_alias!r} shutdown failed: {e}")
 
-        for resource_name, resource in (
-            ("Generation", actor_args.gen_handle),
-            ("Trainer", actor_args.trainer_handle),
-            ("Value", actor_args.value_handle),
-        ):
-            if resource is None:
-                continue
-            try:
-                resource.shutdown()
-            except Exception as e:
-                print(f"{resource_name} shutdown failed: {e}")
+            for resource_name, resource in (
+                ("Generation", actor_args.gen_handle),
+                ("Trainer", actor_args.trainer_handle),
+                ("Value", actor_args.value_handle),
+            ):
+                if resource is None:
+                    continue
+                try:
+                    resource.shutdown()
+                except Exception as e:
+                    print(f"{resource_name} shutdown failed: {e}")
 
         # Last, and before cluster teardown: the OTel SDK's own atexit hook is
         # registered ahead of Ray's and so would otherwise run after it. The

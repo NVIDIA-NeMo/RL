@@ -21,7 +21,12 @@ is what produces the keys.
 
 from __future__ import annotations
 
-from nemo_rl.telemetry.vocabulary import TeedMetric, register_teed_metrics
+from nemo_rl.telemetry.vocabulary import (
+    RecordedMetric,
+    TeedMetric,
+    register_recorded_metrics,
+    register_teed_metrics,
+)
 
 # Engine series surfaced per step, beyond the spec-decode family. These are the
 # family names vLLM registers (vllm/v1/metrics/loggers.py); its reader returns
@@ -99,3 +104,26 @@ VLLM_TEED_METRICS = (
 )
 
 register_teed_metrics(VLLM_TEED_METRICS)
+
+
+#: Wall clock of one batched ``generate()`` call, driver side.
+BATCH_DURATION_METRIC = "rl.vllm.batch.duration"
+
+# Its own series rather than gen_ai.server.request.duration: that histogram is
+# defined per inference request, and one call here covers a whole batch across
+# every data-parallel shard, so its samples would not be comparable with any
+# other producer's. The gen_ai token counts are per-batch sums, which stay
+# additive, so those still go to the semconv instruments.
+VLLM_RECORDED_METRICS = (
+    RecordedMetric(
+        BATCH_DURATION_METRIC,
+        kind="histogram",
+        unit="s",
+        description="Wall clock of one batched generate() call, driver side.",
+    ),
+)
+
+register_recorded_metrics(VLLM_RECORDED_METRICS)
+
+#: Registry key the series above is recorded against.
+BATCH_DURATION_KEY = VLLM_RECORDED_METRICS[0].key

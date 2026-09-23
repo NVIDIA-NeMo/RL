@@ -105,13 +105,11 @@ def main() -> None:
     init_telemetry_driver(config, algorithm="grpo")
 
     try:
-        # One trace over the whole startup. init_ray() and setup() are separate
-        # top-level calls, so without an enclosing span their phases arrive as
-        # unrelated roots and a trace UI cannot show them side by side. Every
-        # phase span below pairs with the rl_init_timer label next to it, so the
-        # waterfall and the printed breakdown cannot drift.
+        # One root span, so init_ray() and setup() phases land in the same
+        # trace. Timer labels match the span names so the printed breakdown
+        # and the waterfall name a phase the same way.
         with startup_span():
-            with rl_init_timer.time("ray_connect"):
+            with rl_init_timer.time("ray_init"):
                 # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
                 maybe_configure_data_plane_env(config.data_plane)
                 # Opens rl.setup.ray_init itself, so no span here.
@@ -141,12 +139,10 @@ def main() -> None:
                     setup_response_data(tokenizer, config.data, config.env)
                 )
 
-            # No child spans inside setup(): its phases run concurrently under
-            # parallel init, and OTel context does not cross into worker threads,
-            # so spans opened there would detach into their own traces. The
-            # breakdown comes from the rl.setup.duration metric instead, which is
-            # measured inside each phase and so is correct either way.
-            with rl_init_timer.time("setup"), setup_span("workers"):
+            # No child spans here: parallel init runs in threads, which do not
+            # carry the OTel context. The breakdown comes from the
+            # rl.setup.duration metric instead.
+            with rl_init_timer.time("workers"), setup_span("workers"):
                 (
                     policy,
                     policy_generation,

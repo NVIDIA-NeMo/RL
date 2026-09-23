@@ -29,7 +29,7 @@ Mirrored from the keys the algorithms already log, one row per series in `_TRAIN
 
 `kl_penalty` is named for the penalty but holds the divergence — the coefficient is divided back out in `loss_functions.py` — which is why the metric is named `rl.kl.divergence`.
 
-A test (`tests/unit/telemetry/test_source_drift.py`) parses the sources and fails the build if a declared logger key stops being emitted, so a renamed key surfaces as a build failure rather than a gauge that silently reports nothing.
+Each row is declared in the module that logs its key, using the same constant the logging site uses, so a rename cannot leave a gauge silently reporting nothing.
 
 ## Startup phases
 
@@ -177,7 +177,7 @@ The counters carry the step's delta, so summing them across steps reconstructs t
 
 **What counts as failed.** vLLM's finish reasons are `stop`, `length`, `abort`, `error` and `repetition`. Only `stop` and `length` leave a usable sample behind, and `length` is a normal RL outcome — a rollout routinely runs to `max_tokens` — so those two are `ok` and *everything else* is `failed`. Counting the remainder rather than an explicit deny-list keeps `ok + failed` equal to the engine's own total even if a future vLLM adds a reason we have not heard of.
 
-vLLM renames these series occasionally, so each is looked up against a short candidate list (the same approach as the alias lists in `nemo_rl/models/generation/dynamo/metrics.py`). A series that matches nothing is **omitted**, leaving a visible gap in the dashboard rather than a plausible-looking zero.
+These are the family names vLLM registers. The reader returns family names, which `prometheus_client` strips of `_total`, so no suffixed alias is needed on this path — unlike the HTTP-scrape path in `nemo_rl/models/generation/dynamo/metrics.py`, where sample names do carry it. `test_engine_metric_names_match_vllm` checks the copies against vLLM itself. A series that matches nothing is **omitted**, leaving a visible gap in the dashboard rather than a plausible-looking zero, and so is one whose total went backwards, which means an engine restarted mid-step.
 
 ## Driver-side generation metrics (`gen_ai.*`)
 
@@ -186,7 +186,8 @@ The driver-side vLLM generation path records token and latency metrics through l
 | Metric | Type | Description |
 |---|---|---|
 | `gen_ai.client.token.usage` | Histogram | Tokens per request, split by `gen_ai.token.type` (`input` / `output`) |
-| `gen_ai.server.request.duration` | Histogram | End-to-end generation request latency |
+
+`gen_ai.server.request.duration` is **not** recorded: it is defined per inference request, and one `generate()` call here is a batch across every data-parallel shard. That wall clock goes to `rl.vllm.batch.duration` (histogram, seconds) instead.
 
 These overlap with `rl.vllm.*` on token counts but are not redundant: `gen_ai.*` is derived from the tensors a `generate()` call returns, so it measures what the driver received, while `rl.vllm.*` is the engine's own accounting. When the two disagree, the gap is work the engine did that never reached the driver — the aborted requests, which appear in no returned tensor at all.
 
@@ -220,7 +221,7 @@ rl_goodput = productive_gpu_s / (productive + overhead + idle + wasted)_gpu_s
 
 See [Span groups — goodput buckets](span-groups.md) and `nemo_rl/telemetry/instrumentation.py`.
 
-Metric names use the **application scope** (`rl.*`); attribute names use the **shared namespace** (`rl.*`, `dl.*`) defined in lens's `semconv.py`.
+Metric names use the **application scope** (`rl.*`); attribute names in the `rl.*` namespace are NeMo-RL's own, defined in `nemo_rl/telemetry/`, not imported from lens's `semconv.py`.
 
 ## Filtering across runs
 

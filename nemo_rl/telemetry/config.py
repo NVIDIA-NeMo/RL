@@ -86,5 +86,5 @@ class TelemetryConfig(BaseModel, extra="allow"):
     vLLM traces per **request**, so this emits one span per rollout -- thousands
     per step, against ~20 for the rest of the run -- and vLLM offers no sampling
     knob. Switch it on to debug a few steps, not for a training run. For engine
-    behaviour in aggregate the ``vllm/*`` metrics are on by default and cost one
-    RPC per step."""
+    behaviour in aggregate the ``vllm/*`` metrics are on by default and cost two
+    RPCs per step (a snapshot before generation and a read after)."""

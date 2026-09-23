@@ -72,6 +72,31 @@ def registry_key(name: str) -> str:
 
 
 @dataclass(frozen=True)
+class RecordedMetric:
+    """A series recorded directly, with no ``Logger`` key behind it.
+
+    Declared by its owner for the same reason the teed rows are: the module
+    that calls ``record_metrics`` for a series is the one that names it.
+
+    Attributes:
+        name: OTel series name emitted; :func:`registry_key` derives the key.
+        kind: One of lens's ``gauge`` / ``counter`` / ``histogram`` / ``up_down_counter``.
+        unit: UCUM-ish unit string, or empty when dimensionless.
+        description: Help text carried to the backend.
+    """
+
+    name: str
+    kind: str = "gauge"
+    unit: str = ""
+    description: str = ""
+
+    @property
+    def key(self) -> str:
+        """Registry key recorded against."""
+        return registry_key(self.name)
+
+
+@dataclass(frozen=True)
 class TeedMetric:
     """One ``Logger`` key mirrored into OTel, and how it is declared to lens.
 
@@ -125,3 +150,25 @@ def register_teed_metrics(rows: Iterable[TeedMetric]) -> None:
 def teed_metrics() -> tuple[TeedMetric, ...]:
     """Every row declared so far, in declaration order."""
     return tuple(_REGISTERED.values())
+
+
+_RECORDED: dict[str, RecordedMetric] = {}
+
+
+def register_recorded_metrics(rows: Iterable[RecordedMetric]) -> None:
+    """Declare *rows* from the module that records them.
+
+    Raises:
+        ValueError: Two rows claim the same series name with different
+            definitions, which would otherwise have them share one instrument.
+    """
+    for row in rows:
+        clash = _RECORDED.get(row.name)
+        if clash is not None and clash != row:
+            raise ValueError(f"series {row.name!r} is already declared as {clash!r}")
+        _RECORDED[row.name] = row
+
+
+def recorded_metrics() -> tuple[RecordedMetric, ...]:
+    """Every directly-recorded row declared so far, in declaration order."""
+    return tuple(_RECORDED.values())

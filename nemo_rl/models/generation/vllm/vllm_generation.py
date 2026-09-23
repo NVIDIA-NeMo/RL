@@ -58,7 +58,8 @@ from nemo_rl.models.generation.vllm.utils import (
     resolve_generation_worker_cls,
 )
 from nemo_rl.telemetry.instrumentation import trace_fn
-from nemo_rl.telemetry.metrics import warn_once
+from nemo_rl.models.generation.vllm.metric_names import BATCH_DURATION_KEY
+from nemo_rl.telemetry.metrics import record_rl_metrics, warn_once
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.fastokens import normalize_fastokens_env
@@ -80,7 +81,7 @@ def _record_vllm_generation_metrics(
     model_name: str | None,
     data: BatchedDataDict,
     combined: BatchedDataDict,
-    request_duration_s: float | None = None,
+    batch_duration_s: float | None = None,
 ) -> None:
     """Record vLLM token-usage metrics to nemo-lens (no-op unless exporting)."""
     telemetry = get_telemetry_handle()
@@ -100,14 +101,20 @@ def _record_vllm_generation_metrics(
             if "generation_lengths" in combined
             else None
         )
+        # No duration: this call is a batch across every data-parallel shard,
+        # and record_inference_metrics would put it in the per-request
+        # gen_ai.server.request.duration histogram. The token counts are sums
+        # over the batch, which is what those instruments mean.
         record_inference_metrics(
             telemetry.meter,
-            request_duration_s,
+            None,
             model=model_name or "",
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             provider_name="vllm",
         )
+        if batch_duration_s is not None:
+            record_rl_metrics({BATCH_DURATION_KEY: batch_duration_s})
     except Exception:
         warn_once("vllm_inference_metrics", "nemo-lens: failed to record vLLM metrics")
 
@@ -1001,7 +1008,7 @@ class VllmGeneration(GenerationInterface):
             self.cfg.get("model_name"),
             data,
             combined,
-            time.perf_counter() - started_at,
+            batch_duration_s=time.perf_counter() - started_at,
         )
         return combined
 
@@ -1062,7 +1069,7 @@ class VllmGeneration(GenerationInterface):
             self.cfg.get("model_name"),
             data,
             combined,
-            time.perf_counter() - started_at,
+            batch_duration_s=time.perf_counter() - started_at,
         )
         return combined
 

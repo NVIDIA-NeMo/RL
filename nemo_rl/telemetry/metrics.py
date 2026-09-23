@@ -53,6 +53,7 @@ from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.vocabulary import (
     RUN_WINDOW_WALL_CLOCK_CATEGORIES,
     as_scalar,
+    recorded_metrics,
     registry_key,
     teed_metrics,
 )
@@ -213,13 +214,13 @@ def _metric_specs() -> list[MetricSpec]:
     )
     specs.extend(
         MetricSpec(
-            teed.key,
-            teed.name,
-            teed.kind,
-            unit=teed.unit,
-            description=teed.description,
+            row.key,
+            row.name,
+            row.kind,
+            unit=row.unit,
+            description=row.description,
         )
-        for teed in teed_metrics()
+        for row in (*teed_metrics(), *recorded_metrics())
     )
     return specs
 
@@ -277,6 +278,23 @@ def _record(
     from nemo.lens.instruments import record_metrics
 
     record_metrics(meter, RL_METRIC_GROUP, values, attributes=attributes)
+
+
+def record_rl_metrics(
+    values: Mapping[str, float],
+    attributes: Optional[Mapping[str, str]] = None,
+) -> None:
+    """Record declared series by registry key. No-op unless exporting.
+
+    For values that never pass through ``Logger.log_metrics`` and so have no
+    teed row. Declare them with ``register_recorded_metrics`` first.
+    """
+    handle = get_telemetry_handle()
+    if handle is None or not handle.is_exporting:
+        return
+    if not ensure_metric_group_registered():
+        return
+    _record(handle.meter, values, attributes)
 
 
 def efficiency_measurements() -> dict[str, str]:
