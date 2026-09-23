@@ -1007,14 +1007,17 @@ class _MegatronCapturePayload:
                 "MInf payload media_tensors must be a mapping, got "
                 f"{type(media_tensors).__name__}"
             )
-        media_tensors = slice_media_tensors(media_tensors, _count(MEDIA_PREV_COUNT_KEY))
+        media: dict[str, Any] | None = (
+            None if media_tensors is None else dict(media_tensors)
+        )
+        media = slice_media_tensors(media, _count(MEDIA_PREV_COUNT_KEY))
         return cls(
             prompt_token_ids=getattr(payload, "prompt_token_ids", None),
             generated_token_ids=getattr(payload, "generated_token_ids", None),
             generated_log_probs=getattr(payload, "generated_log_probs", None),
             compact_prompt_token_ids=getattr(payload, "compact_prompt_token_ids", None),
             compact_prev_len=_count(COMPACT_PREV_LEN_KEY),
-            media_tensors=media_tensors,
+            media_tensors=media,
         )
 
 
