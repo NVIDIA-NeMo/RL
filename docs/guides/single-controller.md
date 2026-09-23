@@ -395,9 +395,13 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   `policy.is_vlm: true`; see the
   [CLEVR Single-Controller recipe](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron-single-controller-async.v1.yaml).
 - NeMo-Gym token capture also supports Omni dynamic-resolution images and native video
-  rollouts with async vLLM generation and a Megatron learner. With
-  `token_capture.enabled: true` and the VLM processor configured, workers capture
-  the processed media used for inference together with each call's token delta.
+  rollouts with async vLLM generation and a Megatron learner, and with Megatron
+  Inference generation through the same media columns and finalizer (the
+  compact-chain handling that backend adds is described in
+  [Token-capture ledger](../design-docs/token-capture-ledger.md#multimodal-rollouts-on-megatron-inference)).
+  With `token_capture.enabled: true` and the VLM processor configured, workers
+  capture the processed media used for inference together with each call's
+  token delta.
   RL hands the owned tensors (`imgs`, `imgs_sizes`, and optional `num_frames`)
   to Gym's `complete_call_from_response` as opaque attachments, and the TQ sink
   writes them in the same `put` as the token columns, so `staged` coordinates
@@ -439,8 +443,12 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   end to end (CLEVR-style images through Gym `string_match`, native video
   through Gym `mcqa`) and gates on `train/finalize/media_row_rate == 1`, the
   metric that reports the fraction of learner rows built from captured media.
-  This integration does not require Megatron inference capture support or a new
-  Megatron-LM pin. Compaction, mixed image/video conversations, native audio,
+  The vLLM path needs no new Megatron-LM pin. The Megatron Inference path
+  requires the Megatron-LM pin from tdene/Megatron-LM#20
+  (`compact_prompt_token_ids` and `media_tensors` on the offloaded payload),
+  the Gym Megatron adapter (lauradang/Gym#1), and the compact-chain columns
+  (`compact_token_ids_delta` / `compact_len`) on the staging partition.
+  Compaction, mixed image/video conversations, native audio,
   video token pruning, static tiling (`num_tiles`), other processor families,
   and `token_capture.defer_routed_experts_to_policy: true` are not supported.
 - Multi-Teacher On-Policy Distillation (MOPD) is supported for text-only NeMo

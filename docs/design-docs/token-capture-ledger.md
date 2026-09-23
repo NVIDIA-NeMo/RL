@@ -117,78 +117,74 @@ conversion is involved in the active path.
 
 ![Token capture custody](../assets/token-capture-ledger-queue-data-flow.png)
 
-### Multimodal rollouts (Megatron Inference only)
+### Multimodal rollouts on Megatron Inference
+
+The media transport is shared with the vLLM backend and is described in
+`docs/guides/single-controller.md` (media columns `MEDIA_STAGING_FIELDS`:
+`media_present`, `media_has_frames`, `media_imgs`, `media_imgs_sizes`,
+`media_num_frames`; `TQTokenSink.stage(record, attachments=...)`;
+`validate_media_tensors` on write and read; batched
+`TQTokenSource.fetch_media`; `RolloutReassembler._resolve_media`). This
+section covers only what Megatron Inference adds.
 
 A vision-language engine has two token spaces. The chat endpoint tokenizes the
 render in *compact* form (one media token per image or video); the engine
 expands every media token into one token per projected embedding and runs on
-the *expanded* form. The trainer needs the expanded ids (they align with the
-projected features); the next turn's chat render can only be spliced against
-the compact ids, because the engine expands whatever it is handed and would
-otherwise expand the previous turn twice and reject the request on its
-placeholder count.
-
-Capture therefore stages both spaces and the media geometry inside the digest,
-and the media tensors themselves as extra, digest-external columns on the same
-call row:
+the *expanded* form. The trainer needs the expanded ids; the next turn's chat
+render can only be spliced against the compact ids, because the engine expands
+whatever it is handed and would otherwise expand the previous turn twice.
 
 - MInf's `OffloadedRequestPayload` carries `compact_prompt_token_ids` and
-  `media_tensors` (the vision-encoder inputs: packed patches `imgs`,
-  `imgs_sizes`, `num_frames` / `num_tiles`). RL derives a small media geometry
-  from those tensors (`tq_token_sink.media_geometry`), and Gym's
-  `MegatronCaptureAdapter` stages the compact delta and that geometry as
-  `StagedCallRecord.extras` (`nemo_gym.token_id_capture.staging.media`), so both
-  are bound by `extras_digest`. `TQTokenSink` pops the compact delta into its
-  own column (`compact_token_ids_delta` / `compact_len`, like `routed_experts`)
-  and keeps the geometry in the extras JSON. These payload fields come from
-  tdene/Megatron-LM#20 (on top of NVIDIA/Megatron-LM#7015) and the media extras
-  from Gym's `staging/media.py` (lauradang/Gym#1 on top of
-  NVIDIA-NeMo/Gym#2823); neither is in the pinned submodules yet, so this path
-  requires both re-pins.
+  `media_tensors` (`imgs` as packed patches, `imgs_sizes`, optional
+  `num_frames`; tdene/Megatron-LM#20 on NVIDIA/Megatron-LM#7015). Gym's
+  `MegatronCaptureAdapter` stages the compact delta
+  (`nemo_gym.token_id_capture.staging.media.build_compact_token_ids_delta`)
+  as `StagedCallRecord.extras["compact_token_ids_delta"]`, bound by
+  `extras_digest`; `TQTokenSink` pops it into its own columns
+  (`compact_token_ids_delta` / `compact_len`), like `routed_experts`. Text
+  calls stage no compact form (`compact_len` 0): their compact and expanded
+  deltas coincide. The pixel tensors travel beside the record as
+  `complete_call_from_response(..., attachments=...)` and land in the same
+  put as the token columns. The Gym side is lauradang/Gym#1 (on
+  NVIDIA-NeMo/Gym#3513); the Gym submodule is pinned to that fork.
 - `TQMegatronPromptPreparer` resolves a `staging_chain` in both spaces
   (`TQTokenSource.fetch_prefix_chains`), splices the *compact* chain into the
   render, hands Gym the *expanded* chain as `required_prefix_token_ids`, and
-  records the compact chain length in `offload_params["ng_capture_minf"]` so
-  the stager can cut the call's compact delta. Gym's existing prefix check on
-  the engine's expanded prompt then verifies that re-expanding the same media
-  reproduced the same tokens; drift poisons the call.
-- The media tensors themselves ride the call row: `TQMegatronTokenStager`
-  writes `media_tensors` as extra columns on the call row
-  (`MEDIA_STAGING_FIELDS`), in the same put as the token columns: the stager
-  parks the tensors on the sink before Gym stages the record, so a call is
-  staged whole or not at all. Routed experts ride the row the same way. Like the token
-  columns they are per-call deltas: every chat request carries the whole
-  conversation, so the engine hands over pixels for every image in the prompt,
-  and the stager drops the items the parent chain already staged
-  (`media_prev_count`, recorded by the preparer next to `compact_prev_len` from
-  the parent rows' geometry; `slice_media_tensors`). They are outside Gym's
-  digest; the digest-covered geometry names what each row holds. Receipts stay
-  token-free and no new key exists: cleanup of the call rows clears the media.
-- `RolloutReassembler.finalize_rollout` walks the terminal chain: for each
-  call whose staged geometry names media it reads that row's media columns,
-  requires the staged `imgs_sizes` / `num_frames` / `num_tiles` to equal the
-  geometry, and rejects the rollout otherwise (`media_columns_missing`,
-  `media_mismatch`, `invalid_media_columns`). The per-call deltas are
-  concatenated in chain order, as the token deltas are. The packed-patch layout is handed to the trainer
-  unchanged as `pixel_values` `[total_patches, C*P*P]` per row (the
-  Megatron-Bridge Omni model passes already-patchified inputs through), with
-  `imgs_sizes` and `num_frames` beside it, so training projects exactly the
-  pixels the policy generated against. `finalize_group` stacks the per-rollout
-  `PackedTensor`s (empty rows for text siblings and placeholders) into the
-  canonical batch through the same `pack_payload` transport the token-echo path
-  uses. A group in which no valid rollout carried media is dropped rather than
-  published (`multimodal run, no valid rollout carried media`; the controller
-  sources a replacement): its rows would omit the media columns, and
-  TransferQueue answers a batch fetch with only the fields every requested key
-  produced, so a train shard mixing such keys with VLM keys would lose
-  `pixel_values` for the VLM rows too. `TQDataPlaneClient.get_samples` raises
-  `KeyError` if a requested column is missing from the response, so that
-  narrowing can no longer pass silently on either path.
+  records `compact_prev_len` and `media_prev_count` in
+  `offload_params["ng_capture_minf"]`. `media_prev_count` is counted from the
+  parent rows' small media columns (`media_present`, `media_has_frames`,
+  `media_imgs_sizes`, `media_num_frames`), never from pixels, and only when the
+  source was built with `capture_media=True`; setup sets the source's and the
+  sink's `capture_media` from the same flag.
+- `TQMegatronTokenStager` slices the payload's `media_tensors` at
+  `media_prev_count` (`slice_media_tensors`) so each row holds only the media
+  new to that call (every chat request carries the whole conversation, so the
+  engine hands over pixels for every image in the prompt), and passes the
+  remainder to Gym as attachments (`None` for text calls). A malformed payload
+  poisons the call with `capture_failed` coordinates instead of raising.
+- The Megatron worker pins the staging column dtype to
+  `MINF_MEDIA_PIXEL_DTYPE` (`torch.float32`): MInf's image preprocessing
+  emits torchvision `ToTensor` + `Normalize` patches uncast, and nothing
+  downstream recasts them before the stager takes custody. vLLM pins the
+  engine model dtype instead. The vision encoder casts pixels to its weight
+  dtype, so both train identically; the sink rejects any other pixel dtype, so
+  a drift in either preprocessor fails loudly at the first media stage.
+- `RolloutReassembler.finalize_group` drops a group in which no valid rollout
+  carried media when `capture_media` is set (`media capture on, no valid
+  rollout carried media`; the controller sources a replacement). TQ answers a
+  batch fetch with only the fields every requested key produced, so a train
+  shard mixing such keys with VLM keys would lose `pixel_values` for the VLM
+  rows too.
 
-Setup rejects `token_capture.enabled` with a multimodal policy on the vLLM
-backend (that capture path stages the pre-processor prompt and carries no
-media) and with `grpo.deduplicate_multimodal_data=true` (capture rows carry
-their own media).
+Tensor contents are not bound to Gym's digest. A staging key written twice
+would go undetected by the media columns alone; Gym rejects a second
+completion of the same call at admission, so this is defence against a bug,
+not a live path. `num_tiles` is not staged: the capture path rejects static
+tiling (`nemo_rl/data/captured_media.py`) and both backends assume the
+packed-patch layout. Setup accepts `token_capture.enabled` with a multimodal
+policy on both the vLLM and Megatron generation backends and rejects
+`grpo.deduplicate_multimodal_data=true` with capture enabled (capture rows
+carry their own media).
 
 ## Framework-owned receipt and cleanup
 
