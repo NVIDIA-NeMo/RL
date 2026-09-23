@@ -129,10 +129,12 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
     monkeypatch.setattr("nemo_rl.data_plane.tq_token_sink.TQTokenSink", _Sink)
     monkeypatch.setattr("nemo_rl.data_plane.tq_token_sink.TQTokenSource", _Source)
     monkeypatch.setattr(
-        "nemo_rl.data_plane.tq_token_sink.TQMegatronPromptPreparer", _Preparer
+        "nemo_rl.models.generation.megatron.token_capture.TQMegatronPromptPreparer",
+        _Preparer,
     )
     monkeypatch.setattr(
-        "nemo_rl.data_plane.tq_token_sink.TQMegatronTokenStager", _Stager
+        "nemo_rl.models.generation.megatron.token_capture.TQMegatronTokenStager",
+        _Stager,
     )
     monkeypatch.setattr(
         "nemo_rl.models.generation.megatron.megatron_worker.torch.distributed.get_rank",
