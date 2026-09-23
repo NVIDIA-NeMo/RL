@@ -1211,7 +1211,7 @@ def test_nemo_gym_reward_penalties_match_legacy_rewards_counts_and_metrics(
     impl = _nemo_gym_impl(True, reward_penalty_config)
     result = _reward_penalty_result(output, assistant_overrides, assistant_tokens)
 
-    completions, penalty_counts = impl._results_to_completions([result])
+    completions, penalty_counts, _ = impl._results_to_completions([result])
 
     assert completions[0].reward == 0.0
     assert penalty_counts[count_key] == 1
