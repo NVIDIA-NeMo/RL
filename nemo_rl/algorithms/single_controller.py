@@ -120,6 +120,11 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     prune_bootstrap_snapshots,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
+from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
+    accumulate_rollout_stats,
+    new_rollout_stats_accumulator,
+    reduce_rollout_stats,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
     apply_message_level_advantage_penalties,
@@ -135,6 +140,7 @@ from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
     DP_TRAIN_FIELDS,
+    INPUT_LENGTHS,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
 )
@@ -567,6 +573,9 @@ class SingleControllerActor:
             "seq_logprob_error_metrics": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
         }
+        # Per-sample rollout distributions (generated tokens, assistant turns,
+        # group reward mix, context use); see single_controller_utils/rollout_stats.py.
+        self._rollout_stats_acc = new_rollout_stats_accumulator()
         self._opd_stat_sum = 0.0
         self._opd_stat_sumsq = 0.0
         self._opd_stat_count = 0
@@ -2845,6 +2854,20 @@ class SingleControllerActor:
                 step_metrics.update(
                     reduce_advantage_pump_metrics(**self._step_log_dict)
                 )
+                try:
+                    policy_cfg = getattr(self._master_config, "policy", None)
+                    max_seq_len = (
+                        policy_cfg.get("max_total_sequence_length")
+                        if isinstance(policy_cfg, dict)
+                        else getattr(policy_cfg, "max_total_sequence_length", None)
+                    )
+                    step_metrics.update(
+                        reduce_rollout_stats(
+                            self._rollout_stats_acc, max_seq_len=max_seq_len
+                        )
+                    )
+                except Exception as error:  # metrics must never fail a step
+                    log.warning("Skipping rollout_stats metrics: %s", error)
                 per_group_rollout_metrics: dict[str, list[Any]] = {}
                 for group_metrics in selected_rollout_metrics:
                     for metric_name, value in group_metrics.items():
@@ -2861,6 +2884,7 @@ class SingleControllerActor:
                 except RayActorError as error:
                     log.warning("Skipping generation step metrics: %s", error)
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
+                self._rollout_stats_acc = new_rollout_stats_accumulator()
                 step_metrics.update(
                     _pooled_opd_metrics(
                         self._opd_stat_sum,
@@ -4852,6 +4876,27 @@ class SingleControllerActor:
         response_advantages = torch.masked_select(advantages, mask.bool())
         self._step_log_dict["rewards"].append(rewards.detach().cpu())
         self._step_log_dict["sample_masks"].append(final_sample_mask.detach().cpu())
+        try:
+            accumulate_rollout_stats(
+                self._rollout_stats_acc,
+                prompt_ids=prompt_ids,
+                rewards=rewards,
+                sample_mask=final_sample_mask,
+                token_mask=token_mask,
+                truncated=truncated,
+                seq_lens=tensor_field(
+                    await call_data_plane(
+                        self._dp_client,
+                        "get_samples",
+                        sample_ids=meta.sample_ids,
+                        partition_id=meta.partition_id,
+                        select_fields=[INPUT_LENGTHS],
+                    ),
+                    INPUT_LENGTHS,
+                ),
+            )
+        except Exception as error:  # metrics must never fail a step
+            log.warning("Skipping rollout_stats accumulation: %s", error)
         if self._teacher_logprobs_required:
             valid = response_advantages.detach().double()
             self._opd_stat_sum += float(valid.sum())
