@@ -639,7 +639,11 @@ class MegatronGeneration(GenerationInterface):
         return True
 
     def setup_token_capture(
-        self, dp_cfg: "DataPlaneConfig", staging_partition: str
+        self,
+        dp_cfg: "DataPlaneConfig",
+        staging_partition: str,
+        *,
+        capture_media: bool = False,
     ) -> None:
         """Install MInf's canonical prompt and completion capture hooks."""
         if not self.cfg["mcore_generation_config"]["expose_http_server"]:
@@ -651,6 +655,7 @@ class MegatronGeneration(GenerationInterface):
             "setup_token_capture",
             dp_cfg=dp_cfg,
             staging_partition=staging_partition,
+            capture_media=capture_media,
         )
         ray.get(futures)
 

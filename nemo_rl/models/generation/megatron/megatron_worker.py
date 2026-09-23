@@ -112,6 +112,14 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     restore_refit_info_placements,
 )
 
+# Pixel dtype of the media tensors MInf hands the payload stager. The HTTP
+# server's image/video preprocessing builds packed patches with torchvision's
+# ToTensor + Normalize (float32) and only moves them across devices before the
+# engine records them as the request's media_tensors; the vision encoder casts
+# to its weight dtype internally, so the staged copy stays float32 regardless
+# of the model's params dtype.
+MINF_MEDIA_PIXEL_DTYPE = torch.float32
+
 
 def _inference_optimized_transformer_layer_spec(config: Any) -> Any:
     """Build the generic GPT layer spec backed by MCore inference linears."""
@@ -964,9 +972,18 @@ class MegatronGenerationMixin:
         return self.base_url
 
     def setup_token_capture(
-        self, dp_cfg: "DataPlaneConfig", staging_partition: str
+        self,
+        dp_cfg: "DataPlaneConfig",
+        staging_partition: str,
+        *,
+        capture_media: bool = False,
     ) -> bool:
-        """Install canonical TQ capture on each MInf model-parallel leader."""
+        """Install canonical TQ capture on each MInf model-parallel leader.
+
+        ``capture_media`` builds the sink/source against the media-enabled
+        staging schema so the stager can hand the engine's media tensors to
+        TQ beside each call's tokens.
+        """
         engine = self.dynamic_inference_engine
         if engine is None:
             raise RuntimeError(
@@ -995,13 +1012,30 @@ class MegatronGenerationMixin:
         )
 
         dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
+        # MInf's wire preprocessing (dynamic_text_gen_server/image_preprocessing
+        # .preprocess_image: torchvision ToTensor + Normalize) emits packed
+        # patches in float32 and nothing downstream recasts them before the
+        # payload stager takes custody (the vision encoder casts internally),
+        # so the media column is pinned to float32. The sink rejects any other
+        # pixel dtype, and text-call sentinels never introduce a second dtype
+        # (TQ keeps one dtype per field).
+        pixel_dtype = MINF_MEDIA_PIXEL_DTYPE if capture_media else None
         prompt_preparer = TQMegatronPromptPreparer(
-            TQTokenSource(dp_client, staging_partition=staging_partition)
+            TQTokenSource(
+                dp_client,
+                staging_partition=staging_partition,
+                capture_media=capture_media,
+            )
         )
         engine.prompt_preparer = prompt_preparer
         self._request_prompt_preparer = prompt_preparer
         stager = TQMegatronTokenStager(
-            TQTokenSink(dp_client, staging_partition=staging_partition)
+            TQTokenSink(
+                dp_client,
+                staging_partition=staging_partition,
+                capture_media=capture_media,
+                media_pixel_dtype=pixel_dtype,
+            )
         )
         engine.payload_stager = stager
         self._request_payload_stager = stager
