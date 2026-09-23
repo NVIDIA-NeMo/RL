@@ -125,10 +125,38 @@ def _invalidate_glm_weight_caches(model: torch.nn.Module) -> dict[str, int]:
     # Import only while inspecting a constructed model because older vLLM
     # releases do not provide the GLM-5.3 implementation.
     try:
-        from vllm.models.glm5next.nvidia.attention import Indexer
-        from vllm.models.glm5next.nvidia.kda import Glm5NextLinearAttention
-    except ImportError:
-        return {"kda": 0, "indexer": 0}
+        from vllm.models.glm5next.common.attention import Indexer
+        from vllm.models.glm5next.common.kda import Glm5NextLinearAttention
+    except ModuleNotFoundError as exc:
+        if exc.name is None or not any(
+            path == exc.name or path.startswith(exc.name + ".")
+            for path in (
+                "vllm.models.glm5next.common.attention",
+                "vllm.models.glm5next.common.kda",
+            )
+        ):
+            raise
+        # vLLM versions before the shared GLM implementation used nvidia/.
+        try:
+            from vllm.models.glm5next.nvidia.attention import Indexer
+            from vllm.models.glm5next.nvidia.kda import Glm5NextLinearAttention
+        except ModuleNotFoundError as exc:
+            if exc.name is None or not any(
+                path == exc.name or path.startswith(exc.name + ".")
+                for path in (
+                    "vllm.models.glm5next.nvidia.attention",
+                    "vllm.models.glm5next.nvidia.kda",
+                )
+            ):
+                raise
+            if any(
+                type(module).__module__.startswith("vllm.models.glm5next.")
+                for module in model.modules()
+            ):
+                raise RuntimeError(
+                    "Cannot resolve GLM classes for weight cache invalidation"
+                ) from exc
+            return {"kda": 0, "indexer": 0}
 
     invalidated = {"kda": 0, "indexer": 0}
     for module in model.modules():

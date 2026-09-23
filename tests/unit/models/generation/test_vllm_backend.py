@@ -16,6 +16,7 @@
 # inside the test bodies (which are marked @pytest.mark.vllm). This keeps the
 # module collectable in the non-vllm unit lane, where these tests are deselected.
 
+import builtins
 import contextlib
 import json
 import sys
@@ -287,7 +288,8 @@ def test_refresh_hpc_modules_after_layerwise_reload(monkeypatch):
 
 
 @pytest.mark.vllm
-def test_invalidate_glm_weight_caches(monkeypatch):
+@pytest.mark.parametrize("namespace", ["common", "nvidia"])
+def test_invalidate_glm_weight_caches(monkeypatch, namespace: str):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     class FakeGlm5NextLinearAttention(torch.nn.Module):
@@ -300,13 +302,19 @@ def test_invalidate_glm_weight_caches(monkeypatch):
             super().__init__()
             self._wp_fp32 = torch.ones(1)
 
-    fake_kda_module = ModuleType("vllm.models.glm5next.nvidia.kda")
+    for candidate in ("common", "nvidia"):
+        for name in ("attention", "kda"):
+            monkeypatch.setitem(
+                sys.modules, f"vllm.models.glm5next.{candidate}.{name}", None
+            )
+
+    fake_kda_module = ModuleType(f"vllm.models.glm5next.{namespace}.kda")
     fake_kda_module.Glm5NextLinearAttention = FakeGlm5NextLinearAttention
-    fake_attention_module = ModuleType("vllm.models.glm5next.nvidia.attention")
+    fake_attention_module = ModuleType(f"vllm.models.glm5next.{namespace}.attention")
     fake_attention_module.Indexer = FakeGlm5NextIndexer
-    monkeypatch.setitem(sys.modules, "vllm.models.glm5next.nvidia.kda", fake_kda_module)
+    monkeypatch.setitem(sys.modules, fake_kda_module.__name__, fake_kda_module)
     monkeypatch.setitem(
-        sys.modules, "vllm.models.glm5next.nvidia.attention", fake_attention_module
+        sys.modules, fake_attention_module.__name__, fake_attention_module
     )
 
     kda = FakeGlm5NextLinearAttention()
@@ -324,6 +332,48 @@ def test_invalidate_glm_weight_caches(monkeypatch):
     assert indexer._wp_fp32 is None
     assert torch.equal(unrelated._merged_conv_weight, torch.ones(1))
     assert torch.equal(unrelated._wp_fp32, torch.ones(1))
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("is_glm", [False, True])
+def test_invalidate_glm_weight_caches_missing_classes(monkeypatch, is_glm: bool):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    for namespace in ("common", "nvidia"):
+        for name in ("attention", "kda"):
+            monkeypatch.setitem(
+                sys.modules, f"vllm.models.glm5next.{namespace}.{name}", None
+            )
+
+    class Model(torch.nn.Module):
+        pass
+
+    if is_glm:
+        Model.__module__ = "vllm.models.glm5next.future.model"
+        with pytest.raises(RuntimeError, match="Cannot resolve GLM classes"):
+            vllm_backend._invalidate_glm_weight_caches(Model())
+    else:
+        assert vllm_backend._invalidate_glm_weight_caches(Model()) == {
+            "kda": 0,
+            "indexer": 0,
+        }
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("error_type", [ImportError, ModuleNotFoundError])
+def test_invalidate_glm_weight_caches_import_failure(monkeypatch, error_type):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    original_import = builtins.__import__
+
+    def failing_import(name, *args, **kwargs):
+        if name == "vllm.models.glm5next.common.attention":
+            raise error_type("broken dependency", name="glm_dependency")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", failing_import)
+    with pytest.raises(error_type, match="broken dependency"):
+        vllm_backend._invalidate_glm_weight_caches(torch.nn.Module())
 
 
 class _DeferredReloadLayer(torch.nn.Module):
