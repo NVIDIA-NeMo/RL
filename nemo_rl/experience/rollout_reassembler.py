@@ -37,7 +37,7 @@ from __future__ import annotations
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import torch
 
@@ -45,6 +45,7 @@ from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
 from nemo_rl.data_plane.tq_token_sink import (
+    FetchedStagedCall,
     StagedMediaTensors,
     TQTokenSink,
     TQTokenSource,
@@ -85,9 +86,9 @@ class FinalizedRollout:
     routed_experts: Optional[torch.Tensor] = None
     route_plan: Optional[RouteAssemblyPlan] = None
     # Trainer-ready media for this row (one logical row per PackedTensor):
-    # the engine's own vision-encoder inputs read off each call row along the
-    # terminal chain, checked against that call's digest-covered media summary,
-    # and concatenated in chain order. None for text rollouts.
+    # the engine's own vision-encoder inputs, read off the terminal chain's
+    # media columns (staged in the same put as each call's tokens) and
+    # structurally validated. None for text rollouts.
     media: Optional[dict[str, PackedTensor]] = None
 
 
@@ -115,74 +116,43 @@ class FinalizedGroup:
     total_row_count: int = 0
 
 
-def _media_mismatch(staged: StagedMediaTensors, summary: Any) -> Optional[str]:
-    """Check the staged media columns against the digest-covered media summary.
-
-    The tensors are outside Gym's digest; the summary (modality, imgs_sizes,
-    num_frames, num_tiles) is inside it. Agreement ties the pixels the
-    trainer will project to the prompt the policy generated against.
-    """
-    if staged.imgs.ndim not in (2, 3, 4) or staged.imgs.numel() == 0:
-        return f"imgs has unsupported shape {tuple(staged.imgs.shape)}"
-    for name in ("imgs_sizes", "num_frames", "num_tiles"):
-        engine_value = getattr(summary, name, None)
-        staged_tensor = getattr(staged, name)
-        staged_value = (
-            None
-            if staged_tensor is None
-            else staged_tensor.reshape(-1, 2).tolist()
-            if name == "imgs_sizes"
-            else (None if staged_tensor is None else staged_tensor.reshape(-1).tolist())
-        )
-        if engine_value is None and staged_value is None:
-            continue
-        if engine_value is None or staged_value is None:
-            return f"{name} summary={engine_value} columns={staged_value}"
-        if [
-            list(v) if isinstance(v, (list, tuple)) else v for v in engine_value
-        ] != staged_value:
-            return f"{name} summary={engine_value} columns={staged_value}"
-    return None
-
-
 def _concat_media(parts: list[StagedMediaTensors]) -> StagedMediaTensors:
     """Concatenate per-call media deltas along the terminal chain, in order.
 
-    Packed patches (``[1, total_patches, F]``) join along the patch dim; padded
-    pixels (``[N, C, H, W]``) along the row dim; the per-item metadata tensors
-    along their only dim. Optional metadata must be present on every part or on
-    none of them.
+    Packed patches (``[1, total_patches, F]``) join along the patch dim, the
+    per-frame sizes and per-video frame counts along their only dim. Parts
+    must agree on pixel dtype and patch feature width (no silent promotion)
+    and either all or none may carry frame counts (no mixed image/video
+    chains). Each part was already validated by ``validate_media_tensors``.
     """
+    if not parts:
+        raise ValueError("media chain has no parts")
     if len(parts) == 1:
         return parts[0]
     first = parts[0].imgs
-    if first.ndim == 3 and first.shape[0] == 1:
-        imgs = torch.cat([part.imgs for part in parts], dim=1)
-    else:
-        imgs = torch.cat([part.imgs for part in parts], dim=0)
-
-    def _join(name: str) -> torch.Tensor | None:
-        values = [getattr(part, name) for part in parts]
-        present = [value is not None for value in values]
-        if not any(present):
-            return None
-        if not all(present):
+    for part in parts[1:]:
+        if part.imgs.dtype != first.dtype:
             raise ValueError(
-                f"{name} is staged on some calls of the chain but not others"
+                f"media chain mixes pixel dtypes {first.dtype} and {part.imgs.dtype}"
             )
-        return torch.cat(
-            [
-                value.reshape(-1, 2) if name == "imgs_sizes" else value.reshape(-1)
-                for value in values
-            ],
-            dim=0,
+        if part.imgs.shape[-1] != first.shape[-1]:
+            raise ValueError(
+                "media chain mixes patch feature widths "
+                f"{int(first.shape[-1])} and {int(part.imgs.shape[-1])}"
+            )
+    frames_present = [part.num_frames is not None for part in parts]
+    if any(frames_present) and not all(frames_present):
+        raise ValueError(
+            "num_frames is staged on some calls of the chain but not others"
         )
-
     return StagedMediaTensors(
-        imgs=imgs,
-        imgs_sizes=_join("imgs_sizes"),
-        num_frames=_join("num_frames"),
-        num_tiles=_join("num_tiles"),
+        imgs=torch.cat([part.imgs for part in parts], dim=1),
+        imgs_sizes=torch.cat([part.imgs_sizes.reshape(-1, 2) for part in parts], dim=0),
+        num_frames=(
+            torch.cat([part.num_frames.reshape(-1) for part in parts], dim=0)  # type: ignore[union-attr]
+            if all(frames_present)
+            else None
+        ),
     )
 
 
@@ -190,9 +160,8 @@ def _trainer_media(staged: StagedMediaTensors) -> dict[str, PackedTensor]:
     """Wrap the engine's media tensors as the trainer's one-row PackedTensors.
 
     ``pixel_values`` keeps MInf's packed-patch layout: ``[total_patches, C*P*P]``
-    per row, which the Megatron-Bridge Omni model accepts directly (its
-    ``_patchify_dynamic_images`` passes already-patchified inputs through), so
-    rows concatenate along dim 0 with no padding. ``imgs_sizes`` and
+    per row, so rows concatenate along dim 0 with no padding. The learner
+    restores Bridge's singleton batch dimension before its forward call. ``imgs_sizes`` and
     ``num_frames`` mirror what ``extract_multimodal_model_inputs`` emits on the
     token-echo path (stills get one frame per image).
     """
@@ -200,15 +169,14 @@ def _trainer_media(staged: StagedMediaTensors) -> dict[str, PackedTensor]:
     if imgs.ndim == 3 and imgs.shape[0] == 1:
         imgs = imgs.squeeze(0)
     media = {"pixel_values": PackedTensor([imgs], dim_to_pack=0)}
-    if staged.imgs_sizes is not None:
-        sizes = staged.imgs_sizes.reshape(-1, 2).to(torch.int32)
-        media["imgs_sizes"] = PackedTensor([sizes], dim_to_pack=0)
-        frames = (
-            staged.num_frames.reshape(-1).to(torch.int32)
-            if staged.num_frames is not None
-            else torch.ones(sizes.shape[0], dtype=torch.int32)
-        )
-        media["num_frames"] = PackedTensor([frames], dim_to_pack=0)
+    sizes = staged.imgs_sizes.reshape(-1, 2).to(torch.int32)
+    media["imgs_sizes"] = PackedTensor([sizes], dim_to_pack=0)
+    frames = (
+        staged.num_frames.reshape(-1).to(torch.int32)
+        if staged.num_frames is not None
+        else torch.ones(sizes.shape[0], dtype=torch.int32)
+    )
+    media["num_frames"] = PackedTensor([frames], dim_to_pack=0)
     return media
 
 
@@ -248,17 +216,18 @@ class RolloutReassembler:
         max_seq_len: int,
         router_replay_enabled: bool = False,
         defer_routed_experts_to_policy: bool = False,
-        multimodal: bool = False,
+        capture_media: bool = False,
     ) -> None:
         self._dp_client = dp_client
         self._partition_id = partition_id
+        # Whether the staging partition carries media columns (setup's
+        # ``token_capture.enabled and processor is not None``). Text-only runs
+        # never read media columns; media-enabled runs must find them.
+        self._capture_media = capture_media
         self._pad_token_id = int(pad_token_id)
         self._max_seq_len = int(max_seq_len)
         self._router_replay_enabled = router_replay_enabled
         self._defer_routed_experts_to_policy = defer_routed_experts_to_policy
-        # Multimodal capture run: every published group must carry the media
-        # columns (see finalize_group's media-less group drop).
-        self._multimodal = multimodal
         if self._defer_routed_experts_to_policy and not self._router_replay_enabled:
             raise ValueError(
                 "defer_routed_experts_to_policy requires router replay to be enabled"
@@ -268,10 +237,14 @@ class RolloutReassembler:
         # carries routes; placeholder-only groups need it to shape their
         # sentinel tensors consistently with the model.
         self._routed_dims: Optional[tuple[int, int]] = None
-        self._source = TQTokenSource(dp_client, staging_partition=staging_partition)
+        self._source = TQTokenSource(
+            dp_client, staging_partition=staging_partition, capture_media=capture_media
+        )
         # The sink's clear() is the staging-partition delete; no staging
         # writes happen here.
-        self._staging = TQTokenSink(dp_client, staging_partition=staging_partition)
+        self._staging = TQTokenSink(
+            dp_client, staging_partition=staging_partition, capture_media=capture_media
+        )
 
     # ── per rollout ─────────────────────────────────────────────────────────
 
@@ -318,8 +291,8 @@ class RolloutReassembler:
             return rejected(f"rollout_failed:{parsed.failure_reason}", staging_keys)
         if parsed.capture_poisoned:
             return rejected("capture_poisoned", staging_keys)
-        # An unpoisoned receipt must name a terminal call that is in the manifest
-        # (RolloutReceipt validators), so a valid receipt here is never empty.
+        if not parsed.manifest:
+            return rejected("empty_manifest", staging_keys)
         if len(set(staging_keys)) != len(staging_keys):
             return rejected(
                 "duplicate_staging_key",
@@ -370,10 +343,9 @@ class RolloutReassembler:
         weight_versions = [record.weight_version for record in parsed.manifest]
         min_wv, max_wv = min(weight_versions), max(weight_versions)
 
-        # Media: each call's staged extras say whether the engine saw new media
-        # on that call. If so its row also carries the media columns the Megatron
-        # worker staged; read them along the chain, check each against its own
-        # summary, and concatenate in chain order.
+        # Media: the presence flags fetched with the base columns say which
+        # terminal-chain calls carry pixels; one batched read pulls them,
+        # after token verification so a rejected rollout never moves pixels.
         media, media_failure = self._resolve_media(row, fetched_by_call)
         if media_failure is not None:
             return rejected(media_failure, staging_keys)
@@ -464,48 +436,41 @@ class RolloutReassembler:
     def _resolve_media(
         self,
         row: Any,
-        fetched_by_call: dict[str, Any],
+        fetched_by_call: dict[str, FetchedStagedCall],
     ) -> tuple[Optional[dict[str, PackedTensor]], Optional[str]]:
-        """Read and verify the media columns along the terminal chain.
+        """Read and validate the media columns along the terminal chain.
 
-        Each call row holds only the media new to that call (the Megatron
-        stager slices at the parent chain's item count), so the chain is
+        Each call row holds only the media new to that call (the worker
+        slices at the parent chain's item count), so the chain's parts are
         concatenated in order, like the token deltas. Returns
-        ``(media, rejection_reason)``; text rollouts return ``(None, None)``
-        without a fetch. The media columns live on the call rows themselves,
-        so cleanup needs no extra key.
+        ``(media, rejection_reason)``. Text-only partitions and text rollouts
+        return ``(None, None)`` without touching storage; media-carrying
+        rollouts cost exactly one batched tensor read. The media columns live
+        on the call rows themselves, so cleanup needs no extra key.
         """
-        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-        from nemo_gym.token_id_capture.staging.media import parse_multimodal_extras
-
-        parts: list[StagedMediaTensors] = []
+        if not self._capture_media:
+            return None, None
+        items: list[FetchedStagedCall] = []
         for call_id, _carry_len, _generation_len in row.link_spans:
             item = fetched_by_call.get(call_id)
             if item is None:
                 return None, f"media_chain_identity:{call_id}"
-            try:
-                _, summary = parse_multimodal_extras(item.extras)
-            except (TypeError, ValueError) as error:
-                return None, f"invalid_media_extras:{call_id}:{error}"
-            if summary is None:
-                continue
-            try:
-                staged = self._source.fetch_media(item.staging_key)
-            except KeyError as error:
-                return None, f"media_columns_missing:{error}"
-            except (TypeError, ValueError) as error:
-                return None, f"invalid_media_columns:{error}"
-            problem = _media_mismatch(staged, summary)
-            if problem is not None:
-                return None, f"media_mismatch:{call_id}:{problem}"
-            parts.append(staged)
-        if not parts:
+            if item.media_present:
+                items.append(item)
+        if not items:
             return None, None
+        if len({item.media_has_frames for item in items}) != 1:
+            return None, "media_chain_incompatible:mixed image and video calls"
+        try:
+            parts = self._source.fetch_media(items)
+        except (KeyError, TypeError, ValueError) as error:
+            return None, f"invalid_media_columns:{error}"
         try:
             combined = _concat_media(parts)
-        except (TypeError, ValueError) as error:
+            media = _trainer_media(combined)
+        except (TypeError, ValueError, RuntimeError) as error:
             return None, f"media_chain_incompatible:{error}"
-        return _trainer_media(combined), None
+        return media, None
 
     def _execute_direct_plan(
         self,
@@ -594,6 +559,14 @@ class RolloutReassembler:
             "finalize/calls_per_rollout": (
                 sum(len(row.staging_keys) for row in rows) / len(rows)
             ),
+            # Fraction of valid rows that carry captured media. 1.0 on a VLM
+            # run is the signal that the learner trains on captured pixels
+            # rather than text-only rows; text runs report 0.0.
+            "finalize/media_row_rate": (
+                sum(1 for row in valid_rows if row.media) / len(valid_rows)
+                if valid_rows
+                else 0.0
+            ),
         }
         # Ledger-derived admission counters (per group): each manifest row
         # carries its admission mode. token_in_rate near 1.0 is the capture
@@ -628,24 +601,25 @@ class RolloutReassembler:
         # on a declaring harness is a regression signal. Failed selections
         # stamp the last stage attempted, so masked rollouts stay visible in
         # their method's bucket (cross-reference finalize/invalid_row_rate).
-        # Receipts whose manifest never parsed carry no method (None) and
-        # fall in no bucket. Method list is derived from Gym's own type
-        # rather than hand-copied, so a new resolution method Gym adds gets a
-        # bucket automatically instead of silently missing from these
-        # metrics; the annotation is ``Literal[...] | None``, so unwrap the
-        # Literal and skip the None member.
+        # Method list is derived from Gym's own type rather than hand-copied,
+        # so a new resolution method Gym adds gets a bucket automatically
+        # instead of silently missing from these metrics.
         from typing import Literal, get_args, get_origin
 
         from nemo_gym.token_id_capture.staging.records import RolloutReceipt
 
-        terminal_selection_methods = tuple(
-            method
-            for member in get_args(
-                RolloutReceipt.model_fields["terminal_selection"].annotation
-            )
-            if get_origin(member) is Literal
-            for method in get_args(member)
-        )
+        # Gym declares the field as ``Literal[...]`` or ``Literal[...] | None``
+        # (optional since Gym #2823); unwrap the union so the method names, not
+        # the union members, name the buckets.
+        annotation = RolloutReceipt.model_fields["terminal_selection"].annotation
+        terminal_selection_methods: list[str] = []
+        for member in (
+            get_args(annotation)
+            if get_origin(annotation) is not Literal
+            else (annotation,)
+        ):
+            if get_origin(member) is Literal:
+                terminal_selection_methods.extend(get_args(member))
         for method in terminal_selection_methods:
             method_receipts = sum(
                 1
@@ -720,7 +694,7 @@ class RolloutReassembler:
             logprobs[i, :length] = torch.tensor(row.logprobs, dtype=torch.float32)
             sample_mask[i] = float(loss_multiplier)
 
-        train_batch = {
+        train_batch: dict[str, Any] = {
             "input_ids": input_ids,
             "input_lengths": lengths,
             "generation_logprobs": logprobs,
@@ -770,7 +744,7 @@ class RolloutReassembler:
         # Media rides the same packed/tagged transport as the token-echo path
         # (pack_payload encodes PackedTensor fields and mints row-shape tags).
         media_fields = _media_fields_for_group(rows)
-        if self._multimodal and not media_fields:
+        if self._capture_media and not media_fields:
             # No valid row carried media, so this group would publish without
             # the media columns. TQ answers a batch fetch with only the fields
             # every requested key produced, so a train shard mixing these keys
@@ -778,7 +752,7 @@ class RolloutReassembler:
             # run image-blind. Drop the group; only the caller can source a
             # replacement.
             print(
-                f"  finalize: group {group_id} dropped — multimodal run but no "
+                f"  finalize: group {group_id} dropped — media capture on but no "
                 "valid rollout carried media",
                 flush=True,
             )
@@ -792,7 +766,7 @@ class RolloutReassembler:
                 canonical_output_tokens=0,
                 metrics=metrics,
                 dropped=True,
-                drop_reason="multimodal run, no valid rollout carried media",
+                drop_reason="media capture on, no valid rollout carried media",
                 valid_row_count=0,
                 total_row_count=0,
             )
@@ -859,7 +833,7 @@ class RolloutReassembler:
             partition_id=self._partition_id,
             task_name="train",
             sample_ids=list(sample_ids),
-            fields=list(fields.keys()),
+            fields=cast(list[str], list(fields.keys())),
             sequence_lengths=[int(s) for s in lengths.tolist()],
             tags=[dict(t) for t in tags],
         )

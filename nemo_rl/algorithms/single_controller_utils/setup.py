@@ -78,7 +78,7 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
-from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
+from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS, uses_image_placeholder
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
@@ -172,6 +172,8 @@ class SingleControllerActorArgs:
     # Defaulted fields must follow the required ones above, so these stay last.
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None
     partition_includes_multimodal_fields: bool = False
+    # Whether the staging partition carries captured media columns.
+    staging_partition_includes_media: bool = False
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None
     rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None
     # None when async_rl.generation_fleet_health is disabled; the SingleController
@@ -302,8 +304,13 @@ def _register_single_controller_partitions(
     master_config: MasterConfig,
     partition_id: str,
     include_multimodal_fields: bool,
+    capture_media: bool = False,
 ) -> None:
-    """Warm all SingleController partitions before concurrent data-plane use."""
+    """Warm all SingleController partitions before concurrent data-plane use.
+
+    ``capture_media`` adds the media columns the vLLM worker stages beside each
+    captured call to the staging partition (VLM token capture only).
+    """
     algo_cfg = algo_config(master_config)
     policy_config = master_config.policy
     token_capture_cfg = master_config.token_capture
@@ -346,13 +353,11 @@ def _register_single_controller_partitions(
             STAGING_FIELDS,
         )
 
-        # Multimodal runs stage the engine's media tensors as extra columns on
-        # each call row (see tq_token_sink.MEDIA_STAGING_FIELDS).
         dp_client.register_partition(
             partition_id=token_capture_cfg.staging_partition,
             fields=list(STAGING_FIELDS)
             + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else [])
-            + (list(MEDIA_STAGING_FIELDS) if include_multimodal_fields else []),
+            + (list(MEDIA_STAGING_FIELDS) if capture_media else []),
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize", "prev_lp", "train"],
         )
@@ -1232,6 +1237,18 @@ def setup_single_controller(
     # nemo_rl/distributed/actor_environments.py), so nothing here needs to
     # change the worker's environment.
     token_capture_cfg = master_config.token_capture
+    capture_media = token_capture_cfg.enabled and processor is not None
+    if capture_media:
+        if not uses_image_placeholder(processor):
+            raise ValueError(
+                "VLM token capture currently supports Omni dynamic images and native video"
+            )
+        if not policy_config["megatron_cfg"]["enabled"]:
+            raise ValueError(
+                "Omni media token capture currently requires the Megatron learner"
+            )
+        if token_capture_cfg.defer_routed_experts_to_policy:
+            raise ValueError("VLM token capture requires direct router replay assembly")
     if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
         if not master_config.checkpointing["enabled"]:
             raise ValueError(
@@ -1277,34 +1294,20 @@ def setup_single_controller(
                 "token_capture.enabled supports vllm or megatron; got "
                 f"{generation_config['backend']!r}"
             )
-        if processor is not None:
-            # Multimodal capture: the media tensors ride a per-rollout staging
-            # row and the compact/expanded prompt split is handled by the
-            # Megatron preparer/stager pair. The vLLM capture path stages the
-            # pre-processor prompt and carries no media, so it stays off.
-            if generation_config["backend"] != "megatron":
-                raise NotImplementedError(
-                    "token_capture.enabled with a multimodal policy is supported "
-                    "on policy.generation.backend=megatron only; the vLLM capture "
-                    "path does not yet carry media (see "
-                    "docs/design-docs/token-capture-ledger.md)"
-                )
-            if master_config.grpo.deduplicate_multimodal_data:
-                raise ValueError(
-                    "token_capture.enabled does not support "
-                    "grpo.deduplicate_multimodal_data=true: capture rows carry "
-                    "their own media"
-                )
-        generation_config_dict = cast(dict[str, Any], generation_config)
-        if (
-            generation_config["backend"] == "vllm"
-            and not generation_config_dict["vllm_cfg"]["async_engine"]
-        ):
+        if capture_media and master_config.grpo.deduplicate_multimodal_data:
             raise ValueError(
-                "token_capture.enabled requires "
-                "policy.generation.vllm_cfg.async_engine=true (the capture "
-                "host is the worker's in-process HTTP server)"
+                "token_capture.enabled does not support "
+                "grpo.deduplicate_multimodal_data=true: capture rows carry "
+                "their own media"
             )
+        generation_config_dict = cast(dict[str, Any], generation_config)
+        if generation_config["backend"] == "vllm":
+            if not generation_config_dict["vllm_cfg"]["async_engine"]:
+                raise ValueError(
+                    "token_capture.enabled requires "
+                    "policy.generation.vllm_cfg.async_engine=true (the capture "
+                    "host is the worker's in-process HTTP server)"
+                )
         if generation_config["backend"] == "megatron":
             if not generation_config_dict["mcore_generation_config"][
                 "expose_http_server"
@@ -1962,10 +1965,17 @@ def setup_single_controller(
             master_config=master_config,
             partition_id=partition_id,
             include_multimodal_fields=processor is not None,
+            capture_media=capture_media,
         )
     if token_capture_cfg.enabled:
-        # Both active backends stage canonical Gym rows in serving workers.
-        generation.setup_token_capture(dp_config, token_capture_cfg.staging_partition)
+        # Host Gym's capture core in every vLLM DP leader (in-worker DP
+        # client + TQTokenSink + the single install_capture call), and give
+        # workers the initial weight version to stamp on captured calls.
+        generation.setup_token_capture(
+            dp_config,
+            token_capture_cfg.staging_partition,
+            capture_media=capture_media,
+        )
         generation.set_rollout_weight_version(0)
 
     if weight_synchronizer is None:
@@ -2028,7 +2038,7 @@ def setup_single_controller(
                 router_replay_enabled=router_replay_enabled(policy_config),
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
-                multimodal=processor is not None,
+                capture_media=capture_media,
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )
@@ -2088,6 +2098,7 @@ def setup_single_controller(
         last_checkpoint_path=recovery_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         partition_includes_multimodal_fields=processor is not None,
+        staging_partition_includes_media=capture_media,
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
         finalizer_actors=finalizer_actors,

@@ -394,6 +394,55 @@ The SC path is still under active development. Feature gaps are tracked in [issu
 - Multimodal/VLM GRPO is supported with Megatron generation. Set
   `policy.is_vlm: true`; see the
   [CLEVR Single-Controller recipe](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron-single-controller-async.v1.yaml).
+- NeMo-Gym token capture also supports Omni dynamic-resolution images and native video
+  rollouts with async vLLM generation and a Megatron learner. With
+  `token_capture.enabled: true` and the VLM processor configured, workers capture
+  the processed media used for inference together with each call's token delta.
+  RL hands the owned tensors (`imgs`, `imgs_sizes`, and optional `num_frames`)
+  to Gym's `complete_call_from_response` as opaque attachments, and the TQ sink
+  writes them in the same `put` as the token columns, so `staged` coordinates
+  acknowledge tokens and pixels together and a failed write is `capture_failed`
+  at call time. Tensors keep their native shapes and dtypes on the wire; two
+  per-row flags (`media_present`, `media_has_frames`) mark which rows carry
+  pixels and whether they are video. Media-enabled staging partitions carry
+  these columns on every row; text-only runs register and read none of them.
+  vLLM pixels are rearranged losslessly into packed patches; the finalizer
+  reads the presence flags with the base columns, then issues one batched read
+  of the tensor columns for the terminal-chain calls that carry media, and
+  publishes `pixel_values`, `imgs_sizes`, and `num_frames` for the existing
+  Megatron learner without resampling or normalizing the media again.
+  Only newly introduced occurrences are staged. vLLM-specific `media_spans`
+  extras retain placeholder positions and token hashes for multi-turn prefix
+  replacement, including video's timestamp-separated visual-token spans.
+  Processor-cache bypass ensures the worker has concrete pixels to capture.
+  Retained images are re-processed by vLLM under the current turn's token
+  budget, which is shared across every image in the prompt; when that budget
+  binds (an image's native patch grid exceeds its share of
+  `max_model_len - prompt_len`) vLLM re-tiles the image and the continuation
+  is rejected before inference with HTTP 400 and error code
+  `retained_media_changed` (other capture-time validation failures use
+  `media_capture_rejected`), and Gym records the rollout as failed. Text-call
+  rows carry sentinels in each column's own dtype, because TransferQueue keeps
+  one dtype per field across live rows.
+  Media bundles are structurally validated before writing and after reading
+  (required tensors, patch geometry, frame grouping); malformed or missing
+  columns reject the rollout as `invalid_media_columns`, incompatible parts
+  along a chain as `media_chain_incompatible`. Tensor contents are not hashed;
+  retained occurrences are checked by geometry and placeholder tokens. Call
+  rows share the existing checkpoint and cleanup lifecycle. TQ has no
+  transactional rollback: a failed combined write is discarded best-effort by
+  the sink, and a failed discard is logged at ERROR.
+  Upgrade the paired Gym and RL changes together; checkpoints written with the
+  former `media_capture`/tensor-attachment format or with the two-write
+  `media_geometry_json` layout are not compatible. The GB200 functional shard
+  `L1_Functional_Tests_GB200_Vllm_Omni_Single_Controller.sh` smokes this path
+  end to end (CLEVR-style images through Gym `string_match`, native video
+  through Gym `mcqa`) and gates on `train/finalize/media_row_rate == 1`, the
+  metric that reports the fraction of learner rows built from captured media.
+  This integration does not require Megatron inference capture support or a new
+  Megatron-LM pin. Compaction, mixed image/video conversations, native audio,
+  video token pruning, static tiling (`num_tiles`), other processor families,
+  and `token_capture.defer_routed_experts_to_policy: true` are not supported.
 - Multi-Teacher On-Policy Distillation (MOPD) is supported for text-only NeMo
   Gym rollouts; multimodal/VLM MOPD is not yet supported. See
   [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).

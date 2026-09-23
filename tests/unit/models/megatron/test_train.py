@@ -39,6 +39,30 @@ pytestmark = pytest.mark.mcore
 class TestModelForward:
     """Tests for model_forward function."""
 
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_model_forward_preserves_captured_omni_pixels(self, packed):
+        from nemo_rl.data.multimodal_utils import PackedTensor
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+        from nemo_rl.models.megatron.train import model_forward
+
+        # Two captured rollouts are materialized as one learner microbatch.
+        pixels = torch.arange(96, dtype=torch.float32).reshape(8, 12)
+        if not packed:
+            pixels = pixels.reshape(2, 3, 4, 4)
+        batch = BatchedDataDict(
+            {
+                "pixel_values": PackedTensor([pixels], dim_to_pack=0),
+                "imgs_sizes": PackedTensor(
+                    [torch.tensor([[4, 4], [4, 4]])], dim_to_pack=0
+                ),
+            }
+        )
+        model = MagicMock(return_value=torch.zeros(1, 4, 10))
+        model_forward(model, batch, torch.tensor([[1, 2, 3, 4]]), None, None)
+        actual = model.call_args.kwargs["pixel_values"]
+        expected = pixels.unsqueeze(0) if packed else pixels
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_model_forward_basic(self):
         """Test basic model_forward without multimodal data."""
         from nemo_rl.models.megatron.train import model_forward

@@ -23,11 +23,13 @@ a mock worker group.
 from __future__ import annotations
 
 import asyncio
+import threading
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 
@@ -41,10 +43,6 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     StageResult,
 )
 
-from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
-    ChainPrefixCache,
-    PrefixChains,
-)
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
@@ -56,9 +54,13 @@ pytestmark = pytest.mark.nemo_gym
 class _MemorySink:
     def __init__(self) -> None:
         self.records: list[StagedCallRecord] = []
+        self.attachments: list[dict | None] = []
 
-    def stage(self, record: StagedCallRecord) -> StageResult:
+    def stage(
+        self, record: StagedCallRecord, *, attachments: dict | None = None
+    ) -> StageResult:
         self.records.append(record)
+        self.attachments.append(attachments)
         return StageResult(ok=True, staging_key=record.staging_key)
 
 
@@ -68,7 +70,9 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
         is_model_owner=is_model_owner,
         token_capture=None,
         _rollout_weight_version=0,
-        _chain_prefix=ChainPrefixCache(),
+        _staging_source=None,
+        _prefix_cache={},
+        _prefix_cache_lock=threading.Lock(),
     )
     worker.install_token_capture = lambda capture: setattr(
         worker, "token_capture", capture
@@ -84,7 +88,11 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
-        lambda dp_client, *, staging_partition: sink,
+        lambda dp_client,
+        *,
+        staging_partition,
+        capture_media,
+        media_pixel_dtype=None: sink,
     )
     worker = _fake_worker()
 
@@ -123,7 +131,11 @@ def test_weight_version_is_stamped_from_worker_state(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
-        lambda dp_client, *, staging_partition: sink,
+        lambda dp_client,
+        *,
+        staging_partition,
+        capture_media,
+        media_pixel_dtype=None: sink,
     )
     worker = _fake_worker()
     asyncio.run(
@@ -169,6 +181,7 @@ def test_generation_setup_token_capture_fans_out(monkeypatch):
         "setup_token_capture",
         dp_cfg={"backend": "simple"},
         staging_partition="rollout_staging",
+        capture_media=False,
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
     )
 
@@ -207,7 +220,9 @@ def _worker_with_capture(sink: _MemorySink):
 
     worker = _fake_worker()
     worker._capture_calls = {}
-    worker._chain_prefix = ChainPrefixCache()
+    worker._prefix_cache = {}
+    worker._prefix_cache_lock = threading.Lock()
+    worker._staging_source = None
     worker._delta_align_routed_experts = (
         VllmAsyncGenerationWorkerImpl._delta_align_routed_experts
     )
@@ -236,11 +251,6 @@ class _MemoryPrefixSource:
     def fetch_prefix_token_ids(self, staging_keys: list[str]) -> list[int]:
         self.calls.append(list(staging_keys))
         return [token for key in staging_keys for token in self.deltas[key]]
-
-    def fetch_prefix_chains(self, staging_keys: list[str]) -> PrefixChains:
-        # Text-only chains: compact == expanded. One recorded call per fetch.
-        expanded = self.fetch_prefix_token_ids(staging_keys)
-        return PrefixChains(expanded=expanded, compact=list(expanded))
 
 
 def _served_content(gen_ids, logprobs):
@@ -365,11 +375,12 @@ def _staging_chain_request(prev_len: int = 3) -> _FakeRequest:
 
 
 def test_staging_chain_prefix_flows_through_adapter_and_begin_call():
-    """The resolved prefix reaches both the engine request and capture admission."""
+    """The admission dict is read once and never mutated: the resolved prefix
+    reaches the request via the adapter and begin_call via its keyword."""
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     source = _MemoryPrefixSource({"r0/c1": [10, 11], "r0/c2": [12]})
-    worker._chain_prefix.install(source)
+    worker._staging_source = source
     request = _staging_chain_request()
     context_before = dict(request.ng_capture)
 
@@ -391,15 +402,14 @@ def test_staging_chain_prefix_flows_through_adapter_and_begin_call():
     assert admission.required_prefix_token_ids == []
     # enter_prefix is the production writer of the request field.
     assert request.required_prefix_token_ids == prefix
-    call, prompt = worker._capture_calls[id(request)]
-    assert call.admission.required_prefix_token_ids == prefix
-    assert prompt == [10, 11, 12, 20]
+    state = worker._capture_calls[id(request)]
+    assert state.call.prefix_token_ids == prefix
+    assert state.prompt_token_ids == [10, 11, 12, 20]
 
 
 def test_inline_prefix_admission_resolves_without_a_fetch():
     worker = _worker_with_capture(_MemorySink())
-    source = _MemoryPrefixSource({})
-    worker._chain_prefix.install(source)
+    worker._staging_source = _MemoryPrefixSource({})
     request = _FakeRequest(
         ng_capture={
             "rollout_id": "r0",
@@ -414,7 +424,7 @@ def test_inline_prefix_admission_resolves_without_a_fetch():
     )
     admission = worker._capture_admission(request)
     assert worker._resolve_admission_prefix(admission) == [10, 11]
-    assert source.calls == []
+    assert worker._staging_source.calls == []
     text_root = worker._capture_admission(
         _FakeRequest(
             ng_capture={"rollout_id": "r0", "model_call_id": "c1", "mode": "text"}
@@ -426,7 +436,7 @@ def test_inline_prefix_admission_resolves_without_a_fetch():
 def test_staging_chain_cache_fetches_only_uncached_suffix():
     worker = _worker_with_capture(_MemorySink())
     source = _MemoryPrefixSource({"r0/c1": [10, 11], "r0/c2": [12]})
-    worker._chain_prefix.install(source)
+    worker._staging_source = source
 
     first = VllmAsyncGenerationWorkerImpl._fetch_chain_prefix(worker, ["r0/c1"])
     second = VllmAsyncGenerationWorkerImpl._fetch_chain_prefix(
@@ -439,9 +449,9 @@ def test_staging_chain_cache_fetches_only_uncached_suffix():
 
 
 def test_staging_chain_prefix_length_mismatch_is_rejected_by_begin_call():
-    """The worker validates a fetched prefix before constructing ActiveCall."""
+    """prev_len enforcement lives in Gym's begin_call, not in the worker."""
     worker = _worker_with_capture(_MemorySink())
-    worker._chain_prefix.install(_MemoryPrefixSource({"r0/c1": [10, 11], "r0/c2": []}))
+    worker._staging_source = _MemoryPrefixSource({"r0/c1": [10, 11], "r0/c2": []})
     request = _staging_chain_request(prev_len=3)
     context_before = dict(request.ng_capture)
 
@@ -461,7 +471,7 @@ def test_staging_chain_admission_requires_the_resolved_prefix_keyword():
     worker = _worker_with_capture(_MemorySink())
     request = _staging_chain_request()
 
-    with pytest.raises(CaptureError, match="requires resolved prefix_token_ids"):
+    with pytest.raises(CaptureError, match="pass the resolved prefix_token_ids"):
         VllmAsyncGenerationWorkerImpl._begin_request_capture(
             worker, request, [10, 11, 12, 20]
         )
@@ -518,3 +528,51 @@ def test_request_capture_abort_fails_the_call_and_drains_state():
         worker, request, _served_content([3], [-0.1])
     )
     assert "ng_commit_coords" not in out
+
+
+@pytest.mark.parametrize("pruning_rate", [0.0, 0.5])
+def test_omni_capture_setup_rejects_video_pruning(monkeypatch, pruning_rate):
+    # nemo_gym-marked tests run in a lane without the vllm extra.
+    pytest.importorskip("vllm")
+    from vllm.model_executor.models.nano_nemotron_vl import NanoNemotronVLProcessingInfo
+
+    info = object.__new__(NanoNemotronVLProcessingInfo)
+    monkeypatch.setattr(NanoNemotronVLProcessingInfo, "is_dynamic_tiler", True)
+    monkeypatch.setattr(
+        NanoNemotronVLProcessingInfo,
+        "get_video_pruning_rate",
+        lambda self: pruning_rate,
+    )
+    monkeypatch.setattr(
+        NanoNemotronVLProcessingInfo,
+        "get_hf_processor",
+        lambda self: SimpleNamespace(_img_context_token_ids=[18]),
+    )
+    monkeypatch.setattr(
+        NanoNemotronVLProcessingInfo,
+        "get_hf_config",
+        lambda self: SimpleNamespace(patch_size=2),
+    )
+    worker = _fake_worker()
+    worker.llm = SimpleNamespace(
+        renderer=SimpleNamespace(get_mm_processor=lambda: SimpleNamespace(info=info)),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.build_data_plane_client",
+        lambda dp_cfg, bootstrap: MagicMock(),
+    )
+    if pruning_rate:
+        with pytest.raises(ValueError, match="video token pruning"):
+            asyncio.run(
+                VllmAsyncGenerationWorkerImpl.setup_token_capture(
+                    worker, {}, staging_partition="staging", capture_media=True
+                )
+            )
+    else:
+        assert asyncio.run(
+            VllmAsyncGenerationWorkerImpl.setup_token_capture(
+                worker, {}, staging_partition="staging", capture_media=True
+            )
+        )
+        assert worker._capture_image_token_id == 18
