@@ -987,11 +987,10 @@ class MegatronGenerationMixin:
             return False
 
         from nemo_rl.data_plane import build_data_plane_client
-        from nemo_rl.data_plane.tq_token_sink import (
+        from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
+        from nemo_rl.models.generation.megatron.token_capture import (
             TQMegatronPromptPreparer,
             TQMegatronTokenStager,
-            TQTokenSink,
-            TQTokenSource,
         )
 
         dp_client = build_data_plane_client(dp_cfg, bootstrap=False)

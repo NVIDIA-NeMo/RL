@@ -47,11 +47,13 @@ from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     STAGING_FIELDS,
     ChainPrefixCache,
-    TQMegatronPromptPreparer,
-    TQMegatronTokenStager,
     TQTokenSink,
     TQTokenSource,
     resolve_admission_prefix,
+)
+from nemo_rl.models.generation.megatron.token_capture import (  # noqa: E402
+    TQMegatronPromptPreparer,
+    TQMegatronTokenStager,
 )
 from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
     build_fixture_artifacts,
@@ -520,7 +522,9 @@ def test_megatron_stager_stamps_admission_epoch_when_request_spans_refit(
         model_call_id="c1",
         mode="text",
     )
-    with caplog.at_level("WARNING", logger="nemo_rl.data_plane.tq_token_sink"):
+    with caplog.at_level(
+        "WARNING", logger="nemo_rl.models.generation.megatron.token_capture"
+    ):
         result = stager.stage(
             "minf-response-1",
             SimpleNamespace(
