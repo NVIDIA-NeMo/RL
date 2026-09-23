@@ -29,7 +29,7 @@ pytestmark = pytest.mark.nemo_gym
 
 def _capture_env() -> NemoGym:
     env_cls = NemoGym.__ray_metadata__.modified_class
-    return object.__new__(env_cls)
+    return env_cls({"token_capture": {"manifest_transport": "http"}})
 
 
 def _digest(label: str) -> str:

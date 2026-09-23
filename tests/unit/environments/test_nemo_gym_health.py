@@ -135,14 +135,14 @@ class TestUnspunActor:
 
     def test_shutdown_is_a_noop_so_teardown_does_not_mask_the_real_error(self):
         """shutdown() runs in a finally block; it must not raise over a training error."""
-        _unspun().shutdown()
+        asyncio.run(_unspun().shutdown())
 
     def test_shutdown_still_forwards_when_spun_up(self):
         env = _unspun()
         run_helper = _FakeRunHelper()
         env.rh = run_helper
-        env.shutdown()
-        env.shutdown()
+        asyncio.run(env.shutdown())
+        asyncio.run(env.shutdown())
         assert run_helper.shutdowns == 1
         assert env.rh is None
 

@@ -105,6 +105,63 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 
 6. **(PPO) Set `ppo:` instead of `grpo:`** — the two algorithm blocks are mutually exclusive, and SC reads every step setting from whichever one is present. A PPO run also needs `value:`, `value_loss_fn:` and `ppo.adv_estimator.name: gae` (same schemas as legacy PPO), a Megatron critic, and `policy.offload_optimizer_for_logprob: true`, which is what keeps the policy optimizer off the GPU while the critic runs. `ppo.policy_training_start_step: N` gives the usual critic warmup: for the first N steps the policy is neither trained nor refit, while the critic trains every step. `ppo.warm_start_value_checkpoint` seeds that critic from another run's checkpoint instead, so a fresh run can skip the online warmup entirely — see [Warm-Starting the Critic](./ppo.md#warm-starting-the-critic).
 
+### Direct manifest reads for NeMo-Gym token capture
+
+For a Gym actor and its policy proxy that share the same node-local filesystem,
+use direct manifest reads to avoid HTTP connector admission for completed
+rollouts:
+
+```yaml
+token_capture:
+  enabled: true
+  manifest_transport: local_file
+  manifest_read_workers: 2
+  manifest_queue_size: 256
+  control_timeout_s: 60.0
+  capture_dir: /dev/shm/gym_token_capture/my-run
+```
+
+The GRPO and PPO single-controller exemplars select `local_file`. The schema
+keeps `http` as its default for existing configurations that omit the field.
+`manifest_read_workers` and `manifest_queue_size` must be positive integers;
+`control_timeout_s` must be positive and finite. HTTP mode retains the shared
+Gym client and sequential receipt processing from main.
+
+Each Gym proxy commits call metadata to
+`<capture_dir>/lineage/<rollout_id>.lineage.jsonl` before serving its response.
+After the rollout completes, the Gym actor admits a job to one bounded service
+shared by all of its rollout streams. Its dedicated threads snapshot the ledger
+under the writer's shared file lock, release the lock, parse the manifest, and
+build the existing token-free receipt. The controller sends that receipt to the
+existing finalizer, which fetches token payloads from TransferQueue. The actor's
+rollout HTTP client and uvloop remain enabled.
+
+Use a unique capture directory per run. The Gym library must provide
+`FileManifestReader` and writer identity markers. After starting the proxy,
+actor startup verifies matching host, directory device, and inode; missing or
+mismatched visibility fails startup with a diagnostic. A remote filesystem with
+the same path string is not sufficient. There is no automatic HTTP fallback;
+select `manifest_transport: http` explicitly for deployments without local
+visibility.
+
+One deadline covers queue admission and waiting for the finished receipt. On
+expiry the caller receives a failed result and finalization produces a
+placeholder, as for an unavailable HTTP manifest. The thread is signalled to
+cancel, but its slot remains occupied until it returns. Closing a rollout
+stream cancels its pending admissions, read futures, and rollout task; other
+streams continue using the same actor-wide service. Schema-invalid ledgers
+produce a corruption result without terminating a reader consumer. Timeout
+callbacks run when the actor event loop can execute, so a busy event loop can
+still delay result delivery.
+
+Periodic `manifest_local_file` logs report bounded latency samples, outcomes,
+and queue/worker high-water marks. Start with two threads; increase capacity
+only after measuring contention and actor event-loop latency. No manifest
+cache grows with rollout count. Transport, timeout, and reader
+capacity settings are operational fingerprint exclusions, so switching them
+does not change receipt/checkpoint compatibility.
+
+
 ## Checkpointing and Replay Recovery
 
 With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint contains:
