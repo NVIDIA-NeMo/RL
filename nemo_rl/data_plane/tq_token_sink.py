@@ -43,6 +43,8 @@ import ray
 import torch
 from tensordict import TensorDict
 
+from nemo_rl.data_plane.gpu_token_payload import GpuTokenPayload
+
 if TYPE_CHECKING:
     # Deferred: nemo_gym is an optional extra absent in non-gym runs; runtime
     # uses import locally so this module (and the finalizer actor importing
@@ -157,7 +159,9 @@ class TQTokenSink:
         self._dp_client = dp_client
         self._staging_partition = staging_partition
 
-    def stage(self, record: StagedCallRecord) -> StageResult:
+    def stage(
+        self, record: StagedCallRecord, *, gpu_payload: GpuTokenPayload | None = None
+    ) -> StageResult:
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.records import StageResult
 
@@ -267,6 +271,17 @@ class TQTokenSink:
                 [routed_encoding], dtype=torch.int64
             )
             field_dict[ROUTED_LEN_FIELD] = torch.tensor([routed_len], dtype=torch.int64)
+            if gpu_payload is not None:
+                try:
+                    with torch.cuda.device(gpu_payload.device()):
+                        gpu_fields = gpu_payload.staging_fields(record, field_dict)
+                        # TQ may read these fields on another executor's stream.
+                        torch.cuda.current_stream().synchronize()
+                    field_dict.update(gpu_fields)
+                except Exception as error:
+                    logging.getLogger(__name__).warning(
+                        "Using CPU staging payload for %s: %s", key, error
+                    )
             fields = TensorDict(field_dict, batch_size=[1])
             tags = [
                 {

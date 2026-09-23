@@ -469,7 +469,10 @@ def test_normalize_routed_experts_strict_mode_rejects_surplus_routes():
         )
 
 
-def test_attach_routed_experts_to_chat_response_choices_reassociates_by_choice_index():
+@pytest.mark.parametrize("start", [0, 2, 3])
+def test_attach_routed_experts_to_chat_response_choices_reassociates_by_choice_index(
+    start: int,
+):
     final_res = SimpleNamespace(
         prompt_token_ids=[101, 102, 103],
         prompt_routed_experts=torch.tensor(
@@ -503,23 +506,30 @@ def test_attach_routed_experts_to_chat_response_choices_reassociates_by_choice_i
         response,
         final_res,
         device=torch.device("cpu"),
+        routed_experts_start=start,
     )
 
     # Routes travel as a base64 string envelope, one opaque object per choice.
     assert isinstance(response.choices[0].message.routed_experts, str)
-    assert _decoded_routes(response.choices[0].message.routed_experts) == [
-        [[10]],
-        [[11]],
-        [[30]],
-        [[0]],
-    ]
-    assert _decoded_routes(response.choices[1].message.routed_experts) == [
-        [[10]],
-        [[11]],
-        [[31]],
-        [[32]],
-        [[0]],
-    ]
+    assert (
+        _decoded_routes(response.choices[0].message.routed_experts)
+        == [
+            [[10]],
+            [[11]],
+            [[30]],
+            [[0]],
+        ][start:]
+    )
+    assert (
+        _decoded_routes(response.choices[1].message.routed_experts)
+        == [
+            [[10]],
+            [[11]],
+            [[31]],
+            [[32]],
+            [[0]],
+        ][start:]
+    )
 
 
 def test_attach_routed_experts_to_chat_response_choices_requires_routed_experts():

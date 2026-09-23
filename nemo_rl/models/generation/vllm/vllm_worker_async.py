@@ -27,8 +27,11 @@ import ray
 import torch
 import uvicorn
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse, Response
 
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
+from nemo_rl.data_plane.gpu_token_payload import BoundGpuTokenSink
+from nemo_rl.data_plane.interfaces import DataPlaneConfig, backend_config
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GENERATION_PORT_RANGE_HIGH,
@@ -49,6 +52,11 @@ from nemo_rl.models.generation.vllm.collective_rpc import (
     resolve_collective_rpc_result,
 )
 from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
+from nemo_rl.models.generation.vllm.gpu_capture_host import (
+    CapturedModelCall,
+    GpuCaptureHost,
+)
+from nemo_rl.models.generation.vllm.gpu_output_capture import GPU_CAPTURE_KEY
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
@@ -66,6 +74,25 @@ LOGGER = logging.getLogger(__name__)
 
 
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
+
+
+def _validate_gpu_route_history(request_output: Any) -> None:
+    """Reject GPU capture when CPU route omission prevents identical PUT bytes."""
+    prompt_len = len(getattr(request_output, "prompt_token_ids", None) or [])
+    prompt_routes = getattr(request_output, "prompt_routed_experts", None)
+    for output in request_output.outputs:
+        routes = getattr(output, "routed_experts", None)
+        actual = sum(len(rows) for rows in (prompt_routes, routes) if rows is not None)
+        expected = max(prompt_len + len(output.token_ids) - 1, 0)
+        if actual < expected:
+            # The CPU adapter pads missing rows with -1. A short chunk can
+            # also shift later rows, so native GPU values may not match that
+            # record. Preserve serving's fallback but do not stage different
+            # bytes under its digest. The normal final dummy row is excluded.
+            raise ValueError(
+                "GPU capture requires complete canonical CPU route history: "
+                f"received {actual} rows, expected at least {expected}"
+            )
 
 
 class _AsyncLLMHTTPClient:
@@ -150,6 +177,12 @@ class _AsyncLLMHTTPClient:
     async def is_tracing_enabled(self) -> bool:
         return await self._engine_client.is_tracing_enabled()
 
+    async def collective_rpc(self, method: str, *, args: tuple[Any, ...]) -> Any:
+        """Run CUDA payload lease operations on the owning engine loop."""
+        return await self._run_on_engine_loop(
+            lambda: self._engine_client.collective_rpc(method, args=args)
+        )
+
 
 class VllmAsyncGenerationWorkerImpl(
     VllmAsyncCheckpointEngineRpcMixin, BaseVllmGenerationWorker
@@ -200,9 +233,9 @@ class VllmAsyncGenerationWorkerImpl(
         # the set_rollout_weight_version fan-out from the SC's _sync_weights.
         self.token_capture = None
         self._rollout_weight_version = 0
-        # In-flight captured calls keyed by id(request): (ActiveCall, the
-        # exact engine prompt ids recorded at preprocess time).
-        self._capture_calls: dict[int, tuple[Any, list[int]]] = {}
+        self._capture_calls: dict[int, CapturedModelCall] = {}
+        self._token_sink: Any | None = None
+        self._gpu_capture_host: GpuCaptureHost | None = None
         self._staging_source: Any | None = None
         # Guarded by _prefix_cache_lock: _fetch_chain_prefix runs on executor
         # threads (asyncio.to_thread), so lookups/evictions can be concurrent.
@@ -500,8 +533,32 @@ class VllmAsyncGenerationWorkerImpl(
         from nemo_rl.data_plane import build_data_plane_client
         from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 
-        dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
+        dp_config = cast(DataPlaneConfig, dp_cfg)
+        self._gpu_capture_host = None
+        if (
+            dp_config.get("backend") == "mooncake_cpu"
+            and backend_config(dp_config).use_gdr
+            and self._http_engine_client is not None
+        ):
+            self._gpu_capture_host = await GpuCaptureHost.create(
+                self._http_engine_client,
+                require_routed_experts=self._return_routed_experts_enabled(),
+            )
+            if self._gpu_capture_host is not None:
+                LOGGER.info(
+                    "GDR token capture retains generated payloads on %s until PUT",
+                    self._gpu_capture_host.device,
+                )
+        # TQ fixes GDR eligibility and its CUDA device when attaching. Resolve
+        # the IPC producer first, then attach on that physical device.
+        if self._gpu_capture_host is not None:
+            with torch.cuda.device(self._gpu_capture_host.device):
+                torch.cuda.init()
+                dp_client = build_data_plane_client(dp_config, bootstrap=False)
+        else:
+            dp_client = build_data_plane_client(dp_config, bootstrap=False)
         sink = TQTokenSink(dp_client, staging_partition=staging_partition)
+        self._token_sink = sink
         self._staging_source = TQTokenSource(
             dp_client, staging_partition=staging_partition
         )
@@ -557,6 +614,12 @@ class VllmAsyncGenerationWorkerImpl(
         against the admission (length == ``prev_len``, equal to an inline
         prefix) and requires it for a ``staging_chain`` admission.
         """
+        # Only ledger-admitted calls can request GPU retention. Do not accept
+        # the internal key from an arbitrary OpenAI request.
+        request_xargs: dict[str, Any] = dict(getattr(request, "vllm_xargs", None) or {})
+        request_xargs.pop(GPU_CAPTURE_KEY, None)
+        if getattr(request, "vllm_xargs", None) is not None:
+            request.vllm_xargs = request_xargs
         capture = self.token_capture
         if capture is None:
             return
@@ -564,12 +627,42 @@ class VllmAsyncGenerationWorkerImpl(
             admission = self._capture_admission(request)
             if admission is None:
                 return
+        gpu_sink = None
+        capture_key = None
+        if self._gpu_capture_host is not None and getattr(request, "n", None) in (
+            None,
+            1,
+        ):
+            # Gym is optional outside token capture; retain its existing record
+            # validation and completion lock in a request-owned capture object.
+            from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
+
+            if self._token_sink is None:
+                raise RuntimeError(
+                    "GPU token capture requires a configured staging sink"
+                )
+            gpu_sink = BoundGpuTokenSink(self._token_sink)
+            capture = RolloutTokenCapture(
+                sink=gpu_sink,
+                weight_version_fn=lambda: self._rollout_weight_version,
+                adapter=capture.adapter,
+            )
+            capture_key = uuid.uuid4().hex
         call = capture.begin_call(
             admission,
             prefix_token_ids=prefix_token_ids,
             stream=bool(getattr(request, "stream", False)),
         )
-        self._capture_calls[id(request)] = (call, list(prompt_token_ids))
+        self._capture_calls[id(request)] = CapturedModelCall(
+            capture=capture,
+            call=call,
+            prompt_token_ids=list(prompt_token_ids),
+            gpu_sink=gpu_sink,
+            capture_key=capture_key,
+        )
+        if capture_key is not None:
+            request_xargs[GPU_CAPTURE_KEY] = capture_key
+            request.vllm_xargs = request_xargs
 
     def _fetch_chain_prefix(self, staging_chain: list[str]) -> list[int]:
         """Assemble prefix token ids from staging_chain, with a worker-local LRU cache."""
@@ -625,10 +718,12 @@ class VllmAsyncGenerationWorkerImpl(
             setattr(request, field_name, value)
 
     @staticmethod
-    def _delta_align_routed_experts(
-        payload: dict[str, Any], *, prev_len: int, prompt_len: int, generated_len: int
+    def _normalize_routed_experts(
+        payload: dict[str, Any],
+        *,
+        delta_len: int,
     ) -> None:
-        """Normalize optional vLLM routes to the exact staged token delta."""
+        """Validate and canonicalize routes already aligned to the staged delta."""
         choices = payload.get("choices") or []
         if len(choices) != 1 or not isinstance(choices[0], dict):
             return
@@ -655,13 +750,12 @@ class VllmAsyncGenerationWorkerImpl(
             else:
                 dtype = torch.int16
             experts = decode_routed_experts(routed, dtype)
-            expected_full_len = prompt_len + generated_len
-            if experts.dim() != 3 or experts.shape[0] != expected_full_len:
+            if experts.dim() != 3 or experts.shape[0] != delta_len:
                 raise ValueError(
-                    f"route length {experts.shape[0]} does not match engine sequence "
-                    f"length {expected_full_len}"
+                    f"route length {experts.shape[0]} does not match staged delta "
+                    f"length {delta_len}"
                 )
-            message["routed_experts"] = encode_routed_experts(experts[prev_len:])
+            message["routed_experts"] = encode_routed_experts(experts)
         except (IndexError, TypeError, ValueError) as error:
             LOGGER.warning(
                 "dropping invalid routed_experts from staged capture: %s", error
@@ -683,25 +777,27 @@ class VllmAsyncGenerationWorkerImpl(
         state = self._capture_calls.pop(id(request), None)
         if state is None:
             return content
-        call, prompt_token_ids = state
+        call, prompt_token_ids = state.call, state.prompt_token_ids
         payload = dict(content)
         # vLLM's OpenAI response carries no prompt ids; the adapter reads the
         # preprocess-time engine prompt off the payload (see
         # nemo_gym.token_id_capture.adapters.vllm.extract_prompt_ids).
         payload["prompt_token_ids"] = prompt_token_ids
-        adapter = self.token_capture.adapter
+        adapter = state.capture.adapter
         if adapter is not None:
             try:
                 generated_token_ids, _ = adapter.extract_generation(payload)
             except Exception:  # capture core will report the authoritative failure
                 generated_token_ids = []
-            self._delta_align_routed_experts(
+            self._normalize_routed_experts(
                 payload,
-                prev_len=call.admission.prev_len,
-                prompt_len=len(prompt_token_ids),
-                generated_len=len(generated_token_ids),
+                delta_len=(
+                    len(prompt_token_ids)
+                    + len(generated_token_ids)
+                    - call.admission.prev_len
+                ),
             )
-        coords = self.token_capture.complete_call_from_response(call, payload)
+        coords = state.capture.complete_call_from_response(call, payload)
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
             # Token arrays and delta-aligned routes were staged to TQ above;
@@ -718,11 +814,34 @@ class VllmAsyncGenerationWorkerImpl(
         content["ng_commit_coords"] = coords.model_dump()
         return content
 
-    def _abort_request_capture(self, request: Any, *, reason: str) -> None:
+    async def _complete_request_capture(
+        self,
+        request: Any,
+        content: dict,
+        *,
+        finalize: Callable[[dict], JSONResponse],
+    ) -> Response:
+        """Keep the original device allocations alive through the blocking PUT."""
+        state = self._capture_calls.get(id(request))
+        operation = lambda: self._finish_request_capture(request, content)
+        if state is not None and state.gpu_sink is not None:
+            assert self._gpu_capture_host is not None
+            return await self._gpu_capture_host.finish(
+                state, operation, finalize=finalize
+            )
+        result = await asyncio.to_thread(operation)
+        return finalize(result)
+
+    async def _abort_request_capture(self, request: Any, *, reason: str) -> None:
         """Drop the in-flight capture state for a request that errored."""
         state = self._capture_calls.pop(id(request), None)
         if state is not None and self.token_capture is not None:
-            self.token_capture.fail_call(state[0], reason=reason)
+            try:
+                state.capture.fail_call(state.call, reason=reason)
+            finally:
+                if state.gpu_sink is not None:
+                    assert self._gpu_capture_host is not None
+                    await self._gpu_capture_host.release(state)
 
     # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
@@ -733,7 +852,7 @@ class VllmAsyncGenerationWorkerImpl(
         from typing import List, Optional, Union
 
         from fastapi import Request
-        from fastapi.responses import JSONResponse, StreamingResponse
+        from fastapi.responses import StreamingResponse
         from vllm.entrypoints.chat_utils import load_chat_template
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
@@ -1045,6 +1164,25 @@ class VllmAsyncGenerationWorkerImpl(
                     nonlocal final_res
                     async for res in result_generator:
                         final_res = res
+                        state = worker_self._capture_calls.get(id(request))
+                        if (
+                            res.finished
+                            and len(res.outputs) == 1
+                            and state is not None
+                            and state.gpu_sink is not None
+                        ):
+                            assert worker_self._gpu_capture_host is not None
+                            try:
+                                worker_self._gpu_capture_host.start_export(
+                                    state,
+                                    generated_token_count=len(res.outputs[0].token_ids),
+                                )
+                            except Exception as error:
+                                LOGGER.warning(
+                                    "Early GPU export unavailable for %s: %s",
+                                    state.capture_key,
+                                    error,
+                                )
                         yield res
 
                 response = await super().chat_completion_full_generator(
@@ -1065,6 +1203,7 @@ class VllmAsyncGenerationWorkerImpl(
                         final_res,
                     )
 
+                state = worker_self._capture_calls.get(id(request))
                 if worker_self._return_routed_experts_enabled():
                     response = attach_routed_experts_to_chat_response_choices(
                         response,
@@ -1072,7 +1211,31 @@ class VllmAsyncGenerationWorkerImpl(
                         device=torch.device("cpu"),
                         logger=LOGGER,
                         routed_experts_dtype=worker_self.routed_experts_dtype,
+                        # Capture stages only this suffix. Trim before encoding
+                        # so completion never decodes the unused prefix again.
+                        routed_experts_start=(
+                            state.call.admission.prev_len if state is not None else 0
+                        ),
                     )
+
+                if state is not None and state.gpu_sink is not None:
+                    assert worker_self._gpu_capture_host is not None
+                    try:
+                        if len(final_res.outputs) != 1:
+                            raise ValueError(
+                                "GPU token capture requires exactly one final output"
+                            )
+                        if worker_self._return_routed_experts_enabled():
+                            _validate_gpu_route_history(final_res)
+                        await worker_self._gpu_capture_host.bind(
+                            state,
+                            generated_token_count=len(final_res.outputs[0].token_ids),
+                        )
+                    except Exception as error:
+                        state.gpu_sink.clear()
+                        LOGGER.warning(
+                            "Using CPU payload for %s: %s", state.capture_key, error
+                        )
 
                 return response
 
@@ -1204,12 +1367,43 @@ class VllmAsyncGenerationWorkerImpl(
                 generator = await openai_serving_chat.create_chat_completion(
                     request, raw_request
                 )
+                if isinstance(generator, ErrorResponse):
+                    await worker_self._abort_request_capture(
+                        request, reason="error_response"
+                    )
+                    return JSONResponse(
+                        content=generator.model_dump(), status_code=generator.error.code
+                    )
+
+                if isinstance(generator, ChatCompletionResponse):
+                    content = model_dump_chat_response_with_dynamic_message_fields(
+                        generator
+                    )
+                    # Complete the blocking PUT off-loop before returning coords.
+                    # Serialization is also inside the abort boundary: it can
+                    # fail after the generator has imported a GPU payload lease.
+                    # A retained GPU lease is released by the ASGI response
+                    # after sending the body, including send failure/cancellation.
+                    return await worker_self._complete_request_capture(
+                        request,
+                        content,
+                        finalize=lambda result: JSONResponse(content=result),
+                    )
+
+                await worker_self._abort_request_capture(
+                    request, reason="streaming_response"
+                )
+                return StreamingResponse(
+                    content=generator, media_type="text/event-stream"
+                )
             except VLLMValidationError as e:
                 # vLLM raises VLLMValidationError for prompts exceeding
                 # max_model_len during tokenization, instead of returning an
                 # ErrorResponse. Convert to HTTP 400 so the Gym proxy can
                 # detect context-length overflow and handle it gracefully.
-                worker_self._abort_request_capture(request, reason="context_length")
+                await worker_self._abort_request_capture(
+                    request, reason="context_length"
+                )
                 return JSONResponse(
                     content={
                         "error": {
@@ -1222,30 +1416,8 @@ class VllmAsyncGenerationWorkerImpl(
                     status_code=400,
                 )
             except BaseException:
-                worker_self._abort_request_capture(request, reason="engine_error")
+                await worker_self._abort_request_capture(request, reason="engine_error")
                 raise
-
-            if isinstance(generator, ErrorResponse):
-                worker_self._abort_request_capture(request, reason="error_response")
-                return JSONResponse(
-                    content=generator.model_dump(), status_code=generator.error.code
-                )
-
-            elif isinstance(generator, ChatCompletionResponse):
-                content = model_dump_chat_response_with_dynamic_message_fields(
-                    generator
-                )
-                # Token capture: stage the delta and ride the coords on the
-                # response; strips logprobs/ids (no-op when capture is off).
-                # Off-loop: the sink write inside complete_call is a blocking
-                # TQ round trip (see the staging protocol's serving-host rule).
-                content = await asyncio.to_thread(
-                    worker_self._finish_request_capture, request, content
-                )
-                return JSONResponse(content=content)
-
-            worker_self._abort_request_capture(request, reason="streaming_response")
-            return StreamingResponse(content=generator, media_type="text/event-stream")
 
         ########################################
         # /tokenize endpoint
