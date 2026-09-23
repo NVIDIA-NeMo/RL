@@ -25,7 +25,7 @@ import os
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, fields as dataclass_fields
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Optional, cast
@@ -308,8 +308,9 @@ def _register_single_controller_partitions(
 ) -> None:
     """Warm all SingleController partitions before concurrent data-plane use.
 
-    ``capture_media`` adds the media columns the vLLM worker stages beside each
-    captured call to the staging partition (VLM token capture only).
+    ``capture_media`` adds the media columns the generation workers (vLLM or
+    Megatron Inference) stage beside each captured call to the staging
+    partition (VLM token capture only).
     """
     algo_cfg = algo_config(master_config)
     policy_config = master_config.policy
@@ -1063,6 +1064,42 @@ def _require_minf_capture_hooks() -> None:
         )
 
 
+_MINF_MEDIA_PAYLOAD_FIELDS = ("media_tensors", "compact_prompt_token_ids")
+
+
+def _require_minf_media_payload_fields() -> None:
+    """Fail at setup if the pinned megatron-core payload lacks the media fields.
+
+    Megatron media capture stages ``OffloadedRequestPayload.media_tensors`` and
+    ``compact_prompt_token_ids`` (tdene/Megatron-LM#20 on NVIDIA/Megatron-LM
+    PR #7015). Without them the stager would hand TQ a text sentinel for every
+    VLM call and the finalizer would drop every group, so check the dataclass
+    fields at config time rather than training image-blind.
+    """
+    try:
+        # Deferred import: megatron-core is a heavy, optional dependency that the
+        # driver venv may not carry at all.
+        from megatron.core.inference import inference_request
+    except ImportError:
+        # The worker-side guard in MegatronGenerationMixin.setup_token_capture
+        # still fails loudly when the engine lacks the capture hooks.
+        return
+    present = {
+        field.name
+        for field in dataclass_fields(inference_request.OffloadedRequestPayload)
+    }
+    missing = [name for name in _MINF_MEDIA_PAYLOAD_FIELDS if name not in present]
+    if missing:
+        raise NotImplementedError(
+            "Megatron media token capture requires OffloadedRequestPayload."
+            "media_tensors and compact_prompt_token_ids (tdene/Megatron-LM#20 on "
+            "NVIDIA/Megatron-LM#7015); the pinned Megatron-LM lacks: "
+            f"{', '.join(missing)}. Bump 3rdparty/Megatron-Bridge-workspace/"
+            "Megatron-Bridge to a revision that includes it, or use "
+            "policy.generation.backend=vllm."
+        )
+
+
 def setup_single_controller(
     master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
@@ -1322,6 +1359,8 @@ def setup_single_controller(
                     "the canonical MInf stager does not yet normalize routed experts"
                 )
             _require_minf_capture_hooks()
+            if capture_media:
+                _require_minf_media_payload_fields()
 
         # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
         # per-run control-plane bearer token, the process-shared capture

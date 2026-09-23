@@ -146,7 +146,8 @@ whatever it is handed and would otherwise expand the previous turn twice.
   deltas coincide. The pixel tensors travel beside the record as
   `complete_call_from_response(..., attachments=...)` and land in the same
   put as the token columns. The Gym side is lauradang/Gym#1 (on
-  NVIDIA-NeMo/Gym#3513); the Gym submodule is pinned to that fork.
+  NVIDIA-NeMo/Gym#3513); the Gym submodule is pinned to the PR head commit
+  (`edd2541ef`), reachable from NVIDIA-NeMo/Gym through that PR.
 - `TQMegatronPromptPreparer` resolves a `staging_chain` in both spaces
   (`TQTokenSource.fetch_prefix_chains`), splices the *compact* chain into the
   render, hands Gym the *expanded* chain as `required_prefix_token_ids`, and

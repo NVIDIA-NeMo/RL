@@ -286,6 +286,53 @@ def test_require_minf_capture_hooks_defers_to_worker_without_megatron_core(
     assert sc_setup_mod._require_minf_capture_hooks() is None
 
 
+def _stub_offloaded_payload(*field_names: str) -> type:
+    """Build a stand-in ``OffloadedRequestPayload`` dataclass with the given fields."""
+    return dataclasses.make_dataclass(
+        "OffloadedRequestPayload", [(name, object) for name in field_names]
+    )
+
+
+def test_require_minf_media_payload_fields_rejects_payload_without_media_tensors(
+    monkeypatch,
+) -> None:
+    _stub_megatron_inference_request(
+        monkeypatch,
+        types.SimpleNamespace(
+            OffloadedRequestPayload=_stub_offloaded_payload(
+                "prompt_token_ids", "compact_prompt_token_ids"
+            )
+        ),
+    )
+
+    with pytest.raises(NotImplementedError, match="lacks: media_tensors"):
+        sc_setup_mod._require_minf_media_payload_fields()
+
+
+def test_require_minf_media_payload_fields_accepts_payload_with_media_fields(
+    monkeypatch,
+) -> None:
+    _stub_megatron_inference_request(
+        monkeypatch,
+        types.SimpleNamespace(
+            OffloadedRequestPayload=_stub_offloaded_payload(
+                "prompt_token_ids", "media_tensors", "compact_prompt_token_ids"
+            )
+        ),
+    )
+
+    assert sc_setup_mod._require_minf_media_payload_fields() is None
+
+
+def test_require_minf_media_payload_fields_defers_to_worker_without_megatron_core(
+    monkeypatch,
+) -> None:
+    # None in sys.modules makes the import raise ModuleNotFoundError.
+    monkeypatch.setitem(sys.modules, "megatron", None)
+
+    assert sc_setup_mod._require_minf_media_payload_fields() is None
+
+
 @pytest.fixture
 def patched_factories():
     """Patch every external factory setup calls.
@@ -3113,6 +3160,9 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
         ) as mock_spinup,
         patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
         patch.object(sc_setup_mod, "_require_minf_capture_hooks"),
+        patch.object(
+            sc_setup_mod, "_require_minf_media_payload_fields"
+        ) as mock_media_gate,
         patch.object(sc_setup_mod, "MegatronGeneration") as mock_megatron,
         patch.object(sc_setup_mod, "ray"),
         patch(
@@ -3156,9 +3206,52 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
     actor_args.gen_handle.setup_token_capture.assert_called_once_with(
         ANY, mc.token_capture.staging_partition, capture_media=multimodal
     )
+    # Only a media run consults the MInf payload fields; a text run never
+    # touches them (its stager reads token columns only).
+    assert mock_media_gate.call_count == (1 if multimodal else 0)
+
+
+def test_token_capture_megatron_media_requires_minf_media_payload_fields(
+    patched_factories, monkeypatch
+):
+    """A multimodal Megatron capture run fails at setup, before any factory
+    runs, when the pinned megatron-core payload lacks ``media_tensors``
+    (otherwise every VLM call would stage a text sentinel and the finalizer
+    would drop every group)."""
+    mc = _make_gym_megatron_capture_config()
+    _stub_megatron_inference_request(
+        monkeypatch,
+        types.SimpleNamespace(
+            RequestPayloadStager=object,
+            RequestPromptPreparer=object,
+            OffloadedRequestPayload=_stub_offloaded_payload(
+                "prompt_token_ids", "compact_prompt_token_ids"
+            ),
+        ),
+    )
+
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+        pytest.raises(NotImplementedError, match="media_tensors"),
+    ):
+        setup_single_controller(
+            mc, MagicMock(pad_token_id=0), processor=MagicMock(name="processor")
+        )
+
+    assert mc.token_capture.generation_backend is None
+    patched_factories["setup_response_data"].assert_not_called()
+    patched_factories["_build_clusters"].assert_not_called()
 
 
 @pytest.mark.mcore
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "pending Megatron-LM pin carrying tdene/Megatron-LM#20 "
+        "(media_tensors on OffloadedRequestPayload)"
+    ),
+)
 def test_offloaded_payload_exposes_multimodal_capture_fields():
     """Pin the engine payload fields the multimodal stager reads with getattr defaults."""
     # Deferred import: megatron-core is a heavy, optional dependency that the

@@ -988,6 +988,11 @@ class MegatronGenerationMixin:
         staging schema so the stager can hand the engine's media tensors to
         TQ beside each call's tokens.
         """
+        engine = self.dynamic_inference_engine
+        if engine is None:
+            raise RuntimeError(
+                "Megatron token capture requires an initialized inference engine"
+            )
         if capture_media and self._image_preprocessing_config is None:
             # Without image preprocessing the engine never produces media
             # tensors, so a media-enabled partition would only ever receive
@@ -995,11 +1000,6 @@ class MegatronGenerationMixin:
             raise ValueError(
                 "Megatron media capture requires an image-capable inference wrapper "
                 "(mcore_generation_config.megatron_inference_wrapper)"
-            )
-        engine = self.dynamic_inference_engine
-        if engine is None:
-            raise RuntimeError(
-                "Megatron token capture requires an initialized inference engine"
             )
         missing = [
             name

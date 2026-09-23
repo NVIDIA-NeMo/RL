@@ -51,7 +51,11 @@ def test_generation_setup_token_capture_fans_tq_config_to_workers(monkeypatch):
     assert worker_group.calls == [
         (
             "setup_token_capture",
-            {"dp_cfg": dp_cfg, "staging_partition": "rollout_staging"},
+            {
+                "dp_cfg": dp_cfg,
+                "staging_partition": "rollout_staging",
+                "capture_media": False,
+            },
         )
     ]
 
