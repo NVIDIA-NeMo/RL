@@ -3474,6 +3474,7 @@ def _grpo_train_impl(
                             "input_lengths": train_data["input_lengths"],
                             "token_mask": flat_messages["token_loss_mask"],
                             "sample_mask": repeated_batch["loss_multiplier"],
+                            "generation_logprobs": train_data["generation_logprobs"],
                             **extra_multimodal_data,
                         }
                     )

@@ -415,15 +415,22 @@ class ClippedPGLossFn(LossFunction):
         opd_full_divergence: Optional[Tensor] = None,
         opd_full_entropy: Optional[Tensor] = None,
         opd_full_cross_entropy: Optional[Tensor] = None,
+        *,
+        shift_labels: bool = True,
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss, or the full-vocabulary MOPD reverse KL.
 
         Which objective runs is fixed at construction by ``opd_full``.
 
         Args:
-            next_token_logprobs: Sampled-token log-probabilities ``[B, S - 1]``.
+            next_token_logprobs: Sampled-token log-probabilities ``[B, S - 1]``
+                by default, or ``[B, S]`` when ``shift_labels=False``.
                 Required on the policy-gradient branch; on the ``opd_full``
                 branch only when ``reference_policy_kl_penalty`` is non-zero.
+            shift_labels: Drop the first column of token-aligned metadata for
+                next-token prediction. Set False for same-position diffusion
+                scores. This flag never shifts the supplied model scores;
+                normalization counts must cover the selected target positions.
             data: Microbatch with masks, advantages, and prior log-probabilities.
             global_valid_seqs: Global valid-sequence count for normalization.
             global_valid_toks: Global valid-token count for normalization.
@@ -451,21 +458,23 @@ class ClippedPGLossFn(LossFunction):
                 opd_full_divergence=opd_full_divergence,
                 opd_full_entropy=opd_full_entropy,
                 opd_full_cross_entropy=opd_full_cross_entropy,
+                shift_labels=shift_labels,
             )
         assert next_token_logprobs is not None, (
             "ClippedPGLossFn requires next_token_logprobs"
         )
         curr_logprobs = next_token_logprobs
-        token_mask = data["token_mask"][:, 1:]
+        start = 1 if shift_labels else 0
+        token_mask = data["token_mask"][:, start:]
         sample_mask = data["sample_mask"]
-        advantages = data["advantages"][:, 1:]
+        advantages = data["advantages"][:, start:]
         # Skip loading prev_logprobs when force_on_policy_ratio=True (will use curr_logprobs instead)
         prev_logprobs = (
-            None if self.force_on_policy_ratio else data["prev_logprobs"][:, 1:]
+            None if self.force_on_policy_ratio else data["prev_logprobs"][:, start:]
         )
-        generation_logprobs = data["generation_logprobs"][:, 1:]
+        generation_logprobs = data["generation_logprobs"][:, start:]
         if self.reference_policy_kl_penalty != 0:
-            reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
+            reference_policy_logprobs = data["reference_policy_logprobs"][:, start:]
             curr_logprobs_unfiltered = data.get(
                 "curr_logprobs_unfiltered", curr_logprobs
             )
@@ -873,6 +882,7 @@ class ClippedPGLossFn(LossFunction):
         opd_full_divergence: Optional[Tensor],
         opd_full_entropy: Optional[Tensor],
         opd_full_cross_entropy: Optional[Tensor],
+        shift_labels: bool = True,
     ) -> tuple[torch.Tensor, dict]:
         """Full-vocabulary MOPD objective: the exact reverse KL is the whole loss.
 
@@ -891,6 +901,8 @@ class ClippedPGLossFn(LossFunction):
             opd_full_divergence: Per-token reverse KL ``[B, S - 1]``.
             opd_full_entropy: Optional ``sum_v p_s log p_s`` diagnostic.
             opd_full_cross_entropy: Optional ``-sum_v p_s log p_t`` diagnostic.
+            shift_labels: Drop the first metadata column for next-token scores;
+                False keeps all columns for same-position scores.
 
         Returns:
             Tuple of the scalar loss and its metric dict.
@@ -902,7 +914,8 @@ class ClippedPGLossFn(LossFunction):
             raise ValueError(
                 "opd_full requires opd_full_divergence from prepare_loss_input."
             )
-        token_mask = data["token_mask"][:, 1:]
+        start = 1 if shift_labels else 0
+        token_mask = data["token_mask"][:, start:]
         sample_mask = data["sample_mask"]
         mask = token_mask * sample_mask.unsqueeze(-1)
 
@@ -948,7 +961,7 @@ class ClippedPGLossFn(LossFunction):
             )
             kl = self.reference_policy_kl_penalty * calculate_kl(
                 logprobs=next_token_logprobs,
-                logprobs_reference=data["reference_policy_logprobs"][:, 1:],
+                logprobs_reference=data["reference_policy_logprobs"][:, start:],
                 kl_type=self.reference_policy_kl_type,
                 input_clamp_value=self.kl_input_clamp_value,
                 output_clamp_value=self.kl_output_clamp_value,

@@ -157,6 +157,10 @@ def _make_worker(loss_type):
     w.dp_size = 2
     w.cp_size = 1
     w.sampling_params = None
+    w.prepare_microbatch_fn = None
+    from nemo_rl.models.policy.workers.megatron_policy_worker import LossPostProcessor
+
+    w.loss_postprocessor_factory = LossPostProcessor
     w.draft_model = None
     w.defer_fp32_logits = False
     w.dtype = torch.float32
@@ -1510,3 +1514,30 @@ class TestPrepareForLpInference:
         w.finish_train_step()
         assert self._grad_offload_calls(w) == []
         assert sentinel.call_count == 1
+
+
+@pytest.mark.parametrize("num_levels", [4, 16])
+def test_partitioned_token_masks_normalize_once_across_levels(
+    mock_module_symbols, num_levels
+):
+    """Standard and Fast diffusion views partition the loss-bearing positions."""
+    from nemo_rl.algorithms.loss.interfaces import LossType
+
+    worker = _make_worker(LossType.TOKEN_LEVEL)
+    worker.begin_train_step(loss_fn=worker._test_loss_fn)
+    for level in range(num_levels):
+        data = _fake_batch()
+        data["sample_mask"][-1] = 0
+        data["token_mask"].zero_()
+        # A nonempty prompt precedes two 16-token response blocks.
+        # Each sample chooses its own offset; no target appears in two views.
+        for row in range(8):
+            offset = (level + row) % 16
+            data["token_mask"][row, 16 + offset] = 1
+            data["token_mask"][row, 32 + offset] = 1
+        worker.train_microbatch(data)
+    worker.finish_train_step()
+    selected_tokens = 7 * 2 * num_levels
+    worker.model.scale_gradients.assert_called_once_with(1 / selected_tokens)
+    worker.optimizer.step.assert_called_once()
+    worker.scheduler.step.assert_called_once()

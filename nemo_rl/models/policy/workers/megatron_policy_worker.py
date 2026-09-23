@@ -21,7 +21,7 @@ import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, replace
-from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
+from typing import Any, Callable, Iterable, Iterator, Optional, TypeVar, cast
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +78,7 @@ from nemo_rl.models.megatron.common import (
     get_moe_metrics,
 )
 from nemo_rl.models.megatron.data import (
+    ProcessedMicrobatch,
     get_microbatch_iterator,
     process_global_batch,
 )
@@ -569,9 +570,26 @@ class MegatronPolicyWorkerImpl(
         skip_weight_load: bool = False,
         is_refit_destination: bool = False,
         reserved_http_server_ports: Optional[dict[int, int]] = None,
+        prepare_microbatch_fn: Optional[
+            Callable[[ProcessedMicrobatch], ProcessedMicrobatch]
+        ] = None,
+        loss_postprocessor_factory: Optional[Callable[..., LossPostProcessor]] = None,
+        logprobs_postprocessor_factory: Optional[
+            Callable[..., LogprobsPostProcessor]
+        ] = None,
         **kwargs: Any,
     ):
-        """Initialize the MegatronPolicyWorker."""
+        """Initialize the MegatronPolicyWorker.
+
+        Args:
+            prepare_microbatch_fn: Optional model-input transformation before
+                the standard forward. Used for training and scoring.
+            loss_postprocessor_factory: Optional constructor with the same
+                interface as LossPostProcessor; defaults to that class.
+            logprobs_postprocessor_factory: Optional constructor with the same
+                interface as LogprobsPostProcessor; used for policy and reference
+                scoring. Defaults to that class.
+        """
         self.is_refit_destination = is_refit_destination
         self.refit_payload_mode: RefitPayloadMode = "hf_export"
         # NVML-based and guarded on torch.cuda.is_initialized(), so this does
@@ -603,6 +621,13 @@ class MegatronPolicyWorkerImpl(
         init_telemetry_worker()
 
         self.cfg = config
+        self.prepare_microbatch_fn = prepare_microbatch_fn
+        self.loss_postprocessor_factory = (
+            loss_postprocessor_factory or LossPostProcessor
+        )
+        self.logprobs_postprocessor_factory = (
+            logprobs_postprocessor_factory or LogprobsPostProcessor
+        )
         self._router_replay_enabled = router_replay_enabled(config)
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
@@ -1075,7 +1100,7 @@ class MegatronPolicyWorkerImpl(
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
 
-                loss_post_processor = LossPostProcessor(
+                loss_post_processor = self.loss_postprocessor_factory(
                     loss_fn=loss_fn,
                     cfg=self.cfg,
                     num_microbatches=num_microbatches,
@@ -1121,6 +1146,7 @@ class MegatronPolicyWorkerImpl(
                     )
                     with maybe_r3_trace_stage("train", enabled=use_router_replay):
                         losses_reduced = megatron_forward_backward(
+                            prepare_microbatch_fn=self.prepare_microbatch_fn,
                             model=self.model,
                             data_iterator=data_iterator,
                             num_microbatches=num_microbatches,
@@ -1731,7 +1757,7 @@ class MegatronPolicyWorkerImpl(
         )
         state["total_num_microbatches"] += int(num_microbatches)
 
-        loss_post_processor = LossPostProcessor(
+        loss_post_processor = self.loss_postprocessor_factory(
             loss_fn=loss_fn,
             cfg=self.cfg,
             num_microbatches=num_microbatches,
@@ -1762,6 +1788,7 @@ class MegatronPolicyWorkerImpl(
             rerun_state_machine = get_rerun_state_machine()
             while rerun_state_machine.should_run_forward_backward(data_iterator):
                 losses_reduced = megatron_forward_backward(
+                    prepare_microbatch_fn=self.prepare_microbatch_fn,
                     model=self.model,
                     data_iterator=data_iterator,
                     num_microbatches=num_microbatches,
@@ -2175,7 +2202,7 @@ class MegatronPolicyWorkerImpl(
         use_fused_linear_logprobs = self.cfg["megatron_cfg"].get(
             "use_fused_linear_logprobs", False
         )
-        logprobs_post_processor = LogprobsPostProcessor(
+        logprobs_post_processor = self.logprobs_postprocessor_factory(
             cfg=self.cfg,
             sampling_params=self.sampling_params,
             use_fused_linear_logprobs=use_fused_linear_logprobs,
@@ -2189,6 +2216,7 @@ class MegatronPolicyWorkerImpl(
 
         with maybe_r3_trace_stage("prev-logprob", enabled=use_router_replay):
             list_of_logprobs = megatron_forward_backward(
+                prepare_microbatch_fn=self.prepare_microbatch_fn,
                 model=self.model,
                 data_iterator=mb_iterator,
                 seq_length=padded_seq_length,
@@ -2419,6 +2447,7 @@ class MegatronPolicyWorkerImpl(
         )
 
         list_of_outputs = megatron_forward_backward(
+            prepare_microbatch_fn=self.prepare_microbatch_fn,
             model=self.model,
             data_iterator=mb_iterator,
             seq_length=padded_seq_length,
@@ -2644,6 +2673,7 @@ class MegatronPolicyWorkerImpl(
         )
 
         list_of_outputs = megatron_forward_backward(
+            prepare_microbatch_fn=self.prepare_microbatch_fn,
             model=self.model,
             data_iterator=mb_iterator,
             seq_length=padded_seq_length,

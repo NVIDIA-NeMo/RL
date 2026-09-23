@@ -1,0 +1,11 @@
+defaults: ./just_grpo-sudoku6x6-4n8g-megatron-inference-long.yaml
+
+# Async collection shares the model and GPUs; generation pauses during training.
+grpo:
+  async_grpo:
+    enabled: true
+
+logger:
+  log_dir: results/just_grpo_sudoku6x6_megatron_inference_async
+  wandb:
+    name: ${oc.env:WANDB_RUN_NAME,just_grpo_sudoku6x6_megatron_inference_async}

@@ -785,3 +785,38 @@ def test_prepare_opd_full_loss_input_projects_the_payload_and_drops_the_last_pos
     assert loss_input["opd_full_entropy"] is None
     assert loss_input["opd_full_cross_entropy"] is None
     assert "next_token_logprobs" not in loss_input
+
+
+@pytest.mark.parametrize("token_level", [False, True])
+def test_opd_full_same_position_matches_padded_metadata(token_level):
+    data = BatchedDataDict(
+        token_mask=torch.tensor([[1, 0, 1], [1, 1, 0]]),
+        sample_mask=torch.tensor([1.0, 0.5]),
+        reference_policy_logprobs=torch.full((2, 3), -1.2),
+    )
+    padded = BatchedDataDict(
+        {
+            key: torch.nn.functional.pad(value, (1, 0)) if value.ndim == 2 else value
+            for key, value in data.items()
+        }
+    )
+    with pytest.warns(UserWarning, match="second KL"):
+        loss_fn = _loss_fn(
+            token_level_loss=token_level, reference_policy_kl_penalty=0.01
+        )
+    divergence = torch.tensor([[0.1, 0.3, 0.2], [0.4, 0.1, 0.3]], requires_grad=True)
+    scores = torch.full((2, 3), -1.0, requires_grad=True)
+    kwargs = dict(
+        next_token_logprobs=scores,
+        opd_full_divergence=divergence,
+        global_valid_seqs=data["sample_mask"].sum(),
+        global_valid_toks=(data["token_mask"] * data["sample_mask"][:, None]).sum(),
+    )
+    expected_loss, expected_metrics = loss_fn(data=padded, **kwargs)
+    loss, metrics = loss_fn(data=data, shift_labels=False, **kwargs)
+    torch.testing.assert_close(loss, expected_loss)
+    assert metrics == pytest.approx(expected_metrics)
+    torch.testing.assert_close(
+        torch.autograd.grad(loss, (scores, divergence), retain_graph=True),
+        torch.autograd.grad(expected_loss, (scores, divergence)),
+    )

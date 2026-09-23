@@ -36,6 +36,36 @@ from nemo_rl.algorithms.loss.interfaces import LossInputType
 pytestmark = pytest.mark.mcore
 
 
+@pytest.mark.parametrize("custom", [False, True])
+def test_input_preparation_keeps_standard_forward(custom):
+    from nemo_rl.models.megatron.train import (
+        forward_with_post_processing_fn,
+        megatron_forward_backward,
+    )
+
+    raw, prepared = object(), object()
+    prepare = MagicMock(return_value=prepared) if custom else None
+    with patch(
+        "nemo_rl.models.megatron.train.get_forward_backward_func"
+    ) as get_schedule:
+        megatron_forward_backward(
+            model=MagicMock(),
+            data_iterator=iter([raw]),
+            num_microbatches=1,
+            seq_length=8,
+            mbs=1,
+            post_processing_fn=MagicMock(),
+            prepare_microbatch_fn=prepare,
+        )
+    dispatched = get_schedule.return_value.call_args.kwargs
+    assert dispatched["forward_step_func"].func is forward_with_post_processing_fn
+    if custom:
+        prepare.assert_not_called()  # Preparation stays lazy.
+    assert next(dispatched["data_iterator"]) is (prepared if custom else raw)
+    if custom:
+        prepare.assert_called_once_with(raw)
+
+
 class TestModelForward:
     """Tests for model_forward function."""
 

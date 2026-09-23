@@ -497,6 +497,9 @@ def megatron_forward_backward(
     use_router_replay: bool = False,
     router_replay_train: bool = False,
     model_slices_context_parallel_inputs: bool = False,
+    prepare_microbatch_fn: Optional[
+        Callable[[ProcessedMicrobatch], ProcessedMicrobatch]
+    ] = None,
 ) -> Any:
     """Execute forward and backward passes using Megatron's utilities.
 
@@ -506,6 +509,9 @@ def megatron_forward_backward(
 
     Args:
         model: The model to train
+        prepare_microbatch_fn: Optional transformation of processed model inputs.
+            Runs lazily before the standard forward; must preserve the microbatch
+            count and satisfy the configured parallel schedule's shape contract.
         data_iterator: Iterator yielding ProcessedMicrobatch objects (already processed)
         num_microbatches: Number of microbatches to process
         seq_length: Sequence length
@@ -526,6 +532,8 @@ def megatron_forward_backward(
     Returns:
         Results from the forward/backward execution
     """
+    if prepare_microbatch_fn is not None:
+        data_iterator = map(prepare_microbatch_fn, data_iterator)
     forward_step = partial(
         forward_with_post_processing_fn,
         post_processing_fn=post_processing_fn,

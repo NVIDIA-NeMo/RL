@@ -3142,3 +3142,89 @@ def test_vocab_parallel_gather_columns_tp_sharded(monkeypatch):
     ref[..., idx].float().backward(grad_out)
     torch.testing.assert_close(shards[0].grad, ref.grad[..., :v_local])
     torch.testing.assert_close(shards[1].grad, ref.grad[..., v_local:])
+
+
+def test_generation_diagnostics_use_recomputed_previous_logprobs():
+    """Changing current scores affects the loss, but not rollout/previous diagnostics."""
+    scores = torch.tensor([[-1.1, -2.2]], requires_grad=True)
+    rollout = torch.tensor([[0.0, -1.0, -2.0]])
+    previous = torch.tensor([[0.0, -1.05, -2.1]])
+    data = BatchedDataDict(
+        token_mask=torch.tensor([[0, 1, 1]]),
+        sample_mask=torch.ones(1),
+        prev_logprobs=previous,
+        generation_logprobs=rollout,
+        advantages=torch.tensor([[0.0, 1.0, -1.0]]),
+    )
+    loss_fn = ClippedPGLossFn(ClippedPGLossConfig(reference_policy_kl_penalty=0))
+    kwargs = dict(
+        data=data,
+        global_valid_seqs=torch.tensor(1),
+        global_valid_toks=torch.tensor(2),
+    )
+    loss, metrics = loss_fn(next_token_logprobs=scores, **kwargs)
+    changed_loss, changed_metrics = loss_fn(
+        next_token_logprobs=scores + torch.tensor([[0.02, -0.03]]), **kwargs
+    )
+    delta = previous[:, 1:] - rollout[:, 1:]
+    assert metrics["gen_kl_error"] == pytest.approx(
+        (delta.exp() - delta - 1).mean().item()
+    )
+    assert metrics["policy_kl_error"] == pytest.approx(
+        ((-delta).exp() + delta - 1).mean().item()
+    )
+    for key in (
+        "gen_kl_error",
+        "policy_kl_error",
+        "js_divergence_error",
+        "token_mult_prob_error",
+    ):
+        assert metrics[key] == changed_metrics[key]
+    assert not torch.isclose(loss, changed_loss)
+    assert torch.autograd.grad(loss, scores)[0].abs().sum() > 0
+
+
+@pytest.mark.parametrize("token_level", [False, True])
+@pytest.mark.parametrize("reference_penalty", [0.0, 0.01])
+@pytest.mark.parametrize("force_on_policy", [False, True])
+def test_clipped_pg_same_position_matches_padded_metadata(
+    token_level, reference_penalty, force_on_policy
+):
+    """Opting out of the AR slice preserves every position, loss, metric and gradient."""
+    scores = torch.tensor([[-1.1, -2.2, -0.7], [-0.8, -1.7, -2.5]], requires_grad=True)
+    data = BatchedDataDict(
+        token_mask=torch.tensor([[1, 0, 1], [1, 1, 0]]),
+        sample_mask=torch.tensor([1.0, 0.5]),
+        advantages=torch.tensor([[1.0, -0.5, -1.0], [-0.4, 0.8, 0.5]]),
+        prev_logprobs=scores.detach() + 0.1,
+        generation_logprobs=scores.detach() - 0.2,
+        reference_policy_logprobs=scores.detach() + 0.3,
+    )
+    padded = BatchedDataDict(
+        {
+            key: torch.nn.functional.pad(value, (1, 0)) if value.ndim == 2 else value
+            for key, value in data.items()
+        }
+    )
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            token_level_loss=token_level,
+            reference_policy_kl_penalty=reference_penalty,
+            force_on_policy_ratio=force_on_policy,
+            use_importance_sampling_correction=True,
+        )
+    )
+    kwargs = dict(
+        next_token_logprobs=scores,
+        global_valid_seqs=data["sample_mask"].sum(),
+        global_valid_toks=(data["token_mask"] * data["sample_mask"][:, None]).sum(),
+    )
+    expected_loss, expected_metrics = loss_fn(data=padded, **kwargs)
+    loss, metrics = loss_fn(data=data, shift_labels=False, **kwargs)
+    torch.testing.assert_close(loss, expected_loss)
+    assert metrics == pytest.approx(expected_metrics)
+    expected_grad = torch.autograd.grad(expected_loss, scores, retain_graph=True)[0]
+    grad = torch.autograd.grad(loss, scores)[0]
+    torch.testing.assert_close(grad, expected_grad)
+    assert grad[:, 0].abs().sum() > 0  # First-position targets must not be dropped.
+    assert not grad[~data["token_mask"].bool()].any()
