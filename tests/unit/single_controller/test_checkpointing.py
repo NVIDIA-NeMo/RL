@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import json
 import os
 import threading
@@ -74,7 +75,10 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
-from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller import (
+    SingleControllerActor,
+    _GymCheckpointReleasePendingError,
+)
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
     MasterConfig,
@@ -87,6 +91,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     BOOTSTRAP_DIRNAME,
+    GYM_RESTART_FALLBACK_MANIFEST_FILENAME,
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
     ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
     BootstrapCompatibilityIdentity,
@@ -694,13 +699,16 @@ class _FakeGymCheckpointActor:
         *,
         fail_prepare: bool = False,
         fail_commit: bool = False,
+        fail_abort_attempts: int = 0,
         fail_resume_attempts: int = 0,
     ):
         self.events = events
         self.fail_prepare = fail_prepare
         self.fail_commit = fail_commit
+        self.fail_abort_attempts = fail_abort_attempts
         self.fail_resume_attempts = fail_resume_attempts
         self.checkpoint_ids: list[str] = []
+        self.abort_checkpoint_ids: list[str] = []
         self.acknowledge_completed_executions = _AsyncRemoteMethod(self._acknowledge)
         self.prepare_checkpoint = _AsyncRemoteMethod(self._prepare)
         self.commit_checkpoint = _AsyncRemoteMethod(self._commit)
@@ -780,8 +788,12 @@ class _FakeGymCheckpointActor:
             raise OSError("temporary Gym resume failure")
         return {"participants": []}
 
-    async def _abort(self, _checkpoint_id: str, _deadline_ts: float) -> dict[str, Any]:
+    async def _abort(self, checkpoint_id: str, _deadline_ts: float) -> dict[str, Any]:
         self.events.append("abort")
+        self.abort_checkpoint_ids.append(checkpoint_id)
+        if self.fail_abort_attempts:
+            self.fail_abort_attempts -= 1
+            raise OSError("temporary Gym abort failure")
         return {"participants": []}
 
 
@@ -1044,6 +1056,7 @@ def _make_actor_args(
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None,
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None,
     rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None,
+    gym_restart_unfinished: bool = False,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
         gen_handle=gen if gen is not None else _FakeGeneration(),
@@ -1073,6 +1086,7 @@ def _make_actor_args(
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
+        gym_restart_unfinished=gym_restart_unfinished,
     )
 
 
@@ -1980,6 +1994,7 @@ class TestPeriodicRolloutCheckpoint:
                 actor._save_checkpoint(
                     {"loss": 1.0},
                     is_policy_training_step=True,
+                    is_final_checkpoint=False,
                 )
             )
             actor._checkpointer.finalize_pending()
@@ -1993,12 +2008,13 @@ class TestPeriodicRolloutCheckpoint:
         manifest = json.loads(
             (snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).read_text()
         )
+        assert not (step / GYM_RESTART_FALLBACK_MANIFEST_FILENAME).exists()
         assert manifest["base_train_step"] == 1
         assert manifest["trainer_version"] == 1
         assert manifest["gym_checkpoint"] is not None
         assert events == ["prepare", "commit", "resume"]
 
-    def test_gym_boundary_failure_keeps_trainer_checkpoint_unpublished(
+    def test_gym_boundary_failure_publishes_restart_unfinished_checkpoint(
         self, tmp_path: Path
     ) -> None:
         actor = self._actor(tmp_path)
@@ -2036,19 +2052,35 @@ class TestPeriodicRolloutCheckpoint:
         actor._trainer_version = 1
 
         try:
-            with pytest.raises(OSError, match="Gym checkpoint storage failed"):
+            with pytest.warns(
+                UserWarning,
+                match="coordinated Gym rollout snapshot failed",
+            ):
                 asyncio.run(
                     actor._save_checkpoint(
                         {"loss": 1.0},
                         is_policy_training_step=True,
+                        is_final_checkpoint=False,
                     )
                 )
+            actor._checkpointer.finalize_pending()
         finally:
             actor._checkpointer.shutdown()
 
         checkpoint_root = tmp_path / "checkpoints"
-        assert not (checkpoint_root / "step_1").exists()
-        assert (checkpoint_root / "tmp_step_1").is_dir()
+        step = checkpoint_root / "step_1"
+        assert step.is_dir()
+        assert not (checkpoint_root / "tmp_step_1").exists()
+        fallback = json.loads(
+            (step / GYM_RESTART_FALLBACK_MANIFEST_FILENAME).read_text()
+        )
+        assert fallback == {
+            "base_train_step": 1,
+            "mode": "restart_unfinished",
+            "schema_version": 1,
+            "trainer_version": 1,
+        }
+        assert not list((step / "rollout_snapshots").glob("snapshot_*"))
         assert events == ["prepare", "commit", "abort"]
 
     def test_gym_ack_outbox_retries_without_holding_a_mutation_cut(
@@ -2275,6 +2307,83 @@ class TestPeriodicRolloutCheckpoint:
         assert len(set(gym_actor.checkpoint_ids)) == 2
         assert actor._gym_checkpoint_rollout_permitted.is_set()
 
+    def test_gym_abort_failure_retries_same_id_before_next_snapshot(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        events: list[str] = []
+        actor._gym_participant_checkpointing_enabled = True
+        actor._master_config.rollout_checkpointing.gym.participant_checkpointing_enabled = True
+        gym_actor = _FakeGymCheckpointActor(
+            events,
+            fail_commit=True,
+            fail_abort_attempts=1,
+        )
+        actor._env_handles = {"nemo_gym": gym_actor}
+        actor._gym_checkpoint_topology = GymCheckpointTopology.model_validate(
+            {
+                "schema_version": 1,
+                "participants": [
+                    {
+                        "participant": {
+                            "server_name": "agent-route",
+                            "component": "responses_api_agents",
+                            "participant_name": "test-agent",
+                        },
+                        "schema_version": 1,
+                        "admission_states": ["accepting"],
+                        "checkpoint_mode": "export_restore",
+                        "concurrency_contract": "serialized_per_session",
+                        "multi_process": {
+                            "mode": "single_worker",
+                            "num_workers": 1,
+                        },
+                        "instance_role": None,
+                        "features": ["completed_result_acknowledgement"],
+                    }
+                ],
+            }
+        )
+
+        try:
+            with pytest.raises(
+                OSError,
+                match="Gym abort is still pending",
+            ):
+                asyncio.run(actor._save_rollout_checkpoint(force=True))
+
+            pending = actor._pending_gym_checkpoint_abort
+            assert pending is not None
+            first_checkpoint_id = pending.checkpoint_id
+            assert gym_actor.checkpoint_ids == [first_checkpoint_id]
+            assert gym_actor.abort_checkpoint_ids == [first_checkpoint_id]
+            assert not actor._gym_checkpoint_rollout_permitted.is_set()
+
+            gym_actor.fail_commit = False
+            result = asyncio.run(actor._save_rollout_checkpoint(force=True))
+
+            assert result.saved
+            assert actor._pending_gym_checkpoint_abort is None
+            assert actor._gym_checkpoint_rollout_permitted.is_set()
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert events == [
+            "prepare",
+            "commit",
+            "abort",
+            "abort",
+            "prepare",
+            "commit",
+            "resume",
+        ]
+        assert gym_actor.abort_checkpoint_ids == [
+            first_checkpoint_id,
+            first_checkpoint_id,
+        ]
+        assert len(gym_actor.checkpoint_ids) == 2
+        assert gym_actor.checkpoint_ids[1] != first_checkpoint_id
+
     def test_gym_prepare_timeout_keeps_previous_snapshot_and_reopens_admission(
         self, tmp_path: Path
     ) -> None:
@@ -2326,7 +2435,7 @@ class TestPeriodicRolloutCheckpoint:
         finally:
             actor._checkpointer.shutdown()
 
-        assert events == ["prepare", "commit", "resume", "prepare"]
+        assert events == ["prepare", "commit", "resume", "prepare", "abort"]
         assert actor._gym_checkpoint_rollout_permitted.is_set()
         assert resolved is not None
         assert resolved.path.name == "snapshot_000001"
@@ -2355,6 +2464,41 @@ class TestPeriodicRolloutCheckpoint:
         finally:
             actor._checkpointer.shutdown()
 
+        assert events == ["prepare", "commit", "abort"]
+        assert actor._gym_checkpoint_rollout_permitted.is_set()
+
+    def test_gym_continuation_validation_failure_aborts_before_publication(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        events: list[str] = []
+        actor._gym_participant_checkpointing_enabled = True
+        actor._master_config.rollout_checkpointing.gym.participant_checkpointing_enabled = True
+        actor._env_handles = {"nemo_gym": _FakeGymCheckpointActor(events)}
+
+        try:
+            with (
+                patch(
+                    "nemo_rl.algorithms.single_controller.gym_checkpoint_continuations",
+                    side_effect=ValueError("agent/model continuation mismatch"),
+                ),
+                pytest.raises(
+                    ValueError,
+                    match="agent/model continuation mismatch",
+                ),
+            ):
+                asyncio.run(actor._save_rollout_checkpoint(force=True))
+        finally:
+            actor._checkpointer.shutdown()
+
+        snapshot_dir = (
+            tmp_path
+            / "checkpoints"
+            / BOOTSTRAP_DIRNAME
+            / "rollout_snapshots"
+            / "snapshot_000001"
+        )
+        assert not snapshot_dir.exists()
         assert events == ["prepare", "commit", "abort"]
         assert actor._gym_checkpoint_rollout_permitted.is_set()
 
@@ -2489,7 +2633,12 @@ class TestPeriodicRolloutCheckpoint:
             actor._checkpointer.shutdown()
 
         first, second, third = actor._logger.log_metrics.call_args_list
-        outcome_keys = {"completed", "failed", "skipped"}
+        outcome_keys = {
+            "completed",
+            "failed",
+            "published_release_pending",
+            "skipped",
+        }
         reason_keys = {
             "reason_completed",
             "reason_invariant_error",
@@ -2497,6 +2646,7 @@ class TestPeriodicRolloutCheckpoint:
             "reason_missing_trainer_anchor",
             "reason_no_data_plane_mutations",
             "reason_optimizer_commit_in_progress",
+            "reason_release_pending",
             "reason_timeout",
             "reason_trainer_state_changed",
         }
@@ -2840,8 +2990,144 @@ class TestPeriodicRolloutCheckpoint:
         assert logged["failed"] == 1.0
         assert logged["reason_invariant_error"] == 1.0
 
+    def test_periodic_pump_reports_published_release_pending(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+        actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 0.001
+        actor._master_config.rollout_checkpointing.max_consecutive_failures = 1
+        actor._train_steps = 1
+
+        async def _main() -> None:
+            async def _release_pending_save(*, force: bool = False) -> bool:
+                del force
+                raise _GymCheckpointReleasePendingError("release unavailable")
+
+            actor._save_rollout_checkpoint = _release_pending_save
+            with pytest.raises(
+                RuntimeError,
+                match="periodic rollout checkpoint failed 1 consecutive times",
+            ):
+                await asyncio.wait_for(
+                    actor._rollout_checkpoint_pump(),
+                    timeout=1.0,
+                )
+
+        try:
+            asyncio.run(_main())
+        finally:
+            actor._checkpointer.shutdown()
+
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["published_release_pending"] == 1.0
+        assert logged["failed"] == 0.0
+        assert logged["reason_release_pending"] == 1.0
+        assert logged["reason_io_error"] == 0.0
+
 
 class TestDataPlaneCheckpoint:
+    def test_rollout_recovery_schema_mismatch_is_actionable(
+        self, tmp_path: Path
+    ) -> None:
+        checkpoint_path = tmp_path / "checkpoints" / "step_3"
+        checkpoint_path.mkdir(parents=True)
+        metadata = _data_plane_checkpoint_metadata(step=3)
+        metadata.update(
+            {
+                "rollout_recovery_schema_version": 2,
+                "rollout_recovery_payload_sha256": "0" * 64,
+                "rollout_recovery_group_count": 0,
+            }
+        )
+        config = _actor_master_config(
+            tmp_path,
+            buffer_checkpoint=True,
+            data_plane_checkpoint=True,
+        )
+        actor = _ACTOR_CLS(
+            config,
+            _make_actor_args(
+                last_checkpoint_path=str(checkpoint_path),
+                data_plane_checkpoint_metadata=metadata,
+            ),
+            SetupTimingMetrics(),
+        )
+
+        try:
+            with pytest.raises(
+                ValueError,
+                match="Backward restore is intentionally unsupported.*fresh checkpoint",
+            ):
+                asyncio.run(
+                    actor._maybe_restore_rollout_recovery(restored_replay_groups=0)
+                )
+        finally:
+            actor._checkpointer.shutdown()
+
+    def test_restart_unfinished_restore_discards_stale_gym_acknowledgements(
+        self, tmp_path: Path
+    ) -> None:
+        checkpoint_path = tmp_path / "checkpoints" / "step_3"
+        checkpoint_path.mkdir(parents=True)
+        state = {
+            "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+            "groups": [],
+            "pending_completed_execution_acknowledgements": [
+                {
+                    "rollout_id": "group-7_g0",
+                    "attempt_index": 0,
+                    "agent_name": "test-agent",
+                    "execution_generation": 1,
+                    "result_identity": "result-group-7_g0-0",
+                    "result_digest": "1" * 64,
+                }
+            ],
+            "batch_shortfall": {},
+            "sampler_stamps_target_steps": False,
+        }
+        payload = io.BytesIO()
+        torch.save(state, payload)
+        recovery_payload = payload.getvalue()
+        (checkpoint_path / ROLLOUT_RECOVERY_STATE_FILENAME).write_bytes(
+            recovery_payload
+        )
+        metadata = _data_plane_checkpoint_metadata(step=3)
+        metadata.update(
+            {
+                "rollout_recovery_schema_version": (ROLLOUT_RECOVERY_SCHEMA_VERSION),
+                "rollout_recovery_payload_sha256": hashlib.sha256(
+                    recovery_payload
+                ).hexdigest(),
+                "rollout_recovery_group_count": 0,
+            }
+        )
+        config = _actor_master_config(
+            tmp_path,
+            buffer_checkpoint=True,
+            data_plane_checkpoint=True,
+        )
+        actor = _ACTOR_CLS(
+            config,
+            _make_actor_args(
+                last_checkpoint_path=str(checkpoint_path),
+                data_plane_checkpoint_metadata=metadata,
+                gym_restart_unfinished=True,
+            ),
+            SetupTimingMetrics(),
+        )
+
+        try:
+            asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=0))
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert (
+            actor._rollout_recovery_ledger.pending_completed_execution_acknowledgements()
+            == []
+        )
+
     def test_metadata_uses_explicit_snapshot_identity(self, tmp_path):
         mc = _actor_master_config(
             tmp_path,
@@ -3696,6 +3982,7 @@ class TestSetupResumeWiring:
             snapshot_attempt_interval_s=120.0
         )
         mc.token_capture = TokenCaptureConfig(enabled=True)
+        mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
         mc.policy["generation"].update(
             {
                 "model_name": "test-model",

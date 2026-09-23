@@ -1697,6 +1697,19 @@ Depending on your data shape, you may want to change these values."""
         Gym's current wire protocol uses the same resume routes for successful
         completion and abort; it does not expose a separate abort endpoint.
         """
+        if self._active_gym_checkpoint_id is None:
+            # The prepare RPC may have failed before reaching this actor, or
+            # prepare may have already completed its own rollback while its
+            # response was lost. In both cases aborting the same transaction is
+            # an idempotent no-op.
+            return GymCheckpointResumeResult(
+                checkpoint_id=checkpoint_id,
+                participants=[],
+            ).model_dump(mode="json")
+        if self._active_gym_checkpoint_id != checkpoint_id:
+            raise RuntimeError(
+                f"Gym checkpoint {self._active_gym_checkpoint_id!r} is already active"
+            )
         return await self.resume_checkpoint(checkpoint_id, deadline_ts)
 
     def list_entries(self) -> Dict[str, List[str]]:

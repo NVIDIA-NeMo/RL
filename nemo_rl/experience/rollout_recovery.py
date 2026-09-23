@@ -18,8 +18,9 @@ The ledger deliberately contains control-plane metadata only. Token tensors and
 router-replay payloads remain in TQ. The versioned ``state_dict`` boundary here is
 what the controller writes into ``rollout_recovery.pt`` at each checkpoint and
 reads back on restore. It also retains completed-result acknowledgement
-obligations until Gym confirms them, so any subsequent snapshot can safely retry
-delivery after restart.
+obligations until Gym confirms them. Those obligations are retried while the
+owning Gym deployment remains live; an exact Gym-aware snapshot is published
+only after its acknowledgement outbox is empty.
 """
 
 from __future__ import annotations
@@ -38,10 +39,20 @@ if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 7
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 3
 _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {ROLLOUT_RECOVERY_SCHEMA_VERSION}
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
+
+
+def _unsupported_schema_message(schema_version: object) -> str:
+    return (
+        "Unsupported rollout-recovery schema version: "
+        f"{schema_version!r}; this build supports only schema version "
+        f"{ROLLOUT_RECOVERY_SCHEMA_VERSION}. Backward restore is intentionally "
+        "unsupported; start from a fresh checkpoint or use a compatible build."
+    )
+
 
 _LEDGER_STATE_FIELDS = frozenset(
     {
@@ -1023,6 +1034,22 @@ class RolloutRecoveryLedger:
             )
         ]
 
+    def discard_completed_execution_acknowledgements(
+        self,
+        cut: DataPlaneMutationCut,
+    ) -> int:
+        """Drop ACKs whose owning Gym process was not restored.
+
+        A trainer-only fallback deliberately starts a fresh Gym deployment, so
+        acknowledgements addressed to executions in the pre-crash process can
+        never be satisfied. The corresponding rollout results are already
+        durable in TQ; only the obsolete remote-cleanup obligations are removed.
+        """
+        cut.require_live()
+        count = len(self._pending_completed_execution_acknowledgements)
+        self._pending_completed_execution_acknowledgements.clear()
+        return count
+
     def mark_completed_executions_acknowledged(
         self,
         cut: DataPlaneMutationCut,
@@ -1292,9 +1319,7 @@ class RolloutRecoveryLedger:
             or not isinstance(schema_version, int)
             or schema_version not in _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
         ):
-            raise ValueError(
-                f"Unsupported rollout-recovery schema version: {schema_version!r}"
-            )
+            raise ValueError(_unsupported_schema_message(schema_version))
         raw_groups = state.get("groups")
         if not isinstance(raw_groups, list):
             raise ValueError("rollout-recovery state must contain a groups list")
@@ -1746,11 +1771,7 @@ def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
         or not isinstance(schema_version, int)
         or schema_version not in _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
     ):
-        raise ValueError(
-            "unsupported rollout recovery schema_version="
-            f"{schema_version!r}; supported versions are "
-            f"{sorted(_SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS)}"
-        )
+        raise ValueError(_unsupported_schema_message(schema_version))
     groups = state.get("groups")
     if not isinstance(groups, list):
         raise TypeError("rollout recovery groups must be a list")

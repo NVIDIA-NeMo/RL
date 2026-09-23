@@ -93,6 +93,8 @@ async_rl:
       # Re-send just the rows that never arrived before retrying the whole group.
       # Gym's stream dies on its first failing row, so one bad row loses every later
       # one; recovering those individually beats redoing all N.
+      # Must be 1 when token_capture.enabled=true; durable retries then create a new
+      # recovery-ledger attempt instead of reusing one physical Gym execution identity.
       max_row_attempts: 3
 
   # Last-resort stall detection. stall_timeout_s must exceed interval_s and every

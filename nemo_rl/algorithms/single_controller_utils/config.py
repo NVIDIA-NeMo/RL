@@ -100,6 +100,9 @@ class NemoGymRolloutFTConfig(BaseModel, extra="allow"):
     # retrying the whole prompt group. Gym's stream dies on its first failing row, so one
     # bad row takes every later row with it; recovering those individually is much
     # cheaper than redoing all num_generations_per_prompt of them.
+    # Token-capture runs require 1 because their stable (rollout_id, attempt_index)
+    # identities cannot be physically redispatched without first retiring the old
+    # Gym execution; the setup validator rejects larger values on that path.
     max_row_attempts: PositiveInt = 3
 
 
@@ -1390,6 +1393,18 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     token_capture_config = master_config.token_capture
     recovery_config = master_config.rollout_recovery
+    if (
+        token_capture_config.enabled
+        and async_config.rollout_failure.nemo_gym.max_row_attempts != 1
+    ):
+        raise ValueError(
+            "token_capture.enabled=true requires "
+            "async_rl.rollout_failure.nemo_gym.max_row_attempts=1. "
+            "Token-captured rows use stable (rollout_id, attempt_index) "
+            "identities, so an immediate row redispatch could overlap the old "
+            "Gym execution. Higher-level rollout recovery creates a new tracked "
+            "attempt instead."
+        )
     if not token_capture_config.enabled and (
         recovery_config.default_granularity is not RecoveryGranularity.SIBLING
         or recovery_config.task_source_granularity_overrides

@@ -574,6 +574,7 @@ def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
         "++data_plane.simple.num_storage_units=2",
         "++data_plane.claim_meta_poll_interval_s=0.5",
         "++token_capture.enabled=true",
+        "++async_rl.rollout_failure.nemo_gym.max_row_attempts=1",
         "++rollout_recovery.default_granularity=prompt_group",
         "++async_rl.sampler.name=in_order",
         "++async_rl.sampler.max_lookahead_versions=1",
@@ -672,6 +673,7 @@ class TestSetup:
     ):
         mc = _make_master_config(env={"should_use_nemo_gym": True})
         mc.token_capture.enabled = True
+        mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
         mc.grpo.invalid_tool_call_advantage = -5.0
 
         with pytest.raises(
@@ -919,6 +921,7 @@ class TestSetup:
         mc.checkpointing["enabled"] = True
         mc.checkpointing["save_data_plane"] = True
         mc.token_capture = TokenCaptureConfig(enabled=True)
+        mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0,
             restore_mode="trainer_checkpoint",
@@ -1030,6 +1033,7 @@ class TestSetup:
         )
         mc.logger["log_dir"] = str(tmp_path / "logs")
         mc.token_capture.enabled = True
+        mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0,
             gym={
@@ -1158,6 +1162,7 @@ class TestSetup:
         mc.checkpointing["enabled"] = True
         mc.checkpointing["save_data_plane"] = True
         mc.token_capture = TokenCaptureConfig(enabled=True)
+        mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
         )
@@ -1177,6 +1182,7 @@ class TestSetup:
         mc.checkpointing["enabled"] = True
         mc.checkpointing["save_data_plane"] = True
         mc.token_capture = TokenCaptureConfig(enabled=True)
+        mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
         )
@@ -1209,6 +1215,7 @@ class TestSetup:
         )
         mc.logger["log_dir"] = str(tmp_path / "logs")
         mc.token_capture.enabled = True
+        mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
         )
@@ -1287,6 +1294,7 @@ class TestSetup:
         )
         mc.logger = {"log_dir": str(tmp_path / "logs")}
         mc.token_capture.enabled = True
+        mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0,
             restore_mode="trainer_checkpoint",
@@ -2035,6 +2043,7 @@ class TestSetup:
         # wandb keys that _make_master_config populates.
         mc.logger = {**mc.logger, "log_dir": "/tmp/test-token-capture"}
         mc.token_capture.enabled = True
+        mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
         mc.token_capture.num_reassembler_workers = 3
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
@@ -2662,6 +2671,7 @@ class TestNativeTQRecoverySetup:
         )
         mc.logger["log_dir"] = str(tmp_path / "logs")
         mc.token_capture.enabled = True
+        mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0,
             restore_mode="latest",

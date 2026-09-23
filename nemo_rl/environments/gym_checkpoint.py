@@ -437,9 +437,11 @@ class GymCheckpointTopology(_StrictWireModel):
         """Require the Gym features used by coordinated turn recovery."""
         missing_acknowledgement: list[str] = []
         missing_agent_checkpoint_participation: list[str] = []
+        missing_continuation_index: list[str] = []
         missing_fresh_restart: list[str] = []
         missing_resource_dependencies: list[str] = []
         missing_storage_reference_index: list[str] = []
+        unsupported_auxiliary_export_restore: list[str] = []
         requires_fresh_restart = bool(self.restart_only_resources())
         for contract in self.participants:
             if contract.participant.component == "responses_api_agents":
@@ -452,6 +454,9 @@ class GymCheckpointTopology(_StrictWireModel):
                         contract.participant.participant_name
                     )
                 if GYM_AGENT_CONTINUATION_INDEX_FEATURE not in contract.features:
+                    missing_continuation_index.append(
+                        contract.participant.participant_name
+                    )
                     continue
                 if (
                     requires_fresh_restart
@@ -468,6 +473,14 @@ class GymCheckpointTopology(_StrictWireModel):
                         contract.participant.participant_name
                     )
                 continue
+            if (
+                contract.participant.component == "responses_api_models"
+                and contract.instance_role == "auxiliary"
+                and contract.checkpoint_mode == "export_restore"
+            ):
+                unsupported_auxiliary_export_restore.append(
+                    contract.participant.participant_name
+                )
             if contract.checkpoint_mode != "export_restore":
                 continue
             if (
@@ -493,6 +506,12 @@ class GymCheckpointTopology(_StrictWireModel):
                 "turn continuation; "
                 f"missing={missing_agent_checkpoint_participation!r}"
             )
+        if missing_continuation_index:
+            raise RuntimeError(
+                "Gym participant checkpointing requires continuation indexes "
+                "from every agent participant; "
+                f"missing={missing_continuation_index!r}"
+            )
         if missing_fresh_restart:
             raise RuntimeError(
                 "Gym restart-only resources require restored-continuation "
@@ -510,6 +529,13 @@ class GymCheckpointTopology(_StrictWireModel):
                 "Gym participant checkpointing requires external-storage "
                 "reference indexes from every stateful policy model; "
                 f"missing={missing_storage_reference_index!r}"
+            )
+        if unsupported_auxiliary_export_restore:
+            raise RuntimeError(
+                "Gym participant checkpointing does not support export/restore "
+                "for auxiliary model participants; configure them as stateless "
+                "or restart-only; "
+                f"unsupported={unsupported_auxiliary_export_restore!r}"
             )
 
 

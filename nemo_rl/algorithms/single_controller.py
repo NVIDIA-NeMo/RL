@@ -118,6 +118,8 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ensure_bootstrap_anchor,
     prepare_snapshot_paths,
     prune_bootstrap_snapshots,
+    remove_gym_restart_fallback_manifest,
+    write_gym_restart_fallback_manifest,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import (
     SingleControllerActorArgs,
@@ -159,8 +161,8 @@ from nemo_rl.environments.gym_checkpoint import (
     GymCheckpointCommitResult,
     GymCheckpointPrepareResult,
     GymCompletedExecution,
+    gym_checkpoint_continuations,
     gym_checkpoint_staging_keys,
-    validate_gym_checkpoint_manifests,
 )
 from nemo_rl.environments.nemo_gym import (
     should_use_nemo_gym,
@@ -226,8 +228,19 @@ class _PendingGymCheckpointRelease:
     trainer_anchored: bool
 
 
+@dataclass(frozen=True)
+class _PendingGymCheckpointAbort:
+    """An unpublished Gym checkpoint whose admission fence still needs abort."""
+
+    checkpoint_id: str
+
+
 class _GymCheckpointReleasePendingError(OSError):
     """The snapshot is durable, but Gym admission remains fail-closed."""
+
+
+class _GymCheckpointAbortPendingError(OSError):
+    """The snapshot failed and its Gym abort still needs confirmation."""
 
 
 @dataclass(frozen=True)
@@ -623,6 +636,7 @@ class SingleControllerActor:
         self._restored_gym_checkpoint_continuations = tuple(
             actor_args.gym_checkpoint_continuations
         )
+        self._gym_restart_unfinished = actor_args.gym_restart_unfinished
         self._rollout_checkpoint_stop_requested = asyncio.Event()
         # Narrow unsafe window after an optimizer mutates model state and before
         # SC publishes the matching TQ cleanup and trainer counters. Gradient
@@ -643,6 +657,8 @@ class SingleControllerActor:
         )
         self._gym_completed_acknowledgement_lock = asyncio.Lock()
         self._gym_completed_acknowledgement_task: Optional[asyncio.Task[None]] = None
+        self._pending_gym_checkpoint_abort: Optional[_PendingGymCheckpointAbort]
+        self._pending_gym_checkpoint_abort = None
         self._pending_gym_checkpoint_release: Optional[_PendingGymCheckpointRelease]
         self._pending_gym_checkpoint_release = None
 
@@ -1071,7 +1087,9 @@ class SingleControllerActor:
             raise ValueError(
                 "native TQ checkpoint rollout recovery schema mismatch: "
                 f"checkpoint={expected_schema_version!r}, "
-                f"expected={ROLLOUT_RECOVERY_SCHEMA_VERSION}"
+                f"expected={ROLLOUT_RECOVERY_SCHEMA_VERSION}. Backward restore "
+                "is intentionally unsupported; start from a fresh checkpoint "
+                "or use a compatible build."
             )
         expected_group_count = metadata.get("rollout_recovery_group_count")
         if (
@@ -1114,6 +1132,17 @@ class SingleControllerActor:
             "recovery_restore"
         ) as cut:
             recovery_ledger.load_state_dict(cut, parsed_state.ledger_state)
+            if self._gym_restart_unfinished:
+                discarded_acknowledgements = (
+                    recovery_ledger.discard_completed_execution_acknowledgements(cut)
+                )
+                if discarded_acknowledgements:
+                    print(
+                        "📦 Discarded "
+                        f"{discarded_acknowledgements} stale Gym completion "
+                        "acknowledgement(s); the owning Gym process was not restored",
+                        flush=True,
+                    )
             recovery_ledger.prepare_for_restart(cut)
             self._batch_shortfall = parsed_state.batch_shortfall
             canonical_state = self._buffer.metadata_state_dict(
@@ -1920,13 +1949,16 @@ class SingleControllerActor:
         """Park Gym and write participant state into an unpublished snapshot."""
         timeout_s = self._master_config.rollout_checkpointing.gym.prepare_timeout_s
         gym_actor = self._nemo_gym_checkpoint_actor()
-        prepared = False
+        prepare_attempted = False
         self._gym_checkpoint_rollout_permitted.clear()
         try:
             # A completed agent result blocks Gym prepare until RL has durably
             # adopted it. Flush every canonical result queued by finalization
             # before asking Gym to park the remaining active executions.
             await self._flush_completed_gym_acknowledgements()
+            # Record before the RPC. Gym may freeze its participants and lose
+            # the response, so every attempted prepare needs an idempotent abort.
+            prepare_attempted = True
             prepare = GymCheckpointPrepareResult.model_validate(
                 await gym_actor.prepare_checkpoint.remote(
                     checkpoint_id,
@@ -1937,7 +1969,6 @@ class SingleControllerActor:
                 raise RuntimeError(
                     f"Gym checkpoint {checkpoint_id!r} returned an incomplete cut"
                 )
-            prepared = True
             checkpoint = GymCheckpointCommitResult.model_validate(
                 await gym_actor.commit_checkpoint.remote(
                     checkpoint_id,
@@ -1956,18 +1987,26 @@ class SingleControllerActor:
                     "Gym participant checkpointing requires a discovered topology"
                 )
             self._gym_checkpoint_topology.validate_checkpoint_participants(checkpoint)
+            # Prove that agent continuation roots and model-owned external
+            # storage references form one recoverable graph before this
+            # temporary snapshot can be published. This also validates every
+            # participant manifest and referenced index.
             await asyncio.to_thread(
-                validate_gym_checkpoint_manifests,
+                gym_checkpoint_continuations,
                 checkpoint_dir,
                 checkpoint,
             )
             return checkpoint
         except BaseException as checkpoint_error:
-            if prepared:
+            if prepare_attempted:
                 try:
-                    await self._release_prepared_gym_checkpoint(
-                        checkpoint_id, committed=False
+                    await self._abort_prepared_gym_checkpoint(checkpoint_id)
+                except _GymCheckpointAbortPendingError as abort_error:
+                    abort_error.add_note(
+                        "Checkpoint failure that required the pending abort: "
+                        f"{type(checkpoint_error).__name__}: {checkpoint_error}"
                     )
+                    raise
                 except BaseException as abort_error:
                     raise BaseExceptionGroup(
                         "Gym checkpoint failed and participant admission could not "
@@ -1995,6 +2034,30 @@ class SingleControllerActor:
         # fence has been released. If the RPC fails, keeping this event cleared
         # fails closed instead of dispatching requests into a possibly paused Gym.
         self._gym_checkpoint_rollout_permitted.set()
+
+    async def _abort_prepared_gym_checkpoint(self, checkpoint_id: str) -> None:
+        """Abort one unpublished Gym checkpoint without losing its identity."""
+        active = self._pending_gym_checkpoint_abort
+        if active is not None and active.checkpoint_id != checkpoint_id:
+            raise RuntimeError(
+                "cannot abort Gym checkpoint while a different abort is pending: "
+                f"active={active.checkpoint_id!r}, requested={checkpoint_id!r}"
+            )
+        self._pending_gym_checkpoint_abort = _PendingGymCheckpointAbort(
+            checkpoint_id=checkpoint_id
+        )
+        try:
+            await self._release_prepared_gym_checkpoint(
+                checkpoint_id,
+                committed=False,
+            )
+        except Exception as error:
+            raise _GymCheckpointAbortPendingError(
+                "rollout checkpoint failed and its Gym abort is still pending; "
+                "admission remains closed and the same checkpoint ID will be "
+                f"retried: {checkpoint_id!r}"
+            ) from error
+        self._pending_gym_checkpoint_abort = None
 
     async def _release_committed_gym_checkpoint(
         self,
@@ -4393,9 +4456,8 @@ class SingleControllerActor:
         """Publish one rollout snapshot anchored to matching trainer state.
 
         Periodic callers resolve an already-published trainer directory. A full
-        trainer save passes its temporary directory while holding the common
-        checkpoint lock, so the trainer and its mandatory Gym snapshot become
-        visible through one directory rename.
+        trainer save publishes its trainer/data-plane tier first, then passes
+        that durable directory while retaining the common checkpoint lock.
         """
         if trainer_anchor is not None and not self._checkpoint_save_lock.locked():
             raise RuntimeError("trainer_anchor requires the checkpoint save lock")
@@ -4405,6 +4467,9 @@ class SingleControllerActor:
             else self._checkpoint_save_lock
         )
         async with save_guard:
+            pending_abort = self._pending_gym_checkpoint_abort
+            if pending_abort is not None:
+                await self._abort_prepared_gym_checkpoint(pending_abort.checkpoint_id)
             pending_release = self._pending_gym_checkpoint_release
             if pending_release is not None:
                 await self._release_committed_gym_checkpoint(pending_release)
@@ -4559,10 +4624,7 @@ class SingleControllerActor:
                     await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
                     if gym_checkpoint is not None:
                         gym_abort_attempted = True
-                        await self._release_prepared_gym_checkpoint(
-                            checkpoint_id,
-                            committed=False,
-                        )
+                        await self._abort_prepared_gym_checkpoint(checkpoint_id)
                     return _RolloutCheckpointSaveResult(
                         saved=False,
                         reason="trainer_state_changed",
@@ -4622,10 +4684,13 @@ class SingleControllerActor:
                     await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
                 if gym_checkpoint is not None and not gym_abort_attempted:
                     try:
-                        await self._release_prepared_gym_checkpoint(
-                            checkpoint_id,
-                            committed=False,
+                        await self._abort_prepared_gym_checkpoint(checkpoint_id)
+                    except _GymCheckpointAbortPendingError as abort_error:
+                        abort_error.add_note(
+                            "Checkpoint save failure that required the pending "
+                            f"abort: {type(save_error).__name__}: {save_error}"
                         )
+                        raise
                     except BaseException as abort_error:
                         raise BaseExceptionGroup(
                             "rollout checkpoint failed and Gym participant admission "
@@ -4644,6 +4709,18 @@ class SingleControllerActor:
                         trainer_anchored=trainer_anchor is not None,
                     )
                 )
+                try:
+                    await asyncio.to_thread(
+                        remove_gym_restart_fallback_manifest,
+                        anchor,
+                    )
+                except OSError as error:
+                    warnings.warn(
+                        "The exact Gym snapshot is durable, but its conservative "
+                        "restart-fallback marker could not be removed: "
+                        f"{type(error).__name__}: {error}",
+                        stacklevel=2,
+                    )
 
             save_completed = time.monotonic()
             checkpoint_metrics = {
@@ -4740,14 +4817,22 @@ class SingleControllerActor:
             try:
                 result = await self._save_rollout_checkpoint(force=deadline_due)
             except Exception as error:
-                if isinstance(error, TimeoutError):
-                    failure_reason: RolloutCheckpointAttemptReason = "timeout"
+                failure_outcome: RolloutCheckpointAttemptOutcome
+                failure_reason: RolloutCheckpointAttemptReason
+                if isinstance(error, _GymCheckpointReleasePendingError):
+                    failure_outcome = "published_release_pending"
+                    failure_reason = "release_pending"
+                elif isinstance(error, TimeoutError):
+                    failure_outcome = "failed"
+                    failure_reason = "timeout"
                 elif isinstance(error, OSError):
+                    failure_outcome = "failed"
                     failure_reason = "io_error"
                 else:
+                    failure_outcome = "failed"
                     failure_reason = "invariant_error"
                 self._log_rollout_checkpoint_outcome(
-                    outcome="failed",
+                    outcome=failure_outcome,
                     reason=failure_reason,
                     attempt_duration_seconds=time.monotonic() - attempt_started,
                 )
@@ -4758,7 +4843,15 @@ class SingleControllerActor:
                         "failed to save the required pre-step rollout checkpoint"
                     ) from error
                 consecutive_failures += 1
-                if isinstance(error, _GymCheckpointReleasePendingError):
+                if isinstance(error, _GymCheckpointAbortPendingError):
+                    print(
+                        "Periodic rollout checkpoint failed, and its Gym abort "
+                        "is pending; retrying the same checkpoint ID before the "
+                        "next snapshot attempt: "
+                        f"consecutive_failures={consecutive_failures}, {error}",
+                        flush=True,
+                    )
+                elif isinstance(error, _GymCheckpointReleasePendingError):
                     print(
                         "Periodic rollout checkpoint was committed, but Gym "
                         "participant release is pending; retrying the same "
@@ -5120,17 +5213,6 @@ class SingleControllerActor:
                     self._data_plane_checkpoint_barrier.mutation_version
                 )
 
-        if self._gym_participant_checkpointing_enabled:
-            boundary_snapshot = await self._save_rollout_checkpoint(
-                force=True,
-                trainer_anchor=Path(checkpoint_path),
-            )
-            if not boundary_snapshot.saved:
-                raise RuntimeError(
-                    "trainer checkpoint could not publish its required Gym rollout "
-                    f"snapshot: {boundary_snapshot.reason}"
-                )
-
         # Save value model
         if self._is_ppo:
             # The critic shares the training GPUs, so the two weight saves are
@@ -5197,6 +5279,16 @@ class SingleControllerActor:
                 ).write_bytes,
                 rollout_recovery_payload,
             )
+        if self._gym_participant_checkpointing_enabled:
+            # Publish the conservative recovery contract with the trainer state.
+            # If the process dies before or during the exact Gym snapshot below,
+            # restore can still keep canonical results and restart unfinished work.
+            await asyncio.to_thread(
+                write_gym_restart_fallback_manifest,
+                Path(checkpoint_path),
+                base_train_step=self._train_steps,
+                trainer_version=self._trainer_version,
+            )
         # Rename happens in the background once the async weight writes
         # finish; flushed at the next save or on exit.
         self._checkpointer.begin_finalization(
@@ -5208,6 +5300,41 @@ class SingleControllerActor:
             self._checkpointer,
             last_checkpoint_step=self._train_steps,
         )
+        if self._gym_participant_checkpointing_enabled:
+            # The coordinated snapshot is a second durability tier. Wait until
+            # step_N is actually published before entering Gym prepare so a long
+            # prepare timeout cannot prevent trainer recovery from this boundary.
+            await asyncio.to_thread(self._checkpointer.finalize_pending)
+            durable_checkpoint_path = (
+                self._checkpointer.checkpoint_dir / f"step_{self._train_steps}"
+            )
+            gym_snapshot_error: Optional[Exception] = None
+            try:
+                boundary_snapshot = await self._save_rollout_checkpoint(
+                    force=True,
+                    trainer_anchor=durable_checkpoint_path,
+                )
+                if not boundary_snapshot.saved:
+                    raise RuntimeError(
+                        "trainer checkpoint could not publish its coordinated Gym "
+                        f"rollout snapshot: {boundary_snapshot.reason}"
+                    )
+            except Exception as error:
+                gym_snapshot_error = error
+                warnings.warn(
+                    "The coordinated Gym rollout snapshot failed after the trainer "
+                    "checkpoint was published. Recovery will preserve completed "
+                    "canonical rollouts and restart unfinished Gym executions: "
+                    f"{type(error).__name__}: {error}",
+                    stacklevel=2,
+                )
+            if isinstance(
+                gym_snapshot_error,
+                (_GymCheckpointAbortPendingError, _GymCheckpointReleasePendingError),
+            ):
+                # The checkpoint is recoverable, but this live Gym process may
+                # still be paused. Fail closed instead of resuming training.
+                raise gym_snapshot_error
 
     # Grace on top of the workers' own refit deadline, so their attributable error wins
     # the race against this bound. They need to hit the deadline, abort, unwind, raise,

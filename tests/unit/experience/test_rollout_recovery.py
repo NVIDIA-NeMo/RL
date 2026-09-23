@@ -972,6 +972,11 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
         )
     )
     assert restored.pending_completed_execution_acknowledgements() == [recorded[1]]
+    assert (
+        _mutate(lambda cut: restored.discard_completed_execution_acknowledgements(cut))
+        == 1
+    )
+    assert restored.pending_completed_execution_acknowledgements() == []
 
     state["schema_version"] = ROLLOUT_RECOVERY_SCHEMA_VERSION + 1
     with pytest.raises(ValueError, match="Unsupported rollout-recovery schema version"):
@@ -1237,13 +1242,33 @@ def test_restore_rejects_malformed_recovery_policy_fields(
 
 def test_restore_rejects_unsupported_schema_version() -> None:
     state = {
-        "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION + 1,
+        "schema_version": 2,
         "groups": [],
         "pending_completed_execution_acknowledgements": [],
     }
 
-    with pytest.raises(ValueError, match="Unsupported rollout-recovery schema"):
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Unsupported rollout-recovery schema version: 2; this build supports "
+            "only schema version 3.*start from a fresh checkpoint"
+        ),
+    ):
         _load(RolloutRecoveryLedger(), state)  # type: ignore[arg-type]
+
+
+def test_checkpoint_parser_rejects_unsupported_schema_with_action() -> None:
+    state = {
+        "schema_version": 2,
+        "groups": [],
+        "pending_completed_execution_acknowledgements": [],
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="Backward restore is intentionally unsupported.*fresh checkpoint",
+    ):
+        parse_rollout_recovery_state(state)
 
 
 def test_restore_rejects_non_list_groups() -> None:

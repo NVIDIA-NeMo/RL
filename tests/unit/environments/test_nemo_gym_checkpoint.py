@@ -513,6 +513,63 @@ def test_checkpoint_prepare_lost_response_resumes_attempted_participant() -> Non
     assert calls == ["pause", "resume"]
 
 
+def test_checkpoint_prepare_failed_rollback_can_be_aborted_with_same_id() -> None:
+    env = _checkpoint_env()
+    capabilities = {
+        "policy": _capability(
+            "responses_api_models",
+            "policy",
+            admission_states=["accepting", "draining", "paused"],
+            concurrency_contract="stateless",
+            instance_role="policy",
+        ),
+    }
+
+    async def discover_control(_method, _path, *, server_name, **_kwargs):
+        return capabilities[server_name]
+
+    env._control = AsyncMock(side_effect=discover_control)
+    asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
+    calls: list[str] = []
+    resume_attempts = 0
+
+    async def prepare_control(_method, path, *, server_name, **_kwargs):
+        nonlocal resume_attempts
+        assert server_name == "policy"
+        if path.endswith("/pause"):
+            calls.append("pause")
+            raise OSError("response lost after pause may have applied")
+        calls.append("resume")
+        resume_attempts += 1
+        if resume_attempts == 1:
+            raise OSError("temporary participant resume failure")
+        return {
+            "state": "accepting",
+            "workers": {"acknowledged": 1, "expected": 1},
+            "released_waiters": 0,
+        }
+
+    env._control = AsyncMock(side_effect=prepare_control)
+
+    with pytest.raises(
+        BaseExceptionGroup,
+        match="prepare failed and participant resume also failed",
+    ):
+        asyncio.run(env.prepare_checkpoint("snapshot-lost", time.time() + 10.0))
+
+    assert env._active_gym_checkpoint_id == "snapshot-lost"
+    assert (
+        env._gym_execution_registry.status()["frozen_checkpoint_id"] == "snapshot-lost"
+    )
+
+    result = asyncio.run(env.abort_checkpoint("snapshot-lost", time.time() + 10.0))
+
+    assert result["checkpoint_id"] == "snapshot-lost"
+    assert calls == ["pause", "resume", "resume"]
+    assert env._active_gym_checkpoint_id is None
+    assert env._gym_execution_registry.status()["frozen_checkpoint_id"] is None
+
+
 def test_checkpoint_commit_restore_and_resume_fan_out() -> None:
     continuation_index = {
         "schema_version": 1,
@@ -648,12 +705,26 @@ def test_checkpoint_commit_restore_and_resume_fan_out() -> None:
 
 def test_abort_checkpoint_uses_idempotent_resume_routes() -> None:
     env = _checkpoint_env()
+    env._active_gym_checkpoint_id = "snapshot-7"
     env.resume_checkpoint = AsyncMock(return_value={"checkpoint_id": "snapshot-7"})
 
     result = asyncio.run(env.abort_checkpoint("snapshot-7", 123.0))
 
     assert result == {"checkpoint_id": "snapshot-7"}
     env.resume_checkpoint.assert_awaited_once_with("snapshot-7", 123.0)
+
+
+def test_abort_checkpoint_is_idempotent_after_prepare_rollback() -> None:
+    env = _checkpoint_env()
+    env.resume_checkpoint = AsyncMock()
+
+    result = asyncio.run(env.abort_checkpoint("snapshot-7", 123.0))
+
+    assert result == {
+        "checkpoint_id": "snapshot-7",
+        "participants": [],
+    }
+    env.resume_checkpoint.assert_not_awaited()
 
 
 def test_completed_results_are_acknowledged_by_resolved_agent() -> None:

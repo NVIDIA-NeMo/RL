@@ -74,6 +74,7 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     BOOTSTRAP_DIRNAME,
     BootstrapCompatibilityIdentity,
     bootstrap_compatibility_identity,
+    load_gym_restart_fallback_manifest,
     resolve_latest_snapshot,
     validate_bootstrap_anchor,
 )
@@ -191,6 +192,7 @@ class SingleControllerActorArgs:
     gym_checkpoint_restore_operation_id: Optional[str] = None
     gym_checkpoint_staging_keys: tuple[str, ...] = ()
     gym_checkpoint_continuations: tuple[GymCheckpointContinuation, ...] = ()
+    gym_restart_unfinished: bool = False
     # None when async_rl.generation_fleet_health is disabled; the SingleController
     # drives the probe loop when it is present.
     fleet_monitor: Optional[GenerationFleetHealth] = None
@@ -1376,6 +1378,7 @@ def setup_single_controller(
         bootstrap_identity.fingerprint() if bootstrap_identity is not None else None
     )
     resolved_snapshot = None
+    gym_restart_unfinished = False
     restored_trainer_version = (
         save_state.trainer_version
         if save_state.trainer_version is not None
@@ -1436,12 +1439,38 @@ def setup_single_controller(
         trainer_checkpoint_path is not None
         and rollout_checkpoint_cfg.gym.participant_checkpointing_enabled
     ):
-        raise ValueError(
-            "Gym participant checkpointing is enabled, but the selected trainer "
-            "checkpoint has no committed rollout snapshot containing Gym state. "
-            "Use an earlier compatible checkpoint directory or disable Gym "
-            "participant recovery explicitly. Existing checkpoint state was not "
-            "modified."
+        fallback = load_gym_restart_fallback_manifest(
+            Path(trainer_checkpoint_path),
+            expected_train_step=save_state.current_step,
+            expected_trainer_version=restored_trainer_version,
+        )
+        if fallback is None:
+            raise ValueError(
+                "Gym participant checkpointing is enabled, but the selected trainer "
+                "checkpoint has neither a committed Gym rollout snapshot nor an "
+                "explicit restart-unfinished fallback marker. Use an earlier "
+                "compatible checkpoint directory or disable Gym participant "
+                "recovery explicitly. Existing checkpoint state was not modified."
+            )
+        required_fallback_paths = (
+            Path(trainer_checkpoint_path, DATA_PLANE_CHECKPOINT_DIR),
+            Path(trainer_checkpoint_path, REPLAY_BUFFER_METADATA_FILENAME),
+            Path(trainer_checkpoint_path, ROLLOUT_RECOVERY_STATE_FILENAME),
+        )
+        missing_fallback_paths = [
+            str(path) for path in required_fallback_paths if not path.exists()
+        ]
+        if missing_fallback_paths:
+            raise FileNotFoundError(
+                "Gym restart-unfinished fallback is missing required trainer/data-"
+                f"plane state: {missing_fallback_paths!r}"
+            )
+        gym_restart_unfinished = True
+        print(
+            "📦 Selected trainer checkpoint with degraded Gym recovery: completed "
+            "canonical rollouts will be restored and unfinished executions will "
+            f"restart from their original tasks: {trainer_checkpoint_path}",
+            flush=True,
         )
     elif restore_mode == "trainer_checkpoint" and trainer_checkpoint_path:
         print(
@@ -2179,6 +2208,7 @@ def setup_single_controller(
         gym_checkpoint_restore_operation_id=gym_checkpoint_restore_operation_id,
         gym_checkpoint_staging_keys=restored_gym_checkpoint_staging_keys,
         gym_checkpoint_continuations=restored_gym_checkpoint_continuations,
+        gym_restart_unfinished=gym_restart_unfinished,
         finalizer_actors=finalizer_actors,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,

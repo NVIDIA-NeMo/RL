@@ -119,6 +119,9 @@ With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint co
 The TQ snapshot and replay index are captured under the same checkpoint barrier. Generation may continue while the snapshot is written, but completed-group commits and destructive TQ clears wait at the barrier. This ensures that the TQ snapshot and replay index describe the same set of groups.
 
 On resume, Single-Controller validates the TQ snapshot against the trainer checkpoint, restores the replay index, and makes completed, committed, unconsumed groups available to the sampler before training resumes.
+The restored TQ partition schemas are authoritative, so startup does not replay
+fresh-run placeholder partition registration. This applies to native and
+NeMo-Gym recovery alike, for both supported TQ backends.
 
 Replay recovery is supported by all built-in samplers: `in_order`, `weight_fifo`, `ready_first`, and `windowed`. Custom samplers must explicitly declare `supports_buffer_checkpoint = True`. Otherwise, setup emits a warning and completed buffered groups are not restored.
 
@@ -145,6 +148,13 @@ rollout_checkpointing:
 
 token_capture:
   enabled: true
+
+async_rl:
+  rollout_failure:
+    nemo_gym:
+      # Stable token-capture identities are retried through the recovery ledger,
+      # not by physically redispatching the same row identity.
+      max_row_attempts: 1
 ```
 
 To include NeMo-Gym's model lineage, parked agent boundaries, and resource
