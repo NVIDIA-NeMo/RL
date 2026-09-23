@@ -399,6 +399,46 @@ class DTensorPolicyWorkerV2Impl(
         """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
         self._rollout_num_gpus_per_engine = num_gpus_per_engine
 
+    def _make_loss_post_processor(self, **kwargs: Any) -> LossPostProcessor:
+        """Build the post-processor used by the training loop."""
+        return LossPostProcessor(**kwargs)
+
+    def _make_logprobs_post_processor(self, **kwargs: Any) -> LogprobsPostProcessor:
+        """Build the post-processor used for policy likelihoods."""
+        return LogprobsPostProcessor(**kwargs)
+
+    def _forward_backward(self, **kwargs: Any) -> list[tuple[Any, dict[str, Any]]]:
+        """Run one set of Automodel microbatches."""
+        return automodel_forward_backward(**kwargs)
+
+    def _logprobs_for_microbatch(
+        self,
+        *,
+        processed_mb: Any,
+        post_processing_fn: Any,
+        sequence_dim: int,
+    ) -> torch.Tensor:
+        """Score one processed microbatch."""
+        prepared = prepare_model_forward(
+            self.model,
+            processed_mb.processed_inputs,
+            device_mesh=self.device_mesh,
+            cp_size=self.cp_size,
+            padding_token_id=self.tokenizer.pad_token_id or 0,
+            is_reward_model=False,
+            allow_flash_attn_args=self.allow_flash_attn_args,
+        )
+        with prepared.model_context_factory(), self._autocast_context():
+            token_logprobs, _metrics, _ = forward_with_post_processing_fn(
+                model=self.model,
+                prepared=prepared,
+                post_processing_fn=post_processing_fn,
+                processed_mb=processed_mb,
+                sampling_params=self.sampling_params,
+                sequence_dim=sequence_dim,
+            )
+        return token_logprobs
+
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
         self,
@@ -436,7 +476,7 @@ class DTensorPolicyWorkerV2Impl(
             self.model.train()
 
         # Create loss post-processor
-        loss_post_processor = LossPostProcessor(
+        loss_post_processor = self._make_loss_post_processor(
             loss_fn=loss_fn,
             cfg=self.cfg,
             cp_mesh=self.cp_mesh,
@@ -490,7 +530,7 @@ class DTensorPolicyWorkerV2Impl(
                 )
 
                 # Use automodel_forward_backward for the training loop
-                mb_results = automodel_forward_backward(
+                mb_results = self._forward_backward(
                     model=self.model,
                     data_iterator=processed_iterator,
                     post_processing_fn=loss_post_processor,
@@ -575,7 +615,6 @@ class DTensorPolicyWorkerV2Impl(
             self.timer.stop("train")
             return metrics
 
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_logprobs")
     def get_logprobs(
         self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
     ) -> BatchedDataDict[LogprobOutputSpec]:
@@ -605,7 +644,7 @@ class DTensorPolicyWorkerV2Impl(
         self.model.eval()
 
         # Create logprobs post-processor
-        logprobs_post_processor = LogprobsPostProcessor(
+        logprobs_post_processor = self._make_logprobs_post_processor(
             cfg=self.cfg,
             enable_seq_packing=self.enable_seq_packing,
             sampling_params=self.sampling_params,
@@ -623,27 +662,11 @@ class DTensorPolicyWorkerV2Impl(
             )
 
             for batch_idx, processed_mb in enumerate(processed_iterator):
-                processed_inputs = processed_mb.processed_inputs
-                prepared = prepare_model_forward(
-                    self.model,
-                    processed_inputs,
-                    device_mesh=self.device_mesh,
-                    cp_size=self.cp_size,
-                    padding_token_id=self.tokenizer.pad_token_id or 0,
-                    is_reward_model=False,
-                    allow_flash_attn_args=self.allow_flash_attn_args,
+                token_logprobs = self._logprobs_for_microbatch(
+                    processed_mb=processed_mb,
+                    post_processing_fn=logprobs_post_processor,
+                    sequence_dim=sequence_dim,
                 )
-
-                with prepared.model_context_factory(), self._autocast_context():
-                    # Use forward_with_post_processing_fn for forward pass and post-processing
-                    token_logprobs, _metrics, _ = forward_with_post_processing_fn(
-                        model=self.model,
-                        prepared=prepared,
-                        post_processing_fn=logprobs_post_processor,
-                        processed_mb=processed_mb,
-                        sampling_params=self.sampling_params,
-                        sequence_dim=sequence_dim,
-                    )
 
                 # skip keeping the logprobs for the dummy batches
                 if batch_idx >= iterator_len:

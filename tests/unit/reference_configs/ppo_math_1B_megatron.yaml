@@ -65,6 +65,7 @@ ppo:
   seq_logprob_error_threshold: null
 
 loss_fn:
+  position_aligned_logprobs: false
   disable_ppo_ratio: false
   reference_policy_kl_penalty: 0.0  # DAPO: no KL penalty
   reference_policy_kl_type: "k3"

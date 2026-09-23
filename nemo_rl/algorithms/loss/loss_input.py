@@ -209,6 +209,7 @@ def prepare_loss_input(
     chunk_size: Optional[int] = None,
     cp_sharder: Optional["ContextParallelSharder"] = None,
     teacher_output_layer_weight_by_index: Optional[dict[int, torch.Tensor]] = None,
+    precomputed_logprobs: bool = False,
 ) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input for a loss function.
 
@@ -216,6 +217,8 @@ def prepare_loss_input(
         logits: Logits from the model.
         data: Microbatch data. Will be updated if sampling_params is not None.
         loss_fn: Loss function.
+        precomputed_logprobs: When True, ``logits`` already holds per-position
+            log probabilities and is passed through unreduced and unshifted.
         vocab_parallel_rank: Vocab parallel rank.
         vocab_parallel_group: Vocab parallel group.
         context_parallel_group: Context parallel group.
@@ -245,9 +248,15 @@ def prepare_loss_input(
         loss_input = {"logits": logits}
 
     elif loss_fn.input_type == LossInputType.LOGPROB:
+        if precomputed_logprobs:
+            # Masked diffusion policies arrive with a per-position ELBO already
+            # accumulated over the quadrature points, so there is no logits
+            # tensor to reduce and no causal shift to apply: the ELBO scores
+            # token i at position i and keeps the full sequence length.
+            logprobs = logits.to(torch.float32)
         # Linear CE fusion patch returns precomputed next-token logprobs (2D tensor).
         # Keep normal path unchanged for standard logits (3D tensor).
-        if (
+        elif (
             hasattr(loss_fn, "use_fused_linear_logprobs")
             and loss_fn.use_fused_linear_logprobs
         ):

@@ -340,6 +340,7 @@ members = [
   # globally we must choose 1.X otherwise we run into pickle issues from ray.
   "research/template_project",
   "research/flow_grpo",
+  "research/gdpo",
 ]
 
 [[tool.uv.index]]
